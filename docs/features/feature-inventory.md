@@ -38,7 +38,7 @@
 
 | Feature | Description |
 |---------|-------------|
-| Multi-Runtime AI Agent Platform | Unified `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / OpenAI-compat five backends with auto-detection |
+| Multi-Runtime AI Agent Platform | Unified `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / Grok (`grok`) / OpenAI-compat six backends with auto-detection |
 | MCP Server (JSON-RPC 2.0) | Exposes 80+ tools to AI Runtime via stdin/stdout; registered at `<agent>/.mcp.json` (v1.8.5 — Claude CLI `-p` only reads project-level), gateway auto-creates/repairs on startup |
 | ACP/A2A Server | `duduclaw acp-server` — stdio JSON-RPC 2.0 with `agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`; `.well-known/agent.json` AgentCard; IDE integration (Zed / JetBrains / Neovim) |
 | Agent Directory Structure | `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/` |
@@ -58,6 +58,7 @@
 | Codex Runtime | OpenAI Codex CLI with `--json` streaming events, `AGENTS.md` file for system prompt |
 | Gemini Runtime | Google Gemini CLI with `--output-format stream-json`, `GEMINI_SYSTEM_MD` env var for system prompt, `--approval-mode yolo`. Retained for paid `GEMINI_API_KEY` users after Google retired the personal-tier Gemini CLI on 2026-06-18 |
 | Antigravity Runtime (v1.24.0) | Google Antigravity CLI (`agy`, the 2026-06-18 Gemini-CLI successor), driven via oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`. Binary auto-resolve (PATH → `~/.local/bin/agy`); no `--system` flag so the system prompt + history are embedded in the prompt (CJK-safe); auth `ANTIGRAVITY_API_KEY`; auto-pre-seeds the agent dir into agy's `trustedWorkspaces` (cross-process lock) to avoid a headless trust-prompt hang; token usage estimated (print mode exposes no stats) |
+| Grok Runtime (R4) | xAI Grok CLI ("Grok Build"), driven via oneshot `grok -p`. Binary auto-resolve (official `grok`, fallback third-party `grok-cli`); system prompt + history embedded in the prompt (no verified `--system` flag, CJK-safe); duduclaw MCP server written to `<agent_dir>/.grok/settings.json`; token usage estimated. **Detection + headless spawn only** — SuperGrok OAuth (accounts.x.ai device-flow) and the exact CLI flag/config/context-file surface are UNVERIFIED and left as a follow-up |
 | OpenAI-compat Runtime | HTTP endpoint (MiniMax / DeepSeek / etc.) via REST API |
 | RuntimeRegistry | Auto-detection of installed CLIs, per-agent `[runtime]` config |
 | Cross-Provider Failover | `FailoverManager` health tracking, cooldown, non-retryable error detection |

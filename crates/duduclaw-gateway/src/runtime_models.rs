@@ -151,6 +151,17 @@ fn agy_fallback() -> Vec<RuntimeModel> {
     ]
 }
 
+/// Grok (xAI "Grok Build") fallback — used when the live probe fails or the CLI
+/// has no non-interactive listing. R4 / UNVERIFIED (2026-07-12): the coding agent
+/// drives `grok-build-0.1`; `grok-4` is listed as a likely general model. Confirm
+/// ids against the real CLI when available.
+fn grok_fallback() -> Vec<RuntimeModel> {
+    vec![
+        m("grok-build-0.1", "Grok Build 0.1", "grok"),
+        m("grok-4", "Grok 4", "grok"),
+    ]
+}
+
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -192,6 +203,16 @@ pub async fn discover_all(home_dir: &Path) -> RuntimeModelsCache {
         // parser: `agy models` prints display names ("Gemini 3.5 Flash (Low)")
         // and `--model` accepts exactly those strings, so lines pass verbatim.
         providers.insert("agy".to_string(), discover_agy(&bin).await);
+    }
+    // R4: Grok CLI (official `grok`, fallback third-party `grok-cli`). No verified
+    // non-interactive listing, so `discover_generic` falls back to the static list.
+    if let Some(bin) =
+        duduclaw_core::which_grok().or_else(|| duduclaw_core::which_grok_in_home(home_dir))
+    {
+        providers.insert(
+            "grok".to_string(),
+            discover_generic("grok", &bin, grok_fallback()).await,
+        );
     }
 
     RuntimeModelsCache { providers, fetched_at: now_rfc3339() }

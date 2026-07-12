@@ -94,7 +94,7 @@ fn resign_preserves_validity_and_reverifies() {
     let (seed, registry) = issuer_pair();
     let fp = generate_fingerprint();
     let (original, blob) =
-        issue_signed_oem_license(&seed, &registry, "v2", "dist-r-1", "dist-r", &fp, 365, None)
+        issue_signed_oem_license(&seed, &registry, "v2", "dist-r-1", "dist-r", &fp, 365, None, None)
             .unwrap();
 
     let rec = IssuedLicense {

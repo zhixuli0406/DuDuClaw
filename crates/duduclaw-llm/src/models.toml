@@ -160,6 +160,26 @@ cache_read_mc = 5000     # $0.05 / MTok
 caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
 
 [[models]]
+id = "grok-4.3"
+provider = "xai"
+context_window = 1000000
+max_output_tokens = 32768
+input_mc = 125000        # $1.25 / MTok
+output_mc = 250000       # $2.50 / MTok
+cache_read_mc = 20000    # $0.20 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "grok-4.5"
+provider = "xai"
+context_window = 500000
+max_output_tokens = 32768
+input_mc = 200000        # $2.00 / MTok
+output_mc = 600000       # $6.00 / MTok
+cache_read_mc = 20000    # $0.20 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
 id = "mistral-small-3"
 provider = "mistral"
 context_window = 128000

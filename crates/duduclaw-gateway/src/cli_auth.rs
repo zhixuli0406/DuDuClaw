@@ -203,6 +203,12 @@ pub fn spec_for(runtime: RuntimeType) -> Option<CliAuthSpec> {
             hint: "於同機瀏覽器完成 Antigravity 登入。遠端請改用 ANTIGRAVITY_API_KEY。",
             success_file: None,
         }),
+        // R4 phase 1: Grok CLI detection + headless spawn only. The SuperGrok
+        // OAuth device-flow (accounts.x.ai) is a phase-2 follow-up, and its exact
+        // `grok` login subcommand/markers are UNVERIFIED, so no interactive login
+        // spec is wired yet (fail-closed: `None` means "no verified login flow").
+        // The binary is still discoverable via `resolve_program` below.
+        RuntimeType::Grok => None,
         RuntimeType::OpenAiCompat => None,
     }
 }
@@ -214,6 +220,7 @@ pub fn resolve_program(runtime: RuntimeType) -> Option<String> {
         RuntimeType::Codex => duduclaw_core::which_codex(),
         RuntimeType::Gemini => duduclaw_core::which_gemini(),
         RuntimeType::Antigravity => duduclaw_core::which_agy(),
+        RuntimeType::Grok => duduclaw_core::which_grok(),
         RuntimeType::OpenAiCompat => None,
     }
 }

@@ -1,9 +1,10 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useTasksStore } from '@/stores/tasks-store';
 import { cn } from '@/lib/utils';
+import { departmentsOf } from '@/lib/agents';
 import {
   api,
   type AgentDetail,
@@ -18,6 +19,10 @@ import {
   type ContainerMount,
   type ContainerEnvVar,
   type AgentOdooOverride,
+  type ToolPolicyRule,
+  type ToolPolicyWhen,
+  type ToolPolicyEffect,
+  type ToolPolicyOp,
 } from '@/lib/api';
 import { Dialog, FormField, inputClass } from '@/components/shared/Dialog';
 import { ModelSelect } from '@/components/shared/ModelSelect';
@@ -34,10 +39,11 @@ import {
   type SelectOption,
 } from '@/components/settings/controls';
 import { toast, formatError } from '@/lib/toast';
-import { Bot, Pause, Play, Send, Eye, Plus, X, ShieldCheck, Pencil, Trash2, LayoutGrid, Table2 } from 'lucide-react';
-import { Page, Card, Button, Badge, EmptyState, Tabs } from '@/components/ui';
+import { Bot, Pause, Play, Send, Eye, Plus, X, ShieldCheck, Pencil, Trash2, LayoutGrid, Table2, Archive, RotateCcw, LogOut } from 'lucide-react';
+import { Page, Card, Button, Badge, CharacterAvatar, EmptyState, Tabs } from '@/components/ui';
 import { AgentStatusGlyph } from '@/components/AgentStatusGlyph';
 import { RosterCard, HireSlotCard } from '@/components/agent';
+import { OffboardDialog } from '@/components/agent/OffboardDialog';
 import { useAgentGlyphState } from '@/stores/agent-activity-store';
 
 /** Roster view mode — remembered in localStorage (§5.4 T6.1). */
@@ -67,6 +73,7 @@ function StatusBadge({ status }: { status: string }) {
     active: 'success',
     paused: 'warning',
     terminated: 'danger',
+    archived: 'neutral',
   };
 
   return (
@@ -88,14 +95,14 @@ function RoleBadge({ role }: { role: string }) {
 export function AgentsPage() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const { agents, fetchAgents, pauseAgent, resumeAgent, removeAgent, loading } = useAgentsStore();
+  const { agents, fetchAgents, pauseAgent, resumeAgent, unarchiveAgent, includeArchived, setIncludeArchived, loading } = useAgentsStore();
   const { tasks, fetchTasks } = useTasksStore();
   const [view, setView] = useState<AgentsView>(readView);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [delegateTarget, setDelegateTarget] = useState<string | null>(null);
   const [inspectTarget, setInspectTarget] = useState<AgentDetail | null>(null);
   const [editTarget, setEditTarget] = useState<AgentDetail | null>(null);
-  const [removeTarget, setRemoveTarget] = useState<string | null>(null);
+  const [offboardTarget, setOffboardTarget] = useState<AgentDetail | null>(null);
 
   useEffect(() => {
     fetchAgents();
@@ -137,7 +144,16 @@ export function AgentsPage() {
       </header>
 
       {!empty && (
-        <div className="flex justify-end">
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <label className="flex items-center gap-2 text-sm text-stone-600 dark:text-stone-300">
+            <input
+              type="checkbox"
+              checked={includeArchived}
+              onChange={(e) => void setIncludeArchived(e.target.checked)}
+              className="h-4 w-4 rounded border-stone-300 text-amber-500 focus-visible:ring-amber-500/50 dark:border-stone-600"
+            />
+            {intl.formatMessage({ id: 'agents.showArchived' })}
+          </label>
           <ViewToggle view={view} onChange={changeView} />
         </div>
       )}
@@ -158,7 +174,13 @@ export function AgentsPage() {
         /* Character roster (§5.4 T6.1). */
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {agents.map((agent) => (
-            <RosterCard key={agent.name} agent={agent} tasks={tasks} onOpen={openDetail} />
+            <RosterCard
+              key={agent.name}
+              agent={agent}
+              tasks={tasks}
+              onOpen={openDetail}
+              onUnarchive={agent.archived ? () => void unarchiveAgent(agent.name) : undefined}
+            />
           ))}
           <HireSlotCard onClick={() => setShowCreateDialog(true)} />
         </div>
@@ -166,10 +188,10 @@ export function AgentsPage() {
         /* Management view — the v1 roster cards, kept for full lifecycle control. */
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {agents.map((agent) => (
-            <Card key={agent.name} interactive>
+            <Card key={agent.name} interactive className={agent.archived ? 'opacity-70' : undefined}>
               <div className="flex items-start justify-between">
                 <div className="flex items-center gap-3">
-                  <span className="text-2xl">{agent.icon || '🤖'}</span>
+                  <CharacterAvatar agentId={agent.name} name={agent.display_name} size={32} />
                   <div className="min-w-0">
                     <h3 className="truncate font-semibold text-stone-900 dark:text-stone-50">{agent.display_name}</h3>
                     <p className="truncate text-xs text-stone-500 dark:text-stone-400">{agent.trigger}</p>
@@ -181,8 +203,17 @@ export function AgentsPage() {
                 </div>
               </div>
 
-              <div className="mt-3 flex items-center gap-2">
+              <div className="mt-3 flex flex-wrap items-center gap-2">
                 <RoleBadge role={agent.role} />
+                {agent.department && (
+                  <Badge tone="neutral">{intl.formatMessage({ id: 'agents.department.label' })}: {agent.department}</Badge>
+                )}
+                {agent.archived && (
+                  <Badge tone="warning">
+                    <Archive className="h-3 w-3" />
+                    {intl.formatMessage({ id: 'agents.archived.badge' })}
+                  </Badge>
+                )}
                 {agent.sandbox_enabled && (
                   <Badge tone="info">
                     <ShieldCheck className="h-3 w-3" />
@@ -239,16 +270,39 @@ export function AgentsPage() {
                 <Button size="sm" variant="ghost" icon={Pencil} onClick={() => setEditTarget(agent)}>
                   {intl.formatMessage({ id: 'agents.edit' })}
                 </Button>
-                {agent.role !== 'main' && (
+                {agent.archived && (
                   <Button
                     size="sm"
                     variant="ghost"
-                    icon={Trash2}
+                    icon={RotateCcw}
+                    className="text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-400"
+                    onClick={() => void unarchiveAgent(agent.name)}
+                  >
+                    {intl.formatMessage({ id: 'agents.unarchive' })}
+                  </Button>
+                )}
+                {agent.role === 'main' ? (
+                  <span title={intl.formatMessage({ id: 'agents.offboard.mainBlocked' })}>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      icon={LogOut}
+                      disabled
+                      aria-label={intl.formatMessage({ id: 'agents.offboard.mainBlocked' })}
+                    />
+                  </span>
+                ) : !agent.archived ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={LogOut}
                     className="text-rose-600 hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-500/10"
                     aria-label={intl.formatMessage({ id: 'agents.remove' })}
-                    onClick={() => setRemoveTarget(agent.name)}
-                  />
-                )}
+                    onClick={() => setOffboardTarget(agent)}
+                  >
+                    {intl.formatMessage({ id: 'agentDetail.dismiss' })}
+                  </Button>
+                ) : null}
               </div>
             </Card>
           ))}
@@ -283,17 +337,16 @@ export function AgentsPage() {
         onSaved={() => { setEditTarget(null); fetchAgents(); }}
       />
 
-      {/* Remove Confirm Dialog */}
-      <RemoveConfirmDialog
-        agentName={removeTarget}
-        onClose={() => setRemoveTarget(null)}
-        onConfirm={async () => {
-          if (removeTarget) {
-            await removeAgent(removeTarget);
-            setRemoveTarget(null);
-          }
-        }}
-      />
+      {/* Offboard Dialog (WP4 — archive / remove / handoff) */}
+      {offboardTarget && (
+        <OffboardDialog
+          open
+          agent={offboardTarget}
+          candidates={agents.filter((a) => a.name !== offboardTarget.name && !a.archived)}
+          onClose={() => setOffboardTarget(null)}
+          onDone={() => { setOffboardTarget(null); fetchAgents(); }}
+        />
+      )}
     </Page>
   );
 }
@@ -510,7 +563,7 @@ function InspectDialog({ agent, onClose, onEdit }: { agent: AgentDetail | null; 
 type MainTab = 'general' | 'advanced';
 type AdvGroup = 'run' | 'access' | 'integration' | 'evo';
 
-const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = ['claude', 'codex', 'gemini', 'openai_compat'];
+const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = ['claude', 'codex', 'gemini', 'grok', 'openai_compat'];
 
 const AGENT_ROLES: ReadonlyArray<string> = ['main', 'specialist', 'worker', 'developer', 'qa', 'planner'];
 
@@ -534,6 +587,142 @@ function SwitchRow({
     <SettingField label={label} help={help} layout="row">
       <ControlSwitch checked={checked} onChange={onChange} disabled={disabled} label={label} />
     </SettingField>
+  );
+}
+
+const POLICY_EFFECTS: readonly ToolPolicyEffect[] = ['allow', 'ask', 'forbid'];
+const POLICY_OPS: readonly ToolPolicyOp[] = ['equals', 'contains', 'starts_with'];
+
+/**
+ * ToolPolicyEditor — a Progent-style tool-authorization rule builder. Each rule
+ * names a tool (`*` = any), an effect (allow / ask / forbid), and optional
+ * AND-ed argument conditions. All updates are immutable (fresh arrays). The
+ * surrounding SettingField carries the "strict allowlist" explanation.
+ */
+function ToolPolicyEditor({
+  value,
+  onChange,
+}: {
+  value: ToolPolicyRule[];
+  onChange: (next: ToolPolicyRule[]) => void;
+}) {
+  const intl = useIntl();
+  const effectOptions: SelectOption[] = POLICY_EFFECTS.map((e) => ({
+    value: e,
+    label: intl.formatMessage({ id: `agents.cap.policy.effect.${e}` }),
+  }));
+  const opOptions: SelectOption[] = POLICY_OPS.map((o) => ({
+    value: o,
+    label: intl.formatMessage({ id: `agents.cap.policy.op.${o}` }),
+  }));
+
+  const updateRule = (idx: number, patch: Partial<ToolPolicyRule>) =>
+    onChange(value.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  const removeRule = (idx: number) => onChange(value.filter((_, i) => i !== idx));
+  const addRule = () => onChange([...value, { tool: '*', effect: 'allow', when: [] }]);
+
+  const whenOf = (ri: number): ToolPolicyWhen[] => value[ri].when ?? [];
+  const updateWhen = (ri: number, wi: number, patch: Partial<ToolPolicyWhen>) =>
+    updateRule(ri, { when: whenOf(ri).map((w, i) => (i === wi ? { ...w, ...patch } : w)) });
+  const addWhen = (ri: number) =>
+    updateRule(ri, { when: [...whenOf(ri), { arg: '', op: 'contains', value: '' }] });
+  const removeWhen = (ri: number, wi: number) =>
+    updateRule(ri, { when: whenOf(ri).filter((_, i) => i !== wi) });
+
+  return (
+    <div className="space-y-3">
+      {value.length === 0 ? (
+        <p className="text-xs text-stone-400 dark:text-stone-500">
+          {intl.formatMessage({ id: 'agents.cap.policy.empty' })}
+        </p>
+      ) : (
+        value.map((rule, ri) => (
+          <div key={ri} className="space-y-2 rounded-lg border border-[var(--panel-border)] p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                className={cn(inputClass, 'min-w-[8rem] flex-1')}
+                value={rule.tool}
+                placeholder="*"
+                aria-label={intl.formatMessage({ id: 'agents.cap.policy.tool' })}
+                onChange={(e) => updateRule(ri, { tool: e.target.value })}
+              />
+              <div className="w-36">
+                <OptionSelect
+                  value={rule.effect}
+                  onChange={(v) => updateRule(ri, { effect: v as ToolPolicyEffect })}
+                  options={effectOptions}
+                  showRaw={false}
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => removeRule(ri)}
+                className="rounded-md p-1.5 text-stone-400 hover:bg-rose-500/10 hover:text-rose-500"
+                aria-label={intl.formatMessage({ id: 'agents.cap.policy.removeRule' })}
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {whenOf(ri).map((w, wi) => (
+              <div key={wi} className="flex flex-wrap items-center gap-2 pl-3">
+                <span className="text-xs text-stone-400 dark:text-stone-500">
+                  {intl.formatMessage({ id: 'agents.cap.policy.when' })}
+                </span>
+                <input
+                  className={cn(inputClass, 'min-w-[6rem] flex-1')}
+                  value={w.arg}
+                  placeholder={intl.formatMessage({ id: 'agents.cap.policy.arg' })}
+                  aria-label={intl.formatMessage({ id: 'agents.cap.policy.arg' })}
+                  onChange={(e) => updateWhen(ri, wi, { arg: e.target.value })}
+                />
+                <div className="w-32">
+                  <OptionSelect
+                    value={w.op}
+                    onChange={(v) => updateWhen(ri, wi, { op: v as ToolPolicyOp })}
+                    options={opOptions}
+                    showRaw={false}
+                  />
+                </div>
+                <input
+                  className={cn(inputClass, 'min-w-[6rem] flex-1')}
+                  value={w.value}
+                  placeholder={intl.formatMessage({ id: 'agents.cap.policy.value' })}
+                  aria-label={intl.formatMessage({ id: 'agents.cap.policy.value' })}
+                  onChange={(e) => updateWhen(ri, wi, { value: e.target.value })}
+                />
+                <button
+                  type="button"
+                  onClick={() => removeWhen(ri, wi)}
+                  className="rounded-md p-1.5 text-stone-400 hover:bg-rose-500/10 hover:text-rose-500"
+                  aria-label={intl.formatMessage({ id: 'agents.cap.policy.removeCondition' })}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ))}
+
+            <button
+              type="button"
+              onClick={() => addWhen(ri)}
+              className="ml-3 inline-flex items-center gap-1 text-xs font-medium text-stone-500 hover:text-amber-600 dark:text-stone-400 dark:hover:text-amber-400"
+            >
+              <Plus className="h-3 w-3" />
+              {intl.formatMessage({ id: 'agents.cap.policy.addCondition' })}
+            </button>
+          </div>
+        ))
+      )}
+
+      <button
+        type="button"
+        onClick={addRule}
+        className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-[var(--panel-border)] px-3 py-2 text-xs font-medium text-stone-600 hover:border-amber-400 hover:text-amber-600 dark:text-stone-300 dark:hover:text-amber-400"
+      >
+        <Plus className="h-3.5 w-3.5" />
+        {intl.formatMessage({ id: 'agents.cap.policy.addRule' })}
+      </button>
+    </div>
   );
 }
 
@@ -605,9 +794,8 @@ const DEFAULT_CONTAINER_ADVANCED: {
   env: [],
 };
 
-/** Default capability values written when the operator hasn't changed a field.
- *  Note: `agents.inspect` does not return the current [capabilities] block, so
- *  this form is write-only — it shows defaults and writes a partial update. */
+/** Default capability values, used until agents.inspect prefills the form on
+ *  tab open. A partial update is written only for fields the operator changed. */
 const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_use_config'>> & {
   computer_use_config: Required<ComputerUseConfig>;
 } = {
@@ -617,6 +805,8 @@ const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_use_confi
   allowed_tools: [],
   denied_tools: [],
   wiki_visible_to: [],
+  native_sandbox: false,
+  policy: [],
   computer_use_config: {
     allowed_apps: [],
     blocked_actions: [],
@@ -706,11 +896,20 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
   // Local form state — initialized from agent when dialog opens
   const [form, setForm] = useState<AgentUpdateParams>({});
 
-  // CAP — capabilities form (write-only; inspect doesn't return current values)
+  // CAP — capabilities form. Prefilled from agents.inspect on tab open (see the
+  // lazy effect below); a partial update is still written only when touched.
   const [caps, setCaps] = useState<typeof DEFAULT_CAPABILITIES>(DEFAULT_CAPABILITIES);
   // Tracks whether the operator touched the Capabilities tab — if untouched we
   // omit `capabilities` from the update so we don't overwrite existing config.
   const [capsDirty, setCapsDirty] = useState(false);
+  // Mirror capsDirty into a ref so the async prefill can tell, at resolution
+  // time, whether the operator already edited the tab (avoid clobbering edits).
+  const capsDirtyRef = useRef(false);
+  useEffect(() => { capsDirtyRef.current = capsDirty; }, [capsDirty]);
+  // Prefill the capability form (incl. the Progent policy rules) from
+  // agents.inspect the first time the tab opens, so existing values are visible
+  // and editable rather than reset to defaults.
+  const [capsLoaded, setCapsLoaded] = useState(false);
 
   // CON — contract form, loaded lazily via contract.get on first tab open
   const [contract, setContract] = useState<ContractConfig>({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
@@ -755,6 +954,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
         trigger: agent.trigger,
         icon: agent.icon,
         reports_to: agent.reports_to,
+        department: agent.department ?? '',
         preferred: currentPreferred,
         fallback: currentFallback,
         api_mode: (agent.model?.api_mode ?? 'cli') as 'cli' | 'direct' | 'auto',
@@ -791,6 +991,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
       // Reset CAP/CON state for the newly-opened agent.
       setCaps(DEFAULT_CAPABILITIES);
       setCapsDirty(false);
+      setCapsLoaded(false);
       setContract({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
       setContractLoaded(false);
       // RT/EVO/CT — reset write-only advanced forms.
@@ -826,6 +1027,36 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
       setContractLoaded(true);
     });
   }, [mainTab, advGroup, agent, contractLoaded, intl]);
+
+  // CAP — lazily prefill the [capabilities] form (incl. Progent policy rules)
+  // from agents.inspect when the 能力與權限 group first opens. Keeps capsDirty
+  // false so an untouched tab still omits `capabilities` from the update.
+  useEffect(() => {
+    if (mainTab !== 'advanced' || advGroup !== 'access' || !agent || capsLoaded) return;
+    // Guard both races: (1) cross-agent — if the dialog switches agents while
+    // this inspect is in flight, `cancelled` (set by cleanup) drops the stale
+    // result so agent A's policy never lands in agent B's form; (2) operator
+    // edits made during the load window are preserved by skipping the merge
+    // when the tab is already dirty.
+    let cancelled = false;
+    api.agents.inspect(agent.name).then((detail) => {
+      if (cancelled) return;
+      const c = detail.capabilities;
+      if (c && !capsDirtyRef.current) {
+        setCaps((prev) => ({
+          ...prev,
+          ...c,
+          computer_use_config: { ...prev.computer_use_config, ...(c.computer_use_config ?? {}) },
+        }));
+      }
+      setCapsLoaded(true);
+    }).catch((e) => {
+      if (cancelled) return;
+      console.warn('[api]', e);
+      setCapsLoaded(true);
+    });
+    return () => { cancelled = true; };
+  }, [mainTab, advGroup, agent, capsLoaded]);
 
   const updateCap = useCallback(<K extends keyof typeof DEFAULT_CAPABILITIES>(key: K, value: (typeof DEFAULT_CAPABILITIES)[K]) => {
     setCapsDirty(true);
@@ -936,6 +1167,8 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
           allowed_tools: caps.allowed_tools,
           denied_tools: caps.denied_tools,
           wiki_visible_to: caps.wiki_visible_to,
+          native_sandbox: caps.native_sandbox,
+          policy: caps.policy,
           computer_use_config: { ...caps.computer_use_config },
         };
       }
@@ -1105,6 +1338,9 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
     reportsToOptions.push({ value: form.reports_to, label: form.reports_to, raw: form.reports_to });
   }
 
+  // WP7 — the set of departments already in use, for the free-input datalist.
+  const departmentOptions: string[] = departmentsOf(agents);
+
   return (
     <Dialog open={agent !== null} onClose={onClose} title={`${agent.icon || '🤖'} ${intl.formatMessage({ id: 'agents.edit' })}`} className="max-w-2xl">
       <div className="space-y-4">
@@ -1132,6 +1368,21 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                 </SettingField>
                 <SettingField label={intl.formatMessage({ id: 'agents.edit.reportsTo' })} help={intl.formatMessage({ id: 'agents.edit.reportsTo.help' })}>
                   <OptionSelect value={form.reports_to ?? ''} onChange={(v) => updateField('reports_to', v)} options={reportsToOptions} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.department.label' })} help={intl.formatMessage({ id: 'agents.department.help' })}>
+                  <input
+                    type="text"
+                    list="agent-department-options"
+                    value={form.department ?? ''}
+                    onChange={(e) => updateField('department', e.target.value)}
+                    placeholder={intl.formatMessage({ id: 'agents.department.placeholder' })}
+                    className={inputClass}
+                  />
+                  <datalist id="agent-department-options">
+                    {departmentOptions.map((d) => (
+                      <option key={d} value={d} />
+                    ))}
+                  </datalist>
                 </SettingField>
               </section>
 
@@ -1380,6 +1631,15 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                 </SettingField>
                 <SettingField label={intl.formatMessage({ id: 'agents.cap.wikiVisibleTo' })} help={intl.formatMessage({ id: 'agents.cap.wikiVisibleTo.hint' })}>
                   <ChipEditor values={caps.wiki_visible_to} onChange={(v) => updateCap('wiki_visible_to', v)} placeholder="coder" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                </SettingField>
+                <SwitchRow
+                  label={intl.formatMessage({ id: 'agents.cap.nativeSandbox' })}
+                  help={intl.formatMessage({ id: 'agents.cap.nativeSandbox.help' })}
+                  checked={caps.native_sandbox}
+                  onChange={(v) => updateCap('native_sandbox', v)}
+                />
+                <SettingField label={intl.formatMessage({ id: 'agents.cap.policy' })} help={intl.formatMessage({ id: 'agents.cap.policy.help' })}>
+                  <ToolPolicyEditor value={caps.policy} onChange={(v) => updateCap('policy', v)} />
                 </SettingField>
               </div>
 
@@ -1687,41 +1947,6 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
           <Button variant="secondary" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
           <Button variant="primary" onClick={handleSave} disabled={saving}>
             {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
-          </Button>
-        </div>
-      </div>
-    </Dialog>
-  );
-}
-
-// ── Remove Confirm Dialog ──
-
-function RemoveConfirmDialog({ agentName, onClose, onConfirm }: { agentName: string | null; onClose: () => void; onConfirm: () => void }) {
-  const intl = useIntl();
-  const [confirming, setConfirming] = useState(false);
-
-  const handleConfirm = async () => {
-    setConfirming(true);
-    try {
-      await onConfirm();
-    } finally {
-      setConfirming(false);
-    }
-  };
-
-  if (!agentName) return null;
-
-  return (
-    <Dialog open={agentName !== null} onClose={onClose} title={intl.formatMessage({ id: 'agents.remove' })}>
-      <div className="space-y-4">
-        <p className="text-sm text-stone-600 dark:text-stone-400">
-          {intl.formatMessage({ id: 'agents.remove.confirm' })}
-        </p>
-        <p className="text-sm font-medium text-stone-900 dark:text-stone-50">Agent: {agentName}</p>
-        <div className="flex justify-end gap-3 pt-2">
-          <Button variant="secondary" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
-          <Button variant="danger" onClick={handleConfirm} disabled={confirming}>
-            {confirming ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'common.delete' })}
           </Button>
         </div>
       </div>

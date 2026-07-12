@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { useSearchParams } from 'react-router';
+import { useNavigate, useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import { Page, PageHeader, Tabs } from '@/components/ui';
 import {
@@ -19,7 +19,6 @@ import {
   Download,
   KeyRound,
   ChevronDown,
-  Palette,
 } from 'lucide-react';
 import { GeneralTab } from '@/components/settings/sections/GeneralTab';
 import { AccountTab } from '@/components/settings/sections/AccountTab';
@@ -35,14 +34,26 @@ import { RedactionTab } from '@/components/settings/sections/RedactionTab';
 import { DoctorTab } from '@/components/settings/sections/DoctorTab';
 import { UpdateTab } from '@/components/settings/sections/UpdateTab';
 import { BrowserTab } from '@/components/settings/sections/BrowserTab';
-import { BrandingTab } from '@/components/settings/sections/BrandingTab';
 
-type TabId = 'general' | 'account' | 'system' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'skillSynthesis' | 'redaction' | 'doctor' | 'update' | 'browser' | 'branding';
+type TabId = 'general' | 'account' | 'system' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'skillSynthesis' | 'redaction' | 'doctor' | 'update' | 'browser';
 
 export function SettingsPage() {
   const intl = useIntl();
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const initialTab = (searchParams.get('tab') as TabId) || 'general';
+  const VALID_TABS: readonly TabId[] = [
+    'general', 'account', 'system', 'container', 'heartbeat', 'cron', 'voice',
+    'proactive', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'update', 'browser',
+  ];
+  const tabParam = searchParams.get('tab');
+  // Branding moved to /manage/distributors (R5). Redirect legacy deep-links
+  // (bookmarks / links to ?tab=branding) instead of rendering a blank tab.
+  useEffect(() => {
+    if (tabParam === 'branding') {
+      navigate('/manage/distributors?tab=branding', { replace: true });
+    }
+  }, [tabParam, navigate]);
+  const initialTab: TabId = VALID_TABS.includes(tabParam as TabId) ? (tabParam as TabId) : 'general';
   const [activeTab, setActiveTab] = useState<TabId>(initialTab);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
@@ -61,13 +72,12 @@ export function SettingsPage() {
     doctor: { label: intl.formatMessage({ id: 'settings.doctor' }), icon: Stethoscope },
     update: { label: intl.formatMessage({ id: 'settings.update' }), icon: Download },
     browser: { label: intl.formatMessage({ id: 'settings.browser' }), icon: Globe },
-    branding: { label: intl.formatMessage({ id: 'settings.branding' }), icon: Palette },
   };
   // Non-engineers only need a handful of these day-to-day; the rest are
   // system/engineering knobs tucked behind an "Advanced" disclosure so the
   // default surface reads like a consumer app, not an ops console.
   const EVERYDAY: TabId[] = ['general', 'account', 'voice', 'proactive', 'update'];
-  const ADVANCED: TabId[] = ['system', 'container', 'heartbeat', 'cron', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser', 'branding'];
+  const ADVANCED: TabId[] = ['system', 'container', 'heartbeat', 'cron', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser'];
   const toItems = (ids: TabId[]) => ids.map((id) => ({ id, ...TAB_META[id] }));
   const activeIsAdvanced = ADVANCED.includes(activeTab);
 
@@ -123,7 +133,6 @@ export function SettingsPage() {
       {activeTab === 'doctor' && <DoctorTab />}
       {activeTab === 'update' && <UpdateTab />}
       {activeTab === 'browser' && <BrowserTab />}
-      {activeTab === 'branding' && <BrandingTab />}
     </Page>
   );
 }

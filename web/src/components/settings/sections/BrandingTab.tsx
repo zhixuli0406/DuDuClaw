@@ -48,6 +48,7 @@ export function BrandingTab() {
   const intl = useIntl();
   const branding = useBrandingStore((s) => s.branding);
   const whiteLabelActive = useBrandingStore((s) => s.whiteLabelActive);
+  const editableFields = useBrandingStore((s) => s.editableFields);
   const fetchBranding = useBrandingStore((s) => s.fetch);
   const setBranding = useBrandingStore((s) => s.setBranding);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -89,6 +90,31 @@ export function BrandingTab() {
   }, [branding]);
 
   const locked = !whiteLabelActive;
+
+  // WP8 field-level masking (a refinement layered ON TOP of the `locked` gate):
+  // even on a white-label instance a customer license may grant only a subset of
+  // branding fields. A field NOT in `editableFields` is provider-managed → its
+  // control is disabled and a plain-language hint explains why. `canEdit` gates
+  // both the control state AND which keys we include in the save payload (so the
+  // whole request is never rejected for touching an off-limits field).
+  const canEdit = (field: string) => !locked && editableFields.includes(field);
+  const fieldDisabled = (field: string) => !canEdit(field);
+  const fieldManaged = (field: string) => !locked && !editableFields.includes(field);
+  const managedMsg = intl.formatMessage({ id: 'branding.field.managed' });
+  const managedTitle = (field: string) => (fieldManaged(field) ? managedMsg : undefined);
+  // Shared control props for the uniform text/color inputs — same `disabled` /
+  // `title` every field wires by hand. (The logo control is bespoke and opts out.)
+  const fieldProps = (field: string) => ({
+    disabled: fieldDisabled(field),
+    title: managedTitle(field),
+  });
+  const managedHint = (field: string) =>
+    fieldManaged(field) ? (
+      <p className="mt-1.5 flex items-center gap-1.5 text-xs text-amber-600/90 dark:text-amber-400/90">
+        <Lock className="h-3 w-3 shrink-0" />
+        {managedMsg}
+      </p>
+    ) : null;
 
   // Debounced (~500ms) server-side sanitize for the preview pane. We ONLY ever
   // render the string the backend returns — the raw textarea value is never
@@ -148,17 +174,25 @@ export function BrandingTab() {
   const handleSave = async () => {
     setSaving(true);
     try {
-      const input: BrandingSetInput = {
-        product_name: productName.trim(),
-        subtitle: subtitle.trim(),
-        company_name: companyName.trim(),
-        website: website.trim(),
-        support_email: supportEmail.trim(),
-        description: description.trim(),
-        logo_data_uri: logo,
-        about_html: aboutHtml,
-        accent_color: accentColor,
-      };
+      // Only send fields this instance may edit — provider-managed fields are
+      // omitted so the gateway preserves their value instead of rejecting the
+      // whole request for touching an off-limits field. Table-driven so the
+      // per-field key + value + trim policy lives in one place.
+      const saveFields: ReadonlyArray<[keyof BrandingSetInput, string]> = [
+        ['product_name', productName.trim()],
+        ['subtitle', subtitle.trim()],
+        ['company_name', companyName.trim()],
+        ['website', website.trim()],
+        ['support_email', supportEmail.trim()],
+        ['description', description.trim()],
+        ['logo_data_uri', logo],
+        ['about_html', aboutHtml],
+        ['accent_color', accentColor],
+      ];
+      const input: BrandingSetInput = {};
+      for (const [key, value] of saveFields) {
+        if (canEdit(key)) (input as Record<string, string>)[key] = value;
+      }
       const res = await api.branding.set(input);
       // Refresh the store in place so the Sidebar / title update instantly.
       setBranding(res.branding, true);
@@ -239,7 +273,7 @@ export function BrandingTab() {
                 id="branding-logo"
                 type="file"
                 accept={ACCEPT}
-                disabled={locked}
+                disabled={fieldDisabled('logo_data_uri')}
                 className="hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0];
@@ -250,14 +284,18 @@ export function BrandingTab() {
               <div className="flex items-center gap-2">
                 <Button
                   variant="secondary"
-                  disabled={locked}
+                  disabled={fieldDisabled('logo_data_uri')}
                   onClick={() => fileRef.current?.click()}
                 >
                   <Upload className="mr-1.5 h-4 w-4" />
                   {intl.formatMessage({ id: 'branding.logo.upload' })}
                 </Button>
                 {previewIsImage && (
-                  <Button variant="ghost" disabled={locked} onClick={() => setLogo('')}>
+                  <Button
+                    variant="ghost"
+                    disabled={fieldDisabled('logo_data_uri')}
+                    onClick={() => setLogo('')}
+                  >
                     <Trash2 className="mr-1.5 h-4 w-4" />
                     {intl.formatMessage({ id: 'branding.logo.remove' })}
                   </Button>
@@ -266,6 +304,7 @@ export function BrandingTab() {
               <p className="text-xs text-stone-400 dark:text-stone-500">
                 {intl.formatMessage({ id: 'branding.logo.hint' })}
               </p>
+              {managedHint('logo_data_uri')}
             </div>
           </div>
         </Field>
@@ -276,12 +315,13 @@ export function BrandingTab() {
             id="branding-name"
             type="text"
             value={productName}
-            disabled={locked}
+            {...fieldProps('product_name')}
             maxLength={60}
             onChange={(e) => setProductName(e.target.value)}
             className={controlClass}
             placeholder="DuDuClaw"
           />
+          {managedHint('product_name')}
         </Field>
 
         <Field label={intl.formatMessage({ id: 'branding.subtitle' })} htmlFor="branding-subtitle">
@@ -289,23 +329,25 @@ export function BrandingTab() {
             id="branding-subtitle"
             type="text"
             value={subtitle}
-            disabled={locked}
+            {...fieldProps('subtitle')}
             maxLength={120}
             onChange={(e) => setSubtitle(e.target.value)}
             className={controlClass}
           />
+          {managedHint('subtitle')}
         </Field>
 
         <Field label={intl.formatMessage({ id: 'branding.description' })} htmlFor="branding-desc">
           <textarea
             id="branding-desc"
             value={description}
-            disabled={locked}
+            {...fieldProps('description')}
             maxLength={500}
             rows={3}
             onChange={(e) => setDescription(e.target.value)}
             className={controlClass}
           />
+          {managedHint('description')}
         </Field>
 
         <Field label={intl.formatMessage({ id: 'branding.company' })} htmlFor="branding-company">
@@ -313,11 +355,12 @@ export function BrandingTab() {
             id="branding-company"
             type="text"
             value={companyName}
-            disabled={locked}
+            {...fieldProps('company_name')}
             maxLength={120}
             onChange={(e) => setCompanyName(e.target.value)}
             className={controlClass}
           />
+          {managedHint('company_name')}
         </Field>
 
         <Field label={intl.formatMessage({ id: 'branding.website' })} htmlFor="branding-website">
@@ -325,11 +368,12 @@ export function BrandingTab() {
             id="branding-website"
             type="url"
             value={website}
-            disabled={locked}
+            {...fieldProps('website')}
             onChange={(e) => setWebsite(e.target.value)}
             className={controlClass}
             placeholder="https://example.com"
           />
+          {managedHint('website')}
         </Field>
 
         <Field label={intl.formatMessage({ id: 'branding.supportEmail' })} htmlFor="branding-email">
@@ -337,11 +381,12 @@ export function BrandingTab() {
             id="branding-email"
             type="email"
             value={supportEmail}
-            disabled={locked}
+            {...fieldProps('support_email')}
             onChange={(e) => setSupportEmail(e.target.value)}
             className={controlClass}
             placeholder="support@example.com"
           />
+          {managedHint('support_email')}
         </Field>
 
         {/* Accent color (design §10.4) */}
@@ -351,7 +396,7 @@ export function BrandingTab() {
               id="branding-accent"
               type="color"
               value={accentColor || DEFAULT_ACCENT}
-              disabled={locked}
+              {...fieldProps('accent_color')}
               onChange={(e) => setAccentColor(e.target.value)}
               className="h-9 w-14 shrink-0 cursor-pointer rounded-lg border border-stone-300/60 bg-transparent p-1 disabled:cursor-not-allowed dark:border-white/10"
             />
@@ -359,7 +404,11 @@ export function BrandingTab() {
               {accentColor || DEFAULT_ACCENT}
             </span>
             {accentColor && (
-              <Button variant="ghost" disabled={locked} onClick={() => setAccentColor('')}>
+              <Button
+                variant="ghost"
+                disabled={fieldDisabled('accent_color')}
+                onClick={() => setAccentColor('')}
+              >
                 <RotateCcw className="mr-1.5 h-4 w-4" />
                 {intl.formatMessage({ id: 'branding.accent.reset' })}
               </Button>
@@ -368,6 +417,7 @@ export function BrandingTab() {
           <p className="mt-1.5 text-xs text-stone-400 dark:text-stone-500">
             {intl.formatMessage({ id: 'branding.accent.hint' })}
           </p>
+          {managedHint('accent_color')}
         </Field>
 
         {/* About-page HTML editor + sanitized preview (design §10.2) */}
@@ -376,7 +426,7 @@ export function BrandingTab() {
             <textarea
               id="branding-about-html"
               value={aboutHtml}
-              disabled={locked}
+              {...fieldProps('about_html')}
               rows={10}
               spellCheck={false}
               onChange={(e) => setAboutHtml(e.target.value)}
@@ -408,6 +458,7 @@ export function BrandingTab() {
           <p className="mt-1.5 text-xs text-stone-400 dark:text-stone-500">
             {intl.formatMessage({ id: 'branding.aboutHtml.hint' })}
           </p>
+          {managedHint('about_html')}
         </Field>
 
         {/* Signed branding bundle (design §10.3) */}

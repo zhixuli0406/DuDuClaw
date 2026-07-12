@@ -92,6 +92,9 @@ export const navGroups: NavGroup[] = [
     // 工作 — the work itself.
     label: 'navGroup.work',
     items: [
+      // 任務看板 restored to the primary sidebar (2026-07-12 walkthrough): it's the
+      // canonical work surface, so it leads the 工作 group. Still reachable from the
+      // Home task-summary cards, the mobile ＋交辦 action, and ⌘K.
       { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc', ownScope: true },
       // U4 co-edited plans — shared step lists between the user and an AI employee.
       { to: '/plans', icon: ListChecks, label: 'nav.plans', desc: 'nav.plans.desc', ownScope: true },
@@ -202,14 +205,19 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
 
 /**
  * Zone A quick-access routes for the mobile bottom nav (§4.3). The `+ 交辦任務`
- * center action is injected by MobileBottomNav itself; these are the four side
- * slots: 首頁 / 收件匣 / 任務 / 對話.
+ * center action is injected by MobileBottomNav itself (and links to the task
+ * board's create intent). Side slots: 首頁 / 收件匣 | ＋ | 對話. The task board
+ * now sits in the desktop sidebar's 工作 group; on mobile it stays reachable via
+ * the ＋交辦 action, Home task cards, ⌘K, and its URL (the compact 4-slot bottom
+ * bar is kept — 對話 is the primary mobile entry).
  */
 export const mobileNavItems: NavItem[] = [
   { to: '/', icon: Home, label: 'nav.home', desc: 'nav.home.desc' },
   { to: '/inbox', icon: Inbox, label: 'nav.inbox', desc: 'nav.inbox.desc', badge: 'inbox' },
-  { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc' },
   { to: '/chat', icon: MessageCircle, label: 'nav.chat', desc: 'nav.chat.desc' },
+  // Task board restored as a primary nav item (R2); keeps the two side groups
+  // balanced 2/2 around the centre ＋交辦 action.
+  { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc' },
 ];
 
 export type { UserRole };

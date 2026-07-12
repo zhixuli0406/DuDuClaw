@@ -116,6 +116,39 @@ pub enum AgentStatus {
     Active,
     Paused,
     Terminated,
+    /// Off-boarded but fully recoverable (WP4): heartbeat/evolution halted and
+    /// hidden from the LIVE roster, but no data is deleted — `unarchive` restores.
+    Archived,
+    /// Soft-deleted (WP4): hidden from every list/route, but the agent directory
+    /// and memory are retained on disk. Distinct from `Terminated` (a runtime
+    /// end-state) — `Deleted` is an explicit off-board removal.
+    Deleted,
+}
+
+impl AgentStatus {
+    /// Central predicate (WP4 / F2): whether an agent may be *acted on* —
+    /// spawned, delegated to, or listed in a team roster. Only `Active` agents
+    /// are operational; `Archived` / `Deleted` (and the runtime end-states
+    /// `Paused` / `Terminated`) are not. This is the single source of truth so
+    /// spawn / delegate / roster-assembly paths cannot drift from each other.
+    ///
+    /// Fail-closed by construction: any status that is not explicitly `Active`
+    /// is non-operational.
+    pub fn is_operational(&self) -> bool {
+        matches!(self, AgentStatus::Active)
+    }
+
+    /// Whether an agent with this status should appear in a listing.
+    /// `Deleted` is never listed; `Archived` is listed only when the caller
+    /// explicitly asks for archived agents (`include_archived`). Every other
+    /// status is listed (so operators still see Paused / Terminated agents).
+    pub fn is_listable(&self, include_archived: bool) -> bool {
+        match self {
+            AgentStatus::Deleted => false,
+            AgentStatus::Archived => include_archived,
+            _ => true,
+        }
+    }
 }
 
 /// LLM model selection configuration.
@@ -168,6 +201,11 @@ pub enum RuntimeType {
     /// Google Antigravity CLI (`agy`) — the 2026-06-18 successor to the
     /// personal-tier Gemini CLI. Same model lineage, distinct binary/flags.
     Antigravity,
+    /// xAI Grok CLI ("Grok Build", beta 2026-05) — terminal coding agent driving
+    /// `grok-build-0.1` behind a SuperGrok / X Premium+ subscription. MCP-native,
+    /// `-p` headless mode. R4 wires CLI *detection + headless spawn*; the
+    /// SuperGrok OAuth device-flow (accounts.x.ai) is a follow-up (phase 2).
+    Grok,
     #[serde(rename = "openai_compat")]
     OpenAiCompat,
 }
@@ -180,6 +218,7 @@ impl RuntimeType {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
             Self::Antigravity => "antigravity",
+            Self::Grok => "grok",
             Self::OpenAiCompat => "openai_compat",
         }
     }
@@ -199,6 +238,7 @@ impl RuntimeType {
             "codex" => Self::Codex,
             "gemini" => Self::Gemini,
             "antigravity" | "agy" => Self::Antigravity,
+            "grok" | "grok-cli" => Self::Grok,
             "openai_compat" | "openai" | "openai-compat" => Self::OpenAiCompat,
             other => {
                 tracing::warn!(
@@ -1678,6 +1718,13 @@ pub struct AgentInfo {
     pub trigger: String,
     pub reports_to: String,
     pub icon: String,
+    /// WP7 — department this agent belongs to (company → department → personal
+    /// knowledge/skill layering). Empty/absent = no department: the agent sees
+    /// no `departments/*` shared-wiki page or department skill, exactly as
+    /// before WP7 (backward compatible). Validated against
+    /// [`crate::department::is_valid_department`] wherever it selects a path.
+    #[serde(default)]
+    pub department: String,
 }
 
 /// Full agent configuration file (`agent.toml`).
@@ -2280,6 +2327,37 @@ pub struct DoctorCheck {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    // ── R4: Grok runtime type ──────────────────────────────────────
+
+    #[test]
+    fn runtime_type_grok_parse_and_display_roundtrip() {
+        // Config-string parse (case/alias-insensitive).
+        assert_eq!(RuntimeType::parse("grok"), RuntimeType::Grok);
+        assert_eq!(RuntimeType::parse("GROK"), RuntimeType::Grok);
+        assert_eq!(RuntimeType::parse("grok-cli"), RuntimeType::Grok);
+        // Stable identifier.
+        assert_eq!(RuntimeType::Grok.as_str(), "grok");
+        // as_str ↔ parse round-trip for every variant.
+        for rt in [
+            RuntimeType::Claude,
+            RuntimeType::Codex,
+            RuntimeType::Gemini,
+            RuntimeType::Antigravity,
+            RuntimeType::Grok,
+            RuntimeType::OpenAiCompat,
+        ] {
+            assert_eq!(RuntimeType::parse(rt.as_str()), rt, "round-trip {rt:?}");
+        }
+    }
+
+    #[test]
+    fn runtime_type_grok_serde_roundtrip() {
+        let json = serde_json::to_string(&RuntimeType::Grok).unwrap();
+        assert_eq!(json, r#""grok""#);
+        let back: RuntimeType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, RuntimeType::Grok);
+    }
 
     // ── WP1 evolution master kill-switch ───────────────────────────
 

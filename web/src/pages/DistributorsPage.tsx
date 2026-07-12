@@ -1,17 +1,21 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
-import { Store, Plus, KeyRound, Copy, Check, Trash2, Ban, Info, FileSignature, Download } from 'lucide-react';
+import { useSearchParams } from 'react-router';
+import { Store, Plus, KeyRound, Copy, Check, Trash2, Ban, Info, FileSignature, Download, Palette } from 'lucide-react';
 import {
   Page,
   PageHeader,
   Card,
+  Tabs,
   Button,
   EmptyState,
   Badge,
   Mono,
+  type TabItem,
 } from '@/components/ui';
 import { Dialog, FormField, inputClass, buttonSecondary, buttonPrimary } from '@/components/shared/Dialog';
 import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
+import { BrandingTab } from '@/components/settings/sections/BrandingTab';
 import { toast, formatError } from '@/lib/toast';
 import {
   api,
@@ -22,19 +26,44 @@ import {
 } from '@/lib/api';
 
 /**
- * DistributorsPage (design-distributor-white-label §4.5) — the OWNER console for
- * white-label distributors (`/manage/distributors`, admin-gated). Sign OEM
- * white-label licenses, keep the distributor ledger, and revoke locally.
+ * DistributorsPage (design-distributor-white-label §4.5) — the combined "白牌與經銷"
+ * console (`/manage/distributors`, admin-gated). Two tabs on one page so the
+ * brand-appearance settings and the distributor issuance ledger no longer live in
+ * two unrelated corners (2026-07-12 walkthrough: "分開很難找"):
+ *   - 品牌設定  → the reusable `BrandingTab` (product name / logo / accent / About
+ *                HTML; keeps its WP8 field-level masking).
+ *   - 經銷商簽發 → the OWNER console: sign OEM white-label licenses, keep the
+ *                distributor ledger, and revoke locally.
  *
  * This is a /manage surface, so internal terms (license / OEM / fingerprint) are
- * fine here — unlike the distributor-facing "品牌設定" tab.
+ * fine in the distributor tab — the branding tab stays customer-facing.
  *
- * Fail-closed: when the gateway reports no issuer key configured, we show an
- * empty state explaining how to set `[distributor] issuer_key_path` and never
- * offer an issue action.
+ * Fail-closed: when the gateway reports no issuer key configured, the distributor
+ * tab shows an empty state explaining how to set `[distributor] issuer_key_path`
+ * and never offers an issue action.
  */
 
+type WhiteLabelTab = 'branding' | 'distributors';
+
 const DEFAULT_EXPIRES_DAYS = 365;
+
+/**
+ * Branding fields a reseller can grant to a customer license (WP8). The `field`
+ * values are the exact `branding.set` serde keys the gateway validates against;
+ * `labelId` reuses the customer-facing branding labels so the wording matches
+ * the "品牌設定" tab. Order mirrors the BrandingTab form.
+ */
+const BRANDING_FIELDS: { field: string; labelId: string }[] = [
+  { field: 'product_name', labelId: 'branding.productName' },
+  { field: 'subtitle', labelId: 'branding.subtitle' },
+  { field: 'logo_data_uri', labelId: 'branding.logo' },
+  { field: 'company_name', labelId: 'branding.company' },
+  { field: 'website', labelId: 'branding.website' },
+  { field: 'support_email', labelId: 'branding.supportEmail' },
+  { field: 'description', labelId: 'branding.description' },
+  { field: 'about_html', labelId: 'branding.aboutHtml' },
+  { field: 'accent_color', labelId: 'branding.accent' },
+];
 
 /** Trigger a client-side download of a pretty-printed JSON object. */
 function downloadJson(filename: string, obj: unknown): void {
@@ -51,6 +80,12 @@ function downloadJson(filename: string, obj: unknown): void {
 
 export function DistributorsPage() {
   const intl = useIntl();
+  const [searchParams] = useSearchParams();
+  // Default to 品牌設定 — the more commonly-edited surface and the one users
+  // struggled to find. `?tab=distributors` (or legacy `?tab=branding`) deep-links.
+  const [tab, setTab] = useState<WhiteLabelTab>(
+    searchParams.get('tab') === 'distributors' ? 'distributors' : 'branding',
+  );
   const [issuerConfigured, setIssuerConfigured] = useState<boolean | null>(null);
   const [refreshEndpointActive, setRefreshEndpointActive] = useState(false);
   const [stats, setStats] = useState<DistributorStats | null>(null);
@@ -129,14 +164,19 @@ export function DistributorsPage() {
     }
   };
 
+  const tabItems: TabItem[] = [
+    { id: 'branding', label: intl.formatMessage({ id: 'settings.branding' }), icon: Palette },
+    { id: 'distributors', label: intl.formatMessage({ id: 'distributor.title' }), icon: Store },
+  ];
+
   return (
     <Page>
       <PageHeader
         icon={Store}
-        title={intl.formatMessage({ id: 'distributor.title' })}
-        subtitle={intl.formatMessage({ id: 'distributor.subtitle' })}
+        title={intl.formatMessage({ id: 'manage.distributors' })}
+        subtitle={intl.formatMessage({ id: 'whitelabel.subtitle' })}
         actions={
-          issuerConfigured ? (
+          tab === 'distributors' && issuerConfigured ? (
             <div className="flex items-center gap-2">
               <Button
                 variant="secondary"
@@ -153,7 +193,11 @@ export function DistributorsPage() {
         }
       />
 
-      {loading ? (
+      <Tabs items={tabItems} value={tab} onChange={(id) => setTab(id as WhiteLabelTab)} />
+
+      {tab === 'branding' && <BrandingTab />}
+
+      {tab === 'distributors' && (loading ? (
         <Card>
           <p className="py-8 text-center text-sm text-stone-500 dark:text-stone-400">
             {intl.formatMessage({ id: 'common.loading' })}
@@ -280,7 +324,7 @@ public_url = "https://your-gateway.example.com"`}
             ))
           )}
         </>
-      )}
+      ))}
 
       {/* Add distributor */}
       <AddDistributorDialog
@@ -574,6 +618,15 @@ function IssueLicenseDialog({
   const [busy, setBusy] = useState(false);
   const [blob, setBlob] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  // WP8: default = grant the full reseller branding range (omit the param).
+  // Enabling `restrictBranding` narrows the customer to the checked fields.
+  const [restrictBranding, setRestrictBranding] = useState(false);
+  const [brandingFields, setBrandingFields] = useState<string[]>([]);
+
+  const toggleField = (field: string) =>
+    setBrandingFields((prev) =>
+      prev.includes(field) ? prev.filter((f) => f !== field) : [...prev, field]
+    );
 
   const handleIssue = async () => {
     setBusy(true);
@@ -583,6 +636,9 @@ function IssueLicenseDialog({
         machine_fingerprint: fingerprint.trim(),
         expires_days: expiresDays,
         note: note.trim() || undefined,
+        // Omit for the full reseller range; send the (possibly empty) subset when
+        // the reseller chose to restrict the customer's editable branding.
+        branding_editable: restrictBranding ? brandingFields : undefined,
       });
       setBlob(res.license_blob);
       toast.success(intl.formatMessage({ id: 'distributor.issue.done' }));
@@ -682,6 +738,45 @@ function IssueLicenseDialog({
               onChange={(e) => setNote(e.target.value)}
             />
           </FormField>
+
+          {/* WP8: branding edit-scope for the issued customer license. */}
+          <div className="space-y-2 rounded-lg border border-stone-300/60 bg-stone-500/[0.03] p-3 dark:border-white/10 dark:bg-white/[0.02]">
+            <label className="flex items-start gap-2 text-sm text-stone-700 dark:text-stone-300">
+              <input
+                type="checkbox"
+                className="mt-0.5 h-4 w-4 shrink-0 accent-amber-500"
+                checked={restrictBranding}
+                onChange={(e) => setRestrictBranding(e.target.checked)}
+              />
+              <span>
+                <span className="font-medium">
+                  {intl.formatMessage({ id: 'distributor.issue.branding.restrict' })}
+                </span>
+                <span className="mt-0.5 block text-xs font-normal text-stone-400 dark:text-stone-500">
+                  {intl.formatMessage({ id: 'distributor.issue.branding.hint' })}
+                </span>
+              </span>
+            </label>
+            {restrictBranding && (
+              <div className="grid grid-cols-1 gap-1.5 border-t border-stone-200/70 pt-2 sm:grid-cols-2 dark:border-white/8">
+                {BRANDING_FIELDS.map(({ field, labelId }) => (
+                  <label
+                    key={field}
+                    className="flex items-center gap-2 text-sm text-stone-600 dark:text-stone-300"
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 shrink-0 accent-amber-500"
+                      checked={brandingFields.includes(field)}
+                      onChange={() => toggleField(field)}
+                    />
+                    {intl.formatMessage({ id: labelId })}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+
           <div className="flex justify-end gap-2 pt-1">
             <button type="button" className={buttonSecondary} onClick={onClose}>
               {intl.formatMessage({ id: 'common.cancel' })}

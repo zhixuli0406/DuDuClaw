@@ -67,22 +67,29 @@ const SESSION_CACHE_CAP: usize = 256;
 /// Returns the rendered injection text. On any store-side error we log
 /// and return an empty string — wiki injection is a best-effort signal,
 /// never fatal.
+/// `viewer_department` (WP7) — the department of the agent this prompt is for.
+/// Pages under the built-in `departments/<dept>/` namespace are kept only when
+/// `<dept>` matches; a `None` viewer (no department) sees no department page.
+/// Company-layer pages are always eligible. Department is a stable property of
+/// the agent, so it does not perturb the session-stable selection cache
+/// (the cache key already scopes per agent).
 pub fn ranked_wiki_injection(
     store: &WikiStore,
     query: &str,
     max_chars: usize,
     citation: Option<CitationContext<'_>>,
     cache_key: Option<&str>,
+    viewer_department: Option<&str>,
 ) -> String {
     if let Some(key) = cache_key {
         if let Some(pages) = cached_selection(key) {
             return render_and_cite(&pages, citation);
         }
-        let pages = select_pages(store, query, max_chars);
+        let pages = select_pages(store, query, max_chars, viewer_department);
         store_selection(key, pages.clone());
         return render_and_cite(&pages, citation);
     }
-    let pages = select_pages(store, query, max_chars);
+    let pages = select_pages(store, query, max_chars, viewer_department);
     render_and_cite(&pages, citation)
 }
 
@@ -97,7 +104,12 @@ struct RankedPage {
 
 /// Collect eligible pages, apply knowledge-ownership filtering, rank by
 /// relevance, and keep the top pages within `max_chars`.
-fn select_pages(store: &WikiStore, query: &str, max_chars: usize) -> Vec<RankedPage> {
+fn select_pages(
+    store: &WikiStore,
+    query: &str,
+    max_chars: usize,
+    viewer_department: Option<&str>,
+) -> Vec<RankedPage> {
     // Gather all candidate pages first. Identity and Core layers are
     // both eligible; L2/L3 stay search-only as the wiki contract states.
     let memory_owned = load_memory_owned_namespaces(store.wiki_dir());
@@ -108,6 +120,12 @@ fn select_pages(store: &WikiStore, query: &str, max_chars: usize) -> Vec<RankedP
                 for (path, body, trust) in pages {
                     if is_memory_owned(&path, &memory_owned) {
                         continue; // memory system is SoT for this namespace
+                    }
+                    // WP7: never inject another department's page (or any
+                    // department page for a no-department viewer). Company
+                    // pages always pass.
+                    if !duduclaw_core::department_page_visible(&path, viewer_department) {
+                        continue;
                     }
                     candidates.push(RankedPage {
                         layer,

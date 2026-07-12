@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { api, type SkillIndexEntry, type SharedSkillInfo, type SkillInfo, type SkillLeaderboardEntry } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
+import { departmentsOf } from '@/lib/agents';
 import { Dialog } from '@/components/shared/Dialog';
 import { CustomSkillsSection } from '@/components/skills/CustomSkillsSection';
 import { toast, formatError } from '@/lib/toast';
@@ -40,6 +42,7 @@ import {
   Puzzle,
   Trophy,
   Clock,
+  Wand2,
 } from 'lucide-react';
 
 interface VetResult {
@@ -59,6 +62,7 @@ type SkillTab = 'market' | 'shared' | 'mySkills' | 'leaderboard';
 
 export function SkillMarketPage() {
   const intl = useIntl();
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<SkillTab>('market');
 
   const tabItems: TabItem[] = [
@@ -74,6 +78,14 @@ export function SkillMarketPage() {
         icon={Puzzle}
         title={intl.formatMessage({ id: 'nav.skills' })}
         subtitle={intl.formatMessage({ id: 'skills.market.title' })}
+        actions={
+          // Primary CTA: build a skill — coexists with the "install from market"
+          // flow below on one converged /skills page (WP1). `/skills/new` route
+          // is preserved for deep-link compatibility.
+          <Button variant="primary" icon={Wand2} onClick={() => navigate('/skills/new')}>
+            {intl.formatMessage({ id: 'skills.new.title' })}
+          </Button>
+        }
       />
 
       <Tabs items={tabItems} value={activeTab} onChange={(id) => setActiveTab(id as SkillTab)} />
@@ -697,6 +709,9 @@ function InstallDialog({
   const scanPassed = scanResult?.passed === true;
   const scanFailed = scanResult !== null && !scanResult.passed;
 
+  // WP7 — departments already in use, for the `department:<dept>` scope option.
+  const departmentOptions: string[] = departmentsOf(agents);
+
   return (
     <Dialog
       open
@@ -713,7 +728,7 @@ function InstallDialog({
           </p>
         </div>
 
-        {/* Scope selector */}
+        {/* Scope selector — company / department / individual (WP7). */}
         <Field label={intl.formatMessage({ id: 'skills.install.scope' })}>
           <select
             value={scope}
@@ -723,14 +738,25 @@ function InstallDialog({
             <option value="global">
               {intl.formatMessage({ id: 'skills.install.scopeGlobal' })}
             </option>
-            {agents.map((agent) => (
-              <option key={agent.name} value={agent.name}>
-                {intl.formatMessage(
-                  { id: 'skills.install.scopeAgent' },
-                  { agent: agent.display_name || agent.name },
-                )}
-              </option>
-            ))}
+            {departmentOptions.length > 0 && (
+              <optgroup label={intl.formatMessage({ id: 'skills.install.scopeDeptGroup' })}>
+                {departmentOptions.map((dept) => (
+                  <option key={dept} value={`department:${dept}`}>
+                    {intl.formatMessage({ id: 'skills.install.scopeDept' }, { dept })}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            <optgroup label={intl.formatMessage({ id: 'skills.install.scopeAgentGroup' })}>
+              {agents.map((agent) => (
+                <option key={agent.name} value={agent.name}>
+                  {intl.formatMessage(
+                    { id: 'skills.install.scopeAgent' },
+                    { agent: agent.display_name || agent.name },
+                  )}
+                </option>
+              ))}
+            </optgroup>
           </select>
         </Field>
 

@@ -7,6 +7,7 @@ pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod grok;
 pub mod openai_compat;
 
 use std::collections::HashMap;
@@ -137,6 +138,13 @@ impl RuntimeRegistry {
         if antigravity.is_available().await {
             info!("Antigravity CLI (agy) detected — registering AntigravityRuntime");
             runtimes.insert(RuntimeType::Antigravity, Box::new(antigravity));
+        }
+
+        // Grok (`grok` / third-party `grok-cli`): check if the CLI is installed.
+        let grok = grok::GrokRuntime::new();
+        if grok.is_available().await {
+            info!("Grok CLI detected — registering GrokRuntime");
+            runtimes.insert(RuntimeType::Grok, Box::new(grok));
         }
 
         // OpenAI-compatible: always available if API key is configured

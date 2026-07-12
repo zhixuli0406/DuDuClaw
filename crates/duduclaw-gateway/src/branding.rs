@@ -146,6 +146,261 @@ impl VendorBlock {
     }
 }
 
+// ── Field-level edit scoping (WP8 white-label field tiers) ────────────────
+//
+// Meeting decision (2026-07-12): a token issued by the upstream vendor (嘟嘟)
+// to a reseller lets the reseller edit the *brand surface* (logo / name / about
+// page …); a token a reseller issues to an enterprise customer grants a smaller
+// (or empty) editable range; the *system surface* (version / license / core)
+// is always vendor-only. This module is the single, fail-closed definition of
+// which branding field sits at which level, plus the scope that gates a write.
+
+/// Edit level of a single branding field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrandingFieldLevel {
+    /// Editable by a reseller (vendor) and above.
+    Vendor,
+    /// Editable only by the system (upstream vendor / issuer). This is the
+    /// fail-closed default for any field NOT explicitly listed as `Vendor`.
+    SystemOnly,
+}
+
+/// **The single source of truth** for every branding field's edit level.
+///
+/// A field that is *not* in this table resolves to [`BrandingFieldLevel::SystemOnly`]
+/// (see [`field_level`]) — so a newly-added `BrandingInput` field is locked to
+/// the system tier until it is deliberately promoted here. That fail-closed
+/// default is pinned by [`tests::unlisted_field_is_system_only`].
+///
+/// Field names are the exact `BrandingInput` / `BrandingConfig` serde keys, so
+/// they match the RPC payload keys and the front-end masking list 1:1.
+const BRANDING_FIELD_LEVELS: &[(&str, BrandingFieldLevel)] = &[
+    ("product_name", BrandingFieldLevel::Vendor),
+    ("subtitle", BrandingFieldLevel::Vendor),
+    ("logo_data_uri", BrandingFieldLevel::Vendor),
+    ("company_name", BrandingFieldLevel::Vendor),
+    ("website", BrandingFieldLevel::Vendor),
+    ("support_email", BrandingFieldLevel::Vendor),
+    ("description", BrandingFieldLevel::Vendor),
+    ("about_html", BrandingFieldLevel::Vendor),
+    ("accent_color", BrandingFieldLevel::Vendor),
+];
+
+/// Every branding field name the write surface knows about. MUST stay in sync
+/// with `BrandingInput`'s fields — [`tests::all_fields_match_field_levels`]
+/// pins that every entry here has a level and vice-versa.
+pub const ALL_BRANDING_FIELDS: &[&str] = &[
+    "product_name",
+    "subtitle",
+    "logo_data_uri",
+    "company_name",
+    "website",
+    "support_email",
+    "description",
+    "about_html",
+    "accent_color",
+];
+
+/// The edit level of a branding field. Fail-closed: an unknown / future field
+/// name is [`BrandingFieldLevel::SystemOnly`]. Comparison is exact equality
+/// (project rule #2 — no substring routing).
+pub fn field_level(name: &str) -> BrandingFieldLevel {
+    BRANDING_FIELD_LEVELS
+        .iter()
+        .find(|(f, _)| *f == name)
+        .map(|(_, lvl)| *lvl)
+        .unwrap_or(BrandingFieldLevel::SystemOnly)
+}
+
+/// The vendor-editable field names (the reseller's default range).
+pub fn vendor_editable_fields() -> Vec<&'static str> {
+    BRANDING_FIELD_LEVELS
+        .iter()
+        .filter(|(_, lvl)| *lvl == BrandingFieldLevel::Vendor)
+        .map(|(f, _)| *f)
+        .collect()
+}
+
+/// Who is editing branding on this instance, and therefore which fields they
+/// may touch. Resolved once per request by [`resolve_edit_scope`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrandingEditScope {
+    /// The system (upstream vendor / issuer) instance — every field, including
+    /// `SystemOnly` ones.
+    System,
+    /// A reseller — every `Vendor`-level field.
+    Vendor,
+    /// An enterprise customer — only the field names explicitly granted by the
+    /// license claim, intersected with the vendor set (a claim can never unlock
+    /// a `SystemOnly` field — fail-closed).
+    Customer(Vec<String>),
+}
+
+impl BrandingEditScope {
+    /// The concrete set of field names this scope may edit.
+    pub fn editable_fields(&self) -> Vec<String> {
+        match self {
+            BrandingEditScope::System => {
+                ALL_BRANDING_FIELDS.iter().map(|s| s.to_string()).collect()
+            }
+            BrandingEditScope::Vendor => vendor_editable_fields()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+            BrandingEditScope::Customer(granted) => granted
+                .iter()
+                .filter(|f| field_level(f) == BrandingFieldLevel::Vendor)
+                .cloned()
+                // De-dup while preserving order.
+                .fold(Vec::new(), |mut acc, f| {
+                    if !acc.contains(&f) {
+                        acc.push(f);
+                    }
+                    acc
+                }),
+        }
+    }
+
+    /// Whether this scope may edit `field` (exact name equality).
+    pub fn allows(&self, field: &str) -> bool {
+        match self {
+            BrandingEditScope::System => true,
+            BrandingEditScope::Vendor => field_level(field) == BrandingFieldLevel::Vendor,
+            BrandingEditScope::Customer(_) => self.editable_fields().iter().any(|f| f == field),
+        }
+    }
+
+    /// `true` when this scope may edit *every* known branding field — used to
+    /// decide whether `reset` can delete the whole file (full scope) or must
+    /// clear only the granted fields and preserve the rest (partial scope).
+    pub fn is_full(&self) -> bool {
+        ALL_BRANDING_FIELDS.iter().all(|f| self.allows(f))
+    }
+}
+
+/// Resolve the effective branding edit scope for the running instance.
+///
+/// - `is_system_instance` — this gateway holds the distributor issuer signing
+///   key (the upstream/owner "system" box) → full [`BrandingEditScope::System`].
+/// - `white_label_active` — the active license unlocks `white_label` (Oem tier).
+/// - `claim` — the active license's signed `branding_editable` claim, if any.
+///
+/// Returns `None` when branding editing is not permitted at all (not the system
+/// instance AND no white_label) — callers must DENY. Fail-closed.
+///
+/// Backward compatibility: a white-label license with **no** claim resolves to
+/// [`BrandingEditScope::Vendor`] — exactly the pre-WP8 behaviour where any OEM
+/// operator could edit every (vendor) field.
+pub fn resolve_edit_scope(
+    is_system_instance: bool,
+    white_label_active: bool,
+    claim: Option<&[String]>,
+) -> Option<BrandingEditScope> {
+    if is_system_instance {
+        return Some(BrandingEditScope::System);
+    }
+    if !white_label_active {
+        return None;
+    }
+    match claim {
+        None => Some(BrandingEditScope::Vendor),
+        Some(list) => Some(BrandingEditScope::Customer(list.to_vec())),
+    }
+}
+
+/// The field names *present* (non-empty) in `input` that `scope` may NOT edit.
+///
+/// A non-empty violation must reject the whole `branding.set` (never silently
+/// dropped — project rule / §5). An omitted or empty field is not a
+/// meaningful edit and is not reported here; [`preserve_unscoped`] additionally
+/// guarantees such fields keep their existing value on write.
+pub fn disallowed_fields(scope: &BrandingEditScope, input: &BrandingInput) -> Vec<String> {
+    let present: [(&str, bool); 9] = [
+        ("product_name", is_present(&input.product_name)),
+        ("subtitle", is_present(&input.subtitle)),
+        ("logo_data_uri", is_present(&input.logo_data_uri)),
+        ("company_name", is_present(&input.company_name)),
+        ("website", is_present(&input.website)),
+        ("support_email", is_present(&input.support_email)),
+        ("description", is_present(&input.description)),
+        ("about_html", is_present(&input.about_html)),
+        ("accent_color", is_present(&input.accent_color)),
+    ];
+    present
+        .iter()
+        .filter(|(name, present)| *present && !scope.allows(name))
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// A field carries a real edit only if it is `Some` and non-empty after trim.
+fn is_present(v: &Option<String>) -> bool {
+    v.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+}
+
+/// Restore every field the caller's `scope` may NOT edit from the on-disk
+/// config, so a partial-scope writer (e.g. a customer granted only `logo`)
+/// cannot wipe the reseller's other fields by omitting them from the payload.
+/// A full-scope writer (System / a Vendor whose set covers everything) is a
+/// no-op fast path.
+pub fn preserve_unscoped(
+    home_dir: &Path,
+    scope: &BrandingEditScope,
+    mut cfg: BrandingConfig,
+) -> BrandingConfig {
+    if scope.is_full() {
+        return cfg;
+    }
+    let allowed: std::collections::HashSet<String> = scope.editable_fields().into_iter().collect();
+    let existing = load(home_dir);
+    macro_rules! preserve {
+        ($field:ident, $name:literal) => {
+            if !allowed.contains($name) {
+                cfg.$field = existing.$field.clone();
+            }
+        };
+    }
+    preserve!(product_name, "product_name");
+    preserve!(subtitle, "subtitle");
+    preserve!(logo_data_uri, "logo_data_uri");
+    preserve!(company_name, "company_name");
+    preserve!(website, "website");
+    preserve!(support_email, "support_email");
+    preserve!(description, "description");
+    preserve!(about_html, "about_html");
+    preserve!(accent_color, "accent_color");
+    cfg
+}
+
+/// Scope-aware reset. A full-scope caller deletes the whole file (revert to the
+/// bundle/default brand); a partial-scope caller (customer / a restricted
+/// vendor) clears ONLY its granted fields and preserves the rest.
+pub fn reset_scoped(home_dir: &Path, scope: &BrandingEditScope) -> Result<(), String> {
+    if scope.is_full() {
+        return reset(home_dir);
+    }
+    let allowed = scope.editable_fields();
+    let mut cfg = load(home_dir);
+    macro_rules! clear {
+        ($field:ident, $name:literal) => {
+            if allowed.iter().any(|f| f == $name) {
+                cfg.$field = None;
+            }
+        };
+    }
+    clear!(product_name, "product_name");
+    clear!(subtitle, "subtitle");
+    clear!(logo_data_uri, "logo_data_uri");
+    clear!(company_name, "company_name");
+    clear!(website, "website");
+    clear!(support_email, "support_email");
+    clear!(description, "description");
+    clear!(about_html, "about_html");
+    clear!(accent_color, "accent_color");
+    cfg.updated_at = Some(chrono::Utc::now().to_rfc3339());
+    save(home_dir, &cfg)
+}
+
 // ── Persistence ───────────────────────────────────────────────────────────
 
 /// Path to the branding file under a home dir.
@@ -1240,6 +1495,173 @@ mod tests {
         let missing = home.path().join("nowhere").join("branding.bundle.json");
         let outcome = seed_bundle_using(home.path(), &registry, &[missing]);
         assert_eq!(outcome, SeedOutcome::NoCandidate);
+    }
+
+    // ── WP8 field-level edit scoping ────────────────────────────
+
+    #[test]
+    fn unlisted_field_is_system_only() {
+        // Fail-closed: any field not explicitly promoted to Vendor is SystemOnly.
+        assert_eq!(field_level("some_future_field"), BrandingFieldLevel::SystemOnly);
+        assert_eq!(field_level(""), BrandingFieldLevel::SystemOnly);
+        // A real vendor field resolves as Vendor.
+        assert_eq!(field_level("logo_data_uri"), BrandingFieldLevel::Vendor);
+    }
+
+    #[test]
+    fn all_fields_match_field_levels() {
+        // Every ALL_BRANDING_FIELDS entry has a level; every level entry is in
+        // ALL_BRANDING_FIELDS. Keeps the two tables (and BrandingInput) in sync.
+        for f in ALL_BRANDING_FIELDS {
+            assert!(
+                BRANDING_FIELD_LEVELS.iter().any(|(n, _)| n == f),
+                "{f} missing from BRANDING_FIELD_LEVELS"
+            );
+        }
+        for (n, _) in BRANDING_FIELD_LEVELS {
+            assert!(
+                ALL_BRANDING_FIELDS.contains(n),
+                "{n} missing from ALL_BRANDING_FIELDS"
+            );
+        }
+        // Today all known fields are vendor-editable (no system_only field yet).
+        assert_eq!(vendor_editable_fields().len(), ALL_BRANDING_FIELDS.len());
+    }
+
+    #[test]
+    fn resolve_scope_matrix() {
+        // System instance always wins (even without white_label).
+        assert_eq!(
+            resolve_edit_scope(true, false, None),
+            Some(BrandingEditScope::System)
+        );
+        // Not system + no white_label → no editing at all.
+        assert_eq!(resolve_edit_scope(false, false, None), None);
+        // White-label, no claim → Vendor (backward compatible).
+        assert_eq!(
+            resolve_edit_scope(false, true, None),
+            Some(BrandingEditScope::Vendor)
+        );
+        // White-label + claim → Customer(restricted).
+        let claim = vec!["logo_data_uri".to_string()];
+        assert_eq!(
+            resolve_edit_scope(false, true, Some(&claim)),
+            Some(BrandingEditScope::Customer(claim))
+        );
+    }
+
+    #[test]
+    fn editable_fields_per_scope() {
+        assert_eq!(
+            BrandingEditScope::System.editable_fields().len(),
+            ALL_BRANDING_FIELDS.len()
+        );
+        assert_eq!(
+            BrandingEditScope::Vendor.editable_fields().len(),
+            vendor_editable_fields().len()
+        );
+        // Customer: a granted vendor field is kept; an unknown/system_only or
+        // duplicate is filtered out (fail-closed).
+        let scope = BrandingEditScope::Customer(vec![
+            "logo_data_uri".into(),
+            "logo_data_uri".into(), // dup
+            "made_up_field".into(), // unknown → system_only → dropped
+        ]);
+        assert_eq!(scope.editable_fields(), vec!["logo_data_uri".to_string()]);
+    }
+
+    #[test]
+    fn is_full_scope() {
+        assert!(BrandingEditScope::System.is_full());
+        // Vendor covers every field today (no system_only field exists yet).
+        assert!(BrandingEditScope::Vendor.is_full());
+        assert!(!BrandingEditScope::Customer(vec!["logo_data_uri".into()]).is_full());
+    }
+
+    #[test]
+    fn disallowed_fields_by_scope() {
+        // A payload that touches product_name + about_html.
+        let input = BrandingInput {
+            product_name: Some("Acme".into()),
+            about_html: Some("<p>hi</p>".into()),
+            ..Default::default()
+        };
+        // System & Vendor allow both → no violations.
+        assert!(disallowed_fields(&BrandingEditScope::System, &input).is_empty());
+        assert!(disallowed_fields(&BrandingEditScope::Vendor, &input).is_empty());
+        // Customer granted only logo → both fields are violations, enumerated.
+        let cust = BrandingEditScope::Customer(vec!["logo_data_uri".into()]);
+        let mut v = disallowed_fields(&cust, &input);
+        v.sort();
+        assert_eq!(v, vec!["about_html".to_string(), "product_name".to_string()]);
+        // Empty/omitted fields are not "present" → never a violation.
+        let empty = BrandingInput {
+            product_name: Some("   ".into()), // whitespace = not a real edit
+            ..Default::default()
+        };
+        assert!(disallowed_fields(&cust, &empty).is_empty());
+    }
+
+    #[test]
+    fn preserve_unscoped_keeps_reseller_fields() {
+        let dir = tempdir().unwrap();
+        // Reseller (Vendor) sets product_name + logo.
+        let base = BrandingConfig {
+            product_name: Some("Reseller Brand".into()),
+            logo_data_uri: Some(png_data_uri()),
+            ..Default::default()
+        };
+        save(dir.path(), &base).unwrap();
+
+        // Customer granted only logo submits a new logo (product_name omitted).
+        let scope = BrandingEditScope::Customer(vec!["logo_data_uri".into()]);
+        let submitted = validate_input(BrandingInput {
+            logo_data_uri: Some(png_data_uri()),
+            ..Default::default()
+        })
+        .unwrap();
+        let merged = preserve_unscoped(dir.path(), &scope, submitted);
+        // product_name preserved from the reseller's config; logo taken from the
+        // customer's submission.
+        assert_eq!(merged.product_name.as_deref(), Some("Reseller Brand"));
+        assert!(merged.logo_data_uri.is_some());
+    }
+
+    #[test]
+    fn preserve_unscoped_is_noop_for_full_scope() {
+        let dir = tempdir().unwrap();
+        let existing = BrandingConfig {
+            product_name: Some("Old".into()),
+            ..Default::default()
+        };
+        save(dir.path(), &existing).unwrap();
+        // Vendor is full-scope today → the submitted config is returned as-is
+        // (product_name cleared because Vendor legitimately may clear it).
+        let submitted = validate_input(BrandingInput::default()).unwrap();
+        let merged = preserve_unscoped(dir.path(), &BrandingEditScope::Vendor, submitted);
+        assert!(merged.product_name.is_none());
+    }
+
+    #[test]
+    fn reset_scoped_partial_preserves_and_full_deletes() {
+        let dir = tempdir().unwrap();
+        let base = BrandingConfig {
+            product_name: Some("Reseller Brand".into()),
+            logo_data_uri: Some(png_data_uri()),
+            ..Default::default()
+        };
+        save(dir.path(), &base).unwrap();
+
+        // Customer reset (granted only logo) clears logo, keeps product_name.
+        let cust = BrandingEditScope::Customer(vec!["logo_data_uri".into()]);
+        reset_scoped(dir.path(), &cust).unwrap();
+        let after = load(dir.path());
+        assert_eq!(after.product_name.as_deref(), Some("Reseller Brand"));
+        assert!(after.logo_data_uri.is_none());
+
+        // Vendor reset (full scope) deletes the file → back to defaults.
+        reset_scoped(dir.path(), &BrandingEditScope::Vendor).unwrap();
+        assert!(load(dir.path()).product_name.is_none());
     }
 
     #[test]

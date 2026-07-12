@@ -1,7 +1,14 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type MemoryEntry, type SkillInfo, type EvolutionVersion, type KeyFactEntry } from '@/lib/api';
+import {
+  api,
+  type MemoryEntry,
+  type EvolutionVersion,
+  type KeyFactEntry,
+  type MemoryChainEntry,
+  type MemoryAtRecord,
+} from '@/lib/api';
 import { parsePredictionMemory, toPercent, type PredictionMemory } from '@/lib/memory-format';
 import { Link } from 'react-router';
 import { toast, formatError } from '@/lib/toast';
@@ -25,19 +32,18 @@ import {
   Search,
   Tag,
   Clock,
-  Sparkles,
-  BookOpen,
-  Shield,
   GitBranch,
   CheckCircle,
   XCircle,
-  Eye,
   ArrowRight,
   Lightbulb,
   Activity,
+  History,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 
-type TabId = 'memories' | 'skills' | 'evolution' | 'insights';
+type TabId = 'memories' | 'evolution' | 'insights';
 
 export function MemoryPage() {
   const intl = useIntl();
@@ -46,7 +52,6 @@ export function MemoryPage() {
   const tabs: TabItem[] = [
     { id: 'memories', label: intl.formatMessage({ id: 'memory.tab.memories' }), icon: Brain },
     { id: 'insights', label: intl.formatMessage({ id: 'memory.tab.insights' }), icon: Lightbulb },
-    { id: 'skills', label: intl.formatMessage({ id: 'memory.tab.skills' }), icon: Sparkles },
     { id: 'evolution', label: intl.formatMessage({ id: 'memory.tab.evolution' }), icon: GitBranch },
   ];
 
@@ -62,7 +67,6 @@ export function MemoryPage() {
 
       {activeTab === 'memories' && <MemoriesTab />}
       {activeTab === 'insights' && <InsightsTab />}
-      {activeTab === 'skills' && <SkillsTab />}
       {activeTab === 'evolution' && <EvolutionTab />}
     </Page>
   );
@@ -202,6 +206,7 @@ function MemoriesTab() {
                     ))}
                   </div>
                 )}
+                <MemoryHistory agentId={entry.agent_id} memoryId={entry.id} />
               </Card>
             );
           })}
@@ -269,145 +274,214 @@ function PredictionMemoryCard({ entry, data }: { entry: MemoryEntry; data: Predi
   );
 }
 
-function SkillsTab() {
+/**
+ * Temporal history / supersession chain for a single memory entry (F1). Lazy:
+ * fetches `memory.history` only when the operator expands it. Renders the fact's
+ * versions as a timeline (when each became valid, when it was superseded, which
+ * one is current) and — when the backend reports a subject/predicate — an
+ * optional point-in-time lookup (which value was valid at a chosen moment).
+ */
+function MemoryHistory({ agentId, memoryId }: { agentId: string; memoryId: string }) {
   const intl = useIntl();
-  const [skills, setSkills] = useState<ReadonlyArray<SkillInfo & { scope?: string }>>([]);
+  const [open, setOpen] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [expandedSkill, setExpandedSkill] = useState<string | null>(null);
-  const [skillContent, setSkillContent] = useState<Record<string, string>>({});
-  const [error, setError] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [chain, setChain] = useState<ReadonlyArray<MemoryChainEntry>>([]);
+  const [currentId, setCurrentId] = useState<string | null>(null);
+  const [subject, setSubject] = useState('');
+  const [predicate, setPredicate] = useState('');
 
-  const fetchSkills = useCallback(async () => {
+  // Point-in-time query state
+  const [atInput, setAtInput] = useState('');
+  const [atLoading, setAtLoading] = useState(false);
+  const [atResult, setAtResult] = useState<{ found: boolean; record?: MemoryAtRecord } | null>(null);
+
+  const load = useCallback(async () => {
     setLoading(true);
-    setError(null);
+    setFailed(false);
     try {
-      const result = await api.skills.list() as Record<string, unknown>;
-      if (Array.isArray(result.skills)) {
-        setSkills(result.skills as SkillInfo[]);
-      } else if (Array.isArray(result.agents)) {
-        const all: Array<SkillInfo & { scope?: string }> = [];
-        for (const ag of result.agents as Array<{ agent_id: string; skills: Array<{ name: string; size: number; scope?: string }> }>) {
-          for (const s of ag.skills) {
-            all.push({ name: s.name, agent_id: ag.agent_id, content: '', security_status: undefined, scope: s.scope });
-          }
-        }
-        setSkills(all);
-      }
-    } catch {
-      setError(intl.formatMessage({ id: 'common.error' }));
+      const res = await api.memory.history(agentId, { memory_id: memoryId });
+      setChain(res?.chain ?? []);
+      setCurrentId(res?.current_id ?? null);
+      setSubject(res?.subject ?? '');
+      setPredicate(res?.predicate ?? '');
+      setLoaded(true);
+    } catch (e) {
+      console.warn('[api]', e);
+      setFailed(true);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [agentId, memoryId]);
 
-  useEffect(() => {
-    fetchSkills();
-  }, [fetchSkills]);
-
-  const handleExpand = async (agentId: string, skillName: string) => {
-    const key = `${agentId}:${skillName}`;
-    if (expandedSkill === key) {
-      setExpandedSkill(null);
-      return;
-    }
-    setExpandedSkill(key);
-    if (!skillContent[key]) {
-      try {
-        const res = await api.skills.content(agentId, skillName);
-        setSkillContent((prev) => ({ ...prev, [key]: res?.content ?? '' }));
-      } catch {
-        setSkillContent((prev) => ({ ...prev, [key]: intl.formatMessage({ id: 'common.error' }) }));
-      }
-    }
+  const handleToggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !loaded && !loading) void load();
   };
 
-  const securityStyles: Record<string, string> = {
-    pass: 'text-emerald-600 dark:text-emerald-400',
-    warn: 'text-amber-600 dark:text-amber-400',
-    fail: 'text-rose-600 dark:text-rose-400',
+  const handleAtQuery = async () => {
+    if (!atInput || !subject || !predicate) return;
+    const parsed = new Date(atInput);
+    if (Number.isNaN(parsed.getTime())) return;
+    setAtLoading(true);
+    setAtResult(null);
+    try {
+      const res = await api.memory.at(agentId, subject, predicate, parsed.toISOString());
+      setAtResult({ found: res?.found ?? false, record: res?.record });
+    } catch (e) {
+      console.warn('[api]', e);
+      setAtResult({ found: false });
+    } finally {
+      setAtLoading(false);
+    }
   };
 
   return (
-    <div className="space-y-4">
-      {error && (
-        <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-400">
-          {error}
-        </div>
-      )}
-      {loading ? (
-        <div className="py-12 text-center text-stone-400">
-          {intl.formatMessage({ id: 'common.loading' })}
-        </div>
-      ) : skills.length === 0 && !error ? (
-        <Card>
-          <EmptyState
-            icon={BookOpen}
-            dudu="idle"
-            title={intl.formatMessage({ id: 'memory.empty.skills' })}
-            action={
-              <Link
-                to="/skills"
-                className="inline-flex items-center gap-1.5 text-sm font-medium text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
-              >
-                {intl.formatMessage({ id: 'memory.empty.skills.action' })}
-                <ArrowRight className="h-3.5 w-3.5" />
-              </Link>
-            }
-          />
-        </Card>
-      ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {skills.map((skill) => {
-            const key = `${skill.agent_id ?? 'global'}:${skill.name}`;
-            const isExpanded = expandedSkill === key;
-            return (
-              <Card key={key} interactive>
-                <div className="flex items-start justify-between">
-                  <div className="flex items-center gap-3">
-                    <div className="rounded-lg bg-amber-500/12 p-2 text-amber-600 dark:text-amber-400">
-                      <Sparkles className="h-4 w-4" />
-                    </div>
-                    <div>
-                      <h3 className="font-semibold text-stone-900 dark:text-stone-50">
-                        {skill.name}
-                      </h3>
-                      {skill.agent_id && (
-                        <p className="flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
-                          <CharacterAvatar agentId={skill.agent_id} name={skill.agent_id} size={24} />
-                          {skill.agent_id}
-                          {skill.scope && <Badge tone="neutral">{skill.scope}</Badge>}
+    <div className="mt-3 border-t border-[var(--panel-border)] pt-2.5">
+      <button
+        type="button"
+        onClick={handleToggle}
+        aria-expanded={open}
+        className="flex items-center gap-1.5 text-xs font-medium text-stone-500 hover:text-amber-600 dark:text-stone-400 dark:hover:text-amber-400"
+      >
+        <History className="h-3.5 w-3.5" />
+        {intl.formatMessage({ id: 'memory.history.toggle' })}
+        {open ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+      </button>
+
+      {open && (
+        <div className="mt-3">
+          {loading ? (
+            <p className="py-3 text-xs text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
+          ) : failed ? (
+            <p className="py-3 text-xs text-stone-500 dark:text-stone-400">
+              {intl.formatMessage({ id: 'memory.history.loadError' })}
+            </p>
+          ) : chain.length === 0 ? (
+            <p className="py-3 text-xs text-stone-400 dark:text-stone-500">
+              {intl.formatMessage({ id: 'memory.history.empty' })}
+            </p>
+          ) : (
+            <>
+              {(subject || predicate) && (
+                <p className="mb-3 text-xs text-stone-400 dark:text-stone-500">
+                  <Mono className="text-xs text-stone-500 dark:text-stone-400">{subject}</Mono>
+                  {' · '}
+                  <Mono className="text-xs text-stone-500 dark:text-stone-400">{predicate}</Mono>
+                </p>
+              )}
+              <ol className="space-y-0">
+                {chain.map((c, i) => {
+                  const isCurrent = c.is_current || c.id === currentId;
+                  return (
+                    <li key={c.id} className="relative flex gap-3 pb-3 last:pb-0">
+                      {/* timeline rail */}
+                      <div className="relative flex flex-col items-center">
+                        <span
+                          className={cn(
+                            'mt-1 h-2.5 w-2.5 shrink-0 rounded-full',
+                            isCurrent ? 'bg-emerald-500' : 'bg-stone-300 dark:bg-stone-600',
+                          )}
+                        />
+                        {i < chain.length - 1 && (
+                          <span className="mt-0.5 w-px flex-1 bg-stone-200 dark:bg-stone-700" />
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="mb-1 flex flex-wrap items-center gap-2">
+                          {isCurrent ? (
+                            <Badge tone="success">{intl.formatMessage({ id: 'memory.history.current' })}</Badge>
+                          ) : (
+                            <Badge tone="neutral">{intl.formatMessage({ id: 'memory.history.superseded' })}</Badge>
+                          )}
+                          {c.confidence != null && (
+                            <span className="text-[11px] text-stone-400 dark:text-stone-500">
+                              {intl.formatMessage(
+                                { id: 'memory.history.confidence' },
+                                { value: Math.round(c.confidence * 100) },
+                              )}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-sm text-stone-700 dark:text-stone-300 whitespace-pre-wrap">
+                          {c.content}
+                        </p>
+                        <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-stone-400 dark:text-stone-500">
+                          <span className="flex items-center gap-1">
+                            <Clock className="h-3 w-3" />
+                            {intl.formatMessage({ id: 'memory.history.validFrom' })}{' '}
+                            <Mono className="text-[11px] text-stone-500 dark:text-stone-400">
+                              {c.valid_from ? new Date(c.valid_from).toLocaleString() : '—'}
+                            </Mono>
+                          </span>
+                          <span>
+                            {intl.formatMessage({ id: 'memory.history.validUntil' })}{' '}
+                            <Mono className="text-[11px] text-stone-500 dark:text-stone-400">
+                              {c.valid_until
+                                ? new Date(c.valid_until).toLocaleString()
+                                : intl.formatMessage({ id: 'memory.history.now' })}
+                            </Mono>
+                          </span>
+                        </p>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ol>
+
+              {/* Point-in-time query */}
+              {subject && predicate && (
+                <div className="mt-3 border-t border-[var(--panel-border)] pt-3">
+                  <p className="mb-2 text-[11px] font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'memory.history.pit.title' })}
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="datetime-local"
+                      value={atInput}
+                      onChange={(e) => setAtInput(e.target.value)}
+                      className={cn(controlClass, 'h-8 w-auto text-xs')}
+                      aria-label={intl.formatMessage({ id: 'memory.history.pit.title' })}
+                    />
+                    <Button
+                      variant="secondary"
+                      onClick={handleAtQuery}
+                      disabled={atLoading || !atInput}
+                    >
+                      {atLoading
+                        ? intl.formatMessage({ id: 'common.loading' })
+                        : intl.formatMessage({ id: 'memory.history.pit.query' })}
+                    </Button>
+                  </div>
+                  {atResult && (
+                    <div className="mt-2 rounded-lg bg-stone-500/5 px-3 py-2 dark:bg-white/5">
+                      {atResult.found && atResult.record ? (
+                        <>
+                          <p className="text-sm text-stone-700 dark:text-stone-300 whitespace-pre-wrap">
+                            {atResult.record.content}
+                          </p>
+                          <p className="mt-1 text-[11px] text-stone-400 dark:text-stone-500">
+                            {intl.formatMessage({ id: 'memory.history.validFrom' })}{' '}
+                            <Mono className="text-[11px] text-stone-500 dark:text-stone-400">
+                              {atResult.record.valid_from
+                                ? new Date(atResult.record.valid_from).toLocaleString()
+                                : '—'}
+                            </Mono>
+                          </p>
+                        </>
+                      ) : (
+                        <p className="text-xs text-stone-400 dark:text-stone-500">
+                          {intl.formatMessage({ id: 'memory.history.pit.none' })}
                         </p>
                       )}
                     </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {skill.security_status && (
-                      <Shield
-                        className={cn(
-                          'h-4 w-4',
-                          securityStyles[skill.security_status] ?? 'text-stone-400'
-                        )}
-                      />
-                    )}
-                    {skill.agent_id && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        icon={Eye}
-                        onClick={() => handleExpand(skill.agent_id!, skill.name)}
-                        aria-label={intl.formatMessage({ id: 'memory.tab.skills' })}
-                      />
-                    )}
-                  </div>
+                  )}
                 </div>
-                {isExpanded && (
-                  <pre className="mt-3 max-h-48 overflow-auto rounded-lg bg-stone-500/5 p-3 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-400">
-                    {skillContent[key] ?? intl.formatMessage({ id: 'common.loading' })}
-                  </pre>
-                )}
-              </Card>
-            );
-          })}
+              )}
+            </>
+          )}
         </div>
       )}
     </div>

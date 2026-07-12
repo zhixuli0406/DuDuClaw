@@ -165,6 +165,7 @@ mod tests {
                 trigger: "manual".to_string(),
                 reports_to: "none".to_string(),
                 icon: "".to_string(),
+                department: String::new(),
             },
             model: ModelConfig {
                 preferred: "gpt-4".to_string(),

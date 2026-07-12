@@ -40,6 +40,176 @@ fn is_valid_agent_id(id: &str) -> bool {
         && !id.contains("..")
 }
 
+// ── WP4 agent avatar upload ───────────────────────────────────────────────
+//
+// Avatars are stored as a single `agents/<id>/avatar.<ext>` file (raw bytes),
+// mirroring the branding-logo policy: PNG/JPEG/WebP only (SVG excluded — it can
+// carry script), a 512 KB decoded ceiling, and magic-byte confirmation of the
+// declared mime. Read back into an inline data URI for the dashboard (same
+// `img-src data:` CSP as the logo).
+
+/// On-disk avatar file extensions, in read-preference order.
+const AVATAR_EXTS: &[&str] = &["png", "jpg", "webp"];
+
+/// Extension → mime for reconstructing the data URI on read.
+const AVATAR_EXT_MIME: &[(&str, &str)] =
+    &[("png", "image/png"), ("jpg", "image/jpeg"), ("webp", "image/webp")];
+
+/// Maximum decoded avatar size (512 KB) — matches the branding-logo ceiling.
+const MAX_AVATAR_DECODED_BYTES: usize = 512 * 1024;
+
+/// Accepted avatar data-URI prefixes → (file extension, magic-byte kind).
+const AVATAR_PREFIXES: &[(&str, &str)] = &[
+    ("data:image/png;base64,", "png"),
+    ("data:image/jpeg;base64,", "jpg"),
+    ("data:image/webp;base64,", "webp"),
+];
+
+/// Decode + validate an avatar data URI. Returns `(bytes, extension)` on success.
+/// Fails closed: unknown mime, oversized payload, or a magic-byte mismatch (the
+/// declared type not matching the real bytes) all error rather than store.
+fn decode_avatar_data_uri(uri: &str) -> Result<(Vec<u8>, &'static str), String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let (b64, ext) = AVATAR_PREFIXES
+        .iter()
+        .find_map(|(prefix, ext)| uri.strip_prefix(prefix).map(|rest| (rest, *ext)))
+        .ok_or_else(|| {
+            "Avatar 格式不支援：僅接受 PNG / JPEG / WebP 的 base64 data URI（不接受 SVG）".to_string()
+        })?;
+    // F8: bound the *encoded* length before allocating the decode buffer so an
+    // oversized payload is rejected up front (base64 inflates ~4/3, so the
+    // decoded ceiling maps to ~4/3 that many base64 chars; +4 for padding
+    // slack). Cheap guard against a huge alloc from a malicious data URI.
+    let b64_trimmed = b64.trim();
+    let max_b64_len = MAX_AVATAR_DECODED_BYTES / 3 * 4 + 4;
+    if b64_trimmed.len() > max_b64_len {
+        return Err(format!(
+            "Avatar 檔案過大（上限 {} KB）",
+            MAX_AVATAR_DECODED_BYTES / 1024
+        ));
+    }
+    let bytes = B64
+        .decode(b64_trimmed)
+        .map_err(|_| "Avatar base64 解碼失敗".to_string())?;
+    if bytes.len() > MAX_AVATAR_DECODED_BYTES {
+        return Err(format!(
+            "Avatar 檔案過大（上限 {} KB）",
+            MAX_AVATAR_DECODED_BYTES / 1024
+        ));
+    }
+    if !avatar_magic_matches(&bytes, ext) {
+        return Err("Avatar 內容與宣告的格式不符（magic bytes 驗證失敗）".to_string());
+    }
+    Ok((bytes, ext))
+}
+
+/// Confirm decoded bytes carry the signature of the declared image kind — the
+/// same defence branding uses against a mislabelled (e.g. SVG-as-PNG) payload.
+fn avatar_magic_matches(bytes: &[u8], ext: &str) -> bool {
+    match ext {
+        "png" => bytes.len() >= 8 && bytes[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        "jpg" => bytes.len() >= 3 && bytes[..3] == [0xFF, 0xD8, 0xFF],
+        "webp" => bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+// ── F6: archive/unarchive evolution+heartbeat snapshot round-trip ────────────
+//
+// Off-boarding (archive / soft-delete) freezes `evolution.enabled` and
+// `heartbeat.enabled` to `false`. Many production agents run with those
+// intentionally disabled, so `unarchive` must restore the operator's ORIGINAL
+// choice rather than force both on. `offboard_freeze_table` snapshots the prior
+// values into `[archive.restore]`; `unarchive_restore_table` restores them and
+// drops the snapshot. Both are pure table transforms so the round-trip is
+// unit-testable without a full handler.
+
+fn table_enabled(table: &toml::Table, section: &str) -> bool {
+    table
+        .get(section)
+        .and_then(|v| v.as_table())
+        .and_then(|s| s.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn archive_restore_snapshot(table: &toml::Table, key: &str) -> Option<bool> {
+    table
+        .get("archive")
+        .and_then(|v| v.as_table())
+        .and_then(|a| a.get("restore"))
+        .and_then(|v| v.as_table())
+        .and_then(|r| r.get(key))
+        .and_then(|v| v.as_bool())
+}
+
+/// Freeze evolution/heartbeat and record their pre-freeze values so a later
+/// unarchive can restore them. Preserves an already-present snapshot across a
+/// double-archive so the *original* value is never lost.
+fn offboard_freeze_table(table: &mut toml::Table, status: &str) -> Result<(), String> {
+    let snap_evolution = archive_restore_snapshot(table, "evolution_enabled")
+        .unwrap_or_else(|| table_enabled(table, "evolution"));
+    let snap_heartbeat = archive_restore_snapshot(table, "heartbeat_enabled")
+        .unwrap_or_else(|| table_enabled(table, "heartbeat"));
+
+    let agent_section = table
+        .get_mut("agent")
+        .and_then(|v| v.as_table_mut())
+        .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
+    agent_section.insert("status".into(), toml::Value::String(status.to_string()));
+
+    for section in ["evolution", "heartbeat"] {
+        let sub = table
+            .entry(section.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(t) = sub.as_table_mut() {
+            t.insert("enabled".into(), toml::Value::Boolean(false));
+        }
+    }
+
+    let archive = table
+        .entry("archive".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let Some(a) = archive.as_table_mut() {
+        let restore = a
+            .entry("restore".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(r) = restore.as_table_mut() {
+            r.insert("evolution_enabled".into(), toml::Value::Boolean(snap_evolution));
+            r.insert("heartbeat_enabled".into(), toml::Value::Boolean(snap_heartbeat));
+        }
+    }
+    Ok(())
+}
+
+/// Restore evolution/heartbeat from the `[archive.restore]` snapshot (absent ⇒
+/// conservative `false`), set status active, and drop the snapshot block.
+fn unarchive_restore_table(table: &mut toml::Table) -> Result<(), String> {
+    let restore_evolution = archive_restore_snapshot(table, "evolution_enabled").unwrap_or(false);
+    let restore_heartbeat = archive_restore_snapshot(table, "heartbeat_enabled").unwrap_or(false);
+
+    let agent_section = table
+        .get_mut("agent")
+        .and_then(|v| v.as_table_mut())
+        .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
+    agent_section.insert("status".into(), toml::Value::String("active".into()));
+
+    for (section, restored) in
+        [("evolution", restore_evolution), ("heartbeat", restore_heartbeat)]
+    {
+        let sub = table
+            .entry(section.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(t) = sub.as_table_mut() {
+            t.insert("enabled".into(), toml::Value::Boolean(restored));
+        }
+    }
+    // Snapshot consumed — drop it so a later re-archive re-snapshots the
+    // current (restored) values.
+    table.remove("archive");
+    Ok(())
+}
+
 // ── P0 dashboard-config helpers (CAP / CON / RED / MK / KS) ───────────────────
 //
 // These are module-level pure functions so the validation + TOML round-trip
@@ -243,6 +413,95 @@ fn apply_capabilities_to_table(
         }
     }
 
+    // ── native_sandbox (bool) — opt-in Seatbelt/Landlock OS confinement ──
+    if let Some(v) = cap.get("native_sandbox").and_then(|v| v.as_bool()) {
+        section.insert("native_sandbox".into(), toml::Value::Boolean(v));
+        changes.push(format!("capabilities.native_sandbox = {v}"));
+    }
+
+    // ── policy[] (Progent-style parameter-level tool policy) ──
+    // Each entry: { tool, effect: allow|forbid|ask, when: [{arg, op, value}] }.
+    // Non-empty `policy` flips the PolicyKernel into strict allowlist mode
+    // (forbid > ask > allow; unmatched call denied) — so validate strictly and
+    // fail-closed on any malformed rule rather than silently dropping it.
+    if let Some(arr) = cap.get("policy").and_then(|v| v.as_array()) {
+        let mut out: Vec<toml::Value> = Vec::with_capacity(arr.len());
+        for (i, rule) in arr.iter().enumerate() {
+            let obj = rule
+                .as_object()
+                .ok_or_else(|| format!("capabilities.policy[{i}] must be an object"))?;
+
+            let tool = obj
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("capabilities.policy[{i}].tool must be a non-empty string"))?;
+
+            let effect = match obj.get("effect").and_then(|v| v.as_str()) {
+                Some("allow") => "allow",
+                Some("forbid") => "forbid",
+                Some("ask") => "ask",
+                _ => {
+                    return Err(format!(
+                        "capabilities.policy[{i}].effect must be one of: allow, forbid, ask"
+                    ))
+                }
+            };
+
+            let mut rule_tbl = toml::map::Map::new();
+            rule_tbl.insert("tool".into(), toml::Value::String(tool.into()));
+            rule_tbl.insert("effect".into(), toml::Value::String(effect.into()));
+
+            // Optional `when` conditions (logical AND). Absent/empty → matches
+            // any arguments.
+            if let Some(when_arr) = obj.get("when").and_then(|v| v.as_array()) {
+                let mut conds: Vec<toml::Value> = Vec::with_capacity(when_arr.len());
+                for (j, c) in when_arr.iter().enumerate() {
+                    let cobj = c.as_object().ok_or_else(|| {
+                        format!("capabilities.policy[{i}].when[{j}] must be an object")
+                    })?;
+                    let arg = cobj
+                        .get("arg")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            format!("capabilities.policy[{i}].when[{j}].arg must be a non-empty string")
+                        })?;
+                    let op = match cobj.get("op").and_then(|v| v.as_str()) {
+                        Some("equals") => "equals",
+                        Some("contains") => "contains",
+                        Some("starts_with") => "starts_with",
+                        _ => {
+                            return Err(format!(
+                                "capabilities.policy[{i}].when[{j}].op must be one of: equals, contains, starts_with"
+                            ))
+                        }
+                    };
+                    // `value` is required but may legitimately be an empty string.
+                    let value = cobj
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            format!("capabilities.policy[{i}].when[{j}].value must be a string")
+                        })?;
+                    let mut cond_tbl = toml::map::Map::new();
+                    cond_tbl.insert("arg".into(), toml::Value::String(arg.into()));
+                    cond_tbl.insert("op".into(), toml::Value::String(op.into()));
+                    cond_tbl.insert("value".into(), toml::Value::String(value.into()));
+                    conds.push(toml::Value::Table(cond_tbl));
+                }
+                rule_tbl.insert("when".into(), toml::Value::Array(conds));
+            }
+
+            out.push(toml::Value::Table(rule_tbl));
+        }
+        let n = out.len();
+        section.insert("policy".into(), toml::Value::Array(out));
+        changes.push(format!("capabilities.policy = [{n} rules]"));
+    }
+
     Ok(changes)
 }
 
@@ -260,7 +519,7 @@ fn apply_capabilities_to_table(
 
 /// Valid AI runtime providers (mirrors the `AgentRuntime` registry backends).
 const VALID_RUNTIME_PROVIDERS: &[&str] =
-    &["claude", "codex", "gemini", "antigravity", "openai_compat"];
+    &["claude", "codex", "gemini", "antigravity", "grok", "openai_compat"];
 
 /// Detect Claude OAuth availability by reading `~/.claude/.credentials.json`
 /// directly (the OS user home, not `DUDUCLAW_HOME`). Returns
@@ -327,7 +586,7 @@ fn apply_runtime_to_table(
     if let Some(v) = rt.get("provider").and_then(|v| v.as_str()) {
         if !VALID_RUNTIME_PROVIDERS.contains(&v) {
             return Err(format!(
-                "Invalid runtime.provider '{v}'. Valid: claude, codex, gemini, openai_compat"
+                "Invalid runtime.provider '{v}'. Valid: claude, codex, gemini, antigravity, grok, openai_compat"
             ));
         }
         section.insert("provider".into(), toml::Value::String(v.into()));
@@ -342,7 +601,7 @@ fn apply_runtime_to_table(
         } else {
             if !VALID_RUNTIME_PROVIDERS.contains(&v) {
                 return Err(format!(
-                    "Invalid runtime.fallback '{v}'. Valid: claude, codex, gemini, openai_compat"
+                    "Invalid runtime.fallback '{v}'. Valid: claude, codex, gemini, antigravity, grok, openai_compat"
                 ));
             }
             section.insert("fallback".into(), toml::Value::String(v.into()));
@@ -1147,7 +1406,9 @@ fn apply_odoo_to_table(
         changes.push(format!("odoo.company_ids = [{} entries]", out.len()));
     }
 
-    // url / db / username (plaintext scalars, optional overrides)
+    // url / db / username (plaintext scalars, optional overrides).
+    // url + db are validated with the SAME SSRF / db-name validators as the
+    // global `odoo.configure` path — an override must not be a bypass (I5).
     for (param_key, toml_key) in &[("url", "url"), ("db", "db"), ("username", "username")] {
         if let Some(v) = odoo_in.get(*param_key).and_then(|v| v.as_str()) {
             let v = v.trim();
@@ -1155,6 +1416,18 @@ fn apply_odoo_to_table(
                 section.remove(*toml_key);
                 changes.push(format!("odoo.{toml_key} cleared"));
             } else {
+                if *toml_key == "url" && !MethodHandler::is_safe_odoo_url(v) {
+                    return Err(
+                        "odoo.url must use HTTPS (http:// only allowed for localhost/127.0.0.1) \
+                         and must not target a private/reserved host"
+                            .into(),
+                    );
+                }
+                if *toml_key == "db"
+                    && !(v.len() < 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                {
+                    return Err("odoo.db must be ≤63 chars of [a-zA-Z0-9_-]".into());
+                }
                 section.insert((*toml_key).into(), toml::Value::String(v.into()));
                 changes.push(format!("odoo.{toml_key} = [SET]"));
             }
@@ -1226,6 +1499,184 @@ fn inference_table_to_response(table: &toml::Table) -> Value {
         );
     }
     v
+}
+
+// ── IDR: [identity] in config.toml (RFC-21 §1 dashboard surface) ──────────────
+// The API-level twin of the `identity_resolve` MCP tool: lets the operator pick
+// which `duduclaw_identity` provider is active and test-resolve an identifier
+// from the dashboard. Secret handling mirrors the [openai_compat] pattern above.
+
+/// Valid `identity.provider` selectors.
+const IDENTITY_PROVIDERS: [&str; 3] = ["wiki_cache", "notion", "chained"];
+
+/// Default Notion field_map — mirrors `NotionFieldMap::default()` in
+/// `duduclaw-identity` so the dashboard shows the same defaults the resolver
+/// uses when the operator hasn't overridden them.
+fn default_notion_field_map() -> Value {
+    json!({
+        "name": "Name",
+        "roles": "Roles",
+        "projects": "Projects",
+        "projects_kind": "multi_select",
+        "emails": "Email",
+        "channel_props": {
+            "discord": "Discord ID",
+            "line": "Line ID",
+            "telegram": "Telegram ID",
+            "email": "Email"
+        }
+    })
+}
+
+/// Build the `identity.config_get` response from config.toml, MASKING the Notion
+/// api key (never returns cleartext or the `_enc` blob). Missing values fall back
+/// to explicit defaults so the caller never sees `null`.
+fn identity_table_to_response(table: &toml::Table) -> Value {
+    let idt = table.get("identity").and_then(|v| v.as_table());
+    let provider = idt
+        .and_then(|t| t.get("provider"))
+        .and_then(|v| v.as_str())
+        .filter(|s| IDENTITY_PROVIDERS.contains(s))
+        .unwrap_or("wiki_cache")
+        .to_string();
+
+    let notion_tbl = idt.and_then(|t| t.get("notion")).and_then(|v| v.as_table());
+    let database_id = notion_tbl
+        .and_then(|t| t.get("database_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let refresh_seconds = notion_tbl
+        .and_then(|t| t.get("refresh_seconds"))
+        .and_then(|v| v.as_integer())
+        .unwrap_or(900);
+    let has_secret = notion_tbl
+        .and_then(|t| t.get("api_key_enc").or_else(|| t.get("api_key")))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    // field_map: start from defaults, overlay any operator overrides.
+    let mut field_map = default_notion_field_map();
+    if let Some(fm) = notion_tbl
+        .and_then(|t| t.get("field_map"))
+        .and_then(|v| v.as_table())
+    {
+        if let Some(obj) = field_map.as_object_mut() {
+            for key in ["name", "roles", "projects", "projects_kind", "emails"] {
+                if let Some(s) = fm.get(key).and_then(|v| v.as_str()) {
+                    obj.insert(key.into(), json!(s));
+                }
+            }
+            if let Some(cp) = fm.get("channel_props").and_then(|v| v.as_table()) {
+                let mut props = serde_json::Map::new();
+                for (k, v) in cp {
+                    if let Some(s) = v.as_str() {
+                        props.insert(k.clone(), json!(s));
+                    }
+                }
+                if !props.is_empty() {
+                    obj.insert("channel_props".into(), Value::Object(props));
+                }
+            }
+        }
+    }
+
+    json!({
+        "provider": provider,
+        "notion": {
+            "database_id": database_id,
+            "refresh_seconds": refresh_seconds,
+            "api_key_set": has_secret,
+            "api_key": if has_secret { SECRET_MASK_SET } else { "" },
+            "field_map": field_map,
+        }
+    })
+}
+
+/// Apply an `identity.config_set` params object onto config.toml's `[identity]`
+/// table (non-secret fields only — the Notion api key is encrypted by the async
+/// handler). Returns the human-readable change list. Validates the provider enum
+/// and `projects_kind`. Fails closed on malformed sections.
+fn apply_identity_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+    changes: &mut Vec<String>,
+) -> Result<(), String> {
+    let obj = params.as_object().ok_or("params must be an object")?;
+
+    let idt = table
+        .entry("identity")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or("Invalid [identity] section")?;
+
+    if let Some(p) = obj.get("provider").and_then(|v| v.as_str()) {
+        if !IDENTITY_PROVIDERS.contains(&p) {
+            return Err(format!(
+                "Invalid provider '{p}'; must be one of wiki_cache | notion | chained"
+            ));
+        }
+        idt.insert("provider".into(), toml::Value::String(p.to_string()));
+        changes.push(format!("identity.provider = {p}"));
+    }
+
+    if let Some(notion) = obj.get("notion").and_then(|v| v.as_object()) {
+        let nt = idt
+            .entry("notion")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .ok_or("Invalid [identity.notion] section")?;
+
+        if let Some(db) = notion.get("database_id").and_then(|v| v.as_str()) {
+            nt.insert(
+                "database_id".into(),
+                toml::Value::String(db.trim().to_string()),
+            );
+            changes.push("identity.notion.database_id updated".to_string());
+        }
+        if let Some(rs) = notion.get("refresh_seconds").and_then(|v| v.as_i64()) {
+            if rs < 0 {
+                return Err("refresh_seconds must be >= 0".to_string());
+            }
+            nt.insert("refresh_seconds".into(), toml::Value::Integer(rs));
+            changes.push(format!("identity.notion.refresh_seconds = {rs}"));
+        }
+
+        if let Some(fm) = notion.get("field_map").and_then(|v| v.as_object()) {
+            let fmt = nt
+                .entry("field_map")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .ok_or("Invalid [identity.notion.field_map] section")?;
+            for key in ["name", "roles", "projects", "emails"] {
+                if let Some(s) = fm.get(key).and_then(|v| v.as_str()) {
+                    fmt.insert(key.into(), toml::Value::String(s.to_string()));
+                    changes.push(format!("identity.notion.field_map.{key} updated"));
+                }
+            }
+            if let Some(pk) = fm.get("projects_kind").and_then(|v| v.as_str()) {
+                if pk != "multi_select" && pk != "relation" {
+                    return Err("projects_kind must be multi_select | relation".to_string());
+                }
+                fmt.insert("projects_kind".into(), toml::Value::String(pk.to_string()));
+                changes.push(format!("identity.notion.field_map.projects_kind = {pk}"));
+            }
+            if let Some(cp) = fm.get("channel_props").and_then(|v| v.as_object()) {
+                // Replace channel_props wholesale (operator sends the full set).
+                let mut new_props = toml::map::Map::new();
+                for (k, v) in cp {
+                    if let Some(s) = v.as_str() {
+                        new_props.insert(k.clone(), toml::Value::String(s.to_string()));
+                    }
+                }
+                fmt.insert("channel_props".into(), toml::Value::Table(new_props));
+                changes.push("identity.notion.field_map.channel_props updated".to_string());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Get-or-create a sub-table by `key` on `table`.
@@ -2578,7 +3029,7 @@ impl MethodHandler {
             "tools.catalog" => self.handle_tools_catalog(params),
 
             // ── Agent methods (filtered by binding) ──────────
-            "agents.list" => self.handle_agents_list_filtered(ctx).await,
+            "agents.list" => self.handle_agents_list_filtered(ctx, params).await,
             "agents.status" => {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_agents_status(params).await
@@ -2596,9 +3047,20 @@ impl MethodHandler {
                 self.handle_agents_update(params).await
             }
             "agents.remove" => { require_admin!(); self.handle_agents_remove(params).await }
+            // ── WP4 off-boarding lifecycle (all admin-gated) ──
+            "agents.archive" => { require_admin!(); self.handle_agents_archive(params).await }
+            "agents.unarchive" => { require_admin!(); self.handle_agents_unarchive(params).await }
+            "agents.handoff" => { require_admin!(); self.handle_agents_handoff(params).await }
+            "agents.set_avatar" => { require_admin!(); self.handle_agents_set_avatar(params).await }
+            "agents.clear_avatar" => { require_admin!(); self.handle_agents_clear_avatar(params).await }
             "agents.inspect" => {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_agents_inspect(params).await
+            }
+            // E1: cheap avatar-only read (no telemetry / config serialization).
+            "agents.avatar" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_agents_avatar(params).await
             }
 
             // ── Behavioral contract (per-agent CONTRACT.toml, CON.1–CON.3) ──
@@ -2608,6 +3070,11 @@ impl MethodHandler {
             // ── Redaction / privacy (global config.toml [redaction], RED.1–RED.4) ──
             "redaction.get" => { require_admin!(); self.handle_redaction_get().await }
             "redaction.update" => { require_admin!(); self.handle_redaction_update(params).await }
+
+            // IDR: identity resolution (RFC-21 §1 dashboard surface)
+            "identity.config_get" => { require_admin!(); self.handle_identity_config_get().await }
+            "identity.config_set" => { require_admin!(); self.handle_identity_config_set(params).await }
+            "identity.resolve" => { require_admin!(); self.handle_identity_resolve(params).await }
 
             // ── Skill synthesis auto-run (global config.toml [skill_synthesis], W19-P1) ──
             "skill_synthesis.get" => { require_admin!(); self.handle_skill_synthesis_get().await }
@@ -2640,6 +3107,9 @@ impl MethodHandler {
             "channels.add" => { require_admin!(); self.handle_channels_add(params).await }
             "channels.test" => { require_admin!(); self.handle_channels_test(params).await }
             "channels.remove" => { require_admin!(); self.handle_channels_remove(params).await }
+            // WP9: mint a one-time Telegram deep-link/QR bind token for a
+            // specific AI employee (shared-bot onboarding). Admin only.
+            "channels.telegram_bind_token" => { require_admin!(); self.handle_telegram_bind_token(params).await }
 
             // ── Account methods (admin only) ─────────────────
             // ── License (read-only snapshot of the gateway LicenseRuntime) ──
@@ -2681,6 +3151,15 @@ impl MethodHandler {
             "memory.key_facts" => {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_memory_key_facts(params).await
+            }
+            // F1 Temporal Memory (v1.19.0): supersession chain + point-in-time.
+            "memory.history" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_memory_history(params).await
+            }
+            "memory.at" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_memory_at(params).await
             }
 
             // ── Wiki (agent-scoped — HS4 fix, mirrors memory.*) ───────
@@ -2806,11 +3285,20 @@ impl MethodHandler {
             "evolution.status" => { require_manager!(); self.handle_evolution_status().await }
             "evolution.history" => { require_manager!(); self.handle_evolution_history(params).await }
 
+            // ── Cost / cache-efficiency telemetry (admin only) ──
+            "cost.summary" => { require_admin!(); self.handle_cost_summary(params).await }
+            "cost.agents" => { require_admin!(); self.handle_cost_agents(params).await }
+            "cost.recent" => { require_admin!(); self.handle_cost_recent(params).await }
+
             // ── Odoo (admin only) ────────────────────────────
             "odoo.status" => { require_admin!(); self.handle_odoo_status().await }
             "odoo.config" => { require_admin!(); self.handle_odoo_config().await }
             "odoo.configure" => { require_admin!(); self.handle_odoo_configure(params).await }
             "odoo.test" => { require_admin!(); self.handle_odoo_test(params).await }
+            // RFC-21 §2: per-agent Odoo credential isolation.
+            "odoo.agent_config_get" => { require_admin!(); self.handle_odoo_agent_config_get(params).await }
+            "odoo.agent_config_set" => { require_admin!(); self.handle_odoo_agent_config_set(params).await }
+            "odoo.agent_test" => { require_admin!(); self.handle_odoo_agent_test(params).await }
 
             // ── User management (admin only) ─────────────────
             "users.list" => { require_admin!(); self.handle_users_list().await }
@@ -2923,6 +3411,20 @@ impl MethodHandler {
             // the agent id is only known after resolving the run's session;
             // unknown run fails closed for non-admins.
             "runs.get" => self.handle_runs_get(params, ctx).await,
+
+            // ── WebChat session history + resume (WP3) ──────
+            // Same gate as runs.list: read-only, agent-scoped, fail-closed.
+            // Admins may list across all agents (agent_id optional); non-admins
+            // MUST scope to a bound agent so they cannot enumerate other teams'
+            // conversations.
+            "chat.sessions.list" => {
+                check_agent_filter!(AccessLevel::Viewer);
+                self.handle_chat_sessions_list(params).await
+            }
+            // Gated inside the handler by the session's owning agent (Viewer) —
+            // the agent id is resolved from the session; an unknown session id
+            // fails closed ("session not found") before any turns are exposed.
+            "chat.sessions.history" => self.handle_chat_sessions_history(params, ctx).await,
 
             // ── Decision Continuity (RFC-24, agent-scoped) ──
             "decisions.list" => {
@@ -3131,6 +3633,7 @@ impl MethodHandler {
                 last_phone_home: None,
                 days_since_phone_home: None,
                 fingerprint_match: None,
+                branding_editable: None,
             },
         };
 
@@ -3157,8 +3660,14 @@ impl MethodHandler {
                 { "name": "agents.pause", "description": "Pause an agent" },
                 { "name": "agents.resume", "description": "Resume an agent" },
                 { "name": "agents.update", "description": "Update agent config fields" },
-                { "name": "agents.remove", "description": "Remove an agent (to trash)" },
+                { "name": "agents.remove", "description": "Soft-delete an agent (hidden, data retained)" },
+                { "name": "agents.archive", "description": "Archive an agent (recoverable off-board)" },
+                { "name": "agents.unarchive", "description": "Restore an archived agent" },
+                { "name": "agents.handoff", "description": "Hand off memory/wiki/tasks to another agent" },
+                { "name": "agents.set_avatar", "description": "Upload an agent avatar image (data URI)" },
+                { "name": "agents.clear_avatar", "description": "Remove an agent's uploaded avatar" },
                 { "name": "agents.inspect", "description": "Inspect agent details" },
+                { "name": "agents.avatar", "description": "Fetch an agent's uploaded avatar as a data URI (lightweight)" },
                 { "name": "channels.status", "description": "Channel connection status" },
                 { "name": "channels.add", "description": "Add a channel" },
                 { "name": "channels.test", "description": "Test a channel" },
@@ -3170,6 +3679,11 @@ impl MethodHandler {
                 { "name": "memory.search", "description": "Search agent memory" },
                 { "name": "memory.browse", "description": "Browse recent memory entries" },
                 { "name": "memory.key_facts", "description": "List extracted key insights (P2 Key-Fact Accumulator)" },
+                { "name": "memory.history", "description": "Fact supersession chain (F1 Temporal Memory)" },
+                { "name": "memory.at", "description": "Point-in-time fact lookup (F1 Temporal Memory)" },
+                { "name": "cost.summary", "description": "Cost / cache-efficiency window summary + price-cliff status" },
+                { "name": "cost.agents", "description": "Per-agent cost + cache health" },
+                { "name": "cost.recent", "description": "Recent per-request cost records" },
                 { "name": "wiki.pages", "description": "List wiki pages for an agent" },
                 { "name": "wiki.read", "description": "Read a wiki page" },
                 { "name": "wiki.search", "description": "Search wiki pages" },
@@ -3481,6 +3995,16 @@ impl MethodHandler {
             Some(a) => a.clone(),
             None => return WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
         };
+        // F2: an archived / soft-deleted agent must not receive delegated work.
+        // Fail-closed with an explicit error rather than silently queueing a
+        // task for an off-boarded agent.
+        if !agent.config.agent.status.is_operational() {
+            let status = format!("{:?}", agent.config.agent.status).to_lowercase();
+            return WsFrame::error_response(
+                "",
+                &format!("Agent '{agent_id}' is not operational (status: {status}); cannot delegate."),
+            );
+        }
         let model = agent.config.model.preferred.clone();
         drop(reg);
 
@@ -3728,6 +4252,22 @@ impl MethodHandler {
                 if let Some(v) = params_clone.get("reports_to").and_then(|v| v.as_str()) {
                     agent_section.insert("reports_to".into(), toml::Value::String(v.into()));
                     changes.push(format!("reports_to = \"{v}\""));
+                }
+                // WP7: department (company → department → personal layering).
+                // Empty string clears it (agent leaves its department).
+                if let Some(v) = params_clone.get("department").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if v.is_empty() {
+                        agent_section.remove("department");
+                        changes.push("department cleared".into());
+                    } else if duduclaw_core::is_valid_department(v) {
+                        agent_section.insert("department".into(), toml::Value::String(v.into()));
+                        changes.push(format!("department = \"{v}\""));
+                    } else {
+                        return Err(format!(
+                            "Invalid department '{v}' (ASCII alphanumeric, '-', '_'; 1..=64 chars)"
+                        ));
+                    }
                 }
             }
 
@@ -4504,6 +5044,256 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "success": true, "changes": changes }))
     }
 
+    // ── IDR: [identity] in config.toml (RFC-21 §1 dashboard surface) ──────────
+
+    /// `identity.config_get` — read config.toml `[identity]` (provider selector
+    /// + Notion settings). The Notion api key is MASKED. Adds `wiki_cache.people_dir`
+    /// for display. Response never contains a secret or a `null`.
+    async fn handle_identity_config_get(&self) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        let mut resp = identity_table_to_response(&table);
+        if let Some(obj) = resp.as_object_mut() {
+            let dir = self
+                .home_dir
+                .join("shared")
+                .join("wiki")
+                .join("identity")
+                .join("people");
+            obj.insert(
+                "wiki_cache".into(),
+                json!({ "people_dir": dir.to_string_lossy() }),
+            );
+        }
+        WsFrame::ok_response("", resp)
+    }
+
+    /// `identity.config_set` — atomic write of config.toml `[identity]`.
+    /// Params (all optional, partial): `{ provider, notion: { database_id,
+    /// refresh_seconds, api_key (write-only, encrypted; '' clears), field_map } }`.
+    /// The masked placeholder is never persisted as a real secret. Response:
+    /// `{ success, changes[] }`.
+    async fn handle_identity_config_set(&self, params: Value) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+
+        let mut changes = Vec::new();
+        if let Err(e) = apply_identity_to_table(&mut table, &params, &mut changes) {
+            return WsFrame::error_response("", &e);
+        }
+
+        // Notion api key secret: encrypt → `api_key_enc`, never store cleartext.
+        // An empty string clears it; the masked placeholder is refused so a
+        // dashboard echo can't overwrite the real secret with "***set***".
+        if let Some(api_key) = params
+            .get("notion")
+            .and_then(|v| v.as_object())
+            .and_then(|n| n.get("api_key"))
+            .and_then(|v| v.as_str())
+        {
+            if api_key != SECRET_MASK_SET {
+                let idt = match table
+                    .entry("identity")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                {
+                    Some(t) => t,
+                    None => return WsFrame::error_response("", "Invalid [identity] section"),
+                };
+                let nt = match idt
+                    .entry("notion")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                {
+                    Some(t) => t,
+                    None => {
+                        return WsFrame::error_response("", "Invalid [identity.notion] section");
+                    }
+                };
+                nt.remove("api_key");
+                if api_key.is_empty() {
+                    nt.remove("api_key_enc");
+                    changes.push("identity.notion.api_key cleared".to_string());
+                } else if let Some(enc) =
+                    crate::config_crypto::encrypt_value(api_key, &self.home_dir)
+                {
+                    nt.insert("api_key_enc".into(), toml::Value::String(enc));
+                    changes.push("identity.notion.api_key = [ENCRYPTED]".to_string());
+                } else {
+                    return WsFrame::error_response(
+                        "",
+                        "Failed to encrypt identity.notion.api_key",
+                    );
+                }
+            }
+        }
+
+        if changes.is_empty() {
+            return WsFrame::error_response("", "No valid identity fields to update");
+        }
+        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!(?changes, "identity.config_set completed");
+        WsFrame::ok_response("", json!({ "success": true, "changes": changes }))
+    }
+
+    /// Build the identity provider from config.toml `[identity]` — the same
+    /// `duduclaw_identity` provider trait the `identity_resolve` MCP tool uses.
+    /// Falls back to the wiki cache (fail-safe) when Notion is selected but not
+    /// fully configured. Returns `(provider, provider_label)`.
+    async fn build_identity_provider(
+        &self,
+    ) -> (
+        std::sync::Arc<dyn duduclaw_identity::IdentityProvider>,
+        String,
+    ) {
+        use duduclaw_identity::providers::{
+            ChainedProvider, NotionConfig, NotionFieldMap, NotionIdentityProvider, ProjectsKind,
+            WikiCacheIdentityProvider,
+        };
+        let wiki: std::sync::Arc<dyn duduclaw_identity::IdentityProvider> =
+            std::sync::Arc::new(WikiCacheIdentityProvider::for_home(self.home_dir.clone()));
+
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        let idt = table.get("identity").and_then(|v| v.as_table());
+        let selector = idt
+            .and_then(|t| t.get("provider"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("wiki_cache");
+
+        if selector != "notion" && selector != "chained" {
+            return (wiki, "wiki-cache".to_string());
+        }
+
+        // Notion selected — try to build it. Any missing piece degrades to wiki.
+        let notion_tbl = match idt.and_then(|t| t.get("notion")).and_then(|v| v.as_table()) {
+            Some(t) => t,
+            None => return (wiki, "wiki-cache".to_string()),
+        };
+        let database_id = notion_tbl
+            .get("database_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let api_key = notion_tbl
+            .get("api_key_enc")
+            .and_then(|v| v.as_str())
+            .and_then(|enc| crate::config_crypto::decrypt_value(enc, &self.home_dir))
+            .or_else(|| {
+                notion_tbl
+                    .get("api_key")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        if database_id.is_empty() || api_key.is_empty() {
+            return (wiki, "wiki-cache".to_string());
+        }
+
+        // Build the field map (defaults + operator overrides).
+        let mut field_map = NotionFieldMap::default();
+        if let Some(fm) = notion_tbl.get("field_map").and_then(|v| v.as_table()) {
+            if let Some(s) = fm.get("name").and_then(|v| v.as_str()) {
+                field_map.name = s.to_string();
+            }
+            if let Some(s) = fm.get("roles").and_then(|v| v.as_str()) {
+                field_map.roles = s.to_string();
+            }
+            if let Some(s) = fm.get("projects").and_then(|v| v.as_str()) {
+                field_map.projects = s.to_string();
+            }
+            if let Some(s) = fm.get("emails").and_then(|v| v.as_str()) {
+                field_map.emails = s.to_string();
+            }
+            if let Some(s) = fm.get("projects_kind").and_then(|v| v.as_str()) {
+                field_map.projects_kind = match s {
+                    "relation" => ProjectsKind::Relation,
+                    _ => ProjectsKind::MultiSelect,
+                };
+            }
+            if let Some(cp) = fm.get("channel_props").and_then(|v| v.as_table()) {
+                let mut props = std::collections::BTreeMap::new();
+                for (k, v) in cp {
+                    if let Some(s) = v.as_str() {
+                        props.insert(k.clone(), s.to_string());
+                    }
+                }
+                if !props.is_empty() {
+                    field_map.channel_props = props;
+                }
+            }
+        }
+        let refresh_seconds = notion_tbl
+            .get("refresh_seconds")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(900)
+            .max(0) as u64;
+
+        let notion: std::sync::Arc<dyn duduclaw_identity::IdentityProvider> =
+            std::sync::Arc::new(NotionIdentityProvider::new(NotionConfig {
+                database_id,
+                api_key,
+                field_map,
+                refresh_seconds,
+            }));
+
+        if selector == "chained" {
+            (
+                std::sync::Arc::new(ChainedProvider::new(wiki, notion)),
+                "chained".to_string(),
+            )
+        } else {
+            (notion, "notion".to_string())
+        }
+    }
+
+    /// `identity.resolve` — resolve an identifier (email / channel user id) to
+    /// its canonical person via the configured identity provider (same trait as
+    /// the `identity_resolve` MCP tool). Params: `{ identifier, channel? }`
+    /// (channel defaults to "email"). Response: `{ found, provider, channel,
+    /// is_project_member, person? }`. A miss is `found: false`, not an error.
+    async fn handle_identity_resolve(&self, params: Value) -> WsFrame {
+        let identifier = match params.get("identifier").and_then(|v| v.as_str()) {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => return WsFrame::error_response("", "Missing 'identifier' parameter"),
+        };
+        let channel_str = params
+            .get("channel")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("email");
+        let channel = duduclaw_identity::ChannelKind::parse_wire(channel_str);
+
+        let (provider, provider_label) = self.build_identity_provider().await;
+        match provider.resolve_by_channel(channel.clone(), &identifier).await {
+            Ok(Some(person)) => {
+                let is_member = !person.project_ids.is_empty();
+                let person_json = serde_json::to_value(&person).unwrap_or_else(|_| json!({}));
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "found": true,
+                        "provider": provider_label,
+                        "channel": channel.as_wire(),
+                        "is_project_member": is_member,
+                        "person": person_json,
+                    }),
+                )
+            }
+            Ok(None) => WsFrame::ok_response(
+                "",
+                json!({
+                    "found": false,
+                    "provider": provider_label,
+                    "channel": channel.as_wire(),
+                }),
+            ),
+            Err(e) => WsFrame::error_response("", &format!("Identity provider error: {e}")),
+        }
+    }
+
     // ── SKS: global [skill_synthesis] in config.toml (W19-P1) ─────────────────
 
     /// `skill_synthesis.get` — read config.toml `[skill_synthesis]`.
@@ -5015,57 +5805,574 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "success": true, "change": change }))
     }
 
-    /// Remove an agent by moving its directory to `_trash/`.
-    ///
-    /// Refuses to remove the main agent. Recovery is possible from `_trash/`.
+    /// Soft-delete an agent (WP4). Marks `status = "deleted"` and halts the
+    /// heartbeat/evolution kill-switch. **No data is removed** — the agent
+    /// directory and its `memory.db` stay on disk; the agent simply disappears
+    /// from every list/route. Refuses the main agent (name kept `remove` for
+    /// front-end compatibility, but the semantics are now soft, not hard).
     async fn handle_agents_remove(&self, params: Value) -> WsFrame {
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
-            Some(id) if !id.is_empty() => id,
+            Some(id) if !id.is_empty() => id.to_string(),
             _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
         };
 
-        if !is_valid_agent_id(agent_id) {
+        if !is_valid_agent_id(&agent_id) {
             return WsFrame::error_response("", "Invalid agent_id format");
         }
 
-        // Refuse to remove the main agent
-        let reg = self.registry.read().await;
-        if let Some(agent) = reg.get(agent_id) {
-            if matches!(agent.config.agent.role, duduclaw_core::types::AgentRole::Main) {
-                return WsFrame::error_response("", "Cannot remove the main agent");
+        // Refuse to remove the main / default agent — it anchors routing.
+        {
+            let reg = self.registry.read().await;
+            match reg.get(&agent_id) {
+                Some(agent) => {
+                    if matches!(agent.config.agent.role, duduclaw_core::types::AgentRole::Main) {
+                        return WsFrame::error_response("", "Cannot remove the main agent");
+                    }
+                }
+                None => return WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
             }
-        } else {
-            return WsFrame::error_response("", &format!("Agent not found: {agent_id}"));
-        }
-        let agents_dir = reg.agents_dir().to_path_buf();
-        drop(reg);
-
-        let agent_dir = agents_dir.join(agent_id);
-        let trash_dir = agents_dir.join("_trash");
-        if let Err(e) = tokio::fs::create_dir_all(&trash_dir).await {
-            return WsFrame::error_response("", &format!("Failed to create _trash/: {e}"));
         }
 
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let trash_dest = trash_dir.join(format!("{agent_id}_{timestamp}"));
-
-        if let Err(e) = tokio::fs::rename(&agent_dir, &trash_dest).await {
-            return WsFrame::error_response("", &format!("Failed to move agent to trash: {e}"));
+        if let Err(e) = self.offboard_agent_toml(&agent_id, "deleted").await {
+            return WsFrame::error_response("", &format!("Failed to soft-delete agent: {e}"));
         }
 
-        // Re-scan registry
-        if let Ok(mut reg) = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            self.registry.write(),
-        ).await {
-            let _ = reg.scan().await;
-        }
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "agent_soft_delete",
+                &agent_id,
+                duduclaw_security::audit::Severity::Warning,
+                json!({ "status": "deleted", "data_retained": true, "source": "dashboard" }),
+            ),
+        );
 
-        info!(agent_id, "Agent removed (moved to _trash/)");
+        info!(agent_id = agent_id.as_str(), "Agent soft-deleted (data retained on disk)");
         WsFrame::ok_response("", json!({
             "success": true,
             "agent_id": agent_id,
-            "trash_path": trash_dest.to_string_lossy(),
+            "status": "deleted",
+            "data_retained": true,
+        }))
+    }
+
+    /// Set `status` **and** flip the freeze kill-switch (`heartbeat.enabled` /
+    /// `evolution.enabled = false`) in one atomic `agent.toml` write. Shared by
+    /// archive + soft-delete so an off-boarded agent never keeps ticking.
+    async fn offboard_agent_toml(&self, agent_id: &str, status: &str) -> Result<(), String> {
+        let status = status.to_string();
+        self.update_agent_toml(agent_id, move |table| offboard_freeze_table(table, &status))
+            .await?;
+        Ok(())
+    }
+
+    /// Archive an agent (WP4): recoverable off-board. `status = "archived"` +
+    /// freeze kill-switch; hidden from the default roster but fully restorable
+    /// via `agents.unarchive`. No data is touched.
+    async fn handle_agents_archive(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        {
+            let reg = self.registry.read().await;
+            match reg.get(&agent_id) {
+                Some(agent) => {
+                    if matches!(agent.config.agent.role, duduclaw_core::types::AgentRole::Main) {
+                        return WsFrame::error_response("", "Cannot archive the main agent");
+                    }
+                }
+                None => return WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
+            }
+        }
+        if let Err(e) = self.offboard_agent_toml(&agent_id, "archived").await {
+            return WsFrame::error_response("", &format!("Failed to archive agent: {e}"));
+        }
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "agent_archive",
+                &agent_id,
+                duduclaw_security::audit::Severity::Warning,
+                json!({ "status": "archived", "source": "dashboard" }),
+            ),
+        );
+        info!(agent_id = agent_id.as_str(), "Agent archived (recoverable)");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "agent_id": agent_id,
+            "status": "archived",
+        }))
+    }
+
+    /// Restore an archived (or soft-deleted) agent to `active` and re-enable the
+    /// heartbeat/evolution kill-switch.
+    async fn handle_agents_unarchive(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        {
+            let reg = self.registry.read().await;
+            if reg.get(&agent_id).is_none() {
+                return WsFrame::error_response("", &format!("Agent not found: {agent_id}"));
+            }
+        }
+        let res = self
+            .update_agent_toml(&agent_id, unarchive_restore_table)
+            .await;
+        if let Err(e) = res {
+            return WsFrame::error_response("", &format!("Failed to unarchive agent: {e}"));
+        }
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "agent_unarchive",
+                &agent_id,
+                duduclaw_security::audit::Severity::Info,
+                json!({ "status": "active", "source": "dashboard" }),
+            ),
+        );
+        info!(agent_id = agent_id.as_str(), "Agent unarchived (restored to active)");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "agent_id": agent_id,
+            "status": "active",
+        }))
+    }
+
+    /// Hand off an off-boarding agent's work to a successor (WP4). Moves any
+    /// combination of memory / wiki / open tasks (each a boolean switch, default
+    /// on) from `from_agent` to `to_agent`, then archives the source unless
+    /// `auto_archive = false`. Every sub-move reports its own count; a failure in
+    /// one sub-move is surfaced as `status: "PARTIAL"` (never silently swallowed).
+    async fn handle_agents_handoff(&self, params: Value) -> WsFrame {
+        let from_agent = match params.get("from_agent").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'from_agent' parameter"),
+        };
+        let to_agent = match params.get("to_agent").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'to_agent' parameter"),
+        };
+        if !is_valid_agent_id(&from_agent) || !is_valid_agent_id(&to_agent) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        if from_agent == to_agent {
+            return WsFrame::error_response("", "from_agent and to_agent must differ");
+        }
+        {
+            let reg = self.registry.read().await;
+            if reg.get(&from_agent).is_none() {
+                return WsFrame::error_response("", &format!("Agent not found: {from_agent}"));
+            }
+            if reg.get(&to_agent).is_none() {
+                return WsFrame::error_response("", &format!("Agent not found: {to_agent}"));
+            }
+        }
+
+        let do_memory = params.get("memory").and_then(|v| v.as_bool()).unwrap_or(true);
+        let do_wiki = params.get("wiki").and_then(|v| v.as_bool()).unwrap_or(true);
+        let do_tasks = params.get("tasks").and_then(|v| v.as_bool()).unwrap_or(true);
+        let auto_archive = params.get("auto_archive").and_then(|v| v.as_bool()).unwrap_or(true);
+
+        let mut result = json!({
+            "success": true,
+            "from_agent": from_agent,
+            "to_agent": to_agent,
+        });
+        let mut errors: Vec<String> = Vec::new();
+
+        if do_memory {
+            match self.handoff_memory(&from_agent, &to_agent).await {
+                Ok(summary) => {
+                    result["memory"] = json!({
+                        "moved": summary.total(),
+                        "memories": summary.memories,
+                        "key_facts": summary.key_facts,
+                        "archived_rows": summary.archived,
+                    });
+                }
+                Err(e) => {
+                    result["memory"] = json!({ "error": e });
+                    errors.push(format!("memory: {e}"));
+                }
+            }
+        }
+
+        if do_wiki {
+            match self.handoff_wiki(&from_agent, &to_agent).await {
+                Ok(count) => result["wiki"] = json!({ "files_moved": count }),
+                Err(e) => {
+                    result["wiki"] = json!({ "error": e });
+                    errors.push(format!("wiki: {e}"));
+                }
+            }
+        }
+
+        if do_tasks {
+            match self.task_store().await {
+                Ok(store) => {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    match store.reassign_open_tasks(&from_agent, &to_agent, &now).await {
+                        Ok(n) => result["tasks"] = json!({ "reassigned": n }),
+                        Err(e) => {
+                            result["tasks"] = json!({ "error": e });
+                            errors.push(format!("tasks: {e}"));
+                        }
+                    }
+                }
+                Err(_) => {
+                    result["tasks"] = json!({ "error": "task store unavailable" });
+                    errors.push("tasks: store unavailable".to_string());
+                }
+            }
+        }
+
+        if auto_archive && errors.is_empty() {
+            if let Err(e) = self.offboard_agent_toml(&from_agent, "archived").await {
+                result["auto_archive"] = json!({ "error": e });
+                errors.push(format!("auto_archive: {e}"));
+            } else {
+                result["auto_archive"] = json!({ "archived": true });
+            }
+        } else if auto_archive {
+            result["auto_archive"] = json!({ "skipped": "handoff had errors" });
+        }
+
+        result["status"] = json!(if errors.is_empty() { "COMPLETE" } else { "PARTIAL" });
+        if !errors.is_empty() {
+            result["success"] = json!(false);
+            result["errors"] = json!(errors);
+
+            // F7: a PARTIAL handoff is a split-brain — some data already moved to
+            // `to_agent` while `from_agent` is still live and NOT archived
+            // (auto_archive was skipped above). We cannot do an atomic
+            // cross-subsystem transaction (memory / wiki / tasks are three
+            // independent stores), so surface the split honestly: flag the
+            // source agent as needing manual reconciliation and spell out which
+            // subsystems moved vs. did not, so the operator can converge it by
+            // hand rather than believing the handoff finished.
+            let mut moved: Vec<&str> = Vec::new();
+            let mut not_moved: Vec<&str> = Vec::new();
+            for (attempted, name) in
+                [(do_memory, "memory"), (do_wiki, "wiki"), (do_tasks, "tasks")]
+            {
+                if !attempted {
+                    continue;
+                }
+                if errors.iter().any(|e| e.starts_with(&format!("{name}:"))) {
+                    not_moved.push(name);
+                } else {
+                    moved.push(name);
+                }
+            }
+            result["manual_intervention_required"] = json!(true);
+            result["moved"] = json!(moved);
+            result["not_moved"] = json!(not_moved);
+            result["warning"] = json!(format!(
+                "PARTIAL handoff: '{from_agent}' was NOT archived and is still live \
+                 while some data already moved to '{to_agent}'. Manual reconciliation \
+                 required (moved: {moved:?}; not moved: {not_moved:?}). This platform \
+                 cannot atomically move memory + wiki + tasks together."
+            ));
+        }
+
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "agent_handoff",
+                &from_agent,
+                if errors.is_empty() {
+                    duduclaw_security::audit::Severity::Warning
+                } else {
+                    duduclaw_security::audit::Severity::Critical
+                },
+                json!({
+                    "to_agent": to_agent,
+                    "memory": do_memory, "wiki": do_wiki, "tasks": do_tasks,
+                    "auto_archive": auto_archive,
+                    "status": result["status"],
+                    "errors": errors,
+                }),
+            ),
+        );
+
+        info!(
+            from_agent = from_agent.as_str(),
+            to_agent = to_agent.as_str(),
+            status = %result["status"],
+            "agents.handoff completed"
+        );
+        WsFrame::ok_response("", result)
+    }
+
+    /// Move `from_agent`'s cognitive memory to `to_agent`. Routes to the in-place
+    /// re-key when both agents share one DB file, else does a cross-DB move.
+    async fn handoff_memory(
+        &self,
+        from_agent: &str,
+        to_agent: &str,
+    ) -> Result<duduclaw_memory::ReassignSummary, String> {
+        let from_db = self.agent_memory_db_path(from_agent);
+        if !from_db.exists() {
+            return Ok(duduclaw_memory::ReassignSummary::default());
+        }
+        let to_db = self.agent_memory_db_path(to_agent);
+
+        let same_file = match (from_db.canonicalize(), to_db.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => from_db == to_db,
+        };
+
+        if same_file {
+            let engine = SqliteMemoryEngine::new(&from_db)
+                .map_err(|e| format!("open memory db: {e}"))?;
+            duduclaw_memory::reassign_agent(&engine, from_agent, to_agent)
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            drop(
+                SqliteMemoryEngine::new(&to_db)
+                    .map_err(|e| format!("init destination memory db: {e}"))?,
+            );
+            let from_engine = SqliteMemoryEngine::new(&from_db)
+                .map_err(|e| format!("open source memory db: {e}"))?;
+            duduclaw_memory::reassign_agent_cross_db(&from_engine, &to_db, from_agent, to_agent)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// Merge `agents/<from>/wiki` into `agents/<to>/wiki`. Filename collisions
+    /// get a numeric suffix (never overwrite). Returns the number of files moved.
+    async fn handoff_wiki(&self, from_agent: &str, to_agent: &str) -> Result<u64, String> {
+        let agents_dir = self.home_dir.join("agents");
+        let from_wiki = agents_dir.join(from_agent).join("wiki");
+        if !from_wiki.exists() {
+            return Ok(0);
+        }
+        let to_wiki = agents_dir.join(to_agent).join("wiki");
+        tokio::fs::create_dir_all(&to_wiki)
+            .await
+            .map_err(|e| format!("create destination wiki: {e}"))?;
+
+        let mut moved: u64 = 0;
+        let mut stack = vec![from_wiki.clone()];
+        while let Some(dir) = stack.pop() {
+            let mut rd = match tokio::fs::read_dir(&dir).await {
+                Ok(rd) => rd,
+                Err(e) => return Err(format!("read wiki dir: {e}")),
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let path = entry.path();
+                let ft = match entry.file_type().await {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let rel = match path.strip_prefix(&from_wiki) {
+                    Ok(r) => r.to_path_buf(),
+                    Err(_) => continue,
+                };
+                let mut dest = to_wiki.join(&rel);
+                if let Some(parent) = dest.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                if dest.exists() {
+                    dest = Self::dedupe_dest_path(&dest, from_agent);
+                }
+                if tokio::fs::rename(&path, &dest).await.is_err() {
+                    tokio::fs::copy(&path, &dest)
+                        .await
+                        .map_err(|e| format!("copy wiki file: {e}"))?;
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Produce a non-colliding destination path by inserting `-<tag>-<n>` before
+    /// the file extension until a free name is found.
+    fn dedupe_dest_path(dest: &Path, tag: &str) -> PathBuf {
+        let parent = dest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let stem = dest
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ext = dest.extension().map(|s| s.to_string_lossy().into_owned());
+        for n in 1..10_000 {
+            let name = match &ext {
+                Some(e) => format!("{stem}-{tag}-{n}.{e}"),
+                None => format!("{stem}-{tag}-{n}"),
+            };
+            let candidate = parent.join(name);
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        parent.join(match &ext {
+            Some(e) => format!("{stem}-{tag}-{ts}.{e}"),
+            None => format!("{stem}-{tag}-{ts}"),
+        })
+    }
+
+    /// Upload an agent avatar image (WP4). Accepts a PNG/JPEG/WebP data URI,
+    /// validates the declared mime against real magic bytes, enforces a 512 KB
+    /// decoded ceiling, and stores the raw bytes at `agents/<id>/avatar.<ext>`
+    /// (atomic temp + rename). Any prior avatar of a different extension is
+    /// removed so exactly one `avatar.*` exists.
+    async fn handle_agents_set_avatar(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        let data_uri = match params.get("data_uri").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => return WsFrame::error_response("", "Missing 'data_uri' parameter"),
+        };
+        {
+            let reg = self.registry.read().await;
+            if reg.get(&agent_id).is_none() {
+                return WsFrame::error_response("", &format!("Agent not found: {agent_id}"));
+            }
+        }
+
+        let (bytes, ext) = match decode_avatar_data_uri(data_uri) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        let agent_dir = self.home_dir.join("agents").join(&agent_id);
+        if !agent_dir.exists() {
+            return WsFrame::error_response("", &format!("Agent directory missing: {agent_id}"));
+        }
+        // F8: write the NEW avatar first (temp → validate → atomic rename), and
+        // only remove the old avatars of a *different* extension AFTER the new
+        // one is committed. The previous order deleted every avatar.* first, so
+        // a failed write left the agent with no image at all.
+        let dest = agent_dir.join(format!("avatar.{ext}"));
+        let tmp = agent_dir.join(format!("avatar.{ext}.tmp"));
+        if let Err(e) = tokio::fs::write(&tmp, &bytes).await {
+            return WsFrame::error_response("", &format!("Failed to write avatar: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return WsFrame::error_response("", &format!("Failed to commit avatar: {e}"));
+        }
+        // New avatar is safely in place; drop stale avatars of other extensions
+        // so exactly one avatar.* remains.
+        for e in AVATAR_EXTS {
+            if *e != ext {
+                let _ = tokio::fs::remove_file(agent_dir.join(format!("avatar.{e}"))).await;
+            }
+        }
+
+        info!(agent_id = agent_id.as_str(), bytes = bytes.len(), ext, "Agent avatar set");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "agent_id": agent_id,
+            "has_avatar": true,
+            "bytes": bytes.len(),
+        }))
+    }
+
+    /// Remove an agent's uploaded avatar (WP4). No-op-safe.
+    async fn handle_agents_clear_avatar(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        let agent_dir = self.home_dir.join("agents").join(&agent_id);
+        let mut removed = false;
+        for e in AVATAR_EXTS {
+            if tokio::fs::remove_file(agent_dir.join(format!("avatar.{e}"))).await.is_ok() {
+                removed = true;
+            }
+        }
+        info!(agent_id = agent_id.as_str(), removed, "Agent avatar cleared");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "agent_id": agent_id,
+            "has_avatar": false,
+            "removed": removed,
+        }))
+    }
+
+    /// Read an agent's stored avatar (if any) back into a data URI. Mirrors the
+    /// branding-logo model (inline data URI) so the front-end renders it under
+    /// the same `img-src data:` CSP. `None` when no `avatar.*` file exists.
+    fn agent_avatar_data_uri(&self, agent_id: &str) -> Option<String> {
+        let agent_dir = self.home_dir.join("agents").join(agent_id);
+        for (ext, mime) in AVATAR_EXT_MIME {
+            let path = agent_dir.join(format!("avatar.{ext}"));
+            if let Ok(bytes) = std::fs::read(&path) {
+                use base64::{engine::general_purpose::STANDARD as B64, Engine};
+                return Some(format!("data:{mime};base64,{}", B64.encode(&bytes)));
+            }
+        }
+        None
+    }
+
+    /// Whether an agent has an uploaded avatar file on disk.
+    ///
+    /// E3: `agents.list` is a roster polling RPC that calls this once per agent,
+    /// so it must be cheap. A single `read_dir` replaces the former up-to-3
+    /// `Path::exists` stat syscalls — we scan the directory once and match any
+    /// `avatar.<ext>` where `<ext>` is a supported image extension.
+    fn agent_has_avatar(&self, agent_id: &str) -> bool {
+        let agent_dir = self.home_dir.join("agents").join(agent_id);
+        let Ok(rd) = std::fs::read_dir(&agent_dir) else {
+            return false;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(ext) = name.strip_prefix("avatar.") {
+                if AVATAR_EXTS.contains(&ext) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// E1: lightweight avatar fetch. The roster/sidebar/chat all render
+    /// `CharacterAvatar` for every AI staff member, and the avatar store resolves
+    /// uploaded bytes one agent at a time. Routing that through `agents.inspect`
+    /// paid for a telemetry month-to-date aggregate + full SOUL/identity/skills/
+    /// model-config serialization on every first-paint avatar — N heavy RPCs just
+    /// to read one image. This handler reads only `agents/<id>/avatar.<ext>` and
+    /// returns it as an inline data URI (or null). Agent visibility is enforced at
+    /// dispatch by `check_agent!(Viewer)` (fail-closed), same gate as `inspect`.
+    async fn handle_agents_avatar(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' parameter");
+        }
+        let avatar = self.agent_avatar_data_uri(agent_id);
+        WsFrame::ok_response("", json!({
+            "agent_id": agent_id,
+            "has_avatar": avatar.is_some(),
+            "avatar": avatar,
         }))
     }
 
@@ -5082,6 +6389,12 @@ impl MethodHandler {
                     "display_name": cfg.agent.display_name,
                     "role": format!("{:?}", cfg.agent.role).to_lowercase(),
                     "status": format!("{:?}", cfg.agent.status).to_lowercase(),
+                    "archived": matches!(cfg.agent.status, duduclaw_core::types::AgentStatus::Archived),
+                    // WP4: full avatar as an inline data URI (branding-logo model)
+                    // + a cheap boolean the list view also uses.
+                    "has_avatar": self.agent_has_avatar(&cfg.agent.name),
+                    "avatar": self.agent_avatar_data_uri(&cfg.agent.name),
+                    "department": cfg.agent.department,
                     "trigger": cfg.agent.trigger,
                     "icon": cfg.agent.icon,
                     "reports_to": cfg.agent.reports_to,
@@ -5145,6 +6458,13 @@ impl MethodHandler {
                         "skill_security_scan": cfg.evolution.skill_security_scan,
                         "max_silence_hours": cfg.evolution.max_silence_hours,
                     },
+                    // #6: full capabilities incl. native_sandbox + Progent policy.
+                    // Serialized straight from CapabilitiesConfig so the dashboard
+                    // gets the exact ToolPolicy shape it must round-trip via
+                    // agents.update. `serde` renders snake_case enums
+                    // (effect: allow|forbid|ask, op: equals|contains|starts_with).
+                    "capabilities": serde_json::to_value(&cfg.capabilities)
+                        .unwrap_or_else(|_| json!({})),
                 }))
             }
             None => WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
@@ -5601,6 +6921,90 @@ impl MethodHandler {
             "type": channel_type,
             "message": format!("{channel_type} token is configured"),
         }))
+    }
+
+    /// WP9: mint a one-time bind token + Telegram deep-link for a target AI
+    /// employee on the company's shared Telegram bot. The frontend renders a
+    /// QR of the returned `deep_link`. The bot username is resolved live from
+    /// the configured global token via getMe — never hardcoded. Admin only.
+    async fn handle_telegram_bind_token(&self, params: Value) -> WsFrame {
+        let agent = params.get("agent").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if agent.is_empty() {
+            return WsFrame::error_response("", "缺少 agent 參數");
+        }
+        // Fail-closed: the target agent must exist in the registry.
+        if self.registry.read().await.get(agent).is_none() {
+            return WsFrame::error_response("", &format!("找不到 AI 員工「{agent}」"));
+        }
+
+        let ttl_minutes = params
+            .get("ttl_minutes")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(crate::agent_binding::DEFAULT_TTL_MINUTES);
+        let max_uses = params
+            .get("max_uses")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(crate::agent_binding::DEFAULT_MAX_USES);
+
+        // The shared bot is the global config.toml token.
+        let token = match crate::config_crypto::read_encrypted_config_field(
+            &self.home_dir,
+            "channels",
+            "telegram_bot_token",
+        )
+        .await
+        {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "尚未設定共用 Telegram Bot Token（請先在通道新增全域 Telegram bot）",
+                );
+            }
+        };
+
+        // Resolve the bot username live — needed to build the t.me deep-link.
+        let bot_username = match fetch_telegram_bot_username(&token).await {
+            Some(u) if !u.is_empty() => u,
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "無法連線 Telegram 取得 bot 帳號，請確認 Bot Token 有效",
+                );
+            }
+        };
+
+        // Cross-process safe: the store reloads from disk before every op, so
+        // the gateway's ReplyContext instance sees this write on redeem.
+        let store = crate::agent_binding::AgentBindingStore::with_persistence(
+            self.home_dir.join("agent_bindings.json"),
+        );
+        let bind_token = store.generate_bind_token("telegram", agent, ttl_minutes, max_uses).await;
+        let deep_link = format!("https://t.me/{bot_username}?start={bind_token}");
+
+        let effective_ttl = if ttl_minutes <= 0 {
+            crate::agent_binding::DEFAULT_TTL_MINUTES
+        } else {
+            ttl_minutes.min(crate::agent_binding::MAX_TTL_MINUTES)
+        };
+        let effective_uses = if max_uses == 0 {
+            crate::agent_binding::DEFAULT_MAX_USES
+        } else {
+            max_uses.min(crate::agent_binding::MAX_USES_LIMIT)
+        };
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "agent": agent,
+                "token": bind_token,
+                "bot_username": bot_username,
+                "deep_link": deep_link,
+                "expires_in_minutes": effective_ttl,
+                "max_uses": effective_uses,
+            }),
+        )
     }
 
     async fn handle_channels_remove(&self, params: Value) -> WsFrame {
@@ -6176,6 +7580,128 @@ impl MethodHandler {
             }
         }
         WsFrame::ok_response("", json!({ "entries": entries }))
+    }
+
+    /// F1 Temporal Memory (v1.19.0): return the full supersession chain for a
+    /// fact, oldest → newest. Accepts either an explicit `(subject, predicate)`
+    /// pair or a `memory_id` (resolved to its triple first). Reuses the engine's
+    /// `get_history` — the ranking / validity logic is not re-implemented here.
+    async fn handle_memory_history(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "subject": null, "predicate": null, "chain": [], "current_id": null }));
+        }
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+
+        // Resolve (subject, predicate): explicit params win; otherwise derive
+        // from a supplied memory_id.
+        let (subject, predicate) = {
+            let s = params.get("subject").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            let p = params.get("predicate").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            match (s, p) {
+                (Some(s), Some(p)) => (s.to_string(), p.to_string()),
+                _ => {
+                    let memory_id = params.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
+                    if memory_id.is_empty() {
+                        return WsFrame::error_response("", "Provide either (subject, predicate) or memory_id");
+                    }
+                    match engine.triple_for_id(agent_id, memory_id).await {
+                        Ok(Some(t)) => t,
+                        Ok(None) => {
+                            // Fail-safe: not a temporal triple (or not owned) →
+                            // empty chain, not an error.
+                            return WsFrame::ok_response("", json!({ "subject": null, "predicate": null, "chain": [], "current_id": null }));
+                        }
+                        Err(e) => return WsFrame::error_response("", &format!("Triple lookup failed: {e}")),
+                    }
+                }
+            }
+        };
+
+        match engine.get_history(agent_id, &subject, &predicate).await {
+            Ok(records) => {
+                let mut current_id: Option<String> = None;
+                let chain: Vec<Value> = records.iter().map(|r| {
+                    let is_current = r.valid_until.is_none();
+                    if is_current {
+                        current_id = Some(r.id.clone());
+                    }
+                    json!({
+                        "id": r.id,
+                        "content": r.content,
+                        "valid_from": r.valid_from,
+                        "valid_until": r.valid_until,
+                        "superseded_by": r.superseded_by,
+                        "supersedes": r.supersedes,
+                        "confidence": r.confidence,
+                        "is_current": is_current,
+                    })
+                }).collect();
+                WsFrame::ok_response("", json!({
+                    "subject": subject,
+                    "predicate": predicate,
+                    "chain": chain,
+                    "current_id": current_id,
+                }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Memory history failed: {e}")),
+        }
+    }
+
+    /// F1 Temporal Memory (v1.19.0): point-in-time lookup — the fact that was
+    /// valid for `(subject, predicate)` at instant `at` (RFC-3339). Reuses the
+    /// engine's `get_at`. Returns `found: false` (not an error) when no version
+    /// was valid at that instant.
+    async fn handle_memory_at(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let subject = params.get("subject").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+        let predicate = params.get("predicate").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+        let at_raw = params.get("at").and_then(|v| v.as_str()).unwrap_or("");
+
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+        if subject.is_empty() || predicate.is_empty() {
+            return WsFrame::error_response("", "Missing 'subject' or 'predicate' parameter");
+        }
+        let at = match chrono::DateTime::parse_from_rfc3339(at_raw) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => return WsFrame::error_response("", "Missing or invalid 'at' parameter (expected RFC-3339 timestamp)"),
+        };
+
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "found": false, "record": null }));
+        }
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+
+        match engine.get_at(agent_id, subject, predicate, at).await {
+            Ok(Some(r)) => WsFrame::ok_response("", json!({
+                "found": true,
+                "record": {
+                    "id": r.id,
+                    "content": r.content,
+                    "valid_from": r.valid_from,
+                    "valid_until": r.valid_until,
+                    "superseded_by": r.superseded_by,
+                    "supersedes": r.supersedes,
+                    "confidence": r.confidence,
+                },
+            })),
+            Ok(None) => WsFrame::ok_response("", json!({ "found": false, "record": null })),
+            Err(e) => WsFrame::error_response("", &format!("Memory point-in-time lookup failed: {e}")),
+        }
     }
 
     // ── Wiki Knowledge Base ──────────────────────────────────
@@ -6929,6 +8455,16 @@ impl MethodHandler {
             duduclaw_agent::skill_loader::install_skill_global(
                 &tmp_file,
                 &self.home_dir,
+                &quarantine_dir,
+            )
+            .await
+        } else if let Some(dept) = scope.strip_prefix("department:") {
+            // WP7: `department:<dept>` installs into the shared department layer.
+            // Admin-gated like global (this RPC already requires admin).
+            duduclaw_agent::skill_loader::install_skill_department(
+                &tmp_file,
+                &self.home_dir,
+                dept,
                 &quarantine_dir,
             )
             .await
@@ -8118,10 +9654,55 @@ impl MethodHandler {
         }
     }
 
+    /// WP8: whether THIS gateway is the upstream/owner ("system") instance — the
+    /// one that holds a **genuine, trusted** distributor issuer signing key. Such
+    /// an instance has full [`BrandingEditScope::System`] rights (every field,
+    /// including system-only ones).
+    ///
+    /// Non-forgeable: the configured `[distributor] issuer_key_path` must load a
+    /// seed that pairs with a baked/trusted issuer public key. A customer-admin
+    /// pointing this at a random 32-byte file does NOT get System scope (the
+    /// derived pubkey is untrusted) — it falls through to their license claim.
+    async fn is_system_branding_instance(&self) -> bool {
+        let key_path = match self.distributor_issuer_key_path().await {
+            Some(p) => p,
+            None => return false,
+        };
+        let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(&key_path)) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        crate::distributor_store::issuer_seed_is_trusted(
+            &seed,
+            &crate::license_runtime::production_registry(),
+        )
+    }
+
+    /// WP8: resolve the branding edit scope for THIS instance from the
+    /// system-instance signal, the white_label feature gate, and the active
+    /// license's signed `branding_editable` claim. `None` ⇒ editing not
+    /// permitted at all (fail-closed).
+    async fn resolve_branding_edit_scope(&self) -> Option<crate::branding::BrandingEditScope> {
+        let is_system = self.is_system_branding_instance().await;
+        let white_label = self.white_label_active().await;
+        let claim = match crate::license_runtime::global() {
+            Some(rt) => rt.snapshot().await.branding_editable,
+            None => None,
+        };
+        crate::branding::resolve_edit_scope(is_system, white_label, claim.as_deref())
+    }
+
     async fn handle_branding_get(&self) -> WsFrame {
         let (branding, source) = crate::branding::load_with_source(&self.home_dir);
         let vendor = crate::branding::VendorBlock::upstream();
         let white_label_active = self.white_label_active().await;
+        // WP8: the field names the current instance may edit, so the dashboard
+        // can mask the branding form. Empty when editing is not permitted.
+        let editable_fields = self
+            .resolve_branding_edit_scope()
+            .await
+            .map(|s| s.editable_fields())
+            .unwrap_or_default();
         let branding_v = serde_json::to_value(&branding).unwrap_or_else(|_| json!({}));
         let vendor_v = serde_json::to_value(vendor).unwrap_or_else(|_| json!({}));
         WsFrame::ok_response(
@@ -8135,6 +9716,7 @@ impl MethodHandler {
                     "subtitle_key": "app.subtitle",
                 },
                 "white_label_active": white_label_active,
+                "editable_fields": editable_fields,
             }),
         )
     }
@@ -8163,24 +9745,38 @@ impl MethodHandler {
     }
 
     async fn handle_branding_set(&self, params: Value) -> WsFrame {
-        // white_label gate — fail-closed (rule #4). Snapshot unavailable or
-        // feature not granted ⇒ DENY before touching disk.
-        if !self.white_label_active().await {
-            return WsFrame::error_response(
-                "",
-                "白牌功能需經銷商授權（未取得 white_label 授權）",
-            );
-        }
+        // WP8: resolve the edit scope (system instance / white_label + license
+        // claim). `None` ⇒ editing not permitted — fail-closed DENY before disk.
+        let scope = match self.resolve_branding_edit_scope().await {
+            Some(s) => s,
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    "白牌功能需經銷商授權（未取得 white_label 授權）",
+                )
+            }
+        };
         let input: crate::branding::BrandingInput = match serde_json::from_value(params) {
             Ok(v) => v,
             Err(e) => {
                 return WsFrame::error_response("", &format!("品牌設定欄位無效：{e}"))
             }
         };
+        // WP8: reject (do NOT silently drop) any field the scope cannot edit.
+        let violations = crate::branding::disallowed_fields(&scope, &input);
+        if !violations.is_empty() {
+            return WsFrame::error_response(
+                "",
+                &format!("此授權層級不可編輯下列品牌欄位：{}", violations.join("、")),
+            );
+        }
         let cfg = match crate::branding::validate_input(input) {
             Ok(c) => c,
             Err(e) => return WsFrame::error_response("", &e),
         };
+        // WP8: a partial-scope writer (customer granted a subset) must not wipe
+        // the reseller's other fields by omitting them — restore them from disk.
+        let cfg = crate::branding::preserve_unscoped(&self.home_dir, &scope, cfg);
         if let Err(e) = crate::branding::save(&self.home_dir, &cfg) {
             return WsFrame::error_response("", &e);
         }
@@ -8193,13 +9789,18 @@ impl MethodHandler {
     }
 
     async fn handle_branding_reset(&self) -> WsFrame {
-        if !self.white_label_active().await {
-            return WsFrame::error_response(
-                "",
-                "白牌功能需經銷商授權（未取得 white_label 授權）",
-            );
-        }
-        match crate::branding::reset(&self.home_dir) {
+        // WP8: scope-aware reset — a full-scope caller reverts the whole brand;
+        // a partial-scope (customer) caller clears only its granted fields.
+        let scope = match self.resolve_branding_edit_scope().await {
+            Some(s) => s,
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    "白牌功能需經銷商授權（未取得 white_label 授權）",
+                )
+            }
+        };
+        match crate::branding::reset_scoped(&self.home_dir, &scope) {
             Ok(()) => WsFrame::ok_response("", json!({ "ok": true })),
             Err(e) => WsFrame::error_response("", &e),
         }
@@ -8490,6 +10091,45 @@ impl MethodHandler {
             .unwrap_or(365)
             .clamp(1, 36_500) as i64;
 
+        // WP8: optional field-level white-label edit claim. Absent ⇒ `None` ⇒ the
+        // consumer resolves to the full vendor set (a reseller token). Present ⇒
+        // a narrowed range (a customer token). Fail-closed: every listed name
+        // must be a real vendor-editable field — a claim can never grant a
+        // system-only / unknown field, so a bad list rejects the whole issue.
+        let branding_editable: Option<Vec<String>> = match params.get("branding_editable") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(arr)) => {
+                let list: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                let invalid: Vec<&str> = list
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|f| {
+                        crate::branding::field_level(f)
+                            != crate::branding::BrandingFieldLevel::Vendor
+                    })
+                    .collect();
+                if !invalid.is_empty() {
+                    return WsFrame::error_response(
+                        "",
+                        &format!(
+                            "branding_editable 含不可授權的欄位（僅允許品牌面欄位）：{}",
+                            invalid.join("、")
+                        ),
+                    );
+                }
+                Some(list)
+            }
+            Some(_) => {
+                return WsFrame::error_response(
+                    "",
+                    "branding_editable 必須是欄位名稱的字串陣列",
+                )
+            }
+        };
+
         let store = self.distributor_store();
         let dist = match store.get_distributor(&distributor_id) {
             Some(d) => d,
@@ -8533,6 +10173,7 @@ impl MethodHandler {
             &machine_fingerprint,
             expires_days,
             public_url.as_deref(),
+            branding_editable,
         ) {
             Ok(v) => v,
             Err(e) => return WsFrame::error_response("", &e),
@@ -10155,6 +11796,9 @@ impl MethodHandler {
         let codex = duduclaw_core::which_codex_in_home(home).is_some();
         let gemini = duduclaw_core::which_gemini_in_home(home).is_some();
         let antigravity = duduclaw_core::which_agy_in_home(home).is_some();
+        // R4: `which_grok*` also probes the third-party `grok-cli` fallback.
+        let grok =
+            duduclaw_core::which_grok().or_else(|| duduclaw_core::which_grok_in_home(home)).is_some();
         let (claude_oauth, claude_subscription) = detect_claude_oauth();
 
         WsFrame::ok_response("", json!({
@@ -10162,6 +11806,7 @@ impl MethodHandler {
             "codex": codex,
             "gemini": gemini,
             "antigravity": antigravity,
+            "grok": grok,
             "claude_oauth": claude_oauth,
             "claude_subscription": claude_subscription,
         }))
@@ -10806,6 +12451,140 @@ impl MethodHandler {
     ///
     /// Reads `[odoo]` from config.toml, attempts to connect if configured,
     /// and returns connected/edition/version info.
+    // ── Cost / cache-efficiency telemetry (dashboard surface for the
+    //    `cost_summary` / `cost_agents` / `cost_recent` MCP tools) ──────────
+    //
+    // All three reuse the exact same `CostTelemetry` query methods the MCP
+    // tools call (`summary_global` / `all_agents_summary` / `recent_records`) —
+    // no second cost/cache-efficiency formula is defined here. `init_telemetry`
+    // is idempotent; when telemetry is unavailable these return a well-formed
+    // empty/zero payload rather than erroring, so the dashboard renders a clean
+    // "no data yet" state instead of a red banner.
+
+    /// Resolve the process-wide telemetry singleton, initialising it on first
+    /// use. Returns `None` only if init itself fails (disk/permission).
+    fn cost_telemetry(&self) -> Option<&'static crate::cost_telemetry::CostTelemetry> {
+        if crate::cost_telemetry::get_telemetry().is_none() {
+            let _ = crate::cost_telemetry::init_telemetry(&self.home_dir);
+        }
+        crate::cost_telemetry::get_telemetry()
+    }
+
+    /// `cost.summary` — window totals: tokens / cost / cache-hit-rate + a
+    /// derived 200K price-cliff status block. `hours` defaults to 24.
+    async fn handle_cost_summary(&self, params: Value) -> WsFrame {
+        let hours = params.get("hours").and_then(|v| v.as_u64()).unwrap_or(24);
+        let Some(tel) = self.cost_telemetry() else {
+            return WsFrame::ok_response("", json!({ "available": false }));
+        };
+
+        let summary = match tel.summary_global(hours).await {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &format!("Cost summary failed: {e}")),
+        };
+
+        // Price-cliff status: reuse `near_price_cliff_for` (registry-derived
+        // per-model threshold, 180K fallback) over recent per-request records —
+        // no new pricing math. This is a status signal, not the aggregate cost.
+        let mut requests_near_cliff = 0u64;
+        let mut max_input_tokens = 0u64;
+        if let Ok(records) = tel.recent_records(500).await {
+            for r in &records {
+                let usage = crate::cost_telemetry::TokenUsage {
+                    input_tokens: r.input_tokens,
+                    cache_read_tokens: r.cache_read_tokens,
+                    cache_creation_tokens: r.cache_creation_tokens,
+                    output_tokens: r.output_tokens,
+                };
+                let total_in = usage.total_input();
+                if total_in > max_input_tokens {
+                    max_input_tokens = total_in;
+                }
+                if crate::cost_telemetry::near_price_cliff_for(&r.model, &usage) {
+                    requests_near_cliff += 1;
+                }
+            }
+        }
+
+        WsFrame::ok_response("", json!({
+            "available": true,
+            "period": summary.period,
+            "total_requests": summary.total_requests,
+            "total_input_tokens": summary.total_input_tokens,
+            "total_cache_read_tokens": summary.total_cache_read_tokens,
+            "total_cache_creation_tokens": summary.total_cache_creation_tokens,
+            "total_output_tokens": summary.total_output_tokens,
+            "avg_cache_efficiency": summary.avg_cache_efficiency,
+            // Alias: cache_efficiency == cache_hit_rate (both from the same formula).
+            "cache_hit_rate": summary.avg_cache_hit_rate,
+            "total_cost_millicents": summary.total_cost_millicents,
+            "total_cache_savings_millicents": summary.total_cache_savings_millicents,
+            "price_cliff": {
+                // Legacy model-agnostic warn threshold (registry may use a
+                // per-model one internally); surfaced for the UI copy.
+                "threshold_input_tokens": 180_000,
+                "requests_near_cliff": requests_near_cliff,
+                "max_input_tokens": max_input_tokens,
+                "warning": requests_near_cliff > 0,
+            },
+        }))
+    }
+
+    /// `cost.agents` — per-agent cost + cache-health rollup. `hours` defaults
+    /// to 24. Empty window → `{ agents: [] }` (not an error).
+    async fn handle_cost_agents(&self, params: Value) -> WsFrame {
+        let hours = params.get("hours").and_then(|v| v.as_u64()).unwrap_or(24);
+        let Some(tel) = self.cost_telemetry() else {
+            return WsFrame::ok_response("", json!({ "available": false, "agents": [] }));
+        };
+        match tel.all_agents_summary(hours).await {
+            Ok(agents) => {
+                let rows: Vec<Value> = agents.iter().map(|a| json!({
+                    "agent_id": a.agent_id,
+                    "cache_health": a.cache_health,
+                    "total_requests": a.summary.total_requests,
+                    "total_input_tokens": a.summary.total_input_tokens,
+                    "total_cache_read_tokens": a.summary.total_cache_read_tokens,
+                    "total_cache_creation_tokens": a.summary.total_cache_creation_tokens,
+                    "total_output_tokens": a.summary.total_output_tokens,
+                    "avg_cache_efficiency": a.summary.avg_cache_efficiency,
+                    "total_cost_millicents": a.summary.total_cost_millicents,
+                    "total_cache_savings_millicents": a.summary.total_cache_savings_millicents,
+                })).collect();
+                WsFrame::ok_response("", json!({ "available": true, "agents": rows }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Cost agents failed: {e}")),
+        }
+    }
+
+    /// `cost.recent` — the last `limit` (≤500, default 20) per-request cost
+    /// records, newest first.
+    async fn handle_cost_recent(&self, params: Value) -> WsFrame {
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(500) as u32;
+        let Some(tel) = self.cost_telemetry() else {
+            return WsFrame::ok_response("", json!({ "available": false, "records": [] }));
+        };
+        match tel.recent_records(limit).await {
+            Ok(records) => {
+                let rows: Vec<Value> = records.iter().map(|r| json!({
+                    "agent_id": r.agent_id,
+                    "request_type": r.request_type,
+                    "model": r.model,
+                    "input_tokens": r.input_tokens,
+                    "cache_read_tokens": r.cache_read_tokens,
+                    "cache_creation_tokens": r.cache_creation_tokens,
+                    "output_tokens": r.output_tokens,
+                    "cache_efficiency": r.cache_efficiency,
+                    "cost_millicents": r.cost_millicents,
+                    "cache_savings_millicents": r.cache_savings_millicents,
+                    "created_at": r.created_at,
+                })).collect();
+                WsFrame::ok_response("", json!({ "available": true, "records": rows }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Cost recent failed: {e}")),
+        }
+    }
+
     async fn handle_odoo_status(&self) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
         let table = self.read_config_table(&config_path).await;
@@ -11331,6 +13110,228 @@ impl MethodHandler {
         plain
     }
 
+    // ── RFC-21 §2: per-agent Odoo credential isolation ──────────────────────
+
+    /// Read + parse an agent's `agent.toml` into a `toml::Table`.
+    async fn read_agent_toml_table(&self, agent_id: &str) -> Result<toml::Table, String> {
+        if !is_valid_agent_id(agent_id) {
+            return Err(format!("Invalid agent_id: {agent_id}"));
+        }
+        let reg = self.registry.read().await;
+        let agent = reg.get(agent_id).ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+        let path = agent.dir.join("agent.toml");
+        drop(reg);
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("Failed to read agent.toml: {e}"))?;
+        content
+            .parse::<toml::Table>()
+            .map_err(|e| format!("Failed to parse agent.toml: {e}"))
+    }
+
+    /// `odoo.agent_config_get {agent_id}` — return the agent's `[odoo]` override
+    /// block WITHOUT any secret. Credentials are reported as booleans + a masked
+    /// placeholder; cleartext / ciphertext is never returned. Absent block →
+    /// `{ configured: false }` (fail-safe, not an error).
+    async fn handle_odoo_agent_config_get(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+        let table = match self.read_agent_toml_table(agent_id).await {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let section = match table.get("odoo").and_then(|v| v.as_table()) {
+            Some(s) => s,
+            None => {
+                return WsFrame::ok_response("", json!({
+                    "agent_id": agent_id,
+                    "configured": false,
+                }))
+            }
+        };
+
+        let get_str = |k: &str| section.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let get_arr = |k: &str| -> Vec<String> {
+            section
+                .get(k)
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default()
+        };
+        let company_ids: Vec<i64> = section
+            .get("company_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_integer()).collect())
+            .unwrap_or_default();
+
+        // Credential presence — never the value. `_enc` (encrypted or a
+        // `secret://` ref) or legacy plaintext both count as "set".
+        let api_key_set = section.get("api_key_enc").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+            || section.get("api_key").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+        let password_set = section.get("password_enc").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+            || section.get("password").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+
+        WsFrame::ok_response("", json!({
+            "agent_id": agent_id,
+            "configured": true,
+            "profile": get_str("profile"),
+            "url": get_str("url"),
+            "db": get_str("db"),
+            "username": get_str("username"),
+            "allowed_models": get_arr("allowed_models"),
+            "allowed_actions": get_arr("allowed_actions"),
+            "company_ids": company_ids,
+            "api_key_set": api_key_set,
+            "api_key": if api_key_set { Some(SECRET_MASK_SET) } else { None },
+            "password_set": password_set,
+        }))
+    }
+
+    /// `odoo.agent_config_set {agent_id, url, db, user/username, api_key,
+    /// password, profile, allowed_models, allowed_actions, company_ids}` — write
+    /// the agent's `[odoo]` override. api_key/password are AES-256-GCM encrypted
+    /// into `*_enc` (cleartext never persisted); the masked placeholder
+    /// (`***set***`) is refused as a real secret so a round-trip get→set doesn't
+    /// overwrite the stored key. url/db go through the same SSRF/HTTPS/db-name
+    /// validators as the global path (via `apply_odoo_to_table`).
+    async fn handle_odoo_agent_config_set(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if agent_id.is_empty() || !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+
+        // Build the nested `{ "odoo": {...} }` shape `apply_odoo_to_table`
+        // consumes from the flat RPC params. `user` is accepted as an alias for
+        // `username`.
+        let mut odoo_obj = serde_json::Map::new();
+        for key in [
+            "url", "db", "username", "api_key", "password", "profile",
+            "allowed_models", "allowed_actions", "company_ids",
+        ] {
+            if let Some(v) = params.get(key) {
+                odoo_obj.insert(key.to_string(), v.clone());
+            }
+        }
+        if !odoo_obj.contains_key("username") {
+            if let Some(v) = params.get("user") {
+                odoo_obj.insert("username".to_string(), v.clone());
+            }
+        }
+        if odoo_obj.is_empty() {
+            return WsFrame::error_response("", "No Odoo fields to update");
+        }
+        let wrapped = json!({ "odoo": odoo_obj });
+        let home = self.home_dir.clone();
+
+        let mut applied_changes: Vec<String> = Vec::new();
+        let result = self
+            .update_agent_toml(&agent_id, |table| {
+                let changes = apply_odoo_to_table(table, &wrapped, &home)?;
+                applied_changes = changes;
+                Ok(())
+            })
+            .await;
+
+        match result {
+            Ok(hot_reloaded) => WsFrame::ok_response("", json!({
+                "success": true,
+                "agent_id": agent_id,
+                "changes": applied_changes,
+                "hot_reloaded": hot_reloaded,
+            })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `odoo.agent_test {agent_id}` — test connectivity using the agent's
+    /// effective Odoo config: the global `config.toml [odoo]` overlaid with the
+    /// agent's `agent.toml [odoo]` (url/db/username), and the agent's credential
+    /// if present, else the global one. Reuses the same SSRF-safe URL validator
+    /// as `odoo.configure`. Never writes to disk.
+    async fn handle_odoo_agent_test(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+
+        let agent_table = match self.read_agent_toml_table(agent_id).await {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        // Start from the global config, overlay agent overrides.
+        let global_path = self.home_dir.join("config.toml");
+        let global_table = self.read_config_table(&global_path).await;
+        let mut cfg = duduclaw_odoo::OdooConfig::from_toml(&global_table);
+
+        if let Some(a) = agent_table.get("odoo").and_then(|v| v.as_table()) {
+            if let Some(u) = a.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                cfg.url = u.to_string();
+            }
+            if let Some(d) = a.get("db").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                cfg.db = d.to_string();
+            }
+            if let Some(un) = a.get("username").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                cfg.username = un.to_string();
+            }
+            if let Some(pr) = a.get("protocol").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                cfg.protocol = pr.to_string();
+            }
+            if let Some(am) = a.get("auth_method").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                cfg.auth_method = am.to_string();
+            }
+        }
+
+        if !cfg.is_configured() {
+            return WsFrame::ok_response("", json!({
+                "success": false,
+                "message": "Odoo not configured for this agent (no url/db — set an override or configure the global Odoo first)",
+            }));
+        }
+        // Fail-closed SSRF/HTTPS re-check on the EFFECTIVE url actually dialed.
+        if !Self::is_safe_odoo_url(&cfg.url) {
+            return WsFrame::ok_response("", json!({
+                "success": false,
+                "message": "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1) and must not target a private/reserved host",
+            }));
+        }
+
+        // Credential: prefer the agent's, else the global one.
+        let credential = self
+            .resolve_odoo_credential(&agent_table)
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.resolve_odoo_credential(&global_table))
+            .filter(|s| !s.is_empty());
+        let credential = match credential {
+            Some(c) => c,
+            None => {
+                return WsFrame::ok_response("", json!({
+                    "success": false,
+                    "message": "No API key/password — set one on this agent or on the global Odoo config",
+                }))
+            }
+        };
+
+        match duduclaw_odoo::OdooConnector::connect(&cfg, &credential).await {
+            Ok(conn) => {
+                let st = conn.status();
+                WsFrame::ok_response("", json!({
+                    "success": true,
+                    "message": format!("Connected — {} {}", st.edition, st.version),
+                }))
+            }
+            Err(e) => {
+                warn!("Odoo agent test connection failed: {e}");
+                WsFrame::ok_response("", json!({
+                    "success": false,
+                    "message": format!("Connection failed: {}", Self::scrub_odoo_error(&e)),
+                }))
+            }
+        }
+    }
+
     /// Mask sensitive values (tokens, secrets, keys) in a TOML table.
     fn mask_sensitive_fields(table: &mut toml::Table) {
         let sensitive_patterns = ["token", "secret", "key", "password"];
@@ -11349,7 +13350,7 @@ impl MethodHandler {
 
     // ── Filtered agent list (respects UserContext) ────────────
 
-    async fn handle_agents_list_filtered(&self, ctx: &UserContext) -> WsFrame {
+    async fn handle_agents_list_filtered(&self, ctx: &UserContext, params: Value) -> WsFrame {
         // Re-scan to pick up changes
         if let Ok(mut reg) = tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -11357,6 +13358,13 @@ impl MethodHandler {
         ).await {
             let _ = reg.scan().await;
         }
+
+        // WP4: archived agents are hidden by default; `include_archived=true`
+        // surfaces them (still flagged). Soft-deleted agents are ALWAYS hidden.
+        let include_archived = params
+            .get("include_archived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let reg = self.registry.read().await;
         let visible = ctx.visible_agents();
@@ -11384,13 +13392,18 @@ impl MethodHandler {
                     Some(names) => names.contains(&a.config.agent.name),
                 }
             })
+            .filter(|a| a.config.agent.status.is_listable(include_archived))
             .map(|a| {
                 let cfg = &a.config;
+                let archived = matches!(cfg.agent.status, duduclaw_core::types::AgentStatus::Archived);
                 json!({
                     "name": cfg.agent.name,
                     "display_name": cfg.agent.display_name,
                     "role": format!("{:?}", cfg.agent.role).to_lowercase(),
                     "status": format!("{:?}", cfg.agent.status).to_lowercase(),
+                    "archived": archived,
+                    "has_avatar": self.agent_has_avatar(&cfg.agent.name),
+                    "department": cfg.agent.department,
                     "trigger": cfg.agent.trigger,
                     "icon": cfg.agent.icon,
                     "reports_to": cfg.agent.reports_to,
@@ -13541,6 +15554,132 @@ impl MethodHandler {
         )
     }
 
+    // ── WebChat session history + resume handlers (WP3) ─────────
+    //
+    // These back the dashboard's "past conversations" picker and resume flow.
+    // Sessions are keyed by agent in `sessions.db`; listing/history are
+    // read-only and agent-scoped (same fail-closed intent as `runs.*`). The
+    // resume write path itself lives in `webchat.rs` (the `/ws/chat` socket);
+    // these RPCs only surface what exists so the client can pick a session id
+    // to resume.
+
+    async fn handle_chat_sessions_list(&self, params: Value) -> WsFrame {
+        let agent_filter = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(a) = agent_filter {
+            if !is_valid_agent_id(a) {
+                return WsFrame::error_response("", "Invalid agent_id format");
+            }
+        }
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(CHAT_SESSIONS_LIST_DEFAULT_LIMIT as u64)
+            .min(CHAT_SESSIONS_LIST_MAX_LIMIT as u64) as usize;
+
+        let rc = match self.reply_ctx.read().await.clone() {
+            Some(c) => c,
+            // Reply context not yet wired (very early startup) — no sessions to
+            // show. Empty is the honest answer, not an error.
+            None => return WsFrame::ok_response("", json!({ "sessions": [] })),
+        };
+
+        match rc.session_manager.list_sessions(agent_filter, limit).await {
+            Ok(list) => {
+                let sessions: Vec<Value> = list
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "session_id": s.id,
+                            "agent_id": s.agent_id,
+                            "title": s.title,
+                            "last_active": s.last_active,
+                            "turns": s.turn_count,
+                            "tokens": s.total_tokens,
+                            "lineage": s.lineage,
+                        })
+                    })
+                    .collect();
+                WsFrame::ok_response("", json!({ "sessions": sessions }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("list sessions: {e}")),
+        }
+    }
+
+    async fn handle_chat_sessions_history(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let session_id = params
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if session_id.is_empty() {
+            return WsFrame::error_response("", "session_id is required");
+        }
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(CHAT_HISTORY_DEFAULT_LIMIT as u64)
+            .min(CHAT_HISTORY_MAX_LIMIT as u64) as usize;
+
+        let rc = match self.reply_ctx.read().await.clone() {
+            Some(c) => c,
+            None => return WsFrame::error_response("", "session store unavailable"),
+        };
+
+        // Resolve the owning agent; fail closed on an unknown id (never expose
+        // an empty transcript for a session that does not exist).
+        let owner = match rc.session_manager.session_agent(&session_id).await {
+            Ok(Some(a)) => a,
+            Ok(None) => return WsFrame::error_response("", "session not found"),
+            Err(e) => return WsFrame::error_response("", &format!("resolve session: {e}")),
+        };
+        // Agent-scoped authz — viewer level, fail-closed for non-admins (mirrors
+        // runs.get). Prevents loading a conversation for an agent the caller
+        // cannot see.
+        if !ctx.is_admin() {
+            if let Err(e) = acl::require_agent_access(ctx, &owner, AccessLevel::Viewer) {
+                return WsFrame::error_response("", &e);
+            }
+        }
+
+        match rc.session_manager.get_messages(&session_id).await {
+            Ok(msgs) => {
+                // F9: `get_messages` returns oldest→newest. Show the NEWEST
+                // `limit` turns (where the user left off), not the oldest — on a
+                // long resumed conversation the oldest window is stale scrollback.
+                // Skip to the tail while preserving chronological order.
+                let start = msgs.len().saturating_sub(limit);
+                let messages: Vec<Value> = msgs
+                    .iter()
+                    .skip(start)
+                    .map(|m| {
+                        json!({
+                            "role": m.role,
+                            // CJK-safe cap — long single turns are bounded so the
+                            // payload stays sane; normal messages pass through whole.
+                            "content": duduclaw_core::truncate_chars(&m.content, CHAT_HISTORY_MSG_MAX_CHARS),
+                            "timestamp": m.timestamp,
+                            "tokens": m.tokens,
+                        })
+                    })
+                    .collect();
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "session_id": session_id,
+                        "agent_id": owner,
+                        "messages": messages,
+                    }),
+                )
+            }
+            Err(e) => WsFrame::error_response("", &format!("session history: {e}")),
+        }
+    }
+
     // ── Live Run Forking handlers (RFC-26) ──────────────────
     //
     // Forks execute in the MCP-server process and persist to the cross-process
@@ -14813,6 +16952,26 @@ fn validate_autopilot_action(action: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// WP9: resolve a Telegram bot's `@username` from its token via getMe.
+/// Returns `None` on any network/parse error or a non-ok Telegram response —
+/// the caller then fails closed (no deep-link minted).
+async fn fetch_telegram_bot_username(token: &str) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let url = format!("https://api.telegram.org/bot{token}/getMe");
+    let resp = client.get(&url).send().await.ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    data.get("result")
+        .and_then(|r| r.get("username"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+}
+
 fn extract_frontmatter(content: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}:");
     for line in content.lines() {
@@ -14840,6 +16999,152 @@ fn update_frontmatter_field(content: &str, key: &str, transform: impl Fn(&str) -
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod avatar_validation_tests {
+    use super::{decode_avatar_data_uri, MAX_AVATAR_DECODED_BYTES};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+    /// Smallest valid PNG header (8 magic bytes + a bit of filler).
+    fn png_bytes() -> Vec<u8> {
+        let mut v = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        v.extend_from_slice(&[0u8; 16]);
+        v
+    }
+
+    fn data_uri(mime: &str, bytes: &[u8]) -> String {
+        format!("data:{mime};base64,{}", B64.encode(bytes))
+    }
+
+    #[test]
+    fn accepts_real_png() {
+        let (bytes, ext) = decode_avatar_data_uri(&data_uri("image/png", &png_bytes())).unwrap();
+        assert_eq!(ext, "png");
+        assert_eq!(bytes.len(), 24);
+    }
+
+    #[test]
+    fn rejects_svg_mime() {
+        // SVG is never accepted (XSS vector), even as a valid data URI.
+        let uri = data_uri("image/svg+xml", b"<svg></svg>");
+        assert!(decode_avatar_data_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn rejects_mime_magic_mismatch() {
+        // Declares PNG but ships JPEG magic bytes — must fail magic-byte check.
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0x00, 0x00];
+        let uri = data_uri("image/png", &jpeg);
+        assert!(decode_avatar_data_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_payload() {
+        // A valid-magic PNG larger than the 512 KB ceiling is rejected.
+        let mut big = png_bytes();
+        big.resize(MAX_AVATAR_DECODED_BYTES + 1, 0);
+        let uri = data_uri("image/png", &big);
+        assert!(decode_avatar_data_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn accepts_webp_and_jpeg() {
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0u8; 4]); // file size
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(&[0u8; 4]);
+        assert_eq!(
+            decode_avatar_data_uri(&data_uri("image/webp", &webp)).unwrap().1,
+            "webp"
+        );
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        assert_eq!(
+            decode_avatar_data_uri(&data_uri("image/jpeg", &jpeg)).unwrap().1,
+            "jpg"
+        );
+    }
+}
+
+#[cfg(test)]
+mod archive_restore_tests {
+    use super::{offboard_freeze_table, unarchive_restore_table};
+
+    fn table_from(toml_src: &str) -> toml::Table {
+        toml::from_str(toml_src).unwrap()
+    }
+
+    fn enabled(t: &toml::Table, section: &str) -> bool {
+        t.get(section)
+            .and_then(|v| v.as_table())
+            .and_then(|s| s.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap()
+    }
+
+    /// F6: an agent that runs with evolution/heartbeat intentionally OFF must
+    /// come back OFF after archive → unarchive, not force-enabled.
+    #[test]
+    fn round_trip_preserves_disabled_flags() {
+        let mut t = table_from(
+            "[agent]\nname = \"x\"\nstatus = \"active\"\n\
+             [evolution]\nenabled = false\n[heartbeat]\nenabled = false\n",
+        );
+        offboard_freeze_table(&mut t, "archived").unwrap();
+        assert!(!enabled(&t, "evolution"), "archive freezes evolution");
+        assert!(!enabled(&t, "heartbeat"), "archive freezes heartbeat");
+
+        unarchive_restore_table(&mut t).unwrap();
+        assert!(!enabled(&t, "evolution"), "unarchive must NOT force evolution on");
+        assert!(!enabled(&t, "heartbeat"), "unarchive must NOT force heartbeat on");
+        assert_eq!(
+            t.get("agent").unwrap().get("status").unwrap().as_str(),
+            Some("active")
+        );
+        assert!(t.get("archive").is_none(), "snapshot block consumed");
+    }
+
+    /// F6: an agent that ran with evolution/heartbeat ON is restored to ON.
+    #[test]
+    fn round_trip_restores_enabled_flags() {
+        let mut t = table_from(
+            "[agent]\nname = \"x\"\nstatus = \"active\"\n\
+             [evolution]\nenabled = true\n[heartbeat]\nenabled = true\n",
+        );
+        offboard_freeze_table(&mut t, "archived").unwrap();
+        assert!(!enabled(&t, "evolution"), "archive still freezes while off-boarded");
+
+        unarchive_restore_table(&mut t).unwrap();
+        assert!(enabled(&t, "evolution"), "unarchive restores the original ON");
+        assert!(enabled(&t, "heartbeat"), "unarchive restores the original ON");
+    }
+
+    /// F6: a double-archive must not lose the true original value.
+    #[test]
+    fn double_archive_preserves_original() {
+        let mut t = table_from(
+            "[agent]\nname = \"x\"\nstatus = \"active\"\n\
+             [evolution]\nenabled = true\n[heartbeat]\nenabled = false\n",
+        );
+        offboard_freeze_table(&mut t, "archived").unwrap();
+        // Re-archive the already-frozen agent (enabled is now false).
+        offboard_freeze_table(&mut t, "deleted").unwrap();
+        unarchive_restore_table(&mut t).unwrap();
+        assert!(enabled(&t, "evolution"), "original ON survives double-archive");
+        assert!(!enabled(&t, "heartbeat"), "original OFF survives double-archive");
+    }
+
+    /// F6: no snapshot present (legacy archived agent) ⇒ conservative OFF.
+    #[test]
+    fn missing_snapshot_defaults_off() {
+        let mut t = table_from(
+            "[agent]\nname = \"x\"\nstatus = \"archived\"\n\
+             [evolution]\nenabled = false\n[heartbeat]\nenabled = false\n",
+        );
+        unarchive_restore_table(&mut t).unwrap();
+        assert!(!enabled(&t, "evolution"));
+        assert!(!enabled(&t, "heartbeat"));
+    }
 }
 
 #[cfg(test)]
@@ -15710,6 +18015,154 @@ policies:
         assert!(apply_odoo_to_table(&mut table, &params, &tmp).is_err());
     }
 
+    // ── ODO §2: per-agent override url/db validation + mask non-overwrite ──────
+
+    #[test]
+    fn odo_apply_rejects_ssrf_url_and_bad_db() {
+        let tmp = std::env::temp_dir();
+        // http:// to a non-localhost host must be refused (SSRF/HTTPS gate).
+        let mut t1 = toml::Table::new();
+        assert!(apply_odoo_to_table(
+            &mut t1,
+            &json!({ "odoo": { "url": "http://169.254.169.254/latest" } }),
+            &tmp,
+        )
+        .is_err());
+        // https:// to a private IP must be refused.
+        let mut t2 = toml::Table::new();
+        assert!(apply_odoo_to_table(
+            &mut t2,
+            &json!({ "odoo": { "url": "https://10.0.0.5" } }),
+            &tmp,
+        )
+        .is_err());
+        // Bad db name must be refused.
+        let mut t3 = toml::Table::new();
+        assert!(apply_odoo_to_table(
+            &mut t3,
+            &json!({ "odoo": { "db": "bad db!" } }),
+            &tmp,
+        )
+        .is_err());
+        // A safe https url + clean db round-trips.
+        let mut t4 = toml::Table::new();
+        let changes = apply_odoo_to_table(
+            &mut t4,
+            &json!({ "odoo": { "url": "https://odoo.example.com", "db": "prod_db" } }),
+            &tmp,
+        )
+        .expect("safe config applies");
+        let odoo = t4.get("odoo").unwrap().as_table().unwrap();
+        assert_eq!(odoo.get("url").unwrap().as_str(), Some("https://odoo.example.com"));
+        assert_eq!(odoo.get("db").unwrap().as_str(), Some("prod_db"));
+        assert!(changes.iter().any(|c| c.contains("odoo.url")));
+    }
+
+    #[test]
+    fn odo_apply_masked_placeholder_does_not_overwrite_real_secret() {
+        let tmp = std::env::temp_dir().join(format!("ddc-odo-mask-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 1) Store a real secret.
+        let mut table = toml::Table::new();
+        apply_odoo_to_table(
+            &mut table,
+            &json!({ "odoo": { "api_key": "real-secret-value" } }),
+            &tmp,
+        )
+        .expect("store real");
+        let enc_before = table
+            .get("odoo")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("api_key_enc"))
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert!(!enc_before.is_empty());
+
+        // 2) Re-apply with the masked placeholder — the stored ciphertext must
+        //    NOT be replaced (mask is not a real secret).
+        apply_odoo_to_table(
+            &mut table,
+            &json!({ "odoo": { "api_key": SECRET_MASK_SET } }),
+            &tmp,
+        )
+        .expect("mask no-op");
+        let enc_after = table
+            .get("odoo")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("api_key_enc"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(enc_before, enc_after, "masked placeholder must not clobber real secret");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── CAP §6: native_sandbox + Progent policy round-trip / fail-closed ──────
+
+    #[test]
+    fn cap_native_sandbox_and_policy_round_trip() {
+        let mut table = toml::Table::new();
+        let params = json!({
+            "capabilities": {
+                "native_sandbox": true,
+                "policy": [
+                    {
+                        "tool": "shell_exec",
+                        "effect": "forbid",
+                        "when": [{ "arg": "command", "op": "contains", "value": "rm -rf" }],
+                    },
+                    { "tool": "*", "effect": "allow" },
+                ],
+            }
+        });
+        let changes = apply_capabilities_to_table(&mut table, &params).expect("apply");
+        let cap = table.get("capabilities").unwrap().as_table().unwrap();
+        assert_eq!(cap.get("native_sandbox").unwrap().as_bool(), Some(true));
+        let policy = cap.get("policy").unwrap().as_array().unwrap();
+        assert_eq!(policy.len(), 2);
+        let first = policy[0].as_table().unwrap();
+        assert_eq!(first.get("tool").unwrap().as_str(), Some("shell_exec"));
+        assert_eq!(first.get("effect").unwrap().as_str(), Some("forbid"));
+        let when = first.get("when").unwrap().as_array().unwrap();
+        assert_eq!(when[0].as_table().unwrap().get("op").unwrap().as_str(), Some("contains"));
+        assert!(changes.iter().any(|c| c.contains("native_sandbox")));
+        assert!(changes.iter().any(|c| c.contains("policy = [2 rules]")));
+
+        // The written section must deserialize back into a real
+        // CapabilitiesConfig (proves the on-disk shape is valid, not just JSON).
+        let cfg: duduclaw_core::types::CapabilitiesConfig =
+            cap.clone().try_into().expect("deserializes into CapabilitiesConfig");
+        assert!(cfg.native_sandbox);
+        assert_eq!(cfg.policy.len(), 2);
+    }
+
+    #[test]
+    fn cap_policy_fail_closed_on_bad_effect_op_and_missing_tool() {
+        // Unknown effect.
+        let mut t1 = toml::Table::new();
+        assert!(apply_capabilities_to_table(
+            &mut t1,
+            &json!({ "capabilities": { "policy": [{ "tool": "x", "effect": "nuke" }] } }),
+        )
+        .is_err());
+        // Unknown op.
+        let mut t2 = toml::Table::new();
+        assert!(apply_capabilities_to_table(
+            &mut t2,
+            &json!({ "capabilities": { "policy": [
+                { "tool": "x", "effect": "allow", "when": [{ "arg": "a", "op": "regex", "value": "b" }] }
+            ] } }),
+        )
+        .is_err());
+        // Missing/empty tool.
+        let mut t3 = toml::Table::new();
+        assert!(apply_capabilities_to_table(
+            &mut t3,
+            &json!({ "capabilities": { "policy": [{ "tool": "", "effect": "allow" }] } }),
+        )
+        .is_err());
+    }
+
     // ── SCP: namespace mode parse ────────────────────────────────────────────
 
     #[test]
@@ -16005,6 +18458,18 @@ pub(crate) fn derive_timeline_rows(
 /// Default / max page size for `runs.list`.
 pub(crate) const RUNS_LIST_DEFAULT_LIMIT: usize = 50;
 pub(crate) const RUNS_LIST_MAX_LIMIT: usize = 200;
+
+/// WP3 — `chat.sessions.list` page size (default / hard cap).
+pub(crate) const CHAT_SESSIONS_LIST_DEFAULT_LIMIT: usize = 50;
+pub(crate) const CHAT_SESSIONS_LIST_MAX_LIMIT: usize = 200;
+/// WP3 — `chat.sessions.history` turn count (default / hard cap). Sessions
+/// auto-compress at 50k tokens, so live turn counts stay bounded well below
+/// this; the cap only guards against a pathological pre-compression backlog.
+pub(crate) const CHAT_HISTORY_DEFAULT_LIMIT: usize = 500;
+pub(crate) const CHAT_HISTORY_MAX_LIMIT: usize = 2000;
+/// WP3 — per-message character cap for history payloads (CJK-safe; normal
+/// turns pass through whole, only pathological single messages are bounded).
+pub(crate) const CHAT_HISTORY_MSG_MAX_CHARS: usize = 20_000;
 /// How many most-recent session messages are scanned per listing (bounds the
 /// full-table read; older turns simply fall off the "recent runs" horizon).
 pub(crate) const RUNS_SCAN_MSG_CAP: usize = 4000;
@@ -17119,5 +19584,316 @@ mod canvas_rpc_tests {
             }
             other => panic!("expected ok response, got: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod agents_avatar_rpc_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn viewer_ctx(agents: &[&str]) -> UserContext {
+        let mut agent_access = HashMap::new();
+        for a in agents {
+            agent_access.insert((*a).to_string(), AccessLevel::Viewer);
+        }
+        UserContext {
+            user_id: "u1".to_string(),
+            email: "u1@test.local".to_string(),
+            role: UserRole::Employee,
+            agent_access,
+        }
+    }
+
+    fn error_text(frame: &WsFrame) -> String {
+        match frame {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// E1: `agents.avatar` returns the stored image as a data URI, `null` when
+    /// none exists, and is denied for agents the caller can't see (fail-closed
+    /// at dispatch, before the handler runs).
+    #[tokio::test]
+    async fn agents_avatar_reads_image_null_and_denies() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = viewer_ctx(&["alpha", "beta"]);
+
+        // "alpha" has an uploaded avatar on disk → data URI comes back.
+        let alpha_dir = home.path().join("agents").join("alpha");
+        std::fs::create_dir_all(&alpha_dir).unwrap();
+        // Minimal PNG magic bytes; the read path does not re-validate content.
+        std::fs::write(alpha_dir.join("avatar.png"), b"\x89PNG\r\n\x1a\nfake").unwrap();
+
+        let frame = handler
+            .handle("agents.avatar", json!({ "agent_id": "alpha" }), &ctx)
+            .await;
+        match frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => {
+                assert_eq!(p["has_avatar"].as_bool(), Some(true));
+                let uri = p["avatar"].as_str().expect("avatar data uri");
+                assert!(uri.starts_with("data:image/png;base64,"), "got: {uri}");
+            }
+            other => panic!("expected ok response, got: {other:?}"),
+        }
+
+        // "beta" is bound but has no avatar file → null / has_avatar=false.
+        std::fs::create_dir_all(home.path().join("agents").join("beta")).unwrap();
+        let frame = handler
+            .handle("agents.avatar", json!({ "agent_id": "beta" }), &ctx)
+            .await;
+        match frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => {
+                assert_eq!(p["has_avatar"].as_bool(), Some(false));
+                assert!(p["avatar"].is_null());
+            }
+            other => panic!("expected ok response, got: {other:?}"),
+        }
+
+        // "gamma" is not in the caller's bindings → permission denied at dispatch.
+        let frame = handler
+            .handle("agents.avatar", json!({ "agent_id": "gamma" }), &ctx)
+            .await;
+        assert!(
+            error_text(&frame).contains("permission denied"),
+            "unseen agent must be denied, got: {frame:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_dashboard_tests {
+    //! IDR: identity.config_get/set round-trip + identity.resolve via the
+    //! wiki-cache provider (RFC-21 §1 dashboard surface). The Notion secret must
+    //! be write-only (masked on read); resolve must reuse the crate provider.
+    use super::*;
+
+    fn frame_ok(frame: &WsFrame) -> bool {
+        matches!(frame, WsFrame::Response { ok: true, .. })
+    }
+
+    fn frame_payload(frame: &WsFrame) -> Value {
+        match frame {
+            WsFrame::Response { payload: Some(p), .. } => p.clone(),
+            _ => Value::Null,
+        }
+    }
+
+    fn frame_error_text(frame: &WsFrame) -> String {
+        match frame {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    // ── Pure-function tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn response_defaults_when_section_absent() {
+        let t = toml::Table::new();
+        let resp = identity_table_to_response(&t);
+        assert_eq!(resp.get("provider").unwrap().as_str(), Some("wiki_cache"));
+        let notion = resp.get("notion").unwrap();
+        assert_eq!(notion.get("api_key_set").unwrap().as_bool(), Some(false));
+        assert_eq!(notion.get("api_key").unwrap().as_str(), Some(""));
+        // field_map defaults present.
+        let fm = notion.get("field_map").unwrap();
+        assert_eq!(fm.get("name").unwrap().as_str(), Some("Name"));
+        assert_eq!(fm.get("projects_kind").unwrap().as_str(), Some("multi_select"));
+    }
+
+    #[test]
+    fn response_masks_notion_secret() {
+        let mut t = toml::Table::new();
+        let mut notion = toml::map::Map::new();
+        notion.insert("api_key_enc".into(), toml::Value::String("ENCBLOB==".into()));
+        let mut idt = toml::map::Map::new();
+        idt.insert("provider".into(), toml::Value::String("notion".into()));
+        idt.insert("notion".into(), toml::Value::Table(notion));
+        t.insert("identity".into(), toml::Value::Table(idt));
+
+        let resp = identity_table_to_response(&t);
+        let serialised = serde_json::to_string(&resp).unwrap();
+        assert!(!serialised.contains("ENCBLOB"), "enc secret leaked: {serialised}");
+        let notion = resp.get("notion").unwrap();
+        assert_eq!(notion.get("api_key_set").unwrap().as_bool(), Some(true));
+        assert_eq!(notion.get("api_key").unwrap().as_str(), Some(SECRET_MASK_SET));
+    }
+
+    #[test]
+    fn apply_rejects_invalid_provider() {
+        let mut t = toml::Table::new();
+        let mut changes = Vec::new();
+        let err = apply_identity_to_table(&mut t, &json!({ "provider": "ldap" }), &mut changes)
+            .unwrap_err();
+        assert!(err.contains("Invalid provider"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_rejects_invalid_projects_kind() {
+        let mut t = toml::Table::new();
+        let mut changes = Vec::new();
+        let err = apply_identity_to_table(
+            &mut t,
+            &json!({ "notion": { "field_map": { "projects_kind": "bogus" } } }),
+            &mut changes,
+        )
+        .unwrap_err();
+        assert!(err.contains("projects_kind"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_writes_provider_and_notion_fields() {
+        let mut t = toml::Table::new();
+        let mut changes = Vec::new();
+        apply_identity_to_table(
+            &mut t,
+            &json!({
+                "provider": "chained",
+                "notion": {
+                    "database_id": "db_123",
+                    "refresh_seconds": 600,
+                    "field_map": {
+                        "name": "Full Name",
+                        "projects_kind": "relation",
+                        "channel_props": { "discord": "DC", "slack": "SL" }
+                    }
+                }
+            }),
+            &mut changes,
+        )
+        .unwrap();
+        let idt = t.get("identity").unwrap().as_table().unwrap();
+        assert_eq!(idt.get("provider").unwrap().as_str(), Some("chained"));
+        let notion = idt.get("notion").unwrap().as_table().unwrap();
+        assert_eq!(notion.get("database_id").unwrap().as_str(), Some("db_123"));
+        let fm = notion.get("field_map").unwrap().as_table().unwrap();
+        assert_eq!(fm.get("projects_kind").unwrap().as_str(), Some("relation"));
+        let cp = fm.get("channel_props").unwrap().as_table().unwrap();
+        assert_eq!(cp.get("slack").unwrap().as_str(), Some("SL"));
+    }
+
+    // ── Handler round-trip tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn config_set_then_get_masks_secret_and_persists_fields() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let set = handler
+            .handle_identity_config_set(json!({
+                "provider": "notion",
+                "notion": {
+                    "database_id": "db_abc",
+                    "api_key": "secret_topsecret",
+                    "field_map": { "name": "Person Name" }
+                }
+            }))
+            .await;
+        assert!(frame_ok(&set), "config_set should succeed: {set:?}");
+
+        // Raw config.toml must NOT contain the cleartext secret.
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(!raw.contains("secret_topsecret"), "cleartext leaked to disk: {raw}");
+        assert!(raw.contains("api_key_enc"), "secret should persist encrypted");
+
+        let get = handler.handle_identity_config_get().await;
+        assert!(frame_ok(&get));
+        let p = frame_payload(&get);
+        assert_eq!(p.get("provider").unwrap().as_str(), Some("notion"));
+        let notion = p.get("notion").unwrap();
+        assert_eq!(notion.get("database_id").unwrap().as_str(), Some("db_abc"));
+        assert_eq!(notion.get("api_key_set").unwrap().as_bool(), Some(true));
+        assert_eq!(notion.get("api_key").unwrap().as_str(), Some(SECRET_MASK_SET));
+    }
+
+    #[tokio::test]
+    async fn config_set_masked_placeholder_does_not_overwrite_secret() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        handler
+            .handle_identity_config_set(json!({
+                "notion": { "api_key": "secret_original" }
+            }))
+            .await;
+        // Re-save with the masked placeholder (what the dashboard echoes when the
+        // operator leaves the field untouched) — the real secret must survive.
+        handler
+            .handle_identity_config_set(json!({
+                "provider": "notion",
+                "notion": { "api_key": SECRET_MASK_SET }
+            }))
+            .await;
+
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(!raw.contains(SECRET_MASK_SET), "placeholder must not be stored: {raw}");
+        assert!(raw.contains("api_key_enc"), "original secret must survive");
+    }
+
+    #[tokio::test]
+    async fn resolve_finds_person_via_wiki_cache() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Seed a wiki-cache identity record.
+        let people = home
+            .path()
+            .join("shared")
+            .join("wiki")
+            .join("identity")
+            .join("people");
+        std::fs::create_dir_all(&people).unwrap();
+        std::fs::write(
+            people.join("ruby.md"),
+            "---\n\
+             person_id: person_2f9\n\
+             display_name: Ruby Lin\n\
+             roles: [customer-pm]\n\
+             project_ids: [proj-alpha]\n\
+             emails: [ruby@example.com]\n\
+             channel_handles:\n  \
+               email: \"ruby@example.com\"\n  \
+               discord: \"1234567890\"\n\
+             ---\n\nnotes\n",
+        )
+        .unwrap();
+
+        let frame = handler
+            .handle_identity_resolve(json!({
+                "identifier": "ruby@example.com",
+                "channel": "email"
+            }))
+            .await;
+        assert!(frame_ok(&frame), "resolve should succeed: {frame:?}");
+        let p = frame_payload(&frame);
+        assert_eq!(p.get("found").unwrap().as_bool(), Some(true));
+        assert_eq!(p.get("is_project_member").unwrap().as_bool(), Some(true));
+        assert_eq!(p.get("provider").unwrap().as_str(), Some("wiki-cache"));
+        let person = p.get("person").unwrap();
+        assert_eq!(person.get("display_name").unwrap().as_str(), Some("Ruby Lin"));
+    }
+
+    #[tokio::test]
+    async fn resolve_miss_is_found_false_not_error() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_identity_resolve(json!({ "identifier": "nobody@example.com" }))
+            .await;
+        assert!(frame_ok(&frame), "a miss must not be an error: {frame:?}");
+        let p = frame_payload(&frame);
+        assert_eq!(p.get("found").unwrap().as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn resolve_requires_identifier() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler.handle_identity_resolve(json!({})).await;
+        assert!(!frame_ok(&frame));
+        assert!(frame_error_text(&frame).contains("identifier"));
     }
 }

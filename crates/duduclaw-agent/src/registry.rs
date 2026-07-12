@@ -79,6 +79,16 @@ impl AgentRegistry {
 
         let mut loaded: HashMap<String, LoadedAgent> = HashMap::new();
 
+        // WP7: department skills live at
+        // `<home>/shared/skills/departments/<dept>/`. Loaded lazily and cached
+        // per department so N agents in one department read the dir once.
+        let home_dir = self
+            .agents_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.agents_dir.clone());
+        let mut dept_skill_cache: HashMap<String, Vec<SkillFile>> = HashMap::new();
+
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
 
@@ -108,15 +118,35 @@ impl AgentRegistry {
             // Attempt to load the agent
             match Self::load_agent(&path).await {
                 Ok(mut agent) => {
-                    // Prepend global skills (agent-local skills override globals with same name)
-                    let local_names: std::collections::HashSet<&str> =
-                        agent.skills.iter().map(|s| s.name.as_str()).collect();
-                    let mut merged: Vec<SkillFile> = self.global_skills.iter()
-                        .filter(|gs| !local_names.contains(gs.name.as_str()))
-                        .cloned()
-                        .collect();
-                    merged.append(&mut agent.skills);
-                    agent.skills = merged;
+                    // WP7: three-layer skill composition — global (company) <
+                    // department < per-agent. Nearest layer wins on a name
+                    // collision. Agents with no (or an invalid) department only
+                    // see global + local, exactly as before WP7.
+                    let dept = agent.config.agent.department.trim().to_string();
+                    let dept_skills: Vec<SkillFile> =
+                        if !dept.is_empty() && duduclaw_core::is_valid_department(&dept) {
+                            if let Some(cached) = dept_skill_cache.get(&dept) {
+                                cached.clone()
+                            } else {
+                                let dir = crate::skill_loader::department_skills_dir(&home_dir, &dept);
+                                let loaded_skills = Self::load_skills(&dir).await;
+                                if !loaded_skills.is_empty() {
+                                    info!(
+                                        department = %dept,
+                                        count = loaded_skills.len(),
+                                        "loaded department skills"
+                                    );
+                                }
+                                dept_skill_cache.insert(dept.clone(), loaded_skills.clone());
+                                loaded_skills
+                            }
+                        } else {
+                            Vec::new()
+                        };
+
+                    let local = std::mem::take(&mut agent.skills);
+                    agent.skills =
+                        Self::compose_skill_layers(&self.global_skills, dept_skills, local);
 
                     let name = agent.config.agent.name.clone();
                     // Two agent directories sharing the same agent name would
@@ -194,6 +224,41 @@ impl AgentRegistry {
     /// Return the global skills (loaded from `~/.duduclaw/skills/`).
     pub fn global_skills(&self) -> &[SkillFile] {
         &self.global_skills
+    }
+
+    /// WP7: compose the three skill layers into one list with precedence
+    /// **per-agent > department > global** — on a same-name collision the
+    /// nearest (higher-precedence) layer wins. The result is ordered
+    /// low→high precedence (`[global-only, department-minus-local, local]`) so
+    /// the highest-precedence skills sit at the tail, matching the prior
+    /// global-then-local ordering.
+    fn compose_skill_layers(
+        global: &[SkillFile],
+        department: Vec<SkillFile>,
+        local: Vec<SkillFile>,
+    ) -> Vec<SkillFile> {
+        use std::collections::HashSet;
+        let local_names: HashSet<&str> = local.iter().map(|s| s.name.as_str()).collect();
+        let dept_names: HashSet<&str> = department.iter().map(|s| s.name.as_str()).collect();
+
+        // global minus (local ∪ department)
+        let mut merged: Vec<SkillFile> = global
+            .iter()
+            .filter(|gs| {
+                !local_names.contains(gs.name.as_str())
+                    && !dept_names.contains(gs.name.as_str())
+            })
+            .cloned()
+            .collect();
+        // department minus local
+        for ds in department.into_iter() {
+            if !local_names.contains(ds.name.as_str()) {
+                merged.push(ds);
+            }
+        }
+        // per-agent (highest precedence, kept last)
+        merged.extend(local);
+        merged
     }
 
     /// Find the agent whose role is `Main`, if any.
@@ -534,6 +599,45 @@ mod load_skills_tests {
         );
         let skills = load(tmp.path()).await;
         assert_eq!(names(&skills), vec!["my-skill"]);
+    }
+
+    // ── WP7: three-layer skill composition ───────────────────────────────
+
+    fn sf(name: &str, body: &str) -> SkillFile {
+        SkillFile { name: name.to_string(), content: body.to_string() }
+    }
+
+    #[test]
+    fn skill_layers_precedence_local_over_department_over_global() {
+        let global = vec![sf("g-only", "G"), sf("shared", "G"), sf("both", "G")];
+        let department = vec![sf("d-only", "D"), sf("shared", "D"), sf("both", "D")];
+        let local = vec![sf("l-only", "L"), sf("both", "L")];
+
+        let merged =
+            AgentRegistry::compose_skill_layers(&global, department, local);
+        let by = |n: &str| merged.iter().find(|s| s.name == n).map(|s| s.content.as_str());
+
+        // Every distinct skill present exactly once.
+        assert_eq!(merged.len(), 5, "one entry per unique name: {:?}", names(&merged));
+        // Nearest layer wins.
+        assert_eq!(by("both"), Some("L"), "local overrides department + global");
+        assert_eq!(by("shared"), Some("D"), "department overrides global");
+        assert_eq!(by("g-only"), Some("G"));
+        assert_eq!(by("d-only"), Some("D"));
+        assert_eq!(by("l-only"), Some("L"));
+        // Highest precedence sits at the tail (prompt attention convention).
+        assert_eq!(merged.last().map(|s| s.name.as_str()), Some("both"));
+    }
+
+    #[test]
+    fn skill_layers_no_department_is_unchanged_from_global_plus_local() {
+        // Backward compatibility: empty department layer == pre-WP7 behaviour.
+        let global = vec![sf("g", "G"), sf("dup", "G")];
+        let local = vec![sf("l", "L"), sf("dup", "L")];
+        let merged =
+            AgentRegistry::compose_skill_layers(&global, Vec::new(), local);
+        assert_eq!(names(&merged), vec!["g", "l", "dup"]);
+        assert_eq!(merged.iter().find(|s| s.name == "dup").unwrap().content, "L");
     }
 
     // ── Layout co-existence ──────────────────────────────────────────────

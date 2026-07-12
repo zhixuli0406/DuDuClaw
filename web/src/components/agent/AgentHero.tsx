@@ -44,6 +44,10 @@ export function AgentHero({
   onPause: () => void;
   onResume: () => void;
 }) {
+  // `detail.avatar` (from inspect) is the source of truth for the hero image;
+  // `undefined` would auto-resolve from cache, so pass `null` explicitly to keep
+  // the generative face when there is no upload.
+  const avatar = detail.avatar ?? null;
   const intl = useIntl();
   const lifecycle = detail.status as AgentLifecycle;
   const pose = agentPose(lifecycle, live);
@@ -81,6 +85,7 @@ export function AgentHero({
           pose={pose}
           emote={emote}
           live={live}
+          avatar={avatar}
         />
       </div>
 
@@ -94,7 +99,14 @@ export function AgentHero({
               {intl.formatMessage({ id: `status.${detail.status}` })}
             </Badge>
           </div>
-          <p className="mt-0.5 truncate text-sm text-stone-500 dark:text-stone-400">{title}</p>
+          <p className="mt-0.5 flex flex-wrap items-center gap-x-2 truncate text-sm text-stone-500 dark:text-stone-400">
+            <span className="truncate">{title}</span>
+            {detail.department && (
+              <Badge tone="neutral">
+                {intl.formatMessage({ id: 'agents.department.label' })}: {detail.department}
+              </Badge>
+            )}
+          </p>
           <p className="mt-1 text-sm text-stone-600 dark:text-stone-300">
             <span aria-hidden="true">{moodEmoji[moodKey] ?? '😌'} </span>
             {intl.formatMessage({ id: `agentDetail.mood.${moodKey}` })}

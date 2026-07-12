@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useSearchParams } from 'react-router';
-import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
+import { useChatStore, historyToMessages, type PendingAttachment } from '@/stores/chat-store';
+import { api, type ChatSessionSummary } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
 import { cn } from '@/lib/utils';
 import { Send, RotateCcw, Loader2, Paperclip, Eye, EyeOff } from 'lucide-react';
@@ -15,6 +16,7 @@ import {
   CenterStage,
   CornerDuDu,
   EmployeeRow,
+  SessionHistoryMenu,
   useChatFace,
   MicButton,
   VoicePlayToggle,
@@ -46,10 +48,12 @@ export function WebChatPage() {
     isRecording,
     ttsEnabled,
     setTtsEnabled,
+    sessionId,
     connect,
     send,
     reset,
     selectAgent,
+    resumeSession,
   } = useChatStore();
 
   const agents = useAgentsStore((s) => s.agents);
@@ -86,6 +90,29 @@ export function WebChatPage() {
     () => (selectedAgentId ? agents.find((a) => a.name === selectedAgentId) ?? null : null),
     [agents, selectedAgentId],
   );
+  // The agent whose history to browse: the chosen employee, or (for DuDu) the
+  // main agent that backs the default assistant. Non-admin callers must pass a
+  // visible agent_id, so resolve one rather than relying on an admin default.
+  const mainAgentId = useMemo(
+    () => agents.find((a) => a.role === 'main')?.name ?? null,
+    [agents],
+  );
+  const historyAgentId = selectedAgentId ?? mainAgentId;
+
+  const handleResume = async (session: ChatSessionSummary) => {
+    try {
+      const hist = await api.chatSessions.history(session.session_id);
+      resumeSession(session.session_id, historyToMessages(hist.messages ?? []));
+    } catch {
+      toast.error(
+        intl.formatMessage({
+          id: 'webchat.history.loadFailed',
+          defaultMessage: '無法載入這個對話',
+        }),
+      );
+    }
+  };
+
   const partnerName = partner?.display_name ?? agentName;
   // Header icon follows the chosen partner (W6a fix: it previously stayed the
   // main agent's icon even after selecting a different employee).
@@ -305,6 +332,12 @@ export function WebChatPage() {
 
         <div className="flex items-center gap-1">
           <VoicePlayToggle />
+          <SessionHistoryMenu
+            key={historyAgentId ?? 'dudu'}
+            agentId={historyAgentId}
+            activeSessionId={sessionId}
+            onResume={handleResume}
+          />
           <Button
             variant="ghost"
             icon={RotateCcw}

@@ -8,6 +8,7 @@ export { TypingIndicator } from './TypingIndicator';
 export { TaskInsights } from './TaskInsights';
 export { CenterStage, CornerDuDu } from './ChatStage';
 export { EmployeeRow, type EmployeeRowAgent } from './EmployeeRow';
+export { SessionHistoryMenu } from './SessionHistoryMenu';
 export { useChatFace } from './useChatFace';
 export { sampleViseme, REST_VISEME } from './viseme-sampler';
 export { MicButton } from './MicButton';

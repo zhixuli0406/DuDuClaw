@@ -121,10 +121,14 @@ pub fn model_matches_provider(model: &str, provider: RuntimeType) -> bool {
     let is_claude = m.starts_with("claude");
     let is_openai = m.starts_with("gpt-") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("codex");
     let is_gemini = m.starts_with("gemini");
+    let is_grok = m.starts_with("grok");
     match provider {
-        RuntimeType::Claude => !(is_openai || is_gemini),
-        RuntimeType::Codex => !(is_claude || is_gemini),
-        RuntimeType::Gemini | RuntimeType::Antigravity => !(is_claude || is_openai),
+        RuntimeType::Claude => !(is_openai || is_gemini || is_grok),
+        RuntimeType::Codex => !(is_claude || is_gemini || is_grok),
+        RuntimeType::Gemini | RuntimeType::Antigravity => !(is_claude || is_openai || is_grok),
+        // Grok serves `grok-*` (e.g. grok-build-0.1, grok-4.x); reject other
+        // known families, accept grok + unknowns.
+        RuntimeType::Grok => !(is_claude || is_openai || is_gemini),
         RuntimeType::OpenAiCompat => true,
     }
 }
@@ -716,10 +720,17 @@ mod tests {
         assert!(!model_matches_provider("gemini-3.1-pro", Claude));
         assert!(!model_matches_provider("claude-sonnet-4-6", Codex));
         assert!(!model_matches_provider("gpt-5.4", Gemini));
+        // R4: grok models reject other providers; foreign models reject Grok.
+        assert!(!model_matches_provider("grok-build-0.1", Claude));
+        assert!(!model_matches_provider("claude-sonnet-4-6", Grok));
+        assert!(!model_matches_provider("gpt-5.4", Grok));
+        assert!(!model_matches_provider("gemini-3.5-flash", Grok));
         // Correct pairings
         assert!(model_matches_provider("claude-haiku-4-5", Claude));
         assert!(model_matches_provider("gpt-5.4-mini", Codex));
         assert!(model_matches_provider("gemini-3.5-flash", Antigravity));
+        assert!(model_matches_provider("grok-build-0.1", Grok));
+        assert!(model_matches_provider("grok-4", Grok));
         // Qualified form + unknown families + compat always pass
         assert!(model_matches_provider("anthropic/claude-sonnet-5", Claude));
         assert!(model_matches_provider("deepseek-v3.2", Claude));

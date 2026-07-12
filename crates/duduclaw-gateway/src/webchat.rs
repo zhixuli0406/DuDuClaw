@@ -297,45 +297,19 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
         }
     }
 
-    // Determine the default agent
-    let (agent_name, agent_icon, agent_id, model_id) = {
+    // The default (main) agent id — still needed later for resume-ownership
+    // checks; the rest of the session_info fields are built by the shared helper.
+    let agent_id = {
         let reg = state.ctx.registry.read().await;
-        match reg.main_agent() {
-            Some(a) => (
-                a.config.agent.display_name.clone(),
-                a.config.agent.icon.clone(),
-                a.config.agent.name.clone(),
-                a.config.model.preferred.clone(),
-            ),
-            None => (
-                // §10.6: fall back to the white-label product name, not the literal.
-                crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home()),
-                "🐾".to_string(),
-                String::new(),
-                String::new(),
-            ),
-        }
+        reg.main_agent()
+            .map(|a| a.config.agent.name.clone())
+            .unwrap_or_default()
     };
 
-    // Resolve whether this agent's model supports image understanding so the
-    // dashboard can label the upload control and warn appropriately.
-    let supports_vision = if agent_id.is_empty() {
-        false
-    } else {
-        let agent_dir = state.ctx.home_dir.join("agents").join(&agent_id);
-        let provider = crate::runtime_config::agent_runtime_provider(&agent_dir);
-        crate::model_capabilities::supports_vision(provider, &model_id)
-    };
-
-    // Send session info on connect
+    // Send session info on connect — the same frame the WP3 resume path echoes
+    // (`agent = None` ⇒ the main/default agent), so the two stay byte-identical.
     let session_id = format!("webchat:{user_id}");
-    let info_msg = ChatMessage::SessionInfo {
-        session_id: session_id.clone(),
-        agent_name,
-        agent_icon,
-        supports_vision,
-        model: model_id,
-    };
+    let info_msg = build_session_info_frame(&state, &session_id, None).await;
     if let Ok(json) = serde_json::to_string(&info_msg) {
         let _ = sink.send(Message::Text(json.into())).await;
     }
@@ -385,8 +359,6 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 
                         match chat_msg {
                             ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments } => {
-                                let base_sid = custom_session.as_deref().unwrap_or(&session_id);
-
                                 // ── L1: resolve the requested conversation partner ──
                                 // A non-empty `agent` must resolve to a loaded
                                 // agent; an unknown id fails closed with an error
@@ -397,7 +369,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     .as_deref()
                                     .map(str::trim)
                                     .filter(|s| !s.is_empty());
-                                let resolved_agent: Option<String> = match requested_agent {
+                                let requested_agent: Option<String> = match requested_agent {
                                     Some(name) => {
                                         let exists = {
                                             let reg = state.ctx.registry.read().await;
@@ -418,24 +390,171 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     None => None,
                                 };
 
-                                // Per-agent session isolation: append an
-                                // `#agent:<id>` suffix so employee A's context
-                                // never leaks into employee B's session. The
-                                // channel prefix (split at ':') stays "webchat",
-                                // so the access gate still classifies it. Default
-                                // path keeps the bare `base_sid` (byte-compatible).
+                                // ── WP3: resume-vs-new session resolution ──
+                                // The connection announces its own auto session id
+                                // (`session_id`) in the `session_info` frame on
+                                // connect; the client echoes it on every turn of
+                                // the *current* conversation. A `session_id` that
+                                // DIFFERS from the connection's own id is a RESUME
+                                // request for a stored past session: it must
+                                // already exist (fail closed — never silently open
+                                // a new one), and a named `agent` must match the
+                                // session's stored owner. Absent / own-id → the
+                                // new-or-continue path, byte-compatible with the
+                                // pre-WP3 behaviour (including the per-agent
+                                // `#agent:` suffix).
+                                let requested_sid = custom_session
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty());
+                                let is_resume = matches!(requested_sid, Some(s) if s != session_id);
+
                                 let sid_owned;
-                                let sid: &str = match &resolved_agent {
-                                    Some(a) => {
-                                        sid_owned = format!("{base_sid}#agent:{a}");
-                                        &sid_owned
+                                let sid: &str;
+                                // The agent the reply actually routes to. On resume
+                                // it is adopted from the stored session when the
+                                // client didn't name one; otherwise it is the
+                                // client's requested agent (None = main/default).
+                                let mut effective_agent: Option<String> = requested_agent.clone();
+
+                                if is_resume {
+                                    let want = requested_sid.unwrap().to_string();
+
+                                    // ── F3: cross-session / cross-channel resume guard ──
+                                    // Without this, any WS client could resume an
+                                    // arbitrary `webchat:…` (or `telegram:…`) session
+                                    // id and read/write another user's conversation:
+                                    // the resume path only checked that a named agent
+                                    // matched the session's stored owner, not that the
+                                    // *connection* owns the session.
+                                    //
+                                    // A webchat connection announces its own session id
+                                    // `webchat:webchat:{peer_ip}:{random-suffix}` and
+                                    // every session it creates shares that id as a
+                                    // prefix (optionally a `#agent:<name>` suffix). We
+                                    // therefore only allow resuming a session that
+                                    // belongs to THIS connection's ownership scope:
+                                    //   * exactly the connection's own session id, or
+                                    //   * one derived from it (`{session_id}#…`).
+                                    // This rejects cross-channel ids (telegram:/discord:
+                                    // never share the prefix) and any session minted by
+                                    // a different connection (different random suffix).
+                                    //
+                                    // Residual limitation (honest DEGRADED): because a
+                                    // webchat identity is only ephemeral IP + random
+                                    // suffix (no durable user), a session created on a
+                                    // *previous* connection cannot be securely resumed
+                                    // on a fresh one — it fails closed here. That is the
+                                    // cost of closing the cross-user read/write hole
+                                    // until webchat gains a real authenticated user id.
+                                    let owns_session = want == session_id
+                                        || want.starts_with(&format!("{session_id}#"));
+                                    if !owns_session {
+                                        warn!(
+                                            "WebChat resume denied: session {want} not owned by connection {session_id}"
+                                        );
+                                        let err = ChatMessage::Error {
+                                            message: "conversation not found".to_string(),
+                                        };
+                                        if let Ok(json) = serde_json::to_string(&err) {
+                                            let _ = sink.send(Message::Text(json.into())).await;
+                                        }
+                                        continue;
                                     }
-                                    None => base_sid,
-                                };
+
+                                    match state.ctx.session_manager.session_agent(&want).await {
+                                        Ok(Some(stored_agent)) => {
+                                            // Identity guard: a named agent must own
+                                            // the resumed session.
+                                            if let Some(a) = &requested_agent {
+                                                if a != &stored_agent {
+                                                    let err = ChatMessage::Error {
+                                                        message: "this conversation belongs to a different AI staff member".to_string(),
+                                                    };
+                                                    if let Ok(json) = serde_json::to_string(&err) {
+                                                        let _ = sink.send(Message::Text(json.into())).await;
+                                                    }
+                                                    continue;
+                                                }
+                                            }
+                                            // Route to the session's true owner. The
+                                            // main/default agent keeps the
+                                            // byte-compatible default path (None);
+                                            // any other agent must still be loaded.
+                                            if stored_agent == agent_id {
+                                                effective_agent = None;
+                                            } else {
+                                                let loaded = {
+                                                    let reg = state.ctx.registry.read().await;
+                                                    reg.get(&stored_agent).is_some()
+                                                };
+                                                if !loaded {
+                                                    let err = ChatMessage::Error {
+                                                        message: "the AI staff member for this conversation is no longer available".to_string(),
+                                                    };
+                                                    if let Ok(json) = serde_json::to_string(&err) {
+                                                        let _ = sink.send(Message::Text(json.into())).await;
+                                                    }
+                                                    continue;
+                                                }
+                                                effective_agent = Some(stored_agent.clone());
+                                            }
+                                            // Resume writes into the stored session
+                                            // verbatim — no re-suffixing.
+                                            sid_owned = want;
+                                            sid = &sid_owned;
+
+                                            // Echo the effective session so the
+                                            // client can confirm the resume took and
+                                            // refresh the header to the owning agent.
+                                            let info = build_session_info_frame(
+                                                &state, sid, effective_agent.as_deref(),
+                                            )
+                                            .await;
+                                            if let Ok(json) = serde_json::to_string(&info) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                        }
+                                        Ok(None) => {
+                                            let err = ChatMessage::Error {
+                                                message: "conversation not found".to_string(),
+                                            };
+                                            if let Ok(json) = serde_json::to_string(&err) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            warn!("WebChat resume lookup failed: {e}");
+                                            let err = ChatMessage::Error {
+                                                message: "failed to load conversation".to_string(),
+                                            };
+                                            if let Ok(json) = serde_json::to_string(&err) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    // New / continue the current connection's
+                                    // session. Per-agent session isolation: append
+                                    // an `#agent:<id>` suffix so employee A's
+                                    // context never leaks into employee B's session.
+                                    // The channel prefix (split at ':') stays
+                                    // "webchat" so the access gate still classifies
+                                    // it. Default path keeps the bare id.
+                                    let base_sid: &str = session_id.as_str();
+                                    sid_owned = match &effective_agent {
+                                        Some(a) => format!("{base_sid}#agent:{a}"),
+                                        None => base_sid.to_string(),
+                                    };
+                                    sid = &sid_owned;
+                                }
+
                                 // The agent id used for chat-command handling /
-                                // contract enforcement — the selected agent when
-                                // one was routed, else the default main agent.
-                                let effective_agent_id: &str = resolved_agent.as_deref().unwrap_or(&agent_id);
+                                // contract enforcement — the routed agent when one
+                                // was selected/adopted, else the default main agent.
+                                let effective_agent_id: &str = effective_agent.as_deref().unwrap_or(&agent_id);
 
                                 // Persist any uploaded files and append path references
                                 // to the prompt — the agent (Claude CLI) reads them from
@@ -486,7 +605,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // branches consume `on_progress`; they are
                                 // mutually exclusive so the single move is valid.
                                 let work = async {
-                                    match &resolved_agent {
+                                    match &effective_agent {
                                         Some(a) => {
                                             crate::channel_reply::build_reply_for_agent(
                                                 &full_content, &state.ctx, a, sid, &user_id, Some(on_progress),
@@ -582,6 +701,53 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 
     state.release_connection(&rate_limit_id).await;
     info!("WebChat connection terminated: {user_id}");
+}
+
+/// Build a `session_info` frame for `session_id` describing the agent that will
+/// answer (`agent = None` → the main/default agent). WP3 uses this to echo the
+/// effective session on resume so the client can confirm the switch and refresh
+/// its header. Falls back to the white-label product name when no agent is
+/// loaded — mirrors the connect-time computation.
+async fn build_session_info_frame(
+    state: &Arc<WebChatState>,
+    session_id: &str,
+    agent: Option<&str>,
+) -> ChatMessage {
+    let (agent_name, agent_icon, resolved_id, model_id) = {
+        let reg = state.ctx.registry.read().await;
+        let resolved = match agent {
+            Some(a) => reg.get(a),
+            None => reg.main_agent(),
+        };
+        match resolved {
+            Some(a) => (
+                a.config.agent.display_name.clone(),
+                a.config.agent.icon.clone(),
+                a.config.agent.name.clone(),
+                a.config.model.preferred.clone(),
+            ),
+            None => (
+                crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home()),
+                "🐾".to_string(),
+                String::new(),
+                String::new(),
+            ),
+        }
+    };
+    let supports_vision = if resolved_id.is_empty() {
+        false
+    } else {
+        let agent_dir = state.ctx.home_dir.join("agents").join(&resolved_id);
+        let provider = crate::runtime_config::agent_runtime_provider(&agent_dir);
+        crate::model_capabilities::supports_vision(provider, &model_id)
+    };
+    ChatMessage::SessionInfo {
+        session_id: session_id.to_string(),
+        agent_name,
+        agent_icon,
+        supports_vision,
+        model: model_id,
+    }
 }
 
 /// Decode, size-check, and persist WebChat attachments to `<home>/attachments/`,

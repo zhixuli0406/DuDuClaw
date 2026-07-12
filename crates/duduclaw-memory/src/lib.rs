@@ -8,6 +8,7 @@ pub mod gdpr;
 pub mod graph_rank;
 pub mod import;
 pub mod janitor;
+pub mod lifecycle;
 pub mod router;
 pub mod search;
 pub mod trust_store;
@@ -27,6 +28,7 @@ pub use engine::{
 pub use feedback::{CitationTracker, DrainOnDrop, TrustSignal, WikiCitation};
 pub use gdpr::{gdpr_erase, gdpr_export, GdprEraseSummary};
 pub use janitor::{JanitorConfig, JanitorReport, WikiJanitor};
+pub use lifecycle::{reassign_agent, reassign_agent_cross_db, ReassignSummary};
 pub use router::classify;
 pub use trust_store::{TrustUpdateOutcome, UpsertResult, WikiTrustSnapshot, WikiTrustStore};
 pub use user_code::{

@@ -1,9 +1,10 @@
 import { useIntl } from 'react-intl';
-import { Plug, KeyRound, Building2 } from 'lucide-react';
+import { Plug, KeyRound, Building2, UserSearch } from 'lucide-react';
 import { TabbedMerge, type MergeTab } from '@/components/layout/TabbedMerge';
 import { McpPage } from './McpPage';
 import { McpKeysPage } from './McpKeysPage';
 import { OdooPage } from './OdooPage';
+import { IdentityPage } from './IdentityPage';
 
 /**
  * IntegrationsPage — the `/manage/integrations` surface merging MCP servers,
@@ -17,6 +18,7 @@ export function IntegrationsPage() {
     { id: 'mcp', label: intl.formatMessage({ id: 'integrations.tab.mcp' }), icon: Plug, render: () => <McpPage /> },
     { id: 'keys', label: intl.formatMessage({ id: 'integrations.tab.keys' }), icon: KeyRound, render: () => <McpKeysPage /> },
     { id: 'odoo', label: intl.formatMessage({ id: 'integrations.tab.odoo' }), icon: Building2, render: () => <OdooPage /> },
+    { id: 'identity', label: intl.formatMessage({ id: 'integrations.tab.identity' }), icon: UserSearch, render: () => <IdentityPage /> },
   ];
   return <TabbedMerge tabs={tabs} />;
 }

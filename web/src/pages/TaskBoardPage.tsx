@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type DragEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
@@ -12,7 +12,6 @@ import {
   Badge,
   Button,
   EmptyState,
-  Toolbar,
   GroupHeader,
   StatusIcon,
   PriorityIcon,
@@ -40,6 +39,12 @@ import {
 // ── Preferences (localStorage, §4.4) ────────────────────────
 const VIEW_KEY = 'duduclaw:tasks:view';
 const GROUP_KEY = 'duduclaw:tasks:group';
+// Persisted set of collapsed group/swimlane keys (shared by the list group-by
+// and the kanban by-agent swimlanes, both keyed by assignee).
+const COLLAPSE_KEY = 'duduclaw:tasks:collapsed';
+// When grouping by AI staff, auto-collapse the swimlanes once there are this
+// many buckets — so a large roster doesn't unfurl into a wall of boards.
+const MANY_AGENTS = 4;
 type ViewMode = 'kanban' | 'list';
 type GroupMode = 'status' | 'assignee';
 
@@ -54,6 +59,26 @@ function readPref<T extends string>(key: string, allowed: readonly T[], fallback
 function writePref(key: string, value: string) {
   try {
     localStorage.setItem(key, value);
+  } catch {
+    /* private mode — preference just won't persist */
+  }
+}
+
+function readCollapsed(): Set<string> {
+  try {
+    const raw = localStorage.getItem(COLLAPSE_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) return new Set(arr.filter((v): v is string => typeof v === 'string'));
+    }
+  } catch {
+    /* ignore malformed / unavailable storage */
+  }
+  return new Set();
+}
+function writeCollapsed(s: ReadonlySet<string>) {
+  try {
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...s]));
   } catch {
     /* private mode — preference just won't persist */
   }
@@ -289,7 +314,7 @@ export function TaskBoardPage() {
 
   const [view, setView] = useState<ViewMode>(() => readPref(VIEW_KEY, ['kanban', 'list'] as const, 'kanban'));
   const [group, setGroup] = useState<GroupMode>(() => readPref(GROUP_KEY, ['status', 'assignee'] as const, 'status'));
-  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(readCollapsed);
   const [showCreate, setShowCreate] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<TaskInfo | null>(null);
   const [burst, setBurst] = useState<{ agentId: string } | null>(null);
@@ -378,29 +403,54 @@ export function TaskBoardPage() {
     [tasks, filterAgent, filterPriority],
   );
 
-  // List grouping — by status (column order) or by assignee.
-  const listGroups = useMemo(() => {
-    if (group === 'assignee') {
-      const buckets = new Map<string, TaskInfo[]>();
-      for (const t of filteredTasks) {
-        const key = t.assigned_to || '__unassigned';
-        (buckets.get(key) ?? buckets.set(key, []).get(key)!).push(t);
-      }
-      return Array.from(buckets.entries()).map(([key, rows]) => ({
-        key,
-        label:
-          key === '__unassigned'
-            ? intl.formatMessage({ id: 'tasks.assignee.none' })
-            : agents.find((a) => a.name === key)?.display_name ?? key,
-        rows,
-      }));
+  // Per-AI-staff buckets (incl. an unassigned bucket) — the single grouping
+  // source shared by the list "by staff" view and the kanban swimlanes.
+  const agentBuckets = useMemo(() => {
+    const buckets = new Map<string, TaskInfo[]>();
+    for (const t of filteredTasks) {
+      const key = t.assigned_to || '__unassigned';
+      (buckets.get(key) ?? buckets.set(key, []).get(key)!).push(t);
     }
+    return Array.from(buckets.entries()).map(([key, rows]) => ({
+      key,
+      agentId: key === '__unassigned' ? undefined : key,
+      label:
+        key === '__unassigned'
+          ? intl.formatMessage({ id: 'tasks.assignee.none' })
+          : agents.find((a) => a.name === key)?.display_name ?? key,
+      rows,
+    }));
+  }, [filteredTasks, agents, intl]);
+
+  // List grouping — by status (column order) or by assignee (shared buckets).
+  const listGroups = useMemo(() => {
+    if (group === 'assignee') return agentBuckets;
     return COLUMNS.map(({ status }) => ({
       key: status,
+      agentId: undefined as string | undefined,
       label: intl.formatMessage({ id: `tasks.column.${status}` }),
       rows: filteredTasks.filter((t) => t.status === status),
     })).filter((g) => g.rows.length > 0);
-  }, [group, filteredTasks, agents, intl]);
+  }, [group, agentBuckets, filteredTasks, intl]);
+
+  // First time the user lands on an assignee grouping with a large roster,
+  // seed the swimlanes collapsed (unless they already have a saved preference).
+  const seededRef = useRef(false);
+  useEffect(() => {
+    if (seededRef.current || group !== 'assignee' || agentBuckets.length === 0) return;
+    seededRef.current = true;
+    let hasStored = false;
+    try {
+      hasStored = localStorage.getItem(COLLAPSE_KEY) != null;
+    } catch {
+      /* ignore */
+    }
+    if (!hasStored && agentBuckets.length >= MANY_AGENTS) {
+      const all = new Set(agentBuckets.map((b) => b.key));
+      setCollapsed(all);
+      writeCollapsed(all);
+    }
+  }, [group, agentBuckets]);
 
   const tasksByStatus = (status: TaskStatus) => filteredTasks.filter((t) => t.status === status);
 
@@ -409,6 +459,7 @@ export function TaskBoardPage() {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
+      writeCollapsed(next);
       return next;
     });
 
@@ -425,39 +476,42 @@ export function TaskBoardPage() {
         }
       />
 
-      <Toolbar>
-        <Filter className="h-4 w-4 text-stone-400" />
-        <select
-          className={cn(controlClass, 'w-auto min-w-[140px]')}
-          value={filterAgent ?? ''}
-          onChange={(e) => setFilterAgent(e.target.value || null)}
-        >
-          <option value="">
-            {intl.formatMessage({ id: 'tasks.filter.all' })} — {intl.formatMessage({ id: 'tasks.filter.agent' })}
-          </option>
-          {agents.map((a) => (
-            <option key={a.name} value={a.name}>
-              {a.display_name}
+      {/* Toolbar: filters grouped on the left, view toggle pinned to the far right
+          (justify-between) so the 看板/清單 switch reads as a distinct control, not
+          another filter. */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Filter className="h-4 w-4 text-stone-400" />
+          <select
+            className={cn(controlClass, 'w-auto min-w-[140px]')}
+            value={filterAgent ?? ''}
+            onChange={(e) => setFilterAgent(e.target.value || null)}
+          >
+            <option value="">
+              {intl.formatMessage({ id: 'tasks.filter.all' })} — {intl.formatMessage({ id: 'tasks.filter.agent' })}
             </option>
-          ))}
-        </select>
-        <select
-          className={cn(controlClass, 'w-auto min-w-[140px]')}
-          value={filterPriority ?? ''}
-          onChange={(e) => setFilterPriority((e.target.value as TaskPriority) || null)}
-        >
-          <option value="">
-            {intl.formatMessage({ id: 'tasks.filter.all' })} — {intl.formatMessage({ id: 'tasks.field.priority' })}
-          </option>
-          {(['low', 'medium', 'high', 'urgent'] as const).map((p) => (
-            <option key={p} value={p}>
-              {intl.formatMessage({ id: `tasks.priority.${p}` })}
+            {agents.map((a) => (
+              <option key={a.name} value={a.name}>
+                {a.display_name}
+              </option>
+            ))}
+          </select>
+          <select
+            className={cn(controlClass, 'w-auto min-w-[140px]')}
+            value={filterPriority ?? ''}
+            onChange={(e) => setFilterPriority((e.target.value as TaskPriority) || null)}
+          >
+            <option value="">
+              {intl.formatMessage({ id: 'tasks.filter.all' })} — {intl.formatMessage({ id: 'tasks.field.priority' })}
             </option>
-          ))}
-        </select>
+            {(['low', 'medium', 'high', 'urgent'] as const).map((p) => (
+              <option key={p} value={p}>
+                {intl.formatMessage({ id: `tasks.priority.${p}` })}
+              </option>
+            ))}
+          </select>
 
-        {/* Group-by (list view only) */}
-        {view === 'list' && (
+          {/* Group-by — applies to both the list groups and the kanban swimlanes. */}
           <select
             className={cn(controlClass, 'w-auto min-w-[130px]')}
             value={group}
@@ -467,10 +521,9 @@ export function TaskBoardPage() {
             <option value="status">{intl.formatMessage({ id: 'tasks.groupBy.status' })}</option>
             <option value="assignee">{intl.formatMessage({ id: 'tasks.groupBy.assignee' })}</option>
           </select>
-        )}
+        </div>
 
-        {/* Kanban ⇄ List view toggle */}
-        <div className="flex-1" />
+        {/* Kanban ⇄ List view toggle — pinned right, separated from the filters. */}
         <div className="inline-flex rounded-control border border-stone-300/50 p-0.5 dark:border-white/10">
           {(
             [
@@ -495,7 +548,7 @@ export function TaskBoardPage() {
             </button>
           ))}
         </div>
-      </Toolbar>
+      </div>
 
       {tasks.length === 0 && !loading && (
         <Card padded={false}>
@@ -504,20 +557,64 @@ export function TaskBoardPage() {
       )}
 
       {view === 'kanban' ? (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-          {COLUMNS.map(({ status, icon }) => (
-            <KanbanColumn
-              key={status}
-              status={status}
-              icon={icon}
-              tasks={tasksByStatus(status)}
-              agents={agents}
-              onDrop={handleDrop}
-              onOpen={openTask}
-              onRemove={setRemoveTarget}
-            />
-          ))}
-        </div>
+        group === 'assignee' ? (
+          // By-staff swimlanes: one collapsible board per AI employee.
+          <div className="space-y-4">
+            {agentBuckets.map((b) => {
+              const isCollapsed = collapsed.has(b.key);
+              return (
+                <div key={b.key}>
+                  <GroupHeader
+                    label={
+                      b.agentId ? (
+                        <span className="flex items-center gap-2">
+                          <CharacterAvatar agentId={b.agentId} name={b.label} size={22} animated={false} />
+                          {b.label}
+                        </span>
+                      ) : (
+                        b.label
+                      )
+                    }
+                    count={b.rows.length}
+                    collapsed={isCollapsed}
+                    onToggle={() => toggleGroup(b.key)}
+                  />
+                  {!isCollapsed && (
+                    <div className="mt-2 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+                      {COLUMNS.map(({ status, icon }) => (
+                        <KanbanColumn
+                          key={status}
+                          status={status}
+                          icon={icon}
+                          tasks={b.rows.filter((t) => t.status === status)}
+                          agents={agents}
+                          onDrop={handleDrop}
+                          onOpen={openTask}
+                          onRemove={setRemoveTarget}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+            {COLUMNS.map(({ status, icon }) => (
+              <KanbanColumn
+                key={status}
+                status={status}
+                icon={icon}
+                tasks={tasksByStatus(status)}
+                agents={agents}
+                onDrop={handleDrop}
+                onOpen={openTask}
+                onRemove={setRemoveTarget}
+              />
+            ))}
+          </div>
+        )
       ) : (
         <div className="space-y-4">
           {listGroups.map((g) => {

@@ -46,6 +46,26 @@ pub struct SessionMessage {
     pub timestamp: String,
 }
 
+/// A lightweight summary of a stored session, for the WebChat history picker
+/// (WP3). `title` is the session's first still-visible user message, CJK-safe
+/// truncated — enough to recognise the conversation without loading it.
+pub struct SessionSummary {
+    pub id: String,
+    pub agent_id: String,
+    pub title: String,
+    pub last_active: String,
+    pub turn_count: u32,
+    pub total_tokens: u32,
+    pub lineage: u32,
+}
+
+/// Max characters kept for a session title (first user message). CJK-safe.
+const SESSION_TITLE_MAX_CHARS: usize = 80;
+
+/// Hard cap on how many sessions a single `list_sessions` call returns, so a
+/// caller cannot force an unbounded scan/response.
+const SESSION_LIST_MAX_LIMIT: usize = 200;
+
 /// SQLite-backed session manager with a simple connection pool (BE-H1).
 pub struct SessionManager {
     pool: Vec<Mutex<Connection>>,
@@ -189,6 +209,17 @@ impl SessionManager {
         );
         let _ = conn.execute(
             "ALTER TABLE sessions ADD COLUMN checkpoint_message_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
+        // E2 (2026-07-12): `list_sessions` orders by `last_active DESC` (optionally
+        // scoped to one agent). Without this index SQLite full-scans `sessions` and
+        // sorts every row before applying LIMIT — the WP3 SessionHistoryMenu popover
+        // refetches on every open, so this is a hot read path. The composite
+        // (agent_id, last_active) serves the agent-scoped popover directly.
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_last_active
+                ON sessions(agent_id, last_active)",
             [],
         );
 
@@ -875,6 +906,103 @@ impl SessionManager {
         }
         Ok(out)
     }
+
+    // ── WP3: WebChat session history list + resume ─────────────────
+
+    /// List stored sessions for the WebChat history picker (WP3), newest first.
+    ///
+    /// - `agent_id`: `Some` restricts to a single agent; `None` lists across
+    ///   every agent. Authz (admins-only for the unscoped case) is enforced by
+    ///   the RPC layer — this method does not filter by user.
+    /// - Archived (soft-deleted) sessions are excluded, matching the normal
+    ///   listing semantics elsewhere in this module.
+    /// - `title` is the first still-visible user message, truncated to
+    ///   [`SESSION_TITLE_MAX_CHARS`] characters (CJK-safe via `truncate_chars`);
+    ///   empty when the session has no user turn yet.
+    /// - `limit` is clamped to [`SESSION_LIST_MAX_LIMIT`].
+    pub async fn list_sessions(
+        &self,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>> {
+        let conn = self.acquire().await;
+        let capped = limit.min(SESSION_LIST_MAX_LIMIT) as i64;
+
+        // E2: compute the per-row title/turn correlated subqueries ONLY for the
+        // rows already narrowed by the inner LIMIT, instead of every row in
+        // `sessions`. The inner query does the filter + `ORDER BY last_active
+        // DESC LIMIT` (served by `idx_sessions_last_active`); the outer query
+        // then runs the two subqueries against that small derived set `s`. The
+        // two variants differ only in the agent filter, kept as separate static
+        // SQL so parameters bind positionally (no string interpolation of
+        // values, no injection surface). Result shape and ordering are unchanged.
+        let outer_head = "SELECT s.id, s.agent_id, s.last_active, s.total_tokens,
+                    COALESCE(s.lineage, 1),
+                    (SELECT COUNT(*) FROM session_messages m
+                       WHERE m.session_id = s.id AND m.hidden = 0 AND m.undone_at IS NULL) AS turns,
+                    (SELECT m2.content FROM session_messages m2
+                       WHERE m2.session_id = s.id AND m2.role = 'user'
+                         AND m2.hidden = 0 AND m2.undone_at IS NULL
+                       ORDER BY m2.id ASC LIMIT 1) AS first_user
+             FROM (";
+        let outer_tail = ") s ORDER BY s.last_active DESC";
+
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<SessionSummary> {
+            let first_user: Option<String> = row.get(6)?;
+            let title = first_user
+                .as_deref()
+                .map(|s| duduclaw_core::truncate_chars(s.trim(), SESSION_TITLE_MAX_CHARS))
+                .unwrap_or_default();
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                last_active: row.get(2)?,
+                total_tokens: row.get(3)?,
+                lineage: row.get::<_, i64>(4)?.max(1) as u32,
+                turn_count: row.get::<_, i64>(5)?.max(0) as u32,
+                title,
+            })
+        };
+
+        let mut out = Vec::new();
+        match agent_id {
+            Some(a) => {
+                let sql = format!(
+                    "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage \
+                     FROM sessions \
+                     WHERE archived_at IS NULL AND agent_id = ?1 \
+                     ORDER BY last_active DESC LIMIT ?2{outer_tail}"
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+                let rows = stmt
+                    .query_map(params![a, capped], map_row)
+                    .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+                for r in rows {
+                    out.push(r.map_err(|e| DuDuClawError::Gateway(e.to_string()))?);
+                }
+            }
+            None => {
+                let sql = format!(
+                    "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage \
+                     FROM sessions \
+                     WHERE archived_at IS NULL \
+                     ORDER BY last_active DESC LIMIT ?1{outer_tail}"
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+                let rows = stmt
+                    .query_map(params![capped], map_row)
+                    .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+                for r in rows {
+                    out.push(r.map_err(|e| DuDuClawError::Gateway(e.to_string()))?);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -899,6 +1027,50 @@ mod tests {
         // purge = hard delete: messages gone.
         mgr.purge_session("s1").await.unwrap();
         assert_eq!(mgr.get_messages("s1").await.unwrap().len(), 0, "purge removes messages");
+    }
+
+    #[tokio::test]
+    async fn e2_list_sessions_limit_order_and_title() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+
+        // Three sessions for the same agent; each user turn bumps last_active.
+        // Append in s1 → s2 → s3 order so s3 is the most recently active.
+        for (sid, first) in [("s1", "第一個問題"), ("s2", "second question"), ("s3", "third")] {
+            mgr.get_or_create(sid, "agent-x").await.unwrap();
+            mgr.append_message(sid, "user", first, 3).await.unwrap();
+            mgr.append_message(sid, "assistant", "reply", 3).await.unwrap();
+            // Tiny gap so rfc3339 last_active timestamps are strictly ordered.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // A session for a DIFFERENT agent — must not leak into the scoped list.
+        mgr.get_or_create("other", "agent-y").await.unwrap();
+        mgr.append_message("other", "user", "不該出現", 3).await.unwrap();
+
+        // Agent-scoped list: newest first, correct title (first user turn) and
+        // turn_count (visible messages only).
+        let scoped = mgr.list_sessions(Some("agent-x"), 10).await.unwrap();
+        assert_eq!(scoped.len(), 3, "only agent-x sessions");
+        assert_eq!(scoped[0].id, "s3", "newest last_active first");
+        assert_eq!(scoped[0].title, "third");
+        assert_eq!(scoped[0].turn_count, 2, "2 visible messages");
+        assert!(scoped.iter().all(|s| s.agent_id == "agent-x"));
+
+        // LIMIT is honored AFTER ordering: the single row is the newest one.
+        let limited = mgr.list_sessions(Some("agent-x"), 1).await.unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, "s3", "LIMIT keeps the newest, not an arbitrary row");
+
+        // Unscoped list spans agents (admin path) and stays newest-first.
+        let all = mgr.list_sessions(None, 10).await.unwrap();
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0].id, "other", "the other-agent session was appended last");
+
+        // Archived sessions drop out of both listings.
+        mgr.delete_session("s3").await.unwrap();
+        let after = mgr.list_sessions(Some("agent-x"), 10).await.unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(after.iter().all(|s| s.id != "s3"));
     }
 
     #[tokio::test]
@@ -1081,5 +1253,107 @@ mod tests {
         // Non-existent session returns empty (not error)
         let pinned = mgr.get_pinned("does-not-exist").await.unwrap();
         assert!(pinned.is_empty());
+    }
+
+    // ── WP3: session list + resume support ─────────────────────────
+
+    #[tokio::test]
+    async fn wp3_list_sessions_by_agent_newest_first_with_titles() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+
+        // Agent "alice": two sessions, plus one belonging to another agent.
+        mgr.get_or_create("webchat:s1", "alice").await.unwrap();
+        mgr.append_message("webchat:s1", "user", "第一個問題：怎麼部署", 6).await.unwrap();
+        mgr.append_message("webchat:s1", "assistant", "答覆", 2).await.unwrap();
+
+        mgr.get_or_create("webchat:s2", "alice").await.unwrap();
+        mgr.append_message("webchat:s2", "user", "second question about billing", 5).await.unwrap();
+
+        mgr.get_or_create("webchat:other", "bob").await.unwrap();
+        mgr.append_message("webchat:other", "user", "bob's private chat", 4).await.unwrap();
+
+        // Scoped list only returns alice's sessions, newest (s2) first.
+        let list = mgr.list_sessions(Some("alice"), 50).await.unwrap();
+        assert_eq!(list.len(), 2, "only alice's sessions, not bob's");
+        assert_eq!(list[0].id, "webchat:s2", "most recently active first");
+        assert_eq!(list[0].title, "second question about billing");
+        assert_eq!(list[1].id, "webchat:s1");
+        // CJK title survives whole (well under the char cap).
+        assert_eq!(list[1].title, "第一個問題：怎麼部署");
+        // Turn counts reflect visible messages.
+        assert_eq!(list[1].turn_count, 2);
+        assert_eq!(list[0].turn_count, 1);
+
+        // Unscoped list (admin path) sees every agent's sessions.
+        let all = mgr.list_sessions(None, 50).await.unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn wp3_title_truncates_cjk_safely() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("webchat:long", "alice").await.unwrap();
+        // 200 CJK chars — longer than SESSION_TITLE_MAX_CHARS (80).
+        let long: String = "測".repeat(200);
+        mgr.append_message("webchat:long", "user", &long, 100).await.unwrap();
+
+        let list = mgr.list_sessions(Some("alice"), 50).await.unwrap();
+        assert_eq!(list.len(), 1);
+        // Truncated to exactly 80 *characters* (not bytes) — no panic, no
+        // mid-codepoint split.
+        assert_eq!(list[0].title.chars().count(), SESSION_TITLE_MAX_CHARS);
+        assert!(list[0].title.chars().all(|c| c == '測'));
+    }
+
+    #[tokio::test]
+    async fn wp3_archived_sessions_excluded_from_list() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("webchat:live", "alice").await.unwrap();
+        mgr.append_message("webchat:live", "user", "live one", 2).await.unwrap();
+        mgr.get_or_create("webchat:gone", "alice").await.unwrap();
+        mgr.append_message("webchat:gone", "user", "archive me", 2).await.unwrap();
+
+        mgr.delete_session("webchat:gone").await.unwrap(); // soft delete = archive
+
+        let list = mgr.list_sessions(Some("alice"), 50).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "webchat:live");
+    }
+
+    #[tokio::test]
+    async fn wp3_session_agent_resolves_owner_and_missing() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("webchat:s1", "alice").await.unwrap();
+
+        assert_eq!(
+            mgr.session_agent("webchat:s1").await.unwrap().as_deref(),
+            Some("alice")
+        );
+        // Unknown id → None (caller must fail closed, not open a new session).
+        assert_eq!(mgr.session_agent("webchat:nope").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn wp3_resume_writes_into_specified_session() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+
+        // Two distinct sessions for the same agent.
+        mgr.get_or_create("webchat:old", "alice").await.unwrap();
+        mgr.append_message("webchat:old", "user", "old turn", 2).await.unwrap();
+        mgr.get_or_create("webchat:new", "alice").await.unwrap();
+
+        // Resuming "old" appends there, leaving "new" untouched — proving a
+        // resume targets the requested session, not a fresh one.
+        mgr.append_message("webchat:old", "user", "resumed turn", 3).await.unwrap();
+
+        let old_msgs = mgr.get_messages("webchat:old").await.unwrap();
+        assert_eq!(old_msgs.len(), 2);
+        assert_eq!(old_msgs[1].content, "resumed turn");
+        assert_eq!(mgr.get_messages("webchat:new").await.unwrap().len(), 0);
     }
 }

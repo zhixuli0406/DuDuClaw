@@ -44,6 +44,12 @@ pub mod keys {
     /// admin-gated chat commands (`!STOP` / `!STOP ALL` / `!RESUME`).
     /// Missing or empty = NO admins on that channel (fail-closed).
     pub const ADMIN_USERS: &str = "admin_users";
+    /// WP9: whether this is a company shared bot where employees bind to their
+    /// own agent via a `/start <token>` deep-link. Values: "true" / "false".
+    /// Default false = the global bot keeps its existing default-agent routing.
+    /// When true, an unbound user on the shared bot is shown a bind-first
+    /// guidance message instead of being answered by the default agent.
+    pub const SHARED_BOT_BINDING: &str = "shared_bot_binding";
 }
 
 /// Cache key: (channel_type, scope_id, key)

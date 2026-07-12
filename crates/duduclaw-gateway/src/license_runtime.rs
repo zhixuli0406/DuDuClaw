@@ -332,6 +332,10 @@ pub struct LicenseSnapshot {
     pub last_phone_home: Option<chrono::DateTime<Utc>>,
     pub days_since_phone_home: Option<i64>,
     pub fingerprint_match: Option<bool>,
+    /// WP8: the active license's signed white-label field-level edit claim, if
+    /// any. `None` (no claim) resolves to the full vendor-editable set — see
+    /// `crate::branding::resolve_edit_scope`.
+    pub branding_editable: Option<Vec<String>>,
 }
 
 impl LicenseSnapshot {
@@ -350,6 +354,7 @@ impl LicenseSnapshot {
             last_phone_home: license.map(|l| l.last_phone_home),
             days_since_phone_home: license.map(|l| l.days_since_phone_home()),
             fingerprint_match: license.map(|l| l.is_valid_for_machine(current_fp)),
+            branding_editable: license.and_then(|l| l.branding_editable.clone()),
         }
     }
 }

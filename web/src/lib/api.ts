@@ -7,10 +7,23 @@ export interface AgentInfo {
   name: string;
   display_name: string;
   role: 'main' | 'specialist' | 'worker';
+  // Note: the backend also reports "archived" here, but archive state is read
+  // from the dedicated `archived` boolean below (the narrow union keeps the many
+  // status-driven components — poses, world stage, assignee — unchanged).
   status: 'active' | 'paused' | 'terminated';
   trigger: string;
   icon: string;
   reports_to: string;
+  /** WP4 — archived (recoverable off-board). Hidden from the roster unless
+   *  `agents.list` is called with `include_archived: true`. */
+  archived?: boolean;
+  /** WP4 — an uploaded avatar image exists on disk. The bytes are NOT in the
+   *  list payload (kept light); resolve them via the lightweight `agents.avatar`
+   *  RPC (see the `agent-avatar-store`). */
+  has_avatar?: boolean;
+  /** WP7 — the department this AI staff member belongs to (company → department
+   *  → personal layering). Empty/absent = no department. */
+  department?: string;
 }
 
 export interface AgentBudget {
@@ -69,6 +82,13 @@ export interface AgentDetail extends AgentInfo {
   sticker?: AgentSticker;
   evolution?: AgentEvolution;
   proactive?: ProactiveSettings;
+  /** WP4 — the uploaded avatar as an inline data URI, or null when none.
+   *  `agents.inspect` returns this alongside the full detail; the avatar store
+   *  uses the lighter `agents.avatar` RPC when it only needs the image. */
+  avatar?: string | null;
+  /** [capabilities] block — returned by agents.inspect so the capability editor
+   *  (incl. the Progent policy rules) can prefill existing values. */
+  capabilities?: AgentCapabilities;
 }
 
 export interface VoiceSettings {
@@ -939,6 +959,9 @@ export interface AgentUpdateParams {
   trigger?: string;
   icon?: string;
   reports_to?: string;
+  /** WP7 — department (ASCII alphanumeric + `-`/`_`, 1..=64). Empty string
+   *  clears it (the agent leaves its department). Admin-only server-side. */
+  department?: string;
   // Model
   preferred?: string;
   fallback?: string;
@@ -1034,6 +1057,36 @@ export interface AgentUpdateParams {
   cultural_context?: Record<string, string | number | boolean>;
 }
 
+// ── WP4: agent handoff (offboard with transfer) ─────────────────
+
+export interface AgentHandoffParams {
+  from_agent: string;
+  to_agent: string;
+  /** Move episodic + semantic memory + key facts. Default true. */
+  memory?: boolean;
+  /** Move the agent's private wiki pages. Default true. */
+  wiki?: boolean;
+  /** Reassign open tasks. Default true. */
+  tasks?: boolean;
+  /** Archive the source agent once the transfer completes. Default true. */
+  auto_archive?: boolean;
+}
+
+/** Result of `agents.handoff`. `status` is COMPLETE only when every requested
+ *  sub-move succeeded; otherwise PARTIAL with `errors[]` populated and
+ *  `success: false`. Each sub-object is present only when its move was requested. */
+export interface AgentHandoffResult {
+  success: boolean;
+  status: 'COMPLETE' | 'PARTIAL';
+  from_agent: string;
+  to_agent: string;
+  memory?: { moved?: number; memories?: number; key_facts?: number; archived_rows?: number; error?: string };
+  wiki?: { files_moved?: number; error?: string };
+  tasks?: { reassigned?: number; error?: string };
+  auto_archive?: { archived?: boolean; skipped?: string; error?: string };
+  errors?: string[];
+}
+
 // ── ODO: per-agent [odoo] override ──────────────────────────────
 
 /** The `odoo` object accepted by `agents.update`. All fields optional —
@@ -1057,7 +1110,7 @@ export interface AgentOdooOverride {
 
 // ── RT: per-agent [runtime] ─────────────────────────────────────
 
-export type RuntimeProvider = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'openai_compat';
+export type RuntimeProvider = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok' | 'openai_compat';
 
 /** The `runtime` object accepted by `agents.update`. All fields optional —
  *  the backend only writes fields that are present. An empty `fallback`
@@ -1223,6 +1276,73 @@ export interface InferenceUpdate {
   embedding?: InferenceBackendSection;
 }
 
+// ── IDR: [identity] identity resolution (RFC-21 §1) ─────────────
+
+/** Which `duduclaw_identity` provider is active. */
+export type IdentityProviderKind = 'wiki_cache' | 'notion' | 'chained';
+
+export type IdentityProjectsKind = 'multi_select' | 'relation';
+
+/** Maps DuDuClaw's logical fields onto Notion property names. */
+export interface IdentityNotionFieldMap {
+  name?: string;
+  roles?: string;
+  projects?: string;
+  projects_kind?: IdentityProjectsKind;
+  emails?: string;
+  /** channel-wire-name → Notion property name. */
+  channel_props?: Record<string, string>;
+}
+
+/** `[identity.notion]` — the api_key is WRITE-ONLY. On read the gateway returns
+ *  `api_key_set: bool` plus a masked placeholder in `api_key` ("***set***"). */
+export interface IdentityNotionConfig {
+  database_id?: string;
+  refresh_seconds?: number;
+  /** On read: masked placeholder. On write: cleartext (encrypted server-side),
+   *  '' clears it. Never send back the masked placeholder. */
+  api_key?: string;
+  /** Read-only flag indicating a secret is stored. */
+  api_key_set?: boolean;
+  field_map?: IdentityNotionFieldMap;
+}
+
+/** Full response of `identity.config_get`. The Notion api_key is masked. */
+export interface IdentityConfig {
+  provider: IdentityProviderKind;
+  notion: IdentityNotionConfig;
+  /** Where the wiki-cache provider reads people records from (display only). */
+  wiki_cache?: { people_dir: string };
+}
+
+/** Partial update payload for `identity.config_set`. Omit `notion.api_key` to
+ *  keep the stored secret; send '' to clear it. */
+export interface IdentityConfigUpdate {
+  provider?: IdentityProviderKind;
+  notion?: IdentityNotionConfig;
+}
+
+/** Canonical person record returned by `identity.resolve`. */
+export interface ResolvedPerson {
+  person_id: string;
+  display_name: string;
+  roles: string[];
+  project_ids: string[];
+  emails: string[];
+  channel_handles: Record<string, string>;
+  source: string;
+  fetched_at: string;
+}
+
+/** Response of `identity.resolve`. A miss is `found: false` (not an error). */
+export interface IdentityResolveResult {
+  found: boolean;
+  provider: string;
+  channel: string;
+  is_project_member?: boolean;
+  person?: ResolvedPerson;
+}
+
 // ── CAP: per-agent [capabilities] ───────────────────────────────
 
 export type ComputerUseMode = 'container' | 'native' | 'auto';
@@ -1237,6 +1357,29 @@ export interface ComputerUseConfig {
   auto_confirm_trusted?: boolean;
 }
 
+/** One clause of a `ToolPolicy` rule — an argument match tested with `op`. */
+export type ToolPolicyOp = 'equals' | 'contains' | 'starts_with';
+
+export interface ToolPolicyWhen {
+  /** Argument name to test on the tool call. */
+  arg: string;
+  op: ToolPolicyOp;
+  value: string;
+}
+
+export type ToolPolicyEffect = 'allow' | 'forbid' | 'ask';
+
+/** A single Progent-style tool-authorization rule. When `policy` is non-empty
+ *  the agent runs in strict-allowlist mode (forbid > ask > allow; no allow
+ *  match ⇒ deny). `effect: "ask"` escalates to human approval. `when` clauses
+ *  are ANDed; absent/empty `when` matches any call to `tool`. `tool: "*"`
+ *  matches every tool. */
+export interface ToolPolicyRule {
+  tool: string;
+  effect: ToolPolicyEffect;
+  when?: ToolPolicyWhen[];
+}
+
 /** The `capabilities` object accepted by `agents.update`. All fields optional —
  *  the backend only writes fields that are present (partial update). */
 export interface AgentCapabilities {
@@ -1247,6 +1390,10 @@ export interface AgentCapabilities {
   denied_tools?: string[];
   wiki_visible_to?: string[];
   computer_use_config?: ComputerUseConfig;
+  /** OS-level sandbox (macOS Seatbelt / Linux Landlock) for tool execution. */
+  native_sandbox?: boolean;
+  /** Progent tool-authorization policy. Empty/absent = not enforced. */
+  policy?: ToolPolicyRule[];
 }
 
 // ── CON: per-agent CONTRACT.toml ────────────────────────────────
@@ -1294,6 +1441,108 @@ export interface RedactionUpdate {
   profiles?: string[];
   sources?: Partial<RedactionSources>;
   tool_egress?: Record<string, RedactionEgressRule | null>;
+}
+
+/** Vault counters from `redaction.stats`. `by_category` is a list of
+ *  `[category, count]` tuples (e.g. `["EMAIL", 12]`). */
+export interface RedactionVaultStats {
+  total: number;
+  active: number;
+  expired: number;
+  by_category: Array<[string, number]>;
+}
+
+/** Response of `redaction.stats`. When the redaction manager is off, the
+ *  gateway returns a zeroed shape with `enabled: false`. */
+export interface RedactionStats {
+  vault: RedactionVaultStats;
+  rule_count: number;
+  config_enabled: boolean;
+  vault_ttl_hours: number;
+  /** Present only in the manager-absent fallback shape. */
+  enabled?: boolean;
+}
+
+/** One audit line from `redaction.recent_audit`. The `event` tag discriminates
+ *  the record (redact / restore_ok / restore_denied / …); fields vary per event
+ *  so this is intentionally an open record. */
+export interface RedactionAuditEntry {
+  event: string;
+  ts?: string;
+  agent_id?: string;
+  category?: string;
+  token?: string;
+  caller?: string;
+  target?: string;
+  tool?: string;
+  reason?: string;
+  [key: string]: unknown;
+}
+
+/** Response of `redaction.policy_status`. */
+export interface RedactionPolicyStatus {
+  config_enabled: boolean;
+  vault_ttl_hours: number;
+  purge_after_expire_days: number;
+  rule_count: number;
+  override_active: boolean;
+}
+
+/** Response of `redaction.override_status`. `record` carries the operator +
+ *  reason when a force-reveal override is active. */
+export interface RedactionOverrideStatus {
+  active: boolean;
+  banner: string | null;
+  record: {
+    started_at: string;
+    operator: string;
+    channels: string[];
+    reason: string;
+  } | null;
+}
+
+// ── EVO: evolution-event audit query (`audit.evolution_query`) ──────
+
+/** One evolution event from `audit.evolution_query`. `event_type` and
+ *  `outcome` are stringified enum labels; `metadata` is an open object. */
+export interface EvolutionEvent {
+  timestamp: string;
+  event_type: string;
+  agent_id: string | null;
+  skill_id: string | null;
+  generation: number | null;
+  outcome: string;
+  trigger_signal: string | null;
+  metadata: Record<string, unknown>;
+}
+
+/** Filters accepted by `audit.evolution_query`. All optional. */
+export interface EvolutionQueryFilter {
+  agent_id?: string;
+  event_type?: string;
+  outcome?: string;
+  skill_id?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** Response of `audit.evolution_query`. */
+export interface EvolutionQueryResult {
+  events: EvolutionEvent[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+// ── TOOLS: platform tool catalog (`tools.catalog`) ─────────────────
+
+/** One entry in the global `tools.catalog` — a platform-wide capability
+ *  available to agents. Not per-agent. */
+export interface ToolCatalogEntry {
+  name: string;
+  description: string;
 }
 
 // ── SKS: global [skill_synthesis] auto-run (W19-P1) ─────────────
@@ -1365,6 +1614,164 @@ export const MCP_SCOPES: ReadonlyArray<McpScope> = [
   'odoo:execute',
   'admin',
 ];
+
+// ── COST: cache-efficiency telemetry (`cost.*`) ─────────────────
+
+/** 200K-token price-cliff analysis from `cost.summary`. `warning` trips when
+ *  requests are approaching / crossing the input-token threshold. */
+export interface CostPriceCliff {
+  threshold_input_tokens: number;
+  requests_near_cliff: number;
+  max_input_tokens: number;
+  warning: boolean;
+}
+
+/** Response of `cost.summary`. `available:false` = telemetry not initialized;
+ *  all numeric fields are then absent. Costs are in millicents (1 cent =
+ *  1000 millicents). */
+export interface CostSummary {
+  available: boolean;
+  period?: string;
+  total_requests?: number;
+  total_input_tokens?: number;
+  total_cache_read_tokens?: number;
+  total_cache_creation_tokens?: number;
+  total_output_tokens?: number;
+  /** 0.0–1.0 mean cache efficiency. */
+  avg_cache_efficiency?: number;
+  /** 0.0–1.0 overall cache hit rate. */
+  cache_hit_rate?: number;
+  total_cost_millicents?: number;
+  total_cache_savings_millicents?: number;
+  price_cliff?: CostPriceCliff;
+}
+
+export type CacheHealth = 'healthy' | 'normal' | 'degraded';
+
+export interface CostAgentRow {
+  agent_id: string;
+  cache_health: CacheHealth;
+  total_requests: number;
+  total_input_tokens?: number;
+  total_cache_read_tokens?: number;
+  total_cache_creation_tokens?: number;
+  total_output_tokens?: number;
+  avg_cache_efficiency: number;
+  total_cost_millicents: number;
+  total_cache_savings_millicents: number;
+}
+
+export interface CostAgentsResult {
+  available: boolean;
+  agents: CostAgentRow[];
+}
+
+export interface CostRecentRow {
+  agent_id: string;
+  request_type: string;
+  model: string;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens?: number;
+  output_tokens?: number;
+  /** 0.0–1.0. */
+  cache_efficiency: number;
+  cost_millicents: number;
+  cache_savings_millicents: number;
+  created_at: string;
+}
+
+export interface CostRecentResult {
+  available: boolean;
+  records: CostRecentRow[];
+}
+
+// ── MEM: temporal history / supersession chain (`memory.history/at`) ──
+
+/** One version in a fact's supersession chain (`memory.history`). */
+export interface MemoryChainEntry {
+  id: string;
+  content: string;
+  valid_from: string | null;
+  valid_until: string | null;
+  superseded_by: string | null;
+  supersedes: string | null;
+  confidence: number | null;
+  is_current: boolean;
+}
+
+/** Response of `memory.history`. An empty `chain` = no recorded history. */
+export interface MemoryHistoryResult {
+  subject: string;
+  predicate: string;
+  current_id: string | null;
+  chain: MemoryChainEntry[];
+}
+
+/** A point-in-time record from `memory.at`. A miss is `found:false`. */
+export interface MemoryAtRecord {
+  id: string;
+  content: string;
+  valid_from: string | null;
+  valid_until: string | null;
+  [key: string]: unknown;
+}
+
+export interface MemoryAtResult {
+  found: boolean;
+  record?: MemoryAtRecord;
+}
+
+/** Selector for `memory.history` — either a fact key (subject+predicate) or a
+ *  specific memory id. */
+export interface MemoryHistoryQuery {
+  subject?: string;
+  predicate?: string;
+  memory_id?: string;
+}
+
+// ── ODO: per-agent Odoo credential override (`odoo.agent_config_*`) ──
+
+/** Response of `odoo.agent_config_get`. `configured:false` = no override, the
+ *  agent inherits the global config. `api_key`/`password` are never returned in
+ *  cleartext — only the `*_set` booleans plus a masked placeholder. */
+export interface OdooAgentConfig {
+  agent_id: string;
+  configured: boolean;
+  profile?: string;
+  url?: string;
+  db?: string;
+  username?: string;
+  allowed_models: string[];
+  allowed_actions: string[];
+  company_ids: number[];
+  api_key_set: boolean;
+  /** Masked placeholder ("***set***") when a key is stored, else absent. */
+  api_key?: string;
+  password_set: boolean;
+}
+
+/** Partial update payload for `odoo.agent_config_set`. `api_key`/`password`
+ *  are write-only: send a new value to set, `''` to clear, omit to keep.
+ *  Sending back the masked placeholder is rejected server-side (no-op). */
+export interface OdooAgentConfigSet {
+  agent_id: string;
+  url?: string;
+  db?: string;
+  user?: string;
+  api_key?: string;
+  password?: string;
+  profile?: string;
+  allowed_models?: string[];
+  allowed_actions?: string[];
+  company_ids?: number[];
+}
+
+export interface OdooAgentConfigSetResult {
+  success: boolean;
+  changes: string[];
+  hot_reloaded: boolean;
+}
 
 // ── KS: KILLSWITCH.toml ─────────────────────────────────────────
 
@@ -1617,6 +2024,10 @@ export interface BrandingGetResponse {
   white_label_active: boolean;
   /** Which layer the active branding resolved from (local / bundle / default). */
   source: BrandingSource;
+  /** WP8: branding field names this instance may edit (serde keys, 1:1 with the
+   *  `branding.set` payload). Empty ⇒ no field is editable (fail-closed). Fields
+   *  absent from this list are provider-managed and must be masked in the form. */
+  editable_fields: string[];
 }
 
 /** Writable subset accepted by `branding.set` (mirrors the backend whitelist). */
@@ -1712,10 +2123,55 @@ export interface DistributorPatch {
 }
 
 // API namespace
+// ── WebChat session history (WP3 — resume past conversations) ───────────────
+
+/** One past WebChat session, as returned by `chat.sessions.list`
+ *  (newest first, archived excluded). */
+export interface ChatSessionSummary {
+  session_id: string;
+  agent_id: string;
+  /** First user message, CJK-safe 80-char truncation. May be empty. */
+  title: string;
+  /** RFC3339 timestamp of the last activity. */
+  last_active: string;
+  turns: number;
+  tokens: number;
+  /** Session lineage marker — opaque, not rendered by the dashboard. */
+  lineage?: unknown;
+}
+
+export interface ChatSessionMessage {
+  role: string;
+  content: string;
+  /** RFC3339 timestamp. */
+  timestamp: string;
+  tokens: number;
+}
+
+export interface ChatSessionHistory {
+  session_id: string;
+  agent_id: string;
+  messages: ChatSessionMessage[];
+}
+
 export const api = {
+  /** WebChat past-conversation browsing + resume (WP3). Goes through the
+   *  dashboard RPC (authz enforced server-side — a non-admin caller must pass a
+   *  visible `agent_id`; other agents' sessions are never returned). */
+  chatSessions: {
+    list: (params: { agent_id?: string; limit?: number }) =>
+      client.call('chat.sessions.list', params) as Promise<{ sessions: ChatSessionSummary[] }>,
+    history: (sessionId: string, limit?: number) =>
+      client.call('chat.sessions.history', {
+        session_id: sessionId,
+        ...(limit != null ? { limit } : {}),
+      }) as Promise<ChatSessionHistory>,
+  },
   agents: {
-    list: () =>
-      client.call('agents.list') as Promise<{ agents: AgentDetail[] }>,
+    /** WP4 — pass `include_archived: true` to also list archived AI staff
+     *  (hidden by default). */
+    list: (params?: { include_archived?: boolean }) =>
+      client.call('agents.list', params ?? {}) as Promise<{ agents: AgentDetail[] }>,
     status: (agentId: string) =>
       client.call('agents.status', { agent_id: agentId }) as Promise<AgentDetail>,
     create: (params: {
@@ -1740,10 +2196,62 @@ export const api = {
       client.call('agents.resume', { agent_id: agentId }) as Promise<{ success: boolean }>,
     inspect: (agentId: string) =>
       client.call('agents.inspect', { agent_id: agentId }) as Promise<AgentDetail>,
+    /** E1 — lightweight avatar-only fetch. Unlike `inspect` this does NOT run a
+     *  telemetry aggregate or serialize SOUL/skills/model config; it reads only
+     *  the uploaded `avatar.<ext>` bytes. Used by the avatar store for first-paint
+     *  images (roster/sidebar/chat) so N staff members don't fire N heavy RPCs. */
+    avatar: (agentId: string) =>
+      client.call('agents.avatar', { agent_id: agentId }) as Promise<{
+        agent_id: string;
+        has_avatar: boolean;
+        avatar: string | null;
+      }>,
     update: (agentId: string, fields: AgentUpdateParams) =>
       client.call('agents.update', { agent_id: agentId, ...fields }) as Promise<{ success: boolean }>,
+    /** WP4 — soft-delete: the AI staff member is hidden from every list but its
+     *  data is retained on disk (not recoverable via the UI). */
     remove: (agentId: string) =>
-      client.call('agents.remove', { agent_id: agentId }) as Promise<{ success: boolean }>,
+      client.call('agents.remove', { agent_id: agentId }) as Promise<{
+        success: boolean;
+        agent_id: string;
+        status: 'deleted';
+        data_retained: boolean;
+      }>,
+    /** WP4 — archive (recoverable off-board). Rejected for the main agent. */
+    archive: (agentId: string) =>
+      client.call('agents.archive', { agent_id: agentId }) as Promise<{
+        success: boolean;
+        agent_id: string;
+        status: 'archived';
+      }>,
+    /** WP4 — restore an archived AI staff member. */
+    unarchive: (agentId: string) =>
+      client.call('agents.unarchive', { agent_id: agentId }) as Promise<{
+        success: boolean;
+        agent_id: string;
+        status: string;
+      }>,
+    /** WP4 — hand off memory / wiki / open tasks to another AI staff member,
+     *  then (by default) archive the source. Every sub-move is optional (all
+     *  default true). A failure in any sub-move returns `status: "PARTIAL"`
+     *  with a populated `errors[]` — never silently swallowed. */
+    handoff: (params: AgentHandoffParams) =>
+      client.call('agents.handoff', { ...params }) as Promise<AgentHandoffResult>,
+    /** WP4 — upload an avatar image (png/jpeg/webp data URI, ≤512 KB). */
+    setAvatar: (agentId: string, dataUri: string) =>
+      client.call('agents.set_avatar', { agent_id: agentId, data_uri: dataUri }) as Promise<{
+        success: boolean;
+        agent_id: string;
+        has_avatar: boolean;
+        bytes: number;
+      }>,
+    /** WP4 — remove an agent's uploaded avatar (no-op-safe). */
+    clearAvatar: (agentId: string) =>
+      client.call('agents.clear_avatar', { agent_id: agentId }) as Promise<{
+        success: boolean;
+        agent_id: string;
+        has_avatar: boolean;
+      }>,
   },
   runtime: {
     /** Detect installed AI runtime CLIs + Claude OAuth — drives the onboarding
@@ -1760,6 +2268,17 @@ export const api = {
       client.call('channels.test', { type }) as Promise<{ success: boolean; message: string }>,
     remove: (type: string) =>
       client.call('channels.remove', { type }),
+    // WP9: mint a one-time Telegram deep-link/QR bind token so an employee can
+    // bind the company's shared bot to a specific AI employee (agent).
+    telegramBindToken: (agent: string, opts?: { ttl_minutes?: number; max_uses?: number }) =>
+      client.call('channels.telegram_bind_token', { agent, ...(opts ?? {}) }) as Promise<{
+        agent: string;
+        token: string;
+        bot_username: string;
+        deep_link: string;
+        expires_in_minutes: number;
+        max_uses: number;
+      }>,
   },
   // Interactive CLI login ("Dashboard 一鍵登入") — drives a CLI's native login
   // in a PTY on the gateway and streams it back via `auth.cli_login.*` events.
@@ -1842,6 +2361,20 @@ export const api = {
         agent_id: agentId,
         limit,
       }) as Promise<{ entries: KeyFactEntry[] }>,
+    /** Supersession chain for a fact — by (subject, predicate) or memory_id. */
+    history: (agentId: string, query: MemoryHistoryQuery) =>
+      client.call('memory.history', {
+        agent_id: agentId,
+        ...query,
+      }) as Promise<MemoryHistoryResult>,
+    /** Point-in-time lookup: which value was valid for (subject, predicate) at `at`. */
+    at: (agentId: string, subject: string, predicate: string, at: string) =>
+      client.call('memory.at', {
+        agent_id: agentId,
+        subject,
+        predicate,
+        at,
+      }) as Promise<MemoryAtResult>,
   },
   wiki: {
     pages: (agentId: string) =>
@@ -2058,6 +2591,12 @@ export const api = {
         agent_id: agentId,
         window_days: windowDays,
       }) as Promise<ReliabilitySummary>,
+    evolutionQuery: (filter: EvolutionQueryFilter = {}) =>
+      client.call('audit.evolution_query', { ...filter }) as Promise<EvolutionQueryResult>,
+  },
+  tools: {
+    catalog: () =>
+      client.call('tools.catalog') as Promise<{ tools: ToolCatalogEntry[] }>,
   },
   skillMarket: {
     search: (query: string) =>
@@ -2149,6 +2688,16 @@ export const api = {
         monthly: Array<{ month: string; human_cost: number; agent_cost: number; savings: number }>;
       }>,
   },
+  // Cache-efficiency telemetry (CostTelemetry). `available:false` on every
+  // response when telemetry isn't initialized.
+  cost: {
+    summary: (hours = 24) =>
+      client.call('cost.summary', { hours }) as Promise<CostSummary>,
+    agents: (hours = 24) =>
+      client.call('cost.agents', { hours }) as Promise<CostAgentsResult>,
+    recent: (limit = 20) =>
+      client.call('cost.recent', { limit }) as Promise<CostRecentResult>,
+  },
   billing: {
     usage: () =>
       client.call('billing.usage') as Promise<BillingUsage>,
@@ -2203,6 +2752,31 @@ export const api = {
         success: boolean;
         message: string;
       }>,
+    /** Per-agent credential override. `configured:false` = inherits global. */
+    agentConfigGet: (agentId: string) =>
+      client.call('odoo.agent_config_get', { agent_id: agentId }) as Promise<OdooAgentConfig>,
+    /** api_key/password write-only: new value sets, '' clears, omit keeps. */
+    agentConfigSet: (params: OdooAgentConfigSet) =>
+      client.call('odoo.agent_config_set', { ...params }) as Promise<OdooAgentConfigSetResult>,
+    agentTest: (agentId: string) =>
+      client.call('odoo.agent_test', { agent_id: agentId }) as Promise<{
+        success: boolean;
+        message: string;
+      }>,
+  },
+  identity: {
+    configGet: () =>
+      client.call('identity.config_get') as Promise<IdentityConfig>,
+    configSet: (config: IdentityConfigUpdate) =>
+      client.call('identity.config_set', { ...config }) as Promise<{
+        success: boolean;
+        changes: string[];
+      }>,
+    resolve: (identifier: string, channel?: string) =>
+      client.call('identity.resolve', {
+        identifier,
+        ...(channel ? { channel } : {}),
+      }) as Promise<IdentityResolveResult>,
   },
   mcp: {
     list: () =>
@@ -2393,6 +2967,15 @@ export const api = {
         success: boolean;
         changes: string[];
       }>,
+    stats: () => client.call('redaction.stats') as Promise<RedactionStats>,
+    recentAudit: (limit = 50) =>
+      client.call('redaction.recent_audit', { limit }) as Promise<{
+        entries: RedactionAuditEntry[];
+      }>,
+    policyStatus: () =>
+      client.call('redaction.policy_status') as Promise<RedactionPolicyStatus>,
+    overrideStatus: () =>
+      client.call('redaction.override_status') as Promise<RedactionOverrideStatus>,
   },
   skillSynthesis: {
     get: () => client.call('skill_synthesis.get') as Promise<SkillSynthesisConfig>,
@@ -2566,6 +3149,10 @@ export const api = {
       machine_fingerprint: string;
       expires_days?: number;
       note?: string;
+      /** WP8: narrow the customer's editable branding range (serde field names).
+       *  Omit ⇒ full reseller (Vendor) range. Provide ⇒ Customer scope limited to
+       *  these fields (non-branding names are rejected by the gateway). */
+      branding_editable?: string[];
     }) =>
       client.call('distributor.issue', { ...params }) as Promise<{
         ok: boolean;

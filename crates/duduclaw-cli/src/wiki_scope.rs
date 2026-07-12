@@ -168,6 +168,14 @@ impl WikiScopePolicy {
         }
     }
 
+    /// Whether the operator has an **explicit** entry for `namespace` in
+    /// `.scope.toml`. WP7 uses this to decide precedence: the built-in
+    /// department isolation applies to the `departments/` namespace *unless*
+    /// the operator has explicitly declared it (explicit config wins).
+    pub fn has_explicit_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.contains_key(namespace)
+    }
+
     /// Mode for a top-level namespace. Unlisted namespaces default to
     /// [`NamespaceMode::AgentWritable`].
     pub fn mode_for(&self, namespace: &str) -> NamespaceMode {
@@ -289,6 +297,42 @@ pub struct NamespaceSnapshot {
 
 /// Reserved policy filename — never permitted as a `shared_wiki_write` target.
 pub const SCOPE_POLICY_FILENAME: &str = ".scope.toml";
+
+/// WP7 built-in department access rule for the `departments/` shared-wiki
+/// namespace. This runs **before** the `.scope.toml` write policy and is the
+/// single decision point behind every shared-wiki tool (ls/read/search/write/
+/// delete) for the department dimension.
+///
+/// Semantics (see [`duduclaw_core::department_page_visible`]):
+/// - Pages outside `departments/` (the company layer) → always `Ok`.
+/// - `departments/<dept>/<page>` → `Ok` only when `caller_department` exactly
+///   equals `<dept>`. A different department, or no department (`None`), is
+///   denied — fail-closed.
+/// - A malformed path inside `departments/` (loose file, no page) is denied.
+///
+/// The operator can override this entirely by declaring the `departments`
+/// namespace in `.scope.toml`; callers gate this check on
+/// [`WikiScopePolicy::has_explicit_namespace`].
+pub fn check_department_access(
+    page_path: &str,
+    caller_department: Option<&str>,
+) -> Result<(), ScopeDeny> {
+    if duduclaw_core::department_page_visible(page_path, caller_department) {
+        return Ok(());
+    }
+    Err(ScopeDeny {
+        namespace: duduclaw_core::DEPARTMENTS_NAMESPACE.to_string(),
+        mode: "department".into(),
+        reason: match caller_department {
+            Some(d) => format!(
+                "'{page_path}' belongs to another department; caller is in department '{d}'"
+            ),
+            None => format!(
+                "'{page_path}' is a department page; caller has no department and cannot access it"
+            ),
+        },
+    })
+}
 
 /// Resolves `<home_dir>/shared/wiki/.scope.toml`.
 pub fn scope_file_path(home_dir: &Path) -> PathBuf {
@@ -431,6 +475,44 @@ mod tests {
         let ns = snap.iter().find(|s| s.namespace == "policies").unwrap();
         assert_eq!(ns.mode, "agent_allowlist");
         assert_eq!(ns.agents.as_deref(), Some(&["agnes".to_string(), "boss".to_string()][..]));
+    }
+
+    // ── WP7 built-in department access ────────────────────────────
+
+    #[test]
+    fn department_access_isolates_by_exact_department() {
+        // Own department can access.
+        assert!(check_department_access("departments/art/style.md", Some("art")).is_ok());
+        // Company layer is open to everyone (incl. no-department agents).
+        assert!(check_department_access("policies/hr.md", Some("art")).is_ok());
+        assert!(check_department_access("policies/hr.md", None).is_ok());
+        // Other department is denied.
+        let err = check_department_access("departments/art/style.md", Some("sales")).unwrap_err();
+        assert_eq!(err.mode, "department");
+        assert!(err.reason.contains("sales"));
+        // No department cannot read any department page.
+        assert!(check_department_access("departments/art/style.md", None).is_err());
+        // Exact match only — no prefix leak.
+        assert!(check_department_access("departments/art/style.md", Some("art-2")).is_err());
+    }
+
+    #[test]
+    fn explicit_departments_declaration_takes_precedence() {
+        // When the operator declares `departments`, callers skip the built-in
+        // rule and defer to the policy mode instead.
+        let tmp = TempDir::new().unwrap();
+        write_policy(
+            tmp.path(),
+            r#"
+                [namespaces."departments"]
+                mode = "operator_only"
+            "#,
+        );
+        let p = WikiScopePolicy::load_for(tmp.path());
+        assert!(p.has_explicit_namespace("departments"));
+        // Policy still enforces operator_only for writes.
+        let caller = WriterCapability::for_agent("agnes");
+        assert!(p.check_write("departments/art/style.md", &caller).is_err());
     }
 
     #[test]

@@ -1,5 +1,6 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { useIntl } from 'react-intl';
+import qrcode from 'qrcode-generator';
 import { cn } from '@/lib/utils';
 import { api, type ChannelStatus, type AgentInfo } from '@/lib/api';
 import { client } from '@/lib/ws-client';
@@ -29,6 +30,9 @@ import {
   AlertTriangle,
   X,
   Loader2,
+  Link2,
+  Copy,
+  Check,
 } from 'lucide-react';
 
 const channelMeta: Record<
@@ -75,6 +79,16 @@ const channelMeta: Record<
     bg: 'bg-indigo-100',
     darkBg: 'dark:bg-indigo-900/30',
   },
+  googlechat: {
+    color: 'text-teal-600 dark:text-teal-400',
+    bg: 'bg-teal-100',
+    darkBg: 'dark:bg-teal-900/30',
+  },
+  teams: {
+    color: 'text-violet-600 dark:text-violet-400',
+    bg: 'bg-violet-100',
+    darkBg: 'dark:bg-violet-900/30',
+  },
 };
 
 function getChannelPlatform(name: string): string {
@@ -98,6 +112,7 @@ export function ChannelsPage() {
   const [channels, setChannels] = useState<ReadonlyArray<ChannelStatus>>([]);
   const [loading, setLoading] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
+  const [showBindDialog, setShowBindDialog] = useState(false);
   const [editChannel, setEditChannel] = useState<string | null>(null);
   const [removeTarget, setRemoveTarget] = useState<string | null>(null);
   const [removing, setRemoving] = useState(false);
@@ -199,9 +214,14 @@ export function ChannelsPage() {
         title={intl.formatMessage({ id: 'channels.title' })}
         subtitle={intl.formatMessage({ id: 'channels.subtitle' })}
         actions={
-          <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
-            {intl.formatMessage({ id: 'channels.add' })}
-          </Button>
+          <div className="flex gap-2">
+            <Button variant="secondary" icon={Link2} onClick={() => setShowBindDialog(true)}>
+              {intl.formatMessage({ id: 'channels.bind.action' })}
+            </Button>
+            <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
+              {intl.formatMessage({ id: 'channels.add' })}
+            </Button>
+          </div>
         }
       />
 
@@ -320,6 +340,12 @@ export function ChannelsPage() {
         onCreated={fetchChannels}
       />
 
+      {/* WP9 — Telegram shared-bot employee bind link / QR */}
+      <TelegramBindDialog
+        open={showBindDialog}
+        onClose={() => setShowBindDialog(false)}
+      />
+
       {/* Edit Channel Dialog (re-uses add flow to replace token) */}
       <AddChannelDialog
         open={editChannel !== null}
@@ -376,6 +402,7 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
   const [waVerifyToken, setWaVerifyToken] = useState('');
   const [waAppSecret, setWaAppSecret] = useState('');
   const [feishuVerifyToken, setFeishuVerifyToken] = useState('');
+  const [teamsTenantId, setTeamsTenantId] = useState('');
   const [wecomAgentId, setWecomAgentId] = useState('');
   const [wecomCallbackToken, setWecomCallbackToken] = useState('');
   const [wecomAesKey, setWecomAesKey] = useState('');
@@ -396,6 +423,9 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
       if (channelType === 'feishu' && feishuVerifyToken.trim()) {
         config.feishu_verification_token = feishuVerifyToken.trim();
       }
+      if (channelType === 'teams' && teamsTenantId.trim()) {
+        config.teams_tenant_id = teamsTenantId.trim();
+      }
       if (channelType === 'wecom') {
         if (wecomAgentId.trim()) config.wecom_agent_id = wecomAgentId.trim();
         if (wecomCallbackToken.trim()) config.wecom_callback_token = wecomCallbackToken.trim();
@@ -409,6 +439,7 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
       setWaVerifyToken('');
       setWaAppSecret('');
       setFeishuVerifyToken('');
+      setTeamsTenantId('');
       setWecomAgentId('');
       setWecomCallbackToken('');
       setWecomAesKey('');
@@ -506,6 +537,26 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
       secretLabel: 'App Key (Client ID)',
       stepKeys: [],
     },
+    googlechat: {
+      tokenLabel: 'Service Account JSON',
+      secretLabel: 'Project Number',
+      stepKeys: [
+        'channels.setup.googlechat.step1',
+        'channels.setup.googlechat.step2',
+        'channels.setup.googlechat.step3',
+        'channels.setup.googlechat.note',
+      ],
+    },
+    teams: {
+      tokenLabel: 'App Password',
+      secretLabel: 'App ID',
+      stepKeys: [
+        'channels.setup.teams.step1',
+        'channels.setup.teams.step2',
+        'channels.setup.teams.step3',
+        'channels.setup.teams.note',
+      ],
+    },
   };
 
   const guide = channelGuide[channelType] ?? { tokenLabel: 'Token', stepKeys: [] };
@@ -524,6 +575,8 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
             <option value="feishu">Feishu</option>
             <option value="wecom">WeCom (企業微信)</option>
             <option value="dingtalk">DingTalk (釘釘)</option>
+            <option value="googlechat">Google Chat</option>
+            <option value="teams">Microsoft Teams</option>
           </select>
         </Field>
 
@@ -592,6 +645,12 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
           </Field>
         )}
 
+        {channelType === 'teams' && (
+          <Field label="Tenant ID" help={intl.formatMessage({ id: 'channels.setup.teams.tenantHint' })}>
+            <input type="text" value={teamsTenantId} onChange={(e) => setTeamsTenantId(e.target.value)} className={controlClass} autoComplete="off" placeholder="(multi-tenant)" />
+          </Field>
+        )}
+
         {/* G.6 — extra WeCom tokens (global) */}
         {channelType === 'wecom' && (
           <>
@@ -618,6 +677,155 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
           <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'channels.dialog.cancel' })}</button>
           <button onClick={() => { setAddError(null); handleSubmit(); }} disabled={submitting || !token.trim()} className={buttonPrimary}>
             {submitting ? intl.formatMessage({ id: 'channels.dialog.adding' }) : intl.formatMessage({ id: 'channels.dialog.add' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+/// Pure-frontend QR renderer (no external CDN/service): encodes `value` with
+/// the zero-dependency `qrcode-generator` and renders the resulting SVG.
+function QrCode({ value, size = 200 }: { value: string; size?: number }) {
+  const svg = useMemo(() => {
+    if (!value) return '';
+    // typeNumber 0 = auto-size; 'M' error correction tolerates ~15% damage.
+    const qr = qrcode(0, 'M');
+    qr.addData(value);
+    qr.make();
+    // scalable SVG so it renders crisp at any size; the input is a t.me URL we
+    // control, so the generated markup is safe to inline.
+    return qr.createSvgTag({ scalable: true });
+  }, [value]);
+  return (
+    <div
+      className="rounded-control bg-white p-3"
+      style={{ width: size, height: size }}
+      aria-hidden
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
+  );
+}
+
+/// WP9 — mint a one-time Telegram deep-link + QR that binds the company's
+/// shared bot to a chosen AI employee. The employee scans the QR / opens the
+/// link, sends `/start`, and every later message routes to that employee.
+function TelegramBindDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const intl = useIntl();
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [selectedAgent, setSelectedAgent] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{
+    agent: string;
+    deep_link: string;
+    bot_username: string;
+    expires_in_minutes: number;
+    max_uses: number;
+  } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      setResult(null);
+      setError(null);
+      setCopied(false);
+      api.agents.list().then((r) => setAgents(r.agents ?? [])).catch((e) => {
+        setError(formatError(e));
+      });
+    }
+  }, [open]);
+
+  const handleGenerate = async () => {
+    if (!selectedAgent) return;
+    setGenerating(true);
+    setError(null);
+    try {
+      const r = await api.channels.telegramBindToken(selectedAgent);
+      setResult(r);
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const handleCopy = async () => {
+    if (!result) return;
+    try {
+      await navigator.clipboard.writeText(result.deep_link);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* clipboard unavailable — the link is still visible for manual copy */
+    }
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} title={intl.formatMessage({ id: 'channels.bind.title' })}>
+      <div className="space-y-4">
+        <p className="text-sm text-stone-600 dark:text-stone-400">
+          {intl.formatMessage({ id: 'channels.bind.desc' })}
+        </p>
+
+        <Field label={intl.formatMessage({ id: 'channels.bind.selectAgent' })}>
+          <select
+            value={selectedAgent}
+            onChange={(e) => { setSelectedAgent(e.target.value); setResult(null); }}
+            className={controlClass}
+          >
+            <option value="">{intl.formatMessage({ id: 'channels.bind.selectPlaceholder' })}</option>
+            {agents.map((a) => (
+              <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+            ))}
+          </select>
+        </Field>
+
+        {error && (
+          <div className="flex items-start gap-2 rounded-control bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
+            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        {result && (
+          <div className="space-y-3 rounded-control border border-[var(--panel-border)] p-4">
+            <div className="flex justify-center">
+              <QrCode value={result.deep_link} />
+            </div>
+            <p className="text-center text-xs text-stone-500 dark:text-stone-400">
+              {intl.formatMessage(
+                { id: 'channels.bind.hint' },
+                { bot: `@${result.bot_username}`, minutes: result.expires_in_minutes, uses: result.max_uses },
+              )}
+            </p>
+            <div className="flex items-center gap-2">
+              <Mono className="flex-1 overflow-x-auto whitespace-nowrap rounded-control bg-stone-100 px-3 py-2 text-xs dark:bg-stone-800">
+                {result.deep_link}
+              </Mono>
+              <Button size="sm" variant="ghost" icon={copied ? Check : Copy} onClick={handleCopy}>
+                {copied
+                  ? intl.formatMessage({ id: 'channels.bind.copied' })
+                  : intl.formatMessage({ id: 'channels.bind.copy' })}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className={buttonSecondary}>
+            {intl.formatMessage({ id: 'channels.dialog.cancel' })}
+          </button>
+          <button
+            onClick={handleGenerate}
+            disabled={generating || !selectedAgent}
+            className={buttonPrimary}
+          >
+            {generating
+              ? intl.formatMessage({ id: 'channels.bind.generating' })
+              : result
+                ? intl.formatMessage({ id: 'channels.bind.regenerate' })
+                : intl.formatMessage({ id: 'channels.bind.generate' })}
           </button>
         </div>
       </div>

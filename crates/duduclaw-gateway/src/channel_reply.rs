@@ -232,6 +232,8 @@ pub struct ReplyContext {
     pub channel_settings: Arc<ChannelSettingsManager>,
     /// User-level access control: allowlist / blocklist / pairing codes.
     pub access_control: Arc<crate::access_control::AccessController>,
+    /// WP9: channel user → agent bindings + one-time bind tokens (shared bot).
+    pub agent_binding: Arc<crate::agent_binding::AgentBindingStore>,
     /// Killswitch configuration (safety words, thresholds, escalation).
     pub killswitch: Arc<KillswitchConfig>,
     /// Failsafe degradation manager (per-scope level tracking).
@@ -287,6 +289,12 @@ impl ReplyContext {
             home_dir.join("access_control.json"),
         ));
 
+        // WP9: shared-bot user→agent bindings, persisted across restarts and
+        // shared with the dashboard RPC that mints bind tokens.
+        let agent_binding = Arc::new(crate::agent_binding::AgentBindingStore::with_persistence(
+            home_dir.join("agent_bindings.json"),
+        ));
+
         // Initialize failsafe manager and circuit breaker registry
         let failsafe = Arc::new(FailsafeManager::new(killswitch.failsafe.clone()));
         let circuit_breakers = Arc::new(CircuitBreakerRegistry::new(
@@ -309,6 +317,7 @@ impl ReplyContext {
             sandbox_store: Arc::new(tokio::sync::Mutex::new(SandboxStore::new())),
             voice_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             access_control,
+            agent_binding,
             channel_settings: Arc::new(channel_settings),
             killswitch: Arc::new(killswitch),
             failsafe: Some(failsafe),
@@ -923,6 +932,10 @@ async fn build_reply_with_session_inner(
         let agents = reg.list();
         agents.iter()
             .filter(|a| a.config.agent.reports_to == agent_id && a.config.agent.name != agent_id)
+            // F2: archived / soft-deleted sub-agents must not appear in the
+            // "Your Team" roster — the agent should never be told to delegate
+            // to an off-boarded teammate.
+            .filter(|a| a.config.agent.status.is_operational())
             .map(|a| TeamMember {
                 name: a.config.agent.name.clone(),
                 display_name: a.config.agent.display_name.clone(),
@@ -7178,12 +7191,23 @@ fn build_system_prompt(
             let cache_key = citation_ctx.map(|(agent_id, conv_id, session_id)| {
                 format!("{agent_id}:{}", session_id.unwrap_or(conv_id))
             });
+            // WP7: department-scope the injection so a `departments/<dept>/`
+            // page never reaches an agent outside that department.
+            let viewer_department = {
+                let d = a.config.agent.department.trim();
+                if !d.is_empty() && duduclaw_core::is_valid_department(d) {
+                    Some(d.to_string())
+                } else {
+                    None
+                }
+            };
             let wiki_ctx = crate::ranked_wiki_injection::ranked_wiki_injection(
                 &store,
                 query,
                 6000,
                 citation_context,
                 cache_key.as_deref(),
+                viewer_department.as_deref(),
             );
             // The helper returns "" on error or no pages — wrap the
             // non-empty case identically to before so prompt shape

@@ -24,7 +24,7 @@ const TimelinePage = lazyPage(() => import('./pages/TimelinePage'), 'TimelinePag
 const RunsPage = lazyPage(() => import('./pages/RunsPage'), 'RunsPage');
 const CanvasPage = lazyPage(() => import('./pages/CanvasPage'), 'CanvasPage');
 const AgentDetailPage = lazyPage(() => import('./pages/AgentDetailPage'), 'AgentDetailPage');
-const SkillsShell = lazyPage(() => import('./pages/SkillsShell'), 'SkillsShell');
+const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'SkillMarketPage');
 const KnowledgeShell = lazyPage(() => import('./pages/KnowledgeShell'), 'KnowledgeShell');
 const IntegrationsPage = lazyPage(() => import('./pages/IntegrationsPage'), 'IntegrationsPage');
 const BillingShell = lazyPage(() => import('./pages/BillingShell'), 'BillingShell');
@@ -145,7 +145,7 @@ export function App() {
               <Route path="agents/:id/:tab" element={<AgentDetailPage />} />
               <Route path="memory" element={<MemoryPage />} />
               <Route path="growth" element={<GrowthPage />} />
-              <Route path="skills" element={<SkillsShell />} />
+              <Route path="skills" element={<SkillMarketPage />} />
               <Route path="skills/new" element={<SkillNewPage />} />
               <Route path="skills/custom/:id" element={<SkillCustomDetailPage />} />
               <Route path="knowledge" element={<KnowledgeShell />} />

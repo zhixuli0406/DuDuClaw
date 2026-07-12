@@ -811,6 +811,34 @@ impl SqliteMemoryEngine {
         }
     }
 
+    /// Resolve the `(subject, predicate)` triple keys for a single memory id
+    /// (agent-isolated). Returns `None` when the row is absent, belongs to
+    /// another agent, or has NULL subject/predicate (i.e. it's not a temporal
+    /// triple). Used by the dashboard `memory.history` RPC so the operator can
+    /// look up a supersession chain starting from a memory id (F1).
+    pub async fn triple_for_id(
+        &self,
+        agent_id: &str,
+        memory_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT subject, predicate FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
+            params![memory_id, agent_id],
+            |r| {
+                let subject: Option<String> = r.get(0)?;
+                let predicate: Option<String> = r.get(1)?;
+                Ok((subject, predicate))
+            },
+        )
+        .optional()
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))
+        .map(|opt| match opt {
+            Some((Some(s), Some(p))) if !s.is_empty() && !p.is_empty() => Some((s, p)),
+            _ => None,
+        })
+    }
+
     /// Count currently-valid memories for an agent filtered by tag substring
     /// (F2b helper). Matches against the JSON-encoded `tags` column.
     pub async fn count_active_with_tag(&self, agent_id: &str, tag: &str) -> Result<u32> {
@@ -2429,6 +2457,43 @@ mod tests {
         let at = engine.get_at(agent, "user", "lang", mid).await.unwrap();
         assert!(at.is_some());
         assert_eq!(at.unwrap().content, "python era");
+    }
+
+    /// `triple_for_id` resolves a memory id back to its (subject, predicate)
+    /// keys, enforces agent isolation, and returns `None` for non-triple rows.
+    #[tokio::test]
+    async fn triple_for_id_resolves_and_isolates() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "triple-agent";
+
+        let e = make_entry(agent, "python era", vec![]);
+        let id = engine
+            .store_temporal(agent, e, triple_meta("user", "lang", "python"))
+            .await
+            .unwrap();
+
+        // Owner resolves the triple.
+        let got = engine.triple_for_id(agent, &id).await.unwrap();
+        assert_eq!(got, Some(("user".to_string(), "lang".to_string())));
+
+        // Cross-agent lookup is isolated → None (no existence leak).
+        let other = engine.triple_for_id("someone-else", &id).await.unwrap();
+        assert_eq!(other, None);
+
+        // A plain (non-triple) row → None.
+        let plain = make_entry(agent, "no triple here", vec![]);
+        let plain_id = engine
+            .store_temporal(agent, plain, TemporalMeta::default())
+            .await
+            .unwrap();
+        assert_eq!(engine.triple_for_id(agent, &plain_id).await.unwrap(), None);
+
+        // The resolved triple drives get_history end-to-end.
+        let (s, p) = got.unwrap();
+        let history = engine.get_history(agent, &s, &p).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "python era");
+        assert!(history[0].valid_until.is_none(), "sole version is current");
     }
 
     /// store_temporal without a triple behaves like a plain insert (still searchable).

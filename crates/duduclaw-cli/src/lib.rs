@@ -3438,10 +3438,11 @@ fn parse_runtime_provider_strict(
         "codex" => Ok(RuntimeType::Codex),
         "gemini" => Ok(RuntimeType::Gemini),
         "antigravity" | "agy" => Ok(RuntimeType::Antigravity),
+        "grok" | "grok-cli" => Ok(RuntimeType::Grok),
         "openai_compat" | "openai" | "openai-compat" => Ok(RuntimeType::OpenAiCompat),
         other => Err(format!(
             "unknown runtime provider '{other}' — expected one of: \
-             claude, codex, gemini, antigravity, openai_compat"
+             claude, codex, gemini, antigravity, grok, openai_compat"
         )),
     }
 }
@@ -3459,6 +3460,11 @@ fn provider_context_filenames(
     match provider {
         RuntimeType::Codex => &["CLAUDE.md", "AGENTS.md"],
         RuntimeType::Gemini => &["CLAUDE.md", "GEMINI.md"],
+        // UNVERIFIED (R4): Grok CLI's context-file convention is unconfirmed;
+        // scaffold the cross-CLI `AGENTS.md` alongside `CLAUDE.md` as the most
+        // likely file the agent reads. GrokRuntime also embeds the system prompt
+        // in the prompt payload, so context delivery does not depend on this.
+        RuntimeType::Grok => &["CLAUDE.md", "AGENTS.md"],
         RuntimeType::Claude | RuntimeType::Antigravity | RuntimeType::OpenAiCompat => {
             &["CLAUDE.md"]
         }
@@ -5037,6 +5043,11 @@ mod agent_scaffold_tests {
             provider_context_filenames(RuntimeType::OpenAiCompat),
             &["CLAUDE.md"]
         );
+        // R4 / UNVERIFIED: Grok scaffolds the cross-CLI AGENTS.md alongside CLAUDE.md.
+        assert_eq!(
+            provider_context_filenames(RuntimeType::Grok),
+            &["CLAUDE.md", "AGENTS.md"]
+        );
     }
 
     #[test]
@@ -5052,6 +5063,10 @@ mod agent_scaffold_tests {
         assert_eq!(
             parse_runtime_provider_strict("agy").unwrap(),
             RuntimeType::Antigravity
+        );
+        assert_eq!(
+            parse_runtime_provider_strict("grok").unwrap(),
+            RuntimeType::Grok
         );
         // Fail-closed: typos must error, never silently scaffold Claude.
         assert!(parse_runtime_provider_strict("claudee").is_err());

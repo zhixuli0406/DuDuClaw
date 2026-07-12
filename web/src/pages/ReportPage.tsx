@@ -1,12 +1,31 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { useConnectionStore } from '@/stores/connection-store';
-import { api } from '@/lib/api';
-import { MessageCircle, Zap, Clock, DollarSign, BarChart3 } from 'lucide-react';
+import {
+  api,
+  type CostSummary,
+  type CostAgentRow,
+  type CostRecentRow,
+  type CacheHealth,
+} from '@/lib/api';
+import { formatMillicents, formatTokens } from '@/lib/format';
+import {
+  MessageCircle,
+  Zap,
+  Clock,
+  DollarSign,
+  BarChart3,
+  Gauge,
+  Coins,
+  Database,
+  TriangleAlert,
+} from 'lucide-react';
 import { toast, formatError } from '@/lib/toast';
-import { Page, PageHeader, Card, StatCard, Tabs, EmptyState, type TabItem } from '@/components/ui';
+import { Page, PageHeader, Card, StatCard, Tabs, Badge, EmptyState, Mono, type TabItem } from '@/components/ui';
 
 type Period = 'day' | 'week' | 'month';
+
+const PERIOD_HOURS: Record<Period, number> = { day: 24, week: 168, month: 720 };
 
 interface Summary {
   total_conversations: number;
@@ -141,6 +160,9 @@ export function ReportPage() {
         </div>
       )}
 
+      {/* Cost & cache efficiency (CostTelemetry) */}
+      <CostEfficiencySection hours={PERIOD_HOURS[period]} />
+
       {/* Zero-cost ratio */}
       {summary && (
         <Card title={intl.formatMessage({ id: 'reports.zeroCostRatio' })}>
@@ -253,5 +275,282 @@ export function ReportPage() {
         </div>
       </Card>
     </Page>
+  );
+}
+
+function cacheHealthTone(h: CacheHealth): 'success' | 'neutral' | 'warning' {
+  if (h === 'healthy') return 'success';
+  if (h === 'degraded') return 'warning';
+  return 'neutral';
+}
+
+function effTone(eff: number): 'success' | 'warning' | 'danger' {
+  if (eff >= 0.7) return 'success';
+  if (eff >= 0.3) return 'warning';
+  return 'danger';
+}
+
+/**
+ * Cache-efficiency + cost telemetry (CostTelemetry). Three-state: telemetry
+ * off → empty state; load error → inline notice (never crashes the page);
+ * otherwise cache hit rate, total cost, savings, 200K price-cliff warning,
+ * per-agent cache health, and a recent-usage table.
+ */
+function CostEfficiencySection({ hours }: { hours: number }) {
+  const intl = useIntl();
+  const connectionState = useConnectionStore((s) => s.state);
+  const [summary, setSummary] = useState<CostSummary | null>(null);
+  const [agents, setAgents] = useState<readonly CostAgentRow[]>([]);
+  const [recent, setRecent] = useState<readonly CostRecentRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (connectionState !== 'authenticated') return;
+    let cancelled = false;
+    setLoading(true);
+    setFailed(false);
+    Promise.all([
+      api.cost.summary(hours),
+      api.cost.agents(hours),
+      api.cost.recent(20),
+    ])
+      .then(([s, a, r]) => {
+        if (cancelled) return;
+        setSummary(s);
+        setAgents(a?.available ? a.agents ?? [] : []);
+        setRecent(r?.available ? r.records ?? [] : []);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        console.warn('[api]', e);
+        setFailed(true);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionState, hours]);
+
+  const title = (
+    <span className="flex items-center gap-2">
+      <Gauge className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+      {intl.formatMessage({ id: 'reports.cache.title' })}
+    </span>
+  );
+
+  if (loading) {
+    return (
+      <Card title={title}>
+        <div className="py-10 text-center text-sm text-stone-400">
+          {intl.formatMessage({ id: 'common.loading' })}
+        </div>
+      </Card>
+    );
+  }
+
+  if (failed) {
+    return (
+      <Card title={title}>
+        <div className="py-8 text-center text-sm text-stone-500 dark:text-stone-400">
+          {intl.formatMessage({ id: 'reports.cache.loadError' })}
+        </div>
+      </Card>
+    );
+  }
+
+  if (!summary?.available) {
+    return (
+      <Card title={title}>
+        <EmptyState
+          icon={Gauge}
+          dudu="sleep"
+          title={intl.formatMessage({ id: 'reports.cache.empty.title' })}
+          hint={intl.formatMessage({ id: 'reports.cache.empty.desc' })}
+        />
+      </Card>
+    );
+  }
+
+  const hitRate = summary.cache_hit_rate ?? 0;
+  const cliff = summary.price_cliff;
+
+  return (
+    <div className="space-y-4">
+      {/* 200K price-cliff warning */}
+      {cliff?.warning && (
+        <div className="flex items-start gap-3 rounded-lg border border-rose-300 bg-rose-50 px-4 py-3 dark:border-rose-800 dark:bg-rose-900/20">
+          <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-rose-500" />
+          <div className="text-sm text-rose-700 dark:text-rose-300">
+            <p className="font-medium">{intl.formatMessage({ id: 'reports.cache.cliff.title' })}</p>
+            <p className="mt-0.5 text-xs">
+              {intl.formatMessage(
+                { id: 'reports.cache.cliff.desc' },
+                {
+                  count: cliff.requests_near_cliff,
+                  threshold: formatTokens(cliff.threshold_input_tokens),
+                  max: formatTokens(cliff.max_input_tokens),
+                },
+              )}
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          icon={Gauge}
+          tone={effTone(hitRate)}
+          label={intl.formatMessage({ id: 'reports.cache.hitRate' })}
+          value={`${(hitRate * 100).toFixed(1)}%`}
+          hint={intl.formatMessage(
+            { id: 'reports.cache.avgEff' },
+            { value: ((summary.avg_cache_efficiency ?? 0) * 100).toFixed(1) },
+          )}
+        />
+        <StatCard
+          icon={Coins}
+          tone="neutral"
+          label={intl.formatMessage({ id: 'reports.cache.totalCost' })}
+          value={formatMillicents(summary.total_cost_millicents)}
+          hint={intl.formatMessage(
+            { id: 'reports.cache.requests' },
+            { count: summary.total_requests ?? 0 },
+          )}
+        />
+        <StatCard
+          icon={DollarSign}
+          tone="success"
+          label={intl.formatMessage({ id: 'reports.cache.savings' })}
+          value={formatMillicents(summary.total_cache_savings_millicents)}
+        />
+        <StatCard
+          icon={Database}
+          tone="accent"
+          label={intl.formatMessage({ id: 'reports.cache.cacheReads' })}
+          value={formatTokens(summary.total_cache_read_tokens)}
+          hint={intl.formatMessage(
+            { id: 'reports.cache.ofInput' },
+            { value: formatTokens(summary.total_input_tokens) },
+          )}
+        />
+      </div>
+
+      {/* Per-agent cache health */}
+      <Card title={intl.formatMessage({ id: 'reports.cache.byAgent' })} padded={false}>
+        {agents.length === 0 ? (
+          <EmptyState icon={Gauge} dudu="idle" title={intl.formatMessage({ id: 'common.noData' })} />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-[var(--panel-border)]">
+                  <th className="px-5 pb-3 pt-4 font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.agent' })}
+                  </th>
+                  <th className="px-5 pb-3 pt-4 font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.health' })}
+                  </th>
+                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.eff' })}
+                  </th>
+                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.requests' })}
+                  </th>
+                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.cost' })}
+                  </th>
+                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.savings' })}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {agents.map((a) => (
+                  <tr key={a.agent_id} className="border-b border-[var(--panel-border)] last:border-0">
+                    <td className="px-5 py-3 text-stone-900 dark:text-stone-100">{a.agent_id}</td>
+                    <td className="px-5 py-3">
+                      <Badge tone={cacheHealthTone(a.cache_health)} dot>
+                        {intl.formatMessage({ id: `reports.cache.health.${a.cache_health}` })}
+                      </Badge>
+                    </td>
+                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
+                      {(a.avg_cache_efficiency * 100).toFixed(1)}%
+                    </td>
+                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
+                      {a.total_requests.toLocaleString()}
+                    </td>
+                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
+                      {formatMillicents(a.total_cost_millicents)}
+                    </td>
+                    <td className="px-5 py-3 text-right font-medium tabular-nums text-emerald-600 dark:text-emerald-400">
+                      {formatMillicents(a.total_cache_savings_millicents)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+
+      {/* Recent usage */}
+      {recent.length > 0 && (
+        <Card title={intl.formatMessage({ id: 'reports.cache.recent' })} padded={false}>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-[var(--panel-border)]">
+                  <th className="px-5 pb-3 pt-4 font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.agent' })}
+                  </th>
+                  <th className="px-5 pb-3 pt-4 font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.model' })}
+                  </th>
+                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.input' })}
+                  </th>
+                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.eff' })}
+                  </th>
+                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.cost' })}
+                  </th>
+                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'reports.cache.col.time' })}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {recent.map((r, i) => (
+                  <tr key={`${r.created_at}-${i}`} className="border-b border-[var(--panel-border)] last:border-0">
+                    <td className="px-5 py-3 text-stone-900 dark:text-stone-100">{r.agent_id}</td>
+                    <td className="px-5 py-3 text-stone-600 dark:text-stone-400">
+                      <Mono className="text-xs text-stone-500 dark:text-stone-400">{r.model}</Mono>
+                    </td>
+                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
+                      {formatTokens(r.input_tokens)}
+                    </td>
+                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
+                      {(r.cache_efficiency * 100).toFixed(0)}%
+                    </td>
+                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
+                      {formatMillicents(r.cost_millicents)}
+                    </td>
+                    <td className="px-5 py-3 text-right text-xs text-stone-400 dark:text-stone-500">
+                      <Mono className="text-xs text-stone-400 dark:text-stone-500">
+                        {new Date(r.created_at).toLocaleString()}
+                      </Mono>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+    </div>
   );
 }
