@@ -6,6 +6,7 @@
 
 pub mod activation;
 pub mod compression;
+pub mod curator;
 pub mod curiosity;
 pub mod dependency_resolver;
 pub mod diagnostician;
@@ -14,6 +15,7 @@ pub mod extraction;
 pub mod gap;
 pub mod gap_accumulator;
 pub mod graduation;
+pub mod hub_install;
 pub mod lift;
 pub mod recommender;
 pub mod reconstruction;

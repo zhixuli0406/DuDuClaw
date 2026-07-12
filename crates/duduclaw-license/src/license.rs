@@ -65,6 +65,21 @@ pub struct License {
     /// Ed25519 signature over the canonical payload (base64 in JSON).
     #[serde(with = "base64_vec")]
     pub signature: Vec<u8>,
+
+    /// Self-carried control-plane base URL (white-label §10.5). When an issuer
+    /// bakes its owner-gateway URL into the key at issue time, the client
+    /// resolves phone-home / CRL against it without the operator having to set
+    /// `DUDUCLAW_CONTROL_URL` — the root fix for the 60-day offline downgrade.
+    ///
+    /// **Deliberately excluded from [`Self::canonical_payload`]** (same tier as
+    /// `signature`): tampering with it requires local write access to the 0600
+    /// `license.json`, and the refresh response is itself signature-verified, so
+    /// the worst case degrades to "URL unreachable" = the pre-existing baseline.
+    /// Old license files lacking this field deserialize to `None` (serde
+    /// default; `License` has no `deny_unknown_fields`, so a new binary reads an
+    /// old file and vice-versa).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_url: Option<String>,
 }
 
 impl License {
@@ -228,6 +243,7 @@ impl License {
             last_phone_home: now,
             public_key_id: public_key_id.into(),
             signature: Vec::new(),
+            control_url: None,
         }
     }
 }
@@ -283,6 +299,7 @@ mod tests {
             last_phone_home: now - Duration::days(phone_home_days_ago),
             public_key_id: "v1".into(),
             signature: Vec::new(),
+            control_url: None,
         }
     }
 
@@ -456,6 +473,43 @@ mod tests {
         // last_phone_home is part of the signed payload — control-plane
         // re-signs on every refresh.
         assert_ne!(payload_a, payload_b);
+    }
+
+    #[test]
+    fn canonical_payload_excludes_control_url() {
+        // control_url is self-carried config, NOT signed — flipping it must not
+        // change the canonical bytes (otherwise every issuer that bakes a URL
+        // would invalidate the signature).
+        let mut license = make_license(LicenseTier::Oem, 30, 0);
+        let payload_a = license.canonical_payload().unwrap();
+        license.control_url = Some("https://gw.example.com".into());
+        let payload_b = license.canonical_payload().unwrap();
+        assert_eq!(payload_a, payload_b, "control_url must not affect signing");
+        let text = String::from_utf8(payload_b).unwrap();
+        assert!(!text.contains("control_url"));
+    }
+
+    #[test]
+    fn old_license_json_without_control_url_deserializes_to_none() {
+        // An old file (pre-§10.5) has no control_url key — serde default → None,
+        // behaviour unchanged. A new file with the key round-trips.
+        let mut license = make_license(LicenseTier::Oem, 365, 1);
+        let json_old = serde_json::to_string(&license).unwrap();
+        assert!(
+            !json_old.contains("control_url"),
+            "None is skipped in serialization"
+        );
+        let parsed_old: License = serde_json::from_str(&json_old).unwrap();
+        assert!(parsed_old.control_url.is_none());
+
+        license.control_url = Some("https://owner.example/".into());
+        let json_new = serde_json::to_string(&license).unwrap();
+        assert!(json_new.contains("control_url"));
+        let parsed_new: License = serde_json::from_str(&json_new).unwrap();
+        assert_eq!(
+            parsed_new.control_url.as_deref(),
+            Some("https://owner.example/")
+        );
     }
 
     #[test]

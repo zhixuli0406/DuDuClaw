@@ -22,6 +22,10 @@
 //! - [`FallbackRouter`] — cooldown- and context-window-aware fallback chain
 //!   aligned with the gateway rotator semantics (rate-limit 120s, billing
 //!   24h, generic 60s).
+//! - MoA virtual models ([`complete_moa_model`]) — named `moa:<name>`
+//!   ensembles from `[moa.<name>]` override sections: parallel proposer
+//!   opinion pass + a single tool-calling aggregator, fail-closed on
+//!   unknown names.
 //! - [`LlmError`] — classified errors with `is_retryable` / `is_failover`,
 //!   aligned with the gateway `FailureReason` categories.
 //!
@@ -30,6 +34,8 @@
 
 mod error;
 mod http;
+mod moa;
+mod provenance;
 mod provider;
 mod registry;
 mod router;
@@ -43,15 +49,25 @@ mod mcp_client;
 pub mod providers;
 
 pub use error::{classify_http, classify_transport, LlmError};
+pub use moa::{
+    complete_moa, complete_moa_model, is_moa_model_id, moa_name, stream_moa, stream_moa_model,
+    MoaResponse, MoaSpec, DEFAULT_PROPOSER_MAX_TOKENS, MOA_MODEL_PREFIX,
+};
 pub use provider::{resolve_env_key, split_model_id, ApiAuth, ChatProvider, ProviderId};
 pub use registry::{Feature, ModelCaps, ModelInfo, ModelRegistry, PriceCliff};
 pub use router::{
     cooldown_for, CandidateOutcome, FallbackRouter, BILLING_COOLDOWN, GENERIC_COOLDOWN,
     RATE_LIMIT_COOLDOWN,
 };
+pub use provenance::{
+    evaluate_call, seed_default_ledger, CallDecision, FlagKind, ProvenanceConfig, ProvenanceFlag,
+    ProvenanceLedger, ProvenancePolicy, SensitiveTool, SourceKind, TaintHit, TrustLevel,
+    CJK_TAINT_MIN_CHARS, DEFAULT_TAINT_MIN_CHARS, MAX_LEDGER_SPANS, MAX_LEDGER_TOTAL_CHARS,
+    PREVIEW_MAX_CHARS,
+};
 pub use tool_loop::{
-    run_tool_loop, PolicyExecutor, ToolExecutor, ToolOutcome, DEFAULT_MAX_TOOL_ITERS,
-    MAX_ITERS_STOP,
+    run_tool_loop, run_tool_loop_with_provenance, PolicyExecutor, ToolExecutor, ToolLoopOutcome,
+    ToolOutcome, DEFAULT_MAX_TOOL_ITERS, MAX_ITERS_STOP,
 };
 
 #[cfg(feature = "mcp-client")]

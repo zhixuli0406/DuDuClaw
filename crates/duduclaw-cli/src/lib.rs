@@ -1,7 +1,7 @@
 #![allow(clippy::empty_line_after_doc_comments)]
 #![allow(clippy::format_in_format_args)]
 #![allow(clippy::ptr_arg)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -36,6 +36,7 @@ pub(crate) mod mcp_sse_store;  // W20-P1 Phase 2C: SSE event ring buffer
 pub mod mcp_wiki;
 pub mod license;               // M1: license activate/status/refresh/export/import/deactivate
 mod migrate;
+mod export_to;                 // G9: export agents as an agentcompanies/v1 package
 mod migrate_from;              // Painless migration from OpenClaw / Hermes / paperclip
 pub mod odoo_pool;             // RFC-21 §2: per-agent Odoo connector pool
 mod ptc;
@@ -325,10 +326,35 @@ enum Commands {
     /// Export your personal-edition data (`~/.duduclaw/`) as a portable
     /// `.tar.gz` (agents, memory, config, license; skips models/logs/backups).
     /// Use to move between machines or switch self-host ↔ managed.
+    ///
+    /// With `--format agentcompanies`, exports agents as a vendor-neutral
+    /// agentcompanies/v1 package directory instead (COMPANY.md +
+    /// agents/<slug>/AGENTS.md + skills/, consumable by paperclip). Secrets
+    /// are never exported.
     Export {
-        /// Output archive path (default: ./duduclaw-export.tar.gz).
+        /// Output archive path (default: ./duduclaw-export.tar.gz), or output
+        /// directory for `--format agentcompanies` (default:
+        /// ./duduclaw-agentcompanies).
         #[arg(long)]
         out: Option<PathBuf>,
+
+        /// Export format. Omit for the personal-edition `.tar.gz`;
+        /// `agentcompanies` emits an agentcompanies/v1 package directory.
+        #[arg(long)]
+        format: Option<String>,
+
+        /// Export a single agent by id (only with `--format agentcompanies`).
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Export all agents (only with `--format agentcompanies`).
+        #[arg(long)]
+        all: bool,
+
+        /// Emit a single machine-readable JSON summary on stdout (only with
+        /// `--format agentcompanies`); logs stay on stderr.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Import a personal-edition `.tar.gz` (produced by `duduclaw export`)
@@ -453,6 +479,13 @@ enum Commands {
     Test {
         /// Agent name to test
         name: String,
+        /// Optional external red-team case bank (JSONL or TOML). Each case
+        /// (`id`, `category`, `payload`, `expected = blocked|allowed`) is run
+        /// through the prompt-injection scanner; benign cases that get blocked
+        /// are reported as over-defense failures (AgentDyn-inspired, S3).
+        /// A starter bank ships at `templates/redteam/starter-bank.jsonl`.
+        #[arg(long)]
+        bank: Option<PathBuf>,
     },
 
     /// Run harness-level agent behavior eval suites (`evals/<suite>/<case>.toml`).
@@ -523,6 +556,18 @@ enum Commands {
         yes: bool,
     },
 
+    /// OAuth login for subscription seats (GitHub Copilot / Qwen).
+    ///
+    /// Runs an RFC 8628 device-authorization flow: prints a user code + URL,
+    /// polls until you approve in the browser, then stores the seat credential
+    /// (AES-256-GCM encrypted) into `config.toml [[accounts]]`. The seat then
+    /// rotates like any account and can be re-exported via `duduclaw proxy`.
+    ///
+    /// Example:
+    ///     duduclaw auth device --provider copilot
+    #[command(subcommand)]
+    Auth(AuthCommands),
+
     /// RL trajectory management
     #[command(subcommand)]
     Rl(RlCommands),
@@ -568,6 +613,36 @@ enum Commands {
         /// Tool call timeout in seconds
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
+    },
+
+    /// Local OpenAI-compatible reverse-proxy over the account pool (G2).
+    ///
+    /// Turns the DuDuClaw account rotator into a local OpenAI-compatible
+    /// endpoint so external tools (Aider / Cline / Codex …) can borrow the
+    /// subscription / API-key quota it manages:
+    ///
+    ///   POST /v1/chat/completions   — chat completions (streaming + buffered)
+    ///   GET  /v1/models             — vendored model catalogue
+    ///   GET  /healthz               — health check (no auth)
+    ///
+    /// Authentication: `Authorization: Bearer <key>`. The key comes from
+    /// `--key`, `DUDUCLAW_PROXY_KEY`, or `config.toml [proxy] key`; if none is
+    /// set a temporary key is generated and printed at startup.
+    ///
+    /// Example:
+    ///     duduclaw proxy --bind 127.0.0.1:8788
+    Proxy {
+        /// Address to bind (host:port). Defaults to loopback.
+        #[arg(long, default_value = "127.0.0.1:8788")]
+        bind: String,
+
+        /// Bearer proxy key (overrides env / config).
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Provider used for bare model ids without a `provider/` prefix.
+        #[arg(long)]
+        default_provider: Option<String>,
     },
 
     /// Internal hook entry points (called by Claude Code PreToolUse hooks).
@@ -641,7 +716,14 @@ enum HookCommands {
 #[derive(Subcommand)]
 enum AgentCommands {
     /// List all registered agents
-    List,
+    List {
+        /// Emit a machine-readable JSON array on stdout (name, display_name,
+        /// role, status, trigger, reports_to, icon, model). Logs stay on
+        /// stderr. Consumed by external integrations (e.g.
+        /// @duduclaw/paperclip-adapter).
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Create a new agent from template
     Create {
@@ -958,6 +1040,20 @@ enum LifecycleCommands {
 }
 
 #[derive(Subcommand)]
+enum AuthCommands {
+    /// Device-code OAuth login for a subscription seat.
+    Device {
+        /// Provider to authorize: `copilot` (GitHub Copilot) or `qwen`.
+        #[arg(long)]
+        provider: String,
+        /// Override the OAuth client id (defaults to the documented public id;
+        /// also settable via `config.toml [auth.<provider>] client_id`).
+        #[arg(long)]
+        client_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum RlCommands {
     /// Export agent sessions as RL training trajectories
     Export {
@@ -1172,7 +1268,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Run { yes } => cmd_run_server(yes).await,
         Commands::Agent { command } => match command {
             None => cmd_agent_interactive(None).await,
-            Some(AgentCommands::List) => cmd_agent_list().await,
+            Some(AgentCommands::List { json }) => cmd_agent_list(json).await,
             Some(AgentCommands::Create {
                 name,
                 display_name,
@@ -1209,7 +1305,23 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::MigrateFrom { platform, source, apply, rename, json } => {
             migrate_from::run(&platform, source, apply, rename, json).await
         }
-        Commands::Export { out } => cmd_export_data(out).await,
+        Commands::Export { out, format, agent, all, json } => {
+            match format.as_deref().map(str::trim) {
+                None => {
+                    if agent.is_some() || all || json {
+                        return Err(DuDuClawError::Config(
+                            "--agent / --all / --json 需搭配 --format agentcompanies 使用"
+                                .to_string(),
+                        ));
+                    }
+                    cmd_export_data(out).await
+                }
+                Some("agentcompanies") => export_to::run(agent, all, out, json).await,
+                Some(other) => Err(DuDuClawError::Config(format!(
+                    "未知匯出格式 '{other}'。支援: agentcompanies（省略 --format 則輸出個人版 .tar.gz）"
+                ))),
+            }
+        }
         Commands::Audit { since, out, webhook, webhook_auth, format } => {
             cmd_audit_export(since, out, webhook, webhook_auth, format).await
         }
@@ -1243,7 +1355,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::McpServer => cmd_mcp_server().await,
         Commands::Mcp(mcp_cmd) => cmd_mcp(mcp_cmd, &duduclaw_home()).await,
         Commands::Wizard => wizard::cmd_wizard(&duduclaw_home()).await,
-        Commands::Test { name } => cmd_test_agent(&name).await,
+        Commands::Test { name, bank } => cmd_test_agent(&name, bank.as_deref()).await,
         Commands::Eval {
             path,
             filter,
@@ -1269,6 +1381,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             cmd_reforward(&message_id, dry_run, &duduclaw_home()).await
         }
         Commands::Update { yes } => cmd_update(yes).await,
+        Commands::Auth(AuthCommands::Device { provider, client_id }) => {
+            auth_device::run(&provider, client_id, &duduclaw_home()).await
+        }
         Commands::Rl(rl_cmd) => {
             cmd_rl(rl_cmd, &duduclaw_home()).await
         }
@@ -1283,6 +1398,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::HttpServer { bind, no_sse, timeout_secs } => {
             cmd_http_server(&bind, no_sse, timeout_secs).await
+        }
+        Commands::Proxy { bind, key, default_provider } => {
+            proxy::run(&bind, key, default_provider).await
         }
         Commands::Hook(HookCommands::AgentFileGuard) => cmd_hook_agent_file_guard().await,
         Commands::License(license_cmd) => license::run(license_cmd).await,
@@ -2969,8 +3087,8 @@ async fn cmd_agent_interactive(
     runner.run_interactive(agent_name).await
 }
 
-/// `duduclaw agent list`
-async fn cmd_agent_list() -> duduclaw_core::error::Result<()> {
+/// `duduclaw agent list [--json]`
+async fn cmd_agent_list(json: bool) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
 
     let runner = match AgentRunner::new(home.clone()).await {
@@ -2980,11 +3098,41 @@ async fn cmd_agent_list() -> duduclaw_core::error::Result<()> {
                 "No agents found. Run `duduclaw onboard` first.\n({})",
                 e
             );
+            if json {
+                // Keep stdout a clean protocol channel even on the error path.
+                println!("[]");
+            }
             return Ok(());
         }
     };
 
     let agents = runner.list_agents();
+
+    if json {
+        // Exactly one JSON array on stdout — nothing else. Field names are a
+        // stable surface consumed by @duduclaw/paperclip-adapter.
+        let rows: Vec<serde_json::Value> = agents
+            .iter()
+            .map(|a| {
+                let info = &a.config.agent;
+                serde_json::json!({
+                    "name": info.name,
+                    "display_name": info.display_name,
+                    "role": serde_json::to_value(&info.role)
+                        .unwrap_or(serde_json::Value::Null),
+                    "status": serde_json::to_value(&info.status)
+                        .unwrap_or(serde_json::Value::Null),
+                    "trigger": info.trigger,
+                    "reports_to": info.reports_to,
+                    "icon": info.icon,
+                    "model": a.config.model.preferred,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&rows)?);
+        return Ok(());
+    }
+
     if agents.is_empty() {
         println!("No agents found in {}", home.join("agents").display());
         println!("Run `duduclaw onboard` to create a default agent.");
@@ -4455,7 +4603,7 @@ async fn cmd_mcp(cmd: McpCommands, home: &std::path::Path) -> duduclaw_core::err
 }
 
 /// `duduclaw test <agent>` - Red-team test an agent against its behavioral contract.
-async fn cmd_test_agent(agent_name: &str) -> duduclaw_core::error::Result<()> {
+async fn cmd_test_agent(agent_name: &str, bank: Option<&Path>) -> duduclaw_core::error::Result<()> {
     use console::style;
     use duduclaw_agent::contract;
     use duduclaw_security::input_guard;
@@ -4590,6 +4738,13 @@ async fn cmd_test_agent(agent_name: &str) -> duduclaw_core::error::Result<()> {
     }
     println!();
 
+    // ── Optional external red-team bank (S3, AgentDyn-inspired) ──
+    let bank_report = if let Some(bank_path) = bank {
+        Some(run_redteam_bank(bank_path)?)
+    } else {
+        None
+    };
+
     // ── Write JSON report ────────────────────────────────────
     let report = serde_json::json!({
         "agent": agent_name,
@@ -4603,6 +4758,7 @@ async fn cmd_test_agent(agent_name: &str) -> duduclaw_core::error::Result<()> {
             "passed": r.passed,
             "detail": r.detail,
         })).collect::<Vec<_>>(),
+        "bank": bank_report,
     });
 
     let report_path = home.join(format!("test-report-{agent_name}.json"));
@@ -4619,6 +4775,106 @@ struct TestResult {
     vector: String,
     passed: bool,
     detail: String,
+}
+
+/// Run an external red-team case bank through the prompt-injection scanner
+/// (S3, AgentDyn-inspired). Prints a per-category pass/fail breakdown that
+/// separates attack coverage from **over-defense** failures (a benign case
+/// the scanner wrongly blocked), and returns a JSON summary for the report.
+fn run_redteam_bank(bank_path: &Path) -> duduclaw_core::error::Result<serde_json::Value> {
+    use console::style;
+    use duduclaw_gateway::redteam;
+    use duduclaw_security::input_guard;
+
+    let cases = redteam::load_bank(bank_path).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Agent(format!("load red-team bank: {e}"))
+    })?;
+
+    let results = redteam::run_bank(&cases, |payload| {
+        let scan = input_guard::scan_input(payload, input_guard::DEFAULT_BLOCK_THRESHOLD);
+        (scan.blocked, scan.risk_score, scan.matched_rules)
+    });
+
+    let by_cat = redteam::summarize_by_category(&results);
+    let total = results.len();
+    let passed = results.iter().filter(|r| r.passed).count();
+    let over_defense = results.iter().filter(|r| r.over_defense).count();
+
+    println!("  {} {}", style("🎯").bold(), style("Red-Team Bank").bold());
+    println!("  Bank: {}", style(bank_path.display()).dim());
+    println!();
+    for (cat, s) in &by_cat {
+        let icon = if s.failed == 0 {
+            style("PASS").green().bold()
+        } else {
+            style("FAIL").red().bold()
+        };
+        let od = if s.over_defense_failures > 0 {
+            format!(" ({} over-defense)", s.over_defense_failures)
+        } else {
+            String::new()
+        };
+        println!(
+            "  [{icon}] {cat}: {}/{} passed{od}",
+            s.passed, s.total
+        );
+    }
+    println!();
+
+    // List the individual failures so operators can act on them.
+    for r in results.iter().filter(|r| !r.passed) {
+        let tag = if r.over_defense {
+            style("OVER-DEFENSE").yellow().bold()
+        } else {
+            style("MISSED").red().bold()
+        };
+        println!(
+            "  [{tag}] {} ({}) — expected {}, scanner {} (score {})",
+            r.case.id,
+            r.case.category,
+            r.case.expected.as_str(),
+            if r.blocked { "blocked" } else { "allowed" },
+            r.risk_score,
+        );
+    }
+    if passed == total {
+        println!("  {}", style(format!("Bank: all {total} cases passed.")).green().bold());
+    } else {
+        println!(
+            "  {}",
+            style(format!(
+                "Bank: {passed}/{total} passed, {} over-defense failure(s).",
+                over_defense
+            ))
+            .yellow()
+        );
+    }
+    println!();
+
+    Ok(serde_json::json!({
+        "path": bank_path.display().to_string(),
+        "total": total,
+        "passed": passed,
+        "failed": total - passed,
+        "over_defense_failures": over_defense,
+        "by_category": by_cat.iter().map(|(cat, s)| serde_json::json!({
+            "category": cat,
+            "total": s.total,
+            "passed": s.passed,
+            "failed": s.failed,
+            "over_defense_failures": s.over_defense_failures,
+        })).collect::<Vec<_>>(),
+        "cases": results.iter().map(|r| serde_json::json!({
+            "id": r.case.id,
+            "category": r.case.category,
+            "expected": r.case.expected.as_str(),
+            "blocked": r.blocked,
+            "risk_score": r.risk_score,
+            "matched_rules": r.matched_rules,
+            "passed": r.passed,
+            "over_defense": r.over_defense,
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 // ── Manual delegation re-forward (v1.8.21) ──────────────────
@@ -4986,5 +5242,12 @@ mod log_level_config_tests {
         assert_eq!(read_log_level_from_config(&dir.config_path()), None);
     }
 }
+
+// G2 Part B: local OpenAI-compatible reverse-proxy (`duduclaw proxy`).
+pub mod proxy;
+
+// G2: device-code OAuth login for subscription seats (Copilot / Qwen) +
+// proxy-side seat forwarding (`duduclaw auth device`).
+pub mod auth_device;
 
 

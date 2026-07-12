@@ -307,7 +307,13 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                 a.config.agent.name.clone(),
                 a.config.model.preferred.clone(),
             ),
-            None => ("DuDuClaw".to_string(), "🐾".to_string(), String::new(), String::new()),
+            None => (
+                // §10.6: fall back to the white-label product name, not the literal.
+                crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home()),
+                "🐾".to_string(),
+                String::new(),
+                String::new(),
+            ),
         }
     };
 

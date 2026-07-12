@@ -405,6 +405,66 @@ async fn line_webhook_handler(
 
             info!("📩 LINE [{sender}]: {}", truncate_bytes(&input_text, 80));
 
+            // ── Chat commands (/status, /new, /handoff, /undo, /rollback, …) ──
+            // Intercepted before the AI pipeline — zero LLM cost. Mirrors slack.rs.
+            if crate::chat_commands::is_command(&input_text) {
+                if let Some(cmd) = crate::chat_commands::parse_command(&input_text, None) {
+                    let session_id = if let Some(gid) =
+                        source.as_ref().and_then(|s| s.group_id.as_deref())
+                    {
+                        format!("line:{gid}")
+                    } else if let Some(rid) = source.as_ref().and_then(|s| s.room_id.as_deref()) {
+                        format!("line:{rid}")
+                    } else {
+                        format!("line:{sender}")
+                    };
+                    // Central access gate (pairing / allowlist / blocklist) —
+                    // same enforcement the AI path applies; commands must not
+                    // bypass it.
+                    if let Some(gate_reply) = crate::channel_reply::check_user_access_gate(
+                        &state.ctx,
+                        &session_id,
+                        sender,
+                        &input_text,
+                    )
+                    .await
+                    {
+                        if !gate_reply.is_empty() {
+                            let messages =
+                                vec![serde_json::json!({ "type": "text", "text": gate_reply })];
+                            if !send_reply_rich(&state.http, &token, reply_token, messages.clone())
+                                .await
+                            {
+                                push_message_rich(&state.http, &token, sender, messages).await;
+                            }
+                        }
+                        continue; // blocked users are silently ignored
+                    }
+                    let agent_id = {
+                        let reg = state.ctx.registry.read().await;
+                        reg.main_agent()
+                            .map(|a| a.config.agent.name.clone())
+                            .unwrap_or_default()
+                    };
+                    // Real per-channel admin status (fail-closed) — never hardcoded.
+                    let is_admin = crate::channel_reply::is_channel_admin(
+                        &state.ctx,
+                        "line",
+                        &[sender, &session_id],
+                    )
+                    .await;
+                    let reply = crate::chat_commands::handle_command(
+                        &cmd, &state.ctx, &session_id, &agent_id, is_admin,
+                    )
+                    .await;
+                    let messages = vec![serde_json::json!({ "type": "text", "text": reply })];
+                    if !send_reply_rich(&state.http, &token, reply_token, messages.clone()).await {
+                        push_message_rich(&state.http, &token, sender, messages).await;
+                    }
+                    continue;
+                }
+            }
+
             // Progress callback via Push API (requires userId).
             // LINE Push API has monthly message quotas — debounce at 60s
             // (more conservative than Telegram's 30s).

@@ -1,14 +1,28 @@
-//! paperclip (`paperclipai/paperclip`, TypeScript) importer — via the official
-//! `paperclipai company export` directory, NOT a direct Postgres read.
+//! paperclip (`paperclipai/paperclip`, TypeScript) importer — consumes any
+//! **agentcompanies/v1** package directory (the official
+//! `paperclipai company export` output, or a package authored/exported by any
+//! other tool in that format), NOT a direct Postgres read.
 //!
-//! Export shape per spec §1.3 (agentcompanies/v1-draft):
+//! Package shape per the spec (verified 2026-07-11 against
+//! `paperclipai/paperclip` `docs/companies/companies-spec.md`, document
+//! version `agentcompanies/v1-draft`; frontmatter `schema:` value is
+//! `agentcompanies/v1`):
 //! - `COMPANY.md` → shared wiki page.
-//! - `agents/<slug>/AGENTS.md` — YAML frontmatter `name/title/reportsTo/skills`
-//!   + body=instructions → DuDuClaw agent (`reportsTo` → `reports_to`; body → SOUL.md).
-//! - `tasks/<slug>/TASK.md` — frontmatter `name/assignee/project/recurring`
-//!   → Task Board; `recurring` → cron_store.
+//! - `agents/<slug>/AGENTS.md` — YAML frontmatter
+//!   `slug/name/title/reportsTo/skills` + body=instructions → DuDuClaw agent
+//!   (`reportsTo` → `reports_to`; body → SOUL.md).
+//! - `teams/<slug>/TEAM.md` — organizational subtree with optional `manager`
+//!   + `includes`; members without their own `reportsTo` inherit the team
+//!   manager as `reports_to` (bridged mapping, reported).
+//! - `tasks/<slug>/TASK.md` AND `projects/<slug>/tasks/<slug>/TASK.md` —
+//!   frontmatter `name/assignee/project/recurring` → Task Board;
+//!   `recurring` → cron_store.
 //! - `skills/<slug>/SKILL.md` → agent SKILLS/.
-//! - The official export contains NO secrets/DB ids → channels + keys SKIPPED.
+//! - `.paperclip.yaml` vendor sidecar (`schema: paperclip/v1`) —
+//!   `routines.<name>.triggers[].{kind: schedule, cronExpression}` → cron
+//!   (only when the routine carries a task prompt; nothing is fabricated).
+//! - The spec's export rules REQUIRE omitting secrets/DB ids → channels +
+//!   keys always SKIPPED.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,11 +36,34 @@ use super::*;
 /// Parsed `AGENTS.md` (frontmatter + instructions body). Pure.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct AgentCard {
+    /// Spec common field `slug` — preferred identity when present (keeps
+    /// round-trips stable for CJK display names that sanitize to empty).
+    pub slug: Option<String>,
     pub name: String,
     pub title: Option<String>,
     pub reports_to: Option<String>,
     pub skills: Vec<String>,
     pub instructions: String,
+}
+
+/// Parsed `teams/<slug>/TEAM.md`. Pure.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct TeamCard {
+    pub name: String,
+    pub manager: Option<String>,
+    /// Raw `includes` entries (paths or slugs; resolved defensively).
+    pub includes: Vec<String>,
+}
+
+/// A schedule routine from the `.paperclip.yaml` vendor sidecar. Pure.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct SidecarRoutine {
+    pub name: String,
+    pub cron: String,
+    /// Task prompt when the routine declares one; `None` → PARTIAL (a cron
+    /// without a task would be fabricated, which we never do).
+    pub task: Option<String>,
+    pub agent: Option<String>,
 }
 
 /// Parsed `TASK.md`. Pure.
@@ -68,12 +105,97 @@ pub(super) fn parse_agent_card(content: &str) -> AgentCard {
         ..Default::default()
     };
     if let Some(fm) = fm {
+        card.slug = ystr(&fm, "slug");
         card.name = ystr(&fm, "name").unwrap_or_default();
         card.title = ystr(&fm, "title");
         card.reports_to = ystr(&fm, "reportsTo").or_else(|| ystr(&fm, "reports_to"));
         card.skills = yseq(&fm, "skills");
     }
     card
+}
+
+/// Parse `teams/<slug>/TEAM.md`. Pure + unit-tested.
+pub(super) fn parse_team_card(content: &str) -> TeamCard {
+    let (fm, _body) = parse_frontmatter(content);
+    let mut card = TeamCard::default();
+    if let Some(fm) = fm {
+        card.name = ystr(&fm, "name").unwrap_or_default();
+        card.manager = ystr(&fm, "manager");
+        card.includes = yseq(&fm, "includes");
+    }
+    card
+}
+
+/// Resolve an `includes` entry (path or slug) to its target slug: the last
+/// non-`.md` path segment. `agents/alice/AGENTS.md` → `alice`; `alice` →
+/// `alice`. Returns `None` for empty/degenerate entries.
+pub(super) fn include_target_slug(entry: &str) -> Option<String> {
+    let segs: Vec<&str> = entry
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .collect();
+    let last = segs.last()?;
+    let slug = if last.to_ascii_lowercase().ends_with(".md") && segs.len() >= 2 {
+        segs[segs.len() - 2]
+    } else if last.to_ascii_lowercase().ends_with(".md") {
+        return None;
+    } else {
+        last
+    };
+    let slug = slug.trim();
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug.to_string())
+    }
+}
+
+/// Parse schedule routines out of a `.paperclip.yaml` sidecar. Defensive:
+/// unknown shapes are simply omitted, never guessed. Deterministic order
+/// (sorted by routine name).
+pub(super) fn parse_sidecar_routines(yaml: &str) -> Vec<SidecarRoutine> {
+    let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return Vec::new();
+    };
+    let Some(routines) = root.get("routines").and_then(|v| v.as_mapping()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SidecarRoutine> = Vec::new();
+    for (k, spec) in routines {
+        let Some(name) = k.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        // First trigger with kind==schedule and a cron expression.
+        let cron = spec
+            .get("triggers")
+            .and_then(|t| t.as_sequence())
+            .and_then(|seq| {
+                seq.iter().find_map(|t| {
+                    let kind = t.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    if kind != "schedule" {
+                        return None;
+                    }
+                    ["cronExpression", "cron_expression", "cron"]
+                        .iter()
+                        .find_map(|key| ystr(t, key))
+                })
+            });
+        let Some(cron) = cron else { continue };
+        let task = ["prompt", "task", "message", "instruction"]
+            .iter()
+            .find_map(|key| ystr(spec, key));
+        let agent = ystr(spec, "agent").or_else(|| ystr(spec, "assignee"));
+        out.push(SidecarRoutine {
+            name,
+            cron,
+            task,
+            agent,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 /// Parse `tasks/<slug>/TASK.md`. Pure + unit-tested.
@@ -96,6 +218,23 @@ pub(super) fn parse_task_card(content: &str) -> TaskCard {
         };
     }
     card
+}
+
+/// Map an AGENTS.md `title` onto a canonical DuDuClaw role. Only exact,
+/// known role tokens (plus their documented aliases) map; anything else —
+/// free-form job titles like "Lead Engineer" — falls back to `specialist`,
+/// never a guess. Keeps `duduclaw export` → import round-trips role-stable.
+pub(super) fn map_role_title(title: Option<&str>) -> &'static str {
+    match title.map(|t| t.trim().to_ascii_lowercase()).as_deref() {
+        Some("main") => "main",
+        Some("worker") => "worker",
+        Some("developer") | Some("engineer") => "developer",
+        Some("qa") | Some("quality-assurance") | Some("quality") => "qa",
+        Some("planner") => "planner",
+        Some("team-leader") | Some("tl") | Some("lead") | Some("teamlead") => "team-leader",
+        Some("product-manager") | Some("pm") => "product-manager",
+        _ => "specialist",
+    }
 }
 
 /// Teaching message printed when `--source` is omitted (paperclip cannot be
@@ -137,6 +276,22 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
     if !src.exists() {
         report.skipped("export", &src.display().to_string(), "匯出目錄不存在");
         return Ok(report);
+    }
+
+    // Fail-closed: an existing directory that carries none of the
+    // agentcompanies package markers is malformed input, not an empty run.
+    let is_package = src.join("COMPANY.md").exists()
+        || src.join("agents").is_dir()
+        || src.join("teams").is_dir()
+        || src.join("projects").is_dir()
+        || src.join("tasks").is_dir()
+        || src.join("skills").is_dir();
+    if !is_package {
+        return Err(duduclaw_core::error::DuDuClawError::Config(format!(
+            "'{}' 不是有效的 agentcompanies 套件目錄（缺 COMPANY.md 與 agents/ teams/ projects/ tasks/ skills/ 任一標記）。\
+             請指向 `paperclipai company export` 的輸出目錄，或 `duduclaw export --format agentcompanies` 產生的套件。",
+            src.display()
+        )));
     }
 
     // Secrets are out of scope by the official export format.
@@ -189,13 +344,20 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
                 }
             };
             let card = parse_agent_card(&content);
-            let display = if card.name.is_empty() {
-                slug.clone()
-            } else {
-                card.name.clone()
-            };
-            let node_id = sanitize_agent_id(&display);
+            // Identity preference: frontmatter `slug` (spec common field) →
+            // directory slug → display name. Keeps round-trips stable even
+            // when the display name sanitizes badly (e.g. CJK-only names).
+            let node_id = card
+                .slug
+                .as_deref()
+                .map(sanitize_agent_id)
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(sanitize_agent_id(&slug)).filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| sanitize_agent_id(&card.name));
             raw_to_node.insert(slug.to_lowercase(), node_id.clone());
+            if let Some(s) = &card.slug {
+                raw_to_node.insert(s.to_lowercase(), node_id.clone());
+            }
             if !card.name.is_empty() {
                 raw_to_node.insert(card.name.to_lowercase(), node_id.clone());
             }
@@ -215,6 +377,9 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
             .as_ref()
             .and_then(|r| raw_to_node.get(&r.to_lowercase()).cloned());
     }
+
+    // ── Teams: members without their own reportsTo inherit the team manager ──
+    apply_teams(&src, &mut report, &raw_to_node, &mut agents);
 
     let nodes: Vec<(String, Option<String>)> = agents
         .iter()
@@ -266,7 +431,7 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
             &mut report,
             node_id,
             &display,
-            "specialist",
+            map_role_title(pa.card.title.as_deref()),
             &parent_final,
             None,
             soul_body,
@@ -294,7 +459,129 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
     // ── Tasks → Task Board (+ recurring → cron) ──
     import_tasks(ctx, &mut report, &src, &raw_to_node, &final_ids).await;
 
+    // ── `.paperclip.yaml` sidecar routines → cron ──
+    import_sidecar_routines(ctx, &mut report, &src, &raw_to_node, &final_ids).await;
+
     Ok(report)
+}
+
+/// Apply `teams/<slug>/TEAM.md` hierarchy: a member listed in `includes`
+/// whose own AGENTS.md has no `reportsTo` inherits the team `manager` as its
+/// parent. Bridged mapping — the spec expresses hierarchy per-agent via
+/// `reportsTo`; TEAM.md only adds organizational grouping, so this is the
+/// closest honest projection onto DuDuClaw `reports_to`.
+fn apply_teams(
+    src: &Path,
+    report: &mut Report,
+    raw_to_node: &HashMap<String, String>,
+    agents: &mut [PaperclipAgent],
+) {
+    let Ok(rd) = std::fs::read_dir(src.join("teams")) else {
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        let slug = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let content = match std::fs::read_to_string(dir.join("TEAM.md")) {
+            Ok(c) => c,
+            Err(_) => {
+                report.skipped("team", &slug, "找不到 TEAM.md");
+                continue;
+            }
+        };
+        let card = parse_team_card(&content);
+        let team_name = if card.name.is_empty() {
+            slug.clone()
+        } else {
+            card.name.clone()
+        };
+        let Some(manager_node) = card
+            .manager
+            .as_ref()
+            .and_then(|m| raw_to_node.get(&m.to_lowercase()).cloned())
+        else {
+            report.partial(
+                "team",
+                &team_name,
+                "無 manager 或 manager 不在套件內，僅記錄不映射",
+            );
+            continue;
+        };
+        let mut bridged = 0usize;
+        for entry in &card.includes {
+            let Some(member_slug) = include_target_slug(entry) else {
+                continue;
+            };
+            let Some(member_node) = raw_to_node.get(&member_slug.to_lowercase()).cloned() else {
+                continue;
+            };
+            if member_node == manager_node {
+                continue;
+            }
+            if let Some(member) = agents.iter_mut().find(|a| a.node_id == member_node)
+                && member.card.reports_to.is_none()
+                && member.reports_to_node.is_none()
+            {
+                member.reports_to_node = Some(manager_node.clone());
+                bridged += 1;
+            }
+        }
+        if bridged > 0 {
+            report.partial(
+                "team",
+                &team_name,
+                format!("{bridged} 位成員無自身 reportsTo，已橋接為 manager '{manager_node}'"),
+            );
+        } else {
+            report.imported("team", &team_name);
+        }
+    }
+}
+
+/// `.paperclip.yaml` routines with a schedule trigger → cron_store. A routine
+/// without a task prompt is PARTIAL (we never fabricate a task body).
+async fn import_sidecar_routines(
+    ctx: &Ctx,
+    report: &mut Report,
+    src: &Path,
+    raw_to_node: &HashMap<String, String>,
+    final_ids: &HashMap<String, String>,
+) {
+    let Ok(content) = std::fs::read_to_string(src.join(".paperclip.yaml")) else {
+        return;
+    };
+    let routines = parse_sidecar_routines(&content);
+    for r in routines {
+        let Some(task) = r.task.clone() else {
+            report.partial(
+                "cron",
+                &r.name,
+                "sidecar routine 無任務內容（prompt/task），無法建立 cron",
+            );
+            continue;
+        };
+        let agent = r
+            .agent
+            .as_ref()
+            .and_then(|a| raw_to_node.get(&a.to_lowercase()))
+            .and_then(|node| final_ids.get(node))
+            .cloned()
+            .unwrap_or_else(|| "main".to_string());
+        let job = CronJob {
+            name: r.name.clone(),
+            cron: r.cron.clone(),
+            task,
+        };
+        import_cron_jobs(ctx, report, &agent, std::slice::from_ref(&job)).await;
+    }
 }
 
 async fn import_tasks(
@@ -304,14 +591,25 @@ async fn import_tasks(
     raw_to_node: &HashMap<String, String>,
     final_ids: &HashMap<String, String>,
 ) {
-    let Ok(rd) = std::fs::read_dir(src.join("tasks")) else {
-        return;
-    };
-    let mut dirs: Vec<PathBuf> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
+    // Task dirs live at `tasks/<slug>/` and — per the spec's implicit task
+    // discovery — nested under `projects/<slug>/tasks/<slug>/`.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(src.join("tasks")) {
+        dirs.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+    }
+    if let Ok(projects) = std::fs::read_dir(src.join("projects")) {
+        let mut proj_dirs: Vec<PathBuf> = projects
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        proj_dirs.sort();
+        for proj in proj_dirs {
+            if let Ok(rd) = std::fs::read_dir(proj.join("tasks")) {
+                dirs.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+            }
+        }
+    }
     dirs.sort();
     if dirs.is_empty() {
         return;
@@ -451,5 +749,84 @@ mod tests {
         let card = parse_task_card(doc);
         assert!(card.recurring.is_none());
         assert_eq!(card.assignee.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn parse_agent_card_prefers_spec_slug() {
+        let doc = "---\nschema: agentcompanies/v1\nkind: agent\nslug: xiao-mei\nname: 小美\n---\nbody\n";
+        let card = parse_agent_card(doc);
+        assert_eq!(card.slug.as_deref(), Some("xiao-mei"));
+        assert_eq!(card.name, "小美");
+    }
+
+    #[test]
+    fn map_role_title_exact_tokens_only() {
+        assert_eq!(map_role_title(Some("main")), "main");
+        assert_eq!(map_role_title(Some("Engineer")), "developer");
+        assert_eq!(map_role_title(Some("pm")), "product-manager");
+        assert_eq!(map_role_title(Some("tl")), "team-leader");
+        // Free-form titles never guess a role.
+        assert_eq!(map_role_title(Some("Lead Engineer")), "specialist");
+        assert_eq!(map_role_title(None), "specialist");
+    }
+
+    #[test]
+    fn parse_team_card_manager_and_includes() {
+        let doc = "---\nname: Core Team\nmanager: boss\nincludes:\n  - agents/alice/AGENTS.md\n  - bob\n---\nTeam body.\n";
+        let card = parse_team_card(doc);
+        assert_eq!(card.name, "Core Team");
+        assert_eq!(card.manager.as_deref(), Some("boss"));
+        assert_eq!(card.includes, vec!["agents/alice/AGENTS.md", "bob"]);
+    }
+
+    #[test]
+    fn include_target_slug_resolves_paths_and_slugs() {
+        assert_eq!(
+            include_target_slug("agents/alice/AGENTS.md").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(include_target_slug("bob").as_deref(), Some("bob"));
+        assert_eq!(
+            include_target_slug("../teams/qa/TEAM.md").as_deref(),
+            Some("qa")
+        );
+        assert_eq!(include_target_slug(""), None);
+        assert_eq!(include_target_slug("AGENTS.md"), None);
+    }
+
+    #[test]
+    fn sidecar_routines_parse_schedule_triggers_only() {
+        let yaml = r#"
+schema: paperclip/v1
+agents:
+  boss:
+    adapter:
+      type: duduclaw
+routines:
+  monday-review:
+    prompt: Review the sprint board
+    agent: boss
+    triggers:
+      - kind: schedule
+        cronExpression: "0 9 * * 1"
+  no-task:
+    triggers:
+      - kind: schedule
+        cronExpression: "0 8 * * *"
+  webhook-only:
+    prompt: not a schedule
+    triggers:
+      - kind: webhook
+"#;
+        let routines = parse_sidecar_routines(yaml);
+        assert_eq!(routines.len(), 2, "webhook-only must be omitted");
+        assert_eq!(routines[0].name, "monday-review");
+        assert_eq!(routines[0].cron, "0 9 * * 1");
+        assert_eq!(routines[0].task.as_deref(), Some("Review the sprint board"));
+        assert_eq!(routines[0].agent.as_deref(), Some("boss"));
+        assert_eq!(routines[1].name, "no-task");
+        assert!(routines[1].task.is_none(), "no prompt → task None (PARTIAL)");
+        // Malformed YAML → empty, never a panic.
+        assert!(parse_sidecar_routines(":::not yaml:::").is_empty());
     }
 }

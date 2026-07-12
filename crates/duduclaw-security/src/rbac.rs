@@ -215,6 +215,7 @@ mod tests {
             ptc: Default::default(),
             channels: None,
             memory: Default::default(),
+            night_engine: Default::default(),
         }
     }
 

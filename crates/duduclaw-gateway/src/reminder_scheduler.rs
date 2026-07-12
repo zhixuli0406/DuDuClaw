@@ -10,6 +10,18 @@
 //! The in-memory time wheel is a read-only cache rebuilt from disk on each
 //! reload.  All mutations (status updates, GC) go through disk first,
 //! serialized by a filesystem lockfile (`reminders.lock`).
+//!
+//! ## U1 natural-timing exemption (2026-07-11)
+//!
+//! Reminders are **user-scheduled**: `trigger_at` is an explicit instant the
+//! user (or an agent acting on the user's words) chose — both `Direct` and
+//! `AgentCallback` modes. The proactive natural-timing gate
+//! (`duduclaw_agent::proactive_timing`) deliberately does NOT apply here:
+//! "remind me at 9am" must fire at 9am, even inside learned quiet hours.
+//! Only agent-initiated nudges (heartbeat silence breaker, PROACTIVE.md
+//! check notifications) are gated — see
+//! `proactive_timing::gate_applies(ProactiveKind::UserScheduledReminder)`,
+//! which encodes and unit-tests this boundary.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};

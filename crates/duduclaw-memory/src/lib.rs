@@ -11,6 +11,7 @@ pub mod janitor;
 pub mod router;
 pub mod search;
 pub mod trust_store;
+pub mod user_code;
 pub mod user_profile;
 pub mod vector;
 pub mod wiki;
@@ -28,7 +29,18 @@ pub use gdpr::{gdpr_erase, gdpr_export, GdprEraseSummary};
 pub use janitor::{JanitorConfig, JanitorReport, WikiJanitor};
 pub use router::classify;
 pub use trust_store::{TrustUpdateOutcome, UpsertResult, WikiTrustSnapshot, WikiTrustStore};
+pub use user_code::{
+    compile_user_profile, ActionDescriptor, Condition, Conflict, Polarity, Provenance, RuleHit,
+    UserProfile, UserRule,
+};
 pub use user_profile::{
     consolidate_profile, profile_block, profile_traits, record_trait, ProfileTrait,
 };
 pub use wiki::{SourceType, WikiFts, WikiLayer, WikiStore};
+
+// ── Night Engine (N3/N4 deterministic memory passes) ──
+pub mod night;
+pub use night::{
+    consolidate_recurrent, detect_themes, induce_schema, recurrence_gate,
+    verify_consolidation, ConsolidationResult, InducedSchema, Theme, VerificationReport,
+};

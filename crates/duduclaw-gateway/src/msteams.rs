@@ -159,6 +159,32 @@ fn load_conv_store(home_dir: &Path) -> std::collections::HashMap<String, Convers
         .unwrap_or_default()
 }
 
+/// Write the conversation store owner-only (`0600`) — it carries per-tenant
+/// serviceUrls + account objects. Same pattern as
+/// `a2a_signing::write_key_owner_only`: mode applied at `open` time (no
+/// `write` → `chmod` window), then re-asserted for pre-existing files.
+fn write_store_owner_only(path: &Path, json: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(json.as_bytes())?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, json)
+    }
+}
+
 /// Persist a conversation reference (advisory-locked read-modify-write —
 /// the file is shared with future adapters per the repo convention).
 fn save_conversation_ref(home_dir: &Path, conversation_id: &str, conv: ConversationRef) {
@@ -177,7 +203,7 @@ fn save_conversation_ref(home_dir: &Path, conversation_id: &str, conv: Conversat
             }
         }
         let json = serde_json::to_string(&store).map_err(std::io::Error::other)?;
-        std::fs::write(&path, json)
+        write_store_owner_only(&path, &json)
     });
     if let Err(e) = result {
         warn!("Teams: failed to persist conversation reference: {e}");
@@ -658,6 +684,31 @@ mod tests {
         // Oldest entries pruned; newest kept.
         assert!(store.contains_key(&format!("conv-{}", CONV_STORE_CAP + 9)));
         assert!(!store.contains_key("conv-0"));
+    }
+
+    /// LOW-A: the conversation store carries tokened serviceUrls — owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn conv_store_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // Pre-create with loose perms to prove they get re-asserted to 0600.
+        let store = conv_store_path(home);
+        std::fs::write(&store, "{}").unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_conversation_ref(
+            home,
+            "conv-perm",
+            ConversationRef {
+                service_url: "https://smba.trafficmanager.net/amer".into(),
+                bot_account: serde_json::json!({"id": "28:bot"}),
+                user_account: serde_json::json!({"id": "29:user"}),
+                updated_at: 1,
+            },
+        );
+        let mode = std::fs::metadata(&store).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "conversation store must be owner-only, got {mode:o}");
     }
 
     #[test]

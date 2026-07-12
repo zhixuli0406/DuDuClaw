@@ -30,6 +30,18 @@ pub struct ForkSettings {
     pub merge_mode: String,
     pub test_command: Option<String>,
     pub test_timeout_s: u64,
+    /// O3 (2026-07): switch an LLM judge to FineVerify-style per-candidate
+    /// scoring (`duduclaw_fork::judge::LlmJudge::with_fine_grained`). Default
+    /// false. Only effective when `judge = "llm"` — the heuristic judge has
+    /// no LLM pass to fine-grain.
+    pub fine_grained_judge: bool,
+    /// Which judge resolves the fork winner: `"heuristic"` (default —
+    /// deterministic, zero LLM cost) or `"llm"` (opt-in —
+    /// `LlmJudge::new(caller).with_fine_grained(fine_grained_judge)` backed by
+    /// the operator's utility runtime, with automatic fallback to
+    /// `HeuristicJudge` on any LLM failure). Unknown values fall back to
+    /// `"heuristic"` with a logged warning (fail-safe).
+    pub judge: String,
 }
 
 impl Default for ForkSettings {
@@ -42,6 +54,8 @@ impl Default for ForkSettings {
             merge_mode: "auto_with_fallback".to_string(),
             test_command: None,
             test_timeout_s: 120,
+            fine_grained_judge: false,
+            judge: "heuristic".to_string(),
         }
     }
 }
@@ -93,6 +107,25 @@ pub fn parse_fork_settings(toml_str: &str) -> ForkSettings {
             .filter(|n| *n >= 1)
             .map(|n| n as u64)
             .unwrap_or(def.test_timeout_s),
+        fine_grained_judge: fork
+            .get("fine_grained_judge")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(def.fine_grained_judge),
+        judge: match fork.get("judge").and_then(|v| v.as_str()) {
+            Some(s) => {
+                let normalized = s.trim().to_ascii_lowercase();
+                match normalized.as_str() {
+                    "heuristic" | "llm" => normalized,
+                    other => {
+                        tracing::warn!(
+                            "unknown [fork] judge '{other}' — falling back to 'heuristic'"
+                        );
+                        def.judge.clone()
+                    }
+                }
+            }
+            None => def.judge.clone(),
+        },
     }
 }
 
@@ -154,6 +187,33 @@ fn require_enabled(settings: &ForkSettings) -> Option<Value> {
         None
     } else {
         Some(err("forking is disabled for this agent (set [fork] enabled = true in agent.toml)"))
+    }
+}
+
+// ── LLM judge caller ────────────────────────────────────────────────────────
+
+/// Production [`duduclaw_fork::judge::LlmCaller`] for `[fork] judge = "llm"`,
+/// backed by the same provider-agnostic utility choke-point the `duduclaw
+/// eval` live judge uses (`eval::judge::GatewayJudgeCaller` — module-private,
+/// so mirrored here): honours `config.toml [runtime]` utility provider/model
+/// settings and account rotation.
+struct UtilityJudgeCaller {
+    home_dir: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl duduclaw_fork::judge::LlmCaller for UtilityJudgeCaller {
+    async fn complete(&self, prompt: &str) -> duduclaw_fork::Result<String> {
+        duduclaw_gateway::runtime_dispatch::run_utility_prompt(
+            &self.home_dir,
+            None,         // agent-less: resolve the global utility runtime
+            "fork-judge", // attribution id for telemetry
+            "",           // judge instructions live in the prompt itself
+            prompt,
+            duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS,
+        )
+        .await
+        .map_err(duduclaw_fork::ForkError::Executor)
     }
 }
 
@@ -276,12 +336,33 @@ pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> V
                 settings: settings.clone(),
                 home_dir: home_dir.to_path_buf(),
             };
-            tokio::spawn(crate::mcp_fork_exec::execute_fork(
-                req,
-                provider,
-                std::sync::Arc::new(crate::mcp_fork_exec::ClaudeCliSpawner),
-                std::sync::Arc::new(duduclaw_fork::judge::HeuristicJudge),
-            ));
+            let spawner = std::sync::Arc::new(crate::mcp_fork_exec::ClaudeCliSpawner);
+            if settings.judge == "llm" {
+                // Opt-in LLM judge ([fork] judge = "llm"): utility-runtime
+                // backed caller + FineVerify toggle, wrapped so any LLM
+                // failure degrades to the deterministic HeuristicJudge with
+                // a logged warning instead of failing the fork.
+                let llm_judge = duduclaw_fork::judge::LlmJudge::new(UtilityJudgeCaller {
+                    home_dir: home_dir.to_path_buf(),
+                })
+                .with_fine_grained(settings.fine_grained_judge);
+                tokio::spawn(crate::mcp_fork_exec::execute_fork(
+                    req,
+                    provider,
+                    spawner,
+                    std::sync::Arc::new(duduclaw_fork::judge::FallbackJudge::new(
+                        llm_judge,
+                        duduclaw_fork::judge::HeuristicJudge,
+                    )),
+                ));
+            } else {
+                tokio::spawn(crate::mcp_fork_exec::execute_fork(
+                    req,
+                    provider,
+                    spawner,
+                    std::sync::Arc::new(duduclaw_fork::judge::HeuristicJudge),
+                ));
+            }
             "running"
         }
         None => "pending_execution_backend",
@@ -550,6 +631,33 @@ test_timeout_s = 60
     fn empty_test_command_is_none() {
         let s = parse_fork_settings("[fork]\nenabled=true\ntest_command=\"  \"\n");
         assert_eq!(s.test_command, None);
+    }
+
+    #[test]
+    fn parse_fine_grained_judge_flag() {
+        // O3 (2026-07): config surface for LlmJudge::with_fine_grained.
+        assert!(!parse_fork_settings("[fork]\nenabled=true\n").fine_grained_judge);
+        assert!(
+            parse_fork_settings("[fork]\nenabled=true\nfine_grained_judge=true\n")
+                .fine_grained_judge
+        );
+        // Malformed value falls back to the default (false).
+        assert!(
+            !parse_fork_settings("[fork]\nfine_grained_judge=\"yes\"\n").fine_grained_judge
+        );
+    }
+
+    #[test]
+    fn parse_judge_setting() {
+        // Default: heuristic — byte-identical behavior for existing configs.
+        assert_eq!(parse_fork_settings("[fork]\nenabled=true\n").judge, "heuristic");
+        assert_eq!(ForkSettings::default().judge, "heuristic");
+        // Opt-in LLM judge parses (case/whitespace tolerant).
+        assert_eq!(parse_fork_settings("[fork]\njudge=\"llm\"\n").judge, "llm");
+        assert_eq!(parse_fork_settings("[fork]\njudge=\" LLM \"\n").judge, "llm");
+        // Unknown / malformed values fall back to heuristic (fail-safe).
+        assert_eq!(parse_fork_settings("[fork]\njudge=\"gpt9\"\n").judge, "heuristic");
+        assert_eq!(parse_fork_settings("[fork]\njudge=42\n").judge, "heuristic");
     }
 
     #[test]

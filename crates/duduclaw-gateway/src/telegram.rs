@@ -310,9 +310,11 @@ async fn spawn_telegram_bot(
 
 /// Register bot commands with Telegram.
 async fn register_commands(client: &reqwest::Client, api_base: &str) {
+    // §10.6: user-visible product name honours white-label branding.
+    let product = crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
     let commands = json!({
         "commands": [
-            { "command": "ask", "description": "向 DuDuClaw AI 提問" },
+            { "command": "ask", "description": format!("向 {product} AI 提問") },
             { "command": "status", "description": "顯示機器人狀態" },
             { "command": "voice", "description": "切換語音回覆模式" },
             { "command": "reset", "description": "清除對話工作階段" },
@@ -463,7 +465,8 @@ async fn poll_loop(
                 let input_text = if let Some(text) = &msg.text {
                     // Handle bot commands
                     if text.starts_with('/') {
-                        handle_command(text, &client, &api_base, chat_id, thread_id, &ctx, &scope_id, agent_name.as_deref()).await;
+                        let from_user_id = msg.from.as_ref().map(|u| u.id);
+                        handle_command(text, &client, &api_base, chat_id, thread_id, &ctx, &scope_id, agent_name.as_deref(), from_user_id).await;
                         continue;
                     }
                     // Strip bot mention
@@ -778,6 +781,11 @@ async fn answer_callback_query(client: &reqwest::Client, api_base: &str, callbac
 }
 
 /// Handle bot commands (/ask, /status, /voice, /reset, /help).
+///
+/// `from_user_id` is the Telegram sender's personal user id (when present)
+/// — used for the per-channel `admin_users` check so a group's admin can be
+/// identified by their own id, not just the shared chat id.
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     text: &str,
     client: &reqwest::Client,
@@ -787,7 +795,32 @@ async fn handle_command(
     ctx: &Arc<ReplyContext>,
     scope_id: &str,
     agent_name: Option<&str>,
+    from_user_id: Option<i64>,
 ) {
+    // Central access gate (pairing / allowlist / blocklist) — the command
+    // intercept runs BEFORE channel_reply's pipeline gate, so apply the SAME
+    // gate here: unpaired/blocked users must not run /reset //undo //handoff
+    // etc. (/ask is gated again inside build_reply — harmless and idempotent).
+    {
+        let gate_session_id = if let Some(tid) = thread_id {
+            format!("telegram:{chat_id}:{tid}")
+        } else {
+            format!("telegram:{chat_id}")
+        };
+        if let Some(gate_reply) = crate::channel_reply::check_user_access_gate(
+            ctx,
+            &gate_session_id,
+            scope_id,
+            text,
+        )
+        .await
+        {
+            if !gate_reply.is_empty() {
+                send_reply(client, api_base, chat_id, &gate_reply, thread_id, None, None).await;
+            }
+            return; // blocked users are silently ignored (empty reply)
+        }
+    }
     // Parse command (strip @bot_username suffix)
     let raw_cmd = text.split_whitespace().next().unwrap_or("");
     let cmd = raw_cmd.split('@').next().unwrap_or(raw_cmd);
@@ -867,7 +900,50 @@ async fn handle_command(
 /help — 顯示本說明";
             send_reply(client, api_base, chat_id, help, thread_id, None, None).await;
         }
-        _ => {} // Unknown command — ignore
+        _ => {
+            // Not a legacy Telegram command — delegate to the shared
+            // chat-command dispatcher (/handoff, /undo, /rollback, /new, …)
+            // so Telegram gets the same command surface as other channels.
+            // Reconstruct "<cmd> <args>" so a "/undo@BotName 2" form parses
+            // the same as "/undo 2".
+            let normalized = if args.is_empty() {
+                cmd.to_string()
+            } else {
+                format!("{cmd} {args}")
+            };
+            if let Some(parsed) = crate::chat_commands::parse_command(&normalized, None) {
+                let session_id = if let Some(tid) = thread_id {
+                    format!("telegram:{chat_id}:{tid}")
+                } else {
+                    format!("telegram:{chat_id}")
+                };
+                let agent_id = match agent_name {
+                    Some(a) => a.to_string(),
+                    None => {
+                        let reg = ctx.registry.read().await;
+                        reg.main_agent()
+                            .map(|a| a.config.agent.name.clone())
+                            .unwrap_or_default()
+                    }
+                };
+                // Real per-channel admin status (fail-closed) — never
+                // hardcoded. Matches the sender's personal user id, the chat
+                // id, or the full session id against `admin_users`.
+                let from_id_str = from_user_id.map(|id| id.to_string());
+                let mut identities: Vec<&str> = vec![scope_id, &session_id];
+                if let Some(fid) = from_id_str.as_deref() {
+                    identities.push(fid);
+                }
+                let is_admin =
+                    crate::channel_reply::is_channel_admin(ctx, "telegram", &identities).await;
+                let reply = crate::chat_commands::handle_command(
+                    &parsed, ctx, &session_id, &agent_id, is_admin,
+                )
+                .await;
+                send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
+            }
+            // Still-unknown slash command — ignore (legacy behavior).
+        }
     }
 }
 

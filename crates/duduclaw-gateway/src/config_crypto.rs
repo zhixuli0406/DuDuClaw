@@ -445,6 +445,39 @@ mod tests {
         assert!(resolve_agent_channel_token_via_reports_to(home.path(), "x", "discord").is_none());
     }
 
+    // ─── MED-B: enc-only fields (no plaintext copy) stay readable ──
+
+    /// `channels.add` no longer persists a plaintext copy of the WeCom /
+    /// DingTalk secrets — the read path must work from `_enc` alone.
+    #[test]
+    fn enc_only_field_reads_without_plaintext_copy() {
+        let home = TempHome::new();
+        let enc = encrypt_value("corp-secret-value", home.path()).expect("encrypt");
+        let toml_src = format!("[channels]\nwecom_corp_secret_enc = \"{enc}\"\n");
+        let table: toml::Table = toml_src.parse().unwrap();
+        assert_eq!(
+            decrypt_config_field(&table, "channels", "wecom_corp_secret", home.path()),
+            Some("corp-secret-value".to_string())
+        );
+    }
+
+    /// An explicitly *empty* plaintext key means "channel removed" even when a
+    /// stale `_enc` remains — which is why the write path REMOVES the plaintext
+    /// key instead of blanking it.
+    #[test]
+    fn empty_plaintext_marks_removed_even_with_stale_enc() {
+        let home = TempHome::new();
+        let enc = encrypt_value("stale-secret", home.path()).expect("encrypt");
+        let toml_src = format!(
+            "[channels]\nwecom_corp_secret = \"\"\nwecom_corp_secret_enc = \"{enc}\"\n"
+        );
+        let table: toml::Table = toml_src.parse().unwrap();
+        assert_eq!(
+            decrypt_config_field(&table, "channels", "wecom_corp_secret", home.path()),
+            None
+        );
+    }
+
     // ─── encrypt_value auto-generates keyfile on fresh install ─────
 
     #[test]

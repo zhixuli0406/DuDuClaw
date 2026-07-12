@@ -108,6 +108,13 @@ struct ChatRequest {
     /// Omitted entirely when not requested so legacy servers see an unchanged body.
     #[serde(skip_serializing_if = "Option::is_none")]
     logprobs: Option<bool>,
+    /// JitRL Tier B injection point (arXiv:2601.18510, see [`crate::jitrl`]):
+    /// token id → additive logit bias, the standard OpenAI-compat `logit_bias`
+    /// field (supported by llama.cpp server, vLLM, SGLang). serde_json encodes
+    /// the integer keys as JSON object string keys, matching the API shape.
+    /// Omitted entirely when absent so legacy request bodies are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logit_bias: Option<std::collections::HashMap<u32, f32>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -224,6 +231,7 @@ impl InferenceBackend for OpenAiCompatBackend {
             top_p: Some(request.params.top_p),
             stop: request.params.stop.clone(),
             logprobs: request.params.capture_logprobs.then_some(true),
+            logit_bias: request.params.logit_bias.clone(),
         };
 
         let url = &self.chat_url;
@@ -343,6 +351,7 @@ mod logprob_tests {
             top_p: Some(0.9),
             stop: vec![],
             logprobs: None,
+            logit_bias: None,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("logprobs"), "legacy request body must be unchanged: {json}");
@@ -350,5 +359,30 @@ mod logprob_tests {
         let body = ChatRequest { logprobs: Some(true), ..body };
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("\"logprobs\":true"));
+    }
+
+    #[test]
+    fn logit_bias_omitted_when_absent_and_string_keyed_when_present() {
+        // JitRL disabled / no similar experience → field must not appear at
+        // all: legacy servers see a byte-identical body shape.
+        let body = ChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: Some(10),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            stop: vec![],
+            logprobs: None,
+            logit_bias: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("logit_bias"), "untouched request must carry no bias: {json}");
+
+        // JitRL enabled → OpenAI-style object with string keys.
+        let mut bias = std::collections::HashMap::new();
+        bias.insert(42u32, 1.5f32);
+        let body = ChatRequest { logit_bias: Some(bias), ..body };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains("\"logit_bias\":{\"42\":1.5}"), "got: {json}");
     }
 }

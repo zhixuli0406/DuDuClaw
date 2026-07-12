@@ -199,7 +199,75 @@ pub struct CustomSkillRecord {
     /// been used, incremented from the channel_reply stream-json path when the
     /// Claude CLI `Skill` tool names this skill's slug (token-equal match). 0 for
     /// unapproved/never-run skills. Feeds the honest saved-hours figure.
+    ///
+    /// G5 curator note: the table also carries a `last_used_at` column stamped
+    /// by [`CustomSkillStore::increment_usage_by_slug`]. It is deliberately NOT
+    /// a struct field (existing literal constructors live outside this module);
+    /// read it via [`CustomSkillStore::registry_last_used_map`].
     pub usage_count: u64,
+}
+
+// ── Curation (G5 curator lifecycle) ─────────────────────────
+
+/// Curation status of one installed skill file. Distinct from
+/// [`CustomSkillStatus`] (which is the *creation* approval lifecycle): every
+/// skill file in a loader scan root gets a curation row, custom or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurationStatus {
+    /// Normal — loadable, recently used or too new to judge.
+    Active,
+    /// Unused past the stale window — flagged, still loadable.
+    Stale,
+    /// Unused past the archive window — file moved to `<home>/skills-archive/`
+    /// (excluded from loader scan roots, recoverable via pin/restore).
+    Archived,
+    /// The curator could not locate the on-disk artifact (e.g. a nested
+    /// `group/<name>/SKILL.md` layout it cannot manage). Flagged once, then
+    /// exempt from scheduled transitions — never archived, never re-reported
+    /// as an error on every pass.
+    Unmanaged,
+}
+
+impl CurationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CurationStatus::Active => "active",
+            CurationStatus::Stale => "stale",
+            CurationStatus::Archived => "archived",
+            CurationStatus::Unmanaged => "unmanaged",
+        }
+    }
+
+    /// Parse from the DB text column. Unknown ⇒ `Stale` (fail-safe: visible
+    /// flag, but never triggers a destructive file move by itself).
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "active" => CurationStatus::Active,
+            "archived" => CurationStatus::Archived,
+            "unmanaged" => CurationStatus::Unmanaged,
+            _ => CurationStatus::Stale,
+        }
+    }
+}
+
+/// One row of `skill_curation`, keyed by `(skill_name, scope)` where scope is
+/// `"global"` or `"agent:<id>"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillCurationRecord {
+    pub skill_name: String,
+    pub scope: String,
+    /// When the curator first saw this skill file (RFC-3339). The stale/archive
+    /// clock starts here when the skill has never been used.
+    pub first_seen: String,
+    /// Last real invocation (RFC-3339), stamped by the usage-increment path.
+    pub last_used_at: Option<String>,
+    /// Pinned skills are exempt from both stale marking and archiving.
+    pub pinned: bool,
+    pub status: CurationStatus,
+    /// Where the file was moved on archive (for recovery).
+    pub archived_path: Option<String>,
+    pub updated_at: String,
 }
 
 // ── Store ───────────────────────────────────────────────────
@@ -264,20 +332,44 @@ impl CustomSkillStore {
         )
         .map_err(|e| format!("init custom skills schema: {e}"))?;
 
-        // Idempotent migration: `usage_count` (L5 §14 — per-skill invocation
-        // counter) may be absent on registries created before this column
-        // existed. `ADD COLUMN` on a live table re-runs on every open, so we
-        // swallow the "duplicate column name" error (the only expected failure)
-        // and surface any other.
-        if let Err(e) = conn.execute(
+        // Idempotent migrations: `ADD COLUMN` on a live table re-runs on every
+        // open, so we swallow the "duplicate column name" error (the only
+        // expected failure) and surface any other.
+        //   - `usage_count` (L5 §14 — per-skill invocation counter)
+        //   - `last_used_at` (G5 curator — last-invocation timestamp)
+        for ddl in [
             "ALTER TABLE custom_skill_registry ADD COLUMN usage_count INTEGER NOT NULL DEFAULT 0",
-            [],
-        ) {
-            let msg = e.to_string();
-            if !msg.contains("duplicate column name") {
-                return Err(format!("migrate usage_count: {msg}"));
+            "ALTER TABLE custom_skill_registry ADD COLUMN last_used_at TEXT",
+        ] {
+            if let Err(e) = conn.execute(ddl, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(format!("migrate custom_skill_registry: {msg}"));
+                }
             }
         }
+
+        // G5 curator tables (CREATE IF NOT EXISTS ⇒ idempotent).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS skill_curation (
+                 skill_name    TEXT NOT NULL,
+                 scope         TEXT NOT NULL,
+                 first_seen    TEXT NOT NULL,
+                 last_used_at  TEXT,
+                 pinned        INTEGER NOT NULL DEFAULT 0,
+                 status        TEXT NOT NULL DEFAULT 'active',
+                 archived_path TEXT,
+                 updated_at    TEXT NOT NULL,
+                 PRIMARY KEY (skill_name, scope)
+             );
+             CREATE INDEX IF NOT EXISTS idx_skill_curation_status ON skill_curation(status);
+
+             CREATE TABLE IF NOT EXISTS curator_meta (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );",
+        )
+        .map_err(|e| format!("init skill curation schema: {e}"))?;
         Ok(())
     }
 
@@ -373,17 +465,194 @@ impl CustomSkillStore {
     /// by its machine `slug`. Fail-closed on scope: only `status = 'approved'`
     /// rows are ever counted, so a draft/pending/retired slug collision cannot
     /// inflate saved-hours. Returns true when a row was actually bumped.
+    ///
+    /// G5 curator: the same call stamps `last_used_at` on the registry row and
+    /// on every `skill_curation` row with this skill name (any scope, any
+    /// approval status — "used" is a fact about the file, not about approval).
+    /// The return value keeps its original approved-row semantics.
     pub async fn increment_usage_by_slug(&self, slug: &str) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
         let n = conn
             .execute(
                 "UPDATE custom_skill_registry
-                    SET usage_count = usage_count + 1
+                    SET usage_count = usage_count + 1,
+                        last_used_at = ?2
                   WHERE slug = ?1 AND status = 'approved'",
-                params![slug],
+                params![slug, now],
             )
             .map_err(|e| format!("increment usage: {e}"))?;
+        conn.execute(
+            "UPDATE skill_curation SET last_used_at = ?2, updated_at = ?2 WHERE skill_name = ?1",
+            params![slug, now],
+        )
+        .map_err(|e| format!("touch curation usage: {e}"))?;
         Ok(n > 0)
+    }
+
+    // ── Curation methods (G5 curator lifecycle) ─────────────
+
+    /// Register a skill file the curator discovered. First sighting inserts an
+    /// `active` row with `first_seen = now`; later sightings are no-ops.
+    /// Returns true when a new row was created.
+    pub async fn curation_upsert_seen(
+        &self,
+        skill_name: &str,
+        scope: &str,
+        now: &str,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO skill_curation
+                    (skill_name, scope, first_seen, pinned, status, updated_at)
+                 VALUES (?1, ?2, ?3, 0, 'active', ?3)",
+                params![skill_name, scope, now],
+            )
+            .map_err(|e| format!("curation upsert: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// Full-row upsert — used by tests (synthetic timestamps) and by the
+    /// pin/restore path. Replaces any existing `(skill_name, scope)` row.
+    pub async fn curation_put(&self, rec: &SkillCurationRecord) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR REPLACE INTO skill_curation
+                (skill_name, scope, first_seen, last_used_at, pinned, status, archived_path, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                rec.skill_name,
+                rec.scope,
+                rec.first_seen,
+                rec.last_used_at,
+                rec.pinned as i64,
+                rec.status.as_str(),
+                rec.archived_path,
+                rec.updated_at,
+            ],
+        )
+        .map_err(|e| format!("curation put: {e}"))?;
+        Ok(())
+    }
+
+    pub async fn curation_get(
+        &self,
+        skill_name: &str,
+        scope: &str,
+    ) -> Result<Option<SkillCurationRecord>, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            &format!("{CURATION_SELECT} WHERE skill_name = ?1 AND scope = ?2"),
+            params![skill_name, scope],
+            row_to_curation,
+        )
+        .optional()
+        .map_err(|e| format!("curation get: {e}"))
+    }
+
+    /// All curation rows, ordered by scope then name (stable report order).
+    pub async fn curation_list(&self) -> Result<Vec<SkillCurationRecord>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&format!("{CURATION_SELECT} ORDER BY scope, skill_name"))
+            .map_err(|e| format!("prepare curation list: {e}"))?;
+        let rows = stmt
+            .query_map([], row_to_curation)
+            .map_err(|e| format!("query curation list: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect curation list: {e}"))?;
+        Ok(rows)
+    }
+
+    /// Set curation status (and archived path when archiving / clearing).
+    pub async fn curation_set_status(
+        &self,
+        skill_name: &str,
+        scope: &str,
+        status: CurationStatus,
+        archived_path: Option<&str>,
+        now: &str,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE skill_curation
+                    SET status = ?3, archived_path = ?4, updated_at = ?5
+                  WHERE skill_name = ?1 AND scope = ?2",
+                params![skill_name, scope, status.as_str(), archived_path, now],
+            )
+            .map_err(|e| format!("curation set status: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// Toggle the pin flag. Returns true when the row exists.
+    pub async fn curation_set_pinned(
+        &self,
+        skill_name: &str,
+        scope: &str,
+        pinned: bool,
+        now: &str,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE skill_curation SET pinned = ?3, updated_at = ?4
+                  WHERE skill_name = ?1 AND scope = ?2",
+                params![skill_name, scope, pinned as i64, now],
+            )
+            .map_err(|e| format!("curation set pinned: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// Remove a curation row (skill file vanished outside the curator's
+    /// control — nothing left to track).
+    pub async fn curation_remove(&self, skill_name: &str, scope: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "DELETE FROM skill_curation WHERE skill_name = ?1 AND scope = ?2",
+                params![skill_name, scope],
+            )
+            .map_err(|e| format!("curation remove: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// `last_used_at` per approved-registry slug (auxiliary usage signal the
+    /// curator merges with the curation rows' own stamps).
+    pub async fn registry_last_used_map(&self) -> Result<std::collections::HashMap<String, String>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT slug, last_used_at FROM custom_skill_registry WHERE last_used_at IS NOT NULL")
+            .map_err(|e| format!("prepare last-used map: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| format!("query last-used map: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect last-used map: {e}"))?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Curator scratch metadata (e.g. `last_run_at`).
+    pub async fn meta_get(&self, key: &str) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT value FROM curator_meta WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("meta get: {e}"))
+    }
+
+    pub async fn meta_set(&self, key: &str, value: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR REPLACE INTO curator_meta (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )
+        .map_err(|e| format!("meta set: {e}"))?;
+        Ok(())
     }
 
     /// Approved custom skills (feeds the growth saved-hours computation). Newest
@@ -513,6 +782,23 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<CustomSkillRecord> {
         updated_at: row.get(13)?,
         approved_at: row.get(14)?,
         usage_count: row.get::<_, i64>(15)?.max(0) as u64,
+    })
+}
+
+const CURATION_SELECT: &str = "SELECT skill_name, scope, first_seen, last_used_at, pinned, \
+    status, archived_path, updated_at FROM skill_curation";
+
+fn row_to_curation(row: &rusqlite::Row) -> rusqlite::Result<SkillCurationRecord> {
+    let status_text: String = row.get(5)?;
+    Ok(SkillCurationRecord {
+        skill_name: row.get(0)?,
+        scope: row.get(1)?,
+        first_seen: row.get(2)?,
+        last_used_at: row.get(3)?,
+        pinned: row.get::<_, i64>(4)? != 0,
+        status: CurationStatus::from_db(&status_text),
+        archived_path: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -793,6 +1079,71 @@ mod tests {
         let approved_rows = store.list_approved().await.unwrap();
         assert_eq!(approved_rows.len(), 1);
         assert_eq!(approved_rows[0].id, "s1");
+
+        // G5: the increment stamped last_used_at on the approved slug.
+        let map = store.registry_last_used_map().await.unwrap();
+        assert!(map.contains_key("daily-report"), "increment must stamp last_used_at");
+        assert!(!map.contains_key("draft-only"), "unapproved slug must not be stamped");
+    }
+
+    // ── G5 curation store ────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn curation_roundtrip_and_usage_touch() {
+        let store = CustomSkillStore::open_in_memory().unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        // First sighting inserts; second is a no-op that preserves first_seen.
+        assert!(store.curation_upsert_seen("web-scraper", "global", &now).await.unwrap());
+        assert!(!store.curation_upsert_seen("web-scraper", "global", "2030-01-01T00:00:00Z").await.unwrap());
+        let rec = store.curation_get("web-scraper", "global").await.unwrap().unwrap();
+        assert_eq!(rec.first_seen, now);
+        assert_eq!(rec.status, CurationStatus::Active);
+        assert!(!rec.pinned);
+        assert!(rec.last_used_at.is_none());
+
+        // Usage increment touches curation last_used_at even without an
+        // approved registry row (usage is a fact about the file).
+        store.increment_usage_by_slug("web-scraper").await.unwrap();
+        let rec = store.curation_get("web-scraper", "global").await.unwrap().unwrap();
+        assert!(rec.last_used_at.is_some(), "usage must stamp curation last_used_at");
+
+        // Pin toggle + status transitions persist.
+        assert!(store.curation_set_pinned("web-scraper", "global", true, &now).await.unwrap());
+        assert!(store
+            .curation_set_status("web-scraper", "global", CurationStatus::Stale, None, &now)
+            .await
+            .unwrap());
+        let rec = store.curation_get("web-scraper", "global").await.unwrap().unwrap();
+        assert!(rec.pinned);
+        assert_eq!(rec.status, CurationStatus::Stale);
+
+        // Missing row: pin/status return false, get returns None.
+        assert!(!store.curation_set_pinned("nope", "global", true, &now).await.unwrap());
+        assert!(store.curation_get("nope", "global").await.unwrap().is_none());
+
+        // Remove.
+        assert!(store.curation_remove("web-scraper", "global").await.unwrap());
+        assert!(store.curation_get("web-scraper", "global").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn curation_status_from_db_fails_safe_to_stale() {
+        assert_eq!(CurationStatus::from_db("active"), CurationStatus::Active);
+        assert_eq!(CurationStatus::from_db("archived"), CurationStatus::Archived);
+        // Unknown must never map to a state that triggers a file move.
+        assert_eq!(CurationStatus::from_db("garbage"), CurationStatus::Stale);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn curator_meta_roundtrip() {
+        let store = CustomSkillStore::open_in_memory().unwrap();
+        assert!(store.meta_get("last_run_at").await.unwrap().is_none());
+        store.meta_set("last_run_at", "2026-07-11T00:00:00Z").await.unwrap();
+        assert_eq!(
+            store.meta_get("last_run_at").await.unwrap().as_deref(),
+            Some("2026-07-11T00:00:00Z")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

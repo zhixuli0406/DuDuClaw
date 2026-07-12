@@ -167,6 +167,28 @@ fn build_system_prompt(
 ///
 /// Returns `None` when the agent has no pending tasks — callers should
 /// skip appending the section in that case to keep the prompt tight.
+/// U4: fetch the agent's co-edited plan checklist (shared store first,
+/// per-call fallback — same access pattern as the task-queue section).
+/// Any store/query failure ⇒ `None`, never an error into the reply path.
+async fn plan_section_for_agent(home_dir: &Path, agent_id: &str) -> Option<String> {
+    let shared = SHARED_TASK_STORE.get().cloned();
+    let fallback_store;
+    let store: &crate::task_store::TaskStore = match shared.as_deref() {
+        Some(s) => s,
+        None => {
+            fallback_store = crate::task_store::TaskStore::open(home_dir).ok()?;
+            &fallback_store
+        }
+    };
+    match store.plan_prompt_section(agent_id).await {
+        Ok(section) => section,
+        Err(e) => {
+            tracing::debug!(agent = %agent_id, error = %e, "plan section omitted from system prompt");
+            None
+        }
+    }
+}
+
 async fn build_pending_tasks_section(home_dir: &Path, agent_id: &str) -> Option<String> {
     // Prefer the shared store (one SQLite connection for the whole
     // gateway process — avoids WAL write-lock contention on high-volume
@@ -193,7 +215,9 @@ async fn build_pending_tasks_section(home_dir: &Path, agent_id: &str) -> Option<
     };
 
     let mut all: Vec<crate::task_store::TaskRow> = Vec::new();
-    for status in &["in_progress", "todo", "blocked"] {
+    // `pending` = durable dispatch-engine tasks awaiting a claim — they must be
+    // surfaced here or nobody ever sees them (MED finding, 2026-07 review).
+    for status in &["in_progress", "todo", "pending", "blocked"] {
         if let Ok(mut rows) = store.list_tasks(Some(status), Some(agent_id), None).await {
             all.append(&mut rows);
         }
@@ -212,6 +236,46 @@ async fn build_pending_tasks_section(home_dir: &Path, agent_id: &str) -> Option<
     all.sort_by(|a, b| priority_rank(&a.priority).cmp(&priority_rank(&b.priority)));
 
     let total = all.len();
+
+    // G8 goal chain: resolve the why-chain (Initiative → Project → Issue) for
+    // each distinct goal referenced by the shown tasks so agents see the WHY,
+    // not just the WHAT. Rendering is deterministic (data-derived only), so the
+    // injected block stays byte-stable when the underlying rows are unchanged
+    // (prompt-cache friendly). Truncation is CJK-safe (`truncate_chars`).
+    let mut goal_chains: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for t in all.iter().take(5) {
+        let Some(gid) = t.goal_id.as_deref() else {
+            continue;
+        };
+        if goal_chains.contains_key(gid) {
+            continue;
+        }
+        match store.goal_ancestry(gid).await {
+            Ok(chain) if !chain.is_empty() => {
+                let mut parts: Vec<String> = chain
+                    .iter()
+                    .map(|g| duduclaw_core::truncate_chars(&g.title, 40))
+                    .collect();
+                // The leaf goal carries the immediate "why" — append it.
+                if let Some(leaf) = chain.last() {
+                    let why = leaf.description.trim();
+                    if !why.is_empty() {
+                        if let Some(last) = parts.last_mut() {
+                            *last =
+                                format!("{last} ({})", duduclaw_core::truncate_chars(why, 80));
+                        }
+                    }
+                }
+                goal_chains.insert(gid.to_string(), parts.join(" → "));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(goal = %gid, error = %e, "goal ancestry lookup failed — omitted");
+            }
+        }
+    }
+
     let shown: Vec<String> = all
         .iter()
         .take(5)
@@ -224,9 +288,16 @@ async fn build_pending_tasks_section(home_dir: &Path, agent_id: &str) -> Option<
                     .map(|r| format!(" — blocked: {r}"))
                     .unwrap_or_default(),
                 "in_progress" => " [in progress]".to_string(),
+                "pending" => " [unclaimed — use tasks_claim]".to_string(),
                 _ => String::new(),
             };
-            format!("{}. [{}] {}{}", i + 1, t.priority, t.title, extra)
+            let goal_line = t
+                .goal_id
+                .as_deref()
+                .and_then(|gid| goal_chains.get(gid))
+                .map(|chain| format!("\n   Goal: {chain}"))
+                .unwrap_or_default();
+            format!("{}. [{}] {}{}{}", i + 1, t.priority, t.title, extra, goal_line)
         })
         .collect();
     let more = if total > 5 {
@@ -237,7 +308,9 @@ async fn build_pending_tasks_section(home_dir: &Path, agent_id: &str) -> Option<
     Some(format!(
         "## Your Task Queue ({total} pending)\n{}{}\n\n\
          Use `tasks_list`, `tasks_claim`, `tasks_update`, `tasks_complete`, `tasks_block` \
-         to manage these, and `activity_post` to report progress without changing status.",
+         to manage these, and `activity_post` to report progress without changing status. \
+         Claimed tasks are leased: on long-running work, call `tasks_renew` every few \
+         minutes or the lease expires and the task is reclaimed.",
         shown.join("\n"),
         more,
     ))
@@ -282,6 +355,35 @@ pub async fn call_claude_for_agent(
 ///
 /// Delegation context (depth, origin, sender) is read from the [`DELEGATION_ENV`]
 /// task-local — set by the dispatcher before calling this function.
+pub async fn call_claude_for_agent_with_type(
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+    prompt: &str,
+    request_type: crate::cost_telemetry::RequestType,
+) -> Result<String, String> {
+    call_claude_for_agent_impl(home_dir, registry, agent_id, prompt, request_type, None).await
+}
+
+/// O2 (ephemeral sub-agent synthesis): like [`call_claude_for_agent_with_type`]
+/// but for an agent loaded from disk instead of the registry. Ephemeral
+/// scaffolds live under `<home>/agents/.ephemeral/` where the registry scan
+/// never sees them — `crate::ephemeral::dispatch` loads the scaffold and
+/// threads it through here so the full delegation path (tier routing guard,
+/// capabilities → allowed/disallowed tools, rotation/PTY/local offload,
+/// cost telemetry) applies unchanged.
+pub async fn call_claude_for_agent_preloaded(
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent: &duduclaw_agent::LoadedAgent,
+    prompt: &str,
+    request_type: crate::cost_telemetry::RequestType,
+) -> Result<String, String> {
+    let agent_id = agent.config.agent.name.clone();
+    call_claude_for_agent_impl(home_dir, registry, &agent_id, prompt, request_type, Some(agent))
+        .await
+}
+
 // OTel GenAI semconv (Development): root `invoke_agent` span for one
 // dispatcher agent run (sub-agent delegation / cron / bus tasks). Attribute
 // names centralized in `crate::otel`; model + usage are resolved mid-flight
@@ -299,22 +401,27 @@ pub async fn call_claude_for_agent(
         gen_ai.usage.output_tokens = tracing::field::Empty,
     )
 )]
-pub async fn call_claude_for_agent_with_type(
+async fn call_claude_for_agent_impl(
     home_dir: &Path,
     registry: &Arc<RwLock<AgentRegistry>>,
     agent_id: &str,
     prompt: &str,
     request_type: crate::cost_telemetry::RequestType,
+    preloaded: Option<&duduclaw_agent::LoadedAgent>,
 ) -> Result<String, String> {
     let reg = registry.read().await;
 
-    let agent = if agent_id == "default" {
-        reg.main_agent()
-    } else {
-        reg.get(agent_id)
+    let agent = match preloaded {
+        Some(a) => a,
+        None => {
+            let found = if agent_id == "default" {
+                reg.main_agent()
+            } else {
+                reg.get(agent_id)
+            };
+            found.ok_or_else(|| format!("Agent '{agent_id}' not found in registry"))?
+        }
     };
-
-    let agent = agent.ok_or_else(|| format!("Agent '{agent_id}' not found in registry"))?;
 
     // Sub-agents inherit a turn id from the dispatch chain via tokio
     // task_local — set by `channel_reply` before invoking the dispatcher.
@@ -350,6 +457,12 @@ pub async fn call_claude_for_agent_with_type(
     // can wrap subprocess invocations in a `BARE_MODE` scope and
     // know to filter the rotator to API-key accounts.
     let cli_bare_mode = agent.config.prompt.cli_bare_mode;
+    // The agent's on-disk directory. For registry agents this equals
+    // `<home>/agents/<id>`; for preloaded (ephemeral) agents it is the
+    // scaffold dir under `<home>/agents/.ephemeral/<id>` — every downstream
+    // config read ([runtime] provider, tier models, hooks, workdir) must use
+    // this, not a recomputed `agents/<id>` join.
+    let agent_dir_owned = agent.dir.clone();
     drop(reg);
 
     // Pending Task Queue is computed from the Task Board so the agent
@@ -361,12 +474,24 @@ pub async fn call_claude_for_agent_with_type(
     // CLI / local inference paths concatenate when composing their prompt
     // (those paths manage cache opaquely through the upstream SDK).
     let tasks_suffix = build_pending_tasks_section(home_dir, agent_id).await;
+    // U4 co-edited plan: append the agent's shared-plan checklist (steps
+    // assigned to it) so the agent opens each turn aware of the plan. Kept
+    // in the same uncached dynamic block as the task queue; rendering is
+    // byte-stable so unchanged plans don't churn prompt bytes. Independent
+    // of the task queue — a plan can exist with zero board tasks.
+    let tasks_suffix = match plan_section_for_agent(home_dir, agent_id).await {
+        Some(plan) => Some(match tasks_suffix {
+            Some(t) => format!("{t}\n\n{plan}"),
+            None => plan,
+        }),
+        None => tasks_suffix,
+    };
 
     // Install agent-file-guard PreToolUse hook before any spawn.
     // Blocks the sub-agent from using raw Write/Edit to create
     // agent-structure files outside <home>/agents/<name>/.
     // Best-effort — logs warning on failure and continues.
-    let agent_dir = home_dir.join("agents").join(agent_id);
+    let agent_dir = agent_dir_owned;
 
     // RFC-25 Phase 2: when the delegated agent's [runtime] provider is not
     // Claude, route the whole task through the provider-agnostic choke-point
@@ -375,6 +500,73 @@ pub async fn call_claude_for_agent_with_type(
     // responding agent's runtime — and is the foundation A2A (Phase 3) builds on.
     // Parse agent.toml once for the routing decision and the choke-point (L7 followup).
     let delegation_settings = crate::runtime_config::load_runtime_settings(&agent_dir);
+
+    // O1: confidence-aware multi-scale routing for delegated sub-tasks
+    // (arXiv:2601.04861). Opt-in, default OFF — `config.toml [delegation]
+    // confidence_routing`, per-agent override `agent.toml [model]
+    // delegation_routing` (agent wins). Applies to the dispatcher path only
+    // (RequestType::Dispatch — bus delegation + worktree dispatch); channel
+    // replies / cron / evolution keep the preferred model untouched. Tiers
+    // resolve through config helpers only (Cheap ⇒ `[model] utility`,
+    // Standard ⇒ `[model] standard` else preferred) — no hardcoded model ids.
+    // Fail-safe: when off or on any config gap this is byte-identical to the
+    // preferred model, never a spawn failure.
+    //
+    // Multi-model doctrine guard (MED, 2026-07 review): tier models are Claude
+    // ids, so tier re-routing only applies when the resolved runtime provider
+    // is Claude — a gemini/codex agent keeps its own model untouched (the
+    // `provider_is_claude` flag below; the non-Claude branch follows).
+    let claude_model = if matches!(request_type, crate::cost_telemetry::RequestType::Dispatch) {
+        let routed = crate::delegation_router::resolve_delegation_model(
+            home_dir,
+            &agent_dir,
+            agent_id,
+            prompt,
+            &claude_model,
+            &delegation_settings.utility_model,
+            delegation_settings.non_claude_provider().is_none(),
+        );
+        if routed != claude_model {
+            // Routing changed the model — re-record it on the OTel span.
+            tracing::Span::current()
+                .record(crate::otel::attrs::REQUEST_MODEL, routed.as_str());
+        }
+        routed
+    } else {
+        claude_model
+    };
+
+    // HIGH-A (2026-07 review): `moa:<name>` virtual models are API-mode only —
+    // they must NEVER reach a CLI spawn (`claude -p --model moa:x` 404s
+    // upstream) and, worse, the rotation loop would call `rotator.on_error`
+    // once per account, poisoning the SHARED pool for every other agent over
+    // one agent's config. Route to the MoA executor here, BEFORE any rotator
+    // or local/hybrid path is touched. Mirrors `channel_reply`'s MoA branch;
+    // dispatch is single-shot by design, so history is empty (same as the
+    // non-Claude branch below).
+    if duduclaw_llm::is_moa_model_id(&claude_model) {
+        info!(
+            agent = %agent_id,
+            model = %claude_model,
+            "dispatcher: routing through MoA ensemble (API mode — no CLI, no rotator)"
+        );
+        let system_with_tasks: std::borrow::Cow<str> = match &tasks_suffix {
+            Some(s) => std::borrow::Cow::Owned(format!("{system_prompt}\n\n---\n\n{s}")),
+            None => std::borrow::Cow::Borrowed(system_prompt.as_str()),
+        };
+        return crate::direct_api::call_moa_model(
+            home_dir,
+            agent_id,
+            request_type,
+            &claude_model,
+            &system_with_tasks,
+            prompt,
+            &[],
+        )
+        .await
+        .map_err(|e| format!("MoA 模型 `{claude_model}` 需要 API 模式（無法經由 CLI 執行）：{e}"));
+    }
+
     if let Some(provider) = delegation_settings.non_claude_provider() {
         info!(
             agent = %agent_id,
@@ -791,11 +983,30 @@ fn build_llm_chat_request(
 /// `complete()` — so a multi-round [`duduclaw_llm::run_tool_loop`] bills each
 /// provider round-trip (G2 cost guard), not just the final response — and
 /// accumulates the total cost for the rotator's per-account budget (G3).
-struct RecordingProvider {
+///
+/// `pub(crate)`: `direct_api::call_moa_model` reuses it to bill every MoA
+/// member call (proposers + aggregator) under the calling agent — previously
+/// MoA usage was completely invisible to CostTelemetry (2026-07 HIGH-B).
+pub(crate) struct RecordingProvider {
     inner: Box<dyn duduclaw_llm::ChatProvider>,
     agent_id: String,
     request_type: crate::cost_telemetry::RequestType,
     cost_acc: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl RecordingProvider {
+    pub(crate) fn new(
+        inner: Box<dyn duduclaw_llm::ChatProvider>,
+        agent_id: &str,
+        request_type: crate::cost_telemetry::RequestType,
+    ) -> Self {
+        Self {
+            inner,
+            agent_id: agent_id.to_string(),
+            request_type,
+            cost_acc: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1102,8 +1313,42 @@ async fn run_llm_provider(
             let empty_policy: Vec<duduclaw_core::types::ToolPolicy> = Vec::new();
             let policy = capabilities.map(|c| c.policy.as_slice()).unwrap_or(&empty_policy);
             let guarded = duduclaw_llm::PolicyExecutor::new(reg, policy, agent_id);
-            duduclaw_llm::run_tool_loop(&provider, req, &guarded, duduclaw_llm::DEFAULT_MAX_TOOL_ITERS)
-                .await
+            // S2 argument-level provenance (PACT): policy comes from
+            // `config.toml [provenance]` — absent/off ⇒ ProvenanceConfig::default()
+            // and the loop below is byte-identical to the plain `run_tool_loop`.
+            // The user prompt is the channel input for this turn ⇒ seeded Tainted.
+            let (prov_policy, prov_sensitive) = {
+                let table = std::fs::read_to_string(
+                    duduclaw_core::duduclaw_home().join("config.toml"),
+                )
+                .ok()
+                .and_then(|s| s.parse::<toml::Table>().ok())
+                .unwrap_or_default();
+                crate::channel_reply::parse_provenance_settings(&table)
+            };
+            let prov_cfg = crate::channel_reply::build_channel_provenance_config(
+                prov_policy,
+                &prov_sensitive,
+                prompt,
+            );
+            duduclaw_llm::run_tool_loop_with_provenance(
+                &provider,
+                req,
+                &guarded,
+                duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
+                prov_cfg,
+            )
+            .await
+            .map(|out| {
+                if !out.provenance_flags.is_empty() {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        flags = out.provenance_flags.len(),
+                        "provenance: tainted-argument flags raised in tool loop"
+                    );
+                }
+                out.response
+            })
         }
         None => provider.complete(&req).await,
     };
@@ -1750,6 +1995,14 @@ async fn call_with_rotation(
     work_dir: Option<&Path>,
     bare_mode: bool,
 ) -> Result<String, String> {
+    // HIGH-A defence-in-depth: a `moa:` virtual model can never be served by
+    // a CLI spawn. Reject BEFORE the rotator is even constructed so a
+    // misconfigured agent cannot degrade the shared account pool's health
+    // (`on_error` per account) over its own config error.
+    if let Some(msg) = crate::channel_reply::reject_moa_on_cli_path(model) {
+        return Err(msg);
+    }
+
     // Pre-flight: check 200K price cliff
     if let Some(estimated) = crate::cost_telemetry::check_price_cliff(system_prompt, prompt) {
         warn!(
@@ -2379,6 +2632,44 @@ mod direct_api_routing_tests {
     #[test]
     fn cache_split_markers_stay_in_sync() {
         assert_eq!(duduclaw_llm::CACHE_SPLIT_MARKER, crate::direct_api::CACHE_SPLIT_MARKER);
+    }
+
+    // ── HIGH-A: `moa:` ids must never reach a CLI spawn / the rotator ────
+
+    #[tokio::test]
+    async fn call_with_rotation_rejects_moa_before_touching_rotator() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+
+        let err = call_with_rotation(
+            home,
+            "moa-test-agent",
+            "hi",
+            "moa:planner",
+            "system",
+            crate::cost_telemetry::RequestType::Dispatch,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("moa id must be rejected on the CLI-rotation path");
+
+        // The zh-TW MoA rejection, NOT the rotation-exhaustion error — the
+        // guard fires before the rotator loop runs a single attempt.
+        assert!(err.contains("MoA"), "got: {err}");
+        assert!(err.contains("API 模式"), "got: {err}");
+        assert!(
+            !err.contains("All accounts exhausted"),
+            "rotator loop must never run for a moa id: {err}"
+        );
+        // Rotator health untouched: the guard returns before `get_rotator`,
+        // so no rotator state (accounts.json / rotation sidecars) is created
+        // in a fresh home.
+        assert!(
+            !home.join("accounts.json").exists(),
+            "rotator state must not be materialized by a rejected moa call"
+        );
     }
 
     #[test]

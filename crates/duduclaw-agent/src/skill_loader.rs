@@ -302,15 +302,51 @@ fn scan_tool_scripts(dir: &Path) -> Vec<String> {
     scripts
 }
 
+/// Validate that a (frontmatter-derived) skill name is a single safe path
+/// component. Fail-closed at the install sink: a hostile SKILL.md with
+/// `name: ../../agents/<victim>/SOUL` must never escape the skills dir —
+/// this guards every install path (hub, dashboard vet, graduate) at once.
+///
+/// Rejected: empty, > 128 bytes, `/`, `\`, NUL, any `..` sequence, and
+/// leading dots (covers `.`, `..`, and hidden-file smuggling).
+pub fn is_safe_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && !name.starts_with('.')
+        && !name.contains("..")
+}
+
 /// Install a skill from a source directory into an agent's SKILLS/ directory.
 ///
-/// [B-1b] Copies the skill file and runs the Rust-native security scan.
+/// [B-1b] Copies the skill file into the target skills directory.
+///
+/// **Security contract**: this function does NOT scan the content itself (the
+/// Rust-native scanner lives in `duduclaw-gateway::skill_lifecycle`, which this
+/// crate cannot depend on). Callers MUST gate the content through
+/// `security_scanner::scan_skill` *before* calling install — the gateway's
+/// hub install path (`skill_lifecycle::hub_install`) and `skill_graduate` do;
+/// a caller that skips the scan ships unvetted content into a loader scan root.
+///
+/// The destination filename derives from frontmatter `meta.name`, which is
+/// attacker-controlled DATA — [`is_safe_skill_name`] gates it here at the
+/// sink (path traversal in `name:` is rejected regardless of caller).
 pub async fn install_skill(
     skill_path: &Path,
     agent_skills_dir: &Path,
     quarantine_dir: &Path,
 ) -> Result<ParsedSkill, String> {
     let parsed = parse_skill_file(skill_path)?;
+
+    if !is_safe_skill_name(&parsed.meta.name) {
+        return Err(format!(
+            "install DENIED: skill name '{}' is not a safe path component \
+             (no '/', '\\', '..', NUL, or leading dots; max 128 bytes)",
+            parsed.meta.name.escape_debug()
+        ));
+    }
 
     // Create directories
     tokio::fs::create_dir_all(agent_skills_dir)
@@ -405,5 +441,73 @@ mod display_tests {
         let m = meta_with(&[("zh-TW", "  ", "  ")]);
         // Blank zh-TW entry must not shadow the original.
         assert_eq!(m.display_name("zh-TW"), "compress-context");
+    }
+}
+
+#[cfg(test)]
+mod install_safety_tests {
+    use super::*;
+
+    #[test]
+    fn safe_skill_name_rejects_traversal_shapes() {
+        // The CRITICAL fix: frontmatter names must be single path components.
+        for bad in [
+            "",
+            "../../agents/victim/SOUL",
+            "..",
+            ".",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "a..b",
+            "nul\0byte",
+        ] {
+            assert!(!is_safe_skill_name(bad), "must reject {bad:?}");
+        }
+        for good in ["notes", "compress-context", "skill_v2", "技能筆記"] {
+            assert!(is_safe_skill_name(good), "must accept {good:?}");
+        }
+        // Length cap.
+        assert!(!is_safe_skill_name(&"a".repeat(129)));
+        assert!(is_safe_skill_name(&"a".repeat(128)));
+    }
+
+    #[tokio::test]
+    async fn install_denies_traversal_name_and_accepts_normal() {
+        let home = std::env::temp_dir().join(format!("duduclaw-loader-{}", uuid::Uuid::new_v4()));
+        let src_dir = home.join("src");
+        let skills_dir = home.join("agents").join("a1").join("SKILLS");
+        let quarantine = home.join("quarantine");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        // Victim file a traversal name would try to overwrite.
+        let victim = home.join("agents").join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("SOUL.md"), "original soul").unwrap();
+
+        // Hostile frontmatter name escaping the skills dir.
+        let evil = src_dir.join("evil.md");
+        std::fs::write(
+            &evil,
+            "---\nname: ../../victim/SOUL\n---\npwned content",
+        )
+        .unwrap();
+        let err = install_skill(&evil, &skills_dir, &quarantine)
+            .await
+            .unwrap_err();
+        assert!(err.contains("DENIED"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(victim.join("SOUL.md")).unwrap(),
+            "original soul",
+            "victim SOUL.md must be untouched"
+        );
+
+        // Normal install still works (existing behavior unaffected).
+        let good = src_dir.join("good.md");
+        std::fs::write(&good, "---\nname: notes\n---\nbody").unwrap();
+        let parsed = install_skill(&good, &skills_dir, &quarantine).await.unwrap();
+        assert_eq!(parsed.meta.name, "notes");
+        assert!(skills_dir.join("notes.md").is_file());
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

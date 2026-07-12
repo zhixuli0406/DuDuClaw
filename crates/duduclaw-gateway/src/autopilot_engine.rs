@@ -57,6 +57,18 @@ pub enum AutopilotEvent {
         idle_minutes: i64,
     },
     CronTick { now: String },
+    /// R2 foresight: a running task's trajectory prefix predicts failure
+    /// (critical threshold crossed). Emitted by `foresight::emit_alarm`
+    /// through the events.db bridge (`run.at_risk`). Policy-driven: the
+    /// engine never kills the run itself — operators write rules on this
+    /// event (notify / delegate / run_skill).
+    RunAtRisk {
+        agent_id: String,
+        session_id: String,
+        score: f64,
+        level: String,
+        reasons: Vec<String>,
+    },
 }
 
 impl AutopilotEvent {
@@ -69,6 +81,7 @@ impl AutopilotEvent {
             Self::ChannelMessage { .. } => "channel_message",
             Self::AgentIdle { .. } => "agent_idle",
             Self::CronTick { .. } => "cron_tick",
+            Self::RunAtRisk { .. } => "run_at_risk",
         }
     }
 
@@ -103,6 +116,29 @@ impl AutopilotEvent {
             }
             Self::CronTick { now } => {
                 map.insert("now".into(), Value::String(now.clone()));
+            }
+            Self::RunAtRisk {
+                agent_id,
+                session_id,
+                score,
+                level,
+                reasons,
+            } => {
+                map.insert("agent_id".into(), Value::String(agent_id.clone()));
+                map.insert("session_id".into(), Value::String(session_id.clone()));
+                map.insert(
+                    "score".into(),
+                    serde_json::Number::from_f64(*score)
+                        .map(Value::Number)
+                        .unwrap_or(Value::Null),
+                );
+                map.insert("level".into(), Value::String(level.clone()));
+                map.insert(
+                    "reasons".into(),
+                    Value::Array(
+                        reasons.iter().map(|r| Value::String(r.clone())).collect(),
+                    ),
+                );
             }
         }
         map
@@ -861,6 +897,37 @@ fn row_to_event(event: &str, payload_json: &str) -> Option<AutopilotEvent> {
         "task.created" => Some(AutopilotEvent::TaskCreated { task: payload }),
         "task.updated" => Some(AutopilotEvent::TaskUpdated { task: payload }),
         "activity.new" => Some(AutopilotEvent::ActivityNew { activity: payload }),
+        // R2 foresight critical alarm — see `foresight::emit_alarm`.
+        "run.at_risk" => Some(AutopilotEvent::RunAtRisk {
+            agent_id: payload
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            session_id: payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            score: payload
+                .get("score")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            level: payload
+                .get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("critical")
+                .to_string(),
+            reasons: payload
+                .get("reasons")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|r| r.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }),
         _ => None,
     }
 }
@@ -1140,6 +1207,40 @@ mod tests {
             .event_name(),
             "task_status_changed"
         );
+        assert_eq!(
+            AutopilotEvent::RunAtRisk {
+                agent_id: "agnes".into(),
+                session_id: "s1".into(),
+                score: 80.0,
+                level: "critical".into(),
+                reasons: vec![],
+            }
+            .event_name(),
+            "run_at_risk"
+        );
+    }
+
+    #[test]
+    fn run_at_risk_row_to_event_and_fields() {
+        let payload = r#"{"agent_id":"agnes","session_id":"s1","score":81.5,"level":"critical","reasons":["工具錯誤密度 100%"]}"#;
+        let ev = row_to_event("run.at_risk", payload).expect("mapped");
+        assert_eq!(ev.event_name(), "run_at_risk");
+        let fields = ev.to_fields();
+        assert_eq!(fields["agent_id"], Value::String("agnes".into()));
+        assert_eq!(fields["session_id"], Value::String("s1".into()));
+        assert_eq!(fields["level"], Value::String("critical".into()));
+        assert_eq!(fields["score"].as_f64(), Some(81.5));
+        assert_eq!(fields["reasons"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn run_at_risk_row_missing_fields_gets_defaults() {
+        let ev = row_to_event("run.at_risk", "{}").expect("mapped with defaults");
+        let fields = ev.to_fields();
+        assert_eq!(fields["agent_id"], Value::String("unknown".into()));
+        assert_eq!(fields["score"].as_f64(), Some(0.0));
+        // Malformed payload JSON must not panic either.
+        assert!(row_to_event("run.at_risk", "not json").is_some());
     }
 
     #[test]

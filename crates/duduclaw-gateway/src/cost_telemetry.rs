@@ -313,6 +313,54 @@ pub struct UserCostSummary {
     pub total_cost_millicents: u64,
 }
 
+/// One per-agent per-day row of the O4 `multi_vs_single` report.
+#[derive(Debug, Clone, Serialize)]
+pub struct MultiVsSingleRow {
+    pub agent_id: String,
+    /// ISO date (YYYY-MM-DD, UTC).
+    pub day: String,
+    /// Cost of delegated work (`request_type = 'dispatch'`), legacy unit.
+    pub dispatch_cost_millicents: u64,
+    pub dispatch_requests: u64,
+    /// Cost of direct replies (`request_type = 'chat'`), legacy unit.
+    pub direct_cost_millicents: u64,
+    pub direct_requests: u64,
+}
+
+/// O4 report: delegated-work cost vs direct-reply cost, per agent per day
+/// (see [`CostTelemetry::multi_vs_single`] for the honest granularity note,
+/// carried in `granularity_note` so API consumers see it too).
+#[derive(Debug, Clone, Serialize)]
+pub struct MultiVsSingleReport {
+    pub period: String,
+    pub granularity_note: String,
+    pub total_dispatch_cost_millicents: u64,
+    pub total_dispatch_requests: u64,
+    pub total_direct_cost_millicents: u64,
+    pub total_direct_requests: u64,
+    pub rows: Vec<MultiVsSingleRow>,
+}
+
+/// The honest-attribution disclaimer embedded in every `multi_vs_single`
+/// report (arXiv:2604.02460).
+pub const MULTI_VS_SINGLE_GRANULARITY_NOTE: &str =
+    "granularity = per-agent per-day (dispatch vs chat request_type); true per-episode \
+     linkage is not derivable from token_usage rows (no message/turn id recorded). \
+     Reference: arXiv:2604.02460 — at equal token budgets a single agent often beats \
+     multi-agent systems; delegate only parallelizable independent work.";
+
+/// Render the one-line zh-TW delegation-cost advisory appended to spawn tool
+/// responses (O4). Pure — testable without a DB. Inputs are window totals in
+/// the legacy telemetry unit (cents; see the unit note on
+/// [`TokenUsage::estimated_cost_millicents`]).
+pub fn render_delegation_advisory(dispatch_cost: u64, direct_cost: u64, hours: u64) -> String {
+    format!(
+        "📊 成本提示(近 {hours}h):委派工作 ${:.2}、直接回覆 ${:.2}。等量 token 預算下單一代理常較划算(arXiv:2604.02460),委派適用於可平行的獨立子任務。",
+        dispatch_cost as f64 / 100.0,
+        direct_cost as f64 / 100.0,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // CostTelemetry — SQLite-backed analytics
 // ---------------------------------------------------------------------------
@@ -435,6 +483,22 @@ impl CostTelemetry {
                 ON token_usage(user_id, created_at);",
         )
         .map_err(|e| format!("token_usage user index: {e}"))?;
+
+        // Ephemeral-agent parent attribution (2026-07): `eph-<uuid>` scaffolds
+        // record their parent here at scaffold time (see
+        // `crate::ephemeral::scaffold` → [`record_ephemeral_parent`]). Raw
+        // `token_usage` rows stay truthful under the eph id; reports
+        // ([`CostTelemetry::all_agents_summary`],
+        // [`CostTelemetry::multi_vs_single`]) JOIN this table to fold eph
+        // spend into "<parent> (ephemeral)".
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ephemeral_parents (
+                eph_id TEXT PRIMARY KEY,
+                parent_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );",
+        )
+        .map_err(|e| format!("ephemeral_parents table: {e}"))?;
         Ok(())
     }
 
@@ -644,6 +708,13 @@ impl CostTelemetry {
     }
 
     /// List all agents with their cost summaries, sorted by total cost descending.
+    ///
+    /// Ephemeral attribution (2026-07): rows recorded under an `eph-<uuid>`
+    /// agent id that has a mapping in `ephemeral_parents` (written at
+    /// scaffold time, see [`record_ephemeral_parent`]) are folded into a
+    /// single `"<parent> (ephemeral)"` bucket instead of proliferating one
+    /// meaningless row per scaffold. Unmapped eph ids stay raw (honest —
+    /// never guessed). Raw `token_usage` rows are untouched.
     pub async fn all_agents_summary(
         &self,
         hours_ago: u64,
@@ -655,20 +726,23 @@ impl CostTelemetry {
         let mut stmt = conn
             .prepare(
                 "SELECT
-                    agent_id,
+                    CASE WHEN ep.parent_id IS NOT NULL
+                         THEN ep.parent_id || ' (ephemeral)'
+                         ELSE tu.agent_id END AS attributed_agent,
                     COUNT(*),
-                    COALESCE(SUM(input_tokens), 0),
-                    COALESCE(SUM(cache_read_tokens), 0),
-                    COALESCE(SUM(cache_creation_tokens), 0),
-                    COALESCE(SUM(output_tokens), 0),
-                    COALESCE(AVG(cache_efficiency), 0.0),
-                    COALESCE(SUM(cost_millicents), 0),
-                    COALESCE(AVG(cache_hit_rate), 0.0),
-                    COALESCE(SUM(cache_savings_millicents), 0)
-                 FROM token_usage
-                 WHERE created_at >= ?1
-                 GROUP BY agent_id
-                 ORDER BY SUM(cost_millicents) DESC",
+                    COALESCE(SUM(tu.input_tokens), 0),
+                    COALESCE(SUM(tu.cache_read_tokens), 0),
+                    COALESCE(SUM(tu.cache_creation_tokens), 0),
+                    COALESCE(SUM(tu.output_tokens), 0),
+                    COALESCE(AVG(tu.cache_efficiency), 0.0),
+                    COALESCE(SUM(tu.cost_millicents), 0),
+                    COALESCE(AVG(tu.cache_hit_rate), 0.0),
+                    COALESCE(SUM(tu.cache_savings_millicents), 0)
+                 FROM token_usage tu
+                 LEFT JOIN ephemeral_parents ep ON tu.agent_id = ep.eph_id
+                 WHERE tu.created_at >= ?1
+                 GROUP BY attributed_agent
+                 ORDER BY SUM(tu.cost_millicents) DESC",
             )
             .map_err(|e| format!("all_agents_summary prepare: {e}"))?;
 
@@ -826,6 +900,110 @@ impl CostTelemetry {
         Ok(out)
     }
 
+    /// O4 — honest multi-agent vs single-agent cost accounting
+    /// (arXiv:2604.02460: at equal token budgets a single agent often beats
+    /// multi-agent systems; delegation only pays off for parallelizable,
+    /// independent sub-work). This report makes DuDuClaw's multi-agent
+    /// features carry their real price tag — "academic honesty as product
+    /// trust".
+    ///
+    /// **Attribution granularity (honest limits):** `token_usage` rows carry
+    /// `agent_id` + `request_type` + timestamp but NO bus message / turn /
+    /// episode id, so a true per-"orchestration episode" rollup (one
+    /// delegation/fork burst attributable to one root task) is NOT derivable
+    /// from the current data. This report therefore aggregates at the best
+    /// available granularity: **per-agent per-day, delegated work
+    /// (`request_type = 'dispatch'`) vs direct replies (`'chat'`)** — plus
+    /// window totals. That answers "how much of this agent's spend came from
+    /// being delegated to vs answering users directly", not "what did episode
+    /// X cost end-to-end". Rows for `evolution`/`cron` traffic are excluded
+    /// from both buckets (they are neither delegation nor direct replies).
+    pub async fn multi_vs_single(&self, days: u64) -> Result<MultiVsSingleReport, String> {
+        let clamped = days.clamp(1, 365);
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(clamped as i64)).to_rfc3339();
+        let conn = self.conn.lock().await;
+
+        // Ephemeral attribution: same `ephemeral_parents` fold as
+        // `all_agents_summary` — mapped `eph-*` rows report as
+        // "<parent> (ephemeral)", unmapped ones stay raw.
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    CASE WHEN ep.parent_id IS NOT NULL
+                         THEN ep.parent_id || ' (ephemeral)'
+                         ELSE tu.agent_id END AS attributed_agent,
+                    substr(tu.created_at, 1, 10) AS day,
+                    COALESCE(SUM(CASE WHEN tu.request_type = 'dispatch' THEN tu.cost_millicents ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN tu.request_type = 'dispatch' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN tu.request_type = 'chat' THEN tu.cost_millicents ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN tu.request_type = 'chat' THEN 1 ELSE 0 END), 0)
+                 FROM token_usage tu
+                 LEFT JOIN ephemeral_parents ep ON tu.agent_id = ep.eph_id
+                 WHERE tu.created_at >= ?1 AND tu.request_type IN ('dispatch', 'chat')
+                 GROUP BY attributed_agent, day
+                 ORDER BY day ASC, attributed_agent ASC",
+            )
+            .map_err(|e| format!("multi_vs_single prepare: {e}"))?;
+
+        let mapped = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(MultiVsSingleRow {
+                    agent_id: row.get(0)?,
+                    day: row.get(1)?,
+                    dispatch_cost_millicents: safe_u64(row.get::<_, i64>(2)?),
+                    dispatch_requests: safe_u64(row.get::<_, i64>(3)?),
+                    direct_cost_millicents: safe_u64(row.get::<_, i64>(4)?),
+                    direct_requests: safe_u64(row.get::<_, i64>(5)?),
+                })
+            })
+            .map_err(|e| format!("multi_vs_single query: {e}"))?;
+
+        let mut rows = Vec::new();
+        for r in mapped {
+            rows.push(r.map_err(|e| format!("multi_vs_single row: {e}"))?);
+        }
+
+        let mut report = MultiVsSingleReport {
+            period: format!("last_{clamped}d"),
+            granularity_note: MULTI_VS_SINGLE_GRANULARITY_NOTE.to_string(),
+            total_dispatch_cost_millicents: 0,
+            total_dispatch_requests: 0,
+            total_direct_cost_millicents: 0,
+            total_direct_requests: 0,
+            rows,
+        };
+        for r in &report.rows {
+            report.total_dispatch_cost_millicents += r.dispatch_cost_millicents;
+            report.total_dispatch_requests += r.dispatch_requests;
+            report.total_direct_cost_millicents += r.direct_cost_millicents;
+            report.total_direct_requests += r.direct_requests;
+        }
+        Ok(report)
+    }
+
+    /// Window totals only: (delegated `dispatch` cost, direct `chat` cost) in
+    /// the legacy telemetry unit over the last `hours_ago` hours. Feeds the
+    /// one-line delegation advisory in spawn tool responses (O4).
+    pub async fn dispatch_vs_direct_totals(&self, hours_ago: u64) -> Result<(u64, u64), String> {
+        let cutoff = cutoff_time(hours_ago);
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN request_type = 'dispatch' THEN cost_millicents ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN request_type = 'chat' THEN cost_millicents ELSE 0 END), 0)
+             FROM token_usage
+             WHERE created_at >= ?1",
+            params![cutoff],
+            |row| {
+                Ok((
+                    safe_u64(row.get::<_, i64>(0)?),
+                    safe_u64(row.get::<_, i64>(1)?),
+                ))
+            },
+        )
+        .map_err(|e| format!("dispatch_vs_direct_totals: {e}"))
+    }
+
     /// Clean up records older than `days` days.
     pub async fn cleanup_old_records(&self, days: u64) -> Result<u64, String> {
         let cutoff =
@@ -869,6 +1047,56 @@ pub fn init_telemetry(home_dir: &Path) -> Result<(), String> {
 /// Get the global telemetry instance (returns None if not initialized).
 pub fn get_telemetry() -> Option<&'static CostTelemetry> {
     TELEMETRY.get()
+}
+
+/// Record an `eph-<uuid>` → parent mapping in `<home>/cost_telemetry.db` so
+/// cost reports can attribute ephemeral-agent spend to
+/// `"<parent> (ephemeral)"` instead of one meaningless per-scaffold row.
+///
+/// Design decision (2026-07): raw data stays truthful — `token_usage` rows
+/// keep the real `eph-*` agent id; the mapping is applied at *report* time
+/// via a LEFT JOIN in [`CostTelemetry::all_agents_summary`] and
+/// [`CostTelemetry::multi_vs_single`]. Eph ids with no mapping (pre-mapping
+/// scaffolds) stay raw rather than being guessed.
+///
+/// Sync + own short-lived WAL connection: the caller
+/// ([`crate::ephemeral::scaffold`]) is synchronous and may run in the
+/// MCP-server process where the global singleton isn't initialized.
+pub fn record_ephemeral_parent(
+    home_dir: &Path,
+    eph_id: &str,
+    parent_id: &str,
+) -> Result<(), String> {
+    record_ephemeral_parent_at(&home_dir.join("cost_telemetry.db"), eph_id, parent_id)
+}
+
+/// [`record_ephemeral_parent`] against an explicit db path (testable core).
+pub fn record_ephemeral_parent_at(
+    db_path: &Path,
+    eph_id: &str,
+    parent_id: &str,
+) -> Result<(), String> {
+    if eph_id.trim().is_empty() || parent_id.trim().is_empty() {
+        return Err("eph_id and parent_id must be non-empty".to_string());
+    }
+    let conn = Connection::open(db_path).map_err(|e| format!("open telemetry db: {e}"))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA busy_timeout=5000;
+         CREATE TABLE IF NOT EXISTS ephemeral_parents (
+             eph_id TEXT PRIMARY KEY,
+             parent_id TEXT NOT NULL,
+             created_at TEXT NOT NULL
+         );",
+    )
+    .map_err(|e| format!("ephemeral_parents table: {e}"))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO ephemeral_parents (eph_id, parent_id, created_at)
+         VALUES (?1, ?2, ?3)",
+        params![eph_id, parent_id, chrono::Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| format!("record ephemeral parent: {e}"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1412,6 +1640,140 @@ mod tests {
         // Reading the flag prunes the stale entry.
         assert!(!telemetry.is_under_cost_pressure("stale-agent"));
         assert!(telemetry.is_under_cost_pressure("fresh-agent"));
+    }
+
+    // ── O4: multi_vs_single honest cost accounting ───────────────────────
+
+    /// Fixture usage priced deterministically through the legacy fallback
+    /// (unknown model): 100K in + 100K out → 30 + 150 = 180 legacy units.
+    fn o4_usage() -> TokenUsage {
+        TokenUsage {
+            input_tokens: 100_000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 100_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_vs_single_math_on_synthetic_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = CostTelemetry::new(&dir.path().join("o4.db")).unwrap();
+        let usage = o4_usage();
+        const MODEL: &str = "o4-test-unknown-model"; // legacy pricing: 180/row
+
+        // worker: 2 delegated rows; boss: 1 direct row; 1 cron row (excluded).
+        t.record("worker", RequestType::Dispatch, MODEL, &usage).await;
+        t.record("worker", RequestType::Dispatch, MODEL, &usage).await;
+        t.record("boss", RequestType::Chat, MODEL, &usage).await;
+        t.record("boss", RequestType::Cron, MODEL, &usage).await;
+
+        let report = t.multi_vs_single(7).await.unwrap();
+        assert_eq!(report.total_dispatch_requests, 2);
+        assert_eq!(report.total_dispatch_cost_millicents, 360);
+        assert_eq!(report.total_direct_requests, 1);
+        assert_eq!(report.total_direct_cost_millicents, 180);
+        // Cron traffic must not leak into either bucket.
+        let boss_rows: Vec<_> =
+            report.rows.iter().filter(|r| r.agent_id == "boss").collect();
+        assert_eq!(boss_rows.len(), 1);
+        assert_eq!(boss_rows[0].direct_requests, 1);
+        assert_eq!(boss_rows[0].dispatch_requests, 0);
+        let worker_row = report.rows.iter().find(|r| r.agent_id == "worker").unwrap();
+        assert_eq!(worker_row.dispatch_cost_millicents, 360);
+        assert_eq!(worker_row.direct_cost_millicents, 0);
+        // Honest-granularity note travels with the report.
+        assert!(report.granularity_note.contains("2604.02460"));
+
+        // Window totals helper agrees with the report.
+        let (dispatch, direct) = t.dispatch_vs_direct_totals(24).await.unwrap();
+        assert_eq!(dispatch, 360);
+        assert_eq!(direct, 180);
+    }
+
+    // ── Ephemeral cost parent attribution (2026-07) ───────────────────────
+
+    #[tokio::test]
+    async fn ephemeral_rows_fold_into_parent_in_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("eph.db");
+        let t = CostTelemetry::new(&db).unwrap();
+        let usage = o4_usage();
+        const MODEL: &str = "o4-test-unknown-model"; // legacy pricing: 180/row
+
+        // 2 mapped eph dispatch rows, 1 parent chat row, 1 unmapped eph row.
+        t.record("eph-1234abcd", RequestType::Dispatch, MODEL, &usage).await;
+        t.record("eph-1234abcd", RequestType::Dispatch, MODEL, &usage).await;
+        t.record("boss", RequestType::Chat, MODEL, &usage).await;
+        t.record("eph-deadbeef", RequestType::Chat, MODEL, &usage).await;
+        record_ephemeral_parent_at(&db, "eph-1234abcd", "boss").unwrap();
+        // Re-recording the same mapping is an idempotent upsert.
+        record_ephemeral_parent_at(&db, "eph-1234abcd", "boss").unwrap();
+
+        // all_agents_summary: mapped eph rows fold into "boss (ephemeral)".
+        let agents = t.all_agents_summary(24).await.unwrap();
+        let by_id = |id: &str| agents.iter().find(|a| a.agent_id == id);
+        let eph = by_id("boss (ephemeral)").expect("folded ephemeral bucket");
+        assert_eq!(eph.summary.total_requests, 2);
+        assert_eq!(eph.summary.total_cost_millicents, 360);
+        let boss = by_id("boss").expect("parent's own row stays separate");
+        assert_eq!(boss.summary.total_requests, 1);
+        // Unmapped eph id stays raw (honest — never guessed).
+        assert!(by_id("eph-deadbeef").is_some());
+        // The mapped raw eph id no longer appears as its own bucket.
+        assert!(by_id("eph-1234abcd").is_none());
+
+        // multi_vs_single: same fold, and window totals are unchanged by
+        // attribution (it only relabels buckets, never drops rows).
+        let report = t.multi_vs_single(7).await.unwrap();
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.agent_id == "boss (ephemeral)")
+            .expect("folded row in multi_vs_single");
+        assert_eq!(row.dispatch_requests, 2);
+        assert_eq!(row.dispatch_cost_millicents, 360);
+        assert_eq!(row.direct_requests, 0);
+        assert_eq!(report.total_dispatch_cost_millicents, 360);
+        assert_eq!(report.total_dispatch_requests, 2);
+        // boss chat (180) + unmapped eph chat (180).
+        assert_eq!(report.total_direct_cost_millicents, 360);
+        assert_eq!(report.total_direct_requests, 2);
+    }
+
+    #[test]
+    fn record_ephemeral_parent_rejects_empty_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("eph2.db");
+        assert!(record_ephemeral_parent_at(&db, "", "boss").is_err());
+        assert!(record_ephemeral_parent_at(&db, "eph-x", "  ").is_err());
+    }
+
+    #[tokio::test]
+    async fn multi_vs_single_empty_db_is_zero_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = CostTelemetry::new(&dir.path().join("o4e.db")).unwrap();
+        let report = t.multi_vs_single(7).await.unwrap();
+        assert!(report.rows.is_empty());
+        assert_eq!(report.total_dispatch_cost_millicents, 0);
+        assert_eq!(report.total_direct_cost_millicents, 0);
+        let (d, c) = t.dispatch_vs_direct_totals(24).await.unwrap();
+        assert_eq!((d, c), (0, 0));
+    }
+
+    #[test]
+    fn delegation_advisory_renders_dollars_and_citation() {
+        let line = render_delegation_advisory(360, 180, 24);
+        // Legacy unit is cents → ÷100 = dollars, two decimals.
+        assert!(line.contains("$3.60"), "got: {line}");
+        assert!(line.contains("$1.80"), "got: {line}");
+        assert!(line.contains("24h"), "got: {line}");
+        assert!(line.contains("2604.02460"), "got: {line}");
+        // One compact line — no embedded newlines.
+        assert!(!line.contains('\n'));
+        // Zero data still renders (spawn responses never fail on this).
+        let zero = render_delegation_advisory(0, 0, 24);
+        assert!(zero.contains("$0.00"));
     }
 
     #[tokio::test]

@@ -43,6 +43,13 @@ pub enum ChatCommand {
     ComputerStop,
     /// `/replay [n]` — show the last N screenshots from audit log
     Replay(u32),
+    /// `/handoff <channel>` — move the current conversation to another channel (G4).
+    /// `None` = missing argument → usage message.
+    Handoff(Option<String>),
+    /// `/undo [n]` — tombstone the last N user+assistant turn pairs (G4, default 1)
+    Undo(u32),
+    /// `/rollback` — undo back to the last checkpoint watermark (G4)
+    Rollback,
     /// `!STOP` / `!停止` — stop the current agent/scope via failsafe
     SafetyStop,
     /// `!STOP ALL` / `!全部停止` — emergency stop all agents
@@ -164,6 +171,15 @@ pub fn parse_command(
                 .unwrap_or(5);
             Some(ChatCommand::Replay(n))
         }
+        "handoff" => Some(ChatCommand::Handoff(
+            args.filter(|a| !a.is_empty()).map(|a| a.to_ascii_lowercase()),
+        )),
+        "undo" => {
+            // Same laxity as /replay: non-numeric arg falls back to default.
+            let n = args.and_then(|a| a.parse::<u32>().ok()).unwrap_or(1);
+            Some(ChatCommand::Undo(n))
+        }
+        "rollback" => Some(ChatCommand::Rollback),
         _ => None,
     }
 }
@@ -179,9 +195,11 @@ pub async fn handle_command(
     agent_id: &str,
     is_admin: bool,
 ) -> String {
-    // Enforce admin requirement for destructive safety commands
+    // Enforce admin requirement for destructive safety commands.
+    // Fail-closed: callers must compute real admin status per channel
+    // (channel_reply::is_channel_admin) — never hardcode `true`.
     if cmd.requires_admin() && !is_admin {
-        return "⚠️ Permission denied. Only admins can use safety stop/resume commands.".to_string();
+        return "⚠️ 此指令僅限管理員使用。請管理員在該頻道設定 admin_users 後再試。".to_string();
     }
 
     match cmd {
@@ -225,6 +243,11 @@ pub async fn handle_command(
         ChatCommand::Replay(n) => {
             handle_replay(ctx, agent_id, *n).await
         }
+        ChatCommand::Handoff(target) => {
+            handle_handoff(ctx, session_id, agent_id, target.as_deref()).await
+        }
+        ChatCommand::Undo(n) => handle_undo(ctx, session_id, *n).await,
+        ChatCommand::Rollback => handle_rollback(ctx, session_id).await,
         ChatCommand::SafetyStop => handle_safety_stop(ctx, session_id, agent_id).await,
         ChatCommand::SafetyStopAll => handle_safety_stop_all(ctx).await,
         ChatCommand::SafetyResume => handle_safety_resume(ctx, session_id).await,
@@ -257,8 +280,8 @@ async fn handle_status(ctx: &ReplyContext, session_id: &str, agent_id: &str) -> 
     // Session info
     let session_info = match ctx.session_manager.get_or_create(session_id, agent_id).await {
         Ok(session) => format!(
-            "Tokens: {}\nLast active: {}",
-            session.total_tokens, session.last_active
+            "Session: #{}\nTokens: {}\nLast active: {}",
+            session.lineage, session.total_tokens, session.last_active
         ),
         Err(_) => "Session: N/A".to_string(),
     };
@@ -317,7 +340,10 @@ fn handle_help() -> String {
      `/compact` — Force session compression\n\
      `/model [name]` — Show or switch model\n\
      `/pair <code>` — Verify pairing code\n\
-     `/voice` — Toggle voice reply\n\n\
+     `/voice` — Toggle voice reply\n\
+     `/handoff <頻道>` — 將對話轉移到其他頻道\n\
+     `/undo [次數]` — 撤銷最近 N 輪對話（預設 1，最多 20）\n\
+     `/rollback` — 回退到最近一次檢查點（僅回退對話，不還原檔案）\n\n\
      *Safety Words*\n\
      `!STOP` / `!停止` — Stop current agent\n\
      `!STOP ALL` / `!全部停止` — Emergency stop all\n\
@@ -370,6 +396,157 @@ async fn handle_model(ctx: &ReplyContext, agent_id: &str, new_model: Option<&str
             }
         }
         None => "⚠️ No agent found.".to_string(),
+    }
+}
+
+// ── G4 session portability handlers (/handoff, /undo, /rollback) ──
+
+/// `/handoff <channel>` — copy the conversation state onto the same agent's
+/// session on the target channel. Fail-closed at every step: unknown
+/// channel, unconfigured/disconnected channel, no existing session on the
+/// target (we cannot invent a `<channel>:<chat_id>` key), or an AMBIGUOUS
+/// target (several unrelated sessions — see `resolve_handoff_target`;
+/// "most recent wins" would land the transcript in another user's chat).
+async fn handle_handoff(
+    ctx: &ReplyContext,
+    session_id: &str,
+    agent_id: &str,
+    target: Option<&str>,
+) -> String {
+    let channel_list = duduclaw_core::SUPPORTED_CHANNEL_TYPES.join("、");
+    let target = match target {
+        Some(t) => t.trim().to_ascii_lowercase(),
+        None => {
+            return format!("用法：/handoff <頻道>\n可用頻道：{channel_list}");
+        }
+    };
+
+    if !duduclaw_core::SUPPORTED_CHANNEL_TYPES.contains(&target.as_str()) {
+        return format!("❌ 不支援的頻道「{target}」。\n可用頻道：{channel_list}");
+    }
+
+    let source_channel = session_id.split(':').next().unwrap_or("");
+    if source_channel == target {
+        return format!("目前對話已經在 {target} 頻道，不需要轉移。");
+    }
+
+    // The session row's agent is authoritative; fall back to the caller's.
+    let owner = match ctx.session_manager.session_agent(session_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => agent_id.to_string(),
+        Err(e) => {
+            warn!(session_id, error = %e, "handoff: session_agent lookup failed");
+            return format!("⚠️ 轉移失敗：{e}");
+        }
+    };
+
+    // Fail closed: the target channel must be configured AND connected on
+    // this gateway before we move a conversation onto it. Per-agent bots
+    // register under `<channel>:<agent>` keys — check those too before
+    // declaring the channel unconnected (exact keys, never substrings).
+    let connected = {
+        let status = ctx.channel_status.read().await;
+        [
+            target.clone(),
+            format!("{target}:{owner}"),
+            format!("{target}:{agent_id}"),
+        ]
+        .iter()
+        .any(|key| status.get(key).map(|s| s.connected).unwrap_or(false))
+    };
+    if !connected {
+        return format!("❌ {target} 頻道尚未設定或目前未連線，無法轉移。請先在儀表板完成該頻道設定。");
+    }
+
+    let candidates = match ctx
+        .session_manager
+        .active_sessions_for_channel(&owner, &target, 10)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(session_id, target = %target, error = %e, "handoff: target lookup failed");
+            return format!("⚠️ 轉移失敗：{e}");
+        }
+    };
+    let target_session = match crate::session_portability::resolve_handoff_target(
+        &candidates,
+        session_id,
+    ) {
+        crate::session_portability::HandoffTarget::Resolved(id) => id,
+        crate::session_portability::HandoffTarget::NoSession => {
+            // Design choice (documented in session_portability.rs): sessions
+            // are keyed by <channel>:<chat_id>, so without an inbound message
+            // we cannot know where to deliver. Ask the user to ping first.
+            return format!(
+                "❌ {target} 頻道還沒有任何對話。請先在 {target} 頻道傳一則訊息給代理建立會話，再回來執行 /handoff {target}。"
+            );
+        }
+        crate::session_portability::HandoffTarget::Ambiguous(n) => {
+            // Fail-closed: never guess among several users' conversations.
+            return format!(
+                "❌ 目標頻道有多個對話（{n} 個），無法確定要轉移到哪一個。\
+                 請先在 {target} 頻道傳送一則訊息以指定對話，再回來執行 /handoff {target}。"
+            );
+        }
+    };
+
+    match ctx
+        .session_manager
+        .handoff_session(session_id, &target_session)
+        .await
+    {
+        Ok(crate::session_portability::HandoffDecision::Done(report)) => format!(
+            "✅ 已將對話轉移到 {target} 頻道（共 {} 則訊息）。\n到 {target} 頻道傳送訊息即可接續目前的對話；本頻道的紀錄仍會保留。",
+            report.copied_messages
+        ),
+        Ok(crate::session_portability::HandoffDecision::NothingToHandoff) => {
+            "目前對話沒有可轉移的內容。".to_string()
+        }
+        Err(e) => {
+            warn!(session_id, target = %target, error = %e, "handoff failed");
+            format!("⚠️ 轉移失敗：{e}")
+        }
+    }
+}
+
+/// `/undo [N]` — tombstone the last N turn pairs (default 1, max 20).
+async fn handle_undo(ctx: &ReplyContext, session_id: &str, n: u32) -> String {
+    use crate::session_portability::{UndoDecision, UNDO_MAX_PAIRS};
+    if n == 0 || n > UNDO_MAX_PAIRS {
+        return format!("❌ 次數必須介於 1 到 {UNDO_MAX_PAIRS} 之間。用法：/undo [次數]");
+    }
+    match ctx.session_manager.undo_last_turns(session_id, n).await {
+        Ok(UndoDecision::Undone { pairs, messages, .. }) => {
+            format!("↩️ 已撤銷最近 {pairs} 輪對話（共 {messages} 則訊息）。")
+        }
+        Ok(UndoDecision::NothingToUndo) => "目前沒有可撤銷的對話。".to_string(),
+        Ok(UndoDecision::BoundaryBlocked { available }) => format!(
+            "⚠️ 無法撤銷 {n} 輪：更早的對話已經過壓縮整理，無法再撤銷。目前最多可撤銷 {available} 輪（/undo {available}）。"
+        ),
+        Err(e) => {
+            warn!(session_id, error = %e, "undo failed");
+            format!("⚠️ 撤銷失敗：{e}")
+        }
+    }
+}
+
+/// `/rollback` — conversation-state rollback to the last checkpoint
+/// watermark. File changes made by the agent are NOT reverted (the CLI
+/// runtimes own file edits) and the reply says so honestly.
+async fn handle_rollback(ctx: &ReplyContext, session_id: &str) -> String {
+    use crate::session_portability::RollbackDecision;
+    match ctx.session_manager.rollback_to_checkpoint(session_id).await {
+        Ok(RollbackDecision::RolledBack { messages, .. }) => format!(
+            "⏪ 已回退到最近一次檢查點（移除 {messages} 則訊息）。\n注意：這只會回退對話內容；代理先前對檔案所做的變更不會被還原。"
+        ),
+        Ok(RollbackDecision::NothingToRollback) => {
+            "目前沒有可回退的檢查點內容。若要撤銷最近的對話，可改用 /undo。".to_string()
+        }
+        Err(e) => {
+            warn!(session_id, error = %e, "rollback failed");
+            format!("⚠️ 回退失敗：{e}")
+        }
     }
 }
 
@@ -559,6 +736,32 @@ mod tests {
         assert_eq!(parse_command("/stop", None), Some(ChatCommand::ComputerStop));
         assert_eq!(parse_command("/replay", None), Some(ChatCommand::Replay(5)));
         assert_eq!(parse_command("/replay 10", None), Some(ChatCommand::Replay(10)));
+    }
+
+    #[test]
+    fn test_parse_session_portability_commands() {
+        // /handoff — arg is lowercased; missing arg → None payload (usage reply)
+        assert_eq!(
+            parse_command("/handoff telegram", None),
+            Some(ChatCommand::Handoff(Some("telegram".to_string())))
+        );
+        assert_eq!(
+            parse_command("/handoff Slack", None),
+            Some(ChatCommand::Handoff(Some("slack".to_string())))
+        );
+        assert_eq!(parse_command("/handoff", None), Some(ChatCommand::Handoff(None)));
+
+        // /undo — default 1, explicit N passes through (validated in handler)
+        assert_eq!(parse_command("/undo", None), Some(ChatCommand::Undo(1)));
+        assert_eq!(parse_command("/undo 3", None), Some(ChatCommand::Undo(3)));
+        assert_eq!(parse_command("/undo abc", None), Some(ChatCommand::Undo(1)));
+
+        assert_eq!(parse_command("/rollback", None), Some(ChatCommand::Rollback));
+
+        // Non-admin commands, same gating as peers (/new, /compact).
+        assert!(!ChatCommand::Handoff(Some("telegram".into())).requires_admin());
+        assert!(!ChatCommand::Undo(1).requires_admin());
+        assert!(!ChatCommand::Rollback.requires_admin());
     }
 
     #[test]

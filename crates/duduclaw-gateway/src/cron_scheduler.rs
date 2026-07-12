@@ -167,11 +167,17 @@ impl CronScheduler {
                     );
 
                     if should_fire {
+                        // Cadence is due. For `time` tasks this fires directly;
+                        // for `condition` / `on_exit` tasks the gate runs inside
+                        // `dispatch_cron_task`. `last_run` advances regardless of
+                        // the gate outcome so the condition is re-evaluated only
+                        // at the next scheduled slot (prevents per-tick runaway).
                         info!(
                             id = %lt.task.id,
                             name = %lt.task.name,
                             agent = %lt.task.agent_id,
-                            "cron task firing"
+                            trigger_kind = %lt.task.trigger_kind,
+                            "cron task cadence due — dispatching"
                         );
                         lt.last_run = Some(now);
                         to_spawn.push(lt.task.clone());
@@ -186,8 +192,90 @@ impl CronScheduler {
                 let sem = self.semaphore.clone();
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await;
-                    execute_cron_task(&home, &store, &registry, &task).await;
+                    dispatch_cron_task(&home, &store, &registry, &task).await;
                 });
+            }
+        }
+    }
+}
+
+/// Route a due cron task through its trigger gate (G3), then execute it if the
+/// gate passes.
+///
+/// - `time`      → execute unconditionally (legacy behaviour).
+/// - `condition` → run the sandboxed condition script; persist any returned
+///   state (≤16 KiB); execute only when the script reports `fire:true`,
+///   injecting its `message` into the prompt.
+/// - `on_exit`   → run the sandboxed watch command; execute only on exit-0.
+///
+/// Every gate is fail-closed: a misconfiguration or evaluation failure skips
+/// execution and logs, it never fires the task.
+async fn dispatch_cron_task(
+    home_dir: &std::path::Path,
+    store: &Arc<CronStore>,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    task: &CronTaskRow,
+) {
+    use crate::condition_eval::{evaluate_condition, evaluate_on_exit, TriggerKind};
+
+    match TriggerKind::from_db(&task.trigger_kind) {
+        TriggerKind::Time => {
+            execute_cron_task(home_dir, store, registry, task, None).await;
+        }
+        TriggerKind::Condition => {
+            let script = match task.condition_script.as_deref() {
+                Some(s) if !s.trim().is_empty() => s,
+                _ => {
+                    warn!(
+                        id = %task.id,
+                        name = %task.name,
+                        "condition trigger 缺少 condition_script（fail-closed，跳過）"
+                    );
+                    return;
+                }
+            };
+
+            let outcome = evaluate_condition(script, task.condition_state.as_deref()).await;
+
+            // Persist any new state regardless of the fire decision — a script
+            // may advance its cursor while choosing not to fire. Oversize state
+            // was already rejected by the parser (fail-closed); this writeback
+            // is best-effort and never blocks the fire decision.
+            if let Some(ref new_state) = outcome.new_state {
+                if let Err(e) = store
+                    .update_condition_state(&task.id, Some(new_state))
+                    .await
+                {
+                    warn!(id = %task.id, "condition state 回寫失敗（略過）：{e}");
+                }
+            }
+
+            if outcome.fire {
+                info!(id = %task.id, name = %task.name, "condition trigger 觸發，執行任務");
+                execute_cron_task(home_dir, store, registry, task, outcome.message.as_deref())
+                    .await;
+            } else {
+                info!(id = %task.id, name = %task.name, "condition trigger 評估未觸發（跳過）");
+            }
+        }
+        TriggerKind::OnExit => {
+            let watch = match task.watch_command.as_deref() {
+                Some(s) if !s.trim().is_empty() => s,
+                _ => {
+                    warn!(
+                        id = %task.id,
+                        name = %task.name,
+                        "on_exit trigger 缺少 watch_command（fail-closed，跳過）"
+                    );
+                    return;
+                }
+            };
+
+            if evaluate_on_exit(watch).await {
+                info!(id = %task.id, name = %task.name, "on_exit trigger 觸發（監看指令退出 0），執行任務");
+                execute_cron_task(home_dir, store, registry, task, None).await;
+            } else {
+                info!(id = %task.id, name = %task.name, "on_exit trigger 未觸發（跳過）");
             }
         }
     }
@@ -195,13 +283,26 @@ impl CronScheduler {
 
 /// Execute a cron task by calling the Claude CLI for the target agent, then
 /// persist the run outcome to the store.
+///
+/// `trigger_message` (G3) is optional context from a `condition` script's
+/// `message` field; when present it is appended to the prompt so the agent
+/// sees why the task fired.
 async fn execute_cron_task(
     home_dir: &std::path::Path,
     store: &Arc<CronStore>,
     registry: &Arc<RwLock<AgentRegistry>>,
     task: &CronTaskRow,
+    trigger_message: Option<&str>,
 ) {
-    let prompt = format!("[Scheduled Task: {}] {}", task.name, task.task);
+    let prompt = match trigger_message {
+        Some(m) if !m.trim().is_empty() => {
+            format!(
+                "[Scheduled Task: {}] {}\n\n[Trigger context] {}",
+                task.name, task.task, m
+            )
+        }
+        _ => format!("[Scheduled Task: {}] {}", task.name, task.task),
+    };
 
     // Wrap cron execution in DELEGATION_ENV scope so the Claude CLI subprocess
     // receives delegation context. Cron tasks start at depth 0 with origin="cron".
@@ -371,13 +472,35 @@ async fn deliver_cron_result(
         _ => chat_id.to_string(),
     };
 
-    let token = resolve_channel_token(home_dir, &task.agent_id, channel).await;
-    if token.is_empty() {
-        return Err(format!(
-            "no bot token configured for channel {channel} (tried agent {} and global config)",
-            task.agent_id
-        ));
-    }
+    // WeCom / DingTalk have no single `<channel>_bot_token` — their senders
+    // resolve corp/app credentials from global config at send time, so a
+    // token-cascade miss must not block delivery. We only verify the channel
+    // section is genuinely configured so a missing setup still fails with a
+    // clear error instead of a cryptic send failure.
+    let token = if crate::channel_sender::sender_self_configures(channel) {
+        let marker = crate::channel_sender::self_config_marker_field(channel)
+            .expect("self-configuring channel must declare a marker field");
+        let present =
+            crate::config_crypto::read_encrypted_config_field(home_dir, "channels", marker)
+                .await
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        if !present {
+            return Err(format!(
+                "channel {channel} is not configured (missing `{marker}` in config.toml [channels])"
+            ));
+        }
+        String::new() // factory-built {channel} sender ignores the token
+    } else {
+        let token = resolve_channel_token(home_dir, &task.agent_id, channel).await;
+        if token.is_empty() {
+            return Err(format!(
+                "no bot token configured for channel {channel} (tried agent {} and global config)",
+                task.agent_id
+            ));
+        }
+        token
+    };
 
     // Clamp by chars (not bytes) — CJK-safe because we already count code
     // points, and it stays under every channel's message size cap.

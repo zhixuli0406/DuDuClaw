@@ -24,6 +24,7 @@
 //!
 //! See `commercial/docs/spec-license-module.md` for the full design rationale.
 
+pub mod bundle;
 pub mod crl;
 pub mod error;
 pub mod fingerprint;
@@ -34,6 +35,9 @@ pub mod storage;
 pub mod tier;
 
 // Re-export primary types for ergonomic use.
+pub use bundle::{
+    sign_bundle, verify_bundle, BrandingBundle, BrandingConfig, BUNDLE_KEY_ID, BUNDLE_SCHEMA,
+};
 pub use crl::SignedCrl;
 pub use error::{LicenseError, Result};
 pub use fingerprint::generate_fingerprint;

@@ -227,6 +227,11 @@ const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "user_code_profile",
+        description: "Compile this agent's user-as-code profile: typed preference/constraint rules parsed from currently-valid memory facts, plus unresolved conflicts and the count of untyped rows. Read-only, no parameters.",
+        params: &[],
+    },
+    ToolDef {
         name: "memory_successful_conversations",
         description: "Find successful past conversations related to a topic (high-importance episodic memories)",
         params: &[
@@ -327,6 +332,16 @@ const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "spawn_ephemeral",
+        description: "Synthesize a purpose-built EPHEMERAL sub-agent (AOrchestra-style Instruction/Context/Tools/Model four-tuple) and dispatch one task to it. The agent is a transient scaffold, restricted to a tool subset of YOUR OWN capabilities (no escalation), and garbage-collected after completion (24h TTL). Model is chosen by TIER, never by raw model id.",
+        params: &[
+            ParamDef { name: "instruction", description: "System-prompt fragment defining the ephemeral agent's role (becomes its SOUL.md)", required: true },
+            ParamDef { name: "context", description: "The task payload the ephemeral agent must execute", required: true },
+            ParamDef { name: "tools", description: "JSON array of allowed tool names (must be a subset of the calling agent's own capabilities; deny-by-default)", required: true },
+            ParamDef { name: "tier", description: "Model tier: cheap | standard | preferred (default: standard). Raw model ids are rejected.", required: false },
+        ],
+    },
+    ToolDef {
         name: "agent_update",
         description: "Update one or more fields of an existing agent's configuration (agent.toml). Supports identity, model, budget, heartbeat, and container fields. Uses atomic write for safety.",
         params: &[
@@ -364,9 +379,12 @@ const TOOLS: &[ToolDef] = &[
     // ── Skill management tools ──────────────────────────────────
     ToolDef {
         name: "skill_search",
-        description: "Search the local skill registry for available skills to install",
+        description: "Search skill hubs for available skills to install. By default aggregates \
+                       across all configured hubs (github / clawhub / lobehub) with the same \
+                       weighted scoring; pass hub to search a single hub.",
         params: &[
             ParamDef { name: "query", description: "Search query (name, tag, or description)", required: true },
+            ParamDef { name: "hub", description: "Restrict to one hub id: github, clawhub, or lobehub (default: aggregate all configured hubs)", required: false },
         ],
     },
     ToolDef {
@@ -409,6 +427,39 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "agent_id", description: "Target agent that will own synthesised skills (default: main agent)", required: false },
             ParamDef { name: "dry_run", description: "true = score only, no Skill Bank writes (default: true)", required: false },
             ParamDef { name: "lookback_days", description: "Days of EvolutionEvents history to scan (default: 1)", required: false },
+        ],
+    },
+    // ── Skill hub + curator tools (G5) ─────────────────────────
+    ToolDef {
+        name: "skill_hub_install",
+        description: "Install a skill from a configured hub (clawhub / lobehub). Every install is \
+                       routed through the security scan gate before activation — high-risk or \
+                       content-less manifests are DENIED (fail-closed).",
+        params: &[
+            ParamDef { name: "hub", description: "Hub id (exact): clawhub or lobehub. github is discovery-only and will be denied by the gate.", required: true },
+            ParamDef { name: "skill_name", description: "Skill slug/identifier on that hub", required: true },
+            ParamDef { name: "owner", description: "Publisher handle — required when the hub reports the slug as ambiguous (clawhub 409)", required: false },
+            ParamDef { name: "scope", description: "Install target: 'global' (default) or an agent id", required: false },
+        ],
+    },
+    ToolDef {
+        name: "skill_curator_status",
+        description: "Report the G5 curator lifecycle state: stale (30d unused), archived (90d, \
+                       recoverable), pinned, and approaching-stale skills. Optionally force a \
+                       maintenance pass now.",
+        params: &[
+            ParamDef { name: "run", description: "true = run a curator pass immediately (default: false, report only)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "skill_pin",
+        description: "Pin or unpin a skill for the curator. Pinned skills are exempt from the \
+                       30-day stale flag and 90-day archive; pinning an archived skill restores \
+                       its file from the archive.",
+        params: &[
+            ParamDef { name: "skill_name", description: "Skill name (machine identity)", required: true },
+            ParamDef { name: "scope", description: "'global' (default) or an agent id", required: false },
+            ParamDef { name: "pinned", description: "true (default) to pin, false to unpin", required: false },
         ],
     },
     // ── Feedback tool ────────────────────────────────────────────
@@ -606,6 +657,19 @@ const TOOLS: &[ToolDef] = &[
         description: "List available llamafile executables in ~/.duduclaw/llamafiles/",
         params: &[],
     },
+    ToolDef {
+        name: "jitrl_feedback",
+        description: "Record explicit JitRL feedback for a (prompt, response) pair on the local \
+                      inference path (arXiv:2601.18510). reward=1 reinforces the response's tokens \
+                      on similar prompts, reward=-1 suppresses them, reward=0 is a no-op. \
+                      Requires [jitrl] enabled = true in inference.toml and an active \
+                      OpenAI-compatible endpoint (for the model's own tokenizer).",
+        params: &[
+            ParamDef { name: "prompt", description: "The prompt the response answered", required: true },
+            ParamDef { name: "response", description: "The model response being rated", required: true },
+            ParamDef { name: "reward", description: "Integer reward: -1 (suppress), 0 (no-op), or 1 (reinforce)", required: true },
+        ],
+    },
     // ── Model registry tools ────────────────────────────────────────
     ToolDef {
         name: "model_search",
@@ -774,6 +838,13 @@ const TOOLS: &[ToolDef] = &[
         description: "Show recent individual API call records with detailed token breakdown (input, cache_read, cache_write, output).",
         params: &[
             ParamDef { name: "limit", description: "Number of recent records (default 20)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "cost_multi_vs_single",
+        description: "Honest multi-agent vs single-agent cost report (arXiv:2604.02460): delegated-work cost ('dispatch') vs direct-reply cost ('chat') per agent per day, with window totals. Note: per-episode linkage is not derivable from current telemetry — the report says so explicitly.",
+        params: &[
+            ParamDef { name: "days", description: "Time window in days (default 7, max 365)", required: false },
         ],
     },
     // ── Voice / ASR / TTS tools ──────────────────────────────────
@@ -948,6 +1019,20 @@ const TOOLS: &[ToolDef] = &[
         description: "Inspect the shared-wiki namespace SoT policy (~/.duduclaw/shared/wiki/.scope.toml). Returns each configured namespace's mode (agent_writable / read_only / operator_only / agent_allowlist) plus synced_from capability or the agent allowlist. Unlisted namespaces are agent_writable. Use this before shared_wiki_write to know whether a target namespace is writable.",
         params: &[],
     },
+    // ── Live Canvas tools (G15) ──────────────────────────────────
+    ToolDef {
+        name: "canvas_push",
+        description: "Push an HTML visual workspace (Live Canvas) that the user views live on the dashboard Canvas page. Use it for reports, dashboards, tables, diagrams — anything better shown than said. The HTML is sanitized server-side at write time (scripts, event handlers, iframes/objects/embeds and form elements are stripped; structural markup, tables, inline SVG, https/data images and inline style attributes are kept) and rendered in a fully sandboxed viewer, so keep it static and self-contained. Max 256 KB. Replaces your current canvas; the last 5 versions are kept as history.",
+        params: &[
+            ParamDef { name: "html", description: "Self-contained static HTML body (max 256 KB; no scripts — they are stripped)", required: true },
+            ParamDef { name: "title", description: "Short canvas title shown in the dashboard (optional)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "canvas_clear",
+        description: "Clear your Live Canvas on the dashboard (viewers see the empty state; earlier versions stay in history).",
+        params: &[],
+    },
     ToolDef {
         name: "identity_resolve",
         description: "RFC-21 §1: Resolve a (channel, external_id) pair to the canonical person it represents — name, roles, project memberships, all known channel handles. Returns null when the person is unknown. Reads from the WikiCacheIdentityProvider (~/.duduclaw/shared/wiki/identity/people/*.md). Use this *before* deciding whether the sender is a project member, instead of grepping shared_wiki_read.",
@@ -1087,6 +1172,12 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "priority", description: "low / medium / high / urgent (default: medium)", required: false },
             ParamDef { name: "tags", description: "Comma-separated tags", required: false },
             ParamDef { name: "parent_task_id", description: "Parent task ID for sub-tasks", required: false },
+            ParamDef { name: "goal_id", description: "Goal this task serves (see goals_create). Its why-chain (Initiative → Project → Issue) is shown to the assignee in their task queue.", required: false },
+            ParamDef { name: "depends_on", description: "Task ids (JSON array or comma-separated) that must be 'done' before this task can be claimed. Enables the durable dispatch lifecycle. Dependency cycles are rejected.", required: false },
+            ParamDef { name: "goal_mode", description: "If true, completion goes through judge acceptance (acceptance_criteria) before 'done'.", required: false },
+            ParamDef { name: "acceptance_criteria", description: "Criteria the judge checks when goal_mode is set.", required: false },
+            ParamDef { name: "max_retries", description: "Requeue cap for zombie reclaim / goal rejection (default 3).", required: false },
+            ParamDef { name: "durable", description: "Force the durable dispatch lifecycle (status 'pending' + atomic claim + lease).", required: false },
         ],
     },
     ToolDef {
@@ -1098,13 +1189,21 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "description", description: "New description", required: false },
             ParamDef { name: "priority", description: "New priority", required: false },
             ParamDef { name: "tags", description: "New comma-separated tags", required: false },
+            ParamDef { name: "depends_on", description: "New dependency list (JSON array or comma-separated task ids). Dependency cycles are rejected.", required: false },
         ],
     },
     ToolDef {
         name: "tasks_claim",
-        description: "Claim a task: reassigns it to the calling agent and transitions status to in_progress. Posts a task_assigned activity event.",
+        description: "Atomically claim a task: only one worker can win a pending task (compare-and-set), reassigns it to the calling agent, transitions to in_progress, and stamps a lease so a crashed worker is reclaimable. Posts a task_assigned activity event.",
         params: &[
             ParamDef { name: "task_id", description: "Task ID to claim", required: true },
+        ],
+    },
+    ToolDef {
+        name: "tasks_renew",
+        description: "Heartbeat for a claimed task: extend the lease you hold so long-running work is not reclaimed as a zombie. Call periodically (well within the lease window) while you are still actively working on the task. Only the claiming agent can renew.",
+        params: &[
+            ParamDef { name: "task_id", description: "Task ID you claimed via tasks_claim", required: true },
         ],
     },
     ToolDef {
@@ -1121,6 +1220,41 @@ const TOOLS: &[ToolDef] = &[
         params: &[
             ParamDef { name: "task_id", description: "Task ID", required: true },
             ParamDef { name: "reason", description: "Blocker reason (required, shown on the card)", required: true },
+        ],
+    },
+    // ── Goal chain tools (G8 — agents see the WHY) ──────────────
+    ToolDef {
+        name: "goals_create",
+        description: "Create a goal in the goal hierarchy (Initiative → Project → Issue). Link tasks to a goal via tasks_create goal_id; assignees then see the full why-chain in their task queue. Goal cycles are rejected.",
+        params: &[
+            ParamDef { name: "title", description: "Goal title (required, <200 chars)", required: true },
+            ParamDef { name: "description", description: "The WHY — rationale carried down to agents working linked tasks", required: false },
+            ParamDef { name: "parent_goal_id", description: "Parent goal ID (must exist; cycles rejected)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "goals_list",
+        description: "List goals in the goal hierarchy, including each goal's parent linkage.",
+        params: &[
+            ParamDef { name: "status", description: "Filter by status: active / done / archived", required: false },
+            ParamDef { name: "limit", description: "Max results (default 50, max 200)", required: false },
+        ],
+    },
+    // ── Co-edited plan tools (U4 — shared user↔agent plan) ──────
+    ToolDef {
+        name: "plan_get",
+        description: "Read the shared plan you co-edit with your user. Without plan_id, returns your most recently updated active plan. Steps are ordered; each has an assignee (user or agent). Update the steps assigned to you via plan_update_step; never touch the user's steps.",
+        params: &[
+            ParamDef { name: "plan_id", description: "Plan ID. Omit to get your most recently updated active plan.", required: false },
+        ],
+    },
+    ToolDef {
+        name: "plan_update_step",
+        description: "Update a step of the shared plan that is assigned to YOU (assignee_kind='agent' and assignee=you — enforced). Use it to tick progress: todo → doing → done (or skipped), and optionally refine the step text.",
+        params: &[
+            ParamDef { name: "step_id", description: "Plan step ID (from plan_get)", required: true },
+            ParamDef { name: "status", description: "New status: todo / doing / done / skipped", required: false },
+            ParamDef { name: "text", description: "Refined step text (optional)", required: false },
         ],
     },
     // ── Activity Feed tools ─────────────────────────────────────
@@ -1259,6 +1393,22 @@ pub(crate) const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
     "send_message",
 ];
 
+#[cfg(test)]
+mod user_code_profile_registration_tests {
+    use super::TOOLS;
+
+    #[test]
+    fn user_code_profile_tool_registered() {
+        let tool = TOOLS
+            .iter()
+            .find(|t| t.name == "user_code_profile")
+            .expect("user_code_profile must be registered in TOOLS");
+        assert!(tool.params.is_empty(), "user_code_profile takes no params");
+        // Internal-only: must NOT be on the external whitelist.
+        assert!(!super::EXTERNAL_TOOLS_WHITELIST.contains(&"user_code_profile"));
+    }
+}
+
 // ── JSON-RPC helpers ─────────────────────────────────────────
 
 /// Detect the host system's IANA timezone name (e.g. `"Asia/Taipei"`,
@@ -1311,23 +1461,26 @@ const MAX_AGENT_ID_LEN: usize = 128;
 
 /// Append a line to a JSONL file with size limit check.
 ///
-/// **Concurrency note (MCP-M4)**: Uses `O_APPEND` which is atomic on POSIX
-/// for writes ≤ PIPE_BUF (typically 4096 bytes). JSONL lines are typically
-/// < 1KB so concurrent appends from MCP server and gateway are safe.
-/// The dispatcher uses its own Mutex for read-modify-write operations.
+/// **Concurrency (project convention #3, 2026-07 MED)**: the whole
+/// check+append runs under `duduclaw_core::with_file_lock`. `O_APPEND` alone
+/// is not enough — the gateway dispatcher REWRITES `bus_queue.jsonl`
+/// (read-modify-write) under the same lock, and a bare append racing that
+/// rewrite is silently lost; oversized records can also interleave.
 fn append_to_jsonl_sync(path: &std::path::Path, line: &str) -> bool {
-    // Check size limit
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() > MAX_QUEUE_FILE_SIZE {
-            tracing::warn!("Queue file {} exceeds size limit", path.display());
-            return false;
-        }
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        writeln!(f, "{line}").is_ok()
-    } else {
-        false
-    }
+    duduclaw_core::with_file_lock(path, || {
+        // Check size limit (inside the lock so it can't race the append).
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.len() > MAX_QUEUE_FILE_SIZE
+        {
+            tracing::warn!("Queue file {} exceeds size limit", path.display());
+            return Ok(false);
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(f, "{line}")?;
+        Ok(true)
+    })
+    .unwrap_or(false)
 }
 
 fn jsonrpc_error(id: &Value, code: i64, message: &str) -> Value {
@@ -3448,43 +3601,54 @@ async fn spawn_agent_with_ctx(
         let entry_str = entry.to_string();
         move || -> std::result::Result<(), String> {
             use std::io::Write;
-            // Enforce bus_queue.jsonl size limit (CLI-H4)
-            const MAX_QUEUE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
-            if let Ok(meta) = std::fs::metadata(&path)
-                && meta.len() > MAX_QUEUE_SIZE
-            {
-                return Err(format!(
-                    "bus_queue.jsonl exceeds {}MB size limit (current: {} bytes). \
-                     Run `duduclaw bus rotate` or wait for dispatcher to drain.",
-                    MAX_QUEUE_SIZE / (1024 * 1024),
-                    meta.len()
-                ));
-            }
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| format!("open {}: {e}", path.display()))?;
-            writeln!(f, "{entry_str}")
-                .map_err(|e| format!("write to {}: {e}", path.display()))?;
-            Ok(())
+            // Project convention #3 (2026-07 MED): hold the cross-process
+            // advisory lock — the dispatcher REWRITES bus_queue.jsonl and a
+            // bare append racing that rewrite is silently dropped.
+            duduclaw_core::with_file_lock(&path, || {
+                // Enforce bus_queue.jsonl size limit (CLI-H4)
+                const MAX_QUEUE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+                if let Ok(meta) = std::fs::metadata(&path)
+                    && meta.len() > MAX_QUEUE_SIZE
+                {
+                    return Err(std::io::Error::other(format!(
+                        "bus_queue.jsonl exceeds {}MB size limit (current: {} bytes). \
+                         Run `duduclaw bus rotate` or wait for dispatcher to drain.",
+                        MAX_QUEUE_SIZE / (1024 * 1024),
+                        meta.len()
+                    )));
+                }
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?;
+                writeln!(f, "{entry_str}")?;
+                Ok(())
+            })
+            .map_err(|e| format!("queue {}: {e}", path.display()))
         }
     })
     .await
     .unwrap_or_else(|join_err| Err(format!("spawn_blocking panicked: {join_err}")));
 
     match queued {
-        Ok(()) => serde_json::json!({
-            "content": [{"type": "text", "text": format!(
-                "Sub-agent '{agent_id}' task spawned successfully.\n\
-                 Task ID: {task_id}\n\
-                 Session key: {}\n\
-                 \n\
-                 The task is queued and will be picked up by the dispatcher.\n\
-                 Use agent_status to check progress, or check bus_queue.jsonl for the response.",
-                if session_key.is_empty() { &task_id } else { session_key }
-            )}]
-        }),
+        Ok(()) => {
+            // O4: one-line honest delegation-cost advisory (arXiv:2604.02460).
+            let advisory = delegation_cost_advisory(home_dir)
+                .await
+                .map(|line| format!("\n\n{line}"))
+                .unwrap_or_default();
+            serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Sub-agent '{agent_id}' task spawned successfully.\n\
+                     Task ID: {task_id}\n\
+                     Session key: {}\n\
+                     \n\
+                     The task is queued and will be picked up by the dispatcher.\n\
+                     Use agent_status to check progress, or check bus_queue.jsonl for the response.{advisory}",
+                    if session_key.is_empty() { &task_id } else { session_key }
+                )}]
+            })
+        }
         Err(reason) => serde_json::json!({
             "content": [{"type": "text", "text": format!(
                 "Error: Failed to queue agent task for '{agent_id}'. Reason: {reason}\n\
@@ -3495,6 +3659,192 @@ async fn spawn_agent_with_ctx(
             )}],
             "isError": true
         }),
+    }
+}
+
+/// O2 — synthesize an ephemeral sub-agent and dispatch one task to it.
+/// See `duduclaw_gateway::ephemeral` for the scaffold/GC design (AOrchestra,
+/// arXiv:2602.03786).
+async fn handle_spawn_ephemeral(params: &Value, home_dir: &Path, caller: &str) -> Value {
+    // The capability envelope is the ACTUAL caller's — in delegated contexts
+    // that is the delegation sender (same trusted env source the audit trail
+    // uses), never a spoofable tool param.
+    let actual_caller = std::env::var(duduclaw_core::ENV_DELEGATION_SENDER)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| caller.to_string());
+    spawn_ephemeral_with_ctx(params, home_dir, &actual_caller, DelegationContext::from_env())
+        .await
+}
+
+/// Core spawn_ephemeral with injectable delegation context (testable).
+async fn spawn_ephemeral_with_ctx(
+    params: &Value,
+    home_dir: &Path,
+    caller: &str,
+    ctx: DelegationContext,
+) -> Value {
+    let instruction = params.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
+    let context = params.get("context").and_then(|v| v.as_str()).unwrap_or("");
+    let tier = params.get("tier").and_then(|v| v.as_str()).unwrap_or("standard");
+
+    // `tools`: JSON array of strings, or a comma-separated string.
+    let tools: Vec<String> = match params.get("tools") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    if instruction.is_empty() || context.is_empty() || tools.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: instruction, context, and a non-empty tools list are required (deny-by-default: the ephemeral agent only gets the tools you explicitly request)"}],
+            "isError": true
+        });
+    }
+    // The dispatcher drops payloads over 100 KB — reject early instead of
+    // scaffolding an agent whose task can never be delivered.
+    if context.len() > 100_000 {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: context exceeds the 100KB bus payload limit"}],
+            "isError": true
+        });
+    }
+
+    let parent = caller.to_string();
+    if !is_valid_agent_id(&parent) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: invalid caller agent id"}],
+            "isError": true
+        });
+    }
+
+    // ── Delegation depth tracking (same rule as spawn_agent) ───────────
+    let incoming_depth = ctx.depth;
+    let outgoing_depth = incoming_depth.saturating_add(1);
+    if outgoing_depth >= duduclaw_core::MAX_DELEGATION_DEPTH {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Error: delegation depth limit ({}) would be exceeded. \
+                 Current depth: {incoming_depth}. Cannot synthesize further agents.",
+                duduclaw_core::MAX_DELEGATION_DEPTH,
+            )}],
+            "isError": true
+        });
+    }
+    let origin = ctx.origin.as_deref().unwrap_or(caller).to_string();
+
+    // ── Scaffold (fail-closed capability subsetting inside) ─────────────
+    let spec = duduclaw_gateway::ephemeral::EphemeralSpawnSpec {
+        parent: parent.clone(),
+        instruction: instruction.to_string(),
+        tools,
+        tier: tier.to_string(),
+    };
+    let home = home_dir.to_path_buf();
+    let scaffolded = tokio::task::spawn_blocking(move || {
+        duduclaw_gateway::ephemeral::scaffold(&home, &spec)
+    })
+    .await
+    .unwrap_or_else(|join_err| Err(format!("spawn_blocking panicked: {join_err}")));
+
+    let scaffolded = match scaffolded {
+        Ok(s) => s,
+        Err(reason) => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: ephemeral synthesis rejected: {reason}")}],
+                "isError": true
+            });
+        }
+    };
+    let eph_id = scaffolded.agent_id.clone();
+
+    // ── Enqueue on the bus — identical shape to spawn_agent ─────────────
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let queue_path = home_dir.join("bus_queue.jsonl");
+    let entry = serde_json::json!({
+        "type": "agent_message",
+        "message_id": &task_id,
+        "agent_id": &eph_id,
+        "payload": context,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "session_key": &task_id,
+        "persistent": true,
+        "delegation_depth": outgoing_depth,
+        "origin_agent": origin,
+        "sender_agent": parent,
+    });
+    let queued: std::result::Result<(), String> = tokio::task::spawn_blocking({
+        let path = queue_path.clone();
+        let entry_str = entry.to_string();
+        move || -> std::result::Result<(), String> {
+            use std::io::Write;
+            // Project convention #3 (2026-07 MED): same advisory lock as the
+            // spawn_agent enqueue — the dispatcher rewrites this file.
+            duduclaw_core::with_file_lock(&path, || {
+                const MAX_QUEUE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB (CLI-H4)
+                if let Ok(meta) = std::fs::metadata(&path)
+                    && meta.len() > MAX_QUEUE_SIZE
+                {
+                    return Err(std::io::Error::other(format!(
+                        "bus_queue.jsonl exceeds {}MB size limit (current: {} bytes)",
+                        MAX_QUEUE_SIZE / (1024 * 1024),
+                        meta.len()
+                    )));
+                }
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?;
+                writeln!(f, "{entry_str}")?;
+                Ok(())
+            })
+            .map_err(|e| format!("queue {}: {e}", path.display()))
+        }
+    })
+    .await
+    .unwrap_or_else(|join_err| Err(format!("spawn_blocking panicked: {join_err}")));
+
+    match queued {
+        Ok(()) => {
+            // O4: one-line honest delegation-cost advisory (arXiv:2604.02460).
+            let advisory = delegation_cost_advisory(home_dir)
+                .await
+                .map(|line| format!("\n\n{line}"))
+                .unwrap_or_default();
+            serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Ephemeral agent '{eph_id}' synthesized and task queued.\n\
+                     Task ID: {task_id}\n\
+                     Tier: {tier}\n\
+                     \n\
+                     The scaffold lives under agents/.ephemeral/ and is \
+                     garbage-collected ~1h after completion (24h hard TTL). \
+                     The response returns through the normal delegation path.{advisory}"
+                )}]
+            })
+        }
+        Err(reason) => {
+            // Queueing failed — tear the scaffold down (best-effort; the
+            // path was produced by `scaffold` and is containment-checked).
+            let _ = std::fs::remove_dir_all(&scaffolded.dir);
+            serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Error: Failed to queue ephemeral task. Reason: {reason}\n\
+                     The scaffold was rolled back. Per RFC-22, do NOT fabricate \
+                     a reply on its behalf."
+                )}],
+                "isError": true
+            })
+        }
     }
 }
 
@@ -4671,6 +5021,50 @@ async fn handle_llamafile_list(home_dir: &Path) -> Value {
     })
 }
 
+/// `jitrl_feedback` — record explicit JitRL feedback (HIGH-D, 2026-07:
+/// `jitrl_record_feedback` previously had zero callers, making the whole
+/// feature untriggerable). Reward is a strict {-1, 0, 1}: 0 is an explicit
+/// no-op (the engine rejects zero rewards — nothing would be recorded), and
+/// a disabled `[jitrl]` section is a clear-message no-op, not an error spam.
+async fn handle_jitrl_feedback(params: &Value, home_dir: &Path) -> Value {
+    let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+    let response = params.get("response").and_then(|v| v.as_str()).unwrap_or("");
+    let reward = params.get("reward").and_then(|v| v.as_i64());
+
+    if prompt.trim().is_empty() || response.trim().is_empty() {
+        return mcp_error("prompt and response are required");
+    }
+    let reward = match reward {
+        Some(r @ (-1 | 0 | 1)) => r,
+        _ => return mcp_error("reward must be one of -1, 0, 1"),
+    };
+
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+    if !engine.jitrl_enabled() {
+        // No-op with a clear message (not isError): JitRL is opt-in and a
+        // disabled install rating a reply is expected, not exceptional.
+        return mcp_text(
+            "JitRL 未啟用（inference.toml 缺少 [jitrl] enabled = true）— 本次回饋未記錄。",
+        );
+    }
+    if reward == 0 {
+        return mcp_text("reward=0 為 no-op：未記錄任何回饋（僅 -1 / 1 會寫入經驗庫）。");
+    }
+    if let Err(e) = engine.init().await {
+        return mcp_error(&format!("Failed to init inference engine: {e}"));
+    }
+
+    match engine
+        .jitrl_record_feedback(prompt, response, reward as f32)
+        .await
+    {
+        Ok(tokens) => mcp_text(&format!(
+            "JitRL feedback recorded: reward={reward}, {tokens} distinct tokens stored."
+        )),
+        Err(e) => mcp_error(&format!("jitrl_feedback failed: {e}")),
+    }
+}
+
 // ── Model registry handlers ─────────────────────────────────
 
 async fn handle_model_search(params: &Value, home_dir: &Path) -> Value {
@@ -4880,6 +5274,45 @@ async fn handle_cost_users(params: &Value, home_dir: &Path) -> Value {
             "content": [{"type": "text", "text": format!("Error: {e}")}]
         }),
     }
+}
+
+/// O4 — honest multi-agent vs single-agent cost report (arXiv:2604.02460).
+/// Granularity is per-agent per-day dispatch-vs-chat; the report carries its
+/// own `granularity_note` explaining why per-episode linkage is not claimed.
+async fn handle_cost_multi_vs_single(params: &Value, home_dir: &Path) -> Value {
+    let _ = duduclaw_gateway::cost_telemetry::init_telemetry(home_dir);
+
+    let telemetry = match duduclaw_gateway::cost_telemetry::get_telemetry() {
+        Some(t) => t,
+        None => return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "Cost telemetry not initialized"}]
+        }),
+    };
+
+    let days = params.get("days").and_then(|v| v.as_u64()).unwrap_or(7);
+
+    match telemetry.multi_vs_single(days).await {
+        Ok(report) => serde_json::json!({
+            "content": [{"type": "text", "text": serde_json::to_string_pretty(&report).unwrap_or_default()}]
+        }),
+        Err(e) => serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("Error: {e}")}]
+        }),
+    }
+}
+
+/// O4 — best-effort one-line zh-TW delegation-cost advisory for spawn/fork
+/// tool responses. `None` when telemetry is unavailable (the spawn result
+/// must never fail because of the advisory).
+async fn delegation_cost_advisory(home_dir: &Path) -> Option<String> {
+    let _ = duduclaw_gateway::cost_telemetry::init_telemetry(home_dir);
+    let telemetry = duduclaw_gateway::cost_telemetry::get_telemetry()?;
+    let (dispatch, direct) = telemetry.dispatch_vs_direct_totals(24).await.ok()?;
+    Some(duduclaw_gateway::cost_telemetry::render_delegation_advisory(
+        dispatch, direct, 24,
+    ))
 }
 
 async fn handle_cost_recent(params: &Value) -> Value {
@@ -5420,7 +5853,9 @@ fn parse_skill_description_from_content(content: &str) -> String {
     String::new()
 }
 
-/// Search the local skill registry.
+/// Search skill hubs (G5). Default aggregates across all configured hubs
+/// with the same weighted scoring the GitHub index uses; `hub` restricts to
+/// one hub by exact id. Per-hub failures are reported, never swallowed.
 async fn handle_skill_search(params: &Value, home_dir: &Path) -> Value {
     let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
     if query.is_empty() {
@@ -5430,31 +5865,193 @@ async fn handle_skill_search(params: &Value, home_dir: &Path) -> Value {
         });
     }
 
-    let registry = duduclaw_agent::skill_registry::SkillRegistry::load(home_dir);
-    let results = registry.search(query, 20);
-
-    if results.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": format!(
-                "No skills found for '{query}'. Registry has {} skills indexed.",
-                registry.count()
-            )}]
-        });
+    let registry = duduclaw_agent::skill_hub::HubRegistry::from_home(home_dir);
+    let hub_filter = params.get("hub").and_then(|v| v.as_str()).map(|s| s.trim());
+    if let Some(h) = hub_filter {
+        // Exact-id validation up front so a typo'd hub errors instead of
+        // silently returning an empty aggregate.
+        if registry.get(h).is_none() {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Error: unknown hub '{h}'. Configured hubs: {}",
+                    registry.ids().join(", ")
+                )}],
+                "isError": true
+            });
+        }
     }
 
-    let mut lines = vec![format!("Found {} skill(s) for '{query}':\n", results.len())];
-    for s in &results {
-        let tags = if s.tags.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", s.tags.join(", "))
-        };
-        lines.push(format!("- **{}**: {}{}", s.name, s.description, tags));
+    let result = registry.search(home_dir, query, 20, hub_filter).await;
+
+    let mut lines: Vec<String> = Vec::new();
+    if result.hits.is_empty() {
+        lines.push(format!("No skills found for '{query}'."));
+    } else {
+        lines.push(format!("Found {} skill(s) for '{query}':\n", result.hits.len()));
+        for h in &result.hits {
+            let s = &h.entry;
+            let tags = if s.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", s.tags.join(", "))
+            };
+            lines.push(format!("- **{}** ({}): {}{}", s.name, h.hub, s.description, tags));
+        }
+    }
+    // Honest degradation: name every hub that failed.
+    for (hub, err) in &result.errors {
+        lines.push(format!("[unreachable: {hub}: {err}]"));
     }
 
     serde_json::json!({
         "content": [{"type": "text", "text": lines.join("\n")}]
     })
+}
+
+/// Install a skill from a hub — always through the fail-closed scan gate.
+async fn handle_skill_hub_install(params: &Value, home_dir: &Path) -> Value {
+    let hub = params.get("hub").and_then(|v| v.as_str()).unwrap_or("");
+    let skill_name = params.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
+    let owner = params.get("owner").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let scope = params.get("scope").and_then(|v| v.as_str()).unwrap_or("global");
+
+    if hub.is_empty() || skill_name.is_empty() {
+        return mcp_error("hub and skill_name are required");
+    }
+    // Path-safety first: slug/owner land in URL paths and file names.
+    if !is_safe_path_component(skill_name) {
+        return mcp_error("invalid skill_name (alphanumeric, hyphens, underscores only)");
+    }
+    if let Some(o) = owner {
+        if !is_safe_path_component(o) {
+            return mcp_error("invalid owner (alphanumeric, hyphens, underscores only)");
+        }
+    }
+    if scope != "global" && !is_safe_path_component(scope) {
+        return mcp_error("invalid scope (use 'global' or a valid agent id)");
+    }
+
+    match duduclaw_gateway::skill_lifecycle::hub_install::install_from_hub(
+        home_dir, hub, skill_name, owner, scope,
+    )
+    .await
+    {
+        Ok(report) => mcp_text(&format!(
+            "Skill '{}' installed from hub '{}' into scope '{}' (scan: risk {}, {} finding(s)).",
+            report.skill_name, report.hub, report.scope, report.risk_level, report.findings
+        )),
+        Err(e) => mcp_error(&e),
+    }
+}
+
+/// Report curator lifecycle state; optionally force a pass.
+async fn handle_skill_curator_status(params: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::custom_skills::{CurationStatus, CustomSkillStore};
+    use duduclaw_gateway::skill_lifecycle::curator;
+
+    let store = match CustomSkillStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return mcp_error(&format!("curation store: {e}")),
+    };
+
+    let force_run = params.get("run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let cfg = curator::CuratorConfig::load_from_home(home_dir);
+    let mut pass_summary = String::new();
+    if force_run {
+        match curator::run_pass(home_dir, &store, &cfg, chrono::Utc::now()).await {
+            Ok(report) => {
+                pass_summary = format!(
+                    "Pass executed: {} newly stale, {} archived, {} reactivated, {} error(s).\n\n",
+                    report.newly_stale.len(),
+                    report.newly_archived.len(),
+                    report.reactivated.len(),
+                    report.errors.len()
+                );
+            }
+            Err(e) => return mcp_error(&format!("curator pass failed: {e}")),
+        }
+    }
+
+    let rows = match store.curation_list().await {
+        Ok(r) => r,
+        Err(e) => return mcp_error(&e),
+    };
+
+    let mut stale = Vec::new();
+    let mut archived = Vec::new();
+    let mut unmanaged = Vec::new();
+    let mut pinned = Vec::new();
+    for r in &rows {
+        let key = format!("{} [{}]", r.skill_name, r.scope);
+        if r.pinned {
+            pinned.push(key.clone());
+        }
+        match r.status {
+            CurationStatus::Stale => stale.push(key),
+            CurationStatus::Archived => archived.push(key),
+            // Nested layouts the curator can't manage — tracked, never
+            // archived (flagged once by the pass).
+            CurationStatus::Unmanaged => unmanaged.push(key),
+            CurationStatus::Active => {}
+        }
+    }
+
+    fn block(title: &str, items: &[String]) -> String {
+        if items.is_empty() {
+            format!("**{title}**: (none)\n")
+        } else {
+            format!("**{title}** ({}):\n{}\n", items.len(), items.iter().map(|i| format!("- {i}\n")).collect::<String>())
+        }
+    }
+
+    let text = format!(
+        "{}Curator status — {} tracked skill(s) (enabled: {}, stale ≥ {}d, archive ≥ {}d)\n\n{}{}{}{}",
+        pass_summary,
+        rows.len(),
+        cfg.enabled,
+        cfg.stale_days,
+        cfg.archive_days,
+        block("Stale", &stale),
+        block("Archived (recoverable via skill_pin)", &archived),
+        block("Unmanaged layout (tracked only, never auto-archived)", &unmanaged),
+        block("Pinned", &pinned),
+    );
+    mcp_text(&text)
+}
+
+/// Pin / unpin a skill (pin exempts from stale+archive; pinning an archived
+/// skill restores it).
+async fn handle_skill_pin(params: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::custom_skills::CustomSkillStore;
+    use duduclaw_gateway::skill_lifecycle::curator;
+
+    let skill_name = params.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
+    let scope_raw = params.get("scope").and_then(|v| v.as_str()).unwrap_or("global");
+    let pinned = params.get("pinned").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    if skill_name.is_empty() {
+        return mcp_error("skill_name is required");
+    }
+    if !is_safe_path_component(skill_name) {
+        return mcp_error("invalid skill_name (alphanumeric, hyphens, underscores only)");
+    }
+    let scope = if scope_raw == "global" {
+        "global".to_string()
+    } else {
+        if !is_safe_path_component(scope_raw) {
+            return mcp_error("invalid scope (use 'global' or a valid agent id)");
+        }
+        format!("agent:{scope_raw}")
+    };
+
+    let store = match CustomSkillStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return mcp_error(&format!("curation store: {e}")),
+    };
+    match curator::set_pin(home_dir, &store, skill_name, &scope, pinned).await {
+        Ok(msg) => mcp_text(&msg),
+        Err(e) => mcp_error(&e),
+    }
 }
 
 /// List all skills installed for a specific agent, including global skills.
@@ -6460,6 +7057,14 @@ pub(crate) async fn handle_tools_call(
 
     // Record state-changing tool calls for post-action hallucination audit.
     // Only tools that mutate agent/system state are tracked.
+    //
+    // 2026-07 HIGH-C sweep: the list previously omitted several mutating
+    // tools (execute_program, the computer-use actions, config/pairing/skill
+    // installs, model lifecycle, reminders, memory_store, decision_resolve),
+    // so their calls left no audit trail at all. Tools that already write
+    // their own tool_calls.jsonl records stay OUT of this list to avoid
+    // double-logging: `odoo_*` (per-call audit in handle_odoo_tool) and
+    // `shared_wiki_write` (authorship-extras record).
     let is_state_changing = matches!(
         tool_name,
         "create_agent"
@@ -6467,6 +7072,7 @@ pub(crate) async fn handle_tools_call(
             | "agent_update"
             | "agent_update_soul"
             | "spawn_agent"
+            | "spawn_ephemeral"
             | "send_to_agent"
             | "create_task"
             | "schedule_task"
@@ -6476,14 +7082,40 @@ pub(crate) async fn handle_tools_call(
             | "tasks_create"
             | "tasks_update"
             | "tasks_claim"
+            | "tasks_renew"
             | "tasks_complete"
             | "tasks_block"
+            | "goals_create"
+            | "plan_update_step"
             | "activity_post"
             | "shared_skill_share"
             | "shared_skill_adopt"
             | "fork_run"
             | "merge_or_select"
             | "terminate_branch"
+            // ── 2026-07 additions (verified mutating, previously untracked) ──
+            | "execute_program"
+            | "computer_click"
+            | "computer_type"
+            | "computer_key"
+            | "computer_scroll"
+            | "computer_session_start"
+            | "computer_session_stop"
+            | "shared_wiki_delete"
+            | "canvas_push"
+            | "canvas_clear"
+            | "channel_config"
+            | "pairing_manage"
+            | "skill_hub_install"
+            | "skill_pin"
+            | "memory_store"
+            | "model_load"
+            | "model_download"
+            | "model_unload"
+            | "create_reminder"
+            | "cancel_reminder"
+            | "decision_resolve"
+            | "jitrl_feedback"
     );
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
@@ -6493,6 +7125,7 @@ pub(crate) async fn handle_tools_call(
         "memory_store"  => crate::mcp_memory_handlers::handle_memory_store(&arguments, memory, ns_ctx, daily_quota).await,
         "user_profile_record" => crate::mcp_memory_handlers::handle_user_profile_record(&arguments, memory, ns_ctx).await,
         "user_profile_get" => crate::mcp_memory_handlers::handle_user_profile_get(&arguments, memory, ns_ctx).await,
+        "user_code_profile" => crate::mcp_memory_handlers::handle_user_code_profile(memory, ns_ctx).await,
         "memory_read"   => crate::mcp_memory_handlers::handle_memory_read(&arguments, memory, ns_ctx).await,
         "memory_fetch_batch" => crate::mcp_memory_handlers::handle_memory_fetch_batch(&arguments, memory, ns_ctx).await,
         "memory_search_by_layer" => handle_memory_search_by_layer(&arguments, memory, default_agent).await,
@@ -6523,6 +7156,7 @@ pub(crate) async fn handle_tools_call(
         "task_status" => handle_task_status(&arguments, home_dir, default_agent).await,
         "agent_status" => handle_agent_status(&arguments, home_dir).await,
         "spawn_agent" => handle_spawn_agent(&arguments, home_dir, default_agent).await,
+        "spawn_ephemeral" => handle_spawn_ephemeral(&arguments, home_dir, default_agent).await,
         "agent_update" => handle_agent_update(&arguments, home_dir).await,
         "agent_remove" => handle_agent_remove(&arguments, home_dir).await,
         "agent_update_soul" => handle_agent_update_soul(&arguments, home_dir).await,
@@ -6532,6 +7166,9 @@ pub(crate) async fn handle_tools_call(
         "skill_graduate" => handle_skill_graduate(&arguments, home_dir).await,
         "skill_synthesis_status" => handle_skill_synthesis_status(&arguments, home_dir).await,
         "skill_synthesis_run" => handle_skill_synthesis_run(&arguments, home_dir, default_agent).await,
+        "skill_hub_install" => handle_skill_hub_install(&arguments, home_dir).await,
+        "skill_curator_status" => handle_skill_curator_status(&arguments, home_dir).await,
+        "skill_pin" => handle_skill_pin(&arguments, home_dir).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir).await,
         "evolution_status" => handle_evolution_status_tool(&arguments, home_dir, default_agent).await,
@@ -6555,6 +7192,7 @@ pub(crate) async fn handle_tools_call(
         "llamafile_start" => handle_llamafile_start(&arguments, home_dir).await,
         "llamafile_stop" => handle_llamafile_stop(home_dir).await,
         "llamafile_list" => handle_llamafile_list(home_dir).await,
+        "jitrl_feedback" => handle_jitrl_feedback(&arguments, home_dir).await,
         // Model registry tools
         "model_search" => handle_model_search(&arguments, home_dir).await,
         "model_download" => handle_model_download(&arguments, home_dir).await,
@@ -6564,6 +7202,7 @@ pub(crate) async fn handle_tools_call(
         "cost_agents" => handle_cost_agents(&arguments, home_dir).await,
         "cost_users" => handle_cost_users(&arguments, home_dir).await,
         "cost_recent" => handle_cost_recent(&arguments).await,
+        "cost_multi_vs_single" => handle_cost_multi_vs_single(&arguments, home_dir).await,
         // Voice / ASR / TTS tools
         "transcribe_audio" => handle_transcribe_audio(&arguments).await,
         "synthesize_speech" => handle_synthesize_speech(&arguments).await,
@@ -6590,6 +7229,11 @@ pub(crate) async fn handle_tools_call(
         "shared_wiki_stats" => handle_shared_wiki_stats(home_dir).await,
         "shared_wiki_lint" => handle_shared_wiki_lint(home_dir).await,
         "wiki_namespace_status" => handle_wiki_namespace_status(home_dir).await,
+        // Live Canvas tools (G15) — agent_id comes from the caller context
+        // (default_agent), never from arguments, so an agent can only ever
+        // write its own canvas.
+        "canvas_push" => handle_canvas_push(&arguments, home_dir, default_agent).await,
+        "canvas_clear" => handle_canvas_clear(home_dir, default_agent).await,
         "identity_resolve" => handle_identity_resolve(&arguments, home_dir, default_agent).await,
         "wiki_share" => handle_wiki_share(&arguments, home_dir, wiki_agent).await,
         // Skill Internalization tools
@@ -6606,8 +7250,15 @@ pub(crate) async fn handle_tools_call(
         "tasks_create" => handle_tasks_create(&arguments, home_dir, default_agent).await,
         "tasks_update" => handle_tasks_update(&arguments, home_dir).await,
         "tasks_claim" => handle_tasks_claim(&arguments, home_dir, default_agent).await,
+        "tasks_renew" => handle_tasks_renew(&arguments, home_dir, default_agent).await,
         "tasks_complete" => handle_tasks_complete(&arguments, home_dir, default_agent).await,
         "tasks_block" => handle_tasks_block(&arguments, home_dir, default_agent).await,
+        // Goal chain tools (G8)
+        "goals_create" => handle_goals_create(&arguments, home_dir, default_agent).await,
+        "goals_list" => handle_goals_list(&arguments, home_dir).await,
+        // Co-edited plan tools (U4)
+        "plan_get" => handle_plan_get(&arguments, home_dir, default_agent).await,
+        "plan_update_step" => handle_plan_update_step(&arguments, home_dir, default_agent).await,
         // Activity Feed tools
         "activity_post" => handle_activity_post(&arguments, home_dir, default_agent).await,
         "activity_list" => handle_activity_list(&arguments, home_dir, default_agent).await,
@@ -6679,12 +7330,17 @@ pub(crate) async fn handle_tools_call(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| default_agent.to_string());
         let params_summary = build_params_summary(tool_name, &arguments);
-        duduclaw_security::audit::append_tool_call(
+        // R4 (TraceElephant): capture the tool's INPUT arguments, not just the
+        // outcome summary — masked (secret keys/values), size-capped, and
+        // skipped for read-only tool names inside the helper. Previously
+        // `append_tool_call_with_input` had zero production callers.
+        duduclaw_security::audit::append_tool_call_with_input(
             home_dir,
             &actual_agent,
             tool_name,
             &params_summary,
             success,
+            Some(&arguments),
         );
     }
 
@@ -6716,6 +7372,11 @@ fn build_params_summary(tool_name: &str, args: &Value) -> String {
         "spawn_agent" | "send_to_agent" => {
             let agent = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
             format!("agent_id={agent}")
+        }
+        "spawn_ephemeral" => {
+            let tier = args.get("tier").and_then(|v| v.as_str()).unwrap_or("standard");
+            let tools = args.get("tools").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            format!("tier={tier} tools={tools}")
         }
         "schedule_task" => {
             let task_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("?");
@@ -6807,7 +7468,9 @@ async fn handle_synthesize_speech(args: &Value) -> Value {
 
 // ── Channel settings tool handlers ──────────────────────────────
 
-const VALID_CHANNELS: &[&str] = &["discord", "telegram", "slack", "line", "whatsapp", "feishu"];
+const VALID_CHANNELS: &[&str] = &[
+    "discord", "telegram", "slack", "line", "whatsapp", "feishu", "wecom", "dingtalk",
+];
 const VALID_KEYS: &[&str] = &[
     "mention_only", "auto_thread", "allowed_channels", "allowed_guilds",
     "agent_override", "response_mode", "thread_archive_minutes",
@@ -8450,6 +9113,59 @@ async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, caller_agent: &
     }
 }
 
+// ── Live Canvas tools (G15) ──────────────────────────────────────
+//
+// The canvas is an XSS-adjacent surface: agent-authored HTML rendered in the
+// operator's dashboard. Both tools write through
+// `duduclaw_gateway::canvas::CanvasStore`, whose `push` sanitizes with the
+// ammonia canvas profile at WRITE time (fail-closed — a sanitizer rejection
+// stores nothing). The dashboard additionally renders inside
+// `<iframe sandbox="">`. Live `canvas.updated` WS events are emitted by the
+// gateway's canvas broadcast bridge (it polls canvas.db), so no bus append is
+// needed here. Both tools are in the `is_state_changing` audit list.
+
+/// Push a sanitized HTML canvas for the calling agent.
+async fn handle_canvas_push(args: &Value, home_dir: &Path, caller_agent: &str) -> Value {
+    // SEC: caller identity is the storage key — validate before any I/O.
+    if !is_valid_agent_id(caller_agent) {
+        return tool_error("Invalid agent ID");
+    }
+    let html = match args.get("html").and_then(|v| v.as_str()) {
+        Some(h) => h,
+        None => return tool_error("Missing required parameter: html"),
+    };
+    let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let store = match duduclaw_gateway::canvas::CanvasStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("Canvas store unavailable: {e}")),
+    };
+    match store.push(caller_agent, title, html).await {
+        Ok(row) => tool_text(&format!(
+            "Canvas updated (version {}, {} bytes after sanitization). The user can view it on the dashboard Canvas page.",
+            row.seq,
+            row.html.len()
+        )),
+        // Fail-closed: oversize / empty-after-sanitization pushes are
+        // rejected with the sanitizer's reason so the agent can fix and retry.
+        Err(e) => tool_error(&format!("Canvas push rejected: {e}")),
+    }
+}
+
+/// Clear the calling agent's canvas (appends an empty tombstone version).
+async fn handle_canvas_clear(home_dir: &Path, caller_agent: &str) -> Value {
+    if !is_valid_agent_id(caller_agent) {
+        return tool_error("Invalid agent ID");
+    }
+    let store = match duduclaw_gateway::canvas::CanvasStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("Canvas store unavailable: {e}")),
+    };
+    match store.clear(caller_agent).await {
+        Ok(_) => tool_text("Canvas cleared. The dashboard now shows the empty state; previous versions remain in history."),
+        Err(e) => tool_error(&format!("Canvas clear failed: {e}")),
+    }
+}
+
 /// Detect agent names claimed as authors within a markdown wiki page.
 ///
 /// RFC-22 Decision 4-D (Phase 3 W2): callers (typically agnes) sometimes
@@ -9421,6 +10137,17 @@ fn task_row_to_json(row: &duduclaw_gateway::task_store::TaskRow) -> Value {
         "parent_task_id": row.parent_task_id,
         "tags": tags,
         "message_id": row.message_id,
+        "claimed_by": row.claimed_by,
+        "lease_expires_at": row.lease_expires_at,
+        "lease_renewed_at": row.lease_renewed_at,
+        "goal_id": row.goal_id,
+        "depends_on": duduclaw_gateway::task_store::parse_depends_on(&row.depends_on),
+        "retry_count": row.retry_count,
+        "max_retries": row.max_retries,
+        "goal_mode": row.goal_mode,
+        "acceptance_criteria": row.acceptance_criteria,
+        "result_summary": row.result_summary,
+        "judge_feedback": row.judge_feedback,
     })
 }
 
@@ -9543,6 +10270,71 @@ async fn handle_tasks_create(args: &Value, home_dir: &Path, default_agent: &str)
     row.tags = tags;
     row.parent_task_id = parent_task_id;
 
+    // G1 durable dispatch options. `depends_on` accepts a JSON array or a
+    // comma-separated list of task ids; when any dispatch option is present the
+    // task enters the durable `pending` lifecycle instead of the board `todo`.
+    let depends_on: Vec<String> = match args.get("depends_on") {
+        Some(serde_json::Value::Array(a)) => {
+            a.iter().filter_map(|v| v.as_str()).map(String::from).collect()
+        }
+        Some(serde_json::Value::String(s)) => s
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let goal_mode = args.get("goal_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+    let acceptance_criteria = args
+        .get("acceptance_criteria")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let durable = args.get("durable").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !depends_on.is_empty() {
+        // Fail-closed dependency validation: every dep must exist (an unknown
+        // id would gate the task forever) and must not close a cycle.
+        for dep in &depends_on {
+            match store.get_task(dep).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return tool_error(&format!("depends_on task not found: {dep}")),
+                Err(e) => return tool_error(&format!("validate depends_on: {e}")),
+            }
+        }
+        let edges = match store.depends_edges().await {
+            Ok(e) => e,
+            Err(e) => return tool_error(&format!("validate depends_on: {e}")),
+        };
+        if duduclaw_gateway::task_store::introduces_dependency_cycle(&edges, &row.id, &depends_on)
+        {
+            return tool_error(
+                "dependency cycle rejected: the task would (transitively) depend on itself",
+            );
+        }
+        row.depends_on = serde_json::to_string(&depends_on).unwrap_or_else(|_| "[]".into());
+    }
+    // G8: link the task to a goal. Fail-closed — the goal must exist so the
+    // why-chain injection never dangles.
+    if let Some(goal_id) = args.get("goal_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        match store.get_goal(goal_id).await {
+            Ok(Some(_)) => row.goal_id = Some(goal_id.to_string()),
+            Ok(None) => return tool_error(&format!("goal not found: {goal_id}")),
+            Err(e) => return tool_error(&format!("validate goal_id: {e}")),
+        }
+    }
+    if goal_mode {
+        row.goal_mode = true;
+        row.acceptance_criteria = acceptance_criteria;
+    }
+    if let Some(mr) = args.get("max_retries").and_then(|v| v.as_i64()) {
+        row.max_retries = mr.clamp(0, 100);
+    }
+    // Durable lifecycle when any dispatch feature is requested.
+    if durable || goal_mode || !depends_on.is_empty() {
+        row.status = "pending".into();
+    }
+
     if let Err(e) = store.insert_task(&row).await {
         return tool_error(&format!("insert task: {e}"));
     }
@@ -9591,6 +10383,32 @@ async fn handle_tasks_update(args: &Value, home_dir: &Path) -> Value {
             fields.insert(k.into(), v.clone());
         }
     }
+    // depends_on rewiring: accept JSON array or comma-separated ids, verify
+    // every dep exists (fail-closed), and normalize to the stored JSON form.
+    // The store itself rejects dependency cycles (`introduces_dependency_cycle`).
+    if let Some(deps_val) = args.get("depends_on") {
+        let deps: Vec<String> = match deps_val {
+            serde_json::Value::Array(a) => {
+                a.iter().filter_map(|v| v.as_str()).map(String::from).collect()
+            }
+            serde_json::Value::String(s) => s
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
+            _ => return tool_error("depends_on must be a JSON array or comma-separated ids"),
+        };
+        for dep in &deps {
+            match store.get_task(dep).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return tool_error(&format!("depends_on task not found: {dep}")),
+                Err(e) => return tool_error(&format!("validate depends_on: {e}")),
+            }
+        }
+        let deps_json = serde_json::to_string(&deps).unwrap_or_else(|_| "[]".into());
+        fields.insert("depends_on".into(), serde_json::Value::String(deps_json));
+    }
     if fields.is_empty() {
         return tool_error("no fields to update");
     }
@@ -9618,11 +10436,59 @@ async fn handle_tasks_claim(args: &Value, home_dir: &Path, default_agent: &str) 
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
-    let fields = serde_json::json!({
-        "assigned_to": default_agent,
-        "status": "in_progress",
-    });
-    let updated = match store.update_task(task_id, &fields).await {
+
+    // G1 durable claim: try the atomic compare-and-set first (only one worker
+    // can win a `pending` task, and the claim stamps a lease so a crashed worker
+    // is reclaimable). Fall back to the legacy unconditional claim for
+    // pre-G1 board tasks (`todo` status, no lease) so existing flows keep working.
+    let now = chrono::Utc::now();
+    let now_s = now.to_rfc3339();
+    let lease = (now
+        + chrono::Duration::seconds(duduclaw_gateway::dispatch_engine::DEFAULT_LEASE_SECS))
+    .to_rfc3339();
+    match store.atomic_claim(task_id, default_agent, &now_s, &lease).await {
+        Ok(duduclaw_gateway::task_store::ClaimOutcome::Claimed) => {}
+        Ok(duduclaw_gateway::task_store::ClaimOutcome::BlockedByDeps(unmet)) => {
+            // Dependency gate is enforced inside the claim transaction itself
+            // (fail-closed); surface the unmet ids so the agent knows what to
+            // wait for instead of retrying blindly.
+            return tool_error(&format!(
+                "task not claimable: {task_id} is blocked by unfinished dependencies [{}] — claim them first or wait until they are done",
+                unmet.join(", ")
+            ));
+        }
+        Ok(duduclaw_gateway::task_store::ClaimOutcome::NotClaimable) => {
+            // Not a claimable durable (`pending`, unclaimed) task. Distinguish
+            // "already taken" from "legacy board task" so we don't silently steal.
+            // Legacy fallback is restricted to UNASSIGNED todo tasks (or ones
+            // already assigned to the caller) — a todo task assigned to another
+            // agent must not be silently re-assigned to the claimer.
+            match store.get_task(task_id).await {
+                Ok(Some(t))
+                    if t.status == "todo"
+                        && (t.assigned_to.is_empty() || t.assigned_to == default_agent) =>
+                {
+                    let fields = serde_json::json!({
+                        "assigned_to": default_agent,
+                        "status": "in_progress",
+                    });
+                    if let Err(e) = store.update_task(task_id, &fields).await {
+                        return tool_error(&format!("claim task: {e}"));
+                    }
+                }
+                Ok(Some(t)) => {
+                    return tool_error(&format!(
+                        "task not claimable: {task_id} is '{}' (assigned_to={:?}, claimed_by={:?})",
+                        t.status, t.assigned_to, t.claimed_by
+                    ));
+                }
+                Ok(None) => return tool_error(&format!("task not found: {task_id}")),
+                Err(e) => return tool_error(&format!("claim task: {e}")),
+            }
+        }
+        Err(e) => return tool_error(&format!("claim task: {e}")),
+    }
+    let updated = match store.get_task(task_id).await {
         Ok(Some(r)) => r,
         Ok(None) => return tool_error(&format!("task not found: {task_id}")),
         Err(e) => return tool_error(&format!("claim task: {e}")),
@@ -9637,7 +10503,53 @@ async fn handle_tasks_claim(args: &Value, home_dir: &Path, default_agent: &str) 
     )
     .await;
     append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
-    tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
+    // G1: leased claims must heartbeat — tell the agent explicitly, in the
+    // claim response itself, or a long task gets reclaimed as a zombie.
+    let mut resp = serde_json::json!({ "task": task_row_to_json(&updated) });
+    if updated.lease_expires_at.is_some() {
+        resp["lease_note"] = serde_json::Value::String(
+            "This claim is leased. For long-running work, call tasks_renew (same task_id) every few minutes; an unrenewed lease expires and the task is reclaimed and re-dispatched.".to_string(),
+        );
+    }
+    tool_text(&resp.to_string())
+}
+
+/// G1: explicit lease heartbeat for external agent processes that claimed a
+/// task via `tasks_claim`. Extends the lease by one full window; only the
+/// claiming agent can renew (`claimed_by` guard in the store — fail-closed).
+async fn handle_tasks_renew(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+    if task_id.is_empty() {
+        return tool_error("task_id is required");
+    }
+    if !is_valid_agent_id(default_agent) {
+        return tool_error("invalid caller agent id");
+    }
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let now = chrono::Utc::now();
+    let new_expiry = (now
+        + chrono::Duration::seconds(duduclaw_gateway::dispatch_engine::DEFAULT_LEASE_SECS))
+    .to_rfc3339();
+    match store
+        .renew_lease(task_id, default_agent, &new_expiry, &now.to_rfc3339())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return tool_error(&format!(
+                "lease not renewable: {task_id} is not an in_progress task claimed by {default_agent}"
+            ));
+        }
+        Err(e) => return tool_error(&format!("renew lease: {e}")),
+    }
+    match store.get_task(task_id).await {
+        Ok(Some(t)) => tool_text(&serde_json::json!({ "task": task_row_to_json(&t) }).to_string()),
+        Ok(None) => tool_error(&format!("task not found: {task_id}")),
+        Err(e) => tool_error(&format!("renew lease: {e}")),
+    }
 }
 
 async fn handle_tasks_complete(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
@@ -9653,13 +10565,20 @@ async fn handle_tasks_complete(args: &Value, home_dir: &Path, default_agent: &st
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
-    let fields = serde_json::json!({ "status": "done" });
-    let updated = match store.update_task(task_id, &fields).await {
+    // G1: `complete_task` routes goal-mode tasks to `review` (judge acceptance
+    // pending) carrying the result summary; plain tasks go straight to `done`.
+    // Also clears the lease so the completed task isn't reclaimed as a zombie.
+    // HIGH-2: caller identity (default_agent — same identity tasks_renew uses)
+    // is enforced against `claimed_by` in the store, so a reclaimed zombie
+    // worker cannot clobber the new holder's in_progress task.
+    let updated = match store.complete_task(task_id, summary, default_agent).await {
         Ok(Some(r)) => r,
         Ok(None) => return tool_error(&format!("task not found: {task_id}")),
         Err(e) => return tool_error(&format!("complete task: {e}")),
     };
-    let activity_summary = if summary.is_empty() {
+    let activity_summary = if updated.status == "review" {
+        format!("Submitted for goal-mode review: {}", updated.title)
+    } else if summary.is_empty() {
         format!("Completed: {}", updated.title)
     } else {
         format!("Completed: {} — {}", updated.title, summary)
@@ -9693,6 +10612,23 @@ async fn handle_tasks_block(args: &Value, home_dir: &Path, default_agent: &str) 
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
+    // HIGH-2 sweep: same holder guard as tasks_complete — a task claimed by X
+    // may only be blocked by X (a reclaimed zombie must not flip the new
+    // holder's in_progress task to blocked). Unclaimed tasks keep the current
+    // behavior (any agent may flag a blocker on an unclaimed board task).
+    match store.get_task(task_id).await {
+        Ok(Some(t)) => {
+            if let Some(holder) = t.claimed_by.as_deref() {
+                if holder != default_agent {
+                    return tool_error(&format!(
+                        "task {task_id} is claimed by '{holder}'; only the claim holder may block it"
+                    ));
+                }
+            }
+        }
+        Ok(None) => return tool_error(&format!("task not found: {task_id}")),
+        Err(e) => return tool_error(&format!("block task: {e}")),
+    }
     let fields = serde_json::json!({
         "status": "blocked",
         "blocked_reason": reason,
@@ -9713,6 +10649,90 @@ async fn handle_tasks_block(args: &Value, home_dir: &Path, default_agent: &str) 
     .await;
     append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
     tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
+}
+
+fn goal_row_to_json(row: &duduclaw_gateway::task_store::GoalRow) -> Value {
+    serde_json::json!({
+        "id": row.id,
+        "title": row.title,
+        "description": row.description,
+        "parent_goal_id": row.parent_goal_id,
+        "status": row.status,
+        "created_at": row.created_at,
+    })
+}
+
+/// G8: create a goal node (Initiative → Project → Issue hierarchy). Parent
+/// existence + cycle rejection are enforced fail-closed in the store.
+async fn handle_goals_create(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if title.is_empty() {
+        return tool_error("title is required");
+    }
+    if title.len() > 200 {
+        return tool_error("title must be <= 200 chars");
+    }
+    if !is_valid_agent_id(default_agent) {
+        return tool_error("invalid caller agent id");
+    }
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let parent_goal_id = args
+        .get("parent_goal_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let mut row = duduclaw_gateway::task_store::GoalRow::new(
+        uuid::Uuid::new_v4().to_string(),
+        title.to_string(),
+        description,
+    );
+    row.parent_goal_id = parent_goal_id;
+    if let Err(e) = store.insert_goal(&row).await {
+        return tool_error(&format!("create goal: {e}"));
+    }
+    append_activity(
+        &store,
+        "goal_created",
+        default_agent,
+        None,
+        &format!("Created goal: {}", row.title),
+        None,
+    )
+    .await;
+    tool_text(&serde_json::json!({ "goal": goal_row_to_json(&row) }).to_string())
+}
+
+async fn handle_goals_list(args: &Value, home_dir: &Path) -> Value {
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let status = args
+        .get("status")
+        .and_then(|v| v.as_str())
+        .filter(|s| matches!(*s, "active" | "done" | "archived"));
+    let rows = match store.list_goals(status).await {
+        Ok(r) => r,
+        Err(e) => return tool_error(&format!("list goals: {e}")),
+    };
+    let limit = clamp_limit(args, 50, 200) as usize;
+    let goals: Vec<Value> = rows.iter().take(limit).map(goal_row_to_json).collect();
+    tool_text(
+        &serde_json::json!({
+            "goals": goals,
+            "total": rows.len(),
+        })
+        .to_string(),
+    )
 }
 
 async fn handle_activity_post(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
@@ -9786,6 +10806,160 @@ async fn handle_activity_list(args: &Value, home_dir: &Path, default_agent: &str
         "activities": items,
         "total": total,
     }).to_string())
+}
+
+// ── Co-edited plan tools (U4) ───────────────────────────────────
+//
+// The shared plan is co-edited: the user edits from the dashboard
+// (`plans.*` RPCs), the agent reads it with `plan_get` and ticks its own
+// steps with `plan_update_step`. Holder rule (fail-closed): an agent may
+// only update steps with `assignee_kind == "agent"` AND `assignee == caller`.
+
+fn plan_row_to_json(row: &duduclaw_gateway::task_store::PlanRow) -> Value {
+    serde_json::json!({
+        "id": row.id,
+        "title": row.title,
+        "description": row.description,
+        "agent_id": row.agent_id,
+        "goal_id": row.goal_id,
+        "status": row.status,
+        "created_by": row.created_by,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    })
+}
+
+fn plan_step_row_to_json(row: &duduclaw_gateway::task_store::PlanStepRow) -> Value {
+    serde_json::json!({
+        "id": row.id,
+        "plan_id": row.plan_id,
+        "text": row.text,
+        "assignee_kind": row.assignee_kind,
+        "assignee": row.assignee,
+        "status": row.status,
+        "step_order": row.step_order,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    })
+}
+
+async fn handle_plan_get(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let plan = match args.get("plan_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        Some(plan_id) => match store.get_plan(plan_id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => return tool_error(&format!("plan not found: {plan_id}")),
+            Err(e) => return tool_error(&format!("get plan: {e}")),
+        },
+        None => {
+            // Default: the caller's most recently updated active plan
+            // (list_plans orders newest-activity-first).
+            match store.list_plans(Some(default_agent), Some("active")).await {
+                Ok(plans) => match plans.into_iter().next() {
+                    Some(p) => p,
+                    None => {
+                        return tool_text(
+                            &serde_json::json!({
+                                "plan": Value::Null,
+                                "steps": [],
+                                "note": "no active shared plan for this agent",
+                            })
+                            .to_string(),
+                        )
+                    }
+                },
+                Err(e) => return tool_error(&format!("list plans: {e}")),
+            }
+        }
+    };
+    let steps = match store.list_plan_steps(&plan.id).await {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("list plan steps: {e}")),
+    };
+    tool_text(
+        &serde_json::json!({
+            "plan": plan_row_to_json(&plan),
+            "steps": steps.iter().map(plan_step_row_to_json).collect::<Vec<_>>(),
+        })
+        .to_string(),
+    )
+}
+
+async fn handle_plan_update_step(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let step_id = args.get("step_id").and_then(|v| v.as_str()).unwrap_or("");
+    if step_id.is_empty() {
+        return tool_error("step_id is required");
+    }
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let step = match store.get_plan_step(step_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return tool_error(&format!("plan step not found: {step_id}")),
+        Err(e) => return tool_error(&format!("get plan step: {e}")),
+    };
+    // Holder rule (fail-closed): agents may only update agent-kind steps
+    // explicitly assigned to THEM. A user's step, another agent's step, or an
+    // unassigned step is off-limits — the user owns the shared plan's shape.
+    if step.assignee_kind != "agent" || step.assignee != default_agent {
+        return tool_error(&format!(
+            "permission denied: step {step_id} is assigned to {} '{}' — you may only update your own agent steps",
+            step.assignee_kind,
+            if step.assignee.is_empty() { "(unassigned)" } else { &step.assignee },
+        ));
+    }
+    // Whitelisted fields only: status (validated in the store) and text.
+    let mut fields = serde_json::Map::new();
+    for k in ["status", "text"] {
+        if let Some(v) = args.get(k) {
+            fields.insert(k.into(), v.clone());
+        }
+    }
+    if fields.is_empty() {
+        return tool_error("no fields to update (pass status and/or text)");
+    }
+    let updated = match store
+        .update_plan_step(step_id, &Value::Object(fields))
+        .await
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => return tool_error(&format!("plan step not found: {step_id}")),
+        Err(e) => return tool_error(&format!("update plan step: {e}")),
+    };
+    // Co-editing timeline: surface the agent's tick in the Activity Feed.
+    let plan_title = store
+        .get_plan(&updated.plan_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.title)
+        .unwrap_or_else(|| updated.plan_id.clone());
+    append_activity(
+        &store,
+        "plan_step_updated",
+        default_agent,
+        None,
+        &format!(
+            "{} updated a plan step in {}: {} [{}]",
+            default_agent,
+            plan_title,
+            duduclaw_core::truncate_chars(&updated.text, 80),
+            updated.status,
+        ),
+        Some(serde_json::json!({ "plan_id": updated.plan_id }).to_string()),
+    )
+    .await;
+    append_bus_event(
+        home_dir,
+        "plan.updated",
+        &serde_json::json!({ "plan_id": updated.plan_id, "agent_id": default_agent }),
+    )
+    .await;
+    tool_text(&serde_json::json!({ "step": plan_step_row_to_json(&updated) }).to_string())
 }
 
 async fn handle_autopilot_list(args: &Value, home_dir: &Path) -> Value {
@@ -10552,6 +11726,137 @@ high_context = true
         assert_eq!(msg["delegation_depth"], 2, "Expected depth 2 (1+1)");
         assert_eq!(msg["origin_agent"], "root-agent", "Origin should be preserved");
         assert_eq!(msg["sender_agent"], "main");
+    }
+
+    // ── O2: spawn_ephemeral (dynamic sub-agent synthesis) ────────────
+
+    /// Like `create_test_agent` but with a restricted `allowed_tools` list
+    /// (edits the empty allowlist inside the fixture's existing
+    /// `[capabilities]` section).
+    fn create_test_agent_with_caps(
+        agents_dir: &std::path::Path,
+        name: &str,
+        allowed_tools: &[&str],
+    ) {
+        create_test_agent(agents_dir, name, "");
+        let toml_path = agents_dir.join(name).join("agent.toml");
+        let content = fs::read_to_string(&toml_path).unwrap();
+        let list = allowed_tools
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let updated = content.replace("allowed_tools = []", &format!("allowed_tools = [{list}]"));
+        assert_ne!(updated, content, "fixture must contain the empty allowlist to replace");
+        fs::write(&toml_path, updated).unwrap();
+    }
+
+    #[tokio::test]
+    async fn e2e_spawn_ephemeral_rejects_privilege_escalation() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        create_test_agent_with_caps(&agents_dir, "boss", &["Read", "Grep"]);
+
+        let ctx = DelegationContext { depth: 0, origin: None };
+        let params = serde_json::json!({
+            "instruction": "You are a log summarizer.",
+            "context": "Summarize the attached logs.",
+            "tools": ["Read", "Bash"], // Bash is NOT in boss's allowlist
+        });
+        let result = spawn_ephemeral_with_ctx(&params, home, "boss", ctx).await;
+
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("privilege escalation"), "got: {text}");
+        // Fail-closed: nothing scaffolded, nothing queued.
+        let eph_root = agents_dir.join(".ephemeral");
+        assert!(
+            !eph_root.exists() || fs::read_dir(&eph_root).unwrap().next().is_none(),
+            "escalation attempt must not leave a scaffold"
+        );
+        assert!(!home.join("bus_queue.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn e2e_spawn_ephemeral_scaffolds_and_queues() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        create_test_agent_with_caps(&agents_dir, "boss", &["Read", "Grep", "WebFetch"]);
+
+        let ctx = DelegationContext { depth: 1, origin: Some("root".into()) };
+        let params = serde_json::json!({
+            "instruction": "You extract dates from text. 只回傳日期。",
+            "context": "Extract every date from: meeting on 2026-07-11.",
+            "tools": ["Read"],
+            "tier": "cheap",
+        });
+        let result = spawn_ephemeral_with_ctx(&params, home, "boss", ctx).await;
+
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("synthesized and task queued"),
+            "expected success, got: {text}"
+        );
+
+        // Bus entry targets the ephemeral id with incremented depth.
+        let content = fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+        let msg: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        let eph_id = msg["agent_id"].as_str().unwrap().to_string();
+        assert!(
+            duduclaw_gateway::ephemeral::is_ephemeral_id(&eph_id),
+            "bus target must be an ephemeral id, got {eph_id}"
+        );
+        assert_eq!(msg["delegation_depth"], 2);
+        assert_eq!(msg["origin_agent"], "root");
+        assert_eq!(msg["sender_agent"], "boss");
+
+        // Scaffold exists under the dedicated namespace with the restricted
+        // subset, the instruction as SOUL.md, and the requested tier.
+        let dir = duduclaw_gateway::ephemeral::resolve_agent_dir(home, &eph_id)
+            .expect("scaffold must resolve inside the ephemeral namespace");
+        let cfg: duduclaw_core::types::AgentConfig =
+            toml::from_str(&fs::read_to_string(dir.join("agent.toml")).unwrap()).unwrap();
+        assert_eq!(cfg.capabilities.allowed_tools, vec!["Read".to_string()]);
+        assert_eq!(cfg.agent.reports_to, "boss");
+        let soul = fs::read_to_string(dir.join("SOUL.md")).unwrap();
+        assert!(soul.contains("只回傳日期"));
+        let meta = duduclaw_gateway::ephemeral::read_meta(&dir).unwrap();
+        assert_eq!(meta.tier, "cheap");
+        assert_eq!(meta.parent, "boss");
+    }
+
+    #[tokio::test]
+    async fn e2e_spawn_ephemeral_rejects_raw_model_id_tier_and_depth_limit() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        create_test_agent_with_caps(&agents_dir, "boss", &["Read"]);
+
+        // A raw model id in `tier` must be rejected (multi-model doctrine).
+        let params = serde_json::json!({
+            "instruction": "x", "context": "y", "tools": ["Read"],
+            "tier": "claude-opus-4-5",
+        });
+        let ctx = DelegationContext { depth: 0, origin: None };
+        let result = spawn_ephemeral_with_ctx(&params, home, "boss", ctx).await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("invalid tier"), "got: {text}");
+
+        // Depth limit applies exactly like spawn_agent.
+        let params = serde_json::json!({
+            "instruction": "x", "context": "y", "tools": ["Read"],
+        });
+        let ctx = DelegationContext { depth: 4, origin: None };
+        let result = spawn_ephemeral_with_ctx(&params, home, "boss", ctx).await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("delegation depth limit"), "got: {text}");
     }
 
     #[tokio::test]
@@ -11470,12 +12775,108 @@ mod task_board_tests {
         assert_eq!(all_tasks["tasks"].as_array().unwrap().len(), 2);
     }
 
+    // ── U4 co-edited plan tools ──────────────────────────────
+
+    async fn seed_plan(home: &std::path::Path) -> (String, String, String) {
+        // Seed a plan for agent "agnes" with one agent step + one user step,
+        // through the same store the MCP handlers open.
+        let store = duduclaw_gateway::task_store::TaskStore::open(home).unwrap();
+        let plan = duduclaw_gateway::task_store::PlanRow::new(
+            "plan-1".into(),
+            "Launch week".into(),
+            "agnes".into(),
+            "louis".into(),
+        );
+        store.insert_plan(&plan).await.unwrap();
+        let agent_step = store
+            .add_plan_step("plan-1", "st-agent", "draft the release notes", "agent", "agnes", None)
+            .await
+            .unwrap();
+        let user_step = store
+            .add_plan_step("plan-1", "st-user", "approve the copy", "user", "louis", None)
+            .await
+            .unwrap();
+        (plan.id, agent_step.id, user_step.id)
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn tasks_claim_transitions_to_in_progress_and_reassigns() {
+    async fn plan_get_defaults_to_callers_active_plan() {
+        let tmp = TempDir::new();
+        let (plan_id, ..) = seed_plan(tmp.path()).await;
+
+        // No plan_id ⇒ the caller's most recently updated active plan.
+        let got = parse_ok(&handle_plan_get(&serde_json::json!({}), tmp.path(), "agnes").await);
+        assert_eq!(got["plan"]["id"], plan_id.as_str());
+        assert_eq!(got["steps"].as_array().unwrap().len(), 2);
+
+        // An agent with no plan gets an explicit empty answer, not an error.
+        let none = parse_ok(&handle_plan_get(&serde_json::json!({}), tmp.path(), "bruno").await);
+        assert!(none["plan"].is_null());
+        assert_eq!(none["steps"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plan_update_step_is_holder_guarded_fail_closed() {
+        let tmp = TempDir::new();
+        let (_plan, agent_step, user_step) = seed_plan(tmp.path()).await;
+
+        // The agent may tick ITS OWN step.
+        let ok = parse_ok(
+            &handle_plan_update_step(
+                &serde_json::json!({ "step_id": agent_step, "status": "done" }),
+                tmp.path(),
+                "agnes",
+            )
+            .await,
+        );
+        assert_eq!(ok["step"]["status"], "done");
+
+        // A USER step is off-limits to the agent (fail-closed).
+        let denied = handle_plan_update_step(
+            &serde_json::json!({ "step_id": user_step, "status": "done" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(denied["isError"].as_bool().unwrap_or(false), "user step must be denied");
+
+        // Another agent may not tick agnes' step either.
+        let denied2 = handle_plan_update_step(
+            &serde_json::json!({ "step_id": agent_step, "status": "todo" }),
+            tmp.path(),
+            "bruno",
+        )
+        .await;
+        assert!(denied2["isError"].as_bool().unwrap_or(false), "other agent must be denied");
+
+        // Invalid status is rejected by the store's enum gate.
+        let bad = handle_plan_update_step(
+            &serde_json::json!({ "step_id": agent_step, "status": "finished" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(bad["isError"].as_bool().unwrap_or(false), "invalid status rejected");
+
+        // The tick landed in the Activity Feed (co-editing timeline).
+        let store = duduclaw_gateway::task_store::TaskStore::open(tmp.path()).unwrap();
+        let (events, _total) = store.list_activity(Some("agnes"), None, 50, 0).await.unwrap();
+        assert!(
+            events.iter().any(|e| e.event_type == "plan_step_updated"),
+            "plan_step_updated activity recorded"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_claim_transitions_to_in_progress_and_rejects_stealing() {
+        // Updated for the LOW 2026-07 fix: the old test asserted the buggy
+        // behavior (agnes silently RE-assigning bruno's todo task to herself
+        // via the legacy fallback). The fallback is now restricted to todo
+        // tasks that are unassigned or already assigned to the caller.
         let tmp = TempDir::new();
         let create = handle_tasks_create(
             &serde_json::json!({
-                "title": "Orphan task",
+                "title": "Bruno's task",
                 "assigned_to": "bruno",
             }),
             tmp.path(),
@@ -11484,16 +12885,136 @@ mod task_board_tests {
         .await;
         let id = parse_ok(&create)["task"]["id"].as_str().unwrap().to_string();
 
-        // agnes claims it
-        let claim = handle_tasks_claim(
+        // agnes must NOT be able to steal bruno's assigned todo task.
+        let steal = handle_tasks_claim(
             &serde_json::json!({ "task_id": id }),
             tmp.path(),
             "agnes",
         )
         .await;
+        assert!(steal["isError"].as_bool().unwrap_or(false), "stealing must error");
+
+        // The assignee himself claims it → in_progress.
+        let claim = handle_tasks_claim(
+            &serde_json::json!({ "task_id": id }),
+            tmp.path(),
+            "bruno",
+        )
+        .await;
         let claimed = parse_ok(&claim);
-        assert_eq!(claimed["task"]["assigned_to"], "agnes");
+        assert_eq!(claimed["task"]["assigned_to"], "bruno");
         assert_eq!(claimed["task"]["status"], "in_progress");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_claim_is_gated_by_unfinished_dependencies() {
+        // HIGH-1 (2026-07 review): a durable task whose depends_on are not all
+        // `done` must not be claimable, and the error names the unmet ids.
+        let tmp = TempDir::new();
+        let dep = handle_tasks_create(
+            &serde_json::json!({ "title": "dep", "durable": true }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let dep_id = parse_ok(&dep)["task"]["id"].as_str().unwrap().to_string();
+        let child = handle_tasks_create(
+            &serde_json::json!({ "title": "child", "durable": true, "depends_on": [dep_id] }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let child_id = parse_ok(&child)["task"]["id"].as_str().unwrap().to_string();
+
+        // Claiming the child while the dep is pending errors with the dep id.
+        let blocked = handle_tasks_claim(
+            &serde_json::json!({ "task_id": child_id }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(blocked["isError"].as_bool().unwrap_or(false));
+        let msg = blocked["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("blocked by unfinished dependencies") && msg.contains(&dep_id),
+            "error must name the unmet dependency: {msg}"
+        );
+
+        // Finish the dep (claim + complete), then the child unlocks.
+        parse_ok(
+            &handle_tasks_claim(
+                &serde_json::json!({ "task_id": dep_id }),
+                tmp.path(),
+                "agnes",
+            )
+            .await,
+        );
+        parse_ok(
+            &handle_tasks_complete(
+                &serde_json::json!({ "task_id": dep_id, "summary": "done" }),
+                tmp.path(),
+                "agnes",
+            )
+            .await,
+        );
+        let claim = handle_tasks_claim(
+            &serde_json::json!({ "task_id": child_id }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let claimed = parse_ok(&claim);
+        assert_eq!(claimed["task"]["status"], "in_progress");
+        assert!(
+            claimed["lease_note"].as_str().unwrap_or("").contains("tasks_renew"),
+            "leased claim response must point at tasks_renew"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_complete_and_block_are_holder_guarded() {
+        // HIGH-2 (2026-07 review): a task claimed by X can only be completed /
+        // blocked by X — a reclaimed zombie worker must not clobber the new
+        // holder's in_progress task.
+        let tmp = TempDir::new();
+        let create = handle_tasks_create(
+            &serde_json::json!({ "title": "guarded", "durable": true }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let id = parse_ok(&create)["task"]["id"].as_str().unwrap().to_string();
+        parse_ok(
+            &handle_tasks_claim(&serde_json::json!({ "task_id": id }), tmp.path(), "agnes").await,
+        );
+
+        // Non-holder completion / block are rejected.
+        let zombie_complete = handle_tasks_complete(
+            &serde_json::json!({ "task_id": id, "summary": "stale result" }),
+            tmp.path(),
+            "bruno",
+        )
+        .await;
+        assert!(zombie_complete["isError"].as_bool().unwrap_or(false));
+        let zombie_block = handle_tasks_block(
+            &serde_json::json!({ "task_id": id, "reason": "stale blocker" }),
+            tmp.path(),
+            "bruno",
+        )
+        .await;
+        assert!(zombie_block["isError"].as_bool().unwrap_or(false));
+
+        // The holder completes normally and the result is hers.
+        let done = parse_ok(
+            &handle_tasks_complete(
+                &serde_json::json!({ "task_id": id, "summary": "real result" }),
+                tmp.path(),
+                "agnes",
+            )
+            .await,
+        );
+        assert_eq!(done["task"]["status"], "done");
+        assert_eq!(done["task"]["result_summary"], "real result");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11749,6 +13270,184 @@ mod task_board_tests {
             (n + 1).to_string()
         });
         assert!(updated.contains("usage_count: 1"));
+    }
+
+    // ── G1 lease renewal (tasks_renew) ──────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_renew_extends_lease_for_holder_only() {
+        let tmp = TempDir::new();
+        let create = handle_tasks_create(
+            &serde_json::json!({ "title": "durable work", "durable": true }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let task_id = parse_ok(&create)["task"]["id"].as_str().unwrap().to_string();
+
+        let claim = handle_tasks_claim(
+            &serde_json::json!({ "task_id": task_id }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let lease_before = parse_ok(&claim)["task"]["lease_expires_at"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Holder renews → lease pushed forward, lease_renewed_at stamped.
+        let renew = handle_tasks_renew(
+            &serde_json::json!({ "task_id": task_id }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let renewed = parse_ok(&renew);
+        let lease_after = renewed["task"]["lease_expires_at"].as_str().unwrap();
+        assert!(lease_after >= lease_before.as_str(), "lease must not regress");
+        assert!(renewed["task"]["lease_renewed_at"].is_string());
+
+        // A non-holder cannot renew (fail-closed).
+        let intruder = handle_tasks_renew(
+            &serde_json::json!({ "task_id": task_id }),
+            tmp.path(),
+            "bruno",
+        )
+        .await;
+        assert!(intruder["isError"].as_bool().unwrap_or(false));
+
+        // Unknown task id → error, not silence.
+        let missing = handle_tasks_renew(
+            &serde_json::json!({ "task_id": "nope" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(missing["isError"].as_bool().unwrap_or(false));
+    }
+
+    // ── G8 goal chain (goals_create / goals_list / tasks goal_id) ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn goals_create_list_and_task_linkage() {
+        let tmp = TempDir::new();
+        let init = handle_goals_create(
+            &serde_json::json!({ "title": "Grow revenue", "description": "2026 north star" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let init_id = parse_ok(&init)["goal"]["id"].as_str().unwrap().to_string();
+
+        let proj = handle_goals_create(
+            &serde_json::json!({
+                "title": "Launch pricing page",
+                "description": "convert trials",
+                "parent_goal_id": init_id,
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let proj_id = parse_ok(&proj)["goal"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            parse_ok(&proj)["goal"]["parent_goal_id"].as_str().unwrap(),
+            init_id
+        );
+
+        // Unknown parent is rejected fail-closed.
+        let orphan = handle_goals_create(
+            &serde_json::json!({ "title": "x", "parent_goal_id": "ghost" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(orphan["isError"].as_bool().unwrap_or(false));
+
+        let list = handle_goals_list(&serde_json::json!({}), tmp.path()).await;
+        let listed = parse_ok(&list);
+        assert_eq!(listed["total"], 2);
+
+        // Task linked to a goal carries goal_id; unknown goal_id is rejected.
+        let task = handle_tasks_create(
+            &serde_json::json!({ "title": "Write copy", "goal_id": proj_id }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert_eq!(parse_ok(&task)["task"]["goal_id"].as_str().unwrap(), proj_id);
+
+        let bad = handle_tasks_create(
+            &serde_json::json!({ "title": "x", "goal_id": "ghost" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(bad["isError"].as_bool().unwrap_or(false));
+    }
+
+    // ── depends_on cycle validation ─────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_depends_on_rejects_cycles_and_unknown_ids() {
+        let tmp = TempDir::new();
+        let a = handle_tasks_create(
+            &serde_json::json!({ "title": "A" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let a_id = parse_ok(&a)["task"]["id"].as_str().unwrap().to_string();
+
+        // B depends on A — legal.
+        let b = handle_tasks_create(
+            &serde_json::json!({ "title": "B", "depends_on": [a_id] }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let b_id = parse_ok(&b)["task"]["id"].as_str().unwrap().to_string();
+
+        // Rewiring A to depend on B closes A → B → A ⇒ rejected.
+        let cycle = handle_tasks_update(
+            &serde_json::json!({ "task_id": a_id, "depends_on": [b_id] }),
+            tmp.path(),
+        )
+        .await;
+        assert!(cycle["isError"].as_bool().unwrap_or(false), "cycle must be rejected");
+
+        // Self-dependency via update ⇒ rejected.
+        let self_dep = handle_tasks_update(
+            &serde_json::json!({ "task_id": a_id, "depends_on": [a_id] }),
+            tmp.path(),
+        )
+        .await;
+        assert!(self_dep["isError"].as_bool().unwrap_or(false));
+
+        // Unknown dependency id ⇒ rejected on create and update.
+        let unknown_create = handle_tasks_create(
+            &serde_json::json!({ "title": "C", "depends_on": ["ghost"] }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(unknown_create["isError"].as_bool().unwrap_or(false));
+        let unknown_update = handle_tasks_update(
+            &serde_json::json!({ "task_id": a_id, "depends_on": "ghost" }),
+            tmp.path(),
+        )
+        .await;
+        assert!(unknown_update["isError"].as_bool().unwrap_or(false));
+
+        // A legal rewire still works (clear B's deps).
+        let clear = handle_tasks_update(
+            &serde_json::json!({ "task_id": b_id, "depends_on": [] }),
+            tmp.path(),
+        )
+        .await;
+        let cleared = parse_ok(&clear);
+        assert!(cleared["task"]["depends_on"].as_array().unwrap().is_empty());
     }
 
     // ── Edge-case tests (security + idempotency + error paths) ─────
@@ -12750,6 +14449,123 @@ mod wiki_namespace_tests {
         }
     }
 
+    // ── G5 hub + curator tools ──────────────────────────────────────
+
+    #[test]
+    fn g5_skill_tools_visible_internal_hidden_external() {
+        use serde_json::json;
+        let internal = super::handle_tools_list(&json!(1), /* is_external= */ false);
+        let internal_names: Vec<&str> = internal["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+        for tool in &["skill_hub_install", "skill_curator_status", "skill_pin"] {
+            assert!(internal_names.contains(tool), "{tool} must be in the internal list");
+        }
+        // skill_search must expose the optional hub param.
+        let search = internal["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some("skill_search"))
+            .unwrap();
+        assert!(search["inputSchema"]["properties"].get("hub").is_some());
+
+        let external = super::handle_tools_list(&json!(1), /* is_external= */ true);
+        let external_names: Vec<&str> = external["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+        for tool in &["skill_hub_install", "skill_curator_status", "skill_pin"] {
+            assert!(
+                !external_names.contains(tool),
+                "{tool} must NOT be exposed to external principals"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn skill_search_rejects_unknown_hub_exactly() {
+        use serde_json::json;
+        let home = std::env::temp_dir().join(format!("duduclaw-mcp-hub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        // Adversarial near-miss ids must error, not fall through to aggregate.
+        for bad in ["githu", "github2", "hub", "clawhub-evil"] {
+            let res = super::handle_skill_search(&json!({"query": "x", "hub": bad}), &home).await;
+            assert_eq!(res["isError"].as_bool(), Some(true), "hub '{bad}' must be rejected");
+            let text = res["content"][0]["text"].as_str().unwrap_or("");
+            assert!(text.contains("unknown hub"), "{text}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn skill_hub_install_validates_inputs_fail_closed() {
+        use serde_json::json;
+        let home = std::env::temp_dir().join(format!("duduclaw-mcp-hubi-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Missing params.
+        let res = super::handle_skill_hub_install(&json!({}), &home).await;
+        assert_eq!(res["isError"].as_bool(), Some(true));
+
+        // Path traversal in slug.
+        let res = super::handle_skill_hub_install(
+            &json!({"hub": "clawhub", "skill_name": "../evil"}),
+            &home,
+        )
+        .await;
+        assert_eq!(res["isError"].as_bool(), Some(true));
+
+        // Unknown hub is denied without any network call.
+        let res = super::handle_skill_hub_install(
+            &json!({"hub": "not-a-hub", "skill_name": "fine-name"}),
+            &home,
+        )
+        .await;
+        assert_eq!(res["isError"].as_bool(), Some(true));
+        let text = res["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("unknown hub"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn skill_pin_and_curator_status_roundtrip() {
+        use serde_json::json;
+        let home = std::env::temp_dir().join(format!("duduclaw-mcp-pin-{}", uuid::Uuid::new_v4()));
+        let skills = home.join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("keeper.md"), "---\nname: keeper\n---\nbody").unwrap();
+
+        // Force a pass so the skill gets tracked.
+        let res = super::handle_skill_curator_status(&json!({"run": true}), &home).await;
+        assert!(res["isError"].as_bool() != Some(true), "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("1 tracked skill"), "{text}");
+
+        // Pin it.
+        let res = super::handle_skill_pin(&json!({"skill_name": "keeper"}), &home).await;
+        assert!(res["isError"].as_bool() != Some(true), "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("pinned"), "{text}");
+
+        // Status reflects the pin.
+        let res = super::handle_skill_curator_status(&json!({}), &home).await;
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("keeper [global]"), "{text}");
+
+        // Unknown skill errors honestly.
+        let res = super::handle_skill_pin(&json!({"skill_name": "ghost"}), &home).await;
+        assert_eq!(res["isError"].as_bool(), Some(true));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // agent_update_soul follow-up fixes (#3, #4 — 2026-05-20)
     //
@@ -13225,3 +15041,215 @@ mod skill_description_parser_tests {
         assert_eq!(parse_skill_description_from_content(content), "");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────
+// 2026-07 review: audit input capture (HIGH-C) + jitrl_feedback (HIGH-D)
+// ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod audit_input_and_jitrl_tests {
+    use super::*;
+    use std::fs;
+
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("duduclaw-aud-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn jitrl_feedback_tool_is_registered() {
+        // HIGH-D: the tool must exist in tools/list, with the reward param.
+        let tool = TOOLS
+            .iter()
+            .find(|t| t.name == "jitrl_feedback")
+            .expect("jitrl_feedback must be registered in TOOLS");
+        assert!(tool.params.iter().any(|p| p.name == "reward" && p.required));
+        assert!(tool.params.iter().any(|p| p.name == "prompt" && p.required));
+        assert!(tool.params.iter().any(|p| p.name == "response" && p.required));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jitrl_feedback_disabled_is_noop_with_clear_message() {
+        // No inference.toml at all ⇒ [jitrl] disabled ⇒ clear no-op, not error.
+        let tmp = TempDir::new();
+        let result = handle_jitrl_feedback(
+            &serde_json::json!({ "prompt": "p", "response": "r", "reward": 1 }),
+            tmp.path(),
+        )
+        .await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("未啟用"), "got: {text}");
+        assert!(
+            !result["isError"].as_bool().unwrap_or(false),
+            "disabled path is a no-op, not an error: {result}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jitrl_feedback_validates_reward_and_treats_zero_as_noop() {
+        let tmp = TempDir::new();
+        // Out-of-range reward rejected regardless of enablement.
+        let bad = handle_jitrl_feedback(
+            &serde_json::json!({ "prompt": "p", "response": "r", "reward": 5 }),
+            tmp.path(),
+        )
+        .await;
+        assert!(bad["isError"].as_bool().unwrap_or(false), "{bad}");
+
+        // Enabled + reward 0 ⇒ explicit no-op message (nothing recorded).
+        fs::write(
+            tmp.path().join("inference.toml"),
+            "enabled = true\n\n[jitrl]\nenabled = true\n",
+        )
+        .unwrap();
+        let zero = handle_jitrl_feedback(
+            &serde_json::json!({ "prompt": "p", "response": "r", "reward": 0 }),
+            tmp.path(),
+        )
+        .await;
+        let text = zero["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("no-op"), "got: {text}");
+        assert!(!zero["isError"].as_bool().unwrap_or(false));
+        assert!(
+            !tmp.path().join("jitrl_experience.jsonl").exists(),
+            "reward=0 must record nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_changing_call_captures_masked_input_in_audit_trail() {
+        // HIGH-C: the tools/call dispatch site now records the tool's INPUT
+        // arguments (masked) via append_tool_call_with_input — previously that
+        // fn had zero production callers.
+        let tmp = TempDir::new();
+        let memory = SqliteMemoryEngine::new(&tmp.path().join("memory.db"))
+            .expect("memory engine");
+        let odoo: OdooState = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        let ns = crate::mcp_namespace::NamespaceContext {
+            write_namespace: "internal/agnes".to_string(),
+            read_namespaces: vec!["internal/agnes".to_string(), "shared/public".to_string()],
+        };
+        let quota = crate::mcp_memory_quota::DailyQuota::new();
+        let http = reqwest::Client::new();
+
+        // `pairing_manage` is state-changing (2026-07 allowlist addition);
+        // smuggle a secret-shaped value through the args to prove masking.
+        let params = serde_json::json!({
+            "name": "pairing_manage",
+            "arguments": {
+                "action": "list",
+                "api_key": "sk-ant-api03-super-secret-value",
+            }
+        });
+        let _ = handle_tools_call(
+            &serde_json::json!(1),
+            &params,
+            tmp.path(),
+            &http,
+            &memory,
+            "agnes",
+            &odoo,
+            &ns,
+            &quota,
+            "default",
+            true,
+        )
+        .await;
+
+        let body = fs::read_to_string(tmp.path().join("tool_calls.jsonl"))
+            .expect("audit record must be written for a state-changing tool");
+        let line = body
+            .lines()
+            .find(|l| l.contains("pairing_manage"))
+            .expect("pairing_manage audit line");
+        let rec: serde_json::Value = serde_json::from_str(line).expect("valid JSONL");
+        let input = rec["input"].as_str().expect("input must be captured");
+        assert!(input.contains("action"), "input must carry the real args: {input}");
+        // Masked secret: neither the JSON line nor the captured input may
+        // contain the raw secret value.
+        assert!(
+            !line.contains("super-secret-value"),
+            "masked secret leaked into the audit line: {line}"
+        );
+    }
+
+    // ── Live Canvas tools (G15) ──────────────────────────────
+
+    /// Push → get roundtrip through the real tool handlers: hostile markup is
+    /// stripped at write time, benign markup and CJK content survive, and the
+    /// stored row is what a later reader (gateway `canvas.get`) sees.
+    #[tokio::test]
+    async fn canvas_push_get_roundtrip_sanitizes() {
+        let tmp = TempDir::new();
+        let args = serde_json::json!({
+            "html": "<h1>週報</h1><script>alert(1)</script><img src=\"https://ok.example/c.png\" onerror=\"x()\"><p>營收 100</p>",
+            "title": "本週儀表板",
+        });
+        let result = handle_canvas_push(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            result.get("isError").is_none() || result["isError"] == serde_json::json!(false),
+            "push must succeed: {result}"
+        );
+        assert!(text.contains("Canvas updated"), "got: {text}");
+
+        let store = duduclaw_gateway::canvas::CanvasStore::open(tmp.path()).unwrap();
+        let row = store.current("agnes").await.unwrap().expect("stored canvas");
+        assert_eq!(row.title, "本週儀表板");
+        assert!(!row.html.contains("script") && !row.html.contains("onerror"), "stored: {}", row.html);
+        assert!(row.html.contains("<h1>週報</h1>") && row.html.contains("營收 100"));
+        assert!(row.html.contains("https://ok.example/c.png"));
+    }
+
+    /// Oversize pushes are rejected fail-closed (nothing stored) with a clear
+    /// error, and `canvas_clear` appends the empty tombstone version.
+    #[tokio::test]
+    async fn canvas_push_size_cap_and_clear() {
+        let tmp = TempDir::new();
+        let big = format!("<p>{}</p>", "x".repeat(duduclaw_gateway::canvas::MAX_CANVAS_BYTES + 1));
+        let result =
+            handle_canvas_push(&serde_json::json!({ "html": big }), tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("too large"), "got: {text}");
+        let store = duduclaw_gateway::canvas::CanvasStore::open(tmp.path()).unwrap();
+        assert!(store.current("agnes").await.unwrap().is_none(), "fail-closed: nothing stored");
+
+        // Now a valid push followed by a clear.
+        handle_canvas_push(&serde_json::json!({ "html": "<p>hi</p>" }), tmp.path(), "agnes").await;
+        let result = handle_canvas_clear(tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("Canvas cleared"), "got: {text}");
+        let cur = store.current("agnes").await.unwrap().expect("tombstone");
+        assert_eq!(cur.html, "");
+    }
+
+    /// Caller identity is validated before any I/O (path-traversal guard).
+    #[tokio::test]
+    async fn canvas_tools_reject_invalid_agent_id() {
+        let tmp = TempDir::new();
+        let result = handle_canvas_push(
+            &serde_json::json!({ "html": "<p>x</p>" }),
+            tmp.path(),
+            "../evil",
+        )
+        .await;
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("Invalid agent ID"), "got: {text}");
+        let result = handle_canvas_clear(tmp.path(), "../evil").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("Invalid agent ID"), "got: {text}");
+    }
+}
+

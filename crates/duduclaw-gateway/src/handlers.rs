@@ -21,9 +21,12 @@ use crate::cron_store::{CronStore, CronTaskRow};
 use crate::extension::GatewayExtension;
 use crate::gvu::version_store::VersionStore;
 use crate::protocol::WsFrame;
-use crate::task_store::{TaskStore, TaskRow, ActivityRow, CommentRow};
+use crate::task_store::{TaskStore, TaskRow, ActivityRow, CommentRow, PlanRow, PlanStepRow};
 use crate::partner_store::{
     PartnerStore, PartnerProfileInput, PartnerCustomerInput, PartnerCustomerPatch,
+};
+use crate::distributor_store::{
+    DistributorInput, DistributorPatch, DistributorStore, IssuedLicense,
 };
 use crate::evolution_events::schema::StagnationDetectionConfig;
 
@@ -2862,6 +2865,31 @@ impl MethodHandler {
             "tasks.comment" => self.handle_tasks_comment(params, ctx).await,
             "tasks.comments" => self.handle_tasks_comments(params, ctx).await,
 
+            // ── Co-edited plans (U4, Cocoa arXiv:2412.10999) ──
+            // Same gate pattern as tasks.*: listing takes the optional
+            // agent-filter gate (Viewer); per-plan methods resolve the plan's
+            // owning agent inside the handler and fail closed (HS4).
+            "plans.list" => {
+                check_agent_filter!(AccessLevel::Viewer);
+                self.handle_plans_list(params).await
+            }
+            "plans.get" => self.handle_plans_get(params, ctx).await,
+            "plans.create" => {
+                // The owning agent is `agent_id`; creating a shared plan for
+                // an agent is side-effecting → Operator binding required.
+                let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+                if agent_id.is_empty() {
+                    return WsFrame::error_response("", "agent_id is required");
+                }
+                check_agent_named!(agent_id, AccessLevel::Operator);
+                self.handle_plans_create(params, ctx).await
+            }
+            "plans.update" => self.handle_plans_update(params, ctx).await,
+            "plans.remove" => self.handle_plans_remove(params, ctx).await,
+            "plans.add_step" => self.handle_plans_add_step(params, ctx).await,
+            "plans.update_step" => self.handle_plans_update_step(params, ctx).await,
+            "plans.remove_step" => self.handle_plans_remove_step(params, ctx).await,
+
             // ── Activity Feed (agent-scoped — HS4 fix) ───
             "activity.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
@@ -2877,6 +2905,25 @@ impl MethodHandler {
                 "note": "All authenticated WS clients receive activity events automatically; no per-client filter is in effect.",
             })),
 
+            // ── Work Timeline (G11) — company Gantt view. Same gate
+            //    as activity.list: viewing is read-only, agent-scoped.
+            "timeline.list" => {
+                check_agent_filter!(AccessLevel::Viewer);
+                self.handle_timeline_list(params).await
+            }
+
+            // ── Run inspector (G12) — per-run transcript derived from
+            //    sessions.db turns + the MCP tool audit trail. Same gate as
+            //    activity.list: read-only, agent-scoped, fail-closed.
+            "runs.list" => {
+                check_agent_filter!(AccessLevel::Viewer);
+                self.handle_runs_list(params).await
+            }
+            // Gated inside the handler by the run's owning agent (Viewer) —
+            // the agent id is only known after resolving the run's session;
+            // unknown run fails closed for non-admins.
+            "runs.get" => self.handle_runs_get(params, ctx).await,
+
             // ── Decision Continuity (RFC-24, agent-scoped) ──
             "decisions.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
@@ -2886,6 +2933,17 @@ impl MethodHandler {
                 // Marking a captured decision as a false positive mutates state.
                 check_agent_filter!(AccessLevel::Operator);
                 self.handle_decisions_dismiss(params).await
+            }
+
+            // ── Live Canvas (G15) — agent-pushed HTML workspace. Same gate
+            //    as activity.list: viewing is read-only, agent-scoped,
+            //    fail-closed (non-admins must name an agent they can view).
+            //    Mutations happen only via the `canvas_push` / `canvas_clear`
+            //    MCP tools; content is ammonia-sanitized at write time and the
+            //    dashboard renders it inside `<iframe sandbox="">`.
+            "canvas.get" => {
+                check_agent_filter!(AccessLevel::Viewer);
+                self.handle_canvas_get(params).await
             }
 
             // ── Live Run Forking (RFC-26) ───────────────────
@@ -2961,6 +3019,63 @@ impl MethodHandler {
             "partner.customer.delete" => {
                 require_admin!();
                 self.handle_partner_customer_delete(params).await
+            }
+
+            // ── White-label branding + About ─────────────────
+            // `branding.get` / `about.get` are readable by any logged-in user
+            // (the dashboard needs the product name on every page). Writes go
+            // through require_admin! AND the white_label feature gate.
+            "branding.get" => self.handle_branding_get().await,
+            "about.get" => self.handle_about_get().await,
+            "branding.set" => {
+                require_admin!();
+                self.handle_branding_set(params).await
+            }
+            "branding.reset" => {
+                require_admin!();
+                self.handle_branding_reset().await
+            }
+            "branding.preview" => {
+                require_admin!();
+                self.handle_branding_preview(params).await
+            }
+            "branding.bundle.create" => {
+                require_admin!();
+                self.handle_branding_bundle_create().await
+            }
+
+            // ── Distributor management (owner instance) ──────
+            "distributor.status" => {
+                require_admin!();
+                self.handle_distributor_status().await
+            }
+            "distributor.list" => {
+                require_admin!();
+                self.handle_distributor_list().await
+            }
+            "distributor.add" => {
+                require_admin!();
+                self.handle_distributor_add(params).await
+            }
+            "distributor.update" => {
+                require_admin!();
+                self.handle_distributor_update(params).await
+            }
+            "distributor.remove" => {
+                require_admin!();
+                self.handle_distributor_remove(params).await
+            }
+            "distributor.issue" => {
+                require_admin!();
+                self.handle_distributor_issue(params).await
+            }
+            "distributor.revoke" => {
+                require_admin!();
+                self.handle_distributor_revoke(params).await
+            }
+            "distributor.bundle.sign" => {
+                require_admin!();
+                self.handle_distributor_bundle_sign(params).await
             }
 
             // ── Billing ──────────────────────────────────────
@@ -3162,7 +3277,15 @@ impl MethodHandler {
             && let Some(ch) = config.get("channels").and_then(|v| v.as_table())
         {
             for key in ["line_channel_token", "telegram_bot_token", "discord_bot_token"] {
-                if ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+                // Presence = plaintext OR `_enc` (2026-07 MED: channels.add is
+                // now enc-only for these too; a plaintext-only check would
+                // undercount freshly-saved channels).
+                let plain = ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+                let enc = ch
+                    .get(&format!("{key}_enc"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty());
+                if plain || enc {
                     n += 1;
                 }
             }
@@ -3929,13 +4052,41 @@ impl MethodHandler {
                     if let Some(val) = params_clone.get(*param_key).and_then(|v| v.as_str()) {
                         if !val.is_empty() {
                             let toml_key = toml_key_override.unwrap_or(param_key);
-                            section.insert(toml_key.to_string(), toml::Value::String(val.into()));
-                            // Encrypt sensitive tokens
-                            if toml_key.contains("token") || toml_key.contains("secret") || toml_key == "app_id" {
+                            // Sensitive tokens: enc-only when encryption is
+                            // available (MED-B parity with channels.add — the
+                            // plaintext key is REMOVED, never blanked, because
+                            // enc-aware readers treat a present-but-empty
+                            // plaintext as "channel removed"). All per-agent
+                            // readers (telegram/discord/slack bots,
+                            // config_crypto::resolve_agent_token) prefer
+                            // `_enc`. Keyfile-unavailable ⇒ legacy plaintext.
+                            // Applies to every sensitive field routed through
+                            // this closure, incl. the wecom/dingtalk secrets.
+                            let is_sensitive = toml_key.contains("token")
+                                || toml_key.contains("secret")
+                                || toml_key == "app_id"
+                                || toml_key.contains("aes_key");
+                            if is_sensitive {
                                 let enc_key = format!("{toml_key}_enc");
-                                if let Some(enc) = crate::config_crypto::encrypt_value(val, &home) {
-                                    section.insert(enc_key, toml::Value::String(enc));
+                                match crate::config_crypto::encrypt_value(val, &home) {
+                                    Some(enc) => {
+                                        section.remove(toml_key); // drop stale plaintext
+                                        section.insert(enc_key, toml::Value::String(enc));
+                                    }
+                                    None => {
+                                        section.insert(
+                                            toml_key.to_string(),
+                                            toml::Value::String(val.into()),
+                                        );
+                                    }
                                 }
+                            } else {
+                                // Identifier, not a secret — plaintext is the
+                                // canonical copy (e.g. phone_number_id).
+                                section.insert(
+                                    toml_key.to_string(),
+                                    toml::Value::String(val.into()),
+                                );
                             }
                         }
                     }
@@ -3980,6 +4131,21 @@ impl MethodHandler {
                 ("feishu_app_id", Some("app_id")),
                 ("feishu_app_secret", Some("app_secret")),
                 ("feishu_verification_token", Some("verification_token")),
+            ], &mut changes)?;
+
+            // WeCom (企業微信)
+            set_channel_token(table, "wecom", &[
+                ("wecom_corp_id", Some("corp_id")),
+                ("wecom_corp_secret", Some("corp_secret")),
+                ("wecom_agent_id", Some("agent_id")),
+                ("wecom_callback_token", Some("callback_token")),
+                ("wecom_encoding_aes_key", Some("encoding_aes_key")),
+            ], &mut changes)?;
+
+            // DingTalk (釘釘)
+            set_channel_token(table, "dingtalk", &[
+                ("dingtalk_app_key", Some("app_key")),
+                ("dingtalk_app_secret", Some("app_secret")),
             ], &mut changes)?;
 
             // ── Sticker fields ([sticker] section) ──
@@ -5002,7 +5168,13 @@ impl MethodHandler {
                 ("discord_bot_token", "discord"),
             ];
             for (key, name) in token_map {
-                let configured = ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+                // Enc-aware presence (2026-07 MED) — matches
+                // `count_configured_channels` so enc-only saves show up here.
+                let configured = ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+                    || ch
+                        .get(&format!("{key}_enc"))
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty());
                 if configured {
                     // Use runtime state if available; otherwise use "connecting" status
                     let (connected, last_ts, error) = match runtime_status.get(name) {
@@ -5123,15 +5295,38 @@ impl MethodHandler {
                     .as_table_mut()
                     .ok_or_else(|| format!("Invalid [channels.{}] section", channel_type_owned))?;
 
-                section.insert(token_field.to_string(), toml::Value::String(token_owned.clone()));
-                if let Some(enc) = crate::config_crypto::encrypt_value(&token_owned, &home) {
-                    section.insert(format!("{token_field}_enc"), toml::Value::String(enc));
+                // Parity with the wecom/dingtalk MED-B fix: when encryption
+                // succeeds, persist ONLY the `_enc` copy and REMOVE the
+                // plaintext key (never blank it — the enc-aware readers treat
+                // a present-but-empty plaintext as "channel removed"). All
+                // per-agent readers (telegram.rs / discord.rs / slack.rs /
+                // config_crypto::resolve_agent_token) prefer `_enc`.
+                // Keyfile-unavailable falls back to legacy plaintext.
+                match crate::config_crypto::encrypt_value(&token_owned, &home) {
+                    Some(enc) => {
+                        section.remove(token_field); // drop any stale plaintext copy
+                        section.insert(format!("{token_field}_enc"), toml::Value::String(enc));
+                    }
+                    None => {
+                        section.insert(
+                            token_field.to_string(),
+                            toml::Value::String(token_owned.clone()),
+                        );
+                    }
                 }
                 if let Some(sf) = secret_field {
                     if !secret_owned.is_empty() {
-                        section.insert(sf.to_string(), toml::Value::String(secret_owned.clone()));
-                        if let Some(enc) = crate::config_crypto::encrypt_value(&secret_owned, &home) {
-                            section.insert(format!("{sf}_enc"), toml::Value::String(enc));
+                        match crate::config_crypto::encrypt_value(&secret_owned, &home) {
+                            Some(enc) => {
+                                section.remove(sf); // drop any stale plaintext copy
+                                section.insert(format!("{sf}_enc"), toml::Value::String(enc));
+                            }
+                            None => {
+                                section.insert(
+                                    sf.to_string(),
+                                    toml::Value::String(secret_owned.clone()),
+                                );
+                            }
                         }
                     }
                 }
@@ -5177,6 +5372,10 @@ impl MethodHandler {
             "googlechat" => ("googlechat_service_account_json", Some("googlechat_project_number")),
             // token = client secret; secret = Microsoft App ID
             "teams" => ("teams_app_password", Some("teams_app_id")),
+            // token = corpsecret; secret = corpid (identifier, plain)
+            "wecom" => ("wecom_corp_secret", Some("wecom_corp_id")),
+            // token = robot AppSecret; secret = AppKey (identifier, plain)
+            "dingtalk" => ("dingtalk_app_secret", Some("dingtalk_app_key")),
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
@@ -5191,7 +5390,8 @@ impl MethodHandler {
         // ARE encrypted.
         let secret_is_plain = matches!(
             secret_key,
-            Some("whatsapp_phone_number_id") | Some("googlechat_project_number") | Some("teams_app_id")
+            Some("whatsapp_phone_number_id") | Some("googlechat_project_number")
+                | Some("teams_app_id") | Some("wecom_corp_id") | Some("dingtalk_app_key")
         );
 
         let config_path = self.home_dir.join("config.toml");
@@ -5207,17 +5407,43 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "Invalid [channels] section in config.toml"),
         };
 
-        // Store encrypted version; also keep plaintext as fallback
-        channels.insert(token_key.to_string(), toml::Value::String(token.to_string()));
-        if let Some(enc) = &encrypted_token {
-            channels.insert(enc_token_key, toml::Value::String(enc.clone()));
+        // MED-B (extended to all channels, 2026-07 nit sweep): secrets never
+        // persist a plaintext copy when encryption succeeds. Every read path
+        // (`config_crypto::read_encrypted_config_field` / `decrypt_config_field`,
+        // dispatcher `resolve_forward_token`, reminder `decrypt_channel_token`)
+        // prefers `_enc` and only uses plaintext as a legacy fallback — note it
+        // treats an *empty* plaintext value as "channel removed", so the
+        // plaintext key must be REMOVED, never blanked. If encryption is
+        // unavailable (no keyfile) we fall back to the legacy plaintext write
+        // so the channel still works.
+        //
+        // The former telegram/discord/line exception is gone (2026-07 MED):
+        // `count_configured_channels` and `handle_channels_status` presence
+        // checks are now `_enc`-aware, so ALL channels are enc-only here.
+        match &encrypted_token {
+            Some(enc) => {
+                channels.remove(token_key); // drop any stale plaintext copy too
+                channels.insert(enc_token_key, toml::Value::String(enc.clone()));
+            }
+            None => {
+                channels.insert(token_key.to_string(), toml::Value::String(token.to_string()));
+            }
         }
         if let Some(sk) = secret_key {
             if !secret.is_empty() {
-                channels.insert(sk.to_string(), toml::Value::String(secret.to_string()));
-                if !secret_is_plain {
-                    if let Some(enc) = crate::config_crypto::encrypt_value(secret, &self.home_dir) {
-                        channels.insert(format!("{sk}_enc"), toml::Value::String(enc));
+                if secret_is_plain {
+                    // Identifier, not a secret — plaintext is the canonical copy.
+                    channels.insert(sk.to_string(), toml::Value::String(secret.to_string()));
+                } else {
+                    match crate::config_crypto::encrypt_value(secret, &self.home_dir) {
+                        Some(enc) => {
+                            channels.remove(sk); // drop any stale plaintext copy
+                            channels.insert(format!("{sk}_enc"), toml::Value::String(enc));
+                        }
+                        None => {
+                            channels
+                                .insert(sk.to_string(), toml::Value::String(secret.to_string()));
+                        }
                     }
                 }
             }
@@ -5230,6 +5456,7 @@ impl MethodHandler {
             "whatsapp" => &["whatsapp_verify_token", "whatsapp_app_secret"],
             "feishu" => &["feishu_verification_token"],
             "teams" => &["teams_tenant_id"],
+            "wecom" => &["wecom_agent_id", "wecom_callback_token", "wecom_encoding_aes_key"],
             _ => &[],
         };
         for field in extra_secret_fields {
@@ -5240,9 +5467,34 @@ impl MethodHandler {
                     channels.remove(&format!("{field}_enc"));
                     continue;
                 }
-                channels.insert((*field).to_string(), toml::Value::String(v.into()));
-                if let Some(enc) = crate::config_crypto::encrypt_value(v, &self.home_dir) {
-                    channels.insert(format!("{field}_enc"), toml::Value::String(enc));
+                // MED-B (extended): extra *secrets* never keep a plaintext
+                // copy when encryption succeeds (see the primary-token note
+                // above). Identifiers (`wecom_agent_id`, `teams_tenant_id`)
+                // are not secrets and keep the plaintext write. All readers
+                // (whatsapp.rs / feishu.rs / msteams.rs / wecom.rs) resolve
+                // via the enc-first `read_encrypted_config_field`.
+                let forbid_plain = matches!(
+                    *field,
+                    "wecom_callback_token"
+                        | "wecom_encoding_aes_key"
+                        | "whatsapp_verify_token"
+                        | "whatsapp_app_secret"
+                        | "feishu_verification_token"
+                );
+                match crate::config_crypto::encrypt_value(v, &self.home_dir) {
+                    Some(enc) => {
+                        channels.insert(format!("{field}_enc"), toml::Value::String(enc));
+                        if forbid_plain {
+                            channels.remove(*field); // drop any stale plaintext copy
+                        } else {
+                            channels
+                                .insert((*field).to_string(), toml::Value::String(v.into()));
+                        }
+                    }
+                    None => {
+                        // No keyfile — plaintext is the only workable copy.
+                        channels.insert((*field).to_string(), toml::Value::String(v.into()));
+                    }
                 }
             }
         }
@@ -5324,6 +5576,8 @@ impl MethodHandler {
             "feishu" => "feishu_app_id",
             "googlechat" => "googlechat_service_account_json",
             "teams" => "teams_app_password",
+            "wecom" => "wecom_corp_secret",
+            "dingtalk" => "dingtalk_app_secret",
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
@@ -5394,6 +5648,8 @@ impl MethodHandler {
             "feishu" => "feishu_app_id",
             "googlechat" => "googlechat_service_account_json",
             "teams" => "teams_app_password",
+            "wecom" => "wecom_corp_secret",
+            "dingtalk" => "dingtalk_app_secret",
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
@@ -5405,6 +5661,8 @@ impl MethodHandler {
             "feishu" => &["feishu_app_secret", "feishu_verification_token"],
             "googlechat" => &["googlechat_project_number"],
             "teams" => &["teams_app_id", "teams_tenant_id"],
+            "wecom" => &["wecom_corp_id", "wecom_agent_id", "wecom_callback_token", "wecom_encoding_aes_key"],
+            "dingtalk" => &["dingtalk_app_key"],
             _ => &[],
         };
 
@@ -5483,7 +5741,7 @@ impl MethodHandler {
                 info!("LINE channel updated; status refreshed (webhook always mounted)");
                 return true;
             }
-            "whatsapp" | "feishu" | "googlechat" | "teams" => {
+            "whatsapp" | "feishu" | "googlechat" | "teams" | "wecom" | "dingtalk" => {
                 // These webhook routers are mounted at boot with their config
                 // baked into router state — a gateway restart is required for
                 // a first-time setup to take effect.
@@ -6626,6 +6884,35 @@ impl MethodHandler {
             .map(|n| n.trim().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
+        // Mandatory server-side security scan of the *content that will be
+        // installed* — the vet RPC is a separate call the client may skip, so
+        // install must re-run the scanner itself. Same fail-closed policy as
+        // skill_lifecycle::hub_install: risk ≥ High ⇒ reject with findings;
+        // Clean/Low/Medium proceed.
+        let scan = crate::skill_lifecycle::security_scanner::scan_skill(&content, None);
+        if !scan.passed {
+            warn!(
+                skill = %skill_name,
+                risk = ?scan.risk_level,
+                findings = scan.findings.len(),
+                "skills.install DENIED by server-side security scan"
+            );
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "Security scan rejected skill '{skill_name}': risk {:?}, {} finding(s): {}",
+                    scan.risk_level,
+                    scan.findings.len(),
+                    scan.findings
+                        .iter()
+                        .take(5)
+                        .map(|f| f.description.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ),
+            );
+        }
+
         // Write content to a temp file for the install functions
         let tmp_dir = std::env::temp_dir().join("duduclaw-skill-install");
         if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
@@ -7248,6 +7535,11 @@ impl MethodHandler {
             "notify_chat_id": row.notify_chat_id,
             "notify_thread_id": row.notify_thread_id,
             "cron_timezone": row.cron_timezone,
+            // G3 event-trigger fields.
+            "trigger_kind": row.trigger_kind,
+            "condition_script": row.condition_script,
+            "condition_state": row.condition_state,
+            "watch_command": row.watch_command,
         })
     }
 
@@ -7357,6 +7649,57 @@ impl MethodHandler {
             }
         }
 
+        // G3 event-trigger fields. `trigger_kind` defaults to "time" (legacy).
+        // Unknown kinds are rejected (strict) so a typo surfaces here rather
+        // than silently degrading to a schedule-only task.
+        let trigger_kind_str = params
+            .get("trigger_kind")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("time")
+            .to_string();
+        let trigger_kind = match crate::condition_eval::TriggerKind::parse_strict(&trigger_kind_str)
+        {
+            Some(k) => k,
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    &format!(
+                        "Unknown trigger_kind '{trigger_kind_str}'. Use 'time', 'condition', or 'on_exit'."
+                    ),
+                );
+            }
+        };
+        let condition_script = params
+            .get("condition_script")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from);
+        let watch_command = params
+            .get("watch_command")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from);
+        // A condition/on_exit task without its script/command would fail closed
+        // forever — reject at creation time.
+        if matches!(trigger_kind, crate::condition_eval::TriggerKind::Condition)
+            && condition_script.is_none()
+        {
+            return WsFrame::error_response(
+                "",
+                "trigger_kind 'condition' requires a non-empty 'condition_script'",
+            );
+        }
+        if matches!(trigger_kind, crate::condition_eval::TriggerKind::OnExit)
+            && watch_command.is_none()
+        {
+            return WsFrame::error_response(
+                "",
+                "trigger_kind 'on_exit' requires a non-empty 'watch_command'",
+            );
+        }
+
         let mut row = CronTaskRow::new(
             uuid::Uuid::new_v4().to_string(),
             name.clone(),
@@ -7368,6 +7711,9 @@ impl MethodHandler {
         row.notify_chat_id = notify_chat_id;
         row.notify_thread_id = notify_thread_id;
         row.cron_timezone = cron_timezone;
+        row.trigger_kind = trigger_kind.as_db().to_string();
+        row.condition_script = condition_script;
+        row.watch_command = watch_command;
         if let Err(e) = store.insert(&row).await {
             return WsFrame::error_response("", &format!("insert: {e}"));
         }
@@ -7494,6 +7840,74 @@ impl MethodHandler {
             };
             if let Err(e) = store.update_cron_timezone(&id, tz_to_store).await {
                 return WsFrame::error_response("", &format!("update_cron_timezone: {e}"));
+            }
+        }
+
+        // G3 event-trigger update — only touch these columns when any of the
+        // three keys is present. Absent keys mean "leave existing values". An
+        // empty-string script/command clears it.
+        let has_trigger_update = params.get("trigger_kind").is_some()
+            || params.get("condition_script").is_some()
+            || params.get("watch_command").is_some();
+        if has_trigger_update {
+            let trigger_kind_str = match params.get("trigger_kind") {
+                Some(v) => v.as_str().map(str::trim).unwrap_or("").to_string(),
+                None => existing.trigger_kind.clone(),
+            };
+            let trigger_kind =
+                match crate::condition_eval::TriggerKind::parse_strict(&trigger_kind_str) {
+                    Some(k) => k,
+                    None => {
+                        return WsFrame::error_response(
+                            "",
+                            &format!(
+                                "Unknown trigger_kind '{trigger_kind_str}'. Use 'time', 'condition', or 'on_exit'."
+                            ),
+                        );
+                    }
+                };
+            let condition_script: Option<String> = match params.get("condition_script") {
+                Some(v) => v
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+                None => existing.condition_script.clone(),
+            };
+            let watch_command: Option<String> = match params.get("watch_command") {
+                Some(v) => v
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+                None => existing.watch_command.clone(),
+            };
+            if matches!(trigger_kind, crate::condition_eval::TriggerKind::Condition)
+                && condition_script.is_none()
+            {
+                return WsFrame::error_response(
+                    "",
+                    "trigger_kind 'condition' requires a non-empty 'condition_script'",
+                );
+            }
+            if matches!(trigger_kind, crate::condition_eval::TriggerKind::OnExit)
+                && watch_command.is_none()
+            {
+                return WsFrame::error_response(
+                    "",
+                    "trigger_kind 'on_exit' requires a non-empty 'watch_command'",
+                );
+            }
+            if let Err(e) = store
+                .update_trigger(
+                    &id,
+                    trigger_kind.as_db(),
+                    condition_script.as_deref(),
+                    watch_command.as_deref(),
+                )
+                .await
+            {
+                return WsFrame::error_response("", &format!("update_trigger: {e}"));
             }
         }
 
@@ -7684,6 +8098,608 @@ impl MethodHandler {
         match store.delete_customer(&id) {
             Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
             Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    // ── White-label branding + About ─────────────────────────
+    //
+    // The upstream vendor attribution ("嘟嘟數位科技有限公司") is const-assembled
+    // by [`crate::branding::VendorBlock::upstream`] into every response — it is
+    // never read from config and never writable, so a reseller can rebrand the
+    // product surface while the "software by" credit stays intact.
+
+    /// white_label feature gate — **fail-closed**. `true` only when a license
+    /// runtime is registered AND its active tier unlocks `white_label` (tier =
+    /// Oem). No runtime / OpenSource / any error ⇒ `false` ⇒ writes denied.
+    async fn white_label_active(&self) -> bool {
+        match crate::license_runtime::global() {
+            Some(rt) => rt.check_feature("white_label").await,
+            None => false,
+        }
+    }
+
+    async fn handle_branding_get(&self) -> WsFrame {
+        let (branding, source) = crate::branding::load_with_source(&self.home_dir);
+        let vendor = crate::branding::VendorBlock::upstream();
+        let white_label_active = self.white_label_active().await;
+        let branding_v = serde_json::to_value(&branding).unwrap_or_else(|_| json!({}));
+        let vendor_v = serde_json::to_value(vendor).unwrap_or_else(|_| json!({}));
+        WsFrame::ok_response(
+            "",
+            json!({
+                "branding": branding_v,
+                "vendor": vendor_v,
+                "source": source,
+                "defaults": {
+                    "product_name": crate::branding::DEFAULT_PRODUCT_NAME,
+                    "subtitle_key": "app.subtitle",
+                },
+                "white_label_active": white_label_active,
+            }),
+        )
+    }
+
+    async fn handle_about_get(&self) -> WsFrame {
+        let (branding, source) = crate::branding::load_with_source(&self.home_dir);
+        let vendor = crate::branding::VendorBlock::upstream();
+        let tier = match crate::license_runtime::global() {
+            Some(rt) => rt.snapshot().await.tier.to_string(),
+            None => duduclaw_license::LicenseTier::OpenSource.to_string(),
+        };
+        let white_label_active = self.white_label_active().await;
+        let branding_v = serde_json::to_value(&branding).unwrap_or_else(|_| json!({}));
+        let vendor_v = serde_json::to_value(vendor).unwrap_or_else(|_| json!({}));
+        WsFrame::ok_response(
+            "",
+            json!({
+                "vendor": vendor_v,
+                "branding": branding_v,
+                "source": source,
+                "version": env!("CARGO_PKG_VERSION"),
+                "tier": tier,
+                "white_label_active": white_label_active,
+            }),
+        )
+    }
+
+    async fn handle_branding_set(&self, params: Value) -> WsFrame {
+        // white_label gate — fail-closed (rule #4). Snapshot unavailable or
+        // feature not granted ⇒ DENY before touching disk.
+        if !self.white_label_active().await {
+            return WsFrame::error_response(
+                "",
+                "白牌功能需經銷商授權（未取得 white_label 授權）",
+            );
+        }
+        let input: crate::branding::BrandingInput = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => {
+                return WsFrame::error_response("", &format!("品牌設定欄位無效：{e}"))
+            }
+        };
+        let cfg = match crate::branding::validate_input(input) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        if let Err(e) = crate::branding::save(&self.home_dir, &cfg) {
+            return WsFrame::error_response("", &e);
+        }
+        match serde_json::to_value(&cfg) {
+            Ok(v) => WsFrame::ok_response("", json!({ "ok": true, "branding": v })),
+            Err(e) => {
+                WsFrame::error_response("", &format!("serialize branding: {e}"))
+            }
+        }
+    }
+
+    async fn handle_branding_reset(&self) -> WsFrame {
+        if !self.white_label_active().await {
+            return WsFrame::error_response(
+                "",
+                "白牌功能需經銷商授權（未取得 white_label 授權）",
+            );
+        }
+        match crate::branding::reset(&self.home_dir) {
+            Ok(()) => WsFrame::ok_response("", json!({ "ok": true })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// Sanitize a raw about_html block and echo the exact sanitized string the
+    /// server would persist (§10.2 — "preview is what you get"). white_label
+    /// gated + fail-closed, same as `branding.set`.
+    async fn handle_branding_preview(&self, params: Value) -> WsFrame {
+        if !self.white_label_active().await {
+            return WsFrame::error_response(
+                "",
+                "白牌功能需經銷商授權（未取得 white_label 授權）",
+            );
+        }
+        let raw = params
+            .get("about_html")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        match crate::branding::sanitize_about_html(raw) {
+            Ok(html) => WsFrame::ok_response(
+                "",
+                json!({ "ok": true, "sanitized_html": html.unwrap_or_default() }),
+            ),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// Produce a signed branding bundle for this distributor instance (§10.3):
+    /// take the local subscription_id + machine fingerprint from the license
+    /// runtime snapshot, POST the current branding to the owner gateway's
+    /// `/v1/branding/sign`, and hand the signed bundle back for download.
+    async fn handle_branding_bundle_create(&self) -> WsFrame {
+        if !self.white_label_active().await {
+            return WsFrame::error_response(
+                "",
+                "白牌功能需經銷商授權（未取得 white_label 授權）",
+            );
+        }
+        let runtime = match crate::license_runtime::global() {
+            Some(rt) => rt,
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    "尚未載入授權資訊，無法產生散發包（請確認已啟用有效授權）",
+                )
+            }
+        };
+        let snapshot = runtime.snapshot().await;
+        let subscription_id = match snapshot.subscription_id {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "找不到訂閱識別碼（subscription_id）；散發包需要有效的經銷商授權",
+                )
+            }
+        };
+        let machine_fingerprint = duduclaw_license::generate_fingerprint();
+        let (branding, _source) = crate::branding::load_with_source(&self.home_dir);
+        let branding_v = serde_json::to_value(&branding).unwrap_or_else(|_| json!({}));
+
+        // Resolve the owner endpoint exactly like phone-home (env > license >
+        // default), then call server-to-server.
+        let base = runtime.control_url().trim_end_matches('/').to_string();
+        let endpoint = format!("{base}/v1/branding/sign");
+        let request_body = json!({
+            "subscription_id": subscription_id,
+            "machine_fingerprint": machine_fingerprint,
+            "branding": branding_v,
+        });
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return WsFrame::error_response("", &format!("建立 HTTP 用戶端失敗：{e}"))
+            }
+        };
+        let response = match client.post(&endpoint).json(&request_body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return WsFrame::error_response(
+                    "",
+                    &format!(
+                        "無法連線簽發端點（{endpoint}）：{e}。請確認 DUDUCLAW_CONTROL_URL 或金鑰內建的續期端點可連線，或改用 owner 端「代簽散發包」"
+                    ),
+                )
+            }
+        };
+        let status = response.status();
+        let body: Value = match response.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return WsFrame::error_response("", &format!("簽發端點回應解析失敗：{e}"))
+            }
+        };
+        if !status.is_success() {
+            let reason = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            return WsFrame::error_response(
+                "",
+                &format!("簽發端點拒絕（HTTP {status}）：{reason}"),
+            );
+        }
+        WsFrame::ok_response("", json!({ "ok": true, "bundle": body }))
+    }
+
+    // ── Distributor management (owner instance) ──────────────
+
+    fn distributor_store(&self) -> DistributorStore {
+        DistributorStore::new(&self.home_dir.join("distributor.db"))
+    }
+
+    /// Read `[distributor] issuer_key_path` from config.toml. `None` when
+    /// unset/empty — issuance is then explicitly refused rather than guessing a
+    /// path (design §3.3: "無預設值：未配置 = 明確錯誤").
+    async fn distributor_issuer_key_path(&self) -> Option<String> {
+        let config_path = self.home_dir.join("config.toml");
+        let content = tokio::fs::read_to_string(&config_path).await.ok()?;
+        let table = content.parse::<toml::Table>().ok()?;
+        table
+            .get("distributor")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("issuer_key_path"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Read `[distributor] public_url` from config.toml — the owner gateway's
+    /// externally-reachable base URL, baked into issued keys as
+    /// `license.control_url` (§10.5) so distributor instances phone home without
+    /// `DUDUCLAW_CONTROL_URL`. Returns `None` when unset/empty or when the value
+    /// is not an http(s) URL (fail-safe: a malformed URL is treated as unset
+    /// rather than embedding a broken endpoint).
+    async fn distributor_public_url(&self) -> Option<String> {
+        let config_path = self.home_dir.join("config.toml");
+        let content = tokio::fs::read_to_string(&config_path).await.ok()?;
+        let table = content.parse::<toml::Table>().ok()?;
+        let raw = table
+            .get("distributor")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("public_url"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let lower = raw.to_ascii_lowercase();
+        if (lower.starts_with("http://") || lower.starts_with("https://"))
+            && !raw.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            Some(raw.to_string())
+        } else {
+            warn!("[distributor] public_url is not a valid http(s) URL — ignoring");
+            None
+        }
+    }
+
+    /// Append a distributor audit event (issue / revoke) to
+    /// `security_audit.jsonl` via the shared, flock-protected writer. The
+    /// private signing key is NEVER part of `details`.
+    fn audit_distributor_event(&self, event_type: &str, details: Value) {
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                event_type,
+                "system",
+                duduclaw_security::audit::Severity::Info,
+                details,
+            ),
+        );
+    }
+
+    async fn handle_distributor_status(&self) -> WsFrame {
+        let issuer_configured = self.distributor_issuer_key_path().await.is_some();
+        let stats = self.distributor_store().compute_stats();
+        let stats_v = serde_json::to_value(stats).unwrap_or_else(|_| json!({}));
+        WsFrame::ok_response(
+            "",
+            json!({
+                "issuer_configured": issuer_configured,
+                "issuer_key_id": "v2",
+                // P2: the refresh + CRL control-plane endpoints self-gate on the
+                // same issuer key, so they are live iff an issuer key is set.
+                "refresh_endpoint_active": issuer_configured,
+                "stats": stats_v,
+            }),
+        )
+    }
+
+    async fn handle_distributor_list(&self) -> WsFrame {
+        let store = self.distributor_store();
+        let mut out: Vec<Value> = Vec::new();
+        for d in store.list_distributors() {
+            let licenses = store.list_licenses(Some(&d.id));
+            let mut dv = serde_json::to_value(&d).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = dv.as_object_mut() {
+                obj.insert(
+                    "licenses".into(),
+                    serde_json::to_value(&licenses).unwrap_or_else(|_| json!([])),
+                );
+            }
+            out.push(dv);
+        }
+        WsFrame::ok_response("", json!({ "distributors": out }))
+    }
+
+    async fn handle_distributor_add(&self, params: Value) -> WsFrame {
+        let input: DistributorInput = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => {
+                return WsFrame::error_response("", &format!("經銷商欄位無效：{e}"))
+            }
+        };
+        let store = self.distributor_store();
+        match store.add_distributor(&input) {
+            Ok(id) => {
+                let profile = store
+                    .get_distributor(&id)
+                    .and_then(|p| serde_json::to_value(&p).ok())
+                    .unwrap_or_else(|| json!({ "id": id }));
+                WsFrame::ok_response("", json!({ "ok": true, "distributor": profile }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_distributor_update(&self, params: Value) -> WsFrame {
+        let id = match params.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "缺少 'id' 參數"),
+        };
+        let patch_value = params.get("patch").cloned().unwrap_or_else(|| json!({}));
+        let patch: DistributorPatch = match serde_json::from_value(patch_value) {
+            Ok(v) => v,
+            Err(e) => {
+                return WsFrame::error_response("", &format!("patch 欄位無效：{e}"))
+            }
+        };
+        match self.distributor_store().update_distributor(&id, &patch) {
+            Ok(()) => WsFrame::ok_response("", json!({ "ok": true })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_distributor_remove(&self, params: Value) -> WsFrame {
+        let id = match params.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "缺少 'id' 參數"),
+        };
+        // The store refuses removal while active licenses remain (revoke first).
+        match self.distributor_store().delete_distributor(&id) {
+            Ok(()) => WsFrame::ok_response("", json!({ "ok": true })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// Sign a fresh OEM (`tier=Oem`) white-label license for a distributor.
+    ///
+    /// Reuses the existing License v2 format so `duduclaw license activate`
+    /// consumes it unchanged. The issuer private key path comes ONLY from
+    /// `[distributor] issuer_key_path`; the signed blob is self-verified against
+    /// the binary's baked v2 public key before it is booked, so a mismatched
+    /// key pair fails loudly instead of shipping an unverifiable license.
+    async fn handle_distributor_issue(&self, params: Value) -> WsFrame {
+        let distributor_id = match params.get("distributor_id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "缺少 'distributor_id' 參數"),
+        };
+        let machine_fingerprint =
+            match params.get("machine_fingerprint").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
+                    return WsFrame::error_response(
+                        "",
+                        "缺少 'machine_fingerprint'（請經銷商執行 duduclaw license fingerprint 提供）",
+                    )
+                }
+            };
+        // Default 365 days; clamp to a sane 1..=36500 window.
+        let expires_days = params
+            .get("expires_days")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(365)
+            .clamp(1, 36_500) as i64;
+
+        let store = self.distributor_store();
+        let dist = match store.get_distributor(&distributor_id) {
+            Some(d) => d,
+            None => return WsFrame::error_response("", "找不到該經銷商"),
+        };
+
+        // Issuer key path — explicit config, no path guessing.
+        let key_path = match self.distributor_issuer_key_path().await {
+            Some(p) => p,
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    "尚未配置簽發金鑰：請在 config.toml 設定 [distributor] issuer_key_path 指向 license-signing-v2.key",
+                )
+            }
+        };
+        let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(
+            &key_path,
+        )) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        // Identifiers embed the distributor id for traceability.
+        let license_id = uuid::Uuid::new_v4().to_string();
+        let short: String = license_id.chars().take(8).collect();
+        let subscription_id = format!("dist-{distributor_id}-{short}");
+        let customer_id = format!("dist-{distributor_id}");
+
+        // §10.5: if the owner has declared its externally-reachable URL, bake it
+        // into the key so the distributor instance auto-refreshes without env.
+        let public_url = self.distributor_public_url().await;
+
+        let registry = crate::license_runtime::production_registry();
+        let (license, blob) = match crate::distributor_store::issue_signed_oem_license(
+            &seed,
+            &registry,
+            "v2",
+            &subscription_id,
+            &customer_id,
+            &machine_fingerprint,
+            expires_days,
+            public_url.as_deref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        let record = IssuedLicense {
+            id: license_id.clone(),
+            distributor_id: distributor_id.clone(),
+            subscription_id: subscription_id.clone(),
+            customer_id,
+            tier: "oem".to_string(),
+            machine_fingerprint: machine_fingerprint.clone(),
+            issued_at: license.issued_at.to_rfc3339(),
+            expires_at: license.expires_at.to_rfc3339(),
+            status: "active".to_string(),
+            revoked_at: None,
+            license_blob: blob.clone(),
+            last_refresh_at: None,
+        };
+        if let Err(e) = store.add_license(&record) {
+            return WsFrame::error_response("", &format!("寫入授權紀錄失敗：{e}"));
+        }
+
+        // Audit — the private key never appears; fingerprint is truncated
+        // (CJK-safe) for a compact forensic line.
+        self.audit_distributor_event(
+            "distributor_license_issued",
+            json!({
+                "license_id": license_id,
+                "distributor_id": distributor_id,
+                "distributor_name": dist.name,
+                "subscription_id": subscription_id,
+                "tier": "oem",
+                "machine_fingerprint": duduclaw_core::truncate_chars(&machine_fingerprint, 16),
+                "expires_at": record.expires_at,
+            }),
+        );
+
+        let record_v = serde_json::to_value(&record).unwrap_or_else(|_| json!({}));
+        // §10.5: when public_url is configured, the key carries its own
+        // control-plane address (no env needed). Otherwise fall back to the §9.3
+        // guidance to set DUDUCLAW_CONTROL_URL.
+        let warnings = match &public_url {
+            Some(url) => vec![format!(
+                "金鑰已內建續期端點（{url}）：客戶 instance 無需設定 DUDUCLAW_CONTROL_URL，即會自動 phone-home 續期並接收撤銷（CRL）"
+            )],
+            None => vec![
+                "請經銷商在其 DuDuClaw instance 設定環境變數 DUDUCLAW_CONTROL_URL 指向本 owner gateway（例如 https://your-gateway.example.com），授權即會自動 phone-home 續期並接收撤銷（CRL）；未設定時仍會在 60 天無 phone-home 後降級為 OpenSource。或在 config.toml 設定 [distributor] public_url 讓後續簽發的金鑰自帶續期端點".to_string(),
+            ],
+        };
+        WsFrame::ok_response(
+            "",
+            json!({
+                "ok": true,
+                "license_blob": blob,
+                "record": record_v,
+                "warnings": warnings,
+            }),
+        )
+    }
+
+    async fn handle_distributor_revoke(&self, params: Value) -> WsFrame {
+        let license_id = match params.get("license_id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "缺少 'license_id' 參數"),
+        };
+        let store = self.distributor_store();
+        let rec = store.get_license(&license_id);
+        match store.revoke_license(&license_id) {
+            Ok(()) => {
+                self.audit_distributor_event(
+                    "distributor_license_revoked",
+                    json!({
+                        "license_id": license_id,
+                        "distributor_id": rec.as_ref().map(|r| r.distributor_id.clone()),
+                        "subscription_id": rec.as_ref().map(|r| r.subscription_id.clone()),
+                    }),
+                );
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "ok": true,
+                        "crl_note": "本地已標記撤銷；遠端撤銷需發布 CRL（見 commercial/LICENSE-OPERATIONS.md）",
+                    }),
+                )
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// Owner-side offline co-signing of a branding bundle (§10.3): the operator
+    /// pastes a distributor's branding JSON and the owner signs it directly with
+    /// the local issuer key — covering the case where the distributor instance
+    /// cannot reach `/v1/branding/sign`. Admin-gated; the owner is the
+    /// authoritative sanitizer (branding is run through `validate_input`).
+    async fn handle_distributor_bundle_sign(&self, params: Value) -> WsFrame {
+        let distributor_id = match params.get("distributor_id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "缺少 'distributor_id' 參數"),
+        };
+        let store = self.distributor_store();
+        if store.get_distributor(&distributor_id).is_none() {
+            return WsFrame::error_response("", "找不到該經銷商");
+        }
+
+        // Parse + authoritatively sanitize the submitted branding.
+        let submitted: crate::branding::BrandingConfig = match params.get("branding") {
+            Some(v) => match serde_json::from_value(v.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    return WsFrame::error_response("", &format!("branding 欄位無效：{e}"))
+                }
+            },
+            None => crate::branding::BrandingConfig::default(),
+        };
+        let sanitized = match crate::branding::validate_input(submitted.into()) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        // Traceability subscription id: explicit param, else derived from the id.
+        let subscription_id = params
+            .get("subscription_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("dist-{distributor_id}"));
+
+        let key_path = match self.distributor_issuer_key_path().await {
+            Some(p) => p,
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    "尚未配置簽發金鑰：請在 config.toml 設定 [distributor] issuer_key_path 指向 license-signing-v2.key",
+                )
+            }
+        };
+        let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(&key_path)) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        let issued_at = chrono::Utc::now().to_rfc3339();
+        let bundle = match crate::branding::sign_bundle(
+            &seed,
+            &distributor_id,
+            &subscription_id,
+            &sanitized,
+            &issued_at,
+            crate::branding::BUNDLE_KEY_ID,
+        ) {
+            Ok(b) => b,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        self.audit_distributor_event(
+            "branding_bundle_signed",
+            json!({
+                "distributor_id": distributor_id,
+                "subscription_id": subscription_id,
+                "mode": "owner_offline",
+            }),
+        );
+
+        match serde_json::to_value(&bundle) {
+            Ok(v) => WsFrame::ok_response("", json!({ "ok": true, "bundle": v })),
+            Err(e) => WsFrame::error_response("", &format!("serialize bundle: {e}")),
         }
     }
 
@@ -8705,19 +9721,41 @@ impl MethodHandler {
                             "SELECT COUNT(*) FROM sessions WHERE last_active >= ?1",
                             params![cutoff], |r| r.get(0),
                         ).unwrap_or(0);
+                        // 2026-07 MED: exclude hide/undo tombstones so the
+                        // dashboard counts match runs.list / runs.get. Older
+                        // DBs without the columns fall back to plain counts
+                        // (never silently 0).
                         let msgs: i64 = conn.query_row(
                             "SELECT COUNT(*) FROM session_messages sm
                              JOIN sessions s ON sm.session_id = s.id
-                             WHERE s.last_active >= ?1",
+                             WHERE s.last_active >= ?1
+                               AND COALESCE(sm.hidden, 0) = 0 AND sm.undone_at IS NULL",
                             params![cutoff], |r| r.get(0),
-                        ).unwrap_or(0);
+                        ).or_else(|e| match e {
+                            rusqlite::Error::SqliteFailure(..) => conn.query_row(
+                                "SELECT COUNT(*) FROM session_messages sm
+                                 JOIN sessions s ON sm.session_id = s.id
+                                 WHERE s.last_active >= ?1",
+                                params![cutoff], |r| r.get(0),
+                            ),
+                            other => Err(other),
+                        }).unwrap_or(0);
                         // auto_reply: messages from assistant role
                         let auto: i64 = conn.query_row(
                             "SELECT COUNT(*) FROM session_messages sm
                              JOIN sessions s ON sm.session_id = s.id
-                             WHERE s.last_active >= ?1 AND sm.role = 'assistant'",
+                             WHERE s.last_active >= ?1 AND sm.role = 'assistant'
+                               AND COALESCE(sm.hidden, 0) = 0 AND sm.undone_at IS NULL",
                             params![cutoff], |r| r.get(0),
-                        ).unwrap_or(0);
+                        ).or_else(|e| match e {
+                            rusqlite::Error::SqliteFailure(..) => conn.query_row(
+                                "SELECT COUNT(*) FROM session_messages sm
+                                 JOIN sessions s ON sm.session_id = s.id
+                                 WHERE s.last_active >= ?1 AND sm.role = 'assistant'",
+                                params![cutoff], |r| r.get(0),
+                            ),
+                            other => Err(other),
+                        }).unwrap_or(0);
                         (convos, msgs, auto, 850_u64, 2400_u64)
                     }
                     Err(_) => (0, 0, 0, 0, 0),
@@ -11357,12 +12395,17 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "task": task_json }))
     }
 
-    async fn handle_tasks_update(&self, params: Value, ctx: &UserContext) -> WsFrame {
+    async fn handle_tasks_update(&self, mut params: Value, ctx: &UserContext) -> WsFrame {
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
         };
-        let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        let task_id = params
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let task_id = task_id.as_str();
         if task_id.is_empty() {
             return WsFrame::error_response("", "task_id is required");
         }
@@ -11387,6 +12430,50 @@ impl MethodHandler {
                     return WsFrame::error_response("", &e);
                 }
             }
+        }
+        // HIGH-1 parity with the MCP layer: a depends_on rewire must reference
+        // existing tasks only (fail-closed — the store validates shape+cycle,
+        // existence is validated here at the RPC boundary). Accepts the stored
+        // JSON-array-string form or a JSON array; normalized before update.
+        if let Some(deps_val) = params.get("depends_on") {
+            let deps: Vec<String> = match deps_val {
+                Value::Array(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(String::from)
+                    .collect(),
+                Value::String(s) => match serde_json::from_str::<Vec<String>>(s) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        return WsFrame::error_response(
+                            "",
+                            "depends_on must be a JSON array of task ids",
+                        )
+                    }
+                },
+                _ => {
+                    return WsFrame::error_response(
+                        "",
+                        "depends_on must be a JSON array of task ids",
+                    )
+                }
+            };
+            for dep in &deps {
+                match store.get_task(dep).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return WsFrame::error_response(
+                            "",
+                            &format!("depends_on task not found: {dep}"),
+                        )
+                    }
+                    Err(e) => {
+                        return WsFrame::error_response("", &format!("validate depends_on: {e}"))
+                    }
+                }
+            }
+            let deps_json = serde_json::to_string(&deps).unwrap_or_else(|_| "[]".into());
+            params["depends_on"] = Value::String(deps_json);
         }
         // Capture previous status for TaskStatusChanged event emission.
         let prev_status = existing.map(|r| r.status);
@@ -11438,6 +12525,27 @@ impl MethodHandler {
                         };
                         let _ = store.append_activity(&activity).await;
                         self.broadcast_event("activity.new", activity_row_to_json(&activity)).await;
+                    }
+
+                    // ── S1 (PORTICO): subgoal closed ⇒ auto-revoke caps ──
+                    // A completed task IS a closed subgoal. Revoke every
+                    // capability granted under this task_id so no handle
+                    // survives its purpose (post-closure reuse denied).
+                    if status == "done" {
+                        match crate::capability::CapabilityBroker::open(&self.home_dir) {
+                            Ok(caps) => match caps.close_scope(task_id).await {
+                                Ok(n) if n > 0 => {
+                                    tracing::info!(task_id, revoked = n, "task done — capabilities auto-revoked");
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(task_id, error = %e, "close_scope on task done failed");
+                                }
+                            },
+                            Err(e) => {
+                                tracing::warn!(task_id, error = %e, "open capability store for close_scope failed");
+                            }
+                        }
                     }
                 }
 
@@ -11591,6 +12699,435 @@ impl MethodHandler {
         }
     }
 
+    // ── Co-edited plan handlers (U4) ────────────────────────
+    //
+    // A plan is agent-scoped exactly like a task (`plans.agent_id` mirrors
+    // `tasks.assigned_to`): Viewer binding to read, Operator to mutate.
+    // Every mutation appends to the Activity Feed so the timeline shows the
+    // co-editing, and broadcasts `plan.updated` for live dashboard refresh.
+
+    /// Max plan / step text length (chars, CJK-safe truncation).
+    const MAX_PLAN_TEXT_CHARS: usize = 2000;
+
+    /// Resolve the agent owning `plan_id` and confirm the caller may access it
+    /// at `level`. Fail-closed: unknown plan denies for non-admins (an admin
+    /// gets a plain "not found"). Mirrors `authorize_task_access`.
+    async fn authorize_plan_access(
+        &self,
+        store: &TaskStore,
+        ctx: &UserContext,
+        plan_id: &str,
+        level: AccessLevel,
+    ) -> Result<PlanRow, WsFrame> {
+        match store.get_plan(plan_id).await {
+            Ok(Some(row)) => {
+                if let Err(e) = acl::require_agent_access(ctx, &row.agent_id, level) {
+                    return Err(WsFrame::error_response("", &e));
+                }
+                Ok(row)
+            }
+            Ok(None) => {
+                if ctx.is_admin() {
+                    Err(WsFrame::error_response("", &format!("Plan not found: {plan_id}")))
+                } else {
+                    Err(WsFrame::error_response("", "permission denied"))
+                }
+            }
+            Err(e) => Err(WsFrame::error_response("", &format!("get plan: {e}"))),
+        }
+    }
+
+    /// Append a plan mutation to the Activity Feed + broadcast the co-editing
+    /// signal (`plan.updated` for panel refresh, `activity.new` for the feed).
+    async fn record_plan_activity(
+        &self,
+        store: &TaskStore,
+        event_type: &str,
+        plan: &PlanRow,
+        summary: String,
+    ) {
+        let activity = ActivityRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: event_type.into(),
+            agent_id: plan.agent_id.clone(),
+            task_id: None,
+            summary,
+            timestamp: Utc::now().to_rfc3339(),
+            metadata: Some(json!({ "plan_id": plan.id }).to_string()),
+        };
+        let _ = store.append_activity(&activity).await;
+        self.broadcast_event("activity.new", activity_row_to_json(&activity)).await;
+        self.broadcast_event(
+            "plan.updated",
+            json!({ "plan_id": plan.id, "agent_id": plan.agent_id }),
+        )
+        .await;
+    }
+
+    /// Actor label for activity summaries: the logged-in user or "system".
+    fn plan_actor(ctx: &UserContext) -> &str {
+        if ctx.user_id.is_empty() { "system" } else { ctx.user_id.as_str() }
+    }
+
+    async fn handle_plans_list(&self, params: Value) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let status = params.get("status").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let plans = match store.list_plans(agent_id, status).await {
+            Ok(rows) => rows,
+            Err(e) => return WsFrame::error_response("", &format!("list plans: {e}")),
+        };
+        // Progress counters ride along so the list view renders without N
+        // follow-up `plans.get` calls (plans are few; steps are tens).
+        let mut out: Vec<Value> = Vec::with_capacity(plans.len());
+        for p in &plans {
+            let steps = store.list_plan_steps(&p.id).await.unwrap_or_default();
+            let done = steps
+                .iter()
+                .filter(|s| s.status == "done" || s.status == "skipped")
+                .count();
+            let mut v = plan_row_to_json(p);
+            v["steps_total"] = json!(steps.len());
+            v["steps_done"] = json!(done);
+            out.push(v);
+        }
+        WsFrame::ok_response("", json!({ "plans": out }))
+    }
+
+    async fn handle_plans_get(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let plan_id = params.get("plan_id").and_then(|v| v.as_str()).unwrap_or("");
+        if plan_id.is_empty() {
+            return WsFrame::error_response("", "plan_id is required");
+        }
+        let plan = match self
+            .authorize_plan_access(&store, ctx, plan_id, AccessLevel::Viewer)
+            .await
+        {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        match store.list_plan_steps(plan_id).await {
+            Ok(steps) => WsFrame::ok_response(
+                "",
+                json!({
+                    "plan": plan_row_to_json(&plan),
+                    "steps": steps.iter().map(plan_step_row_to_json).collect::<Vec<_>>(),
+                }),
+            ),
+            Err(e) => WsFrame::error_response("", &format!("list plan steps: {e}")),
+        }
+    }
+
+    async fn handle_plans_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let title_raw = params.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        if title_raw.trim().is_empty() {
+            return WsFrame::error_response("", "title is required");
+        }
+        // agent_id presence + Operator binding already enforced at dispatch.
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut plan = PlanRow::new(
+            uuid::Uuid::new_v4().to_string(),
+            duduclaw_core::truncate_chars(title_raw.trim(), 200),
+            agent_id,
+            Self::plan_actor(ctx).to_string(),
+        );
+        if let Some(desc) = params.get("description").and_then(|v| v.as_str()) {
+            plan.description = duduclaw_core::truncate_chars(desc, Self::MAX_PLAN_TEXT_CHARS);
+        }
+        // Optional G8 goal linkage — fail-closed on a dangling goal id.
+        if let Some(goal_id) = params.get("goal_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            match store.get_goal(goal_id).await {
+                Ok(Some(_)) => plan.goal_id = Some(goal_id.to_string()),
+                Ok(None) => return WsFrame::error_response("", &format!("goal not found: {goal_id}")),
+                Err(e) => return WsFrame::error_response("", &format!("validate goal_id: {e}")),
+            }
+        }
+        if let Err(e) = store.insert_plan(&plan).await {
+            return WsFrame::error_response("", &format!("create plan: {e}"));
+        }
+        // Optional initial steps: [{text, assignee_kind?, assignee?}, …].
+        let mut steps_out: Vec<Value> = Vec::new();
+        if let Some(steps) = params.get("steps").and_then(|v| v.as_array()) {
+            for s in steps {
+                let text = s.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let kind = s.get("assignee_kind").and_then(|v| v.as_str()).unwrap_or("agent");
+                let assignee = s
+                    .get("assignee")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(if kind == "agent" { plan.agent_id.as_str() } else { "" });
+                match store
+                    .add_plan_step(
+                        &plan.id,
+                        &uuid::Uuid::new_v4().to_string(),
+                        &duduclaw_core::truncate_chars(text.trim(), Self::MAX_PLAN_TEXT_CHARS),
+                        kind,
+                        assignee,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(row) => steps_out.push(plan_step_row_to_json(&row)),
+                    Err(e) => return WsFrame::error_response("", &format!("add plan step: {e}")),
+                }
+            }
+        }
+        self.record_plan_activity(
+            &store,
+            "plan_created",
+            &plan,
+            format!("{} created plan: {}", Self::plan_actor(ctx), plan.title),
+        )
+        .await;
+        WsFrame::ok_response("", json!({ "plan": plan_row_to_json(&plan), "steps": steps_out }))
+    }
+
+    async fn handle_plans_update(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let plan_id = params.get("plan_id").and_then(|v| v.as_str()).unwrap_or("");
+        if plan_id.is_empty() {
+            return WsFrame::error_response("", "plan_id is required");
+        }
+        if let Err(f) = self
+            .authorize_plan_access(&store, ctx, plan_id, AccessLevel::Operator)
+            .await
+        {
+            return f;
+        }
+        match store.update_plan(plan_id, &params).await {
+            Ok(Some(plan)) => {
+                self.record_plan_activity(
+                    &store,
+                    "plan_updated",
+                    &plan,
+                    format!("{} updated plan: {}", Self::plan_actor(ctx), plan.title),
+                )
+                .await;
+                WsFrame::ok_response("", json!({ "plan": plan_row_to_json(&plan) }))
+            }
+            Ok(None) => WsFrame::error_response("", &format!("Plan not found: {plan_id}")),
+            Err(e) => WsFrame::error_response("", &format!("update plan: {e}")),
+        }
+    }
+
+    async fn handle_plans_remove(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let plan_id = params.get("plan_id").and_then(|v| v.as_str()).unwrap_or("");
+        if plan_id.is_empty() {
+            return WsFrame::error_response("", "plan_id is required");
+        }
+        let plan = match self
+            .authorize_plan_access(&store, ctx, plan_id, AccessLevel::Operator)
+            .await
+        {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        match store.remove_plan(plan_id).await {
+            Ok(true) => {
+                self.record_plan_activity(
+                    &store,
+                    "plan_removed",
+                    &plan,
+                    format!("{} removed plan: {}", Self::plan_actor(ctx), plan.title),
+                )
+                .await;
+                WsFrame::ok_response("", json!({ "success": true }))
+            }
+            Ok(false) => WsFrame::error_response("", &format!("Plan not found: {plan_id}")),
+            Err(e) => WsFrame::error_response("", &format!("remove plan: {e}")),
+        }
+    }
+
+    async fn handle_plans_add_step(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let plan_id = params.get("plan_id").and_then(|v| v.as_str()).unwrap_or("");
+        if plan_id.is_empty() {
+            return WsFrame::error_response("", "plan_id is required");
+        }
+        let plan = match self
+            .authorize_plan_access(&store, ctx, plan_id, AccessLevel::Operator)
+            .await
+        {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        if text.trim().is_empty() {
+            return WsFrame::error_response("", "text is required");
+        }
+        let kind = params.get("assignee_kind").and_then(|v| v.as_str()).unwrap_or("agent");
+        let assignee = params
+            .get("assignee")
+            .and_then(|v| v.as_str())
+            .unwrap_or(if kind == "agent" { plan.agent_id.as_str() } else { "" });
+        let position = params
+            .get("position")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as usize);
+        match store
+            .add_plan_step(
+                plan_id,
+                &uuid::Uuid::new_v4().to_string(),
+                &duduclaw_core::truncate_chars(text.trim(), Self::MAX_PLAN_TEXT_CHARS),
+                kind,
+                assignee,
+                position,
+            )
+            .await
+        {
+            Ok(row) => {
+                self.record_plan_activity(
+                    &store,
+                    "plan_step_added",
+                    &plan,
+                    format!(
+                        "{} added a step to {}: {}",
+                        Self::plan_actor(ctx),
+                        plan.title,
+                        duduclaw_core::truncate_chars(&row.text, 80)
+                    ),
+                )
+                .await;
+                WsFrame::ok_response("", json!({ "step": plan_step_row_to_json(&row) }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("add plan step: {e}")),
+        }
+    }
+
+    async fn handle_plans_update_step(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let step_id = params.get("step_id").and_then(|v| v.as_str()).unwrap_or("");
+        if step_id.is_empty() {
+            return WsFrame::error_response("", "step_id is required");
+        }
+        // Resolve the step → its plan → the plan's agent, then gate (Operator).
+        let step = match store.get_plan_step(step_id).await {
+            Ok(Some(s)) => s,
+            Ok(None) if ctx.is_admin() => {
+                return WsFrame::error_response("", &format!("Step not found: {step_id}"))
+            }
+            Ok(None) => return WsFrame::error_response("", "permission denied"),
+            Err(e) => return WsFrame::error_response("", &format!("get step: {e}")),
+        };
+        let plan = match self
+            .authorize_plan_access(&store, ctx, &step.plan_id, AccessLevel::Operator)
+            .await
+        {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        // Field edits (text / status / assignee_kind / assignee) — validated
+        // fail-closed by the store; `position` alone is a pure reorder.
+        let has_field_edit = ["text", "status", "assignee_kind", "assignee"]
+            .iter()
+            .any(|k| params.get(k).is_some());
+        if has_field_edit {
+            if let Err(e) = store.update_plan_step(step_id, &params).await {
+                return WsFrame::error_response("", &format!("update plan step: {e}"));
+            }
+        }
+        if let Some(pos) = params.get("position").and_then(|v| v.as_u64()) {
+            match store.move_plan_step(&step.plan_id, step_id, pos as usize).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return WsFrame::error_response("", &format!("Step not found: {step_id}"))
+                }
+                Err(e) => return WsFrame::error_response("", &format!("move plan step: {e}")),
+            }
+        } else if !has_field_edit {
+            return WsFrame::error_response("", "no step fields to update");
+        }
+        let updated = match store.get_plan_step(step_id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return WsFrame::error_response("", &format!("Step not found: {step_id}")),
+            Err(e) => return WsFrame::error_response("", &format!("get step: {e}")),
+        };
+        self.record_plan_activity(
+            &store,
+            "plan_step_updated",
+            &plan,
+            format!(
+                "{} updated a step in {}: {}",
+                Self::plan_actor(ctx),
+                plan.title,
+                duduclaw_core::truncate_chars(&updated.text, 80)
+            ),
+        )
+        .await;
+        WsFrame::ok_response("", json!({ "step": plan_step_row_to_json(&updated) }))
+    }
+
+    async fn handle_plans_remove_step(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let step_id = params.get("step_id").and_then(|v| v.as_str()).unwrap_or("");
+        if step_id.is_empty() {
+            return WsFrame::error_response("", "step_id is required");
+        }
+        let step = match store.get_plan_step(step_id).await {
+            Ok(Some(s)) => s,
+            Ok(None) if ctx.is_admin() => {
+                return WsFrame::error_response("", &format!("Step not found: {step_id}"))
+            }
+            Ok(None) => return WsFrame::error_response("", "permission denied"),
+            Err(e) => return WsFrame::error_response("", &format!("get step: {e}")),
+        };
+        let plan = match self
+            .authorize_plan_access(&store, ctx, &step.plan_id, AccessLevel::Operator)
+            .await
+        {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        match store.remove_plan_step(step_id).await {
+            Ok(Some(removed)) => {
+                self.record_plan_activity(
+                    &store,
+                    "plan_step_removed",
+                    &plan,
+                    format!(
+                        "{} removed a step from {}: {}",
+                        Self::plan_actor(ctx),
+                        plan.title,
+                        duduclaw_core::truncate_chars(&removed.text, 80)
+                    ),
+                )
+                .await;
+                WsFrame::ok_response("", json!({ "success": true }))
+            }
+            Ok(None) => WsFrame::error_response("", &format!("Step not found: {step_id}")),
+            Err(e) => WsFrame::error_response("", &format!("remove plan step: {e}")),
+        }
+    }
+
     // ── Activity handlers ───────────────────────────────────
 
     async fn handle_activity_list(&self, params: Value) -> WsFrame {
@@ -11610,6 +13147,398 @@ impl MethodHandler {
             }
             Err(e) => WsFrame::error_response("", &format!("list activity: {e}")),
         }
+    }
+
+    // ── Work Timeline (G11) ─────────────────────────────────
+    //
+    // Company-level Gantt rows derived from the stores that already carry
+    // real timestamps: the task board (ranged: created/claimed → completed),
+    // the activity feed (instants), and the in-memory heartbeat scheduler
+    // (`last_run` instants only — heartbeat run durations are NOT persisted
+    // anywhere, so heartbeats are honestly rendered as dots, never bars).
+
+    async fn handle_timeline_list(&self, params: Value) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let now = Utc::now();
+        let to = params
+            .get("to")
+            .and_then(|v| v.as_str())
+            .and_then(parse_timeline_ts)
+            .unwrap_or(now);
+        let from = params
+            .get("from")
+            .and_then(|v| v.as_str())
+            .and_then(parse_timeline_ts)
+            .unwrap_or_else(|| to - chrono::Duration::hours(24));
+        if from >= to {
+            return WsFrame::error_response("", "invalid range: `from` must be earlier than `to`");
+        }
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+        let tasks = match store.list_tasks(None, agent_id, None).await {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &format!("timeline tasks: {e}")),
+        };
+        // Most-recent TIMELINE_ROW_CAP activity events; events older than the
+        // newest cap-full may be missing from wide windows — the `truncated`
+        // flag + `cap` in the response make that visible to the client.
+        let (activities, _total) = match store
+            .list_activity(agent_id, None, TIMELINE_ROW_CAP as i64, 0)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return WsFrame::error_response("", &format!("timeline activity: {e}")),
+        };
+        let heartbeats: Vec<(String, Option<String>)> = {
+            let hb = self.heartbeat.read().await;
+            match hb.as_ref() {
+                Some(scheduler) => scheduler
+                    .status()
+                    .await
+                    .into_iter()
+                    .filter(|h| agent_id.is_none_or(|a| a == h.agent_id))
+                    .map(|h| (h.agent_id, h.last_run))
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+
+        let (rows, truncated) = derive_timeline_rows(&tasks, &activities, &heartbeats, from, to, now);
+        WsFrame::ok_response(
+            "",
+            json!({
+                "rows": rows,
+                "cap": TIMELINE_ROW_CAP,
+                "truncated": truncated,
+                "from": from.to_rfc3339(),
+                "to": to.to_rfc3339(),
+            }),
+        )
+    }
+
+    // ── Run inspector (G12) ─────────────────────────────────
+    //
+    // A "run" is one user turn → the next assistant turn of the same session
+    // in `sessions.db` (the only place per-run conversation turns are
+    // persisted). Tool events come from the MCP tool audit trail
+    // (`tool_calls.jsonl`), correlated by agent + time window.
+    //
+    // HONESTY NOTE (what per-run event persistence actually is): session
+    // text turns come from sessions.db, MCP-tool-call receipts from
+    // tool_calls.jsonl, and — since the G12 upgrade — CLI-native tool steps
+    // (`StepTracker` Start boundaries) plus `TodoWrite` board snapshots from
+    // the bounded `run_steps.db` (written best-effort on the channel-reply
+    // fresh-spawn CLI path; PTY-pool sessions and thinking summaries are
+    // still NOT captured). `runs.get` states the remaining limits in its
+    // response instead of fabricating events.
+
+    async fn handle_runs_list(&self, params: Value) -> WsFrame {
+        let agent_filter = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !agent_filter.is_empty() && !is_valid_agent_id(&agent_filter) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(RUNS_LIST_DEFAULT_LIMIT as u64)
+            .min(RUNS_LIST_MAX_LIMIT as u64) as usize;
+
+        let db_path = self.home_dir.join("sessions.db");
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "runs": [] }));
+        }
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &format!("open sessions db: {e}")),
+        };
+
+        let mut rows = match query_run_msg_rows(&conn, &agent_filter, RUNS_SCAN_MSG_CAP) {
+            Ok(r) => r,
+            Err(e) => return WsFrame::error_response("", &format!("runs query: {e}")),
+        };
+        // Fold expects per-session chronological order.
+        rows.sort_by(|a, b| (&a.session_id, a.rowid).cmp(&(&b.session_id, b.rowid)));
+        let now = Utc::now();
+        let mut runs = fold_session_runs(&rows, now);
+        runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        runs.truncate(limit);
+
+        // Step counts: prefer the persisted CLI-native step stream
+        // (run_steps.db — real `tool_use` boundaries, matched by session key
+        // + window). Runs predating the step store (or PTY-pool runs, which
+        // don't stream through the fresh-spawn parser) have no rows there
+        // and fall back to the MCP tool audit trail as before. The two are
+        // never summed — MCP calls also appear as CLI tool_use boundaries,
+        // so adding them would double-count.
+        let tool_rows = load_tool_call_rows(&self.home_dir);
+        let step_metas = crate::run_steps::shared_store(&self.home_dir)
+            .and_then(|s| s.recent_tool_step_meta(&agent_filter, RUN_STEPS_SCAN_CAP).ok())
+            .unwrap_or_default();
+        let runs_json: Vec<Value> = runs
+            .iter()
+            .map(|r| {
+                let native = step_metas
+                    .iter()
+                    .filter(|(sk, ts)| step_meta_in_run_window(sk, ts, r, now))
+                    .count();
+                let steps = if native > 0 {
+                    native
+                } else {
+                    tool_rows
+                        .iter()
+                        .filter(|t| tool_row_in_run_window(t, r, now))
+                        .count()
+                };
+                run_summary_to_json(r, steps)
+            })
+            .collect();
+        WsFrame::ok_response("", json!({ "runs": runs_json }))
+    }
+
+    async fn handle_runs_get(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let run_id = params.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
+        let Some((session_id, rowid_str)) = run_id.rsplit_once('#') else {
+            return WsFrame::error_response("", "Missing or invalid 'run_id' parameter");
+        };
+        let Ok(rowid) = rowid_str.parse::<i64>() else {
+            return WsFrame::error_response("", "Missing or invalid 'run_id' parameter");
+        };
+
+        let db_path = self.home_dir.join("sessions.db");
+        if !db_path.exists() {
+            return WsFrame::error_response("", "Run not found");
+        }
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &format!("open sessions db: {e}")),
+        };
+
+        // Resolve the run's user turn + owning agent. Fail closed: an unknown
+        // run id yields "not found" BEFORE any payload is exposed.
+        //
+        // 2026-07 MED: honour the /undo //rollback tombstones like runs.list
+        // does (`query_run_msg_rows`) — runs.get is the user-facing transcript
+        // view, not an audit surface, so undone turns must not resolve.
+        // Pre-migration DBs (no hidden/undone_at columns) fall back to the
+        // plain query, mirroring `query_run_msg_rows`.
+        let head_row = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        };
+        let head = conn
+            .query_row(
+                "SELECT s.agent_id, m.role, m.content, m.timestamp
+                 FROM session_messages m JOIN sessions s ON s.id = m.session_id
+                 WHERE m.id = ?1 AND m.session_id = ?2
+                   AND COALESCE(m.hidden, 0) = 0 AND m.undone_at IS NULL",
+                params![rowid, session_id],
+                head_row,
+            )
+            .or_else(|e| match e {
+                // Older DB without the tombstone columns → plain query.
+                rusqlite::Error::SqliteFailure(..) => conn.query_row(
+                    "SELECT s.agent_id, m.role, m.content, m.timestamp
+                     FROM session_messages m JOIN sessions s ON s.id = m.session_id
+                     WHERE m.id = ?1 AND m.session_id = ?2",
+                    params![rowid, session_id],
+                    head_row,
+                ),
+                other => Err(other),
+            });
+        let (agent_id, role, user_content, started_at) = match head {
+            Ok(v) => v,
+            Err(_) => return WsFrame::error_response("", "Run not found"),
+        };
+        if role != "user" {
+            return WsFrame::error_response("", "Run not found");
+        }
+        // Agent-scoped authz — same intent as activity.list, resolved from
+        // the run's owning agent (viewer level, fail-closed for non-admins).
+        if !ctx.is_admin() {
+            if let Err(e) = acl::require_agent_access(ctx, &agent_id, AccessLevel::Viewer) {
+                return WsFrame::error_response("", &e);
+            }
+        }
+
+        // Window boundaries: the next user turn bounds this run; the first
+        // assistant turn inside the bound is the reply.
+        let next_user: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, timestamp FROM session_messages
+                 WHERE session_id = ?1 AND id > ?2 AND role = 'user'
+                   AND COALESCE(hidden, 0) = 0 AND undone_at IS NULL
+                 ORDER BY id LIMIT 1",
+                params![session_id, rowid],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::SqliteFailure(..) => conn.query_row(
+                    "SELECT id, timestamp FROM session_messages
+                     WHERE session_id = ?1 AND id > ?2 AND role = 'user'
+                     ORDER BY id LIMIT 1",
+                    params![session_id, rowid],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                ),
+                other => Err(other),
+            })
+            .ok();
+        let bound_id = next_user.as_ref().map(|(id, _)| *id).unwrap_or(i64::MAX);
+        let assistant: Option<(String, String)> = conn
+            .query_row(
+                "SELECT content, timestamp FROM session_messages
+                 WHERE session_id = ?1 AND id > ?2 AND id < ?3 AND role = 'assistant'
+                   AND COALESCE(hidden, 0) = 0 AND undone_at IS NULL
+                 ORDER BY id LIMIT 1",
+                params![session_id, rowid, bound_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::SqliteFailure(..) => conn.query_row(
+                    "SELECT content, timestamp FROM session_messages
+                     WHERE session_id = ?1 AND id > ?2 AND id < ?3 AND role = 'assistant'
+                     ORDER BY id LIMIT 1",
+                    params![session_id, rowid, bound_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                ),
+                other => Err(other),
+            })
+            .ok();
+
+        let now = Utc::now();
+        let (status, ended_at) = match &assistant {
+            Some((_, ts)) => ("completed".to_string(), Some(ts.clone())),
+            None => {
+                if next_user.is_some() {
+                    ("no_reply".to_string(), None)
+                } else {
+                    (run_open_status(&started_at, now), None)
+                }
+            }
+        };
+
+        // Tool events (MCP audit trail) inside the run window.
+        let window_end: Option<chrono::DateTime<Utc>> = match &ended_at {
+            Some(ts) => parse_timeline_ts(ts),
+            None => match &next_user {
+                Some((_, ts)) => parse_timeline_ts(ts),
+                None => {
+                    if status == "running" {
+                        Some(now)
+                    } else {
+                        parse_timeline_ts(&started_at)
+                            .map(|t| t + chrono::Duration::seconds(RUN_RUNNING_WINDOW_SECS))
+                    }
+                }
+            },
+        };
+        let window_start = parse_timeline_ts(&started_at);
+
+        let mut events: Vec<Value> = Vec::new();
+        events.push(json!({
+            "kind": "text",
+            "role": "user",
+            "ts": started_at,
+            "preview": duduclaw_core::truncate_chars(&user_content, RUN_TEXT_PREVIEW_CHARS),
+        }));
+        if let (Some(ws), Some(we)) = (window_start, window_end) {
+            for t in load_tool_call_rows(&self.home_dir) {
+                if t.agent_id != agent_id {
+                    continue;
+                }
+                let Some(ts) = parse_timeline_ts(&t.ts) else { continue };
+                if ts >= ws && ts <= we {
+                    events.push(json!({
+                        "kind": "tool_use",
+                        "tool": t.tool,
+                        "ok": t.ok,
+                        "ts": t.ts,
+                        "preview": duduclaw_core::truncate_chars(&t.preview, RUN_TOOL_PREVIEW_CHARS),
+                    }));
+                }
+            }
+        }
+        // Persisted CLI-native step events (run_steps.db) inside the window:
+        // tool_step Start boundaries + todo_update board snapshots. Matched
+        // by session key (exact) + agent + time window; a missing/empty
+        // store simply contributes nothing (older runs stay as they were).
+        if let (Some(ws), Some(we)) = (window_start, window_end) {
+            if let Some(store) = crate::run_steps::shared_store(&self.home_dir) {
+                if let Ok(rows) = store.recent_for_session(session_id, RUN_STEPS_SESSION_CAP) {
+                    events.extend(persisted_step_events_for_window(&rows, ws, we));
+                }
+            }
+        }
+        if let Some((content, ts)) = &assistant {
+            events.push(json!({
+                "kind": "text",
+                "role": "assistant",
+                "ts": ts,
+                "preview": duduclaw_core::truncate_chars(content, RUN_TEXT_PREVIEW_CHARS),
+            }));
+        }
+        // Chronological order. Compare by the PARSED instant, not the raw
+        // string — sources format the same time differently (sessions.db uses
+        // `+00:00`, run_steps uses `Z`), so a raw string compare mis-orders
+        // same-instant cross-source events. `seq` breaks remaining ties
+        // (monotonic within the run_steps stream); a stable sort then keeps
+        // insertion order (user turn first) for events with neither signal.
+        let ts_instant = |v: &serde_json::Value| -> Option<chrono::DateTime<chrono::Utc>> {
+            v.get("ts")
+                .and_then(|t| t.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        };
+        events.sort_by(|a, b| {
+            let ia = ts_instant(a);
+            let ib = ts_instant(b);
+            ia.cmp(&ib).then_with(|| {
+                let sa = a.get("seq").and_then(|v| v.as_i64());
+                let sb = b.get("seq").and_then(|v| v.as_i64());
+                sa.cmp(&sb)
+            })
+        });
+
+        let run = json!({
+            "id": run_id,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "channel": run_channel_of(session_id),
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "status": status,
+        });
+        WsFrame::ok_response(
+            "",
+            json!({
+                "run": run,
+                "events": events,
+                // Honest provenance: which store produced which event kind,
+                // and which live-stream kinds are NOT persisted anywhere.
+                // Thinking summaries are still only counted (never captured)
+                // by the stream parser, so they remain unpersisted.
+                "event_sources": {
+                    "text": "sessions.db",
+                    "tool_use": "tool_calls.jsonl (MCP audit)",
+                    "tool_step": "run_steps.db",
+                    "todo_update": "run_steps.db",
+                },
+                "not_persisted": ["thinking_summaries"],
+            }),
+        )
     }
 
     // ── Live Run Forking handlers (RFC-26) ──────────────────
@@ -11908,6 +13837,52 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("decide: {e}"));
         }
 
+        // ── S1 (PORTICO): mint an epoch-bound capability on approve ──
+        // Approving is no longer a permanent grant. If the approval payload
+        // carries a `scope_epoch` (a task_id / session_id subgoal key), mint
+        // a revocable capability handle bound to it; closing that subgoal
+        // (task done / session end) auto-revokes the handle. Absent a
+        // scope_epoch we skip minting — the legacy one-shot behaviour — so
+        // this is additive and never blocks existing approve flows.
+        let mut capability_handle: Value = Value::Null;
+        if approve {
+            if let Some(rec) = &record {
+                if let Some(epoch) = rec.payload.get("scope_epoch").and_then(|v| v.as_str()) {
+                    if !epoch.is_empty() {
+                        match crate::capability::CapabilityBroker::open(&self.home_dir) {
+                            Ok(caps) => {
+                                let ttl = rec
+                                    .payload
+                                    .get("capability_ttl_seconds")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(rec.ttl_seconds);
+                                match caps
+                                    .grant_from_approval(&broker, &approval_id, epoch, ttl, None)
+                                    .await
+                                {
+                                    Ok(g) => capability_handle = json!(g.handle_id),
+                                    Err(e) => {
+                                        // Fail-closed: minting failed ⇒ report,
+                                        // do NOT silently proceed as if granted.
+                                        return WsFrame::error_response(
+                                            "",
+                                            &format!("已核准但核發授權憑證失敗（保守拒絕）：{e}"),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                return WsFrame::error_response(
+                                    "",
+                                    &format!("開啟授權憑證儲存失敗：{e}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Side-effect: custom skill creation (V13-T13.0) ──
         // Approver identity is already gated by require_manager!; routing to a
         // human's manager is a fallback here (no manager_id column yet ⇒ any
@@ -11959,6 +13934,7 @@ impl MethodHandler {
             "id": id,
             "decided": if approve { "approved" } else { "denied" },
             "side_effect": side_effect,
+            "capability_handle": capability_handle,
         }))
     }
 
@@ -12727,6 +14703,36 @@ fn comment_row_to_json(r: &CommentRow) -> Value {
     })
 }
 
+// ── U4 co-edited plan JSON shapes ───────────────────────────
+
+fn plan_row_to_json(r: &PlanRow) -> Value {
+    json!({
+        "id": r.id,
+        "title": r.title,
+        "description": r.description,
+        "agent_id": r.agent_id,
+        "goal_id": r.goal_id,
+        "status": r.status,
+        "created_by": r.created_by,
+        "created_at": r.created_at,
+        "updated_at": r.updated_at,
+    })
+}
+
+fn plan_step_row_to_json(r: &PlanStepRow) -> Value {
+    json!({
+        "id": r.id,
+        "plan_id": r.plan_id,
+        "text": r.text,
+        "assignee_kind": r.assignee_kind,
+        "assignee": r.assignee,
+        "status": r.status,
+        "step_order": r.step_order,
+        "created_at": r.created_at,
+        "updated_at": r.updated_at,
+    })
+}
+
 fn autopilot_rule_to_json(r: &AutopilotRuleRow) -> Value {
     json!({
         "id": r.id,
@@ -12754,6 +14760,9 @@ fn validate_autopilot_trigger_event(ev: &str) -> Result<(), String> {
         "channel_message",
         "agent_idle",
         "cron_tick",
+        // Foresight signal (see `autopilot_engine::Event::RunAtRisk`) — was
+        // missing here, so rules could never subscribe to it (2026-07 MED).
+        "run_at_risk",
     ];
     if KNOWN.iter().any(|k| *k == ev) {
         Ok(())
@@ -12970,9 +14979,18 @@ mod autopilot_validation_tests {
             "channel_message",
             "agent_idle",
             "cron_tick",
+            "run_at_risk",
         ] {
             assert!(validate_autopilot_trigger_event(ev).is_ok(), "should accept {ev}");
         }
+    }
+
+    #[test]
+    fn trigger_event_accepts_foresight_run_at_risk() {
+        // 2026-07 MED regression: `run_at_risk` is emitted by the engine
+        // (`Event::RunAtRisk.event_name()`) but was rejected at rule-write
+        // time, so no rule could ever subscribe to the foresight event.
+        assert!(validate_autopilot_trigger_event("run_at_risk").is_ok());
     }
 
     #[test]
@@ -13765,5 +15783,1341 @@ policies:
         assert!(!is_valid_agent_id("../etc"));
         assert!(!is_valid_agent_id("Bad Name"));
         assert!(is_valid_agent_id("bruno"));
+    }
+}
+
+// ── Work Timeline (G11) row derivation ─────────────────────────────────────
+//
+// Pure functions (no I/O) so the Gantt-row shaping is unit-testable. Rows come
+// only from stores that carry REAL timestamps:
+//   • task board  — ranged bars (created/claimed → completed) or honest instants
+//   • activity    — instants (`ended_at == started_at`); the UI renders dots
+//   • heartbeat   — `last_run` instants only (run durations are not persisted)
+
+/// Hard cap on rows returned by `timeline.list` (stated in the response).
+pub(crate) const TIMELINE_ROW_CAP: usize = 2000;
+
+/// One lane row of the company work timeline.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct TimelineRow {
+    pub agent_id: String,
+    /// "task" | "delegation" | "heartbeat" | "skill" | "autopilot" | "governance" | "activity"
+    pub kind: String,
+    pub label: String,
+    /// RFC3339.
+    pub started_at: String,
+    /// RFC3339. `None` = still running (UI extends to now);
+    /// equal to `started_at` = a point-in-time instant (UI renders a dot).
+    pub ended_at: Option<String>,
+    pub status: String,
+    pub ref_id: String,
+}
+
+pub(crate) fn parse_timeline_ts(s: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// Classify an activity `event_type` into a timeline lane kind.
+pub(crate) fn timeline_kind_for_event(event_type: &str) -> &'static str {
+    let t = event_type.to_ascii_lowercase();
+    if t.contains("delegat") {
+        "delegation"
+    } else if t.contains("heartbeat") {
+        "heartbeat"
+    } else if t.contains("skill") {
+        "skill"
+    } else if t.contains("autopilot") {
+        "autopilot"
+    } else if t.contains("governance") || t.contains("security") {
+        "governance"
+    } else {
+        "activity"
+    }
+}
+
+/// Derive a timeline row from one task, or `None` when the task has no
+/// parseable timestamps or falls entirely outside the `[from, to]` window.
+///
+/// Honesty rules (never invent a duration):
+///   • done / cancelled / failed → bar `start → completed_at` (fallback
+///     `updated_at`, the moment the terminal status was written)
+///   • in_progress → running bar (`ended_at = None`)
+///   • blocked / in_review with a real claim → bar `claimed_at → updated_at`
+///     (the moment the task entered its current state)
+///   • anything never started (todo / backlog / unclaimed blocked) → an
+///     instant at `created_at`
+pub(crate) fn timeline_row_from_task(
+    task: &TaskRow,
+    from: chrono::DateTime<Utc>,
+    to: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> Option<TimelineRow> {
+    let claimed = task
+        .claimed_at
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(parse_timeline_ts);
+    let created = parse_timeline_ts(&task.created_at);
+    let start = claimed.or(created)?;
+
+    let end: Option<chrono::DateTime<Utc>> = match task.status.as_str() {
+        "in_progress" => None,
+        "done" | "cancelled" | "failed" => Some(
+            task.completed_at
+                .as_deref()
+                .and_then(parse_timeline_ts)
+                .or_else(|| parse_timeline_ts(&task.updated_at))
+                .unwrap_or(start),
+        ),
+        "blocked" | "in_review" => {
+            if claimed.is_some() {
+                Some(parse_timeline_ts(&task.updated_at).unwrap_or(start))
+            } else {
+                // Never started: a queue-state instant, not a fake bar.
+                Some(start)
+            }
+        }
+        // todo / backlog / unknown: queued, no real work interval.
+        _ => Some(start),
+    };
+    // A terminal timestamp earlier than the start is data noise, not a
+    // negative-width bar — clamp to an instant.
+    let end = end.map(|e| e.max(start));
+
+    // Window intersection (running bars extend to `now`).
+    let effective_end = end.unwrap_or(now);
+    if effective_end < from || start > to {
+        return None;
+    }
+
+    Some(TimelineRow {
+        agent_id: task.assigned_to.clone(),
+        kind: "task".into(),
+        label: duduclaw_core::truncate_chars(&task.title, 120),
+        started_at: start.to_rfc3339(),
+        ended_at: end.map(|e| e.to_rfc3339()),
+        status: task.status.clone(),
+        ref_id: task.id.clone(),
+    })
+}
+
+/// Derive an instant row from one activity event (or `None` if outside the
+/// window / unparseable / redundant with task bars).
+pub(crate) fn timeline_row_from_activity(
+    event: &ActivityRow,
+    from: chrono::DateTime<Utc>,
+    to: chrono::DateTime<Utc>,
+) -> Option<TimelineRow> {
+    // `task_created` duplicates the start edge of the task bar emitted by
+    // `timeline_row_from_task` — drop it to avoid double-marking lanes.
+    if event.event_type == "task_created" {
+        return None;
+    }
+    let ts = parse_timeline_ts(&event.timestamp)?;
+    if ts < from || ts > to {
+        return None;
+    }
+    let rfc = ts.to_rfc3339();
+    Some(TimelineRow {
+        agent_id: event.agent_id.clone(),
+        kind: timeline_kind_for_event(&event.event_type).into(),
+        label: duduclaw_core::truncate_chars(&event.summary, 120),
+        started_at: rfc.clone(),
+        ended_at: Some(rfc),
+        status: event.event_type.clone(),
+        ref_id: event.id.clone(),
+    })
+}
+
+/// Merge tasks + activity instants + heartbeat `last_run` instants into a
+/// window-filtered, chronologically sorted, capped row set.
+/// Returns `(rows, truncated)`.
+pub(crate) fn derive_timeline_rows(
+    tasks: &[TaskRow],
+    activities: &[ActivityRow],
+    heartbeats: &[(String, Option<String>)],
+    from: chrono::DateTime<Utc>,
+    to: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> (Vec<TimelineRow>, bool) {
+    let mut rows: Vec<TimelineRow> = Vec::new();
+    for task in tasks {
+        if let Some(r) = timeline_row_from_task(task, from, to, now) {
+            rows.push(r);
+        }
+    }
+    for event in activities {
+        if let Some(r) = timeline_row_from_activity(event, from, to) {
+            rows.push(r);
+        }
+    }
+    for (agent_id, last_run) in heartbeats {
+        let Some(ts) = last_run.as_deref().and_then(parse_timeline_ts) else {
+            continue;
+        };
+        if ts < from || ts > to {
+            continue;
+        }
+        let rfc = ts.to_rfc3339();
+        rows.push(TimelineRow {
+            agent_id: agent_id.clone(),
+            kind: "heartbeat".into(),
+            label: String::new(),
+            started_at: rfc.clone(),
+            ended_at: Some(rfc),
+            status: "fired".into(),
+            ref_id: format!("heartbeat:{agent_id}"),
+        });
+    }
+    rows.sort_by(|a, b| {
+        a.started_at
+            .cmp(&b.started_at)
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+            .then_with(|| a.ref_id.cmp(&b.ref_id))
+    });
+    // `truncated` must also cover the case where the activity FETCH hit its
+    // row cap entirely inside the window: the derived row count then stays at
+    // or under the cap, but events older than the oldest fetched activity —
+    // yet still newer than `from` — were never loaded (LOW, 2026-07 review).
+    let fetch_hit_cap = activities.len() >= TIMELINE_ROW_CAP;
+    let oldest_fetched_newer_than_from = activities
+        .iter()
+        .filter_map(|a| parse_timeline_ts(&a.timestamp))
+        .min()
+        .map(|ts| ts > from)
+        .unwrap_or(false);
+    let truncated =
+        rows.len() > TIMELINE_ROW_CAP || (fetch_hit_cap && oldest_fetched_newer_than_from);
+    rows.truncate(TIMELINE_ROW_CAP);
+    (rows, truncated)
+}
+
+// ── Run inspector helpers (G12) ────────────────────────────────────────────
+//
+// Pure functions (no I/O beyond the jsonl loader) so the run derivation is
+// unit-testable. A run = one `user` turn → the next `assistant` turn of the
+// same session; tool receipts are matched by agent + time window from the MCP
+// audit trail. No new store is invented — everything derives from what the
+// gateway already persists.
+
+/// Default / max page size for `runs.list`.
+pub(crate) const RUNS_LIST_DEFAULT_LIMIT: usize = 50;
+pub(crate) const RUNS_LIST_MAX_LIMIT: usize = 200;
+/// How many most-recent session messages are scanned per listing (bounds the
+/// full-table read; older turns simply fall off the "recent runs" horizon).
+pub(crate) const RUNS_SCAN_MSG_CAP: usize = 4000;
+/// An unanswered trailing user turn younger than this reads as "running";
+/// older reads as "no_reply" (we never guess at a duration).
+pub(crate) const RUN_RUNNING_WINDOW_SECS: i64 = 600;
+/// Char caps (CJK-safe — `truncate_chars`, never byte slicing).
+pub(crate) const RUN_LIST_PREVIEW_CHARS: usize = 120;
+pub(crate) const RUN_TOOL_PREVIEW_CHARS: usize = 240;
+pub(crate) const RUN_TEXT_PREVIEW_CHARS: usize = 2000;
+
+/// One user/assistant turn row fetched from `session_messages`.
+#[derive(Debug, Clone)]
+pub(crate) struct RunMsgRow {
+    pub rowid: i64,
+    pub session_id: String,
+    pub agent_id: String,
+    /// "user" | "assistant" (other roles are filtered out in SQL).
+    pub role: String,
+    /// RFC3339.
+    pub ts: String,
+    /// Char-truncated content preview.
+    pub preview: String,
+}
+
+/// A derived run (one user turn + its optional assistant reply).
+#[derive(Debug, Clone)]
+pub(crate) struct RunSummary {
+    pub id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub channel: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    /// "completed" | "running" | "no_reply"
+    pub status: String,
+    pub preview: String,
+}
+
+/// Channel token of a session id ("telegram:12345" → "telegram"). Ids without
+/// a `:` separator get the honest bucket "other" — never a guessed channel.
+pub(crate) fn run_channel_of(session_id: &str) -> String {
+    match session_id.split_once(':') {
+        Some((ch, _)) if !ch.is_empty() => ch.to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+/// Status of a trailing unanswered user turn: recent ⇒ probably still being
+/// answered ("running"); stale ⇒ "no_reply". Unparseable ts fails closed to
+/// "no_reply" (never claims something is live without evidence).
+pub(crate) fn run_open_status(started_at: &str, now: chrono::DateTime<Utc>) -> String {
+    match parse_timeline_ts(started_at) {
+        Some(t) if (now - t).num_seconds() <= RUN_RUNNING_WINDOW_SECS => "running".to_string(),
+        _ => "no_reply".to_string(),
+    }
+}
+
+/// Fold per-session-ordered message rows into runs. `rows` MUST be sorted by
+/// `(session_id, rowid)`; a user turn opens a run, the next assistant turn of
+/// the same session closes it. An older unanswered user turn that was
+/// superseded by a newer user turn is "no_reply"; only the trailing
+/// unanswered turn of a session gets the recency-based "running" check.
+pub(crate) fn fold_session_runs(rows: &[RunMsgRow], now: chrono::DateTime<Utc>) -> Vec<RunSummary> {
+    let mut runs: Vec<RunSummary> = Vec::new();
+    let mut open: Option<RunSummary> = None;
+    let mut open_session: Option<&str> = None;
+
+    let mut finalize_open =
+        |open: &mut Option<RunSummary>, superseded: bool, runs: &mut Vec<RunSummary>| {
+            if let Some(mut r) = open.take() {
+                r.status = if superseded {
+                    "no_reply".to_string()
+                } else {
+                    run_open_status(&r.started_at, now)
+                };
+                runs.push(r);
+            }
+        };
+
+    for row in rows {
+        // Session boundary: whatever is still open belongs to the previous
+        // session and is its trailing turn.
+        if open_session.is_some_and(|s| s != row.session_id) {
+            finalize_open(&mut open, false, &mut runs);
+        }
+        open_session = Some(&row.session_id);
+
+        match row.role.as_str() {
+            "user" => {
+                // A newer user turn supersedes an unanswered one.
+                finalize_open(&mut open, true, &mut runs);
+                open = Some(RunSummary {
+                    id: format!("{}#{}", row.session_id, row.rowid),
+                    session_id: row.session_id.clone(),
+                    agent_id: row.agent_id.clone(),
+                    channel: run_channel_of(&row.session_id),
+                    started_at: row.ts.clone(),
+                    ended_at: None,
+                    status: String::new(),
+                    preview: row.preview.clone(),
+                });
+            }
+            "assistant" => {
+                if let Some(mut r) = open.take() {
+                    r.ended_at = Some(row.ts.clone());
+                    r.status = "completed".to_string();
+                    runs.push(r);
+                }
+                // Assistant with no open user turn (e.g. system-injected
+                // greeting) is not a run — skipped, never fabricated.
+            }
+            _ => {}
+        }
+    }
+    finalize_open(&mut open, false, &mut runs);
+    runs
+}
+
+/// One MCP tool-call receipt from `tool_calls.jsonl`.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolCallRow {
+    pub ts: String,
+    pub agent_id: String,
+    pub tool: String,
+    pub ok: bool,
+    pub preview: String,
+}
+
+/// Load the MCP tool audit trail (missing file / malformed lines ⇒ skipped;
+/// rotated `tool_calls.jsonl.N` archives are NOT read — recent-runs horizon).
+pub(crate) fn load_tool_call_rows(home_dir: &Path) -> Vec<ToolCallRow> {
+    let path = home_dir.join("tool_calls.jsonl");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| {
+            Some(ToolCallRow {
+                ts: v.get("timestamp")?.as_str()?.to_string(),
+                agent_id: v.get("agent_id")?.as_str()?.to_string(),
+                tool: v.get("tool_name")?.as_str()?.to_string(),
+                ok: v.get("success").and_then(|s| s.as_bool()).unwrap_or(true),
+                preview: v
+                    .get("params_summary")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The closing timestamp of a run's correlation window: the reply timestamp,
+/// `now` for a running turn, or start + the running window for a no-reply
+/// turn. `None` when the run's timestamps don't parse (fail closed).
+pub(crate) fn run_window_end(
+    run: &RunSummary,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    match &run.ended_at {
+        Some(e) => parse_timeline_ts(e),
+        None if run.status == "running" => Some(now),
+        None => {
+            parse_timeline_ts(&run.started_at)
+                .map(|s| s + chrono::Duration::seconds(RUN_RUNNING_WINDOW_SECS))
+        }
+    }
+}
+
+/// Does a tool receipt fall inside a run's window? Agent must match exactly
+/// (token equality — project convention 2). Unparseable timestamps ⇒
+/// excluded (fail closed).
+pub(crate) fn tool_row_in_run_window(
+    t: &ToolCallRow,
+    run: &RunSummary,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    if t.agent_id != run.agent_id {
+        return false;
+    }
+    let (Some(ts), Some(start)) = (parse_timeline_ts(&t.ts), parse_timeline_ts(&run.started_at))
+    else {
+        return false;
+    };
+    let Some(end) = run_window_end(run, now) else {
+        return false;
+    };
+    ts >= start && ts <= end
+}
+
+// ── Persisted step events (run_steps.db, G12 upgrade) ───────
+
+/// Rows fetched from `run_steps.db` per session for one `runs.get` merge.
+pub(crate) const RUN_STEPS_SESSION_CAP: usize = 2_000;
+/// Rows scanned for `runs.list` step counting (recent-runs horizon, mirrors
+/// `RUNS_SCAN_MSG_CAP`'s honesty: older steps fall off the counter).
+pub(crate) const RUN_STEPS_SCAN_CAP: usize = 20_000;
+
+/// Does a persisted step row (session_key + ts) fall inside a run's window?
+/// Session key must match exactly (steps are recorded under the very same
+/// `sessions.db` key the run derives from). Unparseable timestamps ⇒
+/// excluded (fail closed).
+pub(crate) fn step_meta_in_run_window(
+    session_key: &str,
+    ts: &str,
+    run: &RunSummary,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    if session_key != run.session_id {
+        return false;
+    }
+    let (Some(ts), Some(start)) = (parse_timeline_ts(ts), parse_timeline_ts(&run.started_at))
+    else {
+        return false;
+    };
+    let Some(end) = run_window_end(run, now) else {
+        return false;
+    };
+    ts >= start && ts <= end
+}
+
+/// Shape the persisted step rows that fall inside `[ws, we]` (and belong to
+/// `agent_id`) into `runs.get` wire events. Previews were secret-masked and
+/// char-capped at write time; rows with unparseable timestamps are dropped
+/// (an incomplete record must not render as a fabricated one).
+/// Rows are already scoped to one session key by `recent_for_session`, and a
+/// session key (`<channel>:<chat_id>`) belongs to exactly one conversation /
+/// agent — so the session key is the authoritative match here. We deliberately
+/// do NOT additionally filter by the run's sessions.db `agent_id`: the step
+/// tee attributes with a work-dir fallback when the task-local agent id is
+/// absent, which can differ from the stored agent name, and an extra agent
+/// filter would then silently drop that run's real steps.
+pub(crate) fn persisted_step_events_for_window(
+    rows: &[crate::run_steps::RunStepRow],
+    ws: chrono::DateTime<Utc>,
+    we: chrono::DateTime<Utc>,
+) -> Vec<Value> {
+    rows.iter()
+        .filter_map(|r| {
+            let ts = parse_timeline_ts(&r.ts)?;
+            if ts < ws || ts > we {
+                return None;
+            }
+            Some(json!({
+                "kind": r.kind,
+                "label": r.label,
+                "ts": r.ts,
+                "seq": r.seq,
+                "preview": r.payload_preview,
+            }))
+        })
+        .collect()
+}
+
+/// Serialize one run for the wire.
+pub(crate) fn run_summary_to_json(r: &RunSummary, step_count: usize) -> Value {
+    json!({
+        "id": r.id,
+        "session_id": r.session_id,
+        "agent_id": r.agent_id,
+        "channel": r.channel,
+        "started_at": r.started_at,
+        "ended_at": r.ended_at,
+        "status": r.status,
+        "step_count": step_count,
+        "preview": r.preview,
+    })
+}
+
+/// Fetch the most recent user/assistant turns (joined to their owning agent),
+/// newest-first up to `cap`, honouring the hide/undo tombstones when those
+/// columns exist (pre-migration databases fall back to the plain query).
+pub(crate) fn query_run_msg_rows(
+    conn: &rusqlite::Connection,
+    agent_filter: &str,
+    cap: usize,
+) -> rusqlite::Result<Vec<RunMsgRow>> {
+    const WITH_TOMBSTONES: &str = "SELECT m.id, m.session_id, s.agent_id, m.role, substr(m.content, 1, 400), m.timestamp
+         FROM session_messages m JOIN sessions s ON s.id = m.session_id
+         WHERE m.role IN ('user','assistant')
+           AND (?1 = '' OR s.agent_id = ?1)
+           AND COALESCE(m.hidden, 0) = 0 AND m.undone_at IS NULL
+         ORDER BY m.id DESC LIMIT ?2";
+    const PLAIN: &str = "SELECT m.id, m.session_id, s.agent_id, m.role, substr(m.content, 1, 400), m.timestamp
+         FROM session_messages m JOIN sessions s ON s.id = m.session_id
+         WHERE m.role IN ('user','assistant')
+           AND (?1 = '' OR s.agent_id = ?1)
+         ORDER BY m.id DESC LIMIT ?2";
+
+    let mut stmt = match conn.prepare(WITH_TOMBSTONES) {
+        Ok(s) => s,
+        // Older DB without the hidden/undone_at columns.
+        Err(_) => conn.prepare(PLAIN)?,
+    };
+    let rows = stmt.query_map(params![agent_filter, cap as i64], |row| {
+        Ok(RunMsgRow {
+            rowid: row.get(0)?,
+            session_id: row.get(1)?,
+            agent_id: row.get(2)?,
+            role: row.get(3)?,
+            preview: duduclaw_core::truncate_chars(
+                &row.get::<_, String>(4)?,
+                RUN_LIST_PREVIEW_CHARS,
+            ),
+            ts: row.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+#[cfg(test)]
+mod runs_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn ts(h: u32, m: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 11, h, m, 0).unwrap()
+    }
+
+    fn msg(rowid: i64, session: &str, role: &str, at: chrono::DateTime<Utc>) -> RunMsgRow {
+        RunMsgRow {
+            rowid,
+            session_id: session.into(),
+            agent_id: "bruno".into(),
+            role: role.into(),
+            ts: at.to_rfc3339(),
+            preview: format!("m{rowid}"),
+        }
+    }
+
+    #[test]
+    fn user_then_assistant_becomes_completed_run() {
+        let rows = vec![
+            msg(1, "telegram:1", "user", ts(1, 0)),
+            msg(2, "telegram:1", "assistant", ts(1, 2)),
+        ];
+        let runs = fold_session_runs(&rows, ts(9, 0));
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, "telegram:1#1");
+        assert_eq!(runs[0].status, "completed");
+        assert_eq!(runs[0].ended_at.as_deref(), Some(ts(1, 2).to_rfc3339().as_str()));
+        assert_eq!(runs[0].channel, "telegram");
+    }
+
+    #[test]
+    fn superseded_user_turn_is_no_reply_and_trailing_recent_turn_is_running() {
+        let rows = vec![
+            msg(1, "discord:9", "user", ts(1, 0)),  // superseded, never answered
+            msg(2, "discord:9", "user", ts(8, 59)), // trailing, 1 min before "now"
+        ];
+        let runs = fold_session_runs(&rows, ts(9, 0));
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].status, "no_reply");
+        assert!(runs[0].ended_at.is_none());
+        assert_eq!(runs[1].status, "running", "recent unanswered trailing turn is live");
+    }
+
+    #[test]
+    fn stale_trailing_turn_is_no_reply_not_running() {
+        let rows = vec![msg(1, "line:5", "user", ts(1, 0))];
+        let runs = fold_session_runs(&rows, ts(9, 0));
+        assert_eq!(runs[0].status, "no_reply", "8h old with no reply is not 'running'");
+    }
+
+    #[test]
+    fn session_boundary_closes_open_run_and_orphan_assistant_is_skipped() {
+        let rows = vec![
+            msg(1, "slack:a", "assistant", ts(0, 30)), // orphan — no run fabricated
+            msg(2, "slack:a", "user", ts(1, 0)),       // trailing open of session a
+            msg(3, "slack:b", "user", ts(2, 0)),
+            msg(4, "slack:b", "assistant", ts(2, 1)),
+        ];
+        let runs = fold_session_runs(&rows, ts(9, 0));
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].session_id, "slack:a");
+        assert_eq!(runs[0].status, "no_reply");
+        assert_eq!(runs[1].session_id, "slack:b");
+        assert_eq!(runs[1].status, "completed");
+    }
+
+    #[test]
+    fn tool_window_matches_agent_and_time_range_only() {
+        let run = RunSummary {
+            id: "telegram:1#1".into(),
+            session_id: "telegram:1".into(),
+            agent_id: "bruno".into(),
+            channel: "telegram".into(),
+            started_at: ts(1, 0).to_rfc3339(),
+            ended_at: Some(ts(1, 5).to_rfc3339()),
+            status: "completed".into(),
+            preview: String::new(),
+        };
+        let inside = ToolCallRow {
+            ts: ts(1, 2).to_rfc3339(),
+            agent_id: "bruno".into(),
+            tool: "shared_wiki_read".into(),
+            ok: true,
+            preview: "path=sop".into(),
+        };
+        let wrong_agent = ToolCallRow { agent_id: "agnes".into(), ..inside.clone() };
+        let too_late = ToolCallRow { ts: ts(2, 0).to_rfc3339(), ..inside.clone() };
+        let now = ts(9, 0);
+        assert!(tool_row_in_run_window(&inside, &run, now));
+        assert!(!tool_row_in_run_window(&wrong_agent, &run, now));
+        assert!(!tool_row_in_run_window(&too_late, &run, now));
+    }
+
+    #[test]
+    fn channel_of_handles_missing_separator() {
+        assert_eq!(run_channel_of("telegram:123"), "telegram");
+        assert_eq!(run_channel_of("weird-session-id"), "other");
+        assert_eq!(run_channel_of(":123"), "other");
+    }
+
+    fn step_row(
+        agent: &str,
+        session: &str,
+        at: chrono::DateTime<Utc>,
+        kind: &str,
+        label: &str,
+        seq: i64,
+    ) -> crate::run_steps::RunStepRow {
+        crate::run_steps::RunStepRow {
+            agent_id: agent.into(),
+            session_key: session.into(),
+            ts: at.to_rfc3339(),
+            kind: kind.into(),
+            label: label.into(),
+            payload_preview: format!("preview-{label}"),
+            seq,
+        }
+    }
+
+    #[test]
+    fn persisted_steps_merge_within_window_regardless_of_agent_label() {
+        let ws = ts(1, 0);
+        let we = ts(1, 5);
+        // Rows arrive already session-key-scoped from recent_for_session; the
+        // window is the only remaining filter. The last row carries a
+        // divergent agent label (the step-tee work-dir fallback) and MUST
+        // still show — an agent filter here would silently drop it.
+        let rows = vec![
+            step_row("bruno", "telegram:1", ts(1, 1), "tool_step", "Read", 1),
+            step_row("bruno", "telegram:1", ts(1, 2), "todo_update", "1/3", 2),
+            // Outside the window — excluded.
+            step_row("bruno", "telegram:1", ts(2, 0), "tool_step", "Bash", 3),
+            // Divergent agent label (work-dir fallback) — still included.
+            step_row("bruno-dir", "telegram:1", ts(1, 3), "tool_step", "Grep", 4),
+        ];
+        let events = persisted_step_events_for_window(&rows, ws, we);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["label"], "Read");
+        assert_eq!(events[0]["seq"], 1);
+        assert_eq!(events[2]["label"], "Grep");
+    }
+
+    #[test]
+    fn persisted_steps_with_bad_timestamps_are_dropped_not_fabricated() {
+        let mut row = step_row("bruno", "telegram:1", ts(1, 1), "tool_step", "Read", 1);
+        row.ts = "not-a-time".into();
+        assert!(persisted_step_events_for_window(&[row], ts(1, 0), ts(2, 0)).is_empty());
+    }
+
+    #[test]
+    fn step_meta_window_requires_exact_session_and_time_range() {
+        let run = RunSummary {
+            id: "telegram:1#1".into(),
+            session_id: "telegram:1".into(),
+            agent_id: "bruno".into(),
+            channel: "telegram".into(),
+            started_at: ts(1, 0).to_rfc3339(),
+            ended_at: Some(ts(1, 5).to_rfc3339()),
+            status: "completed".into(),
+            preview: String::new(),
+        };
+        let now = ts(9, 0);
+        let inside = ts(1, 2).to_rfc3339();
+        assert!(step_meta_in_run_window("telegram:1", &inside, &run, now));
+        // Exact session key equality — never substring (convention 2).
+        assert!(!step_meta_in_run_window("telegram:12", &inside, &run, now));
+        assert!(!step_meta_in_run_window("telegram:1", &ts(2, 0).to_rfc3339(), &run, now));
+        assert!(!step_meta_in_run_window("telegram:1", "garbage", &run, now));
+    }
+
+    #[test]
+    fn run_window_end_covers_reply_running_and_no_reply_shapes() {
+        let base = RunSummary {
+            id: "telegram:1#1".into(),
+            session_id: "telegram:1".into(),
+            agent_id: "bruno".into(),
+            channel: "telegram".into(),
+            started_at: ts(1, 0).to_rfc3339(),
+            ended_at: Some(ts(1, 5).to_rfc3339()),
+            status: "completed".into(),
+            preview: String::new(),
+        };
+        let now = ts(9, 0);
+        assert_eq!(run_window_end(&base, now), Some(ts(1, 5)));
+        let running = RunSummary { ended_at: None, status: "running".into(), ..base.clone() };
+        assert_eq!(run_window_end(&running, now), Some(now));
+        let no_reply = RunSummary { ended_at: None, status: "no_reply".into(), ..base.clone() };
+        assert_eq!(
+            run_window_end(&no_reply, now),
+            Some(ts(1, 0) + chrono::Duration::seconds(RUN_RUNNING_WINDOW_SECS)),
+        );
+        let bad_end = RunSummary { ended_at: Some("garbage".into()), ..base };
+        assert_eq!(run_window_end(&bad_end, now), None, "unparseable end fails closed");
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn ts(h: u32, m: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 11, h, m, 0).unwrap()
+    }
+
+    fn task(id: &str, status: &str) -> TaskRow {
+        let mut t = TaskRow::new(
+            id.into(),
+            format!("task {id}"),
+            String::new(),
+            "medium".into(),
+            "bruno".into(),
+            "boss".into(),
+        );
+        t.status = status.into();
+        t.created_at = ts(1, 0).to_rfc3339();
+        t.updated_at = ts(2, 0).to_rfc3339();
+        t
+    }
+
+    fn activity(id: &str, event_type: &str, at: chrono::DateTime<Utc>) -> ActivityRow {
+        ActivityRow {
+            id: id.into(),
+            event_type: event_type.into(),
+            agent_id: "bruno".into(),
+            task_id: None,
+            summary: format!("event {id}"),
+            timestamp: at.to_rfc3339(),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn done_task_becomes_closed_bar_with_real_end() {
+        let mut t = task("t1", "done");
+        t.claimed_at = Some(ts(1, 30).to_rfc3339());
+        t.completed_at = Some(ts(3, 0).to_rfc3339());
+        let row = timeline_row_from_task(&t, ts(0, 0), ts(23, 0), ts(23, 0)).unwrap();
+        assert_eq!(row.started_at, ts(1, 30).to_rfc3339()); // claim wins over creation
+        assert_eq!(row.ended_at.as_deref(), Some(ts(3, 0).to_rfc3339().as_str()));
+        assert_eq!(row.kind, "task");
+        assert_eq!(row.status, "done");
+    }
+
+    #[test]
+    fn in_progress_task_is_open_ended_running_bar() {
+        let mut t = task("t2", "in_progress");
+        t.claimed_at = Some(ts(4, 0).to_rfc3339());
+        let row = timeline_row_from_task(&t, ts(0, 0), ts(23, 0), ts(23, 0)).unwrap();
+        assert_eq!(row.ended_at, None, "running bar must stay open (null = extends to now)");
+    }
+
+    #[test]
+    fn todo_task_is_an_instant_not_an_invented_bar() {
+        let t = task("t3", "todo");
+        let row = timeline_row_from_task(&t, ts(0, 0), ts(23, 0), ts(23, 0)).unwrap();
+        assert_eq!(row.ended_at.as_deref(), Some(row.started_at.as_str()));
+    }
+
+    #[test]
+    fn end_before_start_clamps_to_instant() {
+        let mut t = task("t4", "done");
+        t.claimed_at = Some(ts(5, 0).to_rfc3339());
+        t.completed_at = Some(ts(4, 0).to_rfc3339()); // data noise: end < start
+        let row = timeline_row_from_task(&t, ts(0, 0), ts(23, 0), ts(23, 0)).unwrap();
+        assert_eq!(row.ended_at.as_deref(), Some(row.started_at.as_str()));
+    }
+
+    #[test]
+    fn window_filtering_keeps_running_bars_and_drops_outsiders() {
+        let done_old = {
+            let mut t = task("old", "done");
+            t.completed_at = Some(ts(2, 30).to_rfc3339());
+            t
+        };
+        let running = {
+            let mut t = task("run", "in_progress");
+            t.claimed_at = Some(ts(1, 0).to_rfc3339());
+            t
+        };
+        // Window starts long after both tasks began.
+        let from = ts(10, 0);
+        let to = ts(23, 0);
+        assert!(
+            timeline_row_from_task(&done_old, from, to, to).is_none(),
+            "closed bar entirely before the window must be dropped"
+        );
+        assert!(
+            timeline_row_from_task(&running, from, to, to).is_some(),
+            "running bar started before the window still overlaps it (extends to now)"
+        );
+    }
+
+    #[test]
+    fn activity_instants_map_kinds_and_skip_task_created() {
+        let from = ts(0, 0);
+        let to = ts(23, 0);
+        let deleg = timeline_row_from_activity(&activity("a1", "delegation_forwarded", ts(6, 0)), from, to)
+            .unwrap();
+        assert_eq!(deleg.kind, "delegation");
+        assert_eq!(deleg.ended_at.as_deref(), Some(deleg.started_at.as_str()));
+        let skill = timeline_row_from_activity(&activity("a2", "skill_activate", ts(6, 5)), from, to).unwrap();
+        assert_eq!(skill.kind, "skill");
+        assert!(
+            timeline_row_from_activity(&activity("a3", "task_created", ts(6, 10)), from, to).is_none(),
+            "task_created duplicates the task bar start edge"
+        );
+        assert!(
+            timeline_row_from_activity(&activity("a4", "autopilot_triggered", ts(23, 30)), from, to).is_none(),
+            "outside window"
+        );
+    }
+
+    #[test]
+    fn derive_merges_sorts_and_caps() {
+        let tasks = vec![task("t1", "todo")];
+        let acts = vec![activity("a1", "governance_violation", ts(0, 30))];
+        let hbs = vec![
+            ("bruno".to_string(), Some(ts(0, 10).to_rfc3339())),
+            ("mia".to_string(), None), // never ran → no row
+        ];
+        let (rows, truncated) = derive_timeline_rows(&tasks, &acts, &hbs, ts(0, 0), ts(23, 0), ts(23, 0));
+        assert!(!truncated);
+        assert_eq!(rows.len(), 3);
+        // Chronological: heartbeat 00:10 → governance 00:30 → task created 01:00.
+        assert_eq!(rows[0].kind, "heartbeat");
+        assert_eq!(rows[1].kind, "governance");
+        assert_eq!(rows[2].kind, "task");
+    }
+
+    #[test]
+    fn cap_truncates_and_reports() {
+        let acts: Vec<ActivityRow> = (0..(TIMELINE_ROW_CAP + 5))
+            .map(|i| activity(&format!("a{i}"), "note", ts(1, 0)))
+            .collect();
+        let (rows, truncated) = derive_timeline_rows(&[], &acts, &[], ts(0, 0), ts(23, 0), ts(23, 0));
+        assert!(truncated);
+        assert_eq!(rows.len(), TIMELINE_ROW_CAP);
+    }
+
+    #[test]
+    fn capped_fetch_inside_window_still_reports_truncated() {
+        // LOW (2026-07 review): exactly TIMELINE_ROW_CAP fetched activities,
+        // all inside the window, oldest fetched (01:00) newer than `from`
+        // (00:00) ⇒ activities between 00:00 and 01:00 were never fetched.
+        // Derived rows == cap (not > cap), so the old `rows.len() > cap`
+        // check reported false — the fetch-hit-cap signal must flag it.
+        let acts: Vec<ActivityRow> = (0..TIMELINE_ROW_CAP)
+            .map(|i| activity(&format!("a{i}"), "note", ts(1, 0)))
+            .collect();
+        let (rows, truncated) =
+            derive_timeline_rows(&[], &acts, &[], ts(0, 0), ts(23, 0), ts(23, 0));
+        assert_eq!(rows.len(), TIMELINE_ROW_CAP);
+        assert!(truncated, "cap-full fetch newer than `from` hides older events");
+    }
+
+    #[test]
+    fn uncapped_fetch_is_not_truncated() {
+        // Fewer rows than the fetch cap ⇒ the window is fully covered even
+        // though the oldest activity is newer than `from`.
+        let acts: Vec<ActivityRow> = (0..3)
+            .map(|i| activity(&format!("a{i}"), "note", ts(1, 0)))
+            .collect();
+        let (rows, truncated) =
+            derive_timeline_rows(&[], &acts, &[], ts(0, 0), ts(23, 0), ts(23, 0));
+        assert_eq!(rows.len(), 3);
+        assert!(!truncated);
+    }
+}
+
+#[cfg(test)]
+mod skills_install_scan_tests {
+    //! skills.install must re-run the security scanner server-side: the vet
+    //! RPC is a separate client call that a malicious client can simply skip.
+    use super::*;
+
+    fn frame_ok(frame: &WsFrame) -> bool {
+        matches!(frame, WsFrame::Response { ok: true, .. })
+    }
+
+    fn frame_error_text(frame: &WsFrame) -> String {
+        match frame {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn malicious_content_install_is_rejected_by_server_side_scan() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Code-execution pattern the scanner classifies ≥ High (same fixture
+        // family as security_scanner::test_code_execution_error_blocks).
+        let malicious = "name: evil-skill\n\nimport subprocess\nsubprocess.run(['ls'])\n";
+        let frame = handler
+            .handle_skills_install(json!({
+                "url": "https://example.com/SKILL.md",
+                "scope": "global",
+                "content": malicious,
+            }))
+            .await;
+
+        assert!(!frame_ok(&frame), "high-risk content must be rejected");
+        let err = frame_error_text(&frame);
+        assert!(
+            err.contains("Security scan rejected"),
+            "error should carry the scan verdict, got: {err}"
+        );
+        // Fail-closed: nothing may reach the global skills directory.
+        assert!(
+            !home.path().join("skills").join("evil-skill.md").exists(),
+            "rejected skill must not be written to the skills dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_content_installs() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let clean = "name: tidy-skill\ndescription: A helpful guide\n\n# Tidy Skill\n\nHelpful, harmless steps.\n";
+        let frame = handler
+            .handle_skills_install(json!({
+                "url": "https://example.com/SKILL.md",
+                "scope": "global",
+                "content": clean,
+            }))
+            .await;
+
+        assert!(frame_ok(&frame), "clean content must install: {frame:?}");
+        assert!(
+            home.path().join("skills").join("tidy-skill.md").exists(),
+            "installed skill file should exist in the global skills dir"
+        );
+    }
+}
+
+#[cfg(test)]
+mod channels_add_enc_only_tests {
+    //! Item: channels.add plaintext-beside-_enc parity. When encryption is
+    //! available, secrets persist ONLY as `_enc` (plaintext key removed, not
+    //! blanked). telegram/discord/line global tokens are the documented
+    //! exception (plaintext-only presence checks elsewhere in this file).
+    use super::*;
+
+    async fn add_channel(handler: &MethodHandler, ty: &str, cfg: Value) -> WsFrame {
+        handler
+            .handle_channels_add(json!({ "type": ty, "config": cfg }))
+            .await
+    }
+
+    fn channels_table(home: &std::path::Path) -> toml::Table {
+        let raw = std::fs::read_to_string(home.join("config.toml")).expect("config.toml");
+        let table: toml::Table = raw.parse().expect("parse config.toml");
+        table["channels"].as_table().cloned().expect("[channels]")
+    }
+
+    #[tokio::test]
+    async fn slack_secrets_are_enc_only_and_read_back() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = add_channel(
+            &handler,
+            "slack",
+            json!({ "token": "xoxb-bot-token", "secret": "xapp-app-token" }),
+        )
+        .await;
+        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+
+        let ch = channels_table(home.path());
+        // Plaintext removed, _enc present.
+        assert!(!ch.contains_key("slack_bot_token"), "plaintext bot token must be dropped");
+        assert!(ch.contains_key("slack_bot_token_enc"));
+        assert!(!ch.contains_key("slack_app_token"), "plaintext app token must be dropped");
+        assert!(ch.contains_key("slack_app_token_enc"));
+
+        // enc-only read path returns the original values.
+        let bot = crate::config_crypto::read_encrypted_config_field(
+            home.path(), "channels", "slack_bot_token",
+        )
+        .await;
+        assert_eq!(bot.as_deref(), Some("xoxb-bot-token"));
+        let app = crate::config_crypto::read_encrypted_config_field(
+            home.path(), "channels", "slack_app_token",
+        )
+        .await;
+        assert_eq!(app.as_deref(), Some("xapp-app-token"));
+    }
+
+    #[tokio::test]
+    async fn whatsapp_token_enc_only_but_phone_number_id_plain() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = add_channel(
+            &handler,
+            "whatsapp",
+            json!({
+                "token": "wa-access-token",
+                "secret": "123456789",              // phone_number_id — identifier
+                "whatsapp_verify_token": "verify-me",
+                "whatsapp_app_secret": "app-secret",
+            }),
+        )
+        .await;
+        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+
+        let ch = channels_table(home.path());
+        assert!(!ch.contains_key("whatsapp_access_token"));
+        assert!(ch.contains_key("whatsapp_access_token_enc"));
+        // Identifier stays plaintext (XC.3).
+        assert_eq!(
+            ch.get("whatsapp_phone_number_id").and_then(|v| v.as_str()),
+            Some("123456789")
+        );
+        // Extra secrets are enc-only too.
+        assert!(!ch.contains_key("whatsapp_verify_token"));
+        assert!(ch.contains_key("whatsapp_verify_token_enc"));
+        assert!(!ch.contains_key("whatsapp_app_secret"));
+        assert!(ch.contains_key("whatsapp_app_secret_enc"));
+
+        let tok = crate::config_crypto::read_encrypted_config_field(
+            home.path(), "channels", "whatsapp_access_token",
+        )
+        .await;
+        assert_eq!(tok.as_deref(), Some("wa-access-token"));
+        let verify = crate::config_crypto::read_encrypted_config_field(
+            home.path(), "channels", "whatsapp_verify_token",
+        )
+        .await;
+        assert_eq!(verify.as_deref(), Some("verify-me"));
+    }
+
+    #[tokio::test]
+    async fn telegram_is_enc_only_and_still_counts_as_configured() {
+        // Updated 2026-07: this test previously asserted the buggy behavior
+        // (plaintext kept beside `_enc` for telegram/discord/line because the
+        // presence checks were plaintext-only). The presence checks are now
+        // `_enc`-aware, so these three channels are enc-only like the rest.
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = add_channel(&handler, "telegram", json!({ "token": "tg-token" })).await;
+        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+
+        let ch = channels_table(home.path());
+        assert!(
+            !ch.contains_key("telegram_bot_token"),
+            "plaintext telegram token must be dropped when encryption succeeds"
+        );
+        assert!(ch.contains_key("telegram_bot_token_enc"));
+
+        // enc-only read path returns the original value.
+        let tok = crate::config_crypto::read_encrypted_config_field(
+            home.path(), "channels", "telegram_bot_token",
+        )
+        .await;
+        assert_eq!(tok.as_deref(), Some("tg-token"));
+
+        // Presence checks see the enc-only channel.
+        assert_eq!(
+            handler.count_configured_channels().await,
+            1,
+            "enc-only telegram must count as configured"
+        );
+        let status = handler.handle_channels_status().await;
+        let listed = match &status {
+            WsFrame::Response { payload: Some(payload), .. } => payload["channels"]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|c| c["name"] == "telegram")),
+            _ => false,
+        };
+        assert!(listed, "enc-only telegram must appear in channels.status: {status:?}");
+    }
+
+    #[tokio::test]
+    async fn agents_update_channel_tokens_are_enc_only_roundtrip() {
+        // 2026-07 MED: the agents.update `set_channel_token` path used to
+        // write plaintext + `_enc` and never strip. It now mirrors
+        // channels.add: enc-only on successful encryption (keyfile-unavailable
+        // falls back to legacy plaintext), including wecom/dingtalk secrets.
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let created = handler
+            .handle_agents_create(json!({ "name": "enc-bot", "display_name": "EncBot" }))
+            .await;
+        assert!(matches!(created, WsFrame::Response { ok: true, .. }), "{created:?}");
+
+        let updated = handler
+            .handle_agents_update(json!({
+                "agent_id": "enc-bot",
+                "telegram_bot_token": "tg-agent-token",
+                "wecom_corp_id": "corp-id-plain",
+                "wecom_corp_secret": "corp-secret-value",
+                "dingtalk_app_secret": "ding-secret-value",
+            }))
+            .await;
+        assert!(matches!(updated, WsFrame::Response { ok: true, .. }), "{updated:?}");
+
+        let raw = std::fs::read_to_string(
+            home.path().join("agents").join("enc-bot").join("agent.toml"),
+        )
+        .expect("agent.toml");
+        let table: toml::Table = raw.parse().expect("parse agent.toml");
+        let channels = table["channels"].as_table().expect("[channels]");
+
+        let tg = channels["telegram"].as_table().unwrap();
+        assert!(!tg.contains_key("bot_token"), "plaintext must be stripped: {tg:?}");
+        let enc = tg["bot_token_enc"].as_str().unwrap();
+        assert_eq!(
+            crate::config_crypto::resolve_agent_token(
+                &Some(enc.to_string()),
+                "",
+                home.path(),
+            ),
+            "tg-agent-token",
+            "enc-only roundtrip must recover the original token"
+        );
+
+        let wecom = channels["wecom"].as_table().unwrap();
+        // corp_id is an identifier → plaintext canonical copy.
+        assert_eq!(wecom["corp_id"].as_str(), Some("corp-id-plain"));
+        assert!(!wecom.contains_key("corp_secret"), "wecom secret must be enc-only");
+        assert!(wecom.contains_key("corp_secret_enc"));
+
+        let dingtalk = channels["dingtalk"].as_table().unwrap();
+        assert!(!dingtalk.contains_key("app_secret"), "dingtalk secret must be enc-only");
+        assert!(dingtalk.contains_key("app_secret_enc"));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Live Canvas handlers (G15)
+// ═══════════════════════════════════════════════════════════════
+
+impl MethodHandler {
+    /// `canvas.get` — the agent's current canvas (or one retained history
+    /// version when `seq` is passed) plus history metadata (no bodies — a
+    /// version can be 256 KB). Read-only; ACL (Viewer, agent-scoped,
+    /// fail-closed) is enforced at dispatch by `check_agent_filter!`, same as
+    /// `activity.list`. The HTML returned here was ammonia-sanitized at write
+    /// time (`canvas::CanvasStore::push` is the only write path); the
+    /// dashboard renders it inside `<iframe sandbox="">` as defense-in-depth.
+    async fn handle_canvas_get(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() {
+            return WsFrame::error_response("", "agent_id is required");
+        }
+        let store = match crate::canvas::CanvasStore::open(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &format!("canvas store: {e}")),
+        };
+        // The first viewer spins up the MCP-push → dashboard-WS bridge
+        // (idempotent latch; pushes happen in the MCP subprocess, which has
+        // no handle to `event_tx` — see canvas::ensure_broadcast_bridge).
+        if let Some(tx) = self.event_tx.read().await.as_ref() {
+            crate::canvas::ensure_broadcast_bridge(self.home_dir.clone(), tx.clone());
+        }
+        let canvas = match params.get("seq").and_then(|v| v.as_i64()) {
+            Some(seq) => store.get_version(agent_id, seq).await,
+            None => store.current(agent_id).await,
+        };
+        let canvas = match canvas {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &format!("canvas get: {e}")),
+        };
+        let history = match store.history(agent_id).await {
+            Ok(h) => h,
+            Err(e) => return WsFrame::error_response("", &format!("canvas history: {e}")),
+        };
+        WsFrame::ok_response(
+            "",
+            json!({
+                "agent_id": agent_id,
+                "canvas": canvas.map(|c| json!({
+                    "seq": c.seq,
+                    "agent_id": c.agent_id,
+                    "title": c.title,
+                    "html": c.html,
+                    "updated_at": c.updated_at,
+                })),
+                "history": history.iter().map(|v| json!({
+                    "seq": v.seq,
+                    "title": v.title,
+                    "updated_at": v.updated_at,
+                    "bytes": v.bytes,
+                })).collect::<Vec<_>>(),
+            }),
+        )
+    }
+}
+
+#[cfg(test)]
+mod canvas_rpc_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn viewer_ctx(agent: &str) -> UserContext {
+        let mut agent_access = HashMap::new();
+        agent_access.insert(agent.to_string(), AccessLevel::Viewer);
+        UserContext {
+            user_id: "u1".to_string(),
+            email: "u1@test.local".to_string(),
+            role: UserRole::Employee,
+            agent_access,
+        }
+    }
+
+    fn error_text(frame: &WsFrame) -> String {
+        match frame {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// HS4-style fail-closed dispatch gate: non-admins must name an agent
+    /// they hold a Viewer binding for; anything else is denied at dispatch,
+    /// before the handler runs.
+    #[tokio::test]
+    async fn canvas_get_authz_fails_closed() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = viewer_ctx("alpha");
+
+        // Missing agent_id → rejected (non-admin may not query unscoped).
+        let frame = handler.handle("canvas.get", json!({}), &ctx).await;
+        assert!(
+            error_text(&frame).contains("agent_id parameter is required"),
+            "got: {frame:?}"
+        );
+
+        // Agent the caller has no binding for → permission denied.
+        let frame = handler
+            .handle("canvas.get", json!({ "agent_id": "beta" }), &ctx)
+            .await;
+        assert!(error_text(&frame).contains("permission denied"), "got: {frame:?}");
+
+        // Bound agent → allowed; empty store yields a null canvas.
+        let frame = handler
+            .handle("canvas.get", json!({ "agent_id": "alpha" }), &ctx)
+            .await;
+        match frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => {
+                assert!(p["canvas"].is_null());
+                assert_eq!(p["history"].as_array().map(Vec::len), Some(0));
+            }
+            other => panic!("expected ok response, got: {other:?}"),
+        }
+    }
+
+    /// Push through the same store the `canvas_push` MCP tool uses, then read
+    /// back through the RPC: HTML comes back sanitized, history is listed,
+    /// and a `seq` param retrieves an older retained version.
+    #[tokio::test]
+    async fn canvas_get_returns_sanitized_current_and_history() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = viewer_ctx("alpha");
+
+        let store = crate::canvas::CanvasStore::open(home.path()).unwrap();
+        let v1 = store
+            .push("alpha", "v1", "<p>第一版</p>")
+            .await
+            .unwrap();
+        store
+            .push("alpha", "儀表板", "<h1>KPI</h1><script>alert(1)</script><p>營收 100</p>")
+            .await
+            .unwrap();
+
+        let frame = handler
+            .handle("canvas.get", json!({ "agent_id": "alpha" }), &ctx)
+            .await;
+        let payload = match frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => p,
+            other => panic!("expected ok response, got: {other:?}"),
+        };
+        let html = payload["canvas"]["html"].as_str().unwrap();
+        assert!(!html.contains("script"), "stored html must be sanitized: {html}");
+        assert!(html.contains("<h1>KPI</h1>") && html.contains("營收 100"));
+        assert_eq!(payload["canvas"]["title"].as_str(), Some("儀表板"));
+        assert_eq!(payload["history"].as_array().map(Vec::len), Some(2));
+
+        // Fetch the older version explicitly by seq.
+        let frame = handler
+            .handle("canvas.get", json!({ "agent_id": "alpha", "seq": v1.seq }), &ctx)
+            .await;
+        match frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => {
+                assert_eq!(p["canvas"]["title"].as_str(), Some("v1"));
+                assert!(p["canvas"]["html"].as_str().unwrap().contains("第一版"));
+            }
+            other => panic!("expected ok response, got: {other:?}"),
+        }
     }
 }

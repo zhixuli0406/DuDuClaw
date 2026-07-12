@@ -207,6 +207,9 @@ pub struct HeartbeatScheduler {
     /// Optional channel for forwarding [`SilenceBreakerEvent`]s to the gateway.
     /// `None` means silence-breaker events stay informational (warn-only).
     silence_tx: Option<tokio::sync::mpsc::UnboundedSender<SilenceBreakerEvent>>,
+    /// U1 natural-timing deferral state (silence breaker + proactive checks).
+    /// In-memory only — restart merely restarts the 6h deferral cap clock.
+    timing_deferrals: Arc<crate::proactive_timing::DeferralLedger>,
 }
 
 impl HeartbeatScheduler {
@@ -219,6 +222,7 @@ impl HeartbeatScheduler {
             global_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_CONCURRENT)),
             proactive_states: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             silence_tx: None,
+            timing_deferrals: Arc::new(crate::proactive_timing::DeferralLedger::new()),
         }
     }
 
@@ -305,8 +309,9 @@ impl HeartbeatScheduler {
             let aid = agent.agent_id.clone();
             let sem = agent.active_runs.clone();
             let ps = self.proactive_states.clone();
+            let timing = self.timing_deferrals.clone();
             tokio::spawn(async move {
-                execute_heartbeat(&home, &aid, &sem, &ps).await;
+                execute_heartbeat(&home, &aid, &sem, &ps, &timing).await;
             });
             true
         } else {
@@ -363,6 +368,10 @@ impl HeartbeatScheduler {
 
             // Collect tasks to spawn while holding the lock, then release before spawning
             let mut to_spawn: Vec<(PathBuf, String, Arc<tokio::sync::Semaphore>)> = Vec::new();
+            // Silence-threshold crossings detected this tick. The actual
+            // send/defer decision + commit happens AFTER the lock is released
+            // (the U1 timing gate reads sessions.db — no I/O under the lock).
+            let mut silence_candidates: Vec<(String, f64)> = Vec::new();
             {
                 let mut agents = self.agents.write().await;
                 for agent in agents.values_mut() {
@@ -370,46 +379,29 @@ impl HeartbeatScheduler {
                         continue;
                     }
 
-                    // ── Silence breaker ──
+                    // ── Silence breaker (detection only) ──
                     // Master evolution kill-switch gate: when `[evolution]
                     // enabled = false`, this agent's autonomous evolution is
                     // frozen, so the silence-breaker must NOT fire (this was a
                     // bypass path — the client-reported "evolution kept running
                     // after I turned it off" bug). Bus polling below is a
                     // separate, non-evolution concern and still runs regardless.
+                    //
+                    // U1 (arXiv:2602.00880 / 2509.24073): crossing the
+                    // threshold no longer means "fire now" — it means "fire at
+                    // the next natural moment". We only collect the candidate
+                    // here; `last_evolution_trigger` stays untouched until the
+                    // timing gate approves the send, so a deferred event is
+                    // simply re-detected on the next 30s tick (the tick loop
+                    // itself is the rescheduler — no separate timer needed).
                     if agent.evolution_enabled {
-                        // If no evolution has occurred for max_silence_hours, mark for
-                        // heartbeat so the prediction engine can pick it up on next conversation.
                         let hours_since_last = agent
                             .last_evolution_trigger
                             .map(|t| now.signed_duration_since(t).num_minutes() as f64 / 60.0)
                             .unwrap_or(agent.max_silence_hours + 1.0);
 
                         if hours_since_last > agent.max_silence_hours {
-                            warn!(
-                                agent = %agent.agent_id,
-                                hours = format!("{hours_since_last:.1}"),
-                                "Silence breaker: no evolution trigger for too long"
-                            );
-                            // Reset the timer first so a slow downstream consumer
-                            // can't cause us to fire repeatedly.
-                            agent.last_evolution_trigger = Some(now);
-                            // Forward to the gateway if a channel is wired up. Use
-                            // `try_send`-style fail-fast: if the receiver is gone
-                            // we don't want to block the scheduler.
-                            if let Some(tx) = self.silence_tx.as_ref() {
-                                let event = SilenceBreakerEvent {
-                                    agent_id: agent.agent_id.clone(),
-                                    hours: hours_since_last,
-                                    timestamp: now,
-                                };
-                                if let Err(e) = tx.send(event) {
-                                    debug!(
-                                        agent = %agent.agent_id,
-                                        "Silence breaker channel closed: {e}"
-                                    );
-                                }
-                            }
+                            silence_candidates.push((agent.agent_id.clone(), hours_since_last));
                         }
                     }
 
@@ -434,16 +426,79 @@ impl HeartbeatScheduler {
                 }
             } // write lock released here
 
+            // ── Silence breaker: natural-timing gate + commit (U1) ──
+            //
+            // Runs without the agents lock: the gate reads sessions.db
+            // (read-only). `SendDecision::Defer` leaves the agent's
+            // `last_evolution_trigger` untouched, so the next 30s tick
+            // re-detects and re-evaluates; the gate's ledger caps total
+            // deferral at 6h, after which the event fires regardless. With
+            // `[proactive] natural_timing = false` (kill switch) the gate
+            // returns SendNow unconditionally — identical to pre-U1 behaviour.
+            for (aid, hours) in silence_candidates {
+                let key = format!("silence:{aid}");
+                let decision = crate::proactive_timing::gate_keyed_send(
+                    &self.home_dir,
+                    &aid,
+                    None,
+                    &key,
+                    &self.timing_deferrals,
+                    now,
+                    "silence-breaker",
+                )
+                .await;
+                if let crate::proactive_timing::SendDecision::Defer { until, reason } = decision {
+                    info!(
+                        agent = %aid,
+                        until = %until.to_rfc3339(),
+                        reason = %reason,
+                        "Silence breaker deferred to natural moment"
+                    );
+                    continue;
+                }
+
+                // Commit: re-acquire the lock, reset the timer, emit the event.
+                let mut agents = self.agents.write().await;
+                let Some(agent) = agents.get_mut(&aid) else {
+                    continue; // agent removed between detection and commit
+                };
+                warn!(
+                    agent = %agent.agent_id,
+                    hours = format!("{hours:.1}"),
+                    "Silence breaker: no evolution trigger for too long"
+                );
+                // Reset the timer first so a slow downstream consumer
+                // can't cause us to fire repeatedly.
+                agent.last_evolution_trigger = Some(now);
+                // Forward to the gateway if a channel is wired up. Use
+                // `try_send`-style fail-fast: if the receiver is gone
+                // we don't want to block the scheduler.
+                if let Some(tx) = self.silence_tx.as_ref() {
+                    let event = SilenceBreakerEvent {
+                        agent_id: agent.agent_id.clone(),
+                        hours,
+                        timestamp: now,
+                    };
+                    if let Err(e) = tx.send(event) {
+                        debug!(
+                            agent = %agent.agent_id,
+                            "Silence breaker channel closed: {e}"
+                        );
+                    }
+                }
+            }
+
             // Now spawn tasks without holding any lock
             for (home, aid, sem) in to_spawn {
                 let global_sem = self.global_semaphore.clone();
                 let proactive_states = self.proactive_states.clone();
+                let timing = self.timing_deferrals.clone();
                 tokio::spawn(async move {
                     let _global_permit = match global_sem.acquire().await {
                         Ok(p) => p,
                         Err(_) => return,
                     };
-                    execute_heartbeat(&home, &aid, &sem, &proactive_states).await;
+                    execute_heartbeat(&home, &aid, &sem, &proactive_states, &timing).await;
                 });
             }
         }
@@ -473,6 +528,7 @@ async fn execute_heartbeat(
     agent_id: &str,
     semaphore: &tokio::sync::Semaphore,
     proactive_states: &tokio::sync::Mutex<HashMap<String, crate::proactive::ProactiveState>>,
+    timing_deferrals: &crate::proactive_timing::DeferralLedger,
 ) {
     let _permit = match semaphore.try_acquire() {
         Ok(p) => p,
@@ -510,7 +566,7 @@ async fn execute_heartbeat(
     check_soul_integrity_with_audit(home_dir, agent_id).await;
 
     // ── Proactive check (new) ──
-    execute_proactive_check(home_dir, agent_id, proactive_states).await;
+    execute_proactive_check(home_dir, agent_id, proactive_states, timing_deferrals).await;
 
     info!(agent = agent_id, "Heartbeat cycle complete");
 }
@@ -612,11 +668,13 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
         tdb.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| format!("set busy_timeout: {e}"))?;
 
-        // Highest-priority todo for this agent.
+        // Highest-priority unstarted task for this agent. `pending` = durable
+        // dispatch-engine tasks awaiting a claim — without it here they are
+        // never surfaced to anyone (MED finding, 2026-07 review).
         let todo: Option<(String, String, String)> = tdb
             .query_row(
                 "SELECT id, title, priority FROM tasks
-                 WHERE assigned_to = ?1 AND status = 'todo'
+                 WHERE assigned_to = ?1 AND status IN ('todo', 'pending')
                  ORDER BY CASE priority
                      WHEN 'critical' THEN 0
                      WHEN 'urgent'   THEN 1
@@ -686,7 +744,9 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
                      • 標題: {title}\n\
                      • 優先級: {priority}\n\n\
                      請使用 MCP 工具 `tasks_claim` 接手這項任務並開始執行；\
-                     若無法立即處理，使用 `tasks_block` 並說明阻塞原因。"
+                     若無法立即處理，使用 `tasks_block` 並說明阻塞原因。\n\
+                     接手後若任務需要較長時間，請每隔幾分鐘呼叫 `tasks_renew` 續約，\
+                     否則租約到期任務會被回收並重新派工。"
                 );
                 qdb.execute(
                     "INSERT INTO message_queue \
@@ -723,7 +783,8 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
                      • Task ID: {task_id}\n\
                      • 標題: {title}\n\n\
                      請使用 MCP 工具 `activity_post` 回報目前進度，或在受阻時 \
-                     `tasks_block` 標記並說明原因。"
+                     `tasks_block` 標記並說明原因；若仍在處理中，記得呼叫 \
+                     `tasks_renew` 續約以免任務被回收。"
                 );
                 qdb.execute(
                     "INSERT INTO message_queue \
@@ -752,6 +813,7 @@ async fn execute_proactive_check(
     home_dir: &Path,
     agent_id: &str,
     proactive_states: &tokio::sync::Mutex<HashMap<String, crate::proactive::ProactiveState>>,
+    timing_deferrals: &crate::proactive_timing::DeferralLedger,
 ) {
     use crate::proactive;
 
@@ -789,6 +851,45 @@ async fn execute_proactive_check(
         Some(md) => md,
         None => return, // No PROACTIVE.md → nothing to do
     };
+
+    // ── U1 natural-timing gate (learned rhythm, sessions.db read-only) ──
+    //
+    // Complements the static config quiet-hours check above with the
+    // *learned* per-agent rhythm: historically-dead hours and mid-flow user
+    // turns defer the whole check to the next heartbeat tick. Gating BEFORE
+    // the LLM spawn also saves the check's token cost while deferred.
+    // Nothing is ever dropped: the check re-runs every heartbeat while the
+    // deferral is open, and the gate's 6h hard cap forces execution even if
+    // the quiet window persists. Kill switch: `[proactive] natural_timing
+    // = false` in the global config.toml restores pre-U1 behaviour.
+    {
+        let channel_filter = if agent_config.proactive.notify_channel.is_empty() {
+            None
+        } else {
+            Some(agent_config.proactive.notify_channel.as_str())
+        };
+        let key = format!("proactive:{agent_id}");
+        if let crate::proactive_timing::SendDecision::Defer { until, reason } =
+            crate::proactive_timing::gate_keyed_send(
+                home_dir,
+                agent_id,
+                channel_filter,
+                &key,
+                timing_deferrals,
+                chrono::Utc::now(),
+                "proactive-check",
+            )
+            .await
+        {
+            info!(
+                agent = agent_id,
+                until = %until.to_rfc3339(),
+                reason = %reason,
+                "Proactive check deferred to natural moment"
+            );
+            return;
+        }
+    }
 
     info!(agent = agent_id, "Proactive check: executing");
 

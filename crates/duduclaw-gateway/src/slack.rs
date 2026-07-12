@@ -405,14 +405,37 @@ async fn handle_event(
     // Chat commands
     if crate::chat_commands::is_command(text) {
         if let Some(cmd) = crate::chat_commands::parse_command(text, None) {
-            let session_id = format!("slack:{channel}");
+            // MUST be the same session id the AI reply path below computes —
+            // `slack:{channel}` targeted a ghost session for DMs (reply path
+            // uses `slack:{user}`) and for groups (`slack:group:{channel}`).
+            let session_id = if is_dm {
+                format!("slack:{user}")
+            } else {
+                format!("slack:group:{channel}")
+            };
+            // Central access gate (pairing / allowlist / blocklist) — same
+            // enforcement the AI path applies; commands must not bypass it.
+            if let Some(gate_reply) =
+                crate::channel_reply::check_user_access_gate(ctx, &session_id, user, text).await
+            {
+                if !gate_reply.is_empty() {
+                    send_message(http, bot_token, channel, &gate_reply, thread_ts.as_deref().or(Some(ts))).await;
+                }
+                remove_reaction_add_done(http, bot_token, channel, ts).await;
+                return; // blocked users are silently ignored (empty reply)
+            }
             let agent_id = {
                 let reg = ctx.registry.read().await;
                 reg.main_agent()
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id, true).await;
+            // Real per-channel admin status (fail-closed) — never hardcoded.
+            let is_admin =
+                crate::channel_reply::is_channel_admin(ctx, "slack", &[user, &session_id]).await;
+            let reply =
+                crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id, is_admin)
+                    .await;
             send_message(http, bot_token, channel, &reply, thread_ts.as_deref().or(Some(ts))).await;
             remove_reaction_add_done(http, bot_token, channel, ts).await;
             return;
@@ -582,7 +605,8 @@ async fn handle_slash_command_envelope(
 
     // ── Channel whitelist applies to slash commands too ──
     if !ctx.channel_settings.is_channel_allowed("slack", "global", channel_id).await {
-        respond_via_response_url(http, response_url, "ephemeral", "❌ 此頻道未被授權使用 DuDuClaw").await;
+        let product = crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
+        respond_via_response_url(http, response_url, "ephemeral", &format!("❌ 此頻道未被授權使用 {product}")).await;
         return;
     }
 
@@ -613,6 +637,19 @@ async fn handle_slash_command_envelope(
             // chat_commands and stay ephemeral.
             let cmd_text = if text.is_empty() { "/help".to_string() } else { format!("/{text}") };
             if let Some(cmd) = crate::chat_commands::parse_command(&cmd_text, None) {
+                // Central access gate — slash commands must not bypass the
+                // pairing/allowlist/blocklist enforcement the AI path applies.
+                if let Some(gate_reply) = crate::channel_reply::check_user_access_gate(
+                    ctx, &session_id, user_id, &cmd_text,
+                )
+                .await
+                {
+                    if !gate_reply.is_empty() {
+                        respond_via_response_url(http, response_url, "ephemeral", &gate_reply)
+                            .await;
+                    }
+                    return; // blocked users are silently ignored
+                }
                 let agent_id = {
                     let reg = ctx.registry.read().await;
                     agent_name
@@ -620,7 +657,16 @@ async fn handle_slash_command_envelope(
                         .or_else(|| reg.main_agent().map(|a| a.config.agent.name.clone()))
                         .unwrap_or_default()
                 };
-                let reply = crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id, true).await;
+                // Real per-channel admin status (fail-closed) — never hardcoded.
+                let is_admin = crate::channel_reply::is_channel_admin(
+                    ctx,
+                    "slack",
+                    &[user_id, &session_id],
+                )
+                .await;
+                let reply =
+                    crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id, is_admin)
+                        .await;
                 respond_via_response_url(http, response_url, "ephemeral", &reply).await;
             } else {
                 respond_via_response_url(

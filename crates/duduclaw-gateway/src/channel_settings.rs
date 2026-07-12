@@ -40,6 +40,10 @@ pub mod keys {
     pub const BLOCKED_USERS: &str = "blocked_users";
     /// Whether unknown users must pair via `/pair <code>` first. Values: "true" / "false".
     pub const REQUIRE_PAIRING: &str = "require_pairing";
+    /// JSON array of admin user/chat IDs (global scope) allowed to run
+    /// admin-gated chat commands (`!STOP` / `!STOP ALL` / `!RESUME`).
+    /// Missing or empty = NO admins on that channel (fail-closed).
+    pub const ADMIN_USERS: &str = "admin_users";
 }
 
 /// Cache key: (channel_type, scope_id, key)

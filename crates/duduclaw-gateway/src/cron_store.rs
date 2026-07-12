@@ -50,6 +50,38 @@ pub struct CronTaskRow {
     /// back to UTC at evaluation time.
     #[serde(default)]
     pub cron_timezone: Option<String>,
+    /// Trigger kind (G3, event-triggered cron): `"time"` (default, legacy —
+    /// fire purely on the cron schedule), `"condition"` (at each due cron
+    /// slot, run `condition_script` in a sandbox and fire only when it
+    /// reports `{fire:true}`), or `"on_exit"` (at each due slot, run
+    /// `watch_command` and fire only when it exits with status 0). Unknown /
+    /// empty values fall back to `"time"` at load time. See
+    /// [`crate::condition_eval::TriggerKind`].
+    #[serde(default = "default_trigger_kind")]
+    pub trigger_kind: String,
+    /// Condition script for `trigger_kind = "condition"`: either an inline
+    /// shell/interpreter body or a path to an existing executable file.
+    /// It receives the prior [`Self::condition_state`] via the
+    /// `DUDUCLAW_CRON_STATE` env var and must print `{fire, message?, state?}`
+    /// JSON to stdout. `None` for non-condition tasks.
+    #[serde(default)]
+    pub condition_script: Option<String>,
+    /// Persisted condition state (JSON string, ≤16 KiB) carried across
+    /// evaluations. Written back from the script's `state` field after each
+    /// successful evaluation. `None` before the first evaluation. Oversized
+    /// state is rejected fail-closed and never stored.
+    #[serde(default)]
+    pub condition_state: Option<String>,
+    /// Watched command for `trigger_kind = "on_exit"`: a shell command run
+    /// (sandboxed) at each due slot; the task fires only when it exits 0.
+    /// `None` for non-`on_exit` tasks.
+    #[serde(default)]
+    pub watch_command: Option<String>,
+}
+
+/// serde default for [`CronTaskRow::trigger_kind`].
+fn default_trigger_kind() -> String {
+    "time".to_string()
 }
 
 impl CronTaskRow {
@@ -74,6 +106,10 @@ impl CronTaskRow {
             notify_chat_id: None,
             notify_thread_id: None,
             cron_timezone: None,
+            trigger_kind: default_trigger_kind(),
+            condition_script: None,
+            condition_state: None,
+            watch_command: None,
         }
     }
 
@@ -135,11 +171,18 @@ impl CronStore {
         // issue #16. SQLite does not support IF NOT EXISTS on ALTER TABLE
         // ADD COLUMN, so we attempt each one and ignore the "duplicate
         // column name" error. All other errors propagate.
+        // G3 (v1.36) migration — add event-trigger columns: trigger_kind
+        // (time|condition|on_exit), condition_script, condition_state,
+        // watch_command. Same idempotent ADD-COLUMN-ignore-duplicate loop.
         for col in [
             "notify_channel",
             "notify_chat_id",
             "notify_thread_id",
             "cron_timezone",
+            "trigger_kind",
+            "condition_script",
+            "condition_state",
+            "watch_command",
         ] {
             let sql = format!("ALTER TABLE cron_tasks ADD COLUMN {col} TEXT");
             if let Err(e) = conn.execute(&sql, []) {
@@ -162,7 +205,8 @@ impl CronStore {
                         created_at, updated_at, last_run_at, last_status, last_error,
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
-                        cron_timezone
+                        cron_timezone,
+                        trigger_kind, condition_script, condition_state, watch_command
                  FROM cron_tasks
                  ORDER BY created_at ASC",
             )
@@ -183,7 +227,8 @@ impl CronStore {
                         created_at, updated_at, last_run_at, last_status, last_error,
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
-                        cron_timezone
+                        cron_timezone,
+                        trigger_kind, condition_script, condition_state, watch_command
                  FROM cron_tasks
                  WHERE enabled = 1
                  ORDER BY created_at ASC",
@@ -205,7 +250,8 @@ impl CronStore {
                         created_at, updated_at, last_run_at, last_status, last_error,
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
-                        cron_timezone
+                        cron_timezone,
+                        trigger_kind, condition_script, condition_state, watch_command
                  FROM cron_tasks WHERE id = ?1",
                 params![id],
                 row_to_cron_task,
@@ -223,7 +269,8 @@ impl CronStore {
                         created_at, updated_at, last_run_at, last_status, last_error,
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
-                        cron_timezone
+                        cron_timezone,
+                        trigger_kind, condition_script, condition_state, watch_command
                  FROM cron_tasks WHERE name = ?1 LIMIT 1",
                 params![name],
                 row_to_cron_task,
@@ -244,9 +291,10 @@ impl CronStore {
                  created_at, updated_at, last_run_at, last_status, last_error,
                  run_count, failure_count,
                  notify_channel, notify_chat_id, notify_thread_id,
-                 cron_timezone)
+                 cron_timezone,
+                 trigger_kind, condition_script, condition_state, watch_command)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17)",
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 row.id,
                 row.name,
@@ -265,6 +313,10 @@ impl CronStore {
                 row.notify_chat_id,
                 row.notify_thread_id,
                 row.cron_timezone,
+                row.trigger_kind,
+                row.condition_script,
+                row.condition_state,
+                row.watch_command,
             ],
         )
         .map_err(|e| format!("insert cron task: {e}"))?;
@@ -314,6 +366,61 @@ impl CronStore {
                 params![id, cron_timezone, now],
             )
             .map_err(|e| format!("update_cron_timezone: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Update the G3 event-trigger fields (`trigger_kind`, `condition_script`,
+    /// `watch_command`). `condition_state` is NOT touched here — it is managed
+    /// by the scheduler via [`Self::update_condition_state`]. Pass `None` to
+    /// clear the script / watch command.
+    pub async fn update_trigger(
+        &self,
+        id: &str,
+        trigger_kind: &str,
+        condition_script: Option<&str>,
+        watch_command: Option<&str>,
+    ) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE cron_tasks
+                 SET trigger_kind = ?2, condition_script = ?3, watch_command = ?4,
+                     updated_at = ?5
+                 WHERE id = ?1",
+                params![id, trigger_kind, condition_script, watch_command, now],
+            )
+            .map_err(|e| format!("update_trigger: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Persist the condition state carried across evaluations. Rejects state
+    /// larger than [`crate::condition_eval::MAX_STATE_BYTES`] (fail-closed —
+    /// the caller logs and skips the writeback). Pass `None` to clear it.
+    pub async fn update_condition_state(
+        &self,
+        id: &str,
+        condition_state: Option<&str>,
+    ) -> Result<bool, String> {
+        if let Some(s) = condition_state {
+            if s.len() > crate::condition_eval::MAX_STATE_BYTES {
+                return Err(format!(
+                    "condition_state {} bytes exceeds {}-byte cap",
+                    s.len(),
+                    crate::condition_eval::MAX_STATE_BYTES
+                ));
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE cron_tasks
+                 SET condition_state = ?2, updated_at = ?3
+                 WHERE id = ?1",
+                params![id, condition_state, now],
+            )
+            .map_err(|e| format!("update_condition_state: {e}"))?;
         Ok(changed > 0)
     }
 
@@ -521,6 +628,27 @@ impl CronStore {
                 notify_chat_id,
                 notify_thread_id,
                 cron_timezone,
+                trigger_kind: value
+                    .get("trigger_kind")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("time")
+                    .to_string(),
+                condition_script: value
+                    .get("condition_script")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+                condition_state: value
+                    .get("condition_state")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+                watch_command: value
+                    .get("watch_command")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
             };
             if let Err(e) = self.insert(&row).await {
                 warn!(id = %row.id, "failed to migrate row: {e}");
@@ -561,6 +689,15 @@ fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTaskRow> {
         notify_chat_id: row.get(14)?,
         notify_thread_id: row.get(15)?,
         cron_timezone: row.get(16)?,
+        // Legacy rows predate these columns; NULL → "time" keeps the
+        // default (schedule-only) trigger behaviour.
+        trigger_kind: row
+            .get::<_, Option<String>>(17)?
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "time".to_string()),
+        condition_script: row.get(18)?,
+        condition_state: row.get(19)?,
+        watch_command: row.get(20)?,
     })
 }
 
@@ -713,6 +850,104 @@ mod tests {
         let store2 = CronStore::open(dir.path()).unwrap();
         // If open succeeded the ALTER idempotency contract holds.
         let _ = store2.list_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trigger_fields_default_and_roundtrip() {
+        let dir = tempdir().unwrap();
+        let store = CronStore::open(dir.path()).unwrap();
+
+        // A freshly-created row defaults to the legacy time trigger.
+        let row = CronTaskRow::new(
+            "g1".into(),
+            "Gated".into(),
+            "agnes".into(),
+            "*/5 * * * *".into(),
+            "run report".into(),
+        );
+        assert_eq!(row.trigger_kind, "time");
+        assert!(row.condition_script.is_none());
+        store.insert(&row).await.unwrap();
+
+        // Promote to a condition trigger.
+        store
+            .update_trigger(
+                "g1",
+                "condition",
+                Some("echo '{\"fire\":true}'"),
+                None,
+            )
+            .await
+            .unwrap();
+        let got = store.get("g1").await.unwrap().unwrap();
+        assert_eq!(got.trigger_kind, "condition");
+        assert_eq!(got.condition_script.as_deref(), Some("echo '{\"fire\":true}'"));
+        assert!(got.watch_command.is_none());
+
+        // update_fields must preserve the trigger columns (it only touches
+        // name/agent/cron/task/enabled).
+        store
+            .update_fields("g1", "Renamed", "agnes", "*/5 * * * *", "run report", true)
+            .await
+            .unwrap();
+        let got = store.get("g1").await.unwrap().unwrap();
+        assert_eq!(got.trigger_kind, "condition");
+        assert_eq!(got.condition_script.as_deref(), Some("echo '{\"fire\":true}'"));
+    }
+
+    #[tokio::test]
+    async fn condition_state_roundtrip_and_size_cap() {
+        let dir = tempdir().unwrap();
+        let store = CronStore::open(dir.path()).unwrap();
+        let row = CronTaskRow::new(
+            "s1".into(),
+            "Stateful".into(),
+            "agnes".into(),
+            "* * * * *".into(),
+            "poll".into(),
+        );
+        store.insert(&row).await.unwrap();
+
+        // A small state persists and reads back.
+        store
+            .update_condition_state("s1", Some(r#"{"cursor":42}"#))
+            .await
+            .unwrap();
+        let got = store.get("s1").await.unwrap().unwrap();
+        assert_eq!(got.condition_state.as_deref(), Some(r#"{"cursor":42}"#));
+
+        // Oversize state is rejected fail-closed and never stored.
+        let big = "y".repeat(crate::condition_eval::MAX_STATE_BYTES + 1);
+        let err = store.update_condition_state("s1", Some(&big)).await.unwrap_err();
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
+        // Prior value is unchanged.
+        let got = store.get("s1").await.unwrap().unwrap();
+        assert_eq!(got.condition_state.as_deref(), Some(r#"{"cursor":42}"#));
+
+        // None clears it.
+        store.update_condition_state("s1", None).await.unwrap();
+        let got = store.get("s1").await.unwrap().unwrap();
+        assert_eq!(got.condition_state, None);
+    }
+
+    #[tokio::test]
+    async fn trigger_columns_migration_is_idempotent() {
+        // Re-opening must not fail on the ADD COLUMN calls for the G3 columns.
+        let dir = tempdir().unwrap();
+        let store1 = CronStore::open(dir.path()).unwrap();
+        let row = CronTaskRow::new(
+            "m1".into(),
+            "M".into(),
+            "agnes".into(),
+            "* * * * *".into(),
+            "x".into(),
+        );
+        store1.insert(&row).await.unwrap();
+        drop(store1);
+        let store2 = CronStore::open(dir.path()).unwrap();
+        // Legacy-shaped row reads back with the default trigger_kind.
+        let got = store2.get("m1").await.unwrap().unwrap();
+        assert_eq!(got.trigger_kind, "time");
     }
 
     #[tokio::test]

@@ -134,6 +134,12 @@ pub struct GenerationParams {
     /// as `None` (fail-safe).
     #[serde(default)]
     pub capture_logprobs: bool,
+    /// Per-request token logit biases (token id → additive bias), injected by
+    /// the JitRL engine (see [`crate::jitrl`], arXiv:2601.18510). `None`
+    /// (default) leaves request bodies byte-identical to pre-JitRL behavior.
+    /// Backends without a bias surface ignore this field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<std::collections::HashMap<u32, f32>>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -162,6 +168,7 @@ impl Default for GenerationParams {
             gpu_layers: default_gpu_layers(),
             context_size: default_context_size(),
             capture_logprobs: false,
+            logit_bias: None,
         }
     }
 }

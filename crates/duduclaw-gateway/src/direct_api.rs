@@ -458,6 +458,178 @@ pub fn cache_attribution_snapshot() -> Vec<(String, String, u64)> {
 }
 
 // ---------------------------------------------------------------------------
+// MoA virtual models (`moa:<name>`) — API-mode-only routing
+// ---------------------------------------------------------------------------
+
+/// Collect the distinct provider ids referenced by a MoA spec's members
+/// (proposers + aggregator). Members without a `provider/` prefix yield
+/// nothing here — `complete_moa_model`'s own `provider_for` lookup then
+/// fails closed with an explicit error, never a silent fallback.
+pub fn moa_member_providers(spec: &duduclaw_llm::MoaSpec) -> Vec<String> {
+    let mut out: Vec<String> = spec
+        .proposers
+        .iter()
+        .chain(std::iter::once(&spec.aggregator))
+        .filter_map(|m| duduclaw_llm::split_model_id(m).0.map(str::to_string))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Execute a `moa:<name>` virtual model through the duduclaw-llm MoA
+/// executor (API mode only — MoA has no CLI equivalent).
+///
+/// Provider clients for every member provider are pre-resolved here (the
+/// executor's lookup closure is sync): API key from the account rotator's
+/// pool for that provider first, then the provider's standard env var.
+/// Providers with no key are simply absent from the map — the executor
+/// fails closed per member with an explicit error.
+///
+/// 2026-07 HIGH-B fixes:
+/// - **Cost visibility**: every member client is wrapped in
+///   [`crate::claude_runner::RecordingProvider`], so each proposer AND the
+///   aggregator call is billed to CostTelemetry under `agent_id` with the
+///   member model id (previously MoA usage was invisible).
+/// - **Multi-turn context**: `conversation_history` (same `(role, content)`
+///   pairs the non-MoA [`call_direct_api`] path threads) is replayed into the
+///   request instead of collapsing every turn into per-turn amnesia.
+///
+/// **Streaming (2026-07, deliberately unwired):** `duduclaw_llm` ships a
+/// streaming twin (`stream_moa_model`), but no gateway surface consumes
+/// `duduclaw_llm::StreamEvent` streams today — channel replies and webchat
+/// deliver buffered text (webchat's `assistant_chunk` protocol variant has no
+/// producer), and the gateway's only `stream()` impls are pass-through trait
+/// completeness (`local_llm` / `RecordingProvider`). The sole live
+/// `StreamEvent` consumer in the workspace is the `duduclaw proxy` SSE
+/// endpoint (duduclaw-cli `proxy.rs`), which is not a gateway path and does
+/// not route `moa:` ids. Wire `stream_moa_model` here (mirroring this
+/// function's RecordingProvider telemetry + history handling) only once a
+/// real gateway streaming surface exists — do not invent one for MoA alone.
+pub async fn call_moa_model(
+    home_dir: &std::path::Path,
+    agent_id: &str,
+    request_type: crate::cost_telemetry::RequestType,
+    model_id: &str,
+    system_prompt: &str,
+    user_message: &str,
+    conversation_history: &[(String, String)],
+) -> Result<String, String> {
+    use std::sync::Arc;
+
+    let name = duduclaw_llm::moa_name(model_id)
+        .ok_or_else(|| format!("`{model_id}` 不是 MoA 模型 id（格式應為 `moa:<name>`）"))?;
+    let registry = crate::cost_telemetry::model_registry();
+    let spec = registry.moa_spec(name).ok_or_else(|| {
+        format!(
+            "未定義的 MoA ensemble `{name}` — 請在 ~/.duduclaw/models.toml 加入 [moa.{name}] 區段"
+        )
+    })?;
+
+    // Pre-resolve one client per member provider (rotator pool → env var).
+    let rotator = crate::claude_runner::get_rotator_cached(home_dir).await.ok();
+    let mut providers: std::collections::HashMap<String, Arc<dyn duduclaw_llm::ChatProvider>> =
+        std::collections::HashMap::new();
+    for provider_id in moa_member_providers(spec) {
+        let key = match &rotator {
+            Some(r) => match r.select_for_provider(&provider_id).await.and_then(|env| env.raw_key)
+            {
+                Some(k) => Some(k),
+                None => duduclaw_llm::resolve_env_key(&provider_id),
+            },
+            None => duduclaw_llm::resolve_env_key(&provider_id),
+        };
+        let Some(key) = key else {
+            debug!(provider = %provider_id, "MoA member provider has no API key — member will fail closed");
+            continue;
+        };
+        if let Some(client) =
+            duduclaw_llm::providers::build_provider(&provider_id, duduclaw_llm::ApiAuth::new(key))
+        {
+            // Telemetry wrapper: bills each member round-trip under the
+            // calling agent, model = the member model actually used.
+            providers.insert(
+                provider_id,
+                Arc::new(crate::claude_runner::RecordingProvider::new(
+                    client,
+                    agent_id,
+                    request_type,
+                )),
+            );
+        }
+    }
+
+    // Normalized request: system prompt (cache markers stripped — member
+    // providers each have their own caching semantics) + the real session
+    // history + the current user turn (mirrors `call_direct_api`'s message
+    // construction).
+    let system_text = system_prompt.replace(CACHE_SPLIT_MARKER, "");
+    let mut req = duduclaw_llm::ChatRequest::new(model_id);
+    if !system_text.trim().is_empty() {
+        req.system = vec![duduclaw_llm::SystemBlock::uncached(system_text)];
+    }
+    req.messages = build_moa_messages(conversation_history, user_message);
+    req.max_tokens = 8192;
+
+    // `complete_moa_model` borrows a `&dyn Fn` lookup across its awaits, which
+    // makes its future non-Send — run it on a blocking thread via
+    // `Handle::block_on` (no Send bound) so this outer future stays Send for
+    // the channel-reply pipeline.
+    let model_id_owned = model_id.to_string();
+    let handle = tokio::runtime::Handle::current();
+    let moa = tokio::task::spawn_blocking(move || {
+        let lookup = move |pid: &str| providers.get(pid).cloned();
+        handle.block_on(duduclaw_llm::complete_moa_model(
+            &model_id_owned,
+            &req,
+            crate::cost_telemetry::model_registry(),
+            &lookup,
+        ))
+    })
+    .await
+    .map_err(|e| format!("MoA 執行緒失敗：{e}"))?
+    .map_err(|e| format!("MoA ensemble `{name}` 執行失敗：{e}"))?;
+
+    if moa.degraded {
+        for (member, err) in &moa.proposer_errors {
+            debug!(ensemble = %moa.ensemble, member = %member, error = %err, "MoA proposer failed");
+        }
+    }
+    info!(
+        ensemble = %moa.ensemble,
+        proposals = moa.proposals_used,
+        degraded = moa.degraded,
+        input_tokens = moa.response.usage.input_tokens,
+        output_tokens = moa.response.usage.output_tokens,
+        "MoA ensemble completed"
+    );
+    Ok(moa.response.text())
+}
+
+/// Build the MoA request's message list from the session history plus the
+/// current user turn — the same `(role, content)` pairs and ordering the
+/// non-MoA [`call_direct_api`] path sends. Pure (unit-tested below).
+///
+/// Role mapping is fail-safe: `"assistant"` (case-insensitive) maps to the
+/// assistant role; anything else — including unknown strings — is treated as
+/// user content, never dropped.
+fn build_moa_messages(
+    conversation_history: &[(String, String)],
+    user_message: &str,
+) -> Vec<duduclaw_llm::ChatMessage> {
+    let mut messages = Vec::with_capacity(conversation_history.len() + 1);
+    for (role, content) in conversation_history {
+        if role.eq_ignore_ascii_case("assistant") {
+            messages.push(duduclaw_llm::ChatMessage::assistant(content.clone()));
+        } else {
+            messages.push(duduclaw_llm::ChatMessage::user(content.clone()));
+        }
+    }
+    messages.push(duduclaw_llm::ChatMessage::user(user_message));
+    messages
+}
+
+// ---------------------------------------------------------------------------
 // System prompt normalization
 // ---------------------------------------------------------------------------
 
@@ -580,6 +752,33 @@ mod tests {
         assert_eq!(get("none"), 1);
         assert_eq!(get("system_block_1"), 1);
         assert_eq!(get("layout"), 1);
+    }
+
+    #[test]
+    fn moa_messages_thread_history_then_current_turn() {
+        // HIGH-B regression: MoA used to send ONLY the current user turn.
+        let history = vec![
+            ("user".to_string(), "第一輪問題".to_string()),
+            ("assistant".to_string(), "first answer".to_string()),
+            ("ASSISTANT".to_string(), "case-insensitive".to_string()),
+            ("weird-role".to_string(), "fail-safe as user".to_string()),
+        ];
+        let msgs = build_moa_messages(&history, "現在的問題");
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[0].role, duduclaw_llm::Role::User);
+        assert_eq!(msgs[1].role, duduclaw_llm::Role::Assistant);
+        assert_eq!(msgs[2].role, duduclaw_llm::Role::Assistant);
+        assert_eq!(msgs[3].role, duduclaw_llm::Role::User);
+        // Current turn is always the last user message.
+        assert_eq!(msgs[4].role, duduclaw_llm::Role::User);
+        assert_eq!(
+            msgs[4].parts,
+            vec![duduclaw_llm::ContentPart::Text("現在的問題".to_string())]
+        );
+        // Empty history == pre-fix shape (single user turn).
+        let solo = build_moa_messages(&[], "hi");
+        assert_eq!(solo.len(), 1);
+        assert_eq!(solo[0].role, duduclaw_llm::Role::User);
     }
 
     #[test]

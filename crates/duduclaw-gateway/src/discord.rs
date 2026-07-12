@@ -111,10 +111,12 @@ const BOT_INTENTS: u64 = INTENT_GUILDS
 // ── Slash command definitions ───────────────────────────────
 
 fn slash_command_definitions() -> Vec<Value> {
+    // §10.6: user-visible product name honours white-label branding.
+    let product = crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
     vec![
         json!({
             "name": "ask",
-            "description": "Ask DuDuClaw AI a question",
+            "description": format!("Ask {product} AI a question"),
             "type": 1,
             "options": [{
                 "name": "prompt",
@@ -125,12 +127,12 @@ fn slash_command_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "status",
-            "description": "Show DuDuClaw bot status",
+            "description": format!("Show {product} bot status"),
             "type": 1
         }),
         json!({
             "name": "config",
-            "description": "Configure DuDuClaw settings for this server",
+            "description": format!("Configure {product} settings for this server"),
             "type": 1,
             "default_member_permissions": "32", // MANAGE_GUILD
             "options": [
@@ -1283,6 +1285,94 @@ async fn handle_message_create(
         || data.get("thread").is_some()
         || data.get("position").is_some();
 
+    // ── Chat commands (/status, /new, /handoff, /undo, /rollback, …) ──
+    // Intercepted before the AI pipeline and before auto-thread creation
+    // (a command should never spawn a new thread). Mirrors slack.rs.
+    if crate::chat_commands::is_command(clean_content) {
+        if let Some(cmd) = crate::chat_commands::parse_command(clean_content, None) {
+            let session_id = if is_thread {
+                format!("discord:thread:{channel_id}")
+            } else {
+                format!("discord:{channel_id}")
+            };
+            // Central access gate (pairing / allowlist / blocklist) — same
+            // enforcement the AI path applies; commands must not bypass it.
+            if let Some(gate_reply) = crate::channel_reply::check_user_access_gate(
+                ctx,
+                &session_id,
+                user_id,
+                clean_content,
+            )
+            .await
+            {
+                if !gate_reply.is_empty() {
+                    let _ = send_discord_message(
+                        http,
+                        token,
+                        channel_id,
+                        json!({ "content": gate_reply }),
+                    )
+                    .await;
+                }
+                return; // blocked users are silently ignored (empty reply)
+            }
+            // Auto-thread mode: session-scoped commands issued in a MAIN
+            // channel target `discord:{channel_id}` while the conversations
+            // live in `discord:thread:{tid}` — an empty result there is just
+            // confusing, so guide the user into the thread instead.
+            // (In-thread behavior unchanged; stateless commands still work.)
+            if !is_thread
+                && auto_thread
+                && !guild_id.is_empty()
+                && matches!(
+                    cmd,
+                    crate::chat_commands::ChatCommand::Undo(_)
+                        | crate::chat_commands::ChatCommand::Rollback
+                        | crate::chat_commands::ChatCommand::Handoff(_)
+                        | crate::chat_commands::ChatCommand::New
+                        | crate::chat_commands::ChatCommand::Compact
+                )
+                && ctx
+                    .session_manager
+                    .get_messages(&session_id)
+                    .await
+                    .map(|m| m.is_empty())
+                    .unwrap_or(true)
+            {
+                let _ = send_discord_message(
+                    http,
+                    token,
+                    channel_id,
+                    json!({ "content": "此頻道的對話都在各自的對話串內進行，請在對話串內使用此指令。" }),
+                )
+                .await;
+                return;
+            }
+            let agent_id = match agent_name {
+                Some(a) => a.to_string(),
+                None => {
+                    let reg = ctx.registry.read().await;
+                    reg.main_agent()
+                        .map(|a| a.config.agent.name.clone())
+                        .unwrap_or_default()
+                }
+            };
+            // Real per-channel admin status (fail-closed) — never hardcoded.
+            let is_admin = crate::channel_reply::is_channel_admin(
+                ctx,
+                "discord",
+                &[user_id, &session_id],
+            )
+            .await;
+            let reply =
+                crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id, is_admin)
+                    .await;
+            let _ = send_discord_message(http, token, channel_id, json!({ "content": reply }))
+                .await;
+            return;
+        }
+    }
+
     // Track whether we created a new thread (for guide message later)
     let mut created_thread = false;
     let reply_channel_id = if auto_thread && !is_thread && !guild_id.is_empty() {
@@ -1916,8 +2006,9 @@ async fn handle_slash_command(
         "ask" => {
             // Guild whitelist applies to slash commands too.
             if !guild_id.is_empty() && !ctx.channel_settings.is_guild_allowed("discord", guild_id).await {
+                let product = crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
                 send_interaction_response(http, interaction_id, interaction_token, 4,
-                    Some(json!({"content": "❌ 此伺服器未被授權使用 DuDuClaw", "flags": 64}))).await;
+                    Some(json!({"content": format!("❌ 此伺服器未被授權使用 {product}"), "flags": 64}))).await;
                 return;
             }
 
@@ -1984,12 +2075,13 @@ async fn handle_slash_command(
                 if auto_thread { "✅" } else { "❌" },
             );
 
+            let product = crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
             let embed = json!({
                 "embeds": [{
-                    "title": "DuDuClaw Status",
+                    "title": format!("{product} Status"),
                     "description": status_text,
                     "color": 0xF59E0B,
-                    "footer": { "text": "DuDuClaw" }
+                    "footer": { "text": product }
                 }]
             });
             send_interaction_response(http, interaction_id, interaction_token, 4, Some(embed)).await;

@@ -33,6 +33,9 @@ pub struct Session {
     pub total_tokens: u32,
     pub last_active: String,
     pub model: String,
+    /// G4 lineage counter: starts at 1, bumped every time the session is
+    /// compressed (auto or `/compact`). Surfaced in `/status` as "#N".
+    pub lineage: u32,
 }
 
 /// A single message within a session.
@@ -74,7 +77,11 @@ impl SessionManager {
     /// Tries non-blocking acquisition across all connections first. If all busy,
     /// sleeps 1ms before retrying to avoid CPU spin (R4-M2). Logs a warning
     /// after 1000 consecutive misses to surface pool exhaustion.
-    async fn acquire(&self) -> tokio::sync::MutexGuard<'_, Connection> {
+    ///
+    /// `pub(crate)` so `session_portability.rs` (G4 handoff/undo/rollback)
+    /// can extend `SessionManager` from its own module without widening
+    /// the public API.
+    pub(crate) async fn acquire(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         let mut attempts = 0u32;
         loop {
             for conn in &self.pool {
@@ -163,6 +170,28 @@ impl SessionManager {
             [],
         );
 
+        // G4 session portability (2026-07-11):
+        // - `undone_at` on messages: /undo //rollback tombstone (NULL = live).
+        //   Distinct from `hidden` (Sculptor hide/restore) so undone turns are
+        //   NOT restorable via restore_message and keep a clean audit trail.
+        // - `lineage` on sessions: visible generation counter, bumped on every
+        //   compression ("#2" after the first compress).
+        // - `checkpoint_message_id` on sessions: turn-id watermark recorded
+        //   just before each user turn is appended (i.e. before every agent
+        //   run); /rollback tombstones everything after it.
+        let _ = conn.execute(
+            "ALTER TABLE session_messages ADD COLUMN undone_at TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN lineage INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN checkpoint_message_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
         // WP5 T5.1: reply-to → session mapping. When the bot sends a reply we
         // record which session that outbound message belongs to; when the user
         // replies to that message, we resume the same session instead of the
@@ -201,7 +230,8 @@ impl SessionManager {
         // Authoritative SELECT — reads whichever row won the race.
         let session = conn
             .query_row(
-                "SELECT id, agent_id, summary, total_tokens, last_active, model
+                "SELECT id, agent_id, summary, total_tokens, last_active, model,
+                        COALESCE(lineage, 1)
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 |row| {
@@ -212,6 +242,7 @@ impl SessionManager {
                         total_tokens: row.get(3)?,
                         last_active: row.get(4)?,
                         model: row.get(5)?,
+                        lineage: row.get::<_, i64>(6)?.max(1) as u32,
                     })
                 },
             )
@@ -240,6 +271,22 @@ impl SessionManager {
         let conn = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
 
+        // G4 checkpoint: every user turn starts a (potentially file-writing)
+        // agent run, so record the turn-id watermark just before it. We
+        // cannot know in advance which runs will write files (the CLI
+        // runtimes own tool use), so this is the conservative superset.
+        // /rollback tombstones everything appended after this watermark.
+        if role == "user" {
+            conn.execute(
+                "UPDATE sessions SET checkpoint_message_id = (
+                     SELECT COALESCE(MAX(id), 0) FROM session_messages
+                     WHERE session_id = ?1
+                 ) WHERE id = ?1",
+                params![session_id],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        }
+
         conn.execute(
             "INSERT INTO session_messages (session_id, role, content, tokens, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -264,7 +311,7 @@ impl SessionManager {
             .prepare(
                 "SELECT role, content, tokens, timestamp
                  FROM session_messages
-                 WHERE session_id = ?1 AND hidden = 0
+                 WHERE session_id = ?1 AND hidden = 0 AND undone_at IS NULL
                  ORDER BY id ASC",
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -305,6 +352,11 @@ impl SessionManager {
     /// Replace all messages with a summary and reset the token count.
     ///
     /// Uses a SQLite transaction to ensure atomicity (BE-M7).
+    ///
+    /// Note: the DELETE below removes EVERY row for the session, including
+    /// tombstoned (`undone_at`) and hidden ones — soft-deleted rows are
+    /// therefore retained for audit only *until the next compression*, not
+    /// indefinitely (see `session_portability.rs` module docs).
     pub async fn compress(&self, session_id: &str, summary: &str) -> Result<()> {
         let conn = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
@@ -325,8 +377,12 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
+        // G4 lineage: each compression starts a new visible generation
+        // ("#2", "#3", …) so users can tell a compressed session apart.
         tx.execute(
-            "UPDATE sessions SET summary = ?1, total_tokens = 0, last_active = ?2 WHERE id = ?3",
+            "UPDATE sessions SET summary = ?1, total_tokens = 0, last_active = ?2,
+                    lineage = COALESCE(lineage, 1) + 1
+             WHERE id = ?3",
             params![summary, now, session_id],
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -724,7 +780,7 @@ impl SessionManager {
         let mut stmt = conn
             .prepare(
                 "SELECT role, content FROM session_messages
-                 WHERE session_id = ?1 AND hidden = 0
+                 WHERE session_id = ?1 AND hidden = 0 AND undone_at IS NULL
                  ORDER BY id ASC
                  LIMIT ?2",
             )
@@ -792,7 +848,8 @@ impl SessionManager {
             .prepare(
                 "SELECT id, role, content, tokens, timestamp
                  FROM session_messages
-                 WHERE session_id = ?1 AND hidden = 1 AND content LIKE ?2 ESCAPE '\\'
+                 WHERE session_id = ?1 AND hidden = 1 AND undone_at IS NULL
+                   AND content LIKE ?2 ESCAPE '\\'
                  ORDER BY id DESC
                  LIMIT ?3",
             )
