@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router';
 import { ChevronDown, Bot, Settings2 } from 'lucide-react';
 import { useChatStore } from '@/stores/chat-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useEffectiveName, useEffectiveLogo } from '@/lib/branding';
 import { cn } from '@/lib/utils';
 
 /**
@@ -22,6 +23,9 @@ export function AgentModelPicker() {
   const agentName = useChatStore((s) => s.agentName);
   const agentIcon = useChatStore((s) => s.agentIcon);
   const model = useChatStore((s) => s.model);
+  const brandName = useEffectiveName();
+  const brandLogo = useEffectiveLogo();
+  const fallbackIcon = brandLogo.isImage ? '🐾' : brandLogo.value;
   const agents = useAgentsStore((s) => s.agents);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const loaded = useAgentsStore((s) => s.loaded);
@@ -63,8 +67,8 @@ export function AgentModelPicker() {
         aria-expanded={open}
         className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--panel-border)] px-2.5 text-xs font-medium text-stone-600 transition-colors hover:bg-stone-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 dark:text-stone-300 dark:hover:bg-white/5"
       >
-        <span className="text-sm leading-none">{agentIcon || '🐾'}</span>
-        <span className="max-w-[8rem] truncate">{agentName || 'DuDuClaw'}</span>
+        <span className="text-sm leading-none">{agentIcon || fallbackIcon}</span>
+        <span className="max-w-[8rem] truncate">{agentName || brandName}</span>
         {model && <span className="hidden text-stone-400 sm:inline">· {model}</span>}
         <ChevronDown className="h-3.5 w-3.5" />
       </button>
@@ -78,10 +82,10 @@ export function AgentModelPicker() {
             {intl.formatMessage({ id: 'workspace.activeAgent', defaultMessage: '目前 AI 員工' })}
           </p>
           <div className="flex items-center gap-2 rounded-lg px-3 py-2">
-            <span className="text-base leading-none">{agentIcon || '🐾'}</span>
+            <span className="text-base leading-none">{agentIcon || fallbackIcon}</span>
             <div className="min-w-0">
               <p className="truncate text-sm font-medium text-stone-800 dark:text-stone-100">
-                {agentName || 'DuDuClaw'}
+                {agentName || brandName}
               </p>
               {model && <p className="truncate text-xs text-stone-400 tabular-nums">{model}</p>}
             </div>

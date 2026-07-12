@@ -19,6 +19,7 @@ import {
   Download,
   KeyRound,
   ChevronDown,
+  Palette,
 } from 'lucide-react';
 import { GeneralTab } from '@/components/settings/sections/GeneralTab';
 import { AccountTab } from '@/components/settings/sections/AccountTab';
@@ -34,8 +35,9 @@ import { RedactionTab } from '@/components/settings/sections/RedactionTab';
 import { DoctorTab } from '@/components/settings/sections/DoctorTab';
 import { UpdateTab } from '@/components/settings/sections/UpdateTab';
 import { BrowserTab } from '@/components/settings/sections/BrowserTab';
+import { BrandingTab } from '@/components/settings/sections/BrandingTab';
 
-type TabId = 'general' | 'account' | 'system' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'skillSynthesis' | 'redaction' | 'doctor' | 'update' | 'browser';
+type TabId = 'general' | 'account' | 'system' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'skillSynthesis' | 'redaction' | 'doctor' | 'update' | 'browser' | 'branding';
 
 export function SettingsPage() {
   const intl = useIntl();
@@ -59,12 +61,13 @@ export function SettingsPage() {
     doctor: { label: intl.formatMessage({ id: 'settings.doctor' }), icon: Stethoscope },
     update: { label: intl.formatMessage({ id: 'settings.update' }), icon: Download },
     browser: { label: intl.formatMessage({ id: 'settings.browser' }), icon: Globe },
+    branding: { label: intl.formatMessage({ id: 'settings.branding' }), icon: Palette },
   };
   // Non-engineers only need a handful of these day-to-day; the rest are
   // system/engineering knobs tucked behind an "Advanced" disclosure so the
   // default surface reads like a consumer app, not an ops console.
   const EVERYDAY: TabId[] = ['general', 'account', 'voice', 'proactive', 'update'];
-  const ADVANCED: TabId[] = ['system', 'container', 'heartbeat', 'cron', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser'];
+  const ADVANCED: TabId[] = ['system', 'container', 'heartbeat', 'cron', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser', 'branding'];
   const toItems = (ids: TabId[]) => ids.map((id) => ({ id, ...TAB_META[id] }));
   const activeIsAdvanced = ADVANCED.includes(activeTab);
 
@@ -120,6 +123,7 @@ export function SettingsPage() {
       {activeTab === 'doctor' && <DoctorTab />}
       {activeTab === 'update' && <UpdateTab />}
       {activeTab === 'browser' && <BrowserTab />}
+      {activeTab === 'branding' && <BrandingTab />}
     </Page>
   );
 }

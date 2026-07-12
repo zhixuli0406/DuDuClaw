@@ -12,6 +12,7 @@ const items: InboxItem[] = [
 
 const labels: InboxRowLabels = {
   typeLabel: (i) => i.type,
+  riskLabel: (level) => level,
   approve: 'Approve',
   reject: 'Reject',
   view: 'View',

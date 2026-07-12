@@ -65,6 +65,16 @@ const channelMeta: Record<
     bg: 'bg-sky-100',
     darkBg: 'dark:bg-sky-900/30',
   },
+  wecom: {
+    color: 'text-cyan-600 dark:text-cyan-400',
+    bg: 'bg-cyan-100',
+    darkBg: 'dark:bg-cyan-900/30',
+  },
+  dingtalk: {
+    color: 'text-indigo-600 dark:text-indigo-400',
+    bg: 'bg-indigo-100',
+    darkBg: 'dark:bg-indigo-900/30',
+  },
 };
 
 function getChannelPlatform(name: string): string {
@@ -366,6 +376,9 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
   const [waVerifyToken, setWaVerifyToken] = useState('');
   const [waAppSecret, setWaAppSecret] = useState('');
   const [feishuVerifyToken, setFeishuVerifyToken] = useState('');
+  const [wecomAgentId, setWecomAgentId] = useState('');
+  const [wecomCallbackToken, setWecomCallbackToken] = useState('');
+  const [wecomAesKey, setWecomAesKey] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
 
@@ -383,6 +396,11 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
       if (channelType === 'feishu' && feishuVerifyToken.trim()) {
         config.feishu_verification_token = feishuVerifyToken.trim();
       }
+      if (channelType === 'wecom') {
+        if (wecomAgentId.trim()) config.wecom_agent_id = wecomAgentId.trim();
+        if (wecomCallbackToken.trim()) config.wecom_callback_token = wecomCallbackToken.trim();
+        if (wecomAesKey.trim()) config.wecom_encoding_aes_key = wecomAesKey.trim();
+      }
       await api.channels.add(channelType, config, selectedAgent || undefined);
       onCreated();
       onClose();
@@ -391,6 +409,9 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
       setWaVerifyToken('');
       setWaAppSecret('');
       setFeishuVerifyToken('');
+      setWecomAgentId('');
+      setWecomCallbackToken('');
+      setWecomAesKey('');
       setSelectedAgent('');
     } catch (e) {
       setAddError(String(e));
@@ -475,6 +496,16 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
         'channels.setup.feishu.step6',
       ],
     },
+    wecom: {
+      tokenLabel: 'Corp Secret',
+      secretLabel: 'Corp ID',
+      stepKeys: [],
+    },
+    dingtalk: {
+      tokenLabel: 'App Secret',
+      secretLabel: 'App Key (Client ID)',
+      stepKeys: [],
+    },
   };
 
   const guide = channelGuide[channelType] ?? { tokenLabel: 'Token', stepKeys: [] };
@@ -491,6 +522,8 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
             <option value="slack">Slack</option>
             <option value="whatsapp">WhatsApp</option>
             <option value="feishu">Feishu</option>
+            <option value="wecom">WeCom (企業微信)</option>
+            <option value="dingtalk">DingTalk (釘釘)</option>
           </select>
         </Field>
 
@@ -557,6 +590,21 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
           <Field label="Verification Token" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
             <input type="password" value={feishuVerifyToken} onChange={(e) => setFeishuVerifyToken(e.target.value)} className={controlClass} autoComplete="off" />
           </Field>
+        )}
+
+        {/* G.6 — extra WeCom tokens (global) */}
+        {channelType === 'wecom' && (
+          <>
+            <Field label="AgentId">
+              <input type="text" value={wecomAgentId} onChange={(e) => setWecomAgentId(e.target.value)} className={controlClass} autoComplete="off" />
+            </Field>
+            <Field label="Callback Token" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
+              <input type="password" value={wecomCallbackToken} onChange={(e) => setWecomCallbackToken(e.target.value)} className={controlClass} autoComplete="off" />
+            </Field>
+            <Field label="EncodingAESKey" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
+              <input type="password" value={wecomAesKey} onChange={(e) => setWecomAesKey(e.target.value)} className={controlClass} autoComplete="off" />
+            </Field>
+          </>
         )}
 
         {addError && (

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, fireEvent } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 
 // The panel imports decideApproval → api-custom-skills → ws-client. Stub the
@@ -58,11 +58,66 @@ describe('<ApprovalDetailPanel> skill_create', () => {
     expect(screen.getByText('客服待辦整理')).toBeInTheDocument();
   });
 
-  it('falls back to the generic raw-payload view when the SKILL.md is absent', () => {
+  it('falls back to the generic view when the SKILL.md is absent', () => {
     const approval = skillCreateApproval({ skill_md: '' });
     renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
     // The summary is shown by the generic branch; no SKILL.md pre block.
     expect(screen.getByText(approval.summary)).toBeInTheDocument();
     expect(screen.queryByText(/name: my-skill/)).not.toBeInTheDocument();
+  });
+});
+
+function genericApproval(over?: Partial<ApprovalItem>): ApprovalItem {
+  return {
+    id: 'apr-2',
+    agent_id: 'agent-b',
+    kind: 'tool_call',
+    summary: 'Run a shell command to tidy the logs',
+    created_at: '2026-07-11T00:00:00Z',
+    ttl_seconds: 3600,
+    payload: { tool: 'Bash', command: 'rm /tmp/old.log', scope: 'workspace-write' },
+    ...over,
+  };
+}
+
+describe('<ApprovalDetailPanel> generic (U2 redesign)', () => {
+  it('leads with the plan summary + a whole-action risk badge', () => {
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval()} onApprove={vi.fn()} onReject={vi.fn()} />);
+    // Plan-first: "What this AI employee plans to do" heading + plain-language kind.
+    expect(screen.getByText('What this AI employee plans to do')).toBeInTheDocument();
+    expect(screen.getByText('Call a tool to carry out an action')).toBeInTheDocument();
+    // Whole-action risk badge (tool_call → medium).
+    expect(screen.getByText('Medium risk')).toBeInTheDocument();
+    // Scope-of-impact facts surface as verification aids.
+    expect(screen.getByText('Bash')).toBeInTheDocument();
+    expect(screen.getByText('workspace-write')).toBeInTheDocument();
+  });
+
+  it('keeps the raw payload behind an opt-in spot-check', () => {
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval()} onApprove={vi.fn()} onReject={vi.fn()} />);
+    // The full JSON payload is not force-read.
+    expect(screen.queryByText(/"command": "rm \/tmp\/old.log"/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText('Spot-check full details'));
+    expect(screen.getByText(/"command": "rm \/tmp\/old.log"/)).toBeInTheDocument();
+  });
+
+  it('approves medium-risk actions directly', () => {
+    const onApprove = vi.fn();
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval()} onApprove={onApprove} onReject={vi.fn()} />);
+    fireEvent.click(screen.getByText('Approve'));
+    expect(onApprove).toHaveBeenCalledTimes(1);
+  });
+
+  it('gates high-risk approval behind a second confirmation', () => {
+    const onApprove = vi.fn();
+    const approval = genericApproval({ kind: 'agent_hire', summary: 'Hire a data-entry AI employee' });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={onApprove} onReject={vi.fn()} />);
+    expect(screen.getByText('High risk')).toBeInTheDocument();
+    // First click opens the confirm dialog — it does NOT approve yet.
+    fireEvent.click(screen.getByText('Approve'));
+    expect(onApprove).not.toHaveBeenCalled();
+    // Confirming in the dialog runs the approval exactly once.
+    fireEvent.click(screen.getByText('Confirm approve'));
+    expect(onApprove).toHaveBeenCalledTimes(1);
   });
 });

@@ -20,6 +20,9 @@ const DashboardPage = lazyPage(() => import('./pages/DashboardPage'), 'Dashboard
 const HomePage = lazyPage(() => import('./pages/HomePage'), 'HomePage');
 const InboxPage = lazyPage(() => import('./pages/InboxPage'), 'InboxPage');
 const RoutinesPage = lazyPage(() => import('./pages/RoutinesPage'), 'RoutinesPage');
+const TimelinePage = lazyPage(() => import('./pages/TimelinePage'), 'TimelinePage');
+const RunsPage = lazyPage(() => import('./pages/RunsPage'), 'RunsPage');
+const CanvasPage = lazyPage(() => import('./pages/CanvasPage'), 'CanvasPage');
 const AgentDetailPage = lazyPage(() => import('./pages/AgentDetailPage'), 'AgentDetailPage');
 const SkillsShell = lazyPage(() => import('./pages/SkillsShell'), 'SkillsShell');
 const KnowledgeShell = lazyPage(() => import('./pages/KnowledgeShell'), 'KnowledgeShell');
@@ -30,6 +33,7 @@ const LicenseShell = lazyPage(() => import('./pages/LicenseShell'), 'LicenseShel
 const WebChatPage = lazyPage(() => import('./pages/WebChatPage'), 'WebChatPage');
 const AgentsPage = lazyPage(() => import('./pages/AgentsPage'), 'AgentsPage');
 const TaskBoardPage = lazyPage(() => import('./pages/TaskBoardPage'), 'TaskBoardPage');
+const PlansPage = lazyPage(() => import('./pages/PlansPage'), 'PlansPage');
 const ForkPage = lazyPage(() => import('./pages/ForkPage'), 'ForkPage');
 const MarketplacePage = lazyPage(() => import('./pages/MarketplacePage'), 'MarketplacePage');
 const MemoryPage = lazyPage(() => import('./pages/MemoryPage'), 'MemoryPage');
@@ -64,6 +68,8 @@ const SkillNewPage = lazyPage(() => import('./pages/SkillNewPage'), 'SkillNewPag
 const SkillCustomDetailPage = lazyPage(() => import('./pages/SkillCustomDetailPage'), 'SkillCustomDetailPage');
 const GrowthPage = lazyPage(() => import('./pages/GrowthPage'), 'GrowthPage');
 const MascotOverlayPage = lazyPage(() => import('./pages/MascotOverlayPage'), 'MascotOverlayPage');
+const AboutPage = lazyPage(() => import('./pages/AboutPage'), 'AboutPage');
+const DistributorsPage = lazyPage(() => import('./pages/DistributorsPage'), 'DistributorsPage');
 
 /** Lightweight route-transition fallback while a lazy page chunk loads. */
 function PageFallback() {
@@ -121,6 +127,13 @@ export function App() {
               {/* ── 工作 ── */}
               <Route path="tasks" element={<TaskBoardPage />} />
               <Route path="tasks/:id" element={<TaskDetailPage />} />
+              {/* U4 co-edited plans — shared step lists between the user and
+                  an AI employee (agent-scoped; the gateway fails closed). */}
+              <Route path="plans" element={<PlansPage />} />
+              {/* G12 run inspector — data-scoped (the gateway fails closed
+                  per agent), so it is open to every authenticated user. */}
+              <Route path="runs" element={<RunsPage />} />
+              <Route path="canvas" element={<CanvasPage />} />
 
               {/* ── 員工 / 公司 ── */}
               <Route path="agents" element={<AgentsPage />} />
@@ -136,11 +149,14 @@ export function App() {
               <Route path="skills/new" element={<SkillNewPage />} />
               <Route path="skills/custom/:id" element={<SkillCustomDetailPage />} />
               <Route path="knowledge" element={<KnowledgeShell />} />
+              {/* 關於 — open to every authenticated user (all instances). */}
+              <Route path="about" element={<AboutPage />} />
 
               {/* manager+ routes (Zone B/C) */}
               <Route element={<RoleGuard minRole="manager" />}>
                 <Route path="forks" element={<ForkPage />} />
                 <Route path="routines" element={<RoutinesPage />} />
+                <Route path="timeline" element={<TimelinePage />} />
                 <Route path="reports" element={<ReportPage />} />
                 <Route path="org" element={<OrgChartPage />} />
               </Route>
@@ -162,6 +178,7 @@ export function App() {
                   <Route path="security" element={<SecurityPage />} />
                   <Route path="governance" element={<GovernanceShell />} />
                   <Route path="users" element={<UsersPage />} />
+                  <Route path="distributors" element={<DistributorsPage />} />
                   <Route path="system" element={<SettingsPage />} />
                 </Route>
               </Route>

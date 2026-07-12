@@ -258,3 +258,21 @@ v2 的可重播配方 — 未來任何再設計/新頁批次沿用：
   viseme/桌寵 另有 JS gate（`resolveStageMode`、`celebrate()` 粒子抑制）。
 - **canvas / SVG**：世界容器 `role="img"`+label；`CharacterAvatar`/`DuDu` wrapper `role="img"`+label、內層 SVG `aria-hidden`。
 - Text overflow：truncate + title；tables scroll-x；長 CJK wrap。每個 async surface 有 loading + empty + error。
+
+## 13. 審批與信心呈現（U2/U3 實證準則）
+
+依 CHI/FAccT 2026 實證重設審批介面（`lib/approval-risk.ts` 純函式 + `inbox/ApprovalDetailPanel.tsx`）。準則：
+
+- **計畫優先於執行**（arXiv:2604.04918）：審批卡**先講「這位 AI 員工打算做什麼」**（白話 action 描述 +
+  影響範圍 + 涉及工具/對象），approve/deny 按鈕排在讀完摘要之後，不是開場就給一對按鈕。
+- **輔助捷思、不假設細讀**（arXiv:2606.05391）：真人是 good-enough 審查者，不會逐項看。用**風險徽章**
+  （`approvalRisk(kind,payload)` → low/medium/high → emerald/amber/rose token）給一眼可判的訊號；完整
+  payload 收在**一鍵抽查**（opt-in 展開）後，不強迫閱讀。**高風險（skill_create / agent_hire / 安檢未過）
+  approve 前走 `ConfirmDialog` 二次確認**。
+- **不確定性只到整體層級**（FAccT arXiv:2605.28571 反直覺結論：顯示過細助長過度信賴）：信心/風險呈現
+  **停在整個動作層級的單一徽章**，**禁止 token 級高亮或逐項機率條**——過度細緻的把握度標示會讓使用者
+  更盲信，反而降低審查品質。
+- **疲勞保護**（arXiv:2606.08919）：Inbox 頂部顯示**當日已審批量**（`bumpApprovedToday`，達
+  `FATIGUE_NUDGE_THRESHOLD` 時轉 amber 提示），同類 pending 審批 ≥ `SIMILAR_BATCH_THRESHOLD` 時給
+  「這批同類，抽查一項代表全批」提示。**只降認知負擔，永不自動批准**。
+- **誠實**：SKIPPED / 安檢 finding / 風險原因**原樣呈現不美化**（沿用 §12 誠實回報精神）。

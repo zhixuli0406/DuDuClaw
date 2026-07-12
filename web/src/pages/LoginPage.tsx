@@ -6,6 +6,7 @@ import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Field, controlClass } from '@/components/ui/Field';
 import { DuDu } from '@/components/mascot';
+import { useEffectiveName, useEffectiveLogo } from '@/lib/branding';
 
 type Mode = 'password' | 'otp';
 type OtpStep = 'email' | 'code';
@@ -13,6 +14,10 @@ type OtpStep = 'email' | 'code';
 export function LoginPage() {
   const intl = useIntl();
   const navigate = useNavigate();
+  // Pre-auth branding comes from the localStorage cache the store hydrates at
+  // module load; a white-label distributor sees their brand on the login page.
+  const brandName = useEffectiveName();
+  const brandLogo = useEffectiveLogo();
   const login = useAuthStore((s) => s.login);
   const otpRequest = useAuthStore((s) => s.otpRequest);
   const otpVerify = useAuthStore((s) => s.otpVerify);
@@ -131,10 +136,19 @@ export function LoginPage() {
 
       <div className="page-enter w-full max-w-sm">
         <div className="mb-8 flex flex-col items-center text-center">
-          {/* DuDu greets the returning operator with a wave (§7.3 接待員). */}
-          <DuDu face="waving" size={96} label="DuDu" />
+          {/* A white-label distributor with a custom logo shows it here;
+              otherwise DuDu greets the returning operator (§7.3 接待員). */}
+          {brandLogo.isImage ? (
+            <img
+              src={brandLogo.value}
+              alt={brandName}
+              className="h-24 w-24 rounded-2xl object-cover"
+            />
+          ) : (
+            <DuDu face="waving" size={96} label="DuDu" />
+          )}
           <h1 className="mt-3 text-2xl font-semibold tracking-tight text-stone-900 dark:text-stone-50">
-            DuDuClaw
+            {brandName}
           </h1>
           <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
             {intl.formatMessage({ id: 'login.subtitle' })}

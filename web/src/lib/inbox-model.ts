@@ -9,6 +9,8 @@
  * Everything here is a pure function or a thin localStorage wrapper so it is
  * unit-testable in isolation from React.
  */
+import type { RiskLevel } from './approval-risk';
+
 export type InboxItemType = 'approval' | 'decision' | 'blocked' | 'budget' | 'failed_run';
 
 export interface InboxItem {
@@ -29,6 +31,8 @@ export interface InboxItem {
   readonly actionable: boolean;
   /** Free-form status token (task status / incident severity) — the "全部" tab filters on it. */
   readonly status?: string;
+  /** Whole-action risk band (approvals only) — drives the row's risk badge (U2). */
+  readonly risk?: RiskLevel;
 }
 
 /** The five inbox lenses (§5.2). */

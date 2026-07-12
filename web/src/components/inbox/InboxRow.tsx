@@ -2,11 +2,14 @@ import { cn } from '@/lib/utils';
 import { Badge, CharacterAvatar } from '@/components/ui';
 import { timeAgo } from '@/lib/format';
 import type { InboxColumn, InboxItem } from '@/lib/inbox-model';
+import { riskTone, type RiskLevel } from '@/lib/approval-risk';
 import { SwipeToArchive } from '@/components/ui';
 import { TYPE_META } from './meta';
 
 export interface InboxRowLabels {
   typeLabel: (item: InboxItem) => string;
+  /** Whole-action risk band → short label ("低/中/高"). */
+  riskLabel: (level: RiskLevel) => string;
   approve: string;
   reject: string;
   view: string;
@@ -62,6 +65,11 @@ export function InboxRow(props: InboxRowProps) {
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
           {columns.includes('type') && <Badge tone={meta.tone}>{labels.typeLabel(item)}</Badge>}
+          {isApproval && item.risk && (
+            <Badge tone={riskTone(item.risk)} dot>
+              {labels.riskLabel(item.risk)}
+            </Badge>
+          )}
           {columns.includes('agent') && item.agentId && (
             <span className="truncate text-xs text-stone-400 dark:text-stone-500">{agentName ?? item.agentId}</span>
           )}

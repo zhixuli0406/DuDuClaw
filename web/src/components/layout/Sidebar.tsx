@@ -24,6 +24,7 @@ import { useGrowthStore } from '@/stores/growth-store';
 import { hasMinRole } from '@/lib/roles';
 import { filterVisible } from '@/lib/nav-visibility';
 import { useForksExist } from '@/hooks/useForksExist';
+import { useBrandingStore, useEffectiveName, useEffectiveLogo } from '@/lib/branding';
 import { CharacterAvatar, agentPose } from '@/components/character';
 import {
   dailyItems,
@@ -274,6 +275,9 @@ export function Sidebar() {
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const onlineCount = agents.filter((a) => a.status === 'active').length;
   const companyLevel = useGrowthStore((s) => s.snapshot?.level ?? null);
+  const brandName = useEffectiveName();
+  const brandLogo = useEffectiveLogo();
+  const brandSubtitle = useBrandingStore((s) => s.branding?.subtitle?.trim() || '');
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
@@ -338,19 +342,27 @@ export function Sidebar() {
     >
       {/* Company nameplate */}
       <div className={cn('flex items-center gap-2 px-3 py-4', rail && 'flex-col px-0')}>
-        <span
-          className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-gradient-to-b from-amber-400 to-amber-500 text-lg shadow-[0_4px_16px_-4px_rgba(245,158,11,0.6)]"
-          role="img"
-          aria-label="paw"
-        >
-          🐾
-        </span>
+        {brandLogo.isImage ? (
+          <img
+            src={brandLogo.value}
+            alt={brandName}
+            className="h-9 w-9 shrink-0 rounded-xl object-cover shadow-[0_4px_16px_-4px_rgba(245,158,11,0.6)]"
+          />
+        ) : (
+          <span
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-gradient-to-b from-amber-400 to-amber-500 text-lg shadow-[0_4px_16px_-4px_rgba(245,158,11,0.6)]"
+            role="img"
+            aria-label={brandName}
+          >
+            {brandLogo.value}
+          </span>
+        )}
         {!rail && (
           <>
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
                 <h1 className="truncate text-base font-semibold tracking-tight text-stone-900 dark:text-stone-50">
-                  DuDuClaw
+                  {brandName}
                 </h1>
                 {/* Company level — real value from the growth snapshot (V10);
                     falls back to a placeholder until the first snapshot lands. */}
@@ -364,7 +376,7 @@ export function Sidebar() {
                 </span>
               </div>
               <p className="truncate text-xs text-stone-500 dark:text-stone-400">
-                {intl.formatMessage({ id: 'app.subtitle' })}
+                {brandSubtitle || intl.formatMessage({ id: 'app.subtitle' })}
               </p>
             </div>
             <button

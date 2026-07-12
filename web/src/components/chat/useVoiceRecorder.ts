@@ -17,13 +17,14 @@ export function micSupported(): boolean {
 }
 
 /** Pick the best available recording container. Empty string → let the UA choose. */
-function pickMimeType(): string {
+export function pickMimeType(): string {
   if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return '';
   const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
   return candidates.find((c) => MediaRecorder.isTypeSupported(c)) ?? '';
 }
 
-function extForMime(mime: string): string {
+/** File extension matching a recording container mime (shared with Talk Mode). */
+export function extForMime(mime: string): string {
   if (mime.includes('ogg')) return 'ogg';
   if (mime.includes('mp4')) return 'm4a';
   return 'webm';
