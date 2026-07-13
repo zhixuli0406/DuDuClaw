@@ -191,6 +191,30 @@ pub struct SqliteMemoryEngine {
     /// write and `search()` blends a cosine similarity signal + appends
     /// vector-only recall hits.
     embedder: Option<std::sync::Arc<dyn crate::vector::EmbeddingProvider>>,
+    /// M1 moat-gate: Cloud paid-tier memory storage quota in bytes.
+    ///
+    /// `0` means **unlimited** — the default for every fresh engine, so
+    /// opensource / self-host deployments are entirely unaffected (the
+    /// enforcement path early-returns before touching the database). Only when a
+    /// caller (the gateway, resolving the active license tier) opts in via
+    /// [`set_memory_quota_gb`](Self::set_memory_quota_gb) does the write path
+    /// begin comparing DB size against this cap. Kept as a plain byte budget so
+    /// the crate never depends on `duduclaw-license`: the quota is a parameter,
+    /// not a license lookup.
+    memory_quota_bytes: u64,
+}
+
+/// Bytes per gigabyte (binary GiB, matching SQLite page-size arithmetic).
+const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
+
+/// Pure quota predicate: is `usage_bytes` at or over the `quota_bytes` cap?
+///
+/// `quota_bytes == 0` is the **unlimited** sentinel and always returns `false`
+/// (never blocks) — this is the load-bearing non-breaking guarantee for
+/// opensource / self-host tiers. Otherwise the check is `usage >= quota`
+/// (fail-closed at the boundary).
+pub fn quota_exceeded_bytes(usage_bytes: u64, quota_bytes: u64) -> bool {
+    quota_bytes != 0 && usage_bytes >= quota_bytes
 }
 
 impl SqliteMemoryEngine {
@@ -205,6 +229,7 @@ impl SqliteMemoryEngine {
             conn: Mutex::new(conn),
             retrieval_weights: RetrievalWeights::default(),
             embedder: None,
+            memory_quota_bytes: 0,
         })
     }
 
@@ -218,7 +243,79 @@ impl SqliteMemoryEngine {
             conn: Mutex::new(conn),
             retrieval_weights: RetrievalWeights::default(),
             embedder: None,
+            memory_quota_bytes: 0,
         })
+    }
+
+    /// Set the memory storage quota in gigabytes (`0` = unlimited). Builder form.
+    ///
+    /// The gateway resolves the active license tier's
+    /// `effective_memory_quota_gb` and passes it here; the crate itself never
+    /// consults a license.
+    pub fn with_memory_quota_gb(mut self, gb: usize) -> Self {
+        self.set_memory_quota_gb(gb);
+        self
+    }
+
+    /// Set the memory storage quota in gigabytes (`0` = unlimited). Mutating form
+    /// for the common case where the engine is constructed then configured.
+    pub fn set_memory_quota_gb(&mut self, gb: usize) {
+        self.memory_quota_bytes = (gb as u64).saturating_mul(BYTES_PER_GB);
+    }
+
+    /// Set the memory storage quota in raw bytes (`0` = unlimited). Exposes
+    /// sub-GB granularity for tests and precise-budget callers.
+    pub fn set_memory_quota_bytes(&mut self, bytes: u64) {
+        self.memory_quota_bytes = bytes;
+    }
+
+    /// Current on-disk (or in-memory) database size in bytes, used as the quota
+    /// usage estimate. `page_count * page_size` covers every agent sharing this
+    /// DB file — the cheapest signal already maintained by SQLite, and it works
+    /// identically for `:memory:` databases (so the enforcement is testable).
+    pub async fn db_usage_bytes(&self) -> u64 {
+        let conn = self.conn.lock().await;
+        Self::db_size_bytes(&conn)
+    }
+
+    /// Synchronous DB-size estimate against an already-held connection.
+    fn db_size_bytes(conn: &Connection) -> u64 {
+        let page_count: i64 = conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap_or(0);
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap_or(0);
+        (page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64)
+    }
+
+    /// Fail-closed-but-graceful quota gate for the write path. Called with the
+    /// connection already locked (so it shares the store's single lock and never
+    /// deadlocks).
+    ///
+    /// - Quota `0` (unlimited): returns immediately **before** any DB query —
+    ///   zero overhead and zero behaviour change for free / self-host tiers.
+    /// - Over quota: returns a clear `Err` (no INSERT runs → no data loss, no
+    ///   panic). The rejected entry is simply not written.
+    fn enforce_quota(&self, conn: &Connection) -> Result<()> {
+        if self.memory_quota_bytes == 0 {
+            return Ok(());
+        }
+        let usage = Self::db_size_bytes(conn);
+        if quota_exceeded_bytes(usage, self.memory_quota_bytes) {
+            warn!(
+                usage_bytes = usage,
+                quota_bytes = self.memory_quota_bytes,
+                "memory quota exceeded — rejecting write (no data lost)"
+            );
+            return Err(DuDuClawError::Memory(format!(
+                "memory quota exceeded: {usage} bytes used ≥ {} byte cap ({} GB tier limit); \
+                 entry rejected, existing data preserved",
+                self.memory_quota_bytes,
+                self.memory_quota_bytes / BYTES_PER_GB
+            )));
+        }
+        Ok(())
     }
 
     /// Attach a semantic embedder, enabling the `w_vec` retrieval signal.
@@ -581,6 +678,9 @@ impl SqliteMemoryEngine {
         meta: TemporalMeta,
     ) -> Result<String> {
         let conn = self.conn.lock().await;
+        // M1 moat-gate: reject once the Cloud paid-tier quota is hit. No-op when
+        // unlimited (quota 0). Runs before any write so a rejection loses nothing.
+        self.enforce_quota(&conn)?;
 
         let now = Utc::now();
         let valid_from = meta.valid_from.unwrap_or(now).to_rfc3339();
@@ -1521,6 +1621,9 @@ impl SqliteMemoryEngine {
 impl MemoryEngine for SqliteMemoryEngine {
     async fn store(&self, agent_id: &str, entry: MemoryEntry) -> Result<()> {
         let conn = self.conn.lock().await;
+        // M1 moat-gate: reject once the Cloud paid-tier quota is hit. No-op when
+        // unlimited (quota 0). Runs before any write so a rejection loses nothing.
+        self.enforce_quota(&conn)?;
 
         let tags_json =
             serde_json::to_string(&entry.tags).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
@@ -2114,6 +2217,103 @@ mod tests {
         let results = engine.search(agent, "rust", 10).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("rust"));
+    }
+
+    // ── M1 moat-gate: memory_quota_gb enforcement ────────────────────────────
+
+    #[test]
+    fn quota_predicate_zero_is_unlimited() {
+        // The load-bearing non-breaking guarantee: quota 0 never blocks,
+        // regardless of usage.
+        assert!(!quota_exceeded_bytes(0, 0));
+        assert!(!quota_exceeded_bytes(u64::MAX, 0));
+        // Below the cap → allowed; at/over the cap → blocked (fail-closed).
+        assert!(!quota_exceeded_bytes(999, 1000));
+        assert!(quota_exceeded_bytes(1000, 1000));
+        assert!(quota_exceeded_bytes(1001, 1000));
+    }
+
+    #[tokio::test]
+    async fn quota_zero_never_blocks() {
+        // Default engine = unlimited: many writes all succeed, behaviour
+        // byte-identical to the un-gated path.
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "unlimited-agent";
+        for i in 0..50 {
+            engine
+                .store(agent, make_entry(agent, &format!("entry {i}"), vec![]))
+                .await
+                .expect("quota 0 must never reject a write");
+        }
+        assert_eq!(engine.list_recent(agent, 100).await.unwrap().len(), 50);
+    }
+
+    #[tokio::test]
+    async fn quota_under_limit_allows_write() {
+        // A quota comfortably above current DB size does not block.
+        let mut engine = SqliteMemoryEngine::in_memory().unwrap();
+        engine.set_memory_quota_gb(10); // 10 GB — far above a fresh in-memory DB
+        let agent = "under-agent";
+        engine
+            .store(agent, make_entry(agent, "well within budget", vec![]))
+            .await
+            .expect("write under quota must succeed");
+        assert_eq!(engine.list_recent(agent, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn quota_over_limit_rejects_gracefully_without_data_loss() {
+        let mut engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "capped-agent";
+
+        // Seed some data while unlimited, then measure real usage.
+        for i in 0..5 {
+            engine
+                .store(agent, make_entry(agent, &format!("seed {i}"), vec![]))
+                .await
+                .unwrap();
+        }
+        let before = engine.list_recent(agent, 100).await.unwrap().len();
+        let usage = engine.db_usage_bytes().await;
+        assert!(usage > 0, "DB usage must be measurable for the test to bite");
+
+        // Set the quota BELOW current usage → the next write must be rejected.
+        engine.set_memory_quota_bytes(usage / 2);
+
+        let err = engine
+            .store(agent, make_entry(agent, "over the cap", vec![]))
+            .await
+            .expect_err("write over quota must be rejected");
+        match err {
+            DuDuClawError::Memory(msg) => assert!(
+                msg.contains("quota exceeded"),
+                "graceful, explicit error; got: {msg}"
+            ),
+            other => panic!("expected Memory error, got {other:?}"),
+        }
+
+        // Fail-closed but graceful: nothing was lost, nothing was partially
+        // written, and no panic occurred.
+        assert_eq!(
+            engine.list_recent(agent, 100).await.unwrap().len(),
+            before,
+            "existing data preserved; rejected entry not written"
+        );
+
+        // store_temporal is gated on the same predicate.
+        let temporal_err = engine
+            .store_temporal(agent, make_entry(agent, "temporal over cap", vec![]), TemporalMeta::default())
+            .await
+            .expect_err("store_temporal over quota must also be rejected");
+        assert!(matches!(temporal_err, DuDuClawError::Memory(_)));
+
+        // Lifting the quota back to unlimited restores writes.
+        engine.set_memory_quota_gb(0);
+        engine
+            .store(agent, make_entry(agent, "after lift", vec![]))
+            .await
+            .expect("unlimited again after quota cleared");
+        assert_eq!(engine.list_recent(agent, 100).await.unwrap().len(), before + 1);
     }
 
     /// Live verification of the `w_vec` signal: the vector layer recalls a
