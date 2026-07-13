@@ -472,8 +472,19 @@ async fn persist_facts(agent_id: &str, memory_db: &Path, facts: Vec<DistilledFac
     let agent = agent_id.to_string();
     let db = memory_db.to_path_buf();
 
+    // M1 moat-gate: resolve the active tier's memory quota (0 = unlimited for
+    // free / self-host — the enforcement is then a no-op). Resolved here in the
+    // async context and passed into the blocking engine so `duduclaw-memory`
+    // stays license-agnostic.
+    let quota_gb = match crate::license_runtime::global() {
+        Some(rt) => rt.effective_memory_quota_gb().await,
+        None => 0,
+    };
+
     let result = tokio::task::spawn_blocking(move || {
-        let engine = SqliteMemoryEngine::new(&db).map_err(|e| format!("open memory engine: {e}"))?;
+        let mut engine =
+            SqliteMemoryEngine::new(&db).map_err(|e| format!("open memory engine: {e}"))?;
+        engine.set_memory_quota_gb(quota_gb);
         let rt = tokio::runtime::Handle::current();
         rt.block_on(store_facts(&engine, &agent, &facts))
     })

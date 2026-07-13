@@ -58,6 +58,7 @@ pub mod partner_store;
 pub mod branding;
 pub mod distributor_store;
 pub mod license_serve;
+pub mod license_seed;
 pub mod autopilot_store;
 pub mod autopilot_engine;
 pub mod approval;

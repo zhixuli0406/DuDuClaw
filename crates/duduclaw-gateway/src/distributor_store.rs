@@ -442,6 +442,25 @@ impl DistributorStore {
         Ok(())
     }
 
+    /// Replace an issued license's stored `license_blob` (P-License upgrade,
+    /// plan §12.1). Used by `distributor.upgrade` after re-signing the same key
+    /// with a new `max_agents`. Only the blob changes — the ledger's
+    /// subscription / fingerprint / validity columns are unchanged (the re-sign
+    /// preserves them). `NotFound` if the id is unknown.
+    pub fn update_license_blob(&self, license_id: &str, new_blob: &str) -> Result<(), String> {
+        let conn = self.open_conn()?;
+        let affected = conn
+            .execute(
+                "UPDATE issued_licenses SET license_blob = ?1 WHERE id = ?2",
+                params![new_blob, license_id],
+            )
+            .map_err(|e| format!("update license blob: {e}"))?;
+        if affected == 0 {
+            return Err(format!("找不到授權 '{license_id}'"));
+        }
+        Ok(())
+    }
+
     /// Mark a license `revoked` locally. Returns the affected record's
     /// distributor id for audit. NOTE: local bookkeeping only — remote
     /// propagation is a CRL/control-plane operation (see design §3.4).
@@ -568,6 +587,7 @@ pub fn issue_signed_oem_license(
     expires_days: i64,
     control_url: Option<&str>,
     branding_editable: Option<Vec<String>>,
+    max_agents: Option<u32>,
 ) -> Result<(License, String), String> {
     let mut license = License::new(
         subscription_id,
@@ -585,6 +605,10 @@ pub fn issue_signed_oem_license(
     // narrows the editable range (a customer token). It IS part of the signed
     // payload, so the claim cannot be widened locally.
     license.branding_editable = branding_editable;
+    // P-License: the signed per-license agent-count quota. `None` = no override
+    // (tier default applies); `Some(n)` = sell exactly N (`Some(0)` = unlimited).
+    // It IS part of the signed payload, so the count cannot be raised locally.
+    license.max_agents = max_agents;
     sign_and_self_verify(signing_seed, verify_registry, key_id, license)
 }
 
@@ -607,6 +631,48 @@ pub fn resign_license_for_refresh(
     verify_registry: &PublicKeyRegistry,
     rec: &IssuedLicense,
 ) -> Result<(License, String), String> {
+    // `None` override ⇒ keep the previously-signed `max_agents` verbatim.
+    resign_license_preserving(signing_seed, verify_registry, rec, None)
+}
+
+/// Re-sign an already-issued OEM license with a **new** `max_agents` (P-License
+/// upgrade / add-on, plan §12.1 gateway offline path).
+///
+/// Preserves every other economically-meaningful field — `subscription_id`,
+/// `customer_id`, `machine_fingerprint`, `issued_at`, `expires_at`,
+/// `control_url`, and the `branding_editable` claim — and only swaps the signed
+/// agent-count quota. `new_max_agents`: `Some(n)` sells exactly N (`Some(0)` =
+/// unlimited); `None` clears the override back to the tier default. Shares the
+/// [`resign_license_preserving`] kernel + sign/self-verify guard with
+/// [`resign_license_for_refresh`] (a mismatched issuer/verify pair fails closed).
+///
+/// The re-signed blob can be handed to the customer directly; the cloud/gateway
+/// `refresh` re-sign reads the previous blob, so once
+/// [`DistributorStore::update_license_blob`] stores it, subsequent phone-home
+/// re-signs naturally carry the new count.
+pub fn resign_license_with_max_agents(
+    signing_seed: &[u8; 32],
+    verify_registry: &PublicKeyRegistry,
+    rec: &IssuedLicense,
+    new_max_agents: Option<u32>,
+) -> Result<(License, String), String> {
+    resign_license_preserving(signing_seed, verify_registry, rec, Some(new_max_agents))
+}
+
+/// Shared re-sign kernel for refresh + upgrade. Rebuilds the signed License from
+/// the ledger record + previous blob, applies an optional `max_agents` override,
+/// advances `last_phone_home`, pins `public_key_id = "v2"`, then signs +
+/// self-verifies.
+///
+/// `max_agents_override`: `None` = keep the previous blob's `max_agents`;
+/// `Some(v)` = set it to `v` (where `v` is itself `Option<u32>`, `Some(0)` =
+/// unlimited, `None` = tier default).
+fn resign_license_preserving(
+    signing_seed: &[u8; 32],
+    verify_registry: &PublicKeyRegistry,
+    rec: &IssuedLicense,
+    max_agents_override: Option<Option<u32>>,
+) -> Result<(License, String), String> {
     use chrono::{DateTime, Utc};
 
     let issued_at = DateTime::parse_from_rfc3339(&rec.issued_at)
@@ -617,9 +683,9 @@ pub fn resign_license_for_refresh(
         .with_timezone(&Utc);
 
     // §10.5 / WP8: preserve the original self-carried `control_url` AND the
-    // signed `branding_editable` claim so a refreshed key keeps phoning home to
+    // signed `branding_editable` claim so a re-signed key keeps phoning home to
     // the same owner gateway and keeps the exact same field-level edit range. A
-    // refresh must never widen the claim (that would let a customer escalate to
+    // re-sign must never widen the claim (that would let a customer escalate to
     // full vendor editing by triggering a re-sign), so we copy it verbatim from
     // the previously-issued blob. The ledger has no dedicated columns for these,
     // but the stored `license_blob` is the signed License JSON. A blob that does
@@ -630,6 +696,12 @@ pub fn resign_license_for_refresh(
         .and_then(|bytes| serde_json::from_slice::<License>(&bytes).ok());
     let control_url = prev.as_ref().and_then(|l| l.control_url.clone());
     let branding_editable = prev.as_ref().and_then(|l| l.branding_editable.clone());
+    // P-License: an upgrade sets `max_agents` explicitly; a refresh preserves the
+    // signed quota verbatim (never widen or silently drop to the tier default).
+    let max_agents = match max_agents_override {
+        Some(v) => v,
+        None => prev.as_ref().and_then(|l| l.max_agents),
+    };
 
     let license = License {
         version: duduclaw_license::CURRENT_SCHEMA_VERSION,
@@ -644,6 +716,7 @@ pub fn resign_license_for_refresh(
         signature: Vec::new(),
         control_url,
         branding_editable,
+        max_agents,
     };
     sign_and_self_verify(signing_seed, verify_registry, "v2", license)
 }
@@ -832,7 +905,7 @@ mod tests {
 
         let fp = duduclaw_license::generate_fingerprint();
         let (license, blob) =
-            issue_signed_oem_license(&seed, &registry, "v2", "dist-abc-001", "dist-abc", &fp, 365, None, None)
+            issue_signed_oem_license(&seed, &registry, "v2", "dist-abc-001", "dist-abc", &fp, 365, None, None, None)
                 .expect("sign+verify should succeed for a paired key");
 
         assert_eq!(license.tier, LicenseTier::Oem);
@@ -868,6 +941,7 @@ mod tests {
             365,
             None,
             Some(claim.clone()),
+            None,
         )
         .expect("issue with claim");
         assert_eq!(license.branding_editable.as_ref(), Some(&claim));
@@ -899,6 +973,7 @@ mod tests {
             365,
             None,
             Some(claim.clone()),
+            None,
         )
         .expect("initial issue");
 
@@ -926,6 +1001,162 @@ mod tests {
     }
 
     #[test]
+    fn issue_and_resign_preserve_max_agents_quota() {
+        // P-License: a "sell 5 agents" OEM key must (a) carry a verifiable signed
+        // quota of 5, and (b) still be 5 after a phone-home refresh re-sign — the
+        // quota must never silently drop back to the tier default.
+        let signing = SigningKey::generate(&mut OsRng);
+        let seed: [u8; 32] = signing.to_bytes();
+        let registry =
+            PublicKeyRegistry::new().with_key("v2", signing.verifying_key().to_bytes().to_vec());
+        let fp = duduclaw_license::generate_fingerprint();
+
+        let (original, blob) = issue_signed_oem_license(
+            &seed,
+            &registry,
+            "v2",
+            "dist-q-1",
+            "dist-q",
+            &fp,
+            365,
+            None,
+            None,
+            Some(5),
+        )
+        .expect("initial issue with quota");
+        assert_eq!(original.max_agents, Some(5));
+        assert!(registry.verify(&original).is_ok());
+
+        let rec = IssuedLicense {
+            id: "lic-q".into(),
+            distributor_id: "d".into(),
+            subscription_id: "dist-q-1".into(),
+            customer_id: "dist-q".into(),
+            tier: "oem".into(),
+            machine_fingerprint: fp.clone(),
+            issued_at: original.issued_at.to_rfc3339(),
+            expires_at: original.expires_at.to_rfc3339(),
+            status: "active".into(),
+            revoked_at: None,
+            license_blob: blob,
+            last_refresh_at: None,
+        };
+        let (resigned, new_blob) =
+            resign_license_for_refresh(&seed, &registry, &rec).expect("resign");
+        assert_eq!(resigned.max_agents, Some(5), "quota preserved across refresh");
+        let decoded = BASE64.decode(new_blob.trim()).unwrap();
+        let parsed: License = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(parsed.max_agents, Some(5));
+        assert!(registry.verify(&parsed).is_ok());
+    }
+
+    #[test]
+    fn upgrade_resigns_new_max_agents_and_refresh_carries_it() {
+        // P-License upgrade: issue 5 → upgrade to 8 (new blob verifies + carries
+        // 8) → a subsequent phone-home refresh must keep 8, not drop it.
+        let signing = SigningKey::generate(&mut OsRng);
+        let seed: [u8; 32] = signing.to_bytes();
+        let registry =
+            PublicKeyRegistry::new().with_key("v2", signing.verifying_key().to_bytes().to_vec());
+        let fp = duduclaw_license::generate_fingerprint();
+
+        let (original, blob) = issue_signed_oem_license(
+            &seed, &registry, "v2", "dist-up-1", "dist-up", &fp, 365, None, None, Some(5),
+        )
+        .expect("initial issue with quota 5");
+        assert_eq!(original.max_agents, Some(5));
+
+        let rec = IssuedLicense {
+            id: "lic-up".into(),
+            distributor_id: "d".into(),
+            subscription_id: "dist-up-1".into(),
+            customer_id: "dist-up".into(),
+            tier: "oem".into(),
+            machine_fingerprint: fp.clone(),
+            issued_at: original.issued_at.to_rfc3339(),
+            expires_at: original.expires_at.to_rfc3339(),
+            status: "active".into(),
+            revoked_at: None,
+            license_blob: blob,
+            last_refresh_at: None,
+        };
+
+        // Upgrade 5 → 8. Identity + validity preserved, only the quota changes.
+        let (upgraded, new_blob) =
+            resign_license_with_max_agents(&seed, &registry, &rec, Some(8)).expect("upgrade");
+        assert_eq!(upgraded.max_agents, Some(8), "new ceiling signed in");
+        assert_eq!(upgraded.subscription_id, "dist-up-1");
+        assert_eq!(upgraded.machine_fingerprint, fp);
+        assert_eq!(upgraded.issued_at, original.issued_at, "validity untouched");
+        assert_eq!(upgraded.expires_at, original.expires_at);
+        // The upgraded blob verifies against the trusted key.
+        let decoded = BASE64.decode(new_blob.trim()).unwrap();
+        let parsed: License = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(parsed.max_agents, Some(8));
+        assert!(registry.verify(&parsed).is_ok());
+
+        // Refresh re-sign reads the (now upgraded) blob → still 8.
+        let rec_after = IssuedLicense {
+            license_blob: new_blob,
+            ..rec.clone()
+        };
+        let (refreshed, _) =
+            resign_license_for_refresh(&seed, &registry, &rec_after).expect("refresh");
+        assert_eq!(refreshed.max_agents, Some(8), "refresh keeps the upgraded quota");
+    }
+
+    #[test]
+    fn update_license_blob_swaps_and_refresh_reads_new() {
+        // Store-level: upgrade path persists the new blob; the row then re-signs
+        // (refresh) off the upgraded blob.
+        let signing = SigningKey::generate(&mut OsRng);
+        let seed: [u8; 32] = signing.to_bytes();
+        let registry =
+            PublicKeyRegistry::new().with_key("v2", signing.verifying_key().to_bytes().to_vec());
+        let fp = duduclaw_license::generate_fingerprint();
+        let (_orig, blob) = issue_signed_oem_license(
+            &seed, &registry, "v2", "dist-sb-1", "dist-sb", &fp, 365, None, None, Some(5),
+        )
+        .unwrap();
+
+        let (_dir, store) = make_store();
+        let did = store
+            .add_distributor(&DistributorInput { name: "D".into(), contact: None, note: None })
+            .unwrap();
+        store
+            .add_license(&IssuedLicense {
+                id: "lic-sb".into(),
+                distributor_id: did,
+                subscription_id: "dist-sb-1".into(),
+                customer_id: "dist-sb".into(),
+                tier: "oem".into(),
+                machine_fingerprint: fp.clone(),
+                issued_at: _orig.issued_at.to_rfc3339(),
+                expires_at: _orig.expires_at.to_rfc3339(),
+                status: "active".into(),
+                revoked_at: None,
+                license_blob: blob,
+                last_refresh_at: None,
+            })
+            .unwrap();
+
+        // Upgrade to 8 and persist.
+        let rec = store.get_license("lic-sb").unwrap();
+        let (_up, new_blob) =
+            resign_license_with_max_agents(&seed, &registry, &rec, Some(8)).unwrap();
+        store.update_license_blob("lic-sb", &new_blob).unwrap();
+
+        // The stored blob now carries 8.
+        let after = store.get_license("lic-sb").unwrap();
+        let decoded = BASE64.decode(after.license_blob.trim()).unwrap();
+        let parsed: License = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(parsed.max_agents, Some(8));
+
+        // Unknown id → NotFound-style error.
+        assert!(store.update_license_blob("nope", &new_blob).is_err());
+    }
+
+    #[test]
     fn sign_self_verify_fails_for_mismatched_pubkey() {
         // Sign with one key, trust a DIFFERENT key → self-verify must reject and
         // NOT return a blob (guards issuer-key ↔ baked-pubkey pairing).
@@ -936,7 +1167,7 @@ mod tests {
             PublicKeyRegistry::new().with_key("v2", other.verifying_key().to_bytes().to_vec());
 
         let fp = duduclaw_license::generate_fingerprint();
-        let res = issue_signed_oem_license(&seed, &registry, "v2", "dist-x-1", "dist-x", &fp, 365, None, None);
+        let res = issue_signed_oem_license(&seed, &registry, "v2", "dist-x-1", "dist-x", &fp, 365, None, None, None);
         assert!(
             res.is_err(),
             "mismatched issuer/verify key must fail self-verify"
@@ -1020,7 +1251,7 @@ mod tests {
 
         let fp = duduclaw_license::generate_fingerprint();
         let (original, _blob) =
-            issue_signed_oem_license(&seed, &registry, "v2", "dist-r-1", "dist-r", &fp, 365, None, None)
+            issue_signed_oem_license(&seed, &registry, "v2", "dist-r-1", "dist-r", &fp, 365, None, None, None)
                 .expect("initial issue");
 
         // Build the ledger record from the issued license (as the store would).
