@@ -58,60 +58,14 @@ const AVATAR_EXT_MIME: &[(&str, &str)] =
 /// Maximum decoded avatar size (512 KB) — matches the branding-logo ceiling.
 const MAX_AVATAR_DECODED_BYTES: usize = 512 * 1024;
 
-/// Accepted avatar data-URI prefixes → (file extension, magic-byte kind).
-const AVATAR_PREFIXES: &[(&str, &str)] = &[
-    ("data:image/png;base64,", "png"),
-    ("data:image/jpeg;base64,", "jpg"),
-    ("data:image/webp;base64,", "webp"),
-];
-
 /// Decode + validate an avatar data URI. Returns `(bytes, extension)` on success.
-/// Fails closed: unknown mime, oversized payload, or a magic-byte mismatch (the
-/// declared type not matching the real bytes) all error rather than store.
+/// Thin wrapper over the shared `branding::validate_image_data_uri` (single
+/// source of truth for raster data-URI validation) — fails closed on unknown
+/// mime, oversized payload (bounded pre-decode), or a magic-byte mismatch.
 fn decode_avatar_data_uri(uri: &str) -> Result<(Vec<u8>, &'static str), String> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
-    let (b64, ext) = AVATAR_PREFIXES
-        .iter()
-        .find_map(|(prefix, ext)| uri.strip_prefix(prefix).map(|rest| (rest, *ext)))
-        .ok_or_else(|| {
-            "Avatar 格式不支援：僅接受 PNG / JPEG / WebP 的 base64 data URI（不接受 SVG）".to_string()
-        })?;
-    // F8: bound the *encoded* length before allocating the decode buffer so an
-    // oversized payload is rejected up front (base64 inflates ~4/3, so the
-    // decoded ceiling maps to ~4/3 that many base64 chars; +4 for padding
-    // slack). Cheap guard against a huge alloc from a malicious data URI.
-    let b64_trimmed = b64.trim();
-    let max_b64_len = MAX_AVATAR_DECODED_BYTES / 3 * 4 + 4;
-    if b64_trimmed.len() > max_b64_len {
-        return Err(format!(
-            "Avatar 檔案過大（上限 {} KB）",
-            MAX_AVATAR_DECODED_BYTES / 1024
-        ));
-    }
-    let bytes = B64
-        .decode(b64_trimmed)
-        .map_err(|_| "Avatar base64 解碼失敗".to_string())?;
-    if bytes.len() > MAX_AVATAR_DECODED_BYTES {
-        return Err(format!(
-            "Avatar 檔案過大（上限 {} KB）",
-            MAX_AVATAR_DECODED_BYTES / 1024
-        ));
-    }
-    if !avatar_magic_matches(&bytes, ext) {
-        return Err("Avatar 內容與宣告的格式不符（magic bytes 驗證失敗）".to_string());
-    }
-    Ok((bytes, ext))
-}
-
-/// Confirm decoded bytes carry the signature of the declared image kind — the
-/// same defence branding uses against a mislabelled (e.g. SVG-as-PNG) payload.
-fn avatar_magic_matches(bytes: &[u8], ext: &str) -> bool {
-    match ext {
-        "png" => bytes.len() >= 8 && bytes[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
-        "jpg" => bytes.len() >= 3 && bytes[..3] == [0xFF, 0xD8, 0xFF],
-        "webp" => bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
-        _ => false,
-    }
+    let img = crate::branding::validate_image_data_uri(uri, MAX_AVATAR_DECODED_BYTES, "Avatar")?;
+    let ext = img.kind.ext();
+    Ok((img.bytes, ext))
 }
 
 // ── F6: archive/unarchive evolution+heartbeat snapshot round-trip ────────────

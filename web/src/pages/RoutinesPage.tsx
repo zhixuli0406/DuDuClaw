@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { CalendarClock, Play, Pause, Trash2, Clock } from 'lucide-react';
+import { CalendarClock, Play, Pause, Trash2, Clock, Plus, Pencil } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAgentsStore } from '@/stores/agents-store';
 import { toast, formatError } from '@/lib/toast';
-import { Page, PageHeader, Card, Badge, Button, EmptyState, SkeletonList, Mono, CharacterAvatar } from '@/components/ui';
+import { Page, PageHeader, Card, Badge, Button, EmptyState, SkeletonList, Mono, CharacterAvatar, controlClass } from '@/components/ui';
+import { Dialog, FormField } from '@/components/shared/Dialog';
+import { ScheduleBuilder, SettingField } from '@/components/settings/controls';
 import { timeAgo } from '@/lib/format';
+import { cn } from '@/lib/utils';
 
 interface Routine {
   id: string;
@@ -19,11 +23,117 @@ interface Routine {
   last_status?: string | null;
 }
 
+/** Agent picker shared by the routine create/edit dialog. */
+function AgentSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const intl = useIntl();
+  const { agents, fetchAgents } = useAgentsStore();
+  useEffect(() => { fetchAgents(); }, [fetchAgents]);
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)} className={controlClass}>
+      {agents.length === 0 && <option value="">{intl.formatMessage({ id: 'settings.system.none' })}</option>}
+      {value && !agents.some((a) => a.name === value) && <option value={value}>{value}</option>}
+      {agents.map((a) => (
+        <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+      ))}
+    </select>
+  );
+}
+
 /**
- * RoutinesPage (`/routines`, Zone B) — the "例行工作" surface promoted out of the
- * former SettingsPage cron tab into a first-class page (dashboard-redesign
- * §3.2 / WP4-T4.3). Lists scheduled tasks with pause/resume/remove. Behaviour
- * preserved: same `cron.*` RPCs, no backend change.
+ * Create / edit dialog for a routine. `task === null` ⇒ create mode
+ * (`cron.add`); otherwise edit mode (`cron.update`). Reuses the same
+ * `ScheduleBuilder` the former settings tab used, so the schedule UX is
+ * unchanged — this is the create/edit surface unified onto the routines page.
+ */
+function RoutineFormDialog({
+  task,
+  onClose,
+  onSaved,
+}: {
+  task: Routine | null;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const intl = useIntl();
+  const isEdit = !!task;
+  const [name, setName] = useState(task?.name ?? '');
+  const [schedule, setSchedule] = useState(task?.schedule ?? task?.cron ?? '0 * * * *');
+  const [agent, setAgent] = useState(task?.agent_id ?? '');
+  const [body, setBody] = useState(task?.task ?? '');
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    // Create requires a name; edit may leave fields blank (⇒ unchanged).
+    if (!schedule.trim() || (!isEdit && !name.trim())) return;
+    setSaving(true);
+    try {
+      if (isEdit && task) {
+        await api.cron.update(task.id, {
+          name: name.trim() || undefined,
+          agent_id: agent.trim() || undefined,
+          cron: schedule.trim() || undefined,
+          task: body.trim() || undefined,
+        });
+        toast.success(intl.formatMessage({ id: 'routines.savedToast' }));
+      } else {
+        await api.cron.add({
+          name: name.trim(),
+          agent_id: agent.trim() || 'default',
+          cron: schedule.trim(),
+          task: body.trim() || undefined,
+        });
+        toast.success(intl.formatMessage({ id: 'routines.addedToast' }));
+      }
+      await onSaved();
+      onClose();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title={intl.formatMessage({ id: isEdit ? 'routines.editTitle' : 'routines.addTitle' })}
+    >
+      <div className="space-y-4">
+        <FormField label={intl.formatMessage({ id: 'settings.cron.name' })} htmlFor="routine-name">
+          <input id="routine-name" type="text" value={name} onChange={(e) => setName(e.target.value)} className={controlClass} />
+        </FormField>
+        <SettingField label={intl.formatMessage({ id: 'settings.cron.schedule' })} help={intl.formatMessage({ id: 'settings.cron.schedule.help' })}>
+          <ScheduleBuilder value={schedule} onChange={setSchedule} />
+        </SettingField>
+        <SettingField label={intl.formatMessage({ id: 'settings.cron.agentPick' })}>
+          <AgentSelect value={agent} onChange={setAgent} />
+        </SettingField>
+        <FormField label={intl.formatMessage({ id: 'settings.cron.task' })} htmlFor="routine-task">
+          <textarea id="routine-task" rows={3} value={body} onChange={(e) => setBody(e.target.value)} className={cn(controlClass, 'h-auto py-2')} />
+        </FormField>
+        <div className="flex justify-end gap-2 pt-1">
+          <Button variant="secondary" onClick={onClose}>
+            {intl.formatMessage({ id: 'common.cancel' })}
+          </Button>
+          <Button
+            variant="primary"
+            onClick={handleSave}
+            disabled={saving || !schedule.trim() || (!isEdit && !name.trim())}
+          >
+            {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+          </Button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+/**
+ * RoutinesPage (`/routines`, Zone B) — the single "例行工作" home. Lists scheduled
+ * tasks with pause/resume/remove AND their create/edit (the former SettingsPage
+ * cron/排程任務 tab was unified here so all routine settings live in one place).
+ * Same `cron.*` RPCs throughout, no backend change.
  */
 export function RoutinesPage() {
   const intl = useIntl();
@@ -31,6 +141,8 @@ export function RoutinesPage() {
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<Record<string, boolean>>({});
+  // `undefined` = dialog closed; `null` = create; a Routine = edit that task.
+  const [dialog, setDialog] = useState<Routine | null | undefined>(undefined);
 
   const load = useCallback(async () => {
     try {
@@ -78,7 +190,20 @@ export function RoutinesPage() {
         icon={CalendarClock}
         title={intl.formatMessage({ id: 'routines.title' })}
         subtitle={intl.formatMessage({ id: 'routines.subtitle' })}
+        actions={
+          <Button variant="primary" icon={Plus} onClick={() => setDialog(null)}>
+            {intl.formatMessage({ id: 'routines.add' })}
+          </Button>
+        }
       />
+
+      {dialog !== undefined && (
+        <RoutineFormDialog
+          task={dialog}
+          onClose={() => setDialog(undefined)}
+          onSaved={load}
+        />
+      )}
 
       {loading ? (
         <Card padded={false}>
@@ -130,6 +255,10 @@ export function RoutinesPage() {
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
+                    <Button size="sm" variant="secondary" icon={Pencil} disabled={b}
+                      onClick={() => setDialog(r)}>
+                      {intl.formatMessage({ id: 'routines.edit' })}
+                    </Button>
                     {r.enabled ? (
                       <Button size="sm" variant="secondary" icon={Pause} disabled={b}
                         onClick={() => act(r.id, () => api.cron.pause(r.id), 'routines.pausedToast')}>

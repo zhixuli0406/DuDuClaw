@@ -6110,6 +6110,38 @@ async fn gate_install_approval(
     .await
 }
 
+/// Dispatch-layer entry to the install / operator-required approval gate (WP5
+/// elevation). Returns `Ok(())` to proceed or `Err(zh-TW message)` on a
+/// fail-closed denial.
+///
+/// This is called once, at the shared `dispatch_tool_call` choke point, so that
+/// `agent.toml [capabilities] approval_required_tools` is honoured for **every**
+/// tool. Before the elevation the gate lived only inside `handle_skill_hub_install`,
+/// so an operator who listed any *other* tool for approval was silently ignored
+/// (fail-open). `skill_hub_install` is deliberately excluded here: it keeps its
+/// own gate that fires **after** the security scan (so the approver sees the scan
+/// result), and gating it at dispatch too would double-prompt and move approval
+/// ahead of the scan. Delegates to the same fail-closed [`gate_install_approval`].
+pub(crate) async fn gate_tool_approval_dispatch(
+    home_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    payload: Value,
+) -> std::result::Result<(), String> {
+    if tool_name == "skill_hub_install" {
+        return Ok(());
+    }
+    let summary =
+        format!("工具「{tool_name}」需經管理員核可後才能執行（agent.toml approval_required_tools 指定）");
+    // caller_is_admin is intentionally `false` — `install_approval_required`
+    // ignores it (F1: the internal MCP principal always holds Admin, and this
+    // agent-autonomous path is exactly what WP5 must gate).
+    match gate_install_approval(home_dir, agent_id, tool_name, &summary, payload, false).await {
+        InstallApprovalOutcome::Proceed => Ok(()),
+        InstallApprovalOutcome::Denied(msg) => Err(msg),
+    }
+}
+
 /// Install a skill from a hub — always through the fail-closed scan gate, and
 /// (for non-admin callers) through the admin-approval gate.
 async fn handle_skill_hub_install(
@@ -16050,6 +16082,47 @@ mod wp5_install_approval_tests {
         // Operator intent (explicit listing) is honoured regardless of admin.
         assert!(install_approval_required(&agent_dir, "skill_hub_install", true));
         assert!(install_approval_required(&agent_dir, "skill_hub_install", false));
+    }
+
+    // ── Dispatch-layer elevation (WP5): gate_tool_approval_dispatch ────────────
+
+    #[tokio::test]
+    async fn dispatch_gate_skips_skill_hub_install() {
+        // skill_hub_install keeps its own richer post-scan gate, so the dispatch
+        // helper must NOT gate it (would double-prompt + move approval ahead of
+        // the scan). Returns Ok without ever touching the broker.
+        let home = TempHome::new();
+        write_agent_toml(
+            home.path(),
+            "dudu",
+            "[capabilities]\napproval_required_tools = [\"skill_hub_install\"]\n",
+        );
+        let out = super::gate_tool_approval_dispatch(
+            home.path(),
+            "dudu",
+            "skill_hub_install",
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(out.is_ok(), "skill_hub_install must be skipped at dispatch");
+    }
+
+    #[tokio::test]
+    async fn dispatch_gate_proceeds_for_unlisted_tool() {
+        // A tool that is neither install-class nor listed in approval_required_tools
+        // proceeds without a gate — the elevation must not accidentally gate every
+        // tool (which would deadlock the broker-free path).
+        let home = TempHome::new();
+        let agent_dir = home.path().join("agents").join("dudu");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let out = super::gate_tool_approval_dispatch(
+            home.path(),
+            "dudu",
+            "memory_search",
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(out.is_ok(), "unlisted tool must proceed without gating");
     }
 
     #[test]

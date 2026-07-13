@@ -53,19 +53,37 @@ const MAX_ABOUT_HTML_BYTES: usize = 64 * 1024;
 /// system prompt / config from ballooning.
 const MAX_LOGO_DECODED_BYTES: usize = 512 * 1024;
 
-/// Accepted logo data-URI prefixes. **SVG is deliberately excluded** — it can
-/// carry `<script>` and is an XSS vector even inside `<img>` on some engines.
-const LOGO_PREFIXES: &[(&str, ImageKind)] = &[
+/// Accepted raster-image data-URI prefixes. **SVG is deliberately excluded** —
+/// it can carry `<script>` and is an XSS vector even inside `<img>` on some
+/// engines. Shared by the branding logo and the agent-avatar validators.
+const IMAGE_PREFIXES: &[(&str, ImageKind)] = &[
     ("data:image/png;base64,", ImageKind::Png),
     ("data:image/jpeg;base64,", ImageKind::Jpeg),
     ("data:image/webp;base64,", ImageKind::Webp),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImageKind {
+pub(crate) enum ImageKind {
     Png,
     Jpeg,
     Webp,
+}
+
+impl ImageKind {
+    /// File-extension token used for on-disk avatar files + mime lookup.
+    pub(crate) fn ext(self) -> &'static str {
+        match self {
+            ImageKind::Png => "png",
+            ImageKind::Jpeg => "jpg",
+            ImageKind::Webp => "webp",
+        }
+    }
+}
+
+/// A raster image validated + decoded from a base64 data URI.
+pub(crate) struct ValidatedImage {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) kind: ImageKind,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -916,27 +934,48 @@ fn validate_support_email(e: &str) -> Result<String, String> {
 /// Validate a logo data URI: prefix whitelist (no SVG), base64 decode, size
 /// ceiling, and magic-byte confirmation of the declared image kind.
 fn validate_logo(uri: &str) -> Result<String, String> {
-    let (b64, kind) = LOGO_PREFIXES
+    validate_image_data_uri(uri, MAX_LOGO_DECODED_BYTES, "Logo")?;
+    Ok(uri.to_string())
+}
+
+/// Validate a base64 PNG/JPEG/WebP data URI — the single source of truth shared
+/// by the branding logo and the agent-avatar paths. Fails closed on: an unknown
+/// prefix (SVG rejected — it can carry `<script>`), an encoded length that would
+/// decode past `max_decoded` (bounded BEFORE allocating the decode buffer so a
+/// hostile data URI can't force a huge allocation), a decoded size over the cap,
+/// or a magic-byte mismatch (declared type ≠ real bytes). `label` personalizes
+/// the zh-TW error ("Logo" / "Avatar").
+pub(crate) fn validate_image_data_uri(
+    uri: &str,
+    max_decoded: usize,
+    label: &str,
+) -> Result<ValidatedImage, String> {
+    let (b64, kind) = IMAGE_PREFIXES
         .iter()
         .find_map(|(prefix, kind)| uri.strip_prefix(prefix).map(|rest| (rest, *kind)))
         .ok_or_else(|| {
-            "Logo 格式不支援：僅接受 PNG / JPEG / WebP 的 base64 data URI（不接受 SVG）".to_string()
+            format!("{label} 格式不支援：僅接受 PNG / JPEG / WebP 的 base64 data URI（不接受 SVG）")
         })?;
+    let b64 = b64.trim();
+
+    // Bound the *encoded* length before allocating the decode buffer (base64
+    // inflates ~4/3; +4 for padding slack) so an oversized payload is rejected
+    // up front rather than after a large decode allocation.
+    let max_b64_len = max_decoded / 3 * 4 + 4;
+    if b64.len() > max_b64_len {
+        return Err(format!("{label} 檔案過大（上限 {} KB）", max_decoded / 1024));
+    }
 
     let bytes = BASE64
-        .decode(b64.trim())
-        .map_err(|_| "Logo base64 解碼失敗".to_string())?;
-
-    if bytes.len() > MAX_LOGO_DECODED_BYTES {
-        return Err(format!(
-            "Logo 檔案過大（上限 {} KB）",
-            MAX_LOGO_DECODED_BYTES / 1024
-        ));
+        .decode(b64)
+        .map_err(|_| format!("{label} base64 解碼失敗"))?;
+    if bytes.len() > max_decoded {
+        return Err(format!("{label} 檔案過大（上限 {} KB）", max_decoded / 1024));
     }
     if !magic_matches(&bytes, kind) {
-        return Err("Logo 內容與宣告的格式不符（magic bytes 驗證失敗）".to_string());
+        return Err(format!("{label} 內容與宣告的格式不符（magic bytes 驗證失敗）"));
     }
-    Ok(uri.to_string())
+    Ok(ValidatedImage { bytes, kind })
 }
 
 /// Confirm the decoded bytes carry the signature of the declared image kind.

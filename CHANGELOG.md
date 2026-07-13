@@ -130,6 +130,22 @@
   i18n 三語同步。
 
 ### Changed
+- **排程任務設定統一到「例行工作」頁,移出系統設定→進階（2026-07-13）。** 原本排程管理是
+  分裂的:`/routines`(例行工作)頁只能列出+暫停/恢復/刪除,而新增/編輯藏在「設定→進階→排程任務」
+  的 `CronTab`。改為把新增/編輯(共用同一個 `ScheduleBuilder`)直接併入 `RoutinesPage`——頁首
+  「新增例行工作」按鈕 + 每列「編輯」鈕 + 共用 create/edit 對話框;`SettingsPage` 移除 `cron`
+  分頁(TabId/VALID_TABS/TAB_META/ADVANCED/render 一併清掉),舊 `?tab=cron` deep-link 自動
+  導向 `/routines`;刪除已無引用的 `CronTab.tsx`。同一批 `cron.*` RPC,無後端變更;i18n 三語同步。
+- **Grok Build runtime 依 docs.x.ai 官方文件重寫,去除 R4 的 UNVERIFIED 假設（2026-07-13）。**
+  以 docs.x.ai 一手來源核對後重寫 `runtime/grok.rs`:headless `-p/--single`(確認)、模型
+  `--model`(確認)、工具限制 `--tools`/`--disallowed-tools`(確認,疊在 `native_sandbox` 硬閘上)、
+  auth `XAI_API_KEY` 環境變數(非先前誤設的 `GROK_API_KEY`)、`AGENTS.md` 指令檔家族。**最大修正**:
+  MCP 設定改寫為 `[mcp_servers.duduclaw]` **TOML**(寫入 per-agent `<agent_dir>/.grok/config.toml`,
+  merge 保留其他表)——先前誤仿 Gemini 寫成 `.grok/settings.json` JSON。agent 身分另經 spawn env
+  轉發作為 fallback;`--version` 探測加逾時(裸 `grok` 會開 TUI,不能讓探測卡住)。殘餘(需 live CLI):
+  `--tools` 清單分隔符、專案本地 config 探索、`--output-format json` schema、完整 `--model` 名冊
+  (`grok models`;目前僅 `grok-4.5`/`grok-build-0.1` 經文件確認)。`docs/features/feature-inventory.md`
+  同步更新。
 - **去識別化設定 UI 改用白話，外部系統（ERP/CRM）成一等公民（2026-07-12）。** 客戶回饋
   「設定太難懂，連開發者都看不懂」——`RedactionTab`（`web/src/components/settings/sections/`）
   重寫：主開關配一句白話說明（明確點名檔案／Wiki／記憶／Odoo／鼎新 ERP／CRM 皆涵蓋）；
@@ -161,6 +177,18 @@
   unarchive 還原（無快照保守維持 false），不再無條件開啟自我演化。
 
 ### Security
+- **WP5 安裝審批閘上收 dispatch 層 — 補 `approval_required_tools` fail-open（2026-07-13）。**
+  審批閘原先只嵌在 `handle_skill_hub_install`,導致 operator 在 `agent.toml [capabilities]
+  approval_required_tools` 列出**其他**工具時被靜默忽略(死設定 = fail-open)。新增
+  `mcp::gate_tool_approval_dispatch` 並在 `mcp_dispatch::dispatch_tool_call` 的統一節流點
+  (complete mediation I3,涵蓋 stdio/HTTP/SSE)於派工前執行:任何 `install_approval_required`
+  為真的工具都先過審批,fail-closed(拒絕/逾時/broker 不可用皆不派工)。`skill_hub_install`
+  維持自身「掃描後才審批」的較佳流程並在 helper 內排除,避免重複提示。
+- **avatar/logo 影像驗證器合併為單一 fail-closed 來源,logo 補預解碼 DoS 防護（2026-07-13）。**
+  `branding::validate_image_data_uri` 成為 PNG/JPEG/WebP data URI 的唯一驗證器(SVG 拒收、
+  magic-byte 比對、解碼上限),avatar (`handlers.rs`) 與 logo (`branding.rs`) 都改呼叫它。
+  合併時把 avatar 既有的「解碼前先擋 encoded 長度」(F8)提升為共用行為——**logo 路徑原本缺這道
+  防護**,惡意超大 base64 會先被完整解碼進記憶體才檢查大小,現已在解碼前擋下。
 - **WebChat resume 擁有權閘（2026-07-12）。** `/ws/chat` resume 強制 resumed session 屬本連線
   （id 相符或 `{session_id}#` 前綴），跨 channel / 他連線一律拒絕（fail-closed）；關閉「送他人
   session_id 讀寫其對話」的越權。殘餘限制：webchat session 無 user 維度，前一連線的 session 無法

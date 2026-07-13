@@ -546,12 +546,11 @@ pub fn which_agy_in_home(home: &std::path::Path) -> Option<String> {
 }
 
 /// Resolve the xAI Grok CLI binary (R4). Prefers the official `grok` ("Grok
-/// Build") binary and falls back to the third-party `grok-cli`
-/// (`superagent-ai/grok-cli`, API-key only) so either install is discovered.
-/// See [`which_cli`].
-///
-/// UNVERIFIED (R4, 2026-07-12): the official "Grok Build" binary name is
-/// assumed to be `grok`. If xAI ships it under a different name, add it here.
+/// Build") binary — **verified** against docs.x.ai (2026-07-13): installed via
+/// `curl -fsSL https://x.ai/cli/install.sh | bash`, invoked as `grok`. Falls
+/// back to the unrelated third-party `grok-cli` (`superagent-ai/grok-cli`) only
+/// so a user who happens to have that installed is still discovered. See
+/// [`which_cli`].
 pub fn which_grok() -> Option<String> {
     which_cli("grok").or_else(|| which_cli("grok-cli"))
 }
