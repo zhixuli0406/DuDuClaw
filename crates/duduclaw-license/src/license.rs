@@ -99,6 +99,22 @@ pub struct License {
     /// signatures still verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branding_editable: Option<Vec<String>>,
+
+    /// Per-license agent-count quota (P-License). When present, it overrides the
+    /// tier-default `max_agents` (`FeatureGate::max_agents`) so a distributor can
+    /// sell "system + N agents" at any N and later upsell more. `Some(0)` = no
+    /// limit (matches the features.toml `0 = unlimited` convention). `None` (the
+    /// default) = no override → fall back to the tier default.
+    ///
+    /// **Part of [`Self::canonical_payload`]** (like `branding_editable`, unlike
+    /// `control_url`): the quota is a security boundary — an unsigned count could
+    /// be self-raised by editing the local `license.json`. Because it is signed,
+    /// widening it (e.g. `3` → `8`) invalidates the signature → the license is
+    /// rejected → OpenSource (fail-closed). Added at the END of the canonical
+    /// struct with `skip_serializing_if`, so a `None` quota serializes
+    /// byte-identically to a pre-P-License key and old signatures still verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_agents: Option<u32>,
 }
 
 impl License {
@@ -164,7 +180,24 @@ impl License {
             return Err(LicenseError::Expired);
         }
 
-        if !self.is_valid_for_machine(current_fingerprint) {
+        // Machine-binding check with an **unbound** escape hatch. An empty
+        // `machine_fingerprint` marks a license that is deliberately NOT tied to
+        // a specific machine — required for Docker/OEM redistribution, where the
+        // container fingerprint (`SHA256(hostname::MAC)`) changes on every
+        // `docker compose up` rebuild and would otherwise trip `InvalidFingerprint`.
+        //
+        // SECURITY GATE (fail-closed): unbound is permitted **only** for the
+        // `Oem` tier. Redistribution is already part of the OEM grant, and the
+        // signed `max_agents` quota (P-License) caps the blast radius of a leaked
+        // unbound key. Any other tier presenting an empty fingerprint is an
+        // abuse/tampering signal → `InvalidFingerprint` (a general subscription
+        // must never run unbound).
+        if self.machine_fingerprint.is_empty() {
+            if self.tier != crate::tier::LicenseTier::Oem {
+                return Err(LicenseError::InvalidFingerprint);
+            }
+            // Oem + empty ⇒ unbound: skip the per-machine binding check.
+        } else if !self.is_valid_for_machine(current_fingerprint) {
             return Err(LicenseError::InvalidFingerprint);
         }
 
@@ -233,6 +266,7 @@ impl License {
             last_phone_home: self.last_phone_home,
             public_key_id: &self.public_key_id,
             branding_editable: self.branding_editable.as_ref(),
+            max_agents: self.max_agents,
         };
         serde_json::to_vec(&payload)
             .map_err(|e| LicenseError::ParseError(format!("canonical payload: {e}")))
@@ -265,6 +299,7 @@ impl License {
             signature: Vec::new(),
             control_url: None,
             branding_editable: None,
+            max_agents: None,
         }
     }
 }
@@ -289,6 +324,11 @@ struct CanonicalPayload<'a> {
     /// bytes to a pre-WP8 license (old signatures keep verifying).
     #[serde(skip_serializing_if = "Option::is_none")]
     branding_editable: Option<&'a Vec<String>>,
+    /// P-License signed agent-count quota. Added last with `skip_serializing_if`
+    /// so a `None` quota yields byte-identical canonical bytes to a pre-P-License
+    /// license (old signatures keep verifying).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_agents: Option<u32>,
 }
 
 /// Serde helper for encoding `Vec<u8>` as base64 strings in JSON.
@@ -327,6 +367,7 @@ mod tests {
             signature: Vec::new(),
             control_url: None,
             branding_editable: None,
+            max_agents: None,
         }
     }
 
@@ -584,6 +625,143 @@ mod tests {
             parsed_new.branding_editable.as_deref(),
             Some(["logo_data_uri".to_string(), "product_name".to_string()].as_slice())
         );
+    }
+
+    // ── P-License: signed per-license agent-count quota ─────────────
+
+    #[test]
+    fn canonical_payload_excludes_max_agents_when_none() {
+        // Backward-compat: a None quota must NOT appear in the signed bytes so a
+        // pre-P-License key (no such field) verifies byte-identically. This is
+        // the whole reason for `skip_serializing_if` (no schema bump).
+        let license = make_license(LicenseTier::Oem, 30, 0);
+        assert!(license.max_agents.is_none());
+        let payload = String::from_utf8(license.canonical_payload().unwrap()).unwrap();
+        assert!(
+            !payload.contains("max_agents"),
+            "None quota must be omitted from canonical bytes: {payload}"
+        );
+    }
+
+    #[test]
+    fn canonical_payload_none_matches_pre_p_license_bytes() {
+        // A None quota must yield the exact same canonical bytes as a license
+        // constructed before the field existed — proven by comparing against the
+        // other pre-existing skip-if-none field (branding_editable None). Both
+        // absent ⇒ identical bytes ⇒ old signatures still verify.
+        let mut license = make_license(LicenseTier::Solo, 30, 0);
+        let baseline = license.canonical_payload().unwrap();
+        // Setting then clearing back to None must be a no-op on the bytes.
+        license.max_agents = Some(3);
+        assert_ne!(baseline, license.canonical_payload().unwrap());
+        license.max_agents = None;
+        assert_eq!(
+            baseline,
+            license.canonical_payload().unwrap(),
+            "clearing max_agents back to None restores byte-identical canonical"
+        );
+    }
+
+    #[test]
+    fn canonical_payload_includes_max_agents_when_some() {
+        // A Some quota IS signed (security boundary, unlike control_url): the
+        // count cannot be raised locally without invalidating the signature.
+        let mut license = make_license(LicenseTier::Oem, 30, 0);
+        let base = license.canonical_payload().unwrap();
+        license.max_agents = Some(5);
+        let with_quota = license.canonical_payload().unwrap();
+        assert_ne!(base, with_quota, "quota must change the signed payload");
+        let text = String::from_utf8(with_quota).unwrap();
+        assert!(text.contains("max_agents"));
+        assert!(text.contains('5'));
+    }
+
+    #[test]
+    fn canonical_payload_changes_on_quota_widening() {
+        // The tamper vector: signing 3 then locally editing to 8 must change the
+        // canonical bytes (so the recomputed payload no longer matches the sig).
+        let mut license = make_license(LicenseTier::Oem, 30, 0);
+        license.max_agents = Some(3);
+        let signed_bytes = license.canonical_payload().unwrap();
+        license.max_agents = Some(8);
+        let tampered_bytes = license.canonical_payload().unwrap();
+        assert_ne!(
+            signed_bytes, tampered_bytes,
+            "raising the quota must change the payload the signature is checked against"
+        );
+    }
+
+    #[test]
+    fn max_agents_serde_roundtrips_and_old_json_defaults_none() {
+        let mut license = make_license(LicenseTier::Oem, 365, 1);
+        let json_old = serde_json::to_string(&license).unwrap();
+        assert!(
+            !json_old.contains("max_agents"),
+            "None is skipped in serialization"
+        );
+        let parsed_old: License = serde_json::from_str(&json_old).unwrap();
+        assert!(parsed_old.max_agents.is_none());
+
+        // Some(0) is the "unlimited" sentinel — it must round-trip (it is NOT
+        // skipped: only None is skipped).
+        license.max_agents = Some(0);
+        let json_unlimited = serde_json::to_string(&license).unwrap();
+        assert!(json_unlimited.contains("max_agents"));
+        let parsed_unlimited: License = serde_json::from_str(&json_unlimited).unwrap();
+        assert_eq!(parsed_unlimited.max_agents, Some(0));
+
+        license.max_agents = Some(5);
+        let json_new = serde_json::to_string(&license).unwrap();
+        assert!(json_new.contains("max_agents"));
+        let parsed_new: License = serde_json::from_str(&json_new).unwrap();
+        assert_eq!(parsed_new.max_agents, Some(5));
+    }
+
+    // ── Unbound license: empty fingerprint, Oem-only (Docker/OEM) ────
+
+    #[test]
+    fn validate_accepts_oem_with_empty_fingerprint_unbound() {
+        // The core unbound guarantee: an Oem license with an empty fingerprint
+        // validates against ANY current machine fingerprint (or none) — this is
+        // what survives a Docker container rebuild.
+        let mut license = make_license(LicenseTier::Oem, 365, 1);
+        license.machine_fingerprint = String::new();
+        // Passes regardless of the machine's actual fingerprint.
+        assert!(license.validate("machine-a-fp", 7, 30).is_ok());
+        assert!(license.validate("totally-different-fp", 7, 30).is_ok());
+        assert!(license.validate("", 7, 30).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_non_oem_with_empty_fingerprint() {
+        // SECURITY: only Oem may run unbound. A cloud/subscription tier with an
+        // empty fingerprint must fail closed with InvalidFingerprint so a normal
+        // subscription can never be silently un-bound from its machine.
+        for tier in [
+            LicenseTier::Studio,
+            LicenseTier::Solo,
+            LicenseTier::Business,
+            LicenseTier::SelfHostPro,
+        ] {
+            let mut license = make_license(tier, 365, 1);
+            license.machine_fingerprint = String::new();
+            let err = license.validate("any-fp", 7, 30).unwrap_err();
+            assert!(
+                matches!(err, LicenseError::InvalidFingerprint),
+                "{tier:?} with empty fingerprint must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_still_binds_oem_with_nonempty_fingerprint() {
+        // A bound Oem license (non-empty fingerprint) keeps the normal
+        // per-machine check — the escape hatch is empty-only, not "Oem ignores
+        // the fingerprint".
+        let license = make_license(LicenseTier::Oem, 365, 1);
+        assert!(license.validate("abc123", 7, 30).is_ok());
+        let err = license.validate("wrong-fp", 7, 30).unwrap_err();
+        assert!(matches!(err, LicenseError::InvalidFingerprint));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{LicenseError, Result};
+use crate::license::License;
 use crate::tier::LicenseTier;
 
 /// Runtime feature gate that checks whether a feature is available
@@ -79,6 +80,17 @@ impl FeatureGate {
         self.get_integer(tier, "max_agents")
     }
 
+    /// Effective agent-count limit for a license: the signed per-license
+    /// `max_agents` override when present, else the tier default. `0` (either
+    /// source) means unlimited. This is the single resolution point for the
+    /// P-License "sell N agents" feature — enforcement callers must use it rather
+    /// than `max_agents(tier)` so a per-license override actually bites.
+    pub fn effective_max_agents(&self, lic: &License) -> usize {
+        lic.max_agents
+            .map(|v| v as usize)
+            .unwrap_or_else(|| self.max_agents(lic.tier))
+    }
+
     /// Return the maximum number of channels for a given tier.
     /// `0` means unlimited.
     pub fn max_channels(&self, tier: LicenseTier) -> usize {
@@ -99,6 +111,24 @@ impl FeatureGate {
     /// Return the memory storage quota in gigabytes. `0` means unlimited.
     pub fn memory_quota_gb(&self, tier: LicenseTier) -> usize {
         self.get_integer(tier, "memory_quota_gb")
+    }
+
+    /// Effective memory storage quota in gigabytes for a tier — the single
+    /// resolution point the M1 moat-gate enforcement (`duduclaw-memory` write
+    /// path, wired through `license_runtime`) must consult. `0` means unlimited.
+    ///
+    /// Non-breaking contract: opensource / self-host tiers carry `0` in
+    /// `features.toml` (unlimited), so enforcement is a no-op for them. Only the
+    /// Cloud paid tiers with an explicit nonzero cap (Studio = 1, Business = 10)
+    /// bite.
+    ///
+    /// This period the value is purely tier-based. A per-license override
+    /// (mirroring [`effective_max_agents`](Self::effective_max_agents), e.g.
+    /// selling a custom quota on a signed seat) is a deliberate future
+    /// extension — kept as a separate named entry so callers depend on the
+    /// resolution point, not the raw tier lookup.
+    pub fn effective_memory_quota_gb(&self, tier: LicenseTier) -> usize {
+        self.memory_quota_gb(tier)
     }
 
     /// Return the phone-home refresh interval in days for this tier.
@@ -260,10 +290,62 @@ license_grace_period_days = 60
     }
 
     #[test]
+    fn effective_max_agents_override_beats_tier() {
+        use crate::license::License;
+        let g = gate();
+        let mut lic = License::new(
+            "sub",
+            "cus",
+            LicenseTier::Studio,
+            "fp",
+            chrono::Duration::days(30),
+            "v1",
+        );
+        // No override → tier default (Studio = 3).
+        assert_eq!(g.effective_max_agents(&lic), 3);
+        // Override raises it.
+        lic.max_agents = Some(10);
+        assert_eq!(g.effective_max_agents(&lic), 10);
+        // Override lowers it (a distributor "sell 2" on a Studio seat).
+        lic.max_agents = Some(2);
+        assert_eq!(g.effective_max_agents(&lic), 2);
+    }
+
+    #[test]
+    fn effective_max_agents_zero_override_is_unlimited() {
+        use crate::license::License;
+        let g = gate();
+        let mut lic = License::new(
+            "sub",
+            "cus",
+            LicenseTier::Solo,
+            "fp",
+            chrono::Duration::days(30),
+            "v1",
+        );
+        // Solo tier default is 1; Some(0) override = unlimited (the sentinel).
+        lic.max_agents = Some(0);
+        assert_eq!(g.effective_max_agents(&lic), 0);
+    }
+
+    #[test]
     fn business_inherits_full_cloud_chain() {
         let g = gate();
         assert_eq!(g.max_agents(LicenseTier::Business), 0);
         assert_eq!(g.memory_quota_gb(LicenseTier::Business), 10);
+    }
+
+    #[test]
+    fn effective_memory_quota_gb_tier_based() {
+        let g = gate();
+        // Free / self-host base tiers → 0 = unlimited (enforcement no-op).
+        assert_eq!(g.effective_memory_quota_gb(LicenseTier::OpenSource), 0);
+        assert_eq!(g.effective_memory_quota_gb(LicenseTier::Hobby), 0);
+        assert_eq!(g.effective_memory_quota_gb(LicenseTier::SelfHostPro), 0);
+        assert_eq!(g.effective_memory_quota_gb(LicenseTier::Oem), 0);
+        // Cloud paid tiers with an explicit cap actually bite.
+        assert_eq!(g.effective_memory_quota_gb(LicenseTier::Studio), 1);
+        assert_eq!(g.effective_memory_quota_gb(LicenseTier::Business), 10);
     }
 
     #[test]

@@ -162,6 +162,51 @@ mod tests {
     }
 
     #[test]
+    fn verify_accepts_signed_max_agents_quota() {
+        // A P-License quota that was signed must verify (round-trip).
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = signing_key.verifying_key();
+        let mut license = make_test_license();
+        license.max_agents = Some(3);
+        license.signature = sign_for_test(&license, &signing_key);
+        verify_license(&license, &public_key.to_bytes()).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_tampered_max_agents() {
+        // THE tamper test: sign a "sell 3 agents" license, then locally raise the
+        // quota to 8 by editing license.json. The recomputed canonical no longer
+        // matches the signature → rejected → downgrade to OpenSource (fail-closed).
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = signing_key.verifying_key();
+        let mut license = make_test_license();
+        license.max_agents = Some(3);
+        license.signature = sign_for_test(&license, &signing_key);
+
+        // Attacker edits the plaintext quota upward.
+        license.max_agents = Some(8);
+
+        let err = verify_license(&license, &public_key.to_bytes()).unwrap_err();
+        assert!(matches!(err, LicenseError::InvalidSignature));
+    }
+
+    #[test]
+    fn verify_rejects_stripped_max_agents() {
+        // Removing the signed quota entirely (None) is also tampering — it must
+        // not silently fall back to the tier default.
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = signing_key.verifying_key();
+        let mut license = make_test_license();
+        license.max_agents = Some(2);
+        license.signature = sign_for_test(&license, &signing_key);
+
+        license.max_agents = None;
+
+        let err = verify_license(&license, &public_key.to_bytes()).unwrap_err();
+        assert!(matches!(err, LicenseError::InvalidSignature));
+    }
+
+    #[test]
     fn verify_rejects_wrong_key() {
         let signing_key = SigningKey::generate(&mut OsRng);
         let other_key = SigningKey::generate(&mut OsRng);
