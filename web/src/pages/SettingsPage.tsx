@@ -7,7 +7,6 @@ import {
   Settings,
   Container,
   HeartPulse,
-  Clock,
   Stethoscope,
   Mic,
   Zap,
@@ -25,7 +24,6 @@ import { AccountTab } from '@/components/settings/sections/AccountTab';
 import { SystemTab } from '@/components/settings/sections/SystemTab';
 import { ContainerTab } from '@/components/settings/sections/ContainerTab';
 import { HeartbeatTab } from '@/components/settings/sections/HeartbeatTab';
-import { CronTab } from '@/components/settings/sections/CronTab';
 import { VoiceTab } from '@/components/settings/sections/VoiceTab';
 import { ProactiveTab } from '@/components/settings/sections/ProactiveTab';
 import { AutopilotTab } from '@/components/settings/sections/AutopilotTab';
@@ -35,22 +33,26 @@ import { DoctorTab } from '@/components/settings/sections/DoctorTab';
 import { UpdateTab } from '@/components/settings/sections/UpdateTab';
 import { BrowserTab } from '@/components/settings/sections/BrowserTab';
 
-type TabId = 'general' | 'account' | 'system' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'skillSynthesis' | 'redaction' | 'doctor' | 'update' | 'browser';
+type TabId = 'general' | 'account' | 'system' | 'container' | 'heartbeat' | 'voice' | 'proactive' | 'autopilot' | 'skillSynthesis' | 'redaction' | 'doctor' | 'update' | 'browser';
 
 export function SettingsPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const VALID_TABS: readonly TabId[] = [
-    'general', 'account', 'system', 'container', 'heartbeat', 'cron', 'voice',
+    'general', 'account', 'system', 'container', 'heartbeat', 'voice',
     'proactive', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'update', 'browser',
   ];
   const tabParam = searchParams.get('tab');
-  // Branding moved to /manage/distributors (R5). Redirect legacy deep-links
-  // (bookmarks / links to ?tab=branding) instead of rendering a blank tab.
+  // Legacy deep-link redirects (bookmarks / older links) instead of a blank tab:
+  //  - branding moved to /manage/distributors (R5)
+  //  - the cron/排程任務 settings tab was unified into the /routines page, so its
+  //    create/edit lives alongside the routine list (page-settings unification)
   useEffect(() => {
     if (tabParam === 'branding') {
       navigate('/manage/distributors?tab=branding', { replace: true });
+    } else if (tabParam === 'cron') {
+      navigate('/routines', { replace: true });
     }
   }, [tabParam, navigate]);
   const initialTab: TabId = VALID_TABS.includes(tabParam as TabId) ? (tabParam as TabId) : 'general';
@@ -63,7 +65,6 @@ export function SettingsPage() {
     system: { label: intl.formatMessage({ id: 'settings.system' }), icon: Server },
     container: { label: intl.formatMessage({ id: 'settings.container' }), icon: Container },
     heartbeat: { label: intl.formatMessage({ id: 'settings.heartbeat' }), icon: HeartPulse },
-    cron: { label: intl.formatMessage({ id: 'settings.cron' }), icon: Clock },
     voice: { label: intl.formatMessage({ id: 'settings.voice' }), icon: Mic },
     proactive: { label: intl.formatMessage({ id: 'settings.proactive' }), icon: Zap },
     autopilot: { label: intl.formatMessage({ id: 'settings.autopilot' }), icon: Workflow },
@@ -77,7 +78,7 @@ export function SettingsPage() {
   // system/engineering knobs tucked behind an "Advanced" disclosure so the
   // default surface reads like a consumer app, not an ops console.
   const EVERYDAY: TabId[] = ['general', 'account', 'voice', 'proactive', 'update'];
-  const ADVANCED: TabId[] = ['system', 'container', 'heartbeat', 'cron', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser'];
+  const ADVANCED: TabId[] = ['system', 'container', 'heartbeat', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser'];
   const toItems = (ids: TabId[]) => ids.map((id) => ({ id, ...TAB_META[id] }));
   const activeIsAdvanced = ADVANCED.includes(activeTab);
 
@@ -124,7 +125,6 @@ export function SettingsPage() {
       {activeTab === 'system' && <SystemTab />}
       {activeTab === 'container' && <ContainerTab />}
       {activeTab === 'heartbeat' && <HeartbeatTab />}
-      {activeTab === 'cron' && <CronTab />}
       {activeTab === 'voice' && <VoiceTab />}
       {activeTab === 'proactive' && <ProactiveTab />}
       {activeTab === 'autopilot' && <AutopilotTab />}

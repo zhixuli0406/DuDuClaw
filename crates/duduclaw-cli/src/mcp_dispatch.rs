@@ -482,6 +482,30 @@ impl McpDispatcher {
             }
         }
 
+        // ── 3.7 Install / operator-required approval (WP5 elevation, I3) ─────
+        // Elevated from the individual tool handlers to this shared choke point
+        // so `agent.toml [capabilities] approval_required_tools` is honoured for
+        // EVERY tool. Before this, only skill_hub_install self-gated, so an
+        // operator listing any other tool for approval was silently ignored
+        // (fail-open). skill_hub_install keeps its richer post-scan gate and is
+        // excluded inside the helper to avoid double-prompting. External clients
+        // are already confined to the read-only whitelist and carry no per-agent
+        // approval config, so they're skipped. Fail-closed: a denial/expiry/
+        // broker-unavailable returns an error instead of dispatching.
+        if !principal.is_external {
+            if let Err(msg) = crate::mcp::gate_tool_approval_dispatch(
+                &self.home_dir,
+                &principal.client_id,
+                tool_name,
+                params_owned.clone(),
+            )
+            .await
+            {
+                duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+                return jsonrpc_error(id, -32003, &msg);
+            }
+        }
+
         // ── 4. Tool dispatch ─────────────────────────────────────────────────
         let caller_is_admin = principal.scopes.contains(&Scope::Admin);
         let mut result = crate::mcp::handle_tools_call(
