@@ -259,6 +259,19 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // drops and the GC task receives its cancel signal — clean shutdown.
     let _redaction_gc = redaction_gc_handle;
 
+    // ── First-run license seeding (E2, enterprise Docker distribution) ──
+    //
+    // Symmetric to the branding-bundle seeding above: when this binary ships
+    // co-located with a signed OEM `license.json` (its path in the
+    // `DUDUCLAW_LICENSE_FILE` env var — the compose pack mounts it read-only at
+    // `/opt/license.json`), verify it against the baked issuer registry and copy
+    // it into `~/.duduclaw/license.json` *before* the license runtime loads it,
+    // so a customer `docker compose up` gets the baked license with zero
+    // `duduclaw license activate`. Idempotent (never overwrites an existing
+    // license) and fail-closed (an unverifiable candidate is skipped). The call
+    // logs its own outcome; the return value is only for tests.
+    let _ = crate::license_seed::seed_license_if_absent(&home_dir);
+
     // ── License runtime bootstrap ───────────────────────────────
     //
     // Loads ~/.duduclaw/license.json (when present), verifies its Ed25519

@@ -310,6 +310,31 @@ impl LicenseRuntime {
         &self.control_url
     }
 
+    /// Effective agent-count limit for the active license: the signed
+    /// per-license `max_agents` override when present, else the tier default.
+    /// `0` means unlimited. Falls back to the tier default when no license is
+    /// installed (OpenSource). The single resolution point the agent-cap
+    /// enforcement in `handlers.rs` must consult (P-License).
+    pub async fn effective_max_agents(&self) -> usize {
+        let inner = self.state.read().await;
+        match inner.license.as_ref() {
+            Some(lic) => self.gate.effective_max_agents(lic),
+            None => self.gate.max_agents(LicenseTier::OpenSource),
+        }
+    }
+
+    /// Effective Cloud memory storage quota in GB for the active tier
+    /// (M1 moat-gate). `0` means unlimited — the value for OpenSource / free /
+    /// self-host tiers, so memory-write enforcement is a no-op there. Only Cloud
+    /// paid tiers with an explicit cap (Studio = 1, Business = 10) return
+    /// nonzero. The single resolution point the memory-write path consults; the
+    /// `duduclaw-memory` crate stays license-agnostic (quota is passed in as a
+    /// parameter, not looked up).
+    pub async fn effective_memory_quota_gb(&self) -> usize {
+        let tier = self.current_tier().await;
+        self.gate.effective_memory_quota_gb(tier)
+    }
+
     /// Snapshot of the current license, if any. Returned by reference
     /// for read-only inspection (dashboard `license.status` RPC, etc.).
     pub async fn snapshot(&self) -> LicenseSnapshot {
@@ -336,6 +361,11 @@ pub struct LicenseSnapshot {
     /// any. `None` (no claim) resolves to the full vendor-editable set — see
     /// `crate::branding::resolve_edit_scope`.
     pub branding_editable: Option<Vec<String>>,
+    /// P-License: the active license's signed per-license agent-count quota, if
+    /// any. `None` = no override → the tier default applies. Surfaced so the
+    /// enforcement path can detect an explicit issuer-set limit (`is_some()`)
+    /// even on a self-host tier — see `handlers::tier_limit_message`.
+    pub max_agents: Option<u32>,
 }
 
 impl LicenseSnapshot {
@@ -355,6 +385,7 @@ impl LicenseSnapshot {
             days_since_phone_home: license.map(|l| l.days_since_phone_home()),
             fingerprint_match: license.map(|l| l.is_valid_for_machine(current_fp)),
             branding_editable: license.and_then(|l| l.branding_editable.clone()),
+            max_agents: license.and_then(|l| l.max_agents),
         }
     }
 }
@@ -601,6 +632,15 @@ pub fn cap_exceeded(max: usize, current: usize) -> bool {
     max != 0 && current >= max
 }
 
+/// P-License §7(b) enforcement gate for the agent cap. Self-host deployments are
+/// normally exempt from resource caps (the Apache 2.0 promise), but a signed
+/// per-license `max_agents` override is the issuer's EXPLICIT intent to cap this
+/// seat count, so it overrides the exemption. Cloud deployments always enforce.
+/// Pure so the decision is unit-testable without a live runtime / env.
+pub fn agent_cap_enforced(is_self_host: bool, has_max_agents_override: bool) -> bool {
+    !is_self_host || has_max_agents_override
+}
+
 // ── Phone-home loop ───────────────────────────────────────────
 
 async fn phone_home_loop(runtime: LicenseRuntime) {
@@ -824,6 +864,14 @@ fn response_nonce_ok(sent: &str, body: &serde_json::Value) -> bool {
 /// Extracted so the acceptance logic is testable without a live control-plane:
 /// construct + sign a `License`, build a trusting `PublicKeyRegistry`, and
 /// assert valid ⇒ Ok while expired / wrong-fingerprint / bad-signature ⇒ Err.
+///
+/// Unbound-OEM note: the machine-binding decision lives entirely inside
+/// `License::validate` (empty fingerprint + `tier == Oem` ⇒ skip binding, all
+/// other tiers ⇒ `InvalidFingerprint`). Both the bootstrap load
+/// (`load_and_validate`) and this refresh path route through `validate`, so an
+/// unbound OEM license refreshed by the control-plane is accepted here for the
+/// same reason it loaded at boot. Do NOT add an independent `machine_fingerprint`
+/// comparison in this path — it would re-break the Docker-rebuild case.
 fn accept_refreshed_license(
     registry: &PublicKeyRegistry,
     new_license: &License,
@@ -1294,6 +1342,30 @@ mod tests {
         assert!(!cap_exceeded(3, 2));
         assert!(cap_exceeded(3, 3));
         assert!(cap_exceeded(3, 4));
+    }
+
+    #[test]
+    fn agent_cap_enforced_p_license_override() {
+        // Cloud always enforces, override or not.
+        assert!(agent_cap_enforced(false, false));
+        assert!(agent_cap_enforced(false, true));
+        // Self-host is normally exempt (Apache 2.0)...
+        assert!(!agent_cap_enforced(true, false));
+        // ...but a signed per-license max_agents override DOES enforce on
+        // self-host (§7(b)) — this is the whole point of P-License.
+        assert!(agent_cap_enforced(true, true));
+    }
+
+    #[test]
+    fn effective_max_agents_via_snapshot_field() {
+        // A LicenseSnapshot carries the per-license override so the enforcement
+        // path can detect it (is_some) even on a self-host tier.
+        let mut lic = fake_license(LicenseTier::SelfHostPro, "fp");
+        let snap_none = LicenseSnapshot::from_state(Some(&lic), LicenseTier::SelfHostPro);
+        assert!(snap_none.max_agents.is_none());
+        lic.max_agents = Some(2);
+        let snap_some = LicenseSnapshot::from_state(Some(&lic), LicenseTier::SelfHostPro);
+        assert_eq!(snap_some.max_agents, Some(2));
     }
 
     // ── Baked production issuer key (single-binary commercial upgrade) ──────

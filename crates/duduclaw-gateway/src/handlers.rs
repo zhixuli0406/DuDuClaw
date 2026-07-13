@@ -3529,6 +3529,10 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_distributor_revoke(params).await
             }
+            "distributor.upgrade" => {
+                require_admin!();
+                self.handle_distributor_upgrade(params).await
+            }
             "distributor.bundle.sign" => {
                 require_admin!();
                 self.handle_distributor_bundle_sign(params).await
@@ -3588,6 +3592,7 @@ impl MethodHandler {
                 days_since_phone_home: None,
                 fingerprint_match: None,
                 branding_editable: None,
+                max_agents: None,
             },
         };
 
@@ -3711,17 +3716,34 @@ impl MethodHandler {
     /// reached. Self-hosted deployments (Apache 2.0) are NEVER capped; a
     /// `max` of 0 in features.toml means unlimited.
     async fn tier_limit_message(&self, kind: &str, current: usize) -> Option<String> {
+        let rt = crate::license_runtime::global()?;
+
+        // P-License §7 decision (b): a signed per-license `max_agents` override is
+        // the issuer's EXPLICIT intent to cap this seat count, so it overrides the
+        // "self-host is never limited" default (an OEM/self-host distributor who
+        // sells "system + N agents" must actually be held to N). Only the agent
+        // cap participates in this override — channels keep the pure self-host
+        // exemption.
+        let agent_override = kind == "agent" && rt.snapshot().await.max_agents.is_some();
+
         // Apache 2.0 promise: never limit self-host. Default deployment is
-        // self-host, so the limit only ever bites managed Cloud tenants.
-        if crate::license_runtime::is_self_host_deployment() {
+        // self-host, so the limit only ever bites managed Cloud tenants — UNLESS
+        // an explicit signed agent-count override says otherwise (§7(b)). Channels
+        // keep the pure self-host exemption.
+        let is_self_host = crate::license_runtime::is_self_host_deployment();
+        let enforce = match kind {
+            "agent" => crate::license_runtime::agent_cap_enforced(is_self_host, agent_override),
+            _ => !is_self_host,
+        };
+        if !enforce {
             return None;
         }
-        let rt = crate::license_runtime::global()?;
         let tier = rt.current_tier().await;
-        let gate = rt.feature_gate();
         let max = match kind {
-            "agent" => gate.max_agents(tier),
-            "channel" => gate.max_channels(tier),
+            // Uses the effective (override > tier) limit so a per-license quota
+            // actually bites, not just the tier default.
+            "agent" => rt.effective_max_agents().await,
+            "channel" => rt.feature_gate().max_channels(tier),
             _ => 0,
         };
         if !crate::license_runtime::cap_exceeded(max, current) {
@@ -10084,6 +10106,24 @@ impl MethodHandler {
             }
         };
 
+        // P-License: optional signed per-license agent-count quota. Absent ⇒
+        // `None` ⇒ no override (the Oem tier default applies). Present ⇒ sell
+        // exactly N agents (`0` = unlimited enterprise bundle). Clamped to a sane
+        // ceiling; it is part of the signed payload so the count cannot be raised
+        // locally without invalidating the signature.
+        let max_agents: Option<u32> = match params.get("max_agents") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_u64() {
+                Some(n) => Some(n.min(100_000) as u32),
+                None => {
+                    return WsFrame::error_response(
+                        "",
+                        "max_agents 必須是非負整數（0 = 不限量）",
+                    )
+                }
+            },
+        };
+
         let store = self.distributor_store();
         let dist = match store.get_distributor(&distributor_id) {
             Some(d) => d,
@@ -10128,6 +10168,7 @@ impl MethodHandler {
             expires_days,
             public_url.as_deref(),
             branding_editable,
+            max_agents,
         ) {
             Ok(v) => v,
             Err(e) => return WsFrame::error_response("", &e),
@@ -10216,6 +10257,106 @@ impl MethodHandler {
             }
             Err(e) => WsFrame::error_response("", &e),
         }
+    }
+
+    /// Local (offline-backup) white-label upgrade: re-sign an already-issued OEM
+    /// license with a new `max_agents` (P-License add-on, plan §12.1).
+    ///
+    /// The issuer key re-signs the SAME key — preserving subscription / customer
+    /// / fingerprint / issued_at / expires_at / control_url and only swapping the
+    /// signed agent-count quota — then `issued_licenses.license_blob` is replaced.
+    /// The `refresh` endpoint re-signs off the previous blob, so continued
+    /// phone-home renewals naturally carry the new count; the returned blob can
+    /// also be delivered to the customer directly for immediate effect. A revoked
+    /// license is refused (fail-closed).
+    async fn handle_distributor_upgrade(&self, params: Value) -> WsFrame {
+        let license_id = match params.get("license_id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "缺少 'license_id' 參數"),
+        };
+        // Required signed agent-count quota. `0` = unlimited. Clamped to a sane
+        // ceiling; part of the signed payload so it cannot be raised locally.
+        let max_agents: u32 = match params.get("max_agents") {
+            Some(v) => match v.as_u64() {
+                Some(n) => n.min(100_000) as u32,
+                None => {
+                    return WsFrame::error_response(
+                        "",
+                        "max_agents 必須是非負整數（0 = 不限量）",
+                    )
+                }
+            },
+            None => return WsFrame::error_response("", "缺少 'max_agents' 參數"),
+        };
+
+        let store = self.distributor_store();
+        let rec = match store.get_license(&license_id) {
+            Some(r) => r,
+            None => return WsFrame::error_response("", "找不到該授權"),
+        };
+        if rec.status == "revoked" {
+            return WsFrame::error_response("", "已撤銷的授權無法升級（請重新簽發）");
+        }
+
+        // Prior signed quota (for the audit old→new line), decoded from the blob.
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        let old_max_agents = B64
+            .decode(rec.license_blob.trim())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<duduclaw_license::License>(&b).ok())
+            .and_then(|l| l.max_agents);
+
+        // Issuer key — explicit config, no path guessing.
+        let key_path = match self.distributor_issuer_key_path().await {
+            Some(p) => p,
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    "尚未配置簽發金鑰：請在 config.toml 設定 [distributor] issuer_key_path 指向 license-signing-v2.key",
+                )
+            }
+        };
+        let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(&key_path)) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        let registry = crate::license_runtime::production_registry();
+        let (_license, blob) = match crate::distributor_store::resign_license_with_max_agents(
+            &seed,
+            &registry,
+            &rec,
+            Some(max_agents),
+        ) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        if let Err(e) = store.update_license_blob(&license_id, &blob) {
+            return WsFrame::error_response("", &format!("更新授權失敗：{e}"));
+        }
+
+        self.audit_distributor_event(
+            "distributor_license_upgraded",
+            json!({
+                "license_id": license_id,
+                "distributor_id": rec.distributor_id,
+                "subscription_id": rec.subscription_id,
+                "old_max_agents": old_max_agents,
+                "new_max_agents": max_agents,
+            }),
+        );
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "ok": true,
+                "license_blob": blob,
+                "old_max_agents": old_max_agents,
+                "new_max_agents": max_agents,
+                "note": "已更新本地授權；可將新 license_blob 交付客戶立即生效，或由客戶端下次 phone-home 續期自動帶入",
+            }),
+        )
     }
 
     /// Owner-side offline co-signing of a branding bundle (§10.3): the operator

@@ -28,6 +28,30 @@ use crate::prediction::metacognition::MetaCognition;
 /// Adaptive depth: up to 7 rounds for thorough evolution.
 const DEFAULT_MAX_GENERATIONS: u32 = 7;
 
+/// Free / CE baseline generation budget.
+///
+/// M1 moat-gate (features.toml `industry_evolution_params`): tiers **without**
+/// the flag (OpenSource / Hobby / Solo / Studio / self-host base) run a fixed
+/// 3-round GVU cycle — the historical free behaviour. Only Business /
+/// SelfHostPro / OEM unlock the full adaptive 3–7 depth.
+const FREE_MAX_GENERATIONS: u32 = 3;
+
+/// Apply the M1 moat-gate to a resolved generation budget.
+///
+/// `base` is the pre-gate budget (MetaCognition's adaptive 3–7, or the fixed
+/// `max_generations`). When `industry_evolution` is `false` the budget is
+/// capped at [`FREE_MAX_GENERATIONS`]; when `true` the full adaptive depth
+/// passes through. Non-breaking by construction: the default resolution path
+/// (no license runtime published → `industry_evolution = false`) yields the
+/// free 3-round cap, matching prior free-tier behaviour.
+pub(crate) fn gated_max_generations(base: u32, industry_evolution: bool) -> u32 {
+    if industry_evolution {
+        base
+    } else {
+        base.min(FREE_MAX_GENERATIONS)
+    }
+}
+
 /// Default wall-clock timeout per GVU cycle (5 minutes).
 ///
 /// Inspired by autoresearch's fixed time budget: each evolution attempt
@@ -250,9 +274,21 @@ impl GvuLoop {
         let mut last_gradient: Option<TextGradient> = None;
 
         // Adaptive depth: use MetaCognition if available, else fixed max_generations
-        let effective_max = metacognition
+        let base_max = metacognition
             .map(|mc| mc.adaptive_max_generations())
             .unwrap_or(self.max_generations);
+
+        // M1 moat-gate: `industry_evolution_params` (Business / SelfHostPro / OEM)
+        // unlocks the full adaptive depth; free / CE / self-host base tiers are
+        // capped at the 3-round free baseline. Resolved live from the
+        // process-global license runtime so a dashboard tier upgrade takes effect
+        // without a restart. Absent runtime (unit tests, non-gateway subcommands)
+        // → free baseline — the non-breaking default.
+        let industry_evolution = match crate::license_runtime::global() {
+            Some(rt) => rt.check_feature("industry_evolution_params").await,
+            None => false,
+        };
+        let effective_max = gated_max_generations(base_max, industry_evolution);
 
         // Wall-clock budget — the entire GVU cycle must complete within this duration.
         let deadline = Instant::now();
@@ -608,5 +644,34 @@ pub fn parse_evaluator_response(response: &str) -> verifier::VerificationResult 
                 "Revise proposal based on evaluator feedback",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::{gated_max_generations, FREE_MAX_GENERATIONS};
+
+    #[test]
+    fn free_tier_is_capped_at_three_rounds() {
+        // No industry_evolution_params → fixed 3-round free behaviour, whatever
+        // the pre-gate adaptive budget was.
+        assert_eq!(gated_max_generations(7, false), FREE_MAX_GENERATIONS);
+        assert_eq!(gated_max_generations(5, false), FREE_MAX_GENERATIONS);
+        assert_eq!(gated_max_generations(3, false), 3);
+        // A base already below the cap is left untouched (min, not clamp-up).
+        assert_eq!(gated_max_generations(2, false), 2);
+    }
+
+    #[test]
+    fn business_tier_unlocks_adaptive_depth() {
+        // industry_evolution_params → full adaptive 3–7 passes through.
+        assert_eq!(gated_max_generations(7, true), 7);
+        assert_eq!(gated_max_generations(5, true), 5);
+        assert_eq!(gated_max_generations(3, true), 3);
+    }
+
+    #[test]
+    fn free_baseline_constant_is_three() {
+        assert_eq!(FREE_MAX_GENERATIONS, 3);
     }
 }
