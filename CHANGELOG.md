@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [1.36.0] - 2026-07-15
+## [1.36.0] - 2026-07-15 — Vetted Skill/MCP install-from-URL + department-routed install approvals
 
 ### Added
 - **Skill / MCP 安裝簽核鏈（2026-07-15）。** 管理員以外的使用者安裝 Skill／MCP

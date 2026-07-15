@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # DuDuClaw Release Automation
 # Usage:
-#   ./scripts/release.sh <patch|minor|major> [--dry-run]   # bump + sync all platforms
+#   ./scripts/release.sh <patch|minor|major> [--title "<theme>"] [--dry-run]
+#                                                          # bump + sync all platforms
 #   ./scripts/release.sh audit                              # show every platform's version + drift
 #   ./scripts/release.sh verify [version]                  # confirm registries published <version>
+#
+# --title "<theme>" sets the one-line release theme in the CHANGELOG version
+# header (house style: "## [1.36.0] - 2026-07-15 — <theme>"). On a bump the
+# curated [Unreleased] section is RENAMED to the new version (its hand-written
+# notes are preserved) and a fresh empty [Unreleased] is left on top.
 #
 # Why this exists: the version lives in MANY platform manifests (Cargo, PyPI's
 # pyproject.toml, the npm wrapper + 5 platform sub-packages, README badges). When
@@ -156,7 +162,8 @@ run_verify() {
 # --- Arg parsing / sub-commands ---
 if [[ $# -lt 1 ]]; then
     echo "Usage:"
-    echo "  $0 <patch|minor|major> [--dry-run]   bump + sync every platform manifest"
+    echo "  $0 <patch|minor|major> [--title \"<theme>\"] [--dry-run]"
+    echo "                                       bump + sync every platform manifest"
     echo "  $0 audit                             show each platform's version + drift"
     echo "  $0 verify [version]                  confirm PyPI/npm published <version>"
     exit 1
@@ -185,10 +192,32 @@ case "$1" in
 esac
 
 BUMP_TYPE="$1"
-if [[ "${2:-}" == "--dry-run" ]]; then
-    DRY_RUN=true
-    echo "[DRY RUN] No files will be modified"
-fi
+shift
+# Optional flags in any order: --dry-run, --title "<tagline>" (or --title=...).
+# TITLE is the one-line release theme that goes after the date in the CHANGELOG
+# version header (Keep-a-Changelog + this repo's convention:
+#   "## [1.35.0] - 2026-07-07 — True auto-update, Ed25519-signed releases").
+TITLE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)
+            DRY_RUN=true
+            echo "[DRY RUN] No files will be modified"
+            ;;
+        --title=*)
+            TITLE="${1#--title=}"
+            ;;
+        --title)
+            shift
+            TITLE="${1:-}"
+            ;;
+        *)
+            echo "Error: unknown option '$1'"
+            exit 1
+            ;;
+    esac
+    shift
+done
 
 if [[ "$BUMP_TYPE" != "patch" && "$BUMP_TYPE" != "minor" && "$BUMP_TYPE" != "major" ]]; then
     echo "Error: bump type must be 'patch', 'minor', 'major', or sub-command 'audit'/'verify'"
@@ -276,36 +305,72 @@ echo "  All platforms synchronized at $NEW_VERSION."
 echo ""
 echo "Updating CHANGELOG.md..."
 DATE=$(date +%Y-%m-%d)
-CHANGELOG_ENTRY="## [$NEW_VERSION] - $DATE
 
-### Added
-- (describe new features here)
-
-### Changed
-- (describe changes here)
-
-### Fixed
-- (describe bug fixes here)
-
-"
+# The version header follows this repo's convention (Keep a Changelog + a
+# one-line theme after the date):
+#   "## [1.36.0] - 2026-07-15 — <title>"
+# The title is passed via --title; without it we emit the bare date header and
+# nag, because a themed header is the house style.
+if [[ -n "$TITLE" ]]; then
+    VERSION_HEADER="## [$NEW_VERSION] - $DATE — $TITLE"
+else
+    VERSION_HEADER="## [$NEW_VERSION] - $DATE"
+    echo "  NOTE: no --title given — header has no theme line. House style is"
+    echo "        '## [$NEW_VERSION] - $DATE — <one-line theme>'. Re-run with"
+    echo "        --title \"<theme>\" or edit the header before pushing."
+fi
 
 if [[ -f "CHANGELOG.md" ]]; then
-    TEMP=$(mktemp)
-    head -2 CHANGELOG.md > "$TEMP"
-    echo "" >> "$TEMP"
-    echo "$CHANGELOG_ENTRY" >> "$TEMP"
-    tail -n +3 CHANGELOG.md >> "$TEMP"
-    mv "$TEMP" CHANGELOG.md
+    if grep -qE '^## \[Unreleased\]' CHANGELOG.md; then
+        # Release move (Keep a Changelog): the curated [Unreleased] section
+        # BECOMES this version. We insert the version header right after the
+        # [Unreleased] heading, so everything accumulated during the cycle now
+        # sits under [X.Y.Z] and a fresh, empty [Unreleased] stays on top.
+        # This is why a bump no longer strands hand-written notes under
+        # [Unreleased] (the historical bug: a placeholder block was prepended
+        # and the real notes were left behind).
+        TEMP=$(mktemp)
+        awk -v hdr="$VERSION_HEADER" '
+            !done && /^## \[Unreleased\]/ {
+                print                # keep the (now-empty) [Unreleased] heading
+                print ""
+                print hdr            # curated content below falls under this version
+                done = 1
+                next
+            }
+            { print }
+        ' CHANGELOG.md > "$TEMP"
+        mv "$TEMP" CHANGELOG.md
+        echo "  Renamed [Unreleased] -> $NEW_VERSION (curated notes preserved)"
+    else
+        # No [Unreleased] section: prepend a fresh version block with placeholder
+        # buckets for the author to fill in.
+        TEMP=$(mktemp)
+        head -2 CHANGELOG.md > "$TEMP"
+        {
+            echo ""
+            echo "$VERSION_HEADER"
+            echo ""
+            echo "### Added"
+            echo "- (describe new features here)"
+            echo ""
+            echo "### Changed"
+            echo "- (describe changes here)"
+            echo ""
+            echo "### Fixed"
+            echo "- (describe bug fixes here)"
+            echo ""
+        } >> "$TEMP"
+        tail -n +3 CHANGELOG.md >> "$TEMP"
+        mv "$TEMP" CHANGELOG.md
+    fi
 else
     cat > CHANGELOG.md << HEREDOC
 # Changelog
 
-All notable changes to DuDuClaw will be documented in this file.
+## [Unreleased]
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-$CHANGELOG_ENTRY## [$CURRENT_VERSION] - $DATE
+$VERSION_HEADER
 
 - Initial tracked release
 
