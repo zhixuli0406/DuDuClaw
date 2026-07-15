@@ -33,7 +33,15 @@ export function FirstRunGate() {
     );
   }
 
-  if (agents.length === 0 && location.pathname !== '/welcome') {
+  // `/license` is reachable during first-run: the welcome wizard's industry
+  // step shows an unlock CTA that sends the operator here to install a Pro
+  // license BEFORE any agent exists. Bouncing it back to /welcome made that
+  // CTA a dead loop.
+  if (
+    agents.length === 0 &&
+    location.pathname !== '/welcome' &&
+    location.pathname !== '/license'
+  ) {
     return <Navigate to="/welcome" replace />;
   }
 

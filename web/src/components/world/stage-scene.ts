@@ -44,7 +44,8 @@ import {
   type Bounds,
 } from './geometry';
 import { resolveAgentTint } from './rooms';
-import { characterFor, type CharacterAccessory } from '@/lib/character-gen';
+import { characterFor } from '@/lib/character-gen';
+import { defaultOutfitFor } from '@/lib/outfit';
 import { advanceCar, findHorizontalLanes, seedCars, type CarState } from './traffic';
 import {
   TileCode,
@@ -569,13 +570,19 @@ export class WorldScene {
     shadow.ellipse(0, 0, 16, 8).fill({ color: 0x000000, alpha: 0.16 });
     bob.addChild(shadow);
 
-    // Body + head + eyes.
+    // Body + head + eyes + wardrobe layers.
     const body = new PX.Graphics();
+    const fit = s.outfit ?? defaultOutfitFor(s.id);
+    this.drawFeet(body, fit.feet, tint);
     body.roundRect(-13, -34, 26, 30, 12).fill({ color: tint });
     body.circle(0, -40, 12).fill({ color: shade(tint, 1.14) });
     body.circle(-4, -42, 2).fill({ color: 0x2a2320 });
     body.circle(4, -42, 2).fill({ color: 0x2a2320 });
-    this.drawAccessory(body, resolveAccessory(traits.accessory), tint);
+    this.drawBodyItem(body, fit.body, tint);
+    this.drawHandsItem(body, fit.hands);
+    this.drawAccessoryItem(body, fit.accessory, tint);
+    this.drawHeadItem(body, fit.head);
+    this.drawHat(body, fit.hat, tint);
     bob.addChild(body);
 
     // Nameplate (always on).
@@ -645,24 +652,179 @@ export class WorldScene {
       .fill({ color: 0xffffff, alpha: 0.96 });
   }
 
-  private drawAccessory(g: PIXI.Graphics, model: AccessoryModel, tint: number): void {
-    switch (model) {
-      case 'glasses':
-        g.circle(-4, -42, 4).stroke({ color: 0x2a2320, width: 1.5 });
-        g.circle(4, -42, 4).stroke({ color: 0x2a2320, width: 1.5 });
-        break;
+  // ---- Wardrobe layers (geometry: head circle (0,-40) r12, body rect
+  // (-13,-34,26,30), ground y≈0; palette mirrors OutfitLayers.tsx) ---------
+
+  private drawHat(g: PIXI.Graphics, item: string, tint: number): void {
+    switch (item) {
       case 'cap':
         g.ellipse(0, -50, 13, 6).fill({ color: shade(tint, 0.7) });
         g.rect(-4, -52, 16, 4).fill({ color: shade(tint, 0.7) });
         break;
-      case 'bow':
-        g.poly([-2, -52, -10, -56, -10, -48]).fill({ color: 0xef7fa2 });
-        g.poly([2, -52, 10, -56, 10, -48]).fill({ color: 0xef7fa2 });
-        g.circle(0, -52, 2).fill({ color: 0xef7fa2 });
+      case 'tophat':
+        g.rect(-11, -52, 22, 2.5).fill({ color: OUTFIT_INK });
+        g.roundRect(-6.5, -63, 13, 11.5, 1).fill({ color: OUTFIT_INK });
+        g.rect(-6.5, -54.5, 13, 2).fill({ color: OUTFIT_GOLD });
         break;
-      default: // antenna
+      case 'beret':
+        g.ellipse(-1.5, -51, 9.5, 4).fill({ color: OUTFIT_PLUM });
+        g.circle(-1.5, -55.5, 1.2).fill({ color: OUTFIT_PLUM });
+        break;
+      case 'crown':
+        g.poly([-7.5, -50, -7.5, -57, -3.5, -53.5, 0, -58, 3.5, -53.5, 7.5, -57, 7.5, -50]).fill({ color: OUTFIT_GOLD });
+        g.circle(0, -51.5, 1).fill({ color: OUTFIT_PINK });
+        break;
+      case 'beanie':
+        g.ellipse(0, -51, 11, 5.5).fill({ color: OUTFIT_TEAL });
+        g.rect(-11, -50, 22, 2.5).fill({ color: shadeHex(OUTFIT_TEAL, 0.8) });
+        g.circle(0, -57.5, 1.8).fill({ color: shadeHex(OUTFIT_TEAL, 0.8) });
+        break;
+      case 'helmet':
+        g.ellipse(0, -50.5, 11.5, 5.5).fill({ color: OUTFIT_GOLD });
+        g.rect(-12.5, -50, 25, 1.6).fill({ color: OUTFIT_GOLD });
+        g.roundRect(-1.7, -56.5, 3.4, 6, 1.2).fill({ color: OUTFIT_GOLD });
+        break;
+      default:
+        break;
+    }
+  }
+
+  private drawHeadItem(g: PIXI.Graphics, item: string): void {
+    switch (item) {
+      case 'glasses':
+        g.circle(-4, -42, 4).stroke({ color: OUTFIT_INK, width: 1.5 });
+        g.circle(4, -42, 4).stroke({ color: OUTFIT_INK, width: 1.5 });
+        break;
+      case 'sunglasses':
+        g.circle(-4, -42, 4).fill({ color: OUTFIT_INK });
+        g.circle(4, -42, 4).fill({ color: OUTFIT_INK });
+        g.rect(-4, -43.2, 8, 1.2).fill({ color: OUTFIT_INK });
+        break;
+      case 'monocle':
+        g.circle(4, -42, 4).stroke({ color: OUTFIT_INK, width: 1.4 });
+        g.moveTo(7, -39).lineTo(9.5, -33).stroke({ color: OUTFIT_INK, width: 1 });
+        break;
+      case 'mask':
+        g.roundRect(-6.5, -38.5, 13, 6, 2).fill({ color: 0xffffff }).stroke({ color: 0x9a938c, width: 0.6 });
+        break;
+      default:
+        break;
+    }
+  }
+
+  private drawBodyItem(g: PIXI.Graphics, item: string, tint: number): void {
+    switch (item) {
+      case 'tie':
+        g.poly([-1.8, -31, 1.8, -31, 0, -28]).fill({ color: shade(tint, 0.55) });
+        g.poly([0, -28, -2.4, -22, 0, -16, 2.4, -22]).fill({ color: shade(tint, 0.55) });
+        break;
+      case 'bowtie':
+        g.poly([0, -30.5, -5, -33, -5, -28]).fill({ color: OUTFIT_PLUM });
+        g.poly([0, -30.5, 5, -33, 5, -28]).fill({ color: OUTFIT_PLUM });
+        g.circle(0, -30.5, 1.4).fill({ color: OUTFIT_GOLD });
+        break;
+      case 'suit':
+        g.moveTo(-8, -32).lineTo(0, -24).lineTo(8, -32).stroke({ color: OUTFIT_INK, width: 1.6 });
+        g.circle(0, -20, 1).fill({ color: OUTFIT_INK });
+        g.circle(0, -16, 1).fill({ color: OUTFIT_INK });
+        break;
+      case 'apron':
+        g.roundRect(-7.5, -24, 15, 14, 2).fill({ color: 0xffffff, alpha: 0.92 });
+        g.moveTo(-6, -24).lineTo(-3, -31).stroke({ color: 0x9a938c, width: 1 });
+        g.moveTo(6, -24).lineTo(3, -31).stroke({ color: 0x9a938c, width: 1 });
+        g.roundRect(-4, -19, 8, 5, 1).stroke({ color: 0x9a938c, width: 0.8 });
+        break;
+      case 'sash':
+        g.poly([-13, -30, 13, -14, 13, -9, -13, -25]).fill({ color: OUTFIT_PINK, alpha: 0.9 });
+        break;
+      default:
+        break;
+    }
+  }
+
+  private drawHandsItem(g: PIXI.Graphics, item: string): void {
+    // Held at the right side of the body block.
+    switch (item) {
+      case 'coffee':
+        g.roundRect(14, -22, 6, 7, 1).fill({ color: 0xffffff }).stroke({ color: 0x9a938c, width: 0.8 });
+        g.circle(20.5, -18.5, 2.2).stroke({ color: 0x9a938c, width: 1 });
+        break;
+      case 'briefcase':
+        g.roundRect(13, -20, 10, 8, 1.5).fill({ color: OUTFIT_GOLD });
+        g.rect(16.5, -22.5, 3, 2.5).stroke({ color: OUTFIT_INK, width: 0.8 });
+        break;
+      case 'wrench':
+        g.moveTo(14, -12).lineTo(21, -22).stroke({ color: 0x6b7280, width: 2.4 });
+        g.circle(21.6, -22.8, 2.4).stroke({ color: 0x6b7280, width: 1.6 });
+        break;
+      case 'clipboard':
+        g.roundRect(13.5, -25, 8.5, 11, 1).fill({ color: 0xffffff }).stroke({ color: 0x9a938c, width: 0.8 });
+        g.rect(16.5, -26, 3, 2).fill({ color: 0x9a938c });
+        g.rect(15, -22, 5.5, 1).fill({ color: 0xd6d0c8 });
+        g.rect(15, -19.5, 5.5, 1).fill({ color: 0xd6d0c8 });
+        break;
+      case 'phone':
+        g.roundRect(14.5, -23, 5.5, 9.5, 1).fill({ color: OUTFIT_INK });
+        g.roundRect(15.3, -22, 4, 6.5, 0.5).fill({ color: 0x7dd3fc });
+        break;
+      default:
+        break;
+    }
+  }
+
+  private drawFeet(g: PIXI.Graphics, item: string, tint: number): void {
+    switch (item) {
+      case 'sneakers':
+        g.ellipse(-6, -3, 5, 2.6).fill({ color: 0xffffff }).stroke({ color: shade(tint, 0.7), width: 1 });
+        g.ellipse(6, -3, 5, 2.6).fill({ color: 0xffffff }).stroke({ color: shade(tint, 0.7), width: 1 });
+        break;
+      case 'boots':
+        g.roundRect(-10.5, -8, 9, 6, 2).fill({ color: 0x8a5a33 });
+        g.roundRect(1.5, -8, 9, 6, 2).fill({ color: 0x8a5a33 });
+        break;
+      case 'skates':
+        g.ellipse(-6, -4.5, 5, 2.4).fill({ color: 0xffffff });
+        g.circle(-8.5, -1.4, 1.4).fill({ color: OUTFIT_INK });
+        g.circle(-3.5, -1.4, 1.4).fill({ color: OUTFIT_INK });
+        g.ellipse(6, -4.5, 5, 2.4).fill({ color: 0xffffff });
+        g.circle(3.5, -1.4, 1.4).fill({ color: OUTFIT_INK });
+        g.circle(8.5, -1.4, 1.4).fill({ color: OUTFIT_INK });
+        break;
+      default:
+        break;
+    }
+  }
+
+  private drawAccessoryItem(g: PIXI.Graphics, item: string, tint: number): void {
+    switch (item) {
+      case 'antenna':
         g.rect(-0.6, -58, 1.2, 8).fill({ color: 0x4a4f57 });
         g.circle(0, -59, 2.5).fill({ color: shade(tint, 1.3) });
+        break;
+      case 'bow':
+        g.poly([-2, -52, -10, -56, -10, -48]).fill({ color: OUTFIT_PINK });
+        g.poly([2, -52, 10, -56, 10, -48]).fill({ color: OUTFIT_PINK });
+        g.circle(0, -52, 2).fill({ color: OUTFIT_PINK });
+        break;
+      case 'flower':
+        for (let i = 0; i < 5; i++) {
+          const rad = (i * 72 * Math.PI) / 180;
+          g.circle(7 + Math.cos(rad) * 2.2, -50 + Math.sin(rad) * 2.2, 1.6).fill({ color: OUTFIT_PLUM });
+        }
+        g.circle(7, -50, 1.4).fill({ color: OUTFIT_GOLD });
+        break;
+      case 'scarf':
+        g.roundRect(-8, -31, 16, 4.5, 2).fill({ color: shade(tint, 0.6) });
+        break;
+      case 'badge':
+        g.circle(-7, -26, 2.4).fill({ color: OUTFIT_GOLD });
+        g.circle(-7, -26, 0.9).fill({ color: 0xffffff });
+        break;
+      case 'halo':
+        g.ellipse(0, -57.5, 7.5, 2.4).stroke({ color: OUTFIT_GOLD, width: 1.6 });
+        break;
+      default:
+        break;
     }
   }
 
@@ -856,11 +1018,17 @@ export class WorldScene {
 
 // ---- Accessory mapping (inlined; the 3D character-3d module was removed) ----
 
-type AccessoryModel = 'antenna' | 'glasses' | 'cap' | 'bow';
-const MODELLED: ReadonlySet<CharacterAccessory> = new Set<CharacterAccessory>(['antenna', 'glasses', 'cap', 'bow']);
-/** Map the full accessory vocabulary onto the drawn set (rest → antenna). */
-function resolveAccessory(accessory: CharacterAccessory): AccessoryModel {
-  return MODELLED.has(accessory) ? (accessory as AccessoryModel) : 'antenna';
+
+// Wardrobe palette (mirrors the CSS tokens OutfitLayers.tsx uses).
+const OUTFIT_INK = 0x2a2320;
+const OUTFIT_GOLD = 0xf6c453;
+const OUTFIT_PINK = 0xef7fa2;
+const OUTFIT_PLUM = 0xb185d1;
+const OUTFIT_TEAL = 0x5eb8a6;
+
+/** `shade` under a name that reads right for hex constants. */
+function shadeHex(color: number, factor: number): number {
+  return shade(color, factor);
 }
 
 /** Scale a packed 0xRRGGBB brightness (`factor` < 1 darkens, > 1 lightens). */

@@ -331,7 +331,7 @@ fn scan_contract_boundaries(
 // Risk classification
 // ---------------------------------------------------------------------------
 
-fn classify_risk(findings: &[SecurityFinding]) -> RiskLevel {
+pub(crate) fn classify_risk(findings: &[SecurityFinding]) -> RiskLevel {
     if findings.is_empty() {
         return RiskLevel::Clean;
     }

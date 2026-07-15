@@ -10,6 +10,7 @@ import {
   BarChart3,
   Users,
   Users2,
+  Network,
   Brain,
   Puzzle,
   BookOpen,
@@ -166,6 +167,9 @@ export const manageNav: NavItem[] = [
   { to: '/manage/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin' },
   { to: '/manage/governance', icon: Scale, label: 'manage.governance', desc: 'manage.governance.desc', minRole: 'admin', enterprise: true },
   { to: '/manage/users', icon: Users, label: 'manage.users', desc: 'manage.users.desc', minRole: 'admin', enterprise: true },
+  // Departments are a core (WP7) grouping, not an enterprise module — the
+  // create-agent dialog's dropdown draws from here on every edition.
+  { to: '/manage/departments', icon: Network, label: 'manage.departments', desc: 'manage.departments.desc', minRole: 'admin' },
   { to: '/manage/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager' },
   { to: '/manage/distributors', icon: Store, label: 'manage.distributors', desc: 'manage.distributors.desc', minRole: 'admin' },
   { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },

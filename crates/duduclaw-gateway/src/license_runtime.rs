@@ -342,6 +342,143 @@ impl LicenseRuntime {
         let inner = self.state.read().await;
         LicenseSnapshot::from_state(inner.license.as_ref(), tier)
     }
+
+    /// Verify a candidate license against this runtime's issuer registry +
+    /// machine fingerprint + expiry, persist it as `license.json`, and
+    /// hot-swap the in-memory license — the dashboard activation flow unlocks
+    /// commercial features WITHOUT a gateway restart. Fail-closed: nothing is
+    /// written unless signature, fingerprint, and expiry all pass; the final
+    /// in-memory swap re-runs the full `load_and_validate` (M51 tier/deploy
+    /// binding, phone-home grace, …) so the RPC path can never be more lenient
+    /// than a restart. Error strings are operator-facing zh-TW.
+    pub async fn install_and_reload(&self, license: License) -> Result<LicenseSnapshot, String> {
+        if self.registry.is_empty() {
+            return Err(
+                "此版本未內建授權簽發公鑰，無法驗證授權（OSS 建置不支援商用授權）".to_string(),
+            );
+        }
+        self.registry
+            .verify(&license)
+            .map_err(|e| format!("授權簽章驗證失敗：{e}"))?;
+        let current_fp = generate_fingerprint();
+        if !license.is_valid_for_machine(&current_fp) {
+            return Err(format!(
+                "授權綁定的機器指紋與本機不符（本機指紋：{current_fp}）。\
+                 若是從舊機器搬移，請在本機執行 `duduclaw license rebind`"
+            ));
+        }
+        if license.is_expired() {
+            return Err(format!("授權已於 {} 過期", license.expires_at));
+        }
+        // M51 pre-check: surface the tier ↔ deployment-mode mismatch BEFORE
+        // writing anything — the post-save re-validation would reject it
+        // anyway, but with an error that hides the actionable reason.
+        let is_self_host = is_self_host_deployment();
+        if license.validate_tier_deployment_binding(is_self_host).is_err() {
+            return Err(format!(
+                "授權方案「{}」與本機部署型態不符：本機是{}部署。\
+                 自架機器請簽發 self-host-pro / personal-pro-self-host / partner / oem；\
+                 雲端託管才使用 solo / studio / business",
+                license.tier,
+                if is_self_host { "自架（self-host）" } else { "雲端（cloud）" },
+            ));
+        }
+        save_default(&license).map_err(|e| format!("寫入授權檔失敗：{e}"))?;
+
+        // A freshly-verified license supersedes a stale revocation marker
+        // (re-subscription path). If this subscription is ALSO on the CRL, the
+        // background CRL poller re-revokes it — we don't weaken that check.
+        let marker = self.home_dir.join(REVOKED_FILENAME);
+        if marker.exists() {
+            if let Err(e) = std::fs::remove_file(&marker) {
+                warn!(error = %e, "could not clear revocation marker after new license install");
+            } else {
+                info!("revocation marker cleared by newly-installed license");
+            }
+        }
+
+        let validated = load_and_validate(&self.registry, &self.gate).await;
+        let ok = validated.is_some();
+        {
+            let mut inner = self.state.write().await;
+            inner.license = validated;
+        }
+        if !ok {
+            return Err(
+                "授權已寫入但完整驗證未通過（詳見 gateway 日誌），目前仍為 OpenSource 模式"
+                    .to_string(),
+            );
+        }
+        Ok(self.snapshot().await)
+    }
+}
+
+/// Parse a dashboard-supplied license key: a base64-encoded license blob or
+/// the raw license JSON. Deliberately does NOT accept filesystem paths (the
+/// CLI does; a path coming from a browser form is a smell, not a feature).
+pub fn parse_license_key(input: &str) -> Result<License, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("授權金鑰不可為空".to_string());
+    }
+    if trimmed.starts_with('{') {
+        return serde_json::from_str(trimmed).map_err(|e| format!("授權 JSON 解析失敗：{e}"));
+    }
+    let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(compact.as_bytes())
+        .map_err(|_| "無法辨識的授權格式（需為 base64 金鑰或授權 JSON 全文）".to_string())?;
+    serde_json::from_slice(&decoded).map_err(|e| format!("授權內容解析失敗：{e}"))
+}
+
+/// Redeem a partner (NFR) code at the control-plane and install the returned
+/// license. Mirrors `duduclaw license redeem`, but finishes with the runtime
+/// hot-reload so the dashboard unlocks immediately.
+pub async fn redeem_partner_code(
+    rt: &LicenseRuntime,
+    code: &str,
+    email: Option<String>,
+) -> Result<LicenseSnapshot, String> {
+    let code = code.trim();
+    if code.is_empty() {
+        return Err("兌換碼不可為空".to_string());
+    }
+    let endpoint = format!("{}/v1/partner/redeem", rt.control_url().trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(20))
+        .build()
+        .map_err(|e| format!("建立 HTTP client 失敗：{e}"))?;
+    let body = json!({
+        "code": code,
+        "machine_fingerprint": generate_fingerprint(),
+        "email": email,
+    });
+    let resp = client
+        .post(&endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("無法連線授權伺服器：{e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+            .unwrap_or_else(|| text.chars().take(200).collect());
+        return Err(format!("授權伺服器回應 HTTP {status}：{msg}"));
+    }
+    let envelope: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("兌換回應解析失敗：{e}"))?;
+    let license: License = envelope
+        .get("license")
+        .cloned()
+        .ok_or_else(|| "兌換回應缺少 license 欄位".to_string())
+        .and_then(|v| serde_json::from_value(v).map_err(|e| format!("授權內容解析失敗：{e}")))?;
+    rt.install_and_reload(license).await
 }
 
 /// Read-only view of the runtime state for dashboards / metrics.
@@ -1044,6 +1181,45 @@ mod tests {
             ChronoDuration::days(30),
             "v1",
         )
+    }
+
+    #[test]
+    fn parse_license_key_rejects_junk_and_paths() {
+        assert!(parse_license_key("").is_err());
+        assert!(parse_license_key("   ").is_err());
+        assert!(parse_license_key("not-base64-not-json!!!").is_err());
+        // A filesystem path must NOT be accepted from the dashboard form.
+        assert!(parse_license_key("/etc/passwd").is_err());
+        // Valid base64 of non-license JSON still fails at deserialization.
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"{\"foo\":1}");
+        assert!(parse_license_key(&b64).is_err());
+    }
+
+    #[test]
+    fn parse_license_key_accepts_json_and_base64() {
+        let lic = fake_license(LicenseTier::Studio, "fp_test");
+        let json = serde_json::to_string(&lic).unwrap();
+        let parsed = parse_license_key(&json).unwrap();
+        assert_eq!(parsed.subscription_id, "sub_test");
+
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        // Whitespace/newlines inside a pasted base64 blob are tolerated.
+        let wrapped = format!("{}\n{}", &b64[..10], &b64[10..]);
+        let parsed = parse_license_key(&wrapped).unwrap();
+        assert_eq!(parsed.customer_id, "cus_test");
+    }
+
+    #[tokio::test]
+    async fn install_and_reload_fails_closed_without_registry_keys() {
+        let tmp = std::env::temp_dir().join(format!("dudu-lic-rt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let rt = LicenseRuntime::bootstrap(tmp.clone(), PublicKeyRegistry::new()).await;
+        let lic = fake_license(LicenseTier::Studio, "fp_test");
+        let err = rt.install_and_reload(lic).await.unwrap_err();
+        assert!(err.contains("公鑰"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! Premium (licensed) industry template resolution.
+//! Premium (licensed) industry template resolution — CLI side.
 //!
 //! Free starter templates live in `templates/` and are copied by the wizard
 //! unconditionally (they ship in the public, Apache-2.0 repo). The *premium*
@@ -8,14 +8,20 @@
 //! `premium_templates` feature (Studio / Business / SelfHostPro /
 //! PersonalProSelfHost / OEM — see `crates/duduclaw-license/features.toml`).
 //!
-//! This module is the single gate between "has a license that unlocks premium
-//! templates" and "can actually instantiate a premium template". It is
-//! **fail-closed** per the project security convention: any error reading the
+//! The filesystem side (directory resolution, discovery, labels, team
+//! manifests) lives in `duduclaw_gateway::premium_templates` so the dashboard
+//! gateway can drive the team staging flow with the exact same logic; this
+//! module keeps the CLI-context license gate and re-exports the shared
+//! symbols so `wizard.rs` callers are unchanged.
+//!
+//! **Fail-closed** per the project security convention: any error reading the
 //! license, a missing/expired license, a missing directory, or an
 //! unrecognised slug all resolve to *locked / unavailable*, never to an
 //! accidental unlock.
 
-use std::path::{Path, PathBuf};
+pub use duduclaw_gateway::premium_templates::{
+    discover_in, find_premium_templates_dir, PremiumIndustry,
+};
 
 use duduclaw_license::{
     load_default, FeatureGate, LicenseError, LicenseTier, EMBEDDED_FEATURES_TOML,
@@ -23,48 +29,6 @@ use duduclaw_license::{
 
 /// The feature flag (in `features.toml`) that unlocks premium templates.
 const PREMIUM_FEATURE: &str = "premium_templates";
-
-/// A discovered premium industry template.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PremiumIndustry {
-    /// Directory slug, e.g. `ecommerce-pro`. Validated to be a safe path
-    /// component (lowercase alphanumeric + hyphen) before use.
-    pub slug: String,
-    /// Human-facing label shown in the wizard, e.g. `電商客服 (Pro)`.
-    pub label: String,
-    /// Absolute path to the template directory.
-    pub dir: PathBuf,
-}
-
-/// Pretty label for a known premium slug; falls back to the slug itself so a
-/// newly-added premium template still shows *something* sensible without a
-/// code change.
-fn label_for_slug(slug: &str) -> String {
-    let pretty = match slug {
-        "ecommerce-pro" => "電商客服 (Pro)",
-        "clinic-pro" => "醫美/牙醫診所 (Pro)",
-        "realestate-pro" => "房仲 (Pro)",
-        "education-pro" => "補習班/招生 (Pro)",
-        "restaurant-pro" => "餐飲 (Pro)",
-        "manufacturing-pro" => "製造業 (Pro)",
-        "trading-pro" => "貿易 (Pro)",
-        "retail-pro" => "零售 (Pro)",
-        other => return format!("{other} (Pro)"),
-    };
-    pretty.to_string()
-}
-
-/// A slug is a single path component: lowercase alphanumeric + hyphen, no
-/// `.`/`/`/`..`. This blocks path-traversal via a crafted slug.
-fn is_safe_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug.len() <= 64
-        && !slug.starts_with('-')
-        && !slug.ends_with('-')
-        && slug
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
 
 /// Pure gate check over a tier — does this tier's license grant
 /// `premium_templates`? Fail-closed: a broken embedded features.toml denies.
@@ -94,93 +58,6 @@ pub fn premium_unlocked() -> bool {
         Err(LicenseError::FileNotFound(_)) => false,
         Err(_) => false,
     }
-}
-
-/// Locate the premium templates directory, if present on disk.
-///
-/// Resolution order (first existing directory wins):
-///   1. `DUDUCLAW_PREMIUM_TEMPLATES` env var (explicit override)
-///   2. `templates-premium/` next to the executable (installed layout)
-///   3. `../../templates-premium` relative to the exe (dev: target/<profile>)
-///   4. `commercial/templates-premium/` under the CWD (dev checkout)
-///   5. `templates-premium/` under the CWD
-///
-/// Returns `None` when no premium tree is installed (e.g. the public OSS
-/// binary that never shipped the closed templates).
-pub fn find_premium_templates_dir() -> Option<PathBuf> {
-    if let Ok(custom) = std::env::var("DUDUCLAW_PREMIUM_TEMPLATES") {
-        let p = PathBuf::from(custom);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("templates-premium");
-            if candidate.is_dir() {
-                return Some(candidate);
-            }
-            // Dev layout: exe in target/<profile>/, premium tree two levels up
-            // under commercial/.
-            if let Some(root) = parent.parent().and_then(|p| p.parent()) {
-                let candidate = root.join("commercial").join("templates-premium");
-                if candidate.is_dir() {
-                    return Some(candidate);
-                }
-                let candidate = root.join("templates-premium");
-                if candidate.is_dir() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-
-    let cwd_commercial = PathBuf::from("commercial").join("templates-premium");
-    if cwd_commercial.is_dir() {
-        return Some(cwd_commercial);
-    }
-    let cwd = PathBuf::from("templates-premium");
-    if cwd.is_dir() {
-        return Some(cwd);
-    }
-
-    None
-}
-
-/// Enumerate premium templates physically present under `dir`.
-///
-/// A premium template is a direct sub-directory that contains a `SOUL.md`
-/// (the minimum marker of a usable template) and whose name is a safe slug.
-/// This does NOT check the license — callers gate with [`premium_unlocked`].
-fn discover_in(dir: &Path) -> Vec<PremiumIndustry> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(slug) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !is_safe_slug(slug) {
-            continue;
-        }
-        if !path.join("SOUL.md").is_file() {
-            continue;
-        }
-        out.push(PremiumIndustry {
-            slug: slug.to_string(),
-            label: label_for_slug(slug),
-            dir: path,
-        });
-    }
-    // Deterministic ordering for stable wizard menus.
-    out.sort_by(|a, b| a.slug.cmp(&b.slug));
-    out
 }
 
 /// The premium industries available to the user *right now*: present on disk
@@ -224,63 +101,5 @@ mod tests {
         assert!(premium_gate_open(LicenseTier::SelfHostPro));
         assert!(premium_gate_open(LicenseTier::PersonalProSelfHost));
         assert!(premium_gate_open(LicenseTier::Oem));
-    }
-
-    #[test]
-    fn safe_slug_accepts_known_premium_dirs() {
-        for s in [
-            "ecommerce-pro",
-            "clinic-pro",
-            "realestate-pro",
-            "education-pro",
-        ] {
-            assert!(is_safe_slug(s), "{s} should be a safe slug");
-        }
-    }
-
-    #[test]
-    fn safe_slug_rejects_traversal_and_junk() {
-        for s in [
-            "",
-            "../etc",
-            "a/b",
-            "..",
-            ".hidden",
-            "-leading",
-            "trailing-",
-            "Upper",
-            "white space",
-        ] {
-            assert!(!is_safe_slug(s), "{s:?} must be rejected");
-        }
-    }
-
-    #[test]
-    fn label_falls_back_to_slug() {
-        assert_eq!(label_for_slug("ecommerce-pro"), "電商客服 (Pro)");
-        assert_eq!(label_for_slug("logistics-pro"), "logistics-pro (Pro)");
-    }
-
-    #[test]
-    fn discover_in_finds_only_dirs_with_soul() {
-        let tmp = std::env::temp_dir().join(format!(
-            "dudu-premium-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        // valid template
-        std::fs::create_dir_all(tmp.join("foo-pro")).unwrap();
-        std::fs::write(tmp.join("foo-pro").join("SOUL.md"), "# x").unwrap();
-        // dir without SOUL.md → ignored
-        std::fs::create_dir_all(tmp.join("bar-pro")).unwrap();
-        // unsafe slug dir (even with SOUL.md) → ignored
-        std::fs::create_dir_all(tmp.join(".sneaky")).unwrap();
-        std::fs::write(tmp.join(".sneaky").join("SOUL.md"), "# x").unwrap();
-
-        let found = discover_in(&tmp);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].slug, "foo-pro");
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

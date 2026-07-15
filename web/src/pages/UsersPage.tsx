@@ -9,7 +9,11 @@ import {
   type SelectOption,
 } from '@/components/settings/controls';
 import { toast, formatError } from '@/lib/toast';
-import { Users, UserPlus, Pencil, Link2, UserX, Trash2, X } from 'lucide-react';
+import { Users, UserPlus, Pencil, Link2, UserX, Trash2, X, Eye } from 'lucide-react';
+import { useNavigate } from 'react-router';
+import { useAuthStore } from '@/stores/auth-store';
+import { ROLE_LEVELS } from '@/lib/roles';
+import type { UserRole } from '@/stores/auth-store';
 import {
   Page,
   PageHeader,
@@ -32,6 +36,54 @@ function roleOptions(intl: ReturnType<typeof useIntl>): SelectOption[] {
   ];
 }
 
+/** Fetch existing department names once (for the create/edit datalist). */
+function useDepartmentNames(): string[] {
+  const [names, setNames] = useState<string[]>([]);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await api.departments.list();
+        if (alive) setNames((res?.departments ?? []).map((d) => d.name));
+      } catch {
+        /* departments are optional; a free-text department still works */
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+  return names;
+}
+
+/** A department picker: type-ahead over existing departments, free entry OK.
+ *  Empty value = no department (clears on edit). */
+function DepartmentInput({
+  value,
+  onChange,
+  options,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  options: string[];
+}) {
+  const intl = useIntl();
+  return (
+    <>
+      <input
+        list="dept-options"
+        placeholder={intl.formatMessage({ id: 'users.field.departmentPlaceholder' })}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className={controlClass}
+      />
+      <datalist id="dept-options">
+        {options.map((d) => (
+          <option key={d} value={d} />
+        ))}
+      </datalist>
+    </>
+  );
+}
+
 function accessOptions(intl: ReturnType<typeof useIntl>): SelectOption[] {
   return [
     { value: 'owner', label: intl.formatMessage({ id: 'users.access.owner' }) },
@@ -42,6 +94,13 @@ function accessOptions(intl: ReturnType<typeof useIntl>): SelectOption[] {
 
 export function UsersPage() {
   const intl = useIntl();
+  const navigate = useNavigate();
+  const viewerRole = useAuthStore((s) => s.user?.role);
+  // View-as gate mirrors the server: strictly lower rank only.
+  const canViewDashboard = (targetRole: string, status: string) =>
+    status === 'active' &&
+    viewerRole != null &&
+    (ROLE_LEVELS[targetRole as UserRole] ?? 99) < ROLE_LEVELS[viewerRole];
   const [users, setUsers] = useState<UserDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -165,7 +224,14 @@ export function UsersPage() {
                     </td>
                     <td className="px-4 py-3 text-stone-600 dark:text-stone-400">{user.email}</td>
                     <td className="px-4 py-3">
-                      <Badge tone={roleTone(user.role)}>{user.role}</Badge>
+                      <div className="flex flex-col items-start gap-1">
+                        <Badge tone={roleTone(user.role)}>{user.role}</Badge>
+                        {user.department && (
+                          <span className="text-xs text-stone-400 dark:text-stone-500">
+                            {intl.formatMessage({ id: 'users.dept.prefix' })}{user.department}
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="px-4 py-3">
                       <Badge tone={statusTone(user.status)}>{user.status}</Badge>
@@ -197,6 +263,16 @@ export function UsersPage() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-1">
+                        {canViewDashboard(user.role, user.status) && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            icon={Eye}
+                            onClick={() => navigate(`/?view_as=${encodeURIComponent(user.id)}`)}
+                            title={intl.formatMessage({ id: 'users.action.viewDashboard' })}
+                            aria-label={intl.formatMessage({ id: 'users.action.viewDashboard' })}
+                          />
+                        )}
                         <Button
                           variant="ghost"
                           size="sm"
@@ -270,6 +346,7 @@ export function UsersPage() {
       {showBind && (
         <BindAgentDialog
           userId={showBind}
+          boundAgents={users.find((u) => u.id === showBind)?.bindings.map((b) => b.agent_name) ?? []}
           onClose={() => setShowBind(null)}
           onBound={() => {
             setShowBind(null);
@@ -361,8 +438,10 @@ function CreateUserDialog({
   const [displayName, setDisplayName] = useState('');
   const [password, setPassword] = useState('');
   const [userRole, setUserRole] = useState('employee');
+  const [department, setDepartment] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const deptOptions = useDepartmentNames();
 
   const handleSubmit = async () => {
     setError('');
@@ -377,7 +456,10 @@ function CreateUserDialog({
     }
     setSubmitting(true);
     try {
-      await api.users.create({ email, display_name: displayName, password, role: userRole });
+      await api.users.create({
+        email, display_name: displayName, password, role: userRole,
+        ...(department.trim() ? { department: department.trim() } : {}),
+      });
       onCreated();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to create user');
@@ -423,6 +505,12 @@ function CreateUserDialog({
         <Field label={intl.formatMessage({ id: 'users.col.role' })}>
           <OptionSelect value={userRole} onChange={setUserRole} options={roleOptions(intl)} />
         </Field>
+        <Field
+          label={intl.formatMessage({ id: 'users.field.department' })}
+          help={intl.formatMessage({ id: 'users.field.departmentHint' })}
+        >
+          <DepartmentInput value={department} onChange={setDepartment} options={deptOptions} />
+        </Field>
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
             {intl.formatMessage({ id: 'common.cancel' })}
@@ -452,9 +540,11 @@ function EditUserDialog({
   const intl = useIntl();
   const [displayName, setDisplayName] = useState(user.display_name);
   const [userRole, setUserRole] = useState<string>(user.role);
+  const [department, setDepartment] = useState(user.department ?? '');
   const [newPassword, setNewPassword] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const deptOptions = useDepartmentNames();
 
   const handleSubmit = async () => {
     setError('');
@@ -466,11 +556,14 @@ function EditUserDialog({
     }
     setSubmitting(true);
     try {
+      // Send department only when it changed. An empty string clears it.
+      const deptChanged = department.trim() !== (user.department ?? '').trim();
       await api.users.update({
         user_id: user.id,
         display_name: displayName !== user.display_name ? displayName : undefined,
         role: userRole !== user.role ? userRole : undefined,
         password: newPassword || undefined,
+        ...(deptChanged ? { department: department.trim() } : {}),
       });
       onUpdated();
     } catch (e) {
@@ -498,6 +591,12 @@ function EditUserDialog({
         <Field label={intl.formatMessage({ id: 'users.col.role' })}>
           <OptionSelect value={userRole} onChange={setUserRole} options={roleOptions(intl)} />
         </Field>
+        <Field
+          label={intl.formatMessage({ id: 'users.field.department' })}
+          help={intl.formatMessage({ id: 'users.field.departmentHint' })}
+        >
+          <DepartmentInput value={department} onChange={setDepartment} options={deptOptions} />
+        </Field>
         <Field label={intl.formatMessage({ id: 'users.field.new_password' })}>
           <input
             type="password"
@@ -522,18 +621,49 @@ function EditUserDialog({
 
 function BindAgentDialog({
   userId,
+  boundAgents,
   onClose,
   onBound,
 }: {
   userId: string;
+  /** Agent names this user is already bound to — excluded from the picker. */
+  boundAgents: string[];
   onClose: () => void;
   onBound: () => void;
 }) {
   const intl = useIntl();
   const [agentName, setAgentName] = useState('');
   const [accessLevel, setAccessLevel] = useState('owner');
+  const [agentOptions, setAgentOptions] = useState<SelectOption[] | null>(null);
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.agents
+      .list()
+      .then(({ agents }) => {
+        if (cancelled) return;
+        const options = agents
+          .filter((a) => !boundAgents.includes(a.name))
+          .map((a) => ({
+            value: a.name,
+            label: a.display_name && a.display_name !== a.name ? `${a.display_name} · ${a.name}` : a.name,
+          }));
+        setAgentOptions(options);
+        setAgentName((prev) => prev || options[0]?.value || '');
+      })
+      .catch(() => {
+        // Roster fetch failed — fall back to the free-text input below.
+        if (!cancelled) setAgentOptions(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // boundAgents is derived fresh from the parent each open; the dialog
+    // remounts per open so a one-shot fetch is enough.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleSubmit = async () => {
     setError('');
@@ -557,12 +687,20 @@ function BindAgentDialog({
           </p>
         )}
         <Field label={intl.formatMessage({ id: 'users.field.agent_name' })}>
-          <input
-            placeholder={intl.formatMessage({ id: 'users.field.agent_name' })}
-            value={agentName}
-            onChange={(e) => setAgentName(e.target.value)}
-            className={controlClass}
-          />
+          {agentOptions && agentOptions.length > 0 ? (
+            <OptionSelect value={agentName} onChange={setAgentName} options={agentOptions} />
+          ) : agentOptions && agentOptions.length === 0 ? (
+            <p className="text-sm text-stone-500 dark:text-stone-400">
+              {intl.formatMessage({ id: 'users.bind.none_available' })}
+            </p>
+          ) : (
+            <input
+              placeholder={intl.formatMessage({ id: 'users.field.agent_name' })}
+              value={agentName}
+              onChange={(e) => setAgentName(e.target.value)}
+              className={controlClass}
+            />
+          )}
         </Field>
         <Field label={intl.formatMessage({ id: 'users.action.bind' })}>
           <OptionSelect value={accessLevel} onChange={setAccessLevel} options={accessOptions(intl)} />

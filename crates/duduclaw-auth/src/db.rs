@@ -140,6 +140,34 @@ impl UserDb {
             )
             .map_err(|e| format!("failed to migrate users table: {e}"))?;
         }
+
+        // Idempotent migration: `department` column (install-approval routing).
+        let has_dept = conn
+            .prepare("PRAGMA table_info(users)")
+            .and_then(|mut stmt| {
+                let cols = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<String>, _>>()?;
+                Ok(cols.iter().any(|c| c == "department"))
+            })
+            .map_err(|e| format!("failed to inspect users table: {e}"))?;
+        if !has_dept {
+            conn.execute("ALTER TABLE users ADD COLUMN department TEXT", [])
+                .map_err(|e| format!("failed to migrate users.department: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Set (or clear with `None`) a user's department. Empty string clears.
+    pub fn set_department(&self, user_id: &str, department: Option<&str>) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let dept = department.map(|d| d.trim()).filter(|d| !d.is_empty());
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE users SET department = ?1, updated_at = ?2 WHERE id = ?3",
+            params![dept, now, user_id],
+        )
+        .map_err(|e| format!("set department: {e}"))?;
         Ok(())
     }
 
@@ -175,6 +203,7 @@ impl UserDb {
             updated_at: now,
             last_login: None,
             must_change_password: false,
+            department: None,
         })
     }
 
@@ -244,6 +273,7 @@ impl UserDb {
             updated_at,
             last_login,
             must_change_password,
+            department: None,
         })
     }
 
@@ -252,7 +282,7 @@ impl UserDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password
+                "SELECT id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password, department
                  FROM users WHERE id = ?1",
             )
             .map_err(|e| format!("query error: {e}"))?;
@@ -271,16 +301,17 @@ impl UserDb {
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, i64>(8)? != 0,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             });
 
         match result {
-            Ok((id, email, display_name, role_str, status_str, created_at, updated_at, last_login, must_change_password)) => {
+            Ok((id, email, display_name, role_str, status_str, created_at, updated_at, last_login, must_change_password, department)) => {
                 let role: UserRole = role_str.parse()
                     .map_err(|e: String| format!("corrupt role in DB: {e}"))?;
                 let status: UserStatus = status_str.parse()
                     .map_err(|e: String| format!("corrupt status in DB: {e}"))?;
-                Ok(Some(User { id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password }))
+                Ok(Some(User { id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password, department }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("query error: {e}")),
@@ -292,7 +323,7 @@ impl UserDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password
+                "SELECT id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password, department
                  FROM users ORDER BY created_at",
             )
             .map_err(|e| format!("query error: {e}"))?;
@@ -309,19 +340,20 @@ impl UserDb {
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, i64>(8)? != 0,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })
             .map_err(|e| format!("query error: {e}"))?;
 
         let mut users = Vec::new();
         for row in rows {
-            let (id, email, display_name, role_str, status_str, created_at, updated_at, last_login, must_change_password) =
+            let (id, email, display_name, role_str, status_str, created_at, updated_at, last_login, must_change_password, department) =
                 row.map_err(|e| format!("row error: {e}"))?;
             let role: UserRole = role_str.parse()
                 .map_err(|e: String| format!("corrupt role in DB: {e}"))?;
             let status: UserStatus = status_str.parse()
                 .map_err(|e: String| format!("corrupt status in DB: {e}"))?;
-            users.push(User { id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password });
+            users.push(User { id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password, department });
         }
         Ok(users)
     }

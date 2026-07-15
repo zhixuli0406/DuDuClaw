@@ -86,26 +86,128 @@ impl RedactionConfig {
     }
 }
 
-/// Per-source policy ("on" / "off" / "selective" / "inherit").
+/// Per-source policy ("on" / "off" / "selective" / "inherit"), optionally
+/// narrowed to specific PII categories per source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SourcePolicy {
-    pub user_input: SourceMode,
-    pub tool_results: SourceMode,
-    pub system_prompt: SourceMode,
-    pub sub_agent: SourceMode,
-    pub cron_context: SourceMode,
+    pub user_input: SourceSetting,
+    pub tool_results: SourceSetting,
+    pub system_prompt: SourceSetting,
+    pub sub_agent: SourceSetting,
+    pub cron_context: SourceSetting,
 }
 
 impl Default for SourcePolicy {
     fn default() -> Self {
         Self {
-            user_input: SourceMode::Off,
-            tool_results: SourceMode::On,
-            system_prompt: SourceMode::Selective,
-            sub_agent: SourceMode::Inherit,
-            cron_context: SourceMode::On,
+            user_input: SourceMode::Off.into(),
+            tool_results: SourceMode::On.into(),
+            system_prompt: SourceMode::Selective.into(),
+            sub_agent: SourceMode::Inherit.into(),
+            cron_context: SourceMode::On.into(),
         }
+    }
+}
+
+/// One source's redaction setting: a mode plus an optional category filter
+/// so operators can pick WHICH fields get de-identified per source.
+///
+/// TOML accepts both the legacy bare-string form and the detailed table form:
+///
+/// ```toml
+/// [redaction.sources]
+/// user_input = "off"                        # legacy — mode only
+///
+/// [redaction.sources.tool_results]          # detailed — mode + field filter
+/// mode = "on"
+/// only_categories = ["TW_ID", "CREDIT_CARD"]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSetting {
+    pub mode: SourceMode,
+    /// When non-empty, ONLY these categories are redacted for this source.
+    pub only_categories: Vec<String>,
+    /// Categories never redacted for this source. Applied after
+    /// `only_categories` — exclusion always wins on overlap.
+    pub exclude_categories: Vec<String>,
+}
+
+impl SourceSetting {
+    /// Whether a rule with `category` may fire for this source. The mode
+    /// gate (on/off/selective/inherit) is evaluated separately by the
+    /// pipeline; this only answers the category-filter question.
+    pub fn allows_category(&self, category: &str) -> bool {
+        if self.exclude_categories.iter().any(|c| c == category) {
+            return false;
+        }
+        if !self.only_categories.is_empty() {
+            return self.only_categories.iter().any(|c| c == category);
+        }
+        true
+    }
+
+    /// True when no category filter is set (pure legacy mode semantics).
+    pub fn is_mode_only(&self) -> bool {
+        self.only_categories.is_empty() && self.exclude_categories.is_empty()
+    }
+}
+
+impl From<SourceMode> for SourceSetting {
+    fn from(mode: SourceMode) -> Self {
+        Self {
+            mode,
+            only_categories: Vec::new(),
+            exclude_categories: Vec::new(),
+        }
+    }
+}
+
+// Legacy configs say `user_input = "off"`; detailed configs use a table.
+impl<'de> serde::Deserialize<'de> for SourceSetting {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Mode(SourceMode),
+            Detail {
+                mode: SourceMode,
+                #[serde(default)]
+                only_categories: Vec<String>,
+                #[serde(default)]
+                exclude_categories: Vec<String>,
+            },
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Mode(mode) => mode.into(),
+            Raw::Detail { mode, only_categories, exclude_categories } => Self {
+                mode,
+                only_categories,
+                exclude_categories,
+            },
+        })
+    }
+}
+
+// Serialize back to the shortest form that round-trips: a bare mode string
+// when no filter is set, the detail table otherwise.
+impl Serialize for SourceSetting {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.is_mode_only() {
+            return self.mode.serialize(serializer);
+        }
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("SourceSetting", 3)?;
+        s.serialize_field("mode", &self.mode)?;
+        s.serialize_field("only_categories", &self.only_categories)?;
+        s.serialize_field("exclude_categories", &self.exclude_categories)?;
+        s.end()
     }
 }
 
@@ -268,9 +370,80 @@ mod tests {
     #[test]
     fn source_policy_defaults_make_sense() {
         let p = SourcePolicy::default();
-        assert_eq!(p.user_input, SourceMode::Off);
-        assert_eq!(p.tool_results, SourceMode::On);
-        assert_eq!(p.system_prompt, SourceMode::Selective);
+        assert_eq!(p.user_input.mode, SourceMode::Off);
+        assert_eq!(p.tool_results.mode, SourceMode::On);
+        assert_eq!(p.system_prompt.mode, SourceMode::Selective);
+        assert!(p.tool_results.is_mode_only());
+    }
+
+    #[test]
+    fn source_setting_accepts_both_toml_forms() {
+        let toml_str = r#"
+[redaction.sources]
+user_input = "off"
+
+[redaction.sources.tool_results]
+mode = "on"
+only_categories = ["TW_ID", "CREDIT_CARD"]
+
+[redaction.sources.cron_context]
+mode = "on"
+exclude_categories = ["EMAIL"]
+"#;
+        #[derive(Deserialize)]
+        struct W {
+            redaction: RedactionConfig,
+        }
+        let w: W = toml::from_str(toml_str).unwrap();
+        let s = &w.redaction.sources;
+        assert_eq!(s.user_input.mode, SourceMode::Off);
+        assert!(s.user_input.is_mode_only());
+        assert_eq!(s.tool_results.mode, SourceMode::On);
+        assert_eq!(s.tool_results.only_categories, ["TW_ID", "CREDIT_CARD"]);
+        assert_eq!(s.cron_context.exclude_categories, ["EMAIL"]);
+        // Unspecified sources keep their defaults.
+        assert_eq!(s.system_prompt.mode, SourceMode::Selective);
+    }
+
+    #[test]
+    fn source_setting_category_filter_semantics() {
+        let only = SourceSetting {
+            mode: SourceMode::On,
+            only_categories: vec!["TW_ID".into()],
+            exclude_categories: vec![],
+        };
+        assert!(only.allows_category("TW_ID"));
+        assert!(!only.allows_category("EMAIL"));
+
+        let exclude = SourceSetting {
+            mode: SourceMode::On,
+            only_categories: vec![],
+            exclude_categories: vec!["EMAIL".into()],
+        };
+        assert!(!exclude.allows_category("EMAIL"));
+        assert!(exclude.allows_category("TW_ID"));
+
+        // Exclusion wins on overlap.
+        let both = SourceSetting {
+            mode: SourceMode::On,
+            only_categories: vec!["EMAIL".into()],
+            exclude_categories: vec!["EMAIL".into()],
+        };
+        assert!(!both.allows_category("EMAIL"));
+    }
+
+    #[test]
+    fn source_setting_serializes_shortest_form() {
+        let plain: SourceSetting = SourceMode::On.into();
+        assert_eq!(toml::Value::try_from(&plain).unwrap(), toml::Value::String("on".into()));
+
+        let detailed = SourceSetting {
+            mode: SourceMode::On,
+            only_categories: vec!["TW_ID".into()],
+            exclude_categories: vec![],
+        };
+        let v = toml::Value::try_from(&detailed).unwrap();
+        assert_eq!(v.get("mode").and_then(|m| m.as_str()), Some("on"));
     }
 
     #[test]

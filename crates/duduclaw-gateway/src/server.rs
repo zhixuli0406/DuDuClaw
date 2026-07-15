@@ -199,8 +199,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // ── RFC-23: redaction pipeline bootstrap ────────────────────
     // Reads `[redaction]` from config.toml. When `enabled = false`
     // (default) the manager is never built; existing behaviour is
-    // unchanged. When enabled, the manager + GC task start now.
-    let redaction_gc_handle: Option<duduclaw_redaction::GcTask> = {
+    // unchanged. When enabled, `swap_redaction_manager` installs the
+    // manager AND its paired vault-GC task (the handler owns both, so
+    // `redaction.update` can later hot-swap them without a restart).
+    {
         let cfg_path = home_dir.join("config.toml");
         let parsed: Option<duduclaw_redaction::RedactionConfig> = std::fs::read_to_string(&cfg_path)
             .ok()
@@ -222,16 +224,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                             ttl_h = manager.vault_ttl_hours(),
                             "RFC-23 redaction pipeline enabled"
                         );
-                        // Inject into handler so dashboard RPCs can see it.
-                        handler.set_redaction_manager(manager.clone()).await;
-
-                        // Spawn GC task — 6h mark / 24h purge defaults.
-                        let gc = duduclaw_redaction::spawn_gc(
-                            manager.vault().clone(),
-                            manager.audit_sink().clone(),
-                            duduclaw_redaction::GcConfig::default(),
-                        );
-                        Some(gc)
+                        handler.swap_redaction_manager(Some(manager)).await;
                     }
                     Err(e) => {
                         // Fail-closed at startup: if redaction was requested
@@ -244,20 +237,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                              gateway continues WITHOUT redaction. Check \
                              config.toml [redaction] and ~/.duduclaw/redaction/."
                         );
-                        None
                     }
                 }
             }
             _ => {
                 tracing::debug!("Redaction pipeline not enabled in config.toml");
-                None
             }
         }
-    };
-    // Bind to a name so the GC task lives for the lifetime of
-    // `start_gateway`. When the gateway returns (shutdown), the handle
-    // drops and the GC task receives its cancel signal — clean shutdown.
-    let _redaction_gc = redaction_gc_handle;
+    }
 
     // ── First-run license seeding (E2, enterprise Docker distribution) ──
     //
@@ -447,15 +434,25 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Ensure a default admin exists on first run
     match user_db.ensure_default_admin() {
         Ok(Some(password)) => {
-            // First-run bootstrap. `ensure_default_admin` logs a box that a
-            // password was generated but NOT its value — so surface it here, or
-            // a fresh install has no way to log in (OTP needs a channel that
-            // isn't configured yet). The account is flagged must_change_password,
-            // so this one-time value forces a reset on first login.
-            println!("\n  🔑 First-run admin — log in with this, you'll be asked to change it:");
-            println!("     Email:    admin@local");
-            println!("     Password: {password}");
-            println!();
+            // First-run bootstrap. The dashboard's first-open screen lets a
+            // LOOPBACK operator SET the admin password directly (the
+            // `/api/first-run/claim` flow), so on a localhost bind the
+            // generated one-time password is a stale second path — printing
+            // it just confuses the setup. Only a non-loopback bind (where the
+            // loopback-only claim endpoint is unreachable from the operator's
+            // browser) still needs the printed value to get in at all.
+            let loopback_only =
+                matches!(config.bind.as_str(), "127.0.0.1" | "::1" | "localhost");
+            if loopback_only {
+                println!("\n  🔑 First-run setup: open the dashboard and set the admin password there (admin@local).");
+                println!();
+                let _ = password; // superseded by the dashboard claim flow
+            } else {
+                println!("\n  🔑 First-run admin — log in with this, you'll be asked to change it:");
+                println!("     Email:    admin@local");
+                println!("     Password: {password}");
+                println!();
+            }
         }
         Ok(None) => {} // Admin already exists
         Err(e) => {

@@ -23,8 +23,12 @@ import {
   type ToolPolicyWhen,
   type ToolPolicyEffect,
   type ToolPolicyOp,
+  type TemplateRoster,
+  type TemplateRoleSummary,
+  type TemplateRoleDetail,
+  type DepartmentInfo,
 } from '@/lib/api';
-import { Dialog, FormField, inputClass } from '@/components/shared/Dialog';
+import { Dialog, FormField, inputClass, selectClass } from '@/components/shared/Dialog';
 import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { ChipEditor } from '@/components/shared/ChipEditor';
@@ -386,59 +390,312 @@ function ViewToggle({ view, onChange }: { view: AgentsView; onChange: (v: Agents
   );
 }
 
+/** Stable presentation order for template roles in the picker. */
+const TEMPLATE_KIND_ORDER: Record<TemplateRoleSummary['kind'], number> = {
+  ceo: 0,
+  front_desk: 1,
+  worker: 2,
+};
+
 function CreateAgentDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: () => void }) {
   const intl = useIntl();
+  const { agents } = useAgentsStore();
   const [name, setName] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [role, setRole] = useState('specialist');
   const [trigger, setTrigger] = useState('');
+  // Org placement — '' keeps the default (standalone, or the template's wiring).
+  const [reportsTo, setReportsTo] = useState('');
+  const [department, setDepartment] = useState('');
+  const [departments, setDepartments] = useState<DepartmentInfo[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // ── Template pack state (silent degrade when the RPC is unavailable) ──
+  const [roster, setRoster] = useState<TemplateRoster | null>(null);
+  const [templateRoleId, setTemplateRoleId] = useState('');
+  const [roleDetail, setRoleDetail] = useState<TemplateRoleDetail | null>(null);
+  const [roleLoading, setRoleLoading] = useState(false);
+  const [soulMd, setSoulMd] = useState('');
+  const [contractToml, setContractToml] = useState('');
+  const [agentToml, setAgentToml] = useState('');
+  // Only user-edited TOML is sent — untouched ⇒ backend uses template defaults.
+  const [contractTouched, setContractTouched] = useState(false);
+  const [agentTomlTouched, setAgentTomlTouched] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    setRoster(null);
+    setTemplateRoleId('');
+    setRoleDetail(null);
+    setError(null);
+    api.templates
+      .roster()
+      // Shape-check the payload — a malformed/foreign response degrades to the
+      // plain form instead of crashing the dialog render.
+      .then((r) => alive && setRoster(Array.isArray(r?.roles) ? r : null))
+      .catch(() => {/* no templates ⇒ plain form */});
+    api.departments
+      .list()
+      .then((r) => alive && setDepartments(Array.isArray(r?.departments) ? r.departments : []))
+      .catch(() => {/* no registry access ⇒ dropdown stays 無部門-only */});
+    return () => {
+      alive = false;
+    };
+  }, [open]);
+
+  const sortedRoles = roster
+    ? [...roster.roles].sort((a, b) => TEMPLATE_KIND_ORDER[a.kind] - TEMPLATE_KIND_ORDER[b.kind])
+    : [];
+
+  const selectTemplate = async (roleId: string) => {
+    setTemplateRoleId(roleId);
+    setRoleDetail(null);
+    setContractTouched(false);
+    setAgentTomlTouched(false);
+    setReportsTo(''); // back to the template's own wiring
+    setDepartment('');
+    if (roleId === '') return;
+    setRoleLoading(true);
+    setError(null);
+    try {
+      const d = await api.templates.role(roleId, roster?.industry ?? undefined);
+      setRoleDetail(d);
+      setName(d.name);
+      setDisplayName(d.display_name);
+      setTrigger(d.trigger);
+      setSoulMd(d.soul_md);
+      setContractToml(d.contract_toml);
+      setAgentToml(d.agent_toml);
+    } catch (e) {
+      setTemplateRoleId('');
+      setError(formatError(e));
+    } finally {
+      setRoleLoading(false);
+    }
+  };
+
+  const resetForm = () => {
+    setName('');
+    setDisplayName('');
+    setRole('specialist');
+    setTrigger('');
+    setReportsTo('');
+    setDepartment('');
+    setTemplateRoleId('');
+    setRoleDetail(null);
+    setContractTouched(false);
+    setAgentTomlTouched(false);
+  };
+
+  const usingTemplate = templateRoleId !== '' && roleDetail !== null;
 
   const handleSubmit = async () => {
     if (!name.trim() || !displayName.trim()) return;
     setError(null);
     setSubmitting(true);
     try {
-      await api.agents.create({ name: name.trim(), display_name: displayName.trim(), role, trigger: trigger || `@${displayName.trim()}` });
+      if (usingTemplate) {
+        const res = await api.templates.createAgent({
+          role_id: templateRoleId,
+          ...(roster?.industry ? { industry: roster.industry } : {}),
+          name: name.trim(),
+          display_name: displayName.trim(),
+          trigger: trigger || `@${displayName.trim()}`,
+          ...(reportsTo ? { reports_to: reportsTo } : {}),
+          ...(department ? { department } : {}),
+          soul_md: soulMd,
+          ...(contractTouched ? { contract_toml: contractToml } : {}),
+          ...(agentTomlTouched ? { agent_toml: agentToml } : {}),
+        });
+        if (res.warning) toast.info(res.warning);
+      } else {
+        await api.agents.create({
+          name: name.trim(),
+          display_name: displayName.trim(),
+          role,
+          trigger: trigger || `@${displayName.trim()}`,
+          ...(reportsTo ? { reports_to: reportsTo } : {}),
+          ...(department ? { department } : {}),
+        });
+      }
       onCreated();
       onClose();
-      setName('');
-      setDisplayName('');
-      setRole('specialist');
-      setTrigger('');
-    } catch {
-      setError(intl.formatMessage({ id: 'agents.create.error' }));
+      resetForm();
+    } catch (e) {
+      // Template errors carry an actionable zh-TW message (e.g. bad TOML).
+      setError(usingTemplate ? formatError(e) : intl.formatMessage({ id: 'agents.create.error' }));
     } finally {
       setSubmitting(false);
     }
   };
 
+  // Human-kept posts / deliberately-not-deployed kits — only meaningful when
+  // an industry-pack role is selected (the generic CEO roster has neither).
+  const showRosterNotes = usingTemplate && roster?.industry != null;
+
   return (
-    <Dialog open={open} onClose={onClose} title={intl.formatMessage({ id: 'agents.create' })}>
-      <div className="space-y-4">
+    <Dialog open={open} onClose={onClose} title={intl.formatMessage({ id: 'agents.create' })} className="max-w-2xl">
+      <div className="max-h-[70vh] space-y-4 overflow-y-auto pr-1">
+        {roster && sortedRoles.length > 0 && (
+          <FormField label={intl.formatMessage({ id: 'agents.create.template' })}>
+            <select
+              value={templateRoleId}
+              onChange={(e) => void selectTemplate(e.target.value)}
+              className={selectClass}
+            >
+              <option value="">{intl.formatMessage({ id: 'agents.create.template.blank' })}</option>
+              {sortedRoles.map((r) => (
+                <option key={r.role_id} value={r.role_id} disabled={r.created}>
+                  {r.display_name}
+                  {r.summary ? ` — ${r.summary}` : ''}
+                  {r.created ? ` ${intl.formatMessage({ id: 'agents.create.template.created' })}` : ''}
+                </option>
+              ))}
+            </select>
+          </FormField>
+        )}
+
+        {showRosterNotes && roster && (roster.humans.length > 0 || roster.excluded.length > 0) && (
+          <div className="space-y-1 rounded-lg bg-stone-500/5 p-3 text-xs text-stone-500 dark:text-stone-400">
+            {roster.humans.length > 0 && (
+              <p>
+                {intl.formatMessage(
+                  { id: 'agents.create.template.humans' },
+                  {
+                    // Locale-aware list join — no hardcoded CJK punctuation.
+                    titles: intl.formatList(
+                      roster.humans.map((h) => h.title),
+                      { type: 'unit' },
+                    ),
+                  },
+                )}
+              </p>
+            )}
+            {roster.excluded.length > 0 && (
+              <p>
+                {intl.formatMessage(
+                  { id: 'agents.create.template.excluded' },
+                  {
+                    items: intl.formatList(
+                      roster.excluded.map((x) =>
+                        intl.formatMessage(
+                          { id: 'agents.create.template.excludedItem' },
+                          { kit: x.kit, reason: x.reason },
+                        ),
+                      ),
+                      { type: 'unit' },
+                    ),
+                  },
+                )}
+              </p>
+            )}
+          </div>
+        )}
+
+        {roleLoading && (
+          <p className="text-sm text-stone-400 dark:text-stone-500">
+            {intl.formatMessage({ id: 'agents.create.template.loading' })}
+          </p>
+        )}
+
         <FormField label={intl.formatMessage({ id: 'agents.create.idLabel' })} hint={intl.formatMessage({ id: 'agents.create.idHint' })}>
           <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="coder" className={inputClass} />
         </FormField>
         <FormField label={intl.formatMessage({ id: 'agents.create.displayName' })}>
           <input type="text" value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="Coder" className={inputClass} />
         </FormField>
-        <FormField label={intl.formatMessage({ id: 'orgchart.detail.role' })}>
-          <OptionSelect
-            value={role}
-            onChange={setRole}
-            options={['main', 'specialist', 'worker', 'developer', 'qa', 'planner'].map((r) => ({ value: r, label: intl.formatMessage({ id: `agents.role.${r}` }), raw: r }))}
-          />
-        </FormField>
+        {!usingTemplate && (
+          <FormField label={intl.formatMessage({ id: 'orgchart.detail.role' })}>
+            <OptionSelect
+              value={role}
+              onChange={setRole}
+              options={['main', 'specialist', 'worker', 'developer', 'qa', 'planner'].map((r) => ({ value: r, label: intl.formatMessage({ id: `agents.role.${r}` }), raw: r }))}
+            />
+          </FormField>
+        )}
         <FormField label={intl.formatMessage({ id: 'orgchart.detail.trigger' })} hint={intl.formatMessage({ id: 'agents.create.triggerHint' })}>
           <input type="text" value={trigger} onChange={(e) => setTrigger(e.target.value)} placeholder="@Coder" className={inputClass} />
         </FormField>
+
+        <FormField label={intl.formatMessage({ id: 'agents.create.reportsTo' })} hint={intl.formatMessage({ id: 'agents.create.reportsToHint' })}>
+          <OptionSelect
+            value={reportsTo}
+            onChange={setReportsTo}
+            options={[
+              {
+                value: '',
+                label:
+                  usingTemplate && roleDetail?.reports_to
+                    ? intl.formatMessage(
+                        { id: 'agents.create.reportsTo.templateDefault' },
+                        { name: roleDetail.reports_to },
+                      )
+                    : intl.formatMessage({ id: 'agents.create.reportsTo.none' }),
+              },
+              ...agents
+                .filter((a) => a.name !== name.trim())
+                .map((a) => ({
+                  value: a.name,
+                  label: a.display_name && a.display_name !== a.name ? `${a.display_name} · ${a.name}` : a.name,
+                })),
+            ]}
+          />
+        </FormField>
+        <FormField label={intl.formatMessage({ id: 'agents.department.label' })} hint={intl.formatMessage({ id: 'agents.create.departmentHint' })}>
+          <OptionSelect
+            value={department}
+            onChange={setDepartment}
+            options={[
+              { value: '', label: intl.formatMessage({ id: 'agents.create.department.none' }) },
+              ...departments.map((d) => ({ value: d.name, label: d.name })),
+            ]}
+          />
+        </FormField>
+
+        {usingTemplate && (
+          <>
+            <FormField label={intl.formatMessage({ id: 'agents.create.template.soul' })}>
+              <textarea
+                value={soulMd}
+                onChange={(e) => setSoulMd(e.target.value)}
+                spellCheck={false}
+                className={cn(inputClass, 'min-h-56 resize-y font-mono text-sm leading-relaxed')}
+              />
+            </FormField>
+            <details className="rounded-lg border border-[var(--panel-border)] p-3">
+              <summary className="cursor-pointer text-sm font-medium text-stone-700 dark:text-stone-300">
+                {intl.formatMessage({ id: 'agents.create.template.advanced' })}
+              </summary>
+              <div className="mt-3 space-y-4">
+                <FormField label={intl.formatMessage({ id: 'agents.create.template.contract' })}>
+                  <textarea
+                    value={contractToml}
+                    onChange={(e) => { setContractToml(e.target.value); setContractTouched(true); }}
+                    spellCheck={false}
+                    className={cn(inputClass, 'min-h-32 resize-y font-mono text-sm leading-relaxed')}
+                  />
+                </FormField>
+                <FormField label={intl.formatMessage({ id: 'agents.create.template.agentToml' })}>
+                  <textarea
+                    value={agentToml}
+                    onChange={(e) => { setAgentToml(e.target.value); setAgentTomlTouched(true); }}
+                    spellCheck={false}
+                    className={cn(inputClass, 'min-h-32 resize-y font-mono text-sm leading-relaxed')}
+                  />
+                </FormField>
+              </div>
+            </details>
+          </>
+        )}
+
         {error && (
           <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>
         )}
         <div className="flex justify-end gap-3 pt-2">
           <Button variant="secondary" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
-          <Button variant="primary" onClick={handleSubmit} disabled={submitting || !name.trim() || !displayName.trim()}>
+          <Button variant="primary" onClick={handleSubmit} disabled={submitting || roleLoading || !name.trim() || !displayName.trim()}>
             {submitting ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'agents.create' })}
           </Button>
         </div>
@@ -882,6 +1139,19 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
   const [advGroup, setAdvGroup] = useState<AdvGroup>('run');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Departments pre-created in the registry (may have no members yet) — merged
+  // into the free-input datalist alongside the in-use set below.
+  const [registryDepartments, setRegistryDepartments] = useState<string[]>([]);
+  useEffect(() => {
+    let alive = true;
+    api.departments
+      .list()
+      .then((r) => alive && setRegistryDepartments((r.departments ?? []).map((d) => d.name)))
+      .catch(() => {/* list is manager+; degrade to in-use-only options */});
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // Available models (cloud + local) — live from the registry, deduped/cached.
   const {
@@ -1338,8 +1608,11 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
     reportsToOptions.push({ value: form.reports_to, label: form.reports_to, raw: form.reports_to });
   }
 
-  // WP7 — the set of departments already in use, for the free-input datalist.
-  const departmentOptions: string[] = departmentsOf(agents);
+  // WP7 — in-use departments ∪ pre-created registry departments, for the
+  // free-input datalist.
+  const departmentOptions: string[] = Array.from(
+    new Set([...departmentsOf(agents), ...registryDepartments]),
+  ).sort();
 
   return (
     <Dialog open={agent !== null} onClose={onClose} title={`${agent.icon || '🤖'} ${intl.formatMessage({ id: 'agents.edit' })}`} className="max-w-2xl">

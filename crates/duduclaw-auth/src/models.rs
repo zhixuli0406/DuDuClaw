@@ -142,6 +142,12 @@ pub struct User {
     /// cleared once the password is changed.
     #[serde(default)]
     pub must_change_password: bool,
+    /// Department this user belongs to (derived-department name, ASCII slug).
+    /// Drives install-approval routing: an employee's request is signed by a
+    /// Manager in the SAME department (admin always overrides). `None` ⇒ no
+    /// department; any manager may sign (graceful fallback).
+    #[serde(default)]
+    pub department: Option<String>,
 }
 
 /// A binding between a user and an agent.

@@ -3,6 +3,164 @@
 ## [Unreleased]
 
 ### Added
+- **Skill / MCP 安裝簽核鏈（2026-07-15）。** 管理員以外的使用者安裝 Skill／MCP
+  前，須送出**簽核申請**，內容包含該項目的**功能說明**與**安全審查結果**
+  （風險等級＋逐項發現），核准後系統才會實際安裝。簽核鏈：**員工** → 部門主管
+  核准 → 管理員核准 → 安裝；**主管** → 管理員核准 → 安裝；管理員仍為直接安裝。
+  管理員核准可一次涵蓋兩關（上級短路）。新增 store `install_requests`（SQLite
+  兩階簽名鏈，角色感知 decide，fail-closed：逾時＝拒絕、終態不可翻轉、風險 ≥
+  High 於申請與執行兩端都拒絕）；admin/manager RPC `install_requests.list`／
+  `install_requests.decide`（最終核准即伺服端重掃並安裝），任一登入者
+  `skills.install_request`／`mcp.install_request`／`install_requests.mine`。
+  審批頁（ApprovalsPage）新增「安裝簽核申請」區；Skill／MCP 引入對話框對非
+  管理員改為「送出簽核申請」並顯示待簽狀態。
+- **簽核鏈的部門路由（2026-07-15）。** 使用者新增 `department` 欄位（`users`
+  表冪等 migration；成員管理頁建立／編輯對話框以 datalist 帶出既有部門，
+  `is_valid_department` 驗證）。員工的安裝申請只路由給**同部門**的主管簽核
+  （大小寫不敏感精確比對）——主管的「安裝簽核申請」清單只列出自己部門、且尚
+  待主管簽的員工申請；跨部門主管與無部門主管都無法簽（會回「屬於其他部門」）。
+  未設部門的申請退回「任一主管」的相容行為；管理員不受部門限制、仍可短路兩關。
+  路由判斷集中在 `InstallRequest::manager_may_sign`。
+
+### Changed
+- **`skills.vet` 與 `mcp.import.fetch` 放寬為任一登入者可呼叫（2026-07-15）。**
+  這兩支是唯讀的抓取＋安全掃描（無任何寫入、共用 SSRF 防護），開放給非管理員
+  是為了讓其在送出安裝簽核前能預覽功能與掃描結果。實際安裝仍受管理員／簽核鏈
+  把關。
+- **Skill 從 GitHub / URL 引入（2026-07-15）。** Skill 頁（原「Skill 市場」，
+  導航改名為「Skill」）市場分頁新增「從 URL 引入」：支援 GitHub repo（自動
+  讀取 SKILL.md）、blob 檔案連結、GitLab、Gist 與任意 raw 檔案網址。內容由
+  後端抓取（共用 SSRF 防護：擋 loopback／私有網段／雲端 metadata，逐跳
+  redirect 重驗，1MB 上限，HTML 頁面拒收）並先過安全掃描，掃描未通過無法
+  安裝；`skills.install` 伺服端 fail-closed 重掃不變。
+- **MCP Server 從 GitHub / URL 引入（2026-07-15）。** MCP 工具頁新增
+  「從 URL 引入」：貼 GitHub / GitLab repo（依序尋找 `.mcp.json`／`mcp.json`／
+  `server.json`（含 **MCP Registry 2025 schema**：npm→npx、pypi→uvx、
+  oci→docker、remotes→自動以 `npx -y mcp-remote <url>` 橋接）／**README
+  設定範例**（fenced code block 內的 `mcpServers` 片段，跨平台重複片段自動
+  去重）／`package.json`（有 `bin` 才推斷 `npx -y <pkg>`））或任意 JSON
+  manifest 網址，後端抓取後**逐一安全掃描**
+  （新掃描器 `mcp_scan`：shell／下載器／提權指令、inline eval、shell
+  metacharacters、docker `--privileged`／根目錄掛載、env 指令替換等，
+  與 skill 掃描共用風險分級，risk ≥ High 拒絕），管理者審視 command／args／
+  env 與掃描結果後才可安裝，可選同時寫入 Marketplace 清單
+  （`~/.duduclaw/marketplace.json`）供重複使用。新增 admin RPC
+  `mcp.import.fetch` / `mcp.import.install`（安裝端 fail-closed 重掃）。
+
+### Changed
+- **既有 MCP 安裝路徑補上同一道安全閘（2026-07-15）。** `mcp.update` 的
+  add 動作與 `marketplace.install`（含使用者自帶 marketplace.json）現在
+  也會掃描 server 定義並在 risk ≥ High 拒絕——先前這兩條路徑完全不經
+  掃描直接寫入 `.mcp.json`。內建 catalog 全數通過掃描（有回歸測試鎖住）。
+
+### Fixed
+- **`skills.vet` 補上 SSRF 防護（2026-07-15）。** 先前 dashboard 的 skill
+  安全掃描 RPC 直接抓取任意 URL，可被用來探測內網／雲端 metadata 端點；
+  現在與 web_fetch 共用同一個 `validate_url` 閘，並限制回應大小與 redirect。
+- **Dashboard 團隊板模一鍵備妥（templates.* RPC，2026-07-14）。** 首次登入
+  onboarding 可選擇產業：後端「備妥」該產業的部門板模但**不建立任何 Agent**，
+  由管理者逐一建立——建立時可選部門角色，SOUL.md 以文本編輯器呈現可修改，
+  CONTRACT.toml / agent.toml 亦可在進階區修改（後端 TOML 驗證 fail-closed，
+  改壞不寫入）。另提供跨產業 CEO（營運總管）板模作為第一位 AI 員工的建議起點。
+  新增 admin-gated RPC 五支：`templates.industries` / `templates.stage` /
+  `templates.roster` / `templates.role` / `templates.create_agent`（license
+  `premium_templates` 閘，未解鎖回 upsell 旗標）。premium 板模的檔案系統探索
+  邏輯自 `duduclaw-cli` 上移至新模組 `duduclaw-gateway::premium_templates`
+  （cli 改 re-export，wizard 行為不變）；agent.toml 身分接線與合規 overlay
+  append 以 `toml_edit` 保留註解地組裝。WelcomePage 精靈改 4 步（新增產業選擇），
+  AgentsPage 建立對話框支援套用板模＋SOUL.md 編輯＋進階 TOML 編輯（i18n 三語）。
+
+- **Dashboard 授權升級 UI（2026-07-14）。** LicensePage 新增「升級／啟用授權」卡：
+  本機指紋顯示＋複製（購買時提供）、授權金鑰啟用（貼 base64 或 JSON）、夥伴
+  NFR 兌換碼免費路徑；首跑期間啟用成功可一鍵返回設定精靈。後端三支 admin-gated
+  RPC：`license.fingerprint` / `license.activate` / `license.redeem`——啟用走
+  fail-closed 驗證（簽章→指紋→效期，全過才寫檔；dashboard 不接受檔案路徑輸入），
+  成功後 `LicenseRuntime::install_and_reload` 熱重載，premium 功能**免重啟**即解鎖
+  （活體驗證：鎖定→啟用→22 產業板模即時解鎖）。
+
+- **Agent 衣帽間（2026-07-14）。** AI 員工造型改為遊戲式配件組合：帽子／頭部／
+  身體／手持／腳部／裝飾六個槽位＋主色（10 色）自由搭配（30+ 內建配件——高帽、
+  皇冠、工程帽、墨鏡、西裝、圍裙、咖啡、扳手、球鞋、光環…）。員工詳情頁
+  「造型」卡開啟衣帽間對話框：即時 bust 預覽（就是列表用的同一個角色元件）、
+  隨機、還原預設；儲存後**同步顯示在員工列表、所有頭像與世界地圖**（PixiJS
+  全身角色含腳部配件）。未打扮的員工維持原本的種子造型（零視覺變化）；打扮
+  過的員工以角色渲染優先於已上傳照片（照片上傳降級為進階摺疊選項）。新增
+  admin RPC `agents.set_outfit`（形狀＋字元集 fail-closed 驗證，`outfit: null`
+  還原），`agents.list` / `agents.inspect` 帶回 `outfit`，持久化為
+  `agents/<id>/outfit.json`。
+- **主管唯讀檢視下屬儀表板（view-as，2026-07-14）。** 主管／管理者可檢視
+  **嚴格低於自己階級**成員的個人儀表板（管理者可看主管與員工；主管只能看
+  員工，看不了同級主管與管理者）：成員管理頁每列的「檢視他的儀表板」眼睛
+  按鈕、或首頁右上「檢視成員儀表板…」下拉。檢視模式顯示唯讀橫幅、隱藏
+  「編輯版面」，畫面用**對方的** widget 目錄與版面，資料範圍縮到對方綁定的
+  AI 員工（WP11 員工資料範圍）。「不能代為修改」是結構性保證——寫入 RPC
+  只存在 `dashboard.layout.set`（永遠寫呼叫者自己的檔），沒有 set-for-others。
+  新增 RPC：`dashboard.layout.view {user_id}`（manager+，階級不足回 generic
+  permission denied 防枚舉）、`users.subordinates`（manager+，僅回 id／顯示
+  名／角色三欄，遠窄於 admin 的 `users.list`）。
+- **客製化個人儀表（WP15 MVP，2026-07-14）。** 首頁下半部改為 per-user widget
+  版面：右上「編輯版面」進入編輯態（上移／下移／隱藏、底部「已隱藏的元件」
+  抽屜重新加入），完成後以**個人 user 身分**存 server 端（`dashboard/layouts/
+  <user_id>.json`），重登入仍在；每人互不影響。首發元件：需要我（manager+）、
+  正在進行、最近活動、最近任務、通道健康（admin）。新增 RPC 三支：
+  `dashboard.widgets.catalog`（**依角色過濾 fail-closed**——無權的 widget 不
+  下發，`layout.set` 對無權 id 直接拒絕而非靜默丟棄）、`dashboard.layout.get`
+  / `dashboard.layout.set`。戰報 HUD 與世界舞台維持固定不入版面系統。
+- **去識別化欄位級設定（2026-07-14）。** 每個輸入來源（工具結果／使用者輸入／
+  系統提示／子代理回覆／排程情境）除模式外，可再細選**哪些欄位**要去識別化：
+  `only_categories`（只遮這些）／`exclude_categories`（排除這些，重疊時排除
+  優先）。TOML 同時接受舊的字串形式（`user_input = "off"`）與新的表格形式
+  （向後相容，空清單自動收斂回字串形式）。dashboard 去識別化分頁改版：
+  「偵測規則集」從盲打名稱改為勾選清單（內建 5 組＋自訂，顯示各組涵蓋欄位）；
+  來源列可展開欄位範圍選擇器（身分證字號、手機、Email、信用卡…18 種欄位
+  中文標籤）。`redaction.get` 回應新增 `available_profiles` 目錄（含每組
+  規則數與欄位類別）；`sources` 改為詳細物件形式。引擎端過濾在 pipeline
+  逐 match 套用，audit 與 vault 行為不變。**設定即時生效（熱重載）**：
+  `redaction.update` 寫入 config.toml 後就地重建 RedactionManager 熱插拔
+  （vault GC 任務隨之重啟，處理中的訊息沿用舊規則自然收尾，下一則訊息即用
+  新規則），不再需要重啟 gateway；重建失敗時保留變更前的即時規則並在回應
+  `warning` 誠實回報（dashboard 以錯誤 toast 呈現）。
+- **部門管理頁＋新增 AI 員工時的組織定位（2026-07-14）。** 新增「管理 → 部門」
+  頁（admin）：預先建立部門（實體化為 `shared/wiki/departments/<dept>/` 知識
+  空間，維持 WP7「部門＝衍生」設計，不引入新儲存）、檢視各部門成員／知識頁／
+  技能數、刪除（有成員拒絕；有內容需二次確認）。新增 RPC 三支：
+  `departments.list`（manager+）/ `departments.create` / `departments.remove`
+  （admin）。新增 AI 員工對話框加入「上級 AI 員工」與「隸屬部門」下拉（板模
+  路徑預設沿用板模接線，可覆寫）；`agents.create` / `templates.create_agent`
+  接受 `reports_to`（須為既有員工，建立前驗證）與 `department`（WP7 allowlist）
+  參數，建立當下寫入 agent.toml。編輯對話框的部門 datalist 併入註冊表清單。
+
+### Fixed
+- **Self-Host Pro／Partner 授權啟用後「帳號管理／治理」企業面板消失（2026-07-14）。**
+  `EditionProfile::from_tier_key` 只把 business/oem 判為 Enterprise，自架線的
+  企業方案 `self_host_pro` 與 `partner` 落到 Personal——啟用授權後 dashboard
+  的多帳號管理（`/manage/users`）、治理等 `enterprise` 導覽項反而被隱藏。
+  修正對應表（與 features.toml `dashboard_enterprise = true` 的 tier 同步，
+  snake_case 與 kebab-case 皆接受）；`system.status` 的 `edition_profile`
+  即時反映，授權熱啟用後免重啟企業面板即出現。帳號管理頁的「綁定 AI 員工」
+  對話框同時從手打名稱改為現有員工下拉選單（已綁定者自動排除，roster 讀取
+  失敗時退回文字輸入），zh-TW 介面用語統一為「AI 員工」。
+- **首跑親測四修（2026-07-14）：**①console 首跑訊息改引導至 dashboard 直接設定
+  管理者密碼（loopback bind 不再印一次性密碼——與 first-run claim 流程一致；
+  非 loopback bind 仍印，因 claim 端點僅限 localhost）；②全新／閒置系統不再
+  彈出全零的「昨日戰報」（`reportHasActivity` 閘，靜默燒當日標記）；
+  ③`runtime.detect` 的 Claude OAuth 偵測在 macOS 永遠回 false——憑證在
+  Keychain 不在 `.credentials.json`，檔案探測 miss 時改問 `claude auth status`
+  （8s timeout）；同函式把 `~/.duduclaw` 誤當使用者 HOME 傳給
+  `which_*_in_home`，nvm/bun 安裝的 CLI 全數隱形——改 PATH 優先＋真使用者
+  HOME（五個 runtime 一併修）；④首跑精靈的「前往授權頁」被 FirstRunGate
+  彈回第一步——`/license` 加入 first-run 白名單，精靈進度（不含 API key）
+  以 sessionStorage 續存，返回時從原步驟繼續。
+- **Template agent.toml 帶 `[container]` 節時 registry 靜默略過（2026-07-14）。**
+  `ContainerConfig.additional_mounts` 缺 `#[serde(default)]`，任何板模部署的
+  agent.toml 只要有 `[container]` 節而未寫該 key，typed 解析即失敗、agent 被
+  scan 靜默跳過（免費 `templates/` 中五個帶 `[container]` 的板模與全部 premium
+  板模都中招）。已改為 default-empty，由 114 角色全量活體掃雷驗證。
+- **建立 main agent 失敗仍降級現任 main（`agents.create` 與 `templates.create_agent`）。**
+  名稱撞既有 agent 時 `demote_current_main` 已先執行，現任 main 被永久降級。
+  兩處都改為先原子取得目錄（`create_dir`，同名併發只有一方成功）再降級，
+  失敗即回滾刪目錄；`templates.create_agent` 的部分寫入失敗不再留下缺
+  CONTRACT 的半成品 agent（agent.toml 原子改名移至最後作為 commit point）。
 - **成本／快取效率遙測 dashboard RPC（#3，2026-07-12）。** 為既有的
   `cost_summary` / `cost_agents` / `cost_recent` MCP 工具補上三個 admin-gated
   （`require_admin!` fail-closed）dashboard RPC，位於

@@ -89,6 +89,16 @@ impl RuleEngine {
         self.rules.len()
     }
 
+    /// `(rule id, category)` pairs for every compiled rule — feeds the
+    /// dashboard's field picker so operators see exactly which fields the
+    /// active profiles cover.
+    pub fn rule_catalogue(&self) -> Vec<(String, String)> {
+        self.rules
+            .iter()
+            .map(|r| (r.id().to_string(), r.category().to_string()))
+            .collect()
+    }
+
     /// Apply all rules to `text` and return the resolved matches in
     /// left-to-right order.
     ///

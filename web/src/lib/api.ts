@@ -24,6 +24,9 @@ export interface AgentInfo {
   /** WP7 — the department this AI staff member belongs to (company → department
    *  → personal layering). Empty/absent = no department. */
   department?: string;
+  /** Wardrobe (衣帽間) composition. `null`/absent = never dressed — surfaces
+   *  render the seeded default look. Shape mirrors `lib/outfit.ts`. */
+  outfit?: import('./outfit').AgentOutfit | null;
 }
 
 export interface AgentBudget {
@@ -809,6 +812,8 @@ export interface UserInfo {
   display_name: string;
   role: 'admin' | 'manager' | 'employee';
   status: 'active' | 'suspended' | 'offboarded';
+  /** Department this user belongs to (drives install-approval routing). */
+  department?: string | null;
   created_at: string;
   updated_at: string;
   last_login?: string;
@@ -924,6 +929,77 @@ export interface McpCatalogItem {
   requires_oauth: boolean;
   default_def: McpServerDef;
   required_env: string[];
+}
+
+export interface McpScanFinding {
+  category: string;
+  severity: string;
+  description: string;
+  pattern?: string;
+}
+
+export interface McpScanResult {
+  passed: boolean;
+  risk_level: string;
+  findings: McpScanFinding[];
+}
+
+export interface McpImportCandidate extends McpServerDef {
+  name: string;
+  description: string;
+  scan: McpScanResult;
+  passed: boolean;
+}
+
+export interface McpImportFetchResult {
+  source_url: string;
+  resolved_url: string;
+  servers: McpImportCandidate[];
+}
+
+// ── Install approval requests (Skill / MCP two-stage signature chain) ──
+
+export interface InstallRequestScanFinding {
+  category: string;
+  severity: string;
+  description: string;
+  pattern?: string;
+}
+
+export type InstallRequestStage =
+  | 'awaiting_manager'
+  | 'awaiting_admin'
+  | 'approved'
+  | 'denied'
+  | 'expired';
+
+export interface InstallRequestInfo {
+  id: string;
+  kind: 'skill' | 'mcp';
+  title: string;
+  description: string;
+  requester_id: string;
+  requester_email: string;
+  requester_role: 'employee' | 'manager' | 'admin';
+  requester_department?: string | null;
+  risk_level: string;
+  scan: InstallRequestScanFinding[];
+  status: 'pending' | 'approved' | 'denied' | 'expired';
+  stage: InstallRequestStage;
+  manager_by: string | null;
+  admin_by: string | null;
+  decided_reason: string | null;
+  executed: boolean;
+  execute_error: string | null;
+  created_at: string;
+  ttl_seconds: number;
+}
+
+export interface InstallRequestFiled {
+  request_id: string;
+  status: 'pending';
+  stage: InstallRequestStage;
+  scan: InstallRequestScanFinding[];
 }
 
 export interface MarketplaceServer {
@@ -1408,12 +1484,32 @@ export interface ContractConfig {
 
 export type RedactionSourceMode = 'on' | 'off' | 'selective' | 'inherit';
 
+/** One source's setting: mode + optional per-source field (category) filter.
+ *  Both lists empty = redact every category the active profiles cover. */
+export interface RedactionSourceSetting {
+  mode: RedactionSourceMode;
+  /** When non-empty, ONLY these categories are redacted for this source. */
+  only_categories: string[];
+  /** Categories never redacted for this source (wins over only_categories). */
+  exclude_categories: string[];
+}
+
 export interface RedactionSources {
-  user_input: RedactionSourceMode;
-  tool_results: RedactionSourceMode;
-  system_prompt: RedactionSourceMode;
-  sub_agent: RedactionSourceMode;
-  cron_context: RedactionSourceMode;
+  user_input: RedactionSourceSetting;
+  tool_results: RedactionSourceSetting;
+  system_prompt: RedactionSourceSetting;
+  sub_agent: RedactionSourceSetting;
+  cron_context: RedactionSourceSetting;
+}
+
+/** One profile in the field-picker catalogue (built-in or custom). */
+export interface RedactionProfileInfo {
+  name: string;
+  description: string;
+  builtin: boolean;
+  rule_count: number;
+  /** PII categories (fields) this profile detects, e.g. "TW_ID", "EMAIL". */
+  categories: string[];
 }
 
 export type RedactionRestoreArgs = 'restore' | 'passthrough' | 'deny';
@@ -1430,6 +1526,8 @@ export interface RedactionConfig {
   profiles: string[];
   sources: RedactionSources;
   tool_egress: Record<string, RedactionEgressRule>;
+  /** Catalogue of selectable profiles + the fields each covers. */
+  available_profiles: RedactionProfileInfo[];
 }
 
 /** Partial update payload for `redaction.update`. A `tool_egress` value of
@@ -2154,6 +2252,116 @@ export interface ChatSessionHistory {
   messages: ChatSessionMessage[];
 }
 
+// ── Industry template packs (premium roster staging, admin-only) ──────────
+
+export interface TemplateIndustrySummary {
+  industry: string;
+  label: string;
+  pack: string;
+  worker_count: number;
+}
+
+export interface TemplatesIndustriesResponse {
+  /** Premium templates unlocked by the active license. */
+  unlocked: boolean;
+  /** Template resources shipped with the install but locked by the license. */
+  present_but_locked: boolean;
+  /** Currently staged industry id, if any. */
+  staged: string | null;
+  /** The generic CEO role is available even without staging an industry. */
+  ceo_available: boolean;
+  industries: TemplateIndustrySummary[];
+}
+
+export type TemplateRoleKind = 'ceo' | 'front_desk' | 'worker';
+
+export interface TemplateRoleSummary {
+  role_id: string;
+  kind: TemplateRoleKind;
+  kit?: string;
+  name: string;
+  display_name: string;
+  summary: string;
+  /** An agent has already been created from this role. */
+  created: boolean;
+  overlay_count: number;
+}
+
+export interface TemplateRosterHuman {
+  title: string;
+  summary: string;
+}
+
+export interface TemplateRosterExcluded {
+  kit: string;
+  reason: string;
+}
+
+export interface TemplateRoster {
+  industry: string | null;
+  label: string | null;
+  roles: TemplateRoleSummary[];
+  /** Positions deliberately kept human (not deployed as AI staff). */
+  humans: TemplateRosterHuman[];
+  /** Kits deliberately excluded from deployment, with the reason. */
+  excluded: TemplateRosterExcluded[];
+}
+
+export interface TemplateRoleDetail {
+  role_id: string;
+  kind: TemplateRoleKind;
+  name: string;
+  display_name: string;
+  trigger: string;
+  reports_to: string | null;
+  summary: string;
+  soul_md: string;
+  contract_toml: string;
+  agent_toml: string;
+  has_extras: boolean;
+}
+
+export interface TemplateCreateAgentParams {
+  role_id: string;
+  industry?: string;
+  name?: string;
+  display_name?: string;
+  trigger?: string;
+  /** Omit ⇒ keep the template's wiring (workers report to the pack's front desk). */
+  reports_to?: string;
+  department?: string;
+  /** Omit ⇒ template default. Backend validates TOML fields server-side. */
+  soul_md?: string;
+  contract_toml?: string;
+  agent_toml?: string;
+}
+
+/** One entry of a saved home layout (WP15 personal dashboard). */
+export interface DashboardLayoutWidget {
+  id: string;
+  hidden: boolean;
+}
+export interface DashboardLayout {
+  schema: number;
+  widgets: DashboardLayoutWidget[];
+}
+
+/** One row of `departments.list` — a department exists when any agent, wiki
+ *  sub-tree, or skill sub-tree references it (WP7 derived design). */
+export interface DepartmentInfo {
+  name: string;
+  agent_count: number;
+  members: string[];
+  wiki_pages: number;
+  skills: number;
+}
+
+export interface TemplateCreateAgentResult {
+  success: boolean;
+  warning: string | null;
+  agent: { name: string; role: string; role_id: string };
+}
+
 export const api = {
   /** WebChat past-conversation browsing + resume (WP3). Goes through the
    *  dashboard RPC (authz enforced server-side — a non-admin caller must pass a
@@ -2180,6 +2388,10 @@ export const api = {
       role?: string;
       trigger?: string;
       soul?: string;
+      /** Supervisor agent name — must already exist. Omit/empty ⇒ standalone. */
+      reports_to?: string;
+      /** WP7 department (ASCII alphanumeric + '-'/'_'). Omit/empty ⇒ none. */
+      department?: string;
       /** Optional `[runtime]` written at create time (e.g. onboarding picks a
        *  non-Claude backend). Omit ⇒ defaults to Claude. */
       runtime?: AgentRuntime;
@@ -2238,6 +2450,14 @@ export const api = {
     handoff: (params: AgentHandoffParams) =>
       client.call('agents.handoff', { ...params }) as Promise<AgentHandoffResult>,
     /** WP4 — upload an avatar image (png/jpeg/webp data URI, ≤512 KB). */
+    /** Save the wardrobe composition; `outfit: null` clears back to the
+     *  seeded default look. Purely cosmetic — never affects behaviour. */
+    setOutfit: (agentId: string, outfit: import('./outfit').AgentOutfit | null) =>
+      client.call('agents.set_outfit', { agent_id: agentId, outfit }) as Promise<{
+        success: boolean;
+        agent_id: string;
+        outfit: import('./outfit').AgentOutfit | null;
+      }>,
     setAvatar: (agentId: string, dataUri: string) =>
       client.call('agents.set_avatar', { agent_id: agentId, data_uri: dataUri }) as Promise<{
         success: boolean;
@@ -2252,6 +2472,55 @@ export const api = {
         agent_id: string;
         has_avatar: boolean;
       }>,
+  },
+  /** Industry template packs — stage a premium roster, then create AI staff
+   *  from the staged roles one by one (all admin-only, license-gated). */
+  templates: {
+    industries: () =>
+      client.call('templates.industries', {}) as Promise<TemplatesIndustriesResponse>,
+    /** Stage an industry pack (prepares templates, creates NO agents). */
+    stage: (industry: string) =>
+      client.call('templates.stage', { industry }) as Promise<{
+        success: boolean;
+        roster: TemplateRoster;
+      }>,
+    /** Omit `industry` ⇒ the already-staged one; unstaged still returns CEO. */
+    roster: (industry?: string) =>
+      client.call('templates.roster', industry ? { industry } : {}) as Promise<TemplateRoster>,
+    role: (roleId: string, industry?: string) =>
+      client.call('templates.role', {
+        role_id: roleId,
+        ...(industry ? { industry } : {}),
+      }) as Promise<TemplateRoleDetail>,
+    createAgent: (params: TemplateCreateAgentParams) =>
+      client.call('templates.create_agent', { ...params }) as Promise<TemplateCreateAgentResult>,
+  },
+  dashboard: {
+    /** Widgets the current user may place on their home (fail-closed server-side). */
+    widgetsCatalog: () =>
+      client.call('dashboard.widgets.catalog') as Promise<{ widgets: Array<{ id: string; min_role: string }> }>,
+    layoutGet: () =>
+      client.call('dashboard.layout.get') as Promise<{ layout: DashboardLayout | null }>,
+    layoutSet: (widgets: DashboardLayoutWidget[]) =>
+      client.call('dashboard.layout.set', { widgets }) as Promise<{ success: boolean; layout: DashboardLayout }>,
+    /** Read-only view of a SUBORDINATE's dashboard (manager+; strict-rank
+     *  gate server-side). There is deliberately no set-for-others RPC. */
+    layoutView: (userId: string) =>
+      client.call('dashboard.layout.view', { user_id: userId }) as Promise<{
+        user: { id: string; display_name: string; role: string };
+        widgets: Array<{ id: string; min_role: string }>;
+        layout: DashboardLayout | null;
+        bound_agents: string[];
+        read_only: true;
+      }>,
+  },
+  departments: {
+    list: () =>
+      client.call('departments.list') as Promise<{ departments: DepartmentInfo[] }>,
+    create: (name: string) =>
+      client.call('departments.create', { name }) as Promise<{ success: boolean; name: string }>,
+    remove: (name: string, force?: boolean) =>
+      client.call('departments.remove', { name, ...(force ? { force } : {}) }) as Promise<{ success: boolean }>,
   },
   runtime: {
     /** Detect installed AI runtime CLIs + Claude OAuth — drives the onboarding
@@ -2448,6 +2717,9 @@ export const api = {
         skill_name: string;
         scope: string;
       }>,
+    /** Non-admin: file a Skill install request for the manager→admin chain. */
+    installRequest: (url: string, scope: string, content: string) =>
+      client.call('skills.install_request', { url, scope, content }) as Promise<InstallRequestFiled>,
     /** WP10-T10.1 — approved skills ranked by estimated time saved. Any authed. */
     leaderboard: (limit?: number) =>
       client.call('skills.leaderboard', limit != null ? { limit } : {}) as Promise<{
@@ -2733,6 +3005,26 @@ export const api = {
      * can render without conditional-loading the call.
      */
     status: () => client.call('license.status') as Promise<LicenseSnapshot>,
+    /** Machine fingerprint — customers quote this when purchasing a license. */
+    fingerprint: () =>
+      client.call('license.fingerprint', {}) as Promise<{ fingerprint: string }>,
+    /**
+     * Install + hot-reload a license (admin-only). `key` accepts either the
+     * base64 key blob or the full license JSON. Errors arrive as WsFrame
+     * error strings, already localized zh-TW (bad signature / fingerprint
+     * mismatch / expired / malformed). No gateway restart needed on success.
+     */
+    activate: (key: string) =>
+      client.call('license.activate', { key }) as Promise<{
+        success: boolean;
+        status: LicenseSnapshot;
+      }>,
+    /** Partner (NFR) redeem-code path — free activation, same hot-reload. */
+    redeem: (code: string, email?: string) =>
+      client.call('license.redeem', {
+        code,
+        ...(email ? { email } : {}),
+      }) as Promise<{ success: boolean; status: LicenseSnapshot }>,
   },
   marketplace: {
     list: () =>
@@ -2803,6 +3095,50 @@ export const api = {
       }>,
     oauthRevoke: (providerId: string) =>
       client.call('mcp.oauth.revoke', { provider_id: providerId }) as Promise<{ success: boolean }>,
+    importFetch: (url: string) =>
+      client.call('mcp.import.fetch', { url }) as Promise<McpImportFetchResult>,
+    importInstall: (params: {
+      agent_id: string;
+      server_name: string;
+      server_def: McpServerDef;
+      add_to_catalog?: boolean;
+      description?: string;
+      source_url?: string;
+    }) =>
+      client.call('mcp.import.install', params) as Promise<{
+        success: boolean;
+        agent_id: string;
+        server_name: string;
+        catalog_added: boolean;
+        warning?: string;
+      }>,
+    /** Non-admin: file an MCP install request for the manager→admin chain. */
+    installRequest: (params: {
+      agent_id: string;
+      server_name: string;
+      server_def: McpServerDef;
+      add_to_catalog?: boolean;
+      description?: string;
+      source_url?: string;
+    }) =>
+      client.call('mcp.install_request', params) as Promise<InstallRequestFiled>,
+  },
+  installRequests: {
+    /** Manager+: requests the caller can currently act on. */
+    list: () =>
+      client.call('install_requests.list') as Promise<{ requests: InstallRequestInfo[]; count: number }>,
+    /** Any user: the caller's own requests + status. */
+    mine: () =>
+      client.call('install_requests.mine') as Promise<{ requests: InstallRequestInfo[]; count: number }>,
+    /** Manager+: approve/deny; executes install on final approval. */
+    decide: (id: string, approve: boolean, reason?: string) =>
+      client.call('install_requests.decide', { id, approve, ...(reason ? { reason } : {}) }) as Promise<{
+        status: string;
+        stage?: string;
+        executed?: boolean;
+        detail?: unknown;
+        warning?: string;
+      }>,
   },
   tasks: {
     list: (filters?: { status?: TaskStatus; agent_id?: string; priority?: TaskPriority }) =>
@@ -2966,6 +3302,10 @@ export const api = {
       client.call('redaction.update', { ...fields }) as Promise<{
         success: boolean;
         changes: string[];
+        /** True when the live pipeline was hot-reloaded with the new config. */
+        applied: boolean;
+        /** Set when the config was saved but could not be applied live. */
+        warning: string | null;
       }>,
     stats: () => client.call('redaction.stats') as Promise<RedactionStats>,
     recentAudit: (limit = 50) =>
@@ -3065,9 +3405,16 @@ export const api = {
   users: {
     list: () =>
       client.call('users.list') as Promise<{ users: UserDetail[] }>,
-    create: (params: { email: string; display_name: string; password: string; role?: string }) =>
+    /** Active users strictly below the caller's rank (manager+). Minimal
+     *  fields — feeds the read-only dashboard viewer picker. */
+    subordinates: () =>
+      client.call('users.subordinates') as Promise<{
+        users: Array<{ id: string; display_name: string; role: string }>;
+      }>,
+    create: (params: { email: string; display_name: string; password: string; role?: string; department?: string }) =>
       client.call('users.create', params) as Promise<{ user: UserInfo }>,
-    update: (params: { user_id: string; display_name?: string; role?: string; password?: string }) =>
+    /** `department: ''` clears the user's department; omit to leave unchanged. */
+    update: (params: { user_id: string; display_name?: string; role?: string; password?: string; department?: string }) =>
       client.call('users.update', params) as Promise<{ status: string }>,
     remove: (userId: string) =>
       client.call('users.remove', { user_id: userId }) as Promise<{ status: string }>,

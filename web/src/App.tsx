@@ -59,6 +59,7 @@ const McpKeysPage = lazyPage(() => import('./pages/McpKeysPage'), 'McpKeysPage')
 const OdooPage = lazyPage(() => import('./pages/OdooPage'), 'OdooPage');
 const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'InferencePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
+const DepartmentsPage = lazyPage(() => import('./pages/DepartmentsPage'), 'DepartmentsPage');
 const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
 const OnboardWizardPage = lazyPage(() => import('./pages/OnboardWizardPage'), 'OnboardWizardPage');
 const WelcomePage = lazyPage(() => import('./pages/WelcomePage'), 'WelcomePage');
@@ -178,6 +179,7 @@ export function App() {
                   <Route path="security" element={<SecurityPage />} />
                   <Route path="governance" element={<GovernanceShell />} />
                   <Route path="users" element={<UsersPage />} />
+                  <Route path="departments" element={<DepartmentsPage />} />
                   <Route path="distributors" element={<DistributorsPage />} />
                   <Route path="system" element={<SettingsPage />} />
                 </Route>

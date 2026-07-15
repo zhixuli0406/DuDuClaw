@@ -67,7 +67,7 @@ fn build_verify_manager(
         cfg.profiles = vec!["general".to_string()];
     }
     // Force user-input scanning on for the verify run.
-    cfg.sources.user_input = SourceMode::On;
+    cfg.sources.user_input = SourceMode::On.into();
 
     let paths = ManagerPaths::under_home(home);
     let manager = RedactionManager::open(cfg, paths)

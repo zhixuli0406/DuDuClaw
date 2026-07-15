@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useParams } from 'react-router';
-import { ArrowLeft, Pause, Play, LogOut, RotateCcw, Brain, Puzzle, CalendarClock, LayoutDashboard, Settings, Upload, Trash2, ImageIcon, Wrench } from 'lucide-react';
+import { ArrowLeft, Pause, Play, LogOut, RotateCcw, Brain, Puzzle, CalendarClock, LayoutDashboard, Settings, Upload, Trash2, ImageIcon, Wrench, Shirt } from 'lucide-react';
 import {
   api,
   type AgentDetail,
@@ -20,6 +20,7 @@ import { toast, formatError } from '@/lib/toast';
 import { Page, Card, Button, Badge, CharacterAvatar, EmptyState, SkeletonList, Mono, Tabs, type TabItem } from '@/components/ui';
 import { AgentHero, AgentOverviewTab, agentTaskStats, isLiveState } from '@/components/agent';
 import { OffboardDialog } from '@/components/agent/OffboardDialog';
+import { WardrobeDialog } from '@/components/agent/WardrobeDialog';
 import { formatCents } from '@/lib/format';
 
 /** 512 KB — matches the backend avatar cap (`agents.set_avatar`). */
@@ -64,6 +65,7 @@ export function AgentDetailPage() {
   const [busy, setBusy] = useState(false);
   // 離職 flow (WP4): three-way offboard — archive / remove / handoff-then-archive.
   const [showOffboard, setShowOffboard] = useState(false);
+  const [showWardrobe, setShowWardrobe] = useState(false);
   const [avatarBusy, setAvatarBusy] = useState(false);
   const avatarFileRef = useRef<HTMLInputElement>(null);
 
@@ -360,50 +362,79 @@ export function AgentDetailPage() {
               </button>
             </Card>
 
-            {/* Avatar (WP4). Upload / remove — falls back to the generative face. */}
-            <Card title={intl.formatMessage({ id: 'agents.avatar.title' })}>
+            {/* 造型（衣帽間）— slot-based look, synced to roster + world.
+                Photo upload survives as a folded secondary path; a saved
+                outfit always outranks a photo. */}
+            <Card title={intl.formatMessage({ id: 'wardrobe.card.title' })}>
               <div className="flex items-center gap-4">
                 <CharacterAvatar
                   agentId={detail.name}
                   name={detail.display_name}
-                  size={64}
-                  variant="avatar"
-                  avatar={detail.avatar ?? null}
+                  size={72}
+                  variant="bust"
+                  avatar={detail.outfit ? null : detail.avatar ?? null}
+                  outfit={detail.outfit ?? null}
                 />
-                <div className="flex flex-col gap-2">
-                  <input
-                    ref={avatarFileRef}
-                    type="file"
-                    accept={AVATAR_ACCEPT}
-                    className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) void handleAvatarFile(f);
-                      e.target.value = '';
-                    }}
-                  />
+                <div className="flex min-w-0 flex-col gap-2">
                   <div className="flex items-center gap-2">
-                    <Button
-                      variant="secondary"
-                      icon={Upload}
-                      disabled={avatarBusy}
-                      onClick={() => avatarFileRef.current?.click()}
-                    >
-                      {intl.formatMessage({ id: 'agents.avatar.upload' })}
+                    <Button variant="secondary" icon={Shirt} onClick={() => setShowWardrobe(true)}>
+                      {intl.formatMessage({ id: 'wardrobe.open' })}
                     </Button>
-                    {detail.has_avatar && (
-                      <Button variant="ghost" icon={Trash2} disabled={avatarBusy} onClick={handleAvatarClear}>
-                        {intl.formatMessage({ id: 'agents.avatar.remove' })}
-                      </Button>
-                    )}
                   </div>
-                  <p className="flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
-                    <ImageIcon className="h-3.5 w-3.5" />
-                    {intl.formatMessage({ id: 'agents.avatar.hint' })}
+                  <p className="text-xs text-stone-400 dark:text-stone-500">
+                    {intl.formatMessage({ id: 'wardrobe.card.hint' })}
                   </p>
+                  <details>
+                    <summary className="cursor-pointer text-xs text-stone-400 hover:text-stone-600 dark:text-stone-500 dark:hover:text-stone-300">
+                      {intl.formatMessage({ id: 'wardrobe.photoFallback' })}
+                    </summary>
+                    <div className="mt-2 flex items-center gap-2">
+                      <input
+                        ref={avatarFileRef}
+                        type="file"
+                        accept={AVATAR_ACCEPT}
+                        className="hidden"
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) void handleAvatarFile(f);
+                          e.target.value = '';
+                        }}
+                      />
+                      <Button
+                        variant="ghost"
+                        icon={Upload}
+                        disabled={avatarBusy}
+                        onClick={() => avatarFileRef.current?.click()}
+                      >
+                        {intl.formatMessage({ id: 'agents.avatar.upload' })}
+                      </Button>
+                      {detail.has_avatar && (
+                        <Button variant="ghost" icon={Trash2} disabled={avatarBusy} onClick={handleAvatarClear}>
+                          {intl.formatMessage({ id: 'agents.avatar.remove' })}
+                        </Button>
+                      )}
+                      <span className="flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
+                        <ImageIcon className="h-3.5 w-3.5" />
+                        {intl.formatMessage({ id: 'agents.avatar.hint' })}
+                      </span>
+                    </div>
+                  </details>
                 </div>
               </div>
             </Card>
+
+            {showWardrobe && (
+              <WardrobeDialog
+                agentId={detail.name}
+                displayName={detail.display_name}
+                outfit={detail.outfit ?? null}
+                onClose={() => setShowWardrobe(false)}
+                onSaved={() => {
+                  void loadDetail();
+                  void fetchAgents();
+                }}
+              />
+            )}
 
             <Card title={intl.formatMessage({ id: 'agentDetail.settings.title' })}>
               <div className="flex flex-wrap items-center gap-2">

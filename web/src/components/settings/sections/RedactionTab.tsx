@@ -5,6 +5,7 @@ import {
   api,
   type RedactionConfig,
   type RedactionSourceMode,
+  type RedactionSourceSetting,
   type RedactionSources,
   type RedactionRestoreArgs,
   type RedactionEgressRule,
@@ -14,7 +15,6 @@ import {
   type RedactionAuditEntry,
 } from '@/lib/api';
 import { FormField, inputClass, selectClass } from '@/components/shared/Dialog';
-import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
 import { Card, Button, Badge } from '@/components/ui';
 import {
@@ -77,6 +77,159 @@ function presetForKey(key: string): ExternalSystemPreset | undefined {
   return EXTERNAL_SYSTEM_PRESETS.find((p) => p.toolKey === key);
 }
 
+/** Human label for a PII category — i18n when we know it, raw tag otherwise. */
+function categoryLabel(intl: ReturnType<typeof useIntl>, cat: string): string {
+  return intl.formatMessage({ id: `redaction.cat.${cat}`, defaultMessage: cat });
+}
+
+/** Which field-filter shape a source setting is currently in. */
+type FieldScope = 'all' | 'only' | 'exclude';
+function scopeOf(s: RedactionSourceSetting): FieldScope {
+  if (s.only_categories.length > 0) return 'only';
+  if (s.exclude_categories.length > 0) return 'exclude';
+  return 'all';
+}
+
+/** One source row: mode select + expandable per-field scope editor. */
+function SourceSettingRow({
+  sourceKey,
+  setting,
+  categories,
+  onChange,
+}: {
+  sourceKey: keyof RedactionSources;
+  setting: RedactionSourceSetting;
+  /** Union of categories covered by the currently selected profiles. */
+  categories: string[];
+  onChange: (next: RedactionSourceSetting) => void;
+}) {
+  const intl = useIntl();
+  const [open, setOpen] = useState(false);
+  const scope = scopeOf(setting);
+  // The field filter only matters when this source actually redacts.
+  const filterable =
+    setting.mode === 'on' || (sourceKey === 'system_prompt' && setting.mode === 'selective');
+  const activeList = scope === 'only' ? setting.only_categories : setting.exclude_categories;
+
+  const setScope = (next: FieldScope) => {
+    if (next === scope) return;
+    // Carry the picked set across radio switches; 'all' clears both lists.
+    const picked = activeList;
+    onChange({
+      ...setting,
+      only_categories: next === 'only' ? picked : [],
+      exclude_categories: next === 'exclude' ? picked : [],
+    });
+  };
+
+  const toggleCategory = (cat: string) => {
+    if (scope === 'all') return;
+    const field = scope === 'only' ? 'only_categories' : 'exclude_categories';
+    const list = setting[field];
+    const next = list.includes(cat) ? list.filter((c) => c !== cat) : [...list, cat];
+    onChange({ ...setting, [field]: next });
+  };
+
+  // Categories referenced in config but absent from the current profile
+  // selection (e.g. a profile was unticked) — keep them visible so the saved
+  // filter is never silently hidden.
+  const orphaned = activeList.filter((c) => !categories.includes(c));
+  const allCategories = [...categories, ...orphaned];
+
+  return (
+    <div>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: `redaction.source.${sourceKey}` })}
+          </p>
+          <p className="mt-0.5 text-xs text-stone-400 dark:text-stone-500">
+            {intl.formatMessage({ id: `redaction.source.${sourceKey}.desc` })}
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {filterable && (
+            <button
+              onClick={() => setOpen((v) => !v)}
+              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-stone-500 hover:bg-stone-500/10 dark:text-stone-400"
+              aria-expanded={open}
+            >
+              {scope === 'all'
+                ? intl.formatMessage({ id: 'redaction.fields.all' })
+                : intl.formatMessage(
+                    { id: `redaction.fields.${scope}.badge` },
+                    { count: activeList.length },
+                  )}
+              <ChevronDown className={cn('h-3 w-3 transition-transform', open && 'rotate-180')} />
+            </button>
+          )}
+          <select
+            value={setting.mode}
+            onChange={(e) => onChange({ ...setting, mode: e.target.value as RedactionSourceMode })}
+            className={cn(selectClass, 'w-32')}
+          >
+            {REDACTION_MODES.map((m) => (
+              <option key={m} value={m}>{intl.formatMessage({ id: `redaction.mode.${m}` })}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {filterable && open && (
+        <div className="mt-2 rounded-lg bg-stone-500/5 p-3 dark:bg-white/5">
+          <div className="mb-2 flex flex-wrap gap-3">
+            {(['all', 'only', 'exclude'] as const).map((s) => (
+              <label key={s} className="flex items-center gap-1.5 text-xs text-stone-600 dark:text-stone-300">
+                <input
+                  type="radio"
+                  name={`fields-${sourceKey}`}
+                  checked={scope === s}
+                  onChange={() => setScope(s)}
+                  className="accent-amber-500"
+                />
+                {intl.formatMessage({ id: `redaction.fields.${s}` })}
+              </label>
+            ))}
+          </div>
+          {scope !== 'all' && (
+            allCategories.length > 0 ? (
+              <div className="flex flex-wrap gap-1.5">
+                {allCategories.map((cat) => {
+                  const checked = activeList.includes(cat);
+                  return (
+                    <button
+                      key={cat}
+                      onClick={() => toggleCategory(cat)}
+                      className={cn(
+                        'rounded-full border px-2.5 py-1 text-xs font-medium transition-colors',
+                        checked
+                          ? 'border-amber-400 bg-amber-500/15 text-amber-700 dark:border-amber-500/60 dark:text-amber-400'
+                          : 'border-stone-300 text-stone-500 hover:bg-stone-500/10 dark:border-stone-600 dark:text-stone-400',
+                      )}
+                      aria-pressed={checked}
+                    >
+                      {categoryLabel(intl, cat)}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="text-xs text-stone-400">
+                {intl.formatMessage({ id: 'redaction.fields.noneAvailable' })}
+              </p>
+            )
+          )}
+          {scope !== 'all' && activeList.length === 0 && (
+            <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+              {intl.formatMessage({ id: `redaction.fields.${scope}.emptyHint` })}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function RedactionTab() {
   const intl = useIntl();
   const [config, setConfig] = useState<RedactionConfig | null>(null);
@@ -121,10 +274,15 @@ export function RedactionTab() {
         sources: config.sources,
         tool_egress: egress,
       };
-      await api.redaction.update(payload);
+      const res = await api.redaction.update(payload);
       savedEgressKeysRef.current = Object.keys(config.tool_egress);
-      setSaved(true);
-      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+      if (res.warning) {
+        // Saved to disk but NOT live — say so instead of pretending success.
+        toast.error(res.warning);
+      } else {
+        setSaved(true);
+        savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+      }
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
@@ -166,6 +324,15 @@ export function RedactionTab() {
   }
 
   const egressEntries = Object.entries(config.tool_egress) as Array<[string, RedactionEgressRule]>;
+  // Fields the current profile selection can recognise — feeds every source
+  // row's per-field scope picker.
+  const selectedCategories = Array.from(
+    new Set(
+      (config.available_profiles ?? [])
+        .filter((p) => config.profiles.includes(p.name))
+        .flatMap((p) => p.categories),
+    ),
+  ).sort();
 
   return (
     <div className="space-y-6">
@@ -190,27 +357,79 @@ export function RedactionTab() {
         <input type="checkbox" checked={config.enabled} onChange={(e) => setConfig({ ...config, enabled: e.target.checked })} className="h-4 w-4 accent-amber-500" />
       </label>
 
-      {/* Sources — plain title + one-line description per row */}
+      {/* Detection rule sets (profiles) — what fields CAN be recognised */}
+      <div className="border-t border-[var(--panel-border)] pt-4">
+        <h4 className="mb-1 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'redaction.profiles.title' })}</h4>
+        <p className="mb-3 text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'redaction.profiles.desc' })}</p>
+        <div className="space-y-2">
+          {(config.available_profiles ?? []).map((p) => {
+            const checked = config.profiles.includes(p.name);
+            return (
+              <label key={p.name} className="flex cursor-pointer items-start gap-2.5 rounded-lg bg-stone-500/5 p-2.5 dark:bg-white/5">
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() =>
+                    setConfig({
+                      ...config,
+                      profiles: checked
+                        ? config.profiles.filter((n) => n !== p.name)
+                        : [...config.profiles, p.name],
+                    })
+                  }
+                  className="mt-0.5 h-4 w-4 accent-amber-500"
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="flex flex-wrap items-center gap-1.5 text-sm font-medium text-stone-700 dark:text-stone-300">
+                    {intl.formatMessage({ id: `redaction.profile.${p.name}`, defaultMessage: p.name })}
+                    {!p.builtin && <Badge tone="neutral">{intl.formatMessage({ id: 'redaction.profile.custom' })}</Badge>}
+                  </span>
+                  <span className="mt-1 flex flex-wrap gap-1">
+                    {p.categories.map((cat) => (
+                      <span key={cat} className="rounded-full bg-stone-500/10 px-2 py-0.5 text-[11px] text-stone-500 dark:text-stone-400">
+                        {categoryLabel(intl, cat)}
+                      </span>
+                    ))}
+                  </span>
+                </span>
+              </label>
+            );
+          })}
+          {/* Config may reference profiles missing from the catalogue (deleted
+              custom file) — keep them visible so saving doesn't drop them. */}
+          {config.profiles
+            .filter((n) => !(config.available_profiles ?? []).some((p) => p.name === n))
+            .map((n) => (
+              <label key={n} className="flex cursor-pointer items-center gap-2.5 rounded-lg bg-stone-500/5 p-2.5 dark:bg-white/5">
+                <input
+                  type="checkbox"
+                  checked
+                  onChange={() => setConfig({ ...config, profiles: config.profiles.filter((x) => x !== n) })}
+                  className="h-4 w-4 accent-amber-500"
+                />
+                <span className="text-sm text-stone-700 dark:text-stone-300">{n}</span>
+                <Badge tone="warning">{intl.formatMessage({ id: 'redaction.profile.missing' })}</Badge>
+              </label>
+            ))}
+        </div>
+        {config.enabled && config.profiles.length === 0 && (
+          <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">{intl.formatMessage({ id: 'redaction.profiles.noneSelected' })}</p>
+        )}
+      </div>
+
+      {/* Sources — mode + per-field scope per row */}
       <div className="border-t border-[var(--panel-border)] pt-4">
         <h4 className="mb-1 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'redaction.sources' })}</h4>
         <p className="mb-3 text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'redaction.sources.hint' })}</p>
         <div className="space-y-3">
           {REDACTION_SOURCE_KEYS.map((key) => (
-            <div key={key} className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: `redaction.source.${key}` })}</p>
-                <p className="mt-0.5 text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: `redaction.source.${key}.desc` })}</p>
-              </div>
-              <select
-                value={config.sources[key]}
-                onChange={(e) => setConfig({ ...config, sources: { ...config.sources, [key]: e.target.value as RedactionSourceMode } })}
-                className={cn(selectClass, 'w-32 shrink-0')}
-              >
-                {REDACTION_MODES.map((m) => (
-                  <option key={m} value={m}>{intl.formatMessage({ id: `redaction.mode.${m}` })}</option>
-                ))}
-              </select>
-            </div>
+            <SourceSettingRow
+              key={key}
+              sourceKey={key}
+              setting={config.sources[key]}
+              categories={selectedCategories}
+              onChange={(next) => setConfig({ ...config, sources: { ...config.sources, [key]: next } })}
+            />
           ))}
         </div>
       </div>
@@ -338,15 +557,12 @@ export function RedactionTab() {
                 <input type="number" min={0} max={3650} value={config.purge_after_expire_days} onChange={(e) => setConfig({ ...config, purge_after_expire_days: Number(e.target.value) })} className={inputClass} />
               </FormField>
             </div>
-            <FormField label={intl.formatMessage({ id: 'redaction.profiles' })} hint={intl.formatMessage({ id: 'redaction.profiles.hint' })}>
-              <ChipEditor values={config.profiles} onChange={(v) => setConfig({ ...config, profiles: v })} placeholder="pii" addLabel={intl.formatMessage({ id: 'common.add' })} />
-            </FormField>
           </div>
         )}
       </div>
 
       <div className="flex items-center justify-end gap-2 pt-2">
-        {saved && <span className="text-xs text-emerald-600 dark:text-emerald-400">{intl.formatMessage({ id: 'settings.general.saved' })}</span>}
+        {saved && <span className="text-xs text-emerald-600 dark:text-emerald-400">{intl.formatMessage({ id: 'redaction.savedLive' })}</span>}
         <Button variant="primary" onClick={handleSave} disabled={saving}>
           {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
         </Button>

@@ -1,8 +1,11 @@
 import { useId } from 'react';
 import { cn } from '@/lib/utils';
 import { characterFor } from '@/lib/character-gen';
+import { defaultOutfitFor, effectiveTint, type AgentOutfit } from '@/lib/outfit';
 import { useAgentAvatar } from '@/stores/agent-avatar-store';
+import { useAgentsStore } from '@/stores/agents-store';
 import { StatusEmote, type StatusEmoteKind } from './StatusEmote';
+import { HeadOutfit, BustOutfit } from './OutfitLayers';
 import type { CharacterPose } from './poses';
 
 /**
@@ -45,6 +48,13 @@ export interface CharacterAvatarProps {
    * `agentId` from the shared cache, so every surface stays consistent.
    */
   avatar?: string | null;
+  /**
+   * Wardrobe composition. `undefined` resolves the saved outfit from the
+   * agents store; `null` explicitly means "no saved outfit" (seeded default).
+   * A dressed agent always renders the generative character — a saved outfit
+   * outranks an uploaded photo.
+   */
+  outfit?: AgentOutfit | null;
   className?: string;
 }
 
@@ -138,62 +148,6 @@ function Cheeks({ h }: { h: Head }) {
   );
 }
 
-function Accessory({ h, kind, gradId }: { h: Head; kind: string; gradId: string }) {
-  const ink = 'var(--character-ink)';
-  const topY = h.cy - h.r;
-  const grad = `url(#${gradId})`;
-  switch (kind) {
-    case 'antenna':
-      return (
-        <g>
-          <line x1={h.cx} y1={topY + h.r * 0.1} x2={h.cx} y2={topY - h.r * 0.5} stroke={ink} strokeWidth={h.r * 0.07} strokeLinecap="round" />
-          <circle cx={h.cx} cy={topY - h.r * 0.55} r={h.r * 0.16} fill="var(--xp)" />
-        </g>
-      );
-    case 'bow':
-      return (
-        <g transform={`translate(${h.cx + h.r * 0.5} ${topY + h.r * 0.12})`}>
-          <path d={`M 0 0 L ${-h.r * 0.32} ${-h.r * 0.2} L ${-h.r * 0.32} ${h.r * 0.2} Z`} fill="var(--xp)" />
-          <path d={`M 0 0 L ${h.r * 0.32} ${-h.r * 0.2} L ${h.r * 0.32} ${h.r * 0.2} Z`} fill="var(--xp)" />
-          <circle cx={0} cy={0} r={h.r * 0.1} fill="var(--coin)" />
-        </g>
-      );
-    case 'glasses': {
-      const e = eyePositions(h);
-      return (
-        <g fill="none" stroke={ink} strokeWidth={h.r * 0.06}>
-          <circle cx={h.cx - e.dx} cy={e.y} r={e.rx * 1.9} />
-          <circle cx={h.cx + e.dx} cy={e.y} r={e.rx * 1.9} />
-          <line x1={h.cx - e.dx + e.rx * 1.9} y1={e.y} x2={h.cx + e.dx - e.rx * 1.9} y2={e.y} />
-        </g>
-      );
-    }
-    case 'cap':
-      return (
-        <g>
-          <path d={`M ${h.cx - h.r * 0.9} ${topY + h.r * 0.28} A ${h.r * 0.9} ${h.r * 0.9} 0 0 1 ${h.cx + h.r * 0.9} ${topY + h.r * 0.28} Z`} fill={grad} />
-          <rect x={h.cx - h.r * 0.95} y={topY + h.r * 0.22} width={h.r * 1.9} height={h.r * 0.14} rx={h.r * 0.07} fill={grad} />
-        </g>
-      );
-    case 'scarf': {
-      const sy = h.cy + h.r * 0.82;
-      return <rect x={h.cx - h.r * 0.72} y={sy} width={h.r * 1.44} height={h.r * 0.34} rx={h.r * 0.17} fill="var(--agent-2b)" />;
-    }
-    case 'flower':
-      return (
-        <g transform={`translate(${h.cx + h.r * 0.55} ${topY + h.r * 0.15})`}>
-          {[0, 72, 144, 216, 288].map((deg) => {
-            const rad = (deg * Math.PI) / 180;
-            return <circle key={deg} cx={Math.cos(rad) * h.r * 0.16} cy={Math.sin(rad) * h.r * 0.16} r={h.r * 0.11} fill="var(--agent-6a)" />;
-          })}
-          <circle cx={0} cy={0} r={h.r * 0.1} fill="var(--xp)" />
-        </g>
-      );
-    default:
-      return null;
-  }
-}
-
 /** Bust body + pose-driven arms. Rendered under the head so the head overlaps.
  *  Geometry is in fixed viewBox units (the head sits at a fixed bust position). */
 function BustBody({ pose, gradId, animated }: { pose: CharacterPose; gradId: string; animated: boolean }) {
@@ -267,6 +221,7 @@ export function CharacterAvatar({
   live = false,
   animated = true,
   avatar,
+  outfit,
   className,
 }: CharacterAvatarProps) {
   const uid = useId().replace(/[:]/g, '');
@@ -275,14 +230,28 @@ export function CharacterAvatar({
   const isBust = variant ? variant === 'bust' : size >= 64;
   const label = name ?? agentId;
 
+  // Resolve the saved outfit. An explicit prop wins (even null = "seeded");
+  // when omitted, the agents store (if it has this agent loaded) supplies it.
+  const storeOutfit = useAgentsStore((s) =>
+    outfit === undefined ? s.agents.find((a) => a.name === agentId)?.outfit ?? null : null,
+  );
+  const savedOutfit = outfit !== undefined ? outfit : storeOutfit;
+  const fit = savedOutfit ?? defaultOutfitFor(agentId);
+
   // Resolve an uploaded avatar. An explicit prop wins (even null = "generative");
   // when omitted we consult the shared cache so any surface picks it up.
-  const resolved = useAgentAvatar(avatar === undefined ? agentId : undefined);
-  const uploadedSrc = avatar !== undefined ? avatar || undefined : resolved;
+  // A DRESSED agent always shows its character — the wardrobe replaces photos.
+  const resolved = useAgentAvatar(avatar === undefined && !savedOutfit ? agentId : undefined);
+  const uploadedSrc = savedOutfit
+    ? undefined
+    : avatar !== undefined
+      ? avatar || undefined
+      : resolved;
 
   const head: Head = isBust ? { cx: 24, cy: 17, r: 12.5 } : { cx: 24, cy: 24, r: 18 };
-  const aVar = `var(--agent-${traits.tintIndex}a)`;
-  const bVar = `var(--agent-${traits.tintIndex}b)`;
+  const tintIndex = effectiveTint(agentId, savedOutfit);
+  const aVar = `var(--agent-${tintIndex}a)`;
+  const bVar = `var(--agent-${tintIndex}b)`;
   const canBlink = animated && pose !== 'sleeping';
 
   return (
@@ -309,6 +278,7 @@ export function CharacterAvatar({
         </defs>
 
         {isBust && <BustBody pose={pose} gradId={gradId} animated={animated} />}
+        {isBust && <BustOutfit fit={fit} />}
 
         {/* Head */}
         <circle
@@ -323,7 +293,7 @@ export function CharacterAvatar({
         <Cheeks h={head} />
         <Eyes h={head} pose={pose} animated={canBlink} blinkSeedMs={traits.blinkSeedMs} />
         <Mouth h={head} pose={pose} />
-        <Accessory h={head} kind={traits.accessory} gradId={gradId} />
+        <HeadOutfit h={head} fit={fit} gradId={gradId} />
       </svg>
       )}
 

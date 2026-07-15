@@ -316,15 +316,25 @@ impl EditionProfile {
     /// Derive the *default* edition implied by a license tier's TOML key.
     ///
     /// Decoupled from `duduclaw-license` (takes the key as `&str`) so
-    /// `duduclaw-core` carries no license dependency. Business / Enterprise /
-    /// OEM tiers imply [`Enterprise`]; everything else (open-source, hobby,
-    /// solo, studio, self-host-pro) implies [`Personal`].
+    /// `duduclaw-core` carries no license dependency. The Enterprise set MUST
+    /// stay in sync with the tiers whose `dashboard_enterprise = true` in
+    /// `crates/duduclaw-license/features.toml`: Business / OEM / Partner /
+    /// Self-Host Pro (the self-host line's enterprise plan). Everything else
+    /// (open-source, hobby, solo, studio, personal-pro-self-host) implies
+    /// [`Personal`].
+    ///
+    /// Accepts both snake_case TOML keys and kebab-case CLI tier values.
     ///
     /// [`Enterprise`]: EditionProfile::Enterprise
     /// [`Personal`]: EditionProfile::Personal
     pub fn from_tier_key(tier_key: &str) -> Self {
-        match tier_key.trim().to_ascii_lowercase().as_str() {
-            "business" | "enterprise" | "oem" => Self::Enterprise,
+        match tier_key
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .as_str()
+        {
+            "business" | "enterprise" | "oem" | "partner" | "self_host_pro" => Self::Enterprise,
             _ => Self::Personal,
         }
     }
@@ -413,6 +423,12 @@ pub struct ContainerConfig {
     pub timeout_ms: u64,
     pub max_concurrent: u32,
     pub readonly_project: bool,
+    // Default-empty: template agent.toml files (free templates/ and premium
+    // packs/kits) ship `[container]` sections without this key, and a missing
+    // mount list can only mean "no extra mounts". Before this default, any
+    // template-deployed agent whose `[container]` section omitted the key
+    // failed the registry's typed parse and was silently skipped on scan.
+    #[serde(default)]
     pub additional_mounts: Vec<MountConfig>,
     /// Run agent tasks inside a sandboxed container (Docker / Apple Container).
     #[serde(default)]
@@ -2573,10 +2589,29 @@ mod tests {
 
     #[test]
     fn edition_profile_from_tier_key() {
-        for k in ["business", "enterprise", "oem", "OEM", " Business "] {
+        for k in [
+            "business",
+            "enterprise",
+            "oem",
+            "OEM",
+            " Business ",
+            // Self-host line enterprise tiers (dashboard_enterprise = true in
+            // features.toml): both TOML snake_case and CLI kebab-case forms.
+            "self_host_pro",
+            "self-host-pro",
+            "partner",
+        ] {
             assert_eq!(EditionProfile::from_tier_key(k), EditionProfile::Enterprise, "{k}");
         }
-        for k in ["opensource", "hobby", "solo", "studio", "self_host_pro", ""] {
+        for k in [
+            "opensource",
+            "hobby",
+            "solo",
+            "studio",
+            "personal_pro_self_host",
+            "personal-pro-self-host",
+            "",
+        ] {
             assert_eq!(EditionProfile::from_tier_key(k), EditionProfile::Personal, "{k}");
         }
     }
