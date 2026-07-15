@@ -30,6 +30,47 @@ use crate::distributor_store::{
 };
 use crate::evolution_events::schema::StagnationDetectionConfig;
 
+/// Copy an industry pack's knowledge extras (FAQ.json + flat wiki/) into a
+/// freshly-created agent directory. Editable core files (SOUL.md /
+/// CONTRACT.toml / agent.toml) are written by the caller from the (possibly
+/// admin-edited) template content, so they are deliberately NOT copied here.
+async fn copy_template_extras(src: &Path, dst: &Path) -> Result<(), String> {
+    let faq = src.join("FAQ.json");
+    if faq.is_file() {
+        tokio::fs::copy(&faq, dst.join("FAQ.json"))
+            .await
+            .map_err(|e| format!("FAQ.json: {e}"))?;
+    }
+    let wiki_src = src.join("wiki");
+    if wiki_src.is_dir() {
+        let wiki_dst = dst.join("wiki");
+        tokio::fs::create_dir_all(&wiki_dst)
+            .await
+            .map_err(|e| format!("wiki dir: {e}"))?;
+        let mut entries = tokio::fs::read_dir(&wiki_src)
+            .await
+            .map_err(|e| format!("wiki read_dir: {e}"))?;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+            let path = entry.path();
+            if path.is_file() {
+                let Some(fname) = path.file_name() else { continue };
+                tokio::fs::copy(&path, wiki_dst.join(fname))
+                    .await
+                    .map_err(|e| format!("wiki/{}: {e}", fname.to_string_lossy()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replace the premium-tree absolute prefix in an error message before it is
+/// forwarded to the dashboard, so internal filesystem layout doesn't leak to
+/// the UI (same discipline as `scrub_odoo_error`). Callers log the full error
+/// via tracing first.
+fn scrub_premium_path(err: &str, premium_dir: &Path) -> String {
+    err.replace(&premium_dir.display().to_string(), "templates-premium")
+}
+
 /// Validate agent ID is safe for filesystem paths (no traversal).
 fn is_valid_agent_id(id: &str) -> bool {
     !id.is_empty()
@@ -66,6 +107,62 @@ fn decode_avatar_data_uri(uri: &str) -> Result<(Vec<u8>, &'static str), String> 
     let img = crate::branding::validate_image_data_uri(uri, MAX_AVATAR_DECODED_BYTES, "Avatar")?;
     let ext = img.kind.ext();
     Ok((img.bytes, ext))
+}
+
+/// Wardrobe slot names — the fixed shape of `outfit.json` (see the web
+/// `lib/outfit.ts` catalogue; the server validates shape + charset only, so
+/// newer clients can ship new item ids without a gateway release).
+const OUTFIT_SLOTS: &[&str] = &["hat", "head", "body", "hands", "feet", "accessory"];
+
+/// Validate + normalize an untrusted `agents.set_outfit` payload into the
+/// canonical stored form. Fail-closed: unknown keys, non-string slots, long or
+/// non-ASCII item ids, and out-of-range tints are all rejected.
+fn normalize_outfit(raw: &Value) -> Result<Value, String> {
+    let obj = raw.as_object().ok_or("outfit must be an object or null")?;
+    for key in obj.keys() {
+        if key != "schema" && key != "tint" && !OUTFIT_SLOTS.contains(&key.as_str()) {
+            return Err(format!("unknown outfit field '{key}'"));
+        }
+    }
+    let tint = match obj.get("tint") {
+        None => 0,
+        Some(v) => {
+            let t = v.as_i64().ok_or("outfit.tint must be an integer 0-10")?;
+            if !(0..=10).contains(&t) {
+                return Err("outfit.tint must be 0-10 (0 = seeded tint)".into());
+            }
+            t
+        }
+    };
+    let mut out = serde_json::Map::new();
+    out.insert("schema".into(), json!(1));
+    out.insert("tint".into(), json!(tint));
+    for slot in OUTFIT_SLOTS {
+        let item = match obj.get(*slot) {
+            None => "",
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| format!("outfit.{slot} must be a string item id"))?,
+        };
+        if item.len() > 24
+            || !item
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "outfit.{slot} item id must be lowercase ASCII (a-z0-9_-), max 24 chars"
+            ));
+        }
+        out.insert((*slot).into(), json!(item));
+    }
+    Ok(Value::Object(out))
+}
+
+/// Read an agent's saved outfit (`agents/<id>/outfit.json`). `None` when the
+/// agent has never been dressed — the client renders the seeded default.
+fn read_agent_outfit(agent_dir: &std::path::Path) -> Option<Value> {
+    let raw = std::fs::read_to_string(agent_dir.join("outfit.json")).ok()?;
+    serde_json::from_str::<Value>(&raw).ok().filter(|v| v.is_object())
 }
 
 // ── F6: archive/unarchive evolution+heartbeat snapshot round-trip ────────────
@@ -475,26 +572,55 @@ fn apply_capabilities_to_table(
 const VALID_RUNTIME_PROVIDERS: &[&str] =
     &["claude", "codex", "gemini", "antigravity", "grok", "openai_compat"];
 
-/// Detect Claude OAuth availability by reading `~/.claude/.credentials.json`
-/// directly (the OS user home, not `DUDUCLAW_HOME`). Returns
-/// `(has_oauth, subscription_tier)`. Never returns the token itself — only its
-/// presence — so this is safe to expose at viewer level. Mirrors the CLI's
-/// `detect_claude_auth_from_file`; we read the file rather than shelling out to
-/// `claude auth status` to keep the RPC fast and side-effect-free.
-fn detect_claude_oauth() -> (bool, Option<String>) {
+/// Detect a Claude Code OAuth session. Returns `(has_oauth, subscription_tier)`.
+/// Never returns the token itself — only its presence — so this is safe to
+/// expose at viewer level.
+///
+/// Fast path reads `~/.claude/.credentials.json` (Linux keeps plaintext
+/// credentials there). On macOS the CLI stores OAuth in the **Keychain**, so a
+/// missing file proves nothing — when the file probe misses and a `claude`
+/// binary exists, ask `claude auth status` directly (read-only JSON, ~1s,
+/// hard 8s timeout). The old file-only probe reported "not logged in" for
+/// every macOS user.
+async fn detect_claude_oauth(claude_bin: Option<&str>) -> (bool, Option<String>) {
+    if let Some(found) = detect_claude_oauth_from_file() {
+        return found;
+    }
+    let Some(bin) = claude_bin else {
+        return (false, None);
+    };
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        tokio::process::Command::new(bin).args(["auth", "status"]).output(),
+    )
+    .await;
+    let Ok(Ok(out)) = output else {
+        return (false, None);
+    };
+    let Ok(json) = serde_json::from_slice::<Value>(&out.stdout) else {
+        return (false, None);
+    };
+    let logged_in = json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+    let sub = json
+        .get("subscriptionType")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    (logged_in, sub)
+}
+
+/// File-based OAuth probe (`~/.claude/.credentials.json`, OS user home — not
+/// `DUDUCLAW_HOME`). `Some` only on a positive hit; a missing/unparsable file
+/// or token-less content falls through to the CLI probe (macOS Keychain case).
+fn detect_claude_oauth_from_file() -> Option<(bool, Option<String>)> {
     let home = duduclaw_core::platform::home_dir();
     if home.is_empty() {
-        return (false, None);
+        return None;
     }
     let cred_path = std::path::Path::new(&home)
         .join(".claude")
         .join(".credentials.json");
-    let Ok(content) = std::fs::read_to_string(&cred_path) else {
-        return (false, None);
-    };
-    let Ok(json) = serde_json::from_str::<Value>(&content) else {
-        return (false, None);
-    };
+    let content = std::fs::read_to_string(&cred_path).ok()?;
+    let json = serde_json::from_str::<Value>(&content).ok()?;
 
     // Two known shapes: `claudeAiOauth` (older) and `oauthAccount` (newer).
     for key in ["claudeAiOauth", "oauthAccount"] {
@@ -510,11 +636,11 @@ fn detect_claude_oauth() -> (bool, Option<String>) {
                     .or_else(|| obj.get("planType"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                return (true, sub);
+                return Some((true, sub));
             }
         }
     }
-    (false, None)
+    None
 }
 
 /// Validate + write the `[runtime]` section from the `runtime` params object.
@@ -1989,8 +2115,40 @@ fn apply_redaction_to_table(table: &mut toml::Table, params: &Value) -> Result<V
         changes.push(format!("redaction.profiles = [{} entries]", arr.len()));
     }
 
-    // ── [redaction.sources] per-source modes ──
+    // ── [redaction.sources] per-source modes + optional category filters ──
+    // Each source accepts either a bare mode string ("on") or a detail object
+    // `{ mode, only_categories[], exclude_categories[] }` — mirroring the two
+    // TOML forms `duduclaw-redaction` parses. Empty filter lists collapse back
+    // to the compact string form.
     if let Some(sources) = params.get("sources").and_then(|v| v.as_object()) {
+        let parse_categories = |obj: &serde_json::Map<String, Value>,
+                                key: &str,
+                                field: &str|
+         -> Result<Vec<String>, String> {
+            let Some(arr) = obj.get(field) else { return Ok(Vec::new()) };
+            let arr = arr
+                .as_array()
+                .ok_or_else(|| format!("sources.{key}.{field} must be an array"))?;
+            if arr.len() > 64 {
+                return Err(format!("sources.{key}.{field} accepts at most 64 entries"));
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        format!("sources.{key}.{field} entries must be non-empty strings")
+                    })?;
+                if s.len() > 64 {
+                    return Err(format!("sources.{key}.{field} entry too long (max 64 chars)"));
+                }
+                out.push(s.to_string());
+            }
+            Ok(out)
+        };
+
         let sub = red
             .entry("sources")
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -2003,14 +2161,56 @@ fn apply_redaction_to_table(table: &mut toml::Table, params: &Value) -> Result<V
             "sub_agent",
             "cron_context",
         ] {
-            if let Some(v) = sources.get(*key).and_then(|v| v.as_str()) {
-                if !is_valid_source_mode(v) {
-                    return Err(format!(
-                        "Invalid redaction source mode '{v}' for {key}. Valid: on, off, selective, inherit"
-                    ));
+            let Some(v) = sources.get(*key) else { continue };
+            let (mode, only, exclude) = if let Some(s) = v.as_str() {
+                (s.to_string(), Vec::new(), Vec::new())
+            } else if let Some(obj) = v.as_object() {
+                let mode = obj
+                    .get("mode")
+                    .and_then(|m| m.as_str())
+                    .ok_or_else(|| format!("sources.{key}.mode is required"))?
+                    .to_string();
+                (
+                    mode,
+                    parse_categories(obj, key, "only_categories")?,
+                    parse_categories(obj, key, "exclude_categories")?,
+                )
+            } else {
+                return Err(format!("sources.{key} must be a mode string or an object"));
+            };
+            if !is_valid_source_mode(&mode) {
+                return Err(format!(
+                    "Invalid redaction source mode '{mode}' for {key}. Valid: on, off, selective, inherit"
+                ));
+            }
+            if only.is_empty() && exclude.is_empty() {
+                sub.insert((*key).into(), toml::Value::String(mode.clone()));
+                changes.push(format!("redaction.sources.{key} = \"{mode}\""));
+            } else {
+                let mut detail = toml::map::Map::new();
+                detail.insert("mode".into(), toml::Value::String(mode.clone()));
+                if !only.is_empty() {
+                    detail.insert(
+                        "only_categories".into(),
+                        toml::Value::Array(
+                            only.iter().map(|c| toml::Value::String(c.clone())).collect(),
+                        ),
+                    );
                 }
-                sub.insert((*key).into(), toml::Value::String(v.into()));
-                changes.push(format!("redaction.sources.{key} = \"{v}\""));
+                if !exclude.is_empty() {
+                    detail.insert(
+                        "exclude_categories".into(),
+                        toml::Value::Array(
+                            exclude.iter().map(|c| toml::Value::String(c.clone())).collect(),
+                        ),
+                    );
+                }
+                sub.insert((*key).into(), toml::Value::Table(detail));
+                changes.push(format!(
+                    "redaction.sources.{key} = {{ mode = \"{mode}\", only = {}, exclude = {} }}",
+                    only.len(),
+                    exclude.len()
+                ));
             }
         }
     }
@@ -2066,6 +2266,54 @@ fn apply_redaction_to_table(table: &mut toml::Table, params: &Value) -> Result<V
     Ok(changes)
 }
 
+/// Profile catalogue for the dashboard's field picker: every built-in profile
+/// plus any custom profile at `<home>/redaction/profiles/*.toml`, each with
+/// its rule count and the PII categories (fields) it covers.
+fn redaction_available_profiles(home_dir: &std::path::Path) -> Vec<Value> {
+    fn summary(name: &str, p: &duduclaw_redaction::config::Profile, builtin: bool) -> Value {
+        let mut cats: Vec<String> = p.rules.values().map(|r| r.category.clone()).collect();
+        cats.sort();
+        cats.dedup();
+        json!({
+            "name": name,
+            "description": p.meta.description,
+            "builtin": builtin,
+            "rule_count": p.rules.len(),
+            "categories": cats,
+        })
+    }
+
+    let mut out = Vec::new();
+    let mut names: Vec<&str> = duduclaw_redaction::profiles::builtin_profiles()
+        .keys()
+        .copied()
+        .collect();
+    names.sort_unstable();
+    for name in names {
+        if let Ok(Some(p)) = duduclaw_redaction::profiles::load_builtin(name) {
+            out.push(summary(name, &p, true));
+        }
+    }
+    // Custom profiles — same directory the manager resolves at boot.
+    let custom_dir = home_dir.join("redaction").join("profiles");
+    if let Ok(entries) = std::fs::read_dir(&custom_dir) {
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .collect();
+        files.sort();
+        for path in files {
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            match duduclaw_redaction::config::Profile::from_path(&path) {
+                Ok(p) => out.push(summary(name, &p, false)),
+                Err(e) => warn!(profile = %name, error = %e, "custom redaction profile unreadable — skipped from catalogue"),
+            }
+        }
+    }
+    out
+}
+
 /// Parse a config.toml `[redaction]` section into the `redaction.get`
 /// response shape.
 fn redaction_table_to_response(table: &toml::Table) -> Value {
@@ -2086,12 +2334,32 @@ fn redaction_table_to_response(table: &toml::Table) -> Value {
         .unwrap_or_default();
 
     let sources = red.and_then(|r| r.get("sources")).and_then(|v| v.as_table());
-    let source_mode = |key: &str, default: &str| -> String {
-        sources
-            .and_then(|s| s.get(key))
-            .and_then(|v| v.as_str())
-            .unwrap_or(default)
-            .to_string()
+    // Sources round-trip both TOML forms (bare mode string / detail table);
+    // the wire response is always the detail-object form.
+    let source_setting = |key: &str, default: &str| -> Value {
+        let toml_cats = |t: &toml::Table, field: &str| -> Vec<String> {
+            t.get(field)
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        };
+        match sources.and_then(|s| s.get(key)) {
+            Some(toml::Value::String(mode)) => json!({
+                "mode": mode,
+                "only_categories": [],
+                "exclude_categories": [],
+            }),
+            Some(toml::Value::Table(t)) => json!({
+                "mode": t.get("mode").and_then(|v| v.as_str()).unwrap_or(default),
+                "only_categories": toml_cats(t, "only_categories"),
+                "exclude_categories": toml_cats(t, "exclude_categories"),
+            }),
+            _ => json!({
+                "mode": default,
+                "only_categories": [],
+                "exclude_categories": [],
+            }),
+        }
     };
 
     let egress = red.and_then(|r| r.get("tool_egress")).and_then(|v| v.as_table());
@@ -2120,11 +2388,11 @@ fn redaction_table_to_response(table: &toml::Table) -> Value {
         "purge_after_expire_days": purge,
         "profiles": profiles,
         "sources": {
-            "user_input": source_mode("user_input", "off"),
-            "tool_results": source_mode("tool_results", "on"),
-            "system_prompt": source_mode("system_prompt", "selective"),
-            "sub_agent": source_mode("sub_agent", "inherit"),
-            "cron_context": source_mode("cron_context", "on"),
+            "user_input": source_setting("user_input", "off"),
+            "tool_results": source_setting("tool_results", "on"),
+            "system_prompt": source_setting("system_prompt", "selective"),
+            "sub_agent": source_setting("sub_agent", "inherit"),
+            "cron_context": source_setting("cron_context", "on"),
         },
         "tool_egress": Value::Object(egress_out),
     })
@@ -2607,6 +2875,9 @@ pub struct MethodHandler {
     >,
     /// RFC-23 redaction manager. `None` ⇒ pipeline disabled at this layer.
     redaction_manager: RwLock<Option<Arc<duduclaw_redaction::RedactionManager>>>,
+    /// Vault GC task paired with the live redaction manager — restarted on
+    /// every hot swap so exactly one sweeper runs against the active vault.
+    redaction_gc: tokio::sync::Mutex<Option<duduclaw_redaction::GcTask>>,
     /// M1/M60: long-lived SQLite-backed audit/reliability index, lazily opened
     /// once and synced by a background task — so audit/reliability RPCs and the
     /// `/api/reliability/summary` HTTP endpoint reuse one connection instead of
@@ -2704,6 +2975,7 @@ impl MethodHandler {
             event_tx: RwLock::new(None),
             autopilot_event_tx: RwLock::new(None),
             redaction_manager: RwLock::new(None),
+            redaction_gc: tokio::sync::Mutex::new(None),
             audit_index: tokio::sync::OnceCell::new(),
         }
     }
@@ -2776,11 +3048,27 @@ impl MethodHandler {
 
     /// Inject the redaction manager (called once after gateway start when
     /// `[redaction] enabled` is true). `None` ⇒ redaction disabled.
-    pub async fn set_redaction_manager(
+    /// Install or clear the redaction manager, restarting the paired vault GC
+    /// task to match. Called at boot and by `redaction.update` hot reload —
+    /// in-flight pipelines keep their old `Arc` and drain naturally; every
+    /// subsequent message sees the new rules.
+    pub async fn swap_redaction_manager(
         &self,
-        manager: Arc<duduclaw_redaction::RedactionManager>,
+        manager: Option<Arc<duduclaw_redaction::RedactionManager>>,
     ) {
-        *self.redaction_manager.write().await = Some(manager);
+        // Stop the old sweeper first so two GC tasks never run concurrently.
+        if let Some(old) = self.redaction_gc.lock().await.take() {
+            old.stop().await;
+        }
+        let gc = manager.as_ref().map(|m| {
+            duduclaw_redaction::spawn_gc(
+                m.vault().clone(),
+                m.audit_sink().clone(),
+                duduclaw_redaction::GcConfig::default(),
+            )
+        });
+        *self.redaction_manager.write().await = manager;
+        *self.redaction_gc.lock().await = gc;
     }
 
     /// Read the redaction manager handle.
@@ -3006,6 +3294,7 @@ impl MethodHandler {
             "agents.unarchive" => { require_admin!(); self.handle_agents_unarchive(params).await }
             "agents.handoff" => { require_admin!(); self.handle_agents_handoff(params).await }
             "agents.set_avatar" => { require_admin!(); self.handle_agents_set_avatar(params).await }
+            "agents.set_outfit" => { require_admin!(); self.handle_agents_set_outfit(params).await }
             "agents.clear_avatar" => { require_admin!(); self.handle_agents_clear_avatar(params).await }
             "agents.inspect" => {
                 let _ = check_agent!(AccessLevel::Viewer);
@@ -3016,6 +3305,13 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_agents_avatar(params).await
             }
+
+            // ── Premium team templates (dashboard onboarding staging flow) ──
+            "templates.industries" => { require_admin!(); self.handle_templates_industries().await }
+            "templates.stage" => { require_admin!(); self.handle_templates_stage(params).await }
+            "templates.roster" => { require_admin!(); self.handle_templates_roster(params).await }
+            "templates.role" => { require_admin!(); self.handle_templates_role(params).await }
+            "templates.create_agent" => { require_admin!(); self.handle_templates_create_agent(params).await }
 
             // ── Behavioral contract (per-agent CONTRACT.toml, CON.1–CON.3) ──
             "contract.get" => { require_admin!(); self.handle_contract_get(params).await }
@@ -3074,6 +3370,12 @@ impl MethodHandler {
             // omits the raw signature and customer email, so it is safe to
             // show to anyone who can already see operational metrics.
             "license.status" => { require_manager!(); self.handle_license_status().await }
+            // Dashboard upgrade flow — install/redeem a commercial license
+            // without touching the CLI. Admin-only: this changes what the
+            // whole install is allowed to do.
+            "license.fingerprint" => { require_admin!(); self.handle_license_fingerprint().await }
+            "license.activate" => { require_admin!(); self.handle_license_activate(params).await }
+            "license.redeem" => { require_admin!(); self.handle_license_redeem(params).await }
 
             "accounts.list" => { require_admin!(); self.handle_accounts_list().await }
             "accounts.budget_summary" => { require_manager!(); self.handle_budget_summary().await }
@@ -3161,8 +3463,12 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_skills_content(params).await
             }
-            "skills.vet" => { require_admin!(); self.handle_skills_vet(params).await }
+            // Read-only preview (fetch + security scan, no mutation): any
+            // authenticated user may scan a skill before requesting install.
+            "skills.vet" => self.handle_skills_vet(params).await,
+            // Direct install stays admin-only; non-admins file an install request.
             "skills.install" => { require_admin!(); self.handle_skills_install(params).await }
+            "skills.install_request" => self.handle_skills_install_request(params, ctx).await,
 
             // ── Cron (admin only) ────────────────────────────
             "cron.list" => { require_admin!(); self.handle_cron_list().await }
@@ -3255,6 +3561,16 @@ impl MethodHandler {
             "odoo.agent_test" => { require_admin!(); self.handle_odoo_agent_test(params).await }
 
             // ── User management (admin only) ─────────────────
+            // ── Personal dashboard (WP15) — per-user, no extra gate ──
+            "dashboard.widgets.catalog" => self.handle_dashboard_widgets_catalog(ctx).await,
+            "dashboard.layout.get" => self.handle_dashboard_layout_get(ctx).await,
+            "dashboard.layout.set" => self.handle_dashboard_layout_set(params, ctx).await,
+            "dashboard.layout.view" => { require_manager!(); self.handle_dashboard_layout_view(params, ctx).await }
+            "users.subordinates" => { require_manager!(); self.handle_users_subordinates(ctx).await }
+            // ── Departments (org structure for agent create/edit) ──
+            "departments.list" => { require_manager!(); self.handle_departments_list().await }
+            "departments.create" => { require_admin!(); self.handle_departments_create(params).await }
+            "departments.remove" => { require_admin!(); self.handle_departments_remove(params).await }
             "users.list" => { require_admin!(); self.handle_users_list().await }
             "users.create" => { require_admin!(); self.handle_users_create(params, ctx).await }
             "users.update" => { require_admin!(); self.handle_users_update(params, ctx).await }
@@ -3272,6 +3588,12 @@ impl MethodHandler {
 
             "mcp.list" => { require_admin!(); self.handle_mcp_list().await }
             "mcp.update" => { require_admin!(); self.handle_mcp_update(&params).await }
+            // Read-only preview (fetch + scan): any authenticated user may
+            // browse and scan candidates before requesting install.
+            "mcp.import.fetch" => self.handle_mcp_import_fetch(params).await,
+            // Direct install stays admin-only; non-admins file an install request.
+            "mcp.import.install" => { require_admin!(); self.handle_mcp_import_install(params).await }
+            "mcp.install_request" => self.handle_mcp_install_request(params, ctx).await,
 
             // ── MCP OAuth (admin only) ──────────────────────────
             "mcp.oauth.providers" => { require_admin!(); self.handle_mcp_oauth_providers().await }
@@ -3418,6 +3740,11 @@ impl MethodHandler {
             // ── Approvals (WP14-T14.7 approval center) ──────
             "approvals.list" => { require_manager!(); self.handle_approvals_list(params).await }
             "approvals.decide" => { require_manager!(); self.handle_approvals_decide(params, ctx).await }
+
+            // Install approval requests (Skill / MCP two-stage signature chain)
+            "install_requests.list" => { require_manager!(); self.handle_install_requests_list(ctx).await }
+            "install_requests.mine" => self.handle_install_requests_mine(ctx).await,
+            "install_requests.decide" => { require_manager!(); self.handle_install_requests_decide(params, ctx).await }
 
             // ── Budget incidents (WP14-T14.6) ───────────────
             "budget.incidents" => { require_manager!(); self.handle_budget_incidents(params).await }
@@ -3577,6 +3904,61 @@ impl MethodHandler {
     /// because we project through [`crate::license_runtime::LicenseSnapshot`]
     /// rather than serializing the raw [`duduclaw_license::License`] (which
     /// contains the Ed25519 signature).
+    /// `license.fingerprint` — this machine's fingerprint, shown in the
+    /// dashboard upgrade card so the operator can have a license issued.
+    async fn handle_license_fingerprint(&self) -> WsFrame {
+        WsFrame::ok_response("", json!({
+            "fingerprint": duduclaw_license::generate_fingerprint(),
+        }))
+    }
+
+    /// `license.activate {key}` — install a purchased license from the
+    /// dashboard (base64 blob or raw JSON; filesystem paths deliberately not
+    /// accepted from a browser form). Signature/fingerprint/expiry verified
+    /// fail-closed, then the license runtime hot-reloads — no restart needed.
+    async fn handle_license_activate(&self, params: Value) -> WsFrame {
+        let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        if key.chars().count() > 64_000 {
+            return WsFrame::error_response("", "授權金鑰內容過長");
+        }
+        let Some(runtime) = crate::license_runtime::global() else {
+            return WsFrame::error_response("", "授權服務尚未就緒，請稍後再試");
+        };
+        let license = match crate::license_runtime::parse_license_key(key) {
+            Ok(l) => l,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        match runtime.install_and_reload(license).await {
+            Ok(snapshot) => {
+                info!(tier = %snapshot.tier, "license activated via dashboard");
+                WsFrame::ok_response("", json!({ "success": true, "status": snapshot }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `license.redeem {code, email?}` — partner (NFR) code redemption from
+    /// the dashboard; control-plane issues a free license bound to this
+    /// machine, installed with the same fail-closed verification.
+    async fn handle_license_redeem(&self, params: Value) -> WsFrame {
+        let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        let email = params
+            .get("email")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let Some(runtime) = crate::license_runtime::global() else {
+            return WsFrame::error_response("", "授權服務尚未就緒，請稍後再試");
+        };
+        match crate::license_runtime::redeem_partner_code(runtime, code, email).await {
+            Ok(snapshot) => {
+                info!(tier = %snapshot.tier, "partner code redeemed via dashboard");
+                WsFrame::ok_response("", json!({ "success": true, "status": snapshot }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
     async fn handle_license_status(&self) -> WsFrame {
         let snapshot = match crate::license_runtime::global() {
             Some(runtime) => runtime.snapshot().await,
@@ -3675,6 +4057,13 @@ impl MethodHandler {
                 { "name": "heartbeat.trigger", "description": "Manually trigger heartbeat for an agent" },
                 { "name": "mcp.list", "description": "List MCP servers for all agents + catalog" },
                 { "name": "mcp.update", "description": "Add or remove an MCP server for an agent" },
+                { "name": "mcp.import.fetch", "description": "Fetch + security-scan MCP server defs from a GitHub/URL manifest" },
+                { "name": "mcp.import.install", "description": "Install a scanned MCP server def (fail-closed re-scan)" },
+                { "name": "skills.install_request", "description": "File a Skill install request for approval (non-admin)" },
+                { "name": "mcp.install_request", "description": "File an MCP install request for approval (non-admin)" },
+                { "name": "install_requests.list", "description": "List install requests actionable by the caller (manager+)" },
+                { "name": "install_requests.mine", "description": "The caller's own install requests + status" },
+                { "name": "install_requests.decide", "description": "Approve/deny an install request; executes on final approval" },
                 { "name": "mcp.oauth.providers", "description": "List available OAuth providers and their auth status" },
                 { "name": "mcp.oauth.start", "description": "Start OAuth flow for a provider" },
                 { "name": "mcp.oauth.status", "description": "Check OAuth status for a provider" },
@@ -3808,17 +4197,51 @@ impl MethodHandler {
             return WsFrame::error_response("", "Agent name must be lowercase alphanumeric with hyphens, max 64 chars");
         }
 
+        // Optional org placement, validated BEFORE any filesystem effect.
+        // `reports_to` must name an existing agent (the supervisor hierarchy
+        // drives team rosters + channel-token cascade); `department` follows
+        // the WP7 allowlist. Empty = none, matching the field defaults.
+        let reports_to = params
+            .get("reports_to")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !reports_to.is_empty() {
+            if reports_to == name {
+                return WsFrame::error_response("", "上級不能是自己");
+            }
+            let exists = self
+                .registry
+                .read()
+                .await
+                .list()
+                .iter()
+                .any(|a| a.config.agent.name == reports_to);
+            if !exists {
+                return WsFrame::error_response(
+                    "",
+                    &format!("上級 AI 員工「{reports_to}」不存在"),
+                );
+            }
+        }
+        let department = params
+            .get("department")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !department.is_empty() && !duduclaw_core::is_valid_department(&department) {
+            return WsFrame::error_response(
+                "",
+                "部門名稱只能使用英數字、'-'、'_'（1–64 字元）",
+            );
+        }
+
         // Cloud-tier agent cap (self-host is never capped — Apache 2.0).
         let agent_count = self.registry.read().await.list().len();
         if let Some(msg) = self.tier_limit_message("agent", agent_count).await {
             return WsFrame::error_response("", &msg);
-        }
-
-        // If creating as main, demote the current main agent first
-        if role == "main" {
-            if let Err(e) = self.demote_current_main(name).await {
-                return WsFrame::error_response("", &e);
-            }
         }
 
         // Create agent directory and files. Own the agents-dir path and release
@@ -3827,12 +4250,31 @@ impl MethodHandler {
         let agents_dir = self.registry.read().await.agents_dir().to_path_buf();
         let agent_dir = agents_dir.join(name);
 
-        if agent_dir.exists() {
-            return WsFrame::error_response("", &format!("Agent '{name}' already exists"));
+        // Atomic directory claim: `create_dir` (not `create_dir_all`) fails on
+        // AlreadyExists, so two concurrent creates can't both win the name.
+        if let Err(e) = tokio::fs::create_dir_all(&agents_dir).await {
+            return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
+        }
+        if let Err(e) = tokio::fs::create_dir(&agent_dir).await {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                return WsFrame::error_response("", &format!("Agent '{name}' already exists"));
+            }
+            return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
+        }
+
+        // If creating as main, demote the current main agent — only AFTER the
+        // name claim succeeded, so a doomed create (name collision) can no
+        // longer demote the live main as a side effect.
+        if role == "main" {
+            if let Err(e) = self.demote_current_main(name).await {
+                let _ = tokio::fs::remove_dir_all(&agent_dir).await;
+                return WsFrame::error_response("", &e);
+            }
         }
 
         let skills_dir = agent_dir.join("SKILLS");
         if let Err(e) = tokio::fs::create_dir_all(&skills_dir).await {
+            let _ = tokio::fs::remove_dir_all(&agent_dir).await;
             return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
         }
 
@@ -3843,7 +4285,8 @@ impl MethodHandler {
             role = role
             status = "active"
             trigger = trigger
-            reports_to = ""
+            reports_to = reports_to
+            department = department
             icon = "🤖"
 
             [model]
@@ -3946,6 +4389,512 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({
             "success": true,
             "agent": { "name": name, "display_name": display_name, "role": role, "status": "active" }
+        }))
+    }
+
+    // ── Premium team templates ─────────────────────────────────────────────
+    // Dashboard onboarding flow: the admin stages an industry (backend
+    // prepares the department templates, creates NOTHING), then creates each
+    // agent one by one — picking a role, reviewing/editing SOUL.md (and
+    // optionally CONTRACT.toml / agent.toml) in a text editor. The
+    // cross-industry CEO kit is offered as the suggested first agent.
+
+    /// Gateway-side premium gate. Fail-closed: license runtime not booted,
+    /// locked tier, or any error all resolve to *locked*.
+    async fn premium_templates_unlocked(&self) -> bool {
+        match crate::license_runtime::global() {
+            Some(rt) => rt.check_feature("premium_templates").await,
+            None => false,
+        }
+    }
+
+    fn team_staging_path(&self) -> PathBuf {
+        self.home_dir.join("team_staging.json")
+    }
+
+    /// The industry the admin staged during onboarding, if any.
+    async fn read_staged_industry(&self) -> Option<String> {
+        let raw = tokio::fs::read_to_string(self.team_staging_path()).await.ok()?;
+        let v: Value = serde_json::from_str(&raw).ok()?;
+        let industry = v.get("industry")?.as_str()?;
+        if industry.is_empty() { None } else { Some(industry.to_string()) }
+    }
+
+    /// Resolve the premium templates dir behind the license gate, or the
+    /// standard locked/absent error frame.
+    async fn premium_dir_unlocked(&self) -> Result<PathBuf, WsFrame> {
+        if !self.premium_templates_unlocked().await {
+            return Err(WsFrame::error_response(
+                "",
+                "Premium 產業板模未解鎖：需要 Pro 以上授權",
+            ));
+        }
+        crate::premium_templates::find_premium_templates_dir().ok_or_else(|| {
+            WsFrame::error_response("", "此安裝未附 Premium 板模資源")
+        })
+    }
+
+    /// Build the roster payload for a (possibly absent) staged team: CEO kit
+    /// first, then front desk + workers, with `created` resolved against the
+    /// live registry so the UI can show which roles are already filled.
+    async fn team_roster_json(
+        &self,
+        premium_dir: &Path,
+        manifest: Option<&crate::premium_templates::TeamManifest>,
+    ) -> Value {
+        use crate::premium_templates as pt;
+        let existing: std::collections::HashSet<String> = self
+            .registry
+            .read()
+            .await
+            .list()
+            .iter()
+            .map(|a| a.config.agent.name.clone())
+            .collect();
+        let mut roles = Vec::new();
+        if let Ok(ceo) = pt::assemble_ceo(premium_dir) {
+            roles.push(json!({
+                "role_id": pt::CEO_ROLE_ID,
+                "kind": "ceo",
+                "name": ceo.name,
+                "display_name": ceo.display_name,
+                "summary": ceo.summary,
+                "created": existing.contains(&ceo.name),
+                "overlay_count": 0,
+            }));
+        }
+        if let Some(m) = manifest {
+            roles.push(json!({
+                "role_id": pt::FRONT_DESK_ROLE_ID,
+                "kind": "front_desk",
+                "name": m.front_desk.name,
+                "display_name": m.front_desk.display_name,
+                "summary": m.front_desk.summary,
+                "created": existing.contains(&m.front_desk.name),
+                "overlay_count": 0,
+            }));
+            for w in &m.workers {
+                roles.push(json!({
+                    "role_id": w.name,
+                    "kind": "worker",
+                    "kit": w.kit,
+                    "name": w.name,
+                    "display_name": w.display_name,
+                    "summary": w.summary,
+                    "created": existing.contains(&w.name),
+                    "overlay_count": w.overlay.len(),
+                }));
+            }
+        }
+        json!({
+            "industry": manifest.map(|m| m.industry.clone()),
+            "label": manifest.map(|m| m.label.clone()),
+            "roles": roles,
+            "humans": manifest
+                .map(|m| m.humans.iter()
+                    .map(|h| json!({ "title": h.title, "summary": h.summary }))
+                    .collect::<Vec<_>>())
+                .unwrap_or_default(),
+            "excluded": manifest
+                .map(|m| m.excluded.iter()
+                    .map(|e| json!({ "kit": e.kit, "reason": e.reason }))
+                    .collect::<Vec<_>>())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// `templates.industries` — list industries that ship a team manifest.
+    /// Never errors on locked/absent: the UI needs the upsell flags.
+    async fn handle_templates_industries(&self) -> WsFrame {
+        use crate::premium_templates as pt;
+        let unlocked = self.premium_templates_unlocked().await;
+        let dir = pt::find_premium_templates_dir();
+        let staged = self.read_staged_industry().await;
+        let (industries, ceo, present) = match &dir {
+            Some(d) => {
+                let list = pt::list_team_industries(d);
+                let present = !list.is_empty() || pt::ceo_available(d);
+                if unlocked {
+                    let ceo = pt::ceo_available(d);
+                    (list, ceo, present)
+                } else {
+                    (Vec::new(), false, present)
+                }
+            }
+            None => (Vec::new(), false, false),
+        };
+        WsFrame::ok_response("", json!({
+            "unlocked": unlocked,
+            "present_but_locked": !unlocked && present,
+            "staged": staged,
+            "ceo_available": ceo,
+            "industries": industries.iter().map(|t| json!({
+                "industry": t.industry,
+                "label": t.label,
+                "pack": t.pack,
+                "worker_count": t.worker_count,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// `templates.stage` — record the chosen industry and return its roster.
+    /// Prepares templates only; creates NO agents (the admin creates each one
+    /// explicitly afterwards).
+    async fn handle_templates_stage(&self, params: Value) -> WsFrame {
+        use crate::premium_templates as pt;
+        let industry = params.get("industry").and_then(|v| v.as_str()).unwrap_or("");
+        let premium_dir = match self.premium_dir_unlocked().await {
+            Ok(d) => d,
+            Err(frame) => return frame,
+        };
+        let manifest = match pt::load_team_manifest(&premium_dir, industry) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(industry, error = %e, "templates.stage: manifest load failed");
+                return WsFrame::error_response(
+                    "",
+                    &format!("無法載入產業板模：{}", scrub_premium_path(&e, &premium_dir)),
+                );
+            }
+        };
+        let staging = serde_json::to_string_pretty(&json!({
+            "industry": manifest.industry,
+            "staged_at": Utc::now().to_rfc3339(),
+        }))
+        .unwrap_or_default();
+        // Atomic write — same temp+rename discipline as agent.toml.
+        let path = self.team_staging_path();
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = tokio::fs::write(&tmp, &staging).await {
+            return WsFrame::error_response("", &format!("Failed to write staging: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return WsFrame::error_response("", &format!("Failed to commit staging: {e}"));
+        }
+        info!(industry, "team templates staged");
+        let roster = self.team_roster_json(&premium_dir, Some(&manifest)).await;
+        WsFrame::ok_response("", json!({ "success": true, "roster": roster }))
+    }
+
+    /// `templates.roster` — the staged (or explicitly named) team's roster.
+    /// With nothing staged, still returns the CEO kit so the create dialog
+    /// can offer it as the first-agent template.
+    async fn handle_templates_roster(&self, params: Value) -> WsFrame {
+        use crate::premium_templates as pt;
+        let premium_dir = match self.premium_dir_unlocked().await {
+            Ok(d) => d,
+            Err(frame) => return frame,
+        };
+        let industry = match params.get("industry").and_then(|v| v.as_str()) {
+            Some(i) if !i.is_empty() => Some(i.to_string()),
+            _ => self.read_staged_industry().await,
+        };
+        let manifest = match &industry {
+            Some(ind) => match pt::load_team_manifest(&premium_dir, ind) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    warn!(industry = %ind, error = %e, "templates.roster: manifest load failed");
+                    return WsFrame::error_response(
+                        "",
+                        &format!("無法載入產業板模：{}", scrub_premium_path(&e, &premium_dir)),
+                    );
+                }
+            },
+            None => None,
+        };
+        let roster = self.team_roster_json(&premium_dir, manifest.as_ref()).await;
+        WsFrame::ok_response("", roster)
+    }
+
+    /// Assemble the deploy-ready default files for a role (shared by
+    /// `templates.role` and `templates.create_agent`).
+    async fn assemble_template_role(
+        &self,
+        premium_dir: &Path,
+        params: &Value,
+        role_id: &str,
+    ) -> Result<crate::premium_templates::AssembledRole, String> {
+        use crate::premium_templates as pt;
+        if role_id == pt::CEO_ROLE_ID {
+            return pt::assemble_ceo(premium_dir);
+        }
+        let industry = match params.get("industry").and_then(|v| v.as_str()) {
+            Some(i) if !i.is_empty() => i.to_string(),
+            _ => self
+                .read_staged_industry()
+                .await
+                .ok_or_else(|| "尚未選擇產業（請先備妥產業板模）".to_string())?,
+        };
+        let manifest = pt::load_team_manifest(premium_dir, &industry)?;
+        pt::assemble_role(premium_dir, &manifest, role_id)
+    }
+
+    /// `templates.role` — the editable file set for one role: SOUL.md prompt
+    /// (text-editor ready), CONTRACT.toml with overlay applied, agent.toml
+    /// with identity pre-wired.
+    async fn handle_templates_role(&self, params: Value) -> WsFrame {
+        let role_id = params.get("role_id").and_then(|v| v.as_str()).unwrap_or("");
+        if role_id.is_empty() {
+            return WsFrame::error_response("", "role_id is required");
+        }
+        let premium_dir = match self.premium_dir_unlocked().await {
+            Ok(d) => d,
+            Err(frame) => return frame,
+        };
+        match self.assemble_template_role(&premium_dir, &params, role_id).await {
+            Ok(r) => WsFrame::ok_response("", json!({
+                "role_id": r.role_id,
+                "kind": r.kind.as_str(),
+                "name": r.name,
+                "display_name": r.display_name,
+                "trigger": r.trigger,
+                "reports_to": r.reports_to,
+                "summary": r.summary,
+                "soul_md": r.soul_md,
+                "contract_toml": r.contract_toml,
+                "agent_toml": r.agent_toml,
+                "has_extras": r.extras_dir.is_some(),
+            })),
+            Err(e) => {
+                warn!(role_id, error = %e, "templates.role: assembly failed");
+                WsFrame::error_response(
+                    "",
+                    &format!("無法組裝角色板模：{}", scrub_premium_path(&e, &premium_dir)),
+                )
+            }
+        }
+    }
+
+    /// `templates.create_agent` — create ONE agent from a (possibly edited)
+    /// role template. Admin-edited SOUL.md is taken as-is; edited
+    /// CONTRACT.toml / agent.toml must still parse (fail-closed: an invalid
+    /// document is rejected, nothing is written). `[agent].name` is always
+    /// forced to the final agent name so the directory and config agree.
+    async fn handle_templates_create_agent(&self, params: Value) -> WsFrame {
+        use crate::premium_templates as pt;
+        let role_id = params.get("role_id").and_then(|v| v.as_str()).unwrap_or("");
+        if role_id.is_empty() {
+            return WsFrame::error_response("", "role_id is required");
+        }
+        let premium_dir = match self.premium_dir_unlocked().await {
+            Ok(d) => d,
+            Err(frame) => return frame,
+        };
+        let assembled = match self.assemble_template_role(&premium_dir, &params, role_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(role_id, error = %e, "templates.create_agent: assembly failed");
+                return WsFrame::error_response(
+                    "",
+                    &format!("無法組裝角色板模：{}", scrub_premium_path(&e, &premium_dir)),
+                );
+            }
+        };
+
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&assembled.name)
+            .to_string();
+        if !is_valid_agent_id(&name) {
+            return WsFrame::error_response(
+                "",
+                "Agent name must be lowercase alphanumeric with hyphens, max 64 chars",
+            );
+        }
+        let display_name = params.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
+        let trigger = params.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Optional org placement overrides. Absent/empty ⇒ keep the template's
+        // wiring (workers already report to the pack's front desk). A non-empty
+        // `reports_to` must name an existing agent; `department` follows the
+        // WP7 allowlist (validated again inside the identity patch).
+        let reports_to_override = params
+            .get("reports_to")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(rt) = &reports_to_override {
+            if *rt == name {
+                return WsFrame::error_response("", "上級不能是自己");
+            }
+            let exists = self
+                .registry
+                .read()
+                .await
+                .list()
+                .iter()
+                .any(|a| a.config.agent.name == *rt);
+            if !exists {
+                return WsFrame::error_response("", &format!("上級 AI 員工「{rt}」不存在"));
+            }
+        }
+        let department_override = params
+            .get("department")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        // SOUL.md: the admin's edited prompt wins; empty falls back to the
+        // template. Cap defensively (CJK-safe char count).
+        let soul_md = params
+            .get("soul_md")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| assembled.soul_md.clone());
+        if soul_md.chars().count() > 100_000 {
+            return WsFrame::error_response("", "SOUL.md 內容過長（上限 100k 字元）");
+        }
+
+        // CONTRACT.toml: must parse or we refuse to write anything.
+        let contract_toml = params
+            .get("contract_toml")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| assembled.contract_toml.clone());
+        if contract_toml.chars().count() > 64_000 {
+            return WsFrame::error_response("", "CONTRACT.toml 內容過長（上限 64k 字元）");
+        }
+        if let Err(e) = contract_toml.parse::<toml::Table>() {
+            return WsFrame::error_response("", &format!("CONTRACT.toml 格式錯誤，未寫入：{e}"));
+        }
+
+        // agent.toml: parse-validate + force identity fields.
+        let agent_src = params
+            .get("agent_toml")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| assembled.agent_toml.clone());
+        if agent_src.chars().count() > 64_000 {
+            return WsFrame::error_response("", "agent.toml 內容過長（上限 64k 字元）");
+        }
+        let agent_toml = match pt::override_agent_identity(
+            &agent_src,
+            &name,
+            display_name,
+            trigger,
+            reports_to_override.as_deref(),
+            department_override.as_deref(),
+        ) {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &format!("agent.toml 格式錯誤，未寫入：{e}")),
+        };
+        let parsed_agent: toml::Table = match agent_toml.parse() {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &format!("agent.toml 格式錯誤，未寫入：{e}")),
+        };
+        let final_role = parsed_agent
+            .get("agent")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("role"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("specialist")
+            .to_string();
+
+        // Cloud-tier agent cap (self-host is never capped — Apache 2.0).
+        let agent_count = self.registry.read().await.list().len();
+        if let Some(msg) = self.tier_limit_message("agent", agent_count).await {
+            return WsFrame::error_response("", &msg);
+        }
+
+        let agents_dir = self.registry.read().await.agents_dir().to_path_buf();
+        let agent_dir = agents_dir.join(&name);
+
+        // Atomic directory claim: `create_dir` (not `create_dir_all`) fails on
+        // AlreadyExists, so two concurrent creates can't both win the name.
+        if let Err(e) = tokio::fs::create_dir_all(&agents_dir).await {
+            return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
+        }
+        if let Err(e) = tokio::fs::create_dir(&agent_dir).await {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                return WsFrame::error_response("", &format!("Agent '{name}' already exists"));
+            }
+            return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
+        }
+
+        // Creating a new main (CEO / front desk) demotes the current one —
+        // only AFTER the name claim succeeded, so a doomed create can no
+        // longer demote the live main as a side effect.
+        if final_role == "main" {
+            if let Err(e) = self.demote_current_main(&name).await {
+                let _ = tokio::fs::remove_dir_all(&agent_dir).await;
+                return WsFrame::error_response("", &e);
+            }
+        }
+
+        // Write SOUL.md / CONTRACT.toml / extras first; the atomic agent.toml
+        // rename comes LAST as the registry-visible commit point. Any failure
+        // before that point removes the whole directory — no half-created
+        // agent (one missing its reviewed CONTRACT) can ever be scanned in.
+        let write_result: Result<Option<String>, String> = async {
+            tokio::fs::create_dir_all(agent_dir.join("SKILLS"))
+                .await
+                .map_err(|e| format!("Failed to create directory: {e}"))?;
+            tokio::fs::write(agent_dir.join("SOUL.md"), &soul_md)
+                .await
+                .map_err(|e| format!("Failed to write SOUL.md: {e}"))?;
+            tokio::fs::write(agent_dir.join("CONTRACT.toml"), &contract_toml)
+                .await
+                .map_err(|e| format!("Failed to write CONTRACT.toml: {e}"))?;
+
+            // Front desk carries the industry pack's knowledge extras
+            // (FAQ.json + wiki/). Best-effort: a copy failure is surfaced as a
+            // warning but doesn't abort the create.
+            let mut extras_warning: Option<String> = None;
+            if let Some(src) = &assembled.extras_dir {
+                if let Err(e) = copy_template_extras(src, &agent_dir).await {
+                    warn!(agent = %name, error = %e, "template extras copy failed");
+                    extras_warning = Some("知識檔（FAQ/wiki）複製失敗，可稍後手動補上".to_string());
+                }
+            }
+
+            let agent_toml_path = agent_dir.join("agent.toml");
+            let agent_toml_tmp = agent_toml_path.with_extension("toml.tmp");
+            tokio::fs::write(&agent_toml_tmp, &agent_toml)
+                .await
+                .map_err(|e| format!("Failed to write agent.toml.tmp: {e}"))?;
+            tokio::fs::rename(&agent_toml_tmp, &agent_toml_path)
+                .await
+                .map_err(|e| format!("Failed to commit agent.toml: {e}"))?;
+            Ok(extras_warning)
+        }
+        .await;
+        let extras_warning = match write_result {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&agent_dir).await;
+                return WsFrame::error_response("", &e);
+            }
+        };
+
+        // Same protections as agents.create: file-guard hook + registry rescan.
+        let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
+        if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await {
+            warn!(agent = %name, error = %e, "Failed to install agent-file-guard hook on templates.create_agent");
+        }
+        {
+            let mut reg = self.registry.write().await;
+            if let Err(e) = reg.scan().await {
+                warn!(name, error = %e, "agent created but registry rescan failed");
+            }
+        }
+
+        info!(name, role_id, "Agent created from premium template");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "warning": extras_warning,
+            "agent": {
+                "name": name,
+                "role": final_role,
+                "role_id": role_id,
+            }
         }))
     }
 
@@ -4994,7 +5943,16 @@ impl MethodHandler {
     async fn handle_redaction_get(&self) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
         let table = self.read_config_table(&config_path).await;
-        WsFrame::ok_response("", redaction_table_to_response(&table))
+        let mut resp = redaction_table_to_response(&table);
+        if let Some(obj) = resp.as_object_mut() {
+            // Field-picker catalogue: which profiles exist and which PII
+            // categories (fields) each one covers.
+            obj.insert(
+                "available_profiles".into(),
+                Value::Array(redaction_available_profiles(&self.home_dir)),
+            );
+        }
+        WsFrame::ok_response("", resp)
     }
 
     /// `redaction.update` — atomic write of config.toml `[redaction]`.
@@ -5016,8 +5974,55 @@ impl MethodHandler {
         if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
             return WsFrame::error_response("", &e);
         }
-        info!(?changes, "redaction.update completed");
-        WsFrame::ok_response("", json!({ "success": true, "changes": changes }))
+
+        // ── Hot reload ── rebuild the live pipeline from the just-written
+        // config so profile/field/source changes apply immediately (no
+        // gateway restart). A rebuild failure leaves the previous live
+        // manager untouched and is reported honestly in the response.
+        let parsed: Option<duduclaw_redaction::RedactionConfig> =
+            toml::to_string(&table).ok().and_then(|s| {
+                #[derive(serde::Deserialize)]
+                struct Wrap {
+                    #[serde(default)]
+                    redaction: duduclaw_redaction::RedactionConfig,
+                }
+                toml::from_str::<Wrap>(&s).ok().map(|w| w.redaction)
+            });
+        let (applied, warning) = match parsed {
+            Some(rcfg) if rcfg.enabled => {
+                match crate::redaction_integration::build_manager_from_home(&self.home_dir, rcfg)
+                {
+                    Ok(m) => {
+                        info!(rules = m.engine().rule_count(), "redaction hot-reloaded");
+                        self.swap_redaction_manager(Some(m)).await;
+                        (true, None)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "redaction config saved but hot reload FAILED — live pipeline unchanged");
+                        (
+                            false,
+                            Some(format!(
+                                "設定已儲存，但即時套用失敗（目前仍沿用變更前的規則）：{e}"
+                            )),
+                        )
+                    }
+                }
+            }
+            Some(_) => {
+                self.swap_redaction_manager(None).await;
+                (true, None)
+            }
+            None => (
+                false,
+                Some("設定已儲存，但無法解析新設定以即時套用，請重啟 gateway".to_string()),
+            ),
+        };
+
+        info!(?changes, applied, "redaction.update completed");
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "changes": changes, "applied": applied, "warning": warning }),
+        )
     }
 
     // ── IDR: [identity] in config.toml (RFC-21 §1 dashboard surface) ──────────
@@ -6210,6 +7215,58 @@ impl MethodHandler {
     /// decoded ceiling, and stores the raw bytes at `agents/<id>/avatar.<ext>`
     /// (atomic temp + rename). Any prior avatar of a different extension is
     /// removed so exactly one `avatar.*` exists.
+    /// `agents.set_outfit` — save (or clear, with `outfit: null`) the agent's
+    /// wardrobe composition. The outfit is a small slot→item-id map rendered
+    /// client-side (SVG roster + PixiJS world); the server validates shape and
+    /// vocabulary-safe characters, then persists `agents/<id>/outfit.json`
+    /// atomically. It never affects agent behaviour — purely cosmetic.
+    async fn handle_agents_set_outfit(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        {
+            let reg = self.registry.read().await;
+            if reg.get(&agent_id).is_none() {
+                return WsFrame::error_response("", &format!("Agent not found: {agent_id}"));
+            }
+        }
+        let agent_dir = self.home_dir.join("agents").join(&agent_id);
+        let outfit_path = agent_dir.join("outfit.json");
+
+        let Some(outfit) = params.get("outfit") else {
+            return WsFrame::error_response("", "Missing 'outfit' parameter (object or null)");
+        };
+        // `outfit: null` clears the saved look (back to the seeded default).
+        if outfit.is_null() {
+            if outfit_path.exists() {
+                if let Err(e) = tokio::fs::remove_file(&outfit_path).await {
+                    return WsFrame::error_response("", &format!("Failed to clear outfit: {e}"));
+                }
+            }
+            return WsFrame::ok_response("", json!({ "success": true, "agent_id": agent_id, "outfit": Value::Null }));
+        }
+        let normalized = match normalize_outfit(outfit) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        let body = serde_json::to_string_pretty(&normalized).unwrap_or_default();
+        let tmp = outfit_path.with_extension("json.tmp");
+        if let Err(e) = tokio::fs::write(&tmp, &body).await {
+            return WsFrame::error_response("", &format!("Failed to write outfit: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &outfit_path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return WsFrame::error_response("", &format!("Failed to commit outfit: {e}"));
+        }
+        info!(agent = %agent_id, "agent outfit saved");
+        WsFrame::ok_response("", json!({ "success": true, "agent_id": agent_id, "outfit": normalized }))
+    }
+
     async fn handle_agents_set_avatar(&self, params: Value) -> WsFrame {
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
@@ -6370,6 +7427,7 @@ impl MethodHandler {
                     // + a cheap boolean the list view also uses.
                     "has_avatar": self.agent_has_avatar(&cfg.agent.name),
                     "avatar": self.agent_avatar_data_uri(&cfg.agent.name),
+                    "outfit": read_agent_outfit(&self.home_dir.join("agents").join(&cfg.agent.name)),
                     "department": cfg.agent.department,
                     "trigger": cfg.agent.trigger,
                     "icon": cfg.agent.icon,
@@ -8281,21 +9339,88 @@ impl MethodHandler {
 
     // ── Skill Vetting & Install ──────────────────────────────
 
-    /// Convert a GitHub URL to a raw content URL for SKILL.md.
-    fn github_to_raw_url(url: &str) -> String {
-        // https://github.com/user/repo -> https://raw.githubusercontent.com/user/repo/HEAD/SKILL.md
-        // https://github.com/user/repo/blob/main/SKILL.md -> raw URL
+    /// Resolve a user-supplied skill source URL to the raw-content URL to fetch.
+    ///
+    /// Accepts GitHub repo/blob URLs, GitHub gists, GitLab repo/blob URLs, and
+    /// any direct https URL to raw SKILL.md content. The scheme/host anchor
+    /// checks use the parsed URL host (never substring matching) so
+    /// `github.com.evil.example` cannot impersonate GitHub.
+    fn resolve_skill_source_url(url: &str) -> Result<String, String> {
         let trimmed = url.trim().trim_end_matches('/');
-        if trimmed.contains("/blob/") {
-            // Direct file URL: convert /blob/ to raw
-            trimmed
-                .replace("github.com", "raw.githubusercontent.com")
-                .replace("/blob/", "/")
-        } else {
-            // Repo root: append HEAD/SKILL.md
-            let base = trimmed.replace("github.com", "raw.githubusercontent.com");
-            format!("{base}/HEAD/SKILL.md")
+        let parsed = reqwest::Url::parse(trimmed).map_err(|e| format!("invalid URL: {e}"))?;
+        if parsed.scheme() != "https" && parsed.scheme() != "http" {
+            return Err(format!("unsupported scheme '{}://'", parsed.scheme()));
         }
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        let path = parsed.path().trim_end_matches('/');
+
+        Ok(match host.as_str() {
+            // github.com/user/repo            -> raw HEAD/SKILL.md
+            // github.com/user/repo/blob/x/f.md -> raw file
+            "github.com" | "www.github.com" => {
+                if path.contains("/blob/") {
+                    format!(
+                        "https://raw.githubusercontent.com{}",
+                        path.replacen("/blob/", "/", 1)
+                    )
+                } else {
+                    format!("https://raw.githubusercontent.com{path}/HEAD/SKILL.md")
+                }
+            }
+            // gist.github.com/user/id -> gist raw (latest revision)
+            "gist.github.com" => format!("https://gist.githubusercontent.com{path}/raw"),
+            // gitlab.com/user/repo             -> raw HEAD/SKILL.md
+            // gitlab.com/user/repo/-/blob/x/f  -> /-/raw/x/f
+            "gitlab.com" | "www.gitlab.com" => {
+                if path.contains("/-/blob/") {
+                    format!("https://gitlab.com{}", path.replacen("/-/blob/", "/-/raw/", 1))
+                } else {
+                    format!("https://gitlab.com{path}/-/raw/HEAD/SKILL.md")
+                }
+            }
+            // Anything else: treat as a direct link to raw skill content
+            // (raw.githubusercontent.com, company file servers, ...).
+            _ => trimmed.to_string(),
+        })
+    }
+
+    /// Max bytes accepted when fetching remote skill content.
+    const SKILL_FETCH_MAX_BYTES: usize = 1024 * 1024;
+
+    /// Fetch a remote text resource with a byte cap and per-redirect SSRF
+    /// re-validation (a public URL must not be allowed to 302 into
+    /// 169.254.169.254 or the LAN). Shared by skill vetting and MCP import.
+    async fn fetch_remote_text(url: &str, max_bytes: usize) -> Result<String, String> {
+        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many redirects");
+            }
+            match crate::web_fetch::validate_url(attempt.url().as_str()) {
+                Ok(_) => attempt.follow(),
+                Err(e) => attempt.error(format!("redirect blocked: {e}")),
+            }
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .redirect(redirect_policy)
+            .user_agent("duduclaw-import")
+            .build()
+            .map_err(|e| format!("http client init failed: {e}"))?;
+
+        let resp = client.get(url).send().await.map_err(|e| format!("{e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+        if let Some(len) = resp.content_length() {
+            if len as usize > max_bytes {
+                return Err(format!("response too large ({len} bytes, max {max_bytes})"));
+            }
+        }
+        let bytes = resp.bytes().await.map_err(|e| format!("read failed: {e}"))?;
+        if bytes.len() > max_bytes {
+            return Err(format!("response too large ({} bytes, max {max_bytes})", bytes.len()));
+        }
+        String::from_utf8(bytes.to_vec()).map_err(|_| "response is not valid UTF-8 text".to_string())
     }
 
 
@@ -8305,30 +9430,30 @@ impl MethodHandler {
             _ => return WsFrame::error_response("", "Missing 'url' parameter"),
         };
 
-        // Fetch SKILL.md content from GitHub
-        let raw_url = Self::github_to_raw_url(url);
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
-
-        let content = match client.get(&raw_url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.text().await {
-                    Ok(text) => text,
-                    Err(e) => return WsFrame::error_response("", &format!("Failed to read response: {e}")),
-                }
-            }
-            Ok(resp) => {
-                return WsFrame::error_response(
-                    "",
-                    &format!("Failed to fetch SKILL.md: HTTP {}", resp.status()),
-                );
-            }
-            Err(e) => {
-                return WsFrame::error_response("", &format!("Failed to fetch SKILL.md: {e}"));
-            }
+        // Resolve GitHub/GitLab/gist/direct URLs to raw content, then gate the
+        // resolved target through the shared SSRF validator (blocks loopback,
+        // private ranges, cloud metadata endpoints, non-http schemes).
+        let raw_url = match Self::resolve_skill_source_url(url) {
+            Ok(u) => u,
+            Err(e) => return WsFrame::error_response("", &format!("Invalid skill source URL: {e}")),
         };
+        if let Err(e) = crate::web_fetch::validate_url(&raw_url) {
+            return WsFrame::error_response("", &format!("Skill source URL rejected: {e}"));
+        }
+        let content = match Self::fetch_remote_text(&raw_url, Self::SKILL_FETCH_MAX_BYTES).await {
+            Ok(text) => text,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to fetch skill content: {e}")),
+        };
+
+        // An HTML page means the URL points at a web view, not raw content —
+        // scanning rendered HTML would produce a garbage verdict.
+        let head = content.trim_start();
+        if head.starts_with("<!DOCTYPE") || head.starts_with("<!doctype") || head.starts_with("<html") {
+            return WsFrame::error_response(
+                "",
+                "URL returned an HTML page, not raw SKILL.md content. Use a raw file link (e.g. raw.githubusercontent.com) or the repo root.",
+            );
+        }
 
         // Extract skill name from frontmatter (best-effort)
         let skill_name = content
@@ -8415,75 +9540,444 @@ impl MethodHandler {
             );
         }
 
-        // Write content to a temp file for the install functions
-        let tmp_dir = std::env::temp_dir().join("duduclaw-skill-install");
-        if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-            return WsFrame::error_response("", &format!("Failed to create temp dir: {e}"));
-        }
-        let tmp_file = tmp_dir.join(format!("{skill_name}.md"));
-        if let Err(e) = std::fs::write(&tmp_file, &content) {
-            return WsFrame::error_response("", &format!("Failed to write temp file: {e}"));
-        }
-
-        let quarantine_dir = self.home_dir.join("quarantine");
-
-        let install_result = if scope == "global" {
-            duduclaw_agent::skill_loader::install_skill_global(
-                &tmp_file,
-                &self.home_dir,
-                &quarantine_dir,
-            )
-            .await
-        } else if let Some(dept) = scope.strip_prefix("department:") {
-            // WP7: `department:<dept>` installs into the shared department layer.
-            // Admin-gated like global (this RPC already requires admin).
-            duduclaw_agent::skill_loader::install_skill_department(
-                &tmp_file,
-                &self.home_dir,
-                dept,
-                &quarantine_dir,
-            )
-            .await
-        } else {
-            // scope is an agent_id — validate it
-            if !is_valid_agent_id(&scope) {
-                let _ = std::fs::remove_file(&tmp_file);
-                return WsFrame::error_response("", "Invalid agent_id for scope");
-            }
-            let agent_skills_dir = self.home_dir.join("agents").join(&scope).join("SKILLS");
-            duduclaw_agent::skill_loader::install_skill(
-                &tmp_file,
-                &agent_skills_dir,
-                &quarantine_dir,
-            )
-            .await
-        };
-
-        // Clean up temp file
-        let _ = std::fs::remove_file(&tmp_file);
-
-        match install_result {
-            Ok(parsed) => {
-                // Reload agent registry to pick up the new skill
-                let mut registry = self.registry.write().await;
-                if let Err(e) = registry.scan().await {
-                    warn!("Failed to rescan agents after skill install: {e}");
-                }
-
-                info!(
-                    skill = %parsed.meta.name,
-                    scope = %scope,
-                    url = %url,
-                    "Skill installed via dashboard"
-                );
-
+        match self.run_skill_install(&scope, &content, &skill_name).await {
+            Ok(installed_name) => {
+                info!(skill = %installed_name, scope = %scope, url = %url, "Skill installed via dashboard");
                 WsFrame::ok_response("", json!({
                     "success": true,
-                    "skill_name": parsed.meta.name,
+                    "skill_name": installed_name,
                     "scope": scope,
                 }))
             }
             Err(e) => WsFrame::error_response("", &format!("Install failed: {e}")),
+        }
+    }
+
+    /// Perform the on-disk skill install for an already-scanned, approved
+    /// content string. Shared by the direct admin path (`skills.install`) and
+    /// the approved-request execution path. Does NOT scan — the caller MUST
+    /// have run `scan_skill` and confirmed `passed` first.
+    async fn run_skill_install(
+        &self,
+        scope: &str,
+        content: &str,
+        skill_name: &str,
+    ) -> Result<String, String> {
+        let tmp_dir = std::env::temp_dir().join("duduclaw-skill-install");
+        std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create temp dir: {e}"))?;
+        let tmp_file = tmp_dir.join(format!("{skill_name}.md"));
+        std::fs::write(&tmp_file, content).map_err(|e| format!("write temp file: {e}"))?;
+
+        let quarantine_dir = self.home_dir.join("quarantine");
+        let install_result = if scope == "global" {
+            duduclaw_agent::skill_loader::install_skill_global(&tmp_file, &self.home_dir, &quarantine_dir).await
+        } else if let Some(dept) = scope.strip_prefix("department:") {
+            duduclaw_agent::skill_loader::install_skill_department(&tmp_file, &self.home_dir, dept, &quarantine_dir).await
+        } else {
+            if !is_valid_agent_id(scope) {
+                let _ = std::fs::remove_file(&tmp_file);
+                return Err("Invalid agent_id for scope".into());
+            }
+            let agent_skills_dir = self.home_dir.join("agents").join(scope).join("SKILLS");
+            duduclaw_agent::skill_loader::install_skill(&tmp_file, &agent_skills_dir, &quarantine_dir).await
+        };
+        let _ = std::fs::remove_file(&tmp_file);
+
+        match install_result {
+            Ok(parsed) => {
+                let mut registry = self.registry.write().await;
+                if let Err(e) = registry.scan().await {
+                    warn!("Failed to rescan agents after skill install: {e}");
+                }
+                Ok(parsed.meta.name)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    // ── Install approval requests (non-admin Skill / MCP install) ───
+    //
+    // A non-admin who wants to install a Skill/MCP files a request that
+    // carries the item's function + security-scan verdict; it flows through a
+    // signature chain (employee → manager → admin; manager → admin) before the
+    // install runs. See `install_requests.rs` for the store + role logic.
+
+    /// Extract a one-line functional description from SKILL.md frontmatter
+    /// (`description:` field, else the first non-frontmatter prose line).
+    fn skill_description_from_content(content: &str) -> String {
+        if let Some(d) = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("description:"))
+            .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+        {
+            if !d.is_empty() {
+                return duduclaw_core::truncate_chars(&d, 300);
+            }
+        }
+        let prose = content
+            .lines()
+            .skip_while(|l| l.trim() == "---" || l.contains(':') || l.trim().is_empty())
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        duduclaw_core::truncate_chars(prose, 300)
+    }
+
+    fn scan_findings_json(scan: &crate::skill_lifecycle::security_scanner::SecurityScanResult) -> Value {
+        json!(scan.findings.iter().map(|f| json!({
+            "category": format!("{:?}", f.category),
+            "severity": format!("{:?}", f.severity).to_lowercase(),
+            "description": f.description,
+            "pattern": f.matched_pattern,
+        })).collect::<Vec<_>>())
+    }
+
+    /// File a Skill install request (non-admin). Scans fail-closed: a
+    /// risk ≥ High skill is rejected outright (no request is created).
+    /// Look up a user's department from the user DB (`None` if unset / no DB).
+    async fn user_department(&self, user_id: &str) -> Option<String> {
+        let db = self.user_db.read().await.as_ref()?.clone();
+        db.get_user(user_id)
+            .ok()
+            .flatten()
+            .and_then(|u| u.department)
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+    }
+
+    async fn handle_skills_install_request(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let scope = match params.get("scope").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'scope' parameter"),
+        };
+        let content = match params.get("content").and_then(|v| v.as_str()) {
+            Some(c) if !c.is_empty() => c.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'content' parameter"),
+        };
+
+        // Non-admins scope-install only where they have access. `global` /
+        // `department:*` are org-wide and reserved for the eventual admin
+        // signer; an employee/manager may only *request* into an agent they can
+        // reach. (The admin who signs can still see the requested scope.)
+        // Validate agent scope binding for non-global scopes.
+        if scope != "global" && !scope.starts_with("department:") {
+            if let Err(e) = acl::require_agent_access(ctx, &scope, AccessLevel::Operator) {
+                return WsFrame::error_response("", &e);
+            }
+        }
+
+        let skill_name = content
+            .lines()
+            .find(|l| l.starts_with("name:"))
+            .and_then(|l| l.strip_prefix("name:"))
+            .map(|n| n.trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let scan = crate::skill_lifecycle::security_scanner::scan_skill(&content, None);
+        if !scan.passed {
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "安全掃描未通過，無法送出申請：風險 {:?}，{} 項問題",
+                    scan.risk_level,
+                    scan.findings.len()
+                ),
+            );
+        }
+
+        let store = match crate::install_requests::InstallRequestStore::open(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &format!("open install requests: {e}")),
+        };
+        let description = Self::skill_description_from_content(&content);
+        let payload = json!({ "scope": scope, "content": content, "url": url });
+        let scan_json = Self::scan_findings_json(&scan);
+        let department = self.user_department(&ctx.user_id).await;
+        match store
+            .create(
+                "skill",
+                &skill_name,
+                &description,
+                &ctx.user_id,
+                &ctx.email,
+                &ctx.role.to_string(),
+                department.as_deref(),
+                &format!("{:?}", scan.risk_level),
+                &scan_json,
+                &payload,
+                crate::install_requests::DEFAULT_INSTALL_TTL_SECONDS,
+            )
+            .await
+        {
+            Ok(id) => {
+                let stage = if ctx.role == UserRole::Employee { "awaiting_manager" } else { "awaiting_admin" };
+                WsFrame::ok_response("", json!({
+                    "request_id": id,
+                    "status": "pending",
+                    "stage": stage,
+                    "scan": scan_json,
+                }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("建立申請失敗：{e}")),
+        }
+    }
+
+    /// File an MCP install request (non-admin). Scans the server definition
+    /// fail-closed before creating the request.
+    async fn handle_mcp_install_request(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        use duduclaw_agent::mcp_template::McpServerDef;
+
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id");
+        }
+        // A requester must have operator access to the target agent.
+        if let Err(e) = acl::require_agent_access(ctx, &agent_id, AccessLevel::Operator) {
+            return WsFrame::error_response("", &e);
+        }
+        let server_name = match params.get("server_name").and_then(|v| v.as_str()) {
+            Some(s) if crate::mcp_scan::is_valid_mcp_server_name(s) => s.to_string(),
+            _ => return WsFrame::error_response("", "Invalid server_name (allowed: A-Za-z0-9._- max 64)"),
+        };
+        let def: McpServerDef = match params.get("server_def") {
+            Some(v) => match serde_json::from_value(v.clone()) {
+                Ok(d) => d,
+                Err(e) => return WsFrame::error_response("", &format!("Invalid server_def: {e}")),
+            },
+            None => return WsFrame::error_response("", "Missing 'server_def' parameter"),
+        };
+
+        let scan = crate::mcp_scan::scan_mcp_server_def(&server_name, &def);
+        if !scan.passed {
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "安全掃描未通過，無法送出申請：風險 {:?}，{} 項問題",
+                    scan.risk_level,
+                    scan.findings.len()
+                ),
+            );
+        }
+
+        let description = params
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|d| duduclaw_core::truncate_chars(d, 300))
+            .unwrap_or_else(|| format!("MCP server: {} {}", def.command, def.args.join(" ")));
+        let store = match crate::install_requests::InstallRequestStore::open(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &format!("open install requests: {e}")),
+        };
+        let payload = json!({
+            "agent_id": agent_id,
+            "server_name": server_name,
+            "server_def": def,
+            "add_to_catalog": params.get("add_to_catalog").and_then(|v| v.as_bool()).unwrap_or(false),
+            "description": description,
+            "source_url": params.get("source_url").and_then(|v| v.as_str()).unwrap_or(""),
+        });
+        let scan_json = Self::mcp_scan_to_json(&scan)["findings"].clone();
+        let title = format!("{server_name} → {agent_id}");
+        let department = self.user_department(&ctx.user_id).await;
+        match store
+            .create(
+                "mcp",
+                &title,
+                &description,
+                &ctx.user_id,
+                &ctx.email,
+                &ctx.role.to_string(),
+                department.as_deref(),
+                &format!("{:?}", scan.risk_level),
+                &scan_json,
+                &payload,
+                crate::install_requests::DEFAULT_INSTALL_TTL_SECONDS,
+            )
+            .await
+        {
+            Ok(id) => {
+                let stage = if ctx.role == UserRole::Employee { "awaiting_manager" } else { "awaiting_admin" };
+                WsFrame::ok_response("", json!({
+                    "request_id": id,
+                    "status": "pending",
+                    "stage": stage,
+                    "scan": scan_json,
+                }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("建立申請失敗：{e}")),
+        }
+    }
+
+    /// List install requests the caller (manager+) can currently act on.
+    /// Admin sees all pending; a manager sees only employee requests still
+    /// awaiting the manager gate AND belonging to the manager's own department
+    /// (a request with no department falls back to any manager).
+    async fn handle_install_requests_list(&self, ctx: &UserContext) -> WsFrame {
+        let store = match crate::install_requests::InstallRequestStore::open(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &format!("open install requests: {e}")),
+        };
+        let pending = match store.list_pending().await {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &format!("list: {e}")),
+        };
+        let is_admin = ctx.role == UserRole::Admin;
+        let mgr_dept = if is_admin { None } else { self.user_department(&ctx.user_id).await };
+        let actionable: Vec<Value> = pending
+            .iter()
+            .filter(|r| {
+                if is_admin {
+                    true
+                } else {
+                    // manager: employee requests still needing the manager gate,
+                    // routed to THIS manager's department.
+                    r.requester_role == "employee"
+                        && r.manager_by.is_none()
+                        && r.manager_may_sign(mgr_dept.as_deref())
+                }
+            })
+            .map(|r| r.to_json())
+            .collect();
+        WsFrame::ok_response("", json!({ "requests": actionable, "count": actionable.len() }))
+    }
+
+    /// The caller's own install requests (any authenticated user).
+    async fn handle_install_requests_mine(&self, ctx: &UserContext) -> WsFrame {
+        let store = match crate::install_requests::InstallRequestStore::open(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &format!("open install requests: {e}")),
+        };
+        match store.list_for_requester(&ctx.user_id).await {
+            Ok(rows) => {
+                let items: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
+                WsFrame::ok_response("", json!({ "requests": items, "count": items.len() }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("list mine: {e}")),
+        }
+    }
+
+    /// Decide an install request (manager+). On final approval the install is
+    /// executed server-side with a fail-closed re-scan.
+    async fn handle_install_requests_decide(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let id = match params.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "id is required"),
+        };
+        let approve = params.get("approve").and_then(|v| v.as_bool()).unwrap_or(false);
+        let reason = params.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        let store = match crate::install_requests::InstallRequestStore::open(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &format!("open install requests: {e}")),
+        };
+        let decider = format!("{}:{}", ctx.role, ctx.user_id);
+        let decider_dept = self.user_department(&ctx.user_id).await;
+        let outcome = match store
+            .decide(&id, &decider, &ctx.role.to_string(), decider_dept.as_deref(), approve, &reason)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        match outcome {
+            crate::install_requests::DecideOutcome::Denied => {
+                WsFrame::ok_response("", json!({ "status": "denied" }))
+            }
+            crate::install_requests::DecideOutcome::AdvancedToAdmin => {
+                WsFrame::ok_response("", json!({ "status": "pending", "stage": "awaiting_admin" }))
+            }
+            crate::install_requests::DecideOutcome::ReadyToExecute => {
+                let req = match store.get(&id).await {
+                    Ok(Some(r)) => r,
+                    _ => return WsFrame::error_response("", "approved, but the request vanished before execution"),
+                };
+                let exec = self.execute_approved_install(&req).await;
+                let ok = exec.is_ok();
+                let _ = store.mark_executed(&id, ok, exec.as_ref().err().map(|s| s.as_str())).await;
+                match exec {
+                    Ok(detail) => WsFrame::ok_response("", json!({
+                        "status": "approved",
+                        "executed": true,
+                        "detail": detail,
+                    })),
+                    Err(e) => WsFrame::ok_response("", json!({
+                        "status": "approved",
+                        "executed": false,
+                        // Honest partial: the signatures landed, execution failed.
+                        "warning": format!("已完成簽核，但安裝執行失敗：{e}"),
+                    })),
+                }
+            }
+        }
+    }
+
+    /// Run the actual install for a fully-approved request. Re-scans
+    /// fail-closed so a request whose target changed risk since filing (or a
+    /// tampered payload) is still blocked at execution time.
+    async fn execute_approved_install(
+        &self,
+        req: &crate::install_requests::InstallRequest,
+    ) -> Result<Value, String> {
+        match req.kind.as_str() {
+            "skill" => {
+                let scope = req.payload.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+                let content = req.payload.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if scope.is_empty() || content.is_empty() {
+                    return Err("request payload missing scope/content".into());
+                }
+                let scan = crate::skill_lifecycle::security_scanner::scan_skill(content, None);
+                if !scan.passed {
+                    return Err(format!("re-scan rejected skill: risk {:?}", scan.risk_level));
+                }
+                let skill_name = content
+                    .lines()
+                    .find(|l| l.starts_with("name:"))
+                    .and_then(|l| l.strip_prefix("name:"))
+                    .map(|n| n.trim().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let installed = self.run_skill_install(scope, content, &skill_name).await?;
+                Ok(json!({ "skill_name": installed, "scope": scope }))
+            }
+            "mcp" => {
+                use duduclaw_agent::mcp_template::{add_server_to_config, McpServerDef};
+                let agent_id = req.payload.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+                let server_name = req.payload.get("server_name").and_then(|v| v.as_str()).unwrap_or("");
+                let def: McpServerDef = req
+                    .payload
+                    .get("server_def")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .ok_or_else(|| "request payload missing server_def".to_string())?;
+                if !is_valid_agent_id(agent_id) || !crate::mcp_scan::is_valid_mcp_server_name(server_name) {
+                    return Err("invalid agent_id/server_name in payload".into());
+                }
+                let scan = crate::mcp_scan::scan_mcp_server_def(server_name, &def);
+                if !scan.passed {
+                    return Err(format!("re-scan rejected MCP server: risk {:?}", scan.risk_level));
+                }
+                let agent_dir = self.home_dir.join("agents").join(agent_id);
+                if !agent_dir.is_dir() {
+                    return Err(format!("agent '{agent_id}' not found"));
+                }
+                let ad = agent_dir.clone();
+                let sn = server_name.to_string();
+                let d = def.clone();
+                tokio::task::spawn_blocking(move || add_server_to_config(&ad, &sn, &d))
+                    .await
+                    .map_err(|e| format!("join: {e}"))??;
+                if req.payload.get("add_to_catalog").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let description = req.payload.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    let source_url = req.payload.get("source_url").and_then(|v| v.as_str()).unwrap_or("");
+                    let _ = self.append_to_user_marketplace(server_name, &def, description, source_url).await;
+                }
+                Ok(json!({ "server_name": server_name, "agent_id": agent_id }))
+            }
+            other => Err(format!("unknown request kind: {other}")),
         }
     }
 
@@ -11886,15 +13380,30 @@ impl MethodHandler {
     /// step so we can flag detected vs. not-installed backends. Viewer-level:
     /// returns only presence booleans + subscription tier, never any secret.
     async fn handle_runtime_detect(&self) -> WsFrame {
-        let home = &self.home_dir;
-        let claude_cli = duduclaw_core::which_claude_in_home(home).is_some();
-        let codex = duduclaw_core::which_codex_in_home(home).is_some();
-        let gemini = duduclaw_core::which_gemini_in_home(home).is_some();
-        let antigravity = duduclaw_core::which_agy_in_home(home).is_some();
+        // `which_*_in_home` expects the OS USER home (`~`) — its candidates are
+        // `~/.bun/bin`, `~/.nvm/...`, etc. Passing `self.home_dir`
+        // (`~/.duduclaw`) here made every HOME-rooted install invisible; only
+        // the fixed absolute paths (Homebrew) could ever hit. PATH-first
+        // (`which_*()`) so terminal-launched gateways see what the user sees.
+        let user_home = std::path::PathBuf::from(duduclaw_core::platform::home_dir());
+        let claude_bin = duduclaw_core::which_claude()
+            .or_else(|| duduclaw_core::which_claude_in_home(&user_home));
+        let claude_cli = claude_bin.is_some();
+        let codex = duduclaw_core::which_codex()
+            .or_else(|| duduclaw_core::which_codex_in_home(&user_home))
+            .is_some();
+        let gemini = duduclaw_core::which_gemini()
+            .or_else(|| duduclaw_core::which_gemini_in_home(&user_home))
+            .is_some();
+        let antigravity = duduclaw_core::which_agy()
+            .or_else(|| duduclaw_core::which_agy_in_home(&user_home))
+            .is_some();
         // R4: `which_grok*` also probes the third-party `grok-cli` fallback.
-        let grok =
-            duduclaw_core::which_grok().or_else(|| duduclaw_core::which_grok_in_home(home)).is_some();
-        let (claude_oauth, claude_subscription) = detect_claude_oauth();
+        let grok = duduclaw_core::which_grok()
+            .or_else(|| duduclaw_core::which_grok_in_home(&user_home))
+            .is_some();
+        let (claude_oauth, claude_subscription) =
+            detect_claude_oauth(claude_bin.as_deref()).await;
 
         WsFrame::ok_response("", json!({
             "claude_cli": claude_cli,
@@ -13498,6 +15007,7 @@ impl MethodHandler {
                     "status": format!("{:?}", cfg.agent.status).to_lowercase(),
                     "archived": archived,
                     "has_avatar": self.agent_has_avatar(&cfg.agent.name),
+                    "outfit": read_agent_outfit(&self.home_dir.join("agents").join(&cfg.agent.name)),
                     "department": cfg.agent.department,
                     "trigger": cfg.agent.trigger,
                     "icon": cfg.agent.icon,
@@ -13566,6 +15076,257 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "agents": agents }))
     }
 
+    // ── Personal dashboard (WP15 MVP): widget catalog + per-user layout ──
+
+    /// Widgets a given ROLE may see (fail-closed: an unauthorized widget id is
+    /// never sent, and `layout.set` re-validates against this same set).
+    fn dashboard_widgets_for_role(role: UserRole) -> Vec<(&'static str, &'static str)> {
+        const CATALOG: &[(&str, &str, UserRole)] = &[
+            ("needs_me", "manager", UserRole::Manager),
+            ("my_agents", "employee", UserRole::Employee),
+            ("recent_activity", "employee", UserRole::Employee),
+            ("my_tasks", "employee", UserRole::Employee),
+            ("channel_health", "admin", UserRole::Admin),
+        ];
+        CATALOG
+            .iter()
+            .filter(|(_, _, min)| role.level() >= min.level())
+            .map(|(id, min_str, _)| (*id, *min_str))
+            .collect()
+    }
+
+    /// Widgets the CALLER may see.
+    fn dashboard_widgets_for(ctx: &UserContext) -> Vec<(&'static str, &'static str)> {
+        Self::dashboard_widgets_for_role(ctx.role)
+    }
+
+    /// Read a saved layout file (shared by `get` and the read-only `view`).
+    async fn read_dashboard_layout(&self, user_id: &str) -> Result<Value, String> {
+        let path = self.dashboard_layout_path(user_id)?;
+        Ok(tokio::fs::read_to_string(&path)
+            .await
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or(Value::Null))
+    }
+
+    /// `users.subordinates` — the ACTIVE users STRICTLY below the caller's
+    /// rank, minimal fields only (id / display name / role). Feeds the
+    /// read-only dashboard viewer's picker; deliberately far narrower than
+    /// the admin-gated `users.list` (no email, no bindings, no status detail).
+    async fn handle_users_subordinates(&self, ctx: &UserContext) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::ok_response("", json!({ "users": [] })),
+        };
+        let users: Vec<Value> = db
+            .list_users()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|u| {
+                u.role.level() < ctx.role.level()
+                    && matches!(u.status, duduclaw_auth::models::UserStatus::Active)
+            })
+            .map(|u| {
+                json!({
+                    "id": u.id,
+                    "display_name": u.display_name,
+                    "role": u.role.to_string().to_lowercase(),
+                })
+            })
+            .collect();
+        WsFrame::ok_response("", json!({ "users": users }))
+    }
+
+    /// `dashboard.layout.view` — a manager/admin views a SUBORDINATE's personal
+    /// dashboard, read-only (§view-as, dashboard-redesign). Gates, fail-closed:
+    /// caller must outrank the target STRICTLY (a manager cannot view a peer
+    /// manager or an admin; nobody views themselves through this path — they
+    /// have `layout.get`). There is deliberately NO `layout.set_for`: the write
+    /// path only ever touches the caller's own layout, so "view but never edit
+    /// on their behalf" is structural, not a UI courtesy.
+    async fn handle_dashboard_layout_view(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(target_id) = params.get("user_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+            return WsFrame::error_response("", "user_id is required");
+        };
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+        let Ok(Some(target)) = db.get_user(target_id) else {
+            return WsFrame::error_response("", "user not found");
+        };
+        if ctx.role.level() <= target.role.level() {
+            // Same generic wording as acl::require_role — no rank enumeration.
+            return WsFrame::error_response("", "permission denied");
+        }
+
+        let layout = match self.read_dashboard_layout(&target.id).await {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let widgets: Vec<Value> = Self::dashboard_widgets_for_role(target.role)
+            .into_iter()
+            .map(|(id, min_role)| json!({ "id": id, "min_role": min_role }))
+            .collect();
+        // The target's bound agents let the viewer's client scope widget data
+        // the way the target actually sees it (WP11 employee data scope).
+        let bound_agents: Vec<String> = db
+            .get_user_agents(&target.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| b.agent_name)
+            .collect();
+        WsFrame::ok_response("", json!({
+            "user": {
+                "id": target.id,
+                "display_name": target.display_name,
+                "role": target.role.to_string().to_lowercase(),
+            },
+            "widgets": widgets,
+            "layout": layout,
+            "bound_agents": bound_agents,
+            "read_only": true,
+        }))
+    }
+
+    /// Path for a user's saved layout. The user id comes from a verified JWT
+    /// (uuid or "system"), but validate the charset anyway before path use.
+    fn dashboard_layout_path(&self, user_id: &str) -> Result<std::path::PathBuf, String> {
+        let ok = !user_id.is_empty()
+            && user_id.len() <= 64
+            && user_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !ok {
+            return Err("invalid user id".into());
+        }
+        Ok(self
+            .home_dir
+            .join("dashboard")
+            .join("layouts")
+            .join(format!("{user_id}.json")))
+    }
+
+    async fn handle_dashboard_widgets_catalog(&self, ctx: &UserContext) -> WsFrame {
+        let widgets: Vec<Value> = Self::dashboard_widgets_for(ctx)
+            .into_iter()
+            .map(|(id, min_role)| json!({ "id": id, "min_role": min_role }))
+            .collect();
+        WsFrame::ok_response("", json!({ "widgets": widgets }))
+    }
+
+    async fn handle_dashboard_layout_get(&self, ctx: &UserContext) -> WsFrame {
+        match self.read_dashboard_layout(&ctx.user_id).await {
+            Ok(layout) => WsFrame::ok_response("", json!({ "layout": layout })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_dashboard_layout_set(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let path = match self.dashboard_layout_path(&ctx.user_id) {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let Some(widgets) = params.get("widgets").and_then(|v| v.as_array()) else {
+            return WsFrame::error_response("", "widgets array is required");
+        };
+        if widgets.len() > 32 {
+            return WsFrame::error_response("", "layout accepts at most 32 widgets");
+        }
+        let allowed: std::collections::HashSet<&str> = Self::dashboard_widgets_for(ctx)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let mut normalized: Vec<Value> = Vec::with_capacity(widgets.len());
+        let mut seen = std::collections::HashSet::new();
+        for w in widgets {
+            let Some(id) = w.get("id").and_then(|v| v.as_str()) else {
+                return WsFrame::error_response("", "each widget needs an 'id'");
+            };
+            // Fail-closed: an id outside the caller's own catalogue is refused
+            // (never silently dropped — the client should know it drifted).
+            if !allowed.contains(id) {
+                return WsFrame::error_response("", &format!("widget '{id}' is not available to you"));
+            }
+            if !seen.insert(id.to_string()) {
+                continue; // duplicates collapse to first occurrence
+            }
+            let hidden = w.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
+            normalized.push(json!({ "id": id, "hidden": hidden }));
+        }
+        let layout = json!({ "schema": 1, "widgets": normalized });
+
+        if let Some(parent) = path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return WsFrame::error_response("", &format!("Failed to create layout dir: {e}"));
+            }
+        }
+        let body = serde_json::to_string_pretty(&layout).unwrap_or_default();
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = tokio::fs::write(&tmp, &body).await {
+            return WsFrame::error_response("", &format!("Failed to write layout: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return WsFrame::error_response("", &format!("Failed to commit layout: {e}"));
+        }
+        WsFrame::ok_response("", json!({ "success": true, "layout": layout }))
+    }
+
+    // ── Department registry handlers ─────────────────────────
+
+    /// Departments referenced anywhere: agent `[agent] department` fields ∪
+    /// `shared/{wiki,skills}/departments/*` sub-trees (WP7 derived design).
+    async fn agent_department_pairs(&self) -> Vec<(String, String)> {
+        let reg = self.registry.read().await;
+        reg.list()
+            .iter()
+            .filter(|a| !a.config.agent.department.is_empty())
+            .map(|a| {
+                (
+                    a.config.agent.department.clone(),
+                    a.config.agent.display_name.clone(),
+                )
+            })
+            .collect()
+    }
+
+    async fn handle_departments_list(&self) -> WsFrame {
+        let pairs = self.agent_department_pairs().await;
+        let list = crate::departments::list_departments(&self.home_dir, &pairs);
+        WsFrame::ok_response("", json!({ "departments": list }))
+    }
+
+    async fn handle_departments_create(&self, params: Value) -> WsFrame {
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let pairs = self.agent_department_pairs().await;
+        let existing = crate::departments::list_departments(&self.home_dir, &pairs);
+        match crate::departments::create_department(&self.home_dir, name, &existing) {
+            Ok(()) => {
+                info!(department = %name, "department created");
+                WsFrame::ok_response("", json!({ "success": true, "name": name }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_departments_remove(&self, params: Value) -> WsFrame {
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+        let pairs = self.agent_department_pairs().await;
+        let existing = crate::departments::list_departments(&self.home_dir, &pairs);
+        let Some(info) = existing.iter().find(|d| d.name == name) else {
+            return WsFrame::error_response("", &format!("部門「{name}」不存在"));
+        };
+        match crate::departments::remove_department(&self.home_dir, name, info, force) {
+            Ok(()) => {
+                info!(department = %name, force, "department removed");
+                WsFrame::ok_response("", json!({ "success": true }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
     // ── User management handlers (admin only) ────────────────
 
     async fn handle_users_list(&self) -> WsFrame {
@@ -13584,6 +15345,7 @@ impl MethodHandler {
                         "display_name": u.display_name,
                         "role": u.role,
                         "status": u.status,
+                        "department": u.department,
                         "created_at": u.created_at,
                         "updated_at": u.updated_at,
                         "last_login": u.last_login,
@@ -13630,8 +15392,23 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &e),
         };
 
+        // Optional department (install-approval routing). Validate the slug
+        // if present; empty / absent ⇒ no department.
+        let department = params.get("department").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
+        if let Some(d) = department {
+            if !duduclaw_core::is_valid_department(d) {
+                return WsFrame::error_response("", "invalid department name (allowed: A-Za-z0-9-_, 1-64 chars)");
+            }
+        }
+
         match db.create_user(email, display_name, password, role) {
-            Ok(user) => {
+            Ok(mut user) => {
+                if let Some(d) = department {
+                    if let Err(e) = db.set_department(&user.id, Some(d)) {
+                        return WsFrame::error_response("", &format!("user created but setting department failed: {e}"));
+                    }
+                    user.department = Some(d.to_string());
+                }
                 let _ = db.log_action(Some(&ctx.user_id), "user.create", Some(&user.id), Some(&format!("email={email}")), None);
                 WsFrame::ok_response("", json!({ "user": user }))
             }
@@ -13668,8 +15445,28 @@ impl MethodHandler {
             }
         }
 
+        // Department update: an explicit "" clears it; a non-empty value is
+        // validated. Absent key ⇒ leave unchanged.
+        let department_change: Option<Option<String>> = match params.get("department") {
+            Some(Value::String(s)) if s.trim().is_empty() => Some(None),
+            Some(Value::String(s)) => {
+                let d = s.trim();
+                if !duduclaw_core::is_valid_department(d) {
+                    return WsFrame::error_response("", "invalid department name (allowed: A-Za-z0-9-_, 1-64 chars)");
+                }
+                Some(Some(d.to_string()))
+            }
+            Some(Value::Null) => Some(None),
+            _ => None,
+        };
+
         match db.update_user(user_id, display_name, role, password) {
             Ok(()) => {
+                if let Some(dept) = department_change {
+                    if let Err(e) = db.set_department(user_id, dept.as_deref()) {
+                        return WsFrame::error_response("", &format!("failed to update department: {e}"));
+                    }
+                }
                 let _ = db.log_action(Some(&ctx.user_id), "user.update", Some(user_id), None, None);
                 WsFrame::ok_response("", json!({"status": "updated"}))
             }
@@ -14059,6 +15856,21 @@ impl MethodHandler {
 
         let server_name = item.id.clone();
         let def = item.default_def;
+        // Defense in depth: the user-contributed marketplace.json is plain
+        // config on disk — scan the definition it hands us before spawning it
+        // into an agent, same fail-closed policy as the import path.
+        let scan = crate::mcp_scan::scan_mcp_server_def(&server_name, &def);
+        if !scan.passed {
+            warn!(server = %server_name, risk = ?scan.risk_level, "marketplace.install DENIED by security scan");
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "Security scan rejected MCP server '{server_name}': risk {:?}: {}",
+                    scan.risk_level,
+                    scan.findings.iter().take(5).map(|f| f.description.as_str()).collect::<Vec<_>>().join("; "),
+                ),
+            );
+        }
         match tokio::task::spawn_blocking(move || add_server_to_config(&agent_dir, &server_name, &def)).await {
             Ok(Ok(())) => {
                 info!(server = %id, agent = %agent_id, "Marketplace server installed");
@@ -14067,6 +15879,640 @@ impl MethodHandler {
             Ok(Err(e)) => WsFrame::error_response("", &e),
             Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
         }
+    }
+
+    // ── MCP import from GitHub / URL (scanned, fail-closed) ─────
+
+    /// Parse a fetched manifest into `(name, def, description)` candidates.
+    ///
+    /// Accepted shapes:
+    /// 1. `.mcp.json`: `{ "mcpServers": { "<name>": { command, args, env } } }`
+    ///    — entries with a `url` instead of a `command` (remote HTTP/SSE
+    ///    servers) are bridged via `npx -y mcp-remote <url>`, the standard
+    ///    stdio adapter those projects themselves document.
+    /// 2. user catalog: `{ "servers": [ { id, name?, description?, default_def } ] }`
+    /// 3. single catalog item: `{ "id": ..., "default_def": { ... } }`
+    /// 4. bare def: `{ "command": ..., "args": [...], "env": {...} }`
+    /// 5. MCP Registry `server.json` (2025 schema): `packages[]` (npm → npx,
+    ///    pypi → uvx, oci → docker) and `remotes[]` (→ mcp-remote bridge).
+    fn parse_mcp_manifest(
+        text: &str,
+        fallback_name: &str,
+    ) -> Result<Vec<(String, duduclaw_agent::mcp_template::McpServerDef, String)>, String> {
+        let value: Value = serde_json::from_str(text)
+            .map_err(|e| format!("not valid JSON: {e}"))?;
+        Self::parse_mcp_manifest_value(&value, fallback_name)
+    }
+
+    /// Build the `npx -y mcp-remote <url>` bridge definition for a remote
+    /// HTTP/SSE MCP server so stdio-only runtimes can use it.
+    fn mcp_remote_bridge_def(url: &str) -> duduclaw_agent::mcp_template::McpServerDef {
+        duduclaw_agent::mcp_template::McpServerDef {
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "mcp-remote".to_string(), url.to_string()],
+            env: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Sanitize an arbitrary string into a valid MCP server name.
+    fn sanitize_mcp_name(raw: &str, fallback: &str) -> String {
+        let cleaned: String = raw
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+            .take(64)
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+        if cleaned.is_empty() { fallback.to_string() } else { cleaned }
+    }
+
+    fn parse_mcp_manifest_value(
+        value: &Value,
+        fallback_name: &str,
+    ) -> Result<Vec<(String, duduclaw_agent::mcp_template::McpServerDef, String)>, String> {
+        use duduclaw_agent::mcp_template::McpServerDef;
+
+        // Shape 1: standard .mcp.json
+        if let Some(map) = value.get("mcpServers").and_then(|v| v.as_object()) {
+            let mut out = Vec::new();
+            let mut skipped = Vec::new();
+            for (name, def_val) in map {
+                if def_val.get("command").is_some() {
+                    match serde_json::from_value::<McpServerDef>(def_val.clone()) {
+                        Ok(def) => out.push((name.clone(), def, String::new())),
+                        Err(e) => skipped.push(format!("{name}: {e}")),
+                    }
+                } else if let Some(url) = def_val.get("url").and_then(|v| v.as_str()) {
+                    out.push((
+                        name.clone(),
+                        Self::mcp_remote_bridge_def(url),
+                        format!("Remote MCP ({url}) bridged via mcp-remote"),
+                    ));
+                } else {
+                    skipped.push(format!("{name}: no command or url"));
+                }
+            }
+            if out.is_empty() {
+                return Err(format!(
+                    "mcpServers map has no usable entries ({})",
+                    skipped.join("; ")
+                ));
+            }
+            return Ok(out);
+        }
+
+        // Shape 5: MCP Registry server.json — identified by packages/remotes
+        // arrays plus a name (the $schema URL is optional in the wild).
+        let has_registry_arrays = value.get("packages").map(|v| v.is_array()).unwrap_or(false)
+            || value.get("remotes").map(|v| v.is_array()).unwrap_or(false);
+        if has_registry_arrays {
+            let reg_name = value.get("name").and_then(|v| v.as_str()).unwrap_or(fallback_name);
+            let base_name = Self::sanitize_mcp_name(reg_name, fallback_name);
+            let description = value
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let mut out = Vec::new();
+
+            for pkg in value.get("packages").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]) {
+                let registry = pkg
+                    .get("registryType")
+                    .or_else(|| pkg.get("registry_name"))
+                    .or_else(|| pkg.get("registryName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let identifier = pkg
+                    .get("identifier")
+                    .or_else(|| pkg.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if identifier.is_empty() {
+                    continue;
+                }
+                let def = match registry {
+                    "npm" => McpServerDef {
+                        command: "npx".into(),
+                        args: vec!["-y".into(), identifier.to_string()],
+                        env: std::collections::HashMap::new(),
+                    },
+                    "pypi" => McpServerDef {
+                        command: "uvx".into(),
+                        args: vec![identifier.to_string()],
+                        env: std::collections::HashMap::new(),
+                    },
+                    "oci" => McpServerDef {
+                        command: "docker".into(),
+                        args: vec!["run".into(), "-i".into(), "--rm".into(), identifier.to_string()],
+                        env: std::collections::HashMap::new(),
+                    },
+                    _ => continue,
+                };
+                out.push((base_name.clone(), def, description.clone()));
+            }
+
+            for remote in value.get("remotes").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]) {
+                if let Some(url) = remote.get("url").and_then(|v| v.as_str()) {
+                    out.push((
+                        base_name.clone(),
+                        Self::mcp_remote_bridge_def(url),
+                        if description.is_empty() {
+                            format!("Remote MCP ({url}) bridged via mcp-remote")
+                        } else {
+                            format!("{description} (remote, bridged via mcp-remote)")
+                        },
+                    ));
+                }
+            }
+
+            if out.is_empty() {
+                return Err("registry server.json has no npm/pypi/oci packages or remotes".into());
+            }
+            return Ok(out);
+        }
+
+        // Shape 2: catalog list
+        if let Some(list) = value.get("servers").and_then(|v| v.as_array()) {
+            let mut out = Vec::new();
+            for item in list {
+                let def_val = item
+                    .get("default_def")
+                    .ok_or_else(|| "catalog entry missing default_def".to_string())?;
+                let def: McpServerDef = serde_json::from_value(def_val.clone())
+                    .map_err(|e| format!("catalog entry has an invalid default_def: {e}"))?;
+                let name = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(fallback_name)
+                    .to_string();
+                let desc = item
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                out.push((name, def, desc));
+            }
+            if out.is_empty() {
+                return Err("manifest has an empty servers list".into());
+            }
+            return Ok(out);
+        }
+
+        // Shape 3: single catalog item
+        if let Some(def_val) = value.get("default_def") {
+            let def: McpServerDef = serde_json::from_value(def_val.clone())
+                .map_err(|e| format!("invalid default_def: {e}"))?;
+            let name = value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(fallback_name)
+                .to_string();
+            let desc = value
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            return Ok(vec![(name, def, desc)]);
+        }
+
+        // Shape 4: bare server definition
+        if value.get("command").is_some() {
+            let def: McpServerDef = serde_json::from_value(value.clone())
+                .map_err(|e| format!("invalid server definition: {e}"))?;
+            return Ok(vec![(fallback_name.to_string(), def, String::new())]);
+        }
+
+        Err("unrecognized manifest shape — expected an .mcp.json (mcpServers map), an MCP Registry server.json (packages/remotes), a catalog ({servers: [...]}) or a single {command, args, env} definition".into())
+    }
+
+    /// Serialize a scan result into the same JSON shape as skill vetting.
+    fn mcp_scan_to_json(scan: &crate::skill_lifecycle::security_scanner::SecurityScanResult) -> Value {
+        json!({
+            "passed": scan.passed,
+            "risk_level": format!("{:?}", scan.risk_level),
+            "findings": scan.findings.iter().map(|f| json!({
+                "category": format!("{:?}", f.category),
+                "severity": format!("{:?}", f.severity).to_lowercase(),
+                "description": f.description,
+                "pattern": f.matched_pattern,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Fetch and scan MCP server definitions from a GitHub repo or direct URL.
+    ///
+    /// Params: `{ "url": "<github repo | blob | raw json url>" }`.
+    /// Returns candidates with their individual scan verdicts; nothing is
+    /// installed by this call.
+    async fn handle_mcp_import_fetch(&self, params: Value) -> WsFrame {
+        let url = match params.get("url").and_then(|v| v.as_str()) {
+            Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+            _ => return WsFrame::error_response("", "Missing 'url' parameter"),
+        };
+
+        let parsed = match reqwest::Url::parse(url.trim_end_matches('/')) {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &format!("Invalid URL: {e}")),
+        };
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        let path = parsed.path().trim_end_matches('/').to_string();
+
+        // Repo root -> try well-known manifest filenames, then README (config
+        // snippets in fenced code blocks — how most MCP repos document setup);
+        // blob/direct -> one URL (markdown content also gets snippet
+        // extraction via manifest_from_text).
+        const MANIFEST_FILES: [&str; 5] =
+            [".mcp.json", "mcp.json", "server.json", "mcp-server.json", "README.md"];
+        let is_github = host == "github.com" || host == "www.github.com";
+        let is_gitlab = host == "gitlab.com" || host == "www.gitlab.com";
+        let github_repo_root = is_github && !path.contains("/blob/");
+        let gitlab_repo_root = is_gitlab && !path.contains("/-/blob/");
+        let raw_base: Option<String> = if github_repo_root {
+            Some(format!("https://raw.githubusercontent.com{path}/HEAD"))
+        } else if gitlab_repo_root {
+            Some(format!("https://gitlab.com{path}/-/raw/HEAD"))
+        } else {
+            None
+        };
+        let candidates: Vec<String> = if let Some(base) = &raw_base {
+            MANIFEST_FILES.iter().map(|f| format!("{base}/{f}")).collect()
+        } else if is_github {
+            vec![format!(
+                "https://raw.githubusercontent.com{}",
+                path.replacen("/blob/", "/", 1)
+            )]
+        } else if is_gitlab {
+            vec![format!("https://gitlab.com{}", path.replacen("/-/blob/", "/-/raw/", 1))]
+        } else {
+            vec![url.clone()]
+        };
+
+        // Fallback server name: last URL path segment (repo name), sanitized.
+        let fallback_name: String = path
+            .rsplit('/')
+            .next()
+            .unwrap_or("imported")
+            .trim_end_matches(".json")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+            .take(64)
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+        let fallback_name = if fallback_name.is_empty() { "imported".to_string() } else { fallback_name };
+
+        let mut tried: Vec<String> = Vec::new();
+        let mut found: Option<(String, Vec<(String, duduclaw_agent::mcp_template::McpServerDef, String)>)> = None;
+
+        for candidate in &candidates {
+            if let Err(e) = crate::web_fetch::validate_url(candidate) {
+                tried.push(format!("URL rejected: {e}"));
+                continue;
+            }
+            let text = match Self::fetch_remote_text(candidate, Self::SKILL_FETCH_MAX_BYTES).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tried.push(format!("{}: {e}", Self::short_candidate_label(candidate)));
+                    continue;
+                }
+            };
+            match Self::manifest_from_text(&text, &fallback_name) {
+                Ok(servers) => {
+                    found = Some((candidate.clone(), servers));
+                    break;
+                }
+                Err(e) => tried.push(format!("{}: {e}", Self::short_candidate_label(candidate))),
+            }
+        }
+
+        // Last-resort fallback for repo roots: an npm package.json with a
+        // `bin` entry is npx-runnable — synthesize `npx -y <pkg>`.
+        if found.is_none() {
+            if let Some(base) = &raw_base {
+                let pkg_url = format!("{base}/package.json");
+                match Self::fetch_remote_text(&pkg_url, Self::SKILL_FETCH_MAX_BYTES).await {
+                    Ok(text) => match serde_json::from_str::<Value>(&text) {
+                        Ok(pkg) => {
+                            let pkg_name = pkg.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            if !pkg_name.is_empty() && pkg.get("bin").is_some() {
+                                let server_name = Self::sanitize_mcp_name(
+                                    pkg_name.rsplit('/').next().unwrap_or(pkg_name),
+                                    &fallback_name,
+                                );
+                                let desc = pkg
+                                    .get("description")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let def = duduclaw_agent::mcp_template::McpServerDef {
+                                    command: "npx".into(),
+                                    args: vec!["-y".into(), pkg_name.to_string()],
+                                    env: std::collections::HashMap::new(),
+                                };
+                                found = Some((
+                                    pkg_url.clone(),
+                                    vec![(server_name, def, format!("{desc} (inferred from package.json)"))],
+                                ));
+                            } else {
+                                tried.push("package.json: no bin field (not npx-runnable)".into());
+                            }
+                        }
+                        Err(e) => tried.push(format!("package.json: {e}")),
+                    },
+                    Err(e) => tried.push(format!("package.json: {e}")),
+                }
+            }
+        }
+
+        let Some((resolved, servers)) = found else {
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "No MCP manifest found. Tried: {}",
+                    duduclaw_core::truncate_chars(&tried.join(" | "), 600),
+                ),
+            );
+        };
+
+        let servers_json: Vec<Value> = servers
+            .iter()
+            .map(|(name, def, desc)| {
+                let scan = crate::mcp_scan::scan_mcp_server_def(name, def);
+                json!({
+                    "name": name,
+                    "description": desc,
+                    "command": def.command,
+                    "args": def.args,
+                    "env": def.env,
+                    "scan": Self::mcp_scan_to_json(&scan),
+                    "passed": scan.passed,
+                })
+            })
+            .collect();
+        info!(url = %resolved, servers = servers_json.len(), "MCP import manifest fetched and scanned");
+        WsFrame::ok_response("", json!({
+            "source_url": url,
+            "resolved_url": resolved,
+            "servers": servers_json,
+        }))
+    }
+
+    /// Trailing path segment of a candidate URL for compact error reporting.
+    fn short_candidate_label(url: &str) -> &str {
+        url.rsplit('/').next().unwrap_or(url)
+    }
+
+    /// Parse manifest text: strict JSON shapes first, then markdown config
+    /// snippet extraction (fenced ```json blocks containing `mcpServers`).
+    fn manifest_from_text(
+        text: &str,
+        fallback_name: &str,
+    ) -> Result<Vec<(String, duduclaw_agent::mcp_template::McpServerDef, String)>, String> {
+        match Self::parse_mcp_manifest(text, fallback_name) {
+            Ok(servers) => Ok(servers),
+            Err(json_err) => {
+                let extracted = Self::extract_mcp_from_markdown(text, fallback_name);
+                if extracted.is_empty() {
+                    Err(json_err)
+                } else {
+                    Ok(extracted)
+                }
+            }
+        }
+    }
+
+    /// Extract `mcpServers` config snippets from markdown fenced code blocks.
+    /// Deduplicates identical (name, command, args) entries — READMEs repeat
+    /// the same snippet for Claude Desktop / Cursor / VS Code.
+    fn extract_mcp_from_markdown(
+        text: &str,
+        fallback_name: &str,
+    ) -> Vec<(String, duduclaw_agent::mcp_template::McpServerDef, String)> {
+        let mut blocks: Vec<String> = Vec::new();
+        let mut in_block = false;
+        let mut current = String::new();
+        for line in text.lines() {
+            if line.trim_start().starts_with("```") {
+                if in_block {
+                    blocks.push(std::mem::take(&mut current));
+                    in_block = false;
+                } else {
+                    in_block = true;
+                }
+            } else if in_block {
+                current.push_str(line);
+                current.push('\n');
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for block in &blocks {
+            if !block.contains("\"mcpServers\"") {
+                continue;
+            }
+            let Some(json_str) = Self::first_json_object(block) else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(&json_str) else { continue };
+            let Ok(servers) = Self::parse_mcp_manifest_value(&value, fallback_name) else { continue };
+            for (name, def, desc) in servers {
+                let key = format!("{name}|{}|{}", def.command, def.args.join("\u{1f}"));
+                if seen.insert(key) {
+                    out.push((name, def, desc));
+                }
+            }
+        }
+        out
+    }
+
+    /// Return the first balanced `{...}` JSON object in a text block
+    /// (string-literal aware, so braces inside quoted values don't miscount).
+    fn first_json_object(text: &str) -> Option<String> {
+        let start = text.find('{')?;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (i, c) in text[start..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(text[start..start + i + c.len_utf8()].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Install a previously fetched (and re-scanned) MCP server definition.
+    ///
+    /// Params: `{ agent_id, server_name, server_def, add_to_catalog?, description?, source_url? }`.
+    /// The definition is re-scanned server-side and rejected fail-closed at
+    /// risk ≥ High — the fetch RPC's verdict cannot be replayed or tampered.
+    async fn handle_mcp_import_install(&self, params: Value) -> WsFrame {
+        use duduclaw_agent::mcp_template::{add_server_to_config, McpServerDef};
+
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id");
+        }
+        let agent_dir = self.home_dir.join("agents").join(&agent_id);
+        if !agent_dir.is_dir() {
+            return WsFrame::error_response("", &format!("Agent '{agent_id}' not found"));
+        }
+        let server_name = match params.get("server_name").and_then(|v| v.as_str()) {
+            Some(s) if crate::mcp_scan::is_valid_mcp_server_name(s) => s.to_string(),
+            _ => return WsFrame::error_response("", "Invalid server_name (allowed: A-Za-z0-9._- max 64)"),
+        };
+        let def: McpServerDef = match params.get("server_def") {
+            Some(v) => match serde_json::from_value(v.clone()) {
+                Ok(d) => d,
+                Err(e) => return WsFrame::error_response("", &format!("Invalid server_def: {e}")),
+            },
+            None => return WsFrame::error_response("", "Missing 'server_def' parameter"),
+        };
+
+        let scan = crate::mcp_scan::scan_mcp_server_def(&server_name, &def);
+        if !scan.passed {
+            warn!(
+                server = %server_name,
+                risk = ?scan.risk_level,
+                findings = scan.findings.len(),
+                "mcp.import.install DENIED by security scan"
+            );
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "Security scan rejected MCP server '{server_name}': risk {:?}, {} finding(s): {}",
+                    scan.risk_level,
+                    scan.findings.len(),
+                    scan.findings.iter().take(5).map(|f| f.description.as_str()).collect::<Vec<_>>().join("; "),
+                ),
+            );
+        }
+
+        let ad = agent_dir.clone();
+        let sn = server_name.clone();
+        let d = def.clone();
+        match tokio::task::spawn_blocking(move || add_server_to_config(&ad, &sn, &d)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return WsFrame::error_response("", &e),
+            Err(e) => return WsFrame::error_response("", &format!("Internal error: {e}")),
+        }
+
+        // Optionally persist into the user marketplace catalog so the server
+        // shows up alongside the built-ins for future installs.
+        let mut catalog_added = false;
+        if params.get("add_to_catalog").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let description = params
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let source_url = params
+                .get("source_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            match self.append_to_user_marketplace(&server_name, &def, &description, &source_url).await {
+                Ok(added) => catalog_added = added,
+                Err(e) => {
+                    // Install already succeeded — report the partial failure
+                    // honestly instead of failing the whole call.
+                    warn!(server = %server_name, error = %e, "installed but failed to update marketplace.json");
+                    return WsFrame::ok_response("", json!({
+                        "success": true,
+                        "agent_id": agent_id,
+                        "server_name": server_name,
+                        "catalog_added": false,
+                        "warning": format!("installed, but adding to the marketplace catalog failed: {e}"),
+                    }));
+                }
+            }
+        }
+
+        info!(server = %server_name, agent = %agent_id, catalog = catalog_added, "MCP server imported from URL");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "agent_id": agent_id,
+            "server_name": server_name,
+            "catalog_added": catalog_added,
+        }))
+    }
+
+    /// Append an imported server to `~/.duduclaw/marketplace.json` (dedup by id).
+    /// Returns Ok(false) when an entry with the same id already exists.
+    async fn append_to_user_marketplace(
+        &self,
+        id: &str,
+        def: &duduclaw_agent::mcp_template::McpServerDef,
+        description: &str,
+        source_url: &str,
+    ) -> Result<bool, String> {
+        use duduclaw_agent::mcp_template::McpCatalogItem;
+
+        #[derive(serde::Serialize, serde::Deserialize, Default)]
+        struct UserCatalog {
+            #[serde(default)]
+            servers: Vec<McpCatalogItem>,
+        }
+
+        let user_path = self.home_dir.join("marketplace.json");
+        let mut catalog: UserCatalog = if user_path.exists() {
+            let content = tokio::fs::read_to_string(&user_path)
+                .await
+                .map_err(|e| format!("read marketplace.json: {e}"))?;
+            serde_json::from_str(&content).map_err(|e| format!("parse marketplace.json: {e}"))?
+        } else {
+            UserCatalog::default()
+        };
+
+        if catalog.servers.iter().any(|s| s.id == id) {
+            return Ok(false);
+        }
+        catalog.servers.push(McpCatalogItem {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: if description.is_empty() {
+                format!("Imported from {source_url}")
+            } else {
+                description.to_string()
+            },
+            category: "imported".to_string(),
+            author: source_url.to_string(),
+            tags: vec!["imported".to_string()],
+            featured: false,
+            requires_oauth: false,
+            default_def: def.clone(),
+            required_env: Vec::new(),
+        });
+
+        let serialized = serde_json::to_string_pretty(&catalog)
+            .map_err(|e| format!("serialize marketplace.json: {e}"))?;
+        // Atomic write: temp + rename, same convention as other config writers.
+        let tmp = user_path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, serialized)
+            .await
+            .map_err(|e| format!("write marketplace.json: {e}"))?;
+        tokio::fs::rename(&tmp, &user_path)
+            .await
+            .map_err(|e| format!("rename marketplace.json: {e}"))?;
+        Ok(true)
     }
 
     // ── MCP Management ──────────────────────────────────────────
@@ -14159,6 +16605,21 @@ impl MethodHandler {
                     },
                     None => return WsFrame::error_response("", "server_def is required for add action"),
                 };
+                // Same fail-closed gate as mcp.import.install — spawning an MCP
+                // server runs a real process, so a shell/downloader definition
+                // is rejected regardless of which RPC carries it.
+                let scan = crate::mcp_scan::scan_mcp_server_def(server_name, &def);
+                if !scan.passed {
+                    warn!(server = %server_name, risk = ?scan.risk_level, "mcp.update add DENIED by security scan");
+                    return WsFrame::error_response(
+                        "",
+                        &format!(
+                            "Security scan rejected MCP server '{server_name}': risk {:?}: {}",
+                            scan.risk_level,
+                            scan.findings.iter().take(5).map(|f| f.description.as_str()).collect::<Vec<_>>().join("; "),
+                        ),
+                    );
+                }
                 let ad = agent_dir.clone();
                 let sn = server_name.to_string();
                 match tokio::task::spawn_blocking(move || add_server_to_config(&ad, &sn, &def)).await {
@@ -17094,6 +19555,331 @@ fn update_frontmatter_field(content: &str, key: &str, transform: impl Fn(&str) -
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod skill_source_url_tests {
+    use super::MethodHandler;
+
+    #[test]
+    fn github_repo_root_appends_skill_md() {
+        assert_eq!(
+            MethodHandler::resolve_skill_source_url("https://github.com/user/repo/").unwrap(),
+            "https://raw.githubusercontent.com/user/repo/HEAD/SKILL.md"
+        );
+    }
+
+    #[test]
+    fn github_blob_becomes_raw() {
+        assert_eq!(
+            MethodHandler::resolve_skill_source_url("https://github.com/u/r/blob/main/skills/x.md").unwrap(),
+            "https://raw.githubusercontent.com/u/r/main/skills/x.md"
+        );
+    }
+
+    #[test]
+    fn gist_gets_raw_suffix() {
+        assert_eq!(
+            MethodHandler::resolve_skill_source_url("https://gist.github.com/user/abc123").unwrap(),
+            "https://gist.githubusercontent.com/user/abc123/raw"
+        );
+    }
+
+    #[test]
+    fn gitlab_repo_and_blob() {
+        assert_eq!(
+            MethodHandler::resolve_skill_source_url("https://gitlab.com/u/r").unwrap(),
+            "https://gitlab.com/u/r/-/raw/HEAD/SKILL.md"
+        );
+        assert_eq!(
+            MethodHandler::resolve_skill_source_url("https://gitlab.com/u/r/-/blob/main/SKILL.md").unwrap(),
+            "https://gitlab.com/u/r/-/raw/main/SKILL.md"
+        );
+    }
+
+    #[test]
+    fn direct_url_passes_through() {
+        assert_eq!(
+            MethodHandler::resolve_skill_source_url("https://example.com/skills/foo.md").unwrap(),
+            "https://example.com/skills/foo.md"
+        );
+    }
+
+    #[test]
+    fn lookalike_host_is_not_rewritten() {
+        // Anchored host matching: github.com.evil.example must NOT be treated
+        // as GitHub (no raw.githubusercontent rewrite).
+        let out = MethodHandler::resolve_skill_source_url("https://github.com.evil.example/u/r").unwrap();
+        assert_eq!(out, "https://github.com.evil.example/u/r");
+    }
+
+    #[test]
+    fn bad_scheme_rejected() {
+        assert!(MethodHandler::resolve_skill_source_url("file:///etc/passwd").is_err());
+        assert!(MethodHandler::resolve_skill_source_url("not a url").is_err());
+    }
+}
+
+#[cfg(test)]
+mod mcp_manifest_tests {
+    use super::MethodHandler;
+
+    #[test]
+    fn parses_standard_mcp_json() {
+        let text = r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["-y", "pkg"], "env": {} } } }"#;
+        let out = MethodHandler::parse_mcp_manifest(text, "fallback").unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "fs");
+        assert_eq!(out[0].1.command, "npx");
+    }
+
+    #[test]
+    fn parses_catalog_list_and_single_item() {
+        let list = r#"{ "servers": [ { "id": "a", "description": "d", "default_def": { "command": "npx", "args": [], "env": {} } } ] }"#;
+        let out = MethodHandler::parse_mcp_manifest(list, "fb").unwrap();
+        assert_eq!(out[0].0, "a");
+        assert_eq!(out[0].2, "d");
+
+        let single = r#"{ "id": "b", "default_def": { "command": "uvx", "args": [], "env": {} } }"#;
+        let out = MethodHandler::parse_mcp_manifest(single, "fb").unwrap();
+        assert_eq!(out[0].0, "b");
+        assert_eq!(out[0].1.command, "uvx");
+    }
+
+    #[test]
+    fn parses_bare_def_with_fallback_name() {
+        let text = r#"{ "command": "npx", "args": ["-y", "pkg"] }"#;
+        let out = MethodHandler::parse_mcp_manifest(text, "my-repo").unwrap();
+        assert_eq!(out[0].0, "my-repo");
+    }
+
+    #[test]
+    fn rejects_garbage_shapes() {
+        assert!(MethodHandler::parse_mcp_manifest("not json", "fb").is_err());
+        assert!(MethodHandler::parse_mcp_manifest(r#"{ "hello": 1 }"#, "fb").is_err());
+        assert!(MethodHandler::parse_mcp_manifest(r#"{ "mcpServers": {} }"#, "fb").is_err());
+    }
+
+    #[test]
+    fn registry_server_json_remotes_bridged_via_mcp_remote() {
+        // Real-world shape: Perspective-AI/mcp ships an MCP Registry
+        // server.json with remotes only (no packages).
+        let text = r#"{
+            "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+            "name": "ai.getperspective/mcp",
+            "description": "An AI concierge.",
+            "remotes": [ { "type": "streamable-http", "url": "https://getperspective.ai/mcp" } ]
+        }"#;
+        let out = MethodHandler::parse_mcp_manifest(text, "fb").unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "ai.getperspective-mcp");
+        assert_eq!(out[0].1.command, "npx");
+        assert_eq!(out[0].1.args, vec!["-y", "mcp-remote", "https://getperspective.ai/mcp"]);
+    }
+
+    #[test]
+    fn registry_server_json_npm_and_pypi_packages() {
+        let text = r#"{
+            "name": "io.example/tool",
+            "packages": [
+                { "registryType": "npm", "identifier": "@example/mcp-tool" },
+                { "registryType": "pypi", "identifier": "example-mcp-tool" },
+                { "registryType": "nuget", "identifier": "ignored" }
+            ]
+        }"#;
+        let out = MethodHandler::parse_mcp_manifest(text, "fb").unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].1.command, "npx");
+        assert_eq!(out[0].1.args, vec!["-y", "@example/mcp-tool"]);
+        assert_eq!(out[1].1.command, "uvx");
+    }
+
+    #[test]
+    fn mcp_servers_url_entry_bridged_command_entry_kept() {
+        let text = r#"{ "mcpServers": {
+            "remote": { "type": "http", "url": "https://x.example/mcp" },
+            "local": { "command": "npx", "args": ["-y", "pkg"] }
+        } }"#;
+        let out = MethodHandler::parse_mcp_manifest(text, "fb").unwrap();
+        assert_eq!(out.len(), 2);
+        let remote = out.iter().find(|(n, _, _)| n == "remote").unwrap();
+        assert_eq!(remote.1.args[1], "mcp-remote");
+        let local = out.iter().find(|(n, _, _)| n == "local").unwrap();
+        assert_eq!(local.1.command, "npx");
+    }
+
+    #[test]
+    fn extracts_config_snippet_from_readme_markdown() {
+        let readme = r#"
+# Some MCP Server
+
+Install it like this:
+
+```json
+{
+  "mcpServers": {
+    "perspective": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://getperspective.ai/mcp"]
+    }
+  }
+}
+```
+
+The same snippet works in Cursor and VS Code:
+
+```json
+{
+  "mcpServers": {
+    "perspective": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://getperspective.ai/mcp"]
+    }
+  }
+}
+```
+"#;
+        // Direct parse fails (markdown), extraction succeeds and dedupes the
+        // repeated snippet down to one candidate.
+        let out = MethodHandler::manifest_from_text(readme, "fb").unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "perspective");
+        assert_eq!(out[0].1.command, "npx");
+    }
+
+    #[test]
+    fn markdown_without_snippets_keeps_json_error() {
+        assert!(MethodHandler::manifest_from_text("# just a readme\nno config here", "fb").is_err());
+    }
+
+    #[test]
+    fn first_json_object_is_string_aware() {
+        let block = r#"prefix { "a": "brace } in string", "b": { "c": 1 } } trailing prose"#;
+        let json = MethodHandler::first_json_object(block).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["b"]["c"], 1);
+    }
+}
+
+#[cfg(test)]
+mod outfit_tests {
+    use super::normalize_outfit;
+    use serde_json::json;
+
+    #[test]
+    fn normalizes_partial_outfit_and_fills_slots() {
+        let v = normalize_outfit(&json!({ "hat": "cap", "tint": 3 })).unwrap();
+        assert_eq!(v["schema"], 1);
+        assert_eq!(v["tint"], 3);
+        assert_eq!(v["hat"], "cap");
+        assert_eq!(v["feet"], "");
+        assert_eq!(v["accessory"], "");
+    }
+
+    #[test]
+    fn rejects_bad_shapes_fail_closed() {
+        for bad in [
+            json!("cap"),                              // not an object
+            json!({ "hat": 3 }),                       // non-string slot
+            json!({ "hat": "CAP" }),                   // uppercase
+            json!({ "hat": "a".repeat(25) }),          // too long
+            json!({ "hat": "../x" }),                  // traversal chars
+            json!({ "tint": 11 }),                     // out of range
+            json!({ "sneaky_extra": "x" }),            // unknown key
+        ] {
+            assert!(normalize_outfit(&bad).is_err(), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod redaction_config_tests {
+    use super::{apply_redaction_to_table, redaction_table_to_response};
+    use serde_json::json;
+
+    #[test]
+    fn sources_round_trip_string_and_detail_forms() {
+        let mut table = toml::Table::new();
+        let params = json!({
+            "enabled": true,
+            "sources": {
+                "user_input": "off",
+                "tool_results": {
+                    "mode": "on",
+                    "only_categories": ["TW_ID", "CREDIT_CARD"],
+                },
+                "cron_context": {
+                    "mode": "on",
+                    "exclude_categories": ["EMAIL"],
+                },
+            },
+        });
+        let changes = apply_redaction_to_table(&mut table, &params).unwrap();
+        assert!(changes.iter().any(|c| c.contains("tool_results")), "{changes:?}");
+
+        // The written TOML must parse under the crate's SourceSetting (both forms).
+        let toml_str = toml::to_string(&table).unwrap();
+        #[derive(serde::Deserialize)]
+        struct W {
+            redaction: duduclaw_redaction::config::RedactionConfig,
+        }
+        let w: W = toml::from_str(&toml_str).unwrap();
+        assert_eq!(w.redaction.sources.tool_results.only_categories, ["TW_ID", "CREDIT_CARD"]);
+        assert_eq!(w.redaction.sources.cron_context.exclude_categories, ["EMAIL"]);
+        assert!(w.redaction.sources.user_input.is_mode_only());
+
+        // Response always uses the detail-object form.
+        let resp = redaction_table_to_response(&table);
+        let tr = &resp["sources"]["tool_results"];
+        assert_eq!(tr["mode"], "on");
+        assert_eq!(tr["only_categories"][1], "CREDIT_CARD");
+        assert_eq!(resp["sources"]["user_input"]["mode"], "off");
+        assert_eq!(
+            resp["sources"]["user_input"]["only_categories"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn detail_form_with_empty_lists_collapses_to_string() {
+        let mut table = toml::Table::new();
+        let params = json!({
+            "sources": { "tool_results": { "mode": "selective", "only_categories": [] } }
+        });
+        apply_redaction_to_table(&mut table, &params).unwrap();
+        let written = table["redaction"]["sources"]["tool_results"].clone();
+        assert_eq!(written, toml::Value::String("selective".into()));
+    }
+
+    #[test]
+    fn invalid_detail_forms_rejected() {
+        let mut table = toml::Table::new();
+        for bad in [
+            json!({ "sources": { "tool_results": { "mode": "sideways" } } }),
+            json!({ "sources": { "tool_results": { "only_categories": ["X"] } } }), // mode missing
+            json!({ "sources": { "tool_results": { "mode": "on", "only_categories": [""] } } }),
+            json!({ "sources": { "tool_results": 42 } }),
+        ] {
+            assert!(apply_redaction_to_table(&mut table, &bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn builtin_profile_catalogue_lists_categories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profiles = super::redaction_available_profiles(tmp.path());
+        assert!(profiles.len() >= 5, "expected the 5 built-ins, got {}", profiles.len());
+        let general = profiles
+            .iter()
+            .find(|p| p["name"] == "general")
+            .expect("general profile present");
+        assert!(general["builtin"].as_bool().unwrap());
+        assert!(general["categories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "EMAIL"));
+    }
 }
 
 #[cfg(test)]

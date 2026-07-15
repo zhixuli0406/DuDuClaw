@@ -5,7 +5,12 @@ import { renderWithProviders } from '@/test/render';
 // The panel imports decideApproval → api-custom-skills → ws-client. Stub the
 // socket so the module graph loads without a live connection.
 vi.mock('@/lib/ws-client', () => ({
-  client: { call: vi.fn().mockResolvedValue({}) },
+  client: {
+    call: vi.fn().mockResolvedValue({}),
+    // agents-store (pulled in via CharacterAvatar → wardrobe outfit lookup)
+    // subscribes at module init; a no-op keeps the graph loadable offline.
+    subscribe: vi.fn(),
+  },
 }));
 
 import { ApprovalDetailPanel } from './ApprovalDetailPanel';

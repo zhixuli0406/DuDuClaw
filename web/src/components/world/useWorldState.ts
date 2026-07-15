@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { characterFor } from '@/lib/character-gen';
+import { effectiveTint, type AgentOutfit } from '@/lib/outfit';
 import { useAgentActivityStore, type AgentLiveState } from '@/stores/agent-activity-store';
 import type { SceneDefinition, WorldAgentState, WorldEmote } from './types';
 import { truncateGraphemes } from './text';
@@ -26,6 +26,8 @@ export interface WorldInputAgent {
   readonly name: string;
   readonly display_name: string;
   readonly status: 'active' | 'paused' | 'terminated';
+  /** Wardrobe composition; null/absent = seeded default look. */
+  readonly outfit?: AgentOutfit | null;
 }
 
 /** How long a speech bubble stays before the renderer fades it. */
@@ -58,11 +60,12 @@ export function mapAgentToWorldState(
 ): WorldAgentState | null {
   const placement = scene.place({ index, status: agent.status, busy: live !== 'idle' });
   if (!placement) return null;
-  const tintIndex = characterFor(agent.name).tintIndex;
+  const tintIndex = effectiveTint(agent.name, agent.outfit);
   return {
     id: agent.name,
     label: agent.display_name,
     tintIndex,
+    outfit: agent.outfit ?? null,
     say,
     x: placement.x,
     y: placement.y,

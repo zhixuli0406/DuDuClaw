@@ -3,8 +3,9 @@ import { useIntl, FormattedMessage } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { useMcpStore } from '@/stores/mcp-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
-import { type McpServerDef, type McpCatalogItem, type McpOAuthProvider } from '@/lib/api';
+import { api, type McpServerDef, type McpCatalogItem, type McpOAuthProvider, type McpImportCandidate } from '@/lib/api';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import { DangerZone } from '@/components/settings/controls';
 import {
@@ -33,7 +34,11 @@ import {
   X,
   Loader2,
   Shield,
+  ShieldCheck,
+  ShieldAlert,
   KeyRound,
+  Link as LinkIcon,
+  Download,
 } from 'lucide-react';
 
 type Tab = 'agents' | 'marketplace' | 'oauth';
@@ -57,6 +62,7 @@ export function McpPage() {
   const [activeTab, setActiveTab] = useState<Tab>('agents');
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [showAddDialog, setShowAddDialog] = useState(false);
+  const [showImportDialog, setShowImportDialog] = useState(false);
   const [catalogFilter, setCatalogFilter] = useState<string | null>(null);
   const [catalogSearch, setCatalogSearch] = useState('');
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
@@ -146,9 +152,14 @@ export function McpPage() {
         title={intl.formatMessage({ id: 'nav.mcp' })}
         subtitle={intl.formatMessage({ id: 'mcp.title' })}
         actions={
-          <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
-            {intl.formatMessage({ id: 'mcp.add' })}
-          </Button>
+          <>
+            <Button variant="secondary" icon={LinkIcon} onClick={() => setShowImportDialog(true)}>
+              {intl.formatMessage({ id: 'mcp.import.fromUrl' })}
+            </Button>
+            <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
+              {intl.formatMessage({ id: 'mcp.add' })}
+            </Button>
+          </>
         }
       />
 
@@ -397,7 +408,263 @@ export function McpPage() {
           showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
         }}
       />
+
+      {/* Import from GitHub / URL */}
+      {showImportDialog && (
+        <ImportFromUrlDialog
+          agents={agents}
+          onClose={() => setShowImportDialog(false)}
+          onInstalled={(serverName, agentId) => {
+            const agentLabel = agents.find((a) => a.name === agentId)?.display_name ?? agentId;
+            showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: serverName, agent: agentLabel }));
+            fetchAll();
+          }}
+        />
+      )}
     </Page>
+  );
+}
+
+// ── Import from GitHub / URL ────────────────────────────────
+//
+// URL → mcp.import.fetch (server-side fetch, SSRF-gated, per-server security
+// scan) → admin reviews command/args/env + findings → mcp.import.install
+// (re-scans fail-closed). A failed scan disables the install button.
+
+const IMPORT_SEVERITY_COLORS: Record<string, string> = {
+  critical: 'text-rose-500',
+  error: 'text-orange-500',
+  warning: 'text-amber-500',
+  info: 'text-stone-400',
+};
+
+function ImportFromUrlDialog({
+  agents,
+  onClose,
+  onInstalled,
+}: {
+  agents: ReadonlyArray<{ name: string; display_name: string }>;
+  onClose: () => void;
+  onInstalled: (serverName: string, agentId: string) => void;
+}) {
+  const intl = useIntl();
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+  const [url, setUrl] = useState('');
+  const [fetching, setFetching] = useState(false);
+  const [candidates, setCandidates] = useState<McpImportCandidate[] | null>(null);
+  const [sourceUrl, setSourceUrl] = useState('');
+  const [targetAgent, setTargetAgent] = useState('');
+  const [addToCatalog, setAddToCatalog] = useState(true);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [installedNames, setInstalledNames] = useState<string[]>([]);
+  const [requestedNames, setRequestedNames] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const trimmed = url.trim();
+  const validUrl = /^https?:\/\/\S+$/i.test(trimmed);
+
+  const handleFetch = async () => {
+    if (!validUrl) return;
+    setFetching(true);
+    setError(null);
+    setCandidates(null);
+    setInstalledNames([]);
+    try {
+      const res = await api.mcp.importFetch(trimmed);
+      setCandidates(res.servers);
+      setSourceUrl(res.source_url);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setFetching(false);
+    }
+  };
+
+  const handleInstall = async (candidate: McpImportCandidate) => {
+    if (!targetAgent || !candidate.passed) return;
+    setInstalling(candidate.name);
+    setError(null);
+    try {
+      const req = {
+        agent_id: targetAgent,
+        server_name: candidate.name,
+        server_def: { command: candidate.command, args: candidate.args, env: candidate.env },
+        add_to_catalog: addToCatalog,
+        description: candidate.description || undefined,
+        source_url: sourceUrl || undefined,
+      };
+      if (isAdmin) {
+        await api.mcp.importInstall(req);
+        setInstalledNames((prev) => [...prev, candidate.name]);
+        onInstalled(candidate.name, targetAgent);
+      } else {
+        // Non-admin: file an approval request (manager → admin chain).
+        await api.mcp.installRequest(req);
+        setRequestedNames((prev) => [...prev, candidate.name]);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setInstalling(null);
+    }
+  };
+
+  return (
+    <Dialog open onClose={onClose} title={intl.formatMessage({ id: 'mcp.import.title' })}>
+      <div className="space-y-4">
+        <p className="text-sm text-stone-500 dark:text-stone-400">
+          {intl.formatMessage({ id: 'mcp.import.desc' })}
+        </p>
+
+        {/* URL + fetch */}
+        <FormField label="URL">
+          <div className="flex gap-2">
+            <input
+              type="url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleFetch(); }}
+              placeholder="https://github.com/user/mcp-server-repo"
+              className={inputClass}
+              autoFocus
+            />
+            <button onClick={handleFetch} disabled={fetching || !validUrl} className={cn(buttonSecondary, 'shrink-0')}>
+              {fetching
+                ? intl.formatMessage({ id: 'mcp.import.fetching' })
+                : intl.formatMessage({ id: 'mcp.import.fetch' })}
+            </button>
+          </div>
+        </FormField>
+        <p className="text-xs text-stone-400 dark:text-stone-500">
+          {intl.formatMessage({ id: 'mcp.import.hint' })}
+        </p>
+
+        {/* Candidates */}
+        {candidates && (
+          <>
+            <FormField label={intl.formatMessage({ id: 'mcp.targetAgent' })}>
+              <select value={targetAgent} onChange={(e) => setTargetAgent(e.target.value)} className={selectClass}>
+                <option value="">--</option>
+                {agents.map((a) => (
+                  <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+                ))}
+              </select>
+            </FormField>
+
+            <label className="flex items-center gap-2 text-sm text-stone-600 dark:text-stone-400">
+              <input
+                type="checkbox"
+                checked={addToCatalog}
+                onChange={(e) => setAddToCatalog(e.target.checked)}
+                className="h-4 w-4 rounded border-stone-300 text-amber-500 focus:ring-amber-500"
+              />
+              {intl.formatMessage({ id: 'mcp.import.addToCatalog' })}
+            </label>
+
+            {!isAdmin && (
+              <p className="text-xs text-stone-500 dark:text-stone-400">
+                {intl.formatMessage({ id: 'install.request.nonAdminNotice' })}
+              </p>
+            )}
+
+            <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
+              {candidates.map((c) => {
+                const isInstalled = installedNames.includes(c.name);
+                const isRequested = requestedNames.includes(c.name);
+                return (
+                  <div key={c.name} className="rounded-lg border border-[var(--panel-border)] p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <h4 className="truncate font-semibold text-stone-900 dark:text-stone-50">{c.name}</h4>
+                          {c.passed ? (
+                            <span className="flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                              <ShieldCheck className="h-3.5 w-3.5" />
+                              {intl.formatMessage({ id: 'mcp.import.scanPassed' })}
+                            </span>
+                          ) : (
+                            <span className="flex items-center gap-1 text-xs font-medium text-rose-600 dark:text-rose-400">
+                              <ShieldAlert className="h-3.5 w-3.5" />
+                              {intl.formatMessage({ id: 'mcp.import.scanFailed' })}
+                            </span>
+                          )}
+                        </div>
+                        {c.description && (
+                          <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">{c.description}</p>
+                        )}
+                        <p className="mt-1 break-all font-mono text-xs text-stone-600 dark:text-stone-300">
+                          {c.command} {c.args.join(' ')}
+                        </p>
+                        {Object.keys(c.env).length > 0 && (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {Object.keys(c.env).map((key) => (
+                              <span key={key} className="inline-flex items-center rounded bg-stone-500/10 px-1.5 py-0.5 text-xs font-mono text-stone-600 dark:text-stone-400">
+                                {key}=***
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => handleInstall(c)}
+                        disabled={!c.passed || !targetAgent || installing === c.name || isInstalled || isRequested}
+                        className={cn(buttonPrimary, 'shrink-0 text-xs')}
+                        title={!c.passed
+                          ? intl.formatMessage({ id: 'mcp.import.blockedHint' })
+                          : !targetAgent
+                            ? intl.formatMessage({ id: 'mcp.targetAgent' })
+                            : undefined}
+                      >
+                        {isInstalled ? (
+                          <span className="flex items-center gap-1"><CheckCircle2 className="h-3.5 w-3.5" />{intl.formatMessage({ id: 'mcp.import.installed' })}</span>
+                        ) : isRequested ? (
+                          <span className="flex items-center gap-1"><CheckCircle2 className="h-3.5 w-3.5" />{intl.formatMessage({ id: 'install.request.filedShort' })}</span>
+                        ) : installing === c.name ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <span className="flex items-center gap-1">
+                            <Download className="h-3.5 w-3.5" />
+                            {intl.formatMessage({ id: isAdmin ? 'mcp.catalog.install' : 'install.request.submit' })}
+                          </span>
+                        )}
+                      </button>
+                    </div>
+
+                    {/* Findings */}
+                    {c.scan.findings.length > 0 && (
+                      <ul className="mt-2 space-y-1 border-t border-[var(--panel-border)] pt-2">
+                        {c.scan.findings.map((f, i) => (
+                          <li key={i} className="flex items-start gap-1.5 text-xs">
+                            <AlertTriangle className={cn('mt-0.5 h-3 w-3 shrink-0', IMPORT_SEVERITY_COLORS[f.severity] ?? IMPORT_SEVERITY_COLORS.info)} />
+                            <span className="text-stone-600 dark:text-stone-400">
+                              <span className={cn('font-semibold uppercase', IMPORT_SEVERITY_COLORS[f.severity] ?? IMPORT_SEVERITY_COLORS.info)}>{f.severity}</span>
+                              {' · '}{f.description}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {error && (
+          <div className="flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
+            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+            <span className="break-all">{error}</span>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className={buttonSecondary}>
+            {intl.formatMessage({ id: 'mcp.cancel' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }
 

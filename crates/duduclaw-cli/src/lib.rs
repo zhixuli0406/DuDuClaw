@@ -2992,11 +2992,17 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
             println!();
         } else {
             // Empty users.db right now, but the gateway ensures a default admin
-            // during startup — so JWT auth WILL be required. Point the operator
-            // at the login flow and the one-time password printed below (during
-            // gateway bootstrap), rather than the misleading "no auth needed".
-            println!("   🔐 First run: a default admin is being created —");
-            println!("     watch for the one-time password below, then log in at http://localhost:{port}/login");
+            // during startup — so JWT auth WILL be required. On a loopback bind
+            // the dashboard's first-open screen asks the operator to SET the
+            // admin password directly (claim flow) — there is no one-time
+            // password to watch for. Only remote binds still print one (the
+            // claim endpoint is loopback-only).
+            if bind == "127.0.0.1" || bind == "::1" || bind == "localhost" {
+                println!("   🔐 First run: open http://localhost:{port} and set the admin password there.");
+            } else {
+                println!("   🔐 First run: a default admin is being created —");
+                println!("     watch for the one-time password below, then log in at http://<host>:{port}/login");
+            }
             println!();
         }
     }

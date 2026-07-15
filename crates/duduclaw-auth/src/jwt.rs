@@ -203,6 +203,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             last_login: None,
             must_change_password: false,
+            department: None,
         }
     }
 

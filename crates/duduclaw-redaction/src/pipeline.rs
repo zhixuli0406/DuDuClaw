@@ -83,13 +83,13 @@ impl RedactionPipeline {
 
     /// Decide whether to redact text from `source`. Returns `SourceMode`
     /// in effect.
-    fn mode_for(&self, source: &Source) -> SourceMode {
+    fn setting_for(&self, source: &Source) -> &crate::config::SourceSetting {
         match source {
-            Source::UserChannelInput { .. } => self.source_policy.user_input,
-            Source::ToolResult { .. } => self.source_policy.tool_results,
-            Source::SystemPrompt { .. } => self.source_policy.system_prompt,
-            Source::SubAgentReply { .. } => self.source_policy.sub_agent,
-            Source::CronContext => self.source_policy.cron_context,
+            Source::UserChannelInput { .. } => &self.source_policy.user_input,
+            Source::ToolResult { .. } => &self.source_policy.tool_results,
+            Source::SystemPrompt { .. } => &self.source_policy.system_prompt,
+            Source::SubAgentReply { .. } => &self.source_policy.sub_agent,
+            Source::CronContext => &self.source_policy.cron_context,
         }
     }
 
@@ -97,7 +97,8 @@ impl RedactionPipeline {
     /// inserted into the vault. **Fail-closed**: if any insert fails, the
     /// entire call returns `Err` and the caller MUST drop the LLM request.
     pub fn redact(&self, text: &str, source: &Source) -> Result<RedactionOutput> {
-        match self.mode_for(source) {
+        let setting = self.setting_for(source);
+        match setting.mode {
             SourceMode::Off | SourceMode::Inherit => {
                 return Ok(RedactionOutput {
                     redacted_text: text.to_string(),
@@ -119,7 +120,14 @@ impl RedactionPipeline {
             }
         }
 
-        let matches = self.engine.apply(text, source);
+        // Per-source field filter: the operator may narrow this source to
+        // specific PII categories (only_categories / exclude_categories).
+        let matches: Vec<_> = self
+            .engine
+            .apply(text, source)
+            .into_iter()
+            .filter(|m| setting.allows_category(m.rule.category()))
+            .collect();
         if matches.is_empty() {
             return Ok(RedactionOutput {
                 redacted_text: text.to_string(),
@@ -543,6 +551,58 @@ mod tests {
         assert!(!out.contains("alice@acme.com"));
     }
 
+    #[test]
+    fn per_source_category_filter_narrows_redaction() {
+        use crate::config::SourceSetting;
+
+        // Two rules: EMAIL + a keyword rule categorised TW_MOBILE.
+        let mobile_rule = RuleSpec {
+            id: "mobile".into(),
+            category: "TW_MOBILE".into(),
+            restore_scope: RestoreScope::Owner,
+            priority: 50,
+            cross_session_stable: false,
+            apply_to_system_prompt: false,
+            kind: RuleKind::Regex { pattern: r"09\d{8}".into() },
+        };
+        let text = "mail alice@acme.com phone 0912345678";
+        let src = Source::ToolResult { tool_name: "odoo.search".into() };
+
+        // only_categories = TW_MOBILE ⇒ email survives, phone tokenised.
+        let policy = SourcePolicy {
+            tool_results: SourceSetting {
+                mode: SourceMode::On,
+                only_categories: vec!["TW_MOBILE".into()],
+                exclude_categories: vec![],
+            },
+            ..SourcePolicy::default()
+        };
+        let (p, _t) = build_pipeline_with_policy(
+            vec![email_rule(50), mobile_rule.clone()],
+            Some("s1"),
+            policy,
+        );
+        let out = p.redact(text, &src).unwrap();
+        assert!(out.redacted_text.contains("alice@acme.com"), "{}", out.redacted_text);
+        assert!(!out.redacted_text.contains("0912345678"), "{}", out.redacted_text);
+        assert_eq!(out.tokens_written.len(), 1);
+
+        // exclude_categories = TW_MOBILE ⇒ phone survives, email tokenised.
+        let policy = SourcePolicy {
+            tool_results: SourceSetting {
+                mode: SourceMode::On,
+                only_categories: vec![],
+                exclude_categories: vec!["TW_MOBILE".into()],
+            },
+            ..SourcePolicy::default()
+        };
+        let (p, _t) =
+            build_pipeline_with_policy(vec![email_rule(50), mobile_rule], Some("s1"), policy);
+        let out = p.redact(text, &src).unwrap();
+        assert!(!out.redacted_text.contains("alice@acme.com"), "{}", out.redacted_text);
+        assert!(out.redacted_text.contains("0912345678"), "{}", out.redacted_text);
+    }
+
     fn build_pipeline_with_policy(
         rules: Vec<RuleSpec>,
         session: Option<&str>,
@@ -573,7 +633,7 @@ mod tests {
         // tool_results = Selective: must NOT force a full redact for a
         // tool-result source (Selective only applies to system-prompt).
         let policy = SourcePolicy {
-            tool_results: SourceMode::Selective,
+            tool_results: SourceMode::Selective.into(),
             ..SourcePolicy::default()
         };
         let (p, _t) = build_pipeline_with_policy(vec![email_rule(50)], Some("s1"), policy);
@@ -594,7 +654,7 @@ mod tests {
         let mut rule = email_rule(50);
         rule.apply_to_system_prompt = true;
         let policy = SourcePolicy {
-            system_prompt: SourceMode::Selective,
+            system_prompt: SourceMode::Selective.into(),
             ..SourcePolicy::default()
         };
         let (p, _t) = build_pipeline_with_policy(vec![rule], Some("s1"), policy);

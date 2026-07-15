@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAgentsStore } from '@/stores/agents-store';
 import { api, type LicenseSnapshot } from '@/lib/api';
 import { TIER_LABELS } from '@/lib/license-labels';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
-import { Page, PageHeader, Card, Section, StatCard, Badge, Button, Mono } from '@/components/ui';
+import { Page, PageHeader, Card, Section, StatCard, Badge, Button, Mono, Field, controlClass } from '@/components/ui';
 import {
   KeyRound,
   ShieldCheck,
@@ -22,7 +24,11 @@ import {
   Check,
   Minus,
   Award,
+  Copy,
+  Ticket,
 } from 'lucide-react';
+
+const PRICING_URL = 'https://duduclaw.dudustudio.monster#pricing';
 
 /** Commercial-module feature flags advertised on the LicensePage matrix. */
 const COMMERCIAL_FEATURES: ReadonlyArray<{
@@ -268,6 +274,11 @@ export function LicensePage() {
             />
           </div>
 
+          {/* ── Upgrade / activate — prominent while on OpenSource ── */}
+          {!snapshot.installed && (
+            <ActivateLicenseCard collapsed={false} onActivated={() => void load()} />
+          )}
+
           {/* ── License details ─────────────────────────────── */}
           <Card title={intl.formatMessage({ id: 'license.activeTier' })}>
             <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -367,7 +378,7 @@ export function LicensePage() {
             >
               <div className="flex flex-wrap gap-3">
                 <a
-                  href="https://duduclaw.dudustudio.monster#pricing"
+                  href={PRICING_URL}
                   target="_blank"
                   rel="noopener noreferrer"
                 >
@@ -395,7 +406,7 @@ export function LicensePage() {
             >
               <div className="flex flex-wrap gap-3">
                 <a
-                  href="https://duduclaw.dudustudio.monster#pricing"
+                  href={PRICING_URL}
                   target="_blank"
                   rel="noopener noreferrer"
                 >
@@ -405,6 +416,11 @@ export function LicensePage() {
                 </a>
               </div>
             </Section>
+          )}
+
+          {/* ── Replace / re-activate — collapsed once licensed ── */}
+          {snapshot.installed && (
+            <ActivateLicenseCard collapsed onActivated={() => void load()} />
           )}
 
           {/* ── CLI hint ───────────────────────────────────── */}
@@ -459,4 +475,217 @@ function DetailRow({
       </dd>
     </div>
   );
+}
+
+/**
+ * Upgrade / activate license card — machine fingerprint (copyable), license
+ * key activation, and the free partner redeem-code path. Prominent while on
+ * OpenSource; collapsed into a <details> once a commercial license is live.
+ * Activation hot-reloads the gateway LicenseRuntime, so `onActivated` only
+ * needs to re-fetch `license.status` — no restart.
+ */
+function ActivateLicenseCard({
+  collapsed,
+  onActivated,
+}: {
+  readonly collapsed: boolean;
+  readonly onActivated: () => void;
+}) {
+  const intl = useIntl();
+  const navigate = useNavigate();
+  // Zero agents ⇒ the operator is still mid-onboarding (came here from the
+  // welcome wizard's industry step) — offer a way back after activating.
+  const agentCount = useAgentsStore((s) => s.agents.length);
+
+  const [fingerprint, setFingerprint] = useState<string | null>(null);
+  const [key, setKey] = useState('');
+  const [activating, setActivating] = useState(false);
+  const [activateError, setActivateError] = useState<string | null>(null);
+  const [code, setCode] = useState('');
+  const [email, setEmail] = useState('');
+  const [redeeming, setRedeeming] = useState(false);
+  const [redeemError, setRedeemError] = useState<string | null>(null);
+  const [activated, setActivated] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    api.license
+      .fingerprint()
+      .then((r) => alive && setFingerprint(r.fingerprint))
+      .catch(() => {/* row shows a dash */});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const copyFingerprint = async () => {
+    if (!fingerprint) return;
+    try {
+      await navigator.clipboard.writeText(fingerprint);
+      toast.success(intl.formatMessage({ id: 'license.activate.fingerprint.copied' }));
+    } catch {
+      toast.error(intl.formatMessage({ id: 'license.activate.fingerprint.copyFailed' }));
+    }
+  };
+
+  const handleActivate = async () => {
+    if (!key.trim()) return;
+    setActivateError(null);
+    setActivating(true);
+    try {
+      await api.license.activate(key.trim());
+      toast.success(intl.formatMessage({ id: 'license.activate.success' }));
+      setKey('');
+      setActivated(true);
+      onActivated();
+    } catch (e) {
+      // Gateway error strings are already localized zh-TW — show verbatim.
+      setActivateError(formatError(e));
+    } finally {
+      setActivating(false);
+    }
+  };
+
+  const handleRedeem = async () => {
+    if (!code.trim()) return;
+    setRedeemError(null);
+    setRedeeming(true);
+    try {
+      await api.license.redeem(code.trim(), email.trim() || undefined);
+      toast.success(intl.formatMessage({ id: 'license.activate.success' }));
+      setCode('');
+      setEmail('');
+      setActivated(true);
+      onActivated();
+    } catch (e) {
+      setRedeemError(formatError(e));
+    } finally {
+      setRedeeming(false);
+    }
+  };
+
+  const body = (
+    <div className="space-y-6">
+      {/* 1 — machine fingerprint + purchase link */}
+      <div className="space-y-2">
+        <p className="flex items-center gap-1.5 text-xs uppercase tracking-wider text-stone-500 dark:text-stone-400">
+          <Fingerprint className="h-3.5 w-3.5" />
+          {intl.formatMessage({ id: 'license.activate.fingerprint' })}
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <Mono className="break-all text-stone-800 dark:text-stone-200">
+            {fingerprint ?? '—'}
+          </Mono>
+          <Button variant="secondary" icon={Copy} onClick={() => void copyFingerprint()} disabled={!fingerprint}>
+            {intl.formatMessage({ id: 'license.activate.fingerprint.copy' })}
+          </Button>
+        </div>
+        <p className="text-xs text-stone-500 dark:text-stone-400">
+          {intl.formatMessage({ id: 'license.activate.fingerprint.hint' })}{' '}
+          <a
+            href={PRICING_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-medium text-amber-600 hover:underline dark:text-amber-400"
+          >
+            {intl.formatMessage({ id: 'license.cta.pricing' })}
+            <ExternalLink className="ml-0.5 inline h-3 w-3" />
+          </a>
+        </p>
+      </div>
+
+      {/* 2 — activate with a license key */}
+      <div className="space-y-3">
+        <Field
+          label={intl.formatMessage({ id: 'license.activate.key.label' })}
+          help={intl.formatMessage({ id: 'license.activate.key.hint' })}
+        >
+          <textarea
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+            spellCheck={false}
+            className={cn(controlClass, 'min-h-28 resize-y font-mono text-xs leading-relaxed')}
+          />
+        </Field>
+        {activateError && (
+          <p className="text-sm text-rose-600 dark:text-rose-400">{activateError}</p>
+        )}
+        <Button
+          variant="primary"
+          icon={KeyRound}
+          onClick={() => void handleActivate()}
+          disabled={activating || !key.trim()}
+        >
+          {intl.formatMessage({
+            id: activating ? 'license.activate.submitting' : 'license.activate.submit',
+          })}
+        </Button>
+      </div>
+
+      {/* 3 — partner (NFR) redeem code, free path */}
+      <div className="space-y-3 border-t border-[var(--panel-border)] pt-4">
+        <p className="flex items-center gap-1.5 text-xs uppercase tracking-wider text-stone-500 dark:text-stone-400">
+          <Ticket className="h-3.5 w-3.5" />
+          {intl.formatMessage({ id: 'license.activate.redeem.title' })}
+        </p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label={intl.formatMessage({ id: 'license.activate.redeem.code' })}>
+            <input
+              type="text"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              spellCheck={false}
+              className={cn(controlClass, 'font-mono')}
+              placeholder="PARTNER-CODE"
+            />
+          </Field>
+          <Field label={intl.formatMessage({ id: 'license.activate.redeem.email' })}>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className={controlClass}
+              autoComplete="off"
+            />
+          </Field>
+        </div>
+        {redeemError && (
+          <p className="text-sm text-rose-600 dark:text-rose-400">{redeemError}</p>
+        )}
+        <Button
+          variant="secondary"
+          onClick={() => void handleRedeem()}
+          disabled={redeeming || !code.trim()}
+        >
+          {intl.formatMessage({
+            id: redeeming ? 'license.activate.redeem.submitting' : 'license.activate.redeem.submit',
+          })}
+        </Button>
+      </div>
+
+      {/* First-run: the operator came from the welcome wizard — send them back. */}
+      {activated && agentCount === 0 && (
+        <div className="border-t border-[var(--panel-border)] pt-4">
+          <Button variant="primary" onClick={() => navigate('/welcome')}>
+            {intl.formatMessage({ id: 'license.activate.backToWizard' })}
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+
+  if (collapsed) {
+    return (
+      <Card>
+        <details>
+          <summary className="cursor-pointer text-sm font-medium text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: 'license.activate.reopen' })}
+          </summary>
+          <div className="mt-4">{body}</div>
+        </details>
+      </Card>
+    );
+  }
+
+  return <Card title={intl.formatMessage({ id: 'license.activate.title' })}>{body}</Card>;
 }

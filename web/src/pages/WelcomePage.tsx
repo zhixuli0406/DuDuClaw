@@ -1,8 +1,16 @@
-import { useState, useEffect, useCallback, type ComponentType } from 'react';
+import { useState, useEffect, useCallback, useRef, type ComponentType } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
-import { api, type RuntimeProvider, type RuntimeDetect } from '@/lib/api';
+import {
+  api,
+  type RuntimeProvider,
+  type RuntimeDetect,
+  type TemplatesIndustriesResponse,
+  type TemplateRoster,
+  type TemplateRoleDetail,
+} from '@/lib/api';
+import { formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useTourStore } from '@/stores/tour-store';
 import { Card, Button, Badge, Field, controlClass } from '@/components/ui';
@@ -42,7 +50,17 @@ const BACKENDS: ReadonlyArray<BackendDef> = [
 const OTHER_CLIS: ReadonlyArray<OtherCli> = ['codex', 'gemini', 'antigravity'] as const;
 
 const DEFAULT_LOCAL_MODEL = 'qwen3-8b-q4_k_m';
-const TOTAL_STEPS = 3;
+const TOTAL_STEPS = 4;
+
+/** Fallback when `templates.industries` fails (OSS install / non-admin):
+ *  behaves as "no template resources" so the industry step auto-skips. */
+const NO_TEMPLATES: TemplatesIndustriesResponse = {
+  unlocked: false,
+  present_but_locked: false,
+  staged: null,
+  ceo_available: false,
+  industries: [],
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -96,6 +114,50 @@ const INITIAL: WizardState = {
 };
 
 // ---------------------------------------------------------------------------
+// Mid-wizard resume (sessionStorage)
+// ---------------------------------------------------------------------------
+
+/**
+ * The wizard legitimately navigates away mid-flow (industry step → /license to
+ * install a Pro key) and a remount would otherwise restart at step 1. Progress
+ * is kept per-tab in sessionStorage; secrets (API keys) are deliberately NOT
+ * persisted — returning users re-enter them. Cleared on successful deploy.
+ */
+const WELCOME_RESUME_KEY = 'duduclaw:welcome:resume';
+
+function restoreWelcomeProgress(initial: WizardState): { step: number; state: WizardState } | null {
+  try {
+    const raw = sessionStorage.getItem(WELCOME_RESUME_KEY);
+    if (!raw) return null;
+    const p = JSON.parse(raw) as { step?: unknown; state?: unknown };
+    if (typeof p.step !== 'number' || typeof p.state !== 'object' || p.state === null) return null;
+    return {
+      step: Math.min(Math.max(Math.trunc(p.step), 1), 4),
+      state: { ...initial, ...(p.state as Partial<WizardState>), apiKey: '', genericKey: '' },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistWelcomeProgress(step: number, state: WizardState): void {
+  try {
+    const { apiKey: _k, genericKey: _g, ...safe } = state;
+    sessionStorage.setItem(WELCOME_RESUME_KEY, JSON.stringify({ step, state: safe }));
+  } catch {
+    /* private mode / quota — resume is best-effort */
+  }
+}
+
+export function clearWelcomeProgress(): void {
+  try {
+    sessionStorage.removeItem(WELCOME_RESUME_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Step indicator
 // ---------------------------------------------------------------------------
 
@@ -145,12 +207,32 @@ export function WelcomePage() {
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const requestTourPrompt = useTourStore((s) => s.requestPrompt);
 
-  const [step, setStep] = useState(1);
-  const [state, setState] = useState<WizardState>(INITIAL);
+  // Resume mid-wizard progress (e.g. back from /license during the industry
+  // step) — lazy init so the restore runs once per mount.
+  const [step, setStep] = useState(() => restoreWelcomeProgress(INITIAL)?.step ?? 1);
+  const [state, setState] = useState<WizardState>(
+    () => restoreWelcomeProgress(INITIAL)?.state ?? INITIAL,
+  );
   const [detect, setDetect] = useState<RuntimeDetect | null>(null);
   const [deploying, setDeploying] = useState(false);
   const [deployed, setDeployed] = useState(false);
+  /** Agent was created but a post-create settings step failed — success page
+   *  still shows (retrying would hit "already exists"), with a warning line. */
+  const [deployWarning, setDeployWarning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // ── Industry template state (Step 3 + Step 4 template picker) ──
+  const [industryInfo, setIndustryInfo] = useState<TemplatesIndustriesResponse | null>(null);
+  const [selectedIndustry, setSelectedIndustry] = useState<string | null>(null);
+  const [industryFilter, setIndustryFilter] = useState('');
+  const [staging, setStaging] = useState(false);
+  const [roster, setRoster] = useState<TemplateRoster | null>(null);
+  const [templateRoleId, setTemplateRoleId] = useState('');
+  const [roleDetail, setRoleDetail] = useState<TemplateRoleDetail | null>(null);
+  const [roleLoading, setRoleLoading] = useState(false);
+  const [soulMd, setSoulMd] = useState('');
+  // Guards the one-shot CEO auto-select per roster (user choice always wins after).
+  const templateAutoDone = useRef(false);
 
   const patch = useCallback((p: Partial<WizardState>) => setState((s) => ({ ...s, ...p })), []);
 
@@ -165,6 +247,126 @@ export function WelcomePage() {
       alive = false;
     };
   }, []);
+
+  // Industry template availability — a failed call degrades to "no templates"
+  // so the industry step silently disappears on OSS installs.
+  useEffect(() => {
+    let alive = true;
+    api.templates
+      .industries()
+      .then((info) => {
+        if (!alive) return;
+        // Shape-check — malformed payloads degrade to "no templates".
+        if (!Array.isArray(info?.industries)) {
+          setIndustryInfo(NO_TEMPLATES);
+          return;
+        }
+        setIndustryInfo(info);
+        if (info.staged) setSelectedIndustry(info.staged);
+      })
+      .catch(() => alive && setIndustryInfo(NO_TEMPLATES));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Keep per-tab resume state current (skipped once the wizard has finished).
+  useEffect(() => {
+    if (!deployed) persistWelcomeProgress(step, state);
+  }, [step, state, deployed]);
+
+  /** True when Step 3 has nothing to show (no packs, not even a locked hint). */
+  const skipIndustryStep =
+    industryInfo !== null &&
+    !industryInfo.present_but_locked &&
+    !(industryInfo.unlocked && industryInfo.industries.length > 0);
+
+  // Auto-skip the industry step for installs without template resources.
+  useEffect(() => {
+    if (step === 3 && skipIndustryStep) setStep(4);
+  }, [step, skipIndustryStep]);
+
+  // Entering Step 4 without a staged roster: the generic CEO role is still
+  // offered when available (templates.roster returns it even unstaged).
+  useEffect(() => {
+    if (step !== 4 || roster !== null || !industryInfo?.ceo_available) return;
+    let alive = true;
+    api.templates
+      .roster()
+      // Shape-check: a malformed payload degrades to blank-only, no crash.
+      .then((r) => alive && setRoster(Array.isArray(r?.roles) ? r : null))
+      .catch(() => {/* blank-only */});
+    return () => {
+      alive = false;
+    };
+  }, [step, roster, industryInfo]);
+
+  /** Load one template role and prefill the identity fields. */
+  const selectTemplate = useCallback(
+    async (roleId: string) => {
+      setTemplateRoleId(roleId);
+      if (roleId === '') {
+        setRoleDetail(null);
+        return;
+      }
+      setRoleLoading(true);
+      setError(null);
+      try {
+        const d = await api.templates.role(roleId, selectedIndustry ?? undefined);
+        setRoleDetail(d);
+        setSoulMd(d.soul_md);
+        setState((s) => ({
+          ...s,
+          displayName: d.display_name,
+          agentId: d.name,
+          trigger: d.trigger,
+        }));
+      } catch (e) {
+        setTemplateRoleId('');
+        setRoleDetail(null);
+        setError(formatError(e));
+      } finally {
+        setRoleLoading(false);
+      }
+    },
+    [selectedIndustry],
+  );
+
+  // Default template = CEO (once per roster; never re-fires over a user choice).
+  useEffect(() => {
+    if (step !== 4 || !roster || templateAutoDone.current) return;
+    templateAutoDone.current = true;
+    const ceo = roster.roles.find((r) => r.kind === 'ceo' && !r.created);
+    if (ceo) void selectTemplate(ceo.role_id);
+  }, [step, roster, selectTemplate]);
+
+  /** Step 3 → Step 4: stage the chosen industry (no agents are created). */
+  const handleIndustryNext = useCallback(async () => {
+    setError(null);
+    if (!selectedIndustry) {
+      // Skip → generic assistant. Drop any previously staged roster from state
+      // so Step 4 falls back to the generic CEO-only roster.
+      setRoster(null);
+      setTemplateRoleId('');
+      setRoleDetail(null);
+      templateAutoDone.current = false;
+      setStep(4);
+      return;
+    }
+    setStaging(true);
+    try {
+      const res = await api.templates.stage(selectedIndustry);
+      setRoster(Array.isArray(res.roster?.roles) ? res.roster : null);
+      setTemplateRoleId('');
+      setRoleDetail(null);
+      templateAutoDone.current = false;
+      setStep(4);
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setStaging(false);
+    }
+  }, [selectedIndustry]);
 
   const detectedFor = (b: Backend): boolean | undefined => {
     if (!detect) return undefined;
@@ -193,6 +395,8 @@ export function WelcomePage() {
           return state.baseUrl.trim().length > 0 && state.genericModel.trim().length > 0;
         return true;
       case 3:
+        return !staging;
+      case 4:
         return state.displayName.trim().length > 0 && AGENT_ID_RE.test(state.agentId);
       default:
         return false;
@@ -243,9 +447,12 @@ export function WelcomePage() {
   const handleDeploy = useCallback(async () => {
     setDeploying(true);
     setError(null);
-    try {
-      const name = state.agentId;
+    const usedTemplate = templateRoleId !== '' && roleDetail !== null;
+    const name = state.agentId;
 
+    // ── Phase A: pre-create config + agent creation. A failure here leaves
+    // nothing created, so it hard-fails and the user can simply retry. ──
+    try {
       // 1. Credentials / endpoint config first, so the agent has a brain.
       if (state.backend === 'claudeApi') {
         await api.accounts.add({
@@ -273,34 +480,65 @@ export function WelcomePage() {
       }
 
       // 3. Create the agent (writes [runtime] provider + SOUL.md).
-      await api.agents.create({
-        name,
-        display_name: state.displayName.trim(),
-        role: 'main',
-        trigger: state.trigger.trim() || `@${state.displayName.trim()}`,
-        soul: state.soul.trim() ? sanitizeSoul(state.soul) : undefined,
-        runtime: { provider: runtimeProvider() },
-      });
+      if (usedTemplate) {
+        // Template path — the backend writes SOUL.md / CONTRACT.toml /
+        // agent.toml from the pack; `name` is always forced into agent.toml.
+        await api.templates.createAgent({
+          role_id: templateRoleId,
+          ...(selectedIndustry ? { industry: selectedIndustry } : {}),
+          name,
+          display_name: state.displayName.trim(),
+          trigger: state.trigger.trim() || `@${state.displayName.trim()}`,
+          soul_md: soulMd,
+        });
+      } else {
+        await api.agents.create({
+          name,
+          display_name: state.displayName.trim(),
+          role: 'main',
+          trigger: state.trigger.trim() || `@${state.displayName.trim()}`,
+          soul: state.soul.trim() ? sanitizeSoul(state.soul) : undefined,
+          runtime: { provider: runtimeProvider() },
+        });
+      }
+    } catch (e) {
+      // Template errors carry an actionable zh-TW message from the gateway
+      // (e.g. a TOML validation failure) — surface it verbatim.
+      setError(usedTemplate ? formatError(e) : intl.formatMessage({ id: 'welcome.error' }));
+      setDeploying(false);
+      return;
+    }
 
-      // 4. Per-agent api_mode (+ local model wiring) via update.
+    // ── Phase B: the agent now exists. A failure below must NOT strand the
+    // user on the deploy page (retry would hit "already exists") — degrade to
+    // a "created, some settings incomplete" warning on the success screen. ──
+    let warned = false;
+
+    // 4. Per-agent api_mode (+ local model wiring) via update.
+    try {
       await api.agents.update(name, {
         api_mode: apiMode(),
         ...(state.backend === 'local'
           ? { local_model: state.localModel.trim() || DEFAULT_LOCAL_MODEL, prefer_local: true }
           : {}),
       });
-
-      // 5. Refresh roster so FirstRunGate lets the app through, then offer tour.
-      await fetchAgents();
-      requestTourPrompt();
-      setDeployed(true);
     } catch {
-      setError(intl.formatMessage({ id: 'welcome.error' }));
-    } finally {
-      setDeploying(false);
+      warned = true;
     }
+
+    // 5. Refresh roster so FirstRunGate lets the app through, then offer tour.
+    try {
+      await fetchAgents();
+    } catch {
+      warned = true;
+    }
+    requestTourPrompt();
+    setDeployWarning(warned);
+    setDeployed(true);
+    setDeploying(false);
+    clearWelcomeProgress();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state, fetchAgents, requestTourPrompt, intl]);
+  }, [state, templateRoleId, roleDetail, soulMd, selectedIndustry, fetchAgents, requestTourPrompt, intl]);
 
   // ── Success ───────────────────────────────────────────────
   if (deployed) {
@@ -314,6 +552,16 @@ export function WelcomePage() {
         <p className="mt-2 text-sm text-stone-500 dark:text-stone-400">
           {intl.formatMessage({ id: 'welcome.success.subtitle' })}
         </p>
+        {deployWarning && (
+          <p className="mt-3 rounded-lg bg-amber-500/10 px-4 py-2 text-sm text-amber-700 dark:text-amber-300">
+            {intl.formatMessage({ id: 'welcome.success.partialWarning' })}
+          </p>
+        )}
+        {selectedIndustry && (
+          <p className="mt-2 text-sm text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'welcome.success.moreRoles' })}
+          </p>
+        )}
         <Button variant="primary" className="mt-8" onClick={() => navigate('/')}>
           {intl.formatMessage({ id: 'welcome.goToDashboard' })}
         </Button>
@@ -522,14 +770,166 @@ export function WelcomePage() {
         </div>
       )}
 
-      {/* Step 3 — agent identity */}
+      {/* Step 3 — pick an industry (premium template packs) */}
       {step === 3 && (
+        <div className="space-y-5">
+          <div className="text-center">
+            <h2 className="text-xl font-semibold text-stone-900 dark:text-stone-50">
+              {intl.formatMessage({ id: 'welcome.industry.title' })}
+            </h2>
+            <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
+              {intl.formatMessage({ id: 'welcome.industry.subtitle' })}
+            </p>
+          </div>
+
+          {industryInfo === null && (
+            <p className="text-center text-sm text-stone-400 dark:text-stone-500">
+              {intl.formatMessage({ id: 'common.loading' })}
+            </p>
+          )}
+
+          {industryInfo?.present_but_locked && (
+            <Card bodyClassName="space-y-3">
+              <p className="text-sm text-stone-600 dark:text-stone-300">
+                {intl.formatMessage(
+                  { id: 'welcome.industry.locked' },
+                  { feature: intl.formatMessage({ id: 'license.feature.premiumTemplates' }) },
+                )}
+              </p>
+              <Button variant="secondary" onClick={() => navigate('/license')}>
+                {intl.formatMessage({ id: 'welcome.industry.lockedCta' })}
+              </Button>
+            </Card>
+          )}
+
+          {industryInfo?.unlocked && industryInfo.industries.length > 0 && (
+            <>
+              {/* Prominent skip → generic assistant */}
+              <button
+                type="button"
+                onClick={() => setSelectedIndustry(null)}
+                aria-pressed={selectedIndustry === null}
+                className={cn(
+                  'panel panel-hover flex w-full items-start gap-3 p-4 text-left transition-colors duration-200',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+                  selectedIndustry === null && 'border-amber-500/70 ring-1 ring-amber-500/40',
+                )}
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-stone-900 dark:text-stone-50">
+                    {intl.formatMessage({ id: 'welcome.industry.skip' })}
+                  </p>
+                  <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">
+                    {intl.formatMessage({ id: 'welcome.industry.skip.desc' })}
+                  </p>
+                </div>
+              </button>
+
+              <input
+                type="text"
+                value={industryFilter}
+                onChange={(e) => setIndustryFilter(e.target.value)}
+                className={controlClass}
+                placeholder={intl.formatMessage({ id: 'welcome.industry.filter' })}
+              />
+
+              <div className="max-h-[46vh] overflow-y-auto pr-1">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {industryInfo.industries
+                    .filter((ind) => {
+                      const f = industryFilter.trim().toLowerCase();
+                      if (!f) return true;
+                      return (
+                        ind.label.toLowerCase().includes(f) || ind.industry.toLowerCase().includes(f)
+                      );
+                    })
+                    .map((ind) => {
+                      const selected = selectedIndustry === ind.industry;
+                      return (
+                        <button
+                          key={ind.industry}
+                          type="button"
+                          onClick={() => setSelectedIndustry(ind.industry)}
+                          aria-pressed={selected}
+                          className={cn(
+                            'panel panel-hover flex flex-col items-start gap-1 p-4 text-left transition-colors duration-200',
+                            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+                            selected && 'border-amber-500/70 ring-1 ring-amber-500/40',
+                          )}
+                        >
+                          <p className="text-sm font-semibold text-stone-900 dark:text-stone-50">
+                            {ind.label}
+                          </p>
+                          <p className="text-xs text-stone-500 dark:text-stone-400">
+                            {intl.formatMessage(
+                              { id: 'welcome.industry.workerCount' },
+                              { count: ind.worker_count },
+                            )}
+                          </p>
+                        </button>
+                      );
+                    })}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Step 4 — create the first AI staff member */}
+      {step === 4 && (
         <div className="mx-auto max-w-lg space-y-5">
           <div className="text-center">
             <h2 className="text-xl font-semibold text-stone-900 dark:text-stone-50">
               {intl.formatMessage({ id: 'welcome.identity.title' })}
             </h2>
           </div>
+
+          {/* Template picker — CEO by default, front-desk when an industry is staged. */}
+          {roster && roster.roles.some((r) => r.kind === 'ceo' || r.kind === 'front_desk') && (
+            <Field label={intl.formatMessage({ id: 'welcome.template.title' })}>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => void selectTemplate('')}
+                  aria-pressed={templateRoleId === ''}
+                  className={cn(
+                    'rounded-lg border px-3 py-2 text-sm transition-colors',
+                    templateRoleId === ''
+                      ? 'border-amber-500/70 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+                      : 'border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-600 dark:text-stone-300',
+                  )}
+                >
+                  {intl.formatMessage({ id: 'welcome.template.blank' })}
+                </button>
+                {roster.roles
+                  .filter((r) => r.kind === 'ceo' || r.kind === 'front_desk')
+                  .map((r) => {
+                    const selected = templateRoleId === r.role_id;
+                    return (
+                      <button
+                        key={r.role_id}
+                        type="button"
+                        disabled={r.created}
+                        onClick={() => void selectTemplate(r.role_id)}
+                        aria-pressed={selected}
+                        title={r.summary}
+                        className={cn(
+                          'rounded-lg border px-3 py-2 text-sm transition-colors disabled:opacity-50',
+                          selected
+                            ? 'border-amber-500/70 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+                            : 'border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-600 dark:text-stone-300',
+                        )}
+                      >
+                        {r.display_name}
+                        {r.created && ` ${intl.formatMessage({ id: 'welcome.template.created' })}`}
+                      </button>
+                    );
+                  })}
+              </div>
+            </Field>
+          )}
+
           <Field label={intl.formatMessage({ id: 'welcome.identity.displayName' })} required>
             <input
               type="text"
@@ -557,15 +957,37 @@ export function WelcomePage() {
               placeholder={`@${state.displayName || 'DuDu'}`}
             />
           </Field>
-          <Field label={intl.formatMessage({ id: 'welcome.identity.persona' })}>
-            <textarea
-              value={state.soul}
-              onChange={(e) => patch({ soul: e.target.value })}
-              rows={4}
-              className={cn(controlClass, 'resize-none')}
-              placeholder={intl.formatMessage({ id: 'welcome.identity.persona.placeholder' })}
-            />
-          </Field>
+          {templateRoleId !== '' ? (
+            roleLoading ? (
+              <p className="text-sm text-stone-400 dark:text-stone-500">
+                {intl.formatMessage({ id: 'welcome.template.loading' })}
+              </p>
+            ) : (
+              roleDetail && (
+                <Field
+                  label={intl.formatMessage({ id: 'welcome.template.soul' })}
+                  help={intl.formatMessage({ id: 'welcome.template.soulHint' })}
+                >
+                  <textarea
+                    value={soulMd}
+                    onChange={(e) => setSoulMd(e.target.value)}
+                    spellCheck={false}
+                    className={cn(controlClass, 'min-h-[40vh] resize-y font-mono text-sm leading-relaxed')}
+                  />
+                </Field>
+              )
+            )
+          ) : (
+            <Field label={intl.formatMessage({ id: 'welcome.identity.persona' })}>
+              <textarea
+                value={state.soul}
+                onChange={(e) => patch({ soul: e.target.value })}
+                rows={4}
+                className={cn(controlClass, 'resize-none')}
+                placeholder={intl.formatMessage({ id: 'welcome.identity.persona.placeholder' })}
+              />
+            </Field>
+          )}
         </div>
       )}
 
@@ -575,7 +997,11 @@ export function WelcomePage() {
       <div className="flex items-center justify-between pt-2">
         <div>
           {step > 1 && (
-            <Button variant="secondary" icon={ChevronLeft} onClick={() => setStep((s) => s - 1)}>
+            <Button
+              variant="secondary"
+              icon={ChevronLeft}
+              onClick={() => setStep((s) => (s === 4 && skipIndustryStep ? 2 : s - 1))}
+            >
               {intl.formatMessage({ id: 'welcome.back' })}
             </Button>
           )}
@@ -586,9 +1012,11 @@ export function WelcomePage() {
               variant="primary"
               iconRight={ChevronRight}
               disabled={!canAdvance()}
-              onClick={() => setStep((s) => s + 1)}
+              onClick={() => (step === 3 ? void handleIndustryNext() : setStep((s) => s + 1))}
             >
-              {intl.formatMessage({ id: step === 1 ? 'welcome.start' : 'welcome.next' })}
+              {intl.formatMessage({
+                id: step === 1 ? 'welcome.start' : step === 3 && staging ? 'welcome.industry.staging' : 'welcome.next',
+              })}
             </Button>
           ) : (
             <Button variant="primary" icon={Rocket} disabled={deploying || !canAdvance()} onClick={handleDeploy}>

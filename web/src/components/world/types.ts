@@ -53,6 +53,8 @@ export interface WorldAgentState {
   readonly facing: Facing;
   /** 1..10 tint index (from `characterFor(id).tintIndex`), keeps world ⇄ UI in sync. */
   readonly tintIndex: number;
+  /** Wardrobe composition; null = seeded default look (legacy accessory). */
+  readonly outfit: import('@/lib/outfit').AgentOutfit | null;
   /** Head-top emote glyph, or null for a calm character. */
   readonly emote: WorldEmote | null;
   /** Whether the desk/nameplate should read as inactive (terminated). */

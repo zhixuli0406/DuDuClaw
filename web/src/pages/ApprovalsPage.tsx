@@ -17,7 +17,8 @@ import { api, type ApprovalItem, type ApprovalKind } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useApprovalsStore } from '@/stores/approvals-store';
 import { toast, formatError } from '@/lib/toast';
-import { Page, PageHeader, Card, Badge, EmptyState, Button, SkeletonList } from '@/components/ui';
+import { Page, PageHeader, Card, Section, Badge, EmptyState, Button, SkeletonList } from '@/components/ui';
+import { InstallRequestsSection } from '@/components/approvals/InstallRequestsSection';
 
 /** Per-kind icon + Badge tone. Unknown kinds fall back to a neutral question mark. */
 const KIND_META: Record<
@@ -114,6 +115,10 @@ export function ApprovalsPage() {
         subtitle={intl.formatMessage({ id: 'approvals.subtitle' })}
       />
 
+      {/* Install approval requests (Skill / MCP) — two-stage signature chain */}
+      <InstallRequestsSection />
+
+      <Section title={intl.formatMessage({ id: 'approvals.section.other' })} className="mt-6">
       {loading ? (
         <Card padded={false}>
           <div className="p-5">
@@ -193,6 +198,7 @@ export function ApprovalsPage() {
           })}
         </div>
       )}
+      </Section>
     </Page>
   );
 }

@@ -25,6 +25,22 @@ export function shouldShowDailyReport(lastShown: string | null, today: string): 
 }
 
 /**
+ * Pure gate: does yesterday's report contain any actual activity? A fresh
+ * install (or a fully idle day) settles to all-zero — popping a zero card on
+ * first open reads as a bug ("brand-new system has no yesterday"). Exported
+ * for unit test.
+ */
+export function reportHasActivity(r: DailyReport): boolean {
+  return (
+    r.tasks_completed > 0 ||
+    r.cost_cents > 0 ||
+    r.xp_gained > 0 ||
+    r.new_knowledge_pages > 0 ||
+    r.most_active_agent != null
+  );
+}
+
+/**
  * DailyReportCard — the once-per-day settlement popup (T10.3). On the first
  * dashboard open of each local day it fetches *yesterday's* report and shows it
  * in a dialog; the "shown" marker is persisted so reloads the same day stay
@@ -55,6 +71,16 @@ export function DailyReportCard() {
       .dailyReport()
       .then((r) => {
         if (!alive) return;
+        if (!reportHasActivity(r)) {
+          // Idle/empty yesterday — stay quiet, and still burn the marker so we
+          // don't re-fetch on every reload (yesterday's numbers can't change).
+          try {
+            localStorage.setItem(LAST_SHOWN_KEY, today);
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
         setReport(r);
         setOpen(true);
         // Burn the marker only on a successful show, so a transient RPC failure

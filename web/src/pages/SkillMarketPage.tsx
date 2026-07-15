@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { api, type SkillIndexEntry, type SharedSkillInfo, type SkillInfo, type SkillLeaderboardEntry } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAuthStore } from '@/stores/auth-store';
 import { departmentsOf } from '@/lib/agents';
 import { Dialog } from '@/components/shared/Dialog';
 import { CustomSkillsSection } from '@/components/skills/CustomSkillsSection';
@@ -43,6 +44,7 @@ import {
   Trophy,
   Clock,
   Wand2,
+  Link as LinkIcon,
 } from 'lucide-react';
 
 interface VetResult {
@@ -203,6 +205,7 @@ function MarketTab() {
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [installSkill, setInstallSkill] = useState<SkillIndexEntry | null>(null);
+  const [showUrlImport, setShowUrlImport] = useState(false);
 
   const handleSearchQuery = async (q: string) => {
     if (!q.trim()) return;
@@ -239,6 +242,9 @@ function MarketTab() {
       >
         <Button variant="primary" icon={Search} onClick={handleSearch} disabled={loading}>
           {intl.formatMessage({ id: 'skills.market.search' })}
+        </Button>
+        <Button variant="secondary" icon={LinkIcon} onClick={() => setShowUrlImport(true)}>
+          {intl.formatMessage({ id: 'skills.import.fromUrl' })}
         </Button>
       </Toolbar>
 
@@ -287,7 +293,80 @@ function MarketTab() {
       )}
 
       {installSkill && <InstallDialog skill={installSkill} onClose={() => setInstallSkill(null)} />}
+      {showUrlImport && <UrlImportDialog onClose={() => setShowUrlImport(false)} />}
     </div>
+  );
+}
+
+// ── Import from GitHub / URL ────────────────────────────────
+//
+// Collects a source URL, then reuses InstallDialog — the vet RPC fetches the
+// content server-side (SSRF-gated), scans it, and install re-scans fail-closed.
+
+function UrlImportDialog({ onClose }: { onClose: () => void }) {
+  const intl = useIntl();
+  const [url, setUrl] = useState('');
+  const [entry, setEntry] = useState<SkillIndexEntry | null>(null);
+
+  const trimmed = url.trim();
+  const valid = /^https?:\/\/\S+$/i.test(trimmed);
+
+  const handleContinue = () => {
+    if (!valid) return;
+    let name = trimmed;
+    try {
+      const u = new URL(trimmed);
+      name = `${u.hostname}${u.pathname}`.replace(/\/+$/, '');
+    } catch { /* keep raw url as the display name */ }
+    setEntry({
+      name,
+      description: trimmed,
+      tags: [],
+      author: '',
+      url: trimmed,
+      compatible: [],
+    });
+  };
+
+  if (entry) {
+    return <InstallDialog skill={entry} onClose={onClose} />;
+  }
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title={intl.formatMessage({ id: 'skills.import.title' })}
+      className="max-w-xl"
+    >
+      <div className="space-y-4">
+        <p className="text-sm text-stone-500 dark:text-stone-400">
+          {intl.formatMessage({ id: 'skills.import.desc' })}
+        </p>
+        <Field label="URL">
+          <input
+            type="url"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleContinue(); }}
+            placeholder="https://github.com/user/repo"
+            className={controlClass}
+            autoFocus
+          />
+        </Field>
+        <p className="text-xs text-stone-400 dark:text-stone-500">
+          {intl.formatMessage({ id: 'skills.import.hint' })}
+        </p>
+        <div className="flex justify-end gap-3 border-t border-[var(--panel-border)] pt-4">
+          <Button variant="secondary" onClick={onClose}>
+            {intl.formatMessage({ id: 'common.cancel' })}
+          </Button>
+          <Button variant="primary" icon={Shield} onClick={handleContinue} disabled={!valid}>
+            {intl.formatMessage({ id: 'skills.import.continue' })}
+          </Button>
+        </div>
+      </div>
+    </Dialog>
   );
 }
 
@@ -666,11 +745,13 @@ function InstallDialog({
 }) {
   const intl = useIntl();
   const { agents, fetchAgents } = useAgentsStore();
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [scope, setScope] = useState('global');
   const [scanning, setScanning] = useState(false);
   const [scanResult, setScanResult] = useState<VetResponse | null>(null);
   const [installing, setInstalling] = useState(false);
   const [installed, setInstalled] = useState(false);
+  const [requested, setRequested] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -697,14 +778,20 @@ function InstallDialog({
     setInstalling(true);
     setError(null);
     try {
-      await api.skills.install(skill.url, scope, scanResult.content);
-      setInstalled(true);
+      if (isAdmin) {
+        await api.skills.install(skill.url, scope, scanResult.content);
+        setInstalled(true);
+      } else {
+        // Non-admin: file an approval request (manager → admin chain).
+        const res = await api.skills.installRequest(skill.url, scope, scanResult.content);
+        setRequested(res.stage);
+      }
     } catch (e) {
       setError(String(e));
     } finally {
       setInstalling(false);
     }
-  }, [scanResult, skill.url, scope]);
+  }, [scanResult, skill.url, scope, isAdmin]);
 
   const scanPassed = scanResult?.passed === true;
   const scanFailed = scanResult !== null && !scanResult.passed;
@@ -827,7 +914,14 @@ function InstallDialog({
           </div>
         )}
 
-        {/* Success message */}
+        {/* Non-admin notice: install goes through approval */}
+        {!isAdmin && scanPassed && !requested && (
+          <p className="text-xs text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'install.request.nonAdminNotice' })}
+          </p>
+        )}
+
+        {/* Success message (admin direct install) */}
         {installed && scanResult && (
           <div className="flex items-center gap-2 rounded-control border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-400">
             <CheckCircle className="h-4 w-4 flex-shrink-0" />
@@ -838,12 +932,24 @@ function InstallDialog({
           </div>
         )}
 
+        {/* Request-filed message (non-admin) */}
+        {requested && (
+          <div className="flex items-center gap-2 rounded-control border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400">
+            <CheckCircle className="h-4 w-4 flex-shrink-0" />
+            {intl.formatMessage({
+              id: requested === 'awaiting_manager'
+                ? 'install.request.filedManager'
+                : 'install.request.filedAdmin',
+            })}
+          </div>
+        )}
+
         {/* Action buttons */}
         <div className="flex items-center justify-end gap-3 border-t border-[var(--panel-border)] pt-4">
           <Button variant="secondary" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
+            {intl.formatMessage({ id: requested || installed ? 'common.close' : 'common.cancel' })}
           </Button>
-          {!installed && (
+          {!installed && !requested && (
             <Button
               variant="primary"
               icon={installing ? Loader2 : Download}
@@ -853,8 +959,8 @@ function InstallDialog({
               className={cn(installing && '[&>svg]:animate-spin')}
             >
               {installing
-                ? intl.formatMessage({ id: 'skills.install.installing' })
-                : intl.formatMessage({ id: 'skills.install.installBtn' })}
+                ? intl.formatMessage({ id: isAdmin ? 'skills.install.installing' : 'install.request.submitting' })
+                : intl.formatMessage({ id: isAdmin ? 'skills.install.installBtn' : 'install.request.submit' })}
             </Button>
           )}
         </div>
