@@ -1,21 +1,30 @@
 import { useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
+import { ArrowRight, ListTodo } from 'lucide-react';
 import { api, type TaskInfo } from '@/lib/api';
-import { CharacterAvatar, Card, Mono, StatusIcon, EmptyState } from '@/components/ui';
-import { ListTodo } from 'lucide-react';
+import {
+  Card,
+  CardHeader,
+  CardTitle,
+  CardFooter,
+  ActorAvatar,
+  Empty,
+} from '@/components/mds';
+import { StatusIcon } from '@/components/ui';
 import { toStatusKey } from '@/lib/task-status';
-import { formatId, timeAgo } from '@/lib/format';
+import { timeAgo } from '@/lib/format';
 import { useSharedLeaderQuery } from '@/hooks/useSharedLeaderQuery';
 
 /**
- * RecentTasks — the right column of Home's "近期" row (V3-T3.4). The 10
- * most-recently-updated tasks: status glyph, title, assignee character avatar,
- * short id, relative time — each row deep-links to the task detail.
+ * RecentTasks — the "最近任務" card on Home (WP1.5, spec §5.4 list-row language).
+ * The most-recently-updated tasks as slim `h-9` rows: status glyph + title +
+ * assignee avatar + relative time — each row deep-links to the task detail, with
+ * an "全部任務 →" footer into `/tasks`.
  *
  * Polled through `useSharedLeaderQuery` so multiple open tabs share one RPC.
  */
-const RECENT_CAP = 10;
+const RECENT_CAP = 8;
 const POLL_MS = 15000;
 
 async function fetchRecent(): Promise<TaskInfo[]> {
@@ -43,34 +52,47 @@ export function RecentTasks({ agents, enabled }: RecentTasksProps) {
   const tasks = data ?? [];
 
   return (
-    <Card title={intl.formatMessage({ id: 'home.recentTasks.title' })}>
+    <Card className="gap-0 py-0">
+      <CardHeader className="pt-4 pb-2">
+        <CardTitle>{intl.formatMessage({ id: 'home.recentTasks.title' })}</CardTitle>
+      </CardHeader>
+
       {tasks.length === 0 ? (
-        <EmptyState icon={ListTodo} title={intl.formatMessage({ id: 'home.recentTasks.empty' })} />
+        <Empty icon={ListTodo} title={intl.formatMessage({ id: 'home.recentTasks.empty' })} />
       ) : (
-        <div className="divide-y divide-stone-100 dark:divide-stone-800">
-          {tasks.map((t) => (
+        <>
+          <div className="px-2 pb-2">
+            {tasks.map((t) => (
+              <Link
+                key={t.id}
+                to={`/tasks/${encodeURIComponent(t.id)}`}
+                className="flex h-9 items-center gap-2 rounded-md px-2 text-sm transition-colors hover:bg-surface-hover"
+              >
+                <StatusIcon status={toStatusKey(t.status)} size="sm" />
+                <span className="min-w-0 flex-1 truncate text-foreground" title={t.title}>
+                  {t.title}
+                </span>
+                {t.assigned_to && (
+                  <span className="hidden shrink-0 sm:inline-flex" title={nameOf.get(t.assigned_to)}>
+                    <ActorAvatar actorType="agent" size="sm" name={nameOf.get(t.assigned_to)} />
+                  </span>
+                )}
+                <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+                  {timeAgo(t.updated_at)}
+                </span>
+              </Link>
+            ))}
+          </div>
+          <CardFooter className="justify-end p-0">
             <Link
-              key={t.id}
-              to={`/tasks/${encodeURIComponent(t.id)}`}
-              className="-mx-2 flex items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-stone-500/8 dark:hover:bg-white/5"
+              to="/tasks"
+              className="flex items-center gap-1 px-4 py-3 text-xs text-muted-foreground transition-colors hover:text-foreground"
             >
-              <StatusIcon status={toStatusKey(t.status)} size="sm" />
-              <span className="min-w-0 flex-1 truncate text-sm text-stone-800 dark:text-stone-100" title={t.title}>
-                {t.title}
-              </span>
-              {t.assigned_to && (
-                <CharacterAvatar
-                  agentId={t.assigned_to}
-                  name={nameOf.get(t.assigned_to)}
-                  size={22}
-                  className="shrink-0"
-                />
-              )}
-              <Mono className="hidden shrink-0 sm:inline">{formatId(t.id)}</Mono>
-              <Mono className="shrink-0">{timeAgo(t.updated_at)}</Mono>
+              {intl.formatMessage({ id: 'home.recentTasks.viewAll' })}
+              <ArrowRight className="size-3" />
             </Link>
-          ))}
-        </div>
+          </CardFooter>
+        </>
       )}
     </Card>
   );

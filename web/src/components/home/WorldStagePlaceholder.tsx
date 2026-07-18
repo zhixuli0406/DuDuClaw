@@ -2,6 +2,7 @@ import { Suspense, lazy, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { LayoutGrid, Sparkles, Maximize2 } from 'lucide-react';
+import { Button } from '@/components/mds';
 import { WorldStageStatic } from './WorldStageStatic';
 import {
   resolveStageMode,
@@ -114,16 +115,17 @@ export function WorldStagePlaceholder({ agents, variant = 'band' }: WorldStagePr
       <div className="relative h-full w-full">
         {stageBranch}
         {mode !== 'stage' && stagePossible && (
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={toggle}
             title={intl.formatMessage({ id: 'home.stage.toggleStage' })}
             aria-label={intl.formatMessage({ id: 'home.stage.toggleStage' })}
-            className="absolute right-4 top-4 z-10 inline-flex items-center gap-1.5 rounded-lg border border-stone-200/70 bg-white/70 px-2.5 py-1.5 text-xs font-medium text-stone-600 backdrop-blur transition-transform hover:bg-white/90 active:scale-[0.97] dark:border-white/10 dark:bg-stone-900/60 dark:text-stone-300"
+            className="absolute right-4 top-4 z-10 border border-surface-border bg-surface/80 backdrop-blur"
           >
-            <Sparkles className="h-3.5 w-3.5" />
+            <Sparkles />
             {intl.formatMessage({ id: 'home.stage.toggleStageLabel' })}
-          </button>
+          </Button>
         )}
       </div>
     );

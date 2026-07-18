@@ -55,12 +55,12 @@ export function AdvancedSection({
   };
 
   return (
-    <div className={cn('border-t border-[var(--panel-border)] pt-3', className)}>
+    <div className={cn('border-t border-surface-border pt-3', className)}>
       <button
         type="button"
         onClick={toggle}
         aria-expanded={open}
-        className="flex items-center gap-1.5 text-xs font-medium text-stone-500 transition-colors hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200"
+        className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
       >
         <ChevronDown className={cn('h-3.5 w-3.5 transition-transform', !open && '-rotate-90')} />
         {label ?? intl.formatMessage({ id: 'settings.advanced' })}

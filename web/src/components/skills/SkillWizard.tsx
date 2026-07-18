@@ -1,9 +1,23 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { Check, Wand2, Loader2, RefreshCw, ShieldCheck, ShieldAlert, ArrowRight, ArrowLeft, Send } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { Card, Button, Field, controlClass, Badge, CharacterAvatar, DuDu, Mono } from '@/components/ui';
+import {
+  Card,
+  CardContent,
+  Button,
+  Badge,
+  Input,
+  Textarea,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  ActorAvatar,
+} from '@/components/mds';
+import { DuDu } from '@/components/mascot';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { useAgentsStore } from '@/stores/agents-store';
 import { toast, formatError } from '@/lib/toast';
@@ -32,14 +46,37 @@ import {
   type WizardStep,
 } from './wizard-machine';
 
-const textareaClass = cn(controlClass, 'h-auto min-h-[96px] resize-y py-2 leading-relaxed');
 const POLL_MS = 3000;
+
+/** Local field wrapper (label + optional help), MDS-styled. */
+function Field({
+  label,
+  help,
+  required,
+  children,
+}: {
+  label: ReactNode;
+  help?: ReactNode;
+  required?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <label className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+        {label}
+        {required && <span className="text-destructive">*</span>}
+      </label>
+      {children}
+      {help && <p className="text-xs text-muted-foreground">{help}</p>}
+    </div>
+  );
+}
 
 /**
  * SkillWizard — the 4-step `/skills/new` self-serve builder (T13.1). Describe →
  * generate (agent authors the SKILL.md) → fill human fields → safety scan +
- * submit for a manager's approval. DuDu accompanies each step, changing face
- * per the wizard machine (curious → writing → idle → proud).
+ * submit for a manager's approval. DuDu accompanies each step as a small
+ * illustration; the surface is now MDS (spec §5.3 detail-page container).
  */
 export function SkillWizard() {
   const intl = useIntl();
@@ -117,7 +154,6 @@ export function SkillWizard() {
     if (!canStartGeneration(description, builderAgent) || starting) return;
     setStarting(true);
     try {
-      // Provisional display name (editable in step 3) derived from the request.
       const provisional = description.trim().split('\n')[0].slice(0, 60) || t('skills.new.defaultName');
       const created = await createCustomSkill({
         display_name: provisional,
@@ -191,8 +227,6 @@ export function SkillWizard() {
       const res = await submitCustomSkill(record.id);
       setSubmitResult(res);
     } catch (e) {
-      // High/critical risk (or missing draft) comes back as an error frame —
-      // surfaced verbatim; the human cannot bypass it.
       setSubmitError(formatError(e));
     } finally {
       setSubmitting(false);
@@ -255,7 +289,10 @@ export function SkillWizard() {
           result={submitResult}
           error={submitError}
           onSubmit={handleSubmit}
-          onBack={() => { setSubmitError(null); setStep(prevStep('review')); }}
+          onBack={() => {
+            setSubmitError(null);
+            setStep(prevStep('review'));
+          }}
           onView={() => navigate(`/skills/custom/${record.id}`)}
         />
       )}
@@ -279,25 +316,23 @@ function Stepper({ step }: { step: WizardStep }) {
             <li key={s} className="flex flex-1 items-center gap-2">
               <span
                 className={cn(
-                  'grid h-7 w-7 shrink-0 place-items-center rounded-full text-xs font-semibold tabular-nums transition-colors',
-                  done && 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400',
-                  active && 'bg-amber-500 text-white',
-                  !done && !active && 'bg-stone-500/10 text-stone-400 dark:bg-white/5',
+                  'grid size-7 shrink-0 place-items-center rounded-full text-xs font-medium tabular-nums transition-colors',
+                  done && 'bg-success/15 text-success',
+                  active && 'bg-brand text-brand-foreground',
+                  !done && !active && 'bg-muted text-muted-foreground',
                 )}
               >
-                {done ? <Check className="h-3.5 w-3.5" /> : i + 1}
+                {done ? <Check className="size-3.5" /> : i + 1}
               </span>
               <span
                 className={cn(
                   'hidden truncate text-xs font-medium sm:block',
-                  active ? 'text-stone-800 dark:text-stone-100' : 'text-stone-400',
+                  active ? 'text-foreground' : 'text-muted-foreground',
                 )}
               >
                 {intl.formatMessage({ id: WIZARD_STEP_LABEL[s] })}
               </span>
-              {i < WIZARD_STEPS.length - 1 && (
-                <span className="h-px flex-1 bg-[var(--panel-border)]" aria-hidden="true" />
-              )}
+              {i < WIZARD_STEPS.length - 1 && <span className="h-px flex-1 bg-surface-border" aria-hidden="true" />}
             </li>
           );
         })}
@@ -328,56 +363,51 @@ function StepDescribe({
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   return (
-    <Card className="space-y-5">
-      <Field label={t('skills.new.describe.label')} help={t('skills.new.describe.help')}>
-        <textarea
-          className={textareaClass}
-          value={description}
-          onChange={(e) => onDescription(e.target.value)}
-          placeholder={t('skills.new.describe.placeholder')}
-          rows={5}
-        />
-      </Field>
+    <Card>
+      <CardContent className="space-y-5">
+        <Field label={t('skills.new.describe.label')} help={t('skills.new.describe.help')}>
+          <Textarea
+            value={description}
+            onChange={(e) => onDescription(e.target.value)}
+            placeholder={t('skills.new.describe.placeholder')}
+            rows={5}
+            className="min-h-24"
+          />
+        </Field>
 
-      <Field label={t('skills.new.builder.label')} help={t('skills.new.builder.help')}>
-        <div className="flex flex-wrap gap-2">
-          {agents.map((a) => {
-            const selected = a.name === builderAgent;
-            return (
-              <button
-                key={a.name}
-                type="button"
-                onClick={() => onBuilderAgent(a.name)}
-                aria-pressed={selected}
-                className={cn(
-                  'flex items-center gap-2 rounded-xl border px-3 py-2 text-sm transition-colors',
-                  selected
-                    ? 'border-amber-500/60 bg-amber-500/10 text-stone-800 dark:text-stone-100'
-                    : 'border-[var(--panel-border)] text-stone-600 hover:bg-stone-500/5 dark:text-stone-300',
-                )}
-              >
-                <CharacterAvatar agentId={a.name} name={a.display_name} size={22} />
-                <span className="truncate">{a.display_name}</span>
-              </button>
-            );
-          })}
-          {agents.length === 0 && (
-            <p className="text-sm text-stone-400">{t('skills.new.builder.none')}</p>
-          )}
+        <Field label={t('skills.new.builder.label')} help={t('skills.new.builder.help')}>
+          <div className="flex flex-wrap gap-2">
+            {agents.map((a) => {
+              const selected = a.name === builderAgent;
+              return (
+                <button
+                  key={a.name}
+                  type="button"
+                  onClick={() => onBuilderAgent(a.name)}
+                  aria-pressed={selected}
+                  className={cn(
+                    'flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors',
+                    selected
+                      ? 'border-brand bg-brand/8 text-foreground'
+                      : 'border-border text-muted-foreground hover:bg-muted',
+                  )}
+                >
+                  <ActorAvatar actorType="agent" size="sm" name={a.display_name} />
+                  <span className="truncate">{a.display_name}</span>
+                </button>
+              );
+            })}
+            {agents.length === 0 && <p className="text-sm text-muted-foreground">{t('skills.new.builder.none')}</p>}
+          </div>
+        </Field>
+
+        <div className="flex justify-end border-t border-surface-border pt-4">
+          <Button variant="brand" onClick={onStart} disabled={starting || !description.trim() || !builderAgent}>
+            {starting ? <Loader2 className="animate-spin" /> : <Wand2 />}
+            {starting ? t('skills.new.starting') : t('skills.new.start')}
+          </Button>
         </div>
-      </Field>
-
-      <div className="flex justify-end border-t border-[var(--panel-border)] pt-4">
-        <Button
-          variant="primary"
-          icon={starting ? Loader2 : Wand2}
-          onClick={onStart}
-          disabled={starting || !description.trim() || !builderAgent}
-          className={cn(starting && '[&>svg]:animate-spin')}
-        >
-          {starting ? t('skills.new.starting') : t('skills.new.start')}
-        </Button>
-      </div>
+      </CardContent>
     </Card>
   );
 }
@@ -413,56 +443,56 @@ function StepGenerate({
   const canNext = canProceedFromGenerate(record.status, draftConfirmed);
 
   return (
-    <Card className="space-y-5">
-      <div className="flex flex-col items-center gap-3 py-4 text-center">
-        <DuDu face={phase === 'ready' ? 'proud' : 'writing'} size="md" animated={phase !== 'ready'} />
-        <p className="text-sm font-medium text-stone-700 dark:text-stone-200">
-          {phase === 'ready' ? t('skills.new.generate.ready') : t('skills.new.generate.working')}
-        </p>
-        <p className="max-w-md text-xs text-stone-500 dark:text-stone-400">
-          {phase === 'ready' ? t('skills.new.generate.readyHint') : t('skills.new.generate.workingHint')}
-        </p>
-      </div>
+    <Card>
+      <CardContent className="space-y-5">
+        <div className="flex flex-col items-center gap-3 py-4 text-center">
+          <DuDu face={phase === 'ready' ? 'proud' : 'writing'} size="md" animated={phase !== 'ready'} />
+          <p className="text-sm font-medium text-foreground">
+            {phase === 'ready' ? t('skills.new.generate.ready') : t('skills.new.generate.working')}
+          </p>
+          <p className="max-w-md text-xs text-muted-foreground">
+            {phase === 'ready' ? t('skills.new.generate.readyHint') : t('skills.new.generate.workingHint')}
+          </p>
+        </div>
 
-      <Field label={t('skills.new.generate.draftPath')}>
-        <Mono className="block truncate text-xs" title={draftPath}>{draftPath || '—'}</Mono>
-      </Field>
+        <Field label={t('skills.new.generate.draftPath')}>
+          <span className="block truncate font-mono text-xs text-muted-foreground" title={draftPath}>
+            {draftPath || '—'}
+          </span>
+        </Field>
 
-      {/* Revision request → regenerate */}
-      <Field label={t('skills.new.generate.reviseLabel')} help={t('skills.new.generate.reviseHelp')}>
-        <textarea
-          className={textareaClass}
-          value={instruction}
-          onChange={(e) => onInstruction(e.target.value)}
-          placeholder={t('skills.new.generate.revisePlaceholder')}
-          rows={3}
-        />
-      </Field>
-      <div className="flex items-center gap-2">
-        <Button
-          variant="secondary"
-          icon={regenerating ? Loader2 : RefreshCw}
-          onClick={onRegenerate}
-          disabled={regenerating}
-          className={cn(regenerating && '[&>svg]:animate-spin')}
-        >
-          {regenerating ? t('skills.new.generate.regenerating') : t('skills.new.generate.regenerate')}
-        </Button>
-        {!canNext && !draftConfirmed && (
-          <Button variant="ghost" size="sm" onClick={onConfirmDraft}>
-            {t('skills.new.generate.confirmDone')}
+        <Field label={t('skills.new.generate.reviseLabel')} help={t('skills.new.generate.reviseHelp')}>
+          <Textarea
+            value={instruction}
+            onChange={(e) => onInstruction(e.target.value)}
+            placeholder={t('skills.new.generate.revisePlaceholder')}
+            rows={3}
+          />
+        </Field>
+
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={onRegenerate} disabled={regenerating}>
+            {regenerating ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            {regenerating ? t('skills.new.generate.regenerating') : t('skills.new.generate.regenerate')}
           </Button>
-        )}
-      </div>
+          {!canNext && !draftConfirmed && (
+            <Button variant="ghost" size="sm" onClick={onConfirmDraft}>
+              {t('skills.new.generate.confirmDone')}
+            </Button>
+          )}
+        </div>
 
-      <div className="flex items-center justify-between border-t border-[var(--panel-border)] pt-4">
-        <Button variant="ghost" icon={ArrowLeft} onClick={onBack}>
-          {t('common.back')}
-        </Button>
-        <Button variant="primary" iconRight={ArrowRight} onClick={onNext} disabled={!canNext}>
-          {t('skills.new.generate.toForm')}
-        </Button>
-      </div>
+        <div className="flex items-center justify-between border-t border-surface-border pt-4">
+          <Button variant="ghost" onClick={onBack}>
+            <ArrowLeft />
+            {t('common.back')}
+          </Button>
+          <Button variant="brand" onClick={onNext} disabled={!canNext}>
+            {t('skills.new.generate.toForm')}
+            <ArrowRight />
+          </Button>
+        </div>
+      </CardContent>
     </Card>
   );
 }
@@ -503,67 +533,60 @@ function StepForm({
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   return (
-    <Card className="space-y-5">
-      <Field label={t('skills.new.form.displayName')} required>
-        <input
-          className={controlClass}
-          value={displayName}
-          onChange={(e) => onDisplayName(e.target.value)}
-          placeholder={t('skills.new.form.displayNamePlaceholder')}
-        />
-      </Field>
-
-      <Field label={t('skills.new.form.description')}>
-        <textarea
-          className={textareaClass}
-          value={descriptionHuman}
-          onChange={(e) => onDescriptionHuman(e.target.value)}
-          rows={4}
-        />
-      </Field>
-
-      <Field label={t('skills.new.form.timeSaved')} help={t('skills.new.form.timeSavedHelp')}>
-        <div className="flex gap-2">
-          <input
-            type="number"
-            min={0}
-            className={cn(controlClass, 'w-28')}
-            value={timeSavedValue}
-            onChange={(e) => onTimeSavedValue(e.target.value)}
+    <Card>
+      <CardContent className="space-y-5">
+        <Field label={t('skills.new.form.displayName')} required>
+          <Input
+            value={displayName}
+            onChange={(e) => onDisplayName(e.target.value)}
+            placeholder={t('skills.new.form.displayNamePlaceholder')}
           />
-          <select
-            className={cn(controlClass, 'w-auto flex-1')}
-            value={timeSavedUnit}
-            onChange={(e) => onTimeSavedUnit(e.target.value as TimeSavedUnit)}
-          >
-            {TIME_UNITS.map((u) => (
-              <option key={u} value={u}>
-                {t(`skills.custom.unit.${u}`)}
-              </option>
-            ))}
-          </select>
+        </Field>
+
+        <Field label={t('skills.new.form.description')}>
+          <Textarea value={descriptionHuman} onChange={(e) => onDescriptionHuman(e.target.value)} rows={4} />
+        </Field>
+
+        <Field label={t('skills.new.form.timeSaved')} help={t('skills.new.form.timeSavedHelp')}>
+          <div className="flex gap-2">
+            <Input
+              type="number"
+              min={0}
+              className="w-28"
+              value={timeSavedValue}
+              onChange={(e) => onTimeSavedValue(e.target.value)}
+            />
+            <Select value={timeSavedUnit} onValueChange={(v) => onTimeSavedUnit(String(v) as TimeSavedUnit)}>
+              <SelectTrigger className="w-48">
+                <SelectValue>{t(`skills.custom.unit.${timeSavedUnit}`)}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {TIME_UNITS.map((u) => (
+                  <SelectItem key={u} value={u}>
+                    {t(`skills.custom.unit.${u}`)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </Field>
+
+        <Field label={t('skills.new.form.tags')}>
+          <ChipEditor values={tags} onChange={onTags} placeholder={t('skills.new.form.tagsPlaceholder')} />
+        </Field>
+
+        <div className="flex items-center justify-between border-t border-surface-border pt-4">
+          <Button variant="ghost" onClick={onBack}>
+            <ArrowLeft />
+            {t('common.back')}
+          </Button>
+          <Button variant="brand" onClick={onNext} disabled={saving || !displayName.trim()}>
+            {saving ? <Loader2 className="animate-spin" /> : null}
+            {saving ? t('common.saving') : t('skills.new.form.toReview')}
+            {!saving && <ArrowRight />}
+          </Button>
         </div>
-      </Field>
-
-      <Field label={t('skills.new.form.tags')}>
-        <ChipEditor values={tags} onChange={onTags} placeholder={t('skills.new.form.tagsPlaceholder')} />
-      </Field>
-
-      <div className="flex items-center justify-between border-t border-[var(--panel-border)] pt-4">
-        <Button variant="ghost" icon={ArrowLeft} onClick={onBack}>
-          {t('common.back')}
-        </Button>
-        <Button
-          variant="primary"
-          icon={saving ? Loader2 : undefined}
-          iconRight={saving ? undefined : ArrowRight}
-          onClick={onNext}
-          disabled={saving || !displayName.trim()}
-          className={cn(saving && '[&>svg]:animate-spin')}
-        >
-          {saving ? t('common.saving') : t('skills.new.form.toReview')}
-        </Button>
-      </div>
+      </CardContent>
     </Card>
   );
 }
@@ -594,91 +617,92 @@ function StepReview({
   if (result) {
     const sr = result.safety_report;
     return (
-      <Card className="space-y-4">
-        <div className="flex flex-col items-center gap-3 py-3 text-center">
-          <DuDu face="proud" size="md" />
-          <p className="text-sm font-semibold text-stone-800 dark:text-stone-100">
-            {t('skills.new.submitted.title')}
-          </p>
-          <p className="max-w-md text-xs text-stone-500 dark:text-stone-400">
-            {t('skills.new.submitted.awaiting')}
-          </p>
-        </div>
-        <div className="space-y-2 rounded-control bg-stone-500/8 p-3 text-xs dark:bg-white/5">
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-stone-500 dark:text-stone-400">{t('skills.new.submitted.approvalId')}</span>
-            <Mono className="truncate">{result.approval_id}</Mono>
+      <Card>
+        <CardContent className="space-y-4">
+          <div className="flex flex-col items-center gap-3 py-3 text-center">
+            <DuDu face="proud" size="md" />
+            <p className="text-sm font-medium text-foreground">{t('skills.new.submitted.title')}</p>
+            <p className="max-w-md text-xs text-muted-foreground">{t('skills.new.submitted.awaiting')}</p>
           </div>
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-stone-500 dark:text-stone-400">{t('skills.new.submitted.risk')}</span>
-            <Badge tone={sr.passed ? 'success' : 'warning'}>{sr.risk_level}</Badge>
+          <div className="space-y-2 rounded-lg bg-muted/60 p-3 text-xs">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-muted-foreground">{t('skills.new.submitted.approvalId')}</span>
+              <span className="truncate font-mono">{result.approval_id}</span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-muted-foreground">{t('skills.new.submitted.risk')}</span>
+              <Badge
+                variant="secondary"
+                className={sr.passed ? 'bg-success/15 text-success' : 'bg-warning/15 text-warning'}
+              >
+                {sr.risk_level}
+              </Badge>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-muted-foreground">{t('skills.new.submitted.findings')}</span>
+              <span className="font-mono tabular-nums text-foreground">{sr.findings.length}</span>
+            </div>
           </div>
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-stone-500 dark:text-stone-400">{t('skills.new.submitted.findings')}</span>
-            <span className="tabular-nums text-stone-700 dark:text-stone-200">{sr.findings.length}</span>
+          <div className="flex justify-end">
+            <Button variant="brand" onClick={onView}>
+              {t('skills.new.submitted.viewDetail')}
+            </Button>
           </div>
-        </div>
-        <div className="flex justify-end">
-          <Button variant="primary" onClick={onView}>
-            {t('skills.new.submitted.viewDetail')}
-          </Button>
-        </div>
+        </CardContent>
       </Card>
     );
   }
 
   return (
-    <Card className="space-y-5">
-      <div className="flex items-start gap-3">
-        <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
-        <div className="space-y-1">
-          <p className="text-sm font-medium text-stone-800 dark:text-stone-100">{t('skills.new.review.title')}</p>
-          <p className="text-xs text-stone-500 dark:text-stone-400">{t('skills.new.review.explain')}</p>
-        </div>
-      </div>
-
-      <div className="space-y-1.5 rounded-control bg-stone-500/8 p-3 text-xs dark:bg-white/5">
-        <div className="flex justify-between gap-2">
-          <span className="text-stone-500 dark:text-stone-400">{t('skills.new.form.displayName')}</span>
-          <span className="truncate font-medium text-stone-800 dark:text-stone-100">{record.display_name}</span>
-        </div>
-        <div className="flex justify-between gap-2">
-          <span className="text-stone-500 dark:text-stone-400">{t('skills.custom.slug')}</span>
-          <Mono className="truncate">{record.slug}</Mono>
-        </div>
-        <div className="flex justify-between gap-2">
-          <span className="text-stone-500 dark:text-stone-400">{t('skills.new.form.timeSaved')}</span>
-          <span className="text-stone-700 dark:text-stone-200">
-            {formatTimeSaved(intl, record.time_saved_value, record.time_saved_unit)}
-          </span>
-        </div>
-      </div>
-
-      {/* Fail-closed error frame: high/critical risk block or missing draft */}
-      {error && (
-        <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-400">
-          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
-          <div className="min-w-0 space-y-1">
-            <p className="font-medium">{t('skills.new.review.blocked')}</p>
-            <p className="break-words text-xs">{error}</p>
+    <Card>
+      <CardContent className="space-y-5">
+        <div className="flex items-start gap-3">
+          <ShieldCheck className="mt-0.5 size-5 shrink-0 text-brand" />
+          <div className="space-y-1">
+            <p className="text-sm font-medium text-foreground">{t('skills.new.review.title')}</p>
+            <p className="text-xs text-muted-foreground">{t('skills.new.review.explain')}</p>
           </div>
         </div>
-      )}
 
-      <div className="flex items-center justify-between border-t border-[var(--panel-border)] pt-4">
-        <Button variant="ghost" icon={ArrowLeft} onClick={onBack}>
-          {t('common.back')}
-        </Button>
-        <Button
-          variant="primary"
-          icon={submitting ? Loader2 : Send}
-          onClick={onSubmit}
-          disabled={submitting}
-          className={cn(submitting && '[&>svg]:animate-spin')}
-        >
-          {submitting ? t('skills.new.review.submitting') : t('skills.new.review.submit')}
-        </Button>
-      </div>
+        <div className="space-y-1.5 rounded-lg bg-muted/60 p-3 text-xs">
+          <div className="flex justify-between gap-2">
+            <span className="text-muted-foreground">{t('skills.new.form.displayName')}</span>
+            <span className="truncate font-medium text-foreground">{record.display_name}</span>
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-muted-foreground">{t('skills.custom.slug')}</span>
+            <span className="truncate font-mono text-foreground">{record.slug}</span>
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-muted-foreground">{t('skills.new.form.timeSaved')}</span>
+            <span className="text-foreground">
+              {formatTimeSaved(intl, record.time_saved_value, record.time_saved_unit)}
+            </span>
+          </div>
+        </div>
+
+        {/* Fail-closed error frame: high/critical risk block or missing draft */}
+        {error && (
+          <div className="flex items-start gap-2 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+            <ShieldAlert className="mt-0.5 size-4 shrink-0" />
+            <div className="min-w-0 space-y-1">
+              <p className="font-medium">{t('skills.new.review.blocked')}</p>
+              <p className="break-words text-xs">{error}</p>
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between border-t border-surface-border pt-4">
+          <Button variant="ghost" onClick={onBack}>
+            <ArrowLeft />
+            {t('common.back')}
+          </Button>
+          <Button variant="brand" onClick={onSubmit} disabled={submitting}>
+            {submitting ? <Loader2 className="animate-spin" /> : <Send />}
+            {submitting ? t('skills.new.review.submitting') : t('skills.new.review.submit')}
+          </Button>
+        </div>
+      </CardContent>
     </Card>
   );
 }

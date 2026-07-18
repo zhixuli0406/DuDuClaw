@@ -1,7 +1,8 @@
-import { Badge } from '@/components/ui';
+import { Badge, SettingsRow } from '@/components/mds';
 
 // Shared read-only "label · value (optional badge)" row used across several
-// settings sections (General / Account / Container).
+// settings sections (General / Account / Container). An mds SettingsRow with the
+// value rendered as the right-hand control content.
 export function SettingRow({
   label,
   value,
@@ -11,20 +12,19 @@ export function SettingRow({
   value: string;
   badge?: 'emerald' | 'amber' | 'rose';
 }) {
-  const badgeTone = { emerald: 'success', amber: 'warning', rose: 'danger' } as const;
+  const badgeClass = {
+    emerald: 'bg-success/10 text-success',
+    amber: 'bg-warning/10 text-warning',
+    rose: 'bg-destructive/10 text-destructive',
+  } as const;
 
   return (
-    <div className="flex items-center justify-between border-b border-[var(--panel-border)] pb-3 last:border-0 last:pb-0">
-      <span className="text-sm text-stone-600 dark:text-stone-400">
-        {label}
-      </span>
+    <SettingsRow label={label}>
       {badge ? (
-        <Badge tone={badgeTone[badge]}>{value}</Badge>
+        <Badge className={badgeClass[badge]}>{value}</Badge>
       ) : (
-        <span className="text-sm font-medium text-stone-900 dark:text-stone-50">
-          {value}
-        </span>
+        <span className="text-sm font-medium text-foreground">{value}</span>
       )}
-    </div>
+    </SettingsRow>
   );
 }

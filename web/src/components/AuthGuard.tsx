@@ -31,8 +31,8 @@ export function AuthGuard() {
   //   2. user is authenticated but WS hasn't completed handshake yet
   if (!initialized || (isAuthenticated && wsState !== 'authenticated')) {
     return (
-      <div className="flex h-screen items-center justify-center bg-stone-50 dark:bg-stone-950">
-        <div className="h-8 w-8 animate-spin rounded-full border-4 border-amber-500 border-t-transparent" />
+      <div className="flex h-screen items-center justify-center bg-background">
+        <div className="h-8 w-8 animate-spin rounded-full border-4 border-brand border-t-transparent" />
       </div>
     );
   }

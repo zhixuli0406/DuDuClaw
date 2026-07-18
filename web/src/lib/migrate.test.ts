@@ -62,10 +62,11 @@ describe('statusChipTone', () => {
 });
 
 describe('verdictToneClass', () => {
+  // Semantic tokens (MDS migration): success / warning / muted-foreground.
   const cases: Array<[MigrateVerdict, string]> = [
-    ['COMPLETE', 'emerald'],
-    ['DEGRADED', 'amber'],
-    ['PARTIAL', 'stone'],
+    ['COMPLETE', 'success'],
+    ['DEGRADED', 'warning'],
+    ['PARTIAL', 'muted-foreground'],
   ];
   it.each(cases)('%s uses a %s token class', (verdict, colour) => {
     expect(verdictToneClass(verdict)).toContain(colour);

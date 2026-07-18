@@ -2,10 +2,17 @@ import { useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { useAgentsStore } from '@/stores/agents-store';
 import { api } from '@/lib/api';
-import { FormField, inputClass } from '@/components/shared/Dialog';
 import { toast, formatError } from '@/lib/toast';
-import { Card, Button } from '@/components/ui';
-import { AdvancedSection, DangerZone, OptionSelect, SettingField, type SelectOption } from '@/components/settings/controls';
+import {
+  Button,
+  Input,
+  SettingsSection,
+  SettingsCard,
+  SettingsRow,
+  SettingsSaveState,
+} from '@/components/mds';
+import { AdvancedSection, DangerZone, type SelectOption } from '@/components/settings/controls';
+import { RowSelect } from '@/pages/agent-form/form-rows';
 
 // ── G — System tab (gateway / rotation / general / logging / secret_manager) ──
 
@@ -105,89 +112,102 @@ export function SystemTab() {
   }));
 
   return (
-    <div className="space-y-6">
-      <p className="rounded-lg bg-stone-500/5 px-4 py-3 text-sm text-stone-500 dark:bg-white/5 dark:text-stone-400">
-        {intl.formatMessage({ id: 'settings.system.desc' })}
-      </p>
-
+    <div className="space-y-8">
       {/* Gateway network binding — restart-required, can lock you out */}
-      <Card title={intl.formatMessage({ id: 'settings.system.gateway' })} bodyClassName="space-y-4">
+      <SettingsSection title={intl.formatMessage({ id: 'settings.system.gateway' })}>
         <DangerZone
           title={intl.formatMessage({ id: 'settings.system.dangerTitle' })}
           description={intl.formatMessage({ id: 'settings.system.dangerDesc' })}
         >
-          <div className="grid grid-cols-2 gap-3">
-            <SettingField label={intl.formatMessage({ id: 'settings.system.bind' })} help={intl.formatMessage({ id: 'settings.system.bind.help' })}>
-              <input type="text" value={bind} onChange={(e) => setBind(e.target.value)} placeholder="0.0.0.0" className={inputClass} />
-            </SettingField>
-            <SettingField label={intl.formatMessage({ id: 'settings.system.port' })} help={intl.formatMessage({ id: 'settings.system.port.help' })}>
-              <input type="number" min={1} max={65535} value={port} onChange={(e) => setPort(e.target.value)} placeholder="3100" className={inputClass} />
-            </SettingField>
-          </div>
+          <SettingsCard>
+            <SettingsRow label={intl.formatMessage({ id: 'settings.system.bind' })} description={intl.formatMessage({ id: 'settings.system.bind.help' })} tier="text">
+              <Input type="text" value={bind} onChange={(e) => setBind(e.target.value)} placeholder="0.0.0.0" />
+            </SettingsRow>
+            <SettingsRow label={intl.formatMessage({ id: 'settings.system.port' })} description={intl.formatMessage({ id: 'settings.system.port.help' })} tier="select">
+              <Input type="number" min={1} max={65535} value={port} onChange={(e) => setPort(e.target.value)} placeholder="3100" />
+            </SettingsRow>
+          </SettingsCard>
         </DangerZone>
-        <FormField label={intl.formatMessage({ id: 'settings.system.authToken' })} hint={intl.formatMessage({ id: 'settings.system.writeOnly' })}>
-          <input type="password" value={authToken} onChange={(e) => setAuthToken(e.target.value)} placeholder="••••••••" className={inputClass} autoComplete="off" />
-        </FormField>
-      </Card>
+        <SettingsCard>
+          <SettingsRow label={intl.formatMessage({ id: 'settings.system.authToken' })} description={intl.formatMessage({ id: 'settings.system.writeOnly' })} tier="text">
+            <Input type="password" value={authToken} onChange={(e) => setAuthToken(e.target.value)} placeholder="••••••••" autoComplete="off" />
+          </SettingsRow>
+        </SettingsCard>
+      </SettingsSection>
 
       {/* Rotation */}
-      <Card title={intl.formatMessage({ id: 'settings.system.rotation' })} bodyClassName="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
-          <SettingField label={intl.formatMessage({ id: 'settings.system.healthInterval' })} help={intl.formatMessage({ id: 'settings.system.healthInterval.help' })}>
-            <input type="number" min={1} max={86400} value={healthInterval} onChange={(e) => setHealthInterval(e.target.value)} placeholder="60" className={inputClass} />
-          </SettingField>
-          <SettingField label={intl.formatMessage({ id: 'settings.system.cooldown' })} help={intl.formatMessage({ id: 'settings.system.cooldown.help' })}>
-            <input type="number" min={1} max={86400} value={cooldown} onChange={(e) => setCooldown(e.target.value)} placeholder="120" className={inputClass} />
-          </SettingField>
-        </div>
-      </Card>
+      <SettingsSection title={intl.formatMessage({ id: 'settings.system.rotation' })}>
+        <SettingsCard>
+          <SettingsRow label={intl.formatMessage({ id: 'settings.system.healthInterval' })} description={intl.formatMessage({ id: 'settings.system.healthInterval.help' })} tier="select">
+            <Input type="number" min={1} max={86400} value={healthInterval} onChange={(e) => setHealthInterval(e.target.value)} placeholder="60" />
+          </SettingsRow>
+          <SettingsRow label={intl.formatMessage({ id: 'settings.system.cooldown' })} description={intl.formatMessage({ id: 'settings.system.cooldown.help' })} tier="select">
+            <Input type="number" min={1} max={86400} value={cooldown} onChange={(e) => setCooldown(e.target.value)} placeholder="120" />
+          </SettingsRow>
+        </SettingsCard>
+      </SettingsSection>
 
       {/* General + Logging */}
-      <Card title={intl.formatMessage({ id: 'settings.system.general' })} bodyClassName="space-y-4">
-        <SettingField label={intl.formatMessage({ id: 'settings.system.defaultAgent' })} help={intl.formatMessage({ id: 'settings.system.defaultAgent.help' })}>
-          <OptionSelect value={defaultAgent} onChange={setDefaultAgent} options={agentOptions} showRaw={false} />
-        </SettingField>
-        <div className="grid grid-cols-2 gap-3">
-          <SettingField label={intl.formatMessage({ id: 'settings.system.inferenceMode' })} help={intl.formatMessage({ id: 'settings.system.inferenceMode.help' })}>
-            <OptionSelect value={inferenceMode} onChange={setInferenceMode} options={inferenceOptions} />
-          </SettingField>
-          <SettingField label={intl.formatMessage({ id: 'settings.system.logFormat' })} help={intl.formatMessage({ id: 'settings.system.logFormat.help' })}>
-            <OptionSelect value={logFormat} onChange={setLogFormat} options={logFormatOptions} />
-          </SettingField>
-        </div>
-      </Card>
+      <SettingsSection title={intl.formatMessage({ id: 'settings.system.general' })}>
+        <SettingsCard>
+          <RowSelect
+            label={intl.formatMessage({ id: 'settings.system.defaultAgent' })}
+            description={intl.formatMessage({ id: 'settings.system.defaultAgent.help' })}
+            value={defaultAgent}
+            onChange={setDefaultAgent}
+            options={agentOptions}
+          />
+          <RowSelect
+            label={intl.formatMessage({ id: 'settings.system.inferenceMode' })}
+            description={intl.formatMessage({ id: 'settings.system.inferenceMode.help' })}
+            value={inferenceMode}
+            onChange={setInferenceMode}
+            options={inferenceOptions}
+          />
+          <RowSelect
+            label={intl.formatMessage({ id: 'settings.system.logFormat' })}
+            description={intl.formatMessage({ id: 'settings.system.logFormat.help' })}
+            value={logFormat}
+            onChange={setLogFormat}
+            options={logFormatOptions}
+          />
+        </SettingsCard>
+      </SettingsSection>
 
       {/* Secret manager — advanced */}
-      <Card title={intl.formatMessage({ id: 'settings.system.secrets' })} bodyClassName="space-y-4">
+      <SettingsSection title={intl.formatMessage({ id: 'settings.system.secrets' })}>
         <AdvancedSection storageKey="settings.system.secrets" label={intl.formatMessage({ id: 'settings.system.vaultSection' })}>
-          <SettingField label={intl.formatMessage({ id: 'settings.system.smBackend' })}>
-            <OptionSelect value={smBackend} onChange={setSmBackend} options={smOptions} />
-          </SettingField>
-          {smBackend === 'vault' && (
-            <>
-              <div className="grid grid-cols-2 gap-3">
-                <FormField label={intl.formatMessage({ id: 'settings.system.vaultAddr' })}>
-                  <input type="text" value={vaultAddr} onChange={(e) => setVaultAddr(e.target.value)} placeholder="https://vault:8200" className={inputClass} />
-                </FormField>
-                <FormField label={intl.formatMessage({ id: 'settings.system.vaultMount' })}>
-                  <input type="text" value={vaultMount} onChange={(e) => setVaultMount(e.target.value)} placeholder="secret" className={inputClass} />
-                </FormField>
-              </div>
-              <FormField label={intl.formatMessage({ id: 'settings.system.vaultToken' })} hint={intl.formatMessage({ id: 'settings.system.writeOnly' })}>
-                <input type="password" value={vaultToken} onChange={(e) => setVaultToken(e.target.value)} placeholder="••••••••" className={inputClass} autoComplete="off" />
-              </FormField>
-            </>
-          )}
+          <SettingsCard>
+            <RowSelect
+              label={intl.formatMessage({ id: 'settings.system.smBackend' })}
+              value={smBackend}
+              onChange={setSmBackend}
+              options={smOptions}
+            />
+            {smBackend === 'vault' && (
+              <>
+                <SettingsRow label={intl.formatMessage({ id: 'settings.system.vaultAddr' })} tier="text">
+                  <Input type="text" value={vaultAddr} onChange={(e) => setVaultAddr(e.target.value)} placeholder="https://vault:8200" />
+                </SettingsRow>
+                <SettingsRow label={intl.formatMessage({ id: 'settings.system.vaultMount' })} tier="text">
+                  <Input type="text" value={vaultMount} onChange={(e) => setVaultMount(e.target.value)} placeholder="secret" />
+                </SettingsRow>
+                <SettingsRow label={intl.formatMessage({ id: 'settings.system.vaultToken' })} description={intl.formatMessage({ id: 'settings.system.writeOnly' })} tier="text">
+                  <Input type="password" value={vaultToken} onChange={(e) => setVaultToken(e.target.value)} placeholder="••••••••" autoComplete="off" />
+                </SettingsRow>
+              </>
+            )}
+          </SettingsCard>
         </AdvancedSection>
-      </Card>
+      </SettingsSection>
 
-      <div className="flex items-center justify-end gap-2">
-        {saved && (
-          <span className="text-xs text-emerald-600 dark:text-emerald-400">
-            {intl.formatMessage({ id: 'settings.general.saved' })}
-          </span>
-        )}
-        <Button variant="primary" onClick={handleSave} disabled={saving}>
+      <div className="flex items-center justify-end gap-3">
+        <SettingsSaveState
+          status={saving ? 'saving' : saved ? 'saved' : 'idle'}
+          savingLabel={intl.formatMessage({ id: 'common.saving' })}
+          savedLabel={intl.formatMessage({ id: 'settings.general.saved' })}
+        />
+        <Button variant="brand" size="sm" onClick={handleSave} disabled={saving}>
           {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
         </Button>
       </div>

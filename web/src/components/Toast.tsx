@@ -161,17 +161,15 @@ interface ToastItemProps {
 }
 
 const VARIANT_STYLES: Record<ToastVariant, string> = {
-  success:
-    'border-emerald-400/30 bg-emerald-50/85 text-emerald-900 dark:border-emerald-400/20 dark:bg-emerald-950/70 dark:text-emerald-100',
-  error:
-    'border-rose-400/30 bg-rose-50/85 text-rose-900 dark:border-rose-400/20 dark:bg-rose-950/70 dark:text-rose-100',
-  info: 'border-amber-400/30 bg-amber-50/85 text-amber-900 dark:border-amber-400/20 dark:bg-amber-950/70 dark:text-amber-100',
+  success: 'border-success/30 bg-success/10 text-success',
+  error: 'border-destructive/30 bg-destructive/10 text-destructive',
+  info: 'border-brand/30 bg-brand/10 text-brand',
 };
 
 const ICON_STYLES: Record<ToastVariant, string> = {
-  success: 'text-emerald-500 dark:text-emerald-400',
-  error: 'text-rose-500 dark:text-rose-400',
-  info: 'text-amber-500 dark:text-amber-400',
+  success: 'text-success',
+  error: 'text-destructive',
+  info: 'text-brand',
 };
 
 function ToastIcon({ variant }: { variant: ToastVariant }) {

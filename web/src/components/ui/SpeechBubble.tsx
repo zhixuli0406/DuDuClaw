@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 import { cn } from '@/lib/utils';
 
 /**
- * SpeechBubble — a soft `rounded-bubble` speech balloon with a little tail, for
+ * SpeechBubble — a soft rounded speech balloon with a little tail, for
  * character utterances (DuDu / agent avatars, world chat, empty-state poses).
  * openhuman "head-top chat bubble" language, Soft Play tokens.
  */
@@ -20,8 +20,8 @@ export function SpeechBubble({
 }) {
   const toneCls =
     tone === 'accent'
-      ? 'bg-amber-500/12 text-amber-900 ring-amber-500/25 dark:text-amber-200'
-      : 'bg-[var(--panel-fill)] text-stone-700 ring-[var(--panel-border)] dark:text-stone-200';
+      ? 'bg-brand/12 text-brand ring-brand/25'
+      : 'bg-surface text-foreground ring-surface-border';
 
   // Tail is a rotated square tucked under the bubble on the chosen side.
   const tailPos: Record<string, string> = {
@@ -34,7 +34,7 @@ export function SpeechBubble({
   return (
     <div
       className={cn(
-        'relative inline-block max-w-xs rounded-bubble px-3 py-2 text-sm ring-1 ring-inset shadow-[var(--shadow-soft)]',
+        'relative inline-block max-w-xs rounded-2xl px-3 py-2 text-sm ring-1 ring-inset shadow-[var(--surface-shadow)]',
         toneCls,
         className,
       )}
@@ -44,7 +44,7 @@ export function SpeechBubble({
         aria-hidden="true"
         className={cn(
           'absolute h-2 w-2 rotate-45 rounded-[2px]',
-          tone === 'accent' ? 'bg-amber-500/12' : 'bg-[var(--panel-fill)]',
+          tone === 'accent' ? 'bg-brand/12' : 'bg-surface',
           tailPos[side],
         )}
       />

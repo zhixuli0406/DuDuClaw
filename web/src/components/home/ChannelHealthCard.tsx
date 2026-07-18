@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { api, type ChannelStatus } from '@/lib/api';
-import { Card, Badge } from '@/components/ui';
 import { Radio } from 'lucide-react';
+import { api, type ChannelStatus } from '@/lib/api';
+import { cn } from '@/lib/utils';
+import { Card, CardHeader, CardTitle } from '@/components/mds';
 
 /**
- * ChannelHealthCard — the admin-only 通道健康 home widget (WP15). A thin
- * read-only summary over `channels.status`; management lives in /manage/channels.
+ * ChannelHealthCard — the admin-only 通道健康 home widget (WP1.5). A thin
+ * read-only summary over `channels.status` as a status-dot list; management
+ * lives in `/manage/channels`.
  */
 export function ChannelHealthCard({ enabled }: { enabled: boolean }) {
   const intl = useIntl();
@@ -25,32 +27,44 @@ export function ChannelHealthCard({ enabled }: { enabled: boolean }) {
   }, [enabled]);
 
   return (
-    <Card
-      title={
-        <span className="flex items-center gap-2">
-          <Radio className="h-4 w-4 text-amber-500" />
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Radio className="size-4 text-brand" />
           {intl.formatMessage({ id: 'home.widget.channel_health' })}
-        </span>
-      }
-    >
-      {channels === null ? (
-        <p className="py-4 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
-      ) : channels.length === 0 ? (
-        <p className="py-4 text-center text-sm text-stone-400">
-          {intl.formatMessage({ id: 'home.widget.channel_health.empty' })}
-        </p>
-      ) : (
-        <ul className="space-y-1.5">
-          {channels.map((c) => (
-            <li key={c.name} className="flex items-center justify-between text-sm">
-              <span className="text-stone-700 dark:text-stone-300">{c.name}</span>
-              <Badge tone={c.connected ? 'success' : 'neutral'} dot>
-                {intl.formatMessage({ id: c.connected ? 'home.widget.channel.on' : 'home.widget.channel.off' })}
-              </Badge>
-            </li>
-          ))}
-        </ul>
-      )}
+        </CardTitle>
+      </CardHeader>
+      <div className="px-4">
+        {channels === null ? (
+          <p className="py-2 text-sm text-muted-foreground">
+            {intl.formatMessage({ id: 'common.loading' })}
+          </p>
+        ) : channels.length === 0 ? (
+          <p className="py-2 text-sm text-muted-foreground">
+            {intl.formatMessage({ id: 'home.widget.channel_health.empty' })}
+          </p>
+        ) : (
+          <ul className="space-y-1">
+            {channels.map((c) => (
+              <li key={c.name} className="flex h-8 items-center justify-between text-sm">
+                <span className="text-foreground">{c.name}</span>
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <span
+                    aria-hidden
+                    className={cn(
+                      'size-1.5 rounded-full',
+                      c.connected ? 'bg-success' : 'bg-muted-foreground/50',
+                    )}
+                  />
+                  {intl.formatMessage({
+                    id: c.connected ? 'home.widget.channel.on' : 'home.widget.channel.off',
+                  })}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </Card>
   );
 }

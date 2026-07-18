@@ -28,7 +28,7 @@ export function FirstRunGate() {
   if (!loaded) {
     return (
       <div className="flex h-full items-center justify-center py-20" role="status" aria-live="polite">
-        <span className="h-6 w-6 animate-spin rounded-full border-2 border-amber-500/30 border-t-amber-500" />
+        <span className="h-6 w-6 animate-spin rounded-full border-2 border-brand/30 border-t-brand" />
       </div>
     );
   }

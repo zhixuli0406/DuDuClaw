@@ -1,14 +1,24 @@
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle } from 'lucide-react';
-import { Dialog, inputClass, buttonSecondary } from '@/components/shared/Dialog';
-import { cn } from '@/lib/utils';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  Button,
+  Input,
+} from '@/components/mds';
 
 /**
  * ConfirmDialog — the single, site-wide destructive-action confirmation. Every
  * delete / offboard / remove routes through this instead of window.confirm or
  * unconfirmed buttons. Optionally requires the user to type an exact string
  * (e.g. the item's name) before the confirm button enables.
+ *
+ * Internally built on the MDS Dialog; the external API is unchanged so the many
+ * consumers do not need edits.
  */
 export function ConfirmDialog({
   open,
@@ -45,47 +55,43 @@ export function ConfirmDialog({
   const canConfirm = !busy && (!requireText || typed.trim() === requireText.trim());
 
   return (
-    <Dialog open={open} onClose={onClose} title={title}>
-      <div className="space-y-4">
+    <Dialog open={open} onOpenChange={(o) => { if (!o) onClose(); }}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+        </DialogHeader>
+
         <div className="flex items-start gap-3">
-          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-rose-500" />
-          <p className="text-sm text-stone-600 dark:text-stone-300">{message}</p>
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
+          <p className="text-sm text-muted-foreground">{message}</p>
         </div>
 
         {requireText && (
           <div className="space-y-1.5">
             {requireTextHint && (
-              <p className="text-xs text-stone-500 dark:text-stone-400">{requireTextHint}</p>
+              <p className="text-xs text-muted-foreground">{requireTextHint}</p>
             )}
-            <input
+            <Input
               type="text"
               value={typed}
               onChange={(e) => setTyped(e.target.value)}
               placeholder={requireText}
-              className={inputClass}
               autoFocus
             />
           </div>
         )}
 
-        <div className="flex justify-end gap-2 pt-1">
-          <button onClick={onClose} className={buttonSecondary} type="button">
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
             {cancelLabel ?? intl.formatMessage({ id: 'common.cancel' })}
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={!canConfirm}
-            type="button"
-            className={cn(
-              'inline-flex items-center justify-center gap-2 rounded-lg bg-gradient-to-b from-rose-500 to-rose-600 px-4 py-2 text-sm font-medium text-white shadow-[0_4px_14px_-4px_rgba(244,63,94,0.55)] transition-all hover:from-rose-500 hover:to-rose-700 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50',
-            )}
-          >
+          </Button>
+          <Button variant="destructive" onClick={onConfirm} disabled={!canConfirm}>
             {busy
               ? intl.formatMessage({ id: 'common.saving' })
               : confirmLabel ?? intl.formatMessage({ id: 'common.delete' })}
-          </button>
-        </div>
-      </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }

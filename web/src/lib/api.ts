@@ -344,7 +344,7 @@ export interface ReliabilitySummary {
 
 // ── Task Board types ────────────────────────────────────────
 
-export type TaskStatus = 'todo' | 'in_progress' | 'done' | 'blocked';
+export type TaskStatus = 'todo' | 'in_progress' | 'done' | 'blocked' | 'needs_human';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'urgent';
 
 export interface TaskInfo {
@@ -359,6 +359,8 @@ export interface TaskInfo {
   updated_at: string;
   completed_at?: string;
   blocked_reason?: string;
+  /** Latest judge feedback / escalation reason (populated for needs_human). */
+  judge_feedback?: string;
   parent_task_id?: string;
   tags: string[];
   message_id?: string;
@@ -381,7 +383,8 @@ export interface TaskCreateParams {
   title: string;
   description?: string;
   priority?: TaskPriority;
-  assigned_to: string;
+  /** Optional — omit for an unassigned task (never auto-dispatched, Bug#4). */
+  assigned_to?: string;
   tags?: string[];
   parent_task_id?: string;
 }
@@ -2336,6 +2339,22 @@ export interface TemplateCreateAgentParams {
   agent_toml?: string;
 }
 
+/** How a custom widget was authored. */
+export type CustomWidgetOrigin = 'html' | 'ai';
+
+/** Custom widget list row (html stripped; lazy-load via widgetsCustom.get). */
+export interface CustomWidgetSummary {
+  id: string;
+  title: string;
+  description: string;
+  origin: CustomWidgetOrigin;
+  created_by_user: string;
+  shared: boolean;
+  html_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
 /** One entry of a saved home layout (WP15 personal dashboard). */
 export interface DashboardLayoutWidget {
   id: string;
@@ -2511,8 +2530,41 @@ export const api = {
         widgets: Array<{ id: string; min_role: string }>;
         layout: DashboardLayout | null;
         bound_agents: string[];
+        /** Custom widgets on the target's layout, with html — the view-as
+         *  grant covers rendering them read-only (they may be private). */
+        custom_widgets: Array<{ id: string; title: string; html: string }>;
         read_only: true;
       }>,
+  },
+  widgetsCustom: {
+    /** Widgets visible to me: my own + instance-shared. List is html-free.
+     *  `max_per_user` is the operator-configured per-user cap (0 = unlimited). */
+    list: () =>
+      client.call('widgets.custom.list') as Promise<{
+        widgets: CustomWidgetSummary[];
+        max_per_user: number;
+      }>,
+    /** Full widget incl. html — lazy-loaded at render/edit time. */
+    get: (id: string) =>
+      client.call('widgets.custom.get', { id }) as Promise<CustomWidgetSummary & { html: string }>,
+    create: (params: { title: string; description?: string; html: string; origin: CustomWidgetOrigin }) =>
+      client.call('widgets.custom.create', { ...params }) as Promise<{ success: boolean; id: string }>,
+    update: (id: string, params: { title?: string; description?: string; html?: string }) =>
+      client.call('widgets.custom.update', { id, ...params }) as Promise<{ success: boolean }>,
+    remove: (id: string) =>
+      client.call('widgets.custom.remove', { id }) as Promise<{ success: boolean }>,
+    share: (id: string, shared: boolean) =>
+      client.call('widgets.custom.share', { id, shared }) as Promise<{ success: boolean; shared: boolean }>,
+    /** Guided NL generation (P2). Returns draft html only — nothing is stored
+     *  until the user previews and explicitly saves via create(). */
+    generate: (params: {
+      prompt: string;
+      style?: string;
+      data_sources?: string[];
+      prior_html?: string;
+      feedback?: string;
+    }) =>
+      client.call('widgets.custom.generate', { ...params }) as Promise<{ html: string }>,
   },
   departments: {
     list: () =>

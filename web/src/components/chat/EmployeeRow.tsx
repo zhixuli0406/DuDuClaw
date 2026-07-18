@@ -44,11 +44,11 @@ export function EmployeeRow({
           defaultMessage: 'Back to DuDu (office assistant)',
         })}
         className={cn(
-          'flex shrink-0 items-center gap-1.5 rounded-control px-1.5 py-1 transition-colors',
-          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+          'flex shrink-0 items-center gap-1.5 rounded-xl px-1.5 py-1 transition-colors',
+          'outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
           selectedId === null
-            ? 'bg-amber-500/15 ring-1 ring-inset ring-amber-500/40'
-            : 'hover:bg-stone-500/10 dark:hover:bg-white/5',
+            ? 'bg-brand/15 ring-1 ring-inset ring-brand/40'
+            : 'hover:bg-muted',
         )}
       >
         <DuDu face="idle" size={24} animated={false} label="DuDu" />
@@ -65,11 +65,11 @@ export function EmployeeRow({
             onClick={() => onSelect(a.name)}
             title={a.display_name}
             className={cn(
-              'flex shrink-0 items-center rounded-control p-1 transition-colors',
-              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+              'flex shrink-0 items-center rounded-xl p-1 transition-colors',
+              'outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
               selected
-                ? 'bg-amber-500/15 ring-1 ring-inset ring-amber-500/40'
-                : 'hover:bg-stone-500/10 dark:hover:bg-white/5',
+                ? 'bg-brand/15 ring-1 ring-inset ring-brand/40'
+                : 'hover:bg-muted',
             )}
           >
             <CharacterAvatar

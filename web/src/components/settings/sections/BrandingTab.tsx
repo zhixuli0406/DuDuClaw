@@ -10,7 +10,14 @@ import {
 } from '@/lib/branding';
 import { readFileAsBase64 } from '@/lib/attachments';
 import { toast, formatError } from '@/lib/toast';
-import { Card, Button, Field, controlClass } from '@/components/ui';
+import {
+  Button,
+  Input,
+  Textarea,
+  SettingsCard,
+  SettingsRow,
+  SettingsSection,
+} from '@/components/mds';
 
 /**
  * BrandingTab (design-distributor-white-label §4.4) — the distributor "品牌設定"
@@ -110,7 +117,7 @@ export function BrandingTab() {
   });
   const managedHint = (field: string) =>
     fieldManaged(field) ? (
-      <p className="mt-1.5 flex items-center gap-1.5 text-xs text-amber-600/90 dark:text-amber-400/90">
+      <p className="mt-1.5 flex items-center gap-1.5 text-xs text-warning">
         <Lock className="h-3 w-3 shrink-0" />
         {managedMsg}
       </p>
@@ -231,266 +238,259 @@ export function BrandingTab() {
   };
 
   return (
-    <Card title={intl.formatMessage({ id: 'branding.title' })}>
-      <div className="space-y-5">
-        <p className="text-sm text-stone-500 dark:text-stone-400">
+    <div className="space-y-6">
+      <div className="space-y-1">
+        <h2 className="text-base font-medium">{intl.formatMessage({ id: 'branding.title' })}</h2>
+        <p className="text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'branding.intro' })}
         </p>
+      </div>
 
-        {locked && (
-          <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
-            <Lock className="mt-0.5 h-4 w-4 shrink-0" />
-            <div>
-              <p className="font-medium">{intl.formatMessage({ id: 'branding.locked.title' })}</p>
-              <p className="mt-0.5 text-amber-700/90 dark:text-amber-300/90">
-                {intl.formatMessage({ id: 'branding.locked.body' })}
-              </p>
-            </div>
+      {locked && (
+        <div className="flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/10 px-4 py-3 text-sm text-warning">
+          <Lock className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <p className="font-medium">{intl.formatMessage({ id: 'branding.locked.title' })}</p>
+            <p className="mt-0.5">{intl.formatMessage({ id: 'branding.locked.body' })}</p>
           </div>
-        )}
+        </div>
+      )}
 
-        {/* Logo */}
-        <Field label={intl.formatMessage({ id: 'branding.logo' })} htmlFor="branding-logo">
-          <div className="flex items-center gap-4">
-            {previewIsImage ? (
-              <img
-                src={previewLogo}
-                alt=""
-                className="h-16 w-16 shrink-0 rounded-2xl object-cover ring-1 ring-stone-300/50 dark:ring-white/10"
-              />
-            ) : (
-              <span
-                className="grid h-16 w-16 shrink-0 place-items-center rounded-2xl bg-gradient-to-b from-amber-400 to-amber-500 text-3xl"
-                role="img"
-                aria-hidden="true"
-              >
-                {DEFAULT_BRAND_LOGO}
-              </span>
-            )}
-            <div className="flex flex-col gap-2">
-              <input
-                ref={fileRef}
-                id="branding-logo"
-                type="file"
-                accept={ACCEPT}
+      {/* Logo (full-width block) */}
+      <SettingsSection title={intl.formatMessage({ id: 'branding.logo' })}>
+        <div className="flex items-center gap-4">
+          {previewIsImage ? (
+            <img
+              src={previewLogo}
+              alt=""
+              className="h-16 w-16 shrink-0 rounded-2xl object-cover ring-1 ring-surface-border"
+            />
+          ) : (
+            <span
+              className="grid h-16 w-16 shrink-0 place-items-center rounded-2xl bg-gradient-to-b from-amber-400 to-amber-500 text-3xl"
+              role="img"
+              aria-hidden="true"
+            >
+              {DEFAULT_BRAND_LOGO}
+            </span>
+          )}
+          <div className="flex flex-col gap-2">
+            <input
+              ref={fileRef}
+              id="branding-logo"
+              type="file"
+              accept={ACCEPT}
+              disabled={fieldDisabled('logo_data_uri')}
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void handleFile(f);
+                e.target.value = '';
+              }}
+            />
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
                 disabled={fieldDisabled('logo_data_uri')}
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) void handleFile(f);
-                  e.target.value = '';
-                }}
-              />
-              <div className="flex items-center gap-2">
+                onClick={() => fileRef.current?.click()}
+              >
+                <Upload />
+                {intl.formatMessage({ id: 'branding.logo.upload' })}
+              </Button>
+              {previewIsImage && (
                 <Button
-                  variant="secondary"
+                  variant="ghost"
                   disabled={fieldDisabled('logo_data_uri')}
-                  onClick={() => fileRef.current?.click()}
+                  onClick={() => setLogo('')}
                 >
-                  <Upload className="mr-1.5 h-4 w-4" />
-                  {intl.formatMessage({ id: 'branding.logo.upload' })}
+                  <Trash2 />
+                  {intl.formatMessage({ id: 'branding.logo.remove' })}
                 </Button>
-                {previewIsImage && (
-                  <Button
-                    variant="ghost"
-                    disabled={fieldDisabled('logo_data_uri')}
-                    onClick={() => setLogo('')}
-                  >
-                    <Trash2 className="mr-1.5 h-4 w-4" />
-                    {intl.formatMessage({ id: 'branding.logo.remove' })}
-                  </Button>
-                )}
-              </div>
-              <p className="text-xs text-stone-400 dark:text-stone-500">
-                {intl.formatMessage({ id: 'branding.logo.hint' })}
-              </p>
-              {managedHint('logo_data_uri')}
+              )}
             </div>
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'branding.logo.hint' })}
+            </p>
+            {managedHint('logo_data_uri')}
           </div>
-        </Field>
+        </div>
+      </SettingsSection>
 
-        {/* Text fields */}
-        <Field label={intl.formatMessage({ id: 'branding.productName' })} htmlFor="branding-name">
-          <input
+      {/* Single-line text fields (label left, control right) */}
+      <SettingsCard>
+        <SettingsRow label={intl.formatMessage({ id: 'branding.productName' })} tier="text">
+          <Input
             id="branding-name"
-            type="text"
             value={productName}
             {...fieldProps('product_name')}
             maxLength={60}
             onChange={(e) => setProductName(e.target.value)}
-            className={controlClass}
             placeholder="DuDuClaw"
           />
           {managedHint('product_name')}
-        </Field>
+        </SettingsRow>
 
-        <Field label={intl.formatMessage({ id: 'branding.subtitle' })} htmlFor="branding-subtitle">
-          <input
+        <SettingsRow label={intl.formatMessage({ id: 'branding.subtitle' })} tier="text">
+          <Input
             id="branding-subtitle"
-            type="text"
             value={subtitle}
             {...fieldProps('subtitle')}
             maxLength={120}
             onChange={(e) => setSubtitle(e.target.value)}
-            className={controlClass}
           />
           {managedHint('subtitle')}
-        </Field>
+        </SettingsRow>
 
-        <Field label={intl.formatMessage({ id: 'branding.description' })} htmlFor="branding-desc">
-          <textarea
-            id="branding-desc"
-            value={description}
-            {...fieldProps('description')}
-            maxLength={500}
-            rows={3}
-            onChange={(e) => setDescription(e.target.value)}
-            className={controlClass}
-          />
-          {managedHint('description')}
-        </Field>
-
-        <Field label={intl.formatMessage({ id: 'branding.company' })} htmlFor="branding-company">
-          <input
+        <SettingsRow label={intl.formatMessage({ id: 'branding.company' })} tier="text">
+          <Input
             id="branding-company"
-            type="text"
             value={companyName}
             {...fieldProps('company_name')}
             maxLength={120}
             onChange={(e) => setCompanyName(e.target.value)}
-            className={controlClass}
           />
           {managedHint('company_name')}
-        </Field>
+        </SettingsRow>
 
-        <Field label={intl.formatMessage({ id: 'branding.website' })} htmlFor="branding-website">
-          <input
+        <SettingsRow label={intl.formatMessage({ id: 'branding.website' })} tier="text">
+          <Input
             id="branding-website"
             type="url"
             value={website}
             {...fieldProps('website')}
             onChange={(e) => setWebsite(e.target.value)}
-            className={controlClass}
             placeholder="https://example.com"
           />
           {managedHint('website')}
-        </Field>
+        </SettingsRow>
 
-        <Field label={intl.formatMessage({ id: 'branding.supportEmail' })} htmlFor="branding-email">
-          <input
+        <SettingsRow label={intl.formatMessage({ id: 'branding.supportEmail' })} tier="text">
+          <Input
             id="branding-email"
             type="email"
             value={supportEmail}
             {...fieldProps('support_email')}
             onChange={(e) => setSupportEmail(e.target.value)}
-            className={controlClass}
             placeholder="support@example.com"
           />
           {managedHint('support_email')}
-        </Field>
+        </SettingsRow>
+      </SettingsCard>
 
-        {/* Accent color (design §10.4) */}
-        <Field label={intl.formatMessage({ id: 'branding.accent' })} htmlFor="branding-accent">
-          <div className="flex items-center gap-3">
-            <input
-              id="branding-accent"
-              type="color"
-              value={accentColor || DEFAULT_ACCENT}
-              {...fieldProps('accent_color')}
-              onChange={(e) => setAccentColor(e.target.value)}
-              className="h-9 w-14 shrink-0 cursor-pointer rounded-lg border border-stone-300/60 bg-transparent p-1 disabled:cursor-not-allowed dark:border-white/10"
-            />
-            <span className="font-mono text-sm uppercase text-stone-600 dark:text-stone-300">
-              {accentColor || DEFAULT_ACCENT}
-            </span>
-            {accentColor && (
-              <Button
-                variant="ghost"
-                disabled={fieldDisabled('accent_color')}
-                onClick={() => setAccentColor('')}
-              >
-                <RotateCcw className="mr-1.5 h-4 w-4" />
-                {intl.formatMessage({ id: 'branding.accent.reset' })}
-              </Button>
+      {/* Description (full-width block — multiline) */}
+      <SettingsSection title={intl.formatMessage({ id: 'branding.description' })}>
+        <Textarea
+          id="branding-desc"
+          value={description}
+          {...fieldProps('description')}
+          maxLength={500}
+          rows={3}
+          onChange={(e) => setDescription(e.target.value)}
+        />
+        {managedHint('description')}
+      </SettingsSection>
+
+      {/* Accent color (design §10.4) */}
+      <SettingsSection
+        title={intl.formatMessage({ id: 'branding.accent' })}
+        description={intl.formatMessage({ id: 'branding.accent.hint' })}
+      >
+        <div className="flex items-center gap-3">
+          <input
+            id="branding-accent"
+            type="color"
+            value={accentColor || DEFAULT_ACCENT}
+            {...fieldProps('accent_color')}
+            onChange={(e) => setAccentColor(e.target.value)}
+            className="h-9 w-14 shrink-0 cursor-pointer rounded-lg border border-surface-border bg-transparent p-1 disabled:cursor-not-allowed"
+          />
+          <span className="font-mono text-sm uppercase text-muted-foreground">
+            {accentColor || DEFAULT_ACCENT}
+          </span>
+          {accentColor && (
+            <Button
+              variant="ghost"
+              disabled={fieldDisabled('accent_color')}
+              onClick={() => setAccentColor('')}
+            >
+              <RotateCcw />
+              {intl.formatMessage({ id: 'branding.accent.reset' })}
+            </Button>
+          )}
+        </div>
+        {managedHint('accent_color')}
+      </SettingsSection>
+
+      {/* About-page HTML editor + sanitized preview (design §10.2) */}
+      <SettingsSection
+        title={intl.formatMessage({ id: 'branding.aboutHtml' })}
+        description={intl.formatMessage({ id: 'branding.aboutHtml.hint' })}
+      >
+        <div className="grid gap-3 lg:grid-cols-2">
+          <Textarea
+            id="branding-about-html"
+            value={aboutHtml}
+            {...fieldProps('about_html')}
+            rows={10}
+            spellCheck={false}
+            onChange={(e) => setAboutHtml(e.target.value)}
+            className="font-mono text-xs leading-relaxed"
+            placeholder={'<h2>關於我們</h2>\n<p>…</p>'}
+          />
+          <div className="min-h-[10rem] overflow-auto rounded-lg border border-surface-border bg-muted/40 p-4">
+            <p className="mb-2 text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
+              {intl.formatMessage({ id: 'branding.aboutHtml.preview' })}
+              {previewing && (
+                <span className="ml-2 font-normal normal-case text-muted-foreground">
+                  {intl.formatMessage({ id: 'common.loading' })}
+                </span>
+              )}
+            </p>
+            {previewHtml ? (
+              // Safe: `previewHtml` is the backend-sanitized string, never raw input.
+              <div
+                className="branding-about-preview text-sm text-foreground"
+                dangerouslySetInnerHTML={{ __html: previewHtml }}
+              />
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {intl.formatMessage({ id: 'branding.aboutHtml.previewEmpty' })}
+              </p>
             )}
           </div>
-          <p className="mt-1.5 text-xs text-stone-400 dark:text-stone-500">
-            {intl.formatMessage({ id: 'branding.accent.hint' })}
-          </p>
-          {managedHint('accent_color')}
-        </Field>
-
-        {/* About-page HTML editor + sanitized preview (design §10.2) */}
-        <Field label={intl.formatMessage({ id: 'branding.aboutHtml' })} htmlFor="branding-about-html">
-          <div className="grid gap-3 lg:grid-cols-2">
-            <textarea
-              id="branding-about-html"
-              value={aboutHtml}
-              {...fieldProps('about_html')}
-              rows={10}
-              spellCheck={false}
-              onChange={(e) => setAboutHtml(e.target.value)}
-              className={`${controlClass} font-mono text-xs leading-relaxed`}
-              placeholder={'<h2>關於我們</h2>\n<p>…</p>'}
-            />
-            <div className="panel min-h-[10rem] overflow-auto p-4">
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-stone-400 dark:text-stone-500">
-                {intl.formatMessage({ id: 'branding.aboutHtml.preview' })}
-                {previewing && (
-                  <span className="ml-2 font-normal normal-case text-stone-400">
-                    {intl.formatMessage({ id: 'common.loading' })}
-                  </span>
-                )}
-              </p>
-              {previewHtml ? (
-                // Safe: `previewHtml` is the backend-sanitized string, never raw input.
-                <div
-                  className="branding-about-preview text-sm text-stone-700 dark:text-stone-200"
-                  dangerouslySetInnerHTML={{ __html: previewHtml }}
-                />
-              ) : (
-                <p className="text-sm text-stone-400 dark:text-stone-500">
-                  {intl.formatMessage({ id: 'branding.aboutHtml.previewEmpty' })}
-                </p>
-              )}
-            </div>
-          </div>
-          <p className="mt-1.5 text-xs text-stone-400 dark:text-stone-500">
-            {intl.formatMessage({ id: 'branding.aboutHtml.hint' })}
-          </p>
-          {managedHint('about_html')}
-        </Field>
-
-        {/* Signed branding bundle (design §10.3) */}
-        <div className="rounded-card border border-stone-200/60 bg-stone-500/[0.03] p-4 dark:border-white/10 dark:bg-white/[0.02]">
-          <div className="flex items-center gap-2">
-            <Package className="h-4 w-4 text-stone-500 dark:text-stone-400" />
-            <h3 className="text-sm font-semibold tracking-tight text-stone-900 dark:text-stone-50">
-              {intl.formatMessage({ id: 'branding.bundle.section' })}
-            </h3>
-          </div>
-          <p className="mt-1.5 text-xs leading-relaxed text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'branding.bundle.desc' })}
-          </p>
-          <div className="mt-3">
-            <Button variant="secondary" disabled={locked || bundling} onClick={handleGenerateBundle}>
-              <Download className="mr-1.5 h-4 w-4" />
-              {bundling
-                ? intl.formatMessage({ id: 'branding.bundle.generating' })
-                : intl.formatMessage({ id: 'branding.bundle.generate' })}
-            </Button>
-          </div>
         </div>
+        {managedHint('about_html')}
+      </SettingsSection>
 
-        <div className="flex items-center justify-end gap-2 pt-1">
-          <Button variant="ghost" onClick={handleReset} disabled={locked || saving}>
-            {intl.formatMessage({ id: 'branding.reset' })}
-          </Button>
-          <Button variant="primary" onClick={handleSave} disabled={locked || saving}>
-            {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+      {/* Signed branding bundle (design §10.3) */}
+      <div className="rounded-xl border border-surface-border bg-muted/40 p-4">
+        <div className="flex items-center gap-2">
+          <Package className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-sm font-semibold">
+            {intl.formatMessage({ id: 'branding.bundle.section' })}
+          </h3>
+        </div>
+        <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+          {intl.formatMessage({ id: 'branding.bundle.desc' })}
+        </p>
+        <div className="mt-3">
+          <Button variant="outline" disabled={locked || bundling} onClick={handleGenerateBundle}>
+            <Download />
+            {bundling
+              ? intl.formatMessage({ id: 'branding.bundle.generating' })
+              : intl.formatMessage({ id: 'branding.bundle.generate' })}
           </Button>
         </div>
       </div>
-    </Card>
+
+      <div className="flex items-center justify-end gap-2 pt-1">
+        <Button variant="ghost" onClick={handleReset} disabled={locked || saving}>
+          {intl.formatMessage({ id: 'branding.reset' })}
+        </Button>
+        <Button variant="brand" onClick={handleSave} disabled={locked || saving}>
+          {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+        </Button>
+      </div>
+    </div>
   );
 }

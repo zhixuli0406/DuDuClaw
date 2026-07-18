@@ -23,16 +23,22 @@ import {
   Package,
 } from 'lucide-react';
 import {
-  Page,
-  PageHeader,
   Card,
+  CardHeader,
+  CardTitle,
+  CardContent,
   Button,
   Badge,
-  Field,
-  StatCard,
-  Mono,
-  controlClass,
-} from '@/components/ui';
+  Input,
+  Switch,
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableHead,
+  TableCell,
+  type BadgeProps,
+} from '@/components/mds';
 import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
@@ -46,6 +52,7 @@ import {
   statusLabelKey,
   verdictLabelKey,
   canScan,
+  type MigrateBadgeTone,
 } from '@/lib/migrate';
 
 type WizardStep = 'platform' | 'preview' | 'result';
@@ -75,40 +82,32 @@ function kindIcon(kind: string): ComponentType<{ className?: string }> {
   return KIND_ICONS[kind] ?? Package;
 }
 
-/** A small on/off switch (mirrors the AgentsPage / InferencePage toggle). */
-function Toggle({
-  checked,
-  onChange,
-  labelId,
-}: {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  labelId: string;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={labelId}
-      onClick={() => onChange(!checked)}
-      className={cn(
-        'relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full transition-colors',
-        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50',
-        checked ? 'bg-amber-500' : 'bg-stone-300 dark:bg-stone-600',
-      )}
-    >
-      <span
-        className={cn(
-          'pointer-events-none mt-0.5 inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform',
-          checked ? 'ml-0.5 translate-x-4' : 'translate-x-0.5',
-        )}
-      />
-    </button>
-  );
+/** Map the migrate status tone → mds Badge variant + className (token-only colours). */
+function statusBadgeProps(tone: MigrateBadgeTone): {
+  variant: BadgeProps['variant'];
+  className?: string;
+} {
+  switch (tone) {
+    case 'success':
+      return { variant: 'secondary', className: 'bg-success/15 text-success' };
+    case 'warning':
+      return { variant: 'secondary', className: 'bg-warning/15 text-warning' };
+    case 'danger':
+      return { variant: 'secondary', className: 'bg-destructive/10 text-destructive' };
+    case 'neutral':
+      return { variant: 'ghost' };
+  }
 }
 
-/** 1-2-3 step indicator. */
+/** Text colour for a summary KPI tile keyed by summary bucket. */
+const SUMMARY_TONE: Record<'imported' | 'partial' | 'skipped' | 'conflict', string> = {
+  imported: 'text-success',
+  partial: 'text-warning',
+  skipped: 'text-muted-foreground',
+  conflict: 'text-destructive',
+};
+
+/** 1-2-3 step indicator (MDS tokens). */
 function Stepper({ step }: { step: WizardStep }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
@@ -129,22 +128,17 @@ function Stepper({ step }: { step: WizardStep }) {
             <span
               className={cn(
                 'grid h-6 w-6 place-items-center rounded-full text-xs font-semibold tabular-nums',
-                active && 'bg-amber-500 text-white',
-                done && 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400',
-                !active && !done && 'bg-stone-500/10 text-stone-400 dark:text-stone-500',
+                active && 'bg-brand text-brand-foreground',
+                done && 'bg-success/15 text-success',
+                !active && !done && 'bg-muted text-muted-foreground',
               )}
             >
               {done ? <Check className="h-3.5 w-3.5" /> : i + 1}
             </span>
-            <span
-              className={cn(
-                'font-medium',
-                active ? 'text-stone-900 dark:text-stone-100' : 'text-stone-400 dark:text-stone-500',
-              )}
-            >
+            <span className={cn('font-medium', active ? 'text-foreground' : 'text-muted-foreground')}>
               {labels[s]}
             </span>
-            {i < order.length - 1 && <span className="mx-1 text-stone-300 dark:text-stone-600">/</span>}
+            {i < order.length - 1 && <span className="mx-1 text-muted-foreground/50">/</span>}
           </li>
         );
       })}
@@ -166,18 +160,18 @@ function CommandBlock({ command }: { command: string }) {
     }
   };
   return (
-    <div className="flex items-start gap-2 rounded-control border border-[var(--panel-border)] bg-stone-500/5 p-2.5 dark:bg-white/5">
-      <Terminal className="mt-0.5 h-4 w-4 shrink-0 text-stone-400" />
-      <code className="min-w-0 flex-1 overflow-x-auto whitespace-pre text-xs text-stone-600 dark:text-stone-300">
+    <div className="flex items-start gap-2 rounded-lg border border-surface-border bg-muted p-2.5">
+      <Terminal className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+      <code className="min-w-0 flex-1 overflow-x-auto whitespace-pre text-xs text-muted-foreground">
         {command}
       </code>
       <button
         type="button"
         onClick={copy}
         aria-label={intl.formatMessage({ id: copied ? 'migrate.copied' : 'migrate.copy' })}
-        className="shrink-0 rounded-md p-1 text-stone-400 transition-colors hover:bg-stone-500/10 hover:text-stone-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 dark:hover:text-stone-200"
+        className="shrink-0 rounded-md p-1 text-muted-foreground transition-colors hover:bg-surface-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
       >
-        {copied ? <Check className="h-4 w-4 text-emerald-500" /> : <Copy className="h-4 w-4" />}
+        {copied ? <Check className="h-4 w-4 text-success" /> : <Copy className="h-4 w-4" />}
       </button>
     </div>
   );
@@ -187,69 +181,79 @@ function CommandBlock({ command }: { command: string }) {
 function ResultReport({ result }: { result: MigrateResult }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
+
+  const tiles: { key: keyof typeof SUMMARY_TONE; value: number }[] = [
+    { key: 'imported', value: result.summary.imported },
+    { key: 'partial', value: result.summary.partial },
+    { key: 'skipped', value: result.summary.skipped },
+    { key: 'conflict', value: result.summary.conflict },
+  ];
+
   return (
     <div className="space-y-5">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <StatCard label={t('migrate.summary.imported')} value={result.summary.imported} tone="success" />
-        <StatCard label={t('migrate.summary.partial')} value={result.summary.partial} tone="warning" />
-        <StatCard label={t('migrate.summary.skipped')} value={result.summary.skipped} tone="neutral" />
-        <StatCard label={t('migrate.summary.conflict')} value={result.summary.conflict} tone="danger" />
+        {tiles.map((tile) => (
+          <Card key={tile.key} className="gap-1 p-4">
+            <span className="text-xs text-muted-foreground">{t(`migrate.summary.${tile.key}`)}</span>
+            <span className={cn('text-2xl font-semibold tabular-nums', SUMMARY_TONE[tile.key])}>
+              {tile.value}
+            </span>
+          </Card>
+        ))}
       </div>
 
-      <Card title={t('migrate.items.title')} padded={false}>
+      <Card className="gap-0 py-0">
+        <CardHeader className="py-4">
+          <CardTitle>{t('migrate.items.title')}</CardTitle>
+        </CardHeader>
         {result.items.length === 0 ? (
-          <p className="px-5 py-8 text-center text-sm text-stone-500 dark:text-stone-400">
-            {t('migrate.items.empty')}
-          </p>
+          <p className="px-4 pb-8 text-center text-sm text-muted-foreground">{t('migrate.items.empty')}</p>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[36rem] text-sm">
-              <thead>
-                <tr className="border-b border-[var(--panel-border)] text-left text-xs text-stone-400 dark:text-stone-500">
-                  <th className="px-5 py-2 font-medium">{t('migrate.col.kind')}</th>
-                  <th className="px-3 py-2 font-medium">{t('migrate.col.name')}</th>
-                  <th className="px-3 py-2 font-medium">{t('migrate.col.status')}</th>
-                  <th className="px-5 py-2 font-medium">{t('migrate.col.reason')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {result.items.map((item: MigrateItem, i) => {
-                  const Icon = kindIcon(item.kind);
-                  return (
-                    <tr
-                      key={`${item.kind}-${item.name}-${i}`}
-                      className="border-b border-[var(--panel-border)] last:border-0"
-                    >
-                      <td className="px-5 py-2.5">
-                        <span className="inline-flex items-center gap-2 text-stone-500 dark:text-stone-400">
-                          <Icon className="h-4 w-4 shrink-0" />
-                          <span className="text-xs">{item.kind}</span>
-                        </span>
-                      </td>
-                      <td className="px-3 py-2.5 font-medium text-stone-800 dark:text-stone-100">
-                        {item.name}
-                      </td>
-                      <td className="px-3 py-2.5">
-                        <Badge tone={statusChipTone(item.status)}>{t(statusLabelKey(item.status))}</Badge>
-                      </td>
-                      <td className="px-5 py-2.5 text-xs text-stone-500 dark:text-stone-400">
-                        {item.reason ?? <span className="text-stone-300 dark:text-stone-600">—</span>}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+          <Table className="min-w-[36rem]">
+            <TableHeader>
+              <TableRow>
+                <TableHead className="px-4">{t('migrate.col.kind')}</TableHead>
+                <TableHead>{t('migrate.col.name')}</TableHead>
+                <TableHead>{t('migrate.col.status')}</TableHead>
+                <TableHead className="px-4">{t('migrate.col.reason')}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {result.items.map((item: MigrateItem, i) => {
+                const Icon = kindIcon(item.kind);
+                const badge = statusBadgeProps(statusChipTone(item.status));
+                return (
+                  <TableRow key={`${item.kind}-${item.name}-${i}`}>
+                    <TableCell className="px-4">
+                      <span className="inline-flex items-center gap-2 text-muted-foreground">
+                        <Icon className="h-4 w-4 shrink-0" />
+                        <span className="text-xs">{item.kind}</span>
+                      </span>
+                    </TableCell>
+                    <TableCell className="font-medium text-foreground">{item.name}</TableCell>
+                    <TableCell>
+                      <Badge variant={badge.variant} className={badge.className}>
+                        {t(statusLabelKey(item.status))}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="px-4 text-xs text-muted-foreground whitespace-normal">
+                      {item.reason ?? <span className="text-muted-foreground/50">—</span>}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
         )}
       </Card>
 
       {result.notes.length > 0 && (
-        <Card title={t('migrate.notes.title')}>
+        <Card className="p-4">
+          <CardTitle className="text-sm">{t('migrate.notes.title')}</CardTitle>
           <ul className="space-y-1.5">
             {result.notes.map((note, i) => (
-              <li key={i} className="flex items-start gap-2 text-sm text-stone-600 dark:text-stone-300">
-                <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-stone-400" aria-hidden="true" />
+              <li key={i} className="flex items-start gap-2 text-sm text-muted-foreground">
+                <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-muted-foreground" aria-hidden="true" />
                 {note}
               </li>
             ))}
@@ -327,33 +331,36 @@ export function MigratePage() {
   const platformName = (p: MigratePlatform) => t(`migrate.platform.${p}.name`);
 
   return (
-    <Page>
-      <PageHeader
-        icon={Import}
-        title={t('migrate.title')}
-        subtitle={t('migrate.subtitle')}
-        actions={<Stepper step={step} />}
-      />
+    <div className="mx-auto w-full max-w-3xl space-y-5">
+      {/* Header */}
+      <div className="space-y-4">
+        <div className="flex items-center gap-2">
+          <Import className="size-5 text-muted-foreground" />
+          <div>
+            <h1 className="text-base font-medium">{t('migrate.title')}</h1>
+            <p className="text-sm text-muted-foreground">{t('migrate.subtitle')}</p>
+          </div>
+        </div>
+        <Stepper step={step} />
+      </div>
 
       {error && (
-        <Card className="border-rose-500/30">
+        <div className="rounded-xl border border-destructive/30 bg-destructive/10 p-4">
           <div className="flex items-start gap-3">
-            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-rose-500" />
+            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
             <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium text-stone-800 dark:text-stone-100">
-                {t('migrate.error.title')}
-              </p>
-              <p className="mt-0.5 break-words text-sm text-stone-500 dark:text-stone-400">{error}</p>
+              <p className="text-sm font-medium text-foreground">{t('migrate.error.title')}</p>
+              <p className="mt-0.5 break-words text-sm text-muted-foreground">{error}</p>
             </div>
             <Button
               size="sm"
-              variant="secondary"
+              variant="outline"
               onClick={step === 'platform' || step === 'preview' ? runScan : runApply}
             >
               {t('migrate.retry')}
             </Button>
           </div>
-        </Card>
+        </div>
       )}
 
       {/* ── Step 1: choose platform + source ── */}
@@ -372,73 +379,65 @@ export function MigratePage() {
                   }}
                   aria-pressed={selected}
                   className={cn(
-                    'panel panel-hover flex flex-col gap-2 p-4 text-left transition-all',
-                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50',
-                    selected && 'ring-2 ring-amber-500/60',
+                    'flex flex-col gap-2 rounded-xl border border-surface-border bg-surface p-4 text-left transition-colors hover:bg-surface-hover',
+                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+                    selected && 'ring-2 ring-brand/50',
                   )}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-base font-semibold text-stone-900 dark:text-stone-50">
-                      {platformName(p.id)}
-                    </span>
-                    {selected && <Check className="h-4 w-4 text-amber-500" />}
+                    <span className="text-base font-semibold text-foreground">{platformName(p.id)}</span>
+                    {selected && <Check className="h-4 w-4 text-brand" />}
                   </div>
-                  <p className="text-xs text-stone-500 dark:text-stone-400">
-                    {t(`migrate.platform.${p.id}.desc`)}
-                  </p>
+                  <p className="text-xs text-muted-foreground">{t(`migrate.platform.${p.id}.desc`)}</p>
                 </button>
               );
             })}
           </div>
 
           {card && (
-            <Card title={t('migrate.source.title')}>
-              <div className="space-y-4">
+            <Card className="p-4">
+              <CardHeader className="px-0">
+                <CardTitle>{t('migrate.source.title')}</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4 px-0">
                 {card.needsExport && (
-                  <div className="space-y-2 rounded-control border border-amber-500/25 bg-amber-500/5 p-3">
-                    <p className="flex items-center gap-2 text-sm font-medium text-amber-700 dark:text-amber-300">
+                  <div className="space-y-2 rounded-xl border border-brand/25 bg-brand/5 p-4">
+                    <p className="flex items-center gap-2 text-sm font-medium text-brand">
                       <ArrowDownToLine className="h-4 w-4" />
                       {t('migrate.paperclip.exportTitle')}
                     </p>
-                    <p className="text-xs text-stone-500 dark:text-stone-400">
-                      {t('migrate.paperclip.exportHint')}
-                    </p>
+                    <p className="text-xs text-muted-foreground">{t('migrate.paperclip.exportHint')}</p>
                     <CommandBlock command={PAPERCLIP_EXPORT_CMD} />
                   </div>
                 )}
 
-                <Field
-                  label={t('migrate.source.label')}
-                  required={card.sourceRequired}
-                  help={
-                    card.sourceRequired
-                      ? t('migrate.source.help.required')
-                      : t('migrate.source.help.optional')
-                  }
-                >
-                  <input
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium text-foreground">
+                    {t('migrate.source.label')}
+                    {card.sourceRequired && <span className="ml-0.5 text-destructive">*</span>}
+                  </label>
+                  <Input
                     type="text"
                     value={source}
                     onChange={(e) => setSource(e.target.value)}
                     placeholder={card.defaultSource ?? t('migrate.source.placeholder.export')}
-                    className={controlClass}
                     autoComplete="off"
                     spellCheck={false}
                   />
-                </Field>
+                  <p className="text-xs text-muted-foreground">
+                    {card.sourceRequired
+                      ? t('migrate.source.help.required')
+                      : t('migrate.source.help.optional')}
+                  </p>
+                </div>
 
                 <div className="flex justify-end">
-                  <Button
-                    variant="primary"
-                    icon={ArrowRight}
-                    pending={scanning}
-                    disabled={!scanReady}
-                    onClick={runScan}
-                  >
+                  <Button variant="brand" disabled={!scanReady || scanning} onClick={runScan}>
+                    {scanning ? <Loader2 className="animate-spin" /> : <ArrowRight />}
                     {t('migrate.action.scan')}
                   </Button>
                 </div>
-              </div>
+              </CardContent>
             </Card>
           )}
         </div>
@@ -450,38 +449,35 @@ export function MigratePage() {
           <ResultReport result={scan} />
 
           {scan.summary.conflict > 0 && (
-            <Card>
+            <Card className="p-4">
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0">
-                  <p className="text-sm font-medium text-stone-800 dark:text-stone-100">
-                    {t('migrate.rename.title')}
-                  </p>
-                  <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">
-                    {t('migrate.rename.hint')}
-                  </p>
+                  <p className="text-sm font-medium text-foreground">{t('migrate.rename.title')}</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">{t('migrate.rename.hint')}</p>
                 </div>
-                <Toggle checked={rename} onChange={setRename} labelId={t('migrate.rename.title')} />
+                <Switch
+                  checked={rename}
+                  onCheckedChange={setRename}
+                  aria-label={t('migrate.rename.title')}
+                />
               </div>
             </Card>
           )}
 
           <div className="flex items-center justify-between gap-3">
-            <Button variant="ghost" icon={ArrowLeft} onClick={() => setStep('platform')} disabled={applying}>
+            <Button variant="ghost" onClick={() => setStep('platform')} disabled={applying}>
+              <ArrowLeft />
               {t('common.back')}
             </Button>
-            <Button
-              variant="primary"
-              icon={ArrowDownToLine}
-              onClick={() => setConfirmOpen(true)}
-              disabled={applying}
-            >
+            <Button variant="brand" onClick={() => setConfirmOpen(true)} disabled={applying}>
+              <ArrowDownToLine />
               {t('migrate.action.apply')}
             </Button>
           </div>
 
           {applying && (
-            <div className="flex items-center justify-center gap-3 rounded-control border border-[var(--panel-border)] bg-stone-500/5 py-6 text-sm text-stone-500 dark:bg-white/5 dark:text-stone-400">
-              <Loader2 className="h-5 w-5 animate-spin text-amber-500" />
+            <div className="flex items-center justify-center gap-3 rounded-xl border border-surface-border bg-muted py-6 text-sm text-muted-foreground">
+              <Loader2 className="h-5 w-5 animate-spin text-brand" />
               {t('migrate.applying')}
             </div>
           )}
@@ -491,11 +487,9 @@ export function MigratePage() {
       {/* ── Step 3: result ── */}
       {step === 'result' && applied && (
         <div className="space-y-5">
-          <Card>
+          <Card className="p-4">
             <div className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-stone-500 dark:text-stone-400">
-                {t('migrate.verdict.label')}
-              </span>
+              <span className="text-xs font-medium text-muted-foreground">{t('migrate.verdict.label')}</span>
               <span className={cn('text-3xl font-semibold tracking-tight', verdictToneClass(applied.verdict))}>
                 {t(verdictLabelKey(applied.verdict))}
               </span>
@@ -505,13 +499,15 @@ export function MigratePage() {
           <ResultReport result={applied} />
 
           {applied.report_path && (
-            <Card title={t('migrate.report.title')}>
-              <Mono className="break-all text-xs">{applied.report_path}</Mono>
+            <Card className="p-4">
+              <CardTitle className="text-sm">{t('migrate.report.title')}</CardTitle>
+              <p className="break-all font-mono text-xs text-muted-foreground">{applied.report_path}</p>
             </Card>
           )}
 
           <div className="flex justify-end">
-            <Button variant="secondary" icon={Import} onClick={reset}>
+            <Button variant="outline" onClick={reset}>
+              <Import />
               {t('migrate.action.again')}
             </Button>
           </div>
@@ -530,6 +526,6 @@ export function MigratePage() {
         confirmLabel={t('migrate.action.apply')}
         busy={applying}
       />
-    </Page>
+    </div>
   );
 }

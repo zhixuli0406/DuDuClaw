@@ -1,7 +1,16 @@
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
-import { Dialog, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogClose,
+  Button,
+} from '@/components/mds';
 import { useConnectionStore } from '@/stores/connection-store';
 import { growthApi, type DailyReport } from '@/lib/api-growth';
 import { DailyReportContent } from './DailyReportContent';
@@ -99,35 +108,37 @@ export function DailyReportCard() {
     };
   }, [authed]);
 
+  if (!report) return null;
+
   return (
-    <Dialog
-      open={open}
-      onClose={() => setOpen(false)}
-      title={intl.formatMessage({ id: 'growth.report.title' })}
-    >
-      {report && (
-        <div className="space-y-5">
-          <p className="text-sm text-stone-500 dark:text-stone-400">
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'growth.report.title' })}</DialogTitle>
+          <DialogDescription>
             {intl.formatMessage({ id: 'growth.report.subtitle' }, { date: report.date })}
-          </p>
-          <DailyReportContent report={report} />
-          <div className="flex justify-end gap-2">
-            <button type="button" className={buttonSecondary} onClick={() => setOpen(false)}>
-              {intl.formatMessage({ id: 'growth.report.dismiss' })}
-            </button>
-            <button
-              type="button"
-              className={buttonPrimary}
-              onClick={() => {
-                setOpen(false);
-                navigate('/growth');
-              }}
-            >
-              {intl.formatMessage({ id: 'growth.report.viewDetails' })}
-            </button>
-          </div>
-        </div>
-      )}
+          </DialogDescription>
+        </DialogHeader>
+        <DailyReportContent report={report} />
+        <DialogFooter>
+          <DialogClose
+            render={
+              <Button variant="outline">
+                {intl.formatMessage({ id: 'growth.report.dismiss' })}
+              </Button>
+            }
+          />
+          <Button
+            variant="brand"
+            onClick={() => {
+              setOpen(false);
+              navigate('/growth');
+            }}
+          >
+            {intl.formatMessage({ id: 'growth.report.viewDetails' })}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }

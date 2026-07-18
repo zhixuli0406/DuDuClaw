@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { fuzzyMatch, highlightSegments } from '@/lib/fuzzy';
-import { dailyItems, navGroups, staffEntry, manageNav, manageEntry, type NavItem } from '@/components/layout/nav-model';
+import { dailyItems, navGroups, manageNav, manageEntry, type NavItem } from '@/components/layout/nav-model';
 import { hasMinRole } from '@/lib/roles';
 import { isVisible } from '@/lib/nav-visibility';
 import { useForksExist } from '@/hooks/useForksExist';
@@ -119,13 +119,13 @@ export function CommandPalette() {
 
   // Build the full command set (nav + actions), role/edition gated like the sidebar.
   const commands = useMemo<Command[]>(() => {
-    // Daily items + the two collapsible groups live in `navGroups`, but the flat
-    // daily row and the 員工 roster entry sit outside it — fold them all back in
-    // so ⌘K reaches every destination (T1.5).
+    // The three collapsible groups (工作 / 公司 / 設定) live in `navGroups`; the
+    // flat daily row sits outside it — fold it back in so ⌘K reaches every
+    // destination (T1.5). `staffEntry` / `manageEntry` are already inside
+    // `navGroups`, so they must NOT be appended again (duplicate route id).
     const navSources: Array<{ item: NavItem; groupLabel: string }> = [
       ...dailyItems.map((item) => ({ item, groupLabel: 'navGroup.daily' })),
       ...navGroups.flatMap((group) => group.items.map((item) => ({ item, groupLabel: group.label }))),
-      { item: staffEntry, groupLabel: 'navGroup.staff' },
     ];
     const visibilityCtx = { hasOperatorAccess, forksExist };
     const navCommands: Command[] = navSources
@@ -290,27 +290,27 @@ export function CommandPalette() {
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-start justify-center px-4 pt-[12vh] sm:pt-[16vh]"
+      className="fixed inset-0 z-[100] flex items-start justify-center px-4 pt-[20vh]"
       role="dialog"
       aria-modal="true"
       aria-label={t('cmdk.title')}
     >
-      {/* Scrim */}
+      {/* Scrim (spec §4 Dialog overlay) */}
       <button
         type="button"
         aria-hidden="true"
         tabIndex={-1}
         onClick={closePalette}
-        className="absolute inset-0 cursor-default bg-stone-900/30 backdrop-blur-[2px] dark:bg-black/50"
+        className="absolute inset-0 cursor-default bg-black/10 backdrop-blur-xs"
       />
 
       <div
-        className="glass-overlay relative flex w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-stone-200/60 shadow-2xl dark:border-white/10"
+        className="relative flex w-full max-w-[calc(100%-2rem)] flex-col overflow-hidden rounded-xl bg-surface-raised text-surface-foreground shadow-[var(--floating-shadow)] ring-1 ring-surface-border sm:max-w-xl"
         onKeyDown={onKeyDown}
       >
-        {/* Search input row */}
-        <div className="flex items-center gap-3 border-b border-stone-200/60 px-4 dark:border-white/8">
-          <Search className="h-[1.125rem] w-[1.125rem] shrink-0 text-stone-400" aria-hidden="true" />
+        {/* Search input row (spec §5.7) */}
+        <div className="flex items-center gap-3 border-b border-surface-border px-4 py-3">
+          <Search className="size-5 shrink-0 text-muted-foreground" aria-hidden="true" />
           <input
             ref={inputRef}
             type="text"
@@ -325,11 +325,11 @@ export function CommandPalette() {
               setActiveIndex(0);
             }}
             placeholder={t('cmdk.placeholder')}
-            className="h-12 flex-1 bg-transparent text-sm text-stone-900 placeholder:text-stone-400 focus:outline-none dark:text-stone-100"
+            className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
             autoComplete="off"
             spellCheck={false}
           />
-          <kbd className="hidden shrink-0 rounded border border-stone-300/60 px-1.5 py-0.5 text-[10px] font-medium text-stone-400 sm:inline-block dark:border-white/10">
+          <kbd className="hidden shrink-0 rounded border border-border px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground sm:inline-block">
             ESC
           </kbd>
         </div>
@@ -340,16 +340,16 @@ export function CommandPalette() {
           id="cmdk-listbox"
           role="listbox"
           aria-label={t('cmdk.title')}
-          className="max-h-[min(60vh,26rem)] overflow-y-auto overscroll-contain p-2"
+          className="max-h-[min(400px,50vh)] overflow-y-auto overscroll-contain p-2"
         >
           {results.length === 0 ? (
-            <div className="px-3 py-10 text-center text-sm text-stone-400">
+            <div className="px-3 py-10 text-center text-sm text-muted-foreground">
               {t('cmdk.empty')}
             </div>
           ) : (
             grouped.map((group) => (
               <div key={group.label} className="mb-1 last:mb-0">
-                <div className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-stone-400 dark:text-stone-500">
+                <div className="px-3 pb-1 pt-2 text-xs font-medium text-muted-foreground">
                   {group.label}
                 </div>
                 {group.items.map(({ cmd, index }) => {
@@ -361,15 +361,14 @@ export function CommandPalette() {
                       key={cmd.id}
                       id={`cmdk-opt-${index}`}
                       data-cmdk-index={index}
+                      data-selected={isActive || undefined}
                       role="option"
                       aria-selected={isActive}
                       onClick={() => run(cmd)}
                       onMouseMove={() => setActiveIndex(index)}
                       className={cn(
-                        'flex cursor-pointer items-start gap-3 rounded-lg px-3 py-2 text-sm transition-colors',
-                        isActive
-                          ? 'bg-amber-500/12 text-amber-800 dark:bg-amber-400/10 dark:text-amber-200'
-                          : 'text-stone-700 dark:text-stone-300'
+                        'flex cursor-pointer items-start gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors',
+                        isActive ? 'bg-accent text-accent-foreground' : 'text-foreground',
                       )}
                     >
                       {cmd.avatarAgentId ? (
@@ -379,8 +378,8 @@ export function CommandPalette() {
                       ) : (
                         <Icon
                           className={cn(
-                            'mt-0.5 h-[1.125rem] w-[1.125rem] shrink-0',
-                            isActive ? 'text-amber-600 dark:text-amber-400' : 'text-stone-400'
+                            'mt-0.5 size-[1.125rem] shrink-0',
+                            isActive ? 'text-foreground' : 'text-muted-foreground',
                           )}
                           aria-hidden="true"
                         />
@@ -389,10 +388,7 @@ export function CommandPalette() {
                         <span className="block truncate leading-tight">
                           {highlightSegments(cmd.label, cmd.indices).map((seg, i) =>
                             seg.hit ? (
-                              <mark
-                                key={i}
-                                className="bg-transparent font-semibold text-amber-700 dark:text-amber-300"
-                              >
+                              <mark key={i} className="bg-transparent font-medium text-brand">
                                 {seg.text}
                               </mark>
                             ) : (
@@ -401,18 +397,18 @@ export function CommandPalette() {
                           )}
                         </span>
                         {cmd.subtitle && (
-                          <span className="mt-0.5 block truncate text-[11px] leading-tight text-stone-400 dark:text-stone-500">
+                          <span className="mt-0.5 block truncate text-xs leading-tight text-muted-foreground">
                             {cmd.subtitle}
                           </span>
                         )}
                       </span>
                       {isCurrent && (
-                        <span className="mt-1 shrink-0 text-[10px] font-medium uppercase tracking-wide text-stone-400">
+                        <span className="mt-1 shrink-0 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                           {t('cmdk.current')}
                         </span>
                       )}
                       {isActive && (
-                        <CornerDownLeft className="mt-1 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden="true" />
+                        <CornerDownLeft className="mt-1 size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
                       )}
                     </div>
                   );
@@ -423,14 +419,14 @@ export function CommandPalette() {
         </div>
 
         {/* Footer hints */}
-        <div className="flex items-center gap-4 border-t border-stone-200/60 px-4 py-2 text-[11px] text-stone-400 dark:border-white/8">
+        <div className="flex items-center gap-4 border-t border-surface-border bg-surface-hover/70 px-4 py-2 text-xs text-muted-foreground">
           <span className="flex items-center gap-1">
-            <ArrowUp className="h-3 w-3" />
-            <ArrowDown className="h-3 w-3" />
+            <ArrowUp className="size-3" />
+            <ArrowDown className="size-3" />
             {t('cmdk.hint.navigate')}
           </span>
           <span className="flex items-center gap-1">
-            <CornerDownLeft className="h-3 w-3" />
+            <CornerDownLeft className="size-3" />
             {t('cmdk.hint.select')}
           </span>
         </div>

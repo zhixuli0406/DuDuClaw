@@ -5,7 +5,7 @@ import { useNavigate, useLocation } from 'react-router';
 import { useTourStore } from '@/stores/tour-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { visibleTourSteps } from './tour-steps';
-import { Button } from '@/components/ui';
+import { Button } from '@/components/mds';
 import { X } from 'lucide-react';
 
 const SPOT_PAD = 6;
@@ -146,9 +146,12 @@ export function GuidedTour() {
       )}
 
       {/* Popover */}
-      <div className="panel z-[101] space-y-3 p-4 shadow-xl" style={popStyle}>
+      <div
+        className="z-[101] space-y-3 rounded-xl border border-surface-border bg-surface p-4 shadow-[var(--menu-shadow)]"
+        style={popStyle}
+      >
         <div className="flex items-start justify-between gap-2">
-          <span className="text-[11px] font-medium uppercase tracking-wider text-amber-600 dark:text-amber-400">
+          <span className="text-[11px] font-medium uppercase tracking-wider text-brand">
             {intl.formatMessage(
               { id: 'tour.stepOf' },
               { current: stepIndex + 1, total: steps.length },
@@ -156,7 +159,7 @@ export function GuidedTour() {
           </span>
           <button
             onClick={skip}
-            className="rounded p-1 text-stone-400 transition-colors hover:bg-stone-500/10 hover:text-stone-600 dark:hover:text-stone-300"
+            className="rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
             aria-label={intl.formatMessage({ id: 'tour.skip' })}
           >
             <X className="h-4 w-4" />
@@ -164,10 +167,10 @@ export function GuidedTour() {
         </div>
 
         <div className="space-y-1">
-          <h3 className="text-sm font-semibold text-stone-900 dark:text-stone-50">
+          <h3 className="text-sm font-semibold text-foreground">
             {intl.formatMessage({ id: current.titleKey })}
           </h3>
-          <p className="text-xs leading-relaxed text-stone-500 dark:text-stone-400">
+          <p className="text-xs leading-relaxed text-muted-foreground">
             {intl.formatMessage({ id: current.bodyKey })}
           </p>
         </div>
@@ -175,17 +178,17 @@ export function GuidedTour() {
         <div className="flex items-center justify-between pt-1">
           <button
             onClick={skip}
-            className="text-xs text-stone-400 transition-colors hover:text-stone-600 dark:hover:text-stone-300"
+            className="text-xs text-muted-foreground transition-colors hover:text-foreground"
           >
             {intl.formatMessage({ id: 'tour.skip' })}
           </button>
           <div className="flex items-center gap-2">
             {stepIndex > 0 && (
-              <Button variant="secondary" size="sm" onClick={back}>
+              <Button variant="outline" size="sm" onClick={back}>
                 {intl.formatMessage({ id: 'tour.back' })}
               </Button>
             )}
-            <Button variant="primary" size="sm" onClick={() => (isLast ? finish() : next())}>
+            <Button variant="default" size="sm" onClick={() => (isLast ? finish() : next())}>
               {intl.formatMessage({ id: isLast ? 'tour.finish' : 'tour.next' })}
             </Button>
           </div>

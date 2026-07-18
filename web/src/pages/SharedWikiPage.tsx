@@ -9,132 +9,119 @@ import {
   type WikiScopeNamespace,
   type WikiScopeMode,
 } from '@/lib/api';
-import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import { toast, formatError } from '@/lib/toast';
+import { timeAgo } from '@/lib/format';
 import {
-  Page,
-  PageHeader,
+  CollectionPageHeader,
+  CollectionPageState,
   Card,
-  Section,
-  StatCard,
-  Tabs,
-  type TabItem,
+  CardContent,
+  BreadcrumbHeader,
+  Segmented,
   Button,
   Badge,
-  EmptyState,
-  Toolbar,
-  CharacterAvatar,
-  Mono,
-} from '@/components/ui';
+  Input,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogClose,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  ListGridContainer,
+  ListGridHeader,
+  ListGridHeaderCell,
+  ListGridRow,
+  ListGridCell,
+  ActorAvatar,
+  type SegmentedOption,
+} from '@/components/mds';
 import {
-  Globe,
-  BookOpen,
-  Search,
-  FileText,
-  Clock,
-  Tag,
-  BarChart3,
-  ChevronRight,
-  ChevronDown,
-  Users,
-  Lock,
-  Plus,
-  Pencil,
-  Trash2,
-  Building2,
+  GlobeIcon,
+  BookOpenIcon,
+  SearchIcon,
+  FileTextIcon,
+  BarChart3Icon,
+  UsersIcon,
+  LockIcon,
+  PlusIcon,
+  PencilIcon,
+  Trash2Icon,
+  Building2Icon,
+  MoreHorizontalIcon,
 } from 'lucide-react';
 
-type TabId = 'browse' | 'search' | 'stats' | 'policy';
+type ViewId = 'browse' | 'search' | 'stats' | 'policy';
 
-export function SharedWikiPage() {
+/** Namespace (top-level dir) of a wiki path; '' for root-level pages. */
+function namespaceOf(path: string): string {
+  const idx = path.indexOf('/');
+  return idx > 0 ? path.slice(0, idx) : '';
+}
+
+/**
+ * SharedWikiPage — the cross-agent shared wiki, re-skinned onto MDS (spec §5.2).
+ * A Segmented view switcher (browse / search / stats / namespace policy); browse
+ * lists pages as a flat ListGrid and opens a max-w-4xl reading view. Namespace
+ * policy modes render as tone-coded badges (read_only=warning / operator_only=
+ * destructive / agent_writable=secondary). Data flow is unchanged. Renders
+ * header-less when `embedded` (KnowledgeShell owns the header).
+ */
+export function SharedWikiPage({ embedded = false }: { embedded?: boolean }) {
   const intl = useIntl();
-  const [activeTab, setActiveTab] = useState<TabId>('browse');
+  const [view, setView] = useState<ViewId>('browse');
 
-  const tabs: TabItem[] = [
-    { id: 'browse', label: intl.formatMessage({ id: 'sharedWiki.tab.browse' }), icon: BookOpen },
-    { id: 'search', label: intl.formatMessage({ id: 'sharedWiki.tab.search' }), icon: Search },
-    { id: 'stats', label: intl.formatMessage({ id: 'sharedWiki.tab.stats' }), icon: BarChart3 },
-    { id: 'policy', label: intl.formatMessage({ id: 'sharedWiki.tab.policy' }), icon: Lock },
+  const viewOptions: SegmentedOption<ViewId>[] = [
+    { value: 'browse', label: intl.formatMessage({ id: 'sharedWiki.tab.browse' }) },
+    { value: 'search', label: intl.formatMessage({ id: 'sharedWiki.tab.search' }) },
+    { value: 'stats', label: intl.formatMessage({ id: 'sharedWiki.tab.stats' }) },
+    { value: 'policy', label: intl.formatMessage({ id: 'sharedWiki.tab.policy' }) },
   ];
 
-  return (
-    <Page>
-      <PageHeader
-        icon={Globe}
-        title={intl.formatMessage({ id: 'nav.sharedWiki' })}
-        subtitle={intl.formatMessage({ id: 'sharedWiki.subtitle' })}
+  const inner = (
+    <div className="space-y-4">
+      <Segmented
+        value={view}
+        onValueChange={setView}
+        options={viewOptions}
+        aria-label={intl.formatMessage({ id: 'nav.sharedWiki' })}
       />
+      {view === 'browse' && <BrowseView />}
+      {view === 'search' && <SearchView />}
+      {view === 'stats' && <StatsView />}
+      {view === 'policy' && <PolicyView />}
+    </div>
+  );
 
-      <Tabs items={tabs} value={activeTab} onChange={(id) => setActiveTab(id as TabId)} />
+  if (embedded) return inner;
 
-      <div role="tabpanel" id={`shared-wiki-panel-${activeTab}`}>
-        {activeTab === 'browse' && <BrowseTab />}
-        {activeTab === 'search' && <SearchTab />}
-        {activeTab === 'stats' && <StatsTab />}
-        {activeTab === 'policy' && <PolicyTab />}
-      </div>
-    </Page>
+  return (
+    <div className="-mx-4 -mt-4 flex flex-1 flex-col md:-mx-6 md:-mt-6">
+      <CollectionPageHeader
+        hideTrigger
+        icon={GlobeIcon}
+        title={intl.formatMessage({ id: 'nav.sharedWiki' })}
+        description={intl.formatMessage({ id: 'sharedWiki.subtitle' })}
+      />
+      <div className="flex-1 p-4 md:p-6">{inner}</div>
+    </div>
   );
 }
 
-// ── Tree helpers ───────────────────────────────────────────
+// ── Browse view (flat page list → reading view) ─────────────
 
-interface TreeNode {
-  name: string;
-  path: string;
-  isDir: boolean;
-  children: TreeNode[];
-  page?: WikiPageMeta;
-}
+const SHARED_WIKI_COLUMNS = 'minmax(0,1fr) auto auto';
 
-function buildTree(pages: ReadonlyArray<WikiPageMeta>): TreeNode[] {
-  const root: TreeNode = { name: '', path: '', isDir: true, children: [] };
-
-  for (const page of pages) {
-    const parts = page.path.split('/');
-    let current = root;
-
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      const isLast = i === parts.length - 1;
-
-      if (isLast) {
-        if (current.children.some((c) => !c.isDir && c.path === page.path)) continue;
-        current.children.push({
-          name: part,
-          path: page.path,
-          isDir: false,
-          children: [],
-          page,
-        });
-      } else {
-        let child = current.children.find((c) => c.isDir && c.name === part);
-        if (!child) {
-          child = { name: part, path: parts.slice(0, i + 1).join('/'), isDir: true, children: [] };
-          current.children.push(child);
-        }
-        current = child;
-      }
-    }
-  }
-
-  const sortNodes = (nodes: TreeNode[]) => {
-    nodes.sort((a, b) => {
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
-    for (const n of nodes) {
-      if (n.isDir) sortNodes(n.children);
-    }
-  };
-  sortNodes(root.children);
-
-  return root.children;
-}
-
-// ── Browse Tab ────────────────────────────────────────────
-
-function BrowseTab() {
+function BrowseView() {
   const intl = useIntl();
   const [pages, setPages] = useState<ReadonlyArray<WikiPageMeta>>([]);
   const [wikiExists, setWikiExists] = useState(false);
@@ -153,311 +140,250 @@ function BrowseTab() {
     }).finally(() => setLoading(false));
   }, []);
 
-  const handleSelectPage = useCallback((path: string) => {
+  const handleSelect = useCallback((path: string) => {
     setSelectedPath(path);
     setPageContent('');
-    api.sharedWiki.read(path).then((res) => {
-      setPageContent(res?.content ?? '');
-    }).catch(() => setPageContent('Error loading page'));
+    api.sharedWiki.read(path).then((res) => setPageContent(res?.content ?? '')).catch(() => setPageContent('Error loading page'));
   }, []);
 
-  const tree = useMemo(() => buildTree(pages), [pages]);
+  const sortedPages = useMemo(
+    () => [...pages].sort((a, b) => a.path.localeCompare(b.path)),
+    [pages],
+  );
 
-  if (loading) {
+  if (loading) return <CollectionPageState state="loading" />;
+
+  if (!wikiExists || pages.length === 0) {
+    return <CollectionPageState state="empty" icon={BookOpenIcon} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />;
+  }
+
+  if (selectedPath) {
+    const page = pages.find((p) => p.path === selectedPath);
     return (
-      <div className="flex items-center justify-center py-12 text-stone-400">
-        <BookOpen className="mr-2 h-5 w-5 animate-pulse" />
-        Loading...
+      <div className="-mx-4 md:-mx-6">
+        <BreadcrumbHeader
+          hideTrigger
+          segments={[
+            { label: intl.formatMessage({ id: 'sharedWiki.pages' }), onClick: () => setSelectedPath('') },
+            { label: page?.title ?? selectedPath },
+          ]}
+        />
+        <div className="mx-auto max-w-4xl px-8 py-8">
+          <h1 className="mb-4 text-xl font-semibold text-foreground sm:text-2xl">{page?.title ?? selectedPath}</h1>
+          <pre className="overflow-auto whitespace-pre-wrap rounded-xl border border-surface-border bg-muted p-4 font-mono text-sm text-foreground">
+            {pageContent || intl.formatMessage({ id: 'common.loading' })}
+          </pre>
+        </div>
       </div>
     );
   }
 
-  if (!wikiExists || pages.length === 0) {
-    return (
-      <Card>
-        <EmptyState dudu="reading" icon={BookOpen} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />
-      </Card>
-    );
-  }
-
   return (
-    <div className="grid grid-cols-12 gap-4">
-      {/* Tree sidebar */}
-      <Card
-        className="col-span-4"
-        title={`${intl.formatMessage({ id: 'sharedWiki.pages' })} (${pages.length})`}
+    <div className="overflow-hidden rounded-xl border border-surface-border">
+      <ListGridContainer
+        columns={SHARED_WIKI_COLUMNS}
+        className="!h-auto"
+        header={
+          <ListGridHeader>
+            <ListGridHeaderCell>{intl.formatMessage({ id: 'sharedWiki.pages' })}</ListGridHeaderCell>
+            <ListGridHeaderCell hideBelow>{intl.formatMessage({ id: 'scp.col.namespace' })}</ListGridHeaderCell>
+            <ListGridHeaderCell hideBelow>{intl.formatMessage({ id: 'sharedWiki.stats.lastUpdated' })}</ListGridHeaderCell>
+          </ListGridHeader>
+        }
       >
-        <div className="max-h-[60vh] overflow-y-auto">
-          {tree.map((node) => (
-            <TreeItem
-              key={node.path}
-              node={node}
-              selectedPath={selectedPath}
-              onSelect={handleSelectPage}
-              depth={0}
-            />
-          ))}
-        </div>
-      </Card>
-
-      {/* Content viewer */}
-      <Card className="col-span-8" title={selectedPath || undefined}>
-        {selectedPath ? (
-          <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap rounded-control bg-stone-500/5 p-4 font-mono text-sm text-stone-800 dark:bg-white/5 dark:text-stone-200">
-            {pageContent || 'Loading...'}
-          </pre>
-        ) : (
-          <EmptyState dudu="idle" icon={FileText} title={intl.formatMessage({ id: 'sharedWiki.selectPage' })} />
-        )}
-      </Card>
+        {sortedPages.map((page) => {
+          const ns = namespaceOf(page.path);
+          const isDept = ns === 'departments';
+          return (
+            <ListGridRow key={page.path} onClick={() => handleSelect(page.path)}>
+              <ListGridCell className="gap-2">
+                <FileTextIcon className="size-4 shrink-0 text-muted-foreground" />
+                <button
+                  type="button"
+                  className="truncate text-left text-sm font-medium text-foreground hover:text-brand hover:underline"
+                  title={page.title || page.path}
+                  onClick={(e) => { e.stopPropagation(); handleSelect(page.path); }}
+                >
+                  {page.title || page.path}
+                </button>
+              </ListGridCell>
+              <ListGridCell hideBelow>
+                {ns ? (
+                  <Badge variant="outline" className={cn('gap-1', isDept && 'text-brand')}>
+                    {isDept && <Building2Icon className="size-3" />}
+                    {isDept ? intl.formatMessage({ id: 'sharedWiki.departments.group' }) : ns}
+                  </Badge>
+                ) : (
+                  <span className="text-xs text-muted-foreground">—</span>
+                )}
+              </ListGridCell>
+              <ListGridCell hideBelow className="font-mono text-xs tabular-nums text-muted-foreground">
+                {page.updated ? timeAgo(page.updated) : '—'}
+              </ListGridCell>
+            </ListGridRow>
+          );
+        })}
+      </ListGridContainer>
     </div>
   );
 }
 
-// ── Tree Item ─────────────────────────────────────────────
+// ── Search view ─────────────────────────────────────────────
 
-function TreeItem({
-  node,
-  selectedPath,
-  onSelect,
-  depth,
-}: {
-  node: TreeNode;
-  selectedPath: string;
-  onSelect: (path: string) => void;
-  depth: number;
-}) {
-  const intl = useIntl();
-  const [expanded, setExpanded] = useState(depth < 1);
-
-  if (node.isDir) {
-    // WP7 — surface the top-level `departments/` namespace as a friendly,
-    // read-only "部門知識庫" group for a non-technical audience.
-    const isDeptRoot = depth === 0 && node.name === 'departments';
-    return (
-      <div>
-        <button
-          onClick={() => setExpanded((prev) => !prev)}
-          className="flex w-full items-center gap-1 rounded-lg px-2 py-1 text-sm text-stone-600 hover:bg-stone-500/8 dark:text-stone-300 dark:hover:bg-white/5"
-          style={{ paddingLeft: `${depth * 12 + 8}px` }}
-        >
-          {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-          {isDeptRoot ? (
-            <span className="flex items-center gap-1.5 font-medium text-amber-700 dark:text-amber-300">
-              <Building2 className="h-3.5 w-3.5" />
-              {intl.formatMessage({ id: 'sharedWiki.departments.group' })}
-            </span>
-          ) : (
-            <span className="font-medium">{node.name}/</span>
-          )}
-        </button>
-        {expanded && node.children.map((child) => (
-          <TreeItem
-            key={child.path}
-            node={child}
-            selectedPath={selectedPath}
-            onSelect={onSelect}
-            depth={depth + 1}
-          />
-        ))}
-      </div>
-    );
-  }
-
-  return (
-    <button
-      onClick={() => onSelect(node.path)}
-      className={cn(
-        'flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-sm transition-colors',
-        selectedPath === node.path
-          ? 'bg-amber-500/12 text-amber-700 dark:text-amber-400'
-          : 'text-stone-600 hover:bg-stone-500/8 dark:text-stone-300 dark:hover:bg-white/5'
-      )}
-      style={{ paddingLeft: `${depth * 12 + 8}px` }}
-    >
-      <FileText className="h-3.5 w-3.5 flex-shrink-0" />
-      <span className="truncate">{node.page?.title ?? node.name}</span>
-    </button>
-  );
-}
-
-// ── Search Tab ────────────────────────────────────────────
-
-function SearchTab() {
+function SearchView() {
   const intl = useIntl();
   const [query, setQuery] = useState('');
   const [hits, setHits] = useState<ReadonlyArray<WikiSearchHit>>([]);
-  const [searching, setSearching] = useState(false);
+  const [loading, setLoading] = useState(false);
 
   const handleSearch = useCallback(() => {
     if (!query.trim()) return;
-    setSearching(true);
-    api.sharedWiki.search(query.trim()).then((res) => {
-      setHits(res?.hits ?? []);
-    }).catch(() => setHits([])).finally(() => setSearching(false));
+    setLoading(true);
+    api.sharedWiki.search(query.trim()).then((res) => setHits(res?.hits ?? [])).catch(() => setHits([])).finally(() => setLoading(false));
   }, [query]);
 
   return (
     <div className="space-y-4">
-      <Toolbar
-        search={query}
-        onSearchChange={setQuery}
-        onSearchEnter={handleSearch}
-        searchPlaceholder={intl.formatMessage({ id: 'sharedWiki.search.placeholder' })}
-      >
-        <Button
-          variant="primary"
-          icon={Search}
-          onClick={handleSearch}
-          disabled={searching || !query.trim()}
+      <div className="relative max-w-md">
+        <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+          placeholder={intl.formatMessage({ id: 'sharedWiki.search.placeholder' })}
+          className="pl-8"
         />
-      </Toolbar>
+      </div>
 
-      {hits.length > 0 ? (
+      {loading ? (
+        <CollectionPageState state="loading" />
+      ) : hits.length === 0 ? (
+        <CollectionPageState state="empty" icon={SearchIcon} title={intl.formatMessage({ id: 'sharedWiki.search.empty' })} />
+      ) : (
         <div className="space-y-3">
           {hits.map((hit) => (
-            <Card key={hit.path}>
-              <div className="flex items-center gap-2">
-                <FileText className="h-4 w-4 text-amber-500" />
-                <span className="font-medium text-stone-900 dark:text-stone-50">{hit.title}</span>
-                <span className="text-xs text-stone-400">({hit.path})</span>
-                <Badge tone="accent" className="ml-auto">
-                  {hit.score}
-                </Badge>
-              </div>
-              {hit.context_lines.length > 0 && (
-                <div className="mt-2 rounded-control bg-stone-500/5 p-2 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-400">
-                  {hit.context_lines.map((line, i) => (
-                    <div key={i} className="truncate">{line}</div>
-                  ))}
+            <Card key={hit.path} data-size="sm">
+              <CardContent className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <FileTextIcon className="size-4 shrink-0 text-brand" />
+                  <span className="truncate text-sm font-medium text-foreground">{hit.title}</span>
+                  <span className="truncate font-mono text-xs text-muted-foreground">{hit.path}</span>
+                  <Badge variant="secondary" className="ml-auto shrink-0">{hit.score}</Badge>
                 </div>
-              )}
+                {hit.context_lines.length > 0 && (
+                  <div className="rounded-lg bg-muted p-2">
+                    {hit.context_lines.map((line, i) => (
+                      <div key={i} className="truncate font-mono text-xs text-muted-foreground">{line}</div>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
             </Card>
           ))}
         </div>
-      ) : (
-        <Card>
-          <EmptyState dudu="concerned" icon={Search} title={intl.formatMessage({ id: 'sharedWiki.search.empty' })} />
-        </Card>
       )}
     </div>
   );
 }
 
-// ── Stats Tab ─────────────────────────────────────────────
+// ── Stats view ──────────────────────────────────────────────
 
-function StatsTab() {
+function StatsView() {
   const intl = useIntl();
   const [stats, setStats] = useState<SharedWikiStats | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api.sharedWiki.stats().then((res) => {
-      setStats(res);
-    }).catch(() => setStats(null)).finally(() => setLoading(false));
+    api.sharedWiki.stats().then(setStats).catch(() => setStats(null)).finally(() => setLoading(false));
   }, []);
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-12 text-stone-400">
-        <BarChart3 className="mr-2 h-5 w-5 animate-pulse" />
-        Loading...
-      </div>
-    );
-  }
+  if (loading) return <CollectionPageState state="loading" />;
 
   if (!stats?.exists) {
-    return (
-      <Card>
-        <EmptyState dudu="reading" icon={BarChart3} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />
-      </Card>
-    );
+    return <CollectionPageState state="empty" icon={BarChart3Icon} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />;
   }
 
   const authorEntries = Object.entries(stats.by_author ?? {}).sort(([, a], [, b]) => b - a);
   const dirEntries = Object.entries(stats.by_directory ?? {}).sort(([, a], [, b]) => b - a);
 
   return (
-    <div className="space-y-6">
-      {/* Summary cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <StatCard
-          icon={FileText}
-          tone="accent"
-          label={intl.formatMessage({ id: 'sharedWiki.stats.totalPages' })}
-          value={stats.total_pages}
-        />
-        <StatCard
-          icon={Users}
-          tone="neutral"
-          label={intl.formatMessage({ id: 'sharedWiki.stats.contributors' })}
-          value={authorEntries.length}
-        />
-        <StatCard
-          icon={Clock}
-          tone="neutral"
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <KpiTile icon={FileTextIcon} label={intl.formatMessage({ id: 'sharedWiki.stats.totalPages' })} value={String(stats.total_pages)} />
+        <KpiTile icon={UsersIcon} label={intl.formatMessage({ id: 'sharedWiki.stats.contributors' })} value={String(authorEntries.length)} />
+        <KpiTile
+          icon={BarChart3Icon}
           label={intl.formatMessage({ id: 'sharedWiki.stats.lastUpdated' })}
-          value={
-            stats.most_recent?.updated
-              ? new Date(stats.most_recent.updated).toLocaleDateString()
-              : '—'
-          }
-          hint={stats.most_recent?.title ?? undefined}
+          value={stats.most_recent?.updated ? new Date(stats.most_recent.updated).toLocaleDateString() : '—'}
         />
       </div>
 
-      {/* By author */}
       {authorEntries.length > 0 && (
-        <Section title={intl.formatMessage({ id: 'sharedWiki.stats.byAuthor' })}>
-          <Card>
-            <div className="space-y-2">
-              {authorEntries.map(([author, count]) => (
-                <div key={author} className="flex items-center gap-2">
-                  <CharacterAvatar agentId={author} name={author} size={24} />
-                  <span className="flex-1 text-sm text-stone-700 dark:text-stone-300">{author}</span>
-                  <div className="h-2 flex-1 overflow-hidden rounded-full bg-stone-500/10 dark:bg-white/10">
-                    <div
-                      className="h-full rounded-full bg-amber-400"
-                      style={{ width: `${(count / stats.total_pages) * 100}%` }}
-                    />
-                  </div>
-                  <Mono className="min-w-[2rem] text-right text-sm font-medium text-stone-500">{count}</Mono>
+        <Card>
+          <CardContent className="space-y-2">
+            <h3 className="text-sm font-medium text-foreground">{intl.formatMessage({ id: 'sharedWiki.stats.byAuthor' })}</h3>
+            {authorEntries.map(([author, count]) => (
+              <div key={author} className="flex items-center gap-2">
+                <ActorAvatar actorType="agent" size="xs" name={author} />
+                <span className="flex-1 truncate text-sm text-foreground">{author}</span>
+                <div className="h-2 w-32 overflow-hidden rounded-full bg-muted">
+                  <div className="h-full rounded-full bg-chart-1" style={{ width: `${(count / stats.total_pages) * 100}%` }} />
                 </div>
-              ))}
-            </div>
-          </Card>
-        </Section>
+                <span className="w-8 text-right font-mono text-xs tabular-nums text-muted-foreground">{count}</span>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
       )}
 
-      {/* By directory */}
       {dirEntries.length > 0 && (
-        <Section title={intl.formatMessage({ id: 'sharedWiki.stats.byDirectory' })}>
-          <Card>
-            <div className="space-y-2">
-              {dirEntries.map(([dir, count]) => (
-                <div key={dir} className="flex items-center gap-2">
-                  <Tag className="h-3.5 w-3.5 text-stone-400" />
-                  <span className="flex-1 text-sm text-stone-700 dark:text-stone-300">{dir}/</span>
-                  <Mono className="text-sm font-medium text-stone-500">{count}</Mono>
-                </div>
-              ))}
-            </div>
-          </Card>
-        </Section>
+        <Card>
+          <CardContent className="space-y-2">
+            <h3 className="text-sm font-medium text-foreground">{intl.formatMessage({ id: 'sharedWiki.stats.byDirectory' })}</h3>
+            {dirEntries.map(([dir, count]) => (
+              <div key={dir} className="flex items-center gap-2">
+                <span className="flex-1 truncate text-sm text-foreground">{dir}/</span>
+                <span className="font-mono text-xs tabular-nums text-muted-foreground">{count}</span>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
       )}
     </div>
   );
 }
 
-// ── Namespace Policy Tab (SCP.2) ──────────────────────────
+function KpiTile({
+  icon: Icon,
+  label,
+  value,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="rounded-lg border border-surface-border bg-card p-4">
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Icon className="size-3.5" />
+        {label}
+      </div>
+      <p className="mt-1 text-2xl font-medium tabular-nums text-foreground">{value}</p>
+    </div>
+  );
+}
 
-const SCOPE_MODE_TONES: Record<WikiScopeMode, 'success' | 'warning' | 'danger'> = {
-  agent_writable: 'success',
-  read_only: 'warning',
-  operator_only: 'danger',
+// ── Namespace policy view (SCP.2) ───────────────────────────
+
+const SCOPE_MODE_BADGE: Record<WikiScopeMode, { variant: 'secondary' | 'destructive'; className?: string }> = {
+  agent_writable: { variant: 'secondary' },
+  read_only: { variant: 'secondary', className: 'bg-warning/15 text-warning' },
+  operator_only: { variant: 'destructive' },
 };
 
-function PolicyTab() {
+const POLICY_COLUMNS = 'minmax(0,1fr) auto auto 2.5rem';
+
+function PolicyView() {
   const intl = useIntl();
   const [namespaces, setNamespaces] = useState<ReadonlyArray<WikiScopeNamespace>>([]);
   const [loading, setLoading] = useState(false);
@@ -475,9 +401,7 @@ function PolicyTab() {
     }
   }, [intl]);
 
-  useEffect(() => {
-    fetchScope();
-  }, [fetchScope]);
+  useEffect(() => { fetchScope(); }, [fetchScope]);
 
   const handleRemove = async (ns: string) => {
     try {
@@ -491,69 +415,82 @@ function PolicyTab() {
 
   return (
     <div className="space-y-4">
-      <Section
-        description={intl.formatMessage({ id: 'scp.desc' })}
-        actions={
-          <Button
-            variant="primary"
-            icon={Plus}
-            onClick={() => setEditing({ ns: { namespace: '', mode: 'agent_writable', synced_from: null }, isNew: true })}
+      <div className="flex items-start justify-between gap-3">
+        <p className="max-w-2xl text-sm text-muted-foreground">{intl.formatMessage({ id: 'scp.desc' })}</p>
+        <Button
+          variant="brand"
+          size="sm"
+          className="shrink-0"
+          onClick={() => setEditing({ ns: { namespace: '', mode: 'agent_writable', synced_from: null }, isNew: true })}
+        >
+          <PlusIcon />
+          <span className="hidden sm:inline">{intl.formatMessage({ id: 'scp.add' })}</span>
+        </Button>
+      </div>
+
+      {loading ? (
+        <CollectionPageState state="loading" />
+      ) : namespaces.length === 0 ? (
+        <CollectionPageState state="empty" icon={LockIcon} title={intl.formatMessage({ id: 'scp.empty' })} />
+      ) : (
+        <div className="overflow-hidden rounded-xl border border-surface-border">
+          <ListGridContainer
+            columns={POLICY_COLUMNS}
+            className="!h-auto"
+            header={
+              <ListGridHeader>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'scp.col.namespace' })}</ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'scp.col.mode' })}</ListGridHeaderCell>
+                <ListGridHeaderCell hideBelow>{intl.formatMessage({ id: 'scp.col.syncedFrom' })}</ListGridHeaderCell>
+                <ListGridHeaderCell aria-hidden />
+              </ListGridHeader>
+            }
           >
-            {intl.formatMessage({ id: 'scp.add' })}
-          </Button>
-        }
-      >
-        <Card padded={false}>
-          {loading ? (
-            <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
-          ) : namespaces.length === 0 ? (
-            <EmptyState dudu="idle" icon={Lock} title={intl.formatMessage({ id: 'scp.empty' })} />
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-[var(--panel-border)]">
-                    <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.namespace' })}</th>
-                    <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.mode' })}</th>
-                    <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.syncedFrom' })}</th>
-                    <th className="px-5 py-2.5 text-right font-medium text-stone-500 dark:text-stone-400" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {namespaces.map((n) => (
-                    <tr key={n.namespace} className="border-b border-[var(--panel-border)] last:border-0">
-                      <td className="px-5 py-2.5 font-medium text-stone-800 dark:text-stone-200">{n.namespace}/</td>
-                      <td className="px-5 py-2.5">
-                        <Badge tone={SCOPE_MODE_TONES[n.mode]}>{n.mode}</Badge>
-                      </td>
-                      <td className="px-5 py-2.5 text-xs text-stone-500 dark:text-stone-400">{n.synced_from ?? '—'}</td>
-                      <td className="px-5 py-2.5 text-right">
-                        <div className="flex items-center justify-end gap-1">
+            {namespaces.map((n) => {
+              const badge = SCOPE_MODE_BADGE[n.mode];
+              return (
+                <ListGridRow key={n.namespace} className="cursor-default">
+                  <ListGridCell>
+                    <span className="truncate font-medium text-foreground">{n.namespace}/</span>
+                  </ListGridCell>
+                  <ListGridCell>
+                    <Badge variant={badge.variant} className={badge.className}>{n.mode}</Badge>
+                  </ListGridCell>
+                  <ListGridCell hideBelow className="text-xs text-muted-foreground">
+                    {n.synced_from ?? '—'}
+                  </ListGridCell>
+                  <ListGridCell className="justify-end">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        render={
                           <Button
                             variant="ghost"
-                            size="sm"
-                            icon={Pencil}
-                            onClick={() => setEditing({ ns: { ...n }, isNew: false })}
-                            title={intl.formatMessage({ id: 'common.edit' })}
+                            size="icon-sm"
+                            aria-label={intl.formatMessage({ id: 'common.edit' })}
+                            data-stop-row-nav
                           />
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            icon={Trash2}
-                            onClick={() => handleRemove(n.namespace)}
-                            title={intl.formatMessage({ id: 'common.delete' })}
-                            className="text-rose-500 hover:bg-rose-500/10 hover:text-rose-600"
-                          />
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Card>
-      </Section>
+                        }
+                      >
+                        <MoreHorizontalIcon />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent>
+                        <DropdownMenuItem onClick={() => setEditing({ ns: { ...n }, isNew: false })}>
+                          <PencilIcon />
+                          {intl.formatMessage({ id: 'common.edit' })}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem className="text-destructive focus:bg-destructive/10" onClick={() => handleRemove(n.namespace)}>
+                          <Trash2Icon />
+                          {intl.formatMessage({ id: 'common.delete' })}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </ListGridCell>
+                </ListGridRow>
+              );
+            })}
+          </ListGridContainer>
+        </div>
+      )}
 
       {editing && (
         <NamespacePolicyDialog
@@ -611,31 +548,48 @@ function NamespacePolicyDialog({
   };
 
   return (
-    <Dialog open onClose={onClose} title={isNew ? intl.formatMessage({ id: 'scp.add' }) : intl.formatMessage({ id: 'scp.edit' })}>
-      <div className="space-y-4">
-        <FormField label={intl.formatMessage({ id: 'scp.col.namespace' })} hint={intl.formatMessage({ id: 'scp.field.namespace.hint' })}>
-          <input type="text" value={namespace} onChange={(e) => setNamespace(e.target.value)} disabled={!isNew} placeholder="identity" className={inputClass} />
-        </FormField>
-        <FormField label={intl.formatMessage({ id: 'scp.col.mode' })} hint={intl.formatMessage({ id: 'scp.field.mode.hint' })}>
-          <select value={mode} onChange={(e) => setMode(e.target.value as WikiScopeMode)} className={selectClass}>
-            <option value="agent_writable">agent_writable</option>
-            <option value="read_only">read_only</option>
-            <option value="operator_only">operator_only</option>
-          </select>
-        </FormField>
-        {mode === 'read_only' && (
-          <FormField label={intl.formatMessage({ id: 'scp.col.syncedFrom' })} hint={intl.formatMessage({ id: 'scp.field.syncedFrom.hint' })}>
-            <input type="text" value={syncedFrom} onChange={(e) => setSyncedFrom(e.target.value)} placeholder="identity:read" className={inputClass} />
-          </FormField>
-        )}
-        {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
-        <div className="flex justify-end gap-3 border-t border-stone-200 pt-4 dark:border-stone-700">
-          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
-          <button onClick={handleSubmit} disabled={submitting} className={buttonPrimary}>
-            {submitting ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
-          </button>
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: isNew ? 'scp.add' : 'scp.edit' })}</DialogTitle>
+          <DialogDescription>{intl.formatMessage({ id: 'scp.desc' })}</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">{intl.formatMessage({ id: 'scp.col.namespace' })}</label>
+            <Input value={namespace} onChange={(e) => setNamespace(e.target.value)} disabled={!isNew} placeholder="identity" />
+            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'scp.field.namespace.hint' })}</p>
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">{intl.formatMessage({ id: 'scp.col.mode' })}</label>
+            <Select value={mode} onValueChange={(v) => setMode(String(v) as WikiScopeMode)}>
+              <SelectTrigger className="w-full">
+                <SelectValue>{mode}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="agent_writable">agent_writable</SelectItem>
+                <SelectItem value="read_only">read_only</SelectItem>
+                <SelectItem value="operator_only">operator_only</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'scp.field.mode.hint' })}</p>
+          </div>
+          {mode === 'read_only' && (
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">{intl.formatMessage({ id: 'scp.col.syncedFrom' })}</label>
+              <Input value={syncedFrom} onChange={(e) => setSyncedFrom(e.target.value)} placeholder="identity:read" />
+              <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'scp.field.syncedFrom.hint' })}</p>
+            </div>
+          )}
+          {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
-      </div>
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'common.cancel' })}</Button>} />
+          <Button variant="brand" onClick={handleSubmit} disabled={submitting}>
+            {intl.formatMessage({ id: submitting ? 'common.saving' : 'common.save' })}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }

@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import type { ActivityEvent, ActivityType } from '@/lib/api';
+import { glyphText } from '@/lib/agent-glyph';
 import {
   Plus,
   CheckCircle2,
@@ -28,8 +29,8 @@ type TypeConfig = {
 
 const FALLBACK_CONFIG: TypeConfig = {
   icon: Activity,
-  color: 'text-stone-500',
-  bgColor: 'bg-stone-100 dark:bg-stone-800',
+  color: 'text-muted-foreground',
+  bgColor: 'bg-muted',
 };
 
 const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
@@ -40,23 +41,23 @@ const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
   },
   task_completed: {
     icon: CheckCircle2,
-    color: 'text-emerald-500',
-    bgColor: 'bg-emerald-100 dark:bg-emerald-900/30',
+    color: 'text-success',
+    bgColor: 'bg-success/10',
   },
   task_blocked: {
     icon: Ban,
-    color: 'text-rose-500',
-    bgColor: 'bg-rose-100 dark:bg-rose-900/30',
+    color: 'text-destructive',
+    bgColor: 'bg-destructive/10',
   },
   task_assigned: {
     icon: UserCheck,
-    color: 'text-amber-500',
-    bgColor: 'bg-amber-100 dark:bg-amber-900/30',
+    color: 'text-brand',
+    bgColor: 'bg-brand/10',
   },
   agent_reply: {
     icon: MessageSquare,
-    color: 'text-stone-500',
-    bgColor: 'bg-stone-100 dark:bg-stone-800',
+    color: 'text-muted-foreground',
+    bgColor: 'bg-muted',
   },
   skill_learned: {
     icon: Sparkles,
@@ -65,23 +66,23 @@ const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
   },
   evolution_triggered: {
     icon: Zap,
-    color: 'text-amber-500',
-    bgColor: 'bg-amber-100 dark:bg-amber-900/30',
+    color: 'text-brand',
+    bgColor: 'bg-brand/10',
   },
   autopilot_triggered: {
     icon: Zap,
-    color: 'text-amber-500',
-    bgColor: 'bg-amber-100 dark:bg-amber-900/30',
+    color: 'text-brand',
+    bgColor: 'bg-brand/10',
   },
   autopilot_lag: {
     icon: AlertTriangle,
-    color: 'text-amber-500',
-    bgColor: 'bg-amber-100 dark:bg-amber-900/30',
+    color: 'text-warning',
+    bgColor: 'bg-warning/10',
   },
   error: {
     icon: AlertTriangle,
-    color: 'text-rose-500',
-    bgColor: 'bg-rose-100 dark:bg-rose-900/30',
+    color: 'text-destructive',
+    bgColor: 'bg-destructive/10',
   },
 };
 
@@ -118,11 +119,11 @@ function ActivityItem({ event }: { event: ActivityEvent }) {
         <Icon className={cn('h-3.5 w-3.5', config.color)} />
       </div>
       <div className="min-w-0 flex-1">
-        <p className="text-sm text-stone-700 dark:text-stone-300">{event.summary}</p>
+        <p className="text-sm text-foreground">{event.summary}</p>
         <div className="mt-0.5 flex items-center gap-2">
-          <span className="text-xs text-stone-400 dark:text-stone-500">{event.agent_id}</span>
-          <span className="text-xs text-stone-300 dark:text-stone-600">·</span>
-          <span className="text-xs text-stone-400 dark:text-stone-500">{timeAgo}</span>
+          <span className="text-xs text-muted-foreground">{event.agent_id}</span>
+          <span className="text-xs text-muted-foreground/50">·</span>
+          <span className="text-xs text-muted-foreground">{timeAgo}</span>
         </div>
       </div>
     </div>
@@ -133,12 +134,12 @@ function ActivityItem({ event }: { event: ActivityEvent }) {
 function CollapsedRun({ agentId, count }: { agentId: string; count: number }) {
   const intl = useIntl();
   return (
-    <div className="flex items-center gap-3 py-2 pl-1 text-xs text-stone-400 dark:text-stone-500">
-      <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-stone-100 dark:bg-stone-800">
-        <Layers className="h-3.5 w-3.5 text-stone-400" />
+    <div className="flex items-center gap-3 py-2 pl-1 text-xs text-muted-foreground">
+      <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-muted">
+        <Layers className="h-3.5 w-3.5 text-muted-foreground" />
       </div>
       <span>
-        <span className="text-stone-500 dark:text-stone-400">{agentId}</span>{' '}
+        <span className="text-muted-foreground">{agentId}</span>{' '}
         {intl.formatMessage({ id: 'activity.collapsed' }, { count })}
       </span>
     </div>
@@ -237,17 +238,17 @@ export function ActivityFeed({
           <select
             value={filterAgent}
             onChange={(e) => { setFilterAgent(e.target.value); setVisibleCount(limit); }}
-            className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-xs text-stone-700 focus:border-amber-400 focus:outline-none dark:border-stone-700 dark:bg-stone-800 dark:text-stone-300"
+            className="rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs text-foreground focus:border-brand focus:outline-none"
           >
             <option value="">{intl.formatMessage({ id: 'activity.filter.all' })}</option>
             {agents.map((a) => (
-              <option key={a.name} value={a.name}>{a.icon || '🤖'} {a.display_name}</option>
+              <option key={a.name} value={a.name}>{glyphText(a.icon)} {a.display_name}</option>
             ))}
           </select>
         )}
         <button
           onClick={() => setShowAll((v) => !v)}
-          className="ml-auto inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-stone-500 transition-colors hover:bg-stone-500/8 hover:text-stone-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200"
+          className="ml-auto inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
           aria-pressed={showAll}
         >
           {showAll ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
@@ -255,11 +256,11 @@ export function ActivityFeed({
         </button>
       </div>
       {rows.rows.length === 0 ? (
-        <div className="flex items-center justify-center py-12 text-stone-400 dark:text-stone-500">
+        <div className="flex items-center justify-center py-12 text-muted-foreground">
           <p>{intl.formatMessage({ id: 'activity.empty' })}</p>
         </div>
       ) : (
-        <div className="divide-y divide-stone-100 dark:divide-stone-800">
+        <div className="divide-y divide-surface-border">
           {rows.rows.map((row) =>
             row.kind === 'event' ? (
               <ActivityItem key={row.event.id} event={row.event} />
@@ -273,7 +274,7 @@ export function ActivityFeed({
       {rows.total > visibleCount && (
         <button
           onClick={handleLoadMore}
-          className="mt-3 flex w-full items-center justify-center gap-1 rounded-lg bg-stone-50 py-2 text-xs text-stone-500 transition-colors hover:bg-stone-100 dark:bg-stone-800 dark:text-stone-400 dark:hover:bg-stone-700"
+          className="mt-3 flex w-full items-center justify-center gap-1 rounded-lg bg-muted py-2 text-xs text-muted-foreground transition-colors hover:bg-surface-hover"
         >
           <ChevronDown className="h-3 w-3" />
           {intl.formatMessage({ id: 'activity.loadMore' })}

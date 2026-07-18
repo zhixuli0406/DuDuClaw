@@ -144,15 +144,49 @@ function startRefreshTimer(refresh: () => Promise<void>) {
   }
 }
 
+/** Error carrying the HTTP status so callers can tell a rejected credential
+ *  (401/403 → wipe token, re-login) apart from a transient failure
+ *  (429 rate-limit / 5xx / network → keep token, retry later). */
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+/**
+ * Should an auth failure keep the refresh token and retry, rather than force a
+ * logout? Only an explicit credential rejection (401 Unauthorized / 403
+ * Forbidden) means the refresh token is actually invalid. Everything else —
+ * 429 (the per-IP `/api/refresh` rate limit tripped by opening many tabs),
+ * 5xx, or a network blip — is transient: wiping the token there needlessly
+ * bounces a still-valid session back to the login screen (bug #1).
+ */
+export function isRetryableAuthError(err: unknown): boolean {
+  if (err instanceof ApiError) {
+    return err.status !== 401 && err.status !== 403;
+  }
+  // Non-HTTP failures (fetch/network/JSON parse) are transient.
+  return true;
+}
+
+// Backoff base for transient `/api/refresh` failures during initial load.
+const RETRY_BASE_MS = 250;
+const RETRY_MAX_ATTEMPTS = 4;
+
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 async function apiPost<T>(path: string, body: Record<string, unknown>): Promise<T> {
   const res = await fetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
+  const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data.error || `HTTP ${res.status}`);
+    throw new ApiError(res.status, data.error || `HTTP ${res.status}`);
   }
   return data as T;
 }
@@ -161,9 +195,9 @@ async function apiGet<T>(path: string, jwt: string): Promise<T> {
   const res = await fetch(path, {
     headers: { Authorization: `Bearer ${jwt}` },
   });
-  const data = await res.json();
+  const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data.error || `HTTP ${res.status}`);
+    throw new ApiError(res.status, data.error || `HTTP ${res.status}`);
   }
   return data as T;
 }
@@ -321,8 +355,15 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         });
         // Re-arm in case timer was lost (e.g., first refresh after loadFromStorage)
         startRefreshTimer(get().refresh);
-      } catch {
-        get().logout();
+      } catch (err) {
+        // Only a rejected credential (401/403) means the refresh token is dead
+        // and we must log out. A transient failure (429 rate-limit / 5xx /
+        // network) keeps the session — the current access token is usually
+        // still valid (we refresh at 25min for a 30min TTL) and the next timer
+        // tick (or an on-demand call) retries. Never bounce to login here (#1).
+        if (!isRetryableAuthError(err)) {
+          get().logout();
+        }
       } finally {
         // Defer cleanup by one microtask so all concurrent awaiters
         // share the same promise (R2 race fix)
@@ -345,31 +386,50 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       return false;
     }
 
-    try {
-      const data = await apiPost<{ access_token: string }>('/api/refresh', {
-        refresh_token: refreshToken,
-      });
+    // Retry transient failures with backoff so a `/api/refresh` rate-limit
+    // spike (429, tripped by opening many tabs) or a network blip doesn't wipe
+    // the token and bounce a valid session to /login (#1). Only an explicit
+    // 401/403 clears the token.
+    for (let attempt = 0; attempt < RETRY_MAX_ATTEMPTS; attempt++) {
+      try {
+        const data = await apiPost<{ access_token: string }>('/api/refresh', {
+          refresh_token: refreshToken,
+        });
 
-      const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
-        '/api/me',
-        data.access_token
-      );
+        const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
+          '/api/me',
+          data.access_token
+        );
 
-      set({
-        user: me.user,
-        jwt: data.access_token,
-        refreshToken,
-        isAuthenticated: true,
-        initialized: true,
-        bindings: me.bindings,
-      });
-      startRefreshTimer(get().refresh);
-      return true;
-    } catch {
-      refreshTokenStorage.clear();
-      set({ initialized: true });
-      return false;
+        set({
+          user: me.user,
+          jwt: data.access_token,
+          refreshToken,
+          isAuthenticated: true,
+          initialized: true,
+          bindings: me.bindings,
+        });
+        startRefreshTimer(get().refresh);
+        return true;
+      } catch (err) {
+        if (!isRetryableAuthError(err)) {
+          // 401/403: the refresh token is genuinely invalid — re-login.
+          refreshTokenStorage.clear();
+          set({ initialized: true });
+          return false;
+        }
+        // Transient: back off and retry, but KEEP the token.
+        if (attempt < RETRY_MAX_ATTEMPTS - 1) {
+          await delay(RETRY_BASE_MS * 2 ** attempt);
+        }
+      }
     }
+
+    // Retries exhausted (persistent 429/network). Preserve the token so the
+    // next reload re-establishes the session without a fresh login; surface
+    // login for now but never wipe the credential.
+    set({ initialized: true });
+    return false;
   },
 
   setUser: (user: AuthUser, bindings: AgentBinding[]) => {

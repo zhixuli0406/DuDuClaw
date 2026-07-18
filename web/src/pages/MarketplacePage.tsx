@@ -1,19 +1,25 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type AgentInfo, type MarketplaceServer } from '@/lib/api';
-import { Dialog, FormField, selectClass } from '@/components/shared/Dialog';
 import {
-  Page,
-  PageHeader,
-  Card,
-  Section,
-  Tabs,
-  Button,
   Badge,
-  EmptyState,
-  Toolbar,
-  type TabItem,
-} from '@/components/ui';
+  Button,
+  Empty,
+  Input,
+  Tabs,
+  TabsList,
+  TabsTab,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/mds';
 import {
   Store,
   Download,
@@ -23,21 +29,16 @@ import {
   Globe,
   Package,
   Sparkles,
+  Search,
   X,
 } from 'lucide-react';
 
 type Category = 'all' | 'featured' | 'browser' | 'data' | 'communication';
 
-const CATEGORIES: ReadonlyArray<Category> = [
-  'all',
-  'featured',
-  'browser',
-  'data',
-  'communication',
-];
+const CATEGORIES: ReadonlyArray<Category> = ['all', 'featured', 'browser', 'data', 'communication'];
 
 /** Map a backend `category` string to a lucide icon component. */
-function iconForCategory(category: string): React.ComponentType<{ className?: string }> {
+function iconForCategory(category: string): ComponentType<{ className?: string }> {
   switch (category) {
     case 'browser':
       return Globe;
@@ -48,6 +49,18 @@ function iconForCategory(category: string): React.ComponentType<{ className?: st
     default:
       return Package;
   }
+}
+
+/** Local labeled-field wrapper (spec §4 form pattern). */
+function Field({ label, htmlFor, children }: { label: string; htmlFor?: string; children: ReactNode }) {
+  return (
+    <div className="space-y-1.5">
+      <label htmlFor={htmlFor} className="text-xs font-medium text-muted-foreground">
+        {label}
+      </label>
+      {children}
+    </div>
+  );
 }
 
 function ServerCard({
@@ -63,37 +76,31 @@ function ServerCard({
   const Icon = iconForCategory(server.category);
 
   return (
-    <Card interactive className="flex h-full flex-col">
+    <div className="flex h-full flex-col rounded-xl border border-surface-border bg-surface p-4 shadow-[var(--surface-shadow)] transition-colors hover:bg-surface-hover">
       <div className="flex items-start gap-3">
-        <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-amber-500/12 text-amber-600 ring-1 ring-inset ring-amber-500/20 dark:bg-amber-400/10 dark:text-amber-400">
-          <Icon className="h-5 w-5" />
+        <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-brand/12 text-brand ring-1 ring-inset ring-brand/20">
+          <Icon className="size-5" />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <h3 className="truncate font-medium text-stone-900 dark:text-stone-50">
-              {server.name}
-            </h3>
+            <h3 className="truncate font-medium text-foreground">{server.name}</h3>
             {server.featured && (
-              <Badge tone="accent">
-                <Sparkles className="h-3 w-3" />
+              <Badge variant="secondary" className="bg-brand/15 text-brand">
+                <Sparkles />
                 {intl.formatMessage({ id: 'marketplace.featured' })}
               </Badge>
             )}
           </div>
-          <p className="mt-0.5 truncate text-xs text-stone-500 dark:text-stone-400">
-            {server.author}
-          </p>
+          <p className="mt-0.5 truncate text-xs text-muted-foreground">{server.author}</p>
         </div>
       </div>
 
-      <p className="mt-3 line-clamp-2 text-sm text-stone-600 dark:text-stone-400">
-        {server.description}
-      </p>
+      <p className="mt-3 line-clamp-2 text-sm text-muted-foreground">{server.description}</p>
 
       {server.tags.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1.5">
           {server.tags.map((tag) => (
-            <Badge key={tag} tone="neutral">
+            <Badge key={tag} variant="secondary">
               {tag}
             </Badge>
           ))}
@@ -102,19 +109,21 @@ function ServerCard({
 
       <div className="mt-4 flex items-center justify-end">
         {installed ? (
-          <Button variant="secondary" size="sm" icon={Check} disabled>
+          <Button variant="outline" size="sm" disabled>
+            <Check />
             {intl.formatMessage({ id: 'marketplace.installed' })}
             {server.installed_by.length > 1 && (
               <span className="ml-0.5 opacity-70">({server.installed_by.length})</span>
             )}
           </Button>
         ) : (
-          <Button variant="primary" size="sm" icon={Download} onClick={onInstall}>
+          <Button variant="brand" size="sm" onClick={onInstall}>
+            <Download />
             {intl.formatMessage({ id: 'marketplace.install' })}
           </Button>
         )}
       </div>
-    </Card>
+    </div>
   );
 }
 
@@ -129,6 +138,7 @@ export function MarketplacePage() {
   const [installTarget, setInstallTarget] = useState<string | null>(null);
   const [installAgent, setInstallAgent] = useState('');
   const [installing, setInstalling] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     api.agents.list().then((res) => {
@@ -141,7 +151,6 @@ export function MarketplacePage() {
       // Agent list failure surfaces when the install dialog opens (empty select).
     });
   }, []);
-  const [loadError, setLoadError] = useState<string | null>(null);
 
   // Fetch the catalog (including backend-derived `installed_by`) so the
   // "installed" state survives reloads and reflects real `.mcp.json` content.
@@ -163,10 +172,7 @@ export function MarketplacePage() {
     load();
   }, [load]);
 
-  const featuredServers = useMemo(
-    () => servers.filter((s) => s.featured),
-    [servers],
-  );
+  const featuredServers = useMemo(() => servers.filter((s) => s.featured), [servers]);
 
   const filtered = useMemo(() => {
     const q = query.toLowerCase();
@@ -202,41 +208,37 @@ export function MarketplacePage() {
       await load();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setInstallError(
-        intl.formatMessage({ id: 'marketplace.installError' }, { message }),
-      );
+      setInstallError(intl.formatMessage({ id: 'marketplace.installError' }, { message }));
     } finally {
       setInstalling(false);
     }
   };
 
-  const categoryTabs: TabItem[] = CATEGORIES.map((cat) => ({
-    id: cat,
-    label: intl.formatMessage({ id: `marketplace.categories.${cat}` }),
-  }));
-
   return (
-    <Page wide>
-      <PageHeader
-        icon={Store}
-        title={intl.formatMessage({ id: 'nav.marketplace' })}
-        subtitle={intl.formatMessage({ id: 'marketplace.subtitle' })}
-      />
+    <div className="space-y-6">
+      {/* Slim page header (spec §5.2). */}
+      <div className="flex items-center gap-2">
+        <Store className="size-5 text-muted-foreground" />
+        <div>
+          <h1 className="text-base font-medium">{intl.formatMessage({ id: 'nav.marketplace' })}</h1>
+          <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'marketplace.subtitle' })}</p>
+        </div>
+      </div>
 
       {/* Install Error Alert */}
       {installError && (
         <div
           role="alert"
-          className="flex items-start justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300"
+          className="flex items-start justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
         >
           <span className="flex-1">{installError}</span>
           <button
             type="button"
             onClick={() => setInstallError(null)}
-            className="shrink-0 text-rose-500 hover:text-rose-700 dark:text-rose-400 dark:hover:text-rose-200"
+            className="shrink-0 text-destructive/70 hover:text-destructive"
             aria-label="Dismiss"
           >
-            <X className="h-4 w-4" />
+            <X className="size-4" />
           </button>
         </div>
       )}
@@ -245,43 +247,48 @@ export function MarketplacePage() {
       {loadError && (
         <div
           role="alert"
-          className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300"
+          className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
         >
           {loadError}
         </div>
       )}
 
-      {/* Search */}
-      <Toolbar
-        search={query}
-        onSearchChange={setQuery}
-        searchPlaceholder={intl.formatMessage({ id: 'marketplace.search' })}
-      />
-
-      {/* Category Tabs */}
-      <Tabs
-        items={categoryTabs}
-        value={category}
-        onChange={(id) => setCategory(id as Category)}
-      />
+      {/* Search + category tabs */}
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={intl.formatMessage({ id: 'marketplace.search' })}
+            className="w-56 pl-8"
+          />
+        </div>
+        <Tabs value={category} onValueChange={(v) => setCategory(v as Category)} variant="line">
+          <TabsList>
+            {CATEGORIES.map((cat) => (
+              <TabsTab key={cat} value={cat}>
+                {intl.formatMessage({ id: `marketplace.categories.${cat}` })}
+              </TabsTab>
+            ))}
+          </TabsList>
+        </Tabs>
+      </div>
 
       {/* Loading */}
       {loading && (
-        <p className="py-12 text-center text-stone-400 dark:text-stone-500">
+        <p className="py-12 text-center text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'common.loading' })}
         </p>
       )}
 
       {/* Featured Section (only on `all` tab with no search) */}
       {!loading && category === 'all' && !query && featuredServers.length > 0 && (
-        <Section
-          title={
-            <span className="flex items-center gap-2">
-              <Sparkles className="h-4 w-4 text-amber-500" />
-              {intl.formatMessage({ id: 'marketplace.featured' })}
-            </span>
-          }
-        >
+        <section className="space-y-3">
+          <h2 className="flex items-center gap-2 text-base font-medium">
+            <Sparkles className="size-4 text-brand" />
+            {intl.formatMessage({ id: 'marketplace.featured' })}
+          </h2>
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {featuredServers.map((server) => (
               <ServerCard
@@ -292,30 +299,27 @@ export function MarketplacePage() {
               />
             ))}
           </div>
-        </Section>
+        </section>
       )}
 
       {/* All Servers Grid */}
       {!loading && (
-        <Section
-          title={
-            category !== 'all' || query
-              ? intl.formatMessage({ id: `marketplace.categories.${category}` })
-              : undefined
-          }
-        >
+        <section className="space-y-3">
+          {(category !== 'all' || query) && (
+            <h2 className="text-base font-medium">
+              {intl.formatMessage({ id: `marketplace.categories.${category}` })}
+            </h2>
+          )}
           {filtered.length === 0 ? (
-            <Card>
-              <EmptyState
-                icon={Package}
-                dudu={servers.length === 0 ? 'idle' : 'concerned'}
-                title={
-                  servers.length === 0
-                    ? intl.formatMessage({ id: 'marketplace.empty' })
-                    : intl.formatMessage({ id: 'common.noData' })
-                }
-              />
-            </Card>
+            <Empty
+              icon={Package}
+              title={
+                servers.length === 0
+                  ? intl.formatMessage({ id: 'marketplace.empty' })
+                  : intl.formatMessage({ id: 'common.noData' })
+              }
+              variant="dashed"
+            />
           ) : (
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {filtered.map((server) => (
@@ -328,55 +332,57 @@ export function MarketplacePage() {
               ))}
             </div>
           )}
-        </Section>
+        </section>
       )}
 
       {/* Install target agent picker */}
-      {installTarget && (
-        <Dialog
-          open
-          onClose={() => setInstallTarget(null)}
-          title={intl.formatMessage({ id: 'marketplace.install' })}
-        >
+      <Dialog open={installTarget !== null} onOpenChange={(o) => !o && setInstallTarget(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{intl.formatMessage({ id: 'marketplace.install' })}</DialogTitle>
+          </DialogHeader>
           <div className="space-y-4">
-            <p className="text-sm text-stone-600 dark:text-stone-400">
-              {intl.formatMessage(
-                { id: 'marketplace.installTo' },
-                { server: servers.find((s) => s.id === installTarget)?.name ?? installTarget },
-              )}
-            </p>
-            <FormField label={intl.formatMessage({ id: 'marketplace.targetAgent' })} htmlFor="marketplace-install-agent">
-              <select
-                id="marketplace-install-agent"
-                value={installAgent}
-                onChange={(e) => setInstallAgent(e.target.value)}
-                className={selectClass}
-              >
-                {agents.length === 0 && (
-                  <option value="">{intl.formatMessage({ id: 'common.noData' })}</option>
+            <p className="text-sm text-muted-foreground">
+              {installTarget &&
+                intl.formatMessage(
+                  { id: 'marketplace.installTo' },
+                  { server: servers.find((s) => s.id === installTarget)?.name ?? installTarget },
                 )}
-                {agents.map((a) => (
-                  <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
-                ))}
-              </select>
-            </FormField>
-            <div className="flex justify-end gap-2 pt-1">
-              <Button variant="secondary" onClick={() => setInstallTarget(null)}>
-                {intl.formatMessage({ id: 'common.cancel' })}
-              </Button>
-              <Button
-                variant="primary"
-                onClick={confirmInstall}
-                disabled={installing || !installAgent}
-              >
-                {installing
-                  ? intl.formatMessage({ id: 'common.saving' })
-                  : intl.formatMessage({ id: 'marketplace.install' })}
-              </Button>
-            </div>
+            </p>
+            <Field label={intl.formatMessage({ id: 'marketplace.targetAgent' })} htmlFor="marketplace-install-agent">
+              <Select value={installAgent} onValueChange={(v) => setInstallAgent(String(v))}>
+                <SelectTrigger id="marketplace-install-agent" className="w-full">
+                  <SelectValue>
+                    {agents.find((a) => a.name === installAgent)?.display_name ||
+                      installAgent ||
+                      intl.formatMessage({ id: 'common.noData' })}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {agents.length === 0 && (
+                    <SelectItem value="">{intl.formatMessage({ id: 'common.noData' })}</SelectItem>
+                  )}
+                  {agents.map((a) => (
+                    <SelectItem key={a.name} value={a.name}>
+                      {a.display_name || a.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
           </div>
-        </Dialog>
-      )}
-    </Page>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setInstallTarget(null)}>
+              {intl.formatMessage({ id: 'common.cancel' })}
+            </Button>
+            <Button variant="brand" onClick={confirmInstall} disabled={installing || !installAgent}>
+              {installing
+                ? intl.formatMessage({ id: 'common.saving' })
+                : intl.formatMessage({ id: 'marketplace.install' })}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
   );
 }

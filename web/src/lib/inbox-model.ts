@@ -11,7 +11,7 @@
  */
 import type { RiskLevel } from './approval-risk';
 
-export type InboxItemType = 'approval' | 'decision' | 'blocked' | 'budget' | 'failed_run';
+export type InboxItemType = 'approval' | 'install' | 'decision' | 'blocked' | 'budget' | 'failed_run';
 
 export interface InboxItem {
   /** Unique across all types — always prefixed with the type (`approval:<id>`). */
@@ -59,6 +59,7 @@ export const TYPE_URGENCY: Record<InboxItemType, number> = {
   budget: 40,
   failed_run: 35,
   blocked: 30,
+  install: 25,
   approval: 20,
   decision: 10,
 };
@@ -128,7 +129,7 @@ export function filterByTab(items: readonly InboxItem[], tab: InboxTab, ctx: Inb
 
 /** Classify an item into the blocked-tab tri-bucket. */
 export function blockedBucket(item: InboxItem): BlockedBucket {
-  if (item.type === 'approval' || item.type === 'decision') return 'decide';
+  if (item.type === 'approval' || item.type === 'install' || item.type === 'decision') return 'decide';
   if (item.type === 'blocked') return item.agentId ? 'input' : 'attention';
   // budget / failed_run — nothing to decide, just needs eyes.
   return 'attention';

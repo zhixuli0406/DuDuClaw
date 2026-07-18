@@ -33,6 +33,26 @@ interface TasksStore {
   addComment: (taskId: string, body: string) => Promise<TaskComment | null>;
 }
 
+/** Upsert a task by id (immutable). If a task with the same id already exists
+ *  it is replaced in place; otherwise the incoming task is appended. This gives
+ *  the optimistic `createTask` add and the `task.created` WebSocket echo the
+ *  same identity — so a freshly created task never renders as two cards (#2).
+ *  Pure — exported for the store reducer and its tests. */
+export function upsertTask(
+  existing: ReadonlyArray<TaskInfo>,
+  incoming: TaskInfo,
+): ReadonlyArray<TaskInfo> {
+  let found = false;
+  const next = existing.map((t) => {
+    if (t.id === incoming.id) {
+      found = true;
+      return incoming;
+    }
+    return t;
+  });
+  return found ? next : [...next, incoming];
+}
+
 /** Insert a comment into a task's list, de-duplicating by id and keeping the
  *  list oldest-first. Pure — exported for the store reducer and its tests. */
 export function mergeComment(
@@ -54,7 +74,10 @@ export const useTasksStore = create<TasksStore>((set, get) => {
 
   client.subscribe('task.created', (payload) => {
     const data = payload as TaskInfo;
-    set({ tasks: [...get().tasks, data] });
+    // Upsert, not append: the creating client already added this task
+    // optimistically in `createTask`, so a blind append would duplicate the
+    // card until the next refetch (#2).
+    set({ tasks: upsertTask(get().tasks, data) });
   });
 
   client.subscribe('task.removed', (payload) => {
@@ -99,7 +122,8 @@ export const useTasksStore = create<TasksStore>((set, get) => {
       try {
         const result = await api.tasks.create(params);
         const task = result.task;
-        set({ tasks: [...get().tasks, task] });
+        // Upsert so a racing `task.created` WebSocket echo can't double-add it.
+        set({ tasks: upsertTask(get().tasks, task) });
         return task;
       } catch (e) {
         set({ error: String(e) });

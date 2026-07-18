@@ -33,17 +33,20 @@ export function AchievementCell({ ach }: { ach: Achievement }) {
 
   if (!ach.available) {
     return (
-      <div className="panel flex items-start gap-3 p-3 opacity-70" aria-label={name}>
-        <span className="grid h-11 w-11 shrink-0 place-items-center rounded-card bg-stone-500/10 text-stone-400 ring-1 ring-inset ring-stone-500/15 grayscale dark:text-stone-500">
+      <div
+        className="flex items-start gap-3 rounded-xl border border-surface-border bg-card p-3 opacity-70"
+        aria-label={name}
+      >
+        <span className="grid h-11 w-11 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground ring-1 ring-inset ring-surface-border grayscale">
           <Icon className="h-6 w-6" aria-hidden="true" />
         </span>
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-semibold text-stone-900 dark:text-stone-50">{name}</p>
+          <p className="truncate text-sm font-semibold text-foreground">{name}</p>
           {desc && (
-            <p className="mt-0.5 line-clamp-2 text-xs text-stone-500 dark:text-stone-400">{desc}</p>
+            <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{desc}</p>
           )}
           <span
-            className="mt-1.5 inline-flex cursor-help items-center rounded-full bg-stone-500/10 px-2 py-0.5 text-[11px] font-medium text-stone-500 dark:text-stone-400"
+            className="mt-1.5 inline-flex cursor-help items-center rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground"
             title={ach.unavailable_reason ?? undefined}
           >
             {intl.formatMessage({ id: 'growth.ach.unavailable' })}

@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback } from 'react';
 import * as d3 from 'd3';
 import type { AgentDetail } from '@/lib/api';
 import { characterFor } from '@/lib/character-gen';
+import { glyphText } from '@/lib/agent-glyph';
 import { useEffectiveName, useEffectiveLogoGlyph } from '@/lib/branding';
 
 // ── Types ─────────────────────────────────────────────────────
@@ -43,7 +44,7 @@ function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string, rootGly
   const toNode = (agent: AgentDetail, visited = new Set<string>()): OrgNode => {
     // Prevent infinite recursion from circular reports_to
     if (visited.has(agent.name)) {
-      return { name: agent.name, displayName: agent.display_name, role: agent.role, status: agent.status, icon: agent.icon || '\u{1F916}', model: agent.model?.preferred ?? '', children: [] };
+      return { name: agent.name, displayName: agent.display_name, role: agent.role, status: agent.status, icon: glyphText(agent.icon), model: agent.model?.preferred ?? '', children: [] };
     }
     const next = new Set(visited);
     next.add(agent.name);
@@ -52,7 +53,7 @@ function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string, rootGly
       displayName: agent.display_name,
       role: agent.role,
       status: agent.status,
-      icon: agent.icon || '\u{1F916}',
+      icon: glyphText(agent.icon),
       model: agent.model?.preferred ?? '',
       children: agents
         .filter((a) => a.reports_to === agent.name && a.name !== agent.name)
@@ -386,7 +387,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
   return (
     <div
       ref={containerRef}
-      className="relative h-full min-h-[500px] w-full overflow-hidden rounded-xl border border-stone-200 bg-white dark:border-stone-800 dark:bg-stone-900"
+      className="relative h-full min-h-[500px] w-full overflow-hidden rounded-xl border border-surface-border bg-surface"
     >
       <svg
         ref={svgRef}
@@ -394,7 +395,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
         style={{ minHeight: '500px' }}
       />
       {/* Legend — labels passed via props or default (FE-L4) */}
-      <div className="absolute bottom-4 left-4 flex gap-4 rounded-lg border border-stone-200 bg-white/90 px-4 py-2 text-xs backdrop-blur-sm dark:border-stone-700 dark:bg-stone-900/90">
+      <div className="absolute bottom-4 left-4 flex gap-4 rounded-lg border border-surface-border bg-surface/90 px-4 py-2 text-xs backdrop-blur-sm">
         <span className="flex items-center gap-1.5">
           <span
             className="inline-block h-2.5 w-2.5 rounded-full"
@@ -418,7 +419,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
         </span>
       </div>
       {/* Zoom hint */}
-      <div className="absolute bottom-4 right-4 rounded-lg border border-stone-200 bg-white/90 px-3 py-1.5 text-xs text-stone-400 backdrop-blur-sm dark:border-stone-700 dark:bg-stone-900/90">
+      <div className="absolute bottom-4 right-4 rounded-lg border border-surface-border bg-surface/90 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur-sm">
         {labels?.zoom ?? 'Scroll to zoom · Drag to pan'}
       </div>
     </div>

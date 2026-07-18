@@ -1,34 +1,56 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import {
-  Shield,
-  ShieldAlert,
-  Lock,
-  RotateCcw,
-  Eye,
-  EyeOff,
-  Activity,
-  X,
+  ShieldIcon,
+  ShieldAlertIcon,
+  LockIcon,
+  RotateCcwIcon,
+  EyeIcon,
+  EyeOffIcon,
+  ActivityIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { api, type WikiTrustHistoryRow, type WikiTrustRow } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
+import { timeAgo } from '@/lib/format';
 import {
-  Page,
-  PageHeader,
+  CollectionPageHeader,
+  CollectionPageState,
   Card,
-  StatCard,
-  Badge,
+  CardContent,
   Button,
-  EmptyState,
-  Field,
-  controlClass,
-} from '@/components/ui';
+  Badge,
+  Input,
+  Checkbox,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogClose,
+  ListGridContainer,
+  ListGridHeader,
+  ListGridHeaderCell,
+  ListGridRow,
+  ListGridCell,
+} from '@/components/mds';
 
-// ───────────────────────────────────────────────────────────────────────
-// Page
-// ───────────────────────────────────────────────────────────────────────
+const TRUST_COLUMNS = 'minmax(9rem,1fr) 9rem 3.5rem 3.5rem 3.5rem auto auto 4.5rem';
 
+/**
+ * WikiTrustPage — prediction-error-driven wiki self-cleaning audit, re-skinned
+ * onto MDS (spec §4/§5.5). A CollectionPageHeader + KPI summary tiles + agent /
+ * max-trust filters; trust rows render in a ListGrid (page path, a mini trust
+ * bar + mono score, citations, error/success signals, flags, updated) and open
+ * an MDS Dialog with the trust-history table and the manual-override form. Data
+ * flow (audit / history / override RPCs) is unchanged.
+ */
 export function WikiTrustPage() {
   const intl = useIntl();
   const [agents, setAgents] = useState<ReadonlyArray<{ name: string; display_name: string }>>([]);
@@ -40,14 +62,11 @@ export function WikiTrustPage() {
   const [note, setNote] = useState<string | undefined>(undefined);
   const [activeRow, setActiveRow] = useState<WikiTrustRow | null>(null);
 
-  // Load agents on mount.
   useEffect(() => {
     api.agents.list().then((res) => {
       const list = res?.agents ?? [];
       setAgents(list);
-      if (list.length > 0) {
-        setSelectedAgent(list[0].name);
-      }
+      if (list.length > 0) setSelectedAgent((prev) => prev || list[0].name);
     }).catch(() => { /* ignore */ });
   }, []);
 
@@ -69,9 +88,7 @@ export function WikiTrustPage() {
   }, []);
 
   useEffect(() => {
-    if (selectedAgent) {
-      refresh(selectedAgent, maxTrust);
-    }
+    if (selectedAgent) refresh(selectedAgent, maxTrust);
   }, [selectedAgent, maxTrust, refresh]);
 
   const summary = useMemo(() => {
@@ -83,211 +100,187 @@ export function WikiTrustPage() {
   }, [rows]);
 
   return (
-    <Page wide>
-      <PageHeader
-        icon={Shield}
-        title={intl.formatMessage({ id: 'wikiTrust.title', defaultMessage: 'Wiki Trust 反饋' })}
-        subtitle={intl.formatMessage({
-          id: 'wikiTrust.subtitle',
-          defaultMessage:
-            '由 prediction error 驅動的 wiki 自我清洗 — trust 過低的頁面會被自動隔離。可手動覆寫並鎖定可信頁面，避免被噪音壓抑。',
-        })}
-        actions={
-          <Button
-            variant="primary"
-            onClick={() => refresh(selectedAgent, maxTrust)}
-            disabled={loading || !selectedAgent}
-          >
-            {loading
-              ? intl.formatMessage({ id: 'common.loading', defaultMessage: '載入中...' })
-              : intl.formatMessage({ id: 'common.refresh', defaultMessage: '重新整理' })}
+    <div className="-mx-4 -mt-4 flex flex-1 flex-col md:-mx-6 md:-mt-6">
+      <CollectionPageHeader
+        hideTrigger
+        icon={ShieldIcon}
+        title={intl.formatMessage({ id: 'wikiTrust.title' })}
+        count={rows.length}
+        description={intl.formatMessage({ id: 'nav.wikiTrust.desc' })}
+        action={
+          <Button variant="outline" size="sm" onClick={() => refresh(selectedAgent, maxTrust)} disabled={loading || !selectedAgent}>
+            {intl.formatMessage({ id: loading ? 'common.loading' : 'common.refresh' })}
           </Button>
         }
       />
 
-      {/* Summary metrics */}
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
-        <StatCard
-          icon={ShieldAlert}
-          tone="danger"
-          label={intl.formatMessage({ id: 'wikiTrust.archived', defaultMessage: '已隔離' })}
-          value={summary.archived}
-        />
-        <StatCard
-          icon={Lock}
-          tone="success"
-          label={intl.formatMessage({ id: 'wikiTrust.locked', defaultMessage: '鎖定' })}
-          value={summary.locked}
-        />
-        <StatCard
-          icon={Activity}
-          tone="neutral"
-          label={intl.formatMessage({ id: 'wikiTrust.signals', defaultMessage: '錯誤/成功' })}
-          value={`${summary.totalErr} / ${summary.totalOk}`}
-          className="col-span-2 lg:col-span-1"
-        />
+      {/* Filter control row. */}
+      <div className="flex h-12 shrink-0 items-center gap-2 overflow-x-auto border-b border-surface-border px-4">
+        <Select value={selectedAgent} onValueChange={(v) => setSelectedAgent(String(v))}>
+          <SelectTrigger className="w-52 shrink-0">
+            <SelectValue>
+              {agents.find((a) => a.name === selectedAgent)?.display_name || selectedAgent || intl.formatMessage({ id: 'wikiTrust.agent' })}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {agents.map((a) => (
+              <SelectItem key={a.name} value={a.name}>{a.display_name} ({a.name})</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={String(maxTrust)} onValueChange={(v) => setMaxTrust(Number(v))}>
+          <SelectTrigger className="w-44 shrink-0">
+            <SelectValue>{intl.formatMessage({ id: 'wikiTrust.maxTrust' })}: {maxTrust.toFixed(2)}</SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="0.3">≤ 0.30</SelectItem>
+            <SelectItem value="0.5">≤ 0.50</SelectItem>
+            <SelectItem value="0.7">≤ 0.70</SelectItem>
+            <SelectItem value="1">1.00 ({intl.formatMessage({ id: 'common.all', defaultMessage: 'All' })})</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
 
-      {/* Filters */}
-      <Card>
-        <div className="flex flex-wrap items-end gap-4">
-          <Field
-            label={intl.formatMessage({ id: 'wikiTrust.agent', defaultMessage: 'Agent' })}
-            className="min-w-[14rem]"
-          >
-            <select
-              value={selectedAgent}
-              onChange={(e) => setSelectedAgent(e.target.value)}
-              className={controlClass}
-            >
-              {agents.map((a) => (
-                <option key={a.name} value={a.name}>
-                  {a.display_name} ({a.name})
-                </option>
-              ))}
-            </select>
-          </Field>
-
-          <Field
-            label={intl.formatMessage({ id: 'wikiTrust.maxTrust', defaultMessage: 'Trust 上限' })}
-            className="min-w-[12rem]"
-          >
-            <select
-              value={maxTrust}
-              onChange={(e) => setMaxTrust(Number(e.target.value))}
-              className={controlClass}
-            >
-              <option value={0.3}>≤ 0.30 (低)</option>
-              <option value={0.5}>≤ 0.50 (中等)</option>
-              <option value={0.7}>≤ 0.70 (含中高)</option>
-              <option value={1.0}>1.00 (全部)</option>
-            </select>
-          </Field>
+      <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
+        {/* Summary tiles. */}
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+          <KpiTile icon={ShieldAlertIcon} tone="destructive" label={intl.formatMessage({ id: 'wikiTrust.archived' })} value={String(summary.archived)} />
+          <KpiTile icon={LockIcon} tone="success" label={intl.formatMessage({ id: 'wikiTrust.locked' })} value={String(summary.locked)} />
+          <KpiTile icon={ActivityIcon} label={intl.formatMessage({ id: 'wikiTrust.signals' })} value={`${summary.totalErr} / ${summary.totalOk}`} className="col-span-2 lg:col-span-1" />
         </div>
-      </Card>
 
-      {available === false && note && (
-        <Card>
-          <p className="flex items-start gap-2 text-sm text-amber-700 dark:text-amber-300">
-            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
-            {note}
-          </p>
-        </Card>
-      )}
+        {available === false && note && (
+          <Card data-size="sm" className="border-warning/40">
+            <CardContent className="flex items-start gap-2 text-sm text-warning">
+              <ShieldAlertIcon className="mt-0.5 size-4 shrink-0" />
+              {note}
+            </CardContent>
+          </Card>
+        )}
 
-      {/* Table */}
-      <Card padded={false}>
-        <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-[var(--panel-border)] text-sm">
-            <thead>
-              <tr>
-                <Th>{intl.formatMessage({ id: 'wikiTrust.col.page', defaultMessage: '頁面' })}</Th>
-                <Th>{intl.formatMessage({ id: 'wikiTrust.col.trust', defaultMessage: 'Trust' })}</Th>
-                <Th>{intl.formatMessage({ id: 'wikiTrust.col.cite', defaultMessage: '引用' })}</Th>
-                <Th>{intl.formatMessage({ id: 'wikiTrust.col.err', defaultMessage: '錯誤' })}</Th>
-                <Th>{intl.formatMessage({ id: 'wikiTrust.col.ok', defaultMessage: '成功' })}</Th>
-                <Th>{intl.formatMessage({ id: 'wikiTrust.col.lastSignal', defaultMessage: '最近信號' })}</Th>
-                <Th>{intl.formatMessage({ id: 'wikiTrust.col.flags', defaultMessage: '狀態' })}</Th>
-                <Th>{intl.formatMessage({ id: 'wikiTrust.col.actions', defaultMessage: '操作' })}</Th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[var(--panel-border)]">
-              {rows.length === 0 && !loading && (
-                <tr>
-                  <td colSpan={8} className="px-4 py-2">
-                    <EmptyState
-                      icon={Shield}
-                      title={intl.formatMessage({
-                        id: 'wikiTrust.empty',
-                        defaultMessage: '沒有頁面落在這個 trust 範圍。',
-                      })}
-                    />
-                  </td>
-                </tr>
-              )}
+        {/* Trust list. */}
+        {loading ? (
+          <CollectionPageState state="loading" />
+        ) : rows.length === 0 ? (
+          <CollectionPageState state="empty" icon={ShieldIcon} title={intl.formatMessage({ id: 'wikiTrust.empty' })} />
+        ) : (
+          <div className="overflow-hidden rounded-xl border border-surface-border">
+            <ListGridContainer
+              columns={TRUST_COLUMNS}
+              className="!h-auto"
+              header={
+                <ListGridHeader>
+                  <ListGridHeaderCell>{intl.formatMessage({ id: 'wikiTrust.col.page' })}</ListGridHeaderCell>
+                  <ListGridHeaderCell>{intl.formatMessage({ id: 'wikiTrust.col.trust' })}</ListGridHeaderCell>
+                  <ListGridHeaderCell>{intl.formatMessage({ id: 'wikiTrust.col.cite' })}</ListGridHeaderCell>
+                  <ListGridHeaderCell hideBelow>{intl.formatMessage({ id: 'wikiTrust.col.err' })}</ListGridHeaderCell>
+                  <ListGridHeaderCell hideBelow>{intl.formatMessage({ id: 'wikiTrust.col.ok' })}</ListGridHeaderCell>
+                  <ListGridHeaderCell hideBelow>{intl.formatMessage({ id: 'wikiTrust.col.flags' })}</ListGridHeaderCell>
+                  <ListGridHeaderCell hideBelow>{intl.formatMessage({ id: 'sharedWiki.stats.lastUpdated' })}</ListGridHeaderCell>
+                  <ListGridHeaderCell aria-hidden />
+                </ListGridHeader>
+              }
+            >
               {rows.map((r) => (
-                <tr
+                <ListGridRow
                   key={`${r.page_path}-${r.agent_id}`}
-                  className={cn(
-                    'transition-colors hover:bg-stone-500/5 dark:hover:bg-white/5',
-                    r.do_not_inject && 'bg-rose-50/30 dark:bg-rose-950/10'
-                  )}
+                  selected={r.do_not_inject}
+                  onClick={() => setActiveRow(r)}
                 >
-                  <td className="px-4 py-2 font-mono text-xs text-stone-700 dark:text-stone-300">
-                    {r.page_path}
-                  </td>
-                  <td className="px-4 py-2">
-                    <TrustBar value={r.trust} />
-                  </td>
-                  <td className="px-4 py-2 tabular-nums text-stone-600 dark:text-stone-400">{r.citation_count}</td>
-                  <td className="px-4 py-2">
-                    <span className={cn('tabular-nums text-rose-600 dark:text-rose-400', r.error_signal_count === 0 && 'text-stone-400 dark:text-stone-600')}>
-                      {r.error_signal_count}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2">
-                    <span className={cn('tabular-nums text-emerald-600 dark:text-emerald-400', r.success_signal_count === 0 && 'text-stone-400 dark:text-stone-600')}>
-                      {r.success_signal_count}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2 text-xs text-stone-500 dark:text-stone-400">
-                    {r.last_signal_at ? new Date(r.last_signal_at).toLocaleString() : '—'}
-                  </td>
-                  <td className="px-4 py-2">
-                    <div className="flex gap-1">
-                      {r.do_not_inject && (
-                        <Badge tone="danger">
-                          <EyeOff className="h-3 w-3" />
-                          {intl.formatMessage({ id: 'wikiTrust.flag.archived', defaultMessage: '隔離' })}
-                        </Badge>
-                      )}
-                      {r.locked && (
-                        <Badge tone="success">
-                          <Lock className="h-3 w-3" />
-                          {intl.formatMessage({ id: 'wikiTrust.flag.locked', defaultMessage: '鎖定' })}
-                        </Badge>
-                      )}
+                  <ListGridCell>
+                    <span className="truncate font-mono text-xs text-foreground" title={r.page_path}>{r.page_path}</span>
+                  </ListGridCell>
+                  <ListGridCell className="gap-2">
+                    <div className="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+                      <div className="h-full rounded-full bg-chart-1" style={{ width: `${Math.max(0, Math.min(100, r.trust * 100))}%` }} />
                     </div>
-                  </td>
-                  <td className="px-4 py-2">
-                    <Button variant="ghost" size="sm" onClick={() => setActiveRow(r)}>
-                      {intl.formatMessage({ id: 'wikiTrust.action.inspect', defaultMessage: '詳情' })}
+                    <span className="font-mono text-xs tabular-nums text-foreground">{r.trust.toFixed(3)}</span>
+                  </ListGridCell>
+                  <ListGridCell className="font-mono text-xs tabular-nums text-muted-foreground">{r.citation_count}</ListGridCell>
+                  <ListGridCell hideBelow className={cn('font-mono text-xs tabular-nums', r.error_signal_count > 0 ? 'text-destructive' : 'text-muted-foreground/50')}>
+                    {r.error_signal_count}
+                  </ListGridCell>
+                  <ListGridCell hideBelow className={cn('font-mono text-xs tabular-nums', r.success_signal_count > 0 ? 'text-success' : 'text-muted-foreground/50')}>
+                    {r.success_signal_count}
+                  </ListGridCell>
+                  <ListGridCell hideBelow className="gap-1">
+                    {r.do_not_inject && (
+                      <Badge variant="destructive"><EyeOffIcon className="size-3" />{intl.formatMessage({ id: 'wikiTrust.flag.archived' })}</Badge>
+                    )}
+                    {r.locked && (
+                      <Badge variant="secondary" className="bg-success/15 text-success"><LockIcon className="size-3" />{intl.formatMessage({ id: 'wikiTrust.flag.locked' })}</Badge>
+                    )}
+                  </ListGridCell>
+                  <ListGridCell hideBelow className="font-mono text-xs tabular-nums text-muted-foreground">
+                    {r.updated_at ? timeAgo(r.updated_at) : '—'}
+                  </ListGridCell>
+                  <ListGridCell className="justify-end">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      data-stop-row-nav
+                      onClick={(e) => { e.stopPropagation(); setActiveRow(r); }}
+                    >
+                      {intl.formatMessage({ id: 'wikiTrust.action.inspect' })}
                     </Button>
-                  </td>
-                </tr>
+                  </ListGridCell>
+                </ListGridRow>
               ))}
-            </tbody>
-          </table>
-        </div>
-      </Card>
+            </ListGridContainer>
+          </div>
+        )}
+      </div>
 
       {activeRow && (
-        <TrustDetailModal
+        <TrustDetailDialog
           row={activeRow}
           agentId={selectedAgent}
           onClose={() => setActiveRow(null)}
-          onChanged={() => {
-            setActiveRow(null);
-            refresh(selectedAgent, maxTrust);
-          }}
+          onChanged={() => { setActiveRow(null); refresh(selectedAgent, maxTrust); }}
         />
       )}
-    </Page>
+    </div>
   );
 }
 
-// ───────────────────────────────────────────────────────────────────────
-// Detail Modal
-// ───────────────────────────────────────────────────────────────────────
+function KpiTile({
+  icon: Icon,
+  label,
+  value,
+  tone = 'default',
+  className,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  value: string;
+  tone?: 'default' | 'success' | 'destructive';
+  className?: string;
+}) {
+  const toneClass = tone === 'success' ? 'text-success' : tone === 'destructive' ? 'text-destructive' : 'text-muted-foreground';
+  return (
+    <div className={cn('rounded-lg border border-surface-border bg-card p-4', className)}>
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Icon className={cn('size-3.5', toneClass)} />
+        {label}
+      </div>
+      <p className={cn('mt-1 text-2xl font-medium tabular-nums', tone === 'default' ? 'text-foreground' : toneClass)}>{value}</p>
+    </div>
+  );
+}
 
-interface TrustDetailModalProps {
+// ── Detail dialog (history + override) ──────────────────────
+
+function TrustDetailDialog({
+  row,
+  agentId,
+  onClose,
+  onChanged,
+}: {
   row: WikiTrustRow;
   agentId: string;
   onClose: () => void;
   onChanged: () => void;
-}
-
-function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModalProps) {
+}) {
   const intl = useIntl();
   const [history, setHistory] = useState<ReadonlyArray<WikiTrustHistoryRow>>([]);
   const [loadingHistory, setLoadingHistory] = useState(true);
@@ -299,8 +292,7 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    api.wiki
-      .trustHistory(agentId, row.page_path, 100)
+    api.wiki.trustHistory(agentId, row.page_path, 100)
       .then((res) => setHistory(res.rows ?? []))
       .catch((err) => toast.error(formatError(err)))
       .finally(() => setLoadingHistory(false));
@@ -308,10 +300,7 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
 
   const submitOverride = async () => {
     if (!reason.trim()) {
-      toast.error(intl.formatMessage({
-        id: 'wikiTrust.override.reasonRequired',
-        defaultMessage: '請填寫修改原因',
-      }));
+      toast.error(intl.formatMessage({ id: 'wikiTrust.override.reasonRequired' }));
       return;
     }
     setSubmitting(true);
@@ -325,15 +314,12 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
         reason: reason.trim(),
       });
       toast.success(intl.formatMessage(
-        {
-          id: 'wikiTrust.override.applied',
-          defaultMessage: 'Trust 已從 {old} → {next}（Δ={delta}）',
-        },
+        { id: 'wikiTrust.override.applied' },
         {
           old: result.old_trust.toFixed(3),
           next: result.new_trust.toFixed(3),
           delta: (result.applied_delta >= 0 ? '+' : '') + result.applied_delta.toFixed(3),
-        }
+        },
       ));
       onChanged();
     } catch (err) {
@@ -344,73 +330,54 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/45 p-4 backdrop-blur-sm"
-      onClick={onClose}
-    >
-      <div
-        className="glass-overlay max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-start justify-between border-b border-[var(--panel-border)] px-6 py-4">
-          <div className="space-y-1">
-            <h3 className="font-mono text-sm text-stone-700 dark:text-stone-300">{row.page_path}</h3>
-            <div className="flex items-center gap-3 text-xs text-stone-500 dark:text-stone-400">
-              <span>agent: <strong>{row.agent_id}</strong></span>
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle className="font-mono text-sm">{row.page_path}</DialogTitle>
+          <DialogDescription>
+            <span className="flex flex-wrap items-center gap-3 text-xs">
+              <span>agent: <strong className="text-foreground">{row.agent_id}</strong></span>
               <span>citations: {row.citation_count}</span>
               <span>updated: {new Date(row.updated_at).toLocaleString()}</span>
-            </div>
-          </div>
-          <Button variant="ghost" size="sm" icon={X} onClick={onClose} aria-label="close" />
-        </div>
+            </span>
+          </DialogDescription>
+        </DialogHeader>
 
         {/* History */}
-        <div className="px-6 py-4">
-          <h4 className="mb-3 flex items-center gap-2 text-sm font-semibold text-stone-700 dark:text-stone-300">
-            <Activity className="h-4 w-4" />
-            {intl.formatMessage({ id: 'wikiTrust.detail.history', defaultMessage: 'Trust 歷史' })}
+        <div className="space-y-3">
+          <h4 className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <ActivityIcon className="size-4" />
+            {intl.formatMessage({ id: 'wikiTrust.detail.history' })}
           </h4>
           {loadingHistory ? (
-            <p className="text-sm text-stone-500">
-              {intl.formatMessage({ id: 'common.loading', defaultMessage: '載入中...' })}
-            </p>
+            <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'common.loading' })}</p>
           ) : history.length === 0 ? (
-            <p className="text-sm text-stone-500">
-              {intl.formatMessage({ id: 'wikiTrust.detail.historyEmpty', defaultMessage: '無歷史記錄' })}
-            </p>
+            <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'wikiTrust.detail.historyEmpty' })}</p>
           ) : (
-            <div className="overflow-hidden rounded-lg border border-[var(--panel-border)]">
-              <table className="min-w-full divide-y divide-[var(--panel-border)] text-xs">
+            <div className="overflow-x-auto rounded-lg border border-surface-border">
+              <table className="min-w-full text-xs">
                 <thead>
-                  <tr>
-                    <Th>{intl.formatMessage({ id: 'wikiTrust.col.ts', defaultMessage: '時間' })}</Th>
-                    <Th>{intl.formatMessage({ id: 'wikiTrust.col.delta', defaultMessage: '變化' })}</Th>
-                    <Th>{intl.formatMessage({ id: 'wikiTrust.col.trigger', defaultMessage: '觸發' })}</Th>
-                    <Th>{intl.formatMessage({ id: 'wikiTrust.col.signal', defaultMessage: '信號' })}</Th>
-                    <Th>{intl.formatMessage({ id: 'wikiTrust.col.error', defaultMessage: '誤差' })}</Th>
+                  <tr className="border-b border-surface-border text-left text-muted-foreground">
+                    <th className="px-3 py-2 font-medium">{intl.formatMessage({ id: 'wikiTrust.col.ts' })}</th>
+                    <th className="px-3 py-2 font-medium">{intl.formatMessage({ id: 'wikiTrust.col.delta' })}</th>
+                    <th className="px-3 py-2 font-medium">{intl.formatMessage({ id: 'wikiTrust.col.trigger' })}</th>
+                    <th className="px-3 py-2 font-medium">{intl.formatMessage({ id: 'wikiTrust.col.signal' })}</th>
+                    <th className="px-3 py-2 font-medium">{intl.formatMessage({ id: 'wikiTrust.col.error' })}</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-[var(--panel-border)]">
+                <tbody>
                   {history.map((h, idx) => (
-                    <tr key={`${h.ts}-${idx}`}>
-                      <td className="px-3 py-1.5 text-stone-600 dark:text-stone-400">
-                        {new Date(h.ts).toLocaleString()}
-                      </td>
+                    <tr key={`${h.ts}-${idx}`} className="border-b border-surface-border last:border-0">
+                      <td className="px-3 py-1.5 text-muted-foreground">{new Date(h.ts).toLocaleString()}</td>
                       <td className="px-3 py-1.5 font-mono">
                         {h.old_trust.toFixed(3)} → {h.new_trust.toFixed(3)}{' '}
-                        <span className={cn(h.applied_delta >= 0 ? 'text-emerald-600' : 'text-rose-600')}>
-                          ({h.applied_delta >= 0 ? '+' : ''}
-                          {h.applied_delta.toFixed(3)})
+                        <span className={cn(h.applied_delta >= 0 ? 'text-success' : 'text-destructive')}>
+                          ({h.applied_delta >= 0 ? '+' : ''}{h.applied_delta.toFixed(3)})
                         </span>
                       </td>
-                      <td className="px-3 py-1.5">
-                        <Badge tone={triggerTone(h.trigger)}>{h.trigger}</Badge>
-                      </td>
-                      <td className="px-3 py-1.5 text-stone-500">{h.signal_kind}</td>
-                      <td className="px-3 py-1.5 font-mono text-stone-500">
-                        {h.composite_error != null ? h.composite_error.toFixed(2) : '—'}
-                      </td>
+                      <td className="px-3 py-1.5"><Badge variant="secondary" className={triggerBadgeClass(h.trigger)}>{h.trigger}</Badge></td>
+                      <td className="px-3 py-1.5 text-muted-foreground">{h.signal_kind}</td>
+                      <td className="px-3 py-1.5 font-mono text-muted-foreground">{h.composite_error != null ? h.composite_error.toFixed(2) : '—'}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -420,26 +387,22 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
         </div>
 
         {/* Override */}
-        <div className="border-t border-[var(--panel-border)] px-6 py-4">
+        <div className="border-t border-surface-border pt-4">
           <button
+            type="button"
             onClick={() => setOverrideOpen((v) => !v)}
-            className="flex items-center gap-2 text-sm font-semibold text-amber-600 hover:text-amber-700 dark:text-amber-400"
+            className="flex items-center gap-2 text-sm font-medium text-brand hover:underline"
           >
-            <RotateCcw className="h-4 w-4" />
-            {intl.formatMessage({
-              id: 'wikiTrust.override.toggle',
-              defaultMessage: '手動覆寫 Trust',
-            })}
+            <RotateCcwIcon className="size-4" />
+            {intl.formatMessage({ id: 'wikiTrust.override.toggle' })}
           </button>
 
           {overrideOpen && (
             <div className="mt-4 space-y-4">
               <div>
-                <label className="flex items-center justify-between text-xs font-medium text-stone-600 dark:text-stone-400">
-                  <span>
-                    {intl.formatMessage({ id: 'wikiTrust.override.trust', defaultMessage: 'Trust 值' })}
-                  </span>
-                  <span className="font-mono text-stone-700 dark:text-stone-300">{trust.toFixed(3)}</span>
+                <label className="flex items-center justify-between text-xs font-medium text-muted-foreground">
+                  <span>{intl.formatMessage({ id: 'wikiTrust.override.trust' })}</span>
+                  <span className="font-mono text-foreground">{trust.toFixed(3)}</span>
                 </label>
                 <input
                   type="range"
@@ -448,116 +411,56 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
                   step={0.01}
                   value={trust}
                   onChange={(e) => setTrust(Number(e.target.value))}
-                  className="mt-2 w-full accent-amber-500"
+                  className="mt-2 w-full accent-[var(--brand)]"
                 />
               </div>
 
-              <div className="flex flex-wrap gap-4">
-                <label className="flex items-center gap-2 text-sm text-stone-700 dark:text-stone-300">
-                  <input
-                    type="checkbox"
-                    checked={lock}
-                    onChange={(e) => setLock(e.target.checked)}
-                    className="accent-amber-500"
-                  />
-                  <Lock className="h-4 w-4" />
-                  {intl.formatMessage({
-                    id: 'wikiTrust.override.lock',
-                    defaultMessage: '鎖定 — 免疫自動調整',
-                  })}
+              <div className="flex flex-wrap gap-6">
+                <label className="flex items-center gap-2 text-sm text-foreground">
+                  <Checkbox checked={lock} onCheckedChange={(v) => setLock(v === true)} />
+                  <LockIcon className="size-4" />
+                  {intl.formatMessage({ id: 'wikiTrust.override.lock' })}
                 </label>
-                <label className="flex items-center gap-2 text-sm text-stone-700 dark:text-stone-300">
-                  <input
-                    type="checkbox"
-                    checked={doNotInject}
-                    onChange={(e) => setDoNotInject(e.target.checked)}
-                    className="accent-amber-500"
-                  />
-                  {doNotInject ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  {intl.formatMessage({
-                    id: 'wikiTrust.override.dni.label',
-                    defaultMessage: '不注入到 AI 員工提示',
-                  })}
+                <label className="flex items-center gap-2 text-sm text-foreground">
+                  <Checkbox checked={doNotInject} onCheckedChange={(v) => setDoNotInject(v === true)} />
+                  {doNotInject ? <EyeOffIcon className="size-4" /> : <EyeIcon className="size-4" />}
+                  {intl.formatMessage({ id: 'wikiTrust.override.dni.label' })}
                 </label>
               </div>
 
-              <Field
-                label={intl.formatMessage({
-                  id: 'wikiTrust.override.reason',
-                  defaultMessage: '修改原因（必填）',
-                })}
-              >
-                <input
-                  type="text"
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-muted-foreground">{intl.formatMessage({ id: 'wikiTrust.override.reason' })}</label>
+                <Input
                   value={reason}
                   onChange={(e) => setReason(e.target.value)}
-                  placeholder={intl.formatMessage({
-                    id: 'wikiTrust.override.reasonPlaceholder',
-                    defaultMessage: '例：人工審核確認此頁面為事實基準',
-                  })}
-                  className={controlClass}
+                  placeholder={intl.formatMessage({ id: 'wikiTrust.override.reasonPlaceholder' })}
                 />
-              </Field>
+              </div>
 
               <div className="flex justify-end gap-2">
-                <Button variant="ghost" onClick={() => setOverrideOpen(false)}>
-                  {intl.formatMessage({ id: 'common.cancel', defaultMessage: '取消' })}
-                </Button>
-                <Button variant="primary" onClick={submitOverride} disabled={submitting}>
-                  {submitting
-                    ? intl.formatMessage({ id: 'common.saving', defaultMessage: '儲存中...' })
-                    : intl.formatMessage({ id: 'wikiTrust.override.apply', defaultMessage: '套用覆寫' })}
+                <Button variant="ghost" onClick={() => setOverrideOpen(false)}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
+                <Button variant="brand" onClick={submitOverride} disabled={submitting}>
+                  {intl.formatMessage({ id: submitting ? 'common.saving' : 'wikiTrust.override.apply' })}
                 </Button>
               </div>
             </div>
           )}
         </div>
-      </div>
-    </div>
+
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'common.close' })}</Button>} />
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
-// ───────────────────────────────────────────────────────────────────────
-// Subcomponents
-// ───────────────────────────────────────────────────────────────────────
-
-function Th({ children }: { children: React.ReactNode }) {
-  return (
-    <th className="px-4 py-2 text-left text-xs font-medium uppercase tracking-wide text-stone-500 dark:text-stone-400">
-      {children}
-    </th>
-  );
-}
-
-function TrustBar({ value }: { value: number }) {
-  const pct = Math.max(0, Math.min(100, value * 100));
-  const tone =
-    value >= 0.7 ? 'bg-emerald-500' : value >= 0.4 ? 'bg-amber-500' : value >= 0.2 ? 'bg-orange-500' : 'bg-rose-500';
-  return (
-    <div className="flex items-center gap-2">
-      <div className="h-1.5 w-24 overflow-hidden rounded-full bg-stone-500/15">
-        <div className={cn('h-full transition-all', tone)} style={{ width: `${pct}%` }} />
-      </div>
-      <span className="font-mono text-xs tabular-nums text-stone-700 dark:text-stone-300">{value.toFixed(3)}</span>
-    </div>
-  );
-}
-
-type BadgeTone = 'neutral' | 'success' | 'warning' | 'danger' | 'info' | 'accent';
-
-function triggerTone(trigger: string): BadgeTone {
+function triggerBadgeClass(trigger: string): string {
   switch (trigger) {
-    case 'prediction_error':
-      return 'warning';
-    case 'auto_correct':
-      return 'danger';
-    case 'manual':
-      return 'info';
-    case 'rollback':
-      return 'neutral';
-    case 'federated_import':
-      return 'success';
-    default:
-      return 'neutral';
+    case 'prediction_error': return 'bg-warning/15 text-warning';
+    case 'auto_correct': return 'bg-destructive/10 text-destructive';
+    case 'manual': return 'bg-info/15 text-info';
+    case 'federated_import': return 'bg-success/15 text-success';
+    default: return '';
   }
 }

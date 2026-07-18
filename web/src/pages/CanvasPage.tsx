@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { History, Presentation } from 'lucide-react';
+import { History, Presentation, RefreshCw, MoreHorizontal } from 'lucide-react';
 import { api, type CanvasGetResult } from '@/lib/api';
 import { canvasSrcDoc, CANVAS_SANDBOX } from '@/lib/canvas-doc';
 import { client } from '@/lib/ws-client';
@@ -8,14 +8,22 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
 import {
-  Page,
   PageHeader,
   Card,
   Badge,
-  EmptyState,
+  Button,
+  Empty,
   Skeleton,
-  controlClass,
-} from '@/components/ui';
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from '@/components/mds';
 
 /**
  * CanvasPage (G15 Live Canvas) — 畫布. An AI staff member pushes an HTML
@@ -113,134 +121,150 @@ export function CanvasPage() {
   const showEmptyAgents = loaded && visibleAgents.length === 0 && scope !== 'all';
 
   return (
-    <Page wide>
-      <PageHeader
-        icon={Presentation}
-        title={intl.formatMessage({ id: 'nav.canvas' })}
-        subtitle={intl.formatMessage({ id: 'canvas.subtitle' })}
-        actions={
-          <div className="flex flex-wrap items-center gap-2">
-            <select
-              aria-label={intl.formatMessage({ id: 'canvas.filter.agent' })}
-              className={`${controlClass} max-w-56`}
-              value={effectiveAgent}
-              onChange={(e) => {
-                setAgentFilter(e.target.value);
-                setViewSeq(null);
-                setResult(null);
-                setLoaded(false);
+    <div className="-mx-4 -mt-4 flex min-h-0 flex-1 flex-col md:-mx-6 md:-mt-6 md:-mb-6">
+      <PageHeader hideTrigger>
+        <Presentation className="size-4 shrink-0 text-muted-foreground" />
+        <h1 className="truncate text-sm font-medium">{intl.formatMessage({ id: 'nav.canvas' })}</h1>
+        <span className="hidden truncate text-sm text-muted-foreground md:block">
+          {intl.formatMessage({ id: 'canvas.subtitle' })}
+        </span>
+        <div className="ml-auto flex items-center gap-2">
+          <Select
+            value={effectiveAgent}
+            onValueChange={(v) => {
+              setAgentFilter(String(v));
+              setViewSeq(null);
+              setResult(null);
+              setLoaded(false);
+            }}
+          >
+            <SelectTrigger size="sm" className="max-w-44">
+              <SelectValue aria-label={intl.formatMessage({ id: 'canvas.filter.agent' })}>
+                {effectiveAgent ? agentName(effectiveAgent) : ''}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {visibleAgents.map((a) => (
+                <SelectItem key={a.name} value={a.name}>
+                  {a.display_name || a.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {history.length > 0 && (
+            <Select
+              value={String(viewSeq ?? currentSeq ?? '')}
+              onValueChange={(v) => {
+                const seq = Number(v);
+                setViewSeq(seq === currentSeq ? null : seq);
               }}
             >
-              {visibleAgents.map((a) => (
-                <option key={a.name} value={a.name}>
-                  {a.display_name || a.name}
-                </option>
-              ))}
-            </select>
-            {history.length > 0 && (
-              <select
-                aria-label={intl.formatMessage({ id: 'canvas.history.aria' })}
-                className={`${controlClass} max-w-64`}
-                value={viewSeq ?? currentSeq ?? ''}
-                onChange={(e) => {
-                  const seq = Number(e.target.value);
-                  setViewSeq(seq === currentSeq ? null : seq);
-                }}
-              >
+              <SelectTrigger size="sm" className="max-w-48">
+                <SelectValue aria-label={intl.formatMessage({ id: 'canvas.history.aria' })} />
+              </SelectTrigger>
+              <SelectContent>
                 {history.map((v, i) => (
-                  <option key={v.seq} value={v.seq}>
+                  <SelectItem key={v.seq} value={String(v.seq)}>
                     {i === 0
                       ? intl.formatMessage({ id: 'canvas.version.current' })
                       : versionLabel(v.title, v.updated_at)}
-                  </option>
+                  </SelectItem>
                 ))}
-              </select>
-            )}
-          </div>
-        }
-      />
-
-      {viewingHistory && (
-        <div className="mb-3 flex items-center gap-3">
-          <Badge tone="warning" dot>
-            <History className="mr-1 inline h-3 w-3" aria-hidden="true" />
-            {intl.formatMessage({ id: 'canvas.viewingHistory' })}
-          </Badge>
-          <button
-            type="button"
-            className="text-sm font-medium text-amber-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 dark:text-amber-400"
-            onClick={() => setViewSeq(null)}
-          >
-            {intl.formatMessage({ id: 'canvas.backToCurrent' })}
-          </button>
+              </SelectContent>
+            </Select>
+          )}
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button variant="ghost" size="icon-sm" aria-label={intl.formatMessage({ id: 'canvas.actions' })} />
+              }
+            >
+              <MoreHorizontal />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent>
+              <DropdownMenuItem onClick={() => void fetchCanvas()}>
+                <RefreshCw />
+                {intl.formatMessage({ id: 'common.refresh' })}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
-      )}
+      </PageHeader>
 
-      <Card padded={false} bodyClassName="flex min-h-[420px] flex-col">
-        {showEmptyAgents ? (
-          <div className="flex flex-1 items-center justify-center p-6">
-            <EmptyState
-              dudu={{ face: 'sleep' }}
-              title={intl.formatMessage({ id: 'canvas.noAgents' })}
-            />
+      <div className="flex min-h-0 flex-1 flex-col p-4 md:p-6">
+        {viewingHistory && (
+          <div className="mb-3 flex items-center gap-3">
+            <Badge variant="secondary" className="gap-1.5">
+              <History className="size-3" aria-hidden="true" />
+              {intl.formatMessage({ id: 'canvas.viewingHistory' })}
+            </Badge>
+            <Button variant="link" size="sm" onClick={() => setViewSeq(null)}>
+              {intl.formatMessage({ id: 'canvas.backToCurrent' })}
+            </Button>
           </div>
-        ) : !loaded ? (
-          <div className="space-y-3 p-5">
-            <Skeleton className="h-8 w-1/2" />
-            <Skeleton className="h-40 w-full" />
-            <Skeleton className="h-12 w-2/3" />
-          </div>
-        ) : error ? (
-          <div className="flex flex-1 items-center justify-center p-6">
-            <EmptyState
-              dudu={{ face: 'concerned' }}
-              title={intl.formatMessage({ id: 'canvas.error' })}
-              hint={error}
-            />
-          </div>
-        ) : isEmpty ? (
-          <div className="flex flex-1 items-center justify-center p-6">
-            <EmptyState
-              dudu={{ face: 'curious' }}
-              title={intl.formatMessage({ id: 'canvas.empty' })}
-              hint={intl.formatMessage({ id: 'canvas.empty.hint' })}
-            />
-          </div>
-        ) : (
-          <>
-            <div className="flex flex-wrap items-center gap-2 border-b border-[var(--panel-border)] px-5 py-3">
-              <p className="min-w-0 flex-1 truncate text-sm font-semibold text-stone-800 dark:text-stone-100">
-                {canvas.title || intl.formatMessage({ id: 'canvas.untitled' })}
-              </p>
-              <p className="shrink-0 text-xs text-stone-400 tabular-nums dark:text-stone-500">
-                {intl.formatMessage(
-                  { id: 'canvas.updatedAt' },
-                  {
-                    time: `${intl.formatDate(canvas.updated_at, { month: 'numeric', day: 'numeric' })} ${intl.formatTime(canvas.updated_at, { hour: '2-digit', minute: '2-digit' })}`,
-                  },
-                )}
-              </p>
+        )}
+
+        <Card className="min-h-0 flex-1 gap-0 py-0">
+          {showEmptyAgents ? (
+            <div className="flex flex-1 items-center justify-center">
+              <Empty icon={Presentation} title={intl.formatMessage({ id: 'canvas.noAgents' })} />
             </div>
-            {/* Wide agent content scrolls INSIDE the frame (base styles wrap
-                tables/pre in overflow-x:auto); the page itself never scrolls
-                horizontally. */}
-            <div className="min-w-0 flex-1 p-3">
-              <iframe
-                title={intl.formatMessage(
-                  { id: 'canvas.frame.title' },
-                  { agent: agentName(canvas.agent_id) },
-                )}
-                sandbox={CANVAS_SANDBOX}
-                srcDoc={canvasSrcDoc(canvas.html)}
-                className="h-[68vh] w-full rounded-xl border border-[var(--panel-border)] bg-stone-50 dark:bg-stone-900"
+          ) : !loaded ? (
+            <div className="space-y-3 p-5">
+              <Skeleton className="h-8 w-1/2" />
+              <Skeleton className="h-40 w-full" />
+              <Skeleton className="h-12 w-2/3" />
+            </div>
+          ) : error ? (
+            <div className="flex flex-1 items-center justify-center">
+              <Empty
+                icon={Presentation}
+                tone="destructive"
+                title={intl.formatMessage({ id: 'canvas.error' })}
+                description={error}
               />
             </div>
-            <p className="border-t border-[var(--panel-border)] px-5 py-3 text-xs text-stone-400 dark:text-stone-500">
-              {intl.formatMessage({ id: 'canvas.note' })}
-            </p>
-          </>
-        )}
-      </Card>
-    </Page>
+          ) : isEmpty ? (
+            <div className="flex flex-1 items-center justify-center">
+              <Empty
+                icon={Presentation}
+                title={intl.formatMessage({ id: 'canvas.empty' })}
+                description={intl.formatMessage({ id: 'canvas.empty.hint' })}
+              />
+            </div>
+          ) : (
+            <>
+              <div className="flex flex-wrap items-center gap-2 border-b border-surface-border px-5 py-3">
+                <p className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
+                  {canvas.title || intl.formatMessage({ id: 'canvas.untitled' })}
+                </p>
+                <p className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+                  {intl.formatMessage(
+                    { id: 'canvas.updatedAt' },
+                    {
+                      time: `${intl.formatDate(canvas.updated_at, { month: 'numeric', day: 'numeric' })} ${intl.formatTime(canvas.updated_at, { hour: '2-digit', minute: '2-digit' })}`,
+                    },
+                  )}
+                </p>
+              </div>
+              {/* Wide agent content scrolls INSIDE the frame (base styles wrap
+                  tables/pre in overflow-x:auto); the page itself never scrolls
+                  horizontally. */}
+              <div className="min-h-0 min-w-0 flex-1 p-3">
+                <iframe
+                  title={intl.formatMessage({ id: 'canvas.frame.title' }, { agent: agentName(canvas.agent_id) })}
+                  sandbox={CANVAS_SANDBOX}
+                  srcDoc={canvasSrcDoc(canvas.html)}
+                  className="h-full min-h-[60vh] w-full rounded-lg border border-surface-border bg-page-canvas"
+                />
+              </div>
+              <p className="border-t border-surface-border px-5 py-3 text-xs text-muted-foreground">
+                {intl.formatMessage({ id: 'canvas.note' })}
+              </p>
+            </>
+          )}
+        </Card>
+      </div>
+    </div>
   );
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { useConnectionStore } from '@/stores/connection-store';
@@ -7,12 +7,29 @@ import { api, type LicenseSnapshot } from '@/lib/api';
 import { TIER_LABELS } from '@/lib/license-labels';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
-import { Page, PageHeader, Card, Section, StatCard, Badge, Button, Mono, Field, controlClass } from '@/components/ui';
+import {
+  Card,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+  CardContent,
+  Badge,
+  Button,
+  Input,
+  Textarea,
+  SettingsCard,
+  SettingsRow,
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableHead,
+  TableCell,
+} from '@/components/mds';
 import {
   KeyRound,
   ShieldCheck,
   Fingerprint,
-  Calendar,
   RefreshCw,
   ExternalLink,
   Sparkles,
@@ -23,7 +40,6 @@ import {
   Globe,
   Check,
   Minus,
-  Award,
   Copy,
   Ticket,
 } from 'lucide-react';
@@ -120,23 +136,63 @@ export function classifyExpiry(daysUntilExpiry: number | null | undefined): {
   return { tone: 'ok', labelId: 'license.expiry.ok' };
 }
 
-/** Map an expiry/phone-home urgency tone onto a Calm Glass Badge tone. */
-const BADGE_TONE: Record<ExpiryTone, 'danger' | 'warning' | 'success' | 'neutral'> = {
-  expired: 'danger',
-  critical: 'danger',
-  warning: 'warning',
-  ok: 'success',
-  unknown: 'neutral',
+/** Map an expiry urgency tone onto an MDS Badge className (semantic tint). */
+const BADGE_CLASS: Record<'ok' | 'warning' | 'critical', string> = {
+  ok: 'bg-success/15 text-success',
+  warning: 'bg-warning/15 text-warning',
+  critical: 'bg-destructive/10 text-destructive',
 };
 
-/** StatCard tone equivalents for the hero metric tiles. */
-const STAT_TONE: Record<ExpiryTone, 'danger' | 'warning' | 'success' | 'neutral'> = {
-  expired: 'danger',
-  critical: 'danger',
-  warning: 'warning',
-  ok: 'success',
-  unknown: 'neutral',
+/** Map an expiry tone onto the KPI value text color. */
+const EXPIRY_TEXT: Record<ExpiryTone, string> = {
+  expired: 'text-destructive',
+  critical: 'text-destructive',
+  warning: 'text-warning',
+  ok: 'text-success',
+  unknown: 'text-muted-foreground',
 };
+
+/** Stacked label + control block (DialogField pattern, spec §5.3). */
+function LicenseField({
+  label,
+  help,
+  children,
+}: {
+  label: string;
+  help?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <label className="text-sm font-medium text-foreground">{label}</label>
+      {children}
+      {help && <p className="text-xs text-muted-foreground">{help}</p>}
+    </div>
+  );
+}
+
+/** A compact KPI tile built on an MDS Card. */
+function StatTile({
+  label,
+  value,
+  valueClassName,
+  sub,
+}: {
+  label: string;
+  value: ReactNode;
+  valueClassName?: string;
+  sub?: ReactNode;
+}) {
+  return (
+    <Card>
+      <CardContent className="space-y-1">
+        <p className="text-sm text-muted-foreground">{label}</p>
+        <div className={cn('text-lg font-semibold', valueClassName)}>{value}</div>
+        {sub && <p className="text-xs text-muted-foreground">{sub}</p>}
+      </CardContent>
+    </Card>
+  );
+}
 
 function PhoneHomeIndicator({
   daysSincePhoneHome,
@@ -146,20 +202,16 @@ function PhoneHomeIndicator({
   const intl = useIntl();
   if (daysSincePhoneHome == null) {
     return (
-      <span className="text-sm text-stone-500 dark:text-stone-400">
+      <span className="text-sm text-muted-foreground">
         {intl.formatMessage({ id: 'license.phoneHome.notApplicable' })}
       </span>
     );
   }
-  const tone: ExpiryTone =
-    daysSincePhoneHome <= 7
-      ? 'ok'
-      : daysSincePhoneHome <= 30
-        ? 'warning'
-        : 'critical';
+  const tone: 'ok' | 'warning' | 'critical' =
+    daysSincePhoneHome <= 7 ? 'ok' : daysSincePhoneHome <= 30 ? 'warning' : 'critical';
   return (
-    <Badge tone={BADGE_TONE[tone]}>
-      <RefreshCw className="h-3.5 w-3.5" />
+    <Badge variant="secondary" className={BADGE_CLASS[tone]}>
+      <RefreshCw className="size-3.5" />
       {intl.formatMessage(
         { id: 'license.phoneHome.daysAgo' },
         { days: daysSincePhoneHome },
@@ -199,54 +251,56 @@ export function LicensePage() {
   const expiryClassification = classifyExpiry(snapshot?.days_until_expiry);
 
   return (
-    <Page>
-      <PageHeader
-        icon={KeyRound}
-        title={intl.formatMessage({ id: 'nav.license' })}
-        subtitle={intl.formatMessage({ id: 'license.subtitle' })}
-        actions={
-          <Button
-            variant="secondary"
-            onClick={() => {
-              setRefreshing(true);
-              void load();
-            }}
-            disabled={refreshing || loading}
-            icon={refreshing ? undefined : RefreshCw}
-          >
-            {refreshing && <RefreshCw className="h-4 w-4 animate-spin" />}
-            {intl.formatMessage({ id: 'license.refresh' })}
-          </Button>
-        }
-      />
+    <div className="mx-auto w-full max-w-4xl space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <KeyRound className="size-5 text-muted-foreground" />
+          <div>
+            <h1 className="text-base font-medium">{intl.formatMessage({ id: 'nav.license' })}</h1>
+            <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'license.subtitle' })}</p>
+          </div>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setRefreshing(true);
+            void load();
+          }}
+          disabled={refreshing || loading}
+        >
+          <RefreshCw className={cn(refreshing && 'animate-spin')} />
+          {intl.formatMessage({ id: 'license.refresh' })}
+        </Button>
+      </div>
 
       {loading && !snapshot && (
         <Card>
-          <p className="py-8 text-center text-sm text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'license.loading' })}
-          </p>
+          <CardContent>
+            <p className="py-8 text-center text-sm text-muted-foreground">
+              {intl.formatMessage({ id: 'license.loading' })}
+            </p>
+          </CardContent>
         </Card>
       )}
 
       {snapshot && (
         <>
-          {/* ── Hero metrics: tier / expiry / phone-home ────── */}
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            <StatCard
-              icon={Award}
-              tone="accent"
+          {/* ── KPI status: tier / expiry / phone-home ────── */}
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <StatTile
               label={intl.formatMessage({ id: 'license.activeTier' })}
               value={TIER_LABELS[snapshot.tier]}
-              hint={
+              sub={
                 snapshot.installed
                   ? intl.formatMessage({ id: 'license.mode.commercial' })
                   : intl.formatMessage({ id: 'license.mode.opensource' })
               }
             />
-            <StatCard
-              icon={Calendar}
-              tone={STAT_TONE[expiryClassification.tone]}
+            <StatTile
               label={intl.formatMessage({ id: 'license.expiresAt' })}
+              valueClassName={EXPIRY_TEXT[expiryClassification.tone]}
               value={
                 snapshot.days_until_expiry != null
                   ? intl.formatMessage(
@@ -255,18 +309,14 @@ export function LicensePage() {
                     )
                   : intl.formatMessage({ id: 'license.expiry.unknown' })
               }
-              hint={
-                snapshot.expires_at
-                  ? new Date(snapshot.expires_at).toLocaleString()
-                  : '—'
+              sub={
+                snapshot.expires_at ? new Date(snapshot.expires_at).toLocaleString() : '—'
               }
             />
-            <StatCard
-              icon={RefreshCw}
-              tone="neutral"
+            <StatTile
               label={intl.formatMessage({ id: 'license.lastPhoneHome' })}
               value={<PhoneHomeIndicator daysSincePhoneHome={snapshot.days_since_phone_home} />}
-              hint={
+              sub={
                 snapshot.last_phone_home
                   ? new Date(snapshot.last_phone_home).toLocaleString()
                   : '—'
@@ -280,142 +330,141 @@ export function LicensePage() {
           )}
 
           {/* ── License details ─────────────────────────────── */}
-          <Card title={intl.formatMessage({ id: 'license.activeTier' })}>
-            <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <DetailRow
-                label={intl.formatMessage({ id: 'license.customerId' })}
-                value={snapshot.customer_id ?? '—'}
-                mono
-              />
-              <DetailRow
-                label={intl.formatMessage({ id: 'license.subscriptionId' })}
-                value={snapshot.subscription_id ?? '—'}
-                mono
-              />
-              <DetailRow
-                label={intl.formatMessage({ id: 'license.expiresAt' })}
-                value={
-                  snapshot.expires_at
-                    ? new Date(snapshot.expires_at).toLocaleString()
-                    : '—'
-                }
-                mono
-              />
-              <DetailRow
-                label={intl.formatMessage({ id: 'license.lastPhoneHome' })}
-                value={
-                  snapshot.last_phone_home
-                    ? new Date(snapshot.last_phone_home).toLocaleString()
-                    : '—'
-                }
-                mono
-              />
-              <DetailRow
-                label={intl.formatMessage({ id: 'license.fingerprintMatch' })}
-                value={
-                  snapshot.fingerprint_match == null
-                    ? '—'
-                    : snapshot.fingerprint_match
-                      ? intl.formatMessage({ id: 'license.fingerprintMatch.yes' })
-                      : intl.formatMessage({ id: 'license.fingerprintMatch.no' })
-                }
-                icon={Fingerprint}
-              />
-            </dl>
-          </Card>
+          <SettingsCard>
+            <SettingsRow label={intl.formatMessage({ id: 'license.customerId' })}>
+              <span className="font-mono text-xs break-all">{snapshot.customer_id ?? '—'}</span>
+            </SettingsRow>
+            <SettingsRow label={intl.formatMessage({ id: 'license.subscriptionId' })}>
+              <span className="font-mono text-xs break-all">{snapshot.subscription_id ?? '—'}</span>
+            </SettingsRow>
+            <SettingsRow label={intl.formatMessage({ id: 'license.expiresAt' })}>
+              <span className="font-mono text-xs">
+                {snapshot.expires_at ? new Date(snapshot.expires_at).toLocaleString() : '—'}
+              </span>
+            </SettingsRow>
+            <SettingsRow label={intl.formatMessage({ id: 'license.lastPhoneHome' })}>
+              <span className="font-mono text-xs">
+                {snapshot.last_phone_home ? new Date(snapshot.last_phone_home).toLocaleString() : '—'}
+              </span>
+            </SettingsRow>
+            <SettingsRow
+              label={
+                <span className="flex items-center gap-1.5">
+                  <Fingerprint className="size-3.5" />
+                  {intl.formatMessage({ id: 'license.fingerprintMatch' })}
+                </span>
+              }
+            >
+              <span className="text-sm">
+                {snapshot.fingerprint_match == null
+                  ? '—'
+                  : snapshot.fingerprint_match
+                    ? intl.formatMessage({ id: 'license.fingerprintMatch.yes' })
+                    : intl.formatMessage({ id: 'license.fingerprintMatch.no' })}
+              </span>
+            </SettingsRow>
+          </SettingsCard>
 
           {/* ── Commercial modules matrix ───────────────────── */}
-          <Card
-            title={intl.formatMessage({ id: 'license.modules.title' })}
-            padded={false}
-          >
-            <p className="border-b border-[var(--panel-border)] px-5 py-3 text-sm text-stone-500 dark:text-stone-400">
-              {intl.formatMessage({ id: 'license.modules.subtitle' })}
-            </p>
-            <ul className="divide-y divide-[var(--panel-border)]">
-              {COMMERCIAL_FEATURES.map(({ key, label, icon: Icon, tiers }) => {
-                const unlocked = tiers.has(snapshot.tier);
-                return (
-                  <li key={key} className="flex items-center gap-3 px-5 py-3">
-                    <Icon
-                      className={cn(
-                        'h-4 w-4 shrink-0',
-                        unlocked
-                          ? 'text-emerald-600 dark:text-emerald-400'
-                          : 'text-stone-400 dark:text-stone-500',
-                      )}
-                    />
-                    <span
-                      className={cn(
-                        'flex-1 text-sm',
-                        unlocked
-                          ? 'text-stone-800 dark:text-stone-200'
-                          : 'text-stone-500 dark:text-stone-500',
-                      )}
-                    >
-                      {intl.formatMessage({ id: label })}
-                    </span>
-                    {unlocked ? (
-                      <Badge tone="success">
-                        <Check className="h-3.5 w-3.5" />
-                      </Badge>
-                    ) : (
-                      <Badge tone="neutral">
-                        <Minus className="h-3.5 w-3.5" />
-                      </Badge>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
+          <Card>
+            <CardHeader>
+              <CardTitle>{intl.formatMessage({ id: 'license.modules.title' })}</CardTitle>
+              <CardDescription>{intl.formatMessage({ id: 'license.modules.subtitle' })}</CardDescription>
+            </CardHeader>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>{intl.formatMessage({ id: 'license.modules.col.module' })}</TableHead>
+                    <TableHead className="text-right">
+                      {intl.formatMessage({ id: 'license.modules.col.status' })}
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {COMMERCIAL_FEATURES.map(({ key, label, icon: Icon, tiers }) => {
+                    const unlocked = tiers.has(snapshot.tier);
+                    return (
+                      <TableRow key={key} className={cn(unlocked && 'bg-surface-selected')}>
+                        <TableCell>
+                          <span className="flex items-center gap-2">
+                            <Icon
+                              className={cn(
+                                'size-4 shrink-0',
+                                unlocked ? 'text-success' : 'text-muted-foreground/50',
+                              )}
+                            />
+                            <span className={cn('text-sm', !unlocked && 'text-muted-foreground')}>
+                              {intl.formatMessage({ id: label })}
+                            </span>
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {unlocked ? (
+                            <Badge variant="secondary" className="bg-success/15 text-success">
+                              <Check className="size-3.5" />
+                            </Badge>
+                          ) : (
+                            <Badge variant="ghost">
+                              <Minus className="size-3.5" />
+                            </Badge>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </CardContent>
           </Card>
 
           {/* ── CTA: upgrade / activate / docs ──────────────── */}
           {!snapshot.installed && (
-            <Section
-              title={intl.formatMessage({ id: 'license.cta.opensource.title' })}
-              description={intl.formatMessage({ id: 'license.cta.opensource.body' })}
-            >
-              <div className="flex flex-wrap gap-3">
-                <a
-                  href={PRICING_URL}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <Button variant="primary" iconRight={ExternalLink}>
-                    {intl.formatMessage({ id: 'license.cta.pricing' })}
-                  </Button>
-                </a>
-                <a
-                  href="https://github.com/zhixuli0406/DuDuClaw#-installation"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <Button variant="secondary" iconRight={ExternalLink}>
-                    {intl.formatMessage({ id: 'license.cta.docs' })}
-                  </Button>
-                </a>
-              </div>
-            </Section>
+            <Card>
+              <CardHeader>
+                <CardTitle>{intl.formatMessage({ id: 'license.cta.opensource.title' })}</CardTitle>
+                <CardDescription>{intl.formatMessage({ id: 'license.cta.opensource.body' })}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="flex flex-wrap gap-3">
+                  <a href={PRICING_URL} target="_blank" rel="noopener noreferrer">
+                    <Button variant="brand">
+                      {intl.formatMessage({ id: 'license.cta.pricing' })}
+                      <ExternalLink />
+                    </Button>
+                  </a>
+                  <a
+                    href="https://github.com/zhixuli0406/DuDuClaw#-installation"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <Button variant="outline">
+                      {intl.formatMessage({ id: 'license.cta.docs' })}
+                      <ExternalLink />
+                    </Button>
+                  </a>
+                </div>
+              </CardContent>
+            </Card>
           )}
 
           {snapshot.installed && expiryClassification.tone !== 'ok' && (
-            <Section
-              title={intl.formatMessage({ id: 'license.cta.renew.title' })}
-              description={intl.formatMessage({ id: 'license.cta.renew.body' })}
-            >
-              <div className="flex flex-wrap gap-3">
-                <a
-                  href={PRICING_URL}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <Button variant="primary" iconRight={ExternalLink}>
-                    {intl.formatMessage({ id: 'license.cta.renew.action' })}
-                  </Button>
-                </a>
-              </div>
-            </Section>
+            <Card>
+              <CardHeader>
+                <CardTitle>{intl.formatMessage({ id: 'license.cta.renew.title' })}</CardTitle>
+                <CardDescription>{intl.formatMessage({ id: 'license.cta.renew.body' })}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="flex flex-wrap gap-3">
+                  <a href={PRICING_URL} target="_blank" rel="noopener noreferrer">
+                    <Button variant="brand">
+                      {intl.formatMessage({ id: 'license.cta.renew.action' })}
+                      <ExternalLink />
+                    </Button>
+                  </a>
+                </div>
+              </CardContent>
+            </Card>
           )}
 
           {/* ── Replace / re-activate — collapsed once licensed ── */}
@@ -424,55 +473,36 @@ export function LicensePage() {
           )}
 
           {/* ── CLI hint ───────────────────────────────────── */}
-          <Card title={intl.formatMessage({ id: 'license.cli.title' })}>
-            <p className="text-sm text-stone-600 dark:text-stone-300">
-              {intl.formatMessage({ id: 'license.cli.body' })}
-            </p>
-            <ul className="mt-3 space-y-1 font-mono text-xs text-stone-700 dark:text-stone-300">
-              <li>$ duduclaw license fingerprint</li>
-              <li>$ duduclaw license activate &lt;key&gt;</li>
-              <li>$ duduclaw license refresh</li>
-              <li>$ duduclaw license deactivate</li>
-            </ul>
+          <Card>
+            <CardHeader>
+              <CardTitle>{intl.formatMessage({ id: 'license.cli.title' })}</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-sm text-muted-foreground">
+                {intl.formatMessage({ id: 'license.cli.body' })}
+              </p>
+              <ul className="space-y-1 font-mono text-xs text-foreground">
+                <li>$ duduclaw license fingerprint</li>
+                <li>$ duduclaw license activate &lt;key&gt;</li>
+                <li>$ duduclaw license refresh</li>
+                <li>$ duduclaw license deactivate</li>
+              </ul>
 
-            <p className="mt-4 text-sm font-medium text-stone-700 dark:text-stone-300">
-              {intl.formatMessage({ id: 'license.cli.selfService' })}
-            </p>
-            <ul className="mt-2 space-y-1 font-mono text-xs text-stone-700 dark:text-stone-300">
-              {/* Free partner (NFR) path — redeem a code, no payment. */}
-              <li>$ duduclaw license redeem &lt;PARTNER-CODE&gt;</li>
-              {/* Self-service machine migration (re-sign for this machine). */}
-              <li>$ duduclaw license rebind</li>
-              {/* Remote subscription / renewal status from the control-plane. */}
-              <li>$ duduclaw license subscriptions</li>
-            </ul>
+              <p className="pt-1 text-sm font-medium text-foreground">
+                {intl.formatMessage({ id: 'license.cli.selfService' })}
+              </p>
+              <ul className="space-y-1 font-mono text-xs text-foreground">
+                {/* Free partner (NFR) path — redeem a code, no payment. */}
+                <li>$ duduclaw license redeem &lt;PARTNER-CODE&gt;</li>
+                {/* Self-service machine migration (re-sign for this machine). */}
+                <li>$ duduclaw license rebind</li>
+                {/* Remote subscription / renewal status from the control-plane. */}
+                <li>$ duduclaw license subscriptions</li>
+              </ul>
+            </CardContent>
           </Card>
         </>
       )}
-    </Page>
-  );
-}
-
-function DetailRow({
-  label,
-  value,
-  mono = false,
-  icon: Icon,
-}: {
-  readonly label: string;
-  readonly value: string;
-  readonly mono?: boolean;
-  readonly icon?: typeof Fingerprint;
-}) {
-  return (
-    <div>
-      <dt className="flex items-center gap-1.5 text-xs uppercase tracking-wider text-stone-500 dark:text-stone-400">
-        {Icon && <Icon className="h-3.5 w-3.5" />}
-        {label}
-      </dt>
-      <dd className="mt-1 text-sm text-stone-800 dark:text-stone-200">
-        {mono ? <Mono className="break-all text-stone-800 dark:text-stone-200">{value}</Mono> : value}
-      </dd>
     </div>
   );
 }
@@ -568,54 +598,47 @@ function ActivateLicenseCard({
     <div className="space-y-6">
       {/* 1 — machine fingerprint + purchase link */}
       <div className="space-y-2">
-        <p className="flex items-center gap-1.5 text-xs uppercase tracking-wider text-stone-500 dark:text-stone-400">
-          <Fingerprint className="h-3.5 w-3.5" />
+        <p className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          <Fingerprint className="size-3.5" />
           {intl.formatMessage({ id: 'license.activate.fingerprint' })}
         </p>
         <div className="flex flex-wrap items-center gap-2">
-          <Mono className="break-all text-stone-800 dark:text-stone-200">
-            {fingerprint ?? '—'}
-          </Mono>
-          <Button variant="secondary" icon={Copy} onClick={() => void copyFingerprint()} disabled={!fingerprint}>
+          <span className="break-all font-mono text-xs">{fingerprint ?? '—'}</span>
+          <Button variant="outline" size="sm" onClick={() => void copyFingerprint()} disabled={!fingerprint}>
+            <Copy />
             {intl.formatMessage({ id: 'license.activate.fingerprint.copy' })}
           </Button>
         </div>
-        <p className="text-xs text-stone-500 dark:text-stone-400">
+        <p className="text-xs text-muted-foreground">
           {intl.formatMessage({ id: 'license.activate.fingerprint.hint' })}{' '}
           <a
             href={PRICING_URL}
             target="_blank"
             rel="noopener noreferrer"
-            className="font-medium text-amber-600 hover:underline dark:text-amber-400"
+            className="font-medium text-brand hover:underline"
           >
             {intl.formatMessage({ id: 'license.cta.pricing' })}
-            <ExternalLink className="ml-0.5 inline h-3 w-3" />
+            <ExternalLink className="ml-0.5 inline size-3" />
           </a>
         </p>
       </div>
 
       {/* 2 — activate with a license key */}
       <div className="space-y-3">
-        <Field
+        <LicenseField
           label={intl.formatMessage({ id: 'license.activate.key.label' })}
           help={intl.formatMessage({ id: 'license.activate.key.hint' })}
         >
-          <textarea
+          <Textarea
             value={key}
             onChange={(e) => setKey(e.target.value)}
             spellCheck={false}
-            className={cn(controlClass, 'min-h-28 resize-y font-mono text-xs leading-relaxed')}
+            className="min-h-28 resize-y font-mono text-xs leading-relaxed"
           />
-        </Field>
-        {activateError && (
-          <p className="text-sm text-rose-600 dark:text-rose-400">{activateError}</p>
-        )}
-        <Button
-          variant="primary"
-          icon={KeyRound}
-          onClick={() => void handleActivate()}
-          disabled={activating || !key.trim()}
-        >
+        </LicenseField>
+        {activateError && <p className="text-sm text-destructive">{activateError}</p>}
+        <Button variant="brand" onClick={() => void handleActivate()} disabled={activating || !key.trim()}>
+          <KeyRound />
           {intl.formatMessage({
             id: activating ? 'license.activate.submitting' : 'license.activate.submit',
           })}
@@ -623,40 +646,33 @@ function ActivateLicenseCard({
       </div>
 
       {/* 3 — partner (NFR) redeem code, free path */}
-      <div className="space-y-3 border-t border-[var(--panel-border)] pt-4">
-        <p className="flex items-center gap-1.5 text-xs uppercase tracking-wider text-stone-500 dark:text-stone-400">
-          <Ticket className="h-3.5 w-3.5" />
+      <div className="space-y-3 border-t border-surface-border pt-4">
+        <p className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          <Ticket className="size-3.5" />
           {intl.formatMessage({ id: 'license.activate.redeem.title' })}
         </p>
         <div className="grid gap-3 sm:grid-cols-2">
-          <Field label={intl.formatMessage({ id: 'license.activate.redeem.code' })}>
-            <input
+          <LicenseField label={intl.formatMessage({ id: 'license.activate.redeem.code' })}>
+            <Input
               type="text"
               value={code}
               onChange={(e) => setCode(e.target.value)}
               spellCheck={false}
-              className={cn(controlClass, 'font-mono')}
+              className="font-mono"
               placeholder="PARTNER-CODE"
             />
-          </Field>
-          <Field label={intl.formatMessage({ id: 'license.activate.redeem.email' })}>
-            <input
+          </LicenseField>
+          <LicenseField label={intl.formatMessage({ id: 'license.activate.redeem.email' })}>
+            <Input
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className={controlClass}
               autoComplete="off"
             />
-          </Field>
+          </LicenseField>
         </div>
-        {redeemError && (
-          <p className="text-sm text-rose-600 dark:text-rose-400">{redeemError}</p>
-        )}
-        <Button
-          variant="secondary"
-          onClick={() => void handleRedeem()}
-          disabled={redeeming || !code.trim()}
-        >
+        {redeemError && <p className="text-sm text-destructive">{redeemError}</p>}
+        <Button variant="secondary" onClick={() => void handleRedeem()} disabled={redeeming || !code.trim()}>
           {intl.formatMessage({
             id: redeeming ? 'license.activate.redeem.submitting' : 'license.activate.redeem.submit',
           })}
@@ -665,8 +681,8 @@ function ActivateLicenseCard({
 
       {/* First-run: the operator came from the welcome wizard — send them back. */}
       {activated && agentCount === 0 && (
-        <div className="border-t border-[var(--panel-border)] pt-4">
-          <Button variant="primary" onClick={() => navigate('/welcome')}>
+        <div className="border-t border-surface-border pt-4">
+          <Button variant="brand" onClick={() => navigate('/welcome')}>
             {intl.formatMessage({ id: 'license.activate.backToWizard' })}
           </Button>
         </div>
@@ -677,15 +693,24 @@ function ActivateLicenseCard({
   if (collapsed) {
     return (
       <Card>
-        <details>
-          <summary className="cursor-pointer text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'license.activate.reopen' })}
-          </summary>
-          <div className="mt-4">{body}</div>
-        </details>
+        <CardContent>
+          <details>
+            <summary className="cursor-pointer text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: 'license.activate.reopen' })}
+            </summary>
+            <div className="mt-4">{body}</div>
+          </details>
+        </CardContent>
       </Card>
     );
   }
 
-  return <Card title={intl.formatMessage({ id: 'license.activate.title' })}>{body}</Card>;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{intl.formatMessage({ id: 'license.activate.title' })}</CardTitle>
+      </CardHeader>
+      <CardContent>{body}</CardContent>
+    </Card>
+  );
 }

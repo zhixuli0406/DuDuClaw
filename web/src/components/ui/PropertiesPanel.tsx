@@ -113,14 +113,14 @@ export function PropertiesPanel({ className }: { className?: string }) {
   const { title, content, collapsed, toggleCollapsed, sheetOpen, setSheetOpen } = usePanel();
 
   const header = (onClose: () => void, closeIcon: ReactNode) => (
-    <div className="flex items-center justify-between gap-2 border-b border-[var(--panel-border)] px-3 py-2">
-      <span className="truncate text-sm font-semibold text-stone-800 dark:text-stone-100">
+    <div className="flex items-center justify-between gap-2 border-b border-surface-border px-3 py-2">
+      <span className="truncate text-sm font-semibold text-foreground">
         {title}
       </span>
       <button
         type="button"
         onClick={onClose}
-        className="grid h-7 w-7 place-items-center rounded-control text-stone-500 hover:bg-stone-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 dark:hover:bg-white/5"
+        className="grid h-7 w-7 place-items-center rounded-lg text-muted-foreground outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
         aria-label="Collapse panel"
       >
         {closeIcon}
@@ -133,7 +133,7 @@ export function PropertiesPanel({ className }: { className?: string }) {
       {/* Desktop right column */}
       <aside
         className={cn(
-          'hidden shrink-0 border-l border-[var(--panel-border)] bg-[var(--panel-fill)] md:flex md:flex-col',
+          'hidden shrink-0 border-l border-surface-border bg-surface md:flex md:flex-col',
           collapsed ? 'w-10' : 'w-80',
           'transition-[width] duration-200',
           className,
@@ -144,7 +144,7 @@ export function PropertiesPanel({ className }: { className?: string }) {
           <button
             type="button"
             onClick={toggleCollapsed}
-            className="grid h-10 w-10 place-items-center text-stone-500 hover:bg-stone-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 dark:hover:bg-white/5"
+            className="grid h-10 w-10 place-items-center text-muted-foreground outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
             aria-label="Expand panel"
           >
             <PanelRightOpen className="h-4 w-4" />
@@ -154,7 +154,7 @@ export function PropertiesPanel({ className }: { className?: string }) {
             {header(toggleCollapsed, <PanelRightClose className="h-4 w-4" />)}
             <div className="min-h-0 flex-1 overflow-y-auto p-3">
               {content ?? (
-                <p className="px-1 pt-2 text-xs text-stone-400 dark:text-stone-500">—</p>
+                <p className="px-1 pt-2 text-xs text-muted-foreground">—</p>
               )}
             </div>
           </>
@@ -168,9 +168,9 @@ export function PropertiesPanel({ className }: { className?: string }) {
             type="button"
             aria-label="Close"
             onClick={() => setSheetOpen(false)}
-            className="absolute inset-0 cursor-default bg-stone-900/30 dark:bg-black/50"
+            className="absolute inset-0 cursor-default bg-black/30 dark:bg-black/50"
           />
-          <div className="absolute inset-x-0 bottom-0 max-h-[80vh] overflow-y-auto rounded-t-bubble border-t border-[var(--panel-border)] bg-[var(--panel-fill)] pb-[env(safe-area-inset-bottom)]">
+          <div className="absolute inset-x-0 bottom-0 max-h-[80vh] overflow-y-auto rounded-t-3xl border-t border-surface-border bg-surface pb-[env(safe-area-inset-bottom)]">
             {header(() => setSheetOpen(false), <X className="h-4 w-4" />)}
             <div className="p-3">{content}</div>
           </div>

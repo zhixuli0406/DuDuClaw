@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { screen, fireEvent } from '@testing-library/react';
 import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { WebChatPage } from './WebChatPage';
@@ -19,10 +18,15 @@ beforeEach(() => {
 });
 
 describe('WebChatPage', () => {
-  it('renders chat interface', () => {
+  it('renders the chat composer', () => {
     renderWithProviders(<WebChatPage />);
-
     expect(screen.getByPlaceholderText(/message/i)).toBeInTheDocument();
+  });
+
+  it('renders the list+detail split (conversations column)', () => {
+    renderWithProviders(<WebChatPage />);
+    // The left column carries a "New conversation" action.
+    expect(screen.getAllByLabelText(/new conversation/i).length).toBeGreaterThan(0);
   });
 
   it('displays messages from store', () => {
@@ -39,25 +43,23 @@ describe('WebChatPage', () => {
     expect(screen.getByText('Hi! How can I help?')).toBeInTheDocument();
   });
 
-  it('shows streaming indicator when assistant is typing', () => {
+  it('shows a busy indicator while the assistant is streaming', () => {
     useChatStore.setState({ isStreaming: true });
 
     renderWithProviders(<WebChatPage />);
 
-    // The typing indicator should be visible
-    const dots = document.querySelectorAll('[class*="animate"]');
-    expect(dots.length).toBeGreaterThan(0);
+    const animated = document.querySelectorAll('[class*="animate"]');
+    expect(animated.length).toBeGreaterThan(0);
   });
 
-  it('allows typing and sending a message', async () => {
-    const user = userEvent.setup();
-    const sendSpy = vi.fn();
-    useChatStore.setState({ send: sendSpy } as never);
-
+  it('allows typing a message into the composer', () => {
     renderWithProviders(<WebChatPage />);
 
-    const input = screen.getByPlaceholderText(/message/i);
-    await user.type(input, 'Test message');
+    // NOTE: the split panes have no measured size under jsdom's mocked
+    // ResizeObserver, so userEvent's visibility check skips typing — drive the
+    // controlled textarea directly instead.
+    const input = screen.getByPlaceholderText(/message/i) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: 'Test message' } });
 
     expect(input).toHaveValue('Test message');
   });

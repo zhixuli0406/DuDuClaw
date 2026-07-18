@@ -22,11 +22,11 @@ export function Breadcrumbs({ items, className }: { items: readonly Crumb[]; cla
         const isLast = i === items.length - 1;
         return (
           <span key={`${crumb.label}-${i}`} className="flex min-w-0 items-center gap-1">
-            {i > 0 && <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-300 dark:text-stone-600" aria-hidden="true" />}
+            {i > 0 && <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" aria-hidden="true" />}
             {crumb.to && !isLast ? (
               <Link
                 to={crumb.to}
-                className="truncate text-stone-500 transition-colors hover:text-stone-800 dark:text-stone-400 dark:hover:text-stone-200"
+                className="truncate text-muted-foreground transition-colors hover:text-foreground"
               >
                 {crumb.label}
               </Link>
@@ -34,7 +34,7 @@ export function Breadcrumbs({ items, className }: { items: readonly Crumb[]; cla
               <span
                 className={cn(
                   'truncate',
-                  isLast ? 'font-medium text-stone-800 dark:text-stone-100' : 'text-stone-500 dark:text-stone-400',
+                  isLast ? 'font-medium text-foreground' : 'text-muted-foreground',
                 )}
                 aria-current={isLast ? 'page' : undefined}
               >

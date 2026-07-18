@@ -3,9 +3,11 @@ import type { ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
 
-/** A single chat turn rendered as a left/right-aligned bubble.
+/** A single chat turn rendered as a left/right-aligned bubble (Multica plain
+ *  style, spec §5.6): the user's turn sits right on `bg-secondary`, the
+ *  assistant's sits left on `bg-surface`, a system notice is destructive-toned.
  *  `leading` renders a small avatar to the left of an assistant/system bubble
- *  (the conversation partner's identity, V7 / T7.2). */
+ *  (the conversation partner's identity). */
 export function MessageBubble({ message, leading }: { message: ChatMessage; leading?: ReactNode }) {
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
@@ -15,12 +17,12 @@ export function MessageBubble({ message, leading }: { message: ChatMessage; lead
       {!isUser && leading && <div className="mb-0.5 shrink-0">{leading}</div>}
       <div
         className={cn(
-          'max-w-[80%] rounded-bubble px-4 py-2.5 text-sm leading-relaxed',
+          'max-w-[80%] rounded-xl px-3.5 py-2 text-sm leading-relaxed',
           isUser
-            ? 'bg-amber-500 text-white'
+            ? 'bg-secondary text-secondary-foreground'
             : isSystem
-              ? 'bg-rose-500/10 text-rose-700 ring-1 ring-inset ring-rose-500/20 dark:text-rose-400'
-              : 'border border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-800 dark:text-stone-200'
+              ? 'bg-destructive/10 text-destructive ring-1 ring-inset ring-destructive/20'
+              : 'bg-surface text-surface-foreground ring-1 ring-surface-border',
         )}
       >
         {message.attachments && message.attachments.length > 0 && (
@@ -30,11 +32,9 @@ export function MessageBubble({ message, leading }: { message: ChatMessage; lead
             ))}
           </div>
         )}
-        {message.content && (
-          <div className="whitespace-pre-wrap break-words">{message.content}</div>
-        )}
+        {message.content && <div className="whitespace-pre-wrap break-words">{message.content}</div>}
         {message.tokens != null && message.tokens > 0 && (
-          <div className="mt-1 text-xs opacity-50 tabular-nums">{message.tokens} tokens</div>
+          <div className="mt-1 font-mono text-xs tabular-nums text-muted-foreground">{message.tokens} tokens</div>
         )}
       </div>
     </div>

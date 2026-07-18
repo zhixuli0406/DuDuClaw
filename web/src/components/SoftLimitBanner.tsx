@@ -40,7 +40,7 @@ export function SoftLimitBanner() {
   if (!sl || !sl.anyOver || dismissed) return null;
 
   return (
-    <div className="mb-4 flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+    <div className="mb-4 flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/10 px-4 py-3 text-sm text-warning">
       <TrendingUp className="mt-0.5 h-4 w-4 shrink-0" />
       <div className="flex-1">
         <p className="font-medium">
@@ -49,7 +49,7 @@ export function SoftLimitBanner() {
             { tier: sl.tier }
           )}
         </p>
-        <p className="mt-0.5 tabular-nums text-amber-700/90 dark:text-amber-300/90">
+        <p className="mt-0.5 tabular-nums text-warning/90">
           {intl.formatMessage(
             { id: 'softLimit.usage' },
             {
@@ -60,21 +60,21 @@ export function SoftLimitBanner() {
             }
           )}
         </p>
-        <p className="mt-0.5 text-amber-700/90 dark:text-amber-300/90">
+        <p className="mt-0.5 text-warning/90">
           {intl.formatMessage({ id: 'softLimit.body' })}
         </p>
         <a
           href="https://duduclaw.dudustudio.monster#pricing"
           target="_blank"
           rel="noreferrer"
-          className="mt-1.5 inline-block font-medium text-amber-700 underline underline-offset-2 hover:text-amber-900 dark:text-amber-300 dark:hover:text-amber-100"
+          className="mt-1.5 inline-block font-medium text-warning underline underline-offset-2 hover:text-warning/80"
         >
           {intl.formatMessage({ id: 'softLimit.upgrade' })}
         </a>
       </div>
       <button
         onClick={() => setDismissed(true)}
-        className="rounded p-1 text-amber-700/70 transition-colors hover:bg-amber-500/15 dark:text-amber-300/70"
+        className="rounded p-1 text-warning/70 transition-colors hover:bg-warning/15"
         aria-label={intl.formatMessage({ id: 'softLimit.dismiss' })}
       >
         <X className="h-4 w-4" />

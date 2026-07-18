@@ -43,10 +43,10 @@ export function TalkModeButton({
         if (!isDisabled) toggle();
       }}
       className={cn(
-        'grid h-11 w-11 shrink-0 place-items-center rounded-control transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+        'grid size-8 shrink-0 place-items-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
         active
-          ? 'bg-amber-500 text-white hover:bg-amber-600'
-          : 'text-stone-500 hover:bg-stone-500/10 hover:text-stone-700 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200',
+          ? 'bg-brand text-brand-foreground hover:bg-brand/90'
+          : 'text-muted-foreground hover:bg-muted hover:text-foreground',
         active &&
           status === 'listening' &&
           'animate-pulse motion-reduce:animate-none',
@@ -54,7 +54,7 @@ export function TalkModeButton({
         className,
       )}
     >
-      <AudioLines className="h-5 w-5" />
+      <AudioLines className="size-4" />
     </button>
   );
 }
@@ -82,7 +82,7 @@ export function TalkModeStatusPill({ status, className }: { status: TalkStatus; 
       role="status"
       aria-live="polite"
       className={cn(
-        'inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-0.5 text-xs text-amber-700 dark:text-amber-400',
+        'inline-flex items-center gap-1.5 rounded-full border border-brand/30 bg-brand/10 px-2.5 py-0.5 text-xs text-brand',
         className,
       )}
     >

@@ -16,13 +16,13 @@ export function AttachmentChip({
 }) {
   const Icon = isImageMime(mime) ? ImageIcon : FileText;
   return (
-    <span className="inline-flex max-w-[12rem] items-center gap-1.5 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-fill)] px-2 py-1 text-xs text-stone-700 dark:text-stone-200">
+    <span className="inline-flex max-w-[12rem] items-center gap-1.5 rounded-lg border border-surface-border bg-surface px-2 py-1 text-xs text-foreground">
       <Icon className="h-3.5 w-3.5 flex-shrink-0" />
       <span className="truncate">{name}</span>
       {onRemove && (
         <button
           onClick={onRemove}
-          className="flex-shrink-0 rounded p-0.5 text-stone-400 transition-colors hover:bg-stone-500/10 hover:text-stone-600 dark:hover:bg-white/5 dark:hover:text-stone-300"
+          className="flex-shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
           aria-label="Remove attachment"
         >
           <X className="h-3 w-3" />

@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { controlClass } from '@/components/ui';
 import {
   parseCron,
   buildCron,
@@ -11,6 +10,9 @@ import {
   type CronParts,
   type CronLabels,
 } from './cron';
+
+const controlClass =
+  'h-8 w-full min-w-0 rounded-lg border border-input bg-transparent px-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-50 dark:bg-input/30';
 
 const MODES: CronMode[] = ['hourly', 'daily', 'interval', 'weekly', 'custom'];
 
@@ -101,7 +103,7 @@ export function ScheduleBuilder({
         </select>
 
         {parts.mode === 'hourly' && (
-          <label className="flex items-center gap-1.5 text-sm text-stone-500 dark:text-stone-400">
+          <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
             {intl.formatMessage({ id: 'controls.cron.atMinute' })}
             <input
               type="number"
@@ -115,7 +117,7 @@ export function ScheduleBuilder({
         )}
 
         {parts.mode === 'interval' && (
-          <label className="flex items-center gap-1.5 text-sm text-stone-500 dark:text-stone-400">
+          <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
             {intl.formatMessage({ id: 'controls.cron.everyN' })}
             <input
               type="number"
@@ -163,9 +165,9 @@ export function ScheduleBuilder({
         )}
       </div>
 
-      <p className="text-xs text-stone-400 dark:text-stone-500">
+      <p className="text-xs text-muted-foreground">
         {describeCron(buildCron(parts), labels)}
-        <span className="ml-2 font-mono text-stone-300 dark:text-stone-600">{buildCron(parts)}</span>
+        <span className="ml-2 font-mono text-muted-foreground">{buildCron(parts)}</span>
       </p>
     </div>
   );

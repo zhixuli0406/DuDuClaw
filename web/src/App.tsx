@@ -25,6 +25,8 @@ const RunsPage = lazyPage(() => import('./pages/RunsPage'), 'RunsPage');
 const CanvasPage = lazyPage(() => import('./pages/CanvasPage'), 'CanvasPage');
 const AgentDetailPage = lazyPage(() => import('./pages/AgentDetailPage'), 'AgentDetailPage');
 const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'SkillMarketPage');
+const WidgetsPage = lazyPage(() => import('./pages/WidgetsPage'), 'WidgetsPage');
+const WidgetComposerPage = lazyPage(() => import('./pages/WidgetComposerPage'), 'WidgetComposerPage');
 const KnowledgeShell = lazyPage(() => import('./pages/KnowledgeShell'), 'KnowledgeShell');
 const IntegrationsPage = lazyPage(() => import('./pages/IntegrationsPage'), 'IntegrationsPage');
 const BillingShell = lazyPage(() => import('./pages/BillingShell'), 'BillingShell');
@@ -32,6 +34,8 @@ const GovernanceShell = lazyPage(() => import('./pages/GovernanceShell'), 'Gover
 const LicenseShell = lazyPage(() => import('./pages/LicenseShell'), 'LicenseShell');
 const WebChatPage = lazyPage(() => import('./pages/WebChatPage'), 'WebChatPage');
 const AgentsPage = lazyPage(() => import('./pages/AgentsPage'), 'AgentsPage');
+const CreateAgentPage = lazyPage(() => import('./pages/agent-form/CreateAgentPage'), 'CreateAgentPage');
+const EditAgentPage = lazyPage(() => import('./pages/agent-form/EditAgentPage'), 'EditAgentPage');
 const TaskBoardPage = lazyPage(() => import('./pages/TaskBoardPage'), 'TaskBoardPage');
 const PlansPage = lazyPage(() => import('./pages/PlansPage'), 'PlansPage');
 const ForkPage = lazyPage(() => import('./pages/ForkPage'), 'ForkPage');
@@ -76,7 +80,7 @@ const DistributorsPage = lazyPage(() => import('./pages/DistributorsPage'), 'Dis
 function PageFallback() {
   return (
     <div className="flex h-full items-center justify-center py-20" role="status" aria-live="polite">
-      <span className="h-6 w-6 animate-spin rounded-full border-2 border-amber-500/30 border-t-amber-500" />
+      <span className="h-6 w-6 animate-spin rounded-full border-2 border-brand/30 border-t-brand" />
     </div>
   );
 }
@@ -138,6 +142,11 @@ export function App() {
 
               {/* ── 員工 / 公司 ── */}
               <Route path="agents" element={<AgentsPage />} />
+              {/* Create / edit forms are standalone pages (formerly dialogs on
+                  the roster). Declared before agents/:id so the static segments
+                  win over the dynamic ones. */}
+              <Route path="agents/new" element={<CreateAgentPage />} />
+              <Route path="agents/:id/edit" element={<EditAgentPage />} />
               {/* The immersive full-bleed world page (PixiJS 2D iso). The Home
                   band and Org "世界" tab both link here so the heavy scene mounts
                   in exactly one place. */}
@@ -149,6 +158,10 @@ export function App() {
               <Route path="skills" element={<SkillMarketPage />} />
               <Route path="skills/new" element={<SkillNewPage />} />
               <Route path="skills/custom/:id" element={<SkillCustomDetailPage />} />
+              {/* Widget 工坊 — custom dashboard widgets (design 2026-07-16). */}
+              <Route path="widgets" element={<WidgetsPage />} />
+              <Route path="widgets/new" element={<WidgetComposerPage />} />
+              <Route path="widgets/:id/edit" element={<WidgetComposerPage />} />
               <Route path="knowledge" element={<KnowledgeShell />} />
               {/* 關於 — open to every authenticated user (all instances). */}
               <Route path="about" element={<AboutPage />} />

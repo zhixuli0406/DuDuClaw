@@ -70,7 +70,7 @@ export function AgentStatusGlyph({
         )}
       </span>
       {showLabel && (
-        <span className="text-[11px] font-medium text-stone-500 dark:text-stone-400">
+        <span className="text-[11px] font-medium text-muted-foreground">
           {label}
         </span>
       )}

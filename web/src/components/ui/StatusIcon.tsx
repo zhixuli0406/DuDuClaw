@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   Ban,
   XCircle,
+  AlertTriangle,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -18,8 +19,11 @@ import { cn } from '@/lib/utils';
  * the AA-contrast `--status-task-icon-*` token, and — when `onChange` is given
  * — opens a small popover to reassign the status inline (paperclip P2/P6).
  *
- * The vocabulary is the full 7-state design set (a superset of the current
- * backend `TaskStatus`); pages map their data onto it.
+ * The vocabulary is the full design set (a superset of the current backend
+ * `TaskStatus`); pages map their data onto it. `needs_human` (P2a autonomous
+ * goal escalation) is a first-class glyph but is NOT in `TASK_STATUS_ORDER` —
+ * the UI renders it but never offers it as a manual pick (it is set only by the
+ * goal loop; humans resolve it via channel buttons / the board, not the picker).
  */
 export type TaskStatusKey =
   | 'backlog'
@@ -28,6 +32,7 @@ export type TaskStatusKey =
   | 'in_review'
   | 'done'
   | 'blocked'
+  | 'needs_human'
   | 'cancelled';
 
 export const TASK_STATUS_ORDER: readonly TaskStatusKey[] = [
@@ -47,6 +52,7 @@ const ICONS: Record<TaskStatusKey, LucideIcon> = {
   in_review: Eye,
   done: CheckCircle2,
   blocked: Ban,
+  needs_human: AlertTriangle,
   cancelled: XCircle,
 };
 
@@ -57,6 +63,7 @@ const DEFAULT_LABELS: Record<TaskStatusKey, string> = {
   in_review: 'In review',
   done: 'Done',
   blocked: 'Blocked',
+  needs_human: 'Needs human',
   cancelled: 'Cancelled',
 };
 
@@ -127,7 +134,7 @@ export function StatusIcon({
         aria-label={label(status)}
         title={label(status)}
         onClick={() => setOpen((v) => !v)}
-        className="inline-flex items-center justify-center rounded-control p-0.5 hover:bg-stone-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 dark:hover:bg-white/5"
+        className="inline-flex items-center justify-center rounded-xl p-0.5 outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
       >
         {glyph}
       </button>
@@ -135,7 +142,7 @@ export function StatusIcon({
         <div
           id={menuId}
           role="menu"
-          className="glass-overlay absolute left-0 top-full z-50 mt-1 min-w-40 rounded-control p-1"
+          className="absolute left-0 top-full z-50 mt-1 min-w-40 rounded-lg bg-surface-raised p-1 shadow-[var(--menu-shadow)] ring-1 ring-surface-border"
         >
           {TASK_STATUS_ORDER.map((s) => {
             const RowIcon = ICONS[s];
@@ -150,7 +157,7 @@ export function StatusIcon({
                   setOpen(false);
                 }}
                 className={cn(
-                  'flex w-full items-center gap-2 rounded-[calc(var(--radius-control)-2px)] px-2 py-1.5 text-left text-sm hover:bg-stone-500/10 dark:hover:bg-white/5',
+                  'flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm hover:bg-muted',
                   s === status && 'font-semibold',
                 )}
               >
@@ -160,7 +167,7 @@ export function StatusIcon({
                   style={{ color: `var(--status-task-icon-${s})` }}
                   aria-hidden="true"
                 />
-                <span className="text-stone-700 dark:text-stone-200">{label(s)}</span>
+                <span className="text-foreground">{label(s)}</span>
               </button>
             );
           })}

@@ -55,10 +55,8 @@ export function CenterStage({
       )}
 
       <div>
-        <h3 className="text-lg font-semibold tracking-tight text-stone-800 dark:text-stone-100">
-          {agentName}
-        </h3>
-        <p className="mt-0.5 text-sm text-stone-500 dark:text-stone-400">{caption}</p>
+        <h3 className="text-lg font-medium tracking-tight text-foreground">{agentName}</h3>
+        <p className="mt-0.5 text-sm text-muted-foreground">{caption}</p>
       </div>
     </div>
   );

@@ -1,278 +1,259 @@
-# DuDuClaw Dashboard — Design System (Soft Play v2「嘟嘟事務所」)
+# DuDuClaw Design System
 
-> Single source of truth for the v2 dashboard. Every page MUST follow this.
-> v2 supersedes the v1 "Calm Glass" console (kept only as colour DNA + engineering
-> discipline). Design authority: `commercial/docs/TODO-dashboard-redesign-v2-2026-07-10.md`
-> (Fable, 2026-07-10). zh-TW first; en / ja-JP parity mandatory.
->
-> **v2 thesis (one line):** *paperclip 的骨架 × openhuman 的血肉 — 「可愛、遊戲化」是
-> 全介面的血液，不是某一頁的貼紙。* Every AI staff member is a **character with a face** on
-> every screen; every completed action gives emotional feedback; the company's growth is
-> visible, computable, and celebrated — all from **real data, never faked**.
+> 儀表板（`web/`）的單一設計真相源。每個頁面、每個新元件都必須遵循本文件。
+> 技術基座：Vite + React 19 + React Router 7 + Tailwind v4（`@theme inline` + CSS 變數）。
+> 語言：zh-TW 為主，en / ja-JP 三語平權。
+> 元件庫位置：`web/src/components/mds/`（本文件簡稱「mds」）。
 
-## 1. Design intent (理解設計意圖)
+本設計系統的一句話：**四層 surface 疊出深度、OKLCH token 決定每一個顏色、克制的動效、圓角與陰影成體系**——目標是一個安靜、精準、資訊密度高但不擁擠的工作台，掃一眼就懂「現在怎麼了、要不要我拍板、我該怎麼做」。
 
-心智模型：**一間 AI 員工的事務所**。每個畫面回答三問 — ① 現在發生什麼事 → ② 有沒有需要我拍板
-→ ③ 我該怎麼做 — 但 v2 用**角色與世界演出來**（掃一眼就懂），用 **paperclip 面板做下去**（快而準）。
+---
 
-| Pillar | v1 Calm Glass | v2 Soft Play |
-| --- | --- | --- |
-| Surface | flat hairline `panel`, no shadow | **soft card**: `rounded-2xl` + `shadow-soft` 軟浮（暖白），glass 仍只給 chrome/overlay |
-| Identity | agent = 文字列 + 狀態點 | agent = **程序化向量角色**（`CharacterAvatar`），一套資料三種呈現，全站唯一視覺身分 |
-| Mascot | emoji 字元（作廢） | **DuDu** 純 SVG 角色（13 表情 + 眨眼 + viseme），跨路由陪伴 |
-| State | 靜態卡片 | **世界舞台**（等距辦公室，state-driven）把狀態具象化，並入首頁 |
-| Reward | 無 | **遊戲化四件套**：XP/等級、成就牆、日報卡、慶祝時刻（全真數據） |
-| Layout | 兩欄（左導航/中內容） | **三欄殼**：左 Sidebar / 中內容 / **右 PropertiesPanel（PanelContext）** |
-| Radius/Motion | `rounded-xl`, 冷靜 | radius 升一級（card 2xl / bubble 3xl）+ pop/spring/celebrate motion，全走 token |
+## 1. 設計語言概述
 
-**保留（色彩與品牌 DNA）**：stone 中性 ramp、amber 稀缺 accent、semantic（emerald/amber/rose/sky）、
-🐾 品牌、lucide 18px、深淺主題跟系統、三語 i18n、`tabular-nums`、**token-only 紀律（禁 hardcode hex/px）**。
+### 1.1 Surface 四層哲學（核心）
 
-**Anti-goals**：emoji 當角色、遊戲化造假（前端估算 XP）、破壞 prompt-cache 的每輪抖動、
-把世界舞台當唯一入口（所有物件動作必有 Sidebar/⌘K 等價路徑）、彩虹 accent、內容區重投影。
+介面的深度不靠陰影堆疊，而靠四層由暗到亮的表面。理解這四層就理解了整個佈局：
 
-## 2. Tokens (Soft Play 層，`src/index.css`)
+| 層 | Token | 角色 | 典型用途 |
+|---|---|---|---|
+| 1 | `--app-shell` | 最外框（最暗） | app 殼、sidebar 底 |
+| 2 | `--page-canvas`（= `--background`） | 內容「生活」的畫布 | 列表 / 看板 / 對話所在的頁面底 |
+| 3 | `--surface`（= `--card`） | 有邊界的內容群組 | 卡片、面板 |
+| 4 | `--surface-raised`（= `--popover`） | 浮層 | menu / select / dialog / tooltip |
 
-只加不減。Use utilities/vars, never hardcode hex or px.
+App Shell 是浮島式（inset）：sidebar 與內容區各自 `rounded-xl`，四周留 `p-2`，內容區帶 `ring-1 ring-surface-border` + `--surface-shadow`，浮在 `--app-shell` 底之上。互動狀態另有 `--surface-hover` / `--surface-selected` / `--surface-border`。
 
-- **Radius**：`--radius-card: 1rem`（2xl）、`--radius-control: 0.75rem`、`--radius-bubble: 1.5rem`。
-- **Shadow**：`--shadow-soft`（`0 2px 8px /4%, 0 8px 24px /6%` 雙層）、`--shadow-pop`（hover 抬升）；
-  dark 模式用 `--ring-soft` 補償（避免暗底陰影糊）。`.panel` utility 已轉軟卡呈現。
-- **Motion**：`--motion-pop: 180ms cubic-bezier(.34,1.56,.64,1)`（過衝彈）、`--motion-fade: 200ms ease-out`；
-  keyframes `pop-in / fade-up / badge-pop / confetti-fall / dudu-hop / character-blink|work|wave`
-  **全部 gate 在 `@media (prefers-reduced-motion: no-preference)`**；另有全域 reduce 斷路器
-  （`* { animation-duration:.01ms; transition-duration:.01ms }`）。
-- **Status tokens（paperclip P6 系統化）**：`--status-agent-{idle,running,paused,error}`（4）
-  + `--status-task-{backlog,todo,in_progress,in_review,done,blocked,cancelled}`（7）
-  + 每個對應 `--status-*-icon-*` **AA 對比變體**（OKLCH 實算 ≥4.5:1，雙主題）。
-  badge / row / chart / 世界 emote **同一套**。
-- **Agent 漸層**：`--agent-{1..10}{a,b}` 10 對暖調漸層（amber/coral/sage/sky/violet… 家族）——
-  角色 avatar 底、org 節點、世界 sprite tint **同源**。
-- **遊戲化 hue**：`--xp`（amber 家族）、`--coin`（amber-600）。
-- **Neutral / Accent / Semantic**（沿用 v1）：stone ramp；amber 稀缺 accent；emerald/amber/rose/sky。
-- **Type**：page title `text-2xl font-semibold tracking-tight`、section `text-sm font-semibold`、
-  body `text-sm`、meta `text-xs`；機器值一律 `<Mono>` + `tabular-nums`。
+### 1.2 OKLCH 色彩 token
 
-## 3. Surfaces
+所有顏色寫成 OKLCH，定義在 `src/index.css` 的 `:root`（light）與 `.dark`（dark），再由 `@theme inline` 映射成 Tailwind color utility（`--color-surface: var(--surface)` 等）。**永遠用 utility / 變數，禁止 hardcode hex 或 px。**
 
-| Utility | Use | Recipe |
-| --- | --- | --- |
-| `panel` | **Content cards**（default） | 暖白 near-opaque fill + `shadow-soft`（dark 用 ring） + `rounded-card` |
-| `panel-hover` | clickable cards | hover 抬升至 `--shadow-pop` + border-brighten |
-| `glass-chrome` | sidebar / header | 重 blur（仍保留給 chrome） |
-| `glass-overlay` | dialogs / menus / popovers / right Sheet | 強 fill + blur |
+語義色成對出現（背景 + `-foreground`）：`--primary`、`--secondary`、`--muted`、`--accent`、`--destructive`、`--brand`、`--success` / `--warning` / `--info`，加上 `--border` / `--input` / `--ring`。Sidebar 有自己一組 `--sidebar-*`。
 
-## 4. 角色系統（v2 最重要新資產 —「可愛」的載體）
+- **Dark 主題不是把亮度乘負值**：`--primary` 在 dark 反轉為近白（`oklch(0.92 …)`），`--border` 改用半透明白（`oklch(1 0 0 / 10%)`）。改 token 一律雙主題同步。
+- **品牌色**：`--brand` 目前是藍（hue 255，light `0.55 0.16` / dark `0.65 0.16`），chart 色相跟隨 brand hue。這是刻意的中性偏冷基調；`index.css` 的 brand 區塊留有註解，日後要換回 amber 只需改這一處而不動其他層。
+- **圖表色 `--chart-1..5`**：以 brand 為 chart-1，向外堆疊「主→次→三級」層次。Light 遞減飽和、dark 反轉亮度（最重要最亮）。純 SVG 圖表一律讀這五個 token 上色，不引入圖表庫。
 
-**每位 AI 員工 = 一個 seeded-by-id 的向量角色**（`components/character/`）。純 SVG + CSS，無新依賴，
-theme-agnostic（agent 漸層 token 雙主題可讀）。
+### 1.3 三層陰影
 
-- `character-gen.ts`：`characterFor(agentId)` 純函數 → `{ tintIndex(1..10), accessory, blinkSeedMs }`
-  （antenna 權重最高，openhuman 同款邏輯）。
-- `CharacterAvatar`（`components/character/CharacterAvatar.tsx`）三種呈現，一套資料：
+陰影按浮起高度分三級，各有 light / dark 兩套，一律用 token 不手寫：
 
-| variant | 觸發 | 用途 | 形態 |
-| --- | --- | --- | --- |
-| `avatar` | `size < 64` | 列表列 / assignee / 留言 / 活動流 / Sidebar | 圓臉 + tint + 配件 + 眨眼 |
-| `bust` | `size ≥ 64` 或 `variant="bust"` | 員工卡 / 詳情 hero / org 節點 | 半身 + 姿勢驅動手臂 |
-| `sprite` | 世界舞台 | 等距角色（PixiJS 貼圖，tint 同源） | 見 §7 |
+| Token | 用途 |
+|---|---|
+| `--surface-shadow` | 卡片（貼地的內容群組） |
+| `--menu-shadow` | menu / select / popover（中浮） |
+| `--floating-shadow` | dialog / sheet（高浮） |
 
-- **poses**（`poses.ts`）：`idle / working / blocked / sleeping / celebrating / waving`——bust 全身反映，
-  avatar 只動眼/嘴。
-- **StatusEmote 頭頂表情泡**：`working 💻 / blocked ⚠️ / awaiting-approval ✋ / sleeping 💤 / error 😵 /
-  celebrating 🎉`，語彙與 `--status-agent-*` 同源。
-- **`animated` prop**（預設 true）：關掉即渲染靜態終態；眨眼/微動一律 gate 在 reduced-motion 之外。
-- **a11y**：wrapper `role="img"` + `aria-label`（name→id fallback），內層 SVG `aria-hidden`。
-- **紀律**：**所有出現 agent 名字的地方一律帶 avatar**；v1 的 `AgentStatusGlyph`（文字+點）降為 fallback。
+慣例：浮層 = `shadow-[var(--…-shadow)] ring-1 ring-surface-border`；tooltip 例外，用更輕的 `border border-border bg-popover`。
 
-## 5. DuDu 吉祥物（`components/mascot/`）
+### 1.4 Radius 體系
 
-- 純 SVG React 元件（`DuDu.tsx`），無 Rive/Lottie，可版控可 diff。造型：圓潤爪爪獸（🐾 具象化），amber 主色。
-- **13 表情**（`faces.ts`）：`sleep / idle / listening / thinking / speaking / happy / concerned /
-  curious / proud / celebrating / writing / reading / waving`。
-- **API**：`<DuDu face viseme size animated label />`；`speaking` 由 **viseme**（`visemes.ts`，7 shape +
-  `lerpViseme`）驅動嘴型；眨眼 clock（`useDuduClock`，thinking 4.2s / 其他 2.6s）。
-- **臉的來源**：`stores/mascot-store.ts` `useDuduFace()` 是 roster+inbox+連線 的**純衍生**
-  （`lib/mascot-mood.ts` 邏輯）；**唯一例外 = transient face**（`useMascotTransientStore.setTransientFace(face, ms)`）：
-  成長時刻（`growthEventBus` achievement_unlocked / level_up）推 `proud` 4s 後回衍生值。
-  a11y：wrapper `role="img"` + `aria-label`；狀態承載時給 label，純裝飾時 `aria-hidden`。
-- **出現點規範**：對話頁置中主舞台（idle→waving→listening→thinking→speaking→happy 生命週期）／
-  首頁問候旁 sm 版／**每個 `EmptyState` 配 pose**（空任務=掃把、空知識=抱書、搜尋無果=聳肩）／
-  錯誤與斷線（`IncidentBanner` concerned）／onboarding 接待員（welcome/wizard/GuidedTour）／
-  Inbox Zero celebrating。
-- **Tauri 桌寵**（`/mascot-overlay`）：第二 window（transparent/always-on-top/skip-taskbar），
-  與 web 版**共用 store/表情引擎/SVG**；已知限制：overlay 在 AuthGuard 外，pending 讀不到則靜態 sleep。
+基準 `--radius: 0.625rem`（10px），`@theme` 內以 calc 推導整套：`sm` ×0.6 / `md` ×0.8 / `lg` ×1 / `xl` ×1.4 / `2xl` ×1.8 / `3xl` ×2.2 / `4xl` ×2.6。
 
-## 6. 三欄殼與右欄 PanelContext
+| 用途 | class |
+|---|---|
+| 按鈕 / 輸入 / select trigger | `rounded-lg` |
+| 卡片 / dialog / sheet | `rounded-xl` |
+| menu item / dropdown item | `rounded-md` |
+| badge（膠囊） | `rounded-4xl` |
 
-`components/layout/` — 左 Sidebar（可收合成 icon rail）｜中 BreadcrumbBar + `<Outlet>`｜
-**右 PropertiesPanel 320px**。CommandPalette、Toast、CelebrationLayer 掛根。
+### 1.5 字體與字級
 
-- **PanelContext**（`ui/PropertiesPanel` + `PanelProvider`，hook `usePanel()`）：任何頁面用
-  `panel.setPanel({ title, content })` + `panel.setSheetOpen(true)` 注入右欄；`panel.clearPanel()` 收合。
-  桌機為固定右欄（偏好記憶）；**行動版轉底部 Sheet**（glass-overlay）。
-  典型消費者：`/tasks/:id` IssueProperties、`/inbox` ApprovalDetailPanel、org 節點員工卡。
-- **Sidebar**（§4.2 設計）：公司牌（名稱 + Lv.N）→ ＋交辦任務（primary）→ 首頁/收件匣(badge)/對話 →
-  工作分節 → **員工活體區**（有 live run 只列在跑的，avatar+live dot+run 數；否則近期 3）→ 公司分節。
-  非 mgr 整節依 `lib/nav-visibility.ts` 隱藏。
-- **Header/HUD**：常駐 **CoinChip**（今日成本，點→帳務）+ **XP 膠囊**（Lv + 進度，點→/growth，
-  `levelUpNonce` 觸發 badge-pop）+ 鈴鐺（inbox badge）+ ⌘K + 主題切換。
-- **MobileBottomNav** 5 格：首頁／收件匣／**＋交辦（中央大鈕）**／任務／對話。
-- **全站慣例**：機器值 `<Mono>` + `lib/format.ts` formatter（XP/coin/duration）；breadcrumb 貫穿；
-  列表偏好 localStorage（key 前綴 `duduclaw:ui:*` / `duduclaw:home:*` / `duduclaw:tasks:*`）；
-  多分頁單 leader 輪詢（`hooks/useSharedLeaderQuery`）。
+- `--font-sans`：**Inter Variable**（self-host，`@fontsource-variable/inter`）+ zh-TW fallback（`PingFang TC` / `Microsoft JhengHei` / `Noto Sans TC`）。禁 CDN。
+- `--font-mono`：**Geist Mono Variable** + `ui-monospace` fallback，無 CJK fallback（刻意）。機器值 / 計數一律 `font-mono tabular-nums`。
+- `<html>` 掛 `antialiased font-sans` + `text-autospace: ideograph-alpha ideograph-numeric`（CJK 與拉丁 / 數字間自動留白）。
+- **字重只用 400 / 500**；詳情 hero 與 Settings 分頁標題可到 600（`font-semibold`）。禁 bold 濫用。
 
-### 6.1 新 primitives（`ui/` barrel）
+| 用途 | class |
+|---|---|
+| 頁 header 標題 | `text-sm font-medium`（配 size-4 icon） |
+| 卡片 / dialog 標題 | `text-base font-medium leading-snug`（dialog `leading-none`） |
+| 詳情 hero / Settings 分頁標題 | `text-xl sm:text-2xl font-semibold` |
+| 內文 / 表格 / 選單 | `text-sm` |
+| meta / label / badge / tooltip | `text-xs` |
+| 計數 / 機器值 | `font-mono text-xs tabular-nums text-muted-foreground` |
 
-`PropertiesPanel`+`PanelProvider` / `PropertyRow`+`PropertySection` / `InlineEditor` / `StatusIcon`（可點改狀態）/
-`PriorityIcon` / `LiveBadge` / `SpeechBubble` / `CoinChip` / `XpBar` / `AchievementBadge` /
-`CelebrationLayer`+`celebrate()`（全域 confetti/彩帶 portal，reduced-motion 無粒子只留 toast）/
-`SwipeToArchive` / `GroupHeader`。沿用：`Page/PageHeader/Card/StatCard/Tabs/Button/Badge/EmptyState/Skeleton/Toolbar/Field/Mono`。
+### 1.6 圖示
 
-## 7. 世界舞台（首頁心臟，`components/world/`；降級鏈是重點）
+統一使用 **lucide-react**，具名匯入（`XxxIcon`），mds 元件內 SVG 自動 `size-4`（xs/sm 尺寸自動降為 size-3 / size-3.5）。禁 emoji 當功能圖示。
 
-- **技術**：PixiJS，`Application.init({ preference:'webgl' })`——**禁 WebGPU**（嵌入殼 adapter hang 死坑）；
-  init **10s timeout** + 錯誤面板 + 重試。600×600 原生場景等比縮放。palette 從 CSS token 讀值，主題即時重建。
-- **資料驅動**（openhuman state-driven）：控制器（`useWorldState`）訂閱 `agents.status` + `activity.subscribe`
-  推 `AgentState{x,y,action,facing,say}`；渲染器（`stage-scene`）只平滑逼近，**不含業務邏輯**。
-  泡泡用 `Intl.Segmenter` CJK-safe 截斷，8s 淡出。
-- **可點物件**：員工→右欄員工卡；佈告欄(inbox badge)→/inbox；白板→/tasks；大門→通道狀態；金庫[mgr]→帳務。
-- **降級鏈（`resolveStageMode` 純函數，已測）**：
-  `reduced-motion` **或** WebGL 不可用 **或** 使用者切「⊞ 清單」 → **靜態插畫 + 角色頭像格**
-  （`WorldStageStatic`，同資料、無 canvas）；**行動版預設 static**（省電，可覆蓋）；toggle 記憶
-  `duduclaw:home:stage-mode`，`stagePossible` 才顯示切換鈕。**世界永遠是增強，不是唯一入口。**
-- **a11y**：舞台容器 `role="img"` + `aria-label`（`home.stage.aria`）；靜態版同樣具名。
+### 1.7 動效與 reduced-motion 紀律
 
-## 8. 遊戲化紀律（全部真數據，禁止造假）
+- 浮層進退場：`duration-100` + `animate-in fade-in-0 zoom-in-95` / `animate-out fade-out-0 zoom-out-95`，方向性 `slide-in-from-*-2`（`tw-animate-css`）。實作走 base-ui 的 `data-*` 過場屬性。
+- Sidebar 開合 `transition-[width] duration-200 ease-out`；右側 detail panel 220ms `cubic-bezier(0.22,1,0.36,1)`（按鈕觸發才動畫，拖曳為 snap）。
+- 按鈕按下 `active:translate-y-px`；tooltip delay 500ms；popover `sideOffset=4`；頂部導航進度條 2px `bg-brand` 掃動。
+- **reduced-motion 是硬紀律**：`index.css` 所有 keyframes 都 gate 在 `@media (prefers-reduced-motion: no-preference)`；另有全域斷路器 `@media (prefers-reduced-motion: reduce)` 把 `animation-duration` / `transition-duration` 壓到 `0.01ms`。JS 驅動的動態（世界舞台、慶祝粒子）另有 JS gate。新增任何動效都必須落在這道 gate 之後。
 
-**核心原則：XP/等級/成就是「既有事實的計分呈現」，不影響任何 agent 行為；判定是純函數、重算永遠可重現。**
+---
 
-- **持久層在 gateway**（拍板 ③=B）：`growth.db`（SQLite/WAL）+ RPC `growth.snapshot` / `growth.daily_report`；
-  XP/成就判定引擎在後端（讀 analytics/tasks/skills/wiki/reliability 既有真實資料），單一權威、跨裝置一致、
-  時間戳可稽核。**前端只讀不算**：`stores/growth-store.ts` 快取 snapshot 並 **diff 前後** 只在真轉態時
-  觸發 §8.1 慶祝一次（首個 snapshot 永不慶祝，避免 firehose）。RPC 不可用 → 顯示「成長資料暫不可用」，
-  不做前端估算。
-- **XP 來源**：完成任務 +12／技能習得 +25／知識頁 +8／例行連續 +5／成就一次性。等級 `Lv=floor(sqrt(XP/100))`。
-- **成就牆**（`components/growth/achievements-def.ts`，i18n key）：id 對映後端（first_agent / first_task_done /
-  tasks_100 / knowledge_100 / skills_10 / inbox_zero_streak_7 / custom_skill_first / custom_skill_saved_100h …）。
-  `available:false` 的成就（無每日快照 / 無 per-skill 計數）顯示「暫不可用」**而非假 0 進度**。
-- **員工個人成長**：員工 Lv（完成數+技能推導，前端**明標推算基準**）、徽章=真技能、心情=prediction/mistake 訊號。
-- **日報結算卡**（`DailyReportCard`）：每日首開一次，讀 `growth.daily_report`。
-- **慶祝時刻總表**（`CelebrationLayer` 接點；全部尊重 reduced-motion → 降級為靜態 toast）：
+## 2. 元件庫（`components/mds/`）
 
-| 時刻 | 效果 |
-| --- | --- |
-| 任務完成 | confetti 小 + 角色 celebrating + `+12 XP` 浮出 |
-| Inbox Zero | 彩帶 + DuDu celebrating + 稱讚 copy |
-| 成就解鎖 | badge-pop + **DuDu proud（transient face 4s）** + toast |
-| 員工入職 | 世界大門走入 + 歡迎泡泡 |
-| 升級 | XP 膠囊 badge-pop（`levelUpNonce`）+ DuDu proud |
+從 barrel `@/components/mds` 匯入。頁面**組合**這些元件，不重新 style（不要往 mds 元件塞 ad-hoc class 蓋掉它的 variant）。
 
-## 9. 資訊架構（v2 路由，`App.tsx` + `layout/nav-model.ts` 單一 nav 源）
+### 2.1 視覺原語（primitives）
 
-心智模型不變（AI 員工公司），落點方式全變。**舊 v1 legacy 別名全部保留 301。**
+| 元件 | 說明 |
+|---|---|
+| `Button` / `buttonVariants` | CVA 驅動，8 variant × 8 size（見 §2.3） |
+| `Card` 家族 | `Card` / `CardHeader` / `CardTitle` / `CardDescription` / `CardAction` / `CardContent` / `CardFooter`；`data-size=sm` 縮排 |
+| `Badge` / `badgeVariants` | 膠囊，5 variant（default / secondary / destructive / outline / ghost） |
+| `Input` / `Textarea` | `h-8 rounded-lg border-input`，`aria-invalid` 轉紅 |
+| `Select` 家族 | trigger + content + item + label + separator，尾 ChevronDown |
+| `Dialog` 家族 | overlay `bg-black/10 backdrop-blur-xs` + 置中 content + header/footer |
+| `DropdownMenu` 家族 | content / item（destructive variant）/ label / separator / shortcut |
+| `Tabs` 家族 | `TabsList` / `TabsTab` / `TabsPanel`，`default` 與 `line` 兩式 |
+| `Segmented` | 分段控制（報表頁切系列 / 時間範圍） |
+| `Table` 家族 | 語義表格原語 |
+| `Tooltip` 家族 | 輕框，delay 500 |
+| `Popover` 家族 | Display / Filter 類彈出面板 |
+| `Switch` / `Checkbox` / `Separator` / `Skeleton` | 基礎控制與骨架 |
+| `Sheet` 家族 | 行動抽屜 / 右側面板 |
+| `Empty` | 空 / 錯誤狀態（圓底 icon + title + 說明 + 選配 action） |
+| `Spinner` | braille 等寬 spinner |
+| `SubmitButton` | ArrowUp / Square / Loader2 三態送出鈕（對話輸入） |
+
+### 2.2 版型件（layout layer）
+
+| 元件 | 說明 |
+|---|---|
+| `Sidebar` 全家 | `SidebarProvider` / `Sidebar` / `SidebarRail` / `SidebarHeader/Content/Footer` / `SidebarGroup(+Label)` / `SidebarMenu(+Item/Button/Badge)` / `SidebarTrigger` / `SidebarInset` + `useSidebar` / `useIsMobile` |
+| `PageHeader` | 每頁自帶的 `h-12` header（無全域 topbar） |
+| `CollectionPageHeader` / `CollectionPageState` / `toCompactAction` | 集合頁 header + 空 / 載入 / 錯誤狀態 |
+| `BreadcrumbHeader` / `BreadcrumbSegment` | 詳情頁麵包屑 header |
+| `SettingsShell` / `SettingsTab` / `SettingsSection` / `SettingsCard` / `SettingsRow` / `SettingsSaveState` | Settings 式版型原語（見 §3.3） |
+| `ResizablePanelGroup` / `ResizablePanel` / `ResizableHandle` | list+detail split（包 react-resizable-panels） |
+| `ListGridContainer` / `ListGridHeader(Cell)` / `ListGridRow` / `ListGridCell` / `useRowLink` | Linear 風列表 + 虛擬捲動 + container query（見 §3.1） |
+| `ActorAvatar` | 統一頭像（見 §2.4） |
+| `NavProgress` | 頂部路由進度條（接 Suspense pending） |
+
+### 2.3 Button variant 對映表
+
+Base：`inline-flex items-center justify-center rounded-lg border border-transparent text-sm font-medium` + `focus-visible:ring-3 focus-visible:ring-ring/50` + `active:translate-y-px` + `disabled:opacity-50`。
+
+| variant | 語義 | recipe |
+|---|---|---|
+| `default` | 主要動作（近黑 / dark 近白） | `bg-primary text-primary-foreground hover:bg-primary/80` |
+| `outline` | 次要 | `border-border bg-background hover:bg-muted` |
+| `brand` | 品牌強調 CTA | `bg-brand text-brand-foreground hover:bg-brand/90` |
+| `brandSubtle` | 輕品牌底 | `border-brand/28 bg-brand/7 hover:bg-brand/12` |
+| `secondary` | 群組內次動作 | `bg-secondary hover:bg-secondary/80` |
+| `ghost` | 無底（icon 鈕 / 列內動作） | `hover:bg-muted` |
+| `destructive` | 破壞性 | `bg-destructive/10 text-destructive hover:bg-destructive/20` |
+| `link` | 純文字連結 | `text-primary hover:underline` |
+
+Size：`default h-8` / `xs h-6` / `sm h-7` / `lg h-9` / `icon size-8` / `icon-xs size-6` / `icon-sm size-7` / `icon-lg size-9`。
+
+Badge variant：`default`（bg-primary）/ `secondary` / `destructive`（`bg-destructive/10 text-destructive`）/ `outline` / `ghost`。
+
+### 2.4 ActorAvatar
+
+全站唯一頭像元件。`actorType`（`user` / `agent` / `system` / `squad`）決定 lucide fallback 圖示；sizes `xs`16 / `sm`20 / `md`24 / `lg`32 / `xl`40 / `2xl`56（px）；可 `showStatusDot`（右下 `size-1.5 rounded-full` 可用性彩點）。**紀律：全站出現 AI 員工名字的地方一律帶 avatar**，樣式為圓形 + `ring-1`、無漸層光暈。
+
+---
+
+## 3. 五種版型範式
+
+每個頁面都落在以下五種範式之一。選對範式、套對骨架，頁面就與全站一致。
+
+### 3.1 集合頁（ListGrid）
+
+列表 / 名冊 / 資源清單。`CollectionPageHeader`（entity icon + `h1 text-sm font-medium` + count（mono）+ description）+ `ListGrid`。
 
 ```
-/                首頁「事務所」 — 問候HUD + 世界舞台 + 需要我 + 正在進行直播卡
-/inbox           收件匣         — paperclip 五 tab（我的/最近/未讀/阻塞/全部）混流 + j/k 鍵盤流
-/chat            對話           — DuDu 置中 + 工具步驟樹；/webchat 301
-/tasks           任務           — 列表⇄看板雙視圖
-/tasks/:id       任務詳情       — 中央單欄 + 右欄 IssueProperties + 底部 tabs（旗艦面）
-/routines        例行工作
-/reports         產出
-/forks           並行分身 [mgr]
-/agents          員工名冊       — 角色卡 roster
-/agents/:id/:tab 員工詳情       — bust 立繪 + 心情 + 徽章 + run 帳本
-/org             團隊 [mgr]     — 組織圖（節點=角色頭像卡）
-/memory          記憶（Brain）
-/skills          技能           — 我的技能⇄市集 tab
-/skills/new      自建技能精靈   — 人類×Agent 協作起草 + 上級核准（4 步 DuDu 陪同）
-/skills/custom/:id 自建技能詳情 — 狀態/內容/審批歷史/省時統計
-/knowledge       知識庫         — 個人⇄共享 tab
-/growth          成長           — 公司等級/XP/成就牆/日報卡
-/manage/*        管理室 [mgr+]  — 11 節點樹（ManageShell subnav）
-/login /welcome /wizard          — 入口三頁，DuDu 接待員化
-/mascot-overlay                  — Tauri 桌寵迷你路由
-/world → 301 /   （世界併入首頁，不再孤立）
+<div className="flex flex-1 min-h-0 flex-col">
+  <CollectionPageHeader icon={…} title count description action={toCompactAction(…)} />
+  <ListGridContainer template="…" virtual={…}>
+    <ListGridHeader> … <ListGridHeaderCell sortable/> … </ListGridHeader>
+    <ListGridRow>  … <ListGridCell/> …  </ListGridRow>   // useRowLink 整列導航
+  </ListGridContainer>
+</div>
 ```
 
-RPC → 頁面**零遺漏**映射：見設計文件附錄 A（164 dispatch arm 逐條落點，`connect.challenge` 為連線層，
-零無家可歸）。
+要點：單行管理列 `h-12`、雙行列（帶 avatar）`h-16`；`hover:bg-accent/40`、選中 `bg-accent/30`；整列導航用 `useRowLink`（非 `<a>` 包整列），真連結放 name cell；checkbox / kebab hover 才現形且 `stopPropagation`。container query 響應式（`@2xl` 顯示全欄，以下收次要欄）；虛擬捲動 header `sticky top-0`。
 
-### 9.1 Measure / terminology table（zh-TW UI copy，拍板 2026-07-08，沿用）
+### 3.2 詳情頁（三式）
 
-非工程受眾 — 內部術語永不外露。新 copy 必先進本表、再進三語 catalogue。
+1. **BreadcrumbHeader 式**（任務詳情）：`BreadcrumbHeader`（段落 + `ChevronRight`，leaf 可截斷）+ 右動作群。主體 = 左內容 `mx-auto max-w-4xl px-8 py-8`（標題就地編輯）+ 右 320px 可折疊 panel（行動版轉 Sheet）。
+2. **Hero header 式**（員工詳情）：`border-b px-4 sm:px-6 pb-5 pt-3` 內 `mx-auto max-w-[1440px]`；麵包屑列 → `ActorAvatar` 2xl + 名（`text-xl sm:text-2xl font-semibold`）+ presence + meta 列 + 右動作。下接 `line` Tab 列（總覽 / 工作 / 能力 / 設定）；能力與設定分頁內再用 master-detail（左 `aside md:w-52 border-r p-4` rail + 右 `max-w-3xl p-4 md:p-8`）。
+3. **Settings 式**（見 §3.3）。
 
-| Concept | zh-TW UI copy | Never show |
-| --- | --- | --- |
-| agent | **AI 員工** | agent / 代理 |
-| session | 對話 | session |
-| skill | 技能 | — |
-| cron | 例行工作 | cron |
-| — | — | MCP / runtime / PTY |
+### 3.3 Settings 式（設定 / 管理區 / 員工能力·設定子分頁）
 
-## 10. Per-page rebuild checklist（可重複方法）
+`SettingsShell`：桌面左 vertical rail（`md:w-56 md:border-r`，分組帶 group label）+ 右 `mx-auto max-w-3xl p-4 md:p-8` 獨立捲動；行動版 rail 轉水平橫捲。分頁狀態存 `?tab=`（replace + whitelist）；空組自動消失、fail-closed 導回。
 
-1. **Read** 現頁；列出每個 data source（stores/api）與 action。**保留所有行為** — 這是視覺/結構重設計。
-2. `<Page>` + `<PageHeader title subtitle actions>` 包起。
-3. 用 `Card/Section/StatCard/Tabs` 取代 ad-hoc；agent 名字處掛 `CharacterAvatar`；機器值用 `<Mono>`。
-4. 軟卡化：`glass-card`→`panel`（軟浮）；radius 升 `rounded-card`；spacing 依 §2；空資料用 `EmptyState`（配 DuDu pose）。
-5. 屬性/詳情走**右欄 PanelContext**；慶祝接點掛 `CelebrationLayer`。
-6. i18n：所有字串走 `intl.formatMessage`，新 key **同 commit 進三語 catalogue**（zh-TW/en/ja-JP 完全一致）。
-7. **Verify**：`npx tsc -b` + `npx vitest run` + `npm run build` 綠；心中跑 `audit`/`critique`
-   （a11y、對比、overflow、鍵盤、reduced-motion）。
-8. 不動 store/api signature；diff 行為保守。
+```
+<SettingsShell nav={groups} value={tab} onValueChange={…}>
+  <SettingsTab title description>              // h2 text-xl font-semibold + 說明
+    <SettingsSection title>
+      <SettingsCard>                            // divide-y divide-surface-border
+        <SettingsRow label description tier>…</SettingsRow>   // label 左、控制右
+      </SettingsCard>
+    </SettingsSection>
+    <SettingsSaveState status />                // idle / saving / saved / error
+  </SettingsTab>
+</SettingsShell>
+```
 
-## 11. Reusable refactor workflow（把流程變成可重複方法）
+`SettingsRow`：`min-h-16 px-4 py-3.5 sm:flex-row sm:justify-between`，控制欄寬 tier — `text` w-96 / `select-wide` w-72 / `select` w-48 / `code` w-40。
 
-v2 的可重播配方 — 未來任何再設計/新頁批次沿用：
+### 3.4 報表 / Usage 式
 
-1. **Understand intent** — 目標美學 + 品牌約束寫進 §1 before/after 表。設計 skills 參考：
-   `teach-impeccable`（蒐集）、`critique`（評估）、`design-taste-frontend`（乾淨美學，**adapt 不照抄**：
-   保留 Lucide + 🐾 + glass-for-chrome + 角色系統）。
-2. **Tokens first** — 擴 `src/index.css`（`@theme` + CSS vars + `@utility`）；加 Soft Play 層（§2）。禁 hardcode。
-3. **Primitives**（`components/ui/` + barrel）— 小可組合集（§6.1）；頁面 compose，never re-style。
-4. **Shell + IA** — 單一 nav 源（`nav-model.ts`）、三欄殼、HUD；group i18n key 進三語。
-5. **Reference surface** — 手工先遷一個旗艦面（`/tasks/:id`）；`npx tsc -b` 綠才 fan out。
-6. **Fan out** — 平行 sub-agent 分批（~6/批）。每 agent 拿：本檔 + barrel + 旗艦面 + §10 checklist。
-   **Anti-conflict 鐵律：**
-   - agents **不編輯 `src/i18n/`**（並發寫入危害）——重用既有 key，或用暫存 `_wN-*-keys.json` 交波間 gate 合併；
-   - agents **不跑 `tsc -b`**（build-info race）——orchestrator 每批跑 ONE 合併 `tsc -b`；
-   - **⛔ agents 絕對禁止用任何 git 寫入指令驗證**（`stash / checkout / reset / add / commit`）。
-     **教訓（W7 事故）**：子代理在多方 WIP 樹上跑 `git stash` 驗證、pop 衝突致樹半殘 + WIP 被 stage +
-     13 個已刪測試檔自 HEAD 復活，指揮花大量 context 收斂。**驗證一律直接讀 `tsc`/`vitest` 輸出，不碰 git。**
-7. **Verify**（§10 point 7）— `tsc -b` + `vitest run` + `npm run build` + `audit`/`critique` 綠；
-   修 criticals（focus ring、search `aria-label`、對比、reduced-motion）。
-   **Gotcha**：部分 `*.test.tsx` 斷言頁面 H1 文案 — 規格變更（如 roster 預設改角色卡）要**同步更新測試**
-   （這是規格變更，非遷就實作），非規格變更則保留原 title i18n key。
+`mx-auto max-w-6xl space-y-5 p-6`：KPI 列（`grid sm:grid-cols-2 lg:grid-cols-4` 的 `rounded-lg border bg-card`，divide 分隔，數字可動畫）→ 趨勢卡（`p-4` + `Segmented` 切系列，`min-h-[240px]`，純 SVG 圖表用 `--chart-*`）→ 排行卡（grid 列：`ActorAvatar` + 名 / 進度條 `h-2 rounded-full bg-muted` + `bg-chart-1` / 數欄 `tabular-nums`）。Header 可換行（`h-auto min-h-12 flex-wrap`）+ Select 篩選 + Segmented 時間範圍。
 
-## 12. Accessibility & resilience（`audit` / `harden` 驅動）
+### 3.5 List + Detail split
 
-- **WCAG 2.1 AA 對比**雙主題：軟卡 `shadow-soft` 下實測 — 次要文字 `text-stone-500 dark:text-stone-400`
-  在暖白 panel（≈99% 白）4.7–4.8:1、dark panel 6.9:1，**達 AA**；status icon 用 `-icon-` OKLCH 變體（≥4.5:1）。
-- **focus-visible ring** 全互動：`Button`/`RosterCard`/`HireSlotCard`/InboxRow 動作鈕/view-toggle tab/wizard 步驟
-  皆 `focus-visible:ring-2 ring-amber-500/50`；InboxRow 走 `role="option"` roving-selection（j/k + selection ring）。
-- **鍵盤**：native `<dialog>` + `showModal()`（`components/shared/Dialog.tsx`）→ Esc 關閉 + focus-trap 天然具備
-  （CreateTaskModal / DailyReportCard / remove-confirm 皆沿用）；`/skills/new` 為**路由頁非 modal**（正常 tab 流）。
-- **reduced-motion**：全 keyframes gate 在 `no-preference` + 全域 reduce 斷路器；世界舞台/CelebrationLayer/
-  viseme/桌寵 另有 JS gate（`resolveStageMode`、`celebrate()` 粒子抑制）。
-- **canvas / SVG**：世界容器 `role="img"`+label；`CharacterAvatar`/`DuDu` wrapper `role="img"`+label、內層 SVG `aria-hidden`。
-- Text overflow：truncate + title；tables scroll-x；長 CJK wrap。每個 async surface 有 loading + empty + error。
+雙欄工作台（收件匣 / 對話 / 執行紀錄）。`ResizablePanelGroup`：左列表 320（min 240 max 480，偏好記憶）+ 右 detail（`minSize 40%`）。行動版改全螢幕切換 + `h-12 border-b` 返回列（ArrowLeft）。未選中：置中 `text-muted-foreground/30` icon + 提示。
 
-## 13. 審批與信心呈現（U2/U3 實證準則）
+---
 
-依 CHI/FAccT 2026 實證重設審批介面（`lib/approval-risk.ts` 純函式 + `inbox/ApprovalDetailPanel.tsx`）。準則：
+## 4. App Shell 與導航
 
-- **計畫優先於執行**（arXiv:2604.04918）：審批卡**先講「這位 AI 員工打算做什麼」**（白話 action 描述 +
-  影響範圍 + 涉及工具/對象），approve/deny 按鈕排在讀完摘要之後，不是開場就給一對按鈕。
-- **輔助捷思、不假設細讀**（arXiv:2606.05391）：真人是 good-enough 審查者，不會逐項看。用**風險徽章**
-  （`approvalRisk(kind,payload)` → low/medium/high → emerald/amber/rose token）給一眼可判的訊號；完整
-  payload 收在**一鍵抽查**（opt-in 展開）後，不強迫閱讀。**高風險（skill_create / agent_hire / 安檢未過）
-  approve 前走 `ConfirmDialog` 二次確認**。
-- **不確定性只到整體層級**（FAccT arXiv:2605.28571 反直覺結論：顯示過細助長過度信賴）：信心/風險呈現
-  **停在整個動作層級的單一徽章**，**禁止 token 級高亮或逐項機率條**——過度細緻的把握度標示會讓使用者
-  更盲信，反而降低審查品質。
-- **疲勞保護**（arXiv:2606.08919）：Inbox 頂部顯示**當日已審批量**（`bumpApprovedToday`，達
-  `FATIGUE_NUDGE_THRESHOLD` 時轉 amber 提示），同類 pending 審批 ≥ `SIMILAR_BATCH_THRESHOLD` 時給
-  「這批同類，抽查一項代表全批」提示。**只降認知負擔，永不自動批准**。
-- **誠實**：SKIPPED / 安檢 finding / 風險原因**原樣呈現不美化**（沿用 §12 誠實回報精神）。
+- Root：`SidebarProvider` 容器 `h-svh bg-app-shell` + 左 `Sidebar variant="inset"`（浮島，`p-2`）+ 右 `SidebarInset`（`bg-page-canvas m-2 rounded-xl ring-1 ring-surface-border shadow`）。**無全域 topbar，每頁自帶 `PageHeader`。**
+- Sidebar 寬 256（可拖 200–360，存 localStorage），可折疊 icon 模式，行動版轉 Sheet 抽屜。
+- 導航分組（單一來源 `layout/nav-model.ts`）：**個人**（首頁 / 收件匣 / 對話）→ **工作**（任務 / 計畫 / 執行紀錄 / 畫布 / 例行 / 時間軸 / 用量 / 並行分身）→ **公司**（員工 / 團隊 / 世界 / 記憶 / 技能 / Widget / 知識庫 / 成長）→ **設定**（管理 / 關於）。非管理者整組依可見性規則隱藏。
+- Menu item：`rounded-md p-2 h-8 text-sm`，未選 `text-muted-foreground`，hover `bg-sidebar-accent/70`，active `bg-sidebar-accent text-sidebar-accent-foreground font-medium`。active 判定 `pathname === href || startsWith(href + "/")`。
+- Sidebar footer 承載：主題切換、Edition / 升級卡、成本 / XP 摘要（原 header HUD 內容遷入）；語言 / 登出在公司下拉。⌘K 開 Command Palette。
+
+---
+
+## 5. 工程紀律
+
+1. **Token-only，禁 hardcode。** 顏色走 OKLCH token / Tailwind color utility，尺寸走 radius / spacing scale，陰影走 `--*-shadow`。任何 `#hex`、裸 `px`、手寫 rgba 陰影都是 bug。改一個 token 必須雙主題（`:root` + `.dark`）同步。
+2. **i18n 三語同步。** 所有面向使用者字串走 `intl.formatMessage`；**新增 key 必在同一 commit 內補齊 `en` / `ja-JP` / `zh-TW` 三份 catalogue**，數量與 key 完全一致。UI 用使用者視角詞彙，不外露內部術語（agent 稱「AI 員工」、session 稱「對話」、cron 稱「例行工作」；MCP / runtime / PTY 等永不出現在 UI）。
+3. **a11y 是預設而非附加。** WCAG 2.1 AA 對比雙主題；所有互動元件 `focus-visible` ring 統一 `ring-3 ring-ring/50`；鍵盤可達（Dialog 走 Esc + focus-trap、列表可 roving-selection）；canvas / SVG 容器 `role="img"` + `aria-label`、內層裝飾 SVG `aria-hidden`；文字 overflow 一律 truncate + `title`，表格 scroll-x，長 CJK wrap；每個 async 面都有 loading / empty / error 三態。
+4. **功能元件 vs 視覺原語的邊界。** mds 是**視覺原語**——只管長相與互動語彙，不含業務邏輯。功能元件（審批風險判定、世界舞台狀態機、圖表資料計算、角色生成）**組合** mds 原語但把邏輯留在自己身上；反過來不要把業務條件寫進 mds。頁面 compose 原語，不 re-style 原語。
+5. **保守遷移行為。** 重設計是換視覺 / 結構，**功能一個不減**：不動 store / api signature，行為 diff 保守。規格變更（如列表預設視圖改變）要同步更新對應 `*.test.tsx` 斷言（這是規格變更，非遷就實作）。
+
+### 5.1 刻意殘留清單（**不是**待清理債務）
+
+以下項目刻意不套 mds token / 樣式，改動前先確認你不是在「修正」一個刻意設計：
+
+- **Terminal / 執行紀錄深色框**：終端輸出區維持深色等寬框（可讀性語彙），不跟隨明暗主題翻白。
+- **d3 圖譜 palette**：記憶 / 知識圖譜的 d3 力導向圖有自己的節點 / 邊配色，不改用 `--chart-*`。
+- **世界舞台（PixiJS）**：`/world` 的等距場景是 canvas 渲染，palette 從 CSS token 讀值即時重建，但其 sprite / tint 體系獨立於 mds 元件層。
+- **平台識別色**：通道設定裡各平台（Telegram / Discord / Slack / LINE …）的品牌識別色為資料值，刻意保留以利辨識，不 token 化。
+- **經銷商白牌（BrandingTab）資料值**：白牌自訂的顏色 / logo 是租戶資料，不是設計 token。
+
+---
+
+## 6. 新頁 / 改頁 checklist
+
+1. Read 現頁：列出每個 data source（stores / api）與 action，**保留所有行為**。
+2. 選定 §3 的版型範式，套上 `PageHeader` / `CollectionPageHeader` / `BreadcrumbHeader` / `SettingsShell` 骨架。
+3. 用 mds 原語取代 ad-hoc；AI 員工名字處掛 `ActorAvatar`；機器值用 `font-mono tabular-nums`；空資料用 `Empty` / `CollectionPageState`。
+4. i18n：字串走 `intl.formatMessage`，新 key 同 commit 進三語。
+5. 屬性 / 詳情走右欄 panel 或 split（§3.2 / §3.5）。
+6. Verify：`npm run build` + `npx vitest run` 綠；心中跑 a11y / 對比 / overflow / 鍵盤 / reduced-motion 一遍。
+7. 不動 store / api signature；規格變更同步改測試。
+
+---
+
+## 附：驗證指令
+
+```bash
+cd web
+npm run build        # 產物輸出到 crates/duduclaw-dashboard/dist/（gateway 以 rust_embed 內嵌）
+npx vitest run        # 單元 / 元件測試
+```
+
+Rust 端內嵌：`crates/duduclaw-dashboard` 用 `rust_embed` `#[folder = "dist/"]` 內嵌 SPA，`cargo build -p duduclaw-gateway` 會把最新 `dist/` 打進 gateway。改動儀表板後先 `npm run build` 再 build gateway。

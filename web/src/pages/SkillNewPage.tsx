@@ -1,19 +1,23 @@
 import { useIntl } from 'react-intl';
-import { Wand2 } from 'lucide-react';
-import { Page, PageHeader } from '@/components/ui';
+import { useNavigate } from 'react-router';
+import { BreadcrumbHeader } from '@/components/mds';
 import { SkillWizard } from '@/components/skills/SkillWizard';
 
-/** `/skills/new` — the self-serve skill wizard (V13 / §5.6 / T13.1). */
+/** `/skills/new` — the self-serve skill wizard (V13 / §5.3 / T13.1). */
 export function SkillNewPage() {
   const intl = useIntl();
+  const navigate = useNavigate();
   return (
-    <Page>
-      <PageHeader
-        icon={Wand2}
-        title={intl.formatMessage({ id: 'skills.new.title' })}
-        subtitle={intl.formatMessage({ id: 'skills.new.subtitle' })}
+    <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+      <BreadcrumbHeader
+        segments={[
+          { label: intl.formatMessage({ id: 'nav.skills' }), onClick: () => navigate('/skills') },
+          { label: intl.formatMessage({ id: 'skills.new.title' }) },
+        ]}
       />
-      <SkillWizard />
-    </Page>
+      <div className="mx-auto w-full max-w-4xl px-5 py-6 md:px-8 md:py-8">
+        <SkillWizard />
+      </div>
+    </div>
   );
 }

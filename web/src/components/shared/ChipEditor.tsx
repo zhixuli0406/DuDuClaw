@@ -1,7 +1,8 @@
 import { useState, type KeyboardEvent } from 'react';
 import { X, Plus } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { inputClass } from './Dialog';
+import { Button } from '@/components/mds';
+import { inputClass } from './controlClass';
 
 interface ChipEditorProps {
   /** Current list of values (immutable — parent owns state). */
@@ -49,13 +50,13 @@ export function ChipEditor({ values, onChange, placeholder, addLabel }: ChipEdit
           {values.map((v, idx) => (
             <span
               key={`${v}-${idx}`}
-              className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+              className="inline-flex items-center gap-1 rounded-full bg-brand/12 px-2.5 py-0.5 text-xs font-medium text-brand"
             >
               {v}
               <button
                 type="button"
                 onClick={() => remove(idx)}
-                className="rounded-full p-0.5 hover:bg-amber-200/60 dark:hover:bg-amber-800/40"
+                className="rounded-full p-0.5 hover:bg-brand/20"
                 aria-label={`remove ${v}`}
               >
                 <X className="h-3 w-3" />
@@ -73,14 +74,10 @@ export function ChipEditor({ values, onChange, placeholder, addLabel }: ChipEdit
           placeholder={placeholder}
           className={cn(inputClass, 'flex-1')}
         />
-        <button
-          type="button"
-          onClick={add}
-          className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-stone-300/70 bg-white/50 px-3 py-2 text-sm font-medium text-stone-700 backdrop-blur transition-colors hover:bg-white/80 dark:border-white/10 dark:bg-white/5 dark:text-stone-300 dark:hover:bg-white/10"
-        >
+        <Button type="button" variant="outline" onClick={add} className="shrink-0">
           <Plus className="h-4 w-4" />
           {addLabel}
-        </button>
+        </Button>
       </div>
     </div>
   );

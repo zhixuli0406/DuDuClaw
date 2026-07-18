@@ -31,7 +31,7 @@ export function AchievementBadge({
   return (
     <div
       className={cn(
-        'panel flex items-start gap-3 p-3',
+        'flex items-start gap-3 rounded-xl border border-surface-border bg-surface p-3 shadow-[var(--surface-shadow)]',
         !unlocked && 'opacity-70',
         className,
       )}
@@ -39,27 +39,27 @@ export function AchievementBadge({
     >
       <span
         className={cn(
-          'grid h-11 w-11 shrink-0 place-items-center rounded-card ring-1 ring-inset',
+          'grid h-11 w-11 shrink-0 place-items-center rounded-2xl ring-1 ring-inset',
           unlocked
-            ? 'bg-amber-500/15 text-amber-600 ring-amber-500/30 dark:text-amber-300'
-            : 'bg-stone-500/10 text-stone-400 ring-stone-500/15 grayscale dark:text-stone-500',
+            ? 'bg-brand/15 text-brand ring-brand/30'
+            : 'bg-muted text-muted-foreground ring-border grayscale',
         )}
       >
         {unlocked ? <Icon className="h-6 w-6" /> : <Lock className="h-5 w-5" aria-hidden="true" />}
       </span>
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-semibold text-stone-900 dark:text-stone-50">{name}</p>
+        <p className="truncate text-sm font-semibold text-foreground">{name}</p>
         {description && (
-          <p className="mt-0.5 line-clamp-2 text-xs text-stone-500 dark:text-stone-400">{description}</p>
+          <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{description}</p>
         )}
         {unlocked ? (
           unlockedAt && (
-            <p className="mt-1 font-mono text-[0.6875rem] tabular-nums text-stone-400 dark:text-stone-500">
+            <p className="mt-1 font-mono text-[0.6875rem] tabular-nums text-muted-foreground">
               {unlockedAt}
             </p>
           )
         ) : (
-          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-stone-500/15 dark:bg-white/10">
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
             <div className="h-full rounded-full bg-[color:var(--xp)]" style={{ width: `${pct}%` }} />
           </div>
         )}

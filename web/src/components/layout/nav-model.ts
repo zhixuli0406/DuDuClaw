@@ -13,6 +13,7 @@ import {
   Network,
   Brain,
   Puzzle,
+  LayoutGrid,
   BookOpen,
   Trophy,
   Radio,
@@ -62,18 +63,20 @@ export type NavGroup = {
 };
 
 /**
- * Single source of truth for the "嘟嘟事務所" navigation (dashboard-redesign-v2
- * §4.2). The Sidebar renders, top to bottom:
- *   1. `dailyItems` — flat, no header (Home / Inbox / Chat).
- *   2. the `工作` group (`navGroups[0]`) — collapsible.
+ * Single source of truth for the "嘟嘟事務所" navigation, re-grouped for the
+ * Multica app shell (WP0.4, spec §5.1). The Sidebar renders, top to bottom:
+ *   1. `dailyItems` — flat, no group label (Home / Inbox / Chat).
+ *   2. the `工作` group (`navGroups[0]`) — collapsible GroupLabel.
  *   3. a LIVE 員工 zone — dynamic, sourced from the agents store, not static
- *      nav items (see Sidebar). `staffEntry` is its "全部員工 →" link.
- *   4. the `公司` group (`navGroups[1]`) — collapsible — plus `manageEntry`.
+ *      nav items (see AppSidebar). `staffEntry` is its "全部員工 →" link.
+ *   4. the `公司` group (`navGroups[1]`) — collapsible.
+ *   5. the `設定` group (`navGroups[2]`) — collapsible: 管理 + 關於.
  *
- * `navGroups` deliberately excludes the daily + staff + manage items so the
- * two collapsible sections map 1:1 to their render blocks; the command palette
- * and breadcrumb resolver fold `dailyItems` / `staffEntry` / `manageEntry` back
- * in (see `crumbsFor` + CommandPalette).
+ * `navGroups` deliberately excludes the daily items so the flat daily row maps
+ * 1:1 to its render block; the command palette and breadcrumb resolver fold
+ * `dailyItems` back in (see `crumbsFor` + CommandPalette). `staffEntry` /
+ * `manageEntry` are also referenced inside `navGroups` so ⌘K + breadcrumbs reach
+ * them, and re-exported standalone for the live staff zone.
  *
  * Gating is per item (`minRole` / `enterprise` / `ownScope` / `operatorOnly`,
  * see `nav-visibility.ts`); a group hides entirely when the viewer can see none
@@ -87,6 +90,32 @@ export const dailyItems: NavItem[] = [
   { to: '/inbox', icon: Inbox, label: 'nav.inbox', desc: 'nav.inbox.desc', badge: 'inbox' },
   { to: '/chat', icon: MessageCircle, label: 'nav.chat', desc: 'nav.chat.desc', ownScope: true },
 ];
+
+/**
+ * The 員工 roster entry — the "全部員工 →" link under the LIVE staff zone, the
+ * lead item of the 公司 group, and the target the command palette exposes for
+ * jumping to the roster.
+ */
+export const staffEntry: NavItem = {
+  to: '/agents',
+  icon: Users,
+  label: 'nav.agents',
+  desc: 'nav.agents.desc',
+  ownScope: true,
+};
+
+/**
+ * The single Zone D entry — first item of the 設定 group. Visible from `manager`
+ * up; each sub-item re-gates itself inside the ManageShell. `employee` never
+ * sees the 管理 entry.
+ */
+export const manageEntry: NavItem = {
+  to: '/manage',
+  icon: Building2,
+  label: 'nav.manage',
+  desc: 'nav.manage.desc',
+  minRole: 'manager',
+};
 
 export const navGroups: NavGroup[] = [
   {
@@ -113,45 +142,30 @@ export const navGroups: NavGroup[] = [
     ],
   },
   {
-    // 公司 — team, memory, skills, knowledge, growth (管理 appended separately).
+    // 公司 — staff, team, world, memory, skills, widgets, knowledge, growth.
     label: 'navGroup.company',
     items: [
+      staffEntry,
       { to: '/org', icon: Users2, label: 'nav.team', desc: 'nav.team.desc', minRole: 'manager' },
       { to: '/world', icon: Globe2, label: 'nav.world', desc: 'nav.world.desc', ownScope: true },
       { to: '/memory', icon: Brain, label: 'nav.memory', desc: 'nav.memory.desc', ownScope: true },
       { to: '/skills', icon: Puzzle, label: 'nav.skills', desc: 'nav.skills.desc' },
+      // Widget 工坊 — custom dashboard cards (AI-built / HTML / shared).
+      { to: '/widgets', icon: LayoutGrid, label: 'nav.widgets', desc: 'nav.widgets.desc' },
       { to: '/knowledge', icon: BookOpen, label: 'nav.knowledge', desc: 'nav.knowledge.desc' },
       { to: '/growth', icon: Trophy, label: 'nav.growth', desc: 'nav.growth.desc', ownScope: true },
+    ],
+  },
+  {
+    // 設定 — management shell entry + brand/about page.
+    label: 'navGroup.settings',
+    items: [
+      manageEntry,
       // 關於 — brand info + fixed upstream-vendor block. Open to every user.
       { to: '/about', icon: Info, label: 'nav.about', desc: 'nav.about.desc' },
     ],
   },
 ];
-
-/**
- * The 員工 roster entry — the "全部員工 →" link under the LIVE staff zone, and
- * the target the command palette exposes for jumping to the roster.
- */
-export const staffEntry: NavItem = {
-  to: '/agents',
-  icon: Users,
-  label: 'nav.agents',
-  desc: 'nav.agents.desc',
-  ownScope: true,
-};
-
-/**
- * The single Zone D entry shown in the main sidebar (last item of the 公司
- * section). Visible from `manager` up; each sub-item re-gates itself inside the
- * ManageShell. `employee` never sees the 管理 entry.
- */
-export const manageEntry: NavItem = {
-  to: '/manage',
-  icon: Building2,
-  label: 'nav.manage',
-  desc: 'nav.manage.desc',
-  minRole: 'manager',
-};
 
 /**
  * Zone D subnav tree, rendered by ManageShell (§6.1). Collapses the former
@@ -167,9 +181,11 @@ export const manageNav: NavItem[] = [
   { to: '/manage/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin' },
   { to: '/manage/governance', icon: Scale, label: 'manage.governance', desc: 'manage.governance.desc', minRole: 'admin', enterprise: true },
   { to: '/manage/users', icon: Users, label: 'manage.users', desc: 'manage.users.desc', minRole: 'admin', enterprise: true },
-  // Departments are a core (WP7) grouping, not an enterprise module — the
-  // create-agent dialog's dropdown draws from here on every edition.
-  { to: '/manage/departments', icon: Network, label: 'manage.departments', desc: 'manage.departments.desc', minRole: 'admin' },
+  // Departments are an org grouping — an Enterprise concept. Personal is a
+  // single-owner form factor with no departments, so this page (and the
+  // department dropdowns that draw from it — agent-create dialog, skill-install
+  // scope) are hidden in the Personal edition.
+  { to: '/manage/departments', icon: Network, label: 'manage.departments', desc: 'manage.departments.desc', minRole: 'admin', enterprise: true },
   { to: '/manage/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager' },
   { to: '/manage/distributors', icon: Store, label: 'manage.distributors', desc: 'manage.distributors.desc', minRole: 'admin' },
   { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },

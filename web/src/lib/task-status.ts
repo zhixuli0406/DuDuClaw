@@ -31,8 +31,10 @@ export function isBackendStatus(key: TaskStatusKey): key is TaskStatus {
 }
 
 /**
- * Backend status → UI status key. Identity on the four shared names (they are
- * all valid `TaskStatusKey` members); typed so call sites feed `StatusIcon`.
+ * Backend status → UI status key. Identity: every persisted `TaskStatus`
+ * (including the P2a `needs_human` escalation) is a valid `TaskStatusKey`, so
+ * `StatusIcon` renders each directly. `needs_human` is display-only — the UI
+ * never *writes* it, so `toBackendStatus` still excludes it (returns null).
  */
 export function toStatusKey(status: TaskStatus): TaskStatusKey {
   return status;

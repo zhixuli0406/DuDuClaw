@@ -2,8 +2,7 @@ import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Archive, Trash2, ArrowRightLeft, AlertTriangle } from 'lucide-react';
 import type { AgentDetail, AgentInfo } from '@/lib/api';
-import { Dialog, FormField, inputClass } from '@/components/shared/Dialog';
-import { Button } from '@/components/ui';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, Input, Button } from '@/components/mds';
 import { Switch } from '@/components/settings/controls';
 import { useAgentsStore } from '@/stores/agents-store';
 import { toast, formatError } from '@/lib/toast';
@@ -14,7 +13,7 @@ type OffboardMode = 'archive' | 'handoff' | 'remove';
 /** A labelled toggle row — the Switch itself only carries an aria-label. */
 function SwitchRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
-    <label className="flex items-center justify-between gap-3 text-sm text-stone-700 dark:text-stone-200">
+    <label className="flex items-center justify-between gap-3 text-sm text-foreground">
       <span>{label}</span>
       <Switch checked={checked} onChange={onChange} label={label} />
     </label>
@@ -128,9 +127,13 @@ export function OffboardDialog({
         : intl.formatMessage({ id: 'agents.offboard.handoff.cta' });
 
   return (
-    <Dialog open={open} onClose={onClose} title={intl.formatMessage({ id: 'agents.offboard.title' }, { name: agent.display_name })}>
-      <div className="space-y-4">
-        <p className="text-sm text-stone-500 dark:text-stone-400">
+    <Dialog open={open} onOpenChange={(o) => { if (!o) onClose(); }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'agents.offboard.title' }, { name: agent.display_name })}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+        <p className="text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'agents.offboard.intro' }, { name: agent.display_name })}
         </p>
 
@@ -148,21 +151,21 @@ export function OffboardDialog({
                 disabled={o.disabled}
                 onClick={() => { setMode(o.id); setErrors(null); }}
                 className={cn(
-                  'flex w-full items-start gap-3 rounded-control border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50',
+                  'flex w-full items-start gap-3 rounded-xl border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
                   active
-                    ? 'border-amber-500/60 bg-amber-500/10'
-                    : 'border-[var(--panel-border)] hover:bg-stone-500/5 dark:hover:bg-white/5',
+                    ? 'border-brand bg-brand/10'
+                    : 'border-surface-border hover:bg-muted',
                   o.disabled && 'cursor-not-allowed opacity-50',
                 )}
               >
-                <span className={cn('mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg', active ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400' : 'bg-stone-500/10 text-stone-500')}>
+                <span className={cn('mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg', active ? 'bg-brand/15 text-brand' : 'bg-muted text-muted-foreground')}>
                   <Icon className="h-4 w-4" />
                 </span>
                 <span className="min-w-0">
-                  <span className="block text-sm font-medium text-stone-800 dark:text-stone-100">
+                  <span className="block text-sm font-medium text-foreground">
                     {intl.formatMessage({ id: `agents.offboard.${o.id}.title` })}
                   </span>
-                  <span className="mt-0.5 block text-xs text-stone-500 dark:text-stone-400">
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
                     {intl.formatMessage({ id: `agents.offboard.${o.id}.desc` })}
                   </span>
                 </span>
@@ -173,14 +176,21 @@ export function OffboardDialog({
 
         {/* Handoff options */}
         {mode === 'handoff' && candidates.length > 0 && (
-          <div className="space-y-3 rounded-control bg-stone-500/5 p-3 dark:bg-white/5">
-            <FormField label={intl.formatMessage({ id: 'agents.offboard.handoff.target' })}>
-              <select value={target} onChange={(e) => setTarget(e.target.value)} className={inputClass}>
+          <div className="space-y-3 rounded-xl bg-muted/50 p-3">
+            <div className="space-y-1.5">
+              <label className="block text-sm font-medium text-foreground">
+                {intl.formatMessage({ id: 'agents.offboard.handoff.target' })}
+              </label>
+              <select
+                value={target}
+                onChange={(e) => setTarget(e.target.value)}
+                className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+              >
                 {candidates.map((c) => (
                   <option key={c.name} value={c.name}>{c.display_name}</option>
                 ))}
               </select>
-            </FormField>
+            </div>
             <div className="space-y-2">
               <SwitchRow label={intl.formatMessage({ id: 'agents.offboard.handoff.memory' })} checked={moveMemory} onChange={setMoveMemory} />
               <SwitchRow label={intl.formatMessage({ id: 'agents.offboard.handoff.wiki' })} checked={moveWiki} onChange={setMoveWiki} />
@@ -191,23 +201,25 @@ export function OffboardDialog({
 
         {/* Remove type-to-confirm */}
         {mode === 'remove' && (
-          <FormField
-            label={intl.formatMessage({ id: 'agents.offboard.remove.confirmLabel' })}
-            hint={intl.formatMessage({ id: 'agents.offboard.remove.confirmHint' }, { name: agent.display_name })}
-          >
-            <input
+          <div className="space-y-1.5">
+            <label className="block text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: 'agents.offboard.remove.confirmLabel' })}
+            </label>
+            <Input
               type="text"
               value={typed}
               onChange={(e) => setTyped(e.target.value)}
               placeholder={agent.display_name}
-              className={inputClass}
             />
-          </FormField>
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'agents.offboard.remove.confirmHint' }, { name: agent.display_name })}
+            </p>
+          </div>
         )}
 
         {/* PARTIAL / error surface — honest, verbatim */}
         {errors && errors.length > 0 && (
-          <div className="space-y-1.5 rounded-lg border border-rose-300 bg-rose-50 p-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300">
+          <div className="space-y-1.5 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
             <p className="flex items-center gap-1.5 font-medium">
               <AlertTriangle className="h-4 w-4 shrink-0" />
               {intl.formatMessage({ id: 'agents.handoff.partialTitle' })}
@@ -220,15 +232,16 @@ export function OffboardDialog({
           </div>
         )}
 
-        <div className="flex justify-end gap-2 pt-1">
-          <Button variant="secondary" onClick={onClose} disabled={submitting}>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={submitting}>
             {intl.formatMessage({ id: 'common.cancel' })}
           </Button>
-          <Button variant={mode === 'archive' ? 'primary' : 'danger'} onClick={handleSubmit} disabled={!canSubmit}>
+          <Button variant={mode === 'archive' ? 'brand' : 'destructive'} onClick={handleSubmit} disabled={!canSubmit}>
             {submitting ? intl.formatMessage({ id: 'common.saving' }) : confirmLabel}
           </Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }

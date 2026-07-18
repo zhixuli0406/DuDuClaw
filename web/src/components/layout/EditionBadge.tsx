@@ -24,8 +24,8 @@ export function EditionBadge() {
       className={cn(
         'inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium',
         isPersonal
-          ? 'bg-amber-500/12 text-amber-700 dark:text-amber-300'
-          : 'bg-stone-500/12 text-stone-600 dark:text-stone-300'
+          ? 'bg-brand/12 text-brand'
+          : 'bg-muted text-muted-foreground'
       )}
       title={intl.formatMessage({ id: labelId })}
     >

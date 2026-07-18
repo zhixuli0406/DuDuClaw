@@ -4,56 +4,49 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { api, type BillingUsage, type BudgetIncident, type BudgetByAgent } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
+import { Wallet, GaugeCircle } from 'lucide-react';
 import {
-  MessageCircle,
-  Bot,
-  Radio,
-  Cpu,
-  Wallet,
-  GaugeCircle,
-  AlertTriangle,
-  Clock,
-} from 'lucide-react';
-import { Page, PageHeader, Card, Badge, EmptyState, Mono, CharacterAvatar } from '@/components/ui';
+  Card,
+  CardHeader,
+  CardTitle,
+  CardContent,
+  Badge,
+  Empty,
+  Segmented,
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableHead,
+  TableCell,
+  ActorAvatar,
+} from '@/components/mds';
 
-function UsageMeter({
+/** A single usage KPI tile: label, big value, `used / limit` sub, progress bar. */
+function UsageTile({
   label,
-  icon: Icon,
   used,
   limit,
-  unlimited,
 }: {
   readonly label: string;
-  readonly icon: React.ComponentType<{ className?: string }>;
   readonly used: number;
   readonly limit: number;
-  readonly unlimited: boolean;
 }) {
   const intl = useIntl();
+  const unlimited = limit < 0;
   const pct = unlimited ? 0 : limit > 0 ? Math.min((used / limit) * 100, 100) : 0;
-  const barColor =
-    pct >= 90
-      ? 'bg-rose-500'
-      : pct >= 70
-        ? 'bg-amber-500'
-        : 'bg-emerald-500';
+  const barColor = pct >= 90 ? 'bg-destructive' : pct >= 70 ? 'bg-warning' : 'bg-success';
 
   return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Icon className="h-4 w-4 text-stone-500 dark:text-stone-400" />
-          <span className="text-sm font-medium text-stone-700 dark:text-stone-300">{label}</span>
-        </div>
-        <Mono className="text-sm text-stone-500 dark:text-stone-400">
-          {used.toLocaleString()}
-          {' / '}
-          {unlimited
-            ? intl.formatMessage({ id: 'billing.unlimited' })
-            : limit.toLocaleString()}
-        </Mono>
-      </div>
-      <div className="h-2.5 w-full overflow-hidden rounded-full bg-stone-200 dark:bg-stone-700">
+    <div className="space-y-2 p-4">
+      <p className="text-sm text-muted-foreground">{label}</p>
+      <p className="text-2xl font-semibold tabular-nums">{used.toLocaleString()}</p>
+      <p className="font-mono text-xs tabular-nums text-muted-foreground">
+        {used.toLocaleString()}
+        {' / '}
+        {unlimited ? intl.formatMessage({ id: 'billing.unlimited' }) : limit.toLocaleString()}
+      </p>
+      <div className="h-2 overflow-hidden rounded-full bg-muted">
         <div
           className={cn('h-full rounded-full transition-all duration-500', barColor)}
           style={{ width: unlimited ? '0%' : `${pct}%` }}
@@ -75,6 +68,7 @@ function BudgetConsole() {
   const [incidents, setIncidents] = useState<BudgetIncident[]>([]);
   const [byAgent, setByAgent] = useState<BudgetByAgent[]>([]);
   const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState<'all' | 'over'>('all');
 
   useEffect(() => {
     setLoading(true);
@@ -92,41 +86,40 @@ function BudgetConsole() {
   }, [intl]);
 
   const openAgents = byAgent.filter((a) => a.open_events > 0);
+  const isOver = (inc: BudgetIncident) => inc.cap_cents > 0 && inc.spent_cents > inc.cap_cents;
+  const filtered = filter === 'over' ? incidents.filter(isOver) : incidents;
 
   return (
-    <Card
-      title={
-        <span className="flex items-center gap-2">
-          <GaugeCircle className="h-4 w-4 text-amber-500" />
-          {intl.formatMessage({ id: 'billing.budgetConsole' })}
-        </span>
-      }
-    >
+    <section className="space-y-4">
+      <div className="flex items-center gap-2">
+        <GaugeCircle className="size-5 text-muted-foreground" />
+        <h2 className="text-base font-medium">{intl.formatMessage({ id: 'billing.budgetConsole' })}</h2>
+      </div>
+
       {loading ? (
-        <div className="py-8 text-center text-sm text-stone-400">
+        <p className="py-6 text-center text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'common.loading' })}
-        </div>
+        </p>
       ) : incidents.length === 0 && openAgents.length === 0 ? (
-        <EmptyState
+        <Empty
           icon={GaugeCircle}
-          dudu="idle"
           title={intl.formatMessage({ id: 'billing.budgetConsole.empty' })}
-          hint={intl.formatMessage({ id: 'billing.budgetConsole.emptyHint' })}
+          description={intl.formatMessage({ id: 'billing.budgetConsole.emptyHint' })}
         />
       ) : (
         <div className="space-y-5">
           {/* Per-agent open-event summary */}
           {openAgents.length > 0 && (
-            <div>
-              <p className="mb-2 text-xs font-medium text-stone-500 dark:text-stone-400">
+            <div className="space-y-2">
+              <p className="text-xs font-medium text-muted-foreground">
                 {intl.formatMessage({ id: 'billing.budgetConsole.openByAgent' })}
               </p>
               <div className="flex flex-wrap gap-2">
                 {openAgents.map((a) => (
-                  <Badge key={a.agent_id} tone="warning">
-                    <CharacterAvatar agentId={a.agent_id} size={16} />
+                  <Badge key={a.agent_id} variant="secondary" className="bg-warning/15 text-warning">
+                    <ActorAvatar actorType="agent" name={a.agent_id} size="xs" />
                     {a.agent_id}
-                    <Mono className="ml-1 font-semibold text-inherit">{a.open_events}</Mono>
+                    <span className="ml-1 font-mono font-semibold">{a.open_events}</span>
                   </Badge>
                 ))}
               </div>
@@ -135,49 +128,70 @@ function BudgetConsole() {
 
           {/* Recent incidents */}
           {incidents.length > 0 && (
-            <div>
-              <p className="mb-2 text-xs font-medium text-stone-500 dark:text-stone-400">
-                {intl.formatMessage({ id: 'billing.budgetConsole.recent' })}
-              </p>
-              <ul className="space-y-1.5">
-                {incidents.map((inc, i) => {
-                  const over = inc.cap_cents > 0 && inc.spent_cents > inc.cap_cents;
-                  return (
-                    <li
-                      key={`${inc.ts}-${inc.agent_id}-${i}`}
-                      className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-control border border-[var(--panel-border)] bg-[var(--panel-fill)] px-3 py-2 text-sm"
-                    >
-                      <AlertTriangle
-                        className={cn('h-3.5 w-3.5 shrink-0', over ? 'text-rose-500' : 'text-amber-500')}
-                      />
-                      <CharacterAvatar agentId={inc.agent_id} size={24} />
-                      <span className="font-medium text-stone-800 dark:text-stone-100">
-                        {inc.agent_id}
-                      </span>
-                      <Badge tone="neutral">{inc.event}</Badge>
-                      <span className="text-xs text-stone-500 dark:text-stone-400">{inc.scope}</span>
-                      <Mono className="text-stone-600 dark:text-stone-300">
-                        {fmtCents(inc.spent_cents)}
-                        <span className="text-stone-400"> / {fmtCents(inc.cap_cents)}</span>
-                      </Mono>
-                      <Mono className="ml-auto flex items-center gap-1 text-xs text-stone-400">
-                        <Clock className="h-3 w-3" />
-                        {new Date(inc.ts).toLocaleString('zh-TW', {
-                          month: 'short',
-                          day: 'numeric',
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
-                      </Mono>
-                    </li>
-                  );
-                })}
-              </ul>
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs font-medium text-muted-foreground">
+                  {intl.formatMessage({ id: 'billing.budgetConsole.recent' })}
+                </p>
+                <Segmented
+                  value={filter}
+                  onValueChange={setFilter}
+                  aria-label={intl.formatMessage({ id: 'billing.budgetConsole.recent' })}
+                  options={[
+                    { value: 'all', label: intl.formatMessage({ id: 'billing.incidents.filter.all' }) },
+                    { value: 'over', label: intl.formatMessage({ id: 'billing.incidents.filter.over' }) },
+                  ]}
+                />
+              </div>
+              <div className="overflow-hidden rounded-xl border border-surface-border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>{intl.formatMessage({ id: 'billing.col.agent' })}</TableHead>
+                      <TableHead>{intl.formatMessage({ id: 'billing.col.event' })}</TableHead>
+                      <TableHead>{intl.formatMessage({ id: 'billing.col.scope' })}</TableHead>
+                      <TableHead>{intl.formatMessage({ id: 'billing.col.spent' })}</TableHead>
+                      <TableHead>{intl.formatMessage({ id: 'billing.col.time' })}</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {filtered.map((inc, i) => {
+                      const over = isOver(inc);
+                      return (
+                        <TableRow key={`${inc.ts}-${inc.agent_id}-${i}`}>
+                          <TableCell>
+                            <span className="flex items-center gap-2">
+                              <ActorAvatar actorType="agent" name={inc.agent_id} size="xs" />
+                              <span className="font-medium">{inc.agent_id}</span>
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant="outline">{inc.event}</Badge>
+                          </TableCell>
+                          <TableCell className="text-xs text-muted-foreground">{inc.scope}</TableCell>
+                          <TableCell className={cn('font-mono text-xs', over && 'text-destructive')}>
+                            {fmtCents(inc.spent_cents)}
+                            <span className="text-muted-foreground"> / {fmtCents(inc.cap_cents)}</span>
+                          </TableCell>
+                          <TableCell className="font-mono text-xs text-muted-foreground">
+                            {new Date(inc.ts).toLocaleString('zh-TW', {
+                              month: 'short',
+                              day: 'numeric',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
             </div>
           )}
         </div>
       )}
-    </Card>
+    </section>
   );
 }
 
@@ -198,48 +212,49 @@ export function BillingPage() {
   }, [connectionState, intl]);
 
   return (
-    <Page>
-      <PageHeader
-        icon={Wallet}
-        title={intl.formatMessage({ id: 'billing.title' })}
-      />
-
-      {/* Usage Meters */}
-      <Card title={intl.formatMessage({ id: 'billing.usage' })}>
-        <div className="space-y-5">
-          <UsageMeter
-            label={intl.formatMessage({ id: 'billing.conversations' })}
-            icon={MessageCircle}
-            used={usage?.conversations.used ?? 0}
-            limit={usage?.conversations.limit ?? 0}
-            unlimited={(usage?.conversations.limit ?? 0) < 0}
-          />
-          <UsageMeter
-            label={intl.formatMessage({ id: 'billing.agents' })}
-            icon={Bot}
-            used={usage?.agents.used ?? 0}
-            limit={usage?.agents.limit ?? 0}
-            unlimited={(usage?.agents.limit ?? 0) < 0}
-          />
-          <UsageMeter
-            label={intl.formatMessage({ id: 'billing.channels' })}
-            icon={Radio}
-            used={usage?.channels.used ?? 0}
-            limit={usage?.channels.limit ?? 0}
-            unlimited={(usage?.channels.limit ?? 0) < 0}
-          />
-          <UsageMeter
-            label={intl.formatMessage({ id: 'billing.inferenceHours' })}
-            icon={Cpu}
-            used={usage?.inference_hours.used ?? 0}
-            limit={usage?.inference_hours.limit ?? 0}
-            unlimited={(usage?.inference_hours.limit ?? 0) < 0}
-          />
+    <div className="mx-auto w-full max-w-6xl space-y-5">
+      {/* Header */}
+      <div className="flex min-w-0 items-center gap-2">
+        <Wallet className="size-5 text-muted-foreground" />
+        <div>
+          <h1 className="text-base font-medium">{intl.formatMessage({ id: 'billing.title' })}</h1>
+          <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'billing.subtitle' })}</p>
         </div>
+      </div>
+
+      {/* Usage KPI group */}
+      <Card>
+        <CardHeader>
+          <CardTitle>{intl.formatMessage({ id: 'billing.usage' })}</CardTitle>
+        </CardHeader>
+        <CardContent className="p-0">
+          <div className="grid grid-cols-2 divide-x divide-y divide-surface-border border-t border-surface-border lg:grid-cols-4">
+            <UsageTile
+              label={intl.formatMessage({ id: 'billing.conversations' })}
+              used={usage?.conversations?.used ?? 0}
+              limit={usage?.conversations?.limit ?? 0}
+            />
+            <UsageTile
+              label={intl.formatMessage({ id: 'billing.agents' })}
+              used={usage?.agents?.used ?? 0}
+              limit={usage?.agents?.limit ?? 0}
+            />
+            <UsageTile
+              label={intl.formatMessage({ id: 'billing.channels' })}
+              used={usage?.channels?.used ?? 0}
+              limit={usage?.channels?.limit ?? 0}
+            />
+            <UsageTile
+              label={intl.formatMessage({ id: 'billing.inferenceHours' })}
+              used={usage?.inference_hours?.used ?? 0}
+              limit={usage?.inference_hours?.limit ?? 0}
+            />
+          </div>
+        </CardContent>
       </Card>
 
       {/* Budget console — open budget events + recent incidents (WP14-T14.6) */}
       <BudgetConsole />
-    </Page>
+    </div>
   );
 }

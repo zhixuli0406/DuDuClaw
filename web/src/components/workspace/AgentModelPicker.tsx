@@ -65,34 +65,34 @@ export function AgentModelPicker() {
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="menu"
         aria-expanded={open}
-        className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--panel-border)] px-2.5 text-xs font-medium text-stone-600 transition-colors hover:bg-stone-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 dark:text-stone-300 dark:hover:bg-white/5"
+        className="flex h-9 items-center gap-1.5 rounded-lg border border-surface-border px-2.5 text-xs font-medium text-muted-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
       >
         <span className="text-sm leading-none">{agentIcon || fallbackIcon}</span>
         <span className="max-w-[8rem] truncate">{agentName || brandName}</span>
-        {model && <span className="hidden text-stone-400 sm:inline">· {model}</span>}
+        {model && <span className="hidden text-muted-foreground sm:inline">· {model}</span>}
         <ChevronDown className="h-3.5 w-3.5" />
       </button>
 
       {open && (
         <div
           role="menu"
-          className="glass-overlay absolute bottom-full left-0 z-50 mb-2 w-64 overflow-hidden rounded-xl p-1"
+          className="absolute bottom-full left-0 z-50 mb-2 w-64 overflow-hidden rounded-lg bg-surface-raised p-1 shadow-[var(--menu-shadow)] ring-1 ring-surface-border"
         >
-          <p className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-stone-400">
+          <p className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             {intl.formatMessage({ id: 'workspace.activeAgent', defaultMessage: '目前 AI 員工' })}
           </p>
           <div className="flex items-center gap-2 rounded-lg px-3 py-2">
             <span className="text-base leading-none">{agentIcon || fallbackIcon}</span>
             <div className="min-w-0">
-              <p className="truncate text-sm font-medium text-stone-800 dark:text-stone-100">
+              <p className="truncate text-sm font-medium text-foreground">
                 {agentName || brandName}
               </p>
-              {model && <p className="truncate text-xs text-stone-400 tabular-nums">{model}</p>}
+              {model && <p className="truncate text-xs text-muted-foreground tabular-nums">{model}</p>}
             </div>
           </div>
 
           {loaded && agents.length > 1 && (
-            <p className="px-3 pt-1 text-[11px] text-stone-400">
+            <p className="px-3 pt-1 text-[11px] text-muted-foreground">
               {intl.formatMessage(
                 { id: 'workspace.agentCount', defaultMessage: '共 {count} 個 AI 員工' },
                 { count: agents.length },
@@ -104,14 +104,14 @@ export function AgentModelPicker() {
             role="menuitem"
             onClick={goManage}
             className={cn(
-              'mt-1 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-stone-600 transition-colors',
-              'hover:bg-stone-500/10 dark:text-stone-300 dark:hover:bg-white/5'
+              'mt-1 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors',
+              'hover:bg-muted'
             )}
           >
             <Settings2 className="h-4 w-4" />
             {intl.formatMessage({ id: 'workspace.manageAgents', defaultMessage: '管理 AI 員工' })}
           </button>
-          <p className="px-3 pb-1.5 pt-0.5 text-[11px] leading-snug text-stone-400">
+          <p className="px-3 pb-1.5 pt-0.5 text-[11px] leading-snug text-muted-foreground">
             <Bot className="mr-1 inline h-3 w-3" />
             {intl.formatMessage({
               id: 'workspace.switchHint',

@@ -21,9 +21,9 @@ function classify(snapshot: LicenseSnapshot | null): Urgency {
 }
 
 const TONE: Record<Exclude<Urgency, null>, string> = {
-  expired: 'border-rose-500/30 bg-rose-500/10 text-rose-800 dark:text-rose-200',
-  critical: 'border-rose-500/30 bg-rose-500/10 text-rose-800 dark:text-rose-200',
-  warning: 'border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-200',
+  expired: 'border-destructive/30 bg-destructive/10 text-destructive',
+  critical: 'border-destructive/30 bg-destructive/10 text-destructive',
+  warning: 'border-warning/30 bg-warning/10 text-warning',
 };
 
 const MESSAGE_ID: Record<Exclude<Urgency, null>, string> = {

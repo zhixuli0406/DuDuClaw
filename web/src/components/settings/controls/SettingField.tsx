@@ -32,15 +32,15 @@ export function SettingField({
     return (
       <div
         className={cn(
-          'flex items-center justify-between gap-4 border-b border-[var(--panel-border)] py-3 last:border-0',
+          'flex items-center justify-between gap-4 border-b border-surface-border py-3 last:border-0',
           className,
         )}
       >
         <div className="min-w-0">
-          <label htmlFor={id} className="block text-sm font-medium text-stone-700 dark:text-stone-200">
+          <label htmlFor={id} className="block text-sm font-medium text-foreground">
             {label}
           </label>
-          {help && <p className="mt-0.5 text-xs text-stone-400 dark:text-stone-500">{help}</p>}
+          {help && <p className="mt-0.5 text-xs text-muted-foreground">{help}</p>}
         </div>
         <div className="shrink-0">{children}</div>
       </div>
@@ -49,10 +49,10 @@ export function SettingField({
 
   return (
     <div className={cn('space-y-1.5', className)}>
-      <label htmlFor={id} className="block text-sm font-medium text-stone-700 dark:text-stone-200">
+      <label htmlFor={id} className="block text-sm font-medium text-foreground">
         {label}
       </label>
-      {help && <p className="text-xs text-stone-400 dark:text-stone-500">{help}</p>}
+      {help && <p className="text-xs text-muted-foreground">{help}</p>}
       {children}
     </div>
   );

@@ -1,6 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
-import { cn } from '@/lib/utils';
 import {
   api,
   MCP_SCOPES,
@@ -8,11 +7,43 @@ import {
   type McpKeyCreateResult,
   type McpScope,
 } from '@/lib/api';
-import { Dialog } from '@/components/shared/Dialog';
 import { toast, formatError } from '@/lib/toast';
-import { Page, PageHeader, Card, Button, Badge, EmptyState, Field, controlClass } from '@/components/ui';
+import {
+  Button,
+  Badge,
+  Input,
+  Switch,
+  Checkbox,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  Empty,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DialogClose,
+  ListGridContainer,
+  ListGridHeader,
+  ListGridHeaderCell,
+  ListGridRow,
+  ListGridCell,
+} from '@/components/mds';
 import { KeyRound, Plus, Trash2, Copy, Check, AlertTriangle } from 'lucide-react';
 
+/** Column template shared by the MCP-keys ListGrid header + rows (spec §4). */
+const KEY_COLUMNS =
+  'minmax(0,1.6fr) minmax(0,1fr) 4rem minmax(0,1.4fr) minmax(0,0.8fr) auto';
+
+/**
+ * McpKeysPage — MCP API keys tab of `/manage/integrations` (MDS surface). A slim
+ * header (description + create action) over a Linear-style ListGrid of issued
+ * keys. Create is an MDS Dialog; the one-time reveal + paste-to-revoke flows are
+ * preserved verbatim. Same `mcp_keys.*` RPCs — no backend change.
+ */
 export function McpKeysPage() {
   const intl = useIntl();
   const [keys, setKeys] = useState<ReadonlyArray<McpKeyEntry>>([]);
@@ -38,87 +69,95 @@ export function McpKeysPage() {
   }, [fetchKeys]);
 
   return (
-    <Page>
-      <PageHeader
-        icon={KeyRound}
-        title={intl.formatMessage({ id: 'nav.mcpKeys' })}
-        subtitle={intl.formatMessage({ id: 'mcpKeys.desc' })}
-        actions={
-          <Button variant="primary" icon={Plus} onClick={() => setShowCreate(true)}>
-            {intl.formatMessage({ id: 'mcpKeys.create' })}
-          </Button>
-        }
-      />
+    <div className="space-y-6">
+      {/* Slim tab header — description left, create action right. */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'mcpKeys.desc' })}</p>
+        <Button variant="brand" size="sm" onClick={() => setShowCreate(true)}>
+          <Plus />
+          {intl.formatMessage({ id: 'mcpKeys.create' })}
+        </Button>
+      </div>
 
-      <Card padded={false}>
-        {loading ? (
-          <p className="py-12 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
-        ) : keys.length === 0 ? (
-          <EmptyState
-            icon={KeyRound}
-            title={intl.formatMessage({ id: 'mcpKeys.empty' })}
-          />
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-[var(--panel-border)]">
-                  <th className="px-5 py-3 text-left text-xs font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.key' })}</th>
-                  <th className="px-5 py-3 text-left text-xs font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.clientId' })}</th>
-                  <th className="px-5 py-3 text-center text-xs font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.external' })}</th>
-                  <th className="px-5 py-3 text-left text-xs font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.scopes' })}</th>
-                  <th className="px-5 py-3 text-left text-xs font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.created' })}</th>
-                  <th className="px-5 py-3 text-right text-xs font-medium text-stone-500 dark:text-stone-400" />
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[var(--panel-border)]">
-                {keys.map((k) => (
-                  <tr key={k.masked}>
-                    <td className="px-5 py-2.5">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <code className="rounded bg-stone-500/10 px-2 py-0.5 font-mono text-xs text-stone-700 dark:text-stone-300">
-                          {k.masked}
-                        </code>
-                        {k.rotate_recommended && (
-                          <Badge tone="warning">
-                            <AlertTriangle className="h-3 w-3" />
-                            {intl.formatMessage({ id: 'mcpKeys.rotate' })}
-                          </Badge>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-5 py-2.5 text-stone-700 dark:text-stone-300">{k.client_id || '—'}</td>
-                    <td className="px-5 py-2.5 text-center">
-                      {k.is_external ? (
-                        <span className="text-emerald-500">&#10003;</span>
-                      ) : (
-                        <span className="text-stone-300 dark:text-stone-600">&#10005;</span>
-                      )}
-                    </td>
-                    <td className="px-5 py-2.5">
-                      <div className="flex flex-wrap gap-1">
-                        {k.scopes.map((s) => (
-                          <Badge key={s} tone="neutral">
-                            <span className="font-mono">{s}</span>
-                          </Badge>
-                        ))}
-                      </div>
-                    </td>
-                    <td className="px-5 py-2.5 text-xs text-stone-400">
-                      {k.created_at ? new Date(k.created_at).toLocaleDateString() : '—'}
-                    </td>
-                    <td className="px-5 py-2.5 text-right">
-                      <Button variant="ghost" size="sm" icon={Trash2} onClick={() => setRevoking(k.masked)} className="text-rose-600 hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-400">
-                        {intl.formatMessage({ id: 'mcpKeys.revoke' })}
-                      </Button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
+      {loading ? (
+        <p className="py-12 text-center text-sm text-muted-foreground">
+          {intl.formatMessage({ id: 'common.loading' })}
+        </p>
+      ) : keys.length === 0 ? (
+        <Empty icon={KeyRound} title={intl.formatMessage({ id: 'mcpKeys.empty' })} variant="dashed" />
+      ) : (
+        <div className="overflow-hidden rounded-xl border border-surface-border">
+          <ListGridContainer
+            columns={KEY_COLUMNS}
+            className="!h-auto"
+            header={
+              <ListGridHeader>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'mcpKeys.col.key' })}</ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'mcpKeys.col.clientId' })}</ListGridHeaderCell>
+                <ListGridHeaderCell className="justify-center">
+                  {intl.formatMessage({ id: 'mcpKeys.col.external' })}
+                </ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'mcpKeys.col.scopes' })}</ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'mcpKeys.col.created' })}</ListGridHeaderCell>
+                <ListGridHeaderCell className="justify-end" aria-hidden />
+              </ListGridHeader>
+            }
+          >
+            {keys.map((k) => (
+              <ListGridRow key={k.masked} className="cursor-default" rowSize="lg">
+                <ListGridCell className="gap-2">
+                  <code className="truncate rounded bg-muted px-2 py-0.5 font-mono text-xs" title={k.masked}>
+                    {k.masked}
+                  </code>
+                  {k.rotate_recommended && (
+                    <Badge variant="destructive">
+                      <AlertTriangle />
+                      {intl.formatMessage({ id: 'mcpKeys.rotate' })}
+                    </Badge>
+                  )}
+                </ListGridCell>
+                <ListGridCell>
+                  <span className="truncate text-sm text-muted-foreground" title={k.client_id || undefined}>
+                    {k.client_id || '—'}
+                  </span>
+                </ListGridCell>
+                <ListGridCell className="justify-center">
+                  {k.is_external ? (
+                    <Check className="size-4 text-success" />
+                  ) : (
+                    <span className="text-muted-foreground/40">—</span>
+                  )}
+                </ListGridCell>
+                <ListGridCell>
+                  <div className="flex flex-wrap gap-1">
+                    {k.scopes.map((s) => (
+                      <Badge key={s} variant="secondary" className="font-mono">
+                        {s}
+                      </Badge>
+                    ))}
+                  </div>
+                </ListGridCell>
+                <ListGridCell>
+                  <span className="truncate text-xs text-muted-foreground">
+                    {k.created_at ? new Date(k.created_at).toLocaleDateString() : '—'}
+                  </span>
+                </ListGridCell>
+                <ListGridCell className="justify-end" data-stop-row-nav>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-destructive hover:bg-destructive/10"
+                    onClick={() => setRevoking(k.masked)}
+                  >
+                    <Trash2 />
+                    {intl.formatMessage({ id: 'mcpKeys.revoke' })}
+                  </Button>
+                </ListGridCell>
+              </ListGridRow>
+            ))}
+          </ListGridContainer>
+        </div>
+      )}
 
       <CreateKeyDialog
         open={showCreate}
@@ -132,14 +171,13 @@ export function McpKeysPage() {
 
       <RevealKeyDialog result={created} onClose={() => setCreated(null)} />
 
-      <RevokeKeyDialog
-        masked={revoking}
-        onClose={() => setRevoking(null)}
-        onRevoked={fetchKeys}
-      />
-    </Page>
+      <RevokeKeyDialog masked={revoking} onClose={() => setRevoking(null)} onRevoked={fetchKeys} />
+    </div>
   );
 }
+
+const ENV_OPTIONS = ['prod', 'staging', 'dev'] as const;
+type KeyEnv = (typeof ENV_OPTIONS)[number];
 
 function CreateKeyDialog({
   open,
@@ -153,7 +191,7 @@ function CreateKeyDialog({
   const intl = useIntl();
   const [clientId, setClientId] = useState('');
   const [isExternal, setIsExternal] = useState(false);
-  const [env, setEnv] = useState<'prod' | 'staging' | 'dev'>('prod');
+  const [env, setEnv] = useState<KeyEnv>('prod');
   const [scopes, setScopes] = useState<McpScope[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -191,53 +229,94 @@ function CreateKeyDialog({
   };
 
   return (
-    <Dialog open={open} onClose={handleClose} title={intl.formatMessage({ id: 'mcpKeys.create' })}>
-      <div className="space-y-4">
-        <Field label={intl.formatMessage({ id: 'mcpKeys.clientId' })} help={intl.formatMessage({ id: 'mcpKeys.clientId.hint' })}>
-          <input type="text" value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="my-integration" className={controlClass} />
-        </Field>
-        <Field label={intl.formatMessage({ id: 'mcpKeys.env' })}>
-          <select value={env} onChange={(e) => setEnv(e.target.value as 'prod' | 'staging' | 'dev')} className={controlClass}>
-            <option value="prod">prod</option>
-            <option value="staging">staging</option>
-            <option value="dev">dev</option>
-          </select>
-        </Field>
-        <label className="flex items-center justify-between py-1.5">
-          <span className="text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: 'mcpKeys.external' })}</span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={isExternal}
-            onClick={() => setIsExternal((v) => !v)}
-            className={cn('relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full transition-colors', isExternal ? 'bg-amber-500' : 'bg-stone-300 dark:bg-stone-600')}
-          >
-            <span className={cn('pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform mt-0.5', isExternal ? 'translate-x-4 ml-0.5' : 'translate-x-0.5')} />
-          </button>
-        </label>
-        <Field label={intl.formatMessage({ id: 'mcpKeys.scopes' })} help={intl.formatMessage({ id: 'mcpKeys.scopes.hint' })}>
-          <div className="grid grid-cols-2 gap-2">
-            {MCP_SCOPES.map((s) => (
-              <label key={s} className="flex items-start gap-2 text-sm text-stone-700 dark:text-stone-300">
-                <input type="checkbox" checked={scopes.includes(s)} onChange={() => toggleScope(s)} className="mt-0.5 accent-amber-500" />
-                <span className="min-w-0">
-                  <code className="text-xs">{s}</code>
-                  <span className="mt-0.5 block text-xs text-stone-400 dark:text-stone-500">
-                    {intl.formatMessage({ id: `mcpKeys.scopeDesc.${s.replace(':', '.')}` })}
-                  </span>
-                </span>
-              </label>
-            ))}
+    <Dialog open={open} onOpenChange={(o) => !o && handleClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'mcpKeys.create' })}</DialogTitle>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <label htmlFor="mcpkey-client-id" className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'mcpKeys.clientId' })}
+            </label>
+            <Input
+              id="mcpkey-client-id"
+              value={clientId}
+              onChange={(e) => setClientId(e.target.value)}
+              placeholder="my-integration"
+            />
+            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'mcpKeys.clientId.hint' })}</p>
           </div>
-        </Field>
-        {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
-        <div className="flex justify-end gap-3 pt-2">
-          <Button variant="secondary" onClick={handleClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
-          <Button variant="primary" onClick={handleSubmit} disabled={submitting || !clientId.trim() || scopes.length === 0}>
+
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'mcpKeys.env' })}
+            </label>
+            <Select value={env} onValueChange={(v) => setEnv(String(v) as KeyEnv)}>
+              <SelectTrigger className="w-full" aria-label={intl.formatMessage({ id: 'mcpKeys.env' })}>
+                <SelectValue>{env}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {ENV_OPTIONS.map((o) => (
+                  <SelectItem key={o} value={o}>
+                    {o}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <label className="flex items-center justify-between gap-4">
+            <span className="text-sm">{intl.formatMessage({ id: 'mcpKeys.external' })}</span>
+            <Switch
+              checked={isExternal}
+              onCheckedChange={(v) => setIsExternal(Boolean(v))}
+              aria-label={intl.formatMessage({ id: 'mcpKeys.external' })}
+            />
+          </label>
+
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'mcpKeys.scopes' })}
+            </label>
+            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'mcpKeys.scopes.hint' })}</p>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {MCP_SCOPES.map((s) => (
+                <label key={s} className="flex items-start gap-2">
+                  <Checkbox
+                    checked={scopes.includes(s)}
+                    onCheckedChange={() => toggleScope(s)}
+                    className="mt-0.5"
+                    aria-label={s}
+                  />
+                  <span className="min-w-0">
+                    <code className="text-xs">{s}</code>
+                    <span className="mt-0.5 block text-xs text-muted-foreground">
+                      {intl.formatMessage({ id: `mcpKeys.scopeDesc.${s.replace(':', '.')}` })}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+
+        <DialogFooter>
+          <DialogClose
+            render={<Button variant="outline">{intl.formatMessage({ id: 'common.cancel' })}</Button>}
+          />
+          <Button
+            variant="brand"
+            onClick={handleSubmit}
+            disabled={submitting || !clientId.trim() || scopes.length === 0}
+          >
             {submitting ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'mcpKeys.create' })}
           </Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
@@ -246,9 +325,8 @@ function RevealKeyDialog({ result, onClose }: { result: McpKeyCreateResult | nul
   const intl = useIntl();
   const [copied, setCopied] = useState(false);
 
-  if (!result) return null;
-
   const handleCopy = async () => {
+    if (!result) return;
     try {
       await navigator.clipboard.writeText(result.key);
       setCopied(true);
@@ -259,22 +337,36 @@ function RevealKeyDialog({ result, onClose }: { result: McpKeyCreateResult | nul
   };
 
   return (
-    <Dialog open={result !== null} onClose={onClose} title={intl.formatMessage({ id: 'mcpKeys.created.title' })}>
-      <div className="space-y-4">
-        <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-900/20">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
-          <p className="text-sm text-amber-700 dark:text-amber-400">{intl.formatMessage({ id: 'mcpKeys.created.warning' })}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <code className="flex-1 break-all rounded-lg bg-stone-900 px-3 py-2 font-mono text-xs text-emerald-400">{result.key}</code>
-          <Button variant="secondary" onClick={handleCopy} icon={copied ? Check : Copy} className={copied ? '[&_svg]:text-emerald-500' : undefined}>
-            {copied ? intl.formatMessage({ id: 'mcpKeys.copied' }) : intl.formatMessage({ id: 'mcpKeys.copy' })}
+    <Dialog open={result !== null} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'mcpKeys.created.title' })}</DialogTitle>
+        </DialogHeader>
+
+        {result && (
+          <div className="space-y-4">
+            <div className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 p-3">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" />
+              <p className="text-sm">{intl.formatMessage({ id: 'mcpKeys.created.warning' })}</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 break-all rounded-lg bg-stone-900 px-3 py-2 font-mono text-xs text-emerald-400">
+                {result.key}
+              </code>
+              <Button variant="outline" onClick={handleCopy}>
+                {copied ? <Check className="text-success" /> : <Copy />}
+                {copied ? intl.formatMessage({ id: 'mcpKeys.copied' }) : intl.formatMessage({ id: 'mcpKeys.copy' })}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        <DialogFooter>
+          <Button variant="brand" onClick={onClose}>
+            {intl.formatMessage({ id: 'mcpKeys.created.done' })}
           </Button>
-        </div>
-        <div className="flex justify-end pt-2">
-          <Button variant="primary" onClick={onClose}>{intl.formatMessage({ id: 'mcpKeys.created.done' })}</Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
@@ -294,8 +386,6 @@ function RevokeKeyDialog({
   // but `mcp_keys.list` only exposes a masked preview. The dashboard never
   // stores cleartext, so the operator must paste the full key to revoke it.
   const [fullKey, setFullKey] = useState('');
-
-  if (!masked) return null;
 
   const handleConfirm = async () => {
     if (!fullKey.trim()) return;
@@ -319,20 +409,44 @@ function RevokeKeyDialog({
   };
 
   return (
-    <Dialog open={masked !== null} onClose={handleClose} title={intl.formatMessage({ id: 'mcpKeys.revoke.title' })}>
-      <div className="space-y-4">
-        <p className="text-sm text-stone-600 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.revoke.confirm' })}</p>
-        <code className="block rounded bg-stone-500/10 px-2 py-1 font-mono text-xs text-stone-700 dark:text-stone-300">{masked}</code>
-        <Field label={intl.formatMessage({ id: 'mcpKeys.revoke.fullKey' })} help={intl.formatMessage({ id: 'mcpKeys.revoke.fullKey.hint' })}>
-          <input type="text" value={fullKey} onChange={(e) => setFullKey(e.target.value)} placeholder="ddc_prod_..." className={cn(controlClass, 'font-mono')} autoComplete="off" />
-        </Field>
-        <div className="flex justify-end gap-3 pt-2">
-          <Button variant="secondary" onClick={handleClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
-          <Button variant="danger" onClick={handleConfirm} disabled={confirming || !fullKey.trim()}>
+    <Dialog open={masked !== null} onOpenChange={(o) => !o && handleClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'mcpKeys.revoke.title' })}</DialogTitle>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'mcpKeys.revoke.confirm' })}</p>
+          {masked && (
+            <code className="block rounded bg-muted px-2 py-1 font-mono text-xs">{masked}</code>
+          )}
+          <div className="space-y-1.5">
+            <label htmlFor="mcpkey-full-key" className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'mcpKeys.revoke.fullKey' })}
+            </label>
+            <Input
+              id="mcpkey-full-key"
+              value={fullKey}
+              onChange={(e) => setFullKey(e.target.value)}
+              placeholder="ddc_prod_..."
+              className="font-mono"
+              autoComplete="off"
+            />
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'mcpKeys.revoke.fullKey.hint' })}
+            </p>
+          </div>
+        </div>
+
+        <DialogFooter>
+          <DialogClose
+            render={<Button variant="outline">{intl.formatMessage({ id: 'common.cancel' })}</Button>}
+          />
+          <Button variant="destructive" onClick={handleConfirm} disabled={confirming || !fullKey.trim()}>
             {confirming ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'mcpKeys.revoke' })}
           </Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }

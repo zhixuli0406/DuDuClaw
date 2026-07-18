@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import {
   api,
@@ -8,7 +8,6 @@ import {
   type IdentityResolveResult,
 } from '@/lib/api';
 import {
-  UserSearch,
   Loader2,
   Save,
   Search,
@@ -18,16 +17,21 @@ import {
   ShieldAlert,
   Database,
 } from 'lucide-react';
+import { cn } from '@/lib/utils';
 import {
-  Page,
-  PageHeader,
   Card,
-  Section,
+  CardHeader,
+  CardTitle,
+  CardContent,
   Button,
   Badge,
-  Field,
-  controlClass,
-} from '@/components/ui';
+  Input,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from '@/components/mds';
 
 /** Channels the test-resolve box can look up an identifier under. Mirrors the
  *  `ChannelKind` wire names in `duduclaw-identity`. */
@@ -42,11 +46,39 @@ const RESOLVE_CHANNELS = [
   'webchat',
 ] as const;
 
+const PROVIDER_KINDS: readonly IdentityProviderKind[] = ['wiki_cache', 'notion', 'chained'];
+const PROJECTS_KINDS: readonly IdentityProjectsKind[] = ['multi_select', 'relation'];
+
+/** Local labeled-field wrapper (spec §4 form pattern) — label over control. */
+function Field({
+  label,
+  htmlFor,
+  help,
+  className,
+  children,
+}: {
+  label: string;
+  htmlFor?: string;
+  help?: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className={cn('space-y-1.5', className)}>
+      <label htmlFor={htmlFor} className="text-xs font-medium text-muted-foreground">
+        {label}
+      </label>
+      {children}
+      {help && <p className="text-xs text-muted-foreground">{help}</p>}
+    </div>
+  );
+}
+
 /**
- * IdentityPage — dashboard surface for RFC-21 §1 identity resolution. Lets the
- * operator pick which provider answers "who sent this message?", configure the
- * Notion People DB, and test-resolve an identifier live (the demo hook: type an
- * email, see the canonical person + whether they're a project member).
+ * IdentityPage — dashboard surface for RFC-21 §1 identity resolution (MDS,
+ * embedded as the "identity" tab of `/manage/integrations`). Lets the operator
+ * pick which provider answers "who sent this message?", configure the Notion
+ * People DB, and test-resolve an identifier live.
  */
 export function IdentityPage() {
   const intl = useIntl();
@@ -168,253 +200,253 @@ export function IdentityPage() {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-20">
-        <Loader2 className="h-6 w-6 animate-spin text-stone-400" />
+        <Loader2 className="size-6 animate-spin text-muted-foreground" />
       </div>
     );
   }
 
   return (
-    <Page>
-      <PageHeader icon={UserSearch} title={t('identity.title')} subtitle={t('identity.subtitle')} />
-
+    <div className="space-y-6">
       {/* Provider selection */}
-      <Card title={t('identity.providerTitle')}>
-        <p className="mb-4 text-sm text-stone-500 dark:text-stone-400">
-          {t('identity.providerDesc')}
-        </p>
-        <Field label={t('identity.provider')} htmlFor="identity-provider">
-          <select
-            id="identity-provider"
-            className={controlClass}
-            value={provider}
-            onChange={(e) => setProvider(e.target.value as IdentityProviderKind)}
-          >
-            <option value="wiki_cache">{t('identity.provider.wiki_cache')}</option>
-            <option value="notion">{t('identity.provider.notion')}</option>
-            <option value="chained">{t('identity.provider.chained')}</option>
-          </select>
-        </Field>
-        <p className="mt-2 text-xs text-stone-500 dark:text-stone-400">
-          {t(`identity.provider.${provider}.hint`)}
-        </p>
-        {peopleDir && (
-          <p className="mt-3 inline-flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
-            <Database className="h-3.5 w-3.5" />
-            {t('identity.peopleDir')}: <code className="font-mono">{peopleDir}</code>
-          </p>
-        )}
+      <Card>
+        <CardHeader>
+          <CardTitle>{t('identity.providerTitle')}</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-sm text-muted-foreground">{t('identity.providerDesc')}</p>
+          <Field label={t('identity.provider')} htmlFor="identity-provider">
+            <Select value={provider} onValueChange={(v) => setProvider(String(v) as IdentityProviderKind)}>
+              <SelectTrigger id="identity-provider" className="w-full">
+                <SelectValue>{t(`identity.provider.${provider}`)}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {PROVIDER_KINDS.map((k) => (
+                  <SelectItem key={k} value={k}>
+                    {t(`identity.provider.${k}`)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+          <p className="text-xs text-muted-foreground">{t(`identity.provider.${provider}.hint`)}</p>
+          {peopleDir && (
+            <p className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Database className="size-3.5" />
+              {t('identity.peopleDir')}: <code className="font-mono">{peopleDir}</code>
+            </p>
+          )}
+        </CardContent>
       </Card>
 
       {/* Notion settings — only when Notion is in the chain */}
       {showNotion && (
-        <Card title={t('identity.notionTitle')}>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label={t('identity.databaseId')} htmlFor="identity-db" help={t('identity.databaseIdHint')}>
-              <input
-                id="identity-db"
-                type="text"
-                className={controlClass}
-                placeholder="2f9c1e8a…"
-                value={databaseId}
-                onChange={(e) => setDatabaseId(e.target.value)}
-              />
-            </Field>
-
-            <Field
-              label={t('identity.apiKey')}
-              htmlFor="identity-api-key"
-              help={apiKeySet ? t('identity.apiKeySetHint') : t('identity.apiKeyHint')}
-            >
-              <input
-                id="identity-api-key"
-                type="password"
-                className={controlClass}
-                placeholder={apiKeySet ? '••••••••' : 'secret_…'}
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-              />
-            </Field>
-
-            <Field label={t('identity.refreshSeconds')} htmlFor="identity-refresh">
-              <input
-                id="identity-refresh"
-                type="number"
-                className={controlClass}
-                min={0}
-                value={refreshSeconds}
-                onChange={(e) => setRefreshSeconds(e.target.value)}
-              />
-            </Field>
-          </div>
-
-          <Section className="mt-5 space-y-3">
-            <p className="text-sm font-medium text-stone-700 dark:text-stone-300">
-              {t('identity.fieldMap')}
-            </p>
-            <p className="text-xs text-stone-500 dark:text-stone-400">{t('identity.fieldMapHint')}</p>
+        <Card>
+          <CardHeader>
+            <CardTitle>{t('identity.notionTitle')}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-5">
             <div className="grid gap-4 sm:grid-cols-2">
-              <Field label={t('identity.fm.name')} htmlFor="identity-fm-name">
-                <input id="identity-fm-name" type="text" className={controlClass} value={fmName} onChange={(e) => setFmName(e.target.value)} />
+              <Field label={t('identity.databaseId')} htmlFor="identity-db" help={t('identity.databaseIdHint')}>
+                <Input
+                  id="identity-db"
+                  type="text"
+                  placeholder="2f9c1e8a…"
+                  value={databaseId}
+                  onChange={(e) => setDatabaseId(e.target.value)}
+                />
               </Field>
-              <Field label={t('identity.fm.roles')} htmlFor="identity-fm-roles">
-                <input id="identity-fm-roles" type="text" className={controlClass} value={fmRoles} onChange={(e) => setFmRoles(e.target.value)} />
+
+              <Field
+                label={t('identity.apiKey')}
+                htmlFor="identity-api-key"
+                help={apiKeySet ? t('identity.apiKeySetHint') : t('identity.apiKeyHint')}
+              >
+                <Input
+                  id="identity-api-key"
+                  type="password"
+                  placeholder={apiKeySet ? '••••••••' : 'secret_…'}
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                />
               </Field>
-              <Field label={t('identity.fm.projects')} htmlFor="identity-fm-projects">
-                <input id="identity-fm-projects" type="text" className={controlClass} value={fmProjects} onChange={(e) => setFmProjects(e.target.value)} />
-              </Field>
-              <Field label={t('identity.fm.emails')} htmlFor="identity-fm-emails">
-                <input id="identity-fm-emails" type="text" className={controlClass} value={fmEmails} onChange={(e) => setFmEmails(e.target.value)} />
-              </Field>
-              <Field label={t('identity.fm.projectsKind')} htmlFor="identity-fm-projects-kind">
-                <select
-                  id="identity-fm-projects-kind"
-                  className={controlClass}
-                  value={fmProjectsKind}
-                  onChange={(e) => setFmProjectsKind(e.target.value as IdentityProjectsKind)}
-                >
-                  <option value="multi_select">{t('identity.projectsKind.multi_select')}</option>
-                  <option value="relation">{t('identity.projectsKind.relation')}</option>
-                </select>
+
+              <Field label={t('identity.refreshSeconds')} htmlFor="identity-refresh">
+                <Input
+                  id="identity-refresh"
+                  type="number"
+                  min={0}
+                  value={refreshSeconds}
+                  onChange={(e) => setRefreshSeconds(e.target.value)}
+                />
               </Field>
             </div>
-          </Section>
+
+            <div className="space-y-3">
+              <p className="text-sm font-medium text-foreground">{t('identity.fieldMap')}</p>
+              <p className="text-xs text-muted-foreground">{t('identity.fieldMapHint')}</p>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label={t('identity.fm.name')} htmlFor="identity-fm-name">
+                  <Input id="identity-fm-name" type="text" value={fmName} onChange={(e) => setFmName(e.target.value)} />
+                </Field>
+                <Field label={t('identity.fm.roles')} htmlFor="identity-fm-roles">
+                  <Input id="identity-fm-roles" type="text" value={fmRoles} onChange={(e) => setFmRoles(e.target.value)} />
+                </Field>
+                <Field label={t('identity.fm.projects')} htmlFor="identity-fm-projects">
+                  <Input id="identity-fm-projects" type="text" value={fmProjects} onChange={(e) => setFmProjects(e.target.value)} />
+                </Field>
+                <Field label={t('identity.fm.emails')} htmlFor="identity-fm-emails">
+                  <Input id="identity-fm-emails" type="text" value={fmEmails} onChange={(e) => setFmEmails(e.target.value)} />
+                </Field>
+                <Field label={t('identity.fm.projectsKind')} htmlFor="identity-fm-projects-kind">
+                  <Select
+                    value={fmProjectsKind}
+                    onValueChange={(v) => setFmProjectsKind(String(v) as IdentityProjectsKind)}
+                  >
+                    <SelectTrigger id="identity-fm-projects-kind" className="w-full">
+                      <SelectValue>{t(`identity.projectsKind.${fmProjectsKind}`)}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PROJECTS_KINDS.map((k) => (
+                        <SelectItem key={k} value={k}>
+                          {t(`identity.projectsKind.${k}`)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Field>
+              </div>
+            </div>
+          </CardContent>
         </Card>
       )}
 
       {/* Save bar */}
       <div className="flex items-center justify-end gap-3">
-        {error && <span className="text-sm text-rose-600 dark:text-rose-400">{error}</span>}
+        {error && <span className="text-sm text-destructive">{error}</span>}
         {saved && (
-          <span className="inline-flex items-center gap-1.5 text-sm font-medium text-emerald-600">
-            <CheckCircle className="h-4 w-4" />
+          <span className="inline-flex items-center gap-1.5 text-sm font-medium text-success">
+            <CheckCircle className="size-4" />
             {t('common.saved')}
           </span>
         )}
-        <Button variant="primary" onClick={handleSave} disabled={saving} icon={saving ? undefined : Save}>
-          {saving && <Loader2 className="h-4 w-4 animate-spin" />}
+        <Button variant="brand" onClick={handleSave} disabled={saving}>
+          {saving ? <Loader2 className="size-4 animate-spin" /> : <Save />}
           {saving ? t('common.saving') : t('common.save')}
         </Button>
       </div>
 
       {/* Test resolve — the demo box */}
-      <Card
-        title={
-          <span className="flex items-center gap-2">
-            <Search className="h-4 w-4 text-stone-400" />
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Search className="size-4 text-muted-foreground" />
             {t('identity.testTitle')}
-          </span>
-        }
-      >
-        <p className="mb-4 text-sm text-stone-500 dark:text-stone-400">{t('identity.testDesc')}</p>
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
-          <Field label={t('identity.testChannel')} htmlFor="identity-test-channel" className="sm:w-44">
-            <select
-              id="identity-test-channel"
-              className={controlClass}
-              value={resolveChannel}
-              onChange={(e) => setResolveChannel(e.target.value)}
-            >
-              {RESOLVE_CHANNELS.map((ch) => (
-                <option key={ch} value={ch}>
-                  {t(`identity.channel.${ch}`)}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label={t('identity.testInput')} htmlFor="identity-test-input" className="flex-1">
-            <input
-              id="identity-test-input"
-              type="text"
-              className={controlClass}
-              placeholder={t('identity.testInputPlaceholder')}
-              value={resolveInput}
-              onChange={(e) => setResolveInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleResolve();
-              }}
-            />
-          </Field>
-          <Button
-            variant="secondary"
-            onClick={handleResolve}
-            disabled={resolving || !resolveInput.trim()}
-            icon={resolving ? undefined : Search}
-          >
-            {resolving && <Loader2 className="h-4 w-4 animate-spin" />}
-            {t('identity.testButton')}
-          </Button>
-        </div>
-
-        {resolveError && (
-          <p className="mt-4 text-sm text-rose-600 dark:text-rose-400">{resolveError}</p>
-        )}
-
-        {resolveResult && !resolveError && (
-          <div className="mt-5">
-            {resolveResult.found && resolveResult.person ? (
-              <div className="rounded-lg border border-[var(--panel-border)] bg-[var(--panel-fill)] p-4">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="text-base font-semibold text-stone-900 dark:text-stone-50">
-                      {resolveResult.person.display_name}
-                    </p>
-                    <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">
-                      {t('identity.result.via')} {resolveResult.provider}
-                    </p>
-                  </div>
-                  {resolveResult.is_project_member ? (
-                    <Badge tone="success" dot>
-                      <ShieldCheck className="h-3.5 w-3.5" />
-                      {t('identity.result.member')}
-                    </Badge>
-                  ) : (
-                    <Badge tone="warning" dot>
-                      <ShieldAlert className="h-3.5 w-3.5" />
-                      {t('identity.result.stranger')}
-                    </Badge>
-                  )}
-                </div>
-
-                <dl className="mt-4 grid gap-3 sm:grid-cols-2">
-                  {resolveResult.person.roles.length > 0 && (
-                    <div>
-                      <dt className="text-xs text-stone-500 dark:text-stone-400">{t('identity.result.roles')}</dt>
-                      <dd className="mt-1 flex flex-wrap gap-1">
-                        {resolveResult.person.roles.map((r) => (
-                          <Badge key={r} tone="neutral">{r}</Badge>
-                        ))}
-                      </dd>
-                    </div>
-                  )}
-                  {resolveResult.person.project_ids.length > 0 && (
-                    <div>
-                      <dt className="text-xs text-stone-500 dark:text-stone-400">{t('identity.result.projects')}</dt>
-                      <dd className="mt-1 flex flex-wrap gap-1">
-                        {resolveResult.person.project_ids.map((p) => (
-                          <Badge key={p} tone="neutral">{p}</Badge>
-                        ))}
-                      </dd>
-                    </div>
-                  )}
-                  {resolveResult.person.emails.length > 0 && (
-                    <div>
-                      <dt className="text-xs text-stone-500 dark:text-stone-400">{t('identity.result.emails')}</dt>
-                      <dd className="mt-1 text-sm text-stone-700 dark:text-stone-300">
-                        {resolveResult.person.emails.join(', ')}
-                      </dd>
-                    </div>
-                  )}
-                </dl>
-              </div>
-            ) : (
-              <div className="inline-flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200">
-                <XCircle className="h-4 w-4" />
-                {t('identity.result.notFound')}
-              </div>
-            )}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-sm text-muted-foreground">{t('identity.testDesc')}</p>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+            <Field label={t('identity.testChannel')} htmlFor="identity-test-channel" className="sm:w-44">
+              <Select value={resolveChannel} onValueChange={(v) => setResolveChannel(String(v))}>
+                <SelectTrigger id="identity-test-channel" className="w-full">
+                  <SelectValue>{t(`identity.channel.${resolveChannel}`)}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {RESOLVE_CHANNELS.map((ch) => (
+                    <SelectItem key={ch} value={ch}>
+                      {t(`identity.channel.${ch}`)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field label={t('identity.testInput')} htmlFor="identity-test-input" className="flex-1">
+              <Input
+                id="identity-test-input"
+                type="text"
+                placeholder={t('identity.testInputPlaceholder')}
+                value={resolveInput}
+                onChange={(e) => setResolveInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleResolve();
+                }}
+              />
+            </Field>
+            <Button variant="outline" onClick={handleResolve} disabled={resolving || !resolveInput.trim()}>
+              {resolving ? <Loader2 className="size-4 animate-spin" /> : <Search />}
+              {t('identity.testButton')}
+            </Button>
           </div>
-        )}
+
+          {resolveError && <p className="text-sm text-destructive">{resolveError}</p>}
+
+          {resolveResult && !resolveError && (
+            <div>
+              {resolveResult.found && resolveResult.person ? (
+                <div className="rounded-lg border border-surface-border bg-muted/50 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-base font-medium text-foreground">
+                        {resolveResult.person.display_name}
+                      </p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {t('identity.result.via')} {resolveResult.provider}
+                      </p>
+                    </div>
+                    {resolveResult.is_project_member ? (
+                      <Badge variant="secondary" className="bg-success/15 text-success">
+                        <ShieldCheck />
+                        {t('identity.result.member')}
+                      </Badge>
+                    ) : (
+                      <Badge variant="secondary" className="bg-warning/15 text-warning">
+                        <ShieldAlert />
+                        {t('identity.result.stranger')}
+                      </Badge>
+                    )}
+                  </div>
+
+                  <dl className="mt-4 grid gap-3 sm:grid-cols-2">
+                    {resolveResult.person.roles.length > 0 && (
+                      <div>
+                        <dt className="text-xs text-muted-foreground">{t('identity.result.roles')}</dt>
+                        <dd className="mt-1 flex flex-wrap gap-1">
+                          {resolveResult.person.roles.map((r) => (
+                            <Badge key={r} variant="secondary">{r}</Badge>
+                          ))}
+                        </dd>
+                      </div>
+                    )}
+                    {resolveResult.person.project_ids.length > 0 && (
+                      <div>
+                        <dt className="text-xs text-muted-foreground">{t('identity.result.projects')}</dt>
+                        <dd className="mt-1 flex flex-wrap gap-1">
+                          {resolveResult.person.project_ids.map((p) => (
+                            <Badge key={p} variant="secondary">{p}</Badge>
+                          ))}
+                        </dd>
+                      </div>
+                    )}
+                    {resolveResult.person.emails.length > 0 && (
+                      <div>
+                        <dt className="text-xs text-muted-foreground">{t('identity.result.emails')}</dt>
+                        <dd className="mt-1 text-sm text-foreground">
+                          {resolveResult.person.emails.join(', ')}
+                        </dd>
+                      </div>
+                    )}
+                  </dl>
+                </div>
+              ) : (
+                <div className="inline-flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/10 px-4 py-3 text-sm text-warning">
+                  <XCircle className="size-4" />
+                  {t('identity.result.notFound')}
+                </div>
+              )}
+            </div>
+          )}
+        </CardContent>
       </Card>
-    </Page>
+    </div>
   );
 }

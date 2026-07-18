@@ -22,19 +22,19 @@ export function DangerZone({
   return (
     <div
       className={cn(
-        'rounded-xl border border-rose-300/70 bg-rose-500/5 p-4 dark:border-rose-500/30',
+        'rounded-xl border border-destructive/30 bg-destructive/5 p-4',
         className,
       )}
     >
       {(title || description) && (
         <div className="mb-3 flex items-start gap-2">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-500" />
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
           <div className="min-w-0">
             {title && (
-              <h4 className="text-sm font-semibold text-rose-700 dark:text-rose-300">{title}</h4>
+              <h4 className="text-sm font-semibold text-destructive">{title}</h4>
             )}
             {description && (
-              <p className="mt-0.5 text-xs text-rose-600/80 dark:text-rose-400/80">{description}</p>
+              <p className="mt-0.5 text-xs text-destructive/80">{description}</p>
             )}
           </div>
         </div>

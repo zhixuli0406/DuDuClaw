@@ -1,141 +1,112 @@
+import { Archive } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { Badge, CharacterAvatar } from '@/components/ui';
+import { ActorAvatar } from '@/components/mds';
 import { timeAgo } from '@/lib/format';
-import type { InboxColumn, InboxItem } from '@/lib/inbox-model';
-import { riskTone, type RiskLevel } from '@/lib/approval-risk';
-import { SwipeToArchive } from '@/components/ui';
+import type { InboxItem } from '@/lib/inbox-model';
+import type { RiskLevel } from '@/lib/approval-risk';
 import { TYPE_META } from './meta';
 
 export interface InboxRowLabels {
   typeLabel: (item: InboxItem) => string;
   /** Whole-action risk band → short label ("低/中/高"). */
   riskLabel: (level: RiskLevel) => string;
-  approve: string;
-  reject: string;
-  view: string;
   archive: string;
 }
 
 export interface InboxRowProps {
   item: InboxItem;
   selected: boolean;
-  columns: readonly InboxColumn[];
-  /** `a` shortcut + swipe archive only on the "我的" tab. */
+  /** Renders the leading unread dot + heavier title weight. */
+  unread: boolean;
+  /** Hover archive button only on the "我的" tab. */
   canArchive: boolean;
-  /** Display name for the leading avatar's a11y label. */
+  /** Display name for the leading avatar. */
   agentName?: string;
   labels: InboxRowLabels;
   onSelect: () => void;
-  onOpen: () => void;
-  onApprove: () => void;
-  onReject: () => void;
-  onView: () => void;
   onArchive: () => void;
 }
 
-/** Single inbox row — leading staff avatar + badges + title + actions. */
+/** Risk band → dot colour token. */
+function riskDot(level: RiskLevel): string {
+  return level === 'high' ? 'bg-destructive' : level === 'medium' ? 'bg-warning' : 'bg-success';
+}
+
+/**
+ * InboxRow — the slim Multica list row (spec §5.6): leading ActorAvatar, a
+ * truncating title, a relative timestamp, and an unread `bg-brand` dot. Actions
+ * (approve / reject / view) live in the right-hand detail panel, not the row —
+ * selecting a row opens it there. Archive is a hover-only affordance.
+ */
 export function InboxRow(props: InboxRowProps) {
-  const { item, selected, columns, canArchive, agentName, labels } = props;
+  const { item, selected, unread, canArchive, agentName, labels } = props;
   const meta = TYPE_META[item.type];
   const Icon = meta.icon;
-  const isApproval = item.type === 'approval';
 
-  const row = (
+  return (
     <div
       role="option"
       aria-selected={selected}
       onMouseEnter={props.onSelect}
-      onClick={props.onOpen}
+      onClick={props.onSelect}
       className={cn(
-        'panel flex cursor-pointer items-center gap-3 px-4 py-3 transition-colors',
-        selected && 'ring-1 ring-inset ring-amber-500/50',
+        'group/row flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 transition-colors',
+        selected ? 'bg-surface-selected' : 'hover:bg-surface-hover',
       )}
     >
       {/* Leading: originating staff avatar, or the type glyph when unowned. */}
-      <span className="shrink-0">
-        {item.agentId ? (
-          <CharacterAvatar agentId={item.agentId} name={agentName ?? item.agentId} size={24} />
-        ) : (
-          <span className="grid h-6 w-6 place-items-center rounded-lg bg-stone-500/10 text-stone-500 dark:bg-white/5 dark:text-stone-400">
-            <Icon className="h-3.5 w-3.5" />
-          </span>
-        )}
-      </span>
+      {item.agentId ? (
+        <ActorAvatar actorType="agent" size="sm" name={agentName ?? item.agentId} className="shrink-0" />
+      ) : (
+        <span className="grid size-5 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground ring-1 ring-surface-border">
+          <Icon className="size-3" />
+        </span>
+      )}
 
       <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-2">
-          {columns.includes('type') && <Badge tone={meta.tone}>{labels.typeLabel(item)}</Badge>}
-          {isApproval && item.risk && (
-            <Badge tone={riskTone(item.risk)} dot>
+        <div className="flex items-center gap-1.5">
+          <p
+            className={cn(
+              'min-w-0 flex-1 truncate text-sm',
+              unread ? 'font-medium text-foreground' : 'text-foreground/90',
+            )}
+            title={item.title}
+          >
+            {item.title}
+          </p>
+          {unread && <span className="size-1.5 shrink-0 rounded-full bg-brand" aria-label="unread" />}
+          <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+            {timeAgo(item.timestamp)}
+          </span>
+        </div>
+        <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+          <span className="truncate">{labels.typeLabel(item)}</span>
+          {item.type === 'approval' && item.risk && (
+            <span className="inline-flex shrink-0 items-center gap-1">
+              <span className={cn('size-1.5 rounded-full', riskDot(item.risk))} aria-hidden="true" />
               {labels.riskLabel(item.risk)}
-            </Badge>
-          )}
-          {columns.includes('agent') && item.agentId && (
-            <span className="truncate text-xs text-stone-400 dark:text-stone-500">{agentName ?? item.agentId}</span>
-          )}
-          {columns.includes('channel') && item.channel && (
-            <span className="truncate rounded bg-stone-500/10 px-1.5 py-0.5 text-[11px] text-stone-500 dark:bg-white/5 dark:text-stone-400">
-              {item.channel}
             </span>
           )}
-          {columns.includes('time') && (
-            <span className="font-mono text-[11px] tabular-nums text-stone-400 dark:text-stone-500">
-              {timeAgo(item.timestamp)}
-            </span>
+          {item.channel && (
+            <span className="truncate rounded bg-muted px-1 text-[10px] font-medium">{item.channel}</span>
           )}
         </div>
-        <p className="mt-0.5 truncate text-sm text-stone-800 dark:text-stone-100" title={item.title}>
-          {item.title}
-        </p>
       </div>
 
-      <div className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-        {isApproval ? (
-          <>
-            <button
-              onClick={props.onApprove}
-              className="rounded-control bg-amber-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40"
-            >
-              {labels.approve}
-            </button>
-            <button
-              onClick={props.onReject}
-              className="rounded-control px-3 py-1.5 text-xs font-medium text-rose-600 transition-colors hover:bg-rose-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/40 dark:text-rose-400"
-            >
-              {labels.reject}
-            </button>
-          </>
-        ) : (
-          item.actionable && (
-            <button
-              onClick={props.onView}
-              className="rounded-control bg-amber-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40"
-            >
-              {labels.view}
-            </button>
-          )
-        )}
-        {canArchive && (
-          <button
-            onClick={props.onArchive}
-            title={labels.archive}
-            aria-label={labels.archive}
-            className="rounded-control px-3 py-1.5 text-xs font-medium text-stone-500 transition-colors hover:bg-stone-500/10 hover:text-stone-800 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200"
-          >
-            {labels.archive}
-          </button>
-        )}
-      </div>
+      {canArchive && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onArchive();
+          }}
+          title={labels.archive}
+          aria-label={labels.archive}
+          className="shrink-0 rounded-md p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-surface-hover hover:text-foreground focus-visible:opacity-100 focus-visible:ring-3 focus-visible:ring-ring/50 group-hover/row:opacity-100 pointer-coarse:opacity-100"
+        >
+          <Archive className="size-3.5" />
+        </button>
+      )}
     </div>
   );
-
-  // Mobile swipe-to-archive only where archiving is allowed.
-  if (canArchive) {
-    return (
-      <SwipeToArchive onArchive={props.onArchive} className="rounded-card">
-        {row}
-      </SwipeToArchive>
-    );
-  }
-  return row;
 }

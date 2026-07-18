@@ -21,18 +21,16 @@ function BottomNavLink({ item, inboxCount }: { item: NavItem; inboxCount: number
       end={item.to === '/'}
       className={({ isActive }) =>
         cn(
-          'relative flex flex-1 flex-col items-center justify-center gap-0.5 text-[10px] font-medium transition-colors',
-          isActive
-            ? 'text-amber-600 dark:text-amber-400'
-            : 'text-stone-500 hover:text-stone-800 dark:text-stone-400 dark:hover:text-stone-200',
+          'relative flex flex-1 flex-col items-center justify-center gap-0.5 text-xs font-medium transition-colors',
+          isActive ? 'text-foreground' : 'text-muted-foreground hover:text-foreground',
         )
       }
     >
       <span className="relative">
-        <Icon className="h-5 w-5" />
+        <Icon className="size-5" />
         {item.badge === 'inbox' && inboxCount > 0 && (
           <span
-            className="absolute -right-2 -top-1.5 inline-flex min-w-[1rem] items-center justify-center rounded-full bg-rose-500 px-1 text-[9px] font-semibold tabular-nums leading-none text-white"
+            className="absolute -right-2 -top-1.5 inline-flex min-w-4 items-center justify-center rounded-full bg-brand px-1 text-[9px] font-medium leading-none text-brand-foreground tabular-nums"
             aria-label={intl.formatMessage({ id: 'nav.inbox.pending' }, { count: inboxCount })}
           >
             {inboxCount > 99 ? '99+' : inboxCount}
@@ -60,7 +58,7 @@ export function MobileBottomNav() {
   return (
     <nav
       aria-label={intl.formatMessage({ id: 'nav.mobile.label' })}
-      className="glass-chrome fixed inset-x-0 bottom-0 z-40 flex h-14 items-stretch border-t border-stone-300/40 md:hidden dark:border-white/8"
+      className="fixed inset-x-0 bottom-0 z-40 flex h-14 items-stretch border-t border-sidebar-border bg-sidebar md:hidden"
     >
       <div className="flex flex-1 items-stretch">
         {left.map((item) => (
@@ -78,9 +76,9 @@ export function MobileBottomNav() {
           onClick={() => navigate('/tasks?new=1')}
           aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
           title={intl.formatMessage({ id: 'sidebar.newTask' })}
-          className="-mt-6 grid h-14 w-14 place-items-center rounded-full bg-gradient-to-b from-amber-400 to-amber-500 text-white shadow-[0_6px_18px_-4px_rgba(245,158,11,0.7)] ring-4 ring-[var(--app-bg)] transition-transform active:scale-95"
+          className="-mt-6 grid size-14 place-items-center rounded-full bg-brand text-brand-foreground shadow-[var(--menu-shadow)] ring-4 ring-sidebar transition-transform active:translate-y-px active:scale-95"
         >
-          <Plus className="h-6 w-6" />
+          <Plus className="size-6" />
         </button>
       </div>
 

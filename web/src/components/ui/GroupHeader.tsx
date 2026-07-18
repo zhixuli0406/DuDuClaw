@@ -28,20 +28,20 @@ export function GroupHeader({
         type="button"
         onClick={onToggle}
         aria-expanded={!collapsed}
-        className="group flex min-w-0 flex-1 items-center gap-1.5 rounded-control py-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50"
+        className="group flex min-w-0 flex-1 items-center gap-1.5 rounded-xl py-1 text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
       >
         <ChevronRight
           className={cn(
-            'h-4 w-4 shrink-0 text-stone-400 transition-transform',
+            'h-4 w-4 shrink-0 text-muted-foreground transition-transform',
             !collapsed && 'rotate-90',
           )}
           aria-hidden="true"
         />
-        <span className="truncate text-sm font-semibold text-stone-700 dark:text-stone-200">
+        <span className="truncate text-sm font-semibold text-foreground">
           {label}
         </span>
         {typeof count === 'number' && (
-          <span className="ml-0.5 rounded-full bg-stone-500/12 px-1.5 text-xs font-medium tabular-nums text-stone-500 dark:text-stone-400">
+          <span className="ml-0.5 rounded-full bg-muted px-1.5 text-xs font-medium tabular-nums text-muted-foreground">
             {count}
           </span>
         )}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import {
@@ -11,35 +11,18 @@ import {
 } from '@/lib/api';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
-import { Page, PageHeader, Card, Button, Field, controlClass } from '@/components/ui';
-import { SettingField } from '@/components/settings/controls';
+import {
+  Button,
+  Input,
+  SettingsSection,
+  SettingsCard,
+  SettingsRow,
+  SettingsSaveState,
+  type SettingsSaveStatus,
+  type SettingsRowTier,
+} from '@/components/mds';
+import { RowText, RowSwitch, FieldBlock } from '@/pages/agent-form/form-rows';
 import { Cpu, Save, RefreshCw, Loader2, AlertTriangle } from 'lucide-react';
-
-// ── Local Toggle (mirrors AgentsPage) ──
-function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
-  return (
-    <label className="flex items-center justify-between py-1.5">
-      <span className="text-sm text-stone-700 dark:text-stone-300">{label}</span>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={checked}
-        onClick={() => onChange(!checked)}
-        className={cn(
-          'relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full transition-colors',
-          checked ? 'bg-amber-500' : 'bg-stone-300 dark:bg-stone-600'
-        )}
-      >
-        <span
-          className={cn(
-            'pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform mt-0.5',
-            checked ? 'translate-x-4 ml-0.5' : 'translate-x-0.5'
-          )}
-        />
-      </button>
-    </label>
-  );
-}
 
 /** Read a flat backend sub-section value as a string for the input field. */
 function asStr(v: unknown): string {
@@ -47,6 +30,45 @@ function asStr(v: unknown): string {
   if (typeof v === 'string') return v;
   if (typeof v === 'number' || typeof v === 'boolean') return String(v);
   return '';
+}
+
+/**
+ * Optional numeric SettingsRow — mirrors the legacy `numField`: an empty input
+ * maps back to `undefined` (the field stays unset) rather than 0/NaN, so we do
+ * not silently write a value the operator never typed. `RowNumber` from
+ * form-rows can't express "unset", hence this local helper.
+ */
+function RowNumOpt({
+  label,
+  description,
+  value,
+  onChange,
+  min,
+  max,
+  step,
+  tier = 'select',
+}: {
+  label: ReactNode;
+  description?: ReactNode;
+  value: number | undefined;
+  onChange: (v: number | undefined) => void;
+  min?: number;
+  max?: number;
+  step?: number;
+  tier?: SettingsRowTier;
+}) {
+  return (
+    <SettingsRow label={label} description={description} tier={tier}>
+      <Input
+        type="number"
+        value={value ?? ''}
+        min={min}
+        max={max}
+        step={step}
+        onChange={(e) => onChange(e.target.value === '' ? undefined : Number(e.target.value))}
+      />
+    </SettingsRow>
+  );
 }
 
 export function InferencePage() {
@@ -65,7 +87,7 @@ export function InferencePage() {
   const [modelsDir, setModelsDir] = useState('');
   const [defaultModel, setDefaultModel] = useState('');
   const [autoLoad, setAutoLoad] = useState(false);
-  const [maxMemoryMb, setMaxMemoryMb] = useState('');
+  const [maxMemoryMb, setMaxMemoryMb] = useState<number | undefined>(undefined);
 
   // Generation
   const [gen, setGen] = useState<InferenceGeneration>({});
@@ -107,7 +129,7 @@ export function InferencePage() {
       setModelsDir(res.models_dir ?? '');
       setDefaultModel(res.default_model ?? '');
       setAutoLoad(Boolean(res.auto_load));
-      setMaxMemoryMb(res.max_memory_mb != null ? String(res.max_memory_mb) : '');
+      setMaxMemoryMb(res.max_memory_mb ?? undefined);
       setGen(res.generation ?? {});
       setRouter(res.router ?? {});
       const ocIn = res.openai_compat ?? {};
@@ -169,7 +191,7 @@ export function InferencePage() {
         models_dir: modelsDir || undefined,
         default_model: defaultModel || undefined,
         auto_load: autoLoad,
-        max_memory_mb: maxMemoryMb !== '' ? Number(maxMemoryMb) : undefined,
+        max_memory_mb: maxMemoryMb,
         generation: gen,
         router,
         openai_compat: {
@@ -200,191 +222,140 @@ export function InferencePage() {
     }
   };
 
-  const numField = (value: number | undefined, set: (n: number | undefined) => void, props?: Record<string, number>) => (
-    <input
-      type="number"
-      value={value ?? ''}
-      onChange={(e) => set(e.target.value === '' ? undefined : Number(e.target.value))}
-      className={controlClass}
-      {...props}
-    />
-  );
-
-  // Generic editor for a flat backend section (string map).
+  // Generic editor for a flat backend section (string map) — each key becomes a
+  // labelled SettingsRow; the section title + raw-config notice carry the rest.
   const BackendSection = ({ title, map, set }: { title: string; map: Record<string, string>; set: (m: Record<string, string>) => void }) => {
     const keys = Object.keys(map);
     return (
-      <div className="rounded-control border border-[var(--panel-border)] p-3">
-        <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{title}</h4>
-        <p className="mb-2 text-xs text-stone-400 dark:text-stone-500">{t('inference.backend.rawNotice')}</p>
+      <SettingsSection title={title} description={t('inference.backend.rawNotice')}>
         {keys.length === 0 ? (
-          <p className="text-xs text-stone-400 dark:text-stone-500">{t('inference.backend.emptySection')}</p>
+          <p className="text-xs text-muted-foreground">{t('inference.backend.emptySection')}</p>
         ) : (
-          <div className="space-y-2">
+          <SettingsCard>
             {keys.map((k) => (
-              <Field key={k} label={k}>
-                <input type="text" value={map[k]} onChange={(e) => set({ ...map, [k]: e.target.value })} className={controlClass} />
-              </Field>
+              <RowText key={k} label={k} value={map[k]} onChange={(v) => set({ ...map, [k]: v })} />
             ))}
-          </div>
+          </SettingsCard>
         )}
-      </div>
+      </SettingsSection>
     );
   };
 
-  return (
-    <Page>
-      <PageHeader
-        icon={Cpu}
-        title={t('nav.inference')}
-        subtitle={t('inference.desc')}
-        actions={
-          <>
-            <Button variant="secondary" onClick={load} disabled={loading}>
-              <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
-              {t('common.refresh')}
-            </Button>
-            <Button variant="primary" onClick={handleSave} disabled={saving || loading}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-              {saved ? t('common.saved') : t('common.save')}
-            </Button>
-          </>
-        }
-      />
+  const saveStatus: SettingsSaveStatus = saving ? 'saving' : saved ? 'saved' : 'idle';
 
-      <div className="flex items-start gap-2 rounded-control border border-[var(--panel-border)] bg-stone-500/5 px-3 py-2.5 text-xs text-stone-500 dark:bg-white/5 dark:text-stone-400">
-        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+  return (
+    <div className="mx-auto w-full max-w-[1200px] space-y-6">
+      {/* Slim header — icon + title + subtitle · save state + actions */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <Cpu className="size-5 shrink-0 text-brand" />
+          <div className="space-y-0.5">
+            <h1 className="text-lg font-semibold">{t('nav.inference')}</h1>
+            <p className="text-sm text-muted-foreground">{t('inference.desc')}</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <SettingsSaveState status={saveStatus} savingLabel={t('common.saving')} savedLabel={t('common.saved')} />
+          <Button variant="outline" size="sm" onClick={load} disabled={loading}>
+            <RefreshCw className={cn('size-4', loading && 'animate-spin')} />
+            {t('common.refresh')}
+          </Button>
+          <Button variant="brand" size="sm" onClick={handleSave} disabled={saving || loading}>
+            {saving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+            {t('common.save')}
+          </Button>
+        </div>
+      </div>
+
+      {/* Advanced-notice banner */}
+      <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
+        <AlertTriangle className="mt-0.5 size-4 shrink-0 text-brand" />
         <span>{t('inference.advancedNotice')}</span>
       </div>
 
       {loading && !config ? (
         <div className="flex justify-center py-16">
-          <Loader2 className="h-6 w-6 animate-spin text-amber-500" />
+          <Loader2 className="size-6 animate-spin text-brand" />
         </div>
       ) : (
-        <div className="grid gap-5 lg:grid-cols-2">
+        <div className="grid items-start gap-6 lg:grid-cols-2">
           {/* Backend (root) */}
-          <Card title={t('inference.section.backend')}>
-            <div className="space-y-3">
-              <Toggle checked={enabled} onChange={setEnabled} label={t('inference.enabled')} />
-              <SettingField label={t('inference.backend')} help={t('inference.backend.hint')}>
-                <input type="text" value={backend} onChange={(e) => setBackend(e.target.value)} placeholder="llama_cpp" className={controlClass} />
-              </SettingField>
-              <SettingField label={t('inference.modelsDir')} help={t('inference.modelsDir.hint')}>
-                <input type="text" value={modelsDir} onChange={(e) => setModelsDir(e.target.value)} placeholder="~/.duduclaw/models" className={controlClass} />
-              </SettingField>
-              <SettingField label={t('inference.defaultModel')} help={t('inference.defaultModel.hint')}>
-                <input type="text" value={defaultModel} onChange={(e) => setDefaultModel(e.target.value)} className={controlClass} />
-              </SettingField>
-              <Toggle checked={autoLoad} onChange={setAutoLoad} label={t('inference.autoLoad')} />
-              <SettingField label={t('inference.maxMemoryMb')} help={t('inference.maxMemoryMb.hint')}>
-                <input type="number" min={0} value={maxMemoryMb} onChange={(e) => setMaxMemoryMb(e.target.value)} className={controlClass} />
-              </SettingField>
-            </div>
-          </Card>
+          <SettingsSection title={t('inference.section.backend')}>
+            <SettingsCard>
+              <RowSwitch label={t('inference.enabled')} checked={enabled} onChange={setEnabled} />
+              <RowText label={t('inference.backend')} description={t('inference.backend.hint')} value={backend} onChange={setBackend} placeholder="llama_cpp" />
+              <RowText label={t('inference.modelsDir')} description={t('inference.modelsDir.hint')} value={modelsDir} onChange={setModelsDir} placeholder="~/.duduclaw/models" />
+              <RowText label={t('inference.defaultModel')} description={t('inference.defaultModel.hint')} value={defaultModel} onChange={setDefaultModel} />
+              <RowSwitch label={t('inference.autoLoad')} checked={autoLoad} onChange={setAutoLoad} />
+              <RowNumOpt label={t('inference.maxMemoryMb')} description={t('inference.maxMemoryMb.hint')} value={maxMemoryMb} onChange={setMaxMemoryMb} min={0} />
+            </SettingsCard>
+          </SettingsSection>
 
           {/* Generation */}
-          <Card title={t('inference.section.generation')}>
-            <div className="space-y-3">
-              <Field label={t('inference.gen.maxTokens')}>
-                {numField(gen.max_tokens, (n) => setGen((p) => ({ ...p, max_tokens: n })), { min: 1 })}
-              </Field>
-              <div className="grid grid-cols-2 gap-3">
-                <Field label={t('inference.gen.temperature')} help="0.0-2.0">
-                  {numField(gen.temperature, (n) => setGen((p) => ({ ...p, temperature: n })), { min: 0, max: 2, step: 0.05 })}
-                </Field>
-                <Field label={t('inference.gen.topP')} help="0.0-1.0">
-                  {numField(gen.top_p, (n) => setGen((p) => ({ ...p, top_p: n })), { min: 0, max: 1, step: 0.05 })}
-                </Field>
-                <Field label={t('inference.gen.gpuLayers')}>
-                  {numField(gen.gpu_layers, (n) => setGen((p) => ({ ...p, gpu_layers: n })), { min: -1 })}
-                </Field>
-                <Field label={t('inference.gen.contextSize')}>
-                  {numField(gen.context_size, (n) => setGen((p) => ({ ...p, context_size: n })), { min: 512 })}
-                </Field>
-              </div>
-              <Field label={t('inference.gen.stop')} help={t('inference.gen.stop.hint')}>
-                <ChipEditor values={gen.stop ?? []} onChange={(v) => setGen((p) => ({ ...p, stop: v }))} placeholder="</s>" addLabel={t('common.add')} />
-              </Field>
-            </div>
-          </Card>
+          <SettingsSection title={t('inference.section.generation')}>
+            <SettingsCard>
+              <RowNumOpt label={t('inference.gen.maxTokens')} value={gen.max_tokens} onChange={(n) => setGen((p) => ({ ...p, max_tokens: n }))} min={1} />
+              <RowNumOpt label={t('inference.gen.temperature')} description="0.0-2.0" value={gen.temperature} onChange={(n) => setGen((p) => ({ ...p, temperature: n }))} min={0} max={2} step={0.05} />
+              <RowNumOpt label={t('inference.gen.topP')} description="0.0-1.0" value={gen.top_p} onChange={(n) => setGen((p) => ({ ...p, top_p: n }))} min={0} max={1} step={0.05} />
+              <RowNumOpt label={t('inference.gen.gpuLayers')} value={gen.gpu_layers} onChange={(n) => setGen((p) => ({ ...p, gpu_layers: n }))} min={-1} />
+              <RowNumOpt label={t('inference.gen.contextSize')} value={gen.context_size} onChange={(n) => setGen((p) => ({ ...p, context_size: n }))} min={512} />
+            </SettingsCard>
+            <FieldBlock label={t('inference.gen.stop')} description={t('inference.gen.stop.hint')}>
+              <ChipEditor values={gen.stop ?? []} onChange={(v) => setGen((p) => ({ ...p, stop: v }))} placeholder="</s>" addLabel={t('common.add')} />
+            </FieldBlock>
+          </SettingsSection>
 
           {/* Router */}
-          <Card title={t('inference.section.router')}>
-            <div className="space-y-3">
-              <Toggle checked={Boolean(router.enabled)} onChange={(v) => setRouter((p) => ({ ...p, enabled: v }))} label={t('inference.router.enabled')} />
-              {strongGteFast && (
-                <div className="flex items-center gap-2 rounded-control bg-rose-500/10 p-2 text-xs text-rose-600 dark:text-rose-400">
-                  <AlertTriangle className="h-4 w-4 shrink-0" />
-                  {t('inference.router.thresholdError')}
-                </div>
-              )}
-              <div className="grid grid-cols-2 gap-3">
-                <Field label={t('inference.router.fastThreshold')} help="0.0-1.0">
-                  {numField(router.fast_threshold, (n) => setRouter((p) => ({ ...p, fast_threshold: n })), { min: 0, max: 1, step: 0.05 })}
-                </Field>
-                <Field label={t('inference.router.strongThreshold')} help={t('inference.router.strongThreshold.hint')}>
-                  {numField(router.strong_threshold, (n) => setRouter((p) => ({ ...p, strong_threshold: n })), { min: 0, max: 1, step: 0.05 })}
-                </Field>
+          <SettingsSection title={t('inference.section.router')}>
+            {strongGteFast && (
+              <div className="flex items-center gap-2 rounded-lg bg-destructive/10 p-2 text-xs text-destructive">
+                <AlertTriangle className="size-4 shrink-0" />
+                {t('inference.router.thresholdError')}
               </div>
-              <Field label={t('inference.router.fastModel')}>
-                <input type="text" value={router.fast_model ?? ''} onChange={(e) => setRouter((p) => ({ ...p, fast_model: e.target.value }))} className={controlClass} />
-              </Field>
-              <Field label={t('inference.router.strongModel')}>
-                <input type="text" value={router.strong_model ?? ''} onChange={(e) => setRouter((p) => ({ ...p, strong_model: e.target.value }))} className={controlClass} />
-              </Field>
-              <Field label={t('inference.router.maxFastPromptTokens')}>
-                {numField(router.max_fast_prompt_tokens, (n) => setRouter((p) => ({ ...p, max_fast_prompt_tokens: n })), { min: 0 })}
-              </Field>
-              <Field label={t('inference.router.cloudKeywords')}>
-                <ChipEditor values={router.cloud_keywords ?? []} onChange={(v) => setRouter((p) => ({ ...p, cloud_keywords: v }))} placeholder="analyze" addLabel={t('common.add')} />
-              </Field>
-              <Field label={t('inference.router.fastKeywords')}>
-                <ChipEditor values={router.fast_keywords ?? []} onChange={(v) => setRouter((p) => ({ ...p, fast_keywords: v }))} placeholder="hi" addLabel={t('common.add')} />
-              </Field>
-            </div>
-          </Card>
+            )}
+            <SettingsCard>
+              <RowSwitch label={t('inference.router.enabled')} checked={Boolean(router.enabled)} onChange={(v) => setRouter((p) => ({ ...p, enabled: v }))} />
+              <RowNumOpt label={t('inference.router.fastThreshold')} description="0.0-1.0" value={router.fast_threshold} onChange={(n) => setRouter((p) => ({ ...p, fast_threshold: n }))} min={0} max={1} step={0.05} />
+              <RowNumOpt label={t('inference.router.strongThreshold')} description={t('inference.router.strongThreshold.hint')} value={router.strong_threshold} onChange={(n) => setRouter((p) => ({ ...p, strong_threshold: n }))} min={0} max={1} step={0.05} />
+              <RowText label={t('inference.router.fastModel')} value={router.fast_model ?? ''} onChange={(v) => setRouter((p) => ({ ...p, fast_model: v }))} />
+              <RowText label={t('inference.router.strongModel')} value={router.strong_model ?? ''} onChange={(v) => setRouter((p) => ({ ...p, strong_model: v }))} />
+              <RowNumOpt label={t('inference.router.maxFastPromptTokens')} value={router.max_fast_prompt_tokens} onChange={(n) => setRouter((p) => ({ ...p, max_fast_prompt_tokens: n }))} min={0} />
+            </SettingsCard>
+            <FieldBlock label={t('inference.router.cloudKeywords')}>
+              <ChipEditor values={router.cloud_keywords ?? []} onChange={(v) => setRouter((p) => ({ ...p, cloud_keywords: v }))} placeholder="analyze" addLabel={t('common.add')} />
+            </FieldBlock>
+            <FieldBlock label={t('inference.router.fastKeywords')}>
+              <ChipEditor values={router.fast_keywords ?? []} onChange={(v) => setRouter((p) => ({ ...p, fast_keywords: v }))} placeholder="hi" addLabel={t('common.add')} />
+            </FieldBlock>
+          </SettingsSection>
 
-          {/* Local backends */}
-          <Card title={t('inference.section.localBackends')}>
-            <div className="space-y-3">
-              <div className="rounded-control border border-[var(--panel-border)] p-3">
-                <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">openai_compat</h4>
-                <div className="space-y-3">
-                  <Field label={t('inference.oc.baseUrl')}>
-                    <input type="text" value={oc.base_url ?? ''} onChange={(e) => setOc((p) => ({ ...p, base_url: e.target.value }))} placeholder="http://localhost:8080/v1" className={controlClass} />
-                  </Field>
-                  <Field label={t('inference.oc.model')}>
-                    <input type="text" value={oc.model ?? ''} onChange={(e) => setOc((p) => ({ ...p, model: e.target.value }))} className={controlClass} />
-                  </Field>
-                  <Field label={t('inference.oc.apiKey')} help={ocApiKeySet ? t('inference.oc.apiKey.set') : t('inference.oc.apiKey.hint')}>
-                    <input type="password" value={ocApiKey} onChange={(e) => setOcApiKey(e.target.value)} placeholder={ocApiKeySet ? '••••••••' : ''} className={controlClass} autoComplete="off" />
-                  </Field>
-                </div>
-              </div>
-              <BackendSection title="exo" map={exo} set={setExo} />
-              <BackendSection title="llamafile" map={llamafile} set={setLlamafile} />
-              <BackendSection title="mlx" map={mlx} set={setMlx} />
-              <BackendSection title="mistralrs" map={mistralrs} set={setMistralrs} />
-            </div>
-          </Card>
+          {/* openai_compat (typed local backend) */}
+          <SettingsSection title={t('inference.section.localBackends')}>
+            <SettingsCard>
+              <RowText label={t('inference.oc.baseUrl')} value={oc.base_url ?? ''} onChange={(v) => setOc((p) => ({ ...p, base_url: v }))} placeholder="http://localhost:8080/v1" />
+              <RowText label={t('inference.oc.model')} value={oc.model ?? ''} onChange={(v) => setOc((p) => ({ ...p, model: v }))} />
+              <RowText
+                label={t('inference.oc.apiKey')}
+                description={ocApiKeySet ? t('inference.oc.apiKey.set') : t('inference.oc.apiKey.hint')}
+                type="password"
+                autoComplete="off"
+                value={ocApiKey}
+                onChange={setOcApiKey}
+                placeholder={ocApiKeySet ? '••••••••' : ''}
+              />
+            </SettingsCard>
+          </SettingsSection>
 
-          {/* Compression */}
-          <Card title={t('inference.section.compression')}>
-            <div className="space-y-3">
-              <BackendSection title="llmlingua" map={llmlingua} set={setLlmlingua} />
-              <BackendSection title="streaming_llm" map={streamingLlm} set={setStreamingLlm} />
-            </div>
-          </Card>
-
-          {/* Embedding */}
-          <Card title={t('inference.section.embedding')}>
-            <div className="space-y-3">
-              <BackendSection title="embedding" map={embedding} set={setEmbedding} />
-            </div>
-          </Card>
+          {/* Generic flat backend sections */}
+          <BackendSection title="exo" map={exo} set={setExo} />
+          <BackendSection title="llamafile" map={llamafile} set={setLlamafile} />
+          <BackendSection title="mlx" map={mlx} set={setMlx} />
+          <BackendSection title="mistralrs" map={mistralrs} set={setMistralrs} />
+          <BackendSection title="llmlingua" map={llmlingua} set={setLlmlingua} />
+          <BackendSection title="streaming_llm" map={streamingLlm} set={setStreamingLlm} />
+          <BackendSection title="embedding" map={embedding} set={setEmbedding} />
         </div>
       )}
-    </Page>
+    </div>
   );
 }

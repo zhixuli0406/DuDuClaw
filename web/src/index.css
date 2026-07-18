@@ -1,8 +1,23 @@
 @import "tailwindcss";
 
+/* Self-hosted variable fonts (offline binary, no CDN) — see spec §2.
+   Inter Variable → `--font-sans`; Geist Mono Variable → `--font-mono`. */
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/geist-mono";
+
 /* Tailwind v4 binds `dark:` to prefers-color-scheme by default; rebind it to
    the `.dark` class so the in-app theme toggle actually controls styling. */
 @custom-variant dark (&:where(.dark, .dark *));
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LEGACY (Calm Glass, 遷移期暫留, P6 移除)
+   ─────────────────────────────────────────────────────────────────────────
+   Everything from here down to the "MULTICA" banner is the previous Calm Glass
+   / Soft Play design system. It is kept verbatim so existing pages under
+   `web/src/pages` and `web/src/components/ui` keep building during migration.
+   New Multica tokens are declared AFTER this block, so on any name collision
+   (--font-sans, --font-mono, --radius-sm, --radius-lg) the Multica value wins.
+   ═══════════════════════════════════════════════════════════════════════════ */
 
 @theme {
   /* Graphite-titanium neutral ramp (cool, low-chroma OKLCH).
@@ -36,16 +51,8 @@
   --color-accent-400: #fb923c;
   --color-accent-500: #f97316;
 
-  --radius-default: 0.75rem;
   --radius-lg: 1rem;
   --radius-sm: 0.5rem;
-
-  /* Soft Play v2 (dashboard-redesign-v2 §3.1 / T0.2) — radius bumped one level
-     for the warmer "soft candy" language. Also exposed as Tailwind `rounded-card`
-     / `rounded-control` / `rounded-bubble` utilities. */
-  --radius-card: 1rem;
-  --radius-control: 0.75rem;
-  --radius-bubble: 1.5rem;
 
   /* system-ui resolves to SF Pro on Apple platforms — the authentic
      Liquid Glass companion. Noto Sans TC covers CJK. */
@@ -60,30 +67,6 @@
 :root {
   color-scheme: light;
   --app-bg: oklch(95.5% 0.006 250);
-  --glass-fill: linear-gradient(
-    165deg,
-    oklch(100% 0 0 / 0.72),
-    oklch(98% 0.004 250 / 0.5)
-  );
-  --glass-fill-strong: linear-gradient(
-    165deg,
-    oklch(100% 0 0 / 0.85),
-    oklch(98% 0.004 250 / 0.72)
-  );
-  --glass-border: oklch(100% 0 0 / 0.65);
-  --glass-edge: inset 0 1px 0 0 oklch(100% 0 0 / 0.9);
-  --glass-shadow: 0 8px 24px -10px oklch(30% 0.02 260 / 0.22);
-  --glass-shadow-hover: 0 16px 40px -12px oklch(30% 0.03 260 / 0.3);
-  --grid-line: oklch(40% 0.02 255 / 0.035);
-
-  /* Calm Glass — flat content panels. Near-opaque, hairline border, no blur.
-     The workhorse surface for content in the refactored dashboard; glass is
-     now reserved for chrome (sidebar/header) and overlays (dialogs/menus). */
-  --panel-fill: oklch(99.4% 0.001 250 / 0.86);
-  --panel-fill-hover: oklch(100% 0 0 / 0.95);
-  --panel-border: oklch(82% 0.006 255 / 0.7);
-  --panel-border-strong: oklch(74% 0.008 255 / 0.85);
-  --panel-shadow-hover: 0 6px 20px -12px oklch(30% 0.02 260 / 0.18);
 
   /* ── Systematised status vocabulary (dashboard-redesign §2.1 P7 / T0.2) ──
      One semantic token per agent/work state, reused by badges, rows, glyphs
@@ -103,25 +86,14 @@
   --inbox-blocked: var(--status-blocked);
   --inbox-budget: var(--status-over-budget);
 
-  /* Greeting-banner reveal timing (respects reduced-motion globally). */
-  --greeting-reveal-ms: 420ms;
-
   /* ─────────────────── Soft Play v2 tokens (T0.2) ───────────────────
      Additive only — existing Calm Glass tokens above are untouched. */
 
-  /* Soft-card elevation. Light theme lifts content on a two-layer soft
-     shadow; dark theme has no real shadow to catch, so `panel` swaps to a
-     hairline `--ring-soft` instead (set on `--panel-shadow` below). */
-  --shadow-soft: 0 2px 8px rgb(0 0 0 / 0.04), 0 8px 24px rgb(0 0 0 / 0.06);
+  /* Soft-card elevation. Consumed by shadow-[var(--shadow-pop)] pop surfaces. */
   --shadow-pop: 0 4px 12px rgb(0 0 0 / 0.06), 0 16px 36px rgb(0 0 0 / 0.10);
-  --ring-soft: inset 0 0 0 1px oklch(100% 0 0 / 0.05);
-  /* The shadow `panel` actually paints — flips to a ring in dark mode. */
-  --panel-shadow: var(--shadow-soft);
 
-  /* Motion — a springy pop for entrances/celebrations, a calm fade for reveals.
-     Consumed by the animation utilities at the bottom of this file, all of which
-     are gated behind `prefers-reduced-motion: no-preference`. */
-  --motion-pop: 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  /* Motion — a calm fade for reveals. Consumed by `.animate-fade-up` at the
+     bottom of this file, gated behind `prefers-reduced-motion: no-preference`. */
   --motion-fade: 200ms ease-out;
 
   /* Agent lifecycle (paperclip P6) — dots / fills / rings. Icon/text uses the
@@ -147,6 +119,7 @@
   --status-task-icon-in_review: oklch(53% 0.19 300);
   --status-task-icon-done: oklch(53% 0.15 150);
   --status-task-icon-blocked: oklch(55% 0.2 25);
+  --status-task-icon-needs_human: oklch(56% 0.19 40);
   --status-task-icon-cancelled: oklch(55% 0.015 255);
 
   /* 10 warm agent gradient pairs (amber/coral/sage/sky/violet families) — the
@@ -179,27 +152,6 @@
 .dark {
   color-scheme: dark;
   --app-bg: oklch(15% 0.014 263);
-  --glass-fill: linear-gradient(
-    165deg,
-    oklch(26% 0.015 260 / 0.62),
-    oklch(20% 0.015 262 / 0.5)
-  );
-  --glass-fill-strong: linear-gradient(
-    165deg,
-    oklch(26% 0.015 260 / 0.88),
-    oklch(19% 0.015 262 / 0.82)
-  );
-  --glass-border: oklch(100% 0 0 / 0.1);
-  --glass-edge: inset 0 1px 0 0 oklch(100% 0 0 / 0.13);
-  --glass-shadow: 0 12px 32px -12px oklch(0% 0 0 / 0.55);
-  --glass-shadow-hover: 0 20px 48px -14px oklch(0% 0 0 / 0.65);
-  --grid-line: oklch(85% 0.02 255 / 0.03);
-
-  --panel-fill: oklch(23% 0.014 262 / 0.66);
-  --panel-fill-hover: oklch(26% 0.015 261 / 0.82);
-  --panel-border: oklch(100% 0 0 / 0.08);
-  --panel-border-strong: oklch(100% 0 0 / 0.14);
-  --panel-shadow-hover: 0 10px 28px -14px oklch(0% 0 0 / 0.5);
 
   /* Status vocabulary — brightened for the dark stage. */
   --status-running: oklch(76% 0.16 155);
@@ -213,14 +165,10 @@
   --inbox-decision: oklch(72% 0.12 255);
   --inbox-blocked: var(--status-blocked);
   --inbox-budget: var(--status-over-budget);
+  /* (--grid-line removed — was only consumed by the retired .app-ambient stage) */
 
-  /* ── Soft Play v2 dark overrides (T0.2) ──
-     No ambient shadow reads on a dark stage, so `panel` swaps to a hairline
-     ring for its edge; hover elevation stays a (stronger) shadow. */
-  --shadow-soft: 0 2px 8px rgb(0 0 0 / 0.3), 0 8px 24px rgb(0 0 0 / 0.4);
+  /* Pop elevation — stronger on the dark stage. */
   --shadow-pop: 0 6px 16px rgb(0 0 0 / 0.4), 0 18px 40px rgb(0 0 0 / 0.55);
-  --ring-soft: inset 0 0 0 1px oklch(100% 0 0 / 0.06);
-  --panel-shadow: var(--ring-soft);
 
   /* Agent lifecycle — brightened for the dark stage. */
   --status-agent-idle: oklch(62% 0.012 255);
@@ -244,6 +192,7 @@
   --status-task-icon-in_review: oklch(76% 0.16 300);
   --status-task-icon-done: oklch(76% 0.15 152);
   --status-task-icon-blocked: oklch(72% 0.19 25);
+  --status-task-icon-needs_human: oklch(76% 0.17 45);
   --status-task-icon-cancelled: oklch(66% 0.015 255);
 
   /* Character system — bubble body goes dark; ink stays dark (agent tints are
@@ -252,144 +201,11 @@
   --character-bubble-border: oklch(44% 0.014 260);
 }
 
-/* Content card — the workhorse surface used across every page. */
-@utility glass-card {
-  background: var(--glass-fill);
-  border: 1px solid var(--glass-border);
-  box-shadow: var(--glass-edge), var(--glass-shadow);
-  -webkit-backdrop-filter: blur(20px) saturate(160%);
-  backdrop-filter: blur(20px) saturate(160%);
-}
-
-@utility glass-card-hover {
-  transition: box-shadow 200ms cubic-bezier(0.22, 1, 0.36, 1),
-    transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
-  &:hover {
-    transform: translateY(-1px);
-    box-shadow: var(--glass-edge), var(--glass-shadow-hover);
-  }
-}
-
-/* Chrome — sidebar / header shell, heavier blur, no drop shadow. */
-@utility glass-chrome {
-  background: var(--glass-fill);
-  -webkit-backdrop-filter: blur(28px) saturate(170%);
-  backdrop-filter: blur(28px) saturate(170%);
-  box-shadow: var(--glass-edge);
-}
-
-/* Opaque-leaning glass for overlays that must stay readable (dialogs, menus). */
-@utility glass-overlay {
-  background: var(--glass-fill-strong);
-  border: 1px solid var(--glass-border);
-  box-shadow: var(--glass-edge), var(--glass-shadow-hover);
-  -webkit-backdrop-filter: blur(32px) saturate(180%);
-  backdrop-filter: blur(32px) saturate(180%);
-}
-
-/* ── Calm Glass content panel — the default content surface (flat, hairline) ──
-   Reserve `glass-card` for legacy code; new pages compose <Card>/<Section>
-   which render `panel`. No backdrop blur → cheaper, calmer, genspark-clean. */
-@utility panel {
-  background: var(--panel-fill);
-  border: 1px solid var(--panel-border);
-  /* Soft Play v2 (T0.2): softer 2xl radius + a soft-card shadow (light) that
-     swaps to a hairline ring in dark mode via `--panel-shadow`. Hairline border
-     is kept in both themes. */
-  border-radius: var(--radius-card);
-  box-shadow: var(--panel-shadow);
-}
-
-@utility panel-hover {
-  transition: background-color 160ms ease, border-color 160ms ease,
-    box-shadow 200ms cubic-bezier(0.22, 1, 0.36, 1),
-    transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
-  cursor: pointer;
-  &:hover {
-    background: var(--panel-fill-hover);
-    border-color: var(--panel-border-strong);
-    box-shadow: var(--panel-shadow-hover);
-    transform: translateY(-1px);
-  }
-}
-
-/* Hairline divider matched to panel borders. */
-@utility hairline {
-  border-color: var(--panel-border);
-}
-
-/* Honour macOS "Reduce transparency": fall back to solid surfaces. */
-@media (prefers-reduced-transparency: reduce) {
-  :root {
-    --glass-fill: oklch(99% 0.002 250);
-    --glass-fill-strong: oklch(99% 0.002 250);
-  }
-  .dark {
-    --glass-fill: oklch(21% 0.015 262);
-    --glass-fill-strong: oklch(21% 0.015 262);
-  }
-  .glass-card,
-  .glass-chrome,
-  .glass-overlay {
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
-  }
-}
-
-/* ───────────────────────── Ambient stage ─────────────────────────
-   Fixed backdrop the glass refracts: graphite field, amber light
-   sources, and a fine engineering grid fading out from the top. */
-.app-ambient {
-  position: fixed;
-  inset: 0;
-  z-index: -10;
-  pointer-events: none;
-  background:
-    radial-gradient(60rem 40rem at 8% -16%, oklch(82% 0.13 75 / 0.09), transparent 60%),
-    radial-gradient(52rem 36rem at 104% 6%, oklch(70% 0.09 255 / 0.05), transparent 58%),
-    var(--app-bg);
-}
-
-.dark .app-ambient {
-  background:
-    radial-gradient(60rem 40rem at 8% -16%, oklch(60% 0.13 70 / 0.12), transparent 60%),
-    radial-gradient(52rem 36rem at 104% 6%, oklch(50% 0.08 260 / 0.1), transparent 58%),
-    var(--app-bg);
-}
-
-.app-ambient::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background-image:
-    linear-gradient(var(--grid-line) 1px, transparent 1px),
-    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
-  background-size: 56px 56px;
-  mask-image: radial-gradient(90rem 64rem at 35% 0%, black 30%, transparent 75%);
-  -webkit-mask-image: radial-gradient(90rem 64rem at 35% 0%, black 30%, transparent 75%);
-}
-
-/* A single slow-drifting light orb keeps the stage alive without noise. */
-.app-ambient::after {
-  content: "";
-  position: absolute;
-  top: -22%;
-  left: 58%;
-  width: 40rem;
-  height: 40rem;
-  border-radius: 50%;
-  background: radial-gradient(circle, oklch(80% 0.13 80 / 0.05), transparent 72%);
-  animation: ambient-drift 48s ease-in-out infinite alternate;
-}
-
-.dark .app-ambient::after {
-  background: radial-gradient(circle, oklch(70% 0.14 75 / 0.07), transparent 72%);
-}
-
-@keyframes ambient-drift {
-  from { transform: translate3d(0, 0, 0) scale(1); }
-  to { transform: translate3d(-18rem, 12rem, 0) scale(1.15); }
-}
+/* The legacy Calm Glass surface utilities (glass-card / glass-card-hover /
+   glass-overlay / panel / panel-hover / hairline) and their backing --glass-* /
+   --panel-* vars were removed in the MDS migration (WP6.2). Surfaces now compose
+   the mds Card / semantic tokens (bg-surface, border-surface-border,
+   shadow-[var(--surface-shadow)]). */
 
 /* ───────────────────────── Base & details ───────────────────────── */
 body {
@@ -452,10 +268,6 @@ h1, h2, h3 {
    via the utility classes, which only carry an `animation` inside
    `prefers-reduced-motion: no-preference` — so in reduced-motion mode elements
    simply render at their resting state (no starting opacity:0 trap). */
-@keyframes pop-in {
-  from { opacity: 0; transform: scale(0.92); }
-  to { opacity: 1; transform: scale(1); }
-}
 @keyframes fade-up {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
@@ -497,7 +309,6 @@ h1, h2, h3 {
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .animate-pop-in { animation: pop-in var(--motion-pop) both; }
   .animate-fade-up { animation: fade-up var(--motion-fade) both; }
   .animate-badge-pop { animation: badge-pop 320ms cubic-bezier(0.34, 1.56, 0.64, 1) both; }
   /* One confetti piece — CelebrationLayer sets per-piece delay/left/colour and
@@ -592,3 +403,310 @@ h1, h2, h3 {
 .dark .branding-about-preview :is(h1, h2, h3, h4) { color: var(--color-stone-50); }
 .dark .branding-about-preview a { color: var(--color-primary-400); }
 .dark .branding-about-preview blockquote { color: var(--color-stone-400); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MULTICA — WP0.1 design token base (multica-redesign-spec §1–§3)
+   ─────────────────────────────────────────────────────────────────────────
+   OKLCH values copied verbatim from the spec. Light defaults live on `:root`,
+   dark overrides on `.dark`; both are mapped into Tailwind utilities via the
+   `@theme inline` block below (so `.dark` overrides stay live). Declared after
+   the LEGACY block on purpose — Multica wins every colliding theme key.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── Base radius (§1.6) — everything else is calc-derived in @theme ── */
+  --radius: 0.625rem; /* 10px */
+
+  /* ── Surface layering (§1.1): app-shell → page-canvas → surface → raised ── */
+  --app-shell: oklch(0.964435 0.001327 286.375);
+  --page-canvas: oklch(0.988087 0 0);
+  --surface: oklch(1 0 0);
+  --surface-foreground: oklch(0.141 0.005 285.823);
+  --surface-raised: oklch(1 0 0);
+  --surface-hover: oklch(0.967 0.001 286.375);
+  --surface-selected: oklch(0.95 0.002 286.375);
+  --surface-selected-foreground: oklch(0.141 0.005 285.823);
+  --surface-border: oklch(0.92 0.004 286.32);
+
+  /* ── Semantic (§1.2) ── */
+  --background: var(--page-canvas);
+  --foreground: oklch(0.141 0.005 285.823);
+  --card: var(--surface);
+  --card-foreground: oklch(0.141 0.005 285.823);
+  --popover: var(--surface-raised);
+  --popover-foreground: oklch(0.141 0.005 285.823);
+  --primary: oklch(0.21 0.006 285.885);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.967 0.001 286.375);
+  --secondary-foreground: oklch(0.21 0.006 285.885);
+  --muted: oklch(0.967 0.001 286.375);
+  --muted-foreground: oklch(0.552 0.016 285.938);
+  --accent: oklch(0.967 0.001 286.375);
+  --accent-foreground: oklch(0.21 0.006 285.885);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.945 0.003 286.32);
+  --input: oklch(0.92 0.004 286.32);
+  --ring: oklch(0.705 0.015 286.067);
+  /* Brand = Multica blue (hue 255). Swap `--brand` back to amber later to
+     re-skin without touching any other layer; chart hues follow brand. */
+  --brand: oklch(0.55 0.16 255);
+  --brand-foreground: oklch(0.985 0 0);
+  --success: oklch(0.55 0.16 145);
+  --warning: oklch(0.75 0.16 85);
+  --info: oklch(0.55 0.18 250);
+
+  /* ── Sidebar (§1.3) ── */
+  --sidebar: var(--app-shell);
+  --sidebar-foreground: oklch(0.141 0.005 285.823);
+  --sidebar-primary: oklch(0.21 0.006 285.885);
+  --sidebar-accent: oklch(0.935 0.003 286.375);
+  --sidebar-accent-foreground: oklch(0.21 0.006 285.885);
+  --sidebar-border: oklch(0.92 0.004 286.32);
+  --sidebar-ring: oklch(0.705 0.015 286.067);
+
+  /* ── Chart (§1.4): chart-1 = brand, main → tertiary ramp, hue 255 ── */
+  --chart-1: oklch(0.55 0.16 255);
+  --chart-2: oklch(0.66 0.13 255);
+  --chart-3: oklch(0.76 0.1 255);
+  --chart-4: oklch(0.85 0.06 255);
+  --chart-5: oklch(0.92 0.03 255);
+
+  /* ── Elevation (§1.5) — three layers ── */
+  --surface-shadow: 0 1px 2px rgb(15 23 42 / 0.04), 0 1px 1px rgb(15 23 42 / 0.03);
+  --menu-shadow: 0 8px 24px rgb(15 23 42 / 0.08), 0 2px 6px rgb(15 23 42 / 0.05);
+  --floating-shadow: 0 16px 40px rgb(15 23 42 / 0.14), 0 3px 10px rgb(15 23 42 / 0.08);
+
+  /* ── Scrollbar (§1.5): 6px, token-coloured thumb ── */
+  --mds-scrollbar-thumb: oklch(0 0 0 / 10%);
+  --mds-scrollbar-thumb-hover: oklch(0 0 0 / 18%);
+}
+
+.dark {
+  --app-shell: oklch(0.155 0.005 285.823);
+  --page-canvas: oklch(0.18 0.005 285.823);
+  --surface: oklch(0.21 0.006 285.885);
+  --surface-foreground: oklch(0.985 0 0);
+  --surface-raised: oklch(0.235 0.007 285.885);
+  --surface-hover: oklch(0.274 0.006 286.033);
+  --surface-selected: oklch(0.3 0.006 286.033);
+  --surface-selected-foreground: oklch(0.985 0 0);
+  --surface-border: oklch(1 0 0 / 10%);
+
+  --background: var(--page-canvas);
+  --foreground: oklch(0.985 0 0);
+  --card: var(--surface);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.235 0.007 285.885);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.92 0.004 286.32);
+  --primary-foreground: oklch(0.21 0.006 285.885);
+  --secondary: oklch(0.274 0.006 286.033);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.274 0.006 286.033);
+  --muted-foreground: oklch(0.705 0.015 286.067);
+  --accent: oklch(0.274 0.006 286.033);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 6%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.552 0.016 285.938);
+  --brand: oklch(0.65 0.16 255);
+  --brand-foreground: oklch(0.985 0 0);
+  --success: oklch(0.65 0.15 145);
+  --warning: oklch(0.7 0.16 85);
+  --info: oklch(0.65 0.18 250);
+
+  --sidebar: oklch(0.21 0.006 285.885);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-accent: oklch(0.274 0.006 286.033);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.552 0.016 285.938);
+
+  /* Chart — brightness inverted (most important = brightest) */
+  --chart-1: oklch(0.72 0.16 255);
+  --chart-2: oklch(0.62 0.13 255);
+  --chart-3: oklch(0.52 0.1 255);
+  --chart-4: oklch(0.42 0.06 255);
+  --chart-5: oklch(0.32 0.03 255);
+
+  --surface-shadow: 0 1px 2px rgb(0 0 0 / 0.2), 0 1px 1px rgb(0 0 0 / 0.16);
+  --menu-shadow: 0 10px 28px rgb(0 0 0 / 0.3), 0 2px 8px rgb(0 0 0 / 0.18);
+  --floating-shadow: 0 20px 48px rgb(0 0 0 / 0.46), 0 4px 12px rgb(0 0 0 / 0.28);
+
+  --mds-scrollbar-thumb: oklch(1 0 0 / 8%);
+  --mds-scrollbar-thumb-hover: oklch(1 0 0 / 18%);
+}
+
+/* Map Multica CSS vars → Tailwind utilities. `inline` keeps the utility
+   referencing the var (not a copied value) so `.dark` overrides stay live and
+   `bg-surface` / `ring-surface-border` / `bg-app-shell` / `bg-page-canvas` /
+   `text-sidebar-foreground` / `bg-brand` / `bg-chart-1` … all resolve. */
+@theme inline {
+  /* Surface layering */
+  --color-app-shell: var(--app-shell);
+  --color-page-canvas: var(--page-canvas);
+  --color-surface: var(--surface);
+  --color-surface-foreground: var(--surface-foreground);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-hover: var(--surface-hover);
+  --color-surface-selected: var(--surface-selected);
+  --color-surface-selected-foreground: var(--surface-selected-foreground);
+  --color-surface-border: var(--surface-border);
+
+  /* Semantic */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+
+  /* Sidebar */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* Charts */
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /* Radius scale (§1.6) — calc-derived from --radius (10px):
+     sm 6 · md 8 · lg 10 · xl 14 · 2xl 18 · 3xl 22 · 4xl 26 px */
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+
+  /* Fonts (§2) — zh-TW-first fallback; mono has no CJK fallback by design */
+  --font-sans: "Inter Variable", -apple-system, "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-heading: var(--font-sans);
+}
+
+/* Base typography + rendering (§2). Applied on <html> so it propagates. */
+html {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-autospace: ideograph-alpha ideograph-numeric;
+}
+
+/* Scrollbar (§1.5) — token-coloured, 6px, transparent track. Declared after
+   the legacy scrollbar rules so these win. */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--mds-scrollbar-thumb); border-radius: 9999px; }
+::-webkit-scrollbar-thumb:hover { background: var(--mds-scrollbar-thumb-hover); }
+
+/* ─────────── Overlay enter/exit motion (§3) ───────────
+   Minimal, composable re-implementation of the tw-animate-css classes the spec
+   uses (`animate-in fade-in-0 zoom-in-95`, `animate-out fade-out-0
+   zoom-out-95`, `slide-in-from-*-2`). Modifier classes only set custom props
+   (inert on their own); the `animation` lives on `.animate-in`/`.animate-out`,
+   both gated behind `prefers-reduced-motion`. `--tw-duration` lets Tailwind's
+   `duration-*` utility tune timing (spec asks for `duration-100`). */
+@keyframes mds-enter {
+  from {
+    opacity: var(--tw-enter-opacity, 1);
+    transform: translate3d(var(--tw-enter-translate-x, 0), var(--tw-enter-translate-y, 0), 0)
+      scale3d(var(--tw-enter-scale, 1), var(--tw-enter-scale, 1), 1)
+      rotate(var(--tw-enter-rotate, 0));
+  }
+}
+@keyframes mds-exit {
+  to {
+    opacity: var(--tw-exit-opacity, 1);
+    transform: translate3d(var(--tw-exit-translate-x, 0), var(--tw-exit-translate-y, 0), 0)
+      scale3d(var(--tw-exit-scale, 1), var(--tw-exit-scale, 1), 1)
+      rotate(var(--tw-exit-rotate, 0));
+  }
+}
+
+/* Directional / opacity / zoom modifiers — always safe (custom props only). */
+.fade-in-0 { --tw-enter-opacity: 0; }
+.fade-out-0 { --tw-exit-opacity: 0; }
+.zoom-in-95 { --tw-enter-scale: 0.95; }
+.zoom-out-95 { --tw-exit-scale: 0.95; }
+.slide-in-from-top-2 { --tw-enter-translate-y: -0.5rem; }
+.slide-in-from-bottom-2 { --tw-enter-translate-y: 0.5rem; }
+.slide-in-from-left-2 { --tw-enter-translate-x: -0.5rem; }
+.slide-in-from-right-2 { --tw-enter-translate-x: 0.5rem; }
+
+/* Top-nav indeterminate progress sweep (§3): 2px bg-brand bar, 1.4s. */
+@keyframes nav-progress-sweep {
+  0% { transform: translateX(-100%) scaleX(0.35); }
+  50% { transform: translateX(0%) scaleX(0.55); }
+  100% { transform: translateX(100%) scaleX(0.35); }
+}
+
+/* ─────────── Onboarding motion (§5.8) ───────────
+   Step transitions are a DELIBERATE pure-opacity fade — no positional shift, so
+   two-column onboarding steps cross-dissolve in place. The completion badge
+   springs in with an overshoot, then an SVG check draws itself via
+   stroke-dashoffset (path exported with pathLength=1). All three are gated
+   behind prefers-reduced-motion: in reduced-motion mode the badge renders at
+   rest (opacity 1, scale 1) and the check paints fully drawn (dashoffset 0),
+   so nothing is stuck invisible. */
+@keyframes mds-step-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes mds-badge-pop {
+  from { opacity: 0; transform: scale(0.4); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes mds-check-draw {
+  to { stroke-dashoffset: 0; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .animate-in {
+    animation: mds-enter var(--tw-duration, 100ms) cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  .animate-out {
+    animation: mds-exit var(--tw-duration, 100ms) cubic-bezier(0.4, 0, 1, 1) both;
+  }
+  .nav-progress-sweep {
+    transform-origin: left center;
+    animation: nav-progress-sweep 1.4s ease-in-out infinite;
+  }
+  /* 0.4s cross-fade between wizard steps (no translate — spec §5.8). */
+  .mds-step-fade { animation: mds-step-fade 0.4s ease-out both; }
+  /* 500ms overshoot spring on the completion badge. */
+  .mds-badge-pop { animation: mds-badge-pop 0.5s cubic-bezier(0.5, 1.5, 0.4, 1) both; }
+  /* Draw the check stroke once the badge has popped in. */
+  .mds-check-draw {
+    stroke-dasharray: 1;
+    stroke-dashoffset: 1;
+    animation: mds-check-draw 0.4s ease-out 0.25s forwards;
+  }
+}
