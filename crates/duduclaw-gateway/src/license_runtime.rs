@@ -503,6 +503,10 @@ pub struct LicenseSnapshot {
     /// enforcement path can detect an explicit issuer-set limit (`is_some()`)
     /// even on a self-host tier — see `handlers::tier_limit_message`.
     pub max_agents: Option<u32>,
+    /// NFR (Not-For-Resale) internal-test marker from the signed license. The
+    /// dashboard MUST render this as a visible badge that white-label branding
+    /// cannot remove — it is the anti-resale watermark for free test licenses.
+    pub nfr: bool,
 }
 
 impl LicenseSnapshot {
@@ -523,6 +527,7 @@ impl LicenseSnapshot {
             fingerprint_match: license.map(|l| l.is_valid_for_machine(current_fp)),
             branding_editable: license.and_then(|l| l.branding_editable.clone()),
             max_agents: license.and_then(|l| l.max_agents),
+            nfr: license.is_some_and(|l| l.nfr),
         }
     }
 }

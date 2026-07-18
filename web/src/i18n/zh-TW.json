@@ -540,6 +540,8 @@
   "license.loading": "讀取 License 狀態中…",
   "license.activeTier": "目前方案",
   "license.mode.commercial": "商業授權",
+  "license.nfr.title": "內部測試授權(NFR)",
+  "license.nfr.subtitle": "此授權僅供經銷商內部測試使用,不得販售或轉讓給客戶。",
   "license.mode.opensource": "Apache 2.0 開源模式（核心功能完整可用）",
   "license.customerId": "客戶 ID",
   "license.subscriptionId": "訂閱 ID",

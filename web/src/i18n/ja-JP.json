@@ -540,6 +540,8 @@
   "license.loading": "ライセンス状態を読み込み中…",
   "license.activeTier": "現在のプラン",
   "license.mode.commercial": "商用ライセンス",
+  "license.nfr.title": "社内テストライセンス(NFR)",
+  "license.nfr.subtitle": "再販不可 — 販売代理店の社内テスト専用です。顧客への販売・譲渡はできません。",
   "license.mode.opensource": "Apache 2.0 オープンソースモード — コア機能はフル利用可能",
   "license.customerId": "顧客 ID",
   "license.subscriptionId": "サブスクリプション ID",
