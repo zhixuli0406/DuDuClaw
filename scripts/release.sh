@@ -406,6 +406,27 @@ git add -- "${STAGE_FILES[@]}"
 git commit -m "chore: bump v$NEW_VERSION"
 git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
 
+# --- Enterprise pro-image (commercial checkout only) ---
+# The duduclaw-pro image is versioned by THIS release train (same gateway,
+# license-gated modules), so building it belongs to the normal release flow:
+# the cloud console's version dropdown lists GitHub releases filtered by
+# which duduclaw-pro:<tag> images actually exist in the private registry —
+# skipping this step means the new version never appears in the dropdown.
+# No-op on public checkouts (script absent). Opt out: DUDUCLAW_SKIP_PRO_IMAGE=1.
+PRO_IMAGE_SCRIPT="commercial/duduclaw-pro-gateway/build-image.sh"
+if [[ -x "$PRO_IMAGE_SCRIPT" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" != "1" ]]; then
+    echo ""
+    echo "Building + pushing enterprise duduclaw-pro:v$NEW_VERSION image..."
+    if "$PRO_IMAGE_SCRIPT" "v$NEW_VERSION"; then
+        echo "  Enterprise image v$NEW_VERSION pushed."
+    else
+        echo ""
+        echo "  WARNING: duduclaw-pro image build/push FAILED. The release commit +"
+        echo "  tag stand, but the cloud console will not offer v$NEW_VERSION until"
+        echo "  you re-run:  $PRO_IMAGE_SCRIPT v$NEW_VERSION"
+    fi
+fi
+
 echo ""
 echo "================================================"
 echo " Release v$NEW_VERSION prepared successfully!"
@@ -413,18 +434,15 @@ echo " All platforms synchronized: Cargo / pyproject (PyPI) / npm / READMEs"
 echo "================================================"
 echo ""
 echo "Next steps:"
-echo "  1. Edit CHANGELOG.md to fill in release notes"
-echo "  2. Update the release highlight in ALL THREE localized READMEs"
-echo "     (README.md / README.en.md / README.ja.md) — keep them aligned:"
-echo "       - Replace the top release highlight block with v$NEW_VERSION"
-echo "       - Demote the previous highlight into the history <details>"
-echo "       - Translate the new highlight into en + ja (zh-TW is the source)"
-echo "       (version badges were bumped automatically; the prose is manual)"
-echo "  3. Amend the commit if needed:  git commit --amend"
-echo "  4. Push to remote:              git push && git push --tags"
+echo "  1. Review CHANGELOG.md release notes (curated [Unreleased] was renamed)"
+echo "  2. Amend the commit if needed:  git commit --amend"
+echo "  3. Push to remote:              git push && git push --tags"
 echo "     -> the tag push triggers .github/workflows/release.yml, which builds"
 echo "        binaries and AUTO-PUBLISHES GitHub Release + npm + PyPI (all 3)."
-echo "  5. After CI finishes, CONFIRM every registry actually got it:"
+echo "  4. After CI finishes, CONFIRM every registry actually got it:"
 echo "       ./scripts/release.sh verify $NEW_VERSION"
 echo "     (this catches a PyPI/npm 'skip-existing' silent miss)"
+echo "     The cloud console's enterprise version dropdown picks the new"
+echo "     version up automatically once the GitHub Release exists AND the"
+echo "     duduclaw-pro:v$NEW_VERSION image is in the registry (built above)."
 echo ""
