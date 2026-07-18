@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
-import { inputClass, selectClass } from './Dialog';
+import { inputClass, selectClass } from './controlClass';
 import type { AvailableModel } from '@/hooks/useAvailableModels';
 
 const CUSTOM = '__custom__';
@@ -91,14 +91,14 @@ export function ModelSelect({
   // refresh handler is wired, regardless of list/manual mode.
   const header = onRefresh ? (
     <div className="flex items-center justify-between gap-2">
-      <span className="text-xs text-stone-400 dark:text-stone-500">{updatedText}</span>
+      <span className="text-xs text-muted-foreground">{updatedText}</span>
       <button
         type="button"
         onClick={onRefresh}
         disabled={refreshing}
         title={intl.formatMessage({ id: 'model.select.refresh' })}
         aria-label={intl.formatMessage({ id: 'model.select.refresh' })}
-        className="cursor-pointer text-xs text-stone-400 transition hover:text-amber-600 disabled:cursor-not-allowed disabled:opacity-50 dark:text-stone-500 dark:hover:text-amber-400"
+        className="cursor-pointer text-xs text-muted-foreground transition hover:text-brand disabled:cursor-not-allowed disabled:opacity-50"
       >
         <span className={refreshing ? 'inline-block animate-spin' : undefined}>🔄</span>
       </button>
@@ -121,14 +121,14 @@ export function ModelSelect({
           className={inputClass}
         />
         {noList ? (
-          <p className="text-xs text-rose-500 dark:text-rose-400">
+          <p className="text-xs text-destructive">
             {intl.formatMessage({ id: 'model.select.unavailable' })}
           </p>
         ) : (
           <button
             type="button"
             onClick={() => setCustom(false)}
-            className="cursor-pointer text-xs text-amber-600 hover:underline dark:text-amber-400"
+            className="cursor-pointer text-xs text-brand hover:underline"
           >
             {intl.formatMessage({ id: 'model.select.backToList' })}
           </button>

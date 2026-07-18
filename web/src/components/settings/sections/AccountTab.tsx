@@ -2,9 +2,14 @@ import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useAuthStore } from '@/stores/auth-store';
 import { api } from '@/lib/api';
-import { FormField, inputClass } from '@/components/shared/Dialog';
 import { toast, formatError } from '@/lib/toast';
-import { Card, Button } from '@/components/ui';
+import {
+  Button,
+  Input,
+  SettingsSection,
+  SettingsCard,
+  SettingsRow,
+} from '@/components/mds';
 import { SettingRow } from './shared';
 
 // ── Account tab — self-service password change ────────────────────────────────
@@ -49,63 +54,63 @@ export function AccountTab() {
   };
 
   return (
-    <Card title={intl.formatMessage({ id: 'settings.account.title' })}>
-      <div className="space-y-4">
-        <SettingRow
-          label={intl.formatMessage({ id: 'settings.account.signedInAs' })}
-          value={user ? `${user.display_name || user.email} (${user.email})` : '-'}
-        />
-
-        <p className="text-xs text-stone-500 dark:text-stone-400">
-          {intl.formatMessage({ id: 'settings.account.hint' })}
-        </p>
-
-        <FormField label={intl.formatMessage({ id: 'settings.account.current' })}>
-          <input
-            type="password"
-            className={inputClass}
-            value={current}
-            onChange={(e) => setCurrent(e.target.value)}
-            autoComplete="current-password"
+    <div className="space-y-8">
+      <SettingsSection>
+        <SettingsCard>
+          <SettingRow
+            label={intl.formatMessage({ id: 'settings.account.signedInAs' })}
+            value={user ? `${user.display_name || user.email} (${user.email})` : '-'}
           />
-        </FormField>
-        <FormField label={intl.formatMessage({ id: 'settings.account.new' })}>
-          <input
-            type="password"
-            className={inputClass}
-            value={next}
-            onChange={(e) => setNext(e.target.value)}
-            autoComplete="new-password"
-          />
-        </FormField>
-        <FormField label={intl.formatMessage({ id: 'settings.account.confirm' })}>
-          <input
-            type="password"
-            className={inputClass}
-            value={confirm}
-            onChange={(e) => setConfirm(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                void submit();
-              }
-            }}
-            autoComplete="new-password"
-          />
-        </FormField>
+        </SettingsCard>
+      </SettingsSection>
 
-        <div className="flex items-center justify-end pt-2">
-          <Button
-            variant="primary"
-            onClick={() => void submit()}
-            disabled={saving || !current || !next || !confirm}
-          >
-            {saving
-              ? intl.formatMessage({ id: 'common.saving' })
-              : intl.formatMessage({ id: 'settings.account.submit' })}
-          </Button>
-        </div>
+      <SettingsSection description={intl.formatMessage({ id: 'settings.account.hint' })}>
+        <SettingsCard>
+          <SettingsRow label={intl.formatMessage({ id: 'settings.account.current' })} tier="text">
+            <Input
+              type="password"
+              value={current}
+              onChange={(e) => setCurrent(e.target.value)}
+              autoComplete="current-password"
+            />
+          </SettingsRow>
+          <SettingsRow label={intl.formatMessage({ id: 'settings.account.new' })} tier="text">
+            <Input
+              type="password"
+              value={next}
+              onChange={(e) => setNext(e.target.value)}
+              autoComplete="new-password"
+            />
+          </SettingsRow>
+          <SettingsRow label={intl.formatMessage({ id: 'settings.account.confirm' })} tier="text">
+            <Input
+              type="password"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void submit();
+                }
+              }}
+              autoComplete="new-password"
+            />
+          </SettingsRow>
+        </SettingsCard>
+      </SettingsSection>
+
+      <div className="flex items-center justify-end">
+        <Button
+          variant="brand"
+          size="sm"
+          onClick={() => void submit()}
+          disabled={saving || !current || !next || !confirm}
+        >
+          {saving
+            ? intl.formatMessage({ id: 'common.saving' })
+            : intl.formatMessage({ id: 'settings.account.submit' })}
+        </Button>
       </div>
-    </Card>
+    </div>
   );
 }

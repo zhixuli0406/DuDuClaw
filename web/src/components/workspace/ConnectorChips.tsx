@@ -80,14 +80,14 @@ export function ConnectorChips() {
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="menu"
         aria-expanded={open}
-        className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--panel-border)] px-2.5 text-xs font-medium text-stone-600 transition-colors hover:bg-stone-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 dark:text-stone-300 dark:hover:bg-white/5"
+        className="flex h-9 items-center gap-1.5 rounded-lg border border-surface-border px-2.5 text-xs font-medium text-muted-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
       >
         <Plug className="h-4 w-4" />
         <span className="hidden sm:inline">
           {intl.formatMessage({ id: 'workspace.connectors', defaultMessage: '連接器' })}
         </span>
         {channelsLive > 0 && (
-          <span className="rounded-full bg-emerald-500/15 px-1.5 text-[10px] font-semibold text-emerald-600 tabular-nums dark:text-emerald-400">
+          <span className="rounded-full bg-success/15 px-1.5 text-[10px] font-semibold text-success tabular-nums">
             {channelsLive}
           </span>
         )}
@@ -97,21 +97,21 @@ export function ConnectorChips() {
       {open && (
         <div
           role="menu"
-          className="glass-overlay absolute bottom-full left-0 z-50 mb-2 w-56 overflow-hidden rounded-xl p-1"
+          className="absolute bottom-full left-0 z-50 mb-2 w-56 overflow-hidden rounded-lg bg-surface-raised p-1 shadow-[var(--menu-shadow)] ring-1 ring-surface-border"
         >
           {visible.map(({ key, to, icon: Icon, label }) => (
             <button
               key={key}
               role="menuitem"
               onClick={() => go(to)}
-              className="flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-sm text-stone-600 transition-colors hover:bg-stone-500/10 dark:text-stone-300 dark:hover:bg-white/5"
+              className="flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted"
             >
               <span className="flex items-center gap-2">
                 <Icon className="h-4 w-4" />
                 {intl.formatMessage({ id: label })}
               </span>
               {key === 'channels' && channelsLive > 0 && (
-                <span className="text-[11px] text-emerald-600 tabular-nums dark:text-emerald-400">
+                <span className="text-[11px] text-success tabular-nums">
                   {intl.formatMessage(
                     { id: 'workspace.channelsLive', defaultMessage: '{n} 已連線' },
                     { n: channelsLive },

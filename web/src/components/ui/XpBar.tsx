@@ -46,12 +46,12 @@ export function XpBar({
   return (
     <div className={cn('flex items-center gap-2', className)}>
       {showLevel && (
-        <span className="shrink-0 text-xs font-semibold text-stone-700 tabular-nums dark:text-stone-200">
+        <span className="shrink-0 text-xs font-semibold tabular-nums text-foreground">
           Lv.{lvl}
         </span>
       )}
       <div
-        className="relative h-2 min-w-16 flex-1 overflow-hidden rounded-full bg-stone-500/15 dark:bg-white/10"
+        className="relative h-2 min-w-16 flex-1 overflow-hidden rounded-full bg-muted"
         role="progressbar"
         aria-valuemin={0}
         aria-valuemax={100}

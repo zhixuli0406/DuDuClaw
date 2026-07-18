@@ -1,11 +1,30 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type AccountInfo, type BudgetSummary } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
-import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import { ChipEditor } from '@/components/shared/ChipEditor';
-import { Page, PageHeader, Card, StatCard, Button, Badge, EmptyState } from '@/components/ui';
+import {
+  Button,
+  Badge,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Empty,
+  Input,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DialogClose,
+} from '@/components/mds';
 import { CliLoginModal, type LoginRuntime } from '@/components/CliLoginModal';
 import {
   Wallet,
@@ -22,6 +41,63 @@ import {
   PiggyBank,
 } from 'lucide-react';
 
+/** KPI tile (spec §5.5): tinted icon + label + big value. */
+function StatTile({
+  icon: Icon,
+  tone,
+  label,
+  value,
+}: {
+  icon: ComponentType<{ className?: string }>;
+  tone: 'brand' | 'success' | 'warning';
+  label: string;
+  value: string;
+}) {
+  const toneClass = tone === 'success' ? 'text-success' : tone === 'warning' ? 'text-warning' : 'text-brand';
+  return (
+    <div className="rounded-lg border border-surface-border bg-card p-4">
+      <div className="flex items-center gap-2">
+        <Icon className={cn('size-4', toneClass)} />
+        <p className="text-sm text-muted-foreground">{label}</p>
+      </div>
+      <p className="mt-2 text-2xl font-semibold tabular-nums text-foreground">{value}</p>
+    </div>
+  );
+}
+
+/** Local labeled-field wrapper (spec §4 form pattern). */
+function Field({
+  label,
+  hint,
+  children,
+  className,
+}: {
+  label: string;
+  hint?: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={cn('space-y-1.5', className)}>
+      <label className="text-xs font-medium text-muted-foreground">{label}</label>
+      {children}
+      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+const CLI_OPTIONS: ReadonlyArray<[LoginRuntime, string]> = [
+  ['claude', 'Claude'],
+  ['codex', 'Codex'],
+  ['gemini', 'Gemini'],
+  ['antigravity', 'Antigravity (agy)'],
+];
+
+/**
+ * AccountsPage — multi-account rotation surface (MDS, the accounts tab of
+ * `/manage/billing` + legacy `/accounts`). Budget KPIs, a usage bar, and a grid
+ * of per-account cards; add / edit / one-click-login all go through MDS dialogs.
+ */
 export function AccountsPage() {
   const intl = useIntl();
   const [budget, setBudget] = useState<BudgetSummary | null>(null);
@@ -57,54 +133,53 @@ export function AccountsPage() {
 
   const totalBudget = budget?.total_budget_cents ?? 0;
   const totalSpent = budget?.total_spent_cents ?? 0;
-  const usagePercent =
-    totalBudget > 0 ? Math.min(100, (totalSpent / totalBudget) * 100) : 0;
+  const usagePercent = totalBudget > 0 ? Math.min(100, (totalSpent / totalBudget) * 100) : 0;
 
   return (
-    <Page>
-      <PageHeader
-        icon={Wallet}
-        title={intl.formatMessage({ id: 'nav.accounts' })}
-        subtitle={intl.formatMessage({ id: 'accounts.title' })}
-        actions={
-          <>
-            <Button variant="secondary" icon={RefreshCw} onClick={handleRotate}>
-              {intl.formatMessage({ id: 'accounts.rotate' })}
-            </Button>
-            <Button variant="secondary" icon={LogIn} onClick={() => setPickerOpen(true)}>
-              一鍵登入
-            </Button>
-            <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
-              {intl.formatMessage({ id: 'accounts.add' })}
-            </Button>
-          </>
-        }
-      />
+    <div className="space-y-6">
+      {/* Slim tab header — description left, actions right (spec §5.2). */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'accounts.title' })}</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" size="sm" onClick={handleRotate}>
+            <RefreshCw />
+            {intl.formatMessage({ id: 'accounts.rotate' })}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setPickerOpen(true)}>
+            <LogIn />
+            一鍵登入
+          </Button>
+          <Button variant="brand" size="sm" onClick={() => setShowAddDialog(true)}>
+            <Plus />
+            {intl.formatMessage({ id: 'accounts.add' })}
+          </Button>
+        </div>
+      </div>
 
       {/* CLI picker for one-click login */}
-      <Dialog open={pickerOpen} onClose={() => setPickerOpen(false)} title="選擇要登入的 CLI">
-        <div className="grid grid-cols-2 gap-2">
-          {([
-            ['claude', 'Claude'],
-            ['codex', 'Codex'],
-            ['gemini', 'Gemini'],
-            ['antigravity', 'Antigravity (agy)'],
-          ] as [LoginRuntime, string][]).map(([rt, label]) => (
-            <button
-              key={rt}
-              className={buttonSecondary}
-              onClick={() => {
-                setPickerOpen(false);
-                setLoginRuntime(rt);
-              }}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-        <p className="mt-3 text-xs text-stone-500 dark:text-stone-400">
-          會在伺服器以 PTY 驅動該 CLI 的原生登入流程並串到這裡。Claude 走 setup-token（遠端可用）；其餘走 localhost 回呼（限自架）。
-        </p>
+      <Dialog open={pickerOpen} onOpenChange={(o) => !o && setPickerOpen(false)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>選擇要登入的 CLI</DialogTitle>
+          </DialogHeader>
+          <div className="grid grid-cols-2 gap-2">
+            {CLI_OPTIONS.map(([rt, label]) => (
+              <Button
+                key={rt}
+                variant="outline"
+                onClick={() => {
+                  setPickerOpen(false);
+                  setLoginRuntime(rt);
+                }}
+              >
+                {label}
+              </Button>
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            會在伺服器以 PTY 驅動該 CLI 的原生登入流程並串到這裡。Claude 走 setup-token（遠端可用）；其餘走 localhost 回呼（限自架）。
+          </p>
+        </DialogContent>
       </Dialog>
 
       {loginRuntime && (
@@ -118,47 +193,48 @@ export function AccountsPage() {
 
       {/* Budget Summary KPIs */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <StatCard
+        <StatTile
           icon={TrendingUp}
           tone="warning"
           label={intl.formatMessage({ id: 'accounts.budget.used' })}
           value={`$${(totalSpent / 100).toFixed(2)}`}
         />
-        <StatCard
+        <StatTile
           icon={PiggyBank}
           tone="success"
           label={intl.formatMessage({ id: 'accounts.budget.remaining' })}
           value={`$${((totalBudget - totalSpent) / 100).toFixed(2)}`}
         />
-        <StatCard
+        <StatTile
           icon={Wallet}
-          tone="accent"
+          tone="brand"
           label={intl.formatMessage({ id: 'accounts.budget.total' })}
           value={`$${(totalBudget / 100).toFixed(2)}`}
         />
       </div>
 
       {/* Budget Summary progress */}
-      <Card title={intl.formatMessage({ id: 'accounts.budget.total' })}>
-        <div className="h-3 overflow-hidden rounded-full bg-stone-500/15 dark:bg-white/10">
-          <div
-            className={cn(
-              'h-full rounded-full transition-all',
-              usagePercent > 80
-                ? 'bg-rose-500'
-                : usagePercent > 60
-                  ? 'bg-amber-500'
-                  : 'bg-emerald-500'
-            )}
-            style={{ width: `${usagePercent}%` }}
-          />
-        </div>
-        <p className="mt-2 flex justify-between text-xs text-stone-500 dark:text-stone-400">
-          <span className="tabular-nums">
-            ${(totalSpent / 100).toFixed(2)} / ${(totalBudget / 100).toFixed(2)}
-          </span>
-          <span className="tabular-nums">{usagePercent.toFixed(0)}%</span>
-        </p>
+      <Card>
+        <CardHeader>
+          <CardTitle>{intl.formatMessage({ id: 'accounts.budget.total' })}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="h-3 overflow-hidden rounded-full bg-muted">
+            <div
+              className={cn(
+                'h-full rounded-full transition-all',
+                usagePercent > 80 ? 'bg-destructive' : usagePercent > 60 ? 'bg-warning' : 'bg-success'
+              )}
+              style={{ width: `${usagePercent}%` }}
+            />
+          </div>
+          <p className="mt-2 flex justify-between text-xs text-muted-foreground">
+            <span className="tabular-nums">
+              ${(totalSpent / 100).toFixed(2)} / ${(totalBudget / 100).toFixed(2)}
+            </span>
+            <span className="tabular-nums">{usagePercent.toFixed(0)}%</span>
+          </p>
+        </CardContent>
       </Card>
 
       {/* Accounts List */}
@@ -169,21 +245,12 @@ export function AccountsPage() {
           ))}
         </div>
       ) : !loading ? (
-        <Card>
-          <EmptyState
-            icon={Wallet}
-            title={intl.formatMessage({ id: 'common.noData' })}
-          />
-        </Card>
+        <Empty icon={Wallet} title={intl.formatMessage({ id: 'common.noData' })} variant="dashed" />
       ) : null}
 
       {/* Add Account Dialog */}
-      <AddAccountDialog
-        open={showAddDialog}
-        onClose={() => setShowAddDialog(false)}
-        onCreated={fetchBudget}
-      />
-    </Page>
+      <AddAccountDialog open={showAddDialog} onClose={() => setShowAddDialog(false)} onCreated={fetchBudget} />
+    </div>
   );
 }
 
@@ -203,7 +270,6 @@ function AddAccountDialog({
   const [budget, setBudget] = useState('50');
   const [priority, setPriority] = useState('1');
   const [submitting, setSubmitting] = useState(false);
-
   const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = async () => {
@@ -235,75 +301,68 @@ function AddAccountDialog({
     }
   };
 
+  const keyLabel = accountType === 'api_key' ? 'API Key' : 'OAuth Token';
+
   return (
-    <Dialog open={open} onClose={onClose} title={intl.formatMessage({ id: 'accounts.add' })}>
-      <div className="space-y-4">
-        <FormField label={intl.formatMessage({ id: 'accounts.provider.name' })}>
-          <input
-            type="text"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder={intl.formatMessage({ id: 'accounts.name.placeholder' })}
-            className={inputClass}
-          />
-        </FormField>
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'accounts.add' })}</DialogTitle>
+        </DialogHeader>
 
-        <FormField label={intl.formatMessage({ id: 'accounts.provider.authMethod' })}>
-          <select
-            value={accountType}
-            onChange={(e) => setAccountType(e.target.value)}
-            className={selectClass}
-          >
-            <option value="api_key">API Key</option>
-            <option value="oauth">OAuth Token</option>
-          </select>
-        </FormField>
-
-        <FormField label={accountType === 'api_key' ? 'API Key' : 'OAuth Token'}>
-          <input
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            placeholder={accountType === 'api_key' ? 'sk-ant-...' : 'oauth-token-...'}
-            className={inputClass}
-          />
-        </FormField>
-
-        <div className="grid grid-cols-2 gap-4">
-          <FormField label={intl.formatMessage({ id: 'accounts.provider.budget' })}>
-            <input
-              type="number"
-              value={budget}
-              onChange={(e) => setBudget(e.target.value)}
-              min="1"
-              className={inputClass}
+        <div className="space-y-4">
+          <Field label={intl.formatMessage({ id: 'accounts.provider.name' })}>
+            <Input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={intl.formatMessage({ id: 'accounts.name.placeholder' })}
             />
-          </FormField>
-          <FormField label={intl.formatMessage({ id: 'accounts.provider.priority' })} hint={intl.formatMessage({ id: 'accounts.provider.priorityHint' })}>
-            <input
-              type="number"
-              value={priority}
-              onChange={(e) => setPriority(e.target.value)}
-              min="1"
-              max="10"
-              className={inputClass}
+          </Field>
+
+          <Field label={intl.formatMessage({ id: 'accounts.provider.authMethod' })}>
+            <Select value={accountType} onValueChange={(v) => setAccountType(String(v))}>
+              <SelectTrigger className="w-full">
+                <SelectValue>{accountType === 'api_key' ? 'API Key' : 'OAuth Token'}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="api_key">API Key</SelectItem>
+                <SelectItem value="oauth">OAuth Token</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+
+          <Field label={keyLabel}>
+            <Input
+              type="password"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={accountType === 'api_key' ? 'sk-ant-...' : 'oauth-token-...'}
             />
-          </FormField>
+          </Field>
+
+          <div className="grid grid-cols-2 gap-4">
+            <Field label={intl.formatMessage({ id: 'accounts.provider.budget' })}>
+              <Input type="number" value={budget} onChange={(e) => setBudget(e.target.value)} min="1" />
+            </Field>
+            <Field
+              label={intl.formatMessage({ id: 'accounts.provider.priority' })}
+              hint={intl.formatMessage({ id: 'accounts.provider.priorityHint' })}
+            >
+              <Input type="number" value={priority} onChange={(e) => setPriority(e.target.value)} min="1" max="10" />
+            </Field>
+          </div>
+
+          {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
 
-        {error && (
-          <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>
-        )}
-
-        <div className="flex justify-end gap-3 pt-2">
-          <button onClick={onClose} className={buttonSecondary}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </button>
-          <button onClick={handleSubmit} disabled={submitting || !name.trim()} className={buttonPrimary}>
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'common.cancel' })}</Button>} />
+          <Button variant="brand" onClick={handleSubmit} disabled={submitting || !name.trim()}>
             {submitting ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'accounts.add' })}
-          </button>
-        </div>
-      </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
@@ -341,19 +400,19 @@ function AccountCard({
   };
 
   return (
-    <div className="panel p-5">
+    <div className="rounded-xl border border-surface-border bg-surface p-5 shadow-[var(--surface-shadow)]">
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-3">
-          <div className="rounded-lg bg-stone-500/10 p-2 dark:bg-white/5">
+          <div className="rounded-lg bg-muted p-2 text-muted-foreground">
             {(account.auth_method ?? 'unknown') === 'apikey' ? (
-              <Key className="h-4 w-4 text-stone-600 dark:text-stone-400" />
+              <Key className="size-4" />
             ) : (
-              <KeyRound className="h-4 w-4 text-stone-600 dark:text-stone-400" />
+              <KeyRound className="size-4" />
             )}
           </div>
           <div>
-            <h3 className="font-semibold text-stone-900 dark:text-stone-50">{account.id}</h3>
-            <p className="text-xs capitalize text-stone-500 dark:text-stone-400">
+            <h3 className="font-medium text-foreground">{account.id}</h3>
+            <p className="text-xs capitalize text-muted-foreground">
               {(account.auth_method ?? account.account_type ?? 'unknown').replace('_', ' ')}
             </p>
           </div>
@@ -361,19 +420,20 @@ function AccountCard({
         <div className="flex items-center gap-2">
           <Button
             variant="ghost"
-            size="sm"
-            icon={Settings2}
+            size="icon-sm"
             onClick={() => setShowDetails(true)}
             title={intl.formatMessage({ id: 'accounts.edit' })}
             aria-label={intl.formatMessage({ id: 'accounts.edit' })}
-          />
+          >
+            <Settings2 />
+          </Button>
           {account.is_healthy ? (
-            <Badge tone="success" dot>
-              <CheckCircle className="h-3.5 w-3.5" />
+            <Badge variant="secondary" className="bg-success/15 text-success">
+              <CheckCircle />
             </Badge>
           ) : (
-            <Badge tone="warning" dot>
-              <AlertTriangle className="h-3.5 w-3.5" />
+            <Badge variant="secondary" className="bg-warning/15 text-warning">
+              <AlertTriangle />
             </Badge>
           )}
         </div>
@@ -383,30 +443,34 @@ function AccountCard({
         account={account}
         open={showDetails}
         onClose={() => setShowDetails(false)}
-        onSaved={() => { setShowDetails(false); onBudgetUpdated(); }}
+        onSaved={() => {
+          setShowDetails(false);
+          onBudgetUpdated();
+        }}
       />
 
-      <div className="mt-3 flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
+      <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
         <span>
-          {intl.formatMessage({ id: 'accounts.priority' })}: <strong className="tabular-nums">{account.priority}</strong>
+          {intl.formatMessage({ id: 'accounts.priority' })}:{' '}
+          <strong className="tabular-nums text-foreground">{account.priority}</strong>
         </span>
       </div>
 
       <div className="mt-4">
-        <div className="mb-1 flex items-center justify-between text-xs text-stone-500 dark:text-stone-400">
+        <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
           <span>{intl.formatMessage({ id: 'accounts.budget.used' })}</span>
           {editing ? (
             <div className="flex items-center gap-1">
               <span className="tabular-nums">${(account.spent_this_month / 100).toFixed(2)} / $</span>
-              <input
+              <Input
                 type="number"
                 min="1"
                 value={budgetInput}
                 onChange={(e) => setBudgetInput(e.target.value)}
-                className="w-20 rounded-lg border border-amber-400 bg-[var(--panel-fill)] px-1.5 py-0.5 text-xs tabular-nums text-stone-900 focus:outline-none dark:border-amber-600 dark:text-stone-50"
+                className="h-7 w-20 tabular-nums"
                 autoFocus
               />
-              <Button size="sm" variant="primary" onClick={handleSaveBudget} disabled={saving}>
+              <Button size="sm" variant="brand" onClick={handleSaveBudget} disabled={saving}>
                 {intl.formatMessage({ id: 'common.save' })}
               </Button>
               <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>
@@ -415,23 +479,23 @@ function AccountCard({
             </div>
           ) : (
             <button
-              onClick={() => { setBudgetInput(String(account.monthly_budget_cents / 100)); setEditing(true); }}
-              className="flex items-center gap-1 hover:text-amber-600 dark:hover:text-amber-400"
+              onClick={() => {
+                setBudgetInput(String(account.monthly_budget_cents / 100));
+                setEditing(true);
+              }}
+              className="flex items-center gap-1 hover:text-brand"
             >
               <span className="tabular-nums">
                 ${(account.spent_this_month / 100).toFixed(2)} / $
                 {(account.monthly_budget_cents / 100).toFixed(2)}
               </span>
-              <Pencil className="h-3 w-3" />
+              <Pencil className="size-3" />
             </button>
           )}
         </div>
-        <div className="h-1.5 overflow-hidden rounded-full bg-stone-500/15 dark:bg-white/10">
+        <div className="h-1.5 overflow-hidden rounded-full bg-muted">
           <div
-            className={cn(
-              'h-full rounded-full transition-all',
-              spentPercent > 80 ? 'bg-rose-500' : 'bg-amber-500'
-            )}
+            className={cn('h-full rounded-full transition-all', spentPercent > 80 ? 'bg-destructive' : 'bg-warning')}
             style={{ width: `${spentPercent}%` }}
           />
         </div>
@@ -501,41 +565,56 @@ function EditAccountDialog({
   };
 
   return (
-    <Dialog open={open} onClose={onClose} title={`${intl.formatMessage({ id: 'accounts.edit' })} — ${account.id}`}>
-      <div className="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label={intl.formatMessage({ id: 'accounts.provider.priority' })}>
-            <input type="number" min={1} max={100} value={priority} onChange={(e) => setPriority(e.target.value)} className={inputClass} />
-          </FormField>
-          <FormField label={intl.formatMessage({ id: 'accounts.provider.budget' })}>
-            <input type="number" min={0} value={budget} onChange={(e) => setBudget(e.target.value)} className={inputClass} />
-          </FormField>
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>
+            {intl.formatMessage({ id: 'accounts.edit' })} — {account.id}
+          </DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <Field label={intl.formatMessage({ id: 'accounts.provider.priority' })}>
+              <Input type="number" min={1} max={100} value={priority} onChange={(e) => setPriority(e.target.value)} />
+            </Field>
+            <Field label={intl.formatMessage({ id: 'accounts.provider.budget' })}>
+              <Input type="number" min={0} value={budget} onChange={(e) => setBudget(e.target.value)} />
+            </Field>
+          </div>
+          <Field label={intl.formatMessage({ id: 'accounts.field.label' })}>
+            <Input type="text" value={label} onChange={(e) => setLabel(e.target.value)} />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label={intl.formatMessage({ id: 'accounts.field.email' })}>
+              <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+            </Field>
+            <Field label={intl.formatMessage({ id: 'accounts.field.subscription' })}>
+              <Input
+                type="text"
+                value={subscription}
+                onChange={(e) => setSubscription(e.target.value)}
+                placeholder="pro / max / team"
+              />
+            </Field>
+          </div>
+          <Field
+            label={intl.formatMessage({ id: 'accounts.field.profile' })}
+            hint={intl.formatMessage({ id: 'accounts.field.profile.hint' })}
+          >
+            <Input type="text" value={profile} onChange={(e) => setProfile(e.target.value)} />
+          </Field>
+          <Field label={intl.formatMessage({ id: 'accounts.field.tags' })}>
+            <ChipEditor values={tags} onChange={setTags} placeholder="prod" addLabel={intl.formatMessage({ id: 'common.add' })} />
+          </Field>
+          {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
-        <FormField label={intl.formatMessage({ id: 'accounts.field.label' })}>
-          <input type="text" value={label} onChange={(e) => setLabel(e.target.value)} className={inputClass} />
-        </FormField>
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label={intl.formatMessage({ id: 'accounts.field.email' })}>
-            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className={inputClass} />
-          </FormField>
-          <FormField label={intl.formatMessage({ id: 'accounts.field.subscription' })}>
-            <input type="text" value={subscription} onChange={(e) => setSubscription(e.target.value)} placeholder="pro / max / team" className={inputClass} />
-          </FormField>
-        </div>
-        <FormField label={intl.formatMessage({ id: 'accounts.field.profile' })} hint={intl.formatMessage({ id: 'accounts.field.profile.hint' })}>
-          <input type="text" value={profile} onChange={(e) => setProfile(e.target.value)} className={inputClass} />
-        </FormField>
-        <FormField label={intl.formatMessage({ id: 'accounts.field.tags' })}>
-          <ChipEditor values={tags} onChange={setTags} placeholder="prod" addLabel={intl.formatMessage({ id: 'common.add' })} />
-        </FormField>
-        {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
-        <div className="flex justify-end gap-3 pt-2">
-          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
-          <button onClick={handleSubmit} disabled={saving} className={buttonPrimary}>
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'common.cancel' })}</Button>} />
+          <Button variant="brand" onClick={handleSubmit} disabled={saving}>
             {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
-          </button>
-        </div>
-      </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }

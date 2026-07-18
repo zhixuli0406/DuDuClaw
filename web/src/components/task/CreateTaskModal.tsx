@@ -1,8 +1,20 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { cn } from '@/lib/utils';
-import { Dialog, FormField, inputClass, selectClass } from '@/components/shared/Dialog';
-import { Button } from '@/components/ui';
+import {
+  Button,
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Input,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Textarea,
+} from '@/components/mds';
 import { AssigneePopover, type AssigneeOption } from './AssigneePopover';
 import type { TaskCreateParams, TaskPriority } from '@/lib/api';
 
@@ -34,24 +46,29 @@ export function CreateTaskModal({
   const [priority, setPriority] = useState<TaskPriority>('medium');
   const [submitting, setSubmitting] = useState(false);
 
-  // Reset the form each time the modal opens; seed the assignee.
+  // Reset the form each time the modal opens. Default to UNASSIGNED (empty) so
+  // a manually-organised task is not silently handed to the first agent and
+  // auto-dispatched (Bug#4). A subtask still inherits its parent's assignee via
+  // `defaultAssignee` when one is provided.
   useEffect(() => {
     if (open) {
       setTitle('');
       setDescription('');
       setPriority('medium');
-      setAssignedTo(defaultAssignee ?? agents[0]?.name ?? '');
+      setAssignedTo(defaultAssignee ?? '');
     }
-  }, [open, defaultAssignee, agents]);
+  }, [open, defaultAssignee]);
 
   const handleSubmit = useCallback(async () => {
-    if (!title.trim() || !assignedTo) return;
+    if (!title.trim()) return;
     setSubmitting(true);
     try {
       await onCreate({
         title: title.trim(),
         description: description.trim() || undefined,
-        assigned_to: assignedTo,
+        // Omit when unassigned — the gateway treats a missing assignee as an
+        // unassigned (never auto-dispatched) task.
+        ...(assignedTo ? { assigned_to: assignedTo } : {}),
         priority,
         ...(parentTaskId ? { parent_task_id: parentTaskId } : {}),
       });
@@ -66,58 +83,79 @@ export function CreateTaskModal({
     : intl.formatMessage({ id: 'tasks.create' });
 
   return (
-    <Dialog open={open} title={dialogTitle} onClose={onClose}>
-      <div className="space-y-4">
-        <FormField label={intl.formatMessage({ id: 'tasks.field.title' })}>
-          <input
-            className={inputClass}
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder={intl.formatMessage({ id: 'tasks.field.title' })}
-            autoFocus
-          />
-        </FormField>
+    <Dialog open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{dialogTitle}</DialogTitle>
+        </DialogHeader>
 
-        <FormField label={intl.formatMessage({ id: 'tasks.field.description' })}>
-          <textarea
-            className={cn(inputClass, 'min-h-[80px] resize-y')}
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            placeholder={intl.formatMessage({ id: 'tasks.field.description' })}
-          />
-        </FormField>
+        <div className="space-y-4">
+          <ModalField label={intl.formatMessage({ id: 'tasks.field.title' })}>
+            <Input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder={intl.formatMessage({ id: 'tasks.field.title' })}
+              autoFocus
+            />
+          </ModalField>
 
-        <FormField label={intl.formatMessage({ id: 'tasks.field.assignTo' })}>
-          <div className="rounded-lg border border-stone-300/70 bg-white/60 px-1 py-1 dark:border-white/10 dark:bg-white/5">
-            <AssigneePopover agents={agents} value={assignedTo || null} onChange={setAssignedTo} />
-          </div>
-        </FormField>
+          <ModalField label={intl.formatMessage({ id: 'tasks.field.description' })}>
+            <Textarea
+              className="min-h-[80px] resize-y"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder={intl.formatMessage({ id: 'tasks.field.description' })}
+            />
+          </ModalField>
 
-        <FormField label={intl.formatMessage({ id: 'tasks.field.priority' })}>
-          <select
-            className={selectClass}
-            value={priority}
-            onChange={(e) => setPriority(e.target.value as TaskPriority)}
-          >
-            {(['low', 'medium', 'high', 'urgent'] as const).map((p) => (
-              <option key={p} value={p}>
-                {intl.formatMessage({ id: `tasks.priority.${p}` })}
-              </option>
-            ))}
-          </select>
-        </FormField>
+          <ModalField label={intl.formatMessage({ id: 'tasks.field.assignTo' })}>
+            <div className="rounded-lg border border-input px-1 py-1">
+              <AssigneePopover agents={agents} value={assignedTo || null} onChange={setAssignedTo} allowUnassigned />
+            </div>
+          </ModalField>
 
-        <div className="flex justify-end gap-3 pt-2">
-          <Button variant="secondary" onClick={onClose}>
+          <ModalField label={intl.formatMessage({ id: 'tasks.field.priority' })}>
+            <Select value={priority} onValueChange={(v) => setPriority(v as TaskPriority)}>
+              <SelectTrigger className="w-full">
+                <SelectValue>
+                  {intl.formatMessage({ id: `tasks.priority.${priority}` })}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {(['low', 'medium', 'high', 'urgent'] as const).map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {intl.formatMessage({ id: `tasks.priority.${p}` })}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </ModalField>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
             {intl.formatMessage({ id: 'agents.delegate.close' })}
           </Button>
-          <Button variant="primary" onClick={handleSubmit} disabled={submitting || !title.trim() || !assignedTo}>
+          <Button
+            variant="brand"
+            onClick={handleSubmit}
+            disabled={submitting || !title.trim()}
+          >
             {submitting
               ? intl.formatMessage({ id: 'agents.delegate.submitting' })
               : intl.formatMessage({ id: 'tasks.create' })}
           </Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
+  );
+}
+
+function ModalField({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="space-y-1.5">
+      <label className="text-xs font-medium text-muted-foreground">{label}</label>
+      {children}
+    </div>
   );
 }

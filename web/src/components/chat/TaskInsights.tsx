@@ -56,18 +56,18 @@ function StepRow({ node, runningLabel, doneLabel }: { node: StepNode; runningLab
   const Icon = iconForTool(node.tool);
   return (
     <li
-      className="flex items-start gap-2 text-xs text-stone-600 dark:text-stone-300"
+      className="flex items-start gap-2 text-xs text-muted-foreground"
       style={{ paddingLeft: `${node.depth * 14}px` }}
     >
       {node.running ? (
-        <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-amber-500" aria-label={runningLabel} />
+        <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-brand" aria-label={runningLabel} />
       ) : (
-        <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" aria-label={doneLabel} />
+        <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" aria-label={doneLabel} />
       )}
-      <Icon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-stone-400 dark:text-stone-500" aria-hidden="true" />
+      <Icon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground/60" aria-hidden="true" />
       <span className="min-w-0 break-words">
-        <span className="font-medium text-stone-700 dark:text-stone-200">{node.tool}</span>
-        {node.summary && <span className="text-stone-500 dark:text-stone-400"> · {node.summary}</span>}
+        <span className="font-medium text-foreground">{node.tool}</span>
+        {node.summary && <span className="text-muted-foreground"> · {node.summary}</span>}
       </span>
     </li>
   );
@@ -110,7 +110,7 @@ export function TaskInsights({
   const doneLabel = intl.formatMessage({ id: 'chat.insights.done', defaultMessage: 'Done' });
 
   return (
-    <div className="rounded-xl border border-[var(--panel-border)] bg-[var(--panel-fill)]/60 p-3">
+    <div className="rounded-xl border border-surface-border bg-surface p-3">
       <button
         type="button"
         onClick={() => {
@@ -118,24 +118,24 @@ export function TaskInsights({
           setOpen((o) => !o);
         }}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 text-sm font-medium text-stone-700 dark:text-stone-200"
+        className="flex w-full items-center gap-2 text-sm font-medium text-foreground"
       >
         <ChevronDown className={cn('h-4 w-4 shrink-0 transition-transform', !open && '-rotate-90')} />
         <span>{intl.formatMessage({ id: 'chat.insights.title', defaultMessage: 'Task insights' })}</span>
-        <span className="rounded-full bg-stone-500/10 px-1.5 text-[11px] tabular-nums text-stone-500 dark:bg-white/10 dark:text-stone-400">
+        <span className="rounded-full bg-muted px-1.5 font-mono text-[11px] tabular-nums text-muted-foreground">
           {total}
         </span>
-        {streaming && <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-500" />}
+        {streaming && <Loader2 className="h-3.5 w-3.5 animate-spin text-brand" />}
       </button>
 
       {open && (
-        <ol className="mt-2 space-y-1.5 border-l border-[var(--panel-border)] pl-3">
+        <ol className="mt-2 space-y-1.5 border-l-2 border-border pl-3 text-xs text-muted-foreground">
           {tree.map((node) => (
             <StepRow key={node.id} node={node} runningLabel={runningLabel} doneLabel={doneLabel} />
           ))}
           {todos.map((s) => (
-            <li key={s.id} className="flex items-start gap-2 text-xs text-stone-600 dark:text-stone-300">
-              <ListChecks className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500 dark:text-amber-400" aria-hidden="true" />
+            <li key={s.id} className="flex items-start gap-2 text-xs text-muted-foreground">
+              <ListChecks className="mt-0.5 h-3.5 w-3.5 shrink-0 text-brand" aria-hidden="true" />
               <span className="min-w-0 whitespace-pre-wrap break-words">{clean(s.content)}</span>
             </li>
           ))}

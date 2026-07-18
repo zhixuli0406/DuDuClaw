@@ -1,27 +1,35 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
-import { Plus, Puzzle, Clock } from 'lucide-react';
+import { Link } from 'react-router';
+import { Plus, Puzzle } from 'lucide-react';
+import { cn } from '@/lib/utils';
 import {
-  Section,
-  Card,
   Button,
   Badge,
-  EmptyState,
-  CharacterAvatar,
-} from '@/components/ui';
+  CollectionPageState,
+  ListGridContainer,
+  ListGridHeader,
+  ListGridHeaderCell,
+  ListGridRow,
+  ListGridCell,
+  ActorAvatar,
+} from '@/components/mds';
 import { toast, formatError } from '@/lib/toast';
 import { timeAgo } from '@/lib/format';
 import { listCustomSkills, type CustomSkillRecord } from '@/lib/api-custom-skills';
-import { statusMeta, formatTimeSaved } from './status-meta';
+import { statusMeta, statusToneBadge, statusToneDot, formatTimeSaved } from './status-meta';
 
 /**
- * CustomSkillsSection — the "自建技能" block inside the "我的技能" tab (T13.2).
- * Minimal-intrusion: mounted at one place in SkillMarketPage. Lists the current
- * user's custom skills with a status chip + time estimate + builder, and a
- * "＋自建技能" CTA into the `/skills/new` wizard. Rows open the detail page.
+ * CustomSkillsSection — the "自建技能" block inside the "我的技能" tab (T13.2),
+ * re-skinned onto the MDS ListGrid (spec §4). Lists the current user's custom
+ * skills as single-row entries (name link + status dot/badge + time estimate +
+ * builder + updated), with a "＋自建技能" CTA into the `/skills/new` wizard.
+ * The optional `filter` narrows by display name (shares the page search box).
  */
-export function CustomSkillsSection() {
+const COLUMNS = 'minmax(0,1fr) auto auto auto auto';
+
+export function CustomSkillsSection({ filter = '' }: { filter?: string }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   const navigate = useNavigate();
@@ -47,70 +55,104 @@ export function CustomSkillsSection() {
     load();
   }, [load]);
 
+  const q = filter.trim().toLowerCase();
+  const visible = useMemo(
+    () => (q ? skills.filter((s) => s.display_name.toLowerCase().includes(q)) : skills),
+    [skills, q],
+  );
+
+  const newButton = (
+    <Button variant="brand" size="sm" onClick={() => navigate('/skills/new')}>
+      <Plus />
+      {t('skills.custom.new')}
+    </Button>
+  );
+
   return (
-    <Section
-      title={t('skills.custom.sectionTitle')}
-      actions={
-        <Button variant="primary" size="sm" icon={Plus} onClick={() => navigate('/skills/new')}>
-          {t('skills.custom.new')}
-        </Button>
-      }
-    >
+    <section className="space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-sm font-medium text-foreground">{t('skills.custom.sectionTitle')}</h2>
+        {newButton}
+      </div>
+
       {loading ? (
-        <div className="py-10 text-center text-stone-400">{t('common.loading')}</div>
-      ) : skills.length === 0 ? (
-        <Card>
-          <EmptyState
-            icon={Puzzle}
-            title={t('skills.custom.empty')}
-            hint={t('skills.custom.emptyHint')}
-            action={
-              <Button variant="primary" size="sm" icon={Plus} onClick={() => navigate('/skills/new')}>
-                {t('skills.custom.new')}
-              </Button>
-            }
-          />
-        </Card>
+        <CollectionPageState state="loading" />
+      ) : visible.length === 0 ? (
+        <CollectionPageState
+          state="empty"
+          icon={Puzzle}
+          title={t(q ? 'skills.market.noResults' : 'skills.custom.empty')}
+          description={q ? undefined : t('skills.custom.emptyHint')}
+          action={q ? undefined : newButton}
+        />
       ) : (
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {skills.map((s) => (
-            <CustomSkillCard key={s.id} skill={s} onOpen={() => navigate(`/skills/custom/${s.id}`)} />
-          ))}
+        <div className="overflow-hidden rounded-xl border border-surface-border">
+          <ListGridContainer
+            columns={COLUMNS}
+            className="!h-auto [&>[aria-hidden]]:hidden"
+            header={
+              <ListGridHeader>
+                <ListGridHeaderCell>{t('skills.custom.col.name')}</ListGridHeaderCell>
+                <ListGridHeaderCell>{t('skills.custom.col.status')}</ListGridHeaderCell>
+                <ListGridHeaderCell hideBelow className="justify-end">
+                  {t('skills.custom.col.timeSaved')}
+                </ListGridHeaderCell>
+                <ListGridHeaderCell hideBelow>{t('skills.custom.col.builtBy')}</ListGridHeaderCell>
+                <ListGridHeaderCell hideBelow className="justify-end">
+                  {t('skills.custom.col.updated')}
+                </ListGridHeaderCell>
+              </ListGridHeader>
+            }
+          >
+            {visible.map((s) => (
+              <CustomSkillRow key={s.id} skill={s} />
+            ))}
+          </ListGridContainer>
         </div>
       )}
-    </Section>
+    </section>
   );
 }
 
-function CustomSkillCard({ skill, onOpen }: { skill: CustomSkillRecord; onOpen: () => void }) {
+function CustomSkillRow({ skill }: { skill: CustomSkillRecord }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   const meta = statusMeta(skill.status);
+  const badge = statusToneBadge(meta.tone);
+  const to = `/skills/custom/${skill.id}`;
+
   return (
-    <Card interactive onClick={onOpen}>
-      <div className="flex items-start justify-between gap-2">
-        <h3 className="min-w-0 truncate font-semibold text-stone-900 dark:text-stone-50" title={skill.display_name}>
+    <ListGridRow to={to}>
+      <ListGridCell className="gap-2">
+        <Puzzle className="size-4 shrink-0 text-muted-foreground" />
+        <Link to={to} className="truncate text-sm font-medium text-foreground hover:underline" title={skill.display_name}>
           {skill.display_name}
-        </h3>
-        <Badge tone={meta.tone}>{t(meta.labelKey)}</Badge>
-      </div>
-
-      <p className="mt-1 flex items-center gap-1.5 text-sm text-amber-600 dark:text-amber-400">
-        <Clock className="h-3.5 w-3.5" />
-        {formatTimeSaved(intl, skill.time_saved_value, skill.time_saved_unit)}
-      </p>
-
-      <div className="mt-4 flex items-center justify-between gap-2 border-t border-[var(--panel-border)] pt-3 text-xs text-stone-500 dark:text-stone-400">
+        </Link>
+      </ListGridCell>
+      <ListGridCell>
+        <span className={cn('mr-2 size-1.5 shrink-0 rounded-full', statusToneDot(meta.tone))} />
+        <Badge variant={badge.variant} className={badge.className}>
+          {t(meta.labelKey)}
+        </Badge>
+      </ListGridCell>
+      <ListGridCell hideBelow className="justify-end">
+        <span className="truncate font-mono text-xs tabular-nums text-muted-foreground">
+          {formatTimeSaved(intl, skill.time_saved_value, skill.time_saved_unit)}
+        </span>
+      </ListGridCell>
+      <ListGridCell hideBelow>
         {skill.built_by_agent ? (
-          <span className="flex min-w-0 items-center gap-1.5">
-            <CharacterAvatar agentId={skill.built_by_agent} name={skill.built_by_agent} size={16} />
+          <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+            <ActorAvatar actorType="agent" size="xs" name={skill.built_by_agent} />
             <span className="truncate">{skill.built_by_agent}</span>
           </span>
         ) : (
-          <span>{skill.created_by_user || '—'}</span>
+          <span className="text-xs text-muted-foreground">{skill.created_by_user || '—'}</span>
         )}
-        <span className="shrink-0">{timeAgo(skill.created_at)}</span>
-      </div>
-    </Card>
+      </ListGridCell>
+      <ListGridCell hideBelow className="justify-end">
+        <span className="font-mono text-xs tabular-nums text-muted-foreground">{timeAgo(skill.created_at)}</span>
+      </ListGridCell>
+    </ListGridRow>
   );
 }

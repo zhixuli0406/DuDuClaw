@@ -66,10 +66,10 @@ export function IncidentBanner({ approvalsCount = 0 }: { approvalsCount?: number
   if (incidents.length === 0) return null;
 
   return (
-    <div className="rounded-xl border border-rose-500/30 bg-rose-500/8 p-3 dark:border-rose-400/25 dark:bg-rose-400/10">
+    <div className="rounded-xl border border-destructive/30 bg-destructive/10 p-3">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <DuDu face="concerned" size={28} className="shrink-0" />
-        <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-rose-700 dark:text-rose-300">
+        <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-destructive">
           <AlertTriangle className="h-4 w-4" />
           {intl.formatMessage({ id: 'dashboard.incident.title' })}
         </span>
@@ -78,7 +78,7 @@ export function IncidentBanner({ approvalsCount = 0 }: { approvalsCount?: number
             <Link
               key={key}
               to={to}
-              className="group inline-flex items-center gap-1.5 rounded-full bg-white/70 px-3 py-1 text-xs font-medium text-rose-700 ring-1 ring-inset ring-rose-500/25 transition-colors hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/50 dark:bg-stone-900/40 dark:text-rose-200 dark:hover:bg-stone-900/70"
+              className="group inline-flex items-center gap-1.5 rounded-full bg-surface px-3 py-1 text-xs font-medium text-destructive ring-1 ring-inset ring-destructive/25 transition-colors outline-none hover:bg-surface-hover focus-visible:ring-3 focus-visible:ring-destructive/50"
             >
               <Icon className="h-3.5 w-3.5" />
               {label}

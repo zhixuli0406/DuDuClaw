@@ -19,7 +19,7 @@ export function PropertySection({
   return (
     <section className={cn('space-y-0.5', className)}>
       {title && (
-        <h3 className="px-1 pb-1 text-[0.6875rem] font-semibold uppercase tracking-wide text-stone-400 dark:text-stone-500">
+        <h3 className="px-1 pb-1 text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground">
           {title}
         </h3>
       )}
@@ -45,11 +45,11 @@ export function PropertyRow({
 }) {
   const inner = (
     <>
-      <span className="flex min-w-0 shrink-0 items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
+      <span className="flex min-w-0 shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
         {Icon && <Icon className="h-3.5 w-3.5 shrink-0" />}
         {label}
       </span>
-      <span className="ml-auto flex min-w-0 items-center gap-1.5 text-right text-sm text-stone-800 dark:text-stone-100">
+      <span className="ml-auto flex min-w-0 items-center gap-1.5 text-right text-sm text-foreground">
         {children}
       </span>
     </>
@@ -61,7 +61,7 @@ export function PropertyRow({
         type="button"
         onClick={onClick}
         className={cn(
-          'flex w-full items-center gap-2 rounded-control px-1.5 py-1.5 text-left hover:bg-stone-500/8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 dark:hover:bg-white/5',
+          'flex w-full items-center gap-2 rounded-xl px-1.5 py-1.5 text-left outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50',
           className,
         )}
       >

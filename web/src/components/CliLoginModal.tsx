@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { client } from '@/lib/ws-client';
-import { Dialog, inputClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, Button, Input } from '@/components/mds';
 
 /* eslint-disable no-control-regex */
 /**
@@ -188,110 +188,115 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
   const StatusBadge = () => {
     if (status === 'succeeded')
       return (
-        <span className="inline-flex items-center gap-1 text-sm text-emerald-600 dark:text-emerald-400">
+        <span className="inline-flex items-center gap-1 text-sm text-success">
           <CheckCircle2 className="h-4 w-4" /> 登入成功
         </span>
       );
     if (status === 'failed' || status === 'error')
       return (
-        <span className="inline-flex items-center gap-1 text-sm text-rose-600 dark:text-rose-400">
+        <span className="inline-flex items-center gap-1 text-sm text-destructive">
           <XCircle className="h-4 w-4" /> {status === 'error' ? errMsg ?? '啟動失敗' : '登入失敗'}
         </span>
       );
     if (status === 'exited')
-      return <span className="text-sm text-stone-500">流程已結束（未偵測到成功訊號）</span>;
+      return <span className="text-sm text-muted-foreground">流程已結束（未偵測到成功訊號）</span>;
     return (
-      <span className="inline-flex items-center gap-1 text-sm text-stone-500">
+      <span className="inline-flex items-center gap-1 text-sm text-muted-foreground">
         <Loader2 className="h-4 w-4 animate-spin" /> 進行中…
       </span>
     );
   };
 
   return (
-    <Dialog open={open} onClose={handleClose} title={`${RUNTIME_LABELS[runtime]} 一鍵登入`}>
-      <div className="space-y-3">
-        {!remoteSafe && (
-          <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            <span>
-              此 CLI 使用 localhost 回呼登入：僅在「Dashboard 與瀏覽器在同一台機器」（自架）可完成。
-              遠端 Cloud 請改用 API key。
-            </span>
-          </div>
-        )}
-        {hint && <p className="text-xs text-stone-500 dark:text-stone-400">{hint}</p>}
+    <Dialog open={open} onOpenChange={(o) => { if (!o) void handleClose(); }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{`${RUNTIME_LABELS[runtime]} 一鍵登入`}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-3">
+          {!remoteSafe && (
+            <div className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                此 CLI 使用 localhost 回呼登入：僅在「Dashboard 與瀏覽器在同一台機器」（自架）可完成。
+                遠端 Cloud 請改用 API key。
+              </span>
+            </div>
+          )}
+          {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
 
-        {/* One-click auth link — surfaces the URL buried in the CLI output. */}
-        {authUrl && status === 'running' && (
-          <div className="space-y-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
-            <p className="text-xs font-medium text-stone-600 dark:text-stone-300">
-              ① 點此開啟授權網址 → 完成授權後複製驗證碼 → ② 貼到下方按 Enter
-            </p>
-            <a
-              href={authUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-3 py-2 text-sm font-medium text-white transition hover:bg-amber-600"
-            >
-              <ExternalLink className="h-4 w-4" /> 開啟授權網址
-            </a>
-            <p className="select-all break-all font-mono text-[10px] text-stone-400">{authUrl}</p>
-          </div>
-        )}
+          {/* One-click auth link — surfaces the URL buried in the CLI output. */}
+          {authUrl && status === 'running' && (
+            <div className="space-y-1.5 rounded-lg border border-warning/30 bg-warning/5 p-3">
+              <p className="text-xs font-medium text-muted-foreground">
+                ① 點此開啟授權網址 → 完成授權後複製驗證碼 → ② 貼到下方按 Enter
+              </p>
+              <a
+                href={authUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-2 rounded-lg bg-brand px-3 py-2 text-sm font-medium text-brand-foreground transition hover:bg-brand/90"
+              >
+                <ExternalLink className="h-4 w-4" /> 開啟授權網址
+              </a>
+              <p className="select-all break-all font-mono text-[10px] text-muted-foreground">{authUrl}</p>
+            </div>
+          )}
 
-        {program && <p className="font-mono text-[11px] text-stone-400">$ {program} …</p>}
+          {program && <p className="font-mono text-[11px] text-muted-foreground">$ {program} …</p>}
 
-        <pre
-          ref={outRef}
-          className="h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-stone-300/50 bg-stone-950/90 p-3 font-mono text-[12px] leading-relaxed text-stone-100 dark:border-white/10"
-        >
-          {clean.trim() || '啟動登入程序中…'}
-        </pre>
-
-        <div className="flex items-center gap-2">
-          <input
-            className={inputClass}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                void sendInput();
-              }
-            }}
-            placeholder="貼上驗證碼 / 輸入回應後按 Enter"
-            disabled={status !== 'running'}
-            autoComplete="off"
-            spellCheck={false}
-          />
-          <button
-            className={buttonSecondary}
-            onClick={() => void sendInput()}
-            disabled={status !== 'running'}
-            title="送出"
+          {/* intentional dark terminal surface */}
+          <pre
+            ref={outRef}
+            className="h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-surface-border bg-stone-950/90 p-3 font-mono text-[12px] leading-relaxed text-stone-100"
           >
-            <SendHorizonal className="h-4 w-4" />
-          </button>
-        </div>
+            {clean.trim() || '啟動登入程序中…'}
+          </pre>
 
-        {registerMsg && status === 'succeeded' && (
-          <p className="text-xs text-stone-500 dark:text-stone-400">{registerMsg}</p>
-        )}
+          <div className="flex items-center gap-2">
+            <Input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void sendInput();
+                }
+              }}
+              placeholder="貼上驗證碼 / 輸入回應後按 Enter"
+              disabled={status !== 'running'}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <Button
+              variant="outline"
+              onClick={() => void sendInput()}
+              disabled={status !== 'running'}
+              title="送出"
+            >
+              <SendHorizonal className="h-4 w-4" />
+            </Button>
+          </div>
 
-        <div className="flex items-center justify-between pt-1">
-          <StatusBadge />
-          <div className="flex gap-2">
-            <button className={buttonSecondary} onClick={handleClose}>
-              {status === 'running' ? '取消' : '關閉'}
-            </button>
-            {status === 'succeeded' && (
-              <button className={buttonPrimary} onClick={onClose}>
-                完成
-              </button>
-            )}
+          {registerMsg && status === 'succeeded' && (
+            <p className="text-xs text-muted-foreground">{registerMsg}</p>
+          )}
+
+          <div className="flex items-center justify-between pt-1">
+            <StatusBadge />
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => void handleClose()}>
+                {status === 'running' ? '取消' : '關閉'}
+              </Button>
+              {status === 'succeeded' && (
+                <Button variant="default" onClick={onClose}>
+                  完成
+                </Button>
+              )}
+            </div>
           </div>
         </div>
-      </div>
+      </DialogContent>
     </Dialog>
   );
 }

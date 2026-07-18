@@ -23,7 +23,7 @@ export function CoinChip({
   const content = (
     <>
       <Coins className="h-4 w-4 shrink-0 text-[color:var(--coin)]" aria-hidden="true" />
-      <span className="font-mono text-xs font-medium tabular-nums text-stone-700 dark:text-stone-200">
+      <span className="font-mono text-xs font-medium tabular-nums text-foreground">
         {formatCoins(cents, currency)}
       </span>
     </>
@@ -38,7 +38,7 @@ export function CoinChip({
         type="button"
         onClick={onClick}
         title={title}
-        className={cn(cls, 'hover:bg-[color:var(--coin)]/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50')}
+        className={cn(cls, 'outline-none hover:bg-[color:var(--coin)]/15 focus-visible:ring-3 focus-visible:ring-ring/50')}
       >
         {content}
       </button>

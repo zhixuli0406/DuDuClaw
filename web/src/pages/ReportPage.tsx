@@ -1,6 +1,7 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useConnectionStore } from '@/stores/connection-store';
+import { cn } from '@/lib/utils';
 import {
   api,
   type CostSummary,
@@ -21,7 +22,20 @@ import {
   TriangleAlert,
 } from 'lucide-react';
 import { toast, formatError } from '@/lib/toast';
-import { Page, PageHeader, Card, StatCard, Tabs, Badge, EmptyState, Mono, type TabItem } from '@/components/ui';
+import {
+  PageHeader,
+  Segmented,
+  Empty,
+  Badge,
+  ActorAvatar,
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableHead,
+  TableCell,
+  type SegmentedOption,
+} from '@/components/mds';
 
 type Period = 'day' | 'week' | 'month';
 
@@ -51,18 +65,87 @@ interface CostRow {
   savings: number;
 }
 
-function rateTone(rate: number): 'success' | 'warning' | 'danger' {
-  if (rate >= 0.85) return 'success';
-  if (rate >= 0.6) return 'warning';
-  return 'danger';
+/** rate → semantic value color (auto-reply / cache efficiency). */
+function rateColorClass(rate: number): string {
+  if (rate >= 0.85) return 'text-success';
+  if (rate >= 0.6) return 'text-warning';
+  return 'text-destructive';
 }
 
-function rateColor(rate: number): string {
-  if (rate >= 0.85) return 'text-emerald-600 dark:text-emerald-400';
-  if (rate >= 0.6) return 'text-amber-600 dark:text-amber-400';
-  return 'text-rose-600 dark:text-rose-400';
+function effColorClass(eff: number): string {
+  if (eff >= 0.7) return 'text-success';
+  if (eff >= 0.3) return 'text-warning';
+  return 'text-destructive';
 }
 
+/** One KPI cell inside a divided KPI group (spec §5.5). */
+function Kpi({
+  icon: Icon,
+  label,
+  value,
+  hint,
+  valueClass,
+}: {
+  icon?: ComponentType<{ className?: string }>;
+  label: ReactNode;
+  value: ReactNode;
+  hint?: ReactNode;
+  valueClass?: string;
+}) {
+  return (
+    <div className="bg-card p-4">
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        {Icon && <Icon className="size-3.5 shrink-0" />}
+        <span className="truncate">{label}</span>
+      </div>
+      <p className={cn('mt-1.5 text-2xl font-semibold tabular-nums text-foreground', valueClass)}>
+        {value}
+      </p>
+      {hint && <p className="mt-0.5 truncate text-xs text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+/** A responsive divided KPI strip (`gap-px` reveals the card-colored gutters). */
+function KpiGroup({ children }: { children: ReactNode }) {
+  return (
+    <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-surface-border bg-surface-border lg:grid-cols-4">
+      {children}
+    </div>
+  );
+}
+
+/** A titled report panel (spec §5.5 `rounded-lg border bg-card p-4`). */
+function ReportCard({
+  title,
+  action,
+  className,
+  children,
+}: {
+  title?: ReactNode;
+  action?: ReactNode;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className={cn('rounded-lg border border-surface-border bg-card p-4', className)}>
+      {(title || action) && (
+        <div className="mb-3 flex items-center justify-between gap-2">
+          {title && <h2 className="text-sm font-medium text-foreground">{title}</h2>}
+          {action}
+        </div>
+      )}
+      {children}
+    </section>
+  );
+}
+
+/**
+ * ReportPage (用量報表) — the Usage/report layout (spec §5.5). KPI strips, a
+ * trend chart, per-agent cache ranking, cost comparison and recent-usage tables,
+ * plus the 200K price-cliff warning. Same `analytics.*` / `cost.*` RPCs; only
+ * the surface moved onto MDS. The SVG/CSS charts are recolored, not rebuilt.
+ */
 export function ReportPage() {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
@@ -77,7 +160,7 @@ export function ReportPage() {
       // errors don't stack three notifications on the user.
       let notified = false;
       const onFailure = (e: unknown) => {
-        console.warn("[api]", e);
+        console.warn('[api]', e);
         if (notified) return;
         notified = true;
         toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
@@ -94,207 +177,181 @@ export function ReportPage() {
     fetchData(period);
   }, [connectionState, period, fetchData]);
 
-  const handlePeriodChange = (p: Period) => {
-    setPeriod(p);
-  };
-
   const maxCount = daily.length > 0 ? Math.max(...daily.map((d) => d.count), 1) : 1;
 
-  // Show last N days based on period
+  // Show last N days based on period.
   const visibleDays = period === 'day' ? 7 : period === 'week' ? 14 : 30;
   const visibleDaily = daily.slice(-visibleDays);
 
-  const periodTabs: TabItem[] = (['day', 'week', 'month'] as const).map((p) => ({
-    id: p,
+  const periodOptions: SegmentedOption<Period>[] = (['day', 'week', 'month'] as const).map((p) => ({
+    value: p,
     label: intl.formatMessage({ id: `reports.period.${p}` }),
   }));
 
   return (
-    <Page>
-      <PageHeader
-        icon={BarChart3}
-        title={intl.formatMessage({ id: 'nav.reports' })}
-        subtitle={intl.formatMessage({ id: 'app.subtitle' })}
-        actions={
-          <Tabs
-            items={periodTabs}
-            value={period}
-            onChange={(id) => handlePeriodChange(id as Period)}
-          />
-        }
-      />
-
-      {/* Summary cards */}
-      {summary && (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <StatCard
-            icon={MessageCircle}
-            tone="accent"
-            label={intl.formatMessage({ id: 'reports.conversations' })}
-            value={summary.total_conversations.toLocaleString()}
-            hint={`${summary.total_messages.toLocaleString()} messages`}
-          />
-          <StatCard
-            icon={Zap}
-            tone={rateTone(summary.auto_reply_rate)}
-            label={intl.formatMessage({ id: 'reports.autoReplyRate' })}
-            value={
-              <span className={rateColor(summary.auto_reply_rate)}>
-                {(summary.auto_reply_rate * 100).toFixed(1)}%
-              </span>
-            }
-          />
-          <StatCard
-            icon={Clock}
-            tone="neutral"
-            label={intl.formatMessage({ id: 'reports.avgResponse' })}
-            value={`${summary.avg_response_ms}ms`}
-            hint={`P95: ${summary.p95_response_ms}ms`}
-          />
-          <StatCard
-            icon={DollarSign}
-            tone="success"
-            label={intl.formatMessage({ id: 'reports.savings' })}
-            value={`$${(summary.estimated_savings_cents / 100).toFixed(2)}`}
-          />
+    <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+      <PageHeader hideTrigger className="h-auto min-h-12 flex-wrap justify-between gap-2 px-5 py-1.5">
+        <div className="flex min-w-0 items-center gap-2">
+          <BarChart3 className="size-4 shrink-0 text-muted-foreground" />
+          <h1 className="truncate text-sm font-medium">{intl.formatMessage({ id: 'nav.reports' })}</h1>
         </div>
-      )}
+        <Segmented
+          value={period}
+          onValueChange={setPeriod}
+          options={periodOptions}
+          aria-label={intl.formatMessage({ id: 'nav.reports' })}
+        />
+      </PageHeader>
 
-      {/* Cost & cache efficiency (CostTelemetry) */}
-      <CostEfficiencySection hours={PERIOD_HOURS[period]} />
+      <div className="mx-auto w-full max-w-6xl space-y-5 p-6">
+        {/* Conversation KPI strip. */}
+        {summary && (
+          <KpiGroup>
+            <Kpi
+              icon={MessageCircle}
+              label={intl.formatMessage({ id: 'reports.conversations' })}
+              value={summary.total_conversations.toLocaleString()}
+              hint={`${summary.total_messages.toLocaleString()} ${intl.formatMessage({ id: 'reports.messages' })}`}
+            />
+            <Kpi
+              icon={Zap}
+              label={intl.formatMessage({ id: 'reports.autoReplyRate' })}
+              value={`${(summary.auto_reply_rate * 100).toFixed(1)}%`}
+              valueClass={rateColorClass(summary.auto_reply_rate)}
+            />
+            <Kpi
+              icon={Clock}
+              label={intl.formatMessage({ id: 'reports.avgResponse' })}
+              value={`${summary.avg_response_ms}ms`}
+              hint={`P95: ${summary.p95_response_ms}ms`}
+            />
+            <Kpi
+              icon={DollarSign}
+              label={intl.formatMessage({ id: 'reports.savings' })}
+              value={`$${(summary.estimated_savings_cents / 100).toFixed(2)}`}
+              valueClass="text-success"
+            />
+          </KpiGroup>
+        )}
 
-      {/* Zero-cost ratio */}
-      {summary && (
-        <Card title={intl.formatMessage({ id: 'reports.zeroCostRatio' })}>
-          <div className="flex items-center gap-4">
-            <div className="flex-1">
-              <div className="h-6 w-full overflow-hidden rounded-full bg-stone-200 dark:bg-stone-700">
+        {/* Cost & cache efficiency (CostTelemetry). */}
+        <CostEfficiencySection hours={PERIOD_HOURS[period]} />
+
+        {/* Zero-cost ratio. */}
+        {summary && (
+          <ReportCard title={intl.formatMessage({ id: 'reports.zeroCostRatio' })}>
+            <div className="flex items-center gap-4">
+              <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
                 <div
-                  className="h-full rounded-full bg-gradient-to-r from-amber-400 to-amber-500 transition-all duration-500"
+                  className="h-full rounded-full bg-chart-1 transition-all duration-500"
                   style={{ width: `${summary.zero_cost_ratio * 100}%` }}
                 />
               </div>
+              <span className="min-w-[4rem] text-right font-mono text-xl font-semibold tabular-nums text-foreground">
+                {(summary.zero_cost_ratio * 100).toFixed(1)}%
+              </span>
             </div>
-            <span className="min-w-[4rem] text-right text-2xl font-bold tabular-nums text-amber-600 dark:text-amber-400">
-              {(summary.zero_cost_ratio * 100).toFixed(1)}%
+            <p className="mt-2 text-sm text-muted-foreground">
+              {intl.formatMessage({ id: 'reports.zeroCostDesc' })}
+            </p>
+          </ReportCard>
+        )}
+
+        {/* Conversation trend (recolored CSS bar chart). */}
+        <ReportCard title={intl.formatMessage({ id: 'reports.trend' })} className="min-h-[240px]">
+          <div className="flex items-end gap-1" style={{ height: 180 }}>
+            {visibleDaily.map((day) => {
+              const totalPct = (day.count / maxCount) * 100;
+              const autoPct = (day.auto_count / maxCount) * 100;
+              const manualPct = totalPct - autoPct;
+              return (
+                <div
+                  key={day.date}
+                  className="group relative flex flex-1 flex-col items-center justify-end"
+                  style={{ height: '100%' }}
+                  title={`${day.date}: ${day.count} total, ${day.auto_count} auto`}
+                >
+                  <div className="flex w-full flex-col items-stretch" style={{ height: `${totalPct}%` }}>
+                    <div
+                      className="w-full rounded-t bg-muted-foreground/30"
+                      style={{
+                        height: `${manualPct > 0 ? (manualPct / totalPct) * 100 : 0}%`,
+                        minHeight: manualPct > 0 ? 2 : 0,
+                      }}
+                    />
+                    <div className="w-full rounded-b bg-chart-1" style={{ flex: 1 }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-2 flex items-center gap-4 text-xs text-muted-foreground">
+            <span className="flex items-center gap-1">
+              <span className="inline-block size-2.5 rounded-sm bg-chart-1" />
+              {intl.formatMessage({ id: 'reports.autoReply' })}
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="inline-block size-2.5 rounded-sm bg-muted-foreground/30" />
+              {intl.formatMessage({ id: 'reports.manual' })}
             </span>
           </div>
-          <p className="mt-2 text-sm text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'reports.zeroCostDesc' })}
-          </p>
-        </Card>
-      )}
+        </ReportCard>
 
-      {/* Conversation trend (CSS bar chart) */}
-      <Card title={intl.formatMessage({ id: 'reports.trend' })}>
-        <div className="flex items-end gap-1" style={{ height: 180 }}>
-          {visibleDaily.map((day) => {
-            const totalPct = (day.count / maxCount) * 100;
-            const autoPct = (day.auto_count / maxCount) * 100;
-            const manualPct = totalPct - autoPct;
-            return (
-              <div
-                key={day.date}
-                className="group relative flex flex-1 flex-col items-center justify-end"
-                style={{ height: '100%' }}
-                title={`${day.date}: ${day.count} total, ${day.auto_count} auto`}
-              >
-                <div className="flex w-full flex-col items-stretch" style={{ height: `${totalPct}%` }}>
-                  <div
-                    className="w-full rounded-t bg-stone-300 dark:bg-stone-600"
-                    style={{ height: `${manualPct > 0 ? (manualPct / totalPct) * 100 : 0}%`, minHeight: manualPct > 0 ? 2 : 0 }}
-                  />
-                  <div
-                    className="w-full rounded-b bg-amber-400 dark:bg-amber-500"
-                    style={{ flex: 1 }}
-                  />
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        <div className="mt-2 flex items-center gap-4 text-xs text-stone-500 dark:text-stone-400">
-          <span className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-400 dark:bg-amber-500" />
-            {intl.formatMessage({ id: 'reports.autoReply' })}
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-stone-300 dark:bg-stone-600" />
-            {intl.formatMessage({ id: 'reports.manual' })}
-          </span>
-        </div>
-      </Card>
-
-      {/* Cost savings table */}
-      <Card title={intl.formatMessage({ id: 'reports.costComparison' })} padded={false}>
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-sm">
-            <thead>
-              <tr className="border-b border-[var(--panel-border)]">
-                <th className="px-5 pb-3 pt-4 font-medium text-stone-500 dark:text-stone-400">
-                  {intl.formatMessage({ id: 'reports.period.month' })}
-                </th>
-                <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                  {intl.formatMessage({ id: 'reports.humanCost' })}
-                </th>
-                <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                  {intl.formatMessage({ id: 'reports.agentCost' })}
-                </th>
-                <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                  {intl.formatMessage({ id: 'reports.netSavings' })}
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {costs.map((row) => (
-                <tr
-                  key={row.month}
-                  className="border-b border-[var(--panel-border)] last:border-0"
-                >
-                  <td className="px-5 py-3 text-stone-900 dark:text-stone-100">{row.month}</td>
-                  <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
-                    ${(row.human_cost / 100).toFixed(2)}
-                  </td>
-                  <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
-                    ${(row.agent_cost / 100).toFixed(2)}
-                  </td>
-                  <td className="px-5 py-3 text-right font-medium tabular-nums text-emerald-600 dark:text-emerald-400">
-                    +${(row.savings / 100).toFixed(2)}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {costs.length === 0 && (
-            <EmptyState
-              icon={DollarSign}
-              dudu="reading"
-              title={intl.formatMessage({ id: 'common.noData' })}
-            />
+        {/* Cost savings table. */}
+        <ReportCard title={intl.formatMessage({ id: 'reports.costComparison' })}>
+          {costs.length === 0 ? (
+            <Empty icon={DollarSign} title={intl.formatMessage({ id: 'common.noData' })} />
+          ) : (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>{intl.formatMessage({ id: 'reports.period.month' })}</TableHead>
+                    <TableHead className="text-right">{intl.formatMessage({ id: 'reports.humanCost' })}</TableHead>
+                    <TableHead className="text-right">{intl.formatMessage({ id: 'reports.agentCost' })}</TableHead>
+                    <TableHead className="text-right">{intl.formatMessage({ id: 'reports.netSavings' })}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {costs.map((row) => (
+                    <TableRow key={row.month}>
+                      <TableCell className="text-foreground">{row.month}</TableCell>
+                      <TableCell className="text-right font-mono tabular-nums text-muted-foreground">
+                        ${(row.human_cost / 100).toFixed(2)}
+                      </TableCell>
+                      <TableCell className="text-right font-mono tabular-nums text-muted-foreground">
+                        ${(row.agent_cost / 100).toFixed(2)}
+                      </TableCell>
+                      <TableCell className="text-right font-mono font-medium tabular-nums text-success">
+                        +${(row.savings / 100).toFixed(2)}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
           )}
-        </div>
-      </Card>
-    </Page>
+        </ReportCard>
+      </div>
+    </div>
   );
 }
 
-function cacheHealthTone(h: CacheHealth): 'success' | 'neutral' | 'warning' {
-  if (h === 'healthy') return 'success';
-  if (h === 'degraded') return 'warning';
-  return 'neutral';
+function cacheHealthTone(h: CacheHealth): 'default' | 'secondary' {
+  return h === 'healthy' ? 'default' : 'secondary';
 }
 
-function effTone(eff: number): 'success' | 'warning' | 'danger' {
-  if (eff >= 0.7) return 'success';
-  if (eff >= 0.3) return 'warning';
-  return 'danger';
+function cacheHealthClass(h: CacheHealth): string | undefined {
+  if (h === 'healthy') return 'bg-success/15 text-success';
+  if (h === 'degraded') return 'bg-warning/15 text-warning';
+  return undefined;
 }
 
 /**
  * Cache-efficiency + cost telemetry (CostTelemetry). Three-state: telemetry
  * off → empty state; load error → inline notice (never crashes the page);
  * otherwise cache hit rate, total cost, savings, 200K price-cliff warning,
- * per-agent cache health, and a recent-usage table.
+ * per-agent cache ranking, and a recent-usage table.
  */
 function CostEfficiencySection({ hours }: { hours: number }) {
   const intl = useIntl();
@@ -310,11 +367,7 @@ function CostEfficiencySection({ hours }: { hours: number }) {
     let cancelled = false;
     setLoading(true);
     setFailed(false);
-    Promise.all([
-      api.cost.summary(hours),
-      api.cost.agents(hours),
-      api.cost.recent(20),
-    ])
+    Promise.all([api.cost.summary(hours), api.cost.agents(hours), api.cost.recent(20)])
       .then(([s, a, r]) => {
         if (cancelled) return;
         setSummary(s);
@@ -334,56 +387,51 @@ function CostEfficiencySection({ hours }: { hours: number }) {
     };
   }, [connectionState, hours]);
 
-  const title = (
-    <span className="flex items-center gap-2">
-      <Gauge className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-      {intl.formatMessage({ id: 'reports.cache.title' })}
-    </span>
-  );
+  const title = intl.formatMessage({ id: 'reports.cache.title' });
 
   if (loading) {
     return (
-      <Card title={title}>
-        <div className="py-10 text-center text-sm text-stone-400">
+      <ReportCard title={title}>
+        <div className="py-10 text-center text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'common.loading' })}
         </div>
-      </Card>
+      </ReportCard>
     );
   }
 
   if (failed) {
     return (
-      <Card title={title}>
-        <div className="py-8 text-center text-sm text-stone-500 dark:text-stone-400">
+      <ReportCard title={title}>
+        <div className="py-8 text-center text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'reports.cache.loadError' })}
         </div>
-      </Card>
+      </ReportCard>
     );
   }
 
   if (!summary?.available) {
     return (
-      <Card title={title}>
-        <EmptyState
+      <ReportCard title={title}>
+        <Empty
           icon={Gauge}
-          dudu="sleep"
           title={intl.formatMessage({ id: 'reports.cache.empty.title' })}
-          hint={intl.formatMessage({ id: 'reports.cache.empty.desc' })}
+          description={intl.formatMessage({ id: 'reports.cache.empty.desc' })}
         />
-      </Card>
+      </ReportCard>
     );
   }
 
   const hitRate = summary.cache_hit_rate ?? 0;
   const cliff = summary.price_cliff;
+  const maxCost = agents.reduce((m, a) => Math.max(m, a.total_cost_millicents), 0);
 
   return (
-    <div className="space-y-4">
-      {/* 200K price-cliff warning */}
+    <div className="space-y-5">
+      {/* 200K price-cliff warning. */}
       {cliff?.warning && (
-        <div className="flex items-start gap-3 rounded-lg border border-rose-300 bg-rose-50 px-4 py-3 dark:border-rose-800 dark:bg-rose-900/20">
-          <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-rose-500" />
-          <div className="text-sm text-rose-700 dark:text-rose-300">
+        <div className="flex items-start gap-3 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3">
+          <TriangleAlert className="mt-0.5 size-5 shrink-0 text-warning" />
+          <div className="text-sm text-warning">
             <p className="font-medium">{intl.formatMessage({ id: 'reports.cache.cliff.title' })}</p>
             <p className="mt-0.5 text-xs">
               {intl.formatMessage(
@@ -399,20 +447,19 @@ function CostEfficiencySection({ hours }: { hours: number }) {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard
+      <KpiGroup>
+        <Kpi
           icon={Gauge}
-          tone={effTone(hitRate)}
           label={intl.formatMessage({ id: 'reports.cache.hitRate' })}
           value={`${(hitRate * 100).toFixed(1)}%`}
+          valueClass={effColorClass(hitRate)}
           hint={intl.formatMessage(
             { id: 'reports.cache.avgEff' },
             { value: ((summary.avg_cache_efficiency ?? 0) * 100).toFixed(1) },
           )}
         />
-        <StatCard
+        <Kpi
           icon={Coins}
-          tone="neutral"
           label={intl.formatMessage({ id: 'reports.cache.totalCost' })}
           value={formatMillicents(summary.total_cost_millicents)}
           hint={intl.formatMessage(
@@ -420,15 +467,14 @@ function CostEfficiencySection({ hours }: { hours: number }) {
             { count: summary.total_requests ?? 0 },
           )}
         />
-        <StatCard
+        <Kpi
           icon={DollarSign}
-          tone="success"
           label={intl.formatMessage({ id: 'reports.cache.savings' })}
           value={formatMillicents(summary.total_cache_savings_millicents)}
+          valueClass="text-success"
         />
-        <StatCard
+        <Kpi
           icon={Database}
-          tone="accent"
           label={intl.formatMessage({ id: 'reports.cache.cacheReads' })}
           value={formatTokens(summary.total_cache_read_tokens)}
           hint={intl.formatMessage(
@@ -436,120 +482,96 @@ function CostEfficiencySection({ hours }: { hours: number }) {
             { value: formatTokens(summary.total_input_tokens) },
           )}
         />
-      </div>
+      </KpiGroup>
 
-      {/* Per-agent cache health */}
-      <Card title={intl.formatMessage({ id: 'reports.cache.byAgent' })} padded={false}>
+      {/* Per-agent cache ranking (spec §5.5 ranking card). */}
+      <ReportCard title={intl.formatMessage({ id: 'reports.cache.byAgent' })}>
         {agents.length === 0 ? (
-          <EmptyState icon={Gauge} dudu="idle" title={intl.formatMessage({ id: 'common.noData' })} />
+          <Empty icon={Gauge} title={intl.formatMessage({ id: 'common.noData' })} />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead>
-                <tr className="border-b border-[var(--panel-border)]">
-                  <th className="px-5 pb-3 pt-4 font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.agent' })}
-                  </th>
-                  <th className="px-5 pb-3 pt-4 font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.health' })}
-                  </th>
-                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.eff' })}
-                  </th>
-                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.requests' })}
-                  </th>
-                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.cost' })}
-                  </th>
-                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.savings' })}
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {agents.map((a) => (
-                  <tr key={a.agent_id} className="border-b border-[var(--panel-border)] last:border-0">
-                    <td className="px-5 py-3 text-stone-900 dark:text-stone-100">{a.agent_id}</td>
-                    <td className="px-5 py-3">
-                      <Badge tone={cacheHealthTone(a.cache_health)} dot>
-                        {intl.formatMessage({ id: `reports.cache.health.${a.cache_health}` })}
-                      </Badge>
-                    </td>
-                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
-                      {(a.avg_cache_efficiency * 100).toFixed(1)}%
-                    </td>
-                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
-                      {a.total_requests.toLocaleString()}
-                    </td>
-                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
+          <div className="divide-y divide-surface-border">
+            {agents.map((a) => {
+              const pct = maxCost > 0 ? Math.max(4, Math.round((a.total_cost_millicents / maxCost) * 100)) : 0;
+              return (
+                <div key={a.agent_id} className="py-3 first:pt-0 last:pb-0">
+                  <div className="flex items-center gap-2">
+                    <ActorAvatar actorType="agent" size="sm" name={a.agent_id} />
+                    <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground" title={a.agent_id}>
+                      {a.agent_id}
+                    </span>
+                    <Badge variant={cacheHealthTone(a.cache_health)} className={cacheHealthClass(a.cache_health)}>
+                      {intl.formatMessage({ id: `reports.cache.health.${a.cache_health}` })}
+                    </Badge>
+                    <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
                       {formatMillicents(a.total_cost_millicents)}
-                    </td>
-                    <td className="px-5 py-3 text-right font-medium tabular-nums text-emerald-600 dark:text-emerald-400">
-                      {formatMillicents(a.total_cache_savings_millicents)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                    </span>
+                  </div>
+                  <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-muted">
+                    <div className="h-full rounded-full bg-chart-1" style={{ width: `${pct}%` }} />
+                  </div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+                    <span>
+                      {intl.formatMessage({ id: 'reports.cache.col.eff' })}:{' '}
+                      <span className="font-mono tabular-nums">{(a.avg_cache_efficiency * 100).toFixed(1)}%</span>
+                    </span>
+                    <span>
+                      {intl.formatMessage({ id: 'reports.cache.col.requests' })}:{' '}
+                      <span className="font-mono tabular-nums">{a.total_requests.toLocaleString()}</span>
+                    </span>
+                    <span className="text-success">
+                      {intl.formatMessage({ id: 'reports.cache.col.savings' })}:{' '}
+                      <span className="font-mono tabular-nums">
+                        {formatMillicents(a.total_cache_savings_millicents)}
+                      </span>
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
-      </Card>
+      </ReportCard>
 
-      {/* Recent usage */}
+      {/* Recent usage. */}
       {recent.length > 0 && (
-        <Card title={intl.formatMessage({ id: 'reports.cache.recent' })} padded={false}>
+        <ReportCard title={intl.formatMessage({ id: 'reports.cache.recent' })}>
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead>
-                <tr className="border-b border-[var(--panel-border)]">
-                  <th className="px-5 pb-3 pt-4 font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.agent' })}
-                  </th>
-                  <th className="px-5 pb-3 pt-4 font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.model' })}
-                  </th>
-                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.input' })}
-                  </th>
-                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.eff' })}
-                  </th>
-                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.cost' })}
-                  </th>
-                  <th className="px-5 pb-3 pt-4 text-right font-medium text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'reports.cache.col.time' })}
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{intl.formatMessage({ id: 'reports.cache.col.agent' })}</TableHead>
+                  <TableHead>{intl.formatMessage({ id: 'reports.cache.col.model' })}</TableHead>
+                  <TableHead className="text-right">{intl.formatMessage({ id: 'reports.cache.col.input' })}</TableHead>
+                  <TableHead className="text-right">{intl.formatMessage({ id: 'reports.cache.col.eff' })}</TableHead>
+                  <TableHead className="text-right">{intl.formatMessage({ id: 'reports.cache.col.cost' })}</TableHead>
+                  <TableHead className="text-right">{intl.formatMessage({ id: 'reports.cache.col.time' })}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {recent.map((r, i) => (
-                  <tr key={`${r.created_at}-${i}`} className="border-b border-[var(--panel-border)] last:border-0">
-                    <td className="px-5 py-3 text-stone-900 dark:text-stone-100">{r.agent_id}</td>
-                    <td className="px-5 py-3 text-stone-600 dark:text-stone-400">
-                      <Mono className="text-xs text-stone-500 dark:text-stone-400">{r.model}</Mono>
-                    </td>
-                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
+                  <TableRow key={`${r.created_at}-${i}`}>
+                    <TableCell className="text-foreground">{r.agent_id}</TableCell>
+                    <TableCell>
+                      <span className="font-mono text-xs text-muted-foreground">{r.model}</span>
+                    </TableCell>
+                    <TableCell className="text-right font-mono tabular-nums text-muted-foreground">
                       {formatTokens(r.input_tokens)}
-                    </td>
-                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
+                    </TableCell>
+                    <TableCell className="text-right font-mono tabular-nums text-muted-foreground">
                       {(r.cache_efficiency * 100).toFixed(0)}%
-                    </td>
-                    <td className="px-5 py-3 text-right tabular-nums text-stone-600 dark:text-stone-400">
+                    </TableCell>
+                    <TableCell className="text-right font-mono tabular-nums text-muted-foreground">
                       {formatMillicents(r.cost_millicents)}
-                    </td>
-                    <td className="px-5 py-3 text-right text-xs text-stone-400 dark:text-stone-500">
-                      <Mono className="text-xs text-stone-400 dark:text-stone-500">
-                        {new Date(r.created_at).toLocaleString()}
-                      </Mono>
-                    </td>
-                  </tr>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs text-muted-foreground">
+                      {new Date(r.created_at).toLocaleString()}
+                    </TableCell>
+                  </TableRow>
                 ))}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
-        </Card>
+        </ReportCard>
       )}
     </div>
   );

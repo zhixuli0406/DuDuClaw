@@ -1,38 +1,74 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
-import { api, type UserDetail } from '@/lib/api';
-import { Dialog } from '@/components/shared/Dialog';
-import {
-  ConfirmDialog,
-  OptionSelect,
-  SettingField,
-  type SelectOption,
-} from '@/components/settings/controls';
-import { toast, formatError } from '@/lib/toast';
-import { Users, UserPlus, Pencil, Link2, UserX, Trash2, X, Eye } from 'lucide-react';
 import { useNavigate } from 'react-router';
+import { api, type UserDetail } from '@/lib/api';
+import { toast, formatError } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
-import { ROLE_LEVELS } from '@/lib/roles';
 import type { UserRole } from '@/stores/auth-store';
+import { ROLE_LEVELS } from '@/lib/roles';
+import { ConfirmDialog } from '@/components/settings/controls';
 import {
-  Page,
-  PageHeader,
-  Card,
-  Badge,
   Button,
-  EmptyState,
-  Field,
-  CharacterAvatar,
-  controlClass,
-} from '@/components/ui';
+  Badge,
+  Input,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  ListGridContainer,
+  ListGridHeader,
+  ListGridHeaderCell,
+  ListGridRow,
+  ListGridCell,
+  ActorAvatar,
+  Empty,
+  type BadgeProps,
+} from '@/components/mds';
+import {
+  Users,
+  UserPlus,
+  Pencil,
+  Link2,
+  UserX,
+  Trash2,
+  X,
+  Eye,
+  MoreHorizontal,
+  Loader2,
+  AlertTriangle,
+} from 'lucide-react';
+
+/** Local option shape shared by the role / access / agent pickers below. */
+interface Option {
+  value: string;
+  label: string;
+}
 
 // Plain-language options paired with the raw enum value that actually gets
-// written to the RPC payload (OptionSelect renders "label · raw").
-function roleOptions(intl: ReturnType<typeof useIntl>): SelectOption[] {
+// written to the RPC payload.
+function roleOptions(intl: ReturnType<typeof useIntl>): Option[] {
   return [
     { value: 'employee', label: intl.formatMessage({ id: 'users.role.employee' }) },
     { value: 'manager', label: intl.formatMessage({ id: 'users.role.manager' }) },
     { value: 'admin', label: intl.formatMessage({ id: 'users.role.admin' }) },
+  ];
+}
+
+function accessOptions(intl: ReturnType<typeof useIntl>): Option[] {
+  return [
+    { value: 'owner', label: intl.formatMessage({ id: 'users.access.owner' }) },
+    { value: 'operator', label: intl.formatMessage({ id: 'users.access.operator' }) },
+    { value: 'viewer', label: intl.formatMessage({ id: 'users.access.viewer' }) },
   ];
 }
 
@@ -68,12 +104,11 @@ function DepartmentInput({
   const intl = useIntl();
   return (
     <>
-      <input
+      <Input
         list="dept-options"
         placeholder={intl.formatMessage({ id: 'users.field.departmentPlaceholder' })}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className={controlClass}
       />
       <datalist id="dept-options">
         {options.map((d) => (
@@ -84,13 +119,38 @@ function DepartmentInput({
   );
 }
 
-function accessOptions(intl: ReturnType<typeof useIntl>): SelectOption[] {
-  return [
-    { value: 'owner', label: intl.formatMessage({ id: 'users.access.owner' }) },
-    { value: 'operator', label: intl.formatMessage({ id: 'users.access.operator' }) },
-    { value: 'viewer', label: intl.formatMessage({ id: 'users.access.viewer' }) },
-  ];
+/** Stacked label + control block used across the user dialogs (spec §5.3). */
+function DialogField({
+  label,
+  help,
+  children,
+}: {
+  label: string;
+  help?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <label className="text-sm font-medium text-foreground">{label}</label>
+      {children}
+      {help && <p className="text-xs text-muted-foreground">{help}</p>}
+    </div>
+  );
 }
+
+function roleBadgeProps(role: string): { variant: BadgeProps['variant']; className?: string } {
+  if (role === 'admin') return { variant: 'destructive' };
+  if (role === 'manager') return { variant: 'secondary' };
+  return { variant: 'outline' };
+}
+
+function statusBadgeProps(status: string): { variant: BadgeProps['variant']; className?: string } {
+  if (status === 'active') return { variant: 'secondary', className: 'bg-success/15 text-success' };
+  if (status === 'suspended') return { variant: 'secondary', className: 'bg-warning/15 text-warning' };
+  return { variant: 'outline' };
+}
+
+const COLUMNS = 'minmax(0,1.6fr) minmax(0,0.9fr) minmax(0,1.8fr) minmax(0,0.7fr) 2.5rem';
 
 export function UsersPage() {
   const intl = useIntl();
@@ -137,186 +197,146 @@ export function UsersPage() {
     }
   }, [intl, fetchUsers]);
 
-  const statusTone = (status: string): 'success' | 'warning' | 'neutral' => {
-    if (status === 'active') return 'success';
-    if (status === 'suspended') return 'warning';
-    return 'neutral';
-  };
-
-  const roleTone = (r: string): 'danger' | 'info' | 'neutral' => {
-    if (r === 'admin') return 'danger';
-    if (r === 'manager') return 'info';
-    return 'neutral';
-  };
-
   return (
-    <Page>
-      <PageHeader
-        icon={Users}
-        title={intl.formatMessage({ id: 'nav.users' })}
-        subtitle={intl.formatMessage({ id: 'app.subtitle' })}
-        actions={
-          <Button variant="primary" icon={UserPlus} onClick={() => setShowCreate(true)}>
-            {intl.formatMessage({ id: 'users.create' })}
+    <div className="mx-auto w-full max-w-[1200px] space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <Users className="size-5 text-muted-foreground" />
+          <div>
+            <h1 className="text-base font-medium">{intl.formatMessage({ id: 'nav.users' })}</h1>
+            <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'nav.users.desc' })}</p>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="brand" size="sm" onClick={() => setShowCreate(true)}>
+            <UserPlus />
+            <span className="hidden sm:inline">{intl.formatMessage({ id: 'users.create' })}</span>
           </Button>
-        }
-      />
+        </div>
+      </div>
 
       {fetchError && (
-        <div className="rounded-lg bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:bg-rose-900/20 dark:text-rose-400">
-          {fetchError}
+        <div className="flex items-start gap-2 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+          <span>{fetchError}</span>
         </div>
       )}
 
       {loading ? (
-        <Card>
-          <div className="py-12 text-center text-sm text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'common.loading' })}
-          </div>
-        </Card>
+        <div className="flex items-center justify-center py-16">
+          <Loader2 className="size-6 animate-spin text-muted-foreground" />
+        </div>
       ) : users.length === 0 ? (
-        <Card>
-          <EmptyState
-            icon={Users}
-            dudu="curious"
-            title={intl.formatMessage({ id: 'users.title' })}
-            action={
-              <Button variant="primary" icon={UserPlus} onClick={() => setShowCreate(true)}>
-                {intl.formatMessage({ id: 'users.create' })}
-              </Button>
-            }
-          />
-        </Card>
+        <Empty icon={Users} title={intl.formatMessage({ id: 'users.title' })} />
       ) : (
-        <Card padded={false}>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="border-b border-[var(--panel-border)] bg-stone-500/5 dark:bg-white/5">
-                <tr>
-                  <th className="px-4 py-3 text-left font-medium text-stone-600 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'users.col.name' })}
-                  </th>
-                  <th className="px-4 py-3 text-left font-medium text-stone-600 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'users.col.email' })}
-                  </th>
-                  <th className="px-4 py-3 text-left font-medium text-stone-600 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'users.col.role' })}
-                  </th>
-                  <th className="px-4 py-3 text-left font-medium text-stone-600 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'users.col.status' })}
-                  </th>
-                  <th className="px-4 py-3 text-left font-medium text-stone-600 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'users.col.agents' })}
-                  </th>
-                  <th className="px-4 py-3 text-right font-medium text-stone-600 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'users.col.actions' })}
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[var(--panel-border)]">
-                {users.map((user) => (
-                  <tr
-                    key={user.id}
-                    className="transition-colors hover:bg-stone-500/5 dark:hover:bg-white/5"
-                  >
-                    <td className="px-4 py-3 font-medium text-stone-900 dark:text-stone-100">
-                      {user.display_name}
-                    </td>
-                    <td className="px-4 py-3 text-stone-600 dark:text-stone-400">{user.email}</td>
-                    <td className="px-4 py-3">
-                      <div className="flex flex-col items-start gap-1">
-                        <Badge tone={roleTone(user.role)}>{user.role}</Badge>
-                        {user.department && (
-                          <span className="text-xs text-stone-400 dark:text-stone-500">
-                            {intl.formatMessage({ id: 'users.dept.prefix' })}{user.department}
-                          </span>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      <Badge tone={statusTone(user.status)}>{user.status}</Badge>
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex flex-wrap gap-1">
-                        {user.bindings.map((b) => (
-                          <span
-                            key={b.agent_name}
-                            className="inline-flex items-center gap-1 rounded-control bg-stone-500/10 px-2 py-0.5 text-xs text-stone-600 dark:text-stone-300"
-                          >
-                            <CharacterAvatar agentId={b.agent_name} name={b.agent_name} size={16} />
-                            {b.agent_name}
-                            <span className="text-stone-400">({b.access_level})</span>
-                            <button
-                              onClick={() => handleUnbind(user.id, b.agent_name)}
-                              className="rounded-full p-0.5 text-stone-400 hover:bg-rose-100 hover:text-rose-600 dark:hover:bg-rose-900/30"
-                              title={intl.formatMessage({ id: 'users.action.unbind' })}
-                              aria-label={`unbind ${b.agent_name}`}
-                            >
-                              <X className="h-3 w-3" />
-                            </button>
-                          </span>
-                        ))}
-                        {user.bindings.length === 0 && (
-                          <span className="text-xs text-stone-400">—</span>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center justify-end gap-1">
+        <div className="overflow-hidden rounded-xl border border-surface-border">
+          <ListGridContainer
+            columns={COLUMNS}
+            className="!h-auto [&>[aria-hidden]]:hidden"
+            header={
+              <ListGridHeader>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.name' })}</ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.role' })}</ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.agents' })}</ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.status' })}</ListGridHeaderCell>
+                <ListGridHeaderCell aria-hidden />
+              </ListGridHeader>
+            }
+          >
+            {users.map((user) => {
+              const role = roleBadgeProps(user.role);
+              const status = statusBadgeProps(user.status);
+              return (
+                <ListGridRow key={user.id} rowSize="lg" className="cursor-default">
+                  <ListGridCell className="gap-2">
+                    <ActorAvatar actorType="user" name={user.display_name} size="sm" />
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-foreground">{user.display_name}</p>
+                      <p className="truncate text-xs text-muted-foreground">{user.email}</p>
+                    </div>
+                  </ListGridCell>
+                  <ListGridCell className="flex-col items-start gap-0.5">
+                    <Badge variant={role.variant} className={role.className}>{user.role}</Badge>
+                    {user.department && (
+                      <span className="truncate text-xs text-muted-foreground">
+                        {intl.formatMessage({ id: 'users.dept.prefix' })}{user.department}
+                      </span>
+                    )}
+                  </ListGridCell>
+                  <ListGridCell className="flex-wrap gap-1 py-1.5">
+                    {user.bindings.map((b) => (
+                      <span
+                        key={b.agent_name}
+                        className="group inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                      >
+                        <ActorAvatar actorType="agent" name={b.agent_name} size="xs" />
+                        {b.agent_name}
+                        <span className="text-muted-foreground/70">({b.access_level})</span>
+                        <button
+                          type="button"
+                          data-stop-row-nav
+                          onClick={() => handleUnbind(user.id, b.agent_name)}
+                          className="rounded-full p-0.5 opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 pointer-coarse:opacity-100"
+                          title={intl.formatMessage({ id: 'users.action.unbind' })}
+                          aria-label={`unbind ${b.agent_name}`}
+                        >
+                          <X className="size-3" />
+                        </button>
+                      </span>
+                    ))}
+                    {user.bindings.length === 0 && <span className="text-xs text-muted-foreground">—</span>}
+                  </ListGridCell>
+                  <ListGridCell>
+                    <Badge variant={status.variant} className={status.className}>{user.status}</Badge>
+                  </ListGridCell>
+                  <ListGridCell className="justify-end">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        render={
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            aria-label={intl.formatMessage({ id: 'common.more' })}
+                            data-stop-row-nav
+                          />
+                        }
+                      >
+                        <MoreHorizontal />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent>
                         {canViewDashboard(user.role, user.status) && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            icon={Eye}
-                            onClick={() => navigate(`/?view_as=${encodeURIComponent(user.id)}`)}
-                            title={intl.formatMessage({ id: 'users.action.viewDashboard' })}
-                            aria-label={intl.formatMessage({ id: 'users.action.viewDashboard' })}
-                          />
+                          <DropdownMenuItem onClick={() => navigate(`/?view_as=${encodeURIComponent(user.id)}`)}>
+                            <Eye />
+                            {intl.formatMessage({ id: 'users.action.viewDashboard' })}
+                          </DropdownMenuItem>
                         )}
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          icon={Pencil}
-                          onClick={() => setShowEdit(user)}
-                          title={intl.formatMessage({ id: 'users.action.edit' })}
-                          aria-label={intl.formatMessage({ id: 'users.action.edit' })}
-                        />
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          icon={Link2}
-                          onClick={() => setShowBind(user.id)}
-                          title={intl.formatMessage({ id: 'users.action.bind' })}
-                          aria-label={intl.formatMessage({ id: 'users.action.bind' })}
-                        />
+                        <DropdownMenuItem onClick={() => setShowEdit(user)}>
+                          <Pencil />
+                          {intl.formatMessage({ id: 'users.action.edit' })}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => setShowBind(user.id)}>
+                          <Link2 />
+                          {intl.formatMessage({ id: 'users.action.bind' })}
+                        </DropdownMenuItem>
                         {user.status === 'active' && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            icon={UserX}
-                            onClick={() => setShowOffboard(user)}
-                            title={intl.formatMessage({ id: 'users.action.offboard' })}
-                            aria-label={intl.formatMessage({ id: 'users.action.offboard' })}
-                            className="text-rose-500 hover:bg-rose-50 hover:text-rose-700 dark:hover:bg-rose-900/20 dark:hover:text-rose-400"
-                          />
+                          <DropdownMenuItem onClick={() => setShowOffboard(user)}>
+                            <UserX />
+                            {intl.formatMessage({ id: 'users.action.offboard' })}
+                          </DropdownMenuItem>
                         )}
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          icon={Trash2}
-                          onClick={() => setShowRemove(user)}
-                          title={intl.formatMessage({ id: 'users.action.remove' })}
-                          aria-label={intl.formatMessage({ id: 'users.action.remove' })}
-                          className="text-rose-500 hover:bg-rose-50 hover:text-rose-700 dark:hover:bg-rose-900/20 dark:hover:text-rose-400"
-                        />
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Card>
+                        <DropdownMenuItem variant="destructive" onClick={() => setShowRemove(user)}>
+                          <Trash2 />
+                          {intl.formatMessage({ id: 'users.action.remove' })}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </ListGridCell>
+                </ListGridRow>
+              );
+            })}
+          </ListGridContainer>
+        </div>
       )}
 
       {/* Create User Dialog */}
@@ -379,7 +399,7 @@ export function UsersPage() {
           }}
         />
       )}
-    </Page>
+    </div>
   );
 }
 
@@ -442,11 +462,15 @@ function CreateUserDialog({
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const deptOptions = useDepartmentNames();
+  const roles = roleOptions(intl);
 
   const handleSubmit = async () => {
     setError('');
-    // Frontend validation (MEDIUM-1 fix)
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    // Frontend validation (MEDIUM-1 fix). Do NOT require a dotted domain: the
+    // seed admin account is `admin@local` and internal hostnames like
+    // `manager.test@local` are legitimate (Bug#6). Match the backend's lenient
+    // rule — a non-empty local part, an `@`, and a non-empty domain.
+    if (!/^[^\s@]+@[^\s@]+$/.test(email)) {
       setError(intl.formatMessage({ id: 'users.error.invalidEmail' }));
       return;
     }
@@ -469,61 +493,70 @@ function CreateUserDialog({
   };
 
   return (
-    <Dialog open title={intl.formatMessage({ id: 'users.create' })} onClose={onClose}>
-      <div className="space-y-4">
-        {error && (
-          <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
-            {error}
-          </p>
-        )}
-        <Field label={intl.formatMessage({ id: 'users.field.email' })}>
-          <input
-            type="email"
-            placeholder={intl.formatMessage({ id: 'users.field.email' })}
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            className={controlClass}
-          />
-        </Field>
-        <Field label={intl.formatMessage({ id: 'users.field.display_name' })}>
-          <input
-            placeholder={intl.formatMessage({ id: 'users.field.display_name' })}
-            value={displayName}
-            onChange={(e) => setDisplayName(e.target.value)}
-            className={controlClass}
-          />
-        </Field>
-        <Field label={intl.formatMessage({ id: 'users.field.password' })}>
-          <input
-            type="password"
-            placeholder={intl.formatMessage({ id: 'users.field.password' })}
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            className={controlClass}
-          />
-        </Field>
-        <Field label={intl.formatMessage({ id: 'users.col.role' })}>
-          <OptionSelect value={userRole} onChange={setUserRole} options={roleOptions(intl)} />
-        </Field>
-        <Field
-          label={intl.formatMessage({ id: 'users.field.department' })}
-          help={intl.formatMessage({ id: 'users.field.departmentHint' })}
-        >
-          <DepartmentInput value={department} onChange={setDepartment} options={deptOptions} />
-        </Field>
-        <div className="flex justify-end gap-2">
-          <Button variant="ghost" onClick={onClose}>
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'users.create' })}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          {error && (
+            <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
+          )}
+          <DialogField label={intl.formatMessage({ id: 'users.field.email' })}>
+            <Input
+              type="email"
+              placeholder={intl.formatMessage({ id: 'users.field.email' })}
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+          </DialogField>
+          <DialogField label={intl.formatMessage({ id: 'users.field.display_name' })}>
+            <Input
+              placeholder={intl.formatMessage({ id: 'users.field.display_name' })}
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+            />
+          </DialogField>
+          <DialogField label={intl.formatMessage({ id: 'users.field.password' })}>
+            <Input
+              type="password"
+              placeholder={intl.formatMessage({ id: 'users.field.password' })}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </DialogField>
+          <DialogField label={intl.formatMessage({ id: 'users.col.role' })}>
+            <Select value={userRole} onValueChange={(v) => setUserRole(String(v))}>
+              <SelectTrigger className="w-full">
+                <SelectValue>{roles.find((r) => r.value === userRole)?.label}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {roles.map((r) => (
+                  <SelectItem key={r.value} value={r.value}>{r.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </DialogField>
+          <DialogField
+            label={intl.formatMessage({ id: 'users.field.department' })}
+            help={intl.formatMessage({ id: 'users.field.departmentHint' })}
+          >
+            <DepartmentInput value={department} onChange={setDepartment} options={deptOptions} />
+          </DialogField>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
             {intl.formatMessage({ id: 'common.cancel' })}
           </Button>
           <Button
-            variant="primary"
+            variant="brand"
             onClick={handleSubmit}
             disabled={submitting || !email || !displayName || !password}
           >
             {intl.formatMessage({ id: 'common.create' })}
           </Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
@@ -545,6 +578,7 @@ function EditUserDialog({
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const deptOptions = useDepartmentNames();
+  const roles = roleOptions(intl);
 
   const handleSubmit = async () => {
     setError('');
@@ -574,47 +608,54 @@ function EditUserDialog({
   };
 
   return (
-    <Dialog open title={intl.formatMessage({ id: 'users.action.edit' })} onClose={onClose}>
-      <div className="space-y-4">
-        {error && (
-          <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
-            {error}
-          </p>
-        )}
-        <Field label={intl.formatMessage({ id: 'users.field.display_name' })}>
-          <input
-            value={displayName}
-            onChange={(e) => setDisplayName(e.target.value)}
-            className={controlClass}
-          />
-        </Field>
-        <Field label={intl.formatMessage({ id: 'users.col.role' })}>
-          <OptionSelect value={userRole} onChange={setUserRole} options={roleOptions(intl)} />
-        </Field>
-        <Field
-          label={intl.formatMessage({ id: 'users.field.department' })}
-          help={intl.formatMessage({ id: 'users.field.departmentHint' })}
-        >
-          <DepartmentInput value={department} onChange={setDepartment} options={deptOptions} />
-        </Field>
-        <Field label={intl.formatMessage({ id: 'users.field.new_password' })}>
-          <input
-            type="password"
-            placeholder={intl.formatMessage({ id: 'users.field.new_password' })}
-            value={newPassword}
-            onChange={(e) => setNewPassword(e.target.value)}
-            className={controlClass}
-          />
-        </Field>
-        <div className="flex justify-end gap-2">
-          <Button variant="ghost" onClick={onClose}>
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'users.action.edit' })}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          {error && (
+            <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
+          )}
+          <DialogField label={intl.formatMessage({ id: 'users.field.display_name' })}>
+            <Input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+          </DialogField>
+          <DialogField label={intl.formatMessage({ id: 'users.col.role' })}>
+            <Select value={userRole} onValueChange={(v) => setUserRole(String(v))}>
+              <SelectTrigger className="w-full">
+                <SelectValue>{roles.find((r) => r.value === userRole)?.label}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {roles.map((r) => (
+                  <SelectItem key={r.value} value={r.value}>{r.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </DialogField>
+          <DialogField
+            label={intl.formatMessage({ id: 'users.field.department' })}
+            help={intl.formatMessage({ id: 'users.field.departmentHint' })}
+          >
+            <DepartmentInput value={department} onChange={setDepartment} options={deptOptions} />
+          </DialogField>
+          <DialogField label={intl.formatMessage({ id: 'users.field.new_password' })}>
+            <Input
+              type="password"
+              placeholder={intl.formatMessage({ id: 'users.field.new_password' })}
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+            />
+          </DialogField>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
             {intl.formatMessage({ id: 'common.cancel' })}
           </Button>
-          <Button variant="primary" onClick={handleSubmit} disabled={submitting}>
+          <Button variant="brand" onClick={handleSubmit} disabled={submitting}>
             {intl.formatMessage({ id: 'common.save' })}
           </Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
@@ -634,9 +675,10 @@ function BindAgentDialog({
   const intl = useIntl();
   const [agentName, setAgentName] = useState('');
   const [accessLevel, setAccessLevel] = useState('owner');
-  const [agentOptions, setAgentOptions] = useState<SelectOption[] | null>(null);
+  const [agentOptions, setAgentOptions] = useState<Option[] | null>(null);
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const accesses = accessOptions(intl);
 
   useEffect(() => {
     let cancelled = false;
@@ -679,41 +721,61 @@ function BindAgentDialog({
   };
 
   return (
-    <Dialog open title={intl.formatMessage({ id: 'users.action.bind' })} onClose={onClose}>
-      <div className="space-y-4">
-        {error && (
-          <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
-            {error}
-          </p>
-        )}
-        <Field label={intl.formatMessage({ id: 'users.field.agent_name' })}>
-          {agentOptions && agentOptions.length > 0 ? (
-            <OptionSelect value={agentName} onChange={setAgentName} options={agentOptions} />
-          ) : agentOptions && agentOptions.length === 0 ? (
-            <p className="text-sm text-stone-500 dark:text-stone-400">
-              {intl.formatMessage({ id: 'users.bind.none_available' })}
-            </p>
-          ) : (
-            <input
-              placeholder={intl.formatMessage({ id: 'users.field.agent_name' })}
-              value={agentName}
-              onChange={(e) => setAgentName(e.target.value)}
-              className={controlClass}
-            />
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'users.action.bind' })}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          {error && (
+            <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
           )}
-        </Field>
-        <Field label={intl.formatMessage({ id: 'users.action.bind' })}>
-          <OptionSelect value={accessLevel} onChange={setAccessLevel} options={accessOptions(intl)} />
-        </Field>
-        <div className="flex justify-end gap-2">
-          <Button variant="ghost" onClick={onClose}>
+          <DialogField label={intl.formatMessage({ id: 'users.field.agent_name' })}>
+            {agentOptions && agentOptions.length > 0 ? (
+              <Select value={agentName} onValueChange={(v) => setAgentName(String(v))}>
+                <SelectTrigger className="w-full">
+                  <SelectValue>{agentOptions.find((o) => o.value === agentName)?.label ?? agentName}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {agentOptions.map((o) => (
+                    <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : agentOptions && agentOptions.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {intl.formatMessage({ id: 'users.bind.none_available' })}
+              </p>
+            ) : (
+              <Input
+                placeholder={intl.formatMessage({ id: 'users.field.agent_name' })}
+                value={agentName}
+                onChange={(e) => setAgentName(e.target.value)}
+              />
+            )}
+          </DialogField>
+          <DialogField label={intl.formatMessage({ id: 'users.action.bind' })}>
+            <Select value={accessLevel} onValueChange={(v) => setAccessLevel(String(v))}>
+              <SelectTrigger className="w-full">
+                <SelectValue>{accesses.find((a) => a.value === accessLevel)?.label}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {accesses.map((a) => (
+                  <SelectItem key={a.value} value={a.value}>{a.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </DialogField>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
             {intl.formatMessage({ id: 'common.cancel' })}
           </Button>
-          <Button variant="primary" onClick={handleSubmit} disabled={submitting || !agentName}>
+          <Button variant="brand" onClick={handleSubmit} disabled={submitting || !agentName}>
             {intl.formatMessage({ id: 'users.action.bind' })}
           </Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
@@ -766,50 +828,59 @@ function OffboardDialog({
 
   // Bindings present → pick a transferee first (preserves the transferTo field),
   // then hand off to ConfirmDialog above.
-  const transferOptions: SelectOption[] = [
+  const transferOptions: Option[] = [
     { value: '', label: intl.formatMessage({ id: 'users.offboard.no_transfer' }) },
     ...users.map((u) => ({ value: u.id, label: `${u.display_name} (${u.email})` })),
   ];
 
   return (
-    <Dialog open title={intl.formatMessage({ id: 'users.action.offboard' })} onClose={onClose}>
-      <div className="space-y-4">
-        <p className="text-sm text-stone-600 dark:text-stone-400">
-          {intl.formatMessage({ id: 'users.offboard.confirm' }, { name: user.display_name })}
-        </p>
-        <div>
-          <p className="text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'users.offboard.agents' })}
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'users.action.offboard' })}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            {intl.formatMessage({ id: 'users.offboard.confirm' }, { name: user.display_name })}
           </p>
-          <div className="mt-1 flex flex-wrap gap-1">
-            {user.bindings.map((b) => (
-              <span
-                key={b.agent_name}
-                className="inline-flex items-center gap-1 rounded-control bg-stone-500/10 px-2 py-0.5 text-xs text-stone-600 dark:text-stone-300"
-              >
-                <CharacterAvatar agentId={b.agent_name} name={b.agent_name} size={16} />
-                {b.agent_name}
-              </span>
-            ))}
+          <div>
+            <p className="text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: 'users.offboard.agents' })}
+            </p>
+            <div className="mt-1 flex flex-wrap gap-1">
+              {user.bindings.map((b) => (
+                <span
+                  key={b.agent_name}
+                  className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                >
+                  <ActorAvatar actorType="agent" name={b.agent_name} size="xs" />
+                  {b.agent_name}
+                </span>
+              ))}
+            </div>
           </div>
+          <DialogField label={intl.formatMessage({ id: 'users.offboard.transfer' })}>
+            <Select value={transferTo} onValueChange={(v) => setTransferTo(String(v))}>
+              <SelectTrigger className="w-full">
+                <SelectValue>{transferOptions.find((o) => o.value === transferTo)?.label}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {transferOptions.map((o) => (
+                  <SelectItem key={o.value || 'none'} value={o.value}>{o.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </DialogField>
         </div>
-        <SettingField label={intl.formatMessage({ id: 'users.offboard.transfer' })}>
-          <OptionSelect
-            value={transferTo}
-            onChange={setTransferTo}
-            options={transferOptions}
-            showRaw={false}
-          />
-        </SettingField>
-        <div className="flex justify-end gap-2">
-          <Button variant="ghost" onClick={onClose}>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
             {intl.formatMessage({ id: 'common.cancel' })}
           </Button>
-          <Button variant="danger" onClick={() => setConfirming(true)}>
+          <Button variant="destructive" onClick={() => setConfirming(true)}>
             {intl.formatMessage({ id: 'users.action.offboard' })}
           </Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }

@@ -13,8 +13,10 @@ import {
 import { formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useTourStore } from '@/stores/tour-store';
-import { Card, Button, Badge, Field, controlClass } from '@/components/ui';
+import { Card, Button, Badge, Input, Textarea } from '@/components/mds';
+import { Field, CompletionBadge } from '@/components/onboarding';
 import { DuDu } from '@/components/mascot';
+import type { DuduFace } from '@/components/mascot/faces';
 import {
   ChevronLeft,
   ChevronRight,
@@ -61,6 +63,14 @@ const NO_TEMPLATES: TemplatesIndustriesResponse = {
   ceo_available: false,
   industries: [],
 };
+
+// Shared selection-card styling (spec §4 Card + §5.8): a resting surface card
+// that highlights with the brand ring when picked.
+const SELECT_CARD =
+  'flex text-left rounded-xl border border-surface-border bg-surface shadow-[var(--surface-shadow)] outline-none ' +
+  'transition-colors hover:bg-surface-hover ' +
+  'focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50';
+const SELECT_CARD_ACTIVE = 'border-brand ring-1 ring-brand hover:bg-surface';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -158,12 +168,24 @@ export function clearWelcomeProgress(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Step indicator
+// Hero / side-panel metadata (§5.8) — one small DuDu illustration + title +
+// description per step. DuDu is now the side-panel illustration, not the stage.
+// ---------------------------------------------------------------------------
+
+const HERO: Record<number, { face: DuduFace; titleId: string; subtitleId: string }> = {
+  1: { face: 'waving', titleId: 'welcome.hero.title', subtitleId: 'welcome.hero.subtitle' },
+  2: { face: 'curious', titleId: 'welcome.backend.title', subtitleId: 'welcome.backend.subtitle' },
+  3: { face: 'curious', titleId: 'welcome.industry.title', subtitleId: 'welcome.industry.subtitle' },
+  4: { face: 'writing', titleId: 'welcome.identity.title', subtitleId: 'welcome.identity.subtitle' },
+};
+
+// ---------------------------------------------------------------------------
+// Step indicator (progress dots — bg-brand active, muted resting)
 // ---------------------------------------------------------------------------
 
 function StepDots({ current }: { current: number }) {
   return (
-    <div className="flex items-center justify-center gap-2">
+    <div className="flex items-center gap-2" aria-hidden="true">
       {Array.from({ length: TOTAL_STEPS }, (_, i) => {
         const step = i + 1;
         const done = step < current;
@@ -172,8 +194,8 @@ function StepDots({ current }: { current: number }) {
           <span
             key={step}
             className={cn(
-              'h-2 rounded-full transition-all duration-200',
-              active ? 'w-8 bg-amber-500' : done ? 'w-2 bg-amber-500/60' : 'w-2 bg-stone-500/25',
+              'h-1.5 rounded-full transition-all duration-200',
+              active ? 'w-8 bg-brand' : done ? 'w-2 bg-brand/50' : 'w-2 bg-muted-foreground/25',
             )}
           />
         );
@@ -189,11 +211,12 @@ function StepDots({ current }: { current: number }) {
 function DetectBadge({ ok, intl }: { ok: boolean | undefined; intl: ReturnType<typeof useIntl> }) {
   if (ok === undefined) return null;
   return ok ? (
-    <Badge tone="success" dot>
+    <Badge variant="outline" className="border-transparent bg-success/12 text-success">
+      <span className="size-1.5 rounded-full bg-success" />
       {intl.formatMessage({ id: 'welcome.backend.detected' })}
     </Badge>
   ) : (
-    <Badge tone="neutral">{intl.formatMessage({ id: 'welcome.backend.notInstalled' })}</Badge>
+    <Badge variant="ghost">{intl.formatMessage({ id: 'welcome.backend.notInstalled' })}</Badge>
   );
 }
 
@@ -543,486 +566,505 @@ export function WelcomePage() {
   // ── Success ───────────────────────────────────────────────
   if (deployed) {
     return (
-      <div className="page-enter mx-auto flex max-w-xl flex-col items-center justify-center py-20 text-center">
-        {/* DuDu cheers on the first employee joining the team (§7.3). */}
-        <DuDu face="celebrating" size={120} label="DuDu" className="mb-4" />
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
+      <div className="mx-auto flex min-h-full max-w-xl flex-col items-center justify-center gap-4 px-6 py-20 text-center">
+        {/* The completion badge springs in + draws its check (§5.8); DuDu cheers
+            as a small side illustration (§7.3). */}
+        <CompletionBadge size={80} label={intl.formatMessage({ id: 'welcome.success.title' })} />
+        <DuDu face="celebrating" size={56} label="DuDu" />
+        <h2 className="text-xl font-semibold text-foreground sm:text-2xl">
           {intl.formatMessage({ id: 'welcome.success.title' })}
         </h2>
-        <p className="mt-2 text-sm text-stone-500 dark:text-stone-400">
+        <p className="text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'welcome.success.subtitle' })}
         </p>
         {deployWarning && (
-          <p className="mt-3 rounded-lg bg-amber-500/10 px-4 py-2 text-sm text-amber-700 dark:text-amber-300">
+          <p className="rounded-lg bg-warning/10 px-4 py-2 text-sm text-warning">
             {intl.formatMessage({ id: 'welcome.success.partialWarning' })}
           </p>
         )}
         {selectedIndustry && (
-          <p className="mt-2 text-sm text-stone-500 dark:text-stone-400">
+          <p className="text-sm text-muted-foreground">
             {intl.formatMessage({ id: 'welcome.success.moreRoles' })}
           </p>
         )}
-        <Button variant="primary" className="mt-8" onClick={() => navigate('/')}>
+        <Button variant="brand" size="lg" className="mt-4" onClick={() => navigate('/')}>
           {intl.formatMessage({ id: 'welcome.goToDashboard' })}
         </Button>
       </div>
     );
   }
 
+  const hero = HERO[step] ?? HERO[1];
+
   return (
-    <div className="page-enter mx-auto max-w-3xl space-y-8 py-4">
-      <StepDots current={step} />
-
-      {/* Step 1 — warm welcome */}
-      {step === 1 && (
-        <div className="flex flex-col items-center gap-5 py-8 text-center">
-          {/* DuDu the receptionist waves the operator in (§7.3 接待員). */}
-          <DuDu face="waving" size={112} label="DuDu" />
-          <h1 className="text-3xl font-semibold tracking-tight text-stone-900 dark:text-stone-50">
-            {intl.formatMessage({ id: 'welcome.hero.title' })}
-          </h1>
-          <p className="max-w-md text-sm leading-relaxed text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'welcome.hero.subtitle' })}
-          </p>
-        </div>
-      )}
-
-      {/* Step 2 — choose AI backend */}
-      {step === 2 && (
-        <div className="space-y-5">
-          <div className="text-center">
-            <h2 className="text-xl font-semibold text-stone-900 dark:text-stone-50">
-              {intl.formatMessage({ id: 'welcome.backend.title' })}
-            </h2>
-            <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
-              {intl.formatMessage({ id: 'welcome.backend.subtitle' })}
+    <div className="min-h-full bg-page-canvas">
+      <div className="mx-auto grid max-w-5xl gap-8 px-6 py-10 lg:grid-cols-[0.85fr_1.15fr] lg:items-start lg:gap-12 lg:py-16">
+        {/* ── Left: hero / side-panel (small DuDu + title + description + dots) ── */}
+        <div className="space-y-5 lg:sticky lg:top-16">
+          <DuDu face={hero.face} size={64} label="DuDu" />
+          <div className="space-y-2">
+            <h1 className="text-xl font-semibold text-foreground sm:text-2xl">
+              {intl.formatMessage({ id: hero.titleId })}
+            </h1>
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              {intl.formatMessage({ id: hero.subtitleId })}
             </p>
           </div>
+          <StepDots current={step} />
+        </div>
 
-          <div className="grid gap-3 sm:grid-cols-2">
-            {BACKENDS.map(({ id, icon: Icon, recommended }) => {
-              const selected = state.backend === id;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  onClick={() => patch({ backend: id })}
-                  aria-pressed={selected}
-                  className={cn(
-                    'panel panel-hover flex items-start gap-3 p-4 text-left transition-colors duration-200',
-                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
-                    selected && 'border-amber-500/70 ring-1 ring-amber-500/40',
-                  )}
-                >
-                  <span
-                    className={cn(
-                      'grid h-10 w-10 shrink-0 place-items-center rounded-lg',
-                      selected ? 'bg-amber-500 text-white' : 'bg-stone-500/10 text-stone-500 dark:text-stone-400',
-                    )}
-                  >
-                    <Icon className="h-5 w-5" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="text-sm font-semibold text-stone-900 dark:text-stone-50">
-                        {intl.formatMessage({ id: `welcome.backend.${id}` })}
-                      </p>
-                      {recommended && (
-                        <Badge tone="accent">{intl.formatMessage({ id: 'welcome.backend.recommended' })}</Badge>
-                      )}
-                      <DetectBadge ok={detectedFor(id)} intl={intl} />
-                    </div>
-                    <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">
-                      {intl.formatMessage({ id: `welcome.backend.${id}.desc` })}
-                    </p>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Backend-specific sub-inputs */}
-          {state.backend === 'claudeSub' && detect && (
-            <Card>
-              <p className="text-sm text-stone-600 dark:text-stone-300">
-                {detect.claude_oauth
-                  ? intl.formatMessage(
-                      { id: 'welcome.backend.claudeLoggedIn' },
-                      { plan: detect.claude_subscription ?? 'OAuth' },
-                    )
-                  : intl.formatMessage({ id: 'welcome.backend.claudeLoginHint' })}
-              </p>
+        {/* ── Right: interactive column. Keyed by step for the pure-opacity
+            cross-fade (§5.8 — no positional shift). ── */}
+        <div key={step} className="mds-step-fade space-y-5">
+          {/* Step 1 — what the wizard will set up (reuses per-step titles). */}
+          {step === 1 && (
+            <Card className="gap-0 p-2">
+              <ol className="divide-y divide-surface-border">
+                {[
+                  { n: 1, id: 'welcome.backend.title', Icon: Cloud },
+                  { n: 2, id: 'welcome.industry.title', Icon: Plug },
+                  { n: 3, id: 'welcome.identity.title', Icon: KeyRound },
+                ].map(({ n, id, Icon }) => (
+                  <li key={n} className="flex items-center gap-3 px-3 py-3.5">
+                    <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
+                      <Icon className="size-4" />
+                    </span>
+                    <span className="text-sm font-medium text-foreground">
+                      {intl.formatMessage({ id })}
+                    </span>
+                  </li>
+                ))}
+              </ol>
             </Card>
           )}
 
-          {state.backend === 'claudeApi' && (
-            <Card bodyClassName="space-y-4">
-              <Field label={intl.formatMessage({ id: 'welcome.backend.apiKey' })} required>
-                <input
-                  type="password"
-                  value={state.apiKey}
-                  onChange={(e) => patch({ apiKey: e.target.value })}
-                  className={controlClass}
-                  placeholder="sk-ant-..."
-                  autoComplete="off"
-                />
-              </Field>
-              <Field label={intl.formatMessage({ id: 'welcome.backend.budget' })} help={intl.formatMessage({ id: 'welcome.backend.budget.hint' })}>
-                <input
-                  type="number"
-                  min="0"
-                  value={state.apiBudget}
-                  onChange={(e) => patch({ apiBudget: e.target.value })}
-                  className={controlClass}
-                />
-              </Field>
-              <p className="text-xs text-stone-400 dark:text-stone-500">
-                {intl.formatMessage({ id: 'welcome.backend.keyValidateNote' })}
-              </p>
-            </Card>
-          )}
-
-          {state.backend === 'genericApi' && (
-            <Card bodyClassName="space-y-4">
-              <Field label={intl.formatMessage({ id: 'welcome.backend.baseUrl' })} required>
-                <input
-                  type="text"
-                  value={state.baseUrl}
-                  onChange={(e) => patch({ baseUrl: e.target.value })}
-                  className={controlClass}
-                  placeholder="https://api.openai.com/v1"
-                />
-              </Field>
-              <Field label={intl.formatMessage({ id: 'welcome.backend.modelId' })} required>
-                <input
-                  type="text"
-                  value={state.genericModel}
-                  onChange={(e) => patch({ genericModel: e.target.value })}
-                  className={controlClass}
-                  placeholder="gpt-4o-mini"
-                />
-              </Field>
-              <Field label={intl.formatMessage({ id: 'welcome.backend.apiKey' })} help={intl.formatMessage({ id: 'welcome.backend.apiKey.optional' })}>
-                <input
-                  type="password"
-                  value={state.genericKey}
-                  onChange={(e) => patch({ genericKey: e.target.value })}
-                  className={controlClass}
-                  autoComplete="off"
-                />
-              </Field>
-            </Card>
-          )}
-
-          {state.backend === 'local' && (
-            <Card bodyClassName="space-y-3">
-              <Field label={intl.formatMessage({ id: 'welcome.backend.localModel' })} help={intl.formatMessage({ id: 'welcome.backend.localModel.hint' })}>
-                <input
-                  type="text"
-                  value={state.localModel}
-                  onChange={(e) => patch({ localModel: e.target.value })}
-                  className={controlClass}
-                  placeholder={DEFAULT_LOCAL_MODEL}
-                />
-              </Field>
-              <p className="text-xs text-stone-400 dark:text-stone-500">
-                {intl.formatMessage({ id: 'welcome.backend.manageInInference' })}
-              </p>
-            </Card>
-          )}
-
-          {state.backend === 'otherCli' && (
-            <Card bodyClassName="space-y-3">
-              <p className="text-sm text-stone-600 dark:text-stone-300">
-                {intl.formatMessage({ id: 'welcome.backend.otherCli.pick' })}
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {OTHER_CLIS.map((cli) => {
-                  const installed = detect
-                    ? cli === 'codex'
-                      ? detect.codex
-                      : cli === 'gemini'
-                        ? detect.gemini
-                        : detect.antigravity
-                    : undefined;
-                  const selected = state.otherCli === cli;
+          {/* Step 2 — choose AI backend */}
+          {step === 2 && (
+            <>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {BACKENDS.map(({ id, icon: Icon, recommended }) => {
+                  const selected = state.backend === id;
                   return (
                     <button
-                      key={cli}
+                      key={id}
                       type="button"
-                      onClick={() => patch({ otherCli: cli })}
+                      onClick={() => patch({ backend: id })}
                       aria-pressed={selected}
-                      className={cn(
-                        'flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors',
-                        selected
-                          ? 'border-amber-500/70 bg-amber-500/10 text-amber-700 dark:text-amber-300'
-                          : 'border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-600 dark:text-stone-300',
-                      )}
+                      className={cn(SELECT_CARD, 'items-start gap-3 p-4', selected && SELECT_CARD_ACTIVE)}
                     >
-                      <span className="font-medium capitalize">{cli}</span>
-                      <DetectBadge ok={installed} intl={intl} />
+                      <span
+                        className={cn(
+                          'grid size-10 shrink-0 place-items-center rounded-lg',
+                          selected ? 'bg-brand text-brand-foreground' : 'bg-muted text-muted-foreground',
+                        )}
+                      >
+                        <Icon className="size-5" />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="text-sm font-medium text-foreground">
+                            {intl.formatMessage({ id: `welcome.backend.${id}` })}
+                          </p>
+                          {recommended && (
+                            <Badge variant="outline" className="border-brand/25 bg-brand/10 text-brand">
+                              {intl.formatMessage({ id: 'welcome.backend.recommended' })}
+                            </Badge>
+                          )}
+                          <DetectBadge ok={detectedFor(id)} intl={intl} />
+                        </div>
+                        <p className="mt-0.5 text-xs text-muted-foreground">
+                          {intl.formatMessage({ id: `welcome.backend.${id}.desc` })}
+                        </p>
+                      </div>
                     </button>
                   );
                 })}
               </div>
-            </Card>
-          )}
-        </div>
-      )}
 
-      {/* Step 3 — pick an industry (premium template packs) */}
-      {step === 3 && (
-        <div className="space-y-5">
-          <div className="text-center">
-            <h2 className="text-xl font-semibold text-stone-900 dark:text-stone-50">
-              {intl.formatMessage({ id: 'welcome.industry.title' })}
-            </h2>
-            <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
-              {intl.formatMessage({ id: 'welcome.industry.subtitle' })}
-            </p>
-          </div>
-
-          {industryInfo === null && (
-            <p className="text-center text-sm text-stone-400 dark:text-stone-500">
-              {intl.formatMessage({ id: 'common.loading' })}
-            </p>
-          )}
-
-          {industryInfo?.present_but_locked && (
-            <Card bodyClassName="space-y-3">
-              <p className="text-sm text-stone-600 dark:text-stone-300">
-                {intl.formatMessage(
-                  { id: 'welcome.industry.locked' },
-                  { feature: intl.formatMessage({ id: 'license.feature.premiumTemplates' }) },
-                )}
-              </p>
-              <Button variant="secondary" onClick={() => navigate('/license')}>
-                {intl.formatMessage({ id: 'welcome.industry.lockedCta' })}
-              </Button>
-            </Card>
-          )}
-
-          {industryInfo?.unlocked && industryInfo.industries.length > 0 && (
-            <>
-              {/* Prominent skip → generic assistant */}
-              <button
-                type="button"
-                onClick={() => setSelectedIndustry(null)}
-                aria-pressed={selectedIndustry === null}
-                className={cn(
-                  'panel panel-hover flex w-full items-start gap-3 p-4 text-left transition-colors duration-200',
-                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
-                  selectedIndustry === null && 'border-amber-500/70 ring-1 ring-amber-500/40',
-                )}
-              >
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-semibold text-stone-900 dark:text-stone-50">
-                    {intl.formatMessage({ id: 'welcome.industry.skip' })}
+              {/* Backend-specific sub-inputs */}
+              {state.backend === 'claudeSub' && detect && (
+                <Card className="p-4">
+                  <p className="text-sm text-muted-foreground">
+                    {detect.claude_oauth
+                      ? intl.formatMessage(
+                          { id: 'welcome.backend.claudeLoggedIn' },
+                          { plan: detect.claude_subscription ?? 'OAuth' },
+                        )
+                      : intl.formatMessage({ id: 'welcome.backend.claudeLoginHint' })}
                   </p>
-                  <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({ id: 'welcome.industry.skip.desc' })}
+                </Card>
+              )}
+
+              {state.backend === 'claudeApi' && (
+                <Card className="p-4">
+                  <Field label={intl.formatMessage({ id: 'welcome.backend.apiKey' })} required>
+                    <Input
+                      type="password"
+                      value={state.apiKey}
+                      onChange={(e) => patch({ apiKey: e.target.value })}
+                      placeholder="sk-ant-..."
+                      autoComplete="off"
+                    />
+                  </Field>
+                  <Field
+                    label={intl.formatMessage({ id: 'welcome.backend.budget' })}
+                    help={intl.formatMessage({ id: 'welcome.backend.budget.hint' })}
+                  >
+                    <Input
+                      type="number"
+                      min="0"
+                      value={state.apiBudget}
+                      onChange={(e) => patch({ apiBudget: e.target.value })}
+                    />
+                  </Field>
+                  <p className="text-xs text-muted-foreground">
+                    {intl.formatMessage({ id: 'welcome.backend.keyValidateNote' })}
                   </p>
-                </div>
-              </button>
+                </Card>
+              )}
 
-              <input
-                type="text"
-                value={industryFilter}
-                onChange={(e) => setIndustryFilter(e.target.value)}
-                className={controlClass}
-                placeholder={intl.formatMessage({ id: 'welcome.industry.filter' })}
-              />
+              {state.backend === 'genericApi' && (
+                <Card className="p-4">
+                  <Field label={intl.formatMessage({ id: 'welcome.backend.baseUrl' })} required>
+                    <Input
+                      type="text"
+                      value={state.baseUrl}
+                      onChange={(e) => patch({ baseUrl: e.target.value })}
+                      placeholder="https://api.openai.com/v1"
+                    />
+                  </Field>
+                  <Field label={intl.formatMessage({ id: 'welcome.backend.modelId' })} required>
+                    <Input
+                      type="text"
+                      value={state.genericModel}
+                      onChange={(e) => patch({ genericModel: e.target.value })}
+                      placeholder="gpt-4o-mini"
+                    />
+                  </Field>
+                  <Field
+                    label={intl.formatMessage({ id: 'welcome.backend.apiKey' })}
+                    help={intl.formatMessage({ id: 'welcome.backend.apiKey.optional' })}
+                  >
+                    <Input
+                      type="password"
+                      value={state.genericKey}
+                      onChange={(e) => patch({ genericKey: e.target.value })}
+                      autoComplete="off"
+                    />
+                  </Field>
+                </Card>
+              )}
 
-              <div className="max-h-[46vh] overflow-y-auto pr-1">
-                <div className="grid gap-3 sm:grid-cols-2">
-                  {industryInfo.industries
-                    .filter((ind) => {
-                      const f = industryFilter.trim().toLowerCase();
-                      if (!f) return true;
-                      return (
-                        ind.label.toLowerCase().includes(f) || ind.industry.toLowerCase().includes(f)
-                      );
-                    })
-                    .map((ind) => {
-                      const selected = selectedIndustry === ind.industry;
+              {state.backend === 'local' && (
+                <Card className="gap-3 p-4">
+                  <Field
+                    label={intl.formatMessage({ id: 'welcome.backend.localModel' })}
+                    help={intl.formatMessage({ id: 'welcome.backend.localModel.hint' })}
+                  >
+                    <Input
+                      type="text"
+                      value={state.localModel}
+                      onChange={(e) => patch({ localModel: e.target.value })}
+                      placeholder={DEFAULT_LOCAL_MODEL}
+                    />
+                  </Field>
+                  <p className="text-xs text-muted-foreground">
+                    {intl.formatMessage({ id: 'welcome.backend.manageInInference' })}
+                  </p>
+                </Card>
+              )}
+
+              {state.backend === 'otherCli' && (
+                <Card className="gap-3 p-4">
+                  <p className="text-sm text-muted-foreground">
+                    {intl.formatMessage({ id: 'welcome.backend.otherCli.pick' })}
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {OTHER_CLIS.map((cli) => {
+                      const installed = detect
+                        ? cli === 'codex'
+                          ? detect.codex
+                          : cli === 'gemini'
+                            ? detect.gemini
+                            : detect.antigravity
+                        : undefined;
+                      const selected = state.otherCli === cli;
                       return (
                         <button
-                          key={ind.industry}
+                          key={cli}
                           type="button"
-                          onClick={() => setSelectedIndustry(ind.industry)}
+                          onClick={() => patch({ otherCli: cli })}
                           aria-pressed={selected}
                           className={cn(
-                            'panel panel-hover flex flex-col items-start gap-1 p-4 text-left transition-colors duration-200',
-                            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
-                            selected && 'border-amber-500/70 ring-1 ring-amber-500/40',
+                            'flex items-center gap-2 rounded-lg border px-3 py-2 text-sm outline-none transition-colors',
+                            'focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50',
+                            selected
+                              ? 'border-brand bg-brand/10 text-brand'
+                              : 'border-input bg-transparent text-foreground hover:bg-muted dark:bg-input/30',
                           )}
                         >
-                          <p className="text-sm font-semibold text-stone-900 dark:text-stone-50">
-                            {ind.label}
-                          </p>
-                          <p className="text-xs text-stone-500 dark:text-stone-400">
-                            {intl.formatMessage(
-                              { id: 'welcome.industry.workerCount' },
-                              { count: ind.worker_count },
-                            )}
-                          </p>
+                          <span className="font-medium capitalize">{cli}</span>
+                          <DetectBadge ok={installed} intl={intl} />
                         </button>
                       );
                     })}
-                </div>
-              </div>
+                  </div>
+                </Card>
+              )}
             </>
           )}
-        </div>
-      )}
 
-      {/* Step 4 — create the first AI staff member */}
-      {step === 4 && (
-        <div className="mx-auto max-w-lg space-y-5">
-          <div className="text-center">
-            <h2 className="text-xl font-semibold text-stone-900 dark:text-stone-50">
-              {intl.formatMessage({ id: 'welcome.identity.title' })}
-            </h2>
-          </div>
+          {/* Step 3 — pick an industry (premium template packs) */}
+          {step === 3 && (
+            <>
+              {industryInfo === null && (
+                <p className="text-sm text-muted-foreground">
+                  {intl.formatMessage({ id: 'common.loading' })}
+                </p>
+              )}
 
-          {/* Template picker — CEO by default, front-desk when an industry is staged. */}
-          {roster && roster.roles.some((r) => r.kind === 'ceo' || r.kind === 'front_desk') && (
-            <Field label={intl.formatMessage({ id: 'welcome.template.title' })}>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => void selectTemplate('')}
-                  aria-pressed={templateRoleId === ''}
-                  className={cn(
-                    'rounded-lg border px-3 py-2 text-sm transition-colors',
-                    templateRoleId === ''
-                      ? 'border-amber-500/70 bg-amber-500/10 text-amber-700 dark:text-amber-300'
-                      : 'border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-600 dark:text-stone-300',
-                  )}
-                >
-                  {intl.formatMessage({ id: 'welcome.template.blank' })}
-                </button>
-                {roster.roles
-                  .filter((r) => r.kind === 'ceo' || r.kind === 'front_desk')
-                  .map((r) => {
-                    const selected = templateRoleId === r.role_id;
-                    return (
-                      <button
-                        key={r.role_id}
-                        type="button"
-                        disabled={r.created}
-                        onClick={() => void selectTemplate(r.role_id)}
-                        aria-pressed={selected}
-                        title={r.summary}
-                        className={cn(
-                          'rounded-lg border px-3 py-2 text-sm transition-colors disabled:opacity-50',
-                          selected
-                            ? 'border-amber-500/70 bg-amber-500/10 text-amber-700 dark:text-amber-300'
-                            : 'border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-600 dark:text-stone-300',
-                        )}
-                      >
-                        {r.display_name}
-                        {r.created && ` ${intl.formatMessage({ id: 'welcome.template.created' })}`}
-                      </button>
-                    );
-                  })}
-              </div>
-            </Field>
+              {industryInfo?.present_but_locked && (
+                <Card className="gap-3 p-4">
+                  <p className="text-sm text-muted-foreground">
+                    {intl.formatMessage(
+                      { id: 'welcome.industry.locked' },
+                      { feature: intl.formatMessage({ id: 'license.feature.premiumTemplates' }) },
+                    )}
+                  </p>
+                  <div>
+                    <Button variant="outline" onClick={() => navigate('/license')}>
+                      {intl.formatMessage({ id: 'welcome.industry.lockedCta' })}
+                    </Button>
+                  </div>
+                </Card>
+              )}
+
+              {industryInfo?.unlocked && industryInfo.industries.length > 0 && (
+                <>
+                  {/* Prominent skip → generic assistant */}
+                  <button
+                    type="button"
+                    onClick={() => setSelectedIndustry(null)}
+                    aria-pressed={selectedIndustry === null}
+                    className={cn(
+                      SELECT_CARD,
+                      'w-full items-start gap-3 p-4',
+                      selectedIndustry === null && SELECT_CARD_ACTIVE,
+                    )}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-foreground">
+                        {intl.formatMessage({ id: 'welcome.industry.skip' })}
+                      </p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {intl.formatMessage({ id: 'welcome.industry.skip.desc' })}
+                      </p>
+                    </div>
+                  </button>
+
+                  <Input
+                    type="text"
+                    value={industryFilter}
+                    onChange={(e) => setIndustryFilter(e.target.value)}
+                    placeholder={intl.formatMessage({ id: 'welcome.industry.filter' })}
+                  />
+
+                  <div className="max-h-[46vh] overflow-y-auto pr-1">
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      {industryInfo.industries
+                        .filter((ind) => {
+                          const f = industryFilter.trim().toLowerCase();
+                          if (!f) return true;
+                          return (
+                            ind.label.toLowerCase().includes(f) ||
+                            ind.industry.toLowerCase().includes(f)
+                          );
+                        })
+                        .map((ind) => {
+                          const selected = selectedIndustry === ind.industry;
+                          return (
+                            <button
+                              key={ind.industry}
+                              type="button"
+                              onClick={() => setSelectedIndustry(ind.industry)}
+                              aria-pressed={selected}
+                              className={cn(
+                                SELECT_CARD,
+                                'flex-col items-start gap-1 p-4',
+                                selected && SELECT_CARD_ACTIVE,
+                              )}
+                            >
+                              <p className="text-sm font-medium text-foreground">{ind.label}</p>
+                              <p className="text-xs text-muted-foreground">
+                                {intl.formatMessage(
+                                  { id: 'welcome.industry.workerCount' },
+                                  { count: ind.worker_count },
+                                )}
+                              </p>
+                            </button>
+                          );
+                        })}
+                    </div>
+                  </div>
+                </>
+              )}
+            </>
           )}
 
-          <Field label={intl.formatMessage({ id: 'welcome.identity.displayName' })} required>
-            <input
-              type="text"
-              value={state.displayName}
-              onChange={(e) => onDisplayNameChange(e.target.value)}
-              className={controlClass}
-              placeholder={intl.formatMessage({ id: 'welcome.identity.displayName.placeholder' })}
-            />
-          </Field>
-          <Field label={intl.formatMessage({ id: 'welcome.identity.agentId' })} help={intl.formatMessage({ id: 'welcome.identity.agentId.hint' })}>
-            <input
-              type="text"
-              value={state.agentId}
-              onChange={(e) => patch({ agentId: e.target.value })}
-              className={controlClass}
-              placeholder="assistant"
-            />
-          </Field>
-          <Field label={intl.formatMessage({ id: 'welcome.identity.trigger' })} help={intl.formatMessage({ id: 'welcome.identity.trigger.hint' })}>
-            <input
-              type="text"
-              value={state.trigger}
-              onChange={(e) => patch({ trigger: e.target.value })}
-              className={controlClass}
-              placeholder={`@${state.displayName || 'DuDu'}`}
-            />
-          </Field>
-          {templateRoleId !== '' ? (
-            roleLoading ? (
-              <p className="text-sm text-stone-400 dark:text-stone-500">
-                {intl.formatMessage({ id: 'welcome.template.loading' })}
-              </p>
-            ) : (
-              roleDetail && (
-                <Field
-                  label={intl.formatMessage({ id: 'welcome.template.soul' })}
-                  help={intl.formatMessage({ id: 'welcome.template.soulHint' })}
-                >
-                  <textarea
-                    value={soulMd}
-                    onChange={(e) => setSoulMd(e.target.value)}
-                    spellCheck={false}
-                    className={cn(controlClass, 'min-h-[40vh] resize-y font-mono text-sm leading-relaxed')}
+          {/* Step 4 — create the first AI staff member */}
+          {step === 4 && (
+            <Card className="p-4">
+              {/* Template picker — CEO by default, front-desk when an industry is staged. */}
+              {roster && roster.roles.some((r) => r.kind === 'ceo' || r.kind === 'front_desk') && (
+                <Field label={intl.formatMessage({ id: 'welcome.template.title' })}>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void selectTemplate('')}
+                      aria-pressed={templateRoleId === ''}
+                      className={cn(
+                        'rounded-lg border px-3 py-2 text-sm outline-none transition-colors',
+                        'focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50',
+                        templateRoleId === ''
+                          ? 'border-brand bg-brand/10 text-brand'
+                          : 'border-input bg-transparent text-foreground hover:bg-muted dark:bg-input/30',
+                      )}
+                    >
+                      {intl.formatMessage({ id: 'welcome.template.blank' })}
+                    </button>
+                    {roster.roles
+                      .filter((r) => r.kind === 'ceo' || r.kind === 'front_desk')
+                      .map((r) => {
+                        const selected = templateRoleId === r.role_id;
+                        return (
+                          <button
+                            key={r.role_id}
+                            type="button"
+                            disabled={r.created}
+                            onClick={() => void selectTemplate(r.role_id)}
+                            aria-pressed={selected}
+                            title={r.summary}
+                            className={cn(
+                              'rounded-lg border px-3 py-2 text-sm outline-none transition-colors disabled:opacity-50',
+                              'focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50',
+                              selected
+                                ? 'border-brand bg-brand/10 text-brand'
+                                : 'border-input bg-transparent text-foreground hover:bg-muted dark:bg-input/30',
+                            )}
+                          >
+                            {r.display_name}
+                            {r.created && ` ${intl.formatMessage({ id: 'welcome.template.created' })}`}
+                          </button>
+                        );
+                      })}
+                  </div>
+                </Field>
+              )}
+
+              <Field label={intl.formatMessage({ id: 'welcome.identity.displayName' })} required>
+                <Input
+                  type="text"
+                  value={state.displayName}
+                  onChange={(e) => onDisplayNameChange(e.target.value)}
+                  placeholder={intl.formatMessage({ id: 'welcome.identity.displayName.placeholder' })}
+                />
+              </Field>
+              <Field
+                label={intl.formatMessage({ id: 'welcome.identity.agentId' })}
+                help={intl.formatMessage({ id: 'welcome.identity.agentId.hint' })}
+              >
+                <Input
+                  type="text"
+                  value={state.agentId}
+                  onChange={(e) => patch({ agentId: e.target.value })}
+                  placeholder="assistant"
+                />
+              </Field>
+              <Field
+                label={intl.formatMessage({ id: 'welcome.identity.trigger' })}
+                help={intl.formatMessage({ id: 'welcome.identity.trigger.hint' })}
+              >
+                <Input
+                  type="text"
+                  value={state.trigger}
+                  onChange={(e) => patch({ trigger: e.target.value })}
+                  placeholder={`@${state.displayName || 'DuDu'}`}
+                />
+              </Field>
+              {templateRoleId !== '' ? (
+                roleLoading ? (
+                  <p className="text-sm text-muted-foreground">
+                    {intl.formatMessage({ id: 'welcome.template.loading' })}
+                  </p>
+                ) : (
+                  roleDetail && (
+                    <Field
+                      label={intl.formatMessage({ id: 'welcome.template.soul' })}
+                      help={intl.formatMessage({ id: 'welcome.template.soulHint' })}
+                    >
+                      <Textarea
+                        value={soulMd}
+                        onChange={(e) => setSoulMd(e.target.value)}
+                        spellCheck={false}
+                        className="min-h-[40vh] resize-y font-mono leading-relaxed"
+                      />
+                    </Field>
+                  )
+                )
+              ) : (
+                <Field label={intl.formatMessage({ id: 'welcome.identity.persona' })}>
+                  <Textarea
+                    value={state.soul}
+                    onChange={(e) => patch({ soul: e.target.value })}
+                    rows={4}
+                    className="resize-none"
+                    placeholder={intl.formatMessage({ id: 'welcome.identity.persona.placeholder' })}
                   />
                 </Field>
-              )
-            )
-          ) : (
-            <Field label={intl.formatMessage({ id: 'welcome.identity.persona' })}>
-              <textarea
-                value={state.soul}
-                onChange={(e) => patch({ soul: e.target.value })}
-                rows={4}
-                className={cn(controlClass, 'resize-none')}
-                placeholder={intl.formatMessage({ id: 'welcome.identity.persona.placeholder' })}
-              />
-            </Field>
+              )}
+            </Card>
           )}
-        </div>
-      )}
 
-      {error && <p className="text-center text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+          {error && <p className="text-sm text-destructive">{error}</p>}
 
-      {/* Navigation */}
-      <div className="flex items-center justify-between pt-2">
-        <div>
-          {step > 1 && (
-            <Button
-              variant="secondary"
-              icon={ChevronLeft}
-              onClick={() => setStep((s) => (s === 4 && skipIndustryStep ? 2 : s - 1))}
-            >
-              {intl.formatMessage({ id: 'welcome.back' })}
-            </Button>
-          )}
-        </div>
-        <div>
-          {step < TOTAL_STEPS ? (
-            <Button
-              variant="primary"
-              iconRight={ChevronRight}
-              disabled={!canAdvance()}
-              onClick={() => (step === 3 ? void handleIndustryNext() : setStep((s) => s + 1))}
-            >
-              {intl.formatMessage({
-                id: step === 1 ? 'welcome.start' : step === 3 && staging ? 'welcome.industry.staging' : 'welcome.next',
-              })}
-            </Button>
-          ) : (
-            <Button variant="primary" icon={Rocket} disabled={deploying || !canAdvance()} onClick={handleDeploy}>
-              {intl.formatMessage({ id: deploying ? 'welcome.creating' : 'welcome.create' })}
-            </Button>
-          )}
+          {/* Navigation */}
+          <div className="flex items-center justify-between pt-2">
+            <div>
+              {step > 1 && (
+                <Button
+                  variant="outline"
+                  onClick={() => setStep((s) => (s === 4 && skipIndustryStep ? 2 : s - 1))}
+                >
+                  <ChevronLeft />
+                  {intl.formatMessage({ id: 'welcome.back' })}
+                </Button>
+              )}
+            </div>
+            <div>
+              {step < TOTAL_STEPS ? (
+                <Button
+                  variant="brand"
+                  disabled={!canAdvance()}
+                  onClick={() => (step === 3 ? void handleIndustryNext() : setStep((s) => s + 1))}
+                >
+                  {intl.formatMessage({
+                    id:
+                      step === 1
+                        ? 'welcome.start'
+                        : step === 3 && staging
+                          ? 'welcome.industry.staging'
+                          : 'welcome.next',
+                  })}
+                  <ChevronRight />
+                </Button>
+              ) : (
+                <Button variant="brand" disabled={deploying || !canAdvance()} onClick={handleDeploy}>
+                  <Rocket />
+                  {intl.formatMessage({ id: deploying ? 'welcome.creating' : 'welcome.create' })}
+                </Button>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>

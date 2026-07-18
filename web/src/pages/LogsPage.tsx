@@ -18,21 +18,21 @@ import {
   Radio,
   FileText,
   Inbox,
+  Search,
 } from 'lucide-react';
 import {
-  Page,
-  PageHeader,
-  Card,
   Tabs,
+  TabsList,
+  TabsTab,
   Button,
   Badge,
-  EmptyState,
-  Toolbar,
-  Mono,
-  CharacterAvatar,
-  controlClass,
-} from '@/components/ui';
-import type { TabItem } from '@/components/ui';
+  Input,
+  Segmented,
+  Skeleton,
+  Empty,
+  ActorAvatar,
+  type SegmentedOption,
+} from '@/components/mds';
 
 // ── Shared styles ──────────────────────────────────────────
 
@@ -60,31 +60,32 @@ export function LogsPage() {
   const intl = useIntl();
   const [tab, setTab] = useState<Tab>('history');
 
-  const tabs: TabItem[] = [
-    {
-      id: 'history',
-      label: intl.formatMessage({ id: 'logs.tab.history' }),
-      icon: History,
-    },
-    {
-      id: 'realtime',
-      label: intl.formatMessage({ id: 'logs.tab.realtime' }),
-      icon: Radio,
-    },
-  ];
-
   return (
-    <Page wide className="flex h-full flex-col">
-      <PageHeader
-        icon={FileText}
-        title={intl.formatMessage({ id: 'nav.logs' })}
-        subtitle={intl.formatMessage({ id: 'logs.subtitle' })}
-      />
+    <div className="flex h-full min-h-0 flex-col gap-4">
+      {/* Header */}
+      <div className="flex items-center gap-2">
+        <FileText className="size-5 text-muted-foreground" />
+        <div>
+          <h1 className="text-base font-medium">{intl.formatMessage({ id: 'nav.logs' })}</h1>
+          <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'logs.subtitle' })}</p>
+        </div>
+      </div>
 
-      <Tabs items={tabs} value={tab} onChange={(id) => setTab(id as Tab)} />
+      <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)} variant="line">
+        <TabsList>
+          <TabsTab value="history">
+            <History />
+            {intl.formatMessage({ id: 'logs.tab.history' })}
+          </TabsTab>
+          <TabsTab value="realtime">
+            <Radio />
+            {intl.formatMessage({ id: 'logs.tab.realtime' })}
+          </TabsTab>
+        </TabsList>
+      </Tabs>
 
       {tab === 'history' ? <HistoryTab /> : <RealtimeTab />}
-    </Page>
+    </div>
   );
 }
 
@@ -184,53 +185,45 @@ function HistoryTab() {
     sourceCounts.channel_failure +
     sourceCounts.feedback;
 
+  const severityOptions: SegmentedOption<SeverityFilter>[] = [
+    { value: 'all', label: intl.formatMessage({ id: 'logs.filter.severity.all' }) },
+    { value: 'info', label: 'info' },
+    { value: 'warning', label: 'warning' },
+    { value: 'critical', label: 'critical' },
+  ];
+
   return (
     <div className="flex flex-1 flex-col gap-4 overflow-hidden">
       {/* Filter bar */}
-      <Toolbar>
-        <div className="flex flex-wrap items-center gap-1.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <SourceChip
+          active={selectedSources === null}
+          onClick={() => setSelectedSources(null)}
+          label={intl.formatMessage({ id: 'logs.filter.source.all' })}
+          count={totalCount}
+        />
+        {ALL_SOURCES.map((src) => (
           <SourceChip
-            active={selectedSources === null}
-            onClick={() => setSelectedSources(null)}
-            label={intl.formatMessage({ id: 'logs.filter.source.all' })}
-            count={totalCount}
+            key={src}
+            active={selectedSources !== null && isSourceActive(src)}
+            onClick={() => toggleSource(src)}
+            label={intl.formatMessage({ id: `logs.filter.source.${src}` })}
+            count={sourceCounts[src]}
           />
-          {ALL_SOURCES.map((src) => (
-            <SourceChip
-              key={src}
-              active={selectedSources !== null && isSourceActive(src)}
-              onClick={() => toggleSource(src)}
-              label={intl.formatMessage({ id: `logs.filter.source.${src}` })}
-              count={sourceCounts[src]}
-            />
-          ))}
-        </div>
-
-        <select
+        ))}
+        <Segmented
+          className="ml-auto"
           value={severityFilter}
-          onChange={(e) => setSeverityFilter(e.target.value as SeverityFilter)}
-          className={cn(controlClass, 'w-auto')}
-        >
-          <option value="all">
-            {intl.formatMessage({ id: 'logs.filter.severity.all' })}
-          </option>
-          <option value="info">info</option>
-          <option value="warning">warning</option>
-          <option value="critical">critical</option>
-        </select>
-      </Toolbar>
+          onValueChange={setSeverityFilter}
+          options={severityOptions}
+        />
+      </div>
 
       {/* Body */}
       {loading ? (
         <HistoryLoadingSkeleton />
       ) : events.length === 0 ? (
-        <Card className="flex-1" bodyClassName="flex h-full items-center justify-center">
-          <EmptyState
-            icon={Inbox}
-            dudu="concerned"
-            title={intl.formatMessage({ id: 'logs.empty.noMatch' })}
-          />
-        </Card>
+        <Empty icon={Inbox} title={intl.formatMessage({ id: 'logs.empty.noMatch' })} />
       ) : (
         <div className="flex-1 space-y-2 overflow-y-auto pr-1">
           {events.map((evt, i) => {
@@ -267,21 +260,14 @@ function SourceChip({
       onClick={onClick}
       className={cn(
         'inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors',
-        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
         active
-          ? 'border-amber-400 bg-amber-500/12 text-amber-800 dark:border-amber-500/50 dark:text-amber-300'
-          : 'border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-600 hover:bg-[var(--panel-fill-hover)] dark:text-stone-400',
+          ? 'border-brand bg-brand/10 text-brand'
+          : 'border-surface-border bg-surface text-muted-foreground hover:bg-surface-hover',
       )}
     >
       <span>{label}</span>
-      <span
-        className={cn(
-          'rounded-full px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
-          active
-            ? 'bg-amber-200 text-amber-900 dark:bg-amber-800/60 dark:text-amber-200'
-            : 'bg-stone-500/12 text-stone-500 dark:text-stone-400',
-        )}
-      >
+      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-muted-foreground">
         {count}
       </span>
     </button>
@@ -292,10 +278,7 @@ function HistoryLoadingSkeleton() {
   return (
     <div className="flex-1 space-y-2 overflow-hidden">
       {Array.from({ length: 6 }).map((_, i) => (
-        <div
-          key={i}
-          className="panel h-16 animate-pulse"
-        />
+        <Skeleton key={i} className="h-16 w-full rounded-lg" />
       ))}
     </div>
   );
@@ -340,44 +323,50 @@ function AuditRow({
   });
 
   return (
-    <Card
-      interactive
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onToggle}
-      className={cn('border-l-4', severityBorder[event.severity])}
-      bodyClassName="p-4"
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onToggle();
+        }
+      }}
+      className={cn(
+        'cursor-pointer rounded-lg border border-l-4 border-surface-border bg-surface p-4 transition-colors hover:bg-surface-hover',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+        severityBorder[event.severity],
+      )}
     >
       <div className="flex flex-wrap items-center gap-2">
-        <Badge tone="neutral">{sourceLabel}</Badge>
-        <span className="font-mono text-xs text-stone-500 dark:text-stone-400">
-          {event.event_type}
-        </span>
+        <Badge variant="ghost">{sourceLabel}</Badge>
+        <span className="font-mono text-xs text-muted-foreground">{event.event_type}</span>
         {event.agent_id && (
-          <span className="flex items-center gap-1 text-xs font-medium text-amber-600 dark:text-amber-400">
-            <CharacterAvatar agentId={event.agent_id} name={event.agent_id} size={16} />
+          <span className="flex items-center gap-1 text-xs font-medium text-brand">
+            <ActorAvatar actorType="agent" name={event.agent_id} size="xs" />
             {event.agent_id}
           </span>
         )}
-        <Mono className="ml-auto text-xs text-stone-400 dark:text-stone-500">
-          {time}
-        </Mono>
+        <span className="ml-auto font-mono text-xs text-muted-foreground">{time}</span>
       </div>
 
       {event.summary && (
-        <p className="mt-2 whitespace-normal break-words text-sm text-stone-700 dark:text-stone-200">
-          {event.summary}
-        </p>
+        <p className="mt-2 whitespace-normal break-words text-sm text-foreground">{event.summary}</p>
       )}
 
       {expanded && event.details && Object.keys(event.details).length > 0 && (
-        <pre className="mt-3 overflow-x-auto rounded-lg bg-stone-500/8 p-3 text-xs text-stone-700 dark:bg-white/5 dark:text-stone-300">
+        <pre className="mt-3 overflow-x-auto rounded-lg bg-muted p-3 font-mono text-xs text-muted-foreground">
           {JSON.stringify(event.details, null, 2)}
         </pre>
       )}
-    </Card>
+    </div>
   );
 }
 
 // ── Realtime tab (WebSocket stream) ────────────────────────
+
+type LevelFilter = 'all' | 'trace' | 'debug' | 'info' | 'warn' | 'error';
 
 function RealtimeTab() {
   const intl = useIntl();
@@ -416,57 +405,59 @@ function RealtimeTab() {
     }
   }, [filteredEntries, paused]);
 
-  const levels = ['trace', 'debug', 'info', 'warn', 'error'];
+  const levelOptions: SegmentedOption<LevelFilter>[] = [
+    { value: 'all', label: intl.formatMessage({ id: 'logs.filter.all' }) },
+    { value: 'trace', label: 'TRACE' },
+    { value: 'debug', label: 'DEBUG' },
+    { value: 'info', label: 'INFO' },
+    { value: 'warn', label: 'WARN' },
+    { value: 'error', label: 'ERROR' },
+  ];
 
   return (
     <div className="flex flex-1 flex-col gap-4 overflow-hidden">
       {/* Filter bar */}
-      <Toolbar
-        search={filter.keyword}
-        onSearchChange={(v) => setFilter({ keyword: v })}
-        searchPlaceholder="Filter..."
-      >
-        {/* Level select */}
-        <select
-          value={filter.level ?? ''}
-          onChange={(e) => setFilter({ level: e.target.value || null })}
-          className={cn(controlClass, 'w-auto')}
-        >
-          <option value="">
-            {intl.formatMessage({ id: 'logs.filter.all' })}
-          </option>
-          {levels.map((level) => (
-            <option key={level} value={level}>
-              {level.toUpperCase()}
-            </option>
-          ))}
-        </select>
+      <div className="flex flex-wrap items-center gap-2">
+        <Segmented
+          value={(filter.level ?? 'all') as LevelFilter}
+          onValueChange={(v) => setFilter({ level: v === 'all' ? null : v })}
+          options={levelOptions}
+        />
 
-        {/* Pause / Resume */}
-        <Button
-          variant={paused ? 'secondary' : 'primary'}
-          size="sm"
-          icon={paused ? Play : Pause}
-          onClick={togglePause}
-        >
-          {paused
-            ? intl.formatMessage({ id: 'logs.resume' })
-            : intl.formatMessage({ id: 'logs.pause' })}
-        </Button>
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={filter.keyword}
+            onChange={(e) => setFilter({ keyword: e.target.value })}
+            placeholder="Filter..."
+            className="w-48 pl-8"
+          />
+        </div>
 
-        {/* Clear */}
-        <Button variant="ghost" size="sm" icon={Trash2} onClick={clear}>
-          {intl.formatMessage({ id: 'logs.clear' })}
-        </Button>
-      </Toolbar>
+        <div className="ml-auto flex items-center gap-2">
+          {/* Pause / Resume */}
+          <Button variant={paused ? 'outline' : 'brand'} size="sm" onClick={togglePause}>
+            {paused ? <Play /> : <Pause />}
+            {paused
+              ? intl.formatMessage({ id: 'logs.resume' })
+              : intl.formatMessage({ id: 'logs.pause' })}
+          </Button>
+
+          {/* Clear */}
+          <Button variant="ghost" size="sm" onClick={clear}>
+            <Trash2 />
+            {intl.formatMessage({ id: 'logs.clear' })}
+          </Button>
+        </div>
+      </div>
 
       {/* Log entries */}
       <div
         ref={listRef}
-        className="flex-1 overflow-y-auto rounded-xl border border-[var(--panel-border)] bg-stone-950 p-1"
+        className="flex-1 overflow-y-auto rounded-xl border border-surface-border bg-stone-950 p-1"
       >
         {filteredEntries.length === 0 ? (
-          <div className="flex items-center justify-center py-16 text-stone-500">
+          <div className="flex items-center justify-center py-16 text-muted-foreground">
             <p>{intl.formatMessage({ id: 'common.noData' })}</p>
           </div>
         ) : (

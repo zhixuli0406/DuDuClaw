@@ -4,44 +4,35 @@ import { cn } from '@/lib/utils';
 import { api, type OdooStatus, type OdooAgentConfig, type OdooAgentConfigSet } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
-  Building2,
-  Briefcase,
   CheckCircle,
   XCircle,
   Loader2,
   RefreshCw,
   Save,
-  ShoppingCart,
-  Package,
-  Calculator,
-  FolderKanban,
-  Users,
-  UserCog,
-  Plug,
   AlertTriangle,
 } from 'lucide-react';
 import {
-  Page,
-  PageHeader,
-  Card,
-  Section,
   Button,
   Badge,
-  Field,
-  controlClass,
-} from '@/components/ui';
+  Input,
+  Checkbox,
+  Spinner,
+  SettingsSection,
+  SettingsCard,
+} from '@/components/mds';
+import { RowText, RowNumber, RowSwitch, RowSelect, FieldBlock } from '@/pages/agent-form/form-rows';
+import type { SelectOption } from '@/components/settings/controls';
 
-const FEATURE_MODULES = [
-  { key: 'crm', icon: Users, color: 'text-blue-500' },
-  { key: 'sale', icon: ShoppingCart, color: 'text-emerald-500' },
-  { key: 'inventory', icon: Package, color: 'text-amber-500' },
-  { key: 'accounting', icon: Calculator, color: 'text-violet-500' },
-  { key: 'project', icon: FolderKanban, color: 'text-rose-500' },
-  { key: 'hr', icon: Briefcase, color: 'text-cyan-500' },
-] as const;
+const FEATURE_MODULES = ['crm', 'sale', 'inventory', 'accounting', 'project', 'hr'] as const;
+type FeatureKey = (typeof FEATURE_MODULES)[number];
 
-type FeatureKey = (typeof FEATURE_MODULES)[number]['key'];
-
+/**
+ * OdooPage — Odoo ERP tab of `/manage/integrations` (MDS Settings surface).
+ * A slim header (description + connection status + Save) over Settings-式 cards:
+ * connection credentials, feature modules, sync (polling/webhook) and a
+ * per-AI-employee credential override. The test-before-save flow and the
+ * write-only credential semantics are preserved verbatim — same `odoo.*` RPCs.
+ */
 export function OdooPage() {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
@@ -197,316 +188,177 @@ export function OdooPage() {
     }
   };
 
-  const toggleFeature = (key: FeatureKey) => {
-    setFeatures((prev) => ({ ...prev, [key]: !prev[key] }));
-  };
+  const protocolOptions: SelectOption[] = [
+    { value: 'jsonrpc', label: 'JSON-RPC' },
+    { value: 'xmlrpc', label: 'XML-RPC' },
+  ];
+  const authOptions: SelectOption[] = [
+    { value: 'api_key', label: t('odoo.authApiKey') },
+    { value: 'password', label: t('odoo.authPassword') },
+  ];
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-20">
-        <Loader2 className="h-6 w-6 animate-spin text-stone-400" />
+      <div className="flex items-center justify-center py-20" role="status" aria-live="polite">
+        <Spinner className="size-6 text-muted-foreground" />
       </div>
     );
   }
 
   return (
-    <Page>
-      <PageHeader
-        icon={Building2}
-        title={t('nav.odoo')}
-        subtitle={t('odoo.subtitle')}
-        actions={
-          status ? (
-            <div className="flex flex-col items-end gap-1">
-              <Badge tone={status.connected ? 'success' : 'neutral'} dot>
-                {status.connected ? (
-                  <CheckCircle className="h-3.5 w-3.5" />
-                ) : (
-                  <XCircle className="h-3.5 w-3.5" />
-                )}
-                {status.connected ? t('odoo.connected') : t('odoo.disconnected')}
-                {status.edition && (
-                  <span className="ml-0.5 opacity-70">({status.edition})</span>
-                )}
-              </Badge>
-              {!status.connected && status.error && (
-                <p className="text-xs text-rose-500 dark:text-rose-400">{status.error}</p>
+    <div className="space-y-6">
+      {/* Slim tab header — description + status left, Save right. */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <p className="text-sm text-muted-foreground">{t('odoo.subtitle')}</p>
+          {status && (
+            <Badge
+              className={cn(
+                status.connected
+                  ? 'border-success/30 bg-success/10 text-success'
+                  : 'border-border text-muted-foreground'
               )}
-            </div>
-          ) : undefined
-        }
-      />
-
-      {/* Connection Settings */}
-      <Card
-        title={
-          <span className="flex items-center gap-2">
-            <Plug className="h-4 w-4 text-stone-400" />
-            {t('odoo.connection')}
-          </span>
-        }
-      >
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label={t('odoo.url')} htmlFor="odoo-url">
-            <input
-              id="odoo-url"
-              type="url"
-              className={controlClass}
-              placeholder="https://mycompany.odoo.com"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-            />
-          </Field>
-
-          <Field label={t('odoo.db')} htmlFor="odoo-db">
-            <input
-              id="odoo-db"
-              type="text"
-              className={controlClass}
-              placeholder="mycompany"
-              value={db}
-              onChange={(e) => setDb(e.target.value)}
-            />
-          </Field>
-
-          <Field label={t('odoo.protocol')} htmlFor="odoo-protocol">
-            <select
-              id="odoo-protocol"
-              className={controlClass}
-              value={protocol}
-              onChange={(e) => setProtocol(e.target.value)}
             >
-              <option value="jsonrpc">JSON-RPC</option>
-              <option value="xmlrpc">XML-RPC</option>
-            </select>
-          </Field>
-
-          <Field label={t('odoo.authMethod')} htmlFor="odoo-auth-method">
-            <select
-              id="odoo-auth-method"
-              className={controlClass}
-              value={authMethod}
-              onChange={(e) => setAuthMethod(e.target.value)}
-            >
-              <option value="api_key">{t('odoo.authApiKey')}</option>
-              <option value="password">{t('odoo.authPassword')}</option>
-            </select>
-          </Field>
-
-          <Field label={t('odoo.username')} htmlFor="odoo-username">
-            <input
-              id="odoo-username"
-              type="text"
-              className={controlClass}
-              placeholder="admin@mycompany.com"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-            />
-          </Field>
-
-          {authMethod === 'api_key' ? (
-            <Field label={t('odoo.apiKey')} htmlFor="odoo-api-key" help={t('odoo.apiKeyHint')}>
-              <input
-                id="odoo-api-key"
-                type="password"
-                className={controlClass}
-                placeholder="••••••••"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-              />
-            </Field>
-          ) : (
-            <Field label={t('odoo.password')} htmlFor="odoo-password">
-              <input
-                id="odoo-password"
-                type="password"
-                className={controlClass}
-                placeholder="••••••••"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </Field>
+              {status.connected ? <CheckCircle /> : <XCircle />}
+              {status.connected ? t('odoo.connected') : t('odoo.disconnected')}
+              {status.edition && <span className="opacity-70">({status.edition})</span>}
+            </Badge>
           )}
         </div>
+        <div className="flex items-center gap-3">
+          {error && <span className="text-sm text-destructive">{error}</span>}
+          {saved && (
+            <span className="inline-flex items-center gap-1.5 text-sm font-medium text-success">
+              <CheckCircle className="size-4" />
+              {t('common.saved')}
+            </span>
+          )}
+          <Button variant="brand" size="sm" onClick={handleSave} disabled={saving || !url.trim()}>
+            {saving ? <Loader2 className="animate-spin" /> : <Save />}
+            {saving ? t('common.saving') : t('common.save')}
+          </Button>
+        </div>
+      </div>
 
-        {/* Test connection */}
-        <div className="mt-5 flex items-center gap-3">
+      {status && !status.connected && status.error && (
+        <p className="text-xs text-destructive">{status.error}</p>
+      )}
+
+      {/* Connection settings */}
+      <SettingsSection title={t('odoo.connection')}>
+        <SettingsCard>
+          <RowText label={t('odoo.url')} value={url} onChange={setUrl} placeholder="https://mycompany.odoo.com" tier="text" />
+          <RowText label={t('odoo.db')} value={db} onChange={setDb} placeholder="mycompany" tier="text" />
+          <RowSelect label={t('odoo.protocol')} value={protocol} onChange={setProtocol} options={protocolOptions} />
+          <RowSelect label={t('odoo.authMethod')} value={authMethod} onChange={setAuthMethod} options={authOptions} />
+          <RowText label={t('odoo.username')} value={username} onChange={setUsername} placeholder="admin@mycompany.com" tier="text" />
+          {authMethod === 'api_key' ? (
+            <RowText
+              label={t('odoo.apiKey')}
+              description={t('odoo.apiKeyHint')}
+              value={apiKey}
+              onChange={setApiKey}
+              type="password"
+              placeholder="••••••••"
+              autoComplete="off"
+              tier="text"
+            />
+          ) : (
+            <RowText
+              label={t('odoo.password')}
+              value={password}
+              onChange={setPassword}
+              type="password"
+              placeholder="••••••••"
+              autoComplete="off"
+              tier="text"
+            />
+          )}
+        </SettingsCard>
+
+        {/* Test-before-save — tests the current form values (transient). */}
+        <div className="flex flex-wrap items-center gap-3">
           <Button
-            variant="secondary"
+            variant="outline"
+            size="sm"
             onClick={handleTest}
             disabled={testing || !url.trim() || !db.trim() || saving}
             title={!status?.connected ? t('odoo.testHint') : undefined}
-            icon={testing ? undefined : RefreshCw}
           >
-            {testing && <Loader2 className="h-4 w-4 animate-spin" />}
+            {testing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
             {t('odoo.testConnection')}
           </Button>
-
           {testResult && (
             <span
               className={cn(
                 'inline-flex items-center gap-1.5 text-sm font-medium',
-                testResult.ok ? 'text-emerald-600' : 'text-rose-600'
+                testResult.ok ? 'text-success' : 'text-destructive'
               )}
             >
-              {testResult.ok ? (
-                <CheckCircle className="h-4 w-4" />
-              ) : (
-                <AlertTriangle className="h-4 w-4" />
-              )}
+              {testResult.ok ? <CheckCircle className="size-4" /> : <AlertTriangle className="size-4" />}
               {testResult.message}
             </span>
           )}
         </div>
-      </Card>
+      </SettingsSection>
 
-      {/* Feature Modules */}
-      <Card title={t('odoo.features')}>
-        <p className="mb-5 text-sm text-stone-500 dark:text-stone-400">
-          {t('odoo.featuresDesc')}
-        </p>
-
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {FEATURE_MODULES.map(({ key, icon: Icon, color }) => (
-            <button
+      {/* Feature modules */}
+      <SettingsSection title={t('odoo.features')} description={t('odoo.featuresDesc')}>
+        <SettingsCard>
+          {FEATURE_MODULES.map((key) => (
+            <RowSwitch
               key={key}
-              role="switch"
-              aria-checked={features[key]}
-              onClick={() => toggleFeature(key)}
-              className={cn(
-                'flex items-center gap-3 rounded-lg border px-4 py-3 text-left transition-colors',
-                features[key]
-                  ? 'border-amber-300 bg-amber-50 dark:border-amber-700 dark:bg-amber-900/20'
-                  : 'border-[var(--panel-border)] bg-[var(--panel-fill)] hover:bg-[var(--panel-fill-hover)]'
-              )}
-            >
-              <Icon className={cn('h-5 w-5 shrink-0', features[key] ? color : 'text-stone-400')} />
-              <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium text-stone-900 dark:text-stone-50">
-                  {t(`odoo.feature.${key}`)}
-                </p>
-                <p className="text-xs text-stone-500 dark:text-stone-400">
-                  {t(`odoo.feature.${key}.desc`)}
-                </p>
-              </div>
-              <div
-                className={cn(
-                  'h-5 w-9 shrink-0 rounded-full transition-colors',
-                  features[key] ? 'bg-amber-500' : 'bg-stone-300 dark:bg-stone-600'
-                )}
-              >
-                <div
-                  className={cn(
-                    'h-5 w-5 rounded-full bg-white shadow-sm transition-transform',
-                    features[key] ? 'translate-x-4' : 'translate-x-0'
-                  )}
-                />
-              </div>
-            </button>
+              label={t(`odoo.feature.${key}`)}
+              description={t(`odoo.feature.${key}.desc`)}
+              checked={features[key]}
+              onChange={(v) => setFeatures((prev) => ({ ...prev, [key]: v }))}
+            />
           ))}
-        </div>
-      </Card>
+        </SettingsCard>
+      </SettingsSection>
 
       {/* Polling & Webhook */}
-      <Card title={t('odoo.sync')}>
-        <div className="grid gap-5 sm:grid-cols-2">
-          {/* Polling */}
-          <Section className="space-y-3">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={pollEnabled}
-                onChange={(e) => setPollEnabled(e.target.checked)}
-                className="h-4 w-4 rounded border-stone-300 text-amber-500 focus:ring-amber-500"
+      <SettingsSection title={t('odoo.sync')}>
+        <SettingsCard>
+          <RowSwitch label={t('odoo.pollEnabled')} checked={pollEnabled} onChange={setPollEnabled} />
+          {pollEnabled && (
+            <>
+              <RowNumber
+                label={t('odoo.pollInterval')}
+                description={t('odoo.pollIntervalHint')}
+                value={Number(pollInterval) || 60}
+                min={60}
+                max={86400}
+                onChange={(v) => setPollInterval(String(v))}
               />
-              <span className="text-sm font-medium text-stone-700 dark:text-stone-300">
-                {t('odoo.pollEnabled')}
-              </span>
-            </label>
-
-            {pollEnabled && (
-              <>
-                <Field label={t('odoo.pollInterval')} htmlFor="odoo-poll-interval" help={t('odoo.pollIntervalHint')}>
-                  <input
-                    id="odoo-poll-interval"
-                    type="number"
-                    className={controlClass}
-                    min={60}
-                    max={86400}
-                    value={pollInterval}
-                    onChange={(e) => setPollInterval(e.target.value)}
-                  />
-                </Field>
-
-                <Field label={t('odoo.pollModels')} htmlFor="odoo-poll-models" help={t('odoo.pollModelsHint')}>
-                  <input
-                    id="odoo-poll-models"
-                    type="text"
-                    className={controlClass}
-                    placeholder="crm.lead,sale.order"
-                    value={pollModels}
-                    onChange={(e) => setPollModels(e.target.value)}
-                  />
-                </Field>
-              </>
-            )}
-          </Section>
-
-          {/* Webhook */}
-          <Section className="space-y-3">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={webhookEnabled}
-                onChange={(e) => setWebhookEnabled(e.target.checked)}
-                className="h-4 w-4 rounded border-stone-300 text-amber-500 focus:ring-amber-500"
+              <RowText
+                label={t('odoo.pollModels')}
+                description={t('odoo.pollModelsHint')}
+                value={pollModels}
+                onChange={setPollModels}
+                placeholder="crm.lead,sale.order"
+                tier="text"
               />
-              <span className="text-sm font-medium text-stone-700 dark:text-stone-300">
-                {t('odoo.webhookEnabled')}
-              </span>
-            </label>
-
-            {webhookEnabled && (
-              <Field label={t('odoo.webhookSecret')} htmlFor="odoo-webhook-secret" help={t('odoo.webhookSecretHint')}>
-                <input
-                  id="odoo-webhook-secret"
-                  type="password"
-                  className={controlClass}
-                  placeholder="••••••••"
-                  value={webhookSecret}
-                  onChange={(e) => setWebhookSecret(e.target.value)}
-                />
-              </Field>
-            )}
-          </Section>
-        </div>
-      </Card>
-
-      {/* Save bar */}
-      <div className="flex items-center justify-end gap-3">
-        {error && (
-          <span className="text-sm text-rose-600 dark:text-rose-400">{error}</span>
-        )}
-        {saved && (
-          <span className="inline-flex items-center gap-1.5 text-sm font-medium text-emerald-600">
-            <CheckCircle className="h-4 w-4" />
-            {t('common.saved')}
-          </span>
-        )}
-        <Button
-          variant="primary"
-          onClick={handleSave}
-          disabled={saving || !url.trim()}
-          icon={saving ? undefined : Save}
-        >
-          {saving && <Loader2 className="h-4 w-4 animate-spin" />}
-          {saving ? t('common.saving') : t('common.save')}
-        </Button>
-      </div>
+            </>
+          )}
+          <RowSwitch label={t('odoo.webhookEnabled')} checked={webhookEnabled} onChange={setWebhookEnabled} />
+          {webhookEnabled && (
+            <RowText
+              label={t('odoo.webhookSecret')}
+              description={t('odoo.webhookSecretHint')}
+              value={webhookSecret}
+              onChange={setWebhookSecret}
+              type="password"
+              placeholder="••••••••"
+              tier="text"
+            />
+          )}
+        </SettingsCard>
+      </SettingsSection>
 
       {/* Per-agent credential override */}
       <AgentOdooOverride />
-    </Page>
+    </div>
   );
 }
 
@@ -649,213 +501,150 @@ function AgentOdooOverride() {
     }
   };
 
-  return (
-    <Card
-      title={
-        <span className="flex items-center gap-2">
-          <UserCog className="h-4 w-4 text-stone-400" />
-          {t('odoo.agent.title')}
-        </span>
-      }
-    >
-      <p className="mb-4 text-sm text-stone-500 dark:text-stone-400">{t('odoo.agent.desc')}</p>
+  const agentOptions: SelectOption[] = agents.map((a) => ({
+    value: a.name,
+    label: a.display_name || a.name,
+  }));
 
+  return (
+    <SettingsSection title={t('odoo.agent.title')} description={t('odoo.agent.desc')}>
       {agents.length === 0 ? (
-        <p className="py-6 text-center text-sm text-stone-400">{t('common.noData')}</p>
+        <p className="py-6 text-center text-sm text-muted-foreground">{t('common.noData')}</p>
       ) : (
         <>
-          <div className="flex flex-wrap items-center gap-3">
-            <Field label={t('odoo.agent.select')} htmlFor="odoo-agent-select" className="min-w-[16rem]">
-              <select
-                id="odoo-agent-select"
-                className={controlClass}
-                value={selected}
-                onChange={(e) => setSelected(e.target.value)}
-              >
-                {agents.map((a) => (
-                  <option key={a.name} value={a.name}>
-                    {a.display_name || a.name}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            {!loading && cfg && (
-              <Badge tone={cfg.configured ? 'accent' : 'neutral'} dot>
-                {cfg.configured ? t('odoo.agent.overridden') : t('odoo.agent.inherited')}
-              </Badge>
-            )}
-          </div>
+          <SettingsCard>
+            <RowSelect
+              label={t('odoo.agent.select')}
+              value={selected}
+              onChange={setSelected}
+              options={agentOptions}
+            />
+          </SettingsCard>
+
+          {!loading && cfg && (
+            <Badge variant={cfg.configured ? 'default' : 'secondary'}>
+              {cfg.configured ? t('odoo.agent.overridden') : t('odoo.agent.inherited')}
+            </Badge>
+          )}
 
           {loading ? (
             <div className="flex items-center justify-center py-10">
-              <Loader2 className="h-5 w-5 animate-spin text-stone-400" />
+              <Spinner className="size-5 text-muted-foreground" />
             </div>
           ) : (
-            <div className="mt-4 space-y-4">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label={t('agents.odoo.profile')} htmlFor="odoo-agent-profile">
-                  <input
-                    id="odoo-agent-profile"
-                    type="text"
-                    className={controlClass}
-                    placeholder="default"
-                    value={profile}
-                    onChange={(e) => setProfile(e.target.value)}
-                  />
-                </Field>
-                <Field label={t('odoo.url')} htmlFor="odoo-agent-url">
-                  <input
-                    id="odoo-agent-url"
-                    type="url"
-                    className={controlClass}
-                    placeholder="https://erp.example.com"
-                    value={url}
-                    onChange={(e) => setUrl(e.target.value)}
-                  />
-                </Field>
-                <Field label={t('odoo.db')} htmlFor="odoo-agent-db">
-                  <input
-                    id="odoo-agent-db"
-                    type="text"
-                    className={controlClass}
-                    value={db}
-                    onChange={(e) => setDb(e.target.value)}
-                  />
-                </Field>
-                <Field label={t('odoo.username')} htmlFor="odoo-agent-username">
-                  <input
-                    id="odoo-agent-username"
-                    type="text"
-                    className={controlClass}
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                  />
-                </Field>
-              </div>
+            <div className="space-y-4">
+              <SettingsCard>
+                <RowText label={t('agents.odoo.profile')} value={profile} onChange={setProfile} placeholder="default" tier="text" />
+                <RowText label={t('odoo.url')} value={url} onChange={setUrl} placeholder="https://erp.example.com" tier="text" />
+                <RowText label={t('odoo.db')} value={db} onChange={setDb} tier="text" />
+                <RowText label={t('odoo.username')} value={username} onChange={setUsername} tier="text" />
+              </SettingsCard>
 
+              {/* Write-only credentials: blank keeps stored, clear-toggle wipes. */}
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field
+                <FieldBlock
                   label={t('odoo.apiKey')}
-                  htmlFor="odoo-agent-apikey"
-                  help={cfg?.api_key_set ? t('odoo.agent.secretSet') : t('odoo.agent.secretHint')}
+                  description={cfg?.api_key_set ? t('odoo.agent.secretSet') : t('odoo.agent.secretHint')}
                 >
-                  <input
-                    id="odoo-agent-apikey"
+                  <Input
                     type="password"
                     autoComplete="off"
-                    className={controlClass}
                     placeholder={cfg?.api_key_set ? '••••••••' : ''}
                     value={apiKey}
                     disabled={clearApiKey}
                     onChange={(e) => setApiKey(e.target.value)}
                   />
                   {cfg?.api_key_set && (
-                    <label className="mt-1.5 flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
-                      <input
-                        type="checkbox"
+                    <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <Checkbox
                         checked={clearApiKey}
-                        onChange={(e) => setClearApiKey(e.target.checked)}
-                        className="h-3.5 w-3.5 rounded border-stone-300 text-amber-500 focus:ring-amber-500"
+                        onCheckedChange={(v) => setClearApiKey(Boolean(v))}
+                        aria-label={t('odoo.agent.clearSecret')}
                       />
                       {t('odoo.agent.clearSecret')}
                     </label>
                   )}
-                </Field>
-                <Field
+                </FieldBlock>
+                <FieldBlock
                   label={t('odoo.password')}
-                  htmlFor="odoo-agent-password"
-                  help={cfg?.password_set ? t('odoo.agent.secretSet') : t('odoo.agent.secretHint')}
+                  description={cfg?.password_set ? t('odoo.agent.secretSet') : t('odoo.agent.secretHint')}
                 >
-                  <input
-                    id="odoo-agent-password"
+                  <Input
                     type="password"
                     autoComplete="off"
-                    className={controlClass}
                     placeholder={cfg?.password_set ? '••••••••' : ''}
                     value={password}
                     disabled={clearPassword}
                     onChange={(e) => setPassword(e.target.value)}
                   />
                   {cfg?.password_set && (
-                    <label className="mt-1.5 flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
-                      <input
-                        type="checkbox"
+                    <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <Checkbox
                         checked={clearPassword}
-                        onChange={(e) => setClearPassword(e.target.checked)}
-                        className="h-3.5 w-3.5 rounded border-stone-300 text-amber-500 focus:ring-amber-500"
+                        onCheckedChange={(v) => setClearPassword(Boolean(v))}
+                        aria-label={t('odoo.agent.clearSecret')}
                       />
                       {t('odoo.agent.clearSecret')}
                     </label>
                   )}
-                </Field>
+                </FieldBlock>
               </div>
 
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label={t('agents.odoo.allowedModels')} htmlFor="odoo-agent-models" help={t('agents.odoo.allowedModels.hint')}>
-                  <input
-                    id="odoo-agent-models"
-                    type="text"
-                    className={controlClass}
-                    placeholder="crm.lead, sale.order"
-                    value={allowedModels}
-                    onChange={(e) => setAllowedModels(e.target.value)}
-                  />
-                </Field>
-                <Field label={t('agents.odoo.allowedActions')} htmlFor="odoo-agent-actions" help={t('agents.odoo.allowedActions.hint')}>
-                  <input
-                    id="odoo-agent-actions"
-                    type="text"
-                    className={controlClass}
-                    placeholder="read, write:crm.lead"
-                    value={allowedActions}
-                    onChange={(e) => setAllowedActions(e.target.value)}
-                  />
-                </Field>
-                <Field label={t('agents.odoo.companyIds')} htmlFor="odoo-agent-companies" help={t('agents.odoo.companyIds.hint')}>
-                  <input
-                    id="odoo-agent-companies"
-                    type="text"
-                    className={controlClass}
-                    placeholder="1, 2"
-                    value={companyIds}
-                    onChange={(e) => setCompanyIds(e.target.value)}
-                  />
-                </Field>
-              </div>
+              <SettingsCard>
+                <RowText
+                  label={t('agents.odoo.allowedModels')}
+                  description={t('agents.odoo.allowedModels.hint')}
+                  value={allowedModels}
+                  onChange={setAllowedModels}
+                  placeholder="crm.lead, sale.order"
+                  tier="text"
+                />
+                <RowText
+                  label={t('agents.odoo.allowedActions')}
+                  description={t('agents.odoo.allowedActions.hint')}
+                  value={allowedActions}
+                  onChange={setAllowedActions}
+                  placeholder="read, write:crm.lead"
+                  tier="text"
+                />
+                <RowText
+                  label={t('agents.odoo.companyIds')}
+                  description={t('agents.odoo.companyIds.hint')}
+                  value={companyIds}
+                  onChange={setCompanyIds}
+                  placeholder="1, 2"
+                  tier="text"
+                />
+              </SettingsCard>
 
-              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--panel-border)] pt-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-surface-border pt-4">
                 <div className="flex items-center gap-3">
-                  <Button
-                    variant="secondary"
-                    onClick={handleTest}
-                    disabled={testing || saving}
-                    icon={testing ? undefined : RefreshCw}
-                  >
-                    {testing && <Loader2 className="h-4 w-4 animate-spin" />}
+                  <Button variant="outline" size="sm" onClick={handleTest} disabled={testing || saving}>
+                    {testing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
                     {t('odoo.agent.test')}
                   </Button>
                   {testResult && (
                     <span
                       className={cn(
                         'inline-flex items-center gap-1.5 text-sm font-medium',
-                        testResult.ok ? 'text-emerald-600' : 'text-rose-600',
+                        testResult.ok ? 'text-success' : 'text-destructive'
                       )}
                     >
-                      {testResult.ok ? <CheckCircle className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
+                      {testResult.ok ? <CheckCircle className="size-4" /> : <AlertTriangle className="size-4" />}
                       {testResult.message}
                     </span>
                   )}
                 </div>
                 <div className="flex items-center gap-3">
-                  {error && <span className="text-sm text-rose-600 dark:text-rose-400">{error}</span>}
+                  {error && <span className="text-sm text-destructive">{error}</span>}
                   {saved && (
-                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-emerald-600">
-                      <CheckCircle className="h-4 w-4" />
+                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-success">
+                      <CheckCircle className="size-4" />
                       {t('common.saved')}
                     </span>
                   )}
-                  <Button variant="primary" onClick={handleSave} disabled={saving} icon={saving ? undefined : Save}>
-                    {saving && <Loader2 className="h-4 w-4 animate-spin" />}
+                  <Button variant="brand" size="sm" onClick={handleSave} disabled={saving}>
+                    {saving ? <Loader2 className="animate-spin" /> : <Save />}
                     {saving ? t('common.saving') : t('odoo.agent.save')}
                   </Button>
                 </div>
@@ -864,6 +653,6 @@ function AgentOdooOverride() {
           )}
         </>
       )}
-    </Card>
+    </SettingsSection>
   );
 }

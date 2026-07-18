@@ -9,6 +9,15 @@ afterEach(() => {
 // jsdom doesn't implement scrollIntoView
 Element.prototype.scrollIntoView = vi.fn();
 
+// jsdom doesn't implement ResizeObserver (react-resizable-panels needs a real
+// constructable one for the list+detail split panes on the Inbox / Chat pages).
+class ResizeObserverMock {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+vi.stubGlobal('ResizeObserver', ResizeObserverMock);
+
 // jsdom doesn't implement HTMLDialogElement.showModal / close
 HTMLDialogElement.prototype.showModal = vi.fn(function (this: HTMLDialogElement) {
   this.setAttribute('open', '');

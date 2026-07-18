@@ -63,7 +63,7 @@ export function SwipeToArchive({
       <div
         aria-hidden={!revealed}
         className={cn(
-          'absolute inset-y-0 right-0 flex items-center gap-1.5 rounded-card bg-rose-500/90 px-4 text-white transition-opacity',
+          'absolute inset-y-0 right-0 flex items-center gap-1.5 rounded-2xl bg-destructive/90 px-4 text-white transition-opacity',
           revealed ? 'opacity-100' : 'opacity-0',
         )}
       >

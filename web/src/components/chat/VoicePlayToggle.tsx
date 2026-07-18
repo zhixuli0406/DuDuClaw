@@ -26,14 +26,14 @@ export function VoicePlayToggle({ className }: { className?: string }) {
       aria-pressed={ttsEnabled}
       title={label}
       className={cn(
-        'grid h-9 w-9 shrink-0 place-items-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+        'grid size-7 shrink-0 place-items-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
         ttsEnabled
-          ? 'text-amber-600 hover:bg-amber-500/10 dark:text-amber-400'
-          : 'text-stone-400 hover:bg-stone-500/10 hover:text-stone-600 dark:text-stone-500 dark:hover:text-stone-300',
+          ? 'text-brand hover:bg-brand/10'
+          : 'text-muted-foreground hover:bg-muted hover:text-foreground',
         className,
       )}
     >
-      {ttsEnabled ? <Volume2 className="h-5 w-5" /> : <VolumeX className="h-5 w-5" />}
+      {ttsEnabled ? <Volume2 className="size-4" /> : <VolumeX className="size-4" />}
     </button>
   );
 }

@@ -1,15 +1,33 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useParams } from 'react-router';
-import { ArrowLeft, Pause, Play, LogOut, RotateCcw, Brain, Puzzle, CalendarClock, LayoutDashboard, Settings, Upload, Trash2, ImageIcon, Wrench, Shirt } from 'lucide-react';
+import {
+  ChevronRight,
+  MessageSquare,
+  Plus,
+  Pause,
+  Play,
+  LogOut,
+  RotateCcw,
+  Archive,
+  Settings,
+  Shirt,
+  Upload,
+  Trash2,
+  MoreHorizontal,
+  Cpu,
+  Server,
+  Activity,
+  ListTodo,
+  CheckCircle2,
+  Loader2,
+  Ban,
+} from 'lucide-react';
 import {
   api,
   type AgentDetail,
-  type KeyFactEntry,
-  type SkillInfo,
   type TaskInfo,
   type ActivityEvent,
-  type ToolCatalogEntry,
 } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAgentAvatarStore } from '@/stores/agent-avatar-store';
@@ -17,29 +35,66 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentGlyphState } from '@/stores/agent-activity-store';
 import { readFileAsBase64 } from '@/lib/attachments';
 import { toast, formatError } from '@/lib/toast';
-import { Page, Card, Button, Badge, CharacterAvatar, EmptyState, SkeletonList, Mono, Tabs, type TabItem } from '@/components/ui';
-import { AgentHero, AgentOverviewTab, agentTaskStats, isLiveState } from '@/components/agent';
+import { cn } from '@/lib/utils';
+import {
+  PageHeader,
+  Button,
+  Badge,
+  Empty,
+  Card,
+  CardHeader,
+  CardTitle,
+  CardContent,
+  ActorAvatar,
+  Tabs,
+  TabsList,
+  TabsTab,
+  TabsPanel,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  Skeleton,
+  type ActorStatus,
+} from '@/components/mds';
+import { StatusIcon } from '@/components/ui';
+import { agentTaskStats, isLiveState, type AgentTaskStats } from '@/components/agent';
 import { OffboardDialog } from '@/components/agent/OffboardDialog';
 import { WardrobeDialog } from '@/components/agent/WardrobeDialog';
-import { formatCents } from '@/lib/format';
+import { computeMood } from '@/lib/mascot-mood';
+import { toStatusKey } from '@/lib/task-status';
+import { timeAgo, formatCents } from '@/lib/format';
 
 /** 512 KB — matches the backend avatar cap (`agents.set_avatar`). */
 const MAX_AVATAR_BYTES = 512 * 1024;
 const AVATAR_ACCEPT = '.png,.jpg,.jpeg,.webp';
 const AVATAR_MIME = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
-const TAB_IDS = ['overview', 'memory', 'skills', 'routines', 'settings'] as const;
+const TAB_IDS = ['overview', 'work', 'records'] as const;
 type TabId = (typeof TAB_IDS)[number];
 
-interface Routine { id: string; name?: string; agent_id: string; cron: string; schedule?: string; enabled: boolean; }
+const MOOD_EMOJI: Record<string, string> = {
+  focused: '🧐',
+  relaxed: '😌',
+  resting: '💤',
+  offline: '😴',
+};
+
+function actorStatus(status: string, archived: boolean, live: boolean): ActorStatus {
+  if (archived) return 'offline';
+  if (status === 'active') return live ? 'busy' : 'online';
+  if (status === 'paused') return 'busy';
+  if (status === 'terminated') return 'error';
+  return 'offline';
+}
 
 /**
- * AgentDetailPage (`/agents/:id/:tab`, dashboard-redesign-v2 §5.4 T6.2) — the
- * personified AI-staff detail. A rich character hero (bust立繪 + mood + XP +
- * skill badges + quick actions) over the 總覽 / 記憶 / 技能 / 例行 / 設定 tab set.
- * The 總覽 tab adds a live activity tail, a win tally, and a recent-task ledger;
- * the other tabs carry over their v1 content (token-aligned only). Actions use
- * the warm wording ("讓 X 休息 / 復工 / 離職") per the §5.1 terminology table.
+ * AgentDetailPage (`/agents/:id/:tab`) — the Multica "員工" hero detail
+ * (spec §5.3 式2). A border-bottom hero header (breadcrumb → avatar + name +
+ * presence + meta) over a line-underline tab strip: 總覽 / 工作 / 紀錄. The
+ * bust立繪 is gone — a plain ActorAvatar carries the identity, mood is a small
+ * element inside the overview card, and per-tab content is mds-Card slim lists.
  */
 export function AgentDetailPage() {
   const intl = useIntl();
@@ -50,26 +105,19 @@ export function AgentDetailPage() {
   const tab: TabId = (TAB_IDS as readonly string[]).includes(rawTab) ? (rawTab as TabId) : 'overview';
 
   const connectionState = useConnectionStore((s) => s.state);
-  const { pauseAgent, resumeAgent, unarchiveAgent, agents, fetchAgents } = useAgentsStore();
+  const { pauseAgent, resumeAgent, archiveAgent, unarchiveAgent, agents, fetchAgents } = useAgentsStore();
   const setAvatarCache = useAgentAvatarStore((s) => s.set);
 
   const [detail, setDetail] = useState<AgentDetail | null>(null);
-  const [facts, setFacts] = useState<KeyFactEntry[] | null>(null);
-  const [skills, setSkills] = useState<SkillInfo[] | null>(null);
-  const [tools, setTools] = useState<ToolCatalogEntry[] | null>(null);
-  const [toolsError, setToolsError] = useState(false);
-  const [routines, setRoutines] = useState<Routine[] | null>(null);
   const [tasks, setTasks] = useState<TaskInfo[] | null>(null);
   const [activities, setActivities] = useState<ActivityEvent[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  // 離職 flow (WP4): three-way offboard — archive / remove / handoff-then-archive.
   const [showOffboard, setShowOffboard] = useState(false);
   const [showWardrobe, setShowWardrobe] = useState(false);
   const [avatarBusy, setAvatarBusy] = useState(false);
   const avatarFileRef = useRef<HTMLInputElement>(null);
 
-  // Live-run state for this one agent (drives the hero pose + XP live dot).
   const glyph = useAgentGlyphState(id, detail?.status);
   const live = isLiveState(glyph);
 
@@ -78,7 +126,6 @@ export function AgentDetailPage() {
     try {
       const d = await api.agents.inspect(id);
       setDetail(d);
-      // Publish the resolved avatar so the hero + every other surface match.
       setAvatarCache(id, d.avatar ?? null);
     } catch (e) {
       console.warn('[api]', e);
@@ -93,8 +140,7 @@ export function AgentDetailPage() {
     loadDetail();
   }, [connectionState, id, loadDetail]);
 
-  // Tasks power the hero level (§6.2 derivation) + the overview tally, so load
-  // them once the agent is known — not gated on the overview tab.
+  // Tasks power the win tally + the 工作 tab.
   useEffect(() => {
     if (connectionState !== 'authenticated' || !id) return;
     api.tasks
@@ -106,38 +152,25 @@ export function AgentDetailPage() {
       });
   }, [connectionState, id]);
 
-  // Lazy per-tab loads. On failure we surface a toast AND set an empty array so
-  // the tab shows its empty state rather than an infinite spinner — but the
-  // failure is never swallowed silently (Haiku review #2).
-  const onTabLoadError = useCallback(
-    (e: unknown) => {
-      console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
-    },
-    [intl],
-  );
+  // Activity ledger (總覽 live tail + 紀錄 tab). Loaded lazily on first need.
   useEffect(() => {
     if (connectionState !== 'authenticated' || !id) return;
-    if (tab === 'overview' && activities === null) {
-      api.activity.list({ agent_id: id, limit: 10 }).then((r) => setActivities(r?.events ?? [])).catch((e) => { onTabLoadError(e); setActivities([]); });
+    if ((tab === 'overview' || tab === 'records') && activities === null) {
+      api.activity
+        .list({ agent_id: id, limit: 50 })
+        .then((r) => setActivities(r?.events ?? []))
+        .catch((e) => {
+          console.warn('[api]', e);
+          toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+          setActivities([]);
+        });
     }
-    if (tab === 'memory' && facts === null) {
-      api.memory.keyFacts(id).then((r) => setFacts(r?.entries ?? [])).catch((e) => { onTabLoadError(e); setFacts([]); });
-    }
-    if (tab === 'skills' && skills === null) {
-      api.skills.list(id).then((r) => setSkills(r?.skills ?? [])).catch((e) => { onTabLoadError(e); setSkills([]); });
-    }
-    // Platform tool catalog (global, not per-agent) — shown alongside skills so
-    // the operator can see the full capability surface this AI staff can call.
-    if (tab === 'skills' && tools === null && !toolsError) {
-      api.tools.catalog()
-        .then((r) => setTools(r?.tools ?? []))
-        .catch((e) => { console.warn('[api]', e); setToolsError(true); setTools([]); });
-    }
-    if (tab === 'routines' && routines === null) {
-      api.cron.list().then((r) => setRoutines((r?.tasks ?? []).filter((t) => t.agent_id === id))).catch((e) => { onTabLoadError(e); setRoutines([]); });
-    }
-  }, [tab, connectionState, id, facts, skills, tools, toolsError, routines, activities, onTabLoadError]);
+  }, [tab, connectionState, id, activities, intl]);
+
+  // Roster (for the handoff target picker).
+  useEffect(() => {
+    if (connectionState === 'authenticated') fetchAgents();
+  }, [connectionState, fetchAgents]);
 
   const setTab = (next: string) => navigate(`/agents/${encodeURIComponent(id)}/${next}`);
 
@@ -156,11 +189,6 @@ export function AgentDetailPage() {
     },
     [detail, id, intl, loadDetail],
   );
-
-  // Roster (for the handoff target picker).
-  useEffect(() => {
-    if (connectionState === 'authenticated') fetchAgents();
-  }, [connectionState, fetchAgents]);
 
   const handleAvatarFile = useCallback(
     async (file: File) => {
@@ -205,275 +233,275 @@ export function AgentDetailPage() {
 
   const stats = useMemo(() => agentTaskStats(tasks ?? [], id), [tasks, id]);
 
-  const tabs: TabItem[] = useMemo(
-    () => [
-      { id: 'overview', label: intl.formatMessage({ id: 'agentDetail.tab.overview' }) },
-      { id: 'memory', label: intl.formatMessage({ id: 'agentDetail.tab.memory' }), badge: facts?.length },
-      { id: 'skills', label: intl.formatMessage({ id: 'agentDetail.tab.skills' }), badge: skills?.length ?? detail?.skills?.length },
-      { id: 'routines', label: intl.formatMessage({ id: 'agentDetail.tab.routines' }), badge: routines?.length },
-      { id: 'settings', label: intl.formatMessage({ id: 'agentDetail.tab.settings' }) },
-    ],
-    [intl, facts, skills, routines, detail],
-  );
-
   if (loading && !detail) {
     return (
-      <Page>
-        <Card padded={false}><div className="p-5"><SkeletonList rows={4} rowClassName="h-12" /></div></Card>
-      </Page>
+      <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+        <PageHeader hideTrigger>
+          <Skeleton className="h-4 w-40" />
+        </PageHeader>
+        <div className="mx-auto w-full max-w-[1440px] space-y-4 p-4 sm:p-6">
+          <Skeleton className="h-24 w-full" />
+          <Skeleton className="h-64 w-full" />
+        </div>
+      </div>
     );
   }
 
   if (!detail) {
     return (
-      <Page>
-        <Card>
-          <EmptyState
-            icon={LayoutDashboard}
-            title={intl.formatMessage({ id: 'agentDetail.notFound' })}
-            action={<Button icon={ArrowLeft} onClick={() => navigate('/agents')}>{intl.formatMessage({ id: 'agentDetail.back' })}</Button>}
-          />
-        </Card>
-      </Page>
+      <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+        <PageHeader hideTrigger>
+          <button
+            onClick={() => navigate('/agents')}
+            className="text-sm text-muted-foreground hover:text-foreground"
+          >
+            {intl.formatMessage({ id: 'nav.agents' })}
+          </button>
+        </PageHeader>
+        <Empty
+          icon={ListTodo}
+          title={intl.formatMessage({ id: 'agentDetail.notFound' })}
+          action={
+            <Button variant="outline" size="sm" onClick={() => navigate('/agents')}>
+              {intl.formatMessage({ id: 'agentDetail.back' })}
+            </Button>
+          }
+        />
+      </div>
     );
   }
 
+  const archived = !!detail.archived;
   const isMain = detail.role === 'main';
+  const roleTitle = detail.role
+    ? intl.formatMessage({ id: `agents.role.${detail.role}` })
+    : detail.name;
+
+  // Mood — an honest one-member-company projection (display only).
+  const moodKey =
+    detail.status === 'paused'
+      ? 'resting'
+      : detail.status === 'terminated'
+        ? 'offline'
+        : computeMood({ total: 1, active: live ? 1 : 0, error: 0, inbox: 0 });
 
   return (
-    <Page wide>
-      <button
-        onClick={() => navigate('/agents')}
-        className="mb-2 inline-flex items-center gap-1 text-sm text-stone-500 transition-colors hover:text-stone-800 dark:text-stone-400 dark:hover:text-stone-200"
-      >
-        <ArrowLeft className="h-4 w-4" /> {intl.formatMessage({ id: 'agentDetail.back' })}
-      </button>
+    <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+      {/* Hero header (spec §5.3 式2). */}
+      <div className="border-b border-surface-border px-4 pt-3 pb-5 sm:px-6">
+        <div className="mx-auto w-full max-w-[1440px]">
+          {/* Breadcrumb */}
+          <nav className="mb-3 flex items-center gap-1 text-xs text-muted-foreground">
+            <button onClick={() => navigate('/agents')} className="hover:text-foreground">
+              {intl.formatMessage({ id: 'nav.agents' })}
+            </button>
+            <ChevronRight className="size-3" />
+            <span className="truncate text-foreground">{detail.display_name}</span>
+          </nav>
 
-      <div className="space-y-4">
-        {detail.archived && (
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-card border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
-            <span>{intl.formatMessage({ id: 'agents.archived.notice' }, { name: detail.display_name })}</span>
-            <Button
-              size="sm"
-              variant="secondary"
-              icon={RotateCcw}
-              disabled={busy}
-              onClick={() => lifecycleAction(() => unarchiveAgent(id), 'agents.unarchive.done')}
-            >
-              {intl.formatMessage({ id: 'agents.unarchive' })}
-            </Button>
-          </div>
-        )}
-        <AgentHero
-          detail={detail}
-          live={live}
-          doneCount={stats.done}
-          busy={busy}
-          onChat={() => navigate(`/chat?agent=${encodeURIComponent(id)}`)}
-          // TODO(v2-W6): TaskBoardPage reads ?new=1 + defaultAssignee param (other
-          // agent's file domain); this call site just routes with the assignee.
-          onDelegate={() => navigate(`/tasks?new=1&assignee=${encodeURIComponent(id)}`)}
-          onPause={() => lifecycleAction(() => pauseAgent(id), 'agentDetail.rested')}
-          onResume={() => lifecycleAction(() => resumeAgent(id), 'agentDetail.resumed')}
-        />
-
-        <Tabs items={tabs} value={tab} onChange={setTab} />
-
-        {tab === 'overview' && (
-          <AgentOverviewTab activities={activities} tasks={tasks} stats={stats} live={live} />
-        )}
-
-        {tab === 'memory' && (
-          <Card title={intl.formatMessage({ id: 'agentDetail.memory.title' })}>
-            {facts === null ? (
-              <SkeletonList rows={3} rowClassName="h-10" />
-            ) : facts.length === 0 ? (
-              <EmptyState icon={Brain} title={intl.formatMessage({ id: 'agentDetail.memory.empty' })} />
-            ) : (
-              <ul className="space-y-2">
-                {facts.map((f) => (
-                  <li key={f.id} className="panel px-3 py-2 text-sm text-stone-700 dark:text-stone-300">{f.fact}</li>
-                ))}
-              </ul>
-            )}
-          </Card>
-        )}
-
-        {tab === 'skills' && (
-          <div className="space-y-4">
-            <Card title={intl.formatMessage({ id: 'agentDetail.skills.title' })}>
-              {skills === null ? (
-                <SkeletonList rows={3} rowClassName="h-10" />
-              ) : skills.length === 0 ? (
-                <EmptyState icon={Puzzle} title={intl.formatMessage({ id: 'agentDetail.skills.empty' })} />
-              ) : (
-                <div className="flex flex-wrap gap-2">
-                  {skills.map((s) => (
-                    <Badge key={s.name} tone={s.security_status === 'fail' ? 'danger' : s.security_status === 'warn' ? 'warning' : 'neutral'}>
-                      {s.name}
-                    </Badge>
-                  ))}
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="flex min-w-0 items-start gap-4">
+              <ActorAvatar
+                actorType="agent"
+                size="2xl"
+                name={detail.display_name}
+                src={detail.avatar ?? undefined}
+                showStatusDot
+                status={actorStatus(detail.status, archived, live)}
+                className="ring-1"
+              />
+              <div className="min-w-0 space-y-1.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h1 className="truncate text-xl font-semibold tracking-tight text-foreground sm:text-2xl">
+                    {detail.display_name}
+                  </h1>
+                  <Badge
+                    variant={
+                      archived ? 'secondary' : detail.status === 'active' ? 'default' : 'secondary'
+                    }
+                  >
+                    {intl.formatMessage({ id: `status.${archived ? 'archived' : detail.status}` })}
+                  </Badge>
                 </div>
-              )}
-            </Card>
-
-            <AgentToolsCard tools={tools} error={toolsError} />
-          </div>
-        )}
-
-        {tab === 'routines' && (
-          <Card title={intl.formatMessage({ id: 'agentDetail.routines.title' })}>
-            {routines === null ? (
-              <SkeletonList rows={3} rowClassName="h-10" />
-            ) : routines.length === 0 ? (
-              <EmptyState icon={CalendarClock} title={intl.formatMessage({ id: 'agentDetail.routines.empty' })} />
-            ) : (
-              <ul className="space-y-2">
-                {routines.map((r) => (
-                  <li key={r.id} className="panel flex items-center justify-between px-3 py-2 text-sm">
-                    <span className="text-stone-700 dark:text-stone-300">{r.name || r.id}</span>
-                    <Mono>{r.schedule || r.cron}</Mono>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </Card>
-        )}
-
-        {tab === 'settings' && (
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <Card title={intl.formatMessage({ id: 'agentDetail.overview.identity' })}>
-              <dl className="space-y-2 text-sm">
-                <Row label={intl.formatMessage({ id: 'agentDetail.field.name' })}><Mono>{detail.name}</Mono></Row>
-                <Row label={intl.formatMessage({ id: 'agentDetail.field.reportsTo' })}>{detail.reports_to || '—'}</Row>
-                <Row label={intl.formatMessage({ id: 'agents.department.label' })}>{detail.department || '—'}</Row>
-                <Row label={intl.formatMessage({ id: 'agentDetail.field.model' })}><Mono>{detail.model?.preferred ?? '—'}</Mono></Row>
-                <Row label={intl.formatMessage({ id: 'agentDetail.field.spent' })}><Mono>{formatCents(detail.budget?.spent_cents)}</Mono></Row>
-                <Row label={intl.formatMessage({ id: 'agentDetail.field.limit' })}><Mono>{formatCents(detail.budget?.monthly_limit_cents)}</Mono></Row>
-                <Row label={intl.formatMessage({ id: 'agentDetail.field.heartbeat' })}>
-                  {detail.heartbeat?.enabled ? intl.formatMessage({ id: 'common.enabled' }) : intl.formatMessage({ id: 'common.disabled' })}
-                </Row>
-              </dl>
-              <button
-                onClick={() => navigate('/agents')}
-                className="mt-3 inline-flex items-center gap-1 border-t border-[var(--panel-border)] pt-3 text-sm font-medium text-amber-600 transition-colors hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
-              >
-                {intl.formatMessage({ id: 'agentDetail.editFull' })} →
-              </button>
-            </Card>
-
-            {/* 造型（衣帽間）— slot-based look, synced to roster + world.
-                Photo upload survives as a folded secondary path; a saved
-                outfit always outranks a photo. */}
-            <Card title={intl.formatMessage({ id: 'wardrobe.card.title' })}>
-              <div className="flex items-center gap-4">
-                <CharacterAvatar
-                  agentId={detail.name}
-                  name={detail.display_name}
-                  size={72}
-                  variant="bust"
-                  avatar={detail.outfit ? null : detail.avatar ?? null}
-                  outfit={detail.outfit ?? null}
-                />
-                <div className="flex min-w-0 flex-col gap-2">
-                  <div className="flex items-center gap-2">
-                    <Button variant="secondary" icon={Shirt} onClick={() => setShowWardrobe(true)}>
-                      {intl.formatMessage({ id: 'wardrobe.open' })}
-                    </Button>
-                  </div>
-                  <p className="text-xs text-stone-400 dark:text-stone-500">
-                    {intl.formatMessage({ id: 'wardrobe.card.hint' })}
-                  </p>
-                  <details>
-                    <summary className="cursor-pointer text-xs text-stone-400 hover:text-stone-600 dark:text-stone-500 dark:hover:text-stone-300">
-                      {intl.formatMessage({ id: 'wardrobe.photoFallback' })}
-                    </summary>
-                    <div className="mt-2 flex items-center gap-2">
-                      <input
-                        ref={avatarFileRef}
-                        type="file"
-                        accept={AVATAR_ACCEPT}
-                        className="hidden"
-                        onChange={(e) => {
-                          const f = e.target.files?.[0];
-                          if (f) void handleAvatarFile(f);
-                          e.target.value = '';
-                        }}
-                      />
-                      <Button
-                        variant="ghost"
-                        icon={Upload}
-                        disabled={avatarBusy}
-                        onClick={() => avatarFileRef.current?.click()}
-                      >
-                        {intl.formatMessage({ id: 'agents.avatar.upload' })}
-                      </Button>
-                      {detail.has_avatar && (
-                        <Button variant="ghost" icon={Trash2} disabled={avatarBusy} onClick={handleAvatarClear}>
-                          {intl.formatMessage({ id: 'agents.avatar.remove' })}
-                        </Button>
-                      )}
-                      <span className="flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
-                        <ImageIcon className="h-3.5 w-3.5" />
-                        {intl.formatMessage({ id: 'agents.avatar.hint' })}
-                      </span>
-                    </div>
-                  </details>
+                <p className="max-w-2xl truncate text-sm text-muted-foreground">
+                  {roleTitle}
+                  {detail.department ? ` · ${detail.department}` : ''}
+                </p>
+                {/* Meta row */}
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pt-0.5 text-xs text-muted-foreground">
+                  {detail.model?.preferred && (
+                    <span className="inline-flex items-center gap-1">
+                      <Cpu className="size-3" />
+                      <span className="font-mono">{detail.model.preferred}</span>
+                    </span>
+                  )}
+                  {detail.model?.api_mode && (
+                    <span className="inline-flex items-center gap-1">
+                      <Server className="size-3" />
+                      {intl.formatMessage({ id: `agents.apiMode.${detail.model.api_mode}` })}
+                    </span>
+                  )}
                 </div>
               </div>
-            </Card>
+            </div>
 
-            {showWardrobe && (
-              <WardrobeDialog
-                agentId={detail.name}
-                displayName={detail.display_name}
-                outfit={detail.outfit ?? null}
-                onClose={() => setShowWardrobe(false)}
-                onSaved={() => {
-                  void loadDetail();
-                  void fetchAgents();
+            {/* Actions */}
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => navigate(`/chat?agent=${encodeURIComponent(id)}`)}
+              >
+                <MessageSquare />
+                {intl.formatMessage({ id: 'agentDetail.action.chat' })}
+              </Button>
+              <Button
+                variant="brand"
+                size="sm"
+                onClick={() => navigate(`/tasks?new=1&assignee=${encodeURIComponent(id)}`)}
+              >
+                <Plus />
+                {intl.formatMessage({ id: 'agentDetail.action.delegate' })}
+              </Button>
+              <input
+                ref={avatarFileRef}
+                type="file"
+                accept={AVATAR_ACCEPT}
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void handleAvatarFile(f);
+                  e.target.value = '';
                 }}
               />
-            )}
-
-            <Card title={intl.formatMessage({ id: 'agentDetail.settings.title' })}>
-              <div className="flex flex-wrap items-center gap-2">
-                {detail.archived ? (
-                  <Button variant="primary" icon={RotateCcw} disabled={busy} onClick={() => lifecycleAction(() => unarchiveAgent(id), 'agents.unarchive.done')}>
-                    {intl.formatMessage({ id: 'agents.unarchive' })}
-                  </Button>
-                ) : detail.status === 'active' ? (
-                  <Button icon={Pause} disabled={busy} onClick={() => lifecycleAction(() => pauseAgent(id), 'agentDetail.rested')}>
-                    {intl.formatMessage({ id: 'agentDetail.rest' })}
-                  </Button>
-                ) : (
-                  <Button variant="primary" icon={Play} disabled={busy} onClick={() => lifecycleAction(() => resumeAgent(id), 'agentDetail.resumed')}>
-                    {intl.formatMessage({ id: 'agentDetail.resume' })}
-                  </Button>
-                )}
-                <Button variant="secondary" icon={Settings} onClick={() => navigate('/agents')}>
-                  {intl.formatMessage({ id: 'agentDetail.editFull' })}
-                </Button>
-                <span title={isMain ? intl.formatMessage({ id: 'agents.offboard.mainBlocked' }) : undefined}>
-                  <Button
-                    variant="danger"
-                    icon={LogOut}
-                    disabled={busy || isMain}
-                    onClick={() => setShowOffboard(true)}
-                  >
-                    {intl.formatMessage({ id: 'agentDetail.dismiss' })}
-                  </Button>
-                </span>
-              </div>
-              {isMain && (
-                <p className="mt-2 text-xs text-stone-400 dark:text-stone-500">
-                  {intl.formatMessage({ id: 'agents.offboard.mainBlocked' })}
-                </p>
-              )}
-            </Card>
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  render={
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={intl.formatMessage({ id: 'agentDetail.more' })}
+                    />
+                  }
+                >
+                  <MoreHorizontal />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent>
+                  {!archived &&
+                    (detail.status === 'active' ? (
+                      <DropdownMenuItem
+                        disabled={busy}
+                        onClick={() => lifecycleAction(() => pauseAgent(id), 'agentDetail.rested')}
+                      >
+                        <Pause />
+                        {intl.formatMessage({ id: 'agentDetail.rest' })}
+                      </DropdownMenuItem>
+                    ) : (
+                      <DropdownMenuItem
+                        disabled={busy}
+                        onClick={() => lifecycleAction(() => resumeAgent(id), 'agentDetail.resumed')}
+                      >
+                        <Play />
+                        {intl.formatMessage({ id: 'agentDetail.resume' })}
+                      </DropdownMenuItem>
+                    ))}
+                  <DropdownMenuItem onClick={() => setShowWardrobe(true)}>
+                    <Shirt />
+                    {intl.formatMessage({ id: 'wardrobe.open' })}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled={avatarBusy} onClick={() => avatarFileRef.current?.click()}>
+                    <Upload />
+                    {intl.formatMessage({ id: 'agents.avatar.upload' })}
+                  </DropdownMenuItem>
+                  {detail.has_avatar && (
+                    <DropdownMenuItem disabled={avatarBusy} onClick={handleAvatarClear}>
+                      <Trash2 />
+                      {intl.formatMessage({ id: 'agents.avatar.remove' })}
+                    </DropdownMenuItem>
+                  )}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => navigate(`/agents/${encodeURIComponent(id)}/edit`)}>
+                    <Settings />
+                    {intl.formatMessage({ id: 'agentDetail.editFull' })}
+                  </DropdownMenuItem>
+                  {archived ? (
+                    <DropdownMenuItem
+                      disabled={busy}
+                      onClick={() => lifecycleAction(() => unarchiveAgent(id), 'agents.unarchive.done')}
+                    >
+                      <RotateCcw />
+                      {intl.formatMessage({ id: 'agents.unarchive' })}
+                    </DropdownMenuItem>
+                  ) : (
+                    !isMain && (
+                      <>
+                        <DropdownMenuItem
+                          disabled={busy}
+                          onClick={() => lifecycleAction(() => archiveAgent(id), 'agents.archive.done')}
+                        >
+                          <Archive />
+                          {intl.formatMessage({ id: 'agents.archive' })}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem variant="destructive" onClick={() => setShowOffboard(true)}>
+                          <LogOut />
+                          {intl.formatMessage({ id: 'agentDetail.dismiss' })}
+                        </DropdownMenuItem>
+                      </>
+                    )
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
-        )}
+        </div>
       </div>
+
+      {/* Archived banner */}
+      {archived && (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-surface-border bg-muted/50 px-4 py-2 sm:px-6">
+          <span className="text-sm text-muted-foreground">
+            {intl.formatMessage({ id: 'agents.archived.notice' }, { name: detail.display_name })}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busy}
+            onClick={() => lifecycleAction(() => unarchiveAgent(id), 'agents.unarchive.done')}
+          >
+            <RotateCcw />
+            {intl.formatMessage({ id: 'agents.unarchive' })}
+          </Button>
+        </div>
+      )}
+
+      {/* Tab strip (line underline). */}
+      <Tabs value={tab} onValueChange={(v) => setTab(String(v))} variant="line" className="gap-0">
+        <div className="border-b border-surface-border px-4 sm:px-6">
+          <div className="mx-auto w-full max-w-[1440px]">
+            <TabsList className="h-11">
+              <TabsTab value="overview">{intl.formatMessage({ id: 'agentDetail.tab.overview' })}</TabsTab>
+              <TabsTab value="work">{intl.formatMessage({ id: 'agentDetail.tab.work' })}</TabsTab>
+              <TabsTab value="records">{intl.formatMessage({ id: 'agentDetail.tab.records' })}</TabsTab>
+            </TabsList>
+          </div>
+        </div>
+
+        <TabsPanel value="overview">
+          <OverviewTab
+            detail={detail}
+            stats={stats}
+            activities={activities}
+            live={live}
+            moodKey={moodKey}
+          />
+        </TabsPanel>
+        <TabsPanel value="work">
+          <WorkTab tasks={tasks} onOpen={(taskId) => navigate(`/tasks/${taskId}`)} />
+        </TabsPanel>
+        <TabsPanel value="records">
+          <RecordsTab activities={activities} />
+        </TabsPanel>
+      </Tabs>
 
       <OffboardDialog
         open={showOffboard}
@@ -481,82 +509,248 @@ export function AgentDetailPage() {
         candidates={agents.filter((a) => a.name !== id && !a.archived)}
         busy={busy}
         onClose={() => setShowOffboard(false)}
-        onDone={() => { setShowOffboard(false); navigate('/agents'); }}
+        onDone={() => {
+          setShowOffboard(false);
+          navigate('/agents');
+        }}
       />
-    </Page>
-  );
-}
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex items-center justify-between gap-3">
-      <dt className="text-stone-500 dark:text-stone-400">{label}</dt>
-      <dd className="text-stone-800 dark:text-stone-100">{children}</dd>
+      {showWardrobe && (
+        <WardrobeDialog
+          agentId={detail.name}
+          displayName={detail.display_name}
+          outfit={detail.outfit ?? null}
+          onClose={() => setShowWardrobe(false)}
+          onSaved={() => {
+            void loadDetail();
+            void fetchAgents();
+          }}
+        />
+      )}
     </div>
   );
 }
 
-/**
- * AgentToolsCard — the platform-wide capability surface every AI staff can
- * call. `tools.catalog` is global (not per-agent), so this is framed as "tools
- * available on this platform" and grouped by the name prefix (agents / channels
- * / memory / …). Handles loading / error / empty inline so a catalog failure
- * never blanks the skills tab.
- */
-function AgentToolsCard({ tools, error }: { tools: ToolCatalogEntry[] | null; error: boolean }) {
+// ── Overview ────────────────────────────────────────────────
+function OverviewTab({
+  detail,
+  stats,
+  activities,
+  live,
+  moodKey,
+}: {
+  detail: AgentDetail;
+  stats: AgentTaskStats;
+  activities: ReadonlyArray<ActivityEvent> | null;
+  live: boolean;
+  moodKey: string;
+}) {
   const intl = useIntl();
+  return (
+    <div className="mx-auto w-full max-w-[1440px] p-4 sm:p-6">
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
+        {/* Left: mood + tally + live tail. */}
+        <div className="space-y-6">
+          {/* Mood (small element, no bust). */}
+          <Card data-size="sm">
+            <CardContent className="flex items-center gap-3">
+              <span className="text-2xl" aria-hidden="true">
+                {MOOD_EMOJI[moodKey] ?? '😌'}
+              </span>
+              <p className="text-sm text-foreground">
+                {intl.formatMessage({ id: `agentDetail.mood.${moodKey}` })}
+              </p>
+            </CardContent>
+          </Card>
 
-  const groups = useMemo(() => {
-    if (!tools) return [];
-    const map = new Map<string, ToolCatalogEntry[]>();
-    for (const t of tools) {
-      const key = t.name.includes('.') ? t.name.split('.')[0] : 'other';
-      const arr = map.get(key) ?? [];
-      arr.push(t);
-      map.set(key, arr);
-    }
-    return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0]));
-  }, [tools]);
+          {/* Win tally. */}
+          <div className="grid grid-cols-3 gap-3">
+            <StatTile icon={CheckCircle2} tone="text-success" value={stats.done} label={intl.formatMessage({ id: 'agentDetail.stats.done' })} />
+            <StatTile icon={Loader2} tone="text-info" value={stats.inProgress} label={intl.formatMessage({ id: 'agentDetail.stats.inProgress' })} />
+            <StatTile icon={Ban} tone="text-destructive" value={stats.blocked} label={intl.formatMessage({ id: 'agentDetail.stats.blocked' })} />
+          </div>
+
+          {/* Live activity tail. */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-sm">
+                {intl.formatMessage({ id: 'agentDetail.live.title' })}
+                {live && <span className="size-1.5 rounded-full bg-success" />}
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {activities === null ? (
+                <ActivitySkeleton />
+              ) : activities.length === 0 ? (
+                <Empty icon={Activity} variant="dashed" title={intl.formatMessage({ id: 'agentDetail.live.empty' })} />
+              ) : (
+                <ul className="space-y-1.5">
+                  {activities.slice(0, 6).map((ev) => (
+                    <li key={ev.id} className="flex items-baseline gap-2 text-sm">
+                      <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+                        {timeAgo(ev.timestamp)}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-foreground">{ev.summary}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Right: summary property rows. */}
+        <Card className="h-fit">
+          <CardHeader>
+            <CardTitle className="text-sm">{intl.formatMessage({ id: 'agentDetail.summary.title' })}</CardTitle>
+          </CardHeader>
+          <CardContent className="divide-y divide-surface-border">
+            <PropertyRow label={intl.formatMessage({ id: 'agents.inspect.status' })}>
+              {intl.formatMessage({ id: `status.${detail.archived ? 'archived' : detail.status}` })}
+            </PropertyRow>
+            <PropertyRow label={intl.formatMessage({ id: 'agentDetail.field.model' })}>
+              <span className="font-mono text-xs">{detail.model?.preferred || '—'}</span>
+            </PropertyRow>
+            <PropertyRow label={intl.formatMessage({ id: 'agentDetail.summary.runtime' })}>
+              {detail.model?.api_mode
+                ? intl.formatMessage({ id: `agents.apiMode.${detail.model.api_mode}` })
+                : '—'}
+            </PropertyRow>
+            <PropertyRow label={intl.formatMessage({ id: 'agentDetail.field.skills' })}>
+              <span className="font-mono tabular-nums">{detail.skills?.length ?? 0}</span>
+            </PropertyRow>
+            {detail.department && (
+              <PropertyRow label={intl.formatMessage({ id: 'agents.department.label' })}>
+                {detail.department}
+              </PropertyRow>
+            )}
+            <PropertyRow label={intl.formatMessage({ id: 'agentDetail.overview.budget' })}>
+              <span className="font-mono text-xs tabular-nums">
+                {formatCents(detail.budget?.spent_cents)} / {formatCents(detail.budget?.monthly_limit_cents)}
+              </span>
+            </PropertyRow>
+            <PropertyRow label={intl.formatMessage({ id: 'agentDetail.field.heartbeat' })}>
+              {detail.heartbeat?.enabled
+                ? intl.formatMessage({ id: 'common.enabled' })
+                : intl.formatMessage({ id: 'common.disabled' })}
+            </PropertyRow>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+// ── Work (task list) ────────────────────────────────────────
+function WorkTab({
+  tasks,
+  onOpen,
+}: {
+  tasks: ReadonlyArray<TaskInfo> | null;
+  onOpen: (taskId: string) => void;
+}) {
+  const intl = useIntl();
+  const rows = useMemo(
+    () =>
+      [...(tasks ?? [])].sort(
+        (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+      ),
+    [tasks],
+  );
 
   return (
-    <Card
-      title={
-        <span className="flex items-center gap-2">
-          <Wrench className="h-4 w-4 text-amber-500" />
-          {intl.formatMessage({ id: 'agentDetail.tools.title' })}
-        </span>
-      }
-    >
-      <p className="mb-3 text-xs text-stone-400 dark:text-stone-500">
-        {intl.formatMessage({ id: 'agentDetail.tools.desc' })}
-      </p>
-
-      {tools === null ? (
-        <SkeletonList rows={3} rowClassName="h-10" />
-      ) : error ? (
-        <EmptyState icon={Wrench} title={intl.formatMessage({ id: 'agentDetail.tools.error' })} />
-      ) : tools.length === 0 ? (
-        <EmptyState icon={Wrench} title={intl.formatMessage({ id: 'agentDetail.tools.empty' })} />
+    <div className="mx-auto w-full max-w-[1440px] p-4 sm:p-6">
+      {tasks === null ? (
+        <ActivitySkeleton />
+      ) : rows.length === 0 ? (
+        <Empty icon={ListTodo} title={intl.formatMessage({ id: 'agentDetail.work.empty' })} />
       ) : (
-        <div className="space-y-4">
-          {groups.map(([group, items]) => (
-            <div key={group}>
-              <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">
-                {group}
-                <span className="ml-1.5 font-normal text-stone-400 dark:text-stone-500">({items.length})</span>
-              </h4>
-              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-                {items.map((t) => (
-                  <div key={t.name} className="rounded-lg bg-stone-500/5 px-3 py-2 dark:bg-white/5">
-                    <Mono className="text-xs text-stone-700 dark:text-stone-300">{t.name}</Mono>
-                    <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">{t.description}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
+        <ul className="overflow-hidden rounded-xl border border-surface-border bg-surface">
+          {rows.map((t) => (
+            <li
+              key={t.id}
+              onClick={() => onOpen(t.id)}
+              className="flex h-9 cursor-pointer items-center gap-2.5 border-b border-surface-border px-4 text-sm transition-colors last:border-b-0 hover:bg-surface-hover"
+            >
+              <StatusIcon status={toStatusKey(t.status)} size="sm" />
+              <span className="min-w-0 flex-1 truncate text-foreground">{t.title}</span>
+              <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+                {timeAgo(t.updated_at)}
+              </span>
+            </li>
           ))}
-        </div>
+        </ul>
       )}
+    </div>
+  );
+}
+
+// ── Records (activity ledger) ───────────────────────────────
+function RecordsTab({ activities }: { activities: ReadonlyArray<ActivityEvent> | null }) {
+  const intl = useIntl();
+  return (
+    <div className="mx-auto w-full max-w-[1440px] p-4 sm:p-6">
+      {activities === null ? (
+        <ActivitySkeleton />
+      ) : activities.length === 0 ? (
+        <Empty icon={Activity} title={intl.formatMessage({ id: 'agentDetail.records.empty' })} />
+      ) : (
+        <ul className="overflow-hidden rounded-xl border border-surface-border bg-surface">
+          {activities.map((ev) => (
+            <li
+              key={ev.id}
+              className="flex h-9 items-center gap-2.5 border-b border-surface-border px-4 text-sm last:border-b-0"
+            >
+              <span className="min-w-0 flex-1 truncate text-foreground">{ev.summary}</span>
+              <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+                {timeAgo(ev.timestamp)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ── Small pieces ────────────────────────────────────────────
+function PropertyRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
+      <dt className="shrink-0 text-xs text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 truncate text-right text-sm text-foreground">{children}</dd>
+    </div>
+  );
+}
+
+function StatTile({
+  icon: Icon,
+  tone,
+  value,
+  label,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  tone: string;
+  value: number;
+  label: string;
+}) {
+  return (
+    <Card data-size="sm">
+      <CardContent className="flex flex-col items-center gap-1 text-center">
+        <Icon className={cn('size-5', tone)} />
+        <span className="text-2xl font-semibold tabular-nums text-foreground">{value}</span>
+        <span className="text-xs text-muted-foreground">{label}</span>
+      </CardContent>
     </Card>
+  );
+}
+
+function ActivitySkeleton() {
+  return (
+    <div className="space-y-2">
+      {Array.from({ length: 3 }).map((_, i) => (
+        <Skeleton key={i} className="h-8 w-full" />
+      ))}
+    </div>
   );
 }

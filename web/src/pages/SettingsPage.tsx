@@ -1,8 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
-import { cn } from '@/lib/utils';
-import { Page, PageHeader, Tabs } from '@/components/ui';
 import {
   Settings,
   Container,
@@ -17,8 +15,12 @@ import {
   EyeOff,
   Download,
   KeyRound,
-  ChevronDown,
 } from 'lucide-react';
+import {
+  SettingsShell,
+  SettingsTab,
+  type SettingsNavGroup,
+} from '@/components/mds';
 import { GeneralTab } from '@/components/settings/sections/GeneralTab';
 import { AccountTab } from '@/components/settings/sections/AccountTab';
 import { SystemTab } from '@/components/settings/sections/SystemTab';
@@ -33,21 +35,31 @@ import { DoctorTab } from '@/components/settings/sections/DoctorTab';
 import { UpdateTab } from '@/components/settings/sections/UpdateTab';
 import { BrowserTab } from '@/components/settings/sections/BrowserTab';
 
-type TabId = 'general' | 'account' | 'system' | 'container' | 'heartbeat' | 'voice' | 'proactive' | 'autopilot' | 'skillSynthesis' | 'redaction' | 'doctor' | 'update' | 'browser';
+/** Settings sub-tab whitelist (spec §5.3 式3). `?tab=` is validated against this
+ *  set; unknown values fall back to `general`. */
+const VALID_TABS = [
+  'general', 'account', 'system', 'container', 'heartbeat', 'voice',
+  'proactive', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'update', 'browser',
+] as const;
+type TabId = (typeof VALID_TABS)[number];
 
+/**
+ * SettingsPage (WP4.2) — the system settings surface rebuilt as a Multica
+ * Settings-式 shell (spec §5.3 式3): a grouped left rail (常用 / 進階, vertical
+ * ≥md, horizontal-scroll on mobile) driving a `max-w-3xl` scrolling content pane
+ * of 13 section panels. Replaces the former Calm Glass Page/PageHeader/Tabs +
+ * ChevronDown "advanced" disclosure; the `?tab=` whitelist and the legacy
+ * branding/cron deep-link redirects are preserved.
+ */
 export function SettingsPage() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const VALID_TABS: readonly TabId[] = [
-    'general', 'account', 'system', 'container', 'heartbeat', 'voice',
-    'proactive', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'update', 'browser',
-  ];
+  const [searchParams, setSearchParams] = useSearchParams();
   const tabParam = searchParams.get('tab');
+
   // Legacy deep-link redirects (bookmarks / older links) instead of a blank tab:
   //  - branding moved to /manage/distributors (R5)
-  //  - the cron/排程任務 settings tab was unified into the /routines page, so its
-  //    create/edit lives alongside the routine list (page-settings unification)
+  //  - the cron/排程任務 settings tab was unified into the /routines page.
   useEffect(() => {
     if (tabParam === 'branding') {
       navigate('/manage/distributors?tab=branding', { replace: true });
@@ -55,84 +67,88 @@ export function SettingsPage() {
       navigate('/routines', { replace: true });
     }
   }, [tabParam, navigate]);
-  const initialTab: TabId = VALID_TABS.includes(tabParam as TabId) ? (tabParam as TabId) : 'general';
-  const [activeTab, setActiveTab] = useState<TabId>(initialTab);
-  const [showAdvanced, setShowAdvanced] = useState(false);
 
-  const TAB_META: Record<TabId, { label: string; icon: React.ComponentType<{ className?: string }> }> = {
-    general: { label: intl.formatMessage({ id: 'settings.general' }), icon: Settings },
-    account: { label: intl.formatMessage({ id: 'settings.account' }), icon: KeyRound },
-    system: { label: intl.formatMessage({ id: 'settings.system' }), icon: Server },
-    container: { label: intl.formatMessage({ id: 'settings.container' }), icon: Container },
-    heartbeat: { label: intl.formatMessage({ id: 'settings.heartbeat' }), icon: HeartPulse },
-    voice: { label: intl.formatMessage({ id: 'settings.voice' }), icon: Mic },
-    proactive: { label: intl.formatMessage({ id: 'settings.proactive' }), icon: Zap },
-    autopilot: { label: intl.formatMessage({ id: 'settings.autopilot' }), icon: Workflow },
-    skillSynthesis: { label: intl.formatMessage({ id: 'settings.skillSynthesis' }), icon: Sparkles },
-    redaction: { label: intl.formatMessage({ id: 'settings.redaction' }), icon: EyeOff },
-    doctor: { label: intl.formatMessage({ id: 'settings.doctor' }), icon: Stethoscope },
-    update: { label: intl.formatMessage({ id: 'settings.update' }), icon: Download },
-    browser: { label: intl.formatMessage({ id: 'settings.browser' }), icon: Globe },
+  const activeTab: TabId = (VALID_TABS as readonly string[]).includes(tabParam ?? '')
+    ? (tabParam as TabId)
+    : 'general';
+  const setTab = (next: string) => {
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.set('tab', next);
+    setSearchParams(nextParams, { replace: true });
   };
-  // Non-engineers only need a handful of these day-to-day; the rest are
-  // system/engineering knobs tucked behind an "Advanced" disclosure so the
-  // default surface reads like a consumer app, not an ops console.
-  const EVERYDAY: TabId[] = ['general', 'account', 'voice', 'proactive', 'update'];
-  const ADVANCED: TabId[] = ['system', 'container', 'heartbeat', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser'];
-  const toItems = (ids: TabId[]) => ids.map((id) => ({ id, ...TAB_META[id] }));
-  const activeIsAdvanced = ADVANCED.includes(activeTab);
+
+  const t = (id: string) => intl.formatMessage({ id });
+
+  // Rail groups mirror the former everyday / advanced split.
+  const navGroups: SettingsNavGroup[] = [
+    {
+      label: t('settings.everyday'),
+      items: [
+        { value: 'general', label: t('settings.general'), icon: Settings },
+        { value: 'account', label: t('settings.account'), icon: KeyRound },
+        { value: 'voice', label: t('settings.voice'), icon: Mic },
+        { value: 'proactive', label: t('settings.proactive'), icon: Zap },
+        { value: 'update', label: t('settings.update'), icon: Download },
+      ],
+    },
+    {
+      label: t('settings.advanced'),
+      items: [
+        { value: 'system', label: t('settings.system'), icon: Server },
+        { value: 'container', label: t('settings.container'), icon: Container },
+        { value: 'heartbeat', label: t('settings.heartbeat'), icon: HeartPulse },
+        { value: 'autopilot', label: t('settings.autopilot'), icon: Workflow },
+        { value: 'skillSynthesis', label: t('settings.skillSynthesis'), icon: Sparkles },
+        { value: 'redaction', label: t('settings.redaction'), icon: EyeOff },
+        { value: 'doctor', label: t('settings.doctor'), icon: Stethoscope },
+        { value: 'browser', label: t('settings.browser'), icon: Globe },
+      ],
+    },
+  ];
 
   return (
-    <Page wide>
-      <PageHeader
-        icon={Settings}
-        title={intl.formatMessage({ id: 'nav.settings' })}
-        subtitle={intl.formatMessage({ id: 'settings.title' })}
-      />
-
-      <Tabs
-        items={toItems(EVERYDAY)}
-        value={activeTab}
-        onChange={(id) => setActiveTab(id as TabId)}
-      />
-
-      <button
-        type="button"
-        onClick={() => setShowAdvanced((v) => !v)}
-        aria-expanded={showAdvanced || activeIsAdvanced}
-        className="mt-3 flex items-center gap-1.5 text-xs font-medium text-stone-500 transition-colors hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200"
-      >
-        <ChevronDown
-          className={cn('h-3.5 w-3.5 transition-transform', !(showAdvanced || activeIsAdvanced) && '-rotate-90')}
-        />
-        {intl.formatMessage({ id: 'settings.advanced' })}
-        <span className="font-normal text-stone-400 dark:text-stone-500">
-          · {intl.formatMessage({ id: 'settings.advanced.hint' })}
-        </span>
-      </button>
-      {(showAdvanced || activeIsAdvanced) && (
-        <div className="mt-1.5">
-          <Tabs
-            items={toItems(ADVANCED)}
-            value={activeTab}
-            onChange={(id) => setActiveTab(id as TabId)}
-          />
-        </div>
-      )}
-
-      {activeTab === 'general' && <GeneralTab />}
-      {activeTab === 'account' && <AccountTab />}
-      {activeTab === 'system' && <SystemTab />}
-      {activeTab === 'container' && <ContainerTab />}
-      {activeTab === 'heartbeat' && <HeartbeatTab />}
-      {activeTab === 'voice' && <VoiceTab />}
-      {activeTab === 'proactive' && <ProactiveTab />}
-      {activeTab === 'autopilot' && <AutopilotTab />}
-      {activeTab === 'skillSynthesis' && <SkillSynthesisTab />}
-      {activeTab === 'redaction' && <RedactionTab />}
-      {activeTab === 'doctor' && <DoctorTab />}
-      {activeTab === 'update' && <UpdateTab />}
-      {activeTab === 'browser' && <BrowserTab />}
-    </Page>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <SettingsShell value={activeTab} onValueChange={setTab} groups={navGroups}>
+        <SettingsTab value="general" title={t('settings.general')}>
+          <GeneralTab />
+        </SettingsTab>
+        <SettingsTab value="account" title={t('settings.account.title')}>
+          <AccountTab />
+        </SettingsTab>
+        <SettingsTab value="system" title={t('settings.system')} description={t('settings.system.desc')}>
+          <SystemTab />
+        </SettingsTab>
+        <SettingsTab value="container" title={t('settings.container')} description={t('settings.container.desc')}>
+          <ContainerTab />
+        </SettingsTab>
+        <SettingsTab value="heartbeat" title={t('settings.heartbeat')} description={t('settings.heartbeat.desc')}>
+          <HeartbeatTab />
+        </SettingsTab>
+        <SettingsTab value="voice" title={t('voice.title')}>
+          <VoiceTab />
+        </SettingsTab>
+        <SettingsTab value="proactive" title={t('proactive.title')}>
+          <ProactiveTab />
+        </SettingsTab>
+        <SettingsTab value="autopilot" title={t('settings.autopilot')} description={t('settings.autopilot.desc')}>
+          <AutopilotTab />
+        </SettingsTab>
+        <SettingsTab value="skillSynthesis" title={t('settings.skillSynthesis')} description={t('skillSynthesis.desc')}>
+          <SkillSynthesisTab />
+        </SettingsTab>
+        <SettingsTab value="redaction" title={t('settings.redaction')}>
+          <RedactionTab />
+        </SettingsTab>
+        <SettingsTab value="doctor" title={t('settings.doctor')} description={t('settings.doctor.desc')}>
+          <DoctorTab />
+        </SettingsTab>
+        <SettingsTab value="update" title={t('settings.update')}>
+          <UpdateTab />
+        </SettingsTab>
+        <SettingsTab value="browser" title={t('settings.browser')} description={t('settings.browser.desc')}>
+          <BrowserTab />
+        </SettingsTab>
+      </SettingsShell>
+    </div>
   );
 }

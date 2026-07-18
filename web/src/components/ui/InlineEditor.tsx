@@ -66,12 +66,12 @@ export function InlineEditor({
         onClick={() => !readOnly && setEditing(true)}
         aria-label={ariaLabel}
         className={cn(
-          'w-full rounded-control px-1.5 py-1 text-left',
-          !readOnly && 'hover:bg-stone-500/8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 dark:hover:bg-white/5',
+          'w-full rounded-xl px-1.5 py-1 text-left',
+          !readOnly && 'outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50',
           className,
         )}
       >
-        <span className={cn(!value && 'text-stone-400 dark:text-stone-500', textClassName)}>
+        <span className={cn(!value && 'text-muted-foreground', textClassName)}>
           {value || placeholder || ''}
         </span>
       </button>
@@ -79,7 +79,7 @@ export function InlineEditor({
   }
 
   const shared =
-    'w-full resize-none rounded-control border border-[var(--panel-border-strong)] bg-[var(--panel-fill)] px-1.5 py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50';
+    'w-full resize-none rounded-lg border border-input bg-transparent px-1.5 py-1 outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30';
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Escape') {

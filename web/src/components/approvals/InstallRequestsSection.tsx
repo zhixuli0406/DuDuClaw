@@ -10,28 +10,31 @@ import {
   ShieldAlert,
   AlertTriangle,
   User,
+  Loader2,
 } from 'lucide-react';
 import { api, type InstallRequestInfo } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { toast, formatError } from '@/lib/toast';
-import { Card, Section, Badge, EmptyState, Button } from '@/components/ui';
+import { Card, CardContent, Badge, Empty, Button } from '@/components/mds';
 
 const SEVERITY_COLOR: Record<string, string> = {
-  critical: 'text-rose-500',
+  critical: 'text-destructive',
   error: 'text-orange-500',
   high: 'text-orange-500',
-  warning: 'text-amber-500',
-  medium: 'text-amber-500',
-  info: 'text-stone-400',
-  low: 'text-stone-400',
+  warning: 'text-warning',
+  medium: 'text-warning',
+  info: 'text-muted-foreground',
+  low: 'text-muted-foreground',
 };
 
-const RISK_TONE: Record<string, 'success' | 'warning' | 'danger' | 'neutral'> = {
-  Clean: 'success',
-  Low: 'success',
-  Medium: 'warning',
-  High: 'danger',
-  Critical: 'danger',
+type RiskBadge = { variant: 'secondary' | 'destructive'; className?: string };
+
+const RISK_BADGE: Record<string, RiskBadge> = {
+  Clean: { variant: 'secondary', className: 'text-success' },
+  Low: { variant: 'secondary', className: 'text-success' },
+  Medium: { variant: 'secondary', className: 'text-warning' },
+  High: { variant: 'destructive' },
+  Critical: { variant: 'destructive' },
 };
 
 /**
@@ -98,44 +101,48 @@ export function InstallRequestsSection() {
   if (!loading && items.length === 0) return null;
 
   return (
-    <Section title={intl.formatMessage({ id: 'install.request.section' })}>
+    <section className="space-y-3">
+      <h2 className="text-base font-medium text-foreground">
+        {intl.formatMessage({ id: 'install.request.section' })}
+      </h2>
       {loading ? null : (
         <div className="space-y-3">
           {items.map((item) => {
             const busy = !!deciding[item.id];
             const KindIcon = item.kind === 'skill' ? Puzzle : Plug;
             const stageLabel = intl.formatMessage({ id: `install.request.stage.${item.stage}`, defaultMessage: item.stage });
-            const riskTone = RISK_TONE[item.risk_level] ?? 'neutral';
+            const riskBadge = RISK_BADGE[item.risk_level] ?? { variant: 'secondary' as const };
             const passed = item.risk_level === 'Clean' || item.risk_level === 'Low' || item.risk_level === 'Medium';
             return (
               <Card key={item.id}>
+                <CardContent>
                 <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
                   <div className="flex min-w-0 items-start gap-3">
-                    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-amber-500/10 text-amber-600 dark:bg-amber-400/10 dark:text-amber-400">
+                    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-brand/10 text-brand">
                       <KindIcon className="h-[1.125rem] w-[1.125rem]" />
                     </span>
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
-                        <Badge tone="accent">
+                        <Badge>
                           {intl.formatMessage({ id: `install.request.kind.${item.kind}` })}
                         </Badge>
-                        <Badge tone="neutral">{stageLabel}</Badge>
-                        <span className="flex items-center gap-1 text-xs text-stone-500 dark:text-stone-400">
+                        <Badge variant="secondary">{stageLabel}</Badge>
+                        <span className="flex items-center gap-1 text-xs text-muted-foreground">
                           <User className="h-3 w-3" />
                           {item.requester_email || item.requester_id}
                           {' · '}
                           {intl.formatMessage({ id: `install.request.role.${item.requester_role}`, defaultMessage: item.requester_role })}
                           {item.requester_department && (
-                            <span className="text-stone-400 dark:text-stone-500">
+                            <span className="text-muted-foreground">
                               {' · '}{intl.formatMessage({ id: 'install.request.dept' })}{item.requester_department}
                             </span>
                           )}
                         </span>
                       </div>
 
-                      <h3 className="mt-1.5 truncate font-semibold text-stone-900 dark:text-stone-50">{item.title}</h3>
+                      <h3 className="mt-1.5 truncate font-semibold text-foreground">{item.title}</h3>
                       {item.description && (
-                        <p className="mt-0.5 break-words text-sm text-stone-600 dark:text-stone-300">
+                        <p className="mt-0.5 break-words text-sm text-muted-foreground">
                           {item.description}
                         </p>
                       )}
@@ -143,15 +150,15 @@ export function InstallRequestsSection() {
                       {/* Security scan verdict */}
                       <div className="mt-2 flex items-center gap-2 text-xs">
                         {passed ? (
-                          <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" />
+                          <ShieldCheck className="h-3.5 w-3.5 text-success" />
                         ) : (
-                          <ShieldAlert className="h-3.5 w-3.5 text-rose-500" />
+                          <ShieldAlert className="h-3.5 w-3.5 text-destructive" />
                         )}
-                        <span className="text-stone-500 dark:text-stone-400">
+                        <span className="text-muted-foreground">
                           {intl.formatMessage({ id: 'install.request.riskLabel' })}:
                         </span>
-                        <Badge tone={riskTone}>{item.risk_level}</Badge>
-                        <span className="text-stone-400 dark:text-stone-500">
+                        <Badge variant={riskBadge.variant} className={riskBadge.className}>{item.risk_level}</Badge>
+                        <span className="text-muted-foreground">
                           {intl.formatMessage({ id: 'install.request.findingsCount' }, { count: item.scan?.length ?? 0 })}
                         </span>
                       </div>
@@ -160,7 +167,7 @@ export function InstallRequestsSection() {
                           {item.scan.slice(0, 5).map((f, i) => (
                             <li key={i} className="flex items-start gap-1.5 text-xs">
                               <AlertTriangle className={`mt-0.5 h-3 w-3 shrink-0 ${SEVERITY_COLOR[f.severity] ?? SEVERITY_COLOR.info}`} />
-                              <span className="text-stone-600 dark:text-stone-400">
+                              <span className="text-muted-foreground">
                                 <span className={`font-semibold uppercase ${SEVERITY_COLOR[f.severity] ?? SEVERITY_COLOR.info}`}>{f.severity}</span>
                                 {' · '}{f.description}
                               </span>
@@ -169,7 +176,7 @@ export function InstallRequestsSection() {
                         </ul>
                       )}
 
-                      <div className="mt-2 flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
+                      <div className="mt-2 flex items-center gap-1 text-xs text-muted-foreground">
                         <Clock className="h-3 w-3" />
                         {new Date(item.created_at).toLocaleString('zh-TW', {
                           month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
@@ -184,24 +191,29 @@ export function InstallRequestsSection() {
                   </div>
 
                   <div className="flex shrink-0 items-center gap-2">
-                    <Button size="sm" variant="primary" icon={Check} pending={busy} disabled={busy} onClick={() => decide(item, true)}>
+                    <Button size="sm" variant="default" disabled={busy} onClick={() => decide(item, true)}>
+                      {busy ? <Loader2 className="animate-spin" /> : <Check />}
                       {intl.formatMessage({ id: 'install.request.approve' })}
                     </Button>
-                    <Button size="sm" variant="danger" icon={X} disabled={busy} onClick={() => decide(item, false)}>
+                    <Button size="sm" variant="destructive" disabled={busy} onClick={() => decide(item, false)}>
+                      <X />
                       {intl.formatMessage({ id: 'install.request.deny' })}
                     </Button>
                   </div>
                 </div>
+                </CardContent>
               </Card>
             );
           })}
           {items.length === 0 && (
             <Card>
-              <EmptyState icon={ShieldCheck} title={intl.formatMessage({ id: 'install.request.empty' })} />
+              <CardContent>
+                <Empty icon={ShieldCheck} title={intl.formatMessage({ id: 'install.request.empty' })} />
+              </CardContent>
             </Card>
           )}
         </div>
       )}
-    </Section>
+    </section>
   );
 }

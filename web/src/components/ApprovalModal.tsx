@@ -84,21 +84,21 @@ export function ApprovalModal() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div className="mx-4 w-full max-w-md rounded-2xl border border-stone-200 bg-white p-6 shadow-2xl dark:border-stone-700 dark:bg-stone-800">
+      <div className="mx-4 w-full max-w-md rounded-2xl border border-surface-border bg-surface p-6 shadow-2xl">
         {/* Header */}
         <div className="mb-4 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-amber-100 dark:bg-amber-900/30">
-            <ShieldAlert className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-warning/10">
+            <ShieldAlert className="h-5 w-5 text-warning" />
           </div>
           <div>
-            <h3 className="font-semibold text-stone-900 dark:text-stone-50">
+            <h3 className="font-semibold text-foreground">
               {intl.formatMessage({ id: 'browser.approvals.required', defaultMessage: 'Approval Required' })}
             </h3>
-            <p className="text-xs text-stone-500 dark:text-stone-400">
+            <p className="text-xs text-muted-foreground">
               {intl.formatMessage({ id: 'browser.approvals.agentId' })}: {request.agent_id}
             </p>
             {queue.length > 1 && (
-              <p className="text-xs font-medium text-amber-600 dark:text-amber-400">
+              <p className="text-xs font-medium text-warning">
                 {intl.formatMessage(
                   { id: 'browser.approvals.queued' },
                   { count: queue.length - 1 },
@@ -107,27 +107,27 @@ export function ApprovalModal() {
             )}
           </div>
           <div className="ml-auto flex items-center gap-1 font-mono text-sm">
-            <Clock className="h-4 w-4 text-stone-400" />
-            <span className={countdown <= 10 ? 'font-bold text-rose-500' : 'text-stone-500'}>
+            <Clock className="h-4 w-4 text-muted-foreground" />
+            <span className={countdown <= 10 ? 'font-bold text-destructive' : 'text-muted-foreground'}>
               {countdown}s
             </span>
           </div>
         </div>
 
         {/* Details */}
-        <div className="mb-5 space-y-2 rounded-lg bg-stone-50 p-3 dark:bg-stone-900">
+        <div className="mb-5 space-y-2 rounded-lg bg-muted p-3">
           <div className="flex gap-2 text-sm">
-            <span className="font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'browser.approvals.action', defaultMessage: 'Action' })}:</span>
-            <span className="font-medium text-stone-800 dark:text-stone-200">{request.action}</span>
+            <span className="font-medium text-muted-foreground">{intl.formatMessage({ id: 'browser.approvals.action', defaultMessage: 'Action' })}:</span>
+            <span className="font-medium text-foreground">{request.action}</span>
           </div>
           {request.url && (
             <div className="flex gap-2 text-sm">
-              <span className="font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'browser.approvals.url', defaultMessage: 'URL' })}:</span>
-              <span className="break-all text-stone-700 dark:text-stone-300">{request.url}</span>
+              <span className="font-medium text-muted-foreground">{intl.formatMessage({ id: 'browser.approvals.url', defaultMessage: 'URL' })}:</span>
+              <span className="break-all text-foreground">{request.url}</span>
             </div>
           )}
           {Object.keys(request.details).length > 0 && (
-            <pre className="mt-2 max-h-24 overflow-auto text-xs text-stone-600 dark:text-stone-400">
+            <pre className="mt-2 max-h-24 overflow-auto text-xs text-muted-foreground">
               {JSON.stringify(request.details, null, 2)}
             </pre>
           )}
@@ -137,7 +137,7 @@ export function ApprovalModal() {
         {responseError && (
           <div
             role="alert"
-            className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300"
+            className="mb-4 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
           >
             {responseError}
           </div>
@@ -147,14 +147,14 @@ export function ApprovalModal() {
         <div className="flex gap-3">
           <button
             onClick={() => handleResponse(false)}
-            className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-stone-300 px-4 py-2.5 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-100 dark:border-stone-600 dark:text-stone-300 dark:hover:bg-stone-700"
+            className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-surface-border px-4 py-2.5 text-sm font-medium text-foreground transition-colors hover:bg-muted"
           >
             <X className="h-4 w-4" />
             {intl.formatMessage({ id: 'browser.approvals.deny', defaultMessage: 'Deny' })}
           </button>
           <button
             onClick={() => handleResponse(true)}
-            className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-amber-500 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-amber-600"
+            className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-brand px-4 py-2.5 text-sm font-medium text-brand-foreground transition-colors hover:bg-brand/90"
           >
             <Check className="h-4 w-4" />
             {intl.formatMessage({ id: 'browser.approvals.approve' })}

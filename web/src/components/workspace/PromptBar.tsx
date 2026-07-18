@@ -83,7 +83,7 @@ export function PromptBar({ onSent }: { onSent?: () => void }) {
   return (
     <div
       className={cn(
-        'panel rounded-2xl px-4 pb-3 pt-4 shadow-sm',
+        'rounded-2xl border border-surface-border bg-surface px-4 pb-3 pt-4 shadow-[var(--surface-shadow)]',
         connectionState !== 'connected' && 'opacity-70'
       )}
     >
@@ -110,13 +110,13 @@ export function PromptBar({ onSent }: { onSent?: () => void }) {
           id: 'workspace.promptPlaceholder',
           defaultMessage: '問任何問題,交辦任何任務…',
         })}
-        className="w-full resize-none bg-transparent px-1 text-base text-stone-800 placeholder:text-stone-400 focus-visible:outline-none dark:text-stone-100 dark:placeholder:text-stone-500"
+        className="w-full resize-none bg-transparent px-1 text-base text-foreground placeholder:text-muted-foreground focus-visible:outline-none"
         disabled={connectionState !== 'connected'}
       />
 
       {/* Vision warning */}
       {showVisionWarning && (
-        <div className="mb-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+        <div className="mb-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
           {intl.formatMessage({ id: 'webchat.visionWarning' })}
         </div>
       )}
@@ -136,7 +136,7 @@ export function PromptBar({ onSent }: { onSent?: () => void }) {
           disabled={connectionState !== 'connected'}
           title={intl.formatMessage({ id: 'webchat.attach' })}
           aria-label={intl.formatMessage({ id: 'webchat.attach' })}
-          className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-stone-500 transition-colors hover:bg-stone-500/10 hover:text-stone-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 disabled:opacity-50 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200"
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-50"
         >
           <Plus className="h-5 w-5" />
         </button>
@@ -153,7 +153,7 @@ export function PromptBar({ onSent }: { onSent?: () => void }) {
           onClick={handleSend}
           disabled={!canSend}
           aria-label={intl.formatMessage({ id: 'workspace.send', defaultMessage: '送出' })}
-          className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-amber-500 text-white transition-colors hover:bg-amber-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 disabled:pointer-events-none disabled:opacity-50"
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-brand text-brand-foreground transition-colors outline-none hover:bg-brand/90 focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50"
         >
           {isStreaming ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send className="h-5 w-5" />}
         </button>
@@ -175,7 +175,7 @@ function VoiceButton() {
       disabled
       title={intl.formatMessage({ id: 'workspace.voiceComingSoon', defaultMessage: '語音功能即將推出' })}
       aria-label={intl.formatMessage({ id: 'workspace.voiceComingSoon', defaultMessage: '語音功能即將推出' })}
-      className="grid h-9 w-9 shrink-0 cursor-not-allowed place-items-center rounded-lg text-stone-300 dark:text-stone-600"
+      className="grid h-9 w-9 shrink-0 cursor-not-allowed place-items-center rounded-lg text-muted-foreground/50"
     >
       <AudioLines className="h-5 w-5" />
     </button>

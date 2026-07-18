@@ -1,26 +1,39 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
-import { Inbox } from 'lucide-react';
-import { api, type ApprovalItem, type TaskInfo, type DecisionInfo } from '@/lib/api';
+import {
+  Inbox as InboxIcon,
+  SlidersHorizontal,
+  CheckCheck,
+  Undo2,
+  ArrowLeft,
+  Check,
+  ExternalLink,
+} from 'lucide-react';
+import { api, type ApprovalItem, type TaskInfo, type DecisionInfo, type InstallRequestInfo } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useApprovalsStore } from '@/stores/approvals-store';
 import { toast, formatError } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import {
-  Page,
   PageHeader,
-  Card,
-  EmptyState,
-  SkeletonList,
-  Tabs,
-  usePanel,
-  celebrate,
-  Mono,
-  DuDu,
-} from '@/components/ui';
+  Button,
+  Badge,
+  Empty,
+  Skeleton,
+  ActorAvatar,
+  ResizablePanelGroup,
+  ResizablePanel,
+  ResizableHandle,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  useIsMobile,
+} from '@/components/mds';
 import { InboxList, type InboxGroup } from '@/components/inbox/InboxList';
-import { InboxToolbar } from '@/components/inbox/InboxToolbar';
 import { ApprovalDetailPanel } from '@/components/inbox/ApprovalDetailPanel';
 import { TYPE_META } from '@/components/inbox/meta';
 import type { InboxRowLabels } from '@/components/inbox/InboxRow';
@@ -35,7 +48,9 @@ import {
 import {
   type InboxItem,
   type InboxTab,
-  type InboxColumn,
+  type InboxGroupBy,
+  type InboxSortBy,
+  type InboxItemType,
   type InboxPrefs,
   INBOX_TABS,
   TYPE_URGENCY,
@@ -60,8 +75,22 @@ import {
 
 /** How many agents to poll for open decisions (best-effort, capped). */
 const DECISION_AGENT_CAP = 12;
+/** Max concurrent per-agent decision RPCs — the decisions poll is deferred and
+ *  chunked so opening the Inbox no longer fires ~17 RPCs at once (Bug#2). */
+const DECISION_POLL_CONCURRENCY = 4;
 /** Cap on failed-run rows pulled from the unified audit log. */
 const FAILED_RUN_CAP = 30;
+
+const GROUP_OPTIONS: InboxGroupBy[] = ['none', 'type', 'agent', 'channel'];
+const SORT_OPTIONS: InboxSortBy[] = ['urgency', 'time', 'stuck'];
+const CATEGORY_OPTIONS: (InboxItemType | 'all')[] = ['all', 'approval', 'install', 'decision', 'blocked', 'budget', 'failed_run'];
+
+/** Split an array into fixed-size chunks (for concurrency-capped polling). */
+function chunked<T>(arr: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
 
 interface RawEntry {
   item: InboxItem;
@@ -73,7 +102,7 @@ export function InboxPage() {
   const intl = useIntl();
   const t = useCallback((id: string) => intl.formatMessage({ id }), [intl]);
   const navigate = useNavigate();
-  const panel = usePanel();
+  const isMobile = useIsMobile();
   const connectionState = useConnectionStore((s) => s.state);
   const setPendingCount = useApprovalsStore((s) => s.setPendingCount);
 
@@ -84,6 +113,8 @@ export function InboxPage() {
   const [read, setRead] = useState<ReadonlySet<string>>(() => loadIdSet(READ_KEY));
   const [archived, setArchived] = useState<ReadonlySet<string>>(() => loadIdSet(ARCHIVED_KEY));
   const [undoStack, setUndoStack] = useState<RawEntry[]>([]);
+  // The open item in the detail pane (split layout).
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   // Fatigue protection (arXiv:2606.08919): today's approval volume, surfaced
   // (not enforced) so a tired operator notices before rubber-stamping.
   const [approvedToday, setApprovedToday] = useState<number>(() => readApprovedToday());
@@ -98,17 +129,21 @@ export function InboxPage() {
 
   const agentName = useCallback((id: string) => agentNames[id] ?? id, [agentNames]);
 
-  // ── Load: five sources, merged. Each is best-effort (a manager-gated source
-  // that errors for this viewer contributes nothing — fail-safe, not fail-loud).
+  // ── Load: six aggregate sources merged for the first paint, then a deferred,
+  // concurrency-capped per-agent decisions poll. Each source is best-effort (a
+  // manager-gated source that errors for this viewer contributes nothing —
+  // fail-safe, not fail-loud). Splitting the decisions poll out of the initial
+  // burst keeps the Inbox from firing ~17 RPCs the moment it opens (Bug#2).
   const load = useCallback(async () => {
-    const [approvalsRes, budgetRes, tasksRes, agentsRes, failedRes] = await Promise.all([
+    const [approvalsRes, budgetRes, tasksRes, agentsRes, failedRes, installRes] = await Promise.all([
       api.approvals.list().catch(() => null),
       api.budget.incidents().catch(() => null),
       api.tasks.list({ status: 'blocked' }).catch(() => null),
       api.agents.list().catch(() => null),
-      // B5: no dedicated failed-run RPC — the unified audit log's channel_failure
-      // source is the real, existing surface. (Not a stub.)
       api.audit.unifiedLog({ sources: ['channel_failure'], limit: FAILED_RUN_CAP }).catch(() => null),
+      // Install approval requests actionable by this viewer (manager/admin).
+      // Employees get 403 → null and simply see no install rows (Bug#3).
+      api.installRequests.list().catch(() => null),
     ]);
 
     const nameMap: Record<string, string> = {};
@@ -130,6 +165,21 @@ export function InboxPage() {
           actionable: true,
           status: 'pending',
           risk: approvalRisk(a.kind, a.payload),
+        },
+      });
+    }
+
+    for (const req of installRes?.requests ?? []) {
+      merged.push({
+        raw: req,
+        item: {
+          id: `install:${req.id}`,
+          type: 'install',
+          title: req.title,
+          timestamp: req.created_at,
+          urgency: TYPE_URGENCY.install,
+          actionable: true,
+          status: req.stage,
         },
       });
     }
@@ -184,35 +234,46 @@ export function InboxPage() {
       });
     }
 
-    // Decisions require a per-agent call — poll a capped set of agents.
+    // Paint the aggregate sources immediately so the list is usable without
+    // waiting on the per-agent decisions poll below.
+    setEntries(merged);
+    setLoading(false);
+
+    // Decisions require a per-agent call — poll a capped set of agents in
+    // small concurrency-limited waves (rather than one N-wide burst) and fold
+    // the results into the already-painted list.
     const agentIds = (agentsRes?.agents ?? []).slice(0, DECISION_AGENT_CAP).map((a) => a.name);
-    const decisionResults = await Promise.all(
-      agentIds.map((name) =>
-        api.decisions
-          .list(name, 10)
-          .then((r) => ({ name, decisions: r?.decisions ?? [] }))
-          .catch(() => ({ name, decisions: [] as DecisionInfo[] })),
-      ),
-    );
-    for (const { name, decisions } of decisionResults) {
-      for (const d of decisions) {
-        merged.push({
-          raw: { agentId: name, decision: d },
-          item: {
-            id: `decision:${name}:${d.id}`,
-            type: 'decision',
-            title: d.question,
-            agentId: name,
-            timestamp: d.created_at ?? undefined,
-            urgency: TYPE_URGENCY.decision,
-            actionable: true,
-            status: 'open',
-          },
-        });
+    const decisionEntries: RawEntry[] = [];
+    for (const wave of chunked(agentIds, DECISION_POLL_CONCURRENCY)) {
+      const results = await Promise.all(
+        wave.map((name) =>
+          api.decisions
+            .list(name, 10)
+            .then((r) => ({ name, decisions: r?.decisions ?? [] }))
+            .catch(() => ({ name, decisions: [] as DecisionInfo[] })),
+        ),
+      );
+      for (const { name, decisions } of results) {
+        for (const d of decisions) {
+          decisionEntries.push({
+            raw: { agentId: name, decision: d },
+            item: {
+              id: `decision:${name}:${d.id}`,
+              type: 'decision',
+              title: d.question,
+              agentId: name,
+              timestamp: d.created_at ?? undefined,
+              urgency: TYPE_URGENCY.decision,
+              actionable: true,
+              status: 'open',
+            },
+          });
+        }
       }
     }
-
-    setEntries(merged);
+    if (decisionEntries.length > 0) {
+      setEntries([...merged, ...decisionEntries]);
+    }
   }, [intl]);
 
   useEffect(() => {
@@ -260,6 +321,7 @@ export function InboxPage() {
         return next;
       });
       setUndoStack((s) => [entry, ...s].slice(0, 20));
+      setSelectedId((cur) => (cur === item.id ? null : cur));
       toast.success(t('inbox.archivedToast'));
       // Decisions have a server-side dismiss; other types are local-archive only.
       if (item.type === 'decision') {
@@ -283,22 +345,17 @@ export function InboxPage() {
     });
   }, []);
 
-  // Remove a decided approval from the queue and close its panel. Archiving (vs.
+  // Remove a decided approval from the queue and close its detail. Archiving (vs.
   // deleting) keeps the id out of every tab; undo deliberately can't cheaply
-  // resurrect a server-decided item. Shared by the generic decide() path and the
-  // skill_create panel (A1) — which decides itself and only signals removal here,
-  // so `approvals.decide` is never called twice for one approval.
-  const markDecided = useCallback(
-    (id: string) => {
-      setArchived((prev) => {
-        const next = withId(prev, id);
-        persistIdSet(ARCHIVED_KEY, next);
-        return next;
-      });
-      panel.clearPanel();
-    },
-    [panel],
-  );
+  // resurrect a server-decided item.
+  const markDecided = useCallback((id: string) => {
+    setArchived((prev) => {
+      const next = withId(prev, id);
+      persistIdSet(ARCHIVED_KEY, next);
+      return next;
+    });
+    setSelectedId((cur) => (cur === id ? null : cur));
+  }, []);
 
   const decide = useCallback(
     async (item: InboxItem, approve: boolean) => {
@@ -321,79 +378,14 @@ export function InboxPage() {
     [findEntry, intl, t, markDecided],
   );
 
-  const openApprovalPanel = useCallback(
-    (item: InboxItem) => {
-      const entry = findEntry(item.id);
-      if (!entry) return;
-      const a = entry.raw as ApprovalItem;
-      panel.setPanel({
-        title: t('inbox.approval.panelTitle'),
-        content: (
-          <ApprovalDetailPanel
-            approval={a}
-            agentName={agentName(a.agent_id)}
-            onApprove={() => decide(item, true)}
-            onReject={() => decide(item, false)}
-            onDecided={() => markDecided(item.id)}
-          />
-        ),
-      });
-      panel.setSheetOpen(true);
-    },
-    [findEntry, panel, t, agentName, decide, markDecided],
-  );
-
-  const openDetailPanel = useCallback(
-    (item: InboxItem) => {
-      const entry = findEntry(item.id);
-      panel.setPanel({
-        title: item.title,
-        content: (
-          <div className="space-y-2 text-sm text-stone-700 dark:text-stone-300">
-            <p>{item.title}</p>
-            {item.agentId && (
-              <p className="text-xs text-stone-400">
-                <Mono>{agentName(item.agentId)}</Mono>
-              </p>
-            )}
-            <pre className="max-h-64 overflow-auto rounded-control bg-stone-500/8 p-2 text-[11px] dark:bg-white/5">
-              {JSON.stringify(entry?.raw ?? item, null, 2)}
-            </pre>
-          </div>
-        ),
-      });
-      panel.setSheetOpen(true);
-    },
-    [findEntry, panel, agentName],
-  );
-
-  const open = useCallback(
+  // Open a row in the detail pane (marks it read).
+  const select = useCallback(
     (item: InboxItem) => {
       markRead(item.id);
-      switch (item.type) {
-        case 'approval':
-          openApprovalPanel(item);
-          break;
-        case 'blocked': {
-          const task = findEntry(item.id)?.raw as TaskInfo | undefined;
-          if (task) navigate(`/tasks/${task.id}`);
-          break;
-        }
-        case 'budget':
-          navigate('/manage/billing');
-          break;
-        case 'decision':
-          navigate('/agents');
-          break;
-        case 'failed_run':
-          openDetailPanel(item);
-          break;
-      }
+      setSelectedId(item.id);
     },
-    [markRead, openApprovalPanel, openDetailPanel, findEntry, navigate],
+    [markRead],
   );
-
-  const view = open; // the primary "view / go" button and Enter behave the same
 
   const markAllRead = useCallback(() => {
     setRead((prev) => {
@@ -404,16 +396,7 @@ export function InboxPage() {
     });
   }, [nonArchived]);
 
-  // ── Inbox Zero celebration (fires once on the >0 → 0 transition). ────────────
-  const prevCount = useRef<number | null>(null);
-  useEffect(() => {
-    if (loading) return;
-    const count = nonArchived.length;
-    if (prevCount.current != null && prevCount.current > 0 && count === 0) {
-      celebrate('inbox_zero', { message: t('inbox.zero.title') });
-    }
-    prevCount.current = count;
-  }, [nonArchived.length, loading, t]);
+  const isUnread = useCallback((item: InboxItem) => !read.has(item.id), [read]);
 
   // ── Tab population + grouping ────────────────────────────────────────────────
   const tabItems = useMemo(
@@ -428,7 +411,7 @@ export function InboxPage() {
   const sorted = useMemo(() => sortInbox(filtered, prefs.sortBy), [filtered, prefs.sortBy]);
 
   const groupLabel = useCallback(
-    (key: string, by: typeof prefs.groupBy, sample: InboxItem): string => {
+    (key: string, by: InboxGroupBy, sample: InboxItem): string => {
       if (by === 'type') return t(TYPE_META[sample.type].labelKey);
       if (by === 'agent') return key === '—' ? t('inbox.group.agent') : agentName(key);
       if (by === 'channel') return key === '—' ? t('inbox.group.channel') : key;
@@ -469,17 +452,12 @@ export function InboxPage() {
     () => ({
       typeLabel: (item) => t(TYPE_META[item.type].labelKey),
       riskLabel: (level: RiskLevel) => t(`approval.risk.${level}`),
-      approve: t('inbox.action.approve'),
-      reject: t('inbox.action.reject'),
-      view: t('inbox.action.view'),
       archive: t('inbox.action.archive'),
     }),
     [t],
   );
 
   // ── Fatigue signals (arXiv:2606.08919) ──────────────────────────────────────
-  // Same-kind clusters among *pending* approvals: hint that a batch is alike so
-  // the operator can spot-check representatively — never an auto-approve.
   const approvalKinds = useMemo(
     () => entries.filter((e) => e.item.type === 'approval').map((e) => (e.raw as ApprovalItem).kind),
     [entries],
@@ -499,127 +477,345 @@ export function InboxPage() {
     [nonArchived, read],
   );
 
-  const tabs = useMemo(
-    () =>
-      INBOX_TABS.map((tab) => ({
-        id: tab,
-        label: t(`inbox.tab.${tab}`),
-        badge: tabItemsFor(tab).length || undefined,
-      })),
-    [t, tabItemsFor],
-  );
-
-  const toggleColumn = useCallback(
-    (c: InboxColumn) => {
-      const has = prefs.columns.includes(c);
-      const next = has ? prefs.columns.filter((x) => x !== c) : [...prefs.columns, c];
-      updatePrefs({ columns: next.length ? next : prefs.columns });
-    },
-    [prefs.columns, updatePrefs],
-  );
-
   const canArchive = prefs.tab === 'mine';
 
-  return (
-    <Page>
-      <PageHeader
-        icon={Inbox}
-        title={t('inbox.title')}
-        subtitle={t('inbox.subtitle')}
-      />
+  // Keep the selection valid as the visible set changes.
+  useEffect(() => {
+    if (selectedId && !sorted.some((it) => it.id === selectedId)) setSelectedId(null);
+  }, [sorted, selectedId]);
 
-      {loading ? (
-        <Card padded={false}>
-          <div className="p-5">
-            <SkeletonList rows={4} rowClassName="h-16" />
-          </div>
-        </Card>
-      ) : nonArchived.length === 0 ? (
-        <Card>
-          <div className="flex flex-col items-center gap-3 py-10 text-center">
-            {/* Inbox Zero — DuDu celebrates the empty inbox (V9 / §7.3). */}
-            <div
-              data-dudu-slot="inbox-zero"
-              className="grid h-20 w-20 place-items-center rounded-bubble bg-amber-500/10"
-            >
-              <DuDu face="celebrating" size={72} />
-            </div>
-            <h2 className="text-lg font-semibold text-stone-800 dark:text-stone-100">{t('inbox.zero.title')}</h2>
-            <p className="max-w-sm text-sm text-stone-500 dark:text-stone-400">{t('inbox.zero.hint')}</p>
-          </div>
-        </Card>
-      ) : (
-        <div className="space-y-4">
-          {(approvedToday > 0 || batches.length > 0) && (
-            <div
-              className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-control bg-stone-500/6 px-3 py-2 text-xs text-stone-500 dark:bg-white/5 dark:text-stone-400"
-              role="status"
-            >
-              {approvedToday > 0 && (
-                <span
-                  className={cn(
-                    approvedToday >= FATIGUE_NUDGE_THRESHOLD && 'font-medium text-amber-700 dark:text-amber-400',
-                  )}
-                >
-                  {intl.formatMessage({ id: 'approval.fatigue.today' }, { count: approvedToday })}
-                  {approvedToday >= FATIGUE_NUDGE_THRESHOLD && ` · ${t('approval.fatigue.nudge')}`}
-                </span>
-              )}
-              {batches.map((b) => (
-                <span key={b.kind} className="rounded bg-stone-500/10 px-1.5 py-0.5 dark:bg-white/10">
-                  {intl.formatMessage(
-                    { id: 'approval.batch.hint' },
-                    { count: b.count, kind: approvalKindLabel(b.kind) },
-                  )}
-                </span>
-              ))}
-            </div>
-          )}
+  const selectedEntry = selectedId ? findEntry(selectedId) : undefined;
 
-          <Tabs items={tabs} value={prefs.tab} onChange={(id) => updatePrefs({ tab: id as InboxTab })} />
-
-          <InboxToolbar
-            showAllFilters={prefs.tab === 'all'}
-            showGroupBy={prefs.tab !== 'blocked'}
-            groupBy={prefs.groupBy}
-            onGroupBy={(v) => updatePrefs({ groupBy: v })}
-            sortBy={prefs.sortBy}
-            onSortBy={(v) => updatePrefs({ sortBy: v })}
-            columns={prefs.columns}
-            onToggleColumn={toggleColumn}
-            categoryFilter={prefs.categoryFilter}
-            onCategory={(v) => updatePrefs({ categoryFilter: v })}
-            statuses={statuses}
-            statusFilter={prefs.statusFilter}
-            onStatus={(v) => updatePrefs({ statusFilter: v })}
-            hasUndo={undoStack.length > 0}
-            onUndo={undo}
-            onMarkAllRead={markAllRead}
+  // ── Detail pane body ─────────────────────────────────────────────────────────
+  const detailBody = useMemo<ReactNode>(() => {
+    if (!selectedEntry) return null;
+    const { item, raw } = selectedEntry;
+    const typeLabel = t(TYPE_META[item.type].labelKey);
+    switch (item.type) {
+      case 'approval':
+        return (
+          <ApprovalDetailPanel
+            approval={raw as ApprovalItem}
+            agentName={agentName((raw as ApprovalItem).agent_id)}
+            onApprove={() => decide(item, true)}
+            onReject={() => decide(item, false)}
+            onDecided={() => markDecided(item.id)}
           />
+        );
+      case 'install': {
+        const req = raw as InstallRequestInfo;
+        return (
+          <DetailShell item={item} typeLabel={typeLabel}>
+            <div className="space-y-1 text-sm text-muted-foreground">
+              <p>{intl.formatMessage({ id: 'inbox.install.requester' }, { email: req.requester_email })}</p>
+              {req.requester_department && (
+                <p>{intl.formatMessage({ id: 'inbox.install.dept' }, { dept: req.requester_department })}</p>
+              )}
+              {req.description && <p className="text-foreground">{req.description}</p>}
+            </div>
+            <Button variant="brand" onClick={() => navigate('/approvals')}>
+              <ExternalLink />
+              {t('inbox.detail.reviewInstall')}
+            </Button>
+          </DetailShell>
+        );
+      }
+      case 'blocked': {
+        const task = raw as TaskInfo;
+        return (
+          <DetailShell item={item} typeLabel={typeLabel} agentName={item.agentId ? agentName(item.agentId) : undefined}>
+            {task.blocked_reason && (
+              <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{task.blocked_reason}</p>
+            )}
+            <Button variant="brand" onClick={() => navigate(`/tasks/${task.id}`)}>
+              <ExternalLink />
+              {t('inbox.detail.viewTask')}
+            </Button>
+          </DetailShell>
+        );
+      }
+      case 'budget':
+        return (
+          <DetailShell item={item} typeLabel={typeLabel} agentName={item.agentId ? agentName(item.agentId) : undefined}>
+            <Button variant="brand" onClick={() => navigate('/manage/billing')}>
+              <ExternalLink />
+              {t('inbox.detail.viewBilling')}
+            </Button>
+          </DetailShell>
+        );
+      case 'decision':
+        return (
+          <DetailShell item={item} typeLabel={typeLabel} agentName={item.agentId ? agentName(item.agentId) : undefined}>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="brand" onClick={() => navigate('/agents')}>
+                <ExternalLink />
+                {t('inbox.detail.viewAgent')}
+              </Button>
+              <Button variant="outline" onClick={() => archive(item)}>
+                <Check />
+                {t('inbox.detail.dismiss')}
+              </Button>
+            </div>
+          </DetailShell>
+        );
+      case 'failed_run':
+        return (
+          <DetailShell item={item} typeLabel={typeLabel} agentName={item.agentId ? agentName(item.agentId) : undefined}>
+            <pre className="max-h-96 overflow-auto rounded-lg bg-muted p-2 text-[11px] leading-relaxed text-muted-foreground">
+              {JSON.stringify(raw, null, 2)}
+            </pre>
+          </DetailShell>
+        );
+    }
+  }, [selectedEntry, agentName, decide, markDecided, navigate, archive, t, intl]);
 
-          <p className="px-1 text-[11px] text-stone-400 dark:text-stone-500">{t('inbox.keyboardHint')}</p>
+  // ── Left column: header + tabs + list ────────────────────────────────────────
+  const listColumn = (
+    <div className="flex h-full min-h-0 flex-col">
+      <PageHeader hideTrigger>
+        <InboxIcon className="size-4 shrink-0 text-muted-foreground" />
+        <h1 className="truncate text-sm font-medium">{t('inbox.title')}</h1>
+        <span className="font-mono text-xs tabular-nums text-muted-foreground">{nonArchived.length}</span>
+        <div className="ml-auto flex items-center gap-1">
+          {undoStack.length > 0 && (
+            <Button variant="ghost" size="icon-sm" onClick={undo} title={t('inbox.undo')} aria-label={t('inbox.undo')}>
+              <Undo2 />
+            </Button>
+          )}
+          <Button variant="ghost" size="icon-sm" onClick={markAllRead} title={t('inbox.markAllRead')} aria-label={t('inbox.markAllRead')}>
+            <CheckCheck />
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button variant="ghost" size="icon-sm" aria-label={t('inbox.group.label')}>
+                  <SlidersHorizontal />
+                </Button>
+              }
+            />
+            <DropdownMenuContent className="min-w-44">
+              <DropdownMenuLabel>{t('inbox.group.label')}</DropdownMenuLabel>
+              {GROUP_OPTIONS.map((g) => (
+                <DropdownMenuItem
+                  key={g}
+                  disabled={prefs.tab === 'blocked'}
+                  onClick={() => updatePrefs({ groupBy: g })}
+                  className={cn(prefs.groupBy === g && 'font-medium text-foreground')}
+                >
+                  <span className="flex-1">{t(`inbox.group.${g}`)}</span>
+                  {prefs.groupBy === g && <Check className="size-3.5 text-brand" />}
+                </DropdownMenuItem>
+              ))}
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>{t('inbox.sort.label')}</DropdownMenuLabel>
+              {SORT_OPTIONS.map((s) => (
+                <DropdownMenuItem
+                  key={s}
+                  onClick={() => updatePrefs({ sortBy: s })}
+                  className={cn(prefs.sortBy === s && 'font-medium text-foreground')}
+                >
+                  <span className="flex-1">{t(`inbox.sort.${s}`)}</span>
+                  {prefs.sortBy === s && <Check className="size-3.5 text-brand" />}
+                </DropdownMenuItem>
+              ))}
+              {prefs.tab === 'all' && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel>{t('inbox.filter.category')}</DropdownMenuLabel>
+                  {CATEGORY_OPTIONS.map((c) => (
+                    <DropdownMenuItem
+                      key={c}
+                      onClick={() => updatePrefs({ categoryFilter: c })}
+                      className={cn(prefs.categoryFilter === c && 'font-medium text-foreground')}
+                    >
+                      <span className="flex-1">{c === 'all' ? t('inbox.filter.all') : t(`inbox.type.${c}`)}</span>
+                      {prefs.categoryFilter === c && <Check className="size-3.5 text-brand" />}
+                    </DropdownMenuItem>
+                  ))}
+                  {statuses.length > 0 && (
+                    <>
+                      <DropdownMenuLabel>{t('inbox.filter.status')}</DropdownMenuLabel>
+                      <DropdownMenuItem
+                        onClick={() => updatePrefs({ statusFilter: 'all' })}
+                        className={cn(prefs.statusFilter === 'all' && 'font-medium text-foreground')}
+                      >
+                        <span className="flex-1">{t('inbox.filter.all')}</span>
+                        {prefs.statusFilter === 'all' && <Check className="size-3.5 text-brand" />}
+                      </DropdownMenuItem>
+                      {statuses.map((s) => (
+                        <DropdownMenuItem
+                          key={s}
+                          onClick={() => updatePrefs({ statusFilter: s })}
+                          className={cn(prefs.statusFilter === s && 'font-medium text-foreground')}
+                        >
+                          <span className="flex-1 truncate">{s}</span>
+                          {prefs.statusFilter === s && <Check className="size-3.5 text-brand" />}
+                        </DropdownMenuItem>
+                      ))}
+                    </>
+                  )}
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </PageHeader>
 
+      {/* Tabs — five scopes with counts. */}
+      <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-surface-border px-2 py-1.5">
+        {INBOX_TABS.map((tab) => {
+          const count = tabItemsFor(tab).length;
+          const active = prefs.tab === tab;
+          return (
+            <button
+              key={tab}
+              type="button"
+              onClick={() => updatePrefs({ tab })}
+              aria-pressed={active}
+              className={cn(
+                'flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors',
+                active ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-surface-hover',
+              )}
+            >
+              {t(`inbox.tab.${tab}`)}
+              {count > 0 && <span className="font-mono tabular-nums text-muted-foreground/70">{count}</span>}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Fatigue hint (compact). */}
+      {(approvedToday > 0 || batches.length > 0) && (
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-surface-border px-3 py-1.5 text-[11px] text-muted-foreground" role="status">
+          {approvedToday > 0 && (
+            <span className={cn(approvedToday >= FATIGUE_NUDGE_THRESHOLD && 'font-medium text-warning')}>
+              {intl.formatMessage({ id: 'approval.fatigue.today' }, { count: approvedToday })}
+              {approvedToday >= FATIGUE_NUDGE_THRESHOLD && ` · ${t('approval.fatigue.nudge')}`}
+            </span>
+          )}
+          {batches.map((b) => (
+            <span key={b.kind} className="rounded bg-muted px-1.5 py-0.5">
+              {intl.formatMessage({ id: 'approval.batch.hint' }, { count: b.count, kind: approvalKindLabel(b.kind) })}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* List */}
+      <div className="min-h-0 flex-1 overflow-y-auto px-2 py-1">
+        {loading ? (
+          <div className="space-y-2 p-2">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <Skeleton key={i} className="h-10 w-full" />
+            ))}
+          </div>
+        ) : (
           <InboxList
             groups={groups}
-            columns={prefs.columns}
             canArchive={canArchive}
             agentName={agentName}
             labels={rowLabels}
-            onOpen={open}
-            onApprove={(item) => decide(item, true)}
-            onReject={(item) => decide(item, false)}
-            onView={view}
+            selectedId={selectedId}
+            isUnread={isUnread}
+            onSelect={select}
             onArchive={archive}
             onUnread={(item) => markUnread(item.id)}
             onUndo={undo}
-            emptyState={
-              <Card>
-                <EmptyState icon={Inbox} title={t('inbox.emptyTab')} />
-              </Card>
-            }
+            emptyState={<Empty icon={InboxIcon} title={t('inbox.emptyTab')} variant="dashed" className="mt-6" />}
           />
+        )}
+      </div>
+      {/* Keyboard shortcuts (j/k/Enter…) are meaningless on touch devices —
+          hide the hint below the md breakpoint / on the mobile layout (#8). */}
+      <p className="hidden shrink-0 border-t border-surface-border px-3 py-1.5 text-[11px] text-muted-foreground/70 md:block">
+        {t('inbox.keyboardHint')}
+      </p>
+    </div>
+  );
+
+  // ── Detail column ────────────────────────────────────────────────────────────
+  const detailColumn = (
+    <div className="flex h-full min-h-0 flex-col">
+      {isMobile && selectedEntry && (
+        <div className="flex h-12 shrink-0 items-center gap-2 border-b border-surface-border px-2">
+          <Button variant="ghost" size="icon-sm" onClick={() => setSelectedId(null)} aria-label={t('common.back')}>
+            <ArrowLeft />
+          </Button>
+          <span className="truncate text-sm font-medium">{selectedEntry.item.title}</span>
         </div>
       )}
-    </Page>
+      {selectedEntry ? (
+        <div className="min-h-0 flex-1 overflow-y-auto p-4 md:p-6">{detailBody}</div>
+      ) : (
+        <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
+          <InboxIcon className="size-10 text-muted-foreground/30" />
+          <p className="text-sm text-muted-foreground">{t('inbox.detail.empty')}</p>
+        </div>
+      )}
+    </div>
+  );
+
+  // ── Whole-inbox empty (nothing in any tab, not loading). ─────────────────────
+  const totallyEmpty = !loading && nonArchived.length === 0;
+
+  return (
+    <div className="-mx-4 -mt-4 flex min-h-0 flex-1 md:-mx-6 md:-mt-6 md:-mb-6">
+      {isMobile ? (
+        selectedEntry ? (
+          detailColumn
+        ) : totallyEmpty ? (
+          <div className="flex h-full w-full flex-col">
+            {listColumn}
+          </div>
+        ) : (
+          <div className="w-full">{listColumn}</div>
+        )
+      ) : (
+        <ResizablePanelGroup orientation="horizontal" id="inbox-split" className="h-full w-full">
+          <ResizablePanel defaultSize={320} minSize={240} maxSize={480} className="border-r border-surface-border">
+            {listColumn}
+          </ResizablePanel>
+          <ResizableHandle />
+          <ResizablePanel minSize="40">{detailColumn}</ResizablePanel>
+        </ResizablePanelGroup>
+      )}
+    </div>
+  );
+}
+
+/** Shared detail scaffold for the non-approval item types. */
+function DetailShell({
+  item,
+  typeLabel,
+  agentName,
+  children,
+}: {
+  item: InboxItem;
+  typeLabel: string;
+  agentName?: string;
+  children: ReactNode;
+}) {
+  const meta = TYPE_META[item.type];
+  const Icon = meta.icon;
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start gap-3">
+        {item.agentId ? (
+          <ActorAvatar actorType="agent" size="lg" name={agentName ?? item.agentId} />
+        ) : (
+          <span className="grid size-8 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground ring-1 ring-surface-border">
+            <Icon className="size-4" />
+          </span>
+        )}
+        <div className="min-w-0 flex-1 space-y-1">
+          <div className="flex items-center gap-2">
+            <Badge variant="secondary">{typeLabel}</Badge>
+            {agentName && <span className="truncate text-xs text-muted-foreground">{agentName}</span>}
+          </div>
+          <h2 className="text-lg font-medium text-foreground">{item.title}</h2>
+        </div>
+      </div>
+      {children}
+    </div>
   );
 }

@@ -97,15 +97,15 @@ export function MicButton({
       onPointerCancel={handleStop}
       onPointerLeave={handleStop}
       className={cn(
-        'grid h-11 w-11 shrink-0 place-items-center rounded-control transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+        'grid size-8 shrink-0 place-items-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
         capturing
-          ? 'animate-pulse bg-rose-500 text-white'
-          : 'text-stone-500 hover:bg-stone-500/10 hover:text-stone-700 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200',
+          ? 'animate-pulse bg-destructive text-white motion-reduce:animate-none'
+          : 'text-muted-foreground hover:bg-muted hover:text-foreground',
         isDisabled && 'cursor-not-allowed opacity-50 hover:bg-transparent',
         className,
       )}
     >
-      {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Mic className="h-5 w-5" />}
+      {busy ? <Loader2 className="size-4 animate-spin" /> : <Mic className="size-4" />}
     </button>
   );
 }

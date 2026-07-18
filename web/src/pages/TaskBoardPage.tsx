@@ -4,20 +4,36 @@ import { useNavigate, useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { Dialog } from '@/components/shared/Dialog';
 import {
-  Page,
   PageHeader,
-  Card,
-  Badge,
   Button,
-  EmptyState,
-  GroupHeader,
+  Badge,
+  Empty,
+  Segmented,
+  Checkbox,
+  ActorAvatar,
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogClose,
+  type SegmentedOption,
+} from '@/components/mds';
+import {
   StatusIcon,
   PriorityIcon,
-  CharacterAvatar,
-  Mono,
-  controlClass,
+  type TaskStatusKey,
 } from '@/components/ui';
 import { CreateTaskModal, TaskDoneBurst, celebrateTaskDone } from '@/components/task';
 import { toStatusKey, toBackendStatus } from '@/lib/task-status';
@@ -25,20 +41,20 @@ import { timeAgo } from '@/lib/format';
 import type { TaskInfo, TaskStatus, TaskPriority, TaskCreateParams } from '@/lib/api';
 import {
   Plus,
-  GripVertical,
-  Clock,
-  AlertCircle,
-  CheckCircle2,
-  Ban,
-  Filter,
   Trash2,
+  Filter as FilterIcon,
+  SlidersHorizontal,
   KanbanSquare,
-  List,
+  List as ListIcon,
+  Check,
+  X,
+  ChevronDown,
 } from 'lucide-react';
 
-// ── Preferences (localStorage, §4.4) ────────────────────────
+// ── Preferences (localStorage, §5.4 view memory) ────────────
 const VIEW_KEY = 'duduclaw:tasks:view';
 const GROUP_KEY = 'duduclaw:tasks:group';
+const ORDER_KEY = 'duduclaw:tasks:order';
 // Persisted set of collapsed group/swimlane keys (shared by the list group-by
 // and the kanban by-agent swimlanes, both keyed by assignee).
 const COLLAPSE_KEY = 'duduclaw:tasks:collapsed';
@@ -47,6 +63,7 @@ const COLLAPSE_KEY = 'duduclaw:tasks:collapsed';
 const MANY_AGENTS = 4;
 type ViewMode = 'kanban' | 'list';
 type GroupMode = 'status' | 'assignee';
+type OrderMode = 'recent' | 'priority' | 'title';
 
 function readPref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
   try {
@@ -84,26 +101,29 @@ function writeCollapsed(s: ReadonlySet<string>) {
   }
 }
 
-const COLUMNS: ReadonlyArray<{ status: TaskStatus; icon: React.ComponentType<{ className?: string }> }> = [
-  { status: 'todo', icon: Clock },
-  { status: 'in_progress', icon: AlertCircle },
-  { status: 'done', icon: CheckCircle2 },
-  { status: 'blocked', icon: Ban },
+const COLUMNS: ReadonlyArray<{ status: TaskStatus }> = [
+  { status: 'todo' },
+  { status: 'in_progress' },
+  // P2a: autonomous goal tasks parked for a human decision (retry/done/abort).
+  { status: 'needs_human' },
+  { status: 'done' },
+  { status: 'blocked' },
 ];
 
-const COLUMN_STYLES: Record<TaskStatus, string> = {
-  todo: 'border-t-stone-400',
-  in_progress: 'border-t-amber-500',
-  done: 'border-t-emerald-500',
-  blocked: 'border-t-rose-500',
-};
+const PRIORITY_RANK: Record<TaskPriority, number> = { urgent: 0, high: 1, medium: 2, low: 3 };
 
-const PRIORITY_TONES: Record<TaskPriority, 'neutral' | 'info' | 'warning' | 'danger'> = {
-  low: 'neutral',
-  medium: 'info',
-  high: 'warning',
-  urgent: 'danger',
-};
+/** Order rows within a group by the active ordering preference (pure). */
+function orderRows(rows: ReadonlyArray<TaskInfo>, order: OrderMode): TaskInfo[] {
+  const copy = [...rows];
+  if (order === 'priority') {
+    copy.sort((a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority] || b.updated_at.localeCompare(a.updated_at));
+  } else if (order === 'title') {
+    copy.sort((a, b) => a.title.localeCompare(b.title));
+  } else {
+    copy.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  }
+  return copy;
+}
 
 // ── Board card ──────────────────────────────────────────────
 function TaskCard({
@@ -130,52 +150,46 @@ function TaskCard({
     <div
       draggable
       onDragStart={handleDragStart}
-      className="panel panel-hover group cursor-grab rounded-card p-3 active:cursor-grabbing"
+      onClick={() => onOpen(task.id)}
+      className="group/card w-64 shrink-0 cursor-grab rounded-lg border border-surface-border bg-surface p-3 shadow-[var(--surface-shadow)] transition-colors hover:bg-surface-hover active:cursor-grabbing"
     >
       <div className="flex items-start justify-between gap-2">
-        <div className="flex min-w-0 items-start gap-2">
-          <GripVertical className="mt-0.5 h-4 w-4 flex-shrink-0 text-stone-300 dark:text-stone-600" />
-          <div className="min-w-0">
-            <button
-              onClick={() => onOpen(task.id)}
-              className="text-left text-sm font-medium text-stone-900 hover:text-amber-600 dark:text-stone-50 dark:hover:text-amber-400"
-            >
-              {task.title}
-            </button>
-            {task.description && (
-              <p className="mt-1 line-clamp-2 text-xs text-stone-500 dark:text-stone-400">{task.description}</p>
-            )}
-          </div>
-        </div>
+        <p className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{task.title}</p>
         <button
-          onClick={() => onRemove(task)}
-          className="flex-shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRemove(task);
+          }}
+          className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/card:opacity-100 pointer-coarse:opacity-100"
           title={intl.formatMessage({ id: 'tasks.remove' })}
+          aria-label={intl.formatMessage({ id: 'tasks.remove' })}
         >
-          <Trash2 className="h-3.5 w-3.5 text-stone-400 hover:text-rose-500" />
+          <Trash2 className="size-3.5" />
         </button>
       </div>
 
-      <div className="mt-3 flex items-center justify-between">
-        <div className="flex items-center gap-1.5">
+      {task.description && (
+        <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{task.description}</p>
+      )}
+
+      <div className="mt-3 flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-1.5">
           <PriorityIcon priority={task.priority} size="sm" />
-          <Badge tone={PRIORITY_TONES[task.priority]}>
-            {intl.formatMessage({ id: `tasks.priority.${task.priority}` })}
-          </Badge>
+          <span className="font-mono text-xs tabular-nums text-muted-foreground">{timeAgo(task.updated_at)}</span>
         </div>
         {agent && (
-          <span className="flex items-center gap-1.5" title={agent.display_name}>
-            <CharacterAvatar agentId={agent.name} name={agent.display_name} size={22} animated={false} />
-            <span className="max-w-[84px] truncate text-xs text-stone-500 dark:text-stone-400">
-              {agent.display_name}
-            </span>
-          </span>
+          <ActorAvatar actorType="agent" size="sm" name={agent.display_name} aria-label={agent.display_name} />
         )}
       </div>
 
       {task.status === 'blocked' && task.blocked_reason && (
-        <div className="mt-2 rounded-md bg-rose-50 px-2 py-1 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
-          {task.blocked_reason}
+        <div className="mt-2 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">{task.blocked_reason}</div>
+      )}
+      {task.status === 'needs_human' && (
+        <div className="mt-2 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">
+          <span className="font-medium">{intl.formatMessage({ id: 'tasks.column.needs_human' })}</span>
+          {task.judge_feedback ? `：${task.judge_feedback}` : ''}
         </div>
       )}
     </div>
@@ -185,53 +199,60 @@ function TaskCard({
 // ── Kanban column ───────────────────────────────────────────
 function KanbanColumn({
   status,
-  icon: Icon,
   tasks,
   agents,
   onDrop,
   onOpen,
   onRemove,
+  onAdd,
 }: {
   status: TaskStatus;
-  icon: React.ComponentType<{ className?: string }>;
   tasks: ReadonlyArray<TaskInfo>;
   agents: ReadonlyArray<{ name: string; display_name: string }>;
   onDrop: (taskId: string, status: TaskStatus) => void;
   onOpen: (id: string) => void;
   onRemove: (task: TaskInfo) => void;
+  onAdd: () => void;
 }) {
   const intl = useIntl();
   const [isDragOver, setIsDragOver] = useState(false);
 
   return (
-    <div
-      className={cn('panel flex min-h-[300px] flex-col border-t-4', COLUMN_STYLES[status], isDragOver && 'ring-2 ring-amber-400/50')}
-      onDragOver={(e) => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = 'move';
-        setIsDragOver(true);
-      }}
-      onDragLeave={() => setIsDragOver(false)}
-      onDrop={(e) => {
-        e.preventDefault();
-        setIsDragOver(false);
-        const taskId = e.dataTransfer.getData('text/plain');
-        if (taskId) onDrop(taskId, status);
-      }}
-    >
-      <div className="flex items-center justify-between border-b border-[var(--panel-border)] px-4 py-3">
-        <div className="flex items-center gap-2">
-          <Icon className="h-4 w-4 text-stone-500 dark:text-stone-400" />
-          <h3 className="text-sm font-semibold text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: `tasks.column.${status}` })}
-          </h3>
-          <Badge tone="neutral" className="tabular-nums">
-            {tasks.length}
-          </Badge>
-        </div>
+    <div className="flex w-70 shrink-0 flex-col">
+      <div className="flex items-center gap-2 px-1 pb-2">
+        <StatusIcon status={toStatusKey(status)} size="sm" />
+        <h3 className="text-sm font-medium text-foreground">
+          {intl.formatMessage({ id: `tasks.column.${status}` })}
+        </h3>
+        <span className="font-mono text-xs tabular-nums text-muted-foreground">{tasks.length}</span>
+        <button
+          type="button"
+          onClick={onAdd}
+          className="ml-auto rounded p-0.5 text-muted-foreground hover:bg-surface-hover hover:text-foreground"
+          title={intl.formatMessage({ id: 'tasks.create' })}
+          aria-label={`${intl.formatMessage({ id: 'tasks.create' })} · ${intl.formatMessage({ id: `tasks.column.${status}` })}`}
+        >
+          <Plus className="size-4" />
+        </button>
       </div>
-
-      <div className="flex-1 space-y-2 p-3">
+      <div
+        className={cn(
+          'flex min-h-[200px] flex-col gap-2 rounded-xl bg-muted/40 p-2 transition-shadow',
+          isDragOver && 'ring-2 ring-brand/25',
+        )}
+        onDragOver={(e) => {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          setIsDragOver(true);
+        }}
+        onDragLeave={() => setIsDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setIsDragOver(false);
+          const taskId = e.dataTransfer.getData('text/plain');
+          if (taskId) onDrop(taskId, status);
+        }}
+      >
         {tasks.map((task) => (
           <TaskCard
             key={task.id}
@@ -242,16 +263,45 @@ function KanbanColumn({
           />
         ))}
         {tasks.length === 0 && (
-          <div
-            className={cn(
-              'flex items-center justify-center rounded-card border-2 border-dashed py-8 text-xs text-stone-400 transition-colors dark:text-stone-600',
-              isDragOver ? 'border-amber-400 bg-amber-50/50 dark:bg-amber-900/10' : 'border-[var(--panel-border)]',
-            )}
-          >
+          <p className="px-2 py-6 text-center text-xs text-muted-foreground/70">
             {intl.formatMessage({ id: 'tasks.dropHint' })}
-          </div>
+          </p>
         )}
       </div>
+    </div>
+  );
+}
+
+/** One horizontal board (five status columns), shared by the flat + swimlane views. */
+function KanbanBoard({
+  rows,
+  agents,
+  onDrop,
+  onOpen,
+  onRemove,
+  onAdd,
+}: {
+  rows: ReadonlyArray<TaskInfo>;
+  agents: ReadonlyArray<{ name: string; display_name: string }>;
+  onDrop: (taskId: string, status: TaskStatus) => void;
+  onOpen: (id: string) => void;
+  onRemove: (task: TaskInfo) => void;
+  onAdd: () => void;
+}) {
+  return (
+    <div className="flex gap-4 overflow-x-auto p-2">
+      {COLUMNS.map(({ status }) => (
+        <KanbanColumn
+          key={status}
+          status={status}
+          tasks={rows.filter((t) => t.status === status)}
+          agents={agents}
+          onDrop={onDrop}
+          onOpen={onOpen}
+          onRemove={onRemove}
+          onAdd={onAdd}
+        />
+      ))}
     </div>
   );
 }
@@ -260,36 +310,270 @@ function KanbanColumn({
 function TaskListRow({
   task,
   agent,
+  selected,
+  onToggleSelect,
   onOpen,
   onStatus,
 }: {
   task: TaskInfo;
   agent?: { name: string; display_name: string };
+  selected: boolean;
+  onToggleSelect: (id: string) => void;
   onOpen: (id: string) => void;
-  onStatus: (task: TaskInfo, key: import('@/components/ui').TaskStatusKey) => void;
+  onStatus: (task: TaskInfo, key: TaskStatusKey) => void;
 }) {
+  const intl = useIntl();
   return (
-    <li className="flex items-center gap-3 px-4 py-2.5 transition-colors hover:bg-stone-500/5 dark:hover:bg-white/5">
-      <StatusIcon status={toStatusKey(task.status)} size="sm" onChange={(key) => onStatus(task, key)} />
+    <li
+      onClick={() => onOpen(task.id)}
+      className={cn(
+        'group/row flex h-9 cursor-pointer items-center gap-2 px-4 text-sm transition-colors',
+        selected ? 'bg-surface-selected' : 'hover:bg-surface-hover',
+      )}
+    >
+      {/* Selection checkbox — reveals on hover, sticky once selected. */}
+      <span
+        onClick={(e) => e.stopPropagation()}
+        className={cn(
+          'flex shrink-0 items-center transition-opacity',
+          selected ? 'opacity-100' : 'opacity-0 group-hover/row:opacity-100 pointer-coarse:opacity-100',
+        )}
+      >
+        <Checkbox
+          checked={selected}
+          onCheckedChange={() => onToggleSelect(task.id)}
+          aria-label={intl.formatMessage({ id: 'tasks.select.toggle' })}
+        />
+      </span>
+
+      {/* Inline status editor (kept: list quick-status change). */}
+      <span onClick={(e) => e.stopPropagation()} className="flex shrink-0 items-center">
+        <StatusIcon status={toStatusKey(task.status)} size="sm" onChange={(key) => onStatus(task, key)} />
+      </span>
+
+      <span className="hidden w-16 shrink-0 font-mono text-xs tabular-nums text-muted-foreground md:inline">
+        {task.id.slice(0, 8)}
+      </span>
+
       <button
         type="button"
-        onClick={() => onOpen(task.id)}
-        className="min-w-0 flex-1 truncate text-left text-sm font-medium text-stone-800 hover:text-amber-600 dark:text-stone-100 dark:hover:text-amber-400"
+        onClick={(e) => {
+          e.stopPropagation();
+          onOpen(task.id);
+        }}
+        className="min-w-0 flex-1 truncate text-left text-sm text-foreground hover:text-foreground/80"
       >
         {task.title}
       </button>
-      <PriorityIcon priority={task.priority} size="sm" />
-      {agent && (
-        <span className="hidden items-center gap-1.5 sm:flex" title={agent.display_name}>
-          <CharacterAvatar agentId={agent.name} name={agent.display_name} size={24} animated={false} />
-          <span className="max-w-[100px] truncate text-xs text-stone-500 dark:text-stone-400">{agent.display_name}</span>
+
+      {task.tags.length > 0 && (
+        <span className="hidden shrink-0 items-center gap-1 md:flex">
+          {task.tags.slice(0, 3).map((tag) => (
+            <Badge key={tag} variant="secondary" className="max-w-24 truncate">
+              {tag}
+            </Badge>
+          ))}
         </span>
       )}
-      <Mono className="hidden w-16 shrink-0 text-right text-[0.6875rem] md:inline">{task.id.slice(0, 8)}</Mono>
-      <span className="w-12 shrink-0 text-right text-[0.6875rem] tabular-nums text-stone-400 dark:text-stone-500">
+
+      <PriorityIcon priority={task.priority} size="sm" className="shrink-0" />
+
+      <span className="hidden w-10 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground sm:inline">
         {timeAgo(task.updated_at)}
       </span>
+
+      {agent && (
+        <span className="hidden shrink-0 sm:inline-flex" title={agent.display_name}>
+          <ActorAvatar actorType="agent" size="sm" name={agent.display_name} aria-label={agent.display_name} />
+        </span>
+      )}
     </li>
+  );
+}
+
+/** Plain Multica swimlane header (status/agent glyph + name + count + collapse). */
+function SwimlaneHeader({
+  label,
+  avatar,
+  count,
+  collapsed,
+  onToggle,
+}: {
+  label: string;
+  avatar?: React.ReactNode;
+  count: number;
+  collapsed: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={!collapsed}
+      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-surface-hover"
+    >
+      <ChevronDown className={cn('size-4 shrink-0 text-muted-foreground transition-transform', collapsed && '-rotate-90')} />
+      {avatar}
+      <span className="truncate text-sm font-medium text-foreground">{label}</span>
+      <span className="font-mono text-xs tabular-nums text-muted-foreground">{count}</span>
+    </button>
+  );
+}
+
+// ── Filter menu (nested-style grouped DropdownMenu) ──────────
+function FilterMenu({
+  agents,
+  filterAgent,
+  filterPriority,
+  setFilterAgent,
+  setFilterPriority,
+}: {
+  agents: ReadonlyArray<{ name: string; display_name: string }>;
+  filterAgent: string | null;
+  filterPriority: TaskPriority | null;
+  setFilterAgent: (v: string | null) => void;
+  setFilterPriority: (v: TaskPriority | null) => void;
+}) {
+  const intl = useIntl();
+  const activeCount = (filterAgent ? 1 : 0) + (filterPriority ? 1 : 0);
+  const active = activeCount > 0;
+
+  const clearAll = () => {
+    setFilterAgent(null);
+    setFilterPriority(null);
+  };
+
+  return (
+    <div className="flex shrink-0 items-center">
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          className={cn(
+            'inline-flex h-7 items-center gap-1 rounded-lg border px-2.5 text-[0.8rem] font-medium outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50',
+            active
+              ? 'border-brand bg-brand text-brand-foreground hover:bg-brand/90'
+              : 'border-border bg-background text-foreground hover:bg-muted',
+          )}
+        >
+          <FilterIcon className="size-3.5" />
+          {intl.formatMessage({ id: 'tasks.filter.title' })}
+          {active && <span className="font-mono text-xs tabular-nums">{activeCount}</span>}
+        </DropdownMenuTrigger>
+        <DropdownMenuContent className="min-w-52">
+          <DropdownMenuLabel>{intl.formatMessage({ id: 'tasks.field.priority' })}</DropdownMenuLabel>
+          <DropdownMenuItem
+            closeOnClick={false}
+            onClick={() => setFilterPriority(null)}
+            className={cn(!filterPriority && 'font-medium text-foreground')}
+          >
+            <span className="flex-1">{intl.formatMessage({ id: 'tasks.filter.all' })}</span>
+            {!filterPriority && <Check className="size-3.5 text-brand" />}
+          </DropdownMenuItem>
+          {(['low', 'medium', 'high', 'urgent'] as const).map((p) => (
+            <DropdownMenuItem
+              key={p}
+              closeOnClick={false}
+              onClick={() => setFilterPriority(p)}
+              className={cn(filterPriority === p && 'font-medium text-foreground')}
+            >
+              <PriorityIcon priority={p} size="sm" />
+              <span className="flex-1">{intl.formatMessage({ id: `tasks.priority.${p}` })}</span>
+              {filterPriority === p && <Check className="size-3.5 text-brand" />}
+            </DropdownMenuItem>
+          ))}
+
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel>{intl.formatMessage({ id: 'tasks.field.assignTo' })}</DropdownMenuLabel>
+          <DropdownMenuItem
+            closeOnClick={false}
+            onClick={() => setFilterAgent(null)}
+            className={cn(!filterAgent && 'font-medium text-foreground')}
+          >
+            <span className="flex-1">{intl.formatMessage({ id: 'tasks.filter.all' })}</span>
+            {!filterAgent && <Check className="size-3.5 text-brand" />}
+          </DropdownMenuItem>
+          {agents.map((a) => (
+            <DropdownMenuItem
+              key={a.name}
+              closeOnClick={false}
+              onClick={() => setFilterAgent(a.name)}
+              className={cn(filterAgent === a.name && 'font-medium text-foreground')}
+            >
+              <ActorAvatar actorType="agent" size="xs" name={a.display_name} />
+              <span className="min-w-0 flex-1 truncate">{a.display_name}</span>
+              {filterAgent === a.name && <Check className="size-3.5 shrink-0 text-brand" />}
+            </DropdownMenuItem>
+          ))}
+
+          {active && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem variant="destructive" onClick={clearAll}>
+                <X className="size-3.5" />
+                {intl.formatMessage({ id: 'tasks.filter.clear' })}
+              </DropdownMenuItem>
+            </>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+}
+
+// ── Display popover (grouping + ordering) ────────────────────
+function DisplayPopover({
+  group,
+  setGroup,
+  order,
+  setOrder,
+}: {
+  group: GroupMode;
+  setGroup: (g: GroupMode) => void;
+  order: OrderMode;
+  setOrder: (o: OrderMode) => void;
+}) {
+  const intl = useIntl();
+  const groupOptions: SegmentedOption<GroupMode>[] = [
+    { value: 'status', label: intl.formatMessage({ id: 'tasks.groupBy.status' }) },
+    { value: 'assignee', label: intl.formatMessage({ id: 'tasks.groupBy.assignee' }) },
+  ];
+  const orderOptions: SegmentedOption<OrderMode>[] = [
+    { value: 'recent', label: intl.formatMessage({ id: 'tasks.order.recent' }) },
+    { value: 'priority', label: intl.formatMessage({ id: 'tasks.order.priority' }) },
+    { value: 'title', label: intl.formatMessage({ id: 'tasks.order.title' }) },
+  ];
+  return (
+    <Popover>
+      <PopoverTrigger
+        className="inline-flex h-7 shrink-0 items-center gap-1 rounded-lg border border-border bg-background px-2.5 text-[0.8rem] font-medium text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
+      >
+        <SlidersHorizontal className="size-3.5" />
+        {intl.formatMessage({ id: 'tasks.display' })}
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-64 space-y-3 p-3">
+        <div className="space-y-1.5">
+          <p className="text-xs font-medium text-muted-foreground">
+            {intl.formatMessage({ id: 'tasks.display.grouping' })}
+          </p>
+          <Segmented
+            value={group}
+            onValueChange={setGroup}
+            options={groupOptions}
+            aria-label={intl.formatMessage({ id: 'tasks.display.grouping' })}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <p className="text-xs font-medium text-muted-foreground">
+            {intl.formatMessage({ id: 'tasks.display.ordering' })}
+          </p>
+          <Segmented
+            value={order}
+            onValueChange={setOrder}
+            options={orderOptions}
+            aria-label={intl.formatMessage({ id: 'tasks.display.ordering' })}
+          />
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -314,9 +598,12 @@ export function TaskBoardPage() {
 
   const [view, setView] = useState<ViewMode>(() => readPref(VIEW_KEY, ['kanban', 'list'] as const, 'kanban'));
   const [group, setGroup] = useState<GroupMode>(() => readPref(GROUP_KEY, ['status', 'assignee'] as const, 'status'));
+  const [order, setOrder] = useState<OrderMode>(() => readPref(ORDER_KEY, ['recent', 'priority', 'title'] as const, 'recent'));
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(readCollapsed);
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [showCreate, setShowCreate] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<TaskInfo | null>(null);
+  const [confirmBatch, setConfirmBatch] = useState(false);
   const [burst, setBurst] = useState<{ agentId: string } | null>(null);
 
   useEffect(() => {
@@ -329,8 +616,7 @@ export function TaskBoardPage() {
     if (searchParams.get('new') === '1') setShowCreate(true);
   }, [searchParams]);
 
-  // `?assignee=<id>` (W3b employee-detail "交辦" button) preselects the assignee
-  // in the create modal (A3). Read live so a fresh deep-link seeds the picker.
+  // `?assignee=<id>` (employee-detail "交辦" button) preselects the assignee.
   const defaultAssignee = searchParams.get('assignee') || undefined;
 
   const setViewPref = (v: ViewMode) => {
@@ -340,6 +626,10 @@ export function TaskBoardPage() {
   const setGroupPref = (g: GroupMode) => {
     setGroup(g);
     writePref(GROUP_KEY, g);
+  };
+  const setOrderPref = (o: OrderMode) => {
+    setOrder(o);
+    writePref(ORDER_KEY, o);
   };
 
   const closeCreate = useCallback(() => {
@@ -356,8 +646,8 @@ export function TaskBoardPage() {
 
   const handleCreate = useCallback(async (params: TaskCreateParams) => createTask(params), [createTask]);
 
-  // One completion path for both drag-drop and the list StatusIcon: write via
-  // the store, and fire the §5.5 celebration when a task first reaches `done`.
+  // One completion path for drag-drop, list StatusIcon, and batch: write via the
+  // store, and fire the §5.5 celebration when a task first reaches `done`.
   const applyStatus = useCallback(
     (task: TaskInfo, next: TaskStatus) => {
       if (next === task.status) return;
@@ -379,7 +669,7 @@ export function TaskBoardPage() {
   );
 
   const handleListStatus = useCallback(
-    (task: TaskInfo, key: import('@/components/ui').TaskStatusKey) => {
+    (task: TaskInfo, key: TaskStatusKey) => {
       const backend = toBackendStatus(key);
       if (backend) applyStatus(task, backend);
     },
@@ -393,6 +683,17 @@ export function TaskBoardPage() {
     }
   }, [removeTarget, removeTask]);
 
+  // ── Selection (batch) ────────────────────────────────────
+  const toggleSelect = useCallback((id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+  const clearSelection = useCallback(() => setSelected(new Set()), []);
+
   const filteredTasks = useMemo(
     () =>
       tasks.filter((t) => {
@@ -402,6 +703,32 @@ export function TaskBoardPage() {
       }),
     [tasks, filterAgent, filterPriority],
   );
+
+  // Prune the selection to what's still visible (filters can hide selected rows).
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.size === 0) return prev;
+      const visible = new Set(filteredTasks.map((t) => t.id));
+      const next = new Set([...prev].filter((id) => visible.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [filteredTasks]);
+
+  const selectedTasks = useMemo(
+    () => filteredTasks.filter((t) => selected.has(t.id)),
+    [filteredTasks, selected],
+  );
+
+  const handleBatchDone = useCallback(() => {
+    for (const t of selectedTasks) applyStatus(t, 'done');
+    clearSelection();
+  }, [selectedTasks, applyStatus, clearSelection]);
+
+  const handleBatchDelete = useCallback(async () => {
+    for (const t of selectedTasks) await removeTask(t.id);
+    clearSelection();
+    setConfirmBatch(false);
+  }, [selectedTasks, removeTask, clearSelection]);
 
   // Per-AI-staff buckets (incl. an unassigned bucket) — the single grouping
   // source shared by the list "by staff" view and the kanban swimlanes.
@@ -424,14 +751,16 @@ export function TaskBoardPage() {
 
   // List grouping — by status (column order) or by assignee (shared buckets).
   const listGroups = useMemo(() => {
-    if (group === 'assignee') return agentBuckets;
+    if (group === 'assignee') {
+      return agentBuckets.map((b) => ({ ...b, rows: orderRows(b.rows, order) }));
+    }
     return COLUMNS.map(({ status }) => ({
       key: status,
       agentId: undefined as string | undefined,
       label: intl.formatMessage({ id: `tasks.column.${status}` }),
-      rows: filteredTasks.filter((t) => t.status === status),
+      rows: orderRows(filteredTasks.filter((t) => t.status === status), order),
     })).filter((g) => g.rows.length > 0);
-  }, [group, agentBuckets, filteredTasks, intl]);
+  }, [group, agentBuckets, filteredTasks, intl, order]);
 
   // First time the user lands on an assignee grouping with a large roster,
   // seed the swimlanes collapsed (unless they already have a saved preference).
@@ -452,8 +781,6 @@ export function TaskBoardPage() {
     }
   }, [group, agentBuckets]);
 
-  const tasksByStatus = (status: TaskStatus) => filteredTasks.filter((t) => t.status === status);
-
   const toggleGroup = (key: string) =>
     setCollapsed((prev) => {
       const next = new Set(prev);
@@ -463,183 +790,183 @@ export function TaskBoardPage() {
       return next;
     });
 
+  const openCreate = () => setShowCreate(true);
+
   return (
-    <Page wide>
-      <PageHeader
-        icon={KanbanSquare}
-        title={intl.formatMessage({ id: 'nav.tasks' })}
-        subtitle={intl.formatMessage({ id: 'tasks.title' })}
-        actions={
-          <Button variant="primary" icon={Plus} onClick={() => setShowCreate(true)}>
-            {intl.formatMessage({ id: 'tasks.create' })}
+    <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+      {/* Layer 1 — page header (icon + title + count). */}
+      <PageHeader hideTrigger className="px-5">
+        <KanbanSquare className="size-4 shrink-0 text-muted-foreground" />
+        <h1 className="truncate text-sm font-medium">{intl.formatMessage({ id: 'nav.tasks' })}</h1>
+        <span className="font-mono text-xs tabular-nums text-muted-foreground">{filteredTasks.length}</span>
+        <div className="ml-auto flex items-center gap-2">
+          <Button variant="brand" size="sm" onClick={openCreate}>
+            <Plus />
+            <span className="hidden sm:inline">{intl.formatMessage({ id: 'tasks.create' })}</span>
           </Button>
-        }
-      />
-
-      {/* Toolbar: filters grouped on the left, view toggle pinned to the far right
-          (justify-between) so the 看板/清單 switch reads as a distinct control, not
-          another filter. */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <Filter className="h-4 w-4 text-stone-400" />
-          <select
-            className={cn(controlClass, 'w-auto min-w-[140px]')}
-            value={filterAgent ?? ''}
-            onChange={(e) => setFilterAgent(e.target.value || null)}
-          >
-            <option value="">
-              {intl.formatMessage({ id: 'tasks.filter.all' })} — {intl.formatMessage({ id: 'tasks.filter.agent' })}
-            </option>
-            {agents.map((a) => (
-              <option key={a.name} value={a.name}>
-                {a.display_name}
-              </option>
-            ))}
-          </select>
-          <select
-            className={cn(controlClass, 'w-auto min-w-[140px]')}
-            value={filterPriority ?? ''}
-            onChange={(e) => setFilterPriority((e.target.value as TaskPriority) || null)}
-          >
-            <option value="">
-              {intl.formatMessage({ id: 'tasks.filter.all' })} — {intl.formatMessage({ id: 'tasks.field.priority' })}
-            </option>
-            {(['low', 'medium', 'high', 'urgent'] as const).map((p) => (
-              <option key={p} value={p}>
-                {intl.formatMessage({ id: `tasks.priority.${p}` })}
-              </option>
-            ))}
-          </select>
-
-          {/* Group-by — applies to both the list groups and the kanban swimlanes. */}
-          <select
-            className={cn(controlClass, 'w-auto min-w-[130px]')}
-            value={group}
-            onChange={(e) => setGroupPref(e.target.value as GroupMode)}
-            aria-label={intl.formatMessage({ id: 'tasks.groupBy' })}
-          >
-            <option value="status">{intl.formatMessage({ id: 'tasks.groupBy.status' })}</option>
-            <option value="assignee">{intl.formatMessage({ id: 'tasks.groupBy.assignee' })}</option>
-          </select>
         </div>
+      </PageHeader>
 
-        {/* Kanban ⇄ List view toggle — pinned right, separated from the filters. */}
-        <div className="inline-flex rounded-control border border-stone-300/50 p-0.5 dark:border-white/10">
-          {(
-            [
-              { id: 'kanban', icon: KanbanSquare },
-              { id: 'list', icon: List },
-            ] as const
-          ).map(({ id, icon: Icon }) => (
-            <button
-              key={id}
-              type="button"
-              onClick={() => setViewPref(id)}
-              aria-pressed={view === id}
-              className={cn(
-                'flex items-center gap-1.5 rounded-[calc(var(--radius-control)-2px)] px-2.5 py-1 text-xs font-medium transition-colors',
-                view === id
-                  ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
-                  : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200',
-              )}
-            >
-              <Icon className="h-3.5 w-3.5" />
-              {intl.formatMessage({ id: `tasks.view.${id}` })}
-            </button>
-          ))}
-        </div>
+      {/* Layer 2 — control row (scope · filter / display / view). */}
+      <div className="flex h-12 shrink-0 items-center gap-2 overflow-x-auto border-b border-surface-border px-4">
+        <span className="mr-auto shrink-0 text-xs text-muted-foreground">
+          {intl.formatMessage({ id: 'tasks.scope.all' })}
+        </span>
+        <FilterMenu
+          agents={agents}
+          filterAgent={filterAgent}
+          filterPriority={filterPriority}
+          setFilterAgent={setFilterAgent}
+          setFilterPriority={setFilterPriority}
+        />
+        <DisplayPopover group={group} setGroup={setGroupPref} order={order} setOrder={setOrderPref} />
+        <Segmented
+          value={view}
+          onValueChange={setViewPref}
+          aria-label={intl.formatMessage({ id: 'tasks.groupBy' })}
+          options={[
+            {
+              value: 'kanban',
+              label: (
+                <>
+                  <KanbanSquare className="size-3.5" />
+                  <span className="sr-only">{intl.formatMessage({ id: 'tasks.view.kanban' })}</span>
+                </>
+              ),
+            },
+            {
+              value: 'list',
+              label: (
+                <>
+                  <ListIcon className="size-3.5" />
+                  <span className="sr-only">{intl.formatMessage({ id: 'tasks.view.list' })}</span>
+                </>
+              ),
+            },
+          ]}
+        />
       </div>
 
-      {tasks.length === 0 && !loading && (
-        <Card padded={false}>
-          <EmptyState icon={Clock} title={intl.formatMessage({ id: 'tasks.empty' })} />
-        </Card>
-      )}
-
-      {view === 'kanban' ? (
-        group === 'assignee' ? (
-          // By-staff swimlanes: one collapsible board per AI employee.
-          <div className="space-y-4">
-            {agentBuckets.map((b) => {
-              const isCollapsed = collapsed.has(b.key);
+      {/* Body */}
+      <div className="min-h-[50vh] pb-16 pt-2">
+        {filteredTasks.length === 0 && !loading ? (
+          <Empty
+            icon={KanbanSquare}
+            title={intl.formatMessage({ id: 'tasks.empty' })}
+            action={
+              <Button variant="brand" size="sm" onClick={openCreate}>
+                <Plus />
+                {intl.formatMessage({ id: 'tasks.create' })}
+              </Button>
+            }
+          />
+        ) : view === 'kanban' ? (
+          group === 'assignee' ? (
+            <div className="space-y-2 px-2">
+              {agentBuckets.map((b) => {
+                const isCollapsed = collapsed.has(b.key);
+                return (
+                  <div key={b.key}>
+                    <SwimlaneHeader
+                      label={b.label}
+                      avatar={
+                        b.agentId ? (
+                          <ActorAvatar actorType="agent" size="sm" name={b.label} />
+                        ) : undefined
+                      }
+                      count={b.rows.length}
+                      collapsed={isCollapsed}
+                      onToggle={() => toggleGroup(b.key)}
+                    />
+                    {!isCollapsed && (
+                      <KanbanBoard
+                        rows={b.rows}
+                        agents={agents}
+                        onDrop={handleDrop}
+                        onOpen={openTask}
+                        onRemove={setRemoveTarget}
+                        onAdd={openCreate}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <KanbanBoard
+              rows={filteredTasks}
+              agents={agents}
+              onDrop={handleDrop}
+              onOpen={openTask}
+              onRemove={setRemoveTarget}
+              onAdd={openCreate}
+            />
+          )
+        ) : (
+          <div className="space-y-3 px-2">
+            {listGroups.map((g) => {
+              const isCollapsed = collapsed.has(g.key);
               return (
-                <div key={b.key}>
-                  <GroupHeader
-                    label={
-                      b.agentId ? (
-                        <span className="flex items-center gap-2">
-                          <CharacterAvatar agentId={b.agentId} name={b.label} size={22} animated={false} />
-                          {b.label}
-                        </span>
-                      ) : (
-                        b.label
-                      )
+                <div key={g.key}>
+                  <SwimlaneHeader
+                    label={g.label}
+                    avatar={
+                      group === 'assignee'
+                        ? g.agentId
+                          ? <ActorAvatar actorType="agent" size="sm" name={g.label} />
+                          : undefined
+                        : <StatusIcon status={toStatusKey(g.key as TaskStatus)} size="sm" />
                     }
-                    count={b.rows.length}
+                    count={g.rows.length}
                     collapsed={isCollapsed}
-                    onToggle={() => toggleGroup(b.key)}
+                    onToggle={() => toggleGroup(g.key)}
                   />
                   {!isCollapsed && (
-                    <div className="mt-2 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-                      {COLUMNS.map(({ status, icon }) => (
-                        <KanbanColumn
-                          key={status}
-                          status={status}
-                          icon={icon}
-                          tasks={b.rows.filter((t) => t.status === status)}
-                          agents={agents}
-                          onDrop={handleDrop}
-                          onOpen={openTask}
-                          onRemove={setRemoveTarget}
-                        />
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-            {COLUMNS.map(({ status, icon }) => (
-              <KanbanColumn
-                key={status}
-                status={status}
-                icon={icon}
-                tasks={tasksByStatus(status)}
-                agents={agents}
-                onDrop={handleDrop}
-                onOpen={openTask}
-                onRemove={setRemoveTarget}
-              />
-            ))}
-          </div>
-        )
-      ) : (
-        <div className="space-y-4">
-          {listGroups.map((g) => {
-            const isCollapsed = collapsed.has(g.key);
-            return (
-              <div key={g.key}>
-                <GroupHeader label={g.label} count={g.rows.length} collapsed={isCollapsed} onToggle={() => toggleGroup(g.key)} />
-                {!isCollapsed && (
-                  <Card padded={false}>
-                    <ul className="divide-y divide-stone-200/60 dark:divide-white/5">
+                    <ul className="mt-1 overflow-hidden rounded-xl border border-surface-border bg-surface">
                       {g.rows.map((t) => (
                         <TaskListRow
                           key={t.id}
                           task={t}
                           agent={agents.find((a) => a.name === t.assigned_to)}
+                          selected={selected.has(t.id)}
+                          onToggleSelect={toggleSelect}
                           onOpen={openTask}
                           onStatus={handleListStatus}
                         />
                       ))}
                     </ul>
-                  </Card>
-                )}
-              </div>
-            );
-          })}
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Batch action toolbar — floats bottom-center while rows are selected. */}
+      {selected.size > 0 && (
+        <div className="pointer-events-none fixed inset-x-0 bottom-6 z-40 flex justify-center px-4">
+          <div className="pointer-events-auto flex items-center gap-2 rounded-xl bg-surface-raised px-3 py-2 shadow-[var(--floating-shadow)] ring-1 ring-surface-border">
+            <span className="px-1 text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: 'tasks.select.count' }, { count: selected.size })}
+            </span>
+            <Button variant="outline" size="sm" onClick={handleBatchDone}>
+              <Check />
+              {intl.formatMessage({ id: 'tasks.batch.markDone' })}
+            </Button>
+            <Button variant="destructive" size="sm" onClick={() => setConfirmBatch(true)}>
+              <Trash2 />
+              {intl.formatMessage({ id: 'tasks.batch.delete' })}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={clearSelection}
+              aria-label={intl.formatMessage({ id: 'tasks.select.clear' })}
+            >
+              <X />
+            </Button>
+          </div>
         </div>
       )}
 
@@ -651,20 +978,44 @@ export function TaskBoardPage() {
         defaultAssignee={defaultAssignee}
       />
 
-      <Dialog open={removeTarget !== null} title={intl.formatMessage({ id: 'tasks.remove' })} onClose={() => setRemoveTarget(null)}>
-        <div className="space-y-4">
-          <p className="text-sm text-stone-600 dark:text-stone-400">
-            {removeTarget && intl.formatMessage({ id: 'tasks.remove.confirm' }, { title: removeTarget.title })}
-          </p>
-          <div className="flex justify-end gap-3">
-            <Button variant="secondary" onClick={() => setRemoveTarget(null)}>
-              {intl.formatMessage({ id: 'agents.delegate.close' })}
-            </Button>
-            <Button variant="danger" onClick={handleRemoveConfirm}>
+      {/* Single-task delete confirmation. */}
+      <Dialog open={removeTarget !== null} onOpenChange={(o) => !o && setRemoveTarget(null)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{intl.formatMessage({ id: 'tasks.remove' })}</DialogTitle>
+            <DialogDescription>
+              {removeTarget && intl.formatMessage({ id: 'tasks.remove.confirm' }, { title: removeTarget.title })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose
+              render={<Button variant="outline">{intl.formatMessage({ id: 'agents.delegate.close' })}</Button>}
+            />
+            <Button variant="destructive" onClick={handleRemoveConfirm}>
               {intl.formatMessage({ id: 'tasks.remove' })}
             </Button>
-          </div>
-        </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Batch delete confirmation. */}
+      <Dialog open={confirmBatch} onOpenChange={setConfirmBatch}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{intl.formatMessage({ id: 'tasks.batch.delete' })}</DialogTitle>
+            <DialogDescription>
+              {intl.formatMessage({ id: 'tasks.batch.deleteConfirm' }, { count: selected.size })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose
+              render={<Button variant="outline">{intl.formatMessage({ id: 'agents.delegate.close' })}</Button>}
+            />
+            <Button variant="destructive" onClick={handleBatchDelete}>
+              {intl.formatMessage({ id: 'tasks.batch.delete' })}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
       </Dialog>
 
       {burst && (
@@ -674,6 +1025,6 @@ export function TaskBoardPage() {
           onDone={() => setBurst(null)}
         />
       )}
-    </Page>
+    </div>
   );
 }

@@ -104,7 +104,7 @@ export function MascotOverlayPage() {
         <DuDu face={face} size="lg" />
         {hasPending && (
           <span
-            className="absolute -right-1 -top-1 grid min-h-[22px] min-w-[22px] place-items-center rounded-full bg-[var(--status-agent-paused)] px-1.5 text-[11px] font-bold text-white shadow-[var(--shadow-pop)] ring-2 ring-white dark:ring-stone-900"
+            className="absolute -right-1 -top-1 grid min-h-[22px] min-w-[22px] place-items-center rounded-full bg-[var(--status-agent-paused)] px-1.5 text-[11px] font-bold text-white shadow-[var(--shadow-pop)] ring-2 ring-background"
             aria-hidden="true"
           >
             {pending > 99 ? '99+' : pending}

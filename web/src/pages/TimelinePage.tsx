@@ -17,22 +17,27 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
 import {
-  Page,
   PageHeader,
   Card,
-  Tabs,
-  EmptyState,
+  CardContent,
+  Segmented,
+  Empty,
   Skeleton,
-  CharacterAvatar,
-  controlClass,
-  type TabItem,
-} from '@/components/ui';
+  ActorAvatar,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  type SegmentedOption,
+} from '@/components/mds';
 
 /**
  * TimelinePage (G11 Work Timeline) — the company-level Gantt: every AI staff
  * member gets a lane; ranged work renders as bars (running work extends to
- * "now"), point events render as dots. Pure SVG — no chart dependency.
- * Data comes from `timeline.list`, which only ever reports REAL timestamps.
+ * "now"), point events render as dots. Pure SVG — no chart dependency. Recolored
+ * onto MDS tokens (spec §5.2 / §4); the layout math is untouched. Data comes from
+ * `timeline.list`, which only ever reports REAL timestamps.
  */
 
 type RangeKey = '1h' | '6h' | '24h' | '7d';
@@ -202,9 +207,12 @@ export function TimelinePage() {
     });
   }, [lanes]);
 
-  const totalH =
-    AXIS_H +
-    lanes.reduce((sum, l) => sum + l.subRowCount * SUBROW_PITCH + LANE_VPAD * 2, 0);
+  const laneHeights = useMemo(
+    () => lanes.map((l) => l.subRowCount * SUBROW_PITCH + LANE_VPAD * 2),
+    [lanes],
+  );
+
+  const totalH = AXIS_H + laneHeights.reduce((sum, h) => sum + h, 0);
 
   const agentName = useCallback(
     (id: string) => agents.find((a) => a.name === id)?.display_name || id,
@@ -217,8 +225,8 @@ export function TimelinePage() {
     [intl],
   );
 
-  const rangeTabs: TabItem[] = (['1h', '6h', '24h', '7d'] as const).map((r) => ({
-    id: r,
+  const rangeOptions: SegmentedOption<RangeKey>[] = (['1h', '6h', '24h', '7d'] as const).map((r) => ({
+    value: r,
     label: intl.formatMessage({ id: `timeline.range.${r}` }),
   }));
 
@@ -249,259 +257,283 @@ export function TimelinePage() {
 
   const hasRows = lanes.length > 0;
   const showAllOption = scope === 'all';
+  const currentAgent = visibleAgents.find((a) => a.name === (agentFilter || effectiveAgent));
 
   return (
-    <Page>
-      <PageHeader
-        icon={ChartGantt}
-        title={intl.formatMessage({ id: 'nav.timeline' })}
-        subtitle={intl.formatMessage({ id: 'timeline.subtitle' })}
-        actions={
-          <Tabs items={rangeTabs} value={range} onChange={(id) => setRange(id as RangeKey)} />
-        }
-      />
-
-      <Card>
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            aria-label={intl.formatMessage({ id: 'timeline.filter.agent' })}
-            className={`${controlClass} max-w-56`}
-            value={agentFilter || effectiveAgent}
-            onChange={(e) => setAgentFilter(e.target.value)}
-          >
-            {showAllOption && (
-              <option value="">{intl.formatMessage({ id: 'timeline.allAgents' })}</option>
-            )}
-            {visibleAgents.map((a) => (
-              <option key={a.name} value={a.name}>
-                {a.display_name || a.name}
-              </option>
-            ))}
-          </select>
-          {/* Legend */}
-          <div className="ml-auto flex flex-wrap items-center gap-3">
-            {LEGEND_KINDS.map((k) => (
-              <span
-                key={k}
-                className="flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400"
-              >
-                <span
-                  aria-hidden="true"
-                  className="h-2.5 w-2.5 rounded-full"
-                  style={{
-                    backgroundColor: fillFor({ kind: k, status: 'in_progress' } as TimelineRow),
-                  }}
-                />
-                {kindLabel(k)}
-              </span>
-            ))}
-          </div>
+    <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+      <PageHeader hideTrigger className="justify-between">
+        <div className="flex min-w-0 items-center gap-2">
+          <ChartGantt className="size-4 shrink-0 text-muted-foreground" />
+          <h1 className="truncate text-sm font-medium">{intl.formatMessage({ id: 'nav.timeline' })}</h1>
         </div>
+        <Segmented
+          value={range}
+          onValueChange={setRange}
+          options={rangeOptions}
+          aria-label={intl.formatMessage({ id: 'nav.timeline' })}
+        />
+      </PageHeader>
 
-        {result?.truncated && (
-          <p className="mt-3 text-xs text-amber-600 dark:text-amber-400">
-            {intl.formatMessage({ id: 'timeline.truncated' }, { cap: result.cap })}
-          </p>
-        )}
-
-        <div className="mt-4">
-          {!loaded ? (
-            <div className="space-y-3">
-              <Skeleton className="h-8 w-full" />
-              <Skeleton className="h-8 w-full" />
-              <Skeleton className="h-8 w-2/3" />
-            </div>
-          ) : error ? (
-            <EmptyState
-              dudu={{ face: 'concerned' }}
-              title={intl.formatMessage({ id: 'timeline.error' })}
-              hint={error}
-            />
-          ) : !hasRows ? (
-            <EmptyState
-              dudu={{ face: 'sleep' }}
-              title={intl.formatMessage({ id: 'timeline.empty' })}
-              hint={intl.formatMessage({ id: 'timeline.empty.hint' })}
-            />
-          ) : (
-            windowMs && (
-              <div className="flex overflow-x-auto">
-                {/* Lane labels */}
-                <div className="shrink-0" style={{ width: LABEL_COL_W }}>
-                  <div style={{ height: AXIS_H }} aria-hidden="true" />
-                  {lanes.map((lane) => (
-                    <div
-                      key={lane.agentId}
-                      className="flex items-center gap-2 border-t border-[var(--panel-border)] pr-3"
-                      style={{ height: lane.subRowCount * SUBROW_PITCH + LANE_VPAD * 2 }}
-                    >
-                      <CharacterAvatar
-                        agentId={lane.agentId}
-                        name={agentName(lane.agentId)}
-                        size={24}
-                      />
-                      <span
-                        className="truncate text-sm text-stone-700 dark:text-stone-200"
-                        title={agentName(lane.agentId)}
-                      >
-                        {agentName(lane.agentId)}
-                      </span>
-                    </div>
+      <div className="flex flex-1 flex-col p-4 md:p-6">
+        <Card>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <Select
+                value={agentFilter || effectiveAgent}
+                onValueChange={(v) => setAgentFilter(String(v))}
+              >
+                <SelectTrigger className="w-56">
+                  <SelectValue placeholder={intl.formatMessage({ id: 'timeline.filter.agent' })}>
+                    {currentAgent
+                      ? currentAgent.display_name || currentAgent.name
+                      : intl.formatMessage({ id: 'timeline.allAgents' })}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {showAllOption && (
+                    <SelectItem value="">{intl.formatMessage({ id: 'timeline.allAgents' })}</SelectItem>
+                  )}
+                  {visibleAgents.map((a) => (
+                    <SelectItem key={a.name} value={a.name}>
+                      {a.display_name || a.name}
+                    </SelectItem>
                   ))}
-                </div>
+                </SelectContent>
+              </Select>
 
-                {/* Chart */}
-                <div ref={chartRef} className="relative min-w-[320px] flex-1">
-                  {chartWidth > 0 && (
-                    <svg
-                      width={chartWidth}
-                      height={totalH}
-                      role="img"
-                      aria-label={intl.formatMessage({ id: 'timeline.chart.aria' })}
-                      className="block"
-                    >
-                      {/* Grid + axis labels */}
-                      {ticks.map((t) => {
-                        const x = xForMs(t.ms, windowMs.fromMs, windowMs.toMs, chartWidth);
-                        return (
-                          <g key={t.ms}>
+              {/* Legend */}
+              <div className="ml-auto flex flex-wrap items-center gap-3">
+                {LEGEND_KINDS.map((k) => (
+                  <span key={k} className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <span
+                      aria-hidden="true"
+                      className="size-2.5 rounded-full"
+                      style={{
+                        backgroundColor: fillFor({ kind: k, status: 'in_progress' } as TimelineRow),
+                      }}
+                    />
+                    {kindLabel(k)}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {result?.truncated && (
+              <p className="text-xs text-warning">
+                {intl.formatMessage({ id: 'timeline.truncated' }, { cap: result.cap })}
+              </p>
+            )}
+
+            <div>
+              {!loaded ? (
+                <div className="space-y-3">
+                  <Skeleton className="h-8 w-full" />
+                  <Skeleton className="h-8 w-full" />
+                  <Skeleton className="h-8 w-2/3" />
+                </div>
+              ) : error ? (
+                <Empty
+                  tone="destructive"
+                  icon={ChartGantt}
+                  title={intl.formatMessage({ id: 'timeline.error' })}
+                  description={error}
+                />
+              ) : !hasRows ? (
+                <Empty
+                  icon={ChartGantt}
+                  title={intl.formatMessage({ id: 'timeline.empty' })}
+                  description={intl.formatMessage({ id: 'timeline.empty.hint' })}
+                />
+              ) : (
+                windowMs && (
+                  <div className="flex overflow-x-auto">
+                    {/* Lane labels */}
+                    <div className="shrink-0" style={{ width: LABEL_COL_W }}>
+                      <div style={{ height: AXIS_H }} aria-hidden="true" />
+                      {lanes.map((lane) => (
+                        <div
+                          key={lane.agentId}
+                          className="flex items-center gap-2 border-t border-surface-border pr-3"
+                          style={{ height: lane.subRowCount * SUBROW_PITCH + LANE_VPAD * 2 }}
+                        >
+                          <ActorAvatar actorType="agent" size="sm" name={agentName(lane.agentId)} />
+                          <span
+                            className="truncate text-xs text-muted-foreground"
+                            title={agentName(lane.agentId)}
+                          >
+                            {agentName(lane.agentId)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Chart */}
+                    <div ref={chartRef} className="relative min-w-[320px] flex-1">
+                      {chartWidth > 0 && (
+                        <svg
+                          width={chartWidth}
+                          height={totalH}
+                          role="img"
+                          aria-label={intl.formatMessage({ id: 'timeline.chart.aria' })}
+                          className="block"
+                        >
+                          {/* Lane bands (spec §5.2: bg-muted/40) */}
+                          {lanes.map((lane, i) => (
+                            <rect
+                              key={`band-${lane.agentId}`}
+                              x={0}
+                              y={laneTops[i]}
+                              width={chartWidth}
+                              height={laneHeights[i]}
+                              className="fill-muted"
+                              opacity={0.4}
+                            />
+                          ))}
+
+                          {/* Grid + axis labels */}
+                          {ticks.map((t) => {
+                            const x = xForMs(t.ms, windowMs.fromMs, windowMs.toMs, chartWidth);
+                            return (
+                              <g key={t.ms}>
+                                <line
+                                  x1={x}
+                                  x2={x}
+                                  y1={AXIS_H}
+                                  y2={totalH}
+                                  className="stroke-border"
+                                  strokeWidth={1}
+                                />
+                                <text
+                                  x={x}
+                                  y={AXIS_H - 10}
+                                  textAnchor="middle"
+                                  className="fill-muted-foreground text-[10px] tabular-nums"
+                                >
+                                  {fmtTick(t.ms, t.isDayStart)}
+                                </text>
+                              </g>
+                            );
+                          })}
+
+                          {/* Lane separators */}
+                          {lanes.map((lane, i) => (
                             <line
-                              x1={x}
-                              x2={x}
-                              y1={AXIS_H}
-                              y2={totalH}
-                              stroke="var(--panel-border)"
+                              key={lane.agentId}
+                              x1={0}
+                              x2={chartWidth}
+                              y1={laneTops[i]}
+                              y2={laneTops[i]}
+                              className="stroke-border"
                               strokeWidth={1}
                             />
-                            <text
-                              x={x}
-                              y={AXIS_H - 10}
-                              textAnchor="middle"
-                              className="fill-stone-400 text-[10px] tabular-nums dark:fill-stone-500"
-                            >
-                              {fmtTick(t.ms, t.isDayStart)}
-                            </text>
-                          </g>
-                        );
-                      })}
+                          ))}
 
-                      {/* Lane separators */}
-                      {lanes.map((lane, i) => (
-                        <line
-                          key={lane.agentId}
-                          x1={0}
-                          x2={chartWidth}
-                          y1={laneTops[i]}
-                          y2={laneTops[i]}
-                          stroke="var(--panel-border)"
-                          strokeWidth={1}
-                        />
-                      ))}
+                          {/* Bars + dots */}
+                          {lanes.map((lane, i) =>
+                            lane.rows.map((placed) => {
+                              const cy =
+                                laneTops[i] +
+                                LANE_VPAD +
+                                placed.subRow * SUBROW_PITCH +
+                                SUBROW_PITCH / 2;
+                              const fill = fillFor(placed.row);
+                              const label = tooltipText(placed);
+                              const common = {
+                                tabIndex: 0,
+                                role: 'img' as const,
+                                'aria-label': label,
+                                className:
+                                  'cursor-default focus-visible:outline-none focus-visible:stroke-brand',
+                                onMouseEnter: (e: React.MouseEvent) => {
+                                  const box = chartRef.current?.getBoundingClientRect();
+                                  setHover({ placed, x: e.clientX - (box?.left ?? 0), y: cy });
+                                },
+                                onMouseLeave: () => setHover(null),
+                                onFocus: () =>
+                                  setHover({
+                                    placed,
+                                    x: xForMs(placed.startMs, windowMs.fromMs, windowMs.toMs, chartWidth),
+                                    y: cy,
+                                  }),
+                                onBlur: () => setHover(null),
+                              };
+                              if (placed.instant) {
+                                return (
+                                  <circle
+                                    key={placed.row.ref_id}
+                                    cx={xForMs(placed.startMs, windowMs.fromMs, windowMs.toMs, chartWidth)}
+                                    cy={cy}
+                                    r={DOT_R}
+                                    fill={fill}
+                                    {...common}
+                                  />
+                                );
+                              }
+                              const x1 = xForMs(placed.startMs, windowMs.fromMs, windowMs.toMs, chartWidth);
+                              const x2 = xForMs(placed.endMs, windowMs.fromMs, windowMs.toMs, chartWidth);
+                              return (
+                                <rect
+                                  key={placed.row.ref_id}
+                                  x={x1}
+                                  y={cy - BAR_H / 2}
+                                  width={Math.max(x2 - x1, 3)}
+                                  height={BAR_H}
+                                  rx={BAR_H / 2}
+                                  fill={fill}
+                                  opacity={placed.running ? undefined : 0.9}
+                                  {...common}
+                                  // Gentle presence pulse for live work — CSS-driven
+                                  // so the reduced-motion breaker freezes it.
+                                  className={`${common.className}${
+                                    placed.running ? ' motion-safe:animate-pulse' : ''
+                                  }`}
+                                />
+                              );
+                            }),
+                          )}
 
-                      {/* Bars + dots */}
-                      {lanes.map((lane, i) =>
-                        lane.rows.map((placed) => {
-                          const cy =
-                            laneTops[i] +
-                            LANE_VPAD +
-                            placed.subRow * SUBROW_PITCH +
-                            SUBROW_PITCH / 2;
-                          const fill = fillFor(placed.row);
-                          const label = tooltipText(placed);
-                          const common = {
-                            tabIndex: 0,
-                            role: 'img' as const,
-                            'aria-label': label,
-                            className:
-                              'cursor-default focus-visible:outline-none focus-visible:stroke-amber-500',
-                            onMouseEnter: (e: React.MouseEvent) => {
-                              const box = chartRef.current?.getBoundingClientRect();
-                              setHover({ placed, x: e.clientX - (box?.left ?? 0), y: cy });
-                            },
-                            onMouseLeave: () => setHover(null),
-                            onFocus: () =>
-                              setHover({
-                                placed,
-                                x: xForMs(placed.startMs, windowMs.fromMs, windowMs.toMs, chartWidth),
-                                y: cy,
-                              }),
-                            onBlur: () => setHover(null),
-                          };
-                          if (placed.instant) {
-                            return (
-                              <circle
-                                key={placed.row.ref_id}
-                                cx={xForMs(placed.startMs, windowMs.fromMs, windowMs.toMs, chartWidth)}
-                                cy={cy}
-                                r={DOT_R}
-                                fill={fill}
-                                {...common}
-                              />
-                            );
-                          }
-                          const x1 = xForMs(placed.startMs, windowMs.fromMs, windowMs.toMs, chartWidth);
-                          const x2 = xForMs(placed.endMs, windowMs.fromMs, windowMs.toMs, chartWidth);
-                          return (
-                            <rect
-                              key={placed.row.ref_id}
-                              x={x1}
-                              y={cy - BAR_H / 2}
-                              width={Math.max(x2 - x1, 3)}
-                              height={BAR_H}
-                              rx={BAR_H / 2}
-                              fill={fill}
-                              opacity={placed.running ? undefined : 0.9}
-                              {...common}
-                              // Gentle presence pulse for live work — CSS-driven
-                              // so the reduced-motion breaker freezes it.
-                              className={`${common.className}${
-                                placed.running ? ' motion-safe:animate-pulse' : ''
-                              }`}
-                            />
-                          );
-                        }),
+                          {/* "now" line (window end = fetch time) */}
+                          <line
+                            x1={chartWidth - 1}
+                            x2={chartWidth - 1}
+                            y1={AXIS_H - 4}
+                            y2={totalH}
+                            className="stroke-brand"
+                            strokeWidth={1.5}
+                            strokeDasharray="2 3"
+                          />
+                          <text
+                            x={chartWidth - 4}
+                            y={AXIS_H - 10}
+                            textAnchor="end"
+                            className="fill-brand text-[10px]"
+                          >
+                            {intl.formatMessage({ id: 'timeline.now' })}
+                          </text>
+                        </svg>
                       )}
 
-                      {/* "now" line (window end = fetch time) */}
-                      <line
-                        x1={chartWidth - 1}
-                        x2={chartWidth - 1}
-                        y1={AXIS_H - 4}
-                        y2={totalH}
-                        className="stroke-amber-500 dark:stroke-amber-400"
-                        strokeWidth={1.5}
-                        strokeDasharray="2 3"
-                      />
-                      <text
-                        x={chartWidth - 4}
-                        y={AXIS_H - 10}
-                        textAnchor="end"
-                        className="fill-amber-500 text-[10px]"
-                      >
-                        {intl.formatMessage({ id: 'timeline.now' })}
-                      </text>
-                    </svg>
-                  )}
-
-                  {/* Hover tooltip */}
-                  {hover && (
-                    <div
-                      role="status"
-                      className="glass-overlay pointer-events-none absolute z-10 max-w-72 rounded-lg px-3 py-2 text-xs text-stone-700 shadow-lg dark:text-stone-200"
-                      style={{
-                        left: Math.min(Math.max(hover.x, 0), Math.max(chartWidth - 160, 0)),
-                        top: Math.max(hover.y - 44, 0),
-                      }}
-                    >
-                      {tooltipText(hover.placed)}
+                      {/* Hover tooltip */}
+                      {hover && (
+                        <div
+                          role="status"
+                          className="pointer-events-none absolute z-10 max-w-72 rounded-lg border border-border bg-popover px-2.5 py-1 text-xs text-popover-foreground shadow-[var(--menu-shadow)]"
+                          style={{
+                            left: Math.min(Math.max(hover.x, 0), Math.max(chartWidth - 160, 0)),
+                            top: Math.max(hover.y - 44, 0),
+                          }}
+                        >
+                          {tooltipText(hover.placed)}
+                        </div>
+                      )}
                     </div>
-                  )}
-                </div>
-              </div>
-            )
-          )}
-        </div>
-      </Card>
-    </Page>
+                  </div>
+                )
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
   );
 }

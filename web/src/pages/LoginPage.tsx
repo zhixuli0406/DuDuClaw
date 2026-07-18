@@ -2,9 +2,8 @@ import { useState, useEffect, type FormEvent } from 'react';
 import { useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
 import { useAuthStore } from '@/stores/auth-store';
-import { Card } from '@/components/ui/Card';
-import { Button } from '@/components/ui/Button';
-import { Field, controlClass } from '@/components/ui/Field';
+import { Card, Button, Input, Spinner } from '@/components/mds';
+import { Field } from '@/components/onboarding';
 import { DuDu } from '@/components/mascot';
 import { useEffectiveName, useEffectiveLogo } from '@/lib/branding';
 
@@ -130,11 +129,21 @@ export function LoginPage() {
     setCode('');
   };
 
-  return (
-    <div className="relative flex min-h-screen items-center justify-center p-4">
-      <div className="app-ambient" aria-hidden="true" />
+  // A brand button that renders a static-frame spinner while busy (login's
+  // three states: idle / submitting / disabled).
+  const submitLabel = (busy: boolean, busyId: string, id: string) =>
+    busy ? (
+      <>
+        <Spinner label={intl.formatMessage({ id: 'login.loading' })} />
+        {intl.formatMessage({ id: busyId })}
+      </>
+    ) : (
+      intl.formatMessage({ id })
+    );
 
-      <div className="page-enter w-full max-w-sm">
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-app-shell p-4">
+      <div className="w-full max-w-sm">
         <div className="mb-8 flex flex-col items-center text-center">
           {/* A white-label distributor with a custom logo shows it here;
               otherwise DuDu greets the returning operator (§7.3 接待員). */}
@@ -142,116 +151,178 @@ export function LoginPage() {
             <img
               src={brandLogo.value}
               alt={brandName}
-              className="h-24 w-24 rounded-2xl object-cover"
+              className="h-16 w-16 rounded-xl object-cover ring-1 ring-surface-border"
             />
           ) : (
-            <DuDu face="waving" size={96} label="DuDu" />
+            <DuDu face="waving" size={72} label="DuDu" />
           )}
-          <h1 className="mt-3 text-2xl font-semibold tracking-tight text-stone-900 dark:text-stone-50">
-            {brandName}
-          </h1>
-          <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
+          <h1 className="mt-3 text-base font-medium text-foreground">{brandName}</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
             {intl.formatMessage({ id: 'login.subtitle' })}
           </p>
         </div>
 
-        <Card>
+        <Card className="gap-5 p-6">
           {error && (
-            <div className="mb-4 rounded-lg border border-rose-400/30 bg-rose-50/80 px-4 py-3 text-sm text-rose-700 dark:bg-rose-950/50 dark:text-rose-300">
+            <div
+              role="alert"
+              className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            >
               {error}
             </div>
           )}
 
           {firstRun ? (
-            <form onSubmit={handleClaim}>
-              <p className="mb-4 text-sm text-stone-500 dark:text-stone-400">
+            <form onSubmit={handleClaim} className="space-y-4">
+              <p className="text-sm text-muted-foreground">
                 {intl.formatMessage({ id: 'login.claim.intro' })}
               </p>
-              <div className="space-y-4">
-                <Field label={intl.formatMessage({ id: 'login.claim.newPassword' })} htmlFor="claim-pw">
-                  <input id="claim-pw" type="password" autoComplete="new-password" required minLength={8}
-                    value={newPassword} onChange={(e) => setNewPassword(e.target.value)}
-                    className={controlClass} placeholder="••••••••" />
-                </Field>
-                <Field label={intl.formatMessage({ id: 'login.claim.confirm' })} htmlFor="claim-confirm">
-                  <input id="claim-confirm" type="password" autoComplete="new-password" required minLength={8}
-                    value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)}
-                    className={controlClass} placeholder="••••••••" />
-                </Field>
-              </div>
-              <Button type="submit" variant="primary" disabled={loading || newPassword.length < 8}
-                className="mt-6 h-10 w-full disabled:cursor-not-allowed">
-                {loading ? intl.formatMessage({ id: 'login.loading' }) : intl.formatMessage({ id: 'login.claim.submit' })}
+              <Field label={intl.formatMessage({ id: 'login.claim.newPassword' })} htmlFor="claim-pw">
+                <Input
+                  id="claim-pw"
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  minLength={8}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="••••••••"
+                />
+              </Field>
+              <Field label={intl.formatMessage({ id: 'login.claim.confirm' })} htmlFor="claim-confirm">
+                <Input
+                  id="claim-confirm"
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  minLength={8}
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="••••••••"
+                />
+              </Field>
+              <Button
+                type="submit"
+                variant="brand"
+                size="lg"
+                disabled={loading || newPassword.length < 8}
+                className="w-full"
+              >
+                {submitLabel(loading, 'login.loading', 'login.claim.submit')}
               </Button>
             </form>
           ) : mode === 'password' ? (
-            <form onSubmit={handlePasswordSubmit}>
-              <div className="space-y-4">
-                <Field label={intl.formatMessage({ id: 'login.email' })} htmlFor="email">
-                  <input id="email" type="email" autoComplete="email" required value={email}
-                    onChange={(e) => setEmail(e.target.value)} className={controlClass} placeholder="admin@local" />
-                </Field>
-                <Field label={intl.formatMessage({ id: 'login.password' })} htmlFor="password">
-                  <input id="password" type="password" autoComplete="current-password" required value={password}
-                    onChange={(e) => setPassword(e.target.value)} className={controlClass} />
-                </Field>
-              </div>
-              <Button type="submit" variant="primary" disabled={loading} className="mt-6 h-10 w-full disabled:cursor-not-allowed">
-                {loading ? intl.formatMessage({ id: 'login.loading' }) : intl.formatMessage({ id: 'login.submit' })}
+            <form onSubmit={handlePasswordSubmit} className="space-y-4">
+              <Field label={intl.formatMessage({ id: 'login.email' })} htmlFor="email">
+                <Input
+                  id="email"
+                  type="email"
+                  autoComplete="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="admin@local"
+                />
+              </Field>
+              <Field label={intl.formatMessage({ id: 'login.password' })} htmlFor="password">
+                <Input
+                  id="password"
+                  type="password"
+                  autoComplete="current-password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </Field>
+              <Button type="submit" variant="brand" size="lg" disabled={loading} className="w-full">
+                {submitLabel(loading, 'login.loading', 'login.submit')}
               </Button>
-              <button type="button" onClick={() => switchMode('otp')}
-                className="mt-4 w-full text-center text-sm text-amber-600 transition-colors hover:text-amber-700 dark:text-amber-400">
+              <Button
+                type="button"
+                variant="link"
+                onClick={() => switchMode('otp')}
+                className="w-full text-brand"
+              >
                 {intl.formatMessage({ id: 'login.useChannelCode' })}
-              </button>
+              </Button>
             </form>
           ) : otpStep === 'email' ? (
-            <form onSubmit={handleOtpRequest}>
-              <div className="space-y-4">
-                <Field label={intl.formatMessage({ id: 'login.email' })} htmlFor="otp-email">
-                  <input id="otp-email" type="email" autoComplete="email" required value={email}
-                    onChange={(e) => setEmail(e.target.value)} className={controlClass} placeholder="you@company.com" />
-                </Field>
-              </div>
-              <Button type="submit" variant="primary" disabled={otpBusy} className="mt-6 h-10 w-full disabled:cursor-not-allowed">
-                {otpBusy ? intl.formatMessage({ id: 'login.loading' }) : intl.formatMessage({ id: 'login.otp.sendCode' })}
+            <form onSubmit={handleOtpRequest} className="space-y-4">
+              <Field label={intl.formatMessage({ id: 'login.email' })} htmlFor="otp-email">
+                <Input
+                  id="otp-email"
+                  type="email"
+                  autoComplete="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="you@company.com"
+                />
+              </Field>
+              <Button type="submit" variant="brand" size="lg" disabled={otpBusy} className="w-full">
+                {submitLabel(otpBusy, 'login.loading', 'login.otp.sendCode')}
               </Button>
-              <button type="button" onClick={() => switchMode('password')}
-                className="mt-4 w-full text-center text-sm text-stone-500 transition-colors hover:text-stone-700 dark:text-stone-400">
+              <Button
+                type="button"
+                variant="link"
+                onClick={() => switchMode('password')}
+                className="w-full text-muted-foreground"
+              >
                 {intl.formatMessage({ id: 'login.usePassword' })}
-              </button>
+              </Button>
             </form>
           ) : (
-            <form onSubmit={handleOtpVerify}>
-              <p className="mb-4 text-sm text-stone-500 dark:text-stone-400">
+            <form onSubmit={handleOtpVerify} className="space-y-4">
+              <p className="text-sm text-muted-foreground">
                 {hint
                   ? intl.formatMessage({ id: 'login.otp.sentTo' }, { target: hint })
                   : intl.formatMessage({ id: 'login.otp.sentGeneric' })}
               </p>
               <Field label={intl.formatMessage({ id: 'login.otp.codeLabel' })} htmlFor="otp-code">
-                <input id="otp-code" inputMode="numeric" autoComplete="one-time-code" required value={code}
+                <Input
+                  id="otp-code"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  required
+                  value={code}
                   onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                  className={controlClass} placeholder="000000" maxLength={6} />
+                  placeholder="000000"
+                  maxLength={6}
+                />
               </Field>
-              <Button type="submit" variant="primary" disabled={loading || code.length < 6}
-                className="mt-6 h-10 w-full disabled:cursor-not-allowed">
-                {loading ? intl.formatMessage({ id: 'login.loading' }) : intl.formatMessage({ id: 'login.otp.verify' })}
+              <Button
+                type="submit"
+                variant="brand"
+                size="lg"
+                disabled={loading || code.length < 6}
+                className="w-full"
+              >
+                {submitLabel(loading, 'login.loading', 'login.otp.verify')}
               </Button>
-              <div className="mt-4 flex items-center justify-between text-sm">
-                <button type="button" onClick={() => setOtpStep('email')}
-                  className="text-stone-500 transition-colors hover:text-stone-700 dark:text-stone-400">
+              <div className="flex items-center justify-between">
+                <Button
+                  type="button"
+                  variant="link"
+                  onClick={() => setOtpStep('email')}
+                  className="text-muted-foreground"
+                >
                   {intl.formatMessage({ id: 'login.otp.back' })}
-                </button>
-                <button type="button" onClick={() => switchMode('password')}
-                  className="text-stone-500 transition-colors hover:text-stone-700 dark:text-stone-400">
+                </Button>
+                <Button
+                  type="button"
+                  variant="link"
+                  onClick={() => switchMode('password')}
+                  className="text-muted-foreground"
+                >
                   {intl.formatMessage({ id: 'login.usePassword' })}
-                </button>
+                </Button>
               </div>
             </form>
           )}
         </Card>
 
         {!firstRun && (
-          <p className="mt-6 text-center text-xs text-stone-400 dark:text-stone-500">
+          <p className="mt-6 text-center text-xs text-muted-foreground">
             {intl.formatMessage({ id: 'login.footer' })}
           </p>
         )}

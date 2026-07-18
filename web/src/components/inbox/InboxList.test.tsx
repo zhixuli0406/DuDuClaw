@@ -3,7 +3,7 @@ import { screen, fireEvent } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { InboxList, type InboxGroup } from './InboxList';
 import type { InboxRowLabels } from './InboxRow';
-import type { InboxColumn, InboxItem } from '@/lib/inbox-model';
+import type { InboxItem } from '@/lib/inbox-model';
 
 const items: InboxItem[] = [
   { id: 'approval:1', type: 'approval', title: 'Approve the deploy', urgency: 20, actionable: true, timestamp: '2026-01-01T00:00:00Z' },
@@ -13,9 +13,6 @@ const items: InboxItem[] = [
 const labels: InboxRowLabels = {
   typeLabel: (i) => i.type,
   riskLabel: (level) => level,
-  approve: 'Approve',
-  reject: 'Reject',
-  view: 'View',
   archive: 'Archive',
 };
 
@@ -23,15 +20,13 @@ function baseProps(over?: Partial<React.ComponentProps<typeof InboxList>>) {
   return {
     // No label ⇒ no header row, so the keyboard cursor lands on a real row.
     groups: [{ key: '', items }] as InboxGroup[],
-    columns: ['type', 'agent', 'time'] as InboxColumn[],
     canArchive: true,
     agentName: (id: string) => id,
     labels,
+    selectedId: null as string | null,
+    isUnread: () => true,
     emptyState: <div>empty</div>,
-    onOpen: vi.fn(),
-    onApprove: vi.fn(),
-    onReject: vi.fn(),
-    onView: vi.fn(),
+    onSelect: vi.fn(),
     onArchive: vi.fn(),
     onUnread: vi.fn(),
     onUndo: vi.fn(),
@@ -51,28 +46,35 @@ describe('<InboxList>', () => {
     expect(screen.getByText('empty')).toBeInTheDocument();
   });
 
-  it('approve / view / archive actions fire their handlers', () => {
-    const props = baseProps();
-    renderWithProviders(<InboxList {...props} />);
-    fireEvent.click(screen.getByText('Approve'));
-    expect(props.onApprove).toHaveBeenCalled();
-    fireEvent.click(screen.getByText('View'));
-    expect(props.onView).toHaveBeenCalled();
-    fireEvent.click(screen.getAllByText('Archive')[0]);
-    expect(props.onArchive).toHaveBeenCalled();
-  });
-
-  it('clicking a row opens it', () => {
+  it('clicking a row selects it (opens the detail pane)', () => {
     const props = baseProps();
     renderWithProviders(<InboxList {...props} />);
     fireEvent.click(screen.getByText('Task is blocked'));
-    expect(props.onOpen).toHaveBeenCalled();
+    expect(props.onSelect).toHaveBeenCalled();
   });
 
-  it('keyboard: a archives, U marks unread, ⌘Z undoes', () => {
+  it('hover archive button fires the archive handler', () => {
     const props = baseProps();
     renderWithProviders(<InboxList {...props} />);
+    fireEvent.click(screen.getAllByLabelText('Archive')[0]);
+    expect(props.onArchive).toHaveBeenCalled();
+  });
+
+  it('archive button stays visible on touch (coarse pointer, no hover)', () => {
+    // Hover-only reveal is unreachable on touch, so the row action must be
+    // pinned visible under `pointer: coarse` (WP5.3 mobile pass).
+    renderWithProviders(<InboxList {...baseProps()} />);
+    expect(screen.getAllByLabelText('Archive')[0]).toHaveClass(
+      'pointer-coarse:opacity-100'
+    );
+  });
+
+  it('keyboard: j/k move selection, a archives, U marks unread, ⌘Z undoes', () => {
+    const props = baseProps({ selectedId: 'approval:1' });
+    renderWithProviders(<InboxList {...props} />);
     const listbox = screen.getByRole('listbox');
+    fireEvent.keyDown(listbox, { key: 'j' });
+    expect(props.onSelect).toHaveBeenCalled();
     fireEvent.keyDown(listbox, { key: 'a' });
     expect(props.onArchive).toHaveBeenCalled();
     fireEvent.keyDown(listbox, { key: 'U' });
@@ -82,7 +84,7 @@ describe('<InboxList>', () => {
   });
 
   it('a does not archive when canArchive is false', () => {
-    const props = baseProps({ canArchive: false });
+    const props = baseProps({ canArchive: false, selectedId: 'approval:1' });
     renderWithProviders(<InboxList {...props} />);
     const listbox = screen.getByRole('listbox');
     fireEvent.keyDown(listbox, { key: 'a' });

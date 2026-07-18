@@ -1,7 +1,9 @@
 import { useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { controlClass } from '@/components/ui';
+
+const controlClass =
+  'h-8 w-full min-w-0 rounded-lg border border-input bg-transparent px-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-50 dark:bg-input/30';
 
 export type DurationUnit = 'sec' | 'min' | 'hour';
 

@@ -1,30 +1,50 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { api, type SkillIndexEntry, type SharedSkillInfo, type SkillInfo, type SkillLeaderboardEntry } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
+import { useSystemStore } from '@/stores/system-store';
 import { departmentsOf } from '@/lib/agents';
-import { Dialog } from '@/components/shared/Dialog';
 import { CustomSkillsSection } from '@/components/skills/CustomSkillsSection';
 import { toast, formatError } from '@/lib/toast';
+import { glyphText } from '@/lib/agent-glyph';
 import {
-  Page,
-  PageHeader,
+  CollectionPageHeader,
+  CollectionPageState,
   Card,
-  Section,
-  Tabs,
-  Toolbar,
+  CardContent,
   Button,
   Badge,
-  EmptyState,
-  Field,
-  CharacterAvatar,
-  Mono,
-  controlClass,
-  type TabItem,
-} from '@/components/ui';
+  Input,
+  Segmented,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  SelectGroup,
+  SelectLabel,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogClose,
+  ListGridContainer,
+  ListGridHeader,
+  ListGridHeaderCell,
+  ListGridRow,
+  ListGridCell,
+  ActorAvatar,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  type SegmentedOption,
+} from '@/components/mds';
 import {
   Search,
   Tag,
@@ -37,14 +57,11 @@ import {
   CheckCircle,
   Loader2,
   Share2,
-  Users,
   Sparkles,
-  Store,
-  Puzzle,
   Trophy,
-  Clock,
-  Wand2,
+  MoreHorizontal,
   Link as LinkIcon,
+  Wrench,
 } from 'lucide-react';
 
 interface VetResult {
@@ -62,51 +79,141 @@ interface VetResponse {
 
 type SkillTab = 'market' | 'shared' | 'mySkills' | 'leaderboard';
 
+/**
+ * SkillMarketPage — the Multica "技能" collection (spec §5.2 + §4/§5.5). A
+ * CollectionPageHeader + a Segmented section switcher (market / team / mine /
+ * leaderboard) with a search field on the right. Installing, sharing, adopting,
+ * the vet-findings dialog and the self-built-skill wizard entry are unchanged;
+ * only the surface is re-skinned onto MDS. The Calm-Glass primitives are gone.
+ */
 export function SkillMarketPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<SkillTab>('market');
 
-  const tabItems: TabItem[] = [
-    { id: 'market', label: intl.formatMessage({ id: 'skills.tab.market' }), icon: Store },
-    { id: 'shared', label: intl.formatMessage({ id: 'skills.tab.shared' }), icon: Users },
-    { id: 'mySkills', label: intl.formatMessage({ id: 'skills.tab.mySkills' }), icon: Sparkles },
-    { id: 'leaderboard', label: intl.formatMessage({ id: 'skills.tab.leaderboard' }), icon: Trophy },
+  // Market search is lifted to the page so its Input can live in the header
+  // control row (spec §5.2) alongside the section switcher.
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<SkillIndexEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [searched, setSearched] = useState(false);
+  const [installSkill, setInstallSkill] = useState<SkillIndexEntry | null>(null);
+  const [showUrlImport, setShowUrlImport] = useState(false);
+
+  // "我的技能" client-side name filter (shares the same header Input).
+  const [mineFilter, setMineFilter] = useState('');
+
+  const runSearch = useCallback(
+    async (q: string) => {
+      if (!q.trim()) return;
+      setLoading(true);
+      setSearched(true);
+      try {
+        const res = await api.skillMarket.search(q);
+        setResults(res?.skills ?? []);
+      } catch (e) {
+        console.warn('[api]', e);
+        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+        setResults([]);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [intl],
+  );
+
+  const tabOptions: SegmentedOption<SkillTab>[] = [
+    { value: 'market', label: intl.formatMessage({ id: 'skills.tab.market' }) },
+    { value: 'shared', label: intl.formatMessage({ id: 'skills.tab.shared' }) },
+    { value: 'mySkills', label: intl.formatMessage({ id: 'skills.tab.mySkills' }) },
+    { value: 'leaderboard', label: intl.formatMessage({ id: 'skills.tab.leaderboard' }) },
   ];
 
+  const showSearch = activeTab === 'market' || activeTab === 'mySkills';
+
   return (
-    <Page wide>
-      <PageHeader
-        icon={Puzzle}
+    <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+      <CollectionPageHeader
+        hideTrigger
+        icon={Wrench}
         title={intl.formatMessage({ id: 'nav.skills' })}
-        subtitle={intl.formatMessage({ id: 'skills.market.title' })}
-        actions={
+        description={intl.formatMessage({ id: 'skills.market.title' })}
+        action={
           // Primary CTA: build a skill — coexists with the "install from market"
-          // flow below on one converged /skills page (WP1). `/skills/new` route
-          // is preserved for deep-link compatibility.
-          <Button variant="primary" icon={Wand2} onClick={() => navigate('/skills/new')}>
-            {intl.formatMessage({ id: 'skills.new.title' })}
+          // flow on this one converged /skills page. `/skills/new` route stays
+          // for deep-link compatibility.
+          <Button variant="brand" size="sm" onClick={() => navigate('/skills/new')}>
+            <Sparkles />
+            <span className="hidden sm:inline">{intl.formatMessage({ id: 'skills.new.title' })}</span>
           </Button>
         }
       />
 
-      <Tabs items={tabItems} value={activeTab} onChange={(id) => setActiveTab(id as SkillTab)} />
+      {/* Control row: section switcher + search (spec §5.2). */}
+      <div className="flex h-12 shrink-0 items-center gap-2 overflow-x-auto border-b border-surface-border px-4">
+        <Segmented
+          value={activeTab}
+          onValueChange={setActiveTab}
+          options={tabOptions}
+          aria-label={intl.formatMessage({ id: 'nav.skills' })}
+        />
+        {showSearch && (
+          <div className="relative ml-auto shrink-0">
+            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={activeTab === 'market' ? query : mineFilter}
+              onChange={(e) =>
+                activeTab === 'market' ? setQuery(e.target.value) : setMineFilter(e.target.value)
+              }
+              onKeyDown={(e) => {
+                if (activeTab === 'market' && e.key === 'Enter') runSearch(query);
+              }}
+              placeholder={intl.formatMessage({
+                id: activeTab === 'market' ? 'skills.market.searchPlaceholder' : 'skills.my.filterPlaceholder',
+              })}
+              className="w-44 pl-8 sm:w-64"
+            />
+          </div>
+        )}
+        {activeTab === 'market' && (
+          <Button
+            variant="outline"
+            size="sm"
+            className={showSearch ? undefined : 'ml-auto'}
+            onClick={() => setShowUrlImport(true)}
+          >
+            <LinkIcon />
+            <span className="hidden sm:inline">{intl.formatMessage({ id: 'skills.import.fromUrl' })}</span>
+          </Button>
+        )}
+      </div>
 
-      {activeTab === 'market' && <MarketTab />}
-      {activeTab === 'shared' && <SharedSkillsTab />}
-      {activeTab === 'mySkills' && <MySkillsTab />}
-      {activeTab === 'leaderboard' && <LeaderboardTab />}
-    </Page>
+      <div className="flex flex-1 flex-col p-4 md:p-6">
+        {activeTab === 'market' && (
+          <MarketTab
+            query={query}
+            onCategory={(cat) => {
+              setQuery(cat);
+              runSearch(cat);
+            }}
+            results={results}
+            loading={loading}
+            searched={searched}
+            onInstall={setInstallSkill}
+          />
+        )}
+        {activeTab === 'shared' && <SharedSkillsTab />}
+        {activeTab === 'mySkills' && <MySkillsTab filter={mineFilter} />}
+        {activeTab === 'leaderboard' && <LeaderboardTab />}
+      </div>
+
+      {installSkill && <InstallDialog skill={installSkill} onClose={() => setInstallSkill(null)} />}
+      {showUrlImport && <UrlImportDialog onClose={() => setShowUrlImport(false)} onInstall={setInstallSkill} />}
+    </div>
   );
 }
 
-// ── Leaderboard Tab (WP10-T10.1 — honour roll of time-saving skills) ─────
-
-const RANK_ACCENT: Record<number, string> = {
-  0: 'text-amber-500',
-  1: 'text-stone-400',
-  2: 'text-orange-400',
-};
+// ── Leaderboard Tab (WP10-T10.1 — honour roll, §5.5 ranking cards) ──────────
 
 function LeaderboardTab() {
   const intl = useIntl();
@@ -131,182 +238,200 @@ function LeaderboardTab() {
     })();
   }, [intl]);
 
+  const max = useMemo(
+    () => entries.reduce((m, e) => Math.max(m, e.estimated_minutes_saved), 0),
+    [entries],
+  );
+
+  if (loading) return <CollectionPageState state="loading" />;
+  if (entries.length === 0) {
+    return (
+      <CollectionPageState
+        state="empty"
+        icon={Trophy}
+        title={intl.formatMessage({ id: 'skills.leaderboard.empty' })}
+        description={intl.formatMessage({ id: 'skills.leaderboard.subtitle' })}
+      />
+    );
+  }
+
   return (
-    <div className="space-y-6">
-      <p className="text-sm text-stone-500 dark:text-stone-400">
+    <div className="space-y-4">
+      <p className="text-sm text-muted-foreground">
         {intl.formatMessage({ id: 'skills.leaderboard.subtitle' })}
       </p>
-
-      {loading ? (
-        <div className="py-12 text-center text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</div>
-      ) : entries.length === 0 ? (
-        <Card>
-          <EmptyState
-            dudu="curious"
-            icon={Trophy}
-            title={intl.formatMessage({ id: 'skills.leaderboard.empty' })}
-          />
-        </Card>
-      ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {entries.map((entry, i) => (
-            <Card key={`${entry.owner}/${entry.skill}`}>
-              <div className="flex items-start gap-3">
-                <span
-                  className={cn(
-                    'flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-stone-500/10 text-sm font-bold tabular-nums dark:bg-white/5',
-                    RANK_ACCENT[i] ?? 'text-stone-500 dark:text-stone-400',
-                  )}
-                  aria-hidden="true"
-                >
-                  {i < 3 ? <Trophy className="h-4 w-4" /> : i + 1}
+      <Card>
+        <CardContent className="divide-y divide-surface-border">
+          {entries.map((entry, i) => {
+            const pct = max > 0 ? Math.max(4, Math.round((entry.estimated_minutes_saved / max) * 100)) : 0;
+            return (
+              <div key={`${entry.owner}/${entry.skill}`} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
+                <span className="w-5 shrink-0 text-center font-mono text-xs tabular-nums text-muted-foreground">
+                  {i + 1}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <h3 className="truncate font-semibold text-stone-900 dark:text-stone-50" title={entry.display_name || entry.skill}>
-                    {entry.display_name || entry.skill}
-                  </h3>
-                  <p className="mt-1 flex items-center gap-1.5 text-sm font-medium text-amber-600 dark:text-amber-400">
-                    <Clock className="h-3.5 w-3.5" />
-                    {intl.formatMessage(
-                      { id: 'skills.leaderboard.minutesSaved' },
-                      { minutes: entry.estimated_minutes_saved },
-                    )}
-                  </p>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-sm font-medium text-foreground" title={entry.display_name || entry.skill}>
+                      {entry.display_name || entry.skill}
+                    </span>
+                    <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+                      {intl.formatMessage(
+                        { id: 'skills.leaderboard.minutesSaved' },
+                        { minutes: entry.estimated_minutes_saved },
+                      )}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-muted">
+                    <div className="h-full rounded-full bg-chart-1" style={{ width: `${pct}%` }} />
+                  </div>
+                  {entry.owner && (
+                    <div className="mt-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <ActorAvatar actorType="agent" size="xs" name={entry.owner} />
+                      <span className="truncate">{entry.owner}</span>
+                      {entry.scope && <Badge variant="secondary">{entry.scope}</Badge>}
+                    </div>
+                  )}
                 </div>
               </div>
-
-              <div className="mt-4 flex flex-wrap items-center gap-1.5 border-t border-[var(--panel-border)] pt-3 text-xs text-stone-500 dark:text-stone-400">
-                {entry.owner && (
-                  <span className="flex items-center gap-1">
-                    <CharacterAvatar agentId={entry.owner} name={entry.owner} size={24} />
-                    {entry.owner}
-                  </span>
-                )}
-                {entry.scope && <Badge tone="neutral">{entry.scope}</Badge>}
-              </div>
-            </Card>
-          ))}
-        </div>
-      )}
-
-      {note && (
-        <p className="text-xs text-stone-400 dark:text-stone-500">{note}</p>
-      )}
+            );
+          })}
+        </CardContent>
+      </Card>
+      {note && <p className="text-xs text-muted-foreground">{note}</p>}
     </div>
   );
 }
 
-// ── Market Tab (original content) ───────────────────────────
+// ── Market Tab ──────────────────────────────────────────────
 
-function MarketTab() {
+function MarketTab({
+  query,
+  onCategory,
+  results,
+  loading,
+  searched,
+  onInstall,
+}: {
+  query: string;
+  onCategory: (cat: string) => void;
+  results: SkillIndexEntry[];
+  loading: boolean;
+  searched: boolean;
+  onInstall: (skill: SkillIndexEntry) => void;
+}) {
   const intl = useIntl();
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState<SkillIndexEntry[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [searched, setSearched] = useState(false);
-  const [installSkill, setInstallSkill] = useState<SkillIndexEntry | null>(null);
-  const [showUrlImport, setShowUrlImport] = useState(false);
 
-  const handleSearchQuery = async (q: string) => {
-    if (!q.trim()) return;
-    setLoading(true);
-    setSearched(true);
-    try {
-      const res = await api.skillMarket.search(q);
-      setResults(res?.skills ?? []);
-    } catch (e) {
-      console.warn('[api]', e);
-      // Surface to the user so they don't mistake a network/backend error for
-      // "no results." The empty-results reset still drives the empty-state UI.
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
-      setResults([]);
-    } finally {
-      setLoading(false);
-    }
-  };
+  if (loading) return <CollectionPageState state="loading" />;
 
-  const handleSearch = () => handleSearchQuery(query);
+  if (searched && results.length === 0) {
+    return (
+      <CollectionPageState
+        state="empty"
+        icon={Search}
+        title={intl.formatMessage({ id: 'skills.market.noResults' })}
+        description={query ? `"${query}"` : undefined}
+      />
+    );
+  }
 
+  if (results.length > 0) {
+    return (
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {results.map((skill) => (
+          <SkillCard key={skill.name} skill={skill} onInstall={() => onInstall(skill)} />
+        ))}
+      </div>
+    );
+  }
+
+  // Not yet searched — category browse.
   return (
-    <div className="space-y-6">
-      <p className="text-sm text-stone-500 dark:text-stone-400">
-        {intl.formatMessage({ id: 'skills.market.subtitle' })}
-      </p>
+    <div className="space-y-3">
+      <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'skills.market.subtitle' })}</p>
+      <h2 className="text-xs font-medium text-muted-foreground">
+        {intl.formatMessage({ id: 'skills.market.categories' })}
+      </h2>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {['utility', 'communication', 'code', 'data', 'security', 'ai', 'media', 'automation'].map((cat) => (
+          <button
+            key={cat}
+            type="button"
+            onClick={() => onCategory(cat)}
+            className="flex items-center gap-2 rounded-xl border border-surface-border bg-surface px-4 py-3 text-sm text-foreground shadow-[var(--surface-shadow)] transition-colors hover:bg-surface-hover"
+          >
+            <Tag className="size-4 text-brand" />
+            {cat}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
-      {/* Search bar */}
-      <Toolbar
-        search={query}
-        onSearchChange={setQuery}
-        onSearchEnter={handleSearch}
-        searchPlaceholder={intl.formatMessage({ id: 'skills.market.searchPlaceholder' })}
-      >
-        <Button variant="primary" icon={Search} onClick={handleSearch} disabled={loading}>
-          {intl.formatMessage({ id: 'skills.market.search' })}
-        </Button>
-        <Button variant="secondary" icon={LinkIcon} onClick={() => setShowUrlImport(true)}>
-          {intl.formatMessage({ id: 'skills.import.fromUrl' })}
-        </Button>
-      </Toolbar>
-
-      {loading && (
-        <div className="py-12 text-center text-stone-400">
-          {intl.formatMessage({ id: 'common.loading' })}
+function SkillCard({ skill, onInstall }: { skill: SkillIndexEntry; onInstall: () => void }) {
+  const intl = useIntl();
+  const hasUrl = skill.url && /^https?:\/\//i.test(skill.url);
+  return (
+    <Card className="gap-3">
+      <CardContent className="flex min-w-0 flex-1 flex-col gap-3">
+        <div className="flex items-start justify-between gap-2">
+          <h3 className="min-w-0 truncate text-base font-medium text-foreground" title={skill.name}>
+            {skill.name}
+          </h3>
+          {hasUrl && (
+            <a
+              href={skill.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="shrink-0 text-muted-foreground hover:text-brand"
+              aria-label="GitHub"
+            >
+              <ExternalLink className="size-4" />
+            </a>
+          )}
         </div>
-      )}
-
-      {!loading && searched && results.length === 0 && (
-        <Card>
-          <EmptyState
-            dudu="concerned"
-            icon={Search}
-            title={intl.formatMessage({ id: 'skills.market.noResults' })}
-          />
-        </Card>
-      )}
-
-      {!loading && results.length > 0 && (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {results.map((skill) => (
-            <SkillCard key={skill.name} skill={skill} onInstall={() => setInstallSkill(skill)} />
-          ))}
-        </div>
-      )}
-
-      {!searched && (
-        <Section title={intl.formatMessage({ id: 'skills.market.categories' })}>
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            {['utility', 'communication', 'code', 'data', 'security', 'ai', 'media', 'automation'].map((cat) => (
-              <Card
-                key={cat}
-                interactive
-                padded={false}
-                onClick={() => { setQuery(cat); handleSearchQuery(cat); }}
-              >
-                <span className="flex items-center gap-2 px-4 py-3 text-sm text-stone-700 dark:text-stone-300">
-                  <Tag className="h-4 w-4 text-amber-500" />
-                  {cat}
-                </span>
-              </Card>
+        <p className="line-clamp-2 text-sm text-muted-foreground">
+          {skill.description || intl.formatMessage({ id: 'common.noData' })}
+        </p>
+        {skill.tags.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {skill.tags.map((tag) => (
+              <Badge key={tag} variant="secondary">{tag}</Badge>
             ))}
           </div>
-        </Section>
-      )}
-
-      {installSkill && <InstallDialog skill={installSkill} onClose={() => setInstallSkill(null)} />}
-      {showUrlImport && <UrlImportDialog onClose={() => setShowUrlImport(false)} />}
-    </div>
+        )}
+      </CardContent>
+      <div className="flex items-center justify-between gap-2 border-t border-surface-border px-4 pt-3">
+        {skill.author ? (
+          <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+            <ActorAvatar actorType="user" size="xs" name={skill.author} />
+            <span className="truncate">{skill.author}</span>
+          </span>
+        ) : (
+          <span />
+        )}
+        <Button variant="brand" size="sm" onClick={onInstall}>
+          <Download />
+          {intl.formatMessage({ id: 'skills.market.install' })}
+        </Button>
+      </div>
+    </Card>
   );
 }
 
 // ── Import from GitHub / URL ────────────────────────────────
-//
 // Collects a source URL, then reuses InstallDialog — the vet RPC fetches the
 // content server-side (SSRF-gated), scans it, and install re-scans fail-closed.
 
-function UrlImportDialog({ onClose }: { onClose: () => void }) {
+function UrlImportDialog({
+  onClose,
+  onInstall,
+}: {
+  onClose: () => void;
+  onInstall: (skill: SkillIndexEntry) => void;
+}) {
   const intl = useIntl();
   const [url, setUrl] = useState('');
-  const [entry, setEntry] = useState<SkillIndexEntry | null>(null);
 
   const trimmed = url.trim();
   const valid = /^https?:\/\/\S+$/i.test(trimmed);
@@ -317,60 +442,49 @@ function UrlImportDialog({ onClose }: { onClose: () => void }) {
     try {
       const u = new URL(trimmed);
       name = `${u.hostname}${u.pathname}`.replace(/\/+$/, '');
-    } catch { /* keep raw url as the display name */ }
-    setEntry({
-      name,
-      description: trimmed,
-      tags: [],
-      author: '',
-      url: trimmed,
-      compatible: [],
-    });
+    } catch {
+      /* keep raw url as the display name */
+    }
+    onClose();
+    onInstall({ name, description: trimmed, tags: [], author: '', url: trimmed, compatible: [] });
   };
 
-  if (entry) {
-    return <InstallDialog skill={entry} onClose={onClose} />;
-  }
-
   return (
-    <Dialog
-      open
-      onClose={onClose}
-      title={intl.formatMessage({ id: 'skills.import.title' })}
-      className="max-w-xl"
-    >
-      <div className="space-y-4">
-        <p className="text-sm text-stone-500 dark:text-stone-400">
-          {intl.formatMessage({ id: 'skills.import.desc' })}
-        </p>
-        <Field label="URL">
-          <input
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'skills.import.title' })}</DialogTitle>
+          <DialogDescription>{intl.formatMessage({ id: 'skills.import.desc' })}</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-2">
+          <label className="text-xs font-medium text-muted-foreground">URL</label>
+          <Input
             type="url"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') handleContinue(); }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') handleContinue();
+            }}
             placeholder="https://github.com/user/repo"
-            className={controlClass}
             autoFocus
           />
-        </Field>
-        <p className="text-xs text-stone-400 dark:text-stone-500">
-          {intl.formatMessage({ id: 'skills.import.hint' })}
-        </p>
-        <div className="flex justify-end gap-3 border-t border-[var(--panel-border)] pt-4">
-          <Button variant="secondary" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </Button>
-          <Button variant="primary" icon={Shield} onClick={handleContinue} disabled={!valid}>
+          <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'skills.import.hint' })}</p>
+        </div>
+        <DialogFooter>
+          <DialogClose
+            render={<Button variant="outline">{intl.formatMessage({ id: 'common.cancel' })}</Button>}
+          />
+          <Button variant="brand" onClick={handleContinue} disabled={!valid}>
+            <Shield />
             {intl.formatMessage({ id: 'skills.import.continue' })}
           </Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
 
-// ── Shared Skills Tab (Phase 4) ─────────────────────────────
+// ── Shared (Team) Skills Tab (Phase 4) ──────────────────────
 
 function SharedSkillsTab() {
   const intl = useIntl();
@@ -399,7 +513,12 @@ function SharedSkillsTab() {
   }, [fetchAgents, intl]);
 
   const adoptTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => { if (adoptTimerRef.current) clearTimeout(adoptTimerRef.current); }, []);
+  useEffect(
+    () => () => {
+      if (adoptTimerRef.current) clearTimeout(adoptTimerRef.current);
+    },
+    [],
+  );
 
   const handleAdopt = useCallback(async () => {
     if (!adoptTarget || !adoptAgent) return;
@@ -413,132 +532,137 @@ function SharedSkillsTab() {
             : s,
         ),
       );
-      adoptTimerRef.current = setTimeout(() => { setAdoptTarget(null); setAdoptSuccess(null); }, 1500);
+      adoptTimerRef.current = setTimeout(() => {
+        setAdoptTarget(null);
+        setAdoptSuccess(null);
+      }, 1500);
     } catch (e) {
       console.warn('[api]', e);
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     }
   }, [adoptTarget, adoptAgent, intl]);
 
+  if (loading) return <CollectionPageState state="loading" />;
+  if (sharedSkills.length === 0) {
+    return (
+      <CollectionPageState
+        state="empty"
+        icon={Share2}
+        title={intl.formatMessage({ id: 'skills.shared.empty' })}
+        description={intl.formatMessage({ id: 'skills.shared.subtitle' })}
+      />
+    );
+  }
+
   return (
-    <div className="space-y-6">
-      <p className="text-sm text-stone-500 dark:text-stone-400">
-        {intl.formatMessage({ id: 'skills.shared.subtitle' })}
-      </p>
-
-      {loading ? (
-        <div className="py-12 text-center text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</div>
-      ) : sharedSkills.length === 0 ? (
-        <Card>
-          <EmptyState
-            dudu="curious"
-            icon={Share2}
-            title={intl.formatMessage({ id: 'skills.shared.empty' })}
-          />
-        </Card>
-      ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {sharedSkills.map((skill) => (
-            <Card key={skill.name} interactive>
-              <h3 className="font-semibold text-stone-900 dark:text-stone-50">{skill.name}</h3>
-              <p className="mt-1 text-sm text-stone-600 dark:text-stone-400">
-                {skill.description || '—'}
-              </p>
-
+    <div className="space-y-4">
+      <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'skills.shared.subtitle' })}</p>
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {sharedSkills.map((skill) => (
+          <Card key={skill.name} className="gap-3">
+            <CardContent className="flex flex-1 flex-col gap-3">
+              <h3 className="truncate text-base font-medium text-foreground" title={skill.name}>
+                {skill.name}
+              </h3>
+              <p className="line-clamp-2 text-sm text-muted-foreground">{skill.description || '—'}</p>
               {skill.tags.length > 0 && (
-                <div className="mt-3 flex flex-wrap gap-1.5">
+                <div className="flex flex-wrap gap-1.5">
                   {skill.tags.map((tag) => (
-                    <Badge key={tag} tone="neutral">{tag}</Badge>
+                    <Badge key={tag} variant="secondary">{tag}</Badge>
                   ))}
                 </div>
               )}
-
-              <div className="mt-4 space-y-2 text-xs text-stone-500 dark:text-stone-400">
-                <div className="flex items-center gap-2">
-                  <CharacterAvatar agentId={skill.shared_by} name={skill.shared_by} size={24} />
-                  <span>{intl.formatMessage({ id: 'skills.shared.sharedBy' })}: {skill.shared_by}</span>
+              <div className="mt-auto space-y-1.5 text-xs text-muted-foreground">
+                <div className="flex items-center gap-1.5">
+                  <ActorAvatar actorType="agent" size="xs" name={skill.shared_by} />
+                  <span className="truncate">
+                    {intl.formatMessage({ id: 'skills.shared.sharedBy' })}: {skill.shared_by}
+                  </span>
                 </div>
-                <div className="flex items-center gap-2">
-                  <Download className="h-3 w-3" />
-                  <span>{intl.formatMessage({ id: 'skills.shared.usageCount' })}: <Mono>{skill.usage_count}</Mono></span>
+                <div className="flex items-center gap-1.5">
+                  <Download className="size-3" />
+                  <span>
+                    {intl.formatMessage({ id: 'skills.shared.usageCount' })}:{' '}
+                    <span className="font-mono tabular-nums">{skill.usage_count}</span>
+                  </span>
                 </div>
-                {skill.adopted_by.length > 0 && (
-                  <div className="flex items-center gap-2">
-                    <Users className="h-3 w-3" />
-                    <span>{intl.formatMessage({ id: 'skills.shared.adoptedBy' })}: {skill.adopted_by.join(', ')}</span>
-                  </div>
-                )}
               </div>
-
-              <div className="mt-4 border-t border-[var(--panel-border)] pt-3">
-                <Button
-                  size="sm"
-                  icon={Download}
-                  onClick={() => {
-                    setAdoptTarget(skill);
-                    setAdoptAgent(agents[0]?.name ?? '');
-                    setAdoptSuccess(null);
-                  }}
-                >
-                  {intl.formatMessage({ id: 'skills.shared.adopt' })}
-                </Button>
-              </div>
-            </Card>
-          ))}
-        </div>
-      )}
-
-      {/* Adopt dialog */}
-      {adoptTarget && (
-        <Dialog
-          open
-          onClose={() => { setAdoptTarget(null); setAdoptSuccess(null); }}
-          title={intl.formatMessage({ id: 'skills.shared.adopt' })}
-        >
-          <div className="space-y-4">
-            <p className="text-sm text-stone-600 dark:text-stone-400">
-              <strong>{adoptTarget.name}</strong> → {intl.formatMessage({ id: 'skills.shared.adoptTo' })}
-            </p>
-            <select
-              value={adoptAgent}
-              onChange={(e) => setAdoptAgent(e.target.value)}
-              className={controlClass}
-            >
-              {agents.map((a) => (
-                <option key={a.name} value={a.name}>{a.icon || '🤖'} {a.display_name}</option>
-              ))}
-            </select>
-            {adoptSuccess && (
-              <div className="flex items-center gap-2 rounded-control border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-400">
-                <CheckCircle className="h-4 w-4 flex-shrink-0" />
-                {adoptSuccess}
-              </div>
-            )}
-            <div className="flex justify-end gap-3">
+            </CardContent>
+            <div className="border-t border-surface-border px-4 pt-3">
               <Button
-                variant="secondary"
-                onClick={() => { setAdoptTarget(null); setAdoptSuccess(null); }}
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setAdoptTarget(skill);
+                  setAdoptAgent(agents[0]?.name ?? '');
+                  setAdoptSuccess(null);
+                }}
               >
-                {intl.formatMessage({ id: 'common.cancel' })}
-              </Button>
-              <Button
-                variant="primary"
-                onClick={handleAdopt}
-                disabled={!adoptAgent || !!adoptSuccess}
-              >
+                <Download />
                 {intl.formatMessage({ id: 'skills.shared.adopt' })}
               </Button>
             </div>
-          </div>
-        </Dialog>
-      )}
+          </Card>
+        ))}
+      </div>
+
+      {/* Adopt dialog */}
+      <Dialog
+        open={adoptTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) {
+            setAdoptTarget(null);
+            setAdoptSuccess(null);
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{intl.formatMessage({ id: 'skills.shared.adopt' })}</DialogTitle>
+            <DialogDescription>
+              <strong className="text-foreground">{adoptTarget?.name}</strong> →{' '}
+              {intl.formatMessage({ id: 'skills.shared.adoptTo' })}
+            </DialogDescription>
+          </DialogHeader>
+          <AgentSelect
+            value={adoptAgent}
+            onValueChange={setAdoptAgent}
+            agents={agents}
+            placeholder={intl.formatMessage({ id: 'skills.shared.adoptTo' })}
+          />
+          {adoptSuccess && (
+            <div className="flex items-center gap-2 rounded-lg bg-success/10 px-3 py-2 text-sm text-success">
+              <CheckCircle className="size-4 shrink-0" />
+              {adoptSuccess}
+            </div>
+          )}
+          <DialogFooter>
+            <DialogClose
+              render={<Button variant="outline">{intl.formatMessage({ id: 'common.cancel' })}</Button>}
+            />
+            <Button variant="brand" onClick={handleAdopt} disabled={!adoptAgent || !!adoptSuccess}>
+              {intl.formatMessage({ id: 'skills.shared.adopt' })}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
 // ── My Skills Tab ───────────────────────────────────────────
 
-function MySkillsTab() {
+/** Security status → semantic dot + Badge tone (installed-skill data model). */
+function securityDot(status?: string): string {
+  if (status === 'pass') return 'bg-success';
+  if (status === 'warn') return 'bg-warning';
+  if (status === 'fail') return 'bg-destructive';
+  return 'bg-muted-foreground';
+}
+
+const MY_SKILLS_COLUMNS = 'minmax(0,1fr) auto 2.5rem';
+
+function MySkillsTab({ filter }: { filter: string }) {
   const intl = useIntl();
   const { agents, fetchAgents } = useAgentsStore();
   const [selectedAgent, setSelectedAgent] = useState<string>('');
@@ -546,8 +670,12 @@ function MySkillsTab() {
   const [loading, setLoading] = useState(false);
   const [shareSuccess, setShareSuccess] = useState<string | null>(null);
 
-  useEffect(() => { fetchAgents(); }, [fetchAgents]);
-  useEffect(() => { if (agents.length > 0 && !selectedAgent) setSelectedAgent(agents[0].name); }, [agents, selectedAgent]);
+  useEffect(() => {
+    fetchAgents();
+  }, [fetchAgents]);
+  useEffect(() => {
+    if (agents.length > 0 && !selectedAgent) setSelectedAgent(agents[0].name);
+  }, [agents, selectedAgent]);
 
   useEffect(() => {
     if (!selectedAgent) return;
@@ -566,183 +694,191 @@ function MySkillsTab() {
     })();
   }, [selectedAgent, intl]);
 
-  const handleShare = useCallback(async (skillName: string) => {
-    if (!selectedAgent) return;
-    try {
-      await api.sharedSkills.share(selectedAgent, skillName);
-      setShareSuccess(skillName);
-      setTimeout(() => setShareSuccess(null), 2000);
-    } catch (e) {
-      console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
-    }
-  }, [selectedAgent, intl]);
+  const handleShare = useCallback(
+    async (skillName: string) => {
+      if (!selectedAgent) return;
+      try {
+        await api.sharedSkills.share(selectedAgent, skillName);
+        setShareSuccess(skillName);
+        setTimeout(() => setShareSuccess(null), 2000);
+      } catch (e) {
+        console.warn('[api]', e);
+        toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+      }
+    },
+    [selectedAgent, intl],
+  );
+
+  const q = filter.trim().toLowerCase();
+  const visible = useMemo(
+    () => (q ? skills.filter((s) => s.name.toLowerCase().includes(q)) : skills),
+    [skills, q],
+  );
 
   return (
     <div className="space-y-6">
-      {/* Self-built skills (V13 / T13.2) */}
-      <CustomSkillsSection />
+      {/* Self-built skills (V13 / T13.2), filtered by the same header search. */}
+      <CustomSkillsSection filter={filter} />
 
-      {/* Agent selector */}
-      <Toolbar>
-        <Field label="Agent" className="space-y-0">
-          <select
+      {/* Installed skills per agent (spec §4 ListGrid, single-row h-12). */}
+      <section className="space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-sm font-medium text-foreground">
+            {intl.formatMessage({ id: 'skills.my.installed' })}
+          </h2>
+          <AgentSelect
             value={selectedAgent}
-            onChange={(e) => setSelectedAgent(e.target.value)}
-            className={cn(controlClass, 'w-auto')}
-          >
-            {agents.map((a) => (
-              <option key={a.name} value={a.name}>{a.icon || '🤖'} {a.display_name}</option>
-            ))}
-          </select>
-        </Field>
-      </Toolbar>
-
-      {loading ? (
-        <div className="py-12 text-center text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</div>
-      ) : skills.length === 0 ? (
-        <Card>
-          <EmptyState
-            dudu="curious"
-            icon={Sparkles}
-            title={intl.formatMessage({ id: 'common.noData' })}
+            onValueChange={setSelectedAgent}
+            agents={agents}
+            placeholder={intl.formatMessage({ id: 'skills.my.selectAgent' })}
           />
-        </Card>
-      ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {skills.map((skill) => (
-            <Card key={skill.name}>
-              <div className="flex items-start justify-between gap-2">
-                <h3 className="font-semibold text-stone-900 dark:text-stone-50">{skill.name}</h3>
-                {skill.security_status && (
-                  <Badge
-                    tone={
-                      skill.security_status === 'pass' ? 'success' :
-                      skill.security_status === 'warn' ? 'warning' :
-                      'danger'
-                    }
-                  >
-                    {skill.security_status}
-                  </Badge>
-                )}
-              </div>
-
-              <p className="mt-2 line-clamp-3 text-sm text-stone-600 dark:text-stone-400">
-                {skill.content.slice(0, 150)}{skill.content.length > 150 ? '...' : ''}
-              </p>
-
-              <div className="mt-4 border-t border-[var(--panel-border)] pt-3">
-                <Button
-                  size="sm"
-                  variant={shareSuccess === skill.name ? 'secondary' : 'primary'}
-                  icon={shareSuccess === skill.name ? CheckCircle : Share2}
-                  onClick={() => handleShare(skill.name)}
-                  disabled={shareSuccess === skill.name}
-                >
-                  {shareSuccess === skill.name
-                    ? 'Shared!'
-                    : intl.formatMessage({ id: 'skills.shared.share' })}
-                </Button>
-              </div>
-            </Card>
-          ))}
         </div>
-      )}
+
+        {loading ? (
+          <CollectionPageState state="loading" />
+        ) : visible.length === 0 ? (
+          <CollectionPageState
+            state="empty"
+            icon={Sparkles}
+            title={intl.formatMessage({ id: q ? 'skills.market.noResults' : 'common.noData' })}
+          />
+        ) : (
+          <div className="overflow-hidden rounded-xl border border-surface-border">
+            <ListGridContainer
+              columns={MY_SKILLS_COLUMNS}
+              className="!h-auto [&>[aria-hidden]]:hidden"
+              header={
+                <ListGridHeader>
+                  <ListGridHeaderCell>{intl.formatMessage({ id: 'skills.my.col.name' })}</ListGridHeaderCell>
+                  <ListGridHeaderCell>{intl.formatMessage({ id: 'skills.my.col.security' })}</ListGridHeaderCell>
+                  <ListGridHeaderCell aria-hidden />
+                </ListGridHeader>
+              }
+            >
+              {visible.map((skill) => (
+                <InstalledSkillRow
+                  key={skill.name}
+                  skill={skill}
+                  shared={shareSuccess === skill.name}
+                  onShare={() => handleShare(skill.name)}
+                />
+              ))}
+            </ListGridContainer>
+          </div>
+        )}
+      </section>
     </div>
   );
 }
 
-function SkillCard({
+function InstalledSkillRow({
   skill,
-  onInstall,
+  shared,
+  onShare,
 }: {
-  skill: SkillIndexEntry;
-  onInstall: () => void;
+  skill: SkillInfo;
+  shared: boolean;
+  onShare: () => void;
 }) {
   const intl = useIntl();
+  const status = skill.security_status;
   return (
-    <Card interactive>
-      <div className="mb-3 flex items-start justify-between">
-        <h3 className="font-semibold text-stone-900 dark:text-stone-50">
+    <ListGridRow className="cursor-default">
+      <ListGridCell className="gap-2">
+        <Sparkles className="size-4 shrink-0 text-muted-foreground" />
+        <span className="truncate text-sm font-medium text-foreground" title={skill.name}>
           {skill.name}
-        </h3>
-        {skill.url && /^https?:\/\//i.test(skill.url) && (
-          <a
-            href={skill.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-stone-400 hover:text-amber-500"
+        </span>
+      </ListGridCell>
+      <ListGridCell>
+        <span className={cn('mr-2 size-1.5 shrink-0 rounded-full', securityDot(status))} />
+        <span className="truncate text-sm text-muted-foreground">
+          {status
+            ? intl.formatMessage({ id: `skills.my.security.${status}` })
+            : intl.formatMessage({ id: 'skills.my.security.unknown' })}
+        </span>
+      </ListGridCell>
+      <ListGridCell className="justify-end">
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={intl.formatMessage({ id: 'skills.my.moreActions' })}
+                data-stop-row-nav
+                onClick={(e) => e.stopPropagation()}
+              />
+            }
           >
-            <ExternalLink className="h-4 w-4" />
-          </a>
-        )}
-      </div>
-
-      <p className="mb-3 text-sm text-stone-600 dark:text-stone-400">
-        {skill.description || intl.formatMessage({ id: 'common.noData' })}
-      </p>
-
-      {skill.tags.length > 0 && (
-        <div className="mb-3 flex flex-wrap gap-1.5">
-          {skill.tags.map((tag) => (
-            <Badge key={tag} tone="neutral">{tag}</Badge>
-          ))}
-        </div>
-      )}
-
-      <div className="flex items-center justify-between border-t border-[var(--panel-border)] pt-3">
-        {skill.author && (
-          <span className="flex items-center gap-1 text-xs text-stone-400">
-            <CharacterAvatar agentId={skill.author} name={skill.author} size={24} />
-            {skill.author}
-          </span>
-        )}
-        <div className="flex items-center gap-2">
-          {skill.url && /^https?:\/\//i.test(skill.url) && (
-            <Button
-              size="sm"
-              variant="secondary"
-              icon={ExternalLink}
-              onClick={() => window.open(skill.url, '_blank', 'noopener,noreferrer')}
-            >
-              GitHub
-            </Button>
-          )}
-          <Button
-            size="sm"
-            variant="primary"
-            icon={Download}
-            onClick={onInstall}
-          >
-            {intl.formatMessage({ id: 'skills.market.install' })}
-          </Button>
-        </div>
-      </div>
-    </Card>
+            <MoreHorizontal />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            <DropdownMenuItem onClick={onShare} disabled={shared}>
+              {shared ? <CheckCircle /> : <Share2 />}
+              {shared
+                ? intl.formatMessage({ id: 'skills.my.shared' })
+                : intl.formatMessage({ id: 'skills.shared.share' })}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </ListGridCell>
+    </ListGridRow>
   );
 }
 
-const SEVERITY_COLORS: Record<string, string> = {
-  critical: 'text-rose-500',
-  high: 'text-orange-500',
-  medium: 'text-amber-500',
-  low: 'text-stone-400',
-};
-
-const SEVERITY_BG: Record<string, string> = {
-  critical: 'bg-rose-50 border-rose-200 dark:bg-rose-900/20 dark:border-rose-800',
-  high: 'bg-orange-50 border-orange-200 dark:bg-orange-900/20 dark:border-orange-800',
-  medium: 'bg-amber-50 border-amber-200 dark:bg-amber-900/20 dark:border-amber-800',
-  low: 'bg-stone-50 border-stone-200 dark:bg-stone-800/50 dark:border-stone-700',
-};
-
-function InstallDialog({
-  skill,
-  onClose,
+/** Small agent picker shared by the install/adopt/my-skills surfaces. */
+function AgentSelect({
+  value,
+  onValueChange,
+  agents,
+  placeholder,
 }: {
-  skill: SkillIndexEntry;
-  onClose: () => void;
+  value: string;
+  onValueChange: (v: string) => void;
+  agents: ReadonlyArray<{ name: string; display_name: string; icon?: string }>;
+  placeholder?: string;
 }) {
+  const current = agents.find((a) => a.name === value);
+  return (
+    <Select value={value} onValueChange={(v) => onValueChange(String(v))}>
+      <SelectTrigger className="w-52">
+        <SelectValue placeholder={placeholder}>
+          {current ? `${glyphText(current.icon)} ${current.display_name}` : placeholder}
+        </SelectValue>
+      </SelectTrigger>
+      <SelectContent>
+        {agents.map((a) => (
+          <SelectItem key={a.name} value={a.name}>
+            {glyphText(a.icon) + ' ' + a.display_name}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
+// ── Install dialog + vet findings ───────────────────────────
+
+/** Finding severity → MDS Badge styling (spec §5.4: low=success/medium=warning/
+ *  high & critical=destructive). */
+function severityBadgeClass(sev: string): { variant: 'secondary' | 'destructive'; className?: string } {
+  switch (sev) {
+    case 'info':
+      return { variant: 'secondary' };
+    case 'low':
+      return { variant: 'secondary', className: 'bg-success/15 text-success' };
+    case 'warning':
+    case 'medium':
+      return { variant: 'secondary', className: 'bg-warning/15 text-warning' };
+    case 'high':
+    case 'critical':
+    default:
+      return { variant: 'destructive' };
+  }
+}
+
+function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: () => void }) {
   const intl = useIntl();
   const { agents, fetchAgents } = useAgentsStore();
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
@@ -797,174 +933,169 @@ function InstallDialog({
   const scanFailed = scanResult !== null && !scanResult.passed;
 
   // WP7 — departments already in use, for the `department:<dept>` scope option.
-  const departmentOptions: string[] = departmentsOf(agents);
+  // Hidden in the Personal edition (no departments there).
+  const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
+  const departmentOptions: string[] = isPersonal ? [] : departmentsOf(agents);
+
+  const scopeLabel = (s: string): string => {
+    if (s === 'global') return intl.formatMessage({ id: 'skills.install.scopeGlobal' });
+    if (s.startsWith('department:')) {
+      return intl.formatMessage({ id: 'skills.install.scopeDept' }, { dept: s.slice('department:'.length) });
+    }
+    const agent = agents.find((a) => a.name === s);
+    return intl.formatMessage({ id: 'skills.install.scopeAgent' }, { agent: agent?.display_name || s });
+  };
 
   return (
-    <Dialog
-      open
-      onClose={onClose}
-      title={intl.formatMessage({ id: 'skills.install.title' })}
-      className="max-w-xl"
-    >
-      <div className="space-y-5">
-        {/* Skill info */}
-        <div>
-          <h4 className="font-semibold text-stone-900 dark:text-stone-50">{skill.name}</h4>
-          <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
-            {skill.description || intl.formatMessage({ id: 'common.noData' })}
-          </p>
-        </div>
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'skills.install.title' })}</DialogTitle>
+          <DialogDescription className="truncate">
+            <span className="font-medium text-foreground">{skill.name}</span>
+            {skill.description ? ` — ${skill.description}` : ''}
+          </DialogDescription>
+        </DialogHeader>
 
-        {/* Scope selector — company / department / individual (WP7). */}
-        <Field label={intl.formatMessage({ id: 'skills.install.scope' })}>
-          <select
-            value={scope}
-            onChange={(e) => setScope(e.target.value)}
-            className={controlClass}
-          >
-            <option value="global">
-              {intl.formatMessage({ id: 'skills.install.scopeGlobal' })}
-            </option>
-            {departmentOptions.length > 0 && (
-              <optgroup label={intl.formatMessage({ id: 'skills.install.scopeDeptGroup' })}>
-                {departmentOptions.map((dept) => (
-                  <option key={dept} value={`department:${dept}`}>
-                    {intl.formatMessage({ id: 'skills.install.scopeDept' }, { dept })}
-                  </option>
-                ))}
-              </optgroup>
-            )}
-            <optgroup label={intl.formatMessage({ id: 'skills.install.scopeAgentGroup' })}>
-              {agents.map((agent) => (
-                <option key={agent.name} value={agent.name}>
-                  {intl.formatMessage(
-                    { id: 'skills.install.scopeAgent' },
-                    { agent: agent.display_name || agent.name },
-                  )}
-                </option>
-              ))}
-            </optgroup>
-          </select>
-        </Field>
+        <div className="space-y-4">
+          {/* Scope selector — company / department / individual (WP7). */}
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'skills.install.scope' })}
+            </label>
+            <Select value={scope} onValueChange={(v) => setScope(String(v))}>
+              <SelectTrigger className="w-full">
+                <SelectValue>{scopeLabel(scope)}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="global">
+                  {intl.formatMessage({ id: 'skills.install.scopeGlobal' })}
+                </SelectItem>
+                {departmentOptions.length > 0 && (
+                  <SelectGroup>
+                    <SelectLabel>{intl.formatMessage({ id: 'skills.install.scopeDeptGroup' })}</SelectLabel>
+                    {departmentOptions.map((dept) => (
+                      <SelectItem key={dept} value={`department:${dept}`}>
+                        {intl.formatMessage({ id: 'skills.install.scopeDept' }, { dept })}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                )}
+                <SelectGroup>
+                  <SelectLabel>{intl.formatMessage({ id: 'skills.install.scopeAgentGroup' })}</SelectLabel>
+                  {agents.map((agent) => (
+                    <SelectItem key={agent.name} value={agent.name}>
+                      {intl.formatMessage(
+                        { id: 'skills.install.scopeAgent' },
+                        { agent: agent.display_name || agent.name },
+                      )}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
 
-        {/* Security scan button */}
-        <div>
-          <Button
-            variant="secondary"
-            icon={scanning ? Loader2 : Shield}
-            onClick={handleScan}
-            disabled={scanning || !skill.url}
-            className={cn(scanning && '[&>svg]:animate-spin')}
-          >
+          {/* Security scan */}
+          <Button variant="outline" onClick={handleScan} disabled={scanning || !skill.url}>
+            {scanning ? <Loader2 className="animate-spin" /> : <Shield />}
             {scanning
               ? intl.formatMessage({ id: 'skills.install.scanning' })
               : intl.formatMessage({ id: 'skills.install.scan' })}
           </Button>
+
+          {/* Scan results */}
+          {scanPassed && scanResult && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-success">
+                <ShieldCheck className="size-5" />
+                <span className="text-sm font-medium">
+                  {intl.formatMessage({ id: 'skills.install.scanPassed' })}
+                </span>
+                <span className="ml-auto font-mono text-xs tabular-nums text-muted-foreground">
+                  {intl.formatMessage({ id: 'skills.install.score' }, { score: scanResult.vet_result.score })}
+                </span>
+              </div>
+              {scanResult.vet_result.findings.length > 0 ? (
+                <FindingsList findings={scanResult.vet_result.findings} />
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  {intl.formatMessage({ id: 'skills.install.noFindings' })}
+                </p>
+              )}
+            </div>
+          )}
+
+          {scanFailed && scanResult && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-destructive">
+                <ShieldAlert className="size-5" />
+                <span className="text-sm font-medium">
+                  {intl.formatMessage({ id: 'skills.install.scanFailed' })}
+                </span>
+                <span className="ml-auto font-mono text-xs tabular-nums text-muted-foreground">
+                  {intl.formatMessage({ id: 'skills.install.score' }, { score: scanResult.vet_result.score })}
+                </span>
+              </div>
+              {scanResult.vet_result.findings.length > 0 && (
+                <FindingsList findings={scanResult.vet_result.findings} />
+              )}
+            </div>
+          )}
+
+          {error && (
+            <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
+          )}
+
+          {!isAdmin && scanPassed && !requested && (
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'install.request.nonAdminNotice' })}
+            </p>
+          )}
+
+          {installed && scanResult && (
+            <div className="flex items-center gap-2 rounded-lg bg-success/10 px-3 py-2 text-sm text-success">
+              <CheckCircle className="size-4 shrink-0" />
+              {intl.formatMessage(
+                { id: 'skills.install.success' },
+                { name: scanResult.skill_name || skill.name },
+              )}
+            </div>
+          )}
+
+          {requested && (
+            <div className="flex items-center gap-2 rounded-lg bg-warning/10 px-3 py-2 text-sm text-warning">
+              <CheckCircle className="size-4 shrink-0" />
+              {intl.formatMessage({
+                id: requested === 'awaiting_manager' ? 'install.request.filedManager' : 'install.request.filedAdmin',
+              })}
+            </div>
+          )}
         </div>
 
-        {/* Scan results */}
-        {scanPassed && scanResult && (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400">
-              <ShieldCheck className="h-5 w-5" />
-              <span className="text-sm font-medium">
-                {intl.formatMessage({ id: 'skills.install.scanPassed' })}
-              </span>
-              <span className="ml-auto text-sm text-stone-500 dark:text-stone-400">
-                {intl.formatMessage(
-                  { id: 'skills.install.score' },
-                  { score: scanResult.vet_result.score },
-                )}
-              </span>
-            </div>
-            {scanResult.vet_result.findings.length > 0 ? (
-              <FindingsList findings={scanResult.vet_result.findings} />
-            ) : (
-              <p className="text-sm text-stone-400 dark:text-stone-500">
-                {intl.formatMessage({ id: 'skills.install.noFindings' })}
-              </p>
-            )}
-          </div>
-        )}
-
-        {scanFailed && scanResult && (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2 text-rose-600 dark:text-rose-400">
-              <ShieldAlert className="h-5 w-5" />
-              <span className="text-sm font-medium">
-                {intl.formatMessage({ id: 'skills.install.scanFailed' })}
-              </span>
-              <span className="ml-auto text-sm text-stone-500 dark:text-stone-400">
-                {intl.formatMessage(
-                  { id: 'skills.install.score' },
-                  { score: scanResult.vet_result.score },
-                )}
-              </span>
-            </div>
-            {scanResult.vet_result.findings.length > 0 && (
-              <FindingsList findings={scanResult.vet_result.findings} />
-            )}
-          </div>
-        )}
-
-        {/* Error */}
-        {error && (
-          <div className="rounded-control border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-400">
-            {error}
-          </div>
-        )}
-
-        {/* Non-admin notice: install goes through approval */}
-        {!isAdmin && scanPassed && !requested && (
-          <p className="text-xs text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'install.request.nonAdminNotice' })}
-          </p>
-        )}
-
-        {/* Success message (admin direct install) */}
-        {installed && scanResult && (
-          <div className="flex items-center gap-2 rounded-control border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-400">
-            <CheckCircle className="h-4 w-4 flex-shrink-0" />
-            {intl.formatMessage(
-              { id: 'skills.install.success' },
-              { name: scanResult.skill_name || skill.name },
-            )}
-          </div>
-        )}
-
-        {/* Request-filed message (non-admin) */}
-        {requested && (
-          <div className="flex items-center gap-2 rounded-control border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400">
-            <CheckCircle className="h-4 w-4 flex-shrink-0" />
-            {intl.formatMessage({
-              id: requested === 'awaiting_manager'
-                ? 'install.request.filedManager'
-                : 'install.request.filedAdmin',
-            })}
-          </div>
-        )}
-
-        {/* Action buttons */}
-        <div className="flex items-center justify-end gap-3 border-t border-[var(--panel-border)] pt-4">
-          <Button variant="secondary" onClick={onClose}>
-            {intl.formatMessage({ id: requested || installed ? 'common.close' : 'common.cancel' })}
-          </Button>
+        <DialogFooter>
+          <DialogClose
+            render={
+              <Button variant="outline">
+                {intl.formatMessage({ id: requested || installed ? 'common.close' : 'common.cancel' })}
+              </Button>
+            }
+          />
           {!installed && !requested && (
             <Button
-              variant="primary"
-              icon={installing ? Loader2 : Download}
+              variant="brand"
               onClick={handleInstall}
               disabled={!scanPassed || installing}
               title={!scanPassed ? intl.formatMessage({ id: 'skills.install.requireScan' }) : undefined}
-              className={cn(installing && '[&>svg]:animate-spin')}
             >
+              {installing ? <Loader2 className="animate-spin" /> : <Download />}
               {installing
                 ? intl.formatMessage({ id: isAdmin ? 'skills.install.installing' : 'install.request.submitting' })
                 : intl.formatMessage({ id: isAdmin ? 'skills.install.installBtn' : 'install.request.submit' })}
             </Button>
           )}
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
@@ -975,28 +1106,29 @@ function FindingsList({
   findings: ReadonlyArray<{ severity: string; category: string; description: string }>;
 }) {
   const intl = useIntl();
-
   return (
     <div className="space-y-2">
-      <p className="text-xs font-medium text-stone-500 dark:text-stone-400">
+      <p className="text-xs font-medium text-muted-foreground">
         {intl.formatMessage({ id: 'skills.install.findings' })}
       </p>
       <ul className="space-y-1.5">
         {findings.map((f, i) => {
-          const severityKey = f.severity.toLowerCase();
+          const sev = f.severity.toLowerCase();
+          const badge = severityBadgeClass(sev);
           return (
             <li
               key={i}
-              className={`flex items-start gap-2 rounded-control border p-2.5 text-sm ${SEVERITY_BG[severityKey] ?? SEVERITY_BG.low}`}
+              className="flex items-start gap-2 rounded-lg border border-surface-border bg-surface p-2.5 text-sm"
             >
-              <AlertTriangle className={`mt-0.5 h-3.5 w-3.5 flex-shrink-0 ${SEVERITY_COLORS[severityKey] ?? SEVERITY_COLORS.low}`} />
-              <div className="min-w-0">
-                <span className={`text-xs font-semibold uppercase ${SEVERITY_COLORS[severityKey] ?? SEVERITY_COLORS.low}`}>
-                  {intl.formatMessage({ id: `skills.install.severity.${severityKey}` })}
-                </span>
-                <span className="mx-1.5 text-stone-300 dark:text-stone-600">|</span>
-                <span className="text-xs text-stone-500 dark:text-stone-400">{f.category}</span>
-                <p className="mt-0.5 text-stone-700 dark:text-stone-300">{f.description}</p>
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+              <div className="min-w-0 space-y-1">
+                <div className="flex items-center gap-1.5">
+                  <Badge variant={badge.variant} className={badge.className}>
+                    {intl.formatMessage({ id: `skills.install.severity.${sev}` })}
+                  </Badge>
+                  <span className="text-xs text-muted-foreground">{f.category}</span>
+                </div>
+                <p className="text-sm text-foreground">{f.description}</p>
               </div>
             </li>
           );

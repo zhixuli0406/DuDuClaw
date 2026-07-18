@@ -6,6 +6,7 @@ import { App } from './App';
 import { ToastProvider } from './components/Toast';
 import { messages, useLocaleStore } from './i18n';
 import { applyTheme, useThemeStore } from './stores/theme-store';
+import { setTimeAgoNowLabel } from './lib/format';
 import './index.css';
 
 // Apply the persisted theme before first render. The embedded production
@@ -15,6 +16,8 @@ applyTheme(useThemeStore.getState().theme);
 
 function Root() {
   const locale = useLocaleStore((s) => s.locale);
+  // Keep the (non-hook) `timeAgo` "now" token in sync with the active locale.
+  setTimeAgoNowLabel(messages[locale]?.['format.timeAgo.now'] ?? 'now');
   return (
     // IntlProvider must wrap ToastProvider: ToastItem calls useIntl(), so the
     // toast viewport has to live inside the intl context or it throws

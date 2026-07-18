@@ -1,7 +1,10 @@
 import { useIntl } from 'react-intl';
 import { Columns3, Undo2, CheckCheck } from 'lucide-react';
-import { Button, controlClass } from '@/components/ui';
+import { Button } from '@/components/mds';
 import { cn } from '@/lib/utils';
+
+const controlClass =
+  'h-8 w-full min-w-0 rounded-lg border border-input bg-transparent px-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-50 dark:bg-input/30';
 import {
   ALL_COLUMNS,
   type InboxColumn,
@@ -74,21 +77,21 @@ export function InboxToolbar(props: InboxToolbarProps) {
 
       {/* column selector (native disclosure) */}
       <details className="relative">
-        <summary className="flex h-8 cursor-pointer list-none items-center gap-1.5 rounded-control border border-[var(--panel-border)] bg-[var(--panel-fill)] px-3 text-xs text-stone-700 marker:content-none hover:bg-stone-500/5 dark:text-stone-200">
+        <summary className="flex h-8 cursor-pointer list-none items-center gap-1.5 rounded-lg border border-surface-border bg-surface px-3 text-xs text-foreground marker:content-none hover:bg-muted">
           <Columns3 className="h-3.5 w-3.5" />
           {t('inbox.columns.label')}
         </summary>
-        <div className="absolute z-20 mt-1 w-40 rounded-card border border-[var(--panel-border)] bg-[var(--panel-fill)] p-1.5 shadow-soft">
+        <div className="absolute z-20 mt-1 w-40 rounded-xl border border-surface-border bg-surface p-1.5 shadow-[var(--menu-shadow)]">
           {ALL_COLUMNS.map((c) => (
             <label
               key={c}
-              className="flex cursor-pointer items-center gap-2 rounded-control px-2 py-1.5 text-xs text-stone-700 hover:bg-stone-500/8 dark:text-stone-200 dark:hover:bg-white/5"
+              className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-foreground hover:bg-muted"
             >
               <input
                 type="checkbox"
                 checked={props.columns.includes(c)}
                 onChange={() => props.onToggleColumn(c)}
-                className="accent-amber-500"
+                className="accent-brand"
               />
               {t(`inbox.col.${c}`)}
             </label>
@@ -130,11 +133,13 @@ export function InboxToolbar(props: InboxToolbarProps) {
 
       <div className="ml-auto flex items-center gap-2">
         {props.hasUndo && (
-          <Button size="sm" variant="ghost" icon={Undo2} onClick={props.onUndo}>
+          <Button size="sm" variant="ghost" onClick={props.onUndo}>
+            <Undo2 />
             {t('inbox.undo')}
           </Button>
         )}
-        <Button size="sm" variant="secondary" icon={CheckCheck} onClick={props.onMarkAllRead}>
+        <Button size="sm" variant="outline" onClick={props.onMarkAllRead}>
+          <CheckCheck />
           {t('inbox.markAllRead')}
         </Button>
       </div>

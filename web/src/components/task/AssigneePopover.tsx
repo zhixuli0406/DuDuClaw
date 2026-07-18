@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { CharacterAvatar } from '@/components/ui';
+import { ActorAvatar } from '@/components/mds';
 
 export interface AssigneeOption {
   name: string;
@@ -25,6 +25,7 @@ export function AssigneePopover({
   children,
   align = 'left',
   className,
+  allowUnassigned = false,
 }: {
   agents: ReadonlyArray<AssigneeOption>;
   value: string | null;
@@ -32,6 +33,11 @@ export function AssigneePopover({
   children?: ReactNode;
   align?: 'left' | 'right';
   className?: string;
+  /** Offer an explicit "unassigned" choice (empty string) at the top of the
+   *  list and label the unselected trigger as "unassigned" rather than a
+   *  call-to-action. Used by the create-task modal so a task can stay
+   *  unassigned instead of being force-assigned to the first agent (Bug#4). */
+  allowUnassigned?: boolean;
 }) {
   const intl = useIntl();
   const [open, setOpen] = useState(false);
@@ -59,12 +65,12 @@ export function AssigneePopover({
     <span className="inline-flex items-center gap-1.5">
       {selected ? (
         <>
-          <CharacterAvatar agentId={selected.name} name={selected.display_name} size={20} animated={false} />
-          <span className="truncate text-sm text-stone-700 dark:text-stone-200">{selected.display_name}</span>
+          <ActorAvatar actorType="agent" size="sm" name={selected.display_name} />
+          <span className="truncate text-sm text-foreground">{selected.display_name}</span>
         </>
       ) : (
-        <span className="text-sm text-stone-400 dark:text-stone-500">
-          {intl.formatMessage({ id: 'tasks.assign' })}
+        <span className="text-sm text-muted-foreground">
+          {intl.formatMessage({ id: allowUnassigned ? 'tasks.assignee.unassigned' : 'tasks.assign' })}
         </span>
       )}
     </span>
@@ -78,7 +84,7 @@ export function AssigneePopover({
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
         onClick={() => setOpen((v) => !v)}
-        className="inline-flex items-center gap-1.5 rounded-control px-1.5 py-1 hover:bg-stone-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 dark:hover:bg-white/5"
+        className="inline-flex items-center gap-1.5 rounded-lg px-1.5 py-1 outline-none transition-colors hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
       >
         {trigger}
       </button>
@@ -87,12 +93,33 @@ export function AssigneePopover({
           id={menuId}
           role="menu"
           className={cn(
-            'glass-overlay absolute top-full z-50 mt-1 max-h-64 min-w-52 overflow-y-auto rounded-control p-1',
+            'absolute top-full z-50 mt-1 max-h-64 min-w-52 overflow-y-auto rounded-lg bg-surface-raised p-1 shadow-[var(--menu-shadow)] ring-1 ring-surface-border',
             align === 'right' ? 'right-0' : 'left-0',
           )}
         >
-          {agents.length === 0 && (
-            <p className="px-2 py-1.5 text-xs text-stone-400 dark:text-stone-500">
+          {allowUnassigned && (
+            <button
+              type="button"
+              role="menuitemradio"
+              aria-checked={!value}
+              onClick={() => {
+                onChange('');
+                setOpen(false);
+              }}
+              className={cn(
+                'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none transition-colors hover:bg-accent hover:text-accent-foreground',
+                !value && 'font-medium',
+              )}
+            >
+              <span className="grid size-6 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground">—</span>
+              <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                {intl.formatMessage({ id: 'tasks.assignee.unassigned' })}
+              </span>
+              {!value && <Check className="size-3.5 shrink-0 text-brand" />}
+            </button>
+          )}
+          {agents.length === 0 && !allowUnassigned && (
+            <p className="px-2 py-1.5 text-xs text-muted-foreground">
               {intl.formatMessage({ id: 'tasks.assignee.empty' })}
             </p>
           )}
@@ -107,13 +134,13 @@ export function AssigneePopover({
                 setOpen(false);
               }}
               className={cn(
-                'flex w-full items-center gap-2 rounded-[calc(var(--radius-control)-2px)] px-2 py-1.5 text-left text-sm hover:bg-stone-500/10 dark:hover:bg-white/5',
-                a.name === value && 'font-semibold',
+                'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none transition-colors hover:bg-accent hover:text-accent-foreground',
+                a.name === value && 'font-medium',
               )}
             >
-              <CharacterAvatar agentId={a.name} name={a.display_name} size={22} animated={false} />
-              <span className="min-w-0 flex-1 truncate text-stone-700 dark:text-stone-200">{a.display_name}</span>
-              {a.name === value && <Check className="h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />}
+              <ActorAvatar actorType="agent" size="sm" name={a.display_name} />
+              <span className="min-w-0 flex-1 truncate text-foreground">{a.display_name}</span>
+              {a.name === value && <Check className="size-3.5 shrink-0 text-brand" />}
             </button>
           ))}
         </div>

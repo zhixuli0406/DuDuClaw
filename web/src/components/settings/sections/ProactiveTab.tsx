@@ -1,11 +1,23 @@
 import { useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
-import { cn } from '@/lib/utils';
 import { useAgentsStore } from '@/stores/agents-store';
 import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
-import { Card, Button, controlClass } from '@/components/ui';
-import { AdvancedSection, OptionSelect, ScheduleBuilder, SettingField, Switch, type SelectOption } from '@/components/settings/controls';
+import {
+  Button,
+  Input,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  SettingsSection,
+  SettingsCard,
+  SettingsRow,
+  SettingsSaveState,
+} from '@/components/mds';
+import { AdvancedSection, ScheduleBuilder, type SelectOption } from '@/components/settings/controls';
+import { RowSelect, RowSwitch, RowNumber, RowText, FieldBlock } from '@/pages/agent-form/form-rows';
 
 // ── Proactive Settings Tab ─────────────────────────────────────
 
@@ -73,93 +85,97 @@ export function ProactiveTab() {
     { value: 'discord', label: 'Discord' },
   ];
 
-  return (
-    <Card
-      bodyClassName="space-y-6"
-      title={intl.formatMessage({ id: 'proactive.title' })}
-      actions={
-        <select
-          value={selectedAgent}
-          onChange={(e) => setSelectedAgent(e.target.value)}
-          className={cn(controlClass, 'h-8 w-auto min-w-[8rem] text-xs')}
-        >
-          {agents.length === 0 && <option value="">{intl.formatMessage({ id: 'common.noData' })}</option>}
-          {agents.map((a) => (
-            <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
-          ))}
-        </select>
-      }
-    >
-      <SettingField
-        layout="row"
-        label={intl.formatMessage({ id: config.enabled ? 'proactive.enabled' : 'proactive.disabled' })}
-        help={intl.formatMessage({ id: 'proactive.enabled.help' })}
-      >
-        <Switch
-          checked={config.enabled}
-          onChange={(v) => setConfig({ ...config, enabled: v })}
-          label={intl.formatMessage({ id: 'proactive.enabled' })}
-        />
-      </SettingField>
+  const currentAgent = agents.find((a) => a.name === selectedAgent);
 
-      <div className="grid gap-4 sm:grid-cols-2">
-        <SettingField
+  return (
+    <div className="space-y-8">
+      {/* Per-agent scope picker */}
+      <div className="flex justify-end">
+        <Select value={selectedAgent} onValueChange={(v) => setSelectedAgent(String(v))} disabled={agents.length === 0}>
+          <SelectTrigger size="sm" aria-label={intl.formatMessage({ id: 'proactive.title' })}>
+            <SelectValue>{currentAgent ? (currentAgent.display_name || currentAgent.name) : intl.formatMessage({ id: 'common.noData' })}</SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {agents.map((a) => (
+              <SelectItem key={a.name} value={a.name}>{a.display_name || a.name}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <SettingsSection>
+        <SettingsCard>
+          <RowSwitch
+            label={intl.formatMessage({ id: config.enabled ? 'proactive.enabled' : 'proactive.disabled' })}
+            description={intl.formatMessage({ id: 'proactive.enabled.help' })}
+            checked={config.enabled}
+            onChange={(v) => setConfig({ ...config, enabled: v })}
+          />
+          <RowNumber
+            label={intl.formatMessage({ id: 'proactive.maxMessagesPerHour' })}
+            description={intl.formatMessage({ id: 'proactive.maxMessagesPerHour.help' })}
+            value={config.max_messages_per_hour}
+            min={1}
+            max={60}
+            onChange={(v) => setConfig({ ...config, max_messages_per_hour: v })}
+          />
+          <SettingsRow
+            label={intl.formatMessage({ id: 'proactive.quietHours' })}
+            description={intl.formatMessage({ id: 'proactive.quietHours.help' })}
+            tier="select-wide"
+          >
+            <div className="flex items-center gap-2">
+              <Input type="number" min={0} max={23} value={config.quiet_hours_start}
+                onChange={(e) => setConfig({ ...config, quiet_hours_start: +e.target.value })}
+                className="w-16 text-center" />
+              <span className="text-muted-foreground">—</span>
+              <Input type="number" min={0} max={23} value={config.quiet_hours_end}
+                onChange={(e) => setConfig({ ...config, quiet_hours_end: +e.target.value })}
+                className="w-16 text-center" />
+            </div>
+          </SettingsRow>
+          <RowSelect
+            label={intl.formatMessage({ id: 'proactive.notifyChannel' })}
+            description={intl.formatMessage({ id: 'proactive.notifyChannel.help' })}
+            value={config.notify_channel}
+            onChange={(v) => setConfig({ ...config, notify_channel: v })}
+            options={channelOptions}
+          />
+        </SettingsCard>
+
+        <FieldBlock
           label={intl.formatMessage({ id: 'proactive.checkInterval' })}
-          help={intl.formatMessage({ id: 'proactive.checkInterval.help2' })}
-          className="sm:col-span-2"
+          description={intl.formatMessage({ id: 'proactive.checkInterval.help2' })}
         >
           <ScheduleBuilder
             value={config.check_interval}
             onChange={(cron) => setConfig({ ...config, check_interval: cron })}
           />
-        </SettingField>
-
-        <SettingField label={intl.formatMessage({ id: 'proactive.quietHours' })} help={intl.formatMessage({ id: 'proactive.quietHours.help' })}>
-          <div className="flex items-center gap-2">
-            <input type="number" min={0} max={23} value={config.quiet_hours_start}
-              onChange={(e) => setConfig({ ...config, quiet_hours_start: +e.target.value })}
-              className={cn(controlClass, 'w-16 px-2 text-center')} />
-            <span className="text-stone-400">—</span>
-            <input type="number" min={0} max={23} value={config.quiet_hours_end}
-              onChange={(e) => setConfig({ ...config, quiet_hours_end: +e.target.value })}
-              className={cn(controlClass, 'w-16 px-2 text-center')} />
-          </div>
-        </SettingField>
-
-        <SettingField label={intl.formatMessage({ id: 'proactive.maxMessagesPerHour' })} help={intl.formatMessage({ id: 'proactive.maxMessagesPerHour.help' })}>
-          <input type="number" min={1} max={60} value={config.max_messages_per_hour}
-            onChange={(e) => setConfig({ ...config, max_messages_per_hour: +e.target.value })}
-            className={cn(controlClass, 'w-24')} />
-        </SettingField>
-
-        <SettingField label={intl.formatMessage({ id: 'proactive.notifyChannel' })} help={intl.formatMessage({ id: 'proactive.notifyChannel.help' })}>
-          <OptionSelect
-            value={config.notify_channel}
-            onChange={(v) => setConfig({ ...config, notify_channel: v })}
-            showRaw={false}
-            options={channelOptions}
-          />
-        </SettingField>
-      </div>
+        </FieldBlock>
+      </SettingsSection>
 
       <AdvancedSection storageKey="settings.proactive" label={intl.formatMessage({ id: 'proactive.advanced' })}>
-        <SettingField label={intl.formatMessage({ id: 'proactive.chatId' })} help={intl.formatMessage({ id: 'proactive.chatId.help' })}>
-          <input type="text" value={config.notify_chat_id}
-            onChange={(e) => setConfig({ ...config, notify_chat_id: e.target.value })}
+        <SettingsCard>
+          <RowText
+            label={intl.formatMessage({ id: 'proactive.chatId' })}
+            description={intl.formatMessage({ id: 'proactive.chatId.help' })}
+            value={config.notify_chat_id}
+            onChange={(v) => setConfig({ ...config, notify_chat_id: v })}
             placeholder="e.g., 123456789"
-            className={controlClass} />
-        </SettingField>
+          />
+        </SettingsCard>
       </AdvancedSection>
 
-      <div className="flex justify-end pt-2">
-        <Button variant="primary" onClick={handleSave} disabled={saving}>
-          {saved
-            ? intl.formatMessage({ id: 'settings.general.saved' })
-            : saving
-              ? intl.formatMessage({ id: 'common.saving' })
-              : intl.formatMessage({ id: 'common.save' })}
+      <div className="flex items-center justify-end gap-3">
+        <SettingsSaveState
+          status={saving ? 'saving' : saved ? 'saved' : 'idle'}
+          savingLabel={intl.formatMessage({ id: 'common.saving' })}
+          savedLabel={intl.formatMessage({ id: 'settings.general.saved' })}
+        />
+        <Button variant="brand" size="sm" onClick={handleSave} disabled={saving}>
+          {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
         </Button>
       </div>
-    </Card>
+    </div>
   );
 }

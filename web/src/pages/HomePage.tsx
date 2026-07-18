@@ -1,50 +1,73 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
-import { useSearchParams } from 'react-router';
-import { api, type TaskInfo, type DashboardLayoutWidget } from '@/lib/api';
+import { useNavigate, useSearchParams } from 'react-router';
+import { api, type DashboardLayoutWidget, type CustomWidgetSummary } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useVisibleAgents } from '@/lib/data-scope';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
-import { Page, Card, Button } from '@/components/ui';
+import {
+  Card,
+  CardHeader,
+  CardTitle,
+  Button,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from '@/components/mds';
 import { ActivityFeed } from '@/components/ActivityFeed';
 import {
   type InboxItem,
   sortInbox,
   TYPE_URGENCY,
 } from '@/lib/inbox-model';
-import { GreetingHud } from '@/components/home/GreetingHud';
-import { WorldStagePlaceholder } from '@/components/home/WorldStagePlaceholder';
 import { NeedsMeRow } from '@/components/home/NeedsMeRow';
 import { LiveCards } from '@/components/home/LiveCards';
 import { RecentTasks } from '@/components/home/RecentTasks';
 import { ChannelHealthCard } from '@/components/home/ChannelHealthCard';
-import { LayoutGrid, ArrowUp, ArrowDown, EyeOff as EyeOffIcon, Plus, Check, X, Eye } from 'lucide-react';
+import { UsageSummary } from '@/components/home/UsageSummary';
+import { CustomWidgetFrame } from '@/components/home/CustomWidgetFrame';
+import {
+  LayoutGrid,
+  ArrowUp,
+  ArrowDown,
+  EyeOff as EyeOffIcon,
+  GripVertical,
+  MoreVertical,
+  Pencil,
+  Plus,
+  Check,
+  X,
+  Eye,
+} from 'lucide-react';
 import { hasMinRole } from '@/lib/roles';
-
-/** Same calendar day in local time. */
-function isToday(iso?: string | null): boolean {
-  if (!iso) return false;
-  const t = new Date(iso);
-  const now = new Date();
-  return t.getFullYear() === now.getFullYear() && t.getMonth() === now.getMonth() && t.getDate() === now.getDate();
-}
 
 /** Default widget order for a fresh user (server catalog order also matches). */
 const DEFAULT_ORDER = ['needs_me', 'my_agents', 'recent_activity', 'my_tasks', 'channel_health'];
 /** Widgets that span the full row; the rest pack into a two-column grid. */
 const FULL_SPAN = new Set(['needs_me', 'my_agents']);
 
+/** Local-time hour → greeting bucket. */
+function greetingBucket(hour: number): 'morning' | 'afternoon' | 'evening' | 'night' {
+  if (hour >= 5 && hour < 12) return 'morning';
+  if (hour >= 12 && hour < 18) return 'afternoon';
+  if (hour >= 18 && hour < 23) return 'evening';
+  return 'night';
+}
+
 /**
- * HomePage (`/`) — 首頁「事務所」 (dashboard-redesign-v2 §5.1) + WP15 personal
- * dashboard: the war-report HUD and world band stay fixed; everything below is
- * a per-user widget list (server-persisted order + visibility, catalog is
- * role-filtered fail-closed by the gateway).
+ * HomePage (`/`) — Multica-style work overview (WP1.5). A reading-type container
+ * (§5.2): a plain greeting line, the fixed 用量摘要 KPI strip (§5.5), then the
+ * per-user widget list (server-persisted order + visibility, catalog role-filtered
+ * fail-closed by the gateway). The PixiJS world stage lives on its own `/world`
+ * page now — the home canvas stays calm and report-shaped.
  */
 export function HomePage() {
   const intl = useIntl();
+  const navigate = useNavigate();
   const user = useAuthStore((s) => s.user);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   // Data-scoped: an employee sees only their own AI staff (§3.4 WP11-T11.3).
@@ -53,14 +76,15 @@ export function HomePage() {
   const authed = connectionState === 'authenticated';
 
   const [needsMe, setNeedsMe] = useState<InboxItem[]>([]);
-  const [spentCents, setSpentCents] = useState<number | null>(null);
-  const [doneToday, setDoneToday] = useState<number | null>(null);
 
-  // ── WP15 layout state ──
+  // ── widget layout state ──
   const [catalog, setCatalog] = useState<string[]>([]);
   const [layout, setLayout] = useState<DashboardLayoutWidget[]>([]);
   const [editing, setEditing] = useState(false);
   const [savedLayout, setSavedLayout] = useState<DashboardLayoutWidget[]>([]);
+  // Custom widgets visible to me (mine + instance-shared) — layout entries
+  // reference them as `custom:<id>` and render in a sandboxed iframe.
+  const [customWidgets, setCustomWidgets] = useState<CustomWidgetSummary[]>([]);
 
   // ── Read-only subordinate view (view-as, manager+). `?view_as=<user_id>`
   // renders THAT user's layout + data scope; editing is disabled and there is
@@ -72,6 +96,7 @@ export function HomePage() {
     role: string;
     layout: DashboardLayoutWidget[];
     boundAgents: string[];
+    customWidgets: Array<{ id: string; title: string; html: string }>;
   } | null>(null);
   const [subordinates, setSubordinates] = useState<Array<{ id: string; display_name: string }>>([]);
   const isManagerUp = hasMinRole(user?.role, 'manager');
@@ -87,7 +112,11 @@ export function HomePage() {
       .then((r) => {
         if (!alive) return;
         const ids = r.widgets.map((w) => w.id);
-        const savedWidgets = (r.layout?.widgets ?? []).filter((w) => ids.includes(w.id));
+        const customs = r.custom_widgets ?? [];
+        const customIds = new Set(customs.map((w) => `custom:${w.id}`));
+        const savedWidgets = (r.layout?.widgets ?? []).filter(
+          (w) => ids.includes(w.id) || customIds.has(w.id),
+        );
         const known = new Set(savedWidgets.map((w) => w.id));
         const ordered = savedWidgets.length > 0
           ? [...savedWidgets, ...ids.filter((id) => !known.has(id)).map((id) => ({ id, hidden: false }))]
@@ -97,6 +126,7 @@ export function HomePage() {
           role: r.user.role,
           layout: ordered,
           boundAgents: r.bound_agents,
+          customWidgets: customs,
         });
       })
       .catch((e) => {
@@ -127,13 +157,20 @@ export function HomePage() {
     Promise.all([
       api.dashboard.widgetsCatalog().catch(() => ({ widgets: [] as Array<{ id: string }> })),
       api.dashboard.layoutGet().catch(() => ({ layout: null })),
-    ]).then(([cat, saved]) => {
+      api.widgetsCustom.list().catch(() => ({ widgets: [] as CustomWidgetSummary[] })),
+    ]).then(([cat, saved, custom]) => {
       if (!alive) return;
       const ids = cat.widgets.map((w) => w.id);
       setCatalog(ids);
-      // Effective layout = saved order ∩ catalog, then any new catalog widgets
-      // appended visible — a widget added in an upgrade shows up by itself.
-      const savedWidgets = (saved.layout?.widgets ?? []).filter((w) => ids.includes(w.id));
+      setCustomWidgets(custom.widgets);
+      // Effective layout = saved order ∩ (catalog ∪ my visible custom
+      // widgets), then any new catalog widgets appended visible — a widget
+      // added in an upgrade shows up by itself. Custom widgets are only ever
+      // added explicitly from the edit drawer.
+      const customIds = new Set(custom.widgets.map((w) => `custom:${w.id}`));
+      const savedWidgets = (saved.layout?.widgets ?? []).filter(
+        (w) => ids.includes(w.id) || customIds.has(w.id),
+      );
       const known = new Set(savedWidgets.map((w) => w.id));
       const ordered = savedWidgets.length > 0
         ? [...savedWidgets, ...ids.filter((id) => !known.has(id)).map((id) => ({ id, hidden: false }))]
@@ -157,9 +194,7 @@ export function HomePage() {
 
     // "需要我" merged stream — four cheap sources (approvals / blocked / budget /
     // failed run). Each is best-effort: a manager-gated source that errors for
-    // this viewer contributes nothing (fail-safe, not fail-loud). Per-agent
-    // decisions are intentionally omitted here — they cost N calls and belong to
-    // the full /inbox, not a home preview.
+    // this viewer contributes nothing (fail-safe, not fail-loud).
     Promise.all([
       api.approvals.list().catch(() => null),
       api.budget.incidents().catch(() => null),
@@ -182,26 +217,14 @@ export function HomePage() {
       }
       setNeedsMe(items);
     }).catch(() => { /* silent — an empty strip is honest */ });
-
-    // Cost tile: no per-day spend on the wired RPC surface, so show the
-    // cumulative total (labelled 「累計」 in the HUD) rather than fake a today value.
-    api.accounts.budgetSummary()
-      .then((b) => setSpentCents(b?.total_spent_cents ?? 0))
-      .catch(() => setSpentCents(null));
-
-    api.tasks.list({ status: 'done' })
-      .then((r) => setDoneToday((r?.tasks ?? []).filter((t: TaskInfo) => isToday(t.completed_at)).length))
-      .catch(() => setDoneToday(null));
     // agents intentionally excluded from deps: the name map is a display nicety
     // resolved at fetch time; re-running on every agent tick would spam the RPCs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authed, fetchAgents, intl]);
 
-  const busyCount = useMemo(() => agents.filter((a) => a.status === 'active').length, [agents]);
-  const actionableCount = useMemo(() => needsMe.filter((i) => i.actionable).length, [needsMe]);
-  const previewTop = useMemo(() => sortInbox(needsMe, 'urgency').slice(0, 3), [needsMe]);
+  const previewTop = useMemo(() => sortInbox(needsMe, 'urgency').slice(0, 4), [needsMe]);
 
-  // ── WP15 edit actions ──
+  // ── edit actions ──
   const move = (id: string, dir: -1 | 1) => {
     setLayout((cur) => {
       const i = cur.findIndex((w) => w.id === id);
@@ -226,6 +249,15 @@ export function HomePage() {
     }
   }, [intl, layout]);
 
+  const viewing = viewAs !== '' && viewTarget !== null;
+  // In view-as mode, scope widget data the way the target sees it (WP11).
+  const scopedAgents = useMemo(() => {
+    if (!viewing || !viewTarget) return agents;
+    if (viewTarget.role !== 'employee') return agents;
+    const bound = new Set(viewTarget.boundAgents);
+    return agents.filter((a) => bound.has(a.name));
+  }, [agents, viewing, viewTarget]);
+
   const renderWidget = (id: string): ReactNode => {
     switch (id) {
       case 'needs_me':
@@ -234,84 +266,141 @@ export function HomePage() {
         return <LiveCards agents={scopedAgents} enabled={authed} />;
       case 'recent_activity':
         return (
-          <Card title={intl.formatMessage({ id: 'activity.title' })}>
-            <ActivityFeed limit={10} showFilter agents={scopedAgents} />
+          <Card>
+            <CardHeader>
+              <CardTitle>{intl.formatMessage({ id: 'activity.title' })}</CardTitle>
+            </CardHeader>
+            <div className="px-4">
+              <ActivityFeed limit={10} showFilter agents={scopedAgents} />
+            </div>
           </Card>
         );
       case 'my_tasks':
         return <RecentTasks agents={scopedAgents} enabled={authed} />;
       case 'channel_health':
         return <ChannelHealthCard enabled={authed} />;
-      default:
+      default: {
+        // `custom:<id>` → sandboxed custom widget. In view-as mode the html
+        // arrives inline with the layout; on my own board the frame lazy-loads it.
+        const cid = id.startsWith('custom:') ? id.slice('custom:'.length) : null;
+        if (cid) {
+          const kebab = !viewing ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button variant="ghost" size="icon-xs" aria-label={intl.formatMessage({ id: 'common.more' })}>
+                    <MoreVertical />
+                  </Button>
+                }
+              />
+              <DropdownMenuContent>
+                <DropdownMenuItem onClick={() => navigate(`/widgets/${encodeURIComponent(cid)}/edit`)}>
+                  <Pencil />
+                  {intl.formatMessage({ id: 'home.widget.custom.edit' })}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : undefined;
+
+          if (viewing && viewTarget) {
+            const w = viewTarget.customWidgets.find((x) => x.id === cid);
+            return w ? <CustomWidgetFrame html={w.html} title={w.title} /> : null;
+          }
+          const meta = customWidgets.find((w) => w.id === cid);
+          return <CustomWidgetFrame widgetId={cid} title={meta?.title} headerAction={kebab} />;
+        }
         return null; // unknown id from a newer server — skip silently
+      }
     }
   };
 
-  const viewing = viewAs !== '' && viewTarget !== null;
-  // In view-as mode, scope widget data the way the target sees it (WP11):
-  // an employee sees only their bound agents; manager+ targets see all.
-  const scopedAgents = useMemo(() => {
-    if (!viewing || !viewTarget) return agents;
-    if (viewTarget.role !== 'employee') return agents;
-    const bound = new Set(viewTarget.boundAgents);
-    return agents.filter((a) => bound.has(a.name));
-  }, [agents, viewing, viewTarget]);
+  /** Display label for a layout id — custom widgets use their own title. */
+  const widgetLabel = (id: string): string => {
+    if (id.startsWith('custom:')) {
+      const meta = customWidgets.find((w) => `custom:${w.id}` === id);
+      return meta?.title ?? intl.formatMessage({ id: 'widgets.frame.unknown' });
+    }
+    return intl.formatMessage({ id: `home.widget.${id}`, defaultMessage: id });
+  };
+
+  // Custom widgets visible to me but not yet on my board — addable in edit mode.
+  const layoutIds = new Set(layout.map((w) => w.id));
+  const addableCustom = customWidgets.filter((w) => !layoutIds.has(`custom:${w.id}`));
+  const addCustom = (id: string) =>
+    setLayout((cur) => [...cur, { id: `custom:${id}`, hidden: false }]);
 
   const activeLayout = viewing && viewTarget ? viewTarget.layout : layout;
-  const visible = activeLayout.filter((w) => !w.hidden);
+  const visible = activeLayout
+    .filter((w) => !w.hidden)
+    // 拍板: the "需要我" strip is silent when empty (except in edit mode, where
+    // every widget must stay reorderable/unhideable).
+    .filter((w) => !(w.id === 'needs_me' && !editing && needsMe.length === 0));
   const hiddenWidgets = layout.filter((w) => w.hidden);
 
-  return (
-    <Page wide>
-      {/* T3.1 — greeting HUD + today's war-report (fixed, not a widget) */}
-      <GreetingHud
-        userName={user?.display_name || intl.formatMessage({ id: 'home.greeting.fallbackName' })}
-        busyCount={busyCount}
-        totalAgents={agents.length}
-        actionableCount={actionableCount}
-        doneToday={doneToday}
-        costCents={spentCents}
-      />
+  const greeting = intl.formatMessage(
+    { id: `home.greeting.${greetingBucket(new Date().getHours())}` },
+    { name: user?.display_name || intl.formatMessage({ id: 'home.greeting.fallbackName' }) },
+  );
 
-      {/* T3.5 — world stage mount (fixed) */}
-      <WorldStagePlaceholder agents={agents} />
+  return (
+    <div className="mx-auto w-full max-w-6xl space-y-5">
+      {/* Plain greeting line (§5.2 reading container — no HUD). */}
+      <div className="min-w-0">
+        <h1 className="truncate text-base font-medium text-foreground">{greeting}</h1>
+        <p className="text-sm text-muted-foreground">
+          {intl.formatDate(new Date(), { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+        </p>
+      </div>
+
+      {/* Fixed 用量摘要 KPI strip (§5.5). */}
+      <UsageSummary enabled={authed} />
 
       {/* Read-only view-as banner (§view-as: look, never touch). */}
       {viewing && viewTarget && (
-        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300/60 bg-amber-500/10 px-4 py-2.5 dark:border-amber-500/40">
-          <span className="flex items-center gap-2 text-sm text-amber-800 dark:text-amber-300">
-            <Eye className="h-4 w-4 shrink-0" />
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-warning/40 bg-warning/10 px-4 py-2.5">
+          <span className="flex items-center gap-2 text-sm text-foreground">
+            <Eye className="size-4 shrink-0 text-warning" />
             {intl.formatMessage({ id: 'home.viewAs.banner' }, { name: viewTarget.name })}
           </span>
-          <Button variant="secondary" icon={X} onClick={() => setSearchParams({}, { replace: true })}>
+          <Button variant="secondary" size="sm" onClick={() => setSearchParams({}, { replace: true })}>
+            <X />
             {intl.formatMessage({ id: 'home.viewAs.exit' })}
           </Button>
         </div>
       )}
 
-      {/* WP15 — edit-mode toolbar. Zero visual noise when not editing. */}
+      {/* Edit-mode toolbar. Zero visual noise when not editing. */}
       {!viewing && (
-        <div className="flex items-center justify-end gap-3">
+        <div className="flex items-center justify-end gap-2">
           {editing ? (
-            <div className="flex items-center gap-2">
-              <Button variant="ghost" icon={X} onClick={() => { setLayout(savedLayout); setEditing(false); }}>
+            <>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setLayout(savedLayout);
+                  setEditing(false);
+                }}
+              >
+                <X />
                 {intl.formatMessage({ id: 'common.cancel' })}
               </Button>
-              <Button variant="primary" icon={Check} onClick={() => void saveLayout()}>
+              <Button variant="brand" size="sm" onClick={() => void saveLayout()}>
+                <Check />
                 {intl.formatMessage({ id: 'home.layout.done' })}
               </Button>
-            </div>
+            </>
           ) : (
             <>
               {isManagerUp && subordinates.length > 0 && (
-                <label className="inline-flex items-center gap-1.5 text-xs text-stone-400 dark:text-stone-500">
-                  <Eye className="h-3.5 w-3.5" />
+                <label className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Eye className="size-3.5" />
                   <select
                     value=""
                     onChange={(e) => {
                       if (e.target.value) setSearchParams({ view_as: e.target.value });
                     }}
-                    className="rounded border border-transparent bg-transparent py-0.5 text-xs text-stone-400 transition-colors hover:text-stone-600 focus:outline-none dark:text-stone-500 dark:hover:text-stone-300"
+                    className="rounded-md border border-transparent bg-transparent py-0.5 text-xs text-muted-foreground transition-colors hover:text-foreground focus:outline-none"
                   >
                     <option value="">{intl.formatMessage({ id: 'home.viewAs.pick' })}</option>
                     {subordinates.map((s) => (
@@ -320,39 +409,57 @@ export function HomePage() {
                   </select>
                 </label>
               )}
-              <button
-                onClick={() => setEditing(true)}
-                className="inline-flex items-center gap-1.5 rounded px-2 py-1 text-xs text-stone-400 transition-colors hover:text-stone-600 dark:text-stone-500 dark:hover:text-stone-300"
-              >
-                <LayoutGrid className="h-3.5 w-3.5" />
+              <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>
+                <LayoutGrid />
                 {intl.formatMessage({ id: 'home.layout.edit' })}
-              </button>
+              </Button>
             </>
           )}
         </div>
       )}
 
       {/* Widget list — full-span widgets break the two-column flow. */}
-      <div className="grid gap-6 lg:grid-cols-2">
+      <div className="grid gap-5 lg:grid-cols-2">
         {visible.map((w, idx) => (
           <div
             key={w.id}
             className={cn(
               FULL_SPAN.has(w.id) && 'lg:col-span-2',
-              editing && 'relative rounded-xl ring-2 ring-amber-400/60 ring-offset-2 ring-offset-[var(--page-bg,transparent)]',
+              editing && 'relative rounded-xl ring-2 ring-brand/25',
             )}
           >
             {editing && (
-              <div className="absolute -top-3 right-3 z-10 flex items-center gap-1 rounded-full border border-[var(--panel-border)] bg-[var(--panel-bg,#fff)] px-1.5 py-0.5 shadow-sm dark:bg-stone-800">
-                <button onClick={() => move(w.id, -1)} disabled={idx === 0} className="rounded p-0.5 text-stone-500 hover:text-stone-800 disabled:opacity-30 dark:hover:text-stone-200" aria-label="move up">
-                  <ArrowUp className="h-3.5 w-3.5" />
-                </button>
-                <button onClick={() => move(w.id, 1)} disabled={idx === visible.length - 1} className="rounded p-0.5 text-stone-500 hover:text-stone-800 disabled:opacity-30 dark:hover:text-stone-200" aria-label="move down">
-                  <ArrowDown className="h-3.5 w-3.5" />
-                </button>
-                <button onClick={() => setHidden(w.id, true)} className="rounded p-0.5 text-rose-500 hover:text-rose-700" aria-label="hide">
-                  <EyeOffIcon className="h-3.5 w-3.5" />
-                </button>
+              <div className="absolute -top-3 right-3 z-10 flex items-center gap-0.5 rounded-lg bg-surface-raised px-1 py-0.5 shadow-[var(--menu-shadow)] ring-1 ring-surface-border">
+                <span className="grid place-items-center px-0.5 text-muted-foreground/60" aria-hidden>
+                  <GripVertical className="size-3.5" />
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={() => move(w.id, -1)}
+                  disabled={idx === 0}
+                  aria-label={intl.formatMessage({ id: 'home.layout.moveUp' })}
+                >
+                  <ArrowUp />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={() => move(w.id, 1)}
+                  disabled={idx === visible.length - 1}
+                  aria-label={intl.formatMessage({ id: 'home.layout.moveDown' })}
+                >
+                  <ArrowDown />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  onClick={() => setHidden(w.id, true)}
+                  aria-label={intl.formatMessage({ id: 'home.layout.hide' })}
+                >
+                  <EyeOffIcon />
+                </Button>
               </div>
             )}
             {renderWidget(w.id)}
@@ -362,28 +469,46 @@ export function HomePage() {
 
       {/* Edit mode: hidden / addable widgets drawer. */}
       {editing && (
-        <Card title={intl.formatMessage({ id: 'home.layout.hiddenTitle' })}>
-          {hiddenWidgets.length === 0 ? (
-            <p className="py-2 text-center text-xs text-stone-400">{intl.formatMessage({ id: 'home.layout.hiddenEmpty' })}</p>
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              {hiddenWidgets.map((w) => (
-                <button
-                  key={w.id}
-                  onClick={() => setHidden(w.id, false)}
-                  className="inline-flex items-center gap-1.5 rounded-full border border-amber-300 px-3 py-1 text-xs font-medium text-amber-700 hover:bg-amber-500/10 dark:border-amber-500/40 dark:text-amber-400"
-                >
-                  <Plus className="h-3 w-3" />
-                  {intl.formatMessage({ id: `home.widget.${w.id}`, defaultMessage: w.id })}
-                </button>
-              ))}
-            </div>
-          )}
-          {catalog.length === 0 && (
-            <p className="mt-2 text-xs text-stone-400">{intl.formatMessage({ id: 'home.layout.catalogUnavailable' })}</p>
-          )}
+        <Card>
+          <CardHeader>
+            <CardTitle>{intl.formatMessage({ id: 'home.layout.hiddenTitle' })}</CardTitle>
+          </CardHeader>
+          <div className="px-4">
+            {hiddenWidgets.length === 0 && addableCustom.length === 0 ? (
+              <p className="py-1 text-sm text-muted-foreground">
+                {intl.formatMessage({ id: 'home.layout.hiddenEmpty' })}
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {hiddenWidgets.map((w) => (
+                  <Button key={w.id} variant="brandSubtle" size="sm" onClick={() => setHidden(w.id, false)}>
+                    <Plus />
+                    {widgetLabel(w.id)}
+                  </Button>
+                ))}
+                {/* Custom widgets not yet on the board (mine + team-shared). */}
+                {addableCustom.map((w) => (
+                  <Button
+                    key={`custom:${w.id}`}
+                    variant="outline"
+                    size="sm"
+                    onClick={() => addCustom(w.id)}
+                    title={w.description}
+                  >
+                    <Plus />
+                    {w.title}
+                  </Button>
+                ))}
+              </div>
+            )}
+            {catalog.length === 0 && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                {intl.formatMessage({ id: 'home.layout.catalogUnavailable' })}
+              </p>
+            )}
+          </div>
         </Card>
       )}
-    </Page>
+    </div>
   );
 }

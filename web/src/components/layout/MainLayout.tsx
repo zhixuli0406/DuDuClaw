@@ -1,7 +1,6 @@
-import { useEffect } from 'react';
-import { Outlet, useLocation } from 'react-router';
-import { Sidebar } from './Sidebar';
-import { Header } from './Header';
+import { Suspense, useEffect } from 'react';
+import { Outlet, useLocation, useNavigate } from 'react-router';
+import { AppSidebar } from './AppSidebar';
 import { MobileBottomNav } from './MobileBottomNav';
 import { GuidedTour } from '@/components/tour/GuidedTour';
 import { TourPrompt } from '@/components/tour/TourPrompt';
@@ -10,60 +9,128 @@ import { LicenseExpiryBanner } from '@/components/LicenseExpiryBanner';
 import { CommandPalette } from '@/components/CommandPalette';
 import { GrowthMount } from '@/components/growth/GrowthMount';
 import { PanelProvider, PropertiesPanel, CelebrationLayer, usePanel } from '@/components/ui';
+import {
+  SidebarProvider,
+  Sidebar,
+  SidebarInset,
+  SidebarTrigger,
+  NavProgress,
+} from '@/components/mds';
+import { ArrowUpCircle, X } from 'lucide-react';
+import { useIntl } from 'react-intl';
 import { useTourStore } from '@/stores/tour-store';
 import { useSystemStore } from '@/stores/system-store';
-import { useBrandingStore } from '@/lib/branding';
+import { useBrandingStore, useEffectiveName } from '@/lib/branding';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
-import { useSidebarStore } from '@/stores/sidebar-store';
+import { useNavProgressStore } from '@/stores/nav-progress-store';
+import { useUpdateStore } from '@/stores/update-store';
 
 /**
- * AppShell — the three-pane frame (dashboard-redesign-v2 §4.1, paperclip P1):
- * left Sidebar │ center (Header breadcrumbs + Outlet) │ right PropertiesPanel.
- * The right column only occupies space when a page has injected panel content
- * (`usePanel().setPanel(...)`), so pages that don't use it read full-width. The
- * CelebrationLayer portal is mounted once here for the §6.5 moments.
+ * Route-transition fallback. Flips the NavProgress store on while a lazy page
+ * chunk loads (reflecting *real* pending navigation, spec §3), and shows a light
+ * spinner in the content area. The shell around it stays mounted because this
+ * boundary sits inside `SidebarInset`, closer than the app-level Suspense.
+ */
+function RouteFallback() {
+  const setActive = useNavProgressStore((s) => s.setActive);
+  useEffect(() => {
+    setActive(true);
+    return () => setActive(false);
+  }, [setActive]);
+  return (
+    <div className="flex flex-1 items-center justify-center py-20" role="status" aria-live="polite">
+      <span className="size-6 animate-spin rounded-full border-2 border-brand/30 border-t-brand" />
+    </div>
+  );
+}
+
+/** Slim in-flow update prompt (migrated from the former global Header). */
+function UpdateBanner() {
+  const intl = useIntl();
+  const navigate = useNavigate();
+  const notification = useUpdateStore((s) => s.notification);
+  const dismissed = useUpdateStore((s) => s.dismissed);
+  const restarting = useUpdateStore((s) => s.restarting);
+  const dismiss = useUpdateStore((s) => s.dismiss);
+  if (restarting) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border border-success/30 bg-success/10 px-3 py-1.5 text-xs text-success">
+        <span className="size-3 animate-spin rounded-full border-2 border-success/40 border-t-success" />
+        {intl.formatMessage({ id: 'update.restarting' })}
+      </div>
+    );
+  }
+  if (!notification?.available || dismissed) return null;
+  return (
+    <div className="flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-1.5">
+      <ArrowUpCircle className="size-4 shrink-0 text-warning" />
+      <span className="text-xs text-warning">
+        {intl.formatMessage({ id: 'update.notification' }, { version: notification.latest_version })}
+      </span>
+      <button
+        onClick={() => navigate('/manage/system?tab=update')}
+        className="ml-auto whitespace-nowrap rounded-md bg-warning px-2 py-0.5 text-xs font-medium text-white transition-colors hover:bg-warning/90"
+      >
+        {intl.formatMessage({ id: 'update.viewDetails' })}
+      </button>
+      <button
+        onClick={dismiss}
+        title={intl.formatMessage({ id: 'update.dismiss' })}
+        className="rounded p-0.5 text-warning/70 transition-colors hover:bg-warning/15 hover:text-warning"
+      >
+        <X className="size-3.5" />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * AppShell — the Multica two-pane frame (WP0.4, spec §5.1): the inset sidebar
+ * island │ the page-canvas SidebarInset. The former global Header is gone — its
+ * duties moved into the sidebar (search / theme / bell / cost) — so pages own
+ * their own PageHeader. During the migration, pages that don't yet carry a
+ * PageHeader still render inside the padded scroll container unchanged; only the
+ * outer frame changed. The right PropertiesPanel column mounts only when a page
+ * injects content (`usePanel().setPanel(...)`).
  */
 function AppShell() {
   const location = useLocation();
   const { content } = usePanel();
-  const mobileNavOpen = useSidebarStore((s) => s.mobileOpen);
-  const closeMobileNav = useSidebarStore((s) => s.closeMobile);
+  const navActive = useNavProgressStore((s) => s.active);
+  const brandName = useEffectiveName();
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      {/* Fixed ambient stage the glass surfaces refract */}
-      <div className="app-ambient" aria-hidden="true" />
-      {/* Mobile nav drawer backdrop (below md only) */}
-      {mobileNavOpen && (
-        <button
-          type="button"
-          aria-hidden="true"
-          tabIndex={-1}
-          onClick={closeMobileNav}
-          className="fixed inset-0 z-40 cursor-default bg-stone-900/30 backdrop-blur-[2px] md:hidden dark:bg-black/50"
-        />
-      )}
+    <SidebarProvider>
+      <Sidebar variant="inset">
+        <AppSidebar />
+      </Sidebar>
 
-      {/* Left column */}
-      <Sidebar />
+      <SidebarInset>
+        <NavProgress active={navActive} />
 
-      {/* Center column */}
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <Header />
-        <main className="flex-1 overflow-y-auto p-6 pb-20 md:pb-6">
-          {/* Non-blocking personal-edition soft-limit hint */}
-          <SoftLimitBanner />
-          {/* Proactive license-expiry warning (30/7-day window + expired) */}
-          <LicenseExpiryBanner />
-          {/* Re-key on route change to replay the entrance reveal */}
-          <div key={location.pathname} className="page-enter">
-            <Outlet />
+        {/* Mobile-only lightweight bar — the drawer trigger lives here since the
+            global desktop topbar is gone and old pages have no PageHeader yet. */}
+        <div className="flex h-12 shrink-0 items-center gap-2 border-b border-surface-border px-3 md:hidden">
+          <SidebarTrigger />
+          <span className="truncate text-sm font-medium text-foreground">{brandName}</span>
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+          <div className="empty:hidden [&>*+*]:mt-2 [&:not(:empty)]:px-4 [&:not(:empty)]:pt-3 md:[&:not(:empty)]:px-6">
+            <SoftLimitBanner />
+            <LicenseExpiryBanner />
+            <UpdateBanner />
           </div>
-        </main>
-      </div>
+          {/* Re-key on route change to replay the entrance reveal */}
+          <div key={location.pathname} className="page-enter flex flex-1 flex-col p-4 pb-20 md:p-6 md:pb-6">
+            <Suspense fallback={<RouteFallback />}>
+              <Outlet />
+            </Suspense>
+          </div>
+        </div>
+      </SidebarInset>
 
-      {/* Right column — mounts only when a page supplies panel content. Renders
-          the collapsible 320px desktop column and the mobile bottom sheet. */}
+      {/* Right column — mounts only when a page supplies panel content. */}
       {content && <PropertiesPanel />}
 
       <TourPrompt />
@@ -76,7 +143,7 @@ function AppShell() {
       {/* Gamification driver (V10): one shared growth.snapshot poll + the
           once-per-day settlement dialog. Renders no visible chrome itself. */}
       <GrowthMount />
-    </div>
+    </SidebarProvider>
   );
 }
 
@@ -86,7 +153,6 @@ export function MainLayout() {
   const status = useSystemStore((s) => s.status);
   const fetchStatus = useSystemStore((s) => s.fetchStatus);
   const recordVisit = useCommandPaletteStore((s) => s.recordVisit);
-  const closeMobileNav = useSidebarStore((s) => s.closeMobile);
   const fetchBranding = useBrandingStore((s) => s.fetch);
 
   // Restore the once-per-user tour state once the user id is known.
@@ -106,12 +172,10 @@ export function MainLayout() {
     if (!status) fetchStatus();
   }, [status, fetchStatus]);
 
-  // Feed the command palette's "recent" list from real navigation, and dismiss
-  // the mobile nav drawer whenever the route changes.
+  // Feed the command palette's "recent" list from real navigation.
   useEffect(() => {
     recordVisit(location.pathname);
-    closeMobileNav();
-  }, [location.pathname, recordVisit, closeMobileNav]);
+  }, [location.pathname, recordVisit]);
 
   return (
     <PanelProvider>

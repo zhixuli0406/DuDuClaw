@@ -3,8 +3,15 @@ import { useIntl } from 'react-intl';
 import { api } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { toast, formatError } from '@/lib/toast';
-import { Card, Button, Field, controlClass } from '@/components/ui';
-import { AdvancedSection, OptionSelect, SettingField, Switch, type SelectOption } from '@/components/settings/controls';
+import {
+  Button,
+  Input,
+  SettingsSection,
+  SettingsCard,
+  SettingsSaveState,
+} from '@/components/mds';
+import { AdvancedSection, type SelectOption } from '@/components/settings/controls';
+import { RowSelect, RowSwitch, RowText, FieldBlock } from '@/pages/agent-form/form-rows';
 
 // ── Voice Settings Tab ─────────────────────────────────────────
 
@@ -81,44 +88,48 @@ export function VoiceTab() {
   ];
 
   return (
-    <div className="space-y-6">
-      <Card title={intl.formatMessage({ id: 'voice.title' })} bodyClassName="space-y-6">
-        <SettingField
-          layout="row"
-          label={intl.formatMessage({ id: 'voice.voiceMode' })}
-          help={intl.formatMessage({ id: 'voice.voiceMode.help' })}
-        >
-          <Switch
+    <div className="space-y-8">
+      <SettingsSection>
+        <SettingsCard>
+          <RowSwitch
+            label={intl.formatMessage({ id: 'voice.voiceMode' })}
+            description={intl.formatMessage({ id: 'voice.voiceMode.help' })}
             checked={config.voice_reply_enabled}
             onChange={(v) => setConfig({ ...config, voice_reply_enabled: v })}
-            label={intl.formatMessage({ id: 'voice.voiceMode' })}
           />
-        </SettingField>
-
-        <div className="grid gap-4 sm:grid-cols-2">
-          <SettingField label={intl.formatMessage({ id: 'voice.asrProvider' })} help={intl.formatMessage({ id: 'voice.asrProvider.help' })}>
-            <OptionSelect value={config.asr_provider} onChange={(v) => setConfig({ ...config, asr_provider: v })} options={asrOptions} />
-          </SettingField>
-
-          <SettingField label={intl.formatMessage({ id: 'voice.ttsProvider' })} help={intl.formatMessage({ id: 'voice.ttsProvider.help' })}>
-            <OptionSelect value={config.tts_provider} onChange={(v) => setConfig({ ...config, tts_provider: v })} options={ttsOptions} />
-          </SettingField>
-
-          <SettingField label={intl.formatMessage({ id: 'voice.language' })} help={intl.formatMessage({ id: 'voice.language.help' })}>
-            <OptionSelect value={config.asr_language} onChange={(v) => setConfig({ ...config, asr_language: v })} options={langOptions} />
-          </SettingField>
-        </div>
-
-        <div className="flex justify-end pt-2">
-          <Button variant="primary" onClick={handleSave} disabled={saving}>
-            {saved
-              ? intl.formatMessage({ id: 'settings.general.saved' })
-              : saving
-                ? intl.formatMessage({ id: 'common.saving' })
-                : intl.formatMessage({ id: 'common.save' })}
+          <RowSelect
+            label={intl.formatMessage({ id: 'voice.asrProvider' })}
+            description={intl.formatMessage({ id: 'voice.asrProvider.help' })}
+            value={config.asr_provider}
+            onChange={(v) => setConfig({ ...config, asr_provider: v })}
+            options={asrOptions}
+          />
+          <RowSelect
+            label={intl.formatMessage({ id: 'voice.ttsProvider' })}
+            description={intl.formatMessage({ id: 'voice.ttsProvider.help' })}
+            value={config.tts_provider}
+            onChange={(v) => setConfig({ ...config, tts_provider: v })}
+            options={ttsOptions}
+          />
+          <RowSelect
+            label={intl.formatMessage({ id: 'voice.language' })}
+            description={intl.formatMessage({ id: 'voice.language.help' })}
+            value={config.asr_language}
+            onChange={(v) => setConfig({ ...config, asr_language: v })}
+            options={langOptions}
+          />
+        </SettingsCard>
+        <div className="flex items-center justify-end gap-3">
+          <SettingsSaveState
+            status={saving ? 'saving' : saved ? 'saved' : 'idle'}
+            savingLabel={intl.formatMessage({ id: 'common.saving' })}
+            savedLabel={intl.formatMessage({ id: 'settings.general.saved' })}
+          />
+          <Button variant="brand" size="sm" onClick={handleSave} disabled={saving}>
+            {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
           </Button>
         </div>
-      </Card>
+      </SettingsSection>
 
       <AdvancedSection storageKey="settings.voice" label={intl.formatMessage({ id: 'voice.advanced' })}>
         <SttConfigCard />
@@ -188,92 +199,82 @@ function SttConfigCard() {
   const isOpenAi = stt.stt_provider === 'openai_compat';
   const isCommand = stt.stt_provider === 'command';
 
-  return (
-    <Card
-      title={intl.formatMessage({ id: 'voice.stt.title', defaultMessage: '語音轉文字（STT）' })}
-      bodyClassName="space-y-4"
-    >
-      <p className="text-sm text-stone-500 dark:text-stone-400">
-        {intl.formatMessage({
-          id: 'voice.stt.desc',
-          defaultMessage: '設定聊天頁「按住說話」的語音辨識來源。未設定時語音輸入會停用。',
-        })}
-      </p>
+  const providerOptions: SelectOption[] = [
+    { value: '', label: intl.formatMessage({ id: 'voice.stt.providerNone', defaultMessage: '未設定（停用語音輸入）' }), raw: '' },
+    { value: 'openai_compat', label: intl.formatMessage({ id: 'voice.stt.providerOpenai', defaultMessage: 'OpenAI 相容（Whisper API / Groq）' }), raw: 'openai_compat' },
+    { value: 'command', label: intl.formatMessage({ id: 'voice.stt.providerCommand', defaultMessage: '本地指令（whisper-cli 等）' }), raw: 'command' },
+  ];
 
-      <Field label={intl.formatMessage({ id: 'voice.stt.provider', defaultMessage: 'STT 供應商' })}>
-        <select
+  return (
+    <SettingsSection
+      title={intl.formatMessage({ id: 'voice.stt.title', defaultMessage: '語音轉文字（STT）' })}
+      description={intl.formatMessage({
+        id: 'voice.stt.desc',
+        defaultMessage: '設定聊天頁「按住說話」的語音辨識來源。未設定時語音輸入會停用。',
+      })}
+    >
+      <SettingsCard>
+        <RowSelect
+          label={intl.formatMessage({ id: 'voice.stt.provider', defaultMessage: 'STT 供應商' })}
           value={stt.stt_provider}
-          onChange={(e) => setStt({ ...stt, stt_provider: e.target.value })}
-          className={controlClass}
-        >
-          <option value="">{intl.formatMessage({ id: 'voice.stt.providerNone', defaultMessage: '未設定（停用語音輸入）' })}</option>
-          <option value="openai_compat">{intl.formatMessage({ id: 'voice.stt.providerOpenai', defaultMessage: 'OpenAI 相容（Whisper API / Groq）' })}</option>
-          <option value="command">{intl.formatMessage({ id: 'voice.stt.providerCommand', defaultMessage: '本地指令（whisper-cli 等）' })}</option>
-        </select>
-      </Field>
+          onChange={(v) => setStt({ ...stt, stt_provider: v })}
+          options={providerOptions}
+        />
+      </SettingsCard>
 
       {isOpenAi && (
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label={intl.formatMessage({ id: 'voice.stt.baseUrl', defaultMessage: 'API Base URL' })}>
-            <input
-              type="text"
-              value={stt.stt_base_url}
-              onChange={(e) => setStt({ ...stt, stt_base_url: e.target.value })}
-              placeholder="https://api.openai.com/v1"
-              className={controlClass}
-            />
-          </Field>
-          <Field label={intl.formatMessage({ id: 'voice.stt.model', defaultMessage: '模型' })}>
-            <input
-              type="text"
-              value={stt.stt_model}
-              onChange={(e) => setStt({ ...stt, stt_model: e.target.value })}
-              placeholder="whisper-1"
-              className={controlClass}
-            />
-          </Field>
-          <Field label={intl.formatMessage({ id: 'voice.stt.apiKey', defaultMessage: 'API Key' })}>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder={keySet
-                ? intl.formatMessage({ id: 'voice.stt.apiKeySet', defaultMessage: '已設定（留空以保留）' })
-                : intl.formatMessage({ id: 'voice.stt.apiKeyPlaceholder', defaultMessage: 'sk-…' })}
-              className={controlClass}
-              autoComplete="off"
-            />
-          </Field>
-        </div>
+        <SettingsCard>
+          <RowText
+            label={intl.formatMessage({ id: 'voice.stt.baseUrl', defaultMessage: 'API Base URL' })}
+            value={stt.stt_base_url}
+            onChange={(v) => setStt({ ...stt, stt_base_url: v })}
+            placeholder="https://api.openai.com/v1"
+          />
+          <RowText
+            label={intl.formatMessage({ id: 'voice.stt.model', defaultMessage: '模型' })}
+            value={stt.stt_model}
+            onChange={(v) => setStt({ ...stt, stt_model: v })}
+            placeholder="whisper-1"
+          />
+          <RowText
+            label={intl.formatMessage({ id: 'voice.stt.apiKey', defaultMessage: 'API Key' })}
+            type="password"
+            value={apiKey}
+            onChange={setApiKey}
+            placeholder={keySet
+              ? intl.formatMessage({ id: 'voice.stt.apiKeySet', defaultMessage: '已設定（留空以保留）' })
+              : intl.formatMessage({ id: 'voice.stt.apiKeyPlaceholder', defaultMessage: 'sk-…' })}
+          />
+        </SettingsCard>
       )}
 
       {isCommand && (
-        <Field label={intl.formatMessage({ id: 'voice.stt.command', defaultMessage: '轉錄指令' })}>
-          <input
+        <FieldBlock
+          label={intl.formatMessage({ id: 'voice.stt.command', defaultMessage: '轉錄指令' })}
+          description={intl.formatMessage({
+            id: 'voice.stt.commandHint',
+            defaultMessage: '{audio} 會被替換成暫存音檔路徑；轉錄結果讀自指令的標準輸出。',
+          })}
+        >
+          <Input
             type="text"
             value={stt.stt_command}
             onChange={(e) => setStt({ ...stt, stt_command: e.target.value })}
             placeholder="whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --no-prints"
-            className={controlClass}
           />
-          <p className="mt-1 text-xs text-stone-400 dark:text-stone-500">
-            {intl.formatMessage({
-              id: 'voice.stt.commandHint',
-              defaultMessage: '{audio} 會被替換成暫存音檔路徑；轉錄結果讀自指令的標準輸出。',
-            })}
-          </p>
-        </Field>
+        </FieldBlock>
       )}
 
-      <div className="flex justify-end pt-2">
-        <Button variant="primary" onClick={handleSave} disabled={saving}>
-          {saved
-            ? intl.formatMessage({ id: 'settings.general.saved' })
-            : saving
-              ? intl.formatMessage({ id: 'common.saving' })
-              : intl.formatMessage({ id: 'common.save' })}
+      <div className="flex items-center justify-end gap-3">
+        <SettingsSaveState
+          status={saving ? 'saving' : saved ? 'saved' : 'idle'}
+          savingLabel={intl.formatMessage({ id: 'common.saving' })}
+          savedLabel={intl.formatMessage({ id: 'settings.general.saved' })}
+        />
+        <Button variant="brand" size="sm" onClick={handleSave} disabled={saving}>
+          {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
         </Button>
       </div>
-    </Card>
+    </SettingsSection>
   );
 }

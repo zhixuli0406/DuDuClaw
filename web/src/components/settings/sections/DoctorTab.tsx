@@ -3,7 +3,7 @@ import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
 import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
-import { Card, Button, EmptyState } from '@/components/ui';
+import { Button, Empty } from '@/components/mds';
 import { Play, Wrench, CheckCircle, AlertTriangle, XCircle, Stethoscope } from 'lucide-react';
 
 export function DoctorTab() {
@@ -11,15 +11,15 @@ export function DoctorTab() {
   const { doctorChecks, runDoctor, loading } = useSystemStore();
 
   const statusIcon: Record<string, React.ReactNode> = {
-    pass: <CheckCircle className="h-5 w-5 text-emerald-500" />,
-    warn: <AlertTriangle className="h-5 w-5 text-amber-500" />,
-    fail: <XCircle className="h-5 w-5 text-rose-500" />,
+    pass: <CheckCircle className="h-5 w-5 text-success" />,
+    warn: <AlertTriangle className="h-5 w-5 text-warning" />,
+    fail: <XCircle className="h-5 w-5 text-destructive" />,
   };
 
   const statusBg: Record<string, string> = {
-    pass: 'border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-900/20',
-    warn: 'border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20',
-    fail: 'border-rose-200 bg-rose-50 dark:border-rose-800 dark:bg-rose-900/20',
+    pass: 'border-success/30 bg-success/10',
+    warn: 'border-warning/30 bg-warning/10',
+    fail: 'border-destructive/30 bg-destructive/10',
   };
 
   const handleRepair = async () => {
@@ -33,26 +33,23 @@ export function DoctorTab() {
 
   return (
     <div className="space-y-6">
-      <p className="rounded-lg bg-stone-500/5 px-4 py-3 text-sm text-stone-500 dark:bg-white/5 dark:text-stone-400">
-        {intl.formatMessage({ id: 'settings.doctor.desc' })}
-      </p>
       <div className="flex gap-2">
-        <Button variant="primary" icon={Play} onClick={runDoctor} disabled={loading}>
+        <Button variant="brand" size="sm" onClick={runDoctor} disabled={loading}>
+          <Play />
           {intl.formatMessage({ id: 'settings.doctor.run' })}
         </Button>
-        <Button variant="secondary" icon={Wrench} onClick={handleRepair} disabled={loading}>
+        <Button variant="secondary" size="sm" onClick={handleRepair} disabled={loading}>
+          <Wrench />
           {intl.formatMessage({ id: 'settings.doctor.repair' })}
         </Button>
       </div>
 
       {doctorChecks.length === 0 ? (
-        <Card padded={false}>
-          <EmptyState
-            icon={Stethoscope}
-            dudu="idle"
-            title={intl.formatMessage({ id: 'settings.doctor.run' })}
-          />
-        </Card>
+        <Empty
+          icon={Stethoscope}
+          variant="dashed"
+          title={intl.formatMessage({ id: 'settings.doctor.run' })}
+        />
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">
           {doctorChecks.map((check) => (
@@ -60,20 +57,20 @@ export function DoctorTab() {
               key={check.name}
               className={cn(
                 'rounded-xl border p-5',
-                statusBg[check.status] ?? 'border-stone-200 bg-white'
+                statusBg[check.status] ?? 'border-surface-border bg-surface'
               )}
             >
               <div className="flex items-start gap-3">
                 {statusIcon[check.status]}
                 <div className="flex-1">
-                  <h4 className="font-semibold text-stone-900 dark:text-stone-50">
+                  <h4 className="font-medium text-foreground">
                     {check.name}
                   </h4>
-                  <p className="mt-1 text-sm text-stone-600 dark:text-stone-400">
+                  <p className="mt-1 text-sm text-muted-foreground">
                     {check.message}
                   </p>
                   {check.can_repair && check.repair_hint && (
-                    <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+                    <p className="mt-2 text-xs text-warning">
                       {check.repair_hint}
                     </p>
                   )}

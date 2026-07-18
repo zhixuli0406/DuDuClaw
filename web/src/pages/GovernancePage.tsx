@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import {
   api,
@@ -10,33 +10,50 @@ import {
   type GovRateResource,
   type GovAction,
 } from '@/lib/api';
-import { Dialog, inputClass } from '@/components/shared/Dialog';
-import { SettingField, OptionSelect } from '@/components/settings/controls';
 import { ChipEditor } from '@/components/shared/ChipEditor';
+import { ConfirmDialog } from '@/components/settings/controls';
 import { toast, formatError } from '@/lib/toast';
-import { Scale, Plus, Trash2, Pencil } from 'lucide-react';
+import { Scale, Plus, Trash2, Pencil, MoreHorizontal } from 'lucide-react';
 import {
-  Page,
-  PageHeader,
-  Card,
   Button,
   Badge,
-  EmptyState,
-  Tabs,
-  Mono,
-  type TabItem,
-} from '@/components/ui';
-
-type BadgeTone = 'info' | 'accent' | 'warning' | 'success';
-
-const TYPE_TONES: Record<GovPolicyType, BadgeTone> = {
-  rate: 'info',
-  permission: 'accent',
-  quota: 'warning',
-  lifecycle: 'success',
-};
+  type BadgeProps,
+  Input,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  Segmented,
+  type SegmentedOption,
+  Empty,
+  ListGridContainer,
+  ListGridHeader,
+  ListGridHeaderCell,
+  ListGridRow,
+  ListGridCell,
+} from '@/components/mds';
 
 type TypeFilter = 'all' | GovPolicyType;
+
+/** Badge tone per policy type (spec: rate=info, permission=accent, quota=warning, lifecycle=success). */
+const TYPE_BADGE: Record<GovPolicyType, { variant: BadgeProps['variant']; className?: string }> = {
+  rate: { variant: 'secondary' },
+  permission: { variant: 'outline' },
+  quota: { variant: 'secondary', className: 'bg-warning/15 text-warning' },
+  lifecycle: { variant: 'secondary', className: 'bg-success/15 text-success' },
+};
+
+const POLICY_COLUMNS = 'minmax(0,1fr) minmax(0,0.7fr) minmax(0,0.9fr) minmax(0,1.6fr) 2.5rem';
 
 /** Build a fresh, validation-friendly default policy of the given type. */
 function defaultPolicy(type: GovPolicyType): GovPolicy {
@@ -59,6 +76,7 @@ export function GovernancePage() {
   const [loading, setLoading] = useState(false);
   const [editing, setEditing] = useState<{ policy: GovPolicy; isNew: boolean } | null>(null);
   const [removing, setRemoving] = useState<GovPolicy | null>(null);
+  const [removeBusy, setRemoveBusy] = useState(false);
   const [filter, setFilter] = useState<TypeFilter>('all');
 
   const fetchPolicies = useCallback(async () => {
@@ -77,13 +95,12 @@ export function GovernancePage() {
     fetchPolicies();
   }, [fetchPolicies]);
 
-  const tabItems: TabItem[] = useMemo(
+  const filterOptions: SegmentedOption<TypeFilter>[] = useMemo(
     () => [
-      { id: 'all', label: intl.formatMessage({ id: 'tasks.filter.all' }), badge: policies.length },
+      { value: 'all', label: `${intl.formatMessage({ id: 'tasks.filter.all' })} (${policies.length})` },
       ...GOV_POLICY_TYPES.map((t) => ({
-        id: t,
-        label: t,
-        badge: policies.filter((p) => p.policy_type === t).length,
+        value: t,
+        label: `${t} (${policies.filter((p) => p.policy_type === t).length})`,
       })),
     ],
     [intl, policies]
@@ -94,83 +111,80 @@ export function GovernancePage() {
     [filter, policies]
   );
 
+  const handleRemove = async () => {
+    if (!removing) return;
+    setRemoveBusy(true);
+    try {
+      await api.governance.remove(removing.policy_id, removing.agent_id);
+      toast.success(intl.formatMessage({ id: 'gov.removed' }));
+      setRemoving(null);
+      fetchPolicies();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    } finally {
+      setRemoveBusy(false);
+    }
+  };
+
   return (
-    <Page>
-      <PageHeader
-        icon={Scale}
-        title={intl.formatMessage({ id: 'nav.governance' })}
-        subtitle={intl.formatMessage({ id: 'gov.desc' })}
-        actions={
-          <Button
-            variant="primary"
-            icon={Plus}
-            onClick={() => setEditing({ policy: defaultPolicy('rate'), isNew: true })}
-          >
-            {intl.formatMessage({ id: 'gov.add' })}
-          </Button>
-        }
+    <div className="mx-auto w-full max-w-[1200px] space-y-6">
+      {/* Slim header */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <Scale className="size-5 text-muted-foreground" />
+          <div>
+            <h1 className="text-base font-medium">{intl.formatMessage({ id: 'nav.governance' })}</h1>
+            <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'gov.desc' })}</p>
+          </div>
+        </div>
+        <Button
+          variant="brand"
+          size="sm"
+          onClick={() => setEditing({ policy: defaultPolicy('rate'), isNew: true })}
+        >
+          <Plus />
+          <span className="hidden sm:inline">{intl.formatMessage({ id: 'gov.add' })}</span>
+        </Button>
+      </div>
+
+      {/* Type filter (all / rate / permission / quota / lifecycle) with counts */}
+      <Segmented
+        value={filter}
+        onValueChange={setFilter}
+        options={filterOptions}
+        aria-label={intl.formatMessage({ id: 'nav.governance' })}
       />
 
-      <Tabs items={tabItems} value={filter} onChange={(id) => setFilter(id as TypeFilter)} />
-
-      <Card padded={false}>
-        {loading ? (
-          <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
-        ) : visiblePolicies.length === 0 ? (
-          <EmptyState icon={Scale} dudu="idle" title={intl.formatMessage({ id: 'gov.empty' })} />
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-[var(--panel-border)]">
-                  <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.id' })}</th>
-                  <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.type' })}</th>
-                  <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.scope' })}</th>
-                  <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.detail' })}</th>
-                  <th className="px-5 py-2.5 text-right font-medium text-stone-500 dark:text-stone-400" />
-                </tr>
-              </thead>
-              <tbody>
-                {visiblePolicies.map((p) => (
-                  <tr key={`${p.scope ?? p.agent_id}:${p.policy_id}`} className="border-b border-[var(--panel-border)] last:border-0">
-                    <td className="px-5 py-2.5 font-medium text-stone-800 dark:text-stone-200">
-                      <Mono>{p.policy_id}</Mono>
-                    </td>
-                    <td className="px-5 py-2.5">
-                      <Badge tone={TYPE_TONES[p.policy_type]}>{p.policy_type}</Badge>
-                    </td>
-                    <td className="px-5 py-2.5 text-stone-600 dark:text-stone-400">
-                      <Mono>{p.scope ?? p.agent_id}</Mono>
-                    </td>
-                    <td className="px-5 py-2.5 text-xs text-stone-500 dark:text-stone-400">{policyDetail(p)}</td>
-                    <td className="px-5 py-2.5 text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          icon={Pencil}
-                          onClick={() => setEditing({ policy: { ...p }, isNew: false })}
-                          title={intl.formatMessage({ id: 'common.edit' })}
-                          aria-label={intl.formatMessage({ id: 'common.edit' })}
-                        />
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          icon={Trash2}
-                          onClick={() => setRemoving(p)}
-                          title={intl.formatMessage({ id: 'common.delete' })}
-                          aria-label={intl.formatMessage({ id: 'common.delete' })}
-                          className="text-rose-500 hover:bg-rose-500/10 hover:text-rose-600 dark:text-rose-400"
-                        />
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
+      {loading ? (
+        <p className="py-8 text-center text-sm text-muted-foreground">{intl.formatMessage({ id: 'common.loading' })}</p>
+      ) : visiblePolicies.length === 0 ? (
+        <Empty icon={Scale} title={intl.formatMessage({ id: 'gov.empty' })} />
+      ) : (
+        <div className="overflow-hidden rounded-xl border border-surface-border">
+          <ListGridContainer
+            columns={POLICY_COLUMNS}
+            className="!h-auto [&>[aria-hidden]]:hidden"
+            header={
+              <ListGridHeader>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'gov.col.id' })}</ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'gov.col.type' })}</ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'gov.col.scope' })}</ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'gov.col.detail' })}</ListGridHeaderCell>
+                <ListGridHeaderCell aria-hidden />
+              </ListGridHeader>
+            }
+          >
+            {visiblePolicies.map((p) => (
+              <PolicyRow
+                key={`${p.scope ?? p.agent_id}:${p.policy_id}`}
+                policy={p}
+                onEdit={() => setEditing({ policy: { ...p }, isNew: false })}
+                onRemove={() => setRemoving(p)}
+              />
+            ))}
+          </ListGridContainer>
+        </div>
+      )}
 
       {editing && (
         <PolicyDialog
@@ -181,12 +195,21 @@ export function GovernancePage() {
         />
       )}
 
-      <RemoveDialog
-        policy={removing}
+      {/* Destructive remove confirmation */}
+      <ConfirmDialog
+        open={removing !== null}
         onClose={() => setRemoving(null)}
-        onRemoved={() => { setRemoving(null); fetchPolicies(); }}
+        onConfirm={handleRemove}
+        title={intl.formatMessage({ id: 'gov.remove.title' })}
+        message={
+          removing
+            ? `${intl.formatMessage({ id: 'gov.remove.confirm' })} ${removing.policy_id} (${removing.scope ?? removing.agent_id})`
+            : ''
+        }
+        confirmLabel={intl.formatMessage({ id: 'common.delete' })}
+        busy={removeBusy}
       />
-    </Page>
+    </div>
   );
 }
 
@@ -205,6 +228,82 @@ function policyDetail(p: GovPolicy): string {
   }
 }
 
+/** One policy row: id · type badge · scope · detail · kebab (edit/delete). */
+function PolicyRow({
+  policy,
+  onEdit,
+  onRemove,
+}: {
+  policy: GovPolicy;
+  onEdit: () => void;
+  onRemove: () => void;
+}) {
+  const intl = useIntl();
+  const tone = TYPE_BADGE[policy.policy_type];
+  const detail = policyDetail(policy);
+  return (
+    <ListGridRow className="cursor-default">
+      <ListGridCell className="font-mono text-xs text-foreground" title={policy.policy_id}>
+        {policy.policy_id}
+      </ListGridCell>
+      <ListGridCell>
+        <Badge variant={tone.variant} className={tone.className}>{policy.policy_type}</Badge>
+      </ListGridCell>
+      <ListGridCell className="font-mono text-xs text-muted-foreground" title={policy.scope ?? policy.agent_id}>
+        {policy.scope ?? policy.agent_id}
+      </ListGridCell>
+      <ListGridCell className="truncate text-xs text-muted-foreground" title={detail}>
+        {detail}
+      </ListGridCell>
+      <ListGridCell className="justify-end">
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={intl.formatMessage({ id: 'common.more' })}
+                data-stop-row-nav
+              />
+            }
+          >
+            <MoreHorizontal />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            <DropdownMenuItem onClick={onEdit}>
+              <Pencil />
+              {intl.formatMessage({ id: 'common.edit' })}
+            </DropdownMenuItem>
+            <DropdownMenuItem variant="destructive" onClick={onRemove}>
+              <Trash2 />
+              {intl.formatMessage({ id: 'common.delete' })}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </ListGridCell>
+    </ListGridRow>
+  );
+}
+
+/** Stacked label + control block used across the policy dialog (spec §5.3). */
+function DialogField({
+  label,
+  help,
+  children,
+}: {
+  label: string;
+  help?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <label className="text-sm font-medium text-foreground">{label}</label>
+      {children}
+      {help && <p className="text-xs text-muted-foreground">{help}</p>}
+    </div>
+  );
+}
+
 function PolicyDialog({
   initial,
   isNew,
@@ -221,9 +320,8 @@ function PolicyDialog({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Plain-language labels for the technical enum values. The raw value is still
-  // shown after a middle dot by OptionSelect, and the written payload is
-  // unchanged — only the visible label is friendlier.
+  // Plain-language labels for the technical enum values. The written payload
+  // is unchanged — only the visible label is friendlier.
   const typeLabels: Record<GovPolicyType, string> = {
     rate: intl.formatMessage({ id: 'gov.type.opt.rate', defaultMessage: '頻率限制' }),
     permission: intl.formatMessage({ id: 'gov.type.opt.permission', defaultMessage: '權限範圍' }),
@@ -271,215 +369,186 @@ function PolicyDialog({
   };
 
   return (
-    <Dialog
-      open
-      onClose={onClose}
-      title={isNew ? intl.formatMessage({ id: 'gov.add' }) : intl.formatMessage({ id: 'gov.edit' })}
-    >
-      <div className="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
-          <SettingField
-            label={intl.formatMessage({ id: 'gov.field.id' })}
-            help={intl.formatMessage({ id: 'gov.field.id.hint' })}
-          >
-            <input
-              type="text"
-              value={policy.policy_id}
-              onChange={(e) => set('policy_id', e.target.value)}
-              disabled={!isNew}
-              placeholder="default-rate-mcp"
-              className={inputClass}
-            />
-          </SettingField>
-          <SettingField
-            label={intl.formatMessage({ id: 'gov.field.type' })}
-            help={intl.formatMessage({ id: 'gov.field.type.help', defaultMessage: '這條規則要管什麼：頻率、權限、配額或生命週期。建立後不可更改。' })}
-          >
-            <OptionSelect
-              value={policy.policy_type}
-              onChange={(v) => changeType(v as GovPolicyType)}
-              disabled={!isNew}
-              options={GOV_POLICY_TYPES.map((t) => ({ value: t, label: typeLabels[t], raw: t }))}
-            />
-          </SettingField>
-        </div>
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>
+            {isNew ? intl.formatMessage({ id: 'gov.add' }) : intl.formatMessage({ id: 'gov.edit' })}
+          </DialogTitle>
+        </DialogHeader>
 
-        <SettingField
-          label={intl.formatMessage({ id: 'gov.field.agentId' })}
-          help={intl.formatMessage({ id: 'gov.field.agentId.hint' })}
-        >
-          <input type="text" value={policy.agent_id} onChange={(e) => set('agent_id', e.target.value)} placeholder="*" className={inputClass} />
-        </SettingField>
-
-        {policy.policy_type === 'rate' && (
-          <>
-            <SettingField
-              label={intl.formatMessage({ id: 'gov.rate.resource' })}
-              help={intl.formatMessage({ id: 'gov.rate.resource.help', defaultMessage: '要計數的動作。超過下面設定的次數時，就會觸發違規動作。' })}
+        <div className="max-h-[60vh] space-y-4 overflow-y-auto">
+          <div className="grid grid-cols-2 gap-3">
+            <DialogField
+              label={intl.formatMessage({ id: 'gov.field.id' })}
+              help={intl.formatMessage({ id: 'gov.field.id.hint' })}
             >
-              <OptionSelect
-                value={policy.resource ?? 'mcp_calls'}
-                onChange={(v) => set('resource', v as GovRateResource)}
-                options={GOV_RATE_RESOURCES.map((r) => ({ value: r, label: resourceLabels[r], raw: r }))}
+              <Input
+                type="text"
+                value={policy.policy_id}
+                onChange={(e) => set('policy_id', e.target.value)}
+                disabled={!isNew}
+                placeholder="default-rate-mcp"
               />
-            </SettingField>
-            <div className="grid grid-cols-2 gap-3">
-              <SettingField
-                label={intl.formatMessage({ id: 'gov.rate.limit' })}
-                help={intl.formatMessage({ id: 'gov.rate.limit.help', defaultMessage: '在時間視窗內允許的最多次數。調高＝更寬鬆，調低＝更嚴格。' })}
-              >
-                <input type="number" min={1} value={policy.limit ?? 0} onChange={(e) => set('limit', Number(e.target.value))} className={inputClass} />
-              </SettingField>
-              <SettingField
-                label={intl.formatMessage({ id: 'gov.rate.window' })}
-                help={intl.formatMessage({ id: 'gov.rate.window.help', defaultMessage: '計數的時間長度（秒）。例如 60 代表「每分鐘」計算一次上限。' })}
-              >
-                <input type="number" min={1} value={policy.window_seconds ?? 0} onChange={(e) => set('window_seconds', Number(e.target.value))} className={inputClass} />
-              </SettingField>
-            </div>
-            <SettingField
-              label={intl.formatMessage({ id: 'gov.rate.action' })}
-              help={intl.formatMessage({ id: 'gov.rate.action.help', defaultMessage: '超過上限時怎麼處理：直接擋下、只記錄警告、或放慢速度。' })}
+            </DialogField>
+            <DialogField
+              label={intl.formatMessage({ id: 'gov.field.type' })}
+              help={intl.formatMessage({ id: 'gov.field.type.help', defaultMessage: '這條規則要管什麼：頻率、權限、配額或生命週期。建立後不可更改。' })}
             >
-              <OptionSelect
-                value={policy.action_on_violation ?? 'reject'}
-                onChange={(v) => set('action_on_violation', v as GovAction)}
-                options={GOV_ACTIONS.map((a) => ({ value: a, label: actionLabels[a], raw: a }))}
-              />
-            </SettingField>
-          </>
-        )}
+              <Select value={policy.policy_type} onValueChange={(v) => changeType(v as GovPolicyType)} disabled={!isNew}>
+                <SelectTrigger className="w-full">
+                  <SelectValue>{typeLabels[policy.policy_type]}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {GOV_POLICY_TYPES.map((t) => (
+                    <SelectItem key={t} value={t}>{typeLabels[t]}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </DialogField>
+          </div>
 
-        {policy.policy_type === 'permission' && (
-          <>
-            <SettingField
-              label={intl.formatMessage({ id: 'gov.perm.allowed' })}
-              help={intl.formatMessage({ id: 'gov.perm.allowed.help', defaultMessage: '只允許使用這些權限；留空代表不特別限制。範例格式見下方。' })}
-            >
-              <ChipEditor values={policy.allowed_scopes ?? []} onChange={(v) => set('allowed_scopes', v)} placeholder="memory:read" addLabel={intl.formatMessage({ id: 'common.add' })} />
-            </SettingField>
-            <SettingField
-              label={intl.formatMessage({ id: 'gov.perm.denied' })}
-              help={intl.formatMessage({ id: 'gov.perm.denied.help', defaultMessage: '明確禁止的權限。即使在允許清單內，出現在這裡也會被擋。' })}
-            >
-              <ChipEditor values={policy.denied_scopes ?? []} onChange={(v) => set('denied_scopes', v)} placeholder="odoo:write" addLabel={intl.formatMessage({ id: 'common.add' })} />
-            </SettingField>
-            <SettingField
-              label={intl.formatMessage({ id: 'gov.perm.requiresApproval' })}
-              help={intl.formatMessage({ id: 'gov.perm.requiresApproval.help', defaultMessage: '這些權限每次使用前都要先經人工核准，適合高風險操作。' })}
-            >
-              <ChipEditor values={policy.requires_approval ?? []} onChange={(v) => set('requires_approval', v)} placeholder="odoo:execute" addLabel={intl.formatMessage({ id: 'common.add' })} />
-            </SettingField>
-          </>
-        )}
+          <DialogField
+            label={intl.formatMessage({ id: 'gov.field.agentId' })}
+            help={intl.formatMessage({ id: 'gov.field.agentId.hint' })}
+          >
+            <Input type="text" value={policy.agent_id} onChange={(e) => set('agent_id', e.target.value)} placeholder="*" />
+          </DialogField>
 
-        {policy.policy_type === 'quota' && (
-          <>
+          {policy.policy_type === 'rate' && (
+            <>
+              <DialogField
+                label={intl.formatMessage({ id: 'gov.rate.resource' })}
+                help={intl.formatMessage({ id: 'gov.rate.resource.help', defaultMessage: '要計數的動作。超過下面設定的次數時，就會觸發違規動作。' })}
+              >
+                <Select value={policy.resource ?? 'mcp_calls'} onValueChange={(v) => set('resource', v as GovRateResource)}>
+                  <SelectTrigger className="w-full">
+                    <SelectValue>{resourceLabels[policy.resource ?? 'mcp_calls']}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {GOV_RATE_RESOURCES.map((r) => (
+                      <SelectItem key={r} value={r}>{resourceLabels[r]}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </DialogField>
+              <div className="grid grid-cols-2 gap-3">
+                <DialogField
+                  label={intl.formatMessage({ id: 'gov.rate.limit' })}
+                  help={intl.formatMessage({ id: 'gov.rate.limit.help', defaultMessage: '在時間視窗內允許的最多次數。調高＝更寬鬆，調低＝更嚴格。' })}
+                >
+                  <Input type="number" min={1} value={policy.limit ?? 0} onChange={(e) => set('limit', Number(e.target.value))} />
+                </DialogField>
+                <DialogField
+                  label={intl.formatMessage({ id: 'gov.rate.window' })}
+                  help={intl.formatMessage({ id: 'gov.rate.window.help', defaultMessage: '計數的時間長度（秒）。例如 60 代表「每分鐘」計算一次上限。' })}
+                >
+                  <Input type="number" min={1} value={policy.window_seconds ?? 0} onChange={(e) => set('window_seconds', Number(e.target.value))} />
+                </DialogField>
+              </div>
+              <DialogField
+                label={intl.formatMessage({ id: 'gov.rate.action' })}
+                help={intl.formatMessage({ id: 'gov.rate.action.help', defaultMessage: '超過上限時怎麼處理：直接擋下、只記錄警告、或放慢速度。' })}
+              >
+                <Select value={policy.action_on_violation ?? 'reject'} onValueChange={(v) => set('action_on_violation', v as GovAction)}>
+                  <SelectTrigger className="w-full">
+                    <SelectValue>{actionLabels[policy.action_on_violation ?? 'reject']}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {GOV_ACTIONS.map((a) => (
+                      <SelectItem key={a} value={a}>{actionLabels[a]}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </DialogField>
+            </>
+          )}
+
+          {policy.policy_type === 'permission' && (
+            <>
+              <DialogField
+                label={intl.formatMessage({ id: 'gov.perm.allowed' })}
+                help={intl.formatMessage({ id: 'gov.perm.allowed.help', defaultMessage: '只允許使用這些權限；留空代表不特別限制。範例格式見下方。' })}
+              >
+                <ChipEditor values={policy.allowed_scopes ?? []} onChange={(v) => set('allowed_scopes', v)} placeholder="memory:read" addLabel={intl.formatMessage({ id: 'common.add' })} />
+              </DialogField>
+              <DialogField
+                label={intl.formatMessage({ id: 'gov.perm.denied' })}
+                help={intl.formatMessage({ id: 'gov.perm.denied.help', defaultMessage: '明確禁止的權限。即使在允許清單內，出現在這裡也會被擋。' })}
+              >
+                <ChipEditor values={policy.denied_scopes ?? []} onChange={(v) => set('denied_scopes', v)} placeholder="odoo:write" addLabel={intl.formatMessage({ id: 'common.add' })} />
+              </DialogField>
+              <DialogField
+                label={intl.formatMessage({ id: 'gov.perm.requiresApproval' })}
+                help={intl.formatMessage({ id: 'gov.perm.requiresApproval.help', defaultMessage: '這些權限每次使用前都要先經人工核准，適合高風險操作。' })}
+              >
+                <ChipEditor values={policy.requires_approval ?? []} onChange={(v) => set('requires_approval', v)} placeholder="odoo:execute" addLabel={intl.formatMessage({ id: 'common.add' })} />
+              </DialogField>
+            </>
+          )}
+
+          {policy.policy_type === 'quota' && (
             <div className="grid grid-cols-2 gap-3">
-              <SettingField
+              <DialogField
                 label={intl.formatMessage({ id: 'gov.quota.dailyBudget' })}
                 help={intl.formatMessage({ id: 'gov.quota.dailyBudget.help', defaultMessage: '每天可用的 token 總量。用完後當天暫停，隔天依重置排程歸零。' })}
               >
-                <input type="number" min={1} value={policy.daily_token_budget ?? 0} onChange={(e) => set('daily_token_budget', Number(e.target.value))} className={inputClass} />
-              </SettingField>
-              <SettingField
+                <Input type="number" min={1} value={policy.daily_token_budget ?? 0} onChange={(e) => set('daily_token_budget', Number(e.target.value))} />
+              </DialogField>
+              <DialogField
                 label={intl.formatMessage({ id: 'gov.quota.maxTasks' })}
                 help={intl.formatMessage({ id: 'gov.quota.maxTasks.help', defaultMessage: '同一時間最多可同時進行的任務數。調高會更快，但也更耗資源。' })}
               >
-                <input type="number" min={1} value={policy.max_concurrent_tasks ?? 0} onChange={(e) => set('max_concurrent_tasks', Number(e.target.value))} className={inputClass} />
-              </SettingField>
-              <SettingField
+                <Input type="number" min={1} value={policy.max_concurrent_tasks ?? 0} onChange={(e) => set('max_concurrent_tasks', Number(e.target.value))} />
+              </DialogField>
+              <DialogField
                 label={intl.formatMessage({ id: 'gov.quota.maxMemory' })}
                 help={intl.formatMessage({ id: 'gov.quota.maxMemory.help', defaultMessage: '可保留的記憶筆數上限。填 0 代表不限制。' })}
               >
-                <input type="number" min={0} value={policy.max_memory_entries ?? 0} onChange={(e) => set('max_memory_entries', Number(e.target.value))} className={inputClass} />
-              </SettingField>
-              <SettingField
+                <Input type="number" min={0} value={policy.max_memory_entries ?? 0} onChange={(e) => set('max_memory_entries', Number(e.target.value))} />
+              </DialogField>
+              <DialogField
                 label={intl.formatMessage({ id: 'gov.quota.resetCron' })}
                 help={intl.formatMessage({ id: 'gov.quota.resetCron.help', defaultMessage: '配額歸零的排程（cron 格式）。預設 0 0 * * * 代表每天午夜重置。' })}
               >
-                <input type="text" value={policy.reset_cron ?? '0 0 * * *'} onChange={(e) => set('reset_cron', e.target.value)} className={inputClass} />
-              </SettingField>
+                <Input type="text" value={policy.reset_cron ?? '0 0 * * *'} onChange={(e) => set('reset_cron', e.target.value)} />
+              </DialogField>
             </div>
-          </>
-        )}
+          )}
 
-        {policy.policy_type === 'lifecycle' && (
-          <>
+          {policy.policy_type === 'lifecycle' && (
             <div className="grid grid-cols-2 gap-3">
-              <SettingField
+              <DialogField
                 label={intl.formatMessage({ id: 'gov.lifecycle.maxIdle' })}
                 help={intl.formatMessage({ id: 'gov.lifecycle.maxIdle.help', defaultMessage: '閒置超過這麼多小時就視為停擺。預設 168 小時（7 天）。' })}
               >
-                <input type="number" min={1} value={policy.max_idle_hours ?? 0} onChange={(e) => set('max_idle_hours', Number(e.target.value))} className={inputClass} />
-              </SettingField>
-              <SettingField
+                <Input type="number" min={1} value={policy.max_idle_hours ?? 0} onChange={(e) => set('max_idle_hours', Number(e.target.value))} />
+              </DialogField>
+              <DialogField
                 label={intl.formatMessage({ id: 'gov.lifecycle.healthCheck' })}
                 help={intl.formatMessage({ id: 'gov.lifecycle.healthCheck.help', defaultMessage: '多久檢查一次健康狀態（秒）。調短偵測更即時，但檢查較頻繁。' })}
               >
-                <input type="number" min={1} value={policy.health_check_interval_seconds ?? 0} onChange={(e) => set('health_check_interval_seconds', Number(e.target.value))} className={inputClass} />
-              </SettingField>
-              <SettingField
+                <Input type="number" min={1} value={policy.health_check_interval_seconds ?? 0} onChange={(e) => set('health_check_interval_seconds', Number(e.target.value))} />
+              </DialogField>
+              <DialogField
                 label={intl.formatMessage({ id: 'gov.lifecycle.autoSuspend' })}
                 help={intl.formatMessage({ id: 'gov.lifecycle.autoSuspend.help', defaultMessage: '累積違規達這個次數就自動暫停這個 AI 員工。填 0 代表關閉此功能。' })}
               >
-                <input type="number" min={0} value={policy.auto_suspend_on_violation_count ?? 0} onChange={(e) => set('auto_suspend_on_violation_count', Number(e.target.value))} className={inputClass} />
-              </SettingField>
+                <Input type="number" min={0} value={policy.auto_suspend_on_violation_count ?? 0} onChange={(e) => set('auto_suspend_on_violation_count', Number(e.target.value))} />
+              </DialogField>
             </div>
-          </>
-        )}
+          )}
 
-        {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
-        <div className="flex justify-end gap-3 border-t border-[var(--panel-border)] pt-4">
-          <Button variant="secondary" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
-          <Button variant="primary" onClick={handleSubmit} disabled={submitting}>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
+          <Button variant="brand" onClick={handleSubmit} disabled={submitting}>
             {submitting ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
           </Button>
-        </div>
-      </div>
-    </Dialog>
-  );
-}
-
-function RemoveDialog({
-  policy,
-  onClose,
-  onRemoved,
-}: {
-  policy: GovPolicy | null;
-  onClose: () => void;
-  onRemoved: () => void;
-}) {
-  const intl = useIntl();
-  const [confirming, setConfirming] = useState(false);
-
-  if (!policy) return null;
-
-  const handleConfirm = async () => {
-    setConfirming(true);
-    try {
-      await api.governance.remove(policy.policy_id, policy.agent_id);
-      toast.success(intl.formatMessage({ id: 'gov.removed' }));
-      onRemoved();
-    } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
-    } finally {
-      setConfirming(false);
-    }
-  };
-
-  return (
-    <Dialog open onClose={onClose} title={intl.formatMessage({ id: 'gov.remove.title' })}>
-      <div className="space-y-4">
-        <p className="text-sm text-stone-600 dark:text-stone-400">{intl.formatMessage({ id: 'gov.remove.confirm' })}</p>
-        <p className="text-sm font-medium text-stone-900 dark:text-stone-50">{policy.policy_id} ({policy.scope ?? policy.agent_id})</p>
-        <div className="flex justify-end gap-3 pt-2">
-          <Button variant="secondary" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
-          <Button variant="danger" onClick={handleConfirm} disabled={confirming}>
-            {confirming ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'common.delete' })}
-          </Button>
-        </div>
-      </div>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }

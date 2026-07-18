@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { History, RefreshCw } from 'lucide-react';
-import { Button } from '@/components/ui';
+import { Button } from '@/components/mds';
 import { timeAgo } from '@/lib/format';
 import { api, type ChatSessionSummary } from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -69,33 +69,36 @@ export function SessionHistoryMenu({
     <div ref={rootRef} className="relative">
       <Button
         variant="ghost"
-        icon={History}
+        size="icon"
         onClick={() => setOpen((v) => !v)}
         title={intl.formatMessage({ id: 'webchat.history', defaultMessage: '歷史對話' })}
         aria-haspopup="menu"
         aria-expanded={open}
-      />
+      >
+        <History />
+      </Button>
 
       {open && (
         <div
           role="menu"
           className={cn(
             'absolute right-0 z-30 mt-2 w-80 max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl',
-            'border border-[var(--panel-border)] bg-[var(--panel-fill)] shadow-xl backdrop-blur',
+            'border border-surface-border bg-surface shadow-[var(--menu-shadow)] backdrop-blur',
           )}
         >
-          <div className="flex items-center justify-between border-b border-[var(--panel-border)] px-3 py-2">
-            <span className="text-sm font-semibold text-stone-800 dark:text-stone-100">
+          <div className="flex items-center justify-between border-b border-surface-border px-3 py-2">
+            <span className="text-sm font-semibold text-foreground">
               {intl.formatMessage({ id: 'webchat.history.title', defaultMessage: '歷史對話' })}
             </span>
             <Button
               variant="ghost"
-              size="sm"
-              icon={RefreshCw}
+              size="icon-sm"
               onClick={() => void load()}
               disabled={state === 'loading'}
               title={intl.formatMessage({ id: 'webchat.history.reload', defaultMessage: '重新整理' })}
-            />
+            >
+              <RefreshCw />
+            </Button>
           </div>
 
           <div className="max-h-80 overflow-y-auto p-1.5">
@@ -104,7 +107,7 @@ export function SessionHistoryMenu({
                 {[0, 1, 2].map((i) => (
                   <div
                     key={i}
-                    className="h-11 animate-pulse rounded-control bg-stone-500/10 dark:bg-white/5"
+                    className="h-11 animate-pulse rounded-lg bg-muted"
                   />
                 ))}
               </div>
@@ -112,20 +115,20 @@ export function SessionHistoryMenu({
 
             {state === 'error' && (
               <div className="flex flex-col items-center gap-2 px-3 py-6 text-center">
-                <span className="text-sm text-stone-500 dark:text-stone-400">
+                <span className="text-sm text-muted-foreground">
                   {intl.formatMessage({
                     id: 'webchat.history.error',
                     defaultMessage: '無法載入歷史對話',
                   })}
                 </span>
-                <Button variant="secondary" size="sm" onClick={() => void load()}>
+                <Button variant="outline" size="sm" onClick={() => void load()}>
                   {intl.formatMessage({ id: 'webchat.history.retry', defaultMessage: '重試' })}
                 </Button>
               </div>
             )}
 
             {state === 'ready' && sessions.length === 0 && (
-              <div className="px-3 py-6 text-center text-sm text-stone-500 dark:text-stone-400">
+              <div className="px-3 py-6 text-center text-sm text-muted-foreground">
                 {intl.formatMessage({
                   id: 'webchat.history.empty',
                   defaultMessage: '尚無歷史對話',
@@ -143,21 +146,21 @@ export function SessionHistoryMenu({
                     role="menuitem"
                     onClick={() => pick(s)}
                     className={cn(
-                      'flex w-full flex-col gap-0.5 rounded-control px-2.5 py-2 text-left transition-colors',
-                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+                      'flex w-full flex-col gap-0.5 rounded-lg px-2.5 py-2 text-left transition-colors',
+                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
                       active
-                        ? 'bg-amber-500/15 ring-1 ring-inset ring-amber-500/40'
-                        : 'hover:bg-stone-500/10 dark:hover:bg-white/5',
+                        ? 'bg-brand/10 ring-1 ring-inset ring-brand/40'
+                        : 'hover:bg-muted',
                     )}
                   >
-                    <span className="truncate text-sm text-stone-800 dark:text-stone-100">
+                    <span className="truncate text-sm text-foreground">
                       {s.title.trim() ||
                         intl.formatMessage({
                           id: 'webchat.history.untitled',
                           defaultMessage: '（無標題）',
                         })}
                     </span>
-                    <span className="flex items-center gap-1.5 text-xs tabular-nums text-stone-400 dark:text-stone-500">
+                    <span className="flex items-center gap-1.5 text-xs tabular-nums text-muted-foreground">
                       <span>{timeAgo(s.last_active)}</span>
                       <span aria-hidden>·</span>
                       <span>

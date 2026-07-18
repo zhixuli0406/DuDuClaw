@@ -1,10 +1,15 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type SkillSynthesisConfig } from '@/lib/api';
-import { FormField, inputClass, buttonPrimary } from '@/components/shared/Dialog';
 import { toast, formatError } from '@/lib/toast';
-import { Card } from '@/components/ui';
-import { Sparkles, AlertTriangle, ExternalLink } from 'lucide-react';
+import {
+  Button,
+  SettingsSection,
+  SettingsCard,
+  SettingsSaveState,
+} from '@/components/mds';
+import { RowText, RowNumber, RowSwitch } from '@/pages/agent-form/form-rows';
+import { AlertTriangle, ExternalLink } from 'lucide-react';
 
 export function SkillSynthesisTab() {
   const intl = useIntl();
@@ -46,55 +51,34 @@ export function SkillSynthesisTab() {
 
   if (!config) {
     return (
-      <Card>
-        <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
-      </Card>
+      <p className="py-8 text-center text-sm text-muted-foreground">
+        {intl.formatMessage({ id: 'common.loading' })}
+      </p>
     );
   }
 
   return (
-    <Card
-      bodyClassName="space-y-6"
-      title={
-        <span className="flex items-center gap-2">
-          <Sparkles className="h-4 w-4 text-amber-500" />
-          {intl.formatMessage({ id: 'settings.skillSynthesis' })}
-        </span>
-      }
-    >
-      <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'skillSynthesis.desc' })}</p>
-
-      {/* Master toggle: auto_run */}
-      <label className="flex items-center justify-between gap-3 py-1.5">
-        <span>
-          <span className="block text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: 'skillSynthesis.autoRun' })}</span>
-          <span className="block text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'skillSynthesis.autoRun.hint' })}</span>
-        </span>
-        <input
-          type="checkbox"
-          checked={config.auto_run}
-          onChange={(e) => setConfig({ ...config, auto_run: e.target.checked })}
-          className="h-4 w-4 shrink-0 accent-amber-500"
-        />
-      </label>
-
-      {/* dry_run toggle */}
-      <label className="flex items-center justify-between gap-3 py-1.5">
-        <span>
-          <span className="block text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: 'skillSynthesis.dryRun' })}</span>
-          <span className="block text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'skillSynthesis.dryRun.hint' })}</span>
-        </span>
-        <input
-          type="checkbox"
-          checked={config.dry_run}
-          onChange={(e) => setConfig({ ...config, dry_run: e.target.checked })}
-          className="h-4 w-4 shrink-0 accent-amber-500"
-        />
-      </label>
+    <div className="space-y-8">
+      <SettingsSection>
+        <SettingsCard>
+          <RowSwitch
+            label={intl.formatMessage({ id: 'skillSynthesis.autoRun' })}
+            description={intl.formatMessage({ id: 'skillSynthesis.autoRun.hint' })}
+            checked={config.auto_run}
+            onChange={(v) => setConfig({ ...config, auto_run: v })}
+          />
+          <RowSwitch
+            label={intl.formatMessage({ id: 'skillSynthesis.dryRun' })}
+            description={intl.formatMessage({ id: 'skillSynthesis.dryRun.hint' })}
+            checked={config.dry_run}
+            onChange={(v) => setConfig({ ...config, dry_run: v })}
+          />
+        </SettingsCard>
+      </SettingsSection>
 
       {/* Live-mode warning when writes are enabled */}
       {config.auto_run && !config.dry_run && (
-        <div className="flex items-start gap-2 rounded-lg border border-amber-300/60 bg-amber-50/60 px-3 py-2 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400">
+        <div className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <div className="space-y-1.5">
             <p>{intl.formatMessage({ id: 'skillSynthesis.liveWarning' })}</p>
@@ -104,7 +88,7 @@ export function SkillSynthesisTab() {
                 href="https://console.anthropic.com/settings/keys"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-0.5 font-medium underline underline-offset-2 hover:text-amber-800 dark:hover:text-amber-300"
+                className="inline-flex items-center gap-0.5 font-medium underline underline-offset-2 hover:text-warning/80"
               >
                 {intl.formatMessage({ id: 'skillSynthesis.apiKeyLink' })}
                 <ExternalLink className="h-3 w-3" />
@@ -114,46 +98,44 @@ export function SkillSynthesisTab() {
         </div>
       )}
 
-      {/* Scalars */}
-      <div className="grid gap-4 sm:grid-cols-2">
-        <FormField label={intl.formatMessage({ id: 'skillSynthesis.intervalHours' })} hint="1-168">
-          <input
-            type="number"
+      <SettingsSection>
+        <SettingsCard>
+          <RowNumber
+            label={intl.formatMessage({ id: 'skillSynthesis.intervalHours' })}
+            description="1-168"
+            value={config.interval_hours}
             min={1}
             max={168}
-            value={config.interval_hours}
-            onChange={(e) => setConfig({ ...config, interval_hours: Number(e.target.value) })}
-            className={inputClass}
+            onChange={(v) => setConfig({ ...config, interval_hours: v })}
           />
-        </FormField>
-        <FormField label={intl.formatMessage({ id: 'skillSynthesis.lookbackDays' })} hint="1-30">
-          <input
-            type="number"
+          <RowNumber
+            label={intl.formatMessage({ id: 'skillSynthesis.lookbackDays' })}
+            description="1-30"
+            value={config.lookback_days}
             min={1}
             max={30}
-            value={config.lookback_days}
-            onChange={(e) => setConfig({ ...config, lookback_days: Number(e.target.value) })}
-            className={inputClass}
+            onChange={(v) => setConfig({ ...config, lookback_days: v })}
           />
-        </FormField>
-      </div>
+          <RowText
+            label={intl.formatMessage({ id: 'skillSynthesis.targetAgent' })}
+            description={intl.formatMessage({ id: 'skillSynthesis.targetAgent.hint' })}
+            value={config.target_agent}
+            onChange={(v) => setConfig({ ...config, target_agent: v })}
+            placeholder={intl.formatMessage({ id: 'skillSynthesis.targetAgent.placeholder' })}
+          />
+        </SettingsCard>
+      </SettingsSection>
 
-      <FormField label={intl.formatMessage({ id: 'skillSynthesis.targetAgent' })} hint={intl.formatMessage({ id: 'skillSynthesis.targetAgent.hint' })}>
-        <input
-          type="text"
-          value={config.target_agent}
-          onChange={(e) => setConfig({ ...config, target_agent: e.target.value })}
-          placeholder={intl.formatMessage({ id: 'skillSynthesis.targetAgent.placeholder' })}
-          className={inputClass}
+      <div className="flex items-center justify-end gap-3">
+        <SettingsSaveState
+          status={saving ? 'saving' : saved ? 'saved' : 'idle'}
+          savingLabel={intl.formatMessage({ id: 'common.saving' })}
+          savedLabel={intl.formatMessage({ id: 'settings.general.saved' })}
         />
-      </FormField>
-
-      <div className="flex items-center justify-end gap-3 border-t border-[var(--panel-border)] pt-4">
-        {saved && <span className="text-sm text-emerald-500">{intl.formatMessage({ id: 'settings.general.saved' })}</span>}
-        <button onClick={handleSave} disabled={saving} className={buttonPrimary}>
+        <Button variant="brand" size="sm" onClick={handleSave} disabled={saving}>
           {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
-        </button>
+        </Button>
       </div>
-    </Card>
+    </div>
   );
 }

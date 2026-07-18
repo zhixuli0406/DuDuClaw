@@ -51,10 +51,22 @@ export function formatId(id: string | null | undefined, head = 6, tail = 4): str
   return `${chars.slice(0, head).join('')}…${chars.slice(-tail).join('')}`;
 }
 
+// The one word among the relative-time tokens that reads as language ("now" vs.
+// "剛剛" vs. "たった今"). The numeric tokens (5m/2h/3d) are locale-neutral, but
+// this one needs translating. Set once per locale from the message catalogue
+// (see `setTimeAgoNowLabel`, wired in `main.tsx`); defaults to English so the
+// pure `timeAgo` unit tests stay stable without any i18n wiring.
+let nowLabel = 'now';
+
+/** Localize the "now" token used by {@link timeAgo}. Called on locale change. */
+export function setTimeAgoNowLabel(label: string): void {
+  if (label) nowLabel = label;
+}
+
 /**
- * Compact relative time from an ISO/parseable timestamp. Returns locale-neutral
- * unit tokens: `now`, `5m`, `2h`, `3d`, `6w`, or a `YYYY-MM-DD` date past ~1y.
- * Invalid input returns `—`.
+ * Compact relative time from an ISO/parseable timestamp. Returns compact unit
+ * tokens: a localized `now`, then locale-neutral `5m`, `2h`, `3d`, `6w`, or a
+ * `YYYY-MM-DD` date past ~1y. Invalid input returns `—`.
  */
 export function timeAgo(input: string | number | Date | null | undefined, nowMs?: number): string {
   if (input == null) return '—';
@@ -62,7 +74,7 @@ export function timeAgo(input: string | number | Date | null | undefined, nowMs?
   if (!Number.isFinite(then)) return '—';
   const now = typeof nowMs === 'number' ? nowMs : Date.now();
   const diffSec = Math.round((now - then) / 1000);
-  if (diffSec < 45) return 'now';
+  if (diffSec < 45) return nowLabel;
   const mins = Math.round(diffSec / 60);
   if (mins < 60) return `${mins}m`;
   const hours = Math.round(mins / 60);

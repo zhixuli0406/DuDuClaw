@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { cn } from '@/lib/utils';
-import { controlClass } from '@/components/ui';
+
+const controlClass =
+  'h-8 w-full min-w-0 rounded-lg border border-input bg-transparent px-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-50 dark:bg-input/30';
 
 /** cents → display string in major units, e.g. 1250 → "12.50". */
 export function centsToDisplay(cents: number): string {
@@ -49,7 +51,7 @@ export function MoneyField({
 
   return (
     <div className={cn('relative', className)}>
-      <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-stone-400">
+      <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">
         {symbol}
       </span>
       <input

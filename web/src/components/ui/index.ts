@@ -1,22 +1,10 @@
 /**
- * Calm Glass UI library — the shared primitives every dashboard page composes
- * from. See web/DESIGN.md for usage rules. Import from '@/components/ui'.
+ * Functional UI primitives — the shared behavioural components dashboard pages
+ * compose from (status/priority icons, inline editing, celebration, character
+ * system, mascot). The former Calm Glass visual primitives (Button/Card/Section/
+ * Badge/EmptyState/Tabs/Field) were retired in favour of '@/components/mds'.
+ * Import from '@/components/ui'.
  */
-export { Page } from './Page';
-export { PageHeader } from './PageHeader';
-export { Card } from './Card';
-export { Section } from './Section';
-export { StatCard } from './StatCard';
-export { Tabs, type TabItem } from './Tabs';
-export { Button } from './Button';
-export { Badge } from './Badge';
-export { EmptyState, type EmptyStateDudu } from './EmptyState';
-export { Skeleton, SkeletonList } from './Skeleton';
-export { Toolbar } from './Toolbar';
-export { Field, controlClass } from './Field';
-export { Mono } from './Mono';
-export { EntityCard } from './EntityCard';
-export { EntityDetailShell, type EntityTab } from './EntityDetailShell';
 
 // ── Soft Play v2 primitives (dashboard-redesign-v2 §3.3 / T0.3) ──
 export {

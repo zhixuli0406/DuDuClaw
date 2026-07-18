@@ -2,8 +2,15 @@ import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
-import { Card, EmptyState } from '@/components/ui';
-import { Switch, describeCron } from '@/components/settings/controls';
+import {
+  Button,
+  Empty,
+  Switch,
+  SettingsSection,
+  SettingsCard,
+  SettingsRow,
+} from '@/components/mds';
+import { describeCron } from '@/components/settings/controls';
 import { HeartPulse, Play } from 'lucide-react';
 
 export function HeartbeatTab() {
@@ -56,80 +63,66 @@ export function HeartbeatTab() {
     return intl.formatMessage({ id: 'controls.cron.desc.interval' }, { n: Math.round(intervalSeconds / 60) || 1 });
   };
 
-  return (
-    <Card
-      title={
-        <span className="flex items-center gap-2">
-          <HeartPulse className="h-4 w-4 text-amber-500" />
-          {intl.formatMessage({ id: 'settings.heartbeat' })}
-        </span>
-      }
-    >
-      <p className="mb-4 text-sm text-stone-500 dark:text-stone-400">
-        {intl.formatMessage({ id: 'settings.heartbeat.desc' })}
-      </p>
+  if (heartbeats.length === 0) {
+    return (
+      <Empty
+        icon={HeartPulse}
+        variant="dashed"
+        title={intl.formatMessage({ id: 'common.noData' })}
+      />
+    );
+  }
 
-      {heartbeats.length === 0 ? (
-        <EmptyState
-          icon={HeartPulse}
-          dudu="idle"
-          title={intl.formatMessage({ id: 'common.noData' })}
-        />
-      ) : (
-        <div className="space-y-3">
-          {heartbeats.map((hb) => (
-            <div
-              key={hb.agent_id}
-              className="flex items-center justify-between rounded-lg bg-stone-500/5 p-3 dark:bg-white/5"
-            >
-              <div className="min-w-0">
-                <span className="text-sm font-medium text-stone-900 dark:text-stone-100">
-                  {hb.agent_id}
-                </span>
-                <p className="mt-0.5 text-xs text-stone-400 dark:text-stone-500">
-                  {intl.formatMessage({ id: 'settings.heartbeat.enabledHelp' })}
-                </p>
-                <div className="mt-1 flex flex-wrap gap-3 text-xs text-stone-400">
-                  <span>{describe(hb.cron, hb.interval_seconds)}</span>
-                  <span>{intl.formatMessage({ id: 'settings.heartbeat.runs' })}: {hb.total_runs}</span>
-                  {hb.last_run && (
-                    <span>{intl.formatMessage({ id: 'settings.heartbeat.last' })}: {new Date(hb.last_run).toLocaleTimeString()}</span>
-                  )}
-                </div>
-              </div>
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-stone-400">
-                  {hb.active_runs}/{hb.max_concurrent}
-                </span>
-                <Switch
-                  checked={hb.enabled}
-                  label={intl.formatMessage({ id: 'settings.heartbeat.enabledHelp' })}
-                  onChange={(next) => {
-                    api.agents.update(hb.agent_id, { heartbeat_enabled: next }).then(() => {
-                      setHeartbeats((prev) =>
-                        prev.map((h) => h.agent_id === hb.agent_id ? { ...h, enabled: next } : h)
-                      );
-                    }).catch((e) => {
-                      console.warn("[api]", e);
-                      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
-                    });
-                  }}
-                />
-                <button
-                  onClick={() => api.heartbeat.trigger(hb.agent_id).catch((e) => {
+  return (
+    <SettingsSection>
+      <SettingsCard>
+        {heartbeats.map((hb) => (
+          <SettingsRow
+            key={hb.agent_id}
+            label={hb.agent_id}
+            description={
+              <span className="flex flex-wrap gap-x-3 gap-y-0.5">
+                <span>{describe(hb.cron, hb.interval_seconds)}</span>
+                <span>{intl.formatMessage({ id: 'settings.heartbeat.runs' })}: {hb.total_runs}</span>
+                {hb.last_run && (
+                  <span>{intl.formatMessage({ id: 'settings.heartbeat.last' })}: {new Date(hb.last_run).toLocaleTimeString()}</span>
+                )}
+              </span>
+            }
+          >
+            <div className="flex items-center gap-3">
+              <span className="font-mono text-xs tabular-nums text-muted-foreground">
+                {hb.active_runs}/{hb.max_concurrent}
+              </span>
+              <Switch
+                checked={hb.enabled}
+                aria-label={intl.formatMessage({ id: 'settings.heartbeat.enabledHelp' })}
+                onCheckedChange={(next) => {
+                  api.agents.update(hb.agent_id, { heartbeat_enabled: Boolean(next) }).then(() => {
+                    setHeartbeats((prev) =>
+                      prev.map((h) => h.agent_id === hb.agent_id ? { ...h, enabled: Boolean(next) } : h)
+                    );
+                  }).catch((e) => {
                     console.warn("[api]", e);
-                    toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
-                  })}
-                  title={intl.formatMessage({ id: 'settings.heartbeat.triggerNow' })}
-                  className="rounded px-1.5 py-0.5 text-xs text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
-                >
-                  <Play className="h-3 w-3" />
-                </button>
-              </div>
+                    toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+                  });
+                }}
+              />
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={() => api.heartbeat.trigger(hb.agent_id).catch((e) => {
+                  console.warn("[api]", e);
+                  toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+                })}
+                title={intl.formatMessage({ id: 'settings.heartbeat.triggerNow' })}
+              >
+                <Play />
+              </Button>
             </div>
-          ))}
-        </div>
-      )}
-    </Card>
+          </SettingsRow>
+        ))}
+      </SettingsCard>
+    </SettingsSection>
   );
 }

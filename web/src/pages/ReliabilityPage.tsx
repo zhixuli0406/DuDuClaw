@@ -16,17 +16,31 @@ import {
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
 import {
-  Page,
-  PageHeader,
-  Card,
-  Badge,
   Button,
-  Toolbar,
-  Mono,
-  CharacterAvatar,
-  EmptyState,
-  controlClass,
-} from '@/components/ui';
+  Badge,
+  Card,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+  CardContent,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  Segmented,
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableHead,
+  TableCell,
+  ActorAvatar,
+  Empty,
+  Skeleton,
+  type SegmentedOption,
+  type BadgeProps,
+} from '@/components/mds';
 
 // ── Window options ────────────────────────────────────────────────────────────
 
@@ -34,12 +48,18 @@ type WindowDays = 7 | 14 | 30;
 
 // ── Evolution events (self-evolution audit trail) ───────────────────────────────
 
-function evolutionOutcomeTone(outcome: string): 'success' | 'warning' | 'danger' | 'neutral' {
+function evolutionOutcomeTone(outcome: string): { variant: NonNullable<BadgeProps['variant']>; className?: string } {
   const o = outcome.toLowerCase();
-  if (o.includes('success') || o.includes('accept') || o.includes('adopt') || o.includes('confirm')) return 'success';
-  if (o.includes('fail') || o.includes('reject') || o.includes('rollback') || o.includes('error')) return 'danger';
-  if (o.includes('pending') || o.includes('observ') || o.includes('extend') || o.includes('trigger')) return 'warning';
-  return 'neutral';
+  if (o.includes('success') || o.includes('accept') || o.includes('adopt') || o.includes('confirm')) {
+    return { variant: 'secondary', className: 'bg-success/15 text-success' };
+  }
+  if (o.includes('fail') || o.includes('reject') || o.includes('rollback') || o.includes('error')) {
+    return { variant: 'destructive' };
+  }
+  if (o.includes('pending') || o.includes('observ') || o.includes('extend') || o.includes('trigger')) {
+    return { variant: 'secondary', className: 'bg-warning/15 text-warning' };
+  }
+  return { variant: 'outline' };
 }
 
 function EvolutionEventsSection({
@@ -78,82 +98,76 @@ function EvolutionEventsSection({
   useEffect(() => { load(); }, [load]);
 
   return (
-    <Card
-      bodyClassName="space-y-3"
-      title={
-        <span className="flex items-center gap-2">
-          <Sparkles className="h-4 w-4 text-amber-500" />
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-sm font-medium">
+          <Sparkles className="size-4 text-brand" />
           {intl.formatMessage({ id: 'evolution.events.title' })}
-        </span>
-      }
-    >
-      <p className="text-xs text-stone-400 dark:text-stone-500">
-        {intl.formatMessage({ id: 'evolution.events.desc' })}
-      </p>
-
-      {loading ? (
-        <div className="space-y-2">
-          {[0, 1, 2].map((i) => (
-            <div key={i} className="h-9 animate-pulse rounded-lg bg-stone-500/5 dark:bg-white/5" />
-          ))}
-        </div>
-      ) : error ? (
-        <div className="flex items-center gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm text-rose-700 dark:border-rose-800/50 dark:bg-rose-900/20 dark:text-rose-400">
-          <AlertTriangle className="h-4 w-4 shrink-0" />
-          <span>{intl.formatMessage({ id: 'evolution.events.error' }, { message: error })}</span>
-        </div>
-      ) : events && events.length > 0 ? (
-        <>
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[36rem] text-left text-sm">
-              <thead>
-                <tr className="border-b border-[var(--panel-border)] text-xs uppercase text-stone-500 dark:text-stone-400">
-                  <th className="py-2 pr-3 font-medium">{intl.formatMessage({ id: 'evolution.events.col.type' })}</th>
-                  <th className="py-2 pr-3 font-medium">{intl.formatMessage({ id: 'evolution.events.col.outcome' })}</th>
-                  <th className="py-2 pr-3 font-medium">{intl.formatMessage({ id: 'evolution.events.col.detail' })}</th>
-                  <th className="py-2 pl-3 text-right font-medium">{intl.formatMessage({ id: 'evolution.events.col.time' })}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {events.map((ev, i) => (
-                  <tr key={i} className="border-b border-[var(--panel-border)]/50 last:border-0">
-                    <td className="py-2 pr-3">
-                      <span className="font-medium text-stone-700 dark:text-stone-300">{ev.event_type}</span>
-                    </td>
-                    <td className="py-2 pr-3">
-                      <Badge tone={evolutionOutcomeTone(ev.outcome)}>{ev.outcome}</Badge>
-                    </td>
-                    <td className="py-2 pr-3 text-stone-500 dark:text-stone-400">
-                      {ev.skill_id ? <Mono className="text-xs">{ev.skill_id}</Mono> : ev.trigger_signal || '—'}
-                    </td>
-                    <td className="py-2 pl-3 text-right">
-                      <Mono className="text-xs text-stone-400 dark:text-stone-500">
+        </CardTitle>
+        <CardDescription>{intl.formatMessage({ id: 'evolution.events.desc' })}</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {loading ? (
+          <div className="space-y-2">
+            {[0, 1, 2].map((i) => (
+              <Skeleton key={i} className="h-9 w-full" />
+            ))}
+          </div>
+        ) : error ? (
+          <div className="flex items-center gap-2 rounded-lg bg-destructive/10 px-3 py-2.5 text-sm text-destructive">
+            <AlertTriangle className="size-4 shrink-0" />
+            <span>{intl.formatMessage({ id: 'evolution.events.error' }, { message: error })}</span>
+          </div>
+        ) : events && events.length > 0 ? (
+          <>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{intl.formatMessage({ id: 'evolution.events.col.type' })}</TableHead>
+                  <TableHead>{intl.formatMessage({ id: 'evolution.events.col.outcome' })}</TableHead>
+                  <TableHead>{intl.formatMessage({ id: 'evolution.events.col.detail' })}</TableHead>
+                  <TableHead className="text-right">{intl.formatMessage({ id: 'evolution.events.col.time' })}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {events.map((ev, i) => {
+                  const tone = evolutionOutcomeTone(ev.outcome);
+                  return (
+                    <TableRow key={i}>
+                      <TableCell className="font-medium text-foreground">{ev.event_type}</TableCell>
+                      <TableCell>
+                        <Badge variant={tone.variant} className={tone.className}>{ev.outcome}</Badge>
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {ev.skill_id ? <span className="font-mono text-xs">{ev.skill_id}</span> : ev.trigger_signal || '—'}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs text-muted-foreground">
                         {new Date(ev.timestamp).toLocaleString('zh-TW', {
                           month: 'short',
                           day: 'numeric',
                           hour: '2-digit',
                           minute: '2-digit',
                         })}
-                      </Mono>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {total > events.length && (
-            <p className="text-xs text-stone-400 dark:text-stone-500">
-              {intl.formatMessage({ id: 'evolution.events.more' }, { shown: events.length, total })}
-            </p>
-          )}
-        </>
-      ) : (
-        <EmptyState
-          icon={Sparkles}
-          title={intl.formatMessage({ id: 'evolution.events.empty' })}
-          hint={intl.formatMessage({ id: 'evolution.events.empty.desc' })}
-        />
-      )}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+            {total > events.length && (
+              <p className="text-xs text-muted-foreground">
+                {intl.formatMessage({ id: 'evolution.events.more' }, { shown: events.length, total })}
+              </p>
+            )}
+          </>
+        ) : (
+          <Empty
+            icon={Sparkles}
+            title={intl.formatMessage({ id: 'evolution.events.empty' })}
+            description={intl.formatMessage({ id: 'evolution.events.empty.desc' })}
+          />
+        )}
+      </CardContent>
     </Card>
   );
 }
@@ -180,46 +194,34 @@ function MetricGauge({
   const isGood = invertBad ? value <= 0.1 : value >= 0.85;
   const isOk = invertBad ? value <= 0.25 : value >= 0.6;
 
-  const barColor = isGood
-    ? 'bg-emerald-500'
-    : isOk
-      ? 'bg-amber-500'
-      : 'bg-rose-500';
-
-  const textColor = isGood
-    ? 'text-emerald-600 dark:text-emerald-400'
-    : isOk
-      ? 'text-amber-600 dark:text-amber-400'
-      : 'text-rose-600 dark:text-rose-400';
-
-  const iconBg = isGood
-    ? 'bg-emerald-100 dark:bg-emerald-900/30'
-    : isOk
-      ? 'bg-amber-100 dark:bg-amber-900/30'
-      : 'bg-rose-100 dark:bg-rose-900/30';
+  const barColor = isGood ? 'bg-success' : isOk ? 'bg-warning' : 'bg-destructive';
+  const textColor = isGood ? 'text-success' : isOk ? 'text-warning' : 'text-destructive';
+  const iconBg = isGood ? 'bg-success/15' : isOk ? 'bg-warning/15' : 'bg-destructive/15';
 
   return (
     <Card>
-      <div className="mb-3 flex items-start gap-3">
-        <div className={cn('rounded-lg p-2', iconBg)}>
-          <Icon className={cn('h-5 w-5', textColor)} />
+      <CardContent className="space-y-3">
+        <div className="flex items-start gap-3">
+          <div className={cn('rounded-lg p-2', iconBg)}>
+            <Icon className={cn('size-5', textColor)} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium text-foreground">{label}</p>
+            <p className="text-xs text-muted-foreground">{description}</p>
+          </div>
+          <span className={cn('text-2xl font-bold tabular-nums', textColor)}>
+            {pct}%
+          </span>
         </div>
-        <div className="min-w-0 flex-1">
-          <p className="text-sm font-medium text-stone-700 dark:text-stone-300">{label}</p>
-          <p className="text-xs text-stone-400 dark:text-stone-500">{description}</p>
-        </div>
-        <span className={cn('text-2xl font-bold tabular-nums', textColor)}>
-          {pct}%
-        </span>
-      </div>
 
-      {/* Progress bar */}
-      <div className="h-2.5 w-full overflow-hidden rounded-full bg-stone-100 dark:bg-stone-800">
-        <div
-          className={cn('h-full rounded-full transition-all duration-700', barColor)}
-          style={{ width: `${pct}%` }}
-        />
-      </div>
+        {/* Progress bar */}
+        <div className="h-2.5 w-full overflow-hidden rounded-full bg-muted">
+          <div
+            className={cn('h-full rounded-full transition-all duration-700', barColor)}
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      </CardContent>
     </Card>
   );
 }
@@ -229,15 +231,17 @@ function MetricGauge({
 function SkeletonGauge() {
   return (
     <Card>
-      <div className="mb-3 flex items-start gap-3">
-        <div className="h-9 w-9 animate-pulse rounded-lg bg-stone-200 dark:bg-stone-700" />
-        <div className="flex-1 space-y-1.5">
-          <div className="h-4 w-32 animate-pulse rounded bg-stone-200 dark:bg-stone-700" />
-          <div className="h-3 w-48 animate-pulse rounded bg-stone-200 dark:bg-stone-700" />
+      <CardContent className="space-y-3">
+        <div className="flex items-start gap-3">
+          <Skeleton className="size-9 rounded-lg" />
+          <div className="flex-1 space-y-1.5">
+            <Skeleton className="h-4 w-32" />
+            <Skeleton className="h-3 w-48" />
+          </div>
+          <Skeleton className="h-8 w-12" />
         </div>
-        <div className="h-8 w-12 animate-pulse rounded bg-stone-200 dark:bg-stone-700" />
-      </div>
-      <div className="h-2.5 w-full animate-pulse rounded-full bg-stone-200 dark:bg-stone-700" />
+        <Skeleton className="h-2.5 w-full rounded-full" />
+      </CardContent>
     </Card>
   );
 }
@@ -305,97 +309,98 @@ export function ReliabilityPage() {
   };
 
   const noData = summary !== null && summary.total_events === 0;
+  const currentAgent = agents.find((a) => a.name === selectedAgent);
+
+  const windowOptions: SegmentedOption<string>[] = ([7, 14, 30] as WindowDays[]).map((d) => ({
+    value: String(d),
+    label: intl.formatMessage({ id: 'reliability.window.days' }, { count: d }),
+  }));
 
   return (
-    <Page>
-      <PageHeader
-        icon={Activity}
-        title={intl.formatMessage({ id: 'nav.reliability' })}
-        subtitle={intl.formatMessage({ id: 'reliability.title' })}
-        actions={
-          <Toolbar>
-            {/* Agent selector */}
-            <select
-              value={selectedAgent}
-              onChange={(e) => setSelectedAgent(e.target.value)}
-              className={cn(controlClass, 'w-auto')}
-            >
-              {agents.map((a) => (
-                <option key={a.name} value={a.name}>
-                  {a.name}
-                </option>
-              ))}
-            </select>
+    <div className="mx-auto w-full max-w-[1200px] space-y-6">
+      {/* Header */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <Activity className="size-5 text-muted-foreground" />
+          <div>
+            <h1 className="text-base font-medium">{intl.formatMessage({ id: 'nav.reliability' })}</h1>
+            <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'reliability.title' })}</p>
+          </div>
+        </div>
 
-            {/* Window selector */}
-            <div className="flex gap-1 rounded-control border border-[var(--panel-border)] bg-[var(--panel-fill)] p-1">
-              {([7, 14, 30] as WindowDays[]).map((d) => (
-                <button
-                  key={d}
-                  onClick={() => setWindowDays(d)}
-                  className={cn(
-                    'rounded-md px-3 py-1 text-sm font-medium transition-colors',
-                    windowDays === d
-                      ? 'bg-amber-500 text-white shadow-sm'
-                      : 'text-stone-600 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200',
-                  )}
-                >
-                  {intl.formatMessage({ id: 'reliability.window.days' }, { count: d })}
-                </button>
-              ))}
-            </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Agent selector */}
+          {agents.length > 0 && (
+            <Select value={selectedAgent} onValueChange={(v) => setSelectedAgent(String(v))}>
+              <SelectTrigger className="w-40 sm:w-48">
+                <SelectValue>
+                  {currentAgent ? currentAgent.display_name || currentAgent.name : selectedAgent}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {agents.map((a) => (
+                  <SelectItem key={a.name} value={a.name}>
+                    {a.display_name || a.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
 
-            {/* Refresh */}
-            <Button
-              variant="secondary"
-              size="md"
-              icon={RefreshCw}
-              onClick={handleRefresh}
-              disabled={refreshing || loading}
-              title={intl.formatMessage({ id: 'common.refresh' })}
-              className={cn(refreshing && '[&_svg]:animate-spin')}
-            />
-          </Toolbar>
-        }
-      />
+          {/* Window selector */}
+          <Segmented value={String(windowDays)} onValueChange={(v) => setWindowDays(Number(v) as WindowDays)} options={windowOptions} />
+
+          {/* Refresh */}
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={handleRefresh}
+            disabled={refreshing || loading}
+            aria-label={intl.formatMessage({ id: 'common.refresh' })}
+            title={intl.formatMessage({ id: 'common.refresh' })}
+          >
+            <RefreshCw className={cn(refreshing && 'animate-spin')} />
+          </Button>
+        </div>
+      </div>
 
       {/* Metadata row */}
       {summary && !loading && (
-        <div className="flex flex-wrap items-center gap-4 rounded-control bg-stone-500/5 px-4 py-2.5 text-sm dark:bg-white/5">
-          <span className="flex items-center gap-2 text-stone-500 dark:text-stone-400">
+        <div className="flex flex-wrap items-center gap-4 rounded-lg bg-muted px-4 py-2.5 text-sm">
+          <span className="flex items-center gap-2 text-muted-foreground">
             {intl.formatMessage({ id: 'reliability.agent' })}
             {': '}
-            <CharacterAvatar agentId={summary.agent_id} name={summary.agent_id} size={24} />
-            <span className="font-medium text-stone-700 dark:text-stone-300">
+            <ActorAvatar actorType="agent" name={summary.agent_id} size="sm" />
+            <span className="font-medium text-foreground">
               {summary.agent_id}
             </span>
           </span>
-          <span className="text-stone-500 dark:text-stone-400">
+          <span className="text-muted-foreground">
             {intl.formatMessage({ id: 'reliability.events' })}
             {': '}
-            <Mono className="font-medium text-stone-700 dark:text-stone-300">
+            <span className="font-mono font-medium text-foreground">
               {summary.total_events.toLocaleString()}
-            </Mono>
+            </span>
           </span>
-          <span className="ml-auto flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
+          <span className="ml-auto flex items-center gap-1 text-xs text-muted-foreground">
             {intl.formatMessage({ id: 'reliability.generatedAt' })}
             {': '}
-            <Mono className="text-xs text-stone-400 dark:text-stone-500">
+            <span className="font-mono text-xs text-muted-foreground">
               {new Date(summary.generated_at).toLocaleString('zh-TW', {
                 month: 'short',
                 day: 'numeric',
                 hour: '2-digit',
                 minute: '2-digit',
               })}
-            </Mono>
+            </span>
           </span>
         </div>
       )}
 
       {/* No audit data banner */}
       {noData && !loading && (
-        <div className="flex items-center gap-3 rounded-control border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700 dark:border-amber-800/50 dark:bg-amber-900/20 dark:text-amber-400">
-          <AlertTriangle className="h-4 w-4 shrink-0" />
+        <div className="flex items-center gap-3 rounded-lg bg-warning/10 px-4 py-3 text-sm text-warning">
+          <AlertTriangle className="size-4 shrink-0" />
           {intl.formatMessage({ id: 'reliability.noEvents' }, { days: windowDays })}
         </div>
       )}
@@ -443,25 +448,28 @@ export function ReliabilityPage() {
       {/* Legend */}
       {!loading && (
         <Card>
-          <div className="flex flex-wrap items-center gap-6">
-            <p className="text-sm font-medium text-stone-500 dark:text-stone-400">
+          <CardContent className="flex flex-wrap items-center gap-6">
+            <p className="text-sm font-medium text-muted-foreground">
               {intl.formatMessage({ id: 'reliability.legend.title' })}
             </p>
             <div className="flex flex-wrap gap-3">
-              <Badge tone="success" dot>
+              <Badge variant="secondary" className="bg-success/15 text-success">
+                <span className="size-1.5 rounded-full bg-success" />
                 {intl.formatMessage({ id: 'reliability.legend.good' })}
               </Badge>
-              <Badge tone="warning" dot>
+              <Badge variant="secondary" className="bg-warning/15 text-warning">
+                <span className="size-1.5 rounded-full bg-warning" />
                 {intl.formatMessage({ id: 'reliability.legend.ok' })}
               </Badge>
-              <Badge tone="danger" dot>
+              <Badge variant="destructive">
+                <span className="size-1.5 rounded-full bg-destructive" />
                 {intl.formatMessage({ id: 'reliability.legend.poor' })}
               </Badge>
             </div>
-            <p className="ml-auto text-xs text-stone-400 dark:text-stone-500">
+            <p className="ml-auto text-xs text-muted-foreground">
               {intl.formatMessage({ id: 'reliability.legend.note' })}
             </p>
-          </div>
+          </CardContent>
         </Card>
       )}
 
@@ -469,6 +477,6 @@ export function ReliabilityPage() {
       {selectedAgent && (
         <EvolutionEventsSection agentId={selectedAgent} windowDays={windowDays} />
       )}
-    </Page>
+    </div>
   );
 }

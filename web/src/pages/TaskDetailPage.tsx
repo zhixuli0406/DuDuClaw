@@ -1,24 +1,29 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useParams } from 'react-router';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
-import { Dialog } from '@/components/shared/Dialog';
 import {
-  Page,
-  Card,
+  BreadcrumbHeader,
   Button,
   Badge,
-  EmptyState,
-  Mono,
-  StatusIcon,
-  PriorityIcon,
-  LiveBadge,
-  InlineEditor,
-  CharacterAvatar,
-  usePanel,
-} from '@/components/ui';
+  Empty,
+  ActorAvatar,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogClose,
+  type BreadcrumbSegment,
+} from '@/components/mds';
+import { StatusIcon, InlineEditor, LiveBadge, usePanel } from '@/components/ui';
 import {
   CreateTaskModal,
   TaskProperties,
@@ -26,18 +31,19 @@ import {
   TaskDoneBurst,
   celebrateTaskDone,
 } from '@/components/task';
-import { toStatusKey, toBackendStatus } from '@/lib/task-status';
+import { toStatusKey } from '@/lib/task-status';
 import { timeAgo } from '@/lib/format';
 import type { TaskInfo, TaskStatus, TaskPriority } from '@/lib/api';
 import {
   ArrowLeft,
   Link2,
-  SlidersHorizontal,
+  PanelRight,
   MoreHorizontal,
   Trash2,
   Plus,
   ClipboardList,
   ChevronRight,
+  CircleCheck,
 } from 'lucide-react';
 import { toast } from '@/lib/toast';
 
@@ -48,7 +54,7 @@ function taskSource(task: TaskInfo): TaskSource {
   return 'manual';
 }
 
-/** `/tasks/:id` — the paperclip IssueDetail flagship (§5.3 T5.2–T5.5). */
+/** `/tasks/:id` — the Multica IssueDetail flagship (spec §5.3 式1). */
 export function TaskDetailPage() {
   const intl = useIntl();
   const navigate = useNavigate();
@@ -73,9 +79,7 @@ export function TaskDetailPage() {
 
   const [addSub, setAddSub] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
   const [burst, setBurst] = useState<{ agentId: string } | null>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     fetchTasks();
@@ -83,7 +87,6 @@ export function TaskDetailPage() {
     fetchActivities({ limit: 100 });
   }, [fetchTasks, fetchAgents, fetchActivities]);
 
-  // Load this task's comments once we know the id.
   useEffect(() => {
     if (id) fetchComments(id);
   }, [id, fetchComments]);
@@ -93,13 +96,8 @@ export function TaskDetailPage() {
     () => (task?.parent_task_id ? tasks.find((t) => t.id === task.parent_task_id) : undefined),
     [tasks, task?.parent_task_id],
   );
-  // Subtasks are derived from the full task list (tasks.list is unfiltered).
-  // TaskInfo carries `parent_task_id`, so this is real data, not a stand-in.
   const subtasks = useMemo(() => (id ? tasks.filter((t) => t.parent_task_id === id) : []), [tasks, id]);
-  const taskActivities = useMemo(
-    () => activities.filter((e) => e.task_id === id),
-    [activities, id],
-  );
+  const taskActivities = useMemo(() => activities.filter((e) => e.task_id === id), [activities, id]);
   const taskComments = useMemo(() => (id ? comments[id] ?? [] : []), [comments, id]);
 
   const assigneeAgent = agents.find((a) => a.name === task?.assigned_to);
@@ -129,7 +127,7 @@ export function TaskDetailPage() {
     [task, assignTask],
   );
 
-  // ── Right-hand PropertiesPanel (§5.3 T5.3) ───────────────
+  // ── Right-hand PropertiesPanel (shell column, spec §5.3 式1 right 320) ──
   useEffect(() => () => clearPanel(), [clearPanel]);
   useEffect(() => {
     if (!task) return;
@@ -146,16 +144,6 @@ export function TaskDetailPage() {
       ),
     });
   }, [task, agents, setPanel, intl, applyStatus, applyPriority, applyAssign]);
-
-  // Close the ⋯ menu on outside click.
-  useEffect(() => {
-    if (!menuOpen) return;
-    const onDoc = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
-    };
-    document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
-  }, [menuOpen]);
 
   const copyLink = useCallback(() => {
     try {
@@ -174,116 +162,132 @@ export function TaskDetailPage() {
     }
   }, [task, removeTask, navigate]);
 
+  const togglePanel = useCallback(() => {
+    setSheetOpen(true); // mobile: open the sheet
+    toggleCollapsed(); // desktop: toggle the 320px column
+  }, [setSheetOpen, toggleCollapsed]);
+
   // ── Loading / not-found ──────────────────────────────────
   if (!task) {
     return (
-      <Page>
-        <Card padded={false}>
-          <EmptyState
-            icon={ClipboardList}
-            title={intl.formatMessage({ id: loading ? 'common.loading' : 'tasks.detail.notFound' })}
-            action={
-              <Button variant="secondary" icon={ArrowLeft} onClick={() => navigate('/tasks')}>
-                {intl.formatMessage({ id: 'tasks.detail.backToBoard' })}
-              </Button>
-            }
-          />
-        </Card>
-      </Page>
+      <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+        <BreadcrumbHeader
+          hideTrigger
+          segments={[{ label: intl.formatMessage({ id: 'nav.tasks' }), onClick: () => navigate('/tasks') }]}
+        />
+        <Empty
+          icon={ClipboardList}
+          title={intl.formatMessage({ id: loading ? 'common.loading' : 'tasks.detail.notFound' })}
+          action={
+            <Button variant="outline" size="sm" onClick={() => navigate('/tasks')}>
+              <ArrowLeft />
+              {intl.formatMessage({ id: 'tasks.detail.backToBoard' })}
+            </Button>
+          }
+        />
+      </div>
     );
   }
 
   const source = taskSource(task);
-  const showLive = assigneeAgent?.status === 'active';
+  const isDone = task.status === 'done';
+  // The Live pill (label "進行中" — same text as taskStatus.in_progress) marks an
+  // in-flight run. Gate it on the task NOT being done so it never lingers as a
+  // stale "進行中" next to a task that's already complete (#4).
+  const showLive = assigneeAgent?.status === 'active' && !isDone;
+
+  const segments: BreadcrumbSegment[] = [
+    { label: intl.formatMessage({ id: 'nav.tasks' }), onClick: () => navigate('/tasks') },
+    { label: `${task.id.slice(0, 8)} · ${task.title}` },
+  ];
 
   return (
-    <Page>
-      <div className="mx-auto w-full max-w-3xl space-y-6">
-        {/* 1 · parent chain */}
+    <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+      <BreadcrumbHeader
+        hideTrigger
+        segments={segments}
+        actions={
+          <>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => applyStatus(isDone ? 'todo' : 'done')}
+              aria-label={intl.formatMessage({ id: isDone ? 'tasks.detail.markDoneUndo' : 'tasks.detail.markDone' })}
+              title={intl.formatMessage({ id: isDone ? 'tasks.detail.markDoneUndo' : 'tasks.detail.markDone' })}
+            >
+              <CircleCheck className={isDone ? 'text-success' : undefined} />
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button variant="ghost" size="icon-sm" aria-label={intl.formatMessage({ id: 'tasks.detail.more' })} />
+                }
+              >
+                <MoreHorizontal />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuItem onClick={copyLink}>
+                  <Link2 />
+                  {intl.formatMessage({ id: 'tasks.detail.copyLink' })}
+                </DropdownMenuItem>
+                <DropdownMenuItem variant="destructive" onClick={() => setConfirmRemove(true)}>
+                  <Trash2 />
+                  {intl.formatMessage({ id: 'tasks.remove' })}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={togglePanel}
+              aria-label={intl.formatMessage({ id: 'tasks.detail.toggleProps' })}
+              title={intl.formatMessage({ id: 'tasks.detail.toggleProps' })}
+            >
+              <PanelRight />
+            </Button>
+          </>
+        }
+      />
+
+      {/* Left content column (spec §5.3 式1: mx-auto max-w-4xl px-8 py-8). */}
+      <div className="mx-auto w-full max-w-4xl space-y-6 px-5 py-6 md:px-8 md:py-8">
+        {/* Parent chain */}
         {parent && (
           <button
             type="button"
             onClick={() => navigate(`/tasks/${parent.id}`)}
-            className="flex items-center gap-1 text-sm text-stone-500 hover:text-amber-600 dark:text-stone-400 dark:hover:text-amber-400"
+            className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
           >
-            <ArrowLeft className="h-3.5 w-3.5" />
+            <ArrowLeft className="size-3.5" />
             <span className="truncate">{parent.title}</span>
           </button>
         )}
 
-        {/* 2 · status row */}
-        <div className="flex flex-wrap items-center gap-2">
-          <StatusIcon
-            status={toStatusKey(task.status)}
-            size="md"
-            onChange={(key) => {
-              const backend = toBackendStatus(key);
-              if (backend) applyStatus(backend);
-            }}
+        {/* Title (inline edit) */}
+        <div className="space-y-2">
+          <InlineEditor
+            value={task.title}
+            onCommit={(next) => updateTask(task.id, { title: next })}
+            ariaLabel={intl.formatMessage({ id: 'tasks.field.title' })}
+            textClassName="text-2xl font-bold tracking-tight text-foreground"
           />
-          <PriorityIcon priority={task.priority} size="md" />
-          <Mono>{task.id.slice(0, 8)}</Mono>
-          {showLive && <LiveBadge />}
-          <Badge tone="neutral">{intl.formatMessage({ id: `tasks.source.${source}` })}</Badge>
-          {assigneeAgent && (
-            <span className="ml-1 flex items-center gap-1.5" title={assigneeAgent.display_name}>
-              <CharacterAvatar agentId={assigneeAgent.name} name={assigneeAgent.display_name} size={22} animated={false} />
-              <span className="text-xs text-stone-500 dark:text-stone-400">{assigneeAgent.display_name}</span>
-            </span>
-          )}
-
-          <div className="ml-auto flex items-center gap-1">
-            <Button variant="ghost" size="sm" icon={Link2} onClick={copyLink} title={intl.formatMessage({ id: 'tasks.detail.copyLink' })} />
-            <Button
-              variant="ghost"
-              size="sm"
-              icon={SlidersHorizontal}
-              title={intl.formatMessage({ id: 'tasks.props.title' })}
-              onClick={() => {
-                setSheetOpen(true); // mobile: open the bottom sheet
-                toggleCollapsed(); // desktop: toggle the 320px column
-              }}
-            />
-            <div ref={menuRef} className="relative">
-              <Button
-                variant="ghost"
-                size="sm"
-                icon={MoreHorizontal}
-                aria-haspopup="menu"
-                aria-expanded={menuOpen}
-                onClick={() => setMenuOpen((v) => !v)}
-              />
-              {menuOpen && (
-                <div role="menu" className="glass-overlay absolute right-0 top-full z-50 mt-1 min-w-40 rounded-control p-1">
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      setConfirmRemove(true);
-                    }}
-                    className="flex w-full items-center gap-2 rounded-[calc(var(--radius-control)-2px)] px-2 py-1.5 text-left text-sm text-rose-600 hover:bg-rose-500/10 dark:text-rose-400"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                    {intl.formatMessage({ id: 'tasks.remove' })}
-                  </button>
-                </div>
-              )}
-            </div>
+          {/* Meta row: status glyph + source + live */}
+          <div className="flex flex-wrap items-center gap-2 px-1.5">
+            <StatusIcon status={toStatusKey(task.status)} size="sm" />
+            <Badge variant="secondary">{intl.formatMessage({ id: `tasks.source.${source}` })}</Badge>
+            {showLive && <LiveBadge />}
+            {assigneeAgent && (
+              <span className="ml-1 inline-flex items-center gap-1.5" title={assigneeAgent.display_name}>
+                <ActorAvatar actorType="agent" size="sm" name={assigneeAgent.display_name} />
+                <span className="text-xs text-muted-foreground">{assigneeAgent.display_name}</span>
+              </span>
+            )}
           </div>
         </div>
 
-        {/* 3 · title (inline edit) */}
-        <InlineEditor
-          value={task.title}
-          onCommit={(next) => updateTask(task.id, { title: next })}
-          ariaLabel={intl.formatMessage({ id: 'tasks.field.title' })}
-          textClassName="text-2xl font-semibold tracking-tight text-stone-900 dark:text-stone-50"
-        />
-
-        {/* 4 · description (inline edit, multiline) */}
+        {/* Description (inline edit, multiline) */}
         <div>
-          <h2 className="mb-1 px-1.5 text-xs font-semibold uppercase tracking-wide text-stone-400 dark:text-stone-500">
+          <h2 className="mb-1 px-1.5 text-xs font-medium text-muted-foreground">
             {intl.formatMessage({ id: 'tasks.field.description' })}
           </h2>
           <InlineEditor
@@ -292,60 +296,58 @@ export function TaskDetailPage() {
             multiline
             placeholder={intl.formatMessage({ id: 'tasks.detail.noDescription' })}
             ariaLabel={intl.formatMessage({ id: 'tasks.field.description' })}
-            textClassName="whitespace-pre-wrap text-sm text-stone-700 dark:text-stone-300"
+            textClassName="whitespace-pre-wrap text-sm text-foreground/90"
           />
         </div>
 
-        {/* 5 · subtasks (real: derived from parent_task_id) */}
+        {/* Subtasks (real: derived from parent_task_id) */}
         <div>
           <div className="mb-1.5 flex items-center justify-between px-1.5">
-            <h2 className="text-xs font-semibold uppercase tracking-wide text-stone-400 dark:text-stone-500">
+            <h2 className="text-xs font-medium text-muted-foreground">
               {intl.formatMessage({ id: 'tasks.subtasks' })}
               {subtasks.length > 0 && (
-                <span className="ml-1.5 tabular-nums text-stone-400 dark:text-stone-500">
+                <span className="ml-1.5 font-mono tabular-nums text-muted-foreground">
                   {subtasks.filter((s) => s.status === 'done').length}/{subtasks.length}
                 </span>
               )}
             </h2>
-            <Button variant="ghost" size="sm" icon={Plus} onClick={() => setAddSub(true)}>
+            <Button variant="ghost" size="sm" onClick={() => setAddSub(true)}>
+              <Plus />
               {intl.formatMessage({ id: 'tasks.subtask.add' })}
             </Button>
           </div>
           {subtasks.length > 0 ? (
-            <Card padded={false}>
-              <ul className="divide-y divide-stone-200/60 dark:divide-white/5">
-                {subtasks.map((s) => {
-                  const a = agents.find((ag) => ag.name === s.assigned_to);
-                  return (
-                    <li key={s.id} className="flex items-center gap-2.5 px-4 py-2 hover:bg-stone-500/5 dark:hover:bg-white/5">
-                      <StatusIcon status={toStatusKey(s.status)} size="sm" />
-                      <button
-                        type="button"
-                        onClick={() => navigate(`/tasks/${s.id}`)}
-                        className="min-w-0 flex-1 truncate text-left text-sm text-stone-700 hover:text-amber-600 dark:text-stone-200 dark:hover:text-amber-400"
-                      >
-                        {s.title}
-                      </button>
-                      {a && <CharacterAvatar agentId={a.name} name={a.display_name} size={20} animated={false} />}
-                      <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-300 dark:text-stone-600" />
-                    </li>
-                  );
-                })}
-              </ul>
-            </Card>
+            <ul className="overflow-hidden rounded-xl border border-surface-border bg-surface">
+              {subtasks.map((s) => {
+                const a = agents.find((ag) => ag.name === s.assigned_to);
+                return (
+                  <li
+                    key={s.id}
+                    onClick={() => navigate(`/tasks/${s.id}`)}
+                    className="flex cursor-pointer items-center gap-2.5 px-4 py-2 transition-colors hover:bg-surface-hover"
+                  >
+                    <StatusIcon status={toStatusKey(s.status)} size="sm" />
+                    <span className="min-w-0 flex-1 truncate text-sm text-foreground">{s.title}</span>
+                    {a && <ActorAvatar actorType="agent" size="sm" name={a.display_name} />}
+                    <ChevronRight className="size-3.5 shrink-0 text-muted-foreground/60" />
+                  </li>
+                );
+              })}
+            </ul>
           ) : (
-            <p className="px-1.5 text-sm text-stone-400 dark:text-stone-500">
+            <p className="px-1.5 text-sm text-muted-foreground">
               {intl.formatMessage({ id: 'tasks.subtasks.empty' })}
             </p>
           )}
         </div>
 
-        {/* 6 · updated timestamp byline */}
-        <p className="px-1.5 text-xs text-stone-400 dark:text-stone-500">
-          {intl.formatMessage({ id: 'tasks.detail.updatedAgo' })} <Mono className="text-[0.6875rem]">{timeAgo(task.updated_at)}</Mono>
+        {/* Updated timestamp byline */}
+        <p className="px-1.5 text-xs text-muted-foreground">
+          {intl.formatMessage({ id: 'tasks.detail.updatedAgo' })}{' '}
+          <span className="font-mono tabular-nums">{timeAgo(task.updated_at)}</span>
         </p>
 
-        {/* 7 · bottom tabs (discussion / activity) */}
+        {/* Bottom tabs (discussion / activity) */}
         <TaskBottomTabs
           events={taskActivities}
           comments={taskComments}
@@ -369,25 +371,28 @@ export function TaskDetailPage() {
       />
 
       {/* Delete confirmation */}
-      <Dialog open={confirmRemove} title={intl.formatMessage({ id: 'tasks.remove' })} onClose={() => setConfirmRemove(false)}>
-        <div className="space-y-4">
-          <p className="text-sm text-stone-600 dark:text-stone-400">
-            {intl.formatMessage({ id: 'tasks.remove.confirm' }, { title: task.title })}
-          </p>
-          <div className="flex justify-end gap-3">
-            <Button variant="secondary" onClick={() => setConfirmRemove(false)}>
-              {intl.formatMessage({ id: 'agents.delegate.close' })}
-            </Button>
-            <Button variant="danger" onClick={handleRemove}>
+      <Dialog open={confirmRemove} onOpenChange={setConfirmRemove}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{intl.formatMessage({ id: 'tasks.remove' })}</DialogTitle>
+            <DialogDescription>
+              {intl.formatMessage({ id: 'tasks.remove.confirm' }, { title: task.title })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose
+              render={<Button variant="outline">{intl.formatMessage({ id: 'agents.delegate.close' })}</Button>}
+            />
+            <Button variant="destructive" onClick={handleRemove}>
               {intl.formatMessage({ id: 'tasks.remove' })}
             </Button>
-          </div>
-        </div>
+          </DialogFooter>
+        </DialogContent>
       </Dialog>
 
       {burst && (
         <TaskDoneBurst agentId={burst.agentId} agentName={assigneeAgent?.display_name} onDone={() => setBurst(null)} />
       )}
-    </Page>
+    </div>
   );
 }

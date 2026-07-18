@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
+import { ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { GroupHeader } from '@/components/ui';
-import type { InboxColumn, InboxItem } from '@/lib/inbox-model';
+import type { InboxItem } from '@/lib/inbox-model';
 import { InboxRow, type InboxRowLabels } from './InboxRow';
 
 /** A precomputed group the page hands down (label omitted ⇒ no header row). */
@@ -15,15 +15,16 @@ export interface InboxGroup {
 
 interface InboxListProps {
   groups: readonly InboxGroup[];
-  columns: readonly InboxColumn[];
   canArchive: boolean;
   agentName: (id: string) => string;
   labels: InboxRowLabels;
+  /** Currently-open item id (drives the highlighted row + keyboard cursor). */
+  selectedId: string | null;
+  /** Per-item unread flag (renders the leading dot). */
+  isUnread: (item: InboxItem) => boolean;
   emptyState: ReactNode;
-  onOpen: (item: InboxItem) => void;
-  onApprove: (item: InboxItem) => void;
-  onReject: (item: InboxItem) => void;
-  onView: (item: InboxItem) => void;
+  /** Select a row → the page opens it in the detail pane + marks it read. */
+  onSelect: (item: InboxItem) => void;
   onArchive: (item: InboxItem) => void;
   onUnread: (item: InboxItem) => void;
   onUndo: () => void;
@@ -39,19 +40,48 @@ function isEditableTarget(el: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
+/** Plain Multica group header — chevron + label + count, collapses the group. */
+function GroupHeaderRow({
+  label,
+  hint,
+  count,
+  collapsed,
+  onToggle,
+}: {
+  label: ReactNode;
+  hint?: ReactNode;
+  count: number;
+  collapsed: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="pt-2">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={!collapsed}
+        className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left transition-colors hover:bg-surface-hover"
+      >
+        <ChevronDown className={cn('size-3.5 shrink-0 text-muted-foreground transition-transform', collapsed && '-rotate-90')} />
+        <span className="truncate text-xs font-medium text-muted-foreground">{label}</span>
+        <span className="font-mono text-xs tabular-nums text-muted-foreground/70">{count}</span>
+      </button>
+      {hint && !collapsed && <p className="px-2 pb-1 pl-7 text-xs text-muted-foreground/70">{hint}</p>}
+    </div>
+  );
+}
+
 /**
- * InboxList — renders precomputed groups and owns the keyboard flow (§5.2 T4.3):
- * `j`/`k` (or ↑/↓) move, `←`/`→` collapse/expand the group, `Enter` opens (or
- * toggles a header), `a` archives (when allowed), `U` marks unread, `⌘Z` undoes.
- * Hover follows the keyboard cursor. Selection is tracked by a stable key so it
- * survives collapse/rebuild.
+ * InboxList — renders precomputed groups and owns the keyboard flow (§5.6):
+ * `j`/`k` (or ↑/↓) move between rows and open each in the detail pane, `←`/`→`
+ * collapse/expand the current row's group, `Enter` re-opens, `a` archives (when
+ * allowed), `U` marks unread, `⌘Z` undoes. Selection is controlled by the page
+ * via `selectedId` so the split's detail pane stays in sync.
  */
 export function InboxList(props: InboxListProps) {
-  const { groups, columns, canArchive, agentName, labels, emptyState } = props;
-  const containerRef = useRef<HTMLDivElement>(null);
+  const { groups, canArchive, agentName, labels, selectedId, isUnread, emptyState } = props;
   const rowRefs = useRef(new Map<string, HTMLElement>());
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
-  const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
   const totalItems = useMemo(() => groups.reduce((n, g) => n + g.items.length, 0), [groups]);
 
@@ -70,25 +100,17 @@ export function InboxList(props: InboxListProps) {
     return out;
   }, [groups, collapsed]);
 
-  const selectedIdx = useMemo(() => {
-    const i = entries.findIndex((e) => e.key === selectedKey);
-    return i >= 0 ? i : 0;
-  }, [entries, selectedKey]);
+  const rows = useMemo(() => entries.filter((e): e is Extract<Entry, { kind: 'row' }> => e.kind === 'row'), [entries]);
+  const currentRowIdx = useMemo(
+    () => (selectedId ? rows.findIndex((r) => r.item.id === selectedId) : -1),
+    [rows, selectedId],
+  );
 
-  // Keep a valid selection as entries change.
+  // Scroll the active row into view when it changes.
   useEffect(() => {
-    if (entries.length === 0) return;
-    if (!selectedKey || !entries.some((e) => e.key === selectedKey)) {
-      const firstRow = entries.find((e) => e.kind === 'row') ?? entries[0];
-      setSelectedKey(firstRow.key);
-    }
-  }, [entries, selectedKey]);
-
-  // Scroll the active entry into view when it changes.
-  useEffect(() => {
-    if (!selectedKey) return;
-    rowRefs.current.get(selectedKey)?.scrollIntoView({ block: 'nearest' });
-  }, [selectedKey]);
+    if (!selectedId) return;
+    rowRefs.current.get(`r:${selectedId}`)?.scrollIntoView({ block: 'nearest' });
+  }, [selectedId]);
 
   const toggleCollapse = useCallback((groupKey: string, next?: boolean) => {
     setCollapsed((prev) => {
@@ -100,9 +122,13 @@ export function InboxList(props: InboxListProps) {
     });
   }, []);
 
+  const groupKeyOfSelected = useMemo(
+    () => rows.find((r) => r.item.id === selectedId)?.groupKey,
+    [rows, selectedId],
+  );
+
   const onKeyDown = (e: ReactKeyboardEvent) => {
     if (isEditableTarget(e.target)) return;
-    const cur = entries[selectedIdx];
 
     // ⌘Z / Ctrl+Z — undo the last archive.
     if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
@@ -112,49 +138,42 @@ export function InboxList(props: InboxListProps) {
     }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
 
+    const curItem = currentRowIdx >= 0 ? rows[currentRowIdx].item : undefined;
+
     switch (e.key) {
       case 'j':
       case 'ArrowDown':
         e.preventDefault();
-        if (entries.length) setSelectedKey(entries[Math.min(selectedIdx + 1, entries.length - 1)].key);
+        if (rows.length) props.onSelect(rows[Math.min(currentRowIdx + 1, rows.length - 1)].item);
         break;
       case 'k':
       case 'ArrowUp':
         e.preventDefault();
-        if (entries.length) setSelectedKey(entries[Math.max(selectedIdx - 1, 0)].key);
+        if (rows.length) props.onSelect(rows[Math.max(currentRowIdx - 1, 0)].item);
         break;
       case 'ArrowLeft':
         e.preventDefault();
-        if (!cur) break;
-        if (cur.kind === 'header') {
-          toggleCollapse(cur.groupKey, true);
-        } else {
-          // Collapse the row's group and land on its header.
-          toggleCollapse(cur.groupKey, true);
-          setSelectedKey(`h:${cur.groupKey}`);
-        }
+        if (groupKeyOfSelected) toggleCollapse(groupKeyOfSelected, true);
         break;
       case 'ArrowRight':
         e.preventDefault();
-        if (cur?.kind === 'header') toggleCollapse(cur.groupKey, false);
+        if (groupKeyOfSelected) toggleCollapse(groupKeyOfSelected, false);
         break;
       case 'Enter':
-        if (!cur) break;
         e.preventDefault();
-        if (cur.kind === 'header') toggleCollapse(cur.groupKey);
-        else props.onOpen(cur.item);
+        if (curItem) props.onSelect(curItem);
         break;
       case 'a':
-        if (cur?.kind === 'row' && canArchive) {
+        if (curItem && canArchive) {
           e.preventDefault();
-          props.onArchive(cur.item);
+          props.onArchive(curItem);
         }
         break;
       case 'u':
       case 'U':
-        if (cur?.kind === 'row') {
+        if (curItem) {
           e.preventDefault();
-          props.onUnread(cur.item);
+          props.onUnread(curItem);
         }
         break;
     }
@@ -169,47 +188,35 @@ export function InboxList(props: InboxListProps) {
 
   return (
     <div
-      ref={containerRef}
       role="listbox"
       tabIndex={0}
       aria-label="inbox"
       onKeyDown={onKeyDown}
-      className="space-y-2 rounded-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/30"
+      className="space-y-0.5 rounded-md outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
     >
       {entries.map((entry) => {
-        const selected = entry.key === selectedKey;
         if (entry.kind === 'header') {
           return (
-            <div key={entry.key} ref={setRef(entry.key)} className={cn('px-1 pt-3', selected && 'rounded-control ring-1 ring-amber-500/40')}>
-              <GroupHeader
-                label={entry.label}
-                count={entry.count}
-                collapsed={collapsed.has(entry.groupKey)}
-                onToggle={() => {
-                  setSelectedKey(entry.key);
-                  toggleCollapse(entry.groupKey);
-                }}
-              />
-              {entry.hint && !collapsed.has(entry.groupKey) && (
-                <p className="px-6 pb-1 text-xs text-stone-400 dark:text-stone-500">{entry.hint}</p>
-              )}
-            </div>
+            <GroupHeaderRow
+              key={entry.key}
+              label={entry.label}
+              hint={entry.hint}
+              count={entry.count}
+              collapsed={collapsed.has(entry.groupKey)}
+              onToggle={() => toggleCollapse(entry.groupKey)}
+            />
           );
         }
         return (
           <div key={entry.key} ref={setRef(entry.key)}>
             <InboxRow
               item={entry.item}
-              selected={selected}
-              columns={columns}
+              selected={entry.item.id === selectedId}
+              unread={isUnread(entry.item)}
               canArchive={canArchive}
               agentName={agentName(entry.item.agentId ?? '')}
               labels={labels}
-              onSelect={() => setSelectedKey(entry.key)}
-              onOpen={() => props.onOpen(entry.item)}
-              onApprove={() => props.onApprove(entry.item)}
-              onReject={() => props.onReject(entry.item)}
-              onView={() => props.onView(entry.item)}
+              onSelect={() => props.onSelect(entry.item)}
               onArchive={() => props.onArchive(entry.item)}
             />
           </div>

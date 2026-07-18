@@ -1,14 +1,11 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { CircleDot, Flag, UserRound, CalendarPlus, CalendarClock, CheckCircle2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
-  PropertySection,
-  PropertyRow,
   StatusIcon,
   PriorityIcon,
   useStatusLabel,
-  Mono,
   type TaskPriorityKey,
 } from '@/components/ui';
 import { toStatusKey, toBackendStatus } from '@/lib/task-status';
@@ -16,6 +13,39 @@ import { AssigneePopover, type AssigneeOption } from './AssigneePopover';
 import type { TaskInfo, TaskPriority } from '@/lib/api';
 
 const PRIORITY_ORDER: readonly TaskPriorityKey[] = ['low', 'medium', 'high', 'urgent'];
+
+/** A grouped section of property rows (Multica PropertyRow style, spec §5.3). */
+function PropSection({ title, children }: { title: ReactNode; children: ReactNode }) {
+  return (
+    <section className="space-y-0.5">
+      <h3 className="px-1 pb-1 text-xs font-medium text-muted-foreground">{title}</h3>
+      <div className="space-y-0.5">{children}</div>
+    </section>
+  );
+}
+
+/** One label-left / value-right line (`text-sm`, label muted). */
+function PropRow({
+  label,
+  icon: Icon,
+  children,
+}: {
+  label: ReactNode;
+  icon?: ComponentType<{ className?: string }>;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex items-center gap-2 px-1 py-1.5 text-sm">
+      <span className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground">
+        {Icon && <Icon className="size-3.5 shrink-0" />}
+        {label}
+      </span>
+      <span className="ml-auto flex min-w-0 items-center justify-end gap-1.5 text-right text-foreground">
+        {children}
+      </span>
+    </div>
+  );
+}
 
 /** A tiny popover to change task priority (PriorityIcon itself is display-only). */
 function PriorityPopover({
@@ -52,15 +82,19 @@ function PriorityPopover({
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
         onClick={() => setOpen((v) => !v)}
-        className="inline-flex items-center gap-1.5 rounded-control px-1.5 py-1 hover:bg-stone-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 dark:hover:bg-white/5"
+        className="inline-flex items-center gap-1.5 rounded-lg px-1.5 py-1 outline-none transition-colors hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
       >
         <PriorityIcon priority={value} size="sm" />
-        <span className="text-sm text-stone-700 dark:text-stone-200">
+        <span className="text-sm text-foreground">
           {intl.formatMessage({ id: `tasks.priority.${value}` })}
         </span>
       </button>
       {open && (
-        <div id={menuId} role="menu" className="glass-overlay absolute right-0 top-full z-50 mt-1 min-w-40 rounded-control p-1">
+        <div
+          id={menuId}
+          role="menu"
+          className="absolute right-0 top-full z-50 mt-1 min-w-40 rounded-lg bg-surface-raised p-1 shadow-[var(--menu-shadow)] ring-1 ring-surface-border"
+        >
           {PRIORITY_ORDER.map((p) => (
             <button
               key={p}
@@ -72,12 +106,12 @@ function PriorityPopover({
                 setOpen(false);
               }}
               className={cn(
-                'flex w-full items-center gap-2 rounded-[calc(var(--radius-control)-2px)] px-2 py-1.5 text-left text-sm hover:bg-stone-500/10 dark:hover:bg-white/5',
-                p === value && 'font-semibold',
+                'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none transition-colors hover:bg-accent hover:text-accent-foreground',
+                p === value && 'font-medium',
               )}
             >
               <PriorityIcon priority={p} size="sm" />
-              <span className="text-stone-700 dark:text-stone-200">
+              <span className="text-foreground">
                 {intl.formatMessage({ id: `tasks.priority.${p}` })}
               </span>
             </button>
@@ -90,8 +124,8 @@ function PriorityPopover({
 
 /**
  * TaskProperties — the right-hand PropertiesPanel content for the detail page
- * (§5.3 T5.3): Triage (status / priority / assignee) + About (timestamps). All
- * edits write straight back through the callbacks the page threads from the
+ * (spec §5.3 式1): Triage (status / priority / assignee) + About (timestamps).
+ * All edits write straight back through the callbacks the page threads from the
  * tasks store. Status writes go through the mapping layer so a forward-looking
  * pick (backlog/in_review/cancelled) is ignored rather than mis-persisted.
  */
@@ -125,8 +159,8 @@ export function TaskProperties({
 
   return (
     <div className="space-y-4">
-      <PropertySection title={intl.formatMessage({ id: 'tasks.props.triage' })}>
-        <PropertyRow label={intl.formatMessage({ id: 'tasks.field.status' })} icon={CircleDot}>
+      <PropSection title={intl.formatMessage({ id: 'tasks.props.triage' })}>
+        <PropRow label={intl.formatMessage({ id: 'tasks.field.status' })} icon={CircleDot}>
           <StatusIcon
             status={statusKey}
             size="sm"
@@ -135,32 +169,32 @@ export function TaskProperties({
               if (backend && backend !== task.status) onStatusChange(backend);
             }}
           />
-          <span className="text-sm text-stone-700 dark:text-stone-200">{statusLabel(statusKey)}</span>
-        </PropertyRow>
-        <PropertyRow label={intl.formatMessage({ id: 'tasks.field.priority' })} icon={Flag}>
+          <span className="text-sm text-foreground">{statusLabel(statusKey)}</span>
+        </PropRow>
+        <PropRow label={intl.formatMessage({ id: 'tasks.field.priority' })} icon={Flag}>
           <PriorityPopover value={task.priority} onChange={onPriorityChange} />
-        </PropertyRow>
-        <PropertyRow label={intl.formatMessage({ id: 'tasks.field.assignTo' })} icon={UserRound}>
+        </PropRow>
+        <PropRow label={intl.formatMessage({ id: 'tasks.field.assignTo' })} icon={UserRound}>
           <AssigneePopover agents={agents} value={task.assigned_to || null} onChange={onAssign} align="right" />
-        </PropertyRow>
-      </PropertySection>
+        </PropRow>
+      </PropSection>
 
-      <PropertySection title={intl.formatMessage({ id: 'tasks.props.about' })}>
-        <PropertyRow label={intl.formatMessage({ id: 'tasks.detail.createdBy' })} icon={UserRound}>
-          <span className="truncate text-sm text-stone-700 dark:text-stone-200">{task.created_by}</span>
-        </PropertyRow>
-        <PropertyRow label={intl.formatMessage({ id: 'tasks.detail.createdAt' })} icon={CalendarPlus}>
-          <Mono className="text-xs">{fmt(task.created_at)}</Mono>
-        </PropertyRow>
-        <PropertyRow label={intl.formatMessage({ id: 'tasks.detail.updatedAt' })} icon={CalendarClock}>
-          <Mono className="text-xs">{fmt(task.updated_at)}</Mono>
-        </PropertyRow>
+      <PropSection title={intl.formatMessage({ id: 'tasks.props.about' })}>
+        <PropRow label={intl.formatMessage({ id: 'tasks.detail.createdBy' })} icon={UserRound}>
+          <span className="truncate text-sm text-foreground">{task.created_by}</span>
+        </PropRow>
+        <PropRow label={intl.formatMessage({ id: 'tasks.detail.createdAt' })} icon={CalendarPlus}>
+          <span className="font-mono text-xs tabular-nums text-muted-foreground">{fmt(task.created_at)}</span>
+        </PropRow>
+        <PropRow label={intl.formatMessage({ id: 'tasks.detail.updatedAt' })} icon={CalendarClock}>
+          <span className="font-mono text-xs tabular-nums text-muted-foreground">{fmt(task.updated_at)}</span>
+        </PropRow>
         {task.completed_at && (
-          <PropertyRow label={intl.formatMessage({ id: 'tasks.detail.completedAt' })} icon={CheckCircle2}>
-            <Mono className="text-xs">{fmt(task.completed_at)}</Mono>
-          </PropertyRow>
+          <PropRow label={intl.formatMessage({ id: 'tasks.detail.completedAt' })} icon={CheckCircle2}>
+            <span className="font-mono text-xs tabular-nums text-muted-foreground">{fmt(task.completed_at)}</span>
+          </PropRow>
         )}
-      </PropertySection>
+      </PropSection>
     </div>
   );
 }

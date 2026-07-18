@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import {
@@ -14,22 +14,24 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
-  Page,
-  PageHeader,
+  BreadcrumbHeader,
+  CollectionPageState,
   Card,
-  Section,
+  CardContent,
   Button,
   Badge,
-  Field,
-  controlClass,
-  EmptyState,
-  Mono,
-  PropertyRow,
-  PropertySection,
-  CharacterAvatar,
-  DuDu,
-  celebrate,
-} from '@/components/ui';
+  Input,
+  Textarea,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  ActorAvatar,
+  type BreadcrumbSegment,
+} from '@/components/mds';
+import { DuDu } from '@/components/mascot';
+import { celebrate } from '@/components/ui/CelebrationLayer';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
 import { timeAgo } from '@/lib/format';
@@ -41,9 +43,8 @@ import {
   type CustomSkillRecord,
   type TimeSavedUnit,
 } from '@/lib/api-custom-skills';
-import { statusMeta, formatTimeSaved } from './status-meta';
+import { statusMeta, statusToneBadge, formatTimeSaved } from './status-meta';
 
-const textareaClass = cn(controlClass, 'h-auto min-h-[80px] resize-y py-2 leading-relaxed');
 const TIME_UNITS: TimeSavedUnit[] = ['minutes_per_use', 'hours_per_month'];
 const POLL_MS = 4000;
 
@@ -51,13 +52,51 @@ function splitTags(tags: string): string[] {
   return tags.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
+/** Local field wrapper (label + optional help), MDS-styled. */
+function Field({
+  label,
+  help,
+  required,
+  children,
+}: {
+  label: ReactNode;
+  help?: ReactNode;
+  required?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <label className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+        {label}
+        {required && <span className="text-destructive">*</span>}
+      </label>
+      {children}
+      {help && <p className="text-xs text-muted-foreground">{help}</p>}
+    </div>
+  );
+}
+
+/** Local property row (label left, value right), MDS-styled (spec §5.3). */
+function PropertyRow({ label, children }: { label: ReactNode; children: ReactNode }) {
+  return (
+    <div className="flex items-start justify-between gap-4 py-2.5 first:pt-0 last:pb-0">
+      <span className="shrink-0 text-sm text-muted-foreground">{label}</span>
+      <span className="min-w-0 text-right text-sm text-foreground">{children}</span>
+    </div>
+  );
+}
+
+function SectionTitle({ children }: { children: ReactNode }) {
+  return <h2 className="text-sm font-medium text-foreground">{children}</h2>;
+}
+
 /**
- * CustomSkillDetail — `/skills/custom/:id` (T13.2). All fields + status +
- * approval history + status-appropriate actions. Draft/rejected are editable
- * and (re)submittable; pending shows a waiting state; rejected shows the
- * reason. Polls for a transition to `approved` to fire the on-launch
- * celebration (T13.4). No per-skill call counter exists on the backend, so the
- * time-saving figure is shown as an estimate, honestly labeled.
+ * CustomSkillDetail — `/skills/custom/:id` (T13.2), re-skinned onto MDS (spec
+ * §5.3 detail-page shell: BreadcrumbHeader + max-w-4xl container). All fields +
+ * status + approval history + status-appropriate actions. Draft/rejected are
+ * editable and (re)submittable; pending shows a waiting state; rejected shows
+ * the reason. Polls for a transition to `approved` to fire the on-launch
+ * celebration (T13.4).
  */
 export function CustomSkillDetail({ id }: { id: string }) {
   const intl = useIntl();
@@ -187,236 +226,248 @@ export function CustomSkillDetail({ id }: { id: string }) {
     }
   }, [record, retiring, load, t, intl]);
 
+  const segments = useCallback(
+    (leaf: ReactNode): BreadcrumbSegment[] => [
+      { label: t('nav.skills'), onClick: () => navigate('/skills') },
+      { label: leaf },
+    ],
+    [navigate, t],
+  );
+
   if (loading) {
     return (
-      <Page>
-        <div className="py-16 text-center text-stone-400">{t('common.loading')}</div>
-      </Page>
+      <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+        <BreadcrumbHeader segments={segments(t('skills.custom.title'))} />
+        <CollectionPageState state="loading" />
+      </div>
     );
   }
 
   if (notFound || !record) {
     return (
-      <Page>
-        <PageHeader icon={Puzzle} title={t('skills.custom.title')} />
-        <Card>
-          <EmptyState
-            icon={Puzzle}
-            title={t('skills.custom.notFound')}
-            action={<Button onClick={() => navigate('/skills')}>{t('skills.custom.backToList')}</Button>}
-          />
-        </Card>
-      </Page>
+      <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+        <BreadcrumbHeader segments={segments(t('skills.custom.title'))} />
+        <CollectionPageState
+          state="empty"
+          icon={Puzzle}
+          title={t('skills.custom.notFound')}
+          action={
+            <Button variant="outline" size="sm" onClick={() => navigate('/skills')}>
+              {t('skills.custom.backToList')}
+            </Button>
+          }
+        />
+      </div>
     );
   }
 
   const meta = statusMeta(record.status);
+  const badge = statusToneBadge(meta.tone);
   const isApproved = record.status === 'approved';
 
   return (
-    <Page>
-      <PageHeader
-        icon={Puzzle}
-        title={record.display_name}
-        subtitle={record.slug}
-        actions={<Badge tone={meta.tone}>{t(meta.labelKey)}</Badge>}
+    <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+      <BreadcrumbHeader
+        segments={segments(record.display_name)}
+        actions={
+          <Badge variant={badge.variant} className={badge.className}>
+            {t(meta.labelKey)}
+          </Badge>
+        }
       />
 
-      <div className="space-y-6">
+      <div className="mx-auto w-full max-w-4xl space-y-6 px-5 py-6 md:px-8 md:py-8">
         {/* Approved banner + DuDu (T13.4) */}
         {isApproved && (
-          <Card className="flex items-center gap-4 border-emerald-300/60 bg-emerald-50/60 dark:border-emerald-800/60 dark:bg-emerald-900/15">
-            <DuDu face="proud" size="sm" />
-            <div>
-              <p className="text-sm font-semibold text-emerald-700 dark:text-emerald-400">
-                {t('skills.custom.liveTitle')}
-              </p>
-              <p className="text-xs text-emerald-600/80 dark:text-emerald-500/80">{t('skills.custom.liveHint')}</p>
-            </div>
+          <Card>
+            <CardContent className="flex items-center gap-4">
+              <DuDu face="proud" size="sm" />
+              <div>
+                <p className="text-sm font-medium text-success">{t('skills.custom.liveTitle')}</p>
+                <p className="text-xs text-muted-foreground">{t('skills.custom.liveHint')}</p>
+              </div>
+            </CardContent>
           </Card>
         )}
 
         {/* Rejection reason (T13.2) */}
         {record.status === 'rejected' && record.rejection_reason && (
-          <Card className="border-rose-200 bg-rose-50/60 dark:border-rose-800 dark:bg-rose-900/15">
-            <div className="flex items-start gap-2 text-sm text-rose-700 dark:text-rose-400">
-              <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <div>
-                <p className="font-medium">{t('skills.custom.rejectedTitle')}</p>
-                <p className="mt-0.5 text-xs">{record.rejection_reason}</p>
-              </div>
+          <div className="flex items-start gap-2 rounded-xl bg-destructive/10 p-4 text-sm text-destructive">
+            <XCircle className="mt-0.5 size-4 shrink-0" />
+            <div>
+              <p className="font-medium">{t('skills.custom.rejectedTitle')}</p>
+              <p className="mt-0.5 text-xs">{record.rejection_reason}</p>
             </div>
-          </Card>
+          </div>
         )}
 
         {/* Pending waiting state */}
         {record.status === 'pending_approval' && (
-          <Card className="flex items-center gap-3 text-sm text-amber-700 dark:text-amber-400">
-            <Clock className="h-4 w-4 shrink-0" />
+          <div className="flex items-center gap-3 rounded-xl bg-warning/10 p-4 text-sm text-warning">
+            <Clock className="size-4 shrink-0" />
             {t('skills.custom.waiting')}
-          </Card>
+          </div>
         )}
 
         {/* Generating */}
         {record.status === 'generating' && (
-          <Card className="flex items-center gap-3 text-sm text-sky-700 dark:text-sky-400">
-            <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+          <div className="flex items-center gap-3 rounded-xl bg-info/10 p-4 text-sm text-info">
+            <Loader2 className="size-4 shrink-0 animate-spin" />
             {t('skills.custom.generatingHint')}
-          </Card>
+          </div>
         )}
 
         {/* Human fields — editable when draft/rejected, else read-only */}
         {editable ? (
-          <Section title={t('skills.custom.fields')}>
-            <div className="space-y-4">
-              <Field label={t('skills.new.form.displayName')} required>
-                <input className={controlClass} value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
-              </Field>
-              <Field label={t('skills.new.form.description')}>
-                <textarea
-                  className={textareaClass}
-                  value={descriptionHuman}
-                  onChange={(e) => setDescriptionHuman(e.target.value)}
-                  rows={3}
-                />
-              </Field>
-              <Field label={t('skills.new.form.timeSaved')} help={t('skills.new.form.timeSavedHelp')}>
-                <div className="flex gap-2">
-                  <input
-                    type="number"
-                    min={0}
-                    className={cn(controlClass, 'w-28')}
-                    value={timeSavedValue}
-                    onChange={(e) => setTimeSavedValue(e.target.value)}
-                  />
-                  <select
-                    className={cn(controlClass, 'w-auto flex-1')}
-                    value={timeSavedUnit}
-                    onChange={(e) => setTimeSavedUnit(e.target.value as TimeSavedUnit)}
-                  >
-                    {TIME_UNITS.map((u) => (
-                      <option key={u} value={u}>
-                        {t(`skills.custom.unit.${u}`)}
-                      </option>
-                    ))}
-                  </select>
+          <section className="space-y-3">
+            <SectionTitle>{t('skills.custom.fields')}</SectionTitle>
+            <Card>
+              <CardContent className="space-y-4">
+                <Field label={t('skills.new.form.displayName')} required>
+                  <Input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+                </Field>
+                <Field label={t('skills.new.form.description')}>
+                  <Textarea value={descriptionHuman} onChange={(e) => setDescriptionHuman(e.target.value)} rows={3} />
+                </Field>
+                <Field label={t('skills.new.form.timeSaved')} help={t('skills.new.form.timeSavedHelp')}>
+                  <div className="flex gap-2">
+                    <Input
+                      type="number"
+                      min={0}
+                      className="w-28"
+                      value={timeSavedValue}
+                      onChange={(e) => setTimeSavedValue(e.target.value)}
+                    />
+                    <Select value={timeSavedUnit} onValueChange={(v) => setTimeSavedUnit(String(v) as TimeSavedUnit)}>
+                      <SelectTrigger className="w-48">
+                        <SelectValue>{t(`skills.custom.unit.${timeSavedUnit}`)}</SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        {TIME_UNITS.map((u) => (
+                          <SelectItem key={u} value={u}>
+                            {t(`skills.custom.unit.${u}`)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </Field>
+                <Field label={t('skills.new.form.tags')}>
+                  <ChipEditor values={tags} onChange={setTags} />
+                </Field>
+                <div>
+                  <Button variant="outline" onClick={handleSave} disabled={saving || !displayName.trim()}>
+                    {saving ? <Loader2 className="animate-spin" /> : <Save />}
+                    {saving ? t('common.saving') : t('common.save')}
+                  </Button>
                 </div>
-              </Field>
-              <Field label={t('skills.new.form.tags')}>
-                <ChipEditor values={tags} onChange={setTags} />
-              </Field>
-              <div>
-                <Button
-                  variant="secondary"
-                  icon={saving ? Loader2 : Save}
-                  onClick={handleSave}
-                  disabled={saving || !displayName.trim()}
-                  className={cn(saving && '[&>svg]:animate-spin')}
-                >
-                  {saving ? t('common.saving') : t('common.save')}
-                </Button>
-              </div>
-            </div>
-          </Section>
+              </CardContent>
+            </Card>
+          </section>
         ) : (
+          <section className="space-y-3">
+            <SectionTitle>{t('skills.custom.fields')}</SectionTitle>
+            <Card>
+              <CardContent className="divide-y divide-surface-border">
+                <PropertyRow label={t('skills.new.form.displayName')}>{record.display_name}</PropertyRow>
+                <PropertyRow label={t('skills.custom.slug')}>
+                  <span className="font-mono">{record.slug}</span>
+                </PropertyRow>
+                <PropertyRow label={t('skills.new.form.description')}>
+                  <span className="whitespace-pre-wrap">{record.description_human || '—'}</span>
+                </PropertyRow>
+                <PropertyRow label={t('skills.new.form.timeSaved')}>
+                  {formatTimeSaved(intl, record.time_saved_value, record.time_saved_unit)}
+                </PropertyRow>
+                {record.tags && (
+                  <PropertyRow label={t('skills.new.form.tags')}>
+                    <span className="flex flex-wrap justify-end gap-1">
+                      {splitTags(record.tags).map((tg) => (
+                        <Badge key={tg} variant="secondary">
+                          {tg}
+                        </Badge>
+                      ))}
+                    </span>
+                  </PropertyRow>
+                )}
+              </CardContent>
+            </Card>
+          </section>
+        )}
+
+        {/* Cumulative time saved — real figure computed by the backend, still
+            labeled as the user's own estimate basis. */}
+        <section className="space-y-3">
+          <SectionTitle>{t('skills.custom.savings')}</SectionTitle>
           <Card>
-            <PropertySection title={t('skills.custom.fields')}>
-              <PropertyRow label={t('skills.new.form.displayName')}>{record.display_name}</PropertyRow>
-              <PropertyRow label={t('skills.custom.slug')}>
-                <Mono>{record.slug}</Mono>
+            <CardContent>
+              <p className="text-2xl font-semibold tabular-nums text-foreground">
+                {intl.formatMessage(
+                  { id: 'skills.custom.savings.hoursValue', defaultMessage: '{value} h' },
+                  { value: (record.saved_hours_estimate ?? 0).toFixed(1) },
+                )}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">{t('skills.custom.savings.estimateNote')}</p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {intl.formatMessage(
+                  { id: 'skills.custom.savings.usedTimes', defaultMessage: 'Used {count} times' },
+                  { count: record.usage_count ?? 0 },
+                )}
+              </p>
+            </CardContent>
+          </Card>
+        </section>
+
+        {/* Metadata + approval history */}
+        <section className="space-y-3">
+          <SectionTitle>{t('skills.custom.history')}</SectionTitle>
+          <Card>
+            <CardContent className="divide-y divide-surface-border">
+              <PropertyRow label={t('skills.custom.builtBy')}>
+                {record.built_by_agent ? (
+                  <span className="flex items-center justify-end gap-1.5">
+                    <ActorAvatar actorType="agent" size="xs" name={record.built_by_agent} />
+                    <span className="truncate">{record.built_by_agent}</span>
+                  </span>
+                ) : (
+                  '—'
+                )}
               </PropertyRow>
-              <PropertyRow label={t('skills.new.form.description')}>
-                <span className="whitespace-pre-wrap">{record.description_human || '—'}</span>
-              </PropertyRow>
-              <PropertyRow label={t('skills.new.form.timeSaved')}>
-                {formatTimeSaved(intl, record.time_saved_value, record.time_saved_unit)}
-              </PropertyRow>
-              {record.tags && (
-                <PropertyRow label={t('skills.new.form.tags')}>
-                  <span className="flex flex-wrap gap-1">
-                    {splitTags(record.tags).map((tg) => (
-                      <Badge key={tg} tone="neutral">{tg}</Badge>
-                    ))}
+              <PropertyRow label={t('skills.custom.createdBy')}>{record.created_by_user || '—'}</PropertyRow>
+              <PropertyRow label={t('skills.custom.created')}>{timeAgo(record.created_at)}</PropertyRow>
+              {record.approval_id && (
+                <PropertyRow label={t('skills.custom.approvalId')}>
+                  <span className="font-mono">{record.approval_id}</span>
+                </PropertyRow>
+              )}
+              {record.approved_at && (
+                <PropertyRow label={t('skills.custom.approvedAt')}>
+                  <span className="flex items-center justify-end gap-1 text-success">
+                    <CheckCircle2 className="size-3.5" />
+                    {timeAgo(record.approved_at)}
                   </span>
                 </PropertyRow>
               )}
-            </PropertySection>
+              {record.rejection_reason && (
+                <PropertyRow label={t('skills.custom.rejectionReason')}>{record.rejection_reason}</PropertyRow>
+              )}
+            </CardContent>
           </Card>
-        )}
-
-        {/* Cumulative time saved — now a real figure: usage_count × per-use
-            estimate (or months-since-approval × per-month estimate), computed by
-            the backend. Still labeled as the user's own estimate basis. */}
-        <Section title={t('skills.custom.savings')}>
-          <Card>
-            <p className="text-2xl font-semibold tabular-nums text-stone-800 dark:text-stone-100">
-              {intl.formatMessage(
-                { id: 'skills.custom.savings.hoursValue', defaultMessage: '{value} h' },
-                { value: (record.saved_hours_estimate ?? 0).toFixed(1) },
-              )}
-            </p>
-            <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">{t('skills.custom.savings.estimateNote')}</p>
-            <p className="mt-2 text-xs text-stone-400 dark:text-stone-500">
-              {intl.formatMessage(
-                { id: 'skills.custom.savings.usedTimes', defaultMessage: 'Used {count} times' },
-                { count: record.usage_count ?? 0 },
-              )}
-            </p>
-          </Card>
-        </Section>
-
-        {/* Metadata + approval history */}
-        <Card>
-          <PropertySection title={t('skills.custom.history')}>
-            <PropertyRow label={t('skills.custom.builtBy')}>
-              {record.built_by_agent ? (
-                <span className="flex items-center gap-1.5">
-                  <CharacterAvatar agentId={record.built_by_agent} name={record.built_by_agent} size={18} />
-                  <span className="truncate">{record.built_by_agent}</span>
-                </span>
-              ) : (
-                '—'
-              )}
-            </PropertyRow>
-            <PropertyRow label={t('skills.custom.createdBy')}>{record.created_by_user || '—'}</PropertyRow>
-            <PropertyRow label={t('skills.custom.created')}>{timeAgo(record.created_at)}</PropertyRow>
-            {record.approval_id && (
-              <PropertyRow label={t('skills.custom.approvalId')}>
-                <Mono>{record.approval_id}</Mono>
-              </PropertyRow>
-            )}
-            {record.approved_at && (
-              <PropertyRow label={t('skills.custom.approvedAt')}>
-                <span className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
-                  <CheckCircle2 className="h-3.5 w-3.5" />
-                  {timeAgo(record.approved_at)}
-                </span>
-              </PropertyRow>
-            )}
-            {record.rejection_reason && (
-              <PropertyRow label={t('skills.custom.rejectionReason')}>{record.rejection_reason}</PropertyRow>
-            )}
-          </PropertySection>
-        </Card>
+        </section>
 
         {/* Fail-closed submit error */}
         {submitError && (
-          <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-400">
-            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
-            <p className="break-words text-xs">{submitError}</p>
+          <div className="flex items-start gap-2 rounded-xl bg-destructive/10 p-3 text-sm text-destructive">
+            <ShieldAlert className="mt-0.5 size-4 shrink-0" />
+            <p className="min-w-0 break-words text-xs">{submitError}</p>
           </div>
         )}
 
         {/* Actions */}
-        <div className="flex items-center gap-2 border-t border-[var(--panel-border)] pt-4">
+        <div className="flex items-center gap-2 border-t border-surface-border pt-4">
           {canSubmit && (
-            <Button
-              variant="primary"
-              icon={submitting ? Loader2 : Send}
-              onClick={handleSubmit}
-              disabled={submitting}
-              className={cn(submitting && '[&>svg]:animate-spin')}
-            >
+            <Button variant="brand" onClick={handleSubmit} disabled={submitting}>
+              {submitting ? <Loader2 className="animate-spin" /> : <Send />}
               {submitting
                 ? t('skills.new.review.submitting')
                 : record.status === 'rejected'
@@ -425,18 +476,13 @@ export function CustomSkillDetail({ id }: { id: string }) {
             </Button>
           )}
           {canRetire && (
-            <Button
-              variant="ghost"
-              icon={retiring ? Loader2 : Archive}
-              onClick={handleRetire}
-              disabled={retiring}
-              className={cn(retiring && '[&>svg]:animate-spin')}
-            >
+            <Button variant="ghost" onClick={handleRetire} disabled={retiring}>
+              {retiring ? <Loader2 className={cn('animate-spin')} /> : <Archive />}
               {t('skills.custom.retire')}
             </Button>
           )}
         </div>
       </div>
-    </Page>
+    </div>
   );
 }

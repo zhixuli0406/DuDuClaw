@@ -1,37 +1,56 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { useIntl, FormattedMessage } from 'react-intl';
+import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { useMcpStore } from '@/stores/mcp-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
-import { api, type McpServerDef, type McpCatalogItem, type McpOAuthProvider, type McpImportCandidate } from '@/lib/api';
-import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { toast } from '@/lib/toast';
+import { api, type McpServerDef, type McpCatalogItem, type McpOAuthProvider, type McpImportCandidate, type McpServerEntry } from '@/lib/api';
 import { DangerZone } from '@/components/settings/controls';
 import {
-  Page,
-  PageHeader,
-  Card,
-  Section,
-  Badge,
   Button,
-  EmptyState,
-  Toolbar,
-  Tabs,
-  type TabItem,
-} from '@/components/ui';
+  Badge,
+  Input,
+  Textarea,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  Switch,
+  Segmented,
+  Card,
+  CardContent,
+  Empty,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogClose,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  ListGridContainer,
+  ListGridHeader,
+  ListGridHeaderCell,
+  ListGridRow,
+  ListGridCell,
+  type SegmentedOption,
+} from '@/components/mds';
 import {
   Plug,
   Plus,
   Trash2,
   Package,
-  ChevronRight,
   Globe,
-  Database,
   MessageSquare,
+  Database,
   CheckCircle2,
   AlertTriangle,
-  X,
   Loader2,
   Shield,
   ShieldCheck,
@@ -39,9 +58,12 @@ import {
   KeyRound,
   Link as LinkIcon,
   Download,
+  RefreshCw,
+  MoreHorizontal,
 } from 'lucide-react';
 
 type Tab = 'agents' | 'marketplace' | 'oauth';
+type AgentLite = { name: string; display_name: string };
 
 const categoryIcons: Record<string, typeof Globe> = {
   browser: Globe,
@@ -52,6 +74,49 @@ const categoryIcons: Record<string, typeof Globe> = {
 
 function getCategoryIcon(category: string) {
   return categoryIcons[category] ?? Package;
+}
+
+/** Derive a transport label from a stdio server def (spec §4 transport Badge). */
+function transportOf(def: McpServerDef): 'stdio' | 'http' {
+  const blob = [def.command, ...def.args].join(' ').toLowerCase();
+  return blob.includes('mcp-remote') || blob.includes('http') ? 'http' : 'stdio';
+}
+
+/** Column template shared by the MCP-server ListGrid header + rows (spec §4). */
+const SERVER_COLUMNS =
+  'minmax(0,1.4fr) minmax(0,1.6fr) minmax(0,0.7fr) minmax(0,0.5fr) 2.5rem';
+
+/** Small agent picker (MDS Select) shared by the add/import/install dialogs. */
+function AgentSelect({
+  value,
+  onChange,
+  agents,
+  placeholder,
+  className,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  agents: ReadonlyArray<AgentLite>;
+  placeholder?: string;
+  className?: string;
+}) {
+  const current = agents.find((a) => a.name === value);
+  return (
+    <Select value={value} onValueChange={(v) => onChange(String(v))}>
+      <SelectTrigger className={cn('w-full', className)}>
+        <SelectValue placeholder={placeholder}>
+          {current ? current.display_name || current.name : placeholder}
+        </SelectValue>
+      </SelectTrigger>
+      <SelectContent>
+        {agents.map((a) => (
+          <SelectItem key={a.name} value={a.name}>
+            {a.display_name || a.name}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
 }
 
 export function McpPage() {
@@ -65,20 +130,10 @@ export function McpPage() {
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [catalogFilter, setCatalogFilter] = useState<string | null>(null);
   const [catalogSearch, setCatalogSearch] = useState('');
-  const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
-  const toastTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
   const showToast = useCallback((type: 'success' | 'error', message: string) => {
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    setToast({ type, message });
-    toastTimerRef.current = setTimeout(() => setToast(null), type === 'error' ? 8000 : 4000);
-  }, []);
-  const dismissToast = useCallback(() => {
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    setToast(null);
-  }, []);
-  useEffect(() => {
-    return () => { if (toastTimerRef.current) clearTimeout(toastTimerRef.current); };
+    if (type === 'success') toast.success(message);
+    else toast.error(message);
   }, []);
 
   useEffect(() => {
@@ -98,21 +153,24 @@ export function McpPage() {
 
   const selectedConfig = agentConfigs.find((c) => c.agent_id === selectedAgentId);
   // Backend serializes servers as an array of `{ name, command, args, env }`
-  // entries; normalize to [name, def] tuples for rendering. The Array.isArray
-  // guard keeps older object-shaped payloads working.
-  const serverEntries: Array<[string, { command: string; args: string[]; env: Record<string, string> }]> =
-    selectedConfig
-      ? Array.isArray(selectedConfig.servers)
-        ? selectedConfig.servers.map((s) => [s.name, s])
-        : Object.entries(selectedConfig.servers)
-      : [];
+  // entries; normalize to McpServerEntry[]. The Array.isArray guard keeps older
+  // object-shaped payloads working.
+  const serverEntries: McpServerEntry[] = selectedConfig
+    ? Array.isArray(selectedConfig.servers)
+      ? selectedConfig.servers
+      : Object.entries(
+          selectedConfig.servers as Record<string, McpServerDef>,
+        ).map(([name, def]) => ({ name, ...def }))
+    : [];
+
+  const agentLabel = (agentId: string) =>
+    agents.find((a) => a.name === agentId)?.display_name ?? agentId;
 
   const handleRemoveServer = async (agentId: string, serverName: string) => {
-    const agentLabel = agents.find((a) => a.name === agentId)?.display_name ?? agentId;
-    if (!confirm(intl.formatMessage({ id: 'mcp.confirmRemove' }, { agent: agentLabel, server: serverName }))) return;
+    if (!confirm(intl.formatMessage({ id: 'mcp.confirmRemove' }, { agent: agentLabel(agentId), server: serverName }))) return;
     try {
       await useMcpStore.getState().removeServer(agentId, serverName);
-      showToast('success', intl.formatMessage({ id: 'mcp.removed' }, { server: serverName, agent: agentLabel }));
+      showToast('success', intl.formatMessage({ id: 'mcp.removed' }, { server: serverName, agent: agentLabel(agentId) }));
     } catch {
       showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
     }
@@ -129,268 +187,132 @@ export function McpPage() {
     return matchesCategory && matchesSearch;
   });
 
-  // Group filtered catalog by category
-  const groupedCatalog = filteredCatalog.reduce<Record<string, ReadonlyArray<McpCatalogItem>>>((acc, item) => {
-    const group = acc[item.category] ?? [];
-    return { ...acc, [item.category]: [...group, item] };
-  }, {});
-
   // Check if a catalog item is installed on any agent
   const isInstalled = (catalogId: string) =>
-    agentConfigs.some((cfg) => Object.keys(cfg.servers).includes(catalogId));
+    agentConfigs.some((cfg) =>
+      (Array.isArray(cfg.servers) ? cfg.servers.map((s) => s.name) : Object.keys(cfg.servers)).includes(catalogId),
+    );
 
-  const tabItems: TabItem[] = [
-    { id: 'agents', label: intl.formatMessage({ id: 'mcp.tab.agents' }) },
-    { id: 'marketplace', label: intl.formatMessage({ id: 'mcp.tab.marketplace' }) },
-    { id: 'oauth', label: intl.formatMessage({ id: 'mcp.tab.oauth' }) },
+  const tabOptions: SegmentedOption<Tab>[] = [
+    { value: 'agents', label: intl.formatMessage({ id: 'mcp.tab.agents' }) },
+    { value: 'marketplace', label: intl.formatMessage({ id: 'mcp.tab.marketplace' }) },
+    { value: 'oauth', label: intl.formatMessage({ id: 'mcp.tab.oauth' }) },
   ];
 
   return (
-    <Page wide>
-      <PageHeader
-        icon={Plug}
-        title={intl.formatMessage({ id: 'nav.mcp' })}
-        subtitle={intl.formatMessage({ id: 'mcp.title' })}
-        actions={
-          <>
-            <Button variant="secondary" icon={LinkIcon} onClick={() => setShowImportDialog(true)}>
-              {intl.formatMessage({ id: 'mcp.import.fromUrl' })}
-            </Button>
-            <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
-              {intl.formatMessage({ id: 'mcp.add' })}
-            </Button>
-          </>
-        }
+    <div className="space-y-6">
+      {/* Slim header (inside the Integrations tab — no big page title). */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-sm text-muted-foreground">
+          {intl.formatMessage({ id: 'mcp.title' })}
+        </p>
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              fetchAll();
+              fetchOAuthProviders();
+            }}
+          >
+            <RefreshCw />
+            <span className="hidden sm:inline">{intl.formatMessage({ id: 'common.refresh' })}</span>
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setShowImportDialog(true)}>
+            <LinkIcon />
+            <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.import.fromUrl' })}</span>
+          </Button>
+          <Button variant="brand" size="sm" onClick={() => setShowAddDialog(true)}>
+            <Plus />
+            <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.add' })}</span>
+          </Button>
+        </div>
+      </div>
+
+      {/* Sub-navigation (agents / marketplace / oauth). */}
+      <Segmented
+        value={activeTab}
+        onValueChange={setActiveTab}
+        options={tabOptions}
+        aria-label={intl.formatMessage({ id: 'mcp.title' })}
       />
 
-      {/* Toast */}
-      {toast && (
-        <div className={cn(
-          'flex items-start gap-3 rounded-lg px-4 py-3 text-sm transition-all',
-          toast.type === 'success'
-            ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
-            : 'bg-rose-50 text-rose-700 dark:bg-rose-900/20 dark:text-rose-400'
-        )}>
-          {toast.type === 'success' ? (
-            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
-          ) : (
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-          )}
-          <span className="flex-1">{toast.message}</span>
-          <button
-            onClick={dismissToast}
-            className="shrink-0 rounded p-0.5 opacity-60 transition-opacity hover:opacity-100"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
+      {loading ? (
+        <div className="flex items-center justify-center py-16">
+          <Loader2 className="size-6 animate-spin text-brand" />
         </div>
-      )}
-
-      {/* Tabs */}
-      <Tabs items={tabItems} value={activeTab} onChange={(id) => setActiveTab(id as Tab)} />
-
-      {loading && (
-        <div className="flex items-center justify-center py-12">
-          <Loader2 className="h-6 w-6 animate-spin text-amber-500" />
-        </div>
-      )}
-
-      {/* Tab 1: Agent Config */}
-      {!loading && activeTab === 'agents' && (
-        <div className="flex gap-6">
-          {/* Left panel: agent list */}
-          <div className="w-56 shrink-0 space-y-1">
-            {agentConfigs.length === 0 ? (
-              <Card>
-                <EmptyState icon={Plug} title={intl.formatMessage({ id: 'mcp.empty' })} />
-              </Card>
-            ) : (
-              agentConfigs.map((cfg) => {
-                const agent = agents.find((a) => a.name === cfg.agent_id);
-                const serverCount = Object.keys(cfg.servers).length;
-                return (
-                  <button
-                    key={cfg.agent_id}
-                    onClick={() => setSelectedAgentId(cfg.agent_id)}
-                    className={cn(
-                      'flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm transition-colors',
-                      selectedAgentId === cfg.agent_id
-                        ? 'bg-amber-500/12 text-amber-700 dark:text-amber-400'
-                        : 'text-stone-600 hover:bg-stone-500/8 dark:text-stone-400 dark:hover:bg-white/5'
-                    )}
-                  >
-                    <span className="truncate font-medium">{agent?.display_name ?? cfg.agent_id}</span>
-                    <div className="flex items-center gap-1">
-                      <span className="text-xs tabular-nums text-stone-400 dark:text-stone-500">{serverCount}</span>
-                      <ChevronRight className="h-3.5 w-3.5 text-stone-400 dark:text-stone-500" />
-                    </div>
-                  </button>
-                );
-              })
-            )}
-          </div>
-
-          {/* Right panel: server cards */}
-          <div className="flex-1">
-            {!selectedAgentId ? (
-              <Card>
-                <EmptyState icon={Plug} title={intl.formatMessage({ id: 'mcp.selectAgent' })} />
-              </Card>
-            ) : serverEntries.length === 0 ? (
-              <Card>
-                <EmptyState icon={Package} title={intl.formatMessage({ id: 'mcp.noServers' })} />
-              </Card>
-            ) : (
-              <div className="grid gap-4 sm:grid-cols-2">
-                {serverEntries.map(([name, def]) => (
-                  <Card key={name}>
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="rounded-lg bg-amber-500/12 p-2.5 dark:bg-amber-400/10">
-                          <Plug className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-                        </div>
-                        <div>
-                          <h3 className="font-semibold text-stone-900 dark:text-stone-50">{name}</h3>
-                          <p className="text-xs text-stone-500 dark:text-stone-400 font-mono">{def.command}</p>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Args */}
-                    {def.args.length > 0 && (
-                      <div className="mt-3">
-                        <p className="text-xs font-medium text-stone-500 dark:text-stone-400">
-                          {intl.formatMessage({ id: 'mcp.args' })}
-                        </p>
-                        <p className="mt-0.5 text-xs font-mono text-stone-600 dark:text-stone-300 break-all">
-                          {def.args.join(' ')}
-                        </p>
-                      </div>
-                    )}
-
-                    {/* Env keys (values masked) */}
-                    {Object.keys(def.env).length > 0 && (
-                      <div className="mt-3">
-                        <p className="text-xs font-medium text-stone-500 dark:text-stone-400">
-                          {intl.formatMessage({ id: 'mcp.env' })}
-                        </p>
-                        <div className="mt-1 flex flex-wrap gap-1">
-                          {Object.keys(def.env).map((key) => (
-                            <span
-                              key={key}
-                              className="inline-flex items-center rounded bg-stone-500/10 px-1.5 py-0.5 text-xs font-mono text-stone-600 dark:text-stone-400"
-                            >
-                              {key}=***
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Actions */}
-                    <div className="mt-4 flex border-t border-[var(--panel-border)] pt-3">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        icon={Trash2}
-                        onClick={() => handleRemoveServer(selectedAgentId!, name)}
-                        className="text-rose-600 hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-500/10"
-                      >
-                        {intl.formatMessage({ id: 'mcp.remove' })}
-                      </Button>
-                    </div>
-                  </Card>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Tab 2: Marketplace */}
-      {!loading && activeTab === 'marketplace' && (
+      ) : activeTab === 'agents' ? (
         <div className="space-y-4">
-          {/* Search + category filters */}
-          <Toolbar
-            search={catalogSearch}
-            onSearchChange={setCatalogSearch}
-            searchPlaceholder={intl.formatMessage({ id: 'mcp.serverName' })}
-          >
-            <button
-              onClick={() => setCatalogFilter(null)}
-              className={cn(
-                'rounded-full px-3 py-1.5 text-xs font-medium transition-colors',
-                !catalogFilter
-                  ? 'bg-amber-500/12 text-amber-700 dark:text-amber-400'
-                  : 'text-stone-500 hover:bg-stone-500/8 dark:text-stone-400 dark:hover:bg-white/5'
-              )}
-            >
-              All
-            </button>
-            {categories.map((cat) => {
-              const CatIcon = getCategoryIcon(cat);
-              const labelKey = `mcp.catalog.${cat}` as const;
-              return (
-                <button
-                  key={cat}
-                  onClick={() => setCatalogFilter(cat === catalogFilter ? null : cat)}
-                  className={cn(
-                    'inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-xs font-medium transition-colors',
-                    catalogFilter === cat
-                      ? 'bg-amber-500/12 text-amber-700 dark:text-amber-400'
-                      : 'text-stone-500 hover:bg-stone-500/8 dark:text-stone-400 dark:hover:bg-white/5'
-                  )}
-                >
-                  <CatIcon className="h-3 w-3" />
-                  {intl.formatMessage({ id: labelKey, defaultMessage: cat })}
-                </button>
-              );
-            })}
-          </Toolbar>
+          {/* Agent picker → its configured servers. */}
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: 'mcp.targetAgent' })}
+            </h2>
+            {agentConfigs.length > 0 && (
+              <AgentSelect
+                value={selectedAgentId ?? ''}
+                onChange={setSelectedAgentId}
+                agents={agentConfigs.map((c) => ({ name: c.agent_id, display_name: agentLabel(c.agent_id) }))}
+                placeholder={intl.formatMessage({ id: 'mcp.selectAgent' })}
+                className="w-56"
+              />
+            )}
+          </div>
 
-          {/* Catalog grid */}
-          {Object.keys(groupedCatalog).length === 0 ? (
-            <Card>
-              <EmptyState icon={Package} title={intl.formatMessage({ id: 'mcp.empty' })} />
-            </Card>
+          {agentConfigs.length === 0 ? (
+            <Empty icon={Plug} title={intl.formatMessage({ id: 'mcp.empty' })} />
+          ) : !selectedAgentId ? (
+            <Empty icon={Plug} title={intl.formatMessage({ id: 'mcp.selectAgent' })} />
+          ) : serverEntries.length === 0 ? (
+            <Empty icon={Package} title={intl.formatMessage({ id: 'mcp.noServers' })} />
           ) : (
-            Object.entries(groupedCatalog).map(([category, items]) => (
-              <Section
-                key={category}
-                title={intl.formatMessage({ id: `mcp.catalog.${category}`, defaultMessage: category })}
+            <div className="overflow-hidden rounded-xl border border-surface-border">
+              <ListGridContainer
+                columns={SERVER_COLUMNS}
+                className="!h-auto [&>[aria-hidden]]:hidden"
+                header={
+                  <ListGridHeader>
+                    <ListGridHeaderCell>{intl.formatMessage({ id: 'mcp.serverName' })}</ListGridHeaderCell>
+                    <ListGridHeaderCell>{intl.formatMessage({ id: 'mcp.command' })}</ListGridHeaderCell>
+                    <ListGridHeaderCell>{intl.formatMessage({ id: 'mcp.col.transport' })}</ListGridHeaderCell>
+                    <ListGridHeaderCell className="justify-end">
+                      {intl.formatMessage({ id: 'mcp.col.env' })}
+                    </ListGridHeaderCell>
+                    <ListGridHeaderCell aria-hidden />
+                  </ListGridHeader>
+                }
               >
-                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                  {items.map((item) => {
-                    const installed = isInstalled(item.id);
-                    const CatIcon = getCategoryIcon(item.category);
-                    return (
-                      <CatalogCard
-                        key={item.id}
-                        item={item}
-                        installed={installed}
-                        CatIcon={CatIcon}
-                        agents={agents}
-                        onInstall={async (agentId) => {
-                          try {
-                            await useMcpStore.getState().addServer(agentId, item.id, item.default_def);
-                            const agentLabel = agents.find((a) => a.name === agentId)?.display_name ?? agentId;
-                            showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: item.name, agent: agentLabel }));
-                          } catch {
-                            showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
-                          }
-                        }}
-                      />
-                    );
-                  })}
-                </div>
-              </Section>
-            ))
+                {serverEntries.map((entry) => (
+                  <ServerRow
+                    key={entry.name}
+                    entry={entry}
+                    onRemove={() => handleRemoveServer(selectedAgentId, entry.name)}
+                  />
+                ))}
+              </ListGridContainer>
+            </div>
           )}
         </div>
-      )}
-
-      {/* Tab 3: OAuth */}
-      {!loading && activeTab === 'oauth' && (
+      ) : activeTab === 'marketplace' ? (
+        <MarketplaceTab
+          catalog={filteredCatalog}
+          categories={categories}
+          catalogFilter={catalogFilter}
+          setCatalogFilter={setCatalogFilter}
+          catalogSearch={catalogSearch}
+          setCatalogSearch={setCatalogSearch}
+          isInstalled={isInstalled}
+          agents={agents}
+          onInstall={async (agentId, item) => {
+            try {
+              await useMcpStore.getState().addServer(agentId, item.id, item.default_def);
+              showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: item.name, agent: agentLabel(agentId) }));
+            } catch {
+              showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
+            }
+          }}
+        />
+      ) : (
         <OAuthTab providers={oauthProviders} showToast={showToast} />
       )}
 
@@ -401,8 +323,7 @@ export function McpPage() {
         catalog={catalog}
         agents={agents}
         onAdded={(serverName, agentId) => {
-          const agentLabel = agents.find((a) => a.name === agentId)?.display_name ?? agentId;
-          showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: serverName, agent: agentLabel }));
+          showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: serverName, agent: agentLabel(agentId) }));
         }}
         onError={() => {
           showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
@@ -415,13 +336,227 @@ export function McpPage() {
           agents={agents}
           onClose={() => setShowImportDialog(false)}
           onInstalled={(serverName, agentId) => {
-            const agentLabel = agents.find((a) => a.name === agentId)?.display_name ?? agentId;
-            showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: serverName, agent: agentLabel }));
+            showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: serverName, agent: agentLabel(agentId) }));
             fetchAll();
           }}
         />
       )}
-    </Page>
+    </div>
+  );
+}
+
+// ── Agent-config server row (spec §4 ListGrid) ─────────────────
+
+function ServerRow({ entry, onRemove }: { entry: McpServerEntry; onRemove: () => void }) {
+  const intl = useIntl();
+  const transport = transportOf(entry);
+  const envCount = Object.keys(entry.env).length;
+  return (
+    <ListGridRow className="cursor-default">
+      <ListGridCell className="gap-2">
+        <span className="size-1.5 shrink-0 rounded-full bg-success" title={intl.formatMessage({ id: 'common.enabled' })} />
+        <Plug className="size-4 shrink-0 text-muted-foreground" />
+        <span className="truncate text-sm font-medium text-foreground" title={entry.name}>
+          {entry.name}
+        </span>
+      </ListGridCell>
+      <ListGridCell>
+        <span className="truncate font-mono text-xs text-muted-foreground" title={`${entry.command} ${entry.args.join(' ')}`}>
+          {entry.command} {entry.args.join(' ')}
+        </span>
+      </ListGridCell>
+      <ListGridCell>
+        <Badge variant="secondary">{transport}</Badge>
+      </ListGridCell>
+      <ListGridCell className="justify-end">
+        <span className="font-mono text-xs tabular-nums text-muted-foreground">{envCount}</span>
+      </ListGridCell>
+      <ListGridCell className="justify-end">
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={intl.formatMessage({ id: 'common.more' })}
+                data-stop-row-nav
+              />
+            }
+          >
+            <MoreHorizontal />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            <DropdownMenuItem variant="destructive" onClick={onRemove}>
+              <Trash2 />
+              {intl.formatMessage({ id: 'mcp.remove' })}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </ListGridCell>
+    </ListGridRow>
+  );
+}
+
+// ── Marketplace tab (tool catalog, slim row list) ──────────────
+
+function MarketplaceTab({
+  catalog,
+  categories,
+  catalogFilter,
+  setCatalogFilter,
+  catalogSearch,
+  setCatalogSearch,
+  isInstalled,
+  agents,
+  onInstall,
+}: {
+  catalog: ReadonlyArray<McpCatalogItem>;
+  categories: string[];
+  catalogFilter: string | null;
+  setCatalogFilter: (v: string | null) => void;
+  catalogSearch: string;
+  setCatalogSearch: (v: string) => void;
+  isInstalled: (id: string) => boolean;
+  agents: ReadonlyArray<AgentLite>;
+  onInstall: (agentId: string, item: McpCatalogItem) => Promise<void>;
+}) {
+  const intl = useIntl();
+  return (
+    <div className="space-y-4">
+      {/* Search + category filters. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          value={catalogSearch}
+          onChange={(e) => setCatalogSearch(e.target.value)}
+          placeholder={intl.formatMessage({ id: 'mcp.serverName' })}
+          className="w-full sm:w-64"
+        />
+        <div className="flex flex-wrap gap-1.5">
+          <Button
+            variant={catalogFilter === null ? 'brandSubtle' : 'ghost'}
+            size="xs"
+            onClick={() => setCatalogFilter(null)}
+          >
+            {intl.formatMessage({ id: 'common.all' })}
+          </Button>
+          {categories.map((cat) => {
+            const CatIcon = getCategoryIcon(cat);
+            return (
+              <Button
+                key={cat}
+                variant={catalogFilter === cat ? 'brandSubtle' : 'ghost'}
+                size="xs"
+                onClick={() => setCatalogFilter(cat === catalogFilter ? null : cat)}
+              >
+                <CatIcon />
+                {intl.formatMessage({ id: `mcp.catalog.${cat}`, defaultMessage: cat })}
+              </Button>
+            );
+          })}
+        </div>
+      </div>
+
+      {catalog.length === 0 ? (
+        <Empty icon={Package} title={intl.formatMessage({ id: 'mcp.empty' })} />
+      ) : (
+        <div className="overflow-hidden rounded-xl border border-surface-border divide-y divide-surface-border">
+          {catalog.map((item) => (
+            <CatalogRow
+              key={item.id}
+              item={item}
+              installed={isInstalled(item.id)}
+              agents={agents}
+              onInstall={(agentId) => onInstall(agentId, item)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CatalogRow({
+  item,
+  installed,
+  agents,
+  onInstall,
+}: {
+  item: McpCatalogItem;
+  installed: boolean;
+  agents: ReadonlyArray<AgentLite>;
+  onInstall: (agentId: string) => Promise<void>;
+}) {
+  const intl = useIntl();
+  const CatIcon = getCategoryIcon(item.category);
+  const [showInstall, setShowInstall] = useState(false);
+  const [targetAgent, setTargetAgent] = useState('');
+  const [installing, setInstalling] = useState(false);
+
+  const handleInstall = async () => {
+    if (!targetAgent) return;
+    setInstalling(true);
+    try {
+      await onInstall(targetAgent);
+      setShowInstall(false);
+      setTargetAgent('');
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-3 px-4 py-3">
+      <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
+        <CatIcon className="size-4 text-muted-foreground" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-sm font-medium text-foreground" title={item.name}>
+            {item.name}
+          </span>
+          <Badge variant="secondary">
+            {intl.formatMessage({ id: `mcp.catalog.${item.category}`, defaultMessage: item.category })}
+          </Badge>
+          {installed && <CheckCircle2 className="size-4 shrink-0 text-success" />}
+        </div>
+        <p className="truncate text-xs text-muted-foreground">{item.description}</p>
+        {item.required_env.length > 0 && (
+          <p className="mt-0.5 truncate text-xs text-muted-foreground/80">
+            {intl.formatMessage({ id: 'mcp.catalog.requiresEnv' }, { vars: item.required_env.join(', ') })}
+          </p>
+        )}
+      </div>
+      <Button variant="outline" size="sm" onClick={() => setShowInstall(true)} className="shrink-0">
+        <Plus />
+        <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.catalog.install' })}</span>
+      </Button>
+
+      <Dialog open={showInstall} onOpenChange={(o) => { if (!o) { setShowInstall(false); setTargetAgent(''); } }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{intl.formatMessage({ id: 'mcp.catalog.install' })}</DialogTitle>
+            <DialogDescription>{item.name}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'mcp.targetAgent' })}
+            </label>
+            <AgentSelect
+              value={targetAgent}
+              onChange={setTargetAgent}
+              agents={agents}
+              placeholder={intl.formatMessage({ id: 'mcp.targetAgent' })}
+            />
+          </div>
+          <DialogFooter>
+            <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'mcp.cancel' })}</Button>} />
+            <Button variant="brand" onClick={handleInstall} disabled={installing || !targetAgent}>
+              {installing ? intl.formatMessage({ id: 'mcp.adding' }) : intl.formatMessage({ id: 'mcp.catalog.install' })}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
   );
 }
 
@@ -429,13 +564,14 @@ export function McpPage() {
 //
 // URL → mcp.import.fetch (server-side fetch, SSRF-gated, per-server security
 // scan) → admin reviews command/args/env + findings → mcp.import.install
-// (re-scans fail-closed). A failed scan disables the install button.
+// (re-scans fail-closed). A failed scan disables the install button. Non-admins
+// file an approval request (manager → admin chain) via mcp.install_request.
 
 const IMPORT_SEVERITY_COLORS: Record<string, string> = {
-  critical: 'text-rose-500',
-  error: 'text-orange-500',
-  warning: 'text-amber-500',
-  info: 'text-stone-400',
+  critical: 'text-destructive',
+  error: 'text-warning',
+  warning: 'text-warning',
+  info: 'text-muted-foreground',
 };
 
 function ImportFromUrlDialog({
@@ -443,7 +579,7 @@ function ImportFromUrlDialog({
   onClose,
   onInstalled,
 }: {
-  agents: ReadonlyArray<{ name: string; display_name: string }>;
+  agents: ReadonlyArray<AgentLite>;
   onClose: () => void;
   onInstalled: (serverName: string, agentId: string) => void;
 }) {
@@ -510,190 +646,176 @@ function ImportFromUrlDialog({
   };
 
   return (
-    <Dialog open onClose={onClose} title={intl.formatMessage({ id: 'mcp.import.title' })}>
-      <div className="space-y-4">
-        <p className="text-sm text-stone-500 dark:text-stone-400">
-          {intl.formatMessage({ id: 'mcp.import.desc' })}
-        </p>
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'mcp.import.title' })}</DialogTitle>
+          <DialogDescription>{intl.formatMessage({ id: 'mcp.import.desc' })}</DialogDescription>
+        </DialogHeader>
 
-        {/* URL + fetch */}
-        <FormField label="URL">
-          <div className="flex gap-2">
-            <input
-              type="url"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleFetch(); }}
-              placeholder="https://github.com/user/mcp-server-repo"
-              className={inputClass}
-              autoFocus
-            />
-            <button onClick={handleFetch} disabled={fetching || !validUrl} className={cn(buttonSecondary, 'shrink-0')}>
-              {fetching
-                ? intl.formatMessage({ id: 'mcp.import.fetching' })
-                : intl.formatMessage({ id: 'mcp.import.fetch' })}
-            </button>
-          </div>
-        </FormField>
-        <p className="text-xs text-stone-400 dark:text-stone-500">
-          {intl.formatMessage({ id: 'mcp.import.hint' })}
-        </p>
-
-        {/* Candidates */}
-        {candidates && (
-          <>
-            <FormField label={intl.formatMessage({ id: 'mcp.targetAgent' })}>
-              <select value={targetAgent} onChange={(e) => setTargetAgent(e.target.value)} className={selectClass}>
-                <option value="">--</option>
-                {agents.map((a) => (
-                  <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
-                ))}
-              </select>
-            </FormField>
-
-            <label className="flex items-center gap-2 text-sm text-stone-600 dark:text-stone-400">
-              <input
-                type="checkbox"
-                checked={addToCatalog}
-                onChange={(e) => setAddToCatalog(e.target.checked)}
-                className="h-4 w-4 rounded border-stone-300 text-amber-500 focus:ring-amber-500"
+        <div className="space-y-4">
+          {/* URL + fetch */}
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">URL</label>
+            <div className="flex gap-2">
+              <Input
+                type="url"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleFetch(); }}
+                placeholder="https://github.com/user/mcp-server-repo"
+                autoFocus
               />
-              {intl.formatMessage({ id: 'mcp.import.addToCatalog' })}
-            </label>
+              <Button variant="outline" onClick={handleFetch} disabled={fetching || !validUrl} className="shrink-0">
+                {fetching
+                  ? intl.formatMessage({ id: 'mcp.import.fetching' })
+                  : intl.formatMessage({ id: 'mcp.import.fetch' })}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'mcp.import.hint' })}</p>
+          </div>
 
-            {!isAdmin && (
-              <p className="text-xs text-stone-500 dark:text-stone-400">
-                {intl.formatMessage({ id: 'install.request.nonAdminNotice' })}
-              </p>
-            )}
+          {/* Candidates */}
+          {candidates && (
+            <>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-muted-foreground">
+                  {intl.formatMessage({ id: 'mcp.targetAgent' })}
+                </label>
+                <AgentSelect
+                  value={targetAgent}
+                  onChange={setTargetAgent}
+                  agents={agents}
+                  placeholder={intl.formatMessage({ id: 'mcp.targetAgent' })}
+                />
+              </div>
 
-            <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
-              {candidates.map((c) => {
-                const isInstalled = installedNames.includes(c.name);
-                const isRequested = requestedNames.includes(c.name);
-                return (
-                  <div key={c.name} className="rounded-lg border border-[var(--panel-border)] p-3">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <h4 className="truncate font-semibold text-stone-900 dark:text-stone-50">{c.name}</h4>
-                          {c.passed ? (
-                            <span className="flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                              <ShieldCheck className="h-3.5 w-3.5" />
-                              {intl.formatMessage({ id: 'mcp.import.scanPassed' })}
-                            </span>
-                          ) : (
-                            <span className="flex items-center gap-1 text-xs font-medium text-rose-600 dark:text-rose-400">
-                              <ShieldAlert className="h-3.5 w-3.5" />
-                              {intl.formatMessage({ id: 'mcp.import.scanFailed' })}
-                            </span>
+              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Switch checked={addToCatalog} onCheckedChange={setAddToCatalog} />
+                {intl.formatMessage({ id: 'mcp.import.addToCatalog' })}
+              </label>
+
+              {!isAdmin && (
+                <p className="text-xs text-muted-foreground">
+                  {intl.formatMessage({ id: 'install.request.nonAdminNotice' })}
+                </p>
+              )}
+
+              <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
+                {candidates.map((c) => {
+                  const isInstalled = installedNames.includes(c.name);
+                  const isRequested = requestedNames.includes(c.name);
+                  return (
+                    <div key={c.name} className="rounded-lg border border-surface-border p-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <h4 className="truncate text-sm font-medium text-foreground">{c.name}</h4>
+                            {c.passed ? (
+                              <span className="flex items-center gap-1 text-xs font-medium text-success">
+                                <ShieldCheck className="size-3.5" />
+                                {intl.formatMessage({ id: 'mcp.import.scanPassed' })}
+                              </span>
+                            ) : (
+                              <span className="flex items-center gap-1 text-xs font-medium text-destructive">
+                                <ShieldAlert className="size-3.5" />
+                                {intl.formatMessage({ id: 'mcp.import.scanFailed' })}
+                              </span>
+                            )}
+                          </div>
+                          {c.description && (
+                            <p className="mt-0.5 text-xs text-muted-foreground">{c.description}</p>
+                          )}
+                          <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+                            {c.command} {c.args.join(' ')}
+                          </p>
+                          {Object.keys(c.env).length > 0 && (
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              {Object.keys(c.env).map((key) => (
+                                <span key={key} className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
+                                  {key}=***
+                                </span>
+                              ))}
+                            </div>
                           )}
                         </div>
-                        {c.description && (
-                          <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">{c.description}</p>
-                        )}
-                        <p className="mt-1 break-all font-mono text-xs text-stone-600 dark:text-stone-300">
-                          {c.command} {c.args.join(' ')}
-                        </p>
-                        {Object.keys(c.env).length > 0 && (
-                          <div className="mt-1 flex flex-wrap gap-1">
-                            {Object.keys(c.env).map((key) => (
-                              <span key={key} className="inline-flex items-center rounded bg-stone-500/10 px-1.5 py-0.5 text-xs font-mono text-stone-600 dark:text-stone-400">
-                                {key}=***
-                              </span>
-                            ))}
-                          </div>
-                        )}
+                        <Button
+                          variant="brand"
+                          size="sm"
+                          onClick={() => handleInstall(c)}
+                          disabled={!c.passed || !targetAgent || installing === c.name || isInstalled || isRequested}
+                          className="shrink-0"
+                          title={!c.passed
+                            ? intl.formatMessage({ id: 'mcp.import.blockedHint' })
+                            : !targetAgent
+                              ? intl.formatMessage({ id: 'mcp.targetAgent' })
+                              : undefined}
+                        >
+                          {isInstalled ? (
+                            <><CheckCircle2 />{intl.formatMessage({ id: 'mcp.import.installed' })}</>
+                          ) : isRequested ? (
+                            <><CheckCircle2 />{intl.formatMessage({ id: 'install.request.filedShort' })}</>
+                          ) : installing === c.name ? (
+                            <Loader2 className="animate-spin" />
+                          ) : (
+                            <><Download />{intl.formatMessage({ id: isAdmin ? 'mcp.catalog.install' : 'install.request.submit' })}</>
+                          )}
+                        </Button>
                       </div>
-                      <button
-                        onClick={() => handleInstall(c)}
-                        disabled={!c.passed || !targetAgent || installing === c.name || isInstalled || isRequested}
-                        className={cn(buttonPrimary, 'shrink-0 text-xs')}
-                        title={!c.passed
-                          ? intl.formatMessage({ id: 'mcp.import.blockedHint' })
-                          : !targetAgent
-                            ? intl.formatMessage({ id: 'mcp.targetAgent' })
-                            : undefined}
-                      >
-                        {isInstalled ? (
-                          <span className="flex items-center gap-1"><CheckCircle2 className="h-3.5 w-3.5" />{intl.formatMessage({ id: 'mcp.import.installed' })}</span>
-                        ) : isRequested ? (
-                          <span className="flex items-center gap-1"><CheckCircle2 className="h-3.5 w-3.5" />{intl.formatMessage({ id: 'install.request.filedShort' })}</span>
-                        ) : installing === c.name ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <span className="flex items-center gap-1">
-                            <Download className="h-3.5 w-3.5" />
-                            {intl.formatMessage({ id: isAdmin ? 'mcp.catalog.install' : 'install.request.submit' })}
-                          </span>
-                        )}
-                      </button>
+
+                      {/* Findings */}
+                      {c.scan.findings.length > 0 && (
+                        <ul className="mt-2 space-y-1 border-t border-surface-border pt-2">
+                          {c.scan.findings.map((f, i) => (
+                            <li key={i} className="flex items-start gap-1.5 text-xs">
+                              <AlertTriangle className={cn('mt-0.5 size-3 shrink-0', IMPORT_SEVERITY_COLORS[f.severity] ?? IMPORT_SEVERITY_COLORS.info)} />
+                              <span className="text-muted-foreground">
+                                <span className={cn('font-medium uppercase', IMPORT_SEVERITY_COLORS[f.severity] ?? IMPORT_SEVERITY_COLORS.info)}>{f.severity}</span>
+                                {' · '}{f.description}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                     </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
 
-                    {/* Findings */}
-                    {c.scan.findings.length > 0 && (
-                      <ul className="mt-2 space-y-1 border-t border-[var(--panel-border)] pt-2">
-                        {c.scan.findings.map((f, i) => (
-                          <li key={i} className="flex items-start gap-1.5 text-xs">
-                            <AlertTriangle className={cn('mt-0.5 h-3 w-3 shrink-0', IMPORT_SEVERITY_COLORS[f.severity] ?? IMPORT_SEVERITY_COLORS.info)} />
-                            <span className="text-stone-600 dark:text-stone-400">
-                              <span className={cn('font-semibold uppercase', IMPORT_SEVERITY_COLORS[f.severity] ?? IMPORT_SEVERITY_COLORS.info)}>{f.severity}</span>
-                              {' · '}{f.description}
-                            </span>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                );
-              })}
+          {error && (
+            <div className="flex items-start gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+              <span className="break-all">{error}</span>
             </div>
-          </>
-        )}
-
-        {error && (
-          <div className="flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
-            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-            <span className="break-all">{error}</span>
-          </div>
-        )}
-
-        <div className="flex justify-end gap-3 pt-2">
-          <button onClick={onClose} className={buttonSecondary}>
-            {intl.formatMessage({ id: 'mcp.cancel' })}
-          </button>
+          )}
         </div>
-      </div>
+
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'mcp.cancel' })}</Button>} />
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
 
-function getStatusBadge(
+// ── OAuth tab ──────────────────────────────────────────────
+
+function statusBadge(
   provider: McpOAuthProvider,
-  intl: ReturnType<typeof useIntl>
-): { label: string; tone: 'neutral' | 'success' | 'danger' | 'warning' } {
+  intl: ReturnType<typeof useIntl>,
+): { label: string; variant: 'secondary' | 'destructive'; className?: string } {
   if (!provider.configured) {
-    return {
-      label: intl.formatMessage({ id: 'mcp.oauth.notConfigured' }),
-      tone: 'neutral',
-    };
+    return { label: intl.formatMessage({ id: 'mcp.oauth.notConfigured' }), variant: 'secondary' };
   }
   switch (provider.token_status) {
     case 'authenticated':
-      return {
-        label: intl.formatMessage({ id: 'mcp.oauth.authenticated' }),
-        tone: 'success',
-      };
+      return { label: intl.formatMessage({ id: 'mcp.oauth.authenticated' }), variant: 'secondary', className: 'bg-success/15 text-success' };
     case 'expired':
-      return {
-        label: intl.formatMessage({ id: 'mcp.oauth.expired' }),
-        tone: 'danger',
-      };
+      return { label: intl.formatMessage({ id: 'mcp.oauth.expired' }), variant: 'destructive' };
     default:
-      return {
-        label: intl.formatMessage({ id: 'mcp.oauth.notAuthenticated' }),
-        tone: 'warning',
-      };
+      return { label: intl.formatMessage({ id: 'mcp.oauth.notAuthenticated' }), variant: 'secondary', className: 'bg-warning/15 text-warning' };
   }
 }
 
@@ -709,7 +831,6 @@ function OAuthTab({
   const [configureProvider, setConfigureProvider] = useState<McpOAuthProvider | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Cleanup polling on unmount
   useEffect(() => {
     return () => {
       if (pollTimerRef.current) clearInterval(pollTimerRef.current);
@@ -757,95 +878,77 @@ function OAuthTab({
   };
 
   return (
-    <Section title={intl.formatMessage({ id: 'mcp.oauth.title' })}>
+    <div className="space-y-4">
+      <h2 className="text-sm font-medium text-foreground">{intl.formatMessage({ id: 'mcp.oauth.title' })}</h2>
       {providers.length === 0 ? (
-        <Card>
-          <EmptyState icon={Shield} title={intl.formatMessage({ id: 'mcp.empty' })} />
-        </Card>
+        <Empty icon={Shield} title={intl.formatMessage({ id: 'mcp.empty' })} />
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {providers.map((provider) => {
-            const status = getStatusBadge(provider, intl);
+            const status = statusBadge(provider, intl);
             const isPending = pendingProvider === provider.provider_id;
-
             return (
               <Card key={provider.provider_id}>
-                <div className="flex items-start justify-between">
+                <CardContent className="space-y-3">
                   <div className="flex items-center gap-3">
-                    <div className="rounded-lg bg-amber-500/12 p-2.5 dark:bg-amber-400/10">
-                      <Globe className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+                    <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
+                      <Globe className="size-5 text-muted-foreground" />
                     </div>
+                    <div className="min-w-0">
+                      <h3 className="truncate text-base font-medium text-foreground">{provider.name}</h3>
+                      <Badge variant={status.variant} className={status.className}>{status.label}</Badge>
+                    </div>
+                  </div>
+
+                  {/* Scopes */}
+                  {provider.scopes.length > 0 && (
                     <div>
-                      <h3 className="font-semibold text-stone-900 dark:text-stone-50">{provider.name}</h3>
-                      <Badge tone={status.tone}>{status.label}</Badge>
+                      <p className="text-xs font-medium text-muted-foreground">
+                        {intl.formatMessage({ id: 'mcp.oauth.scopes' })}
+                      </p>
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {provider.scopes.map((scope) => (
+                          <span key={scope} className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
+                            {scope}
+                          </span>
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                </div>
+                  )}
 
-                {/* Scopes */}
-                {provider.scopes.length > 0 && (
-                  <div className="mt-3">
-                    <p className="text-xs font-medium text-stone-500 dark:text-stone-400">
-                      {intl.formatMessage({ id: 'mcp.oauth.scopes' })}
+                  {/* Expires at */}
+                  {provider.token_status === 'authenticated' && provider.expires_at && (
+                    <p className="text-xs text-muted-foreground">
+                      {intl.formatMessage({ id: 'mcp.oauth.expiresAt' }, { date: new Date(provider.expires_at).toLocaleDateString() })}
                     </p>
-                    <div className="mt-1 flex flex-wrap gap-1">
-                      {provider.scopes.map((scope) => (
-                        <span
-                          key={scope}
-                          className="inline-flex items-center rounded bg-stone-500/10 px-1.5 py-0.5 text-xs font-mono text-stone-600 dark:text-stone-400"
-                        >
-                          {scope}
-                        </span>
-                      ))}
+                  )}
+
+                  {/* Pending state */}
+                  {isPending && (
+                    <div className="flex items-center gap-2 text-sm text-brand">
+                      <Loader2 className="size-4 animate-spin" />
+                      {intl.formatMessage({ id: 'mcp.oauth.waiting' })}
                     </div>
-                  </div>
-                )}
-
-                {/* Expires at */}
-                {provider.token_status === 'authenticated' && provider.expires_at && (
-                  <p className="mt-2 text-xs text-stone-400 dark:text-stone-500">
-                    {intl.formatMessage({ id: 'mcp.oauth.expiresAt' }, { date: new Date(provider.expires_at).toLocaleDateString() })}
-                  </p>
-                )}
-
-                {/* Pending state */}
-                {isPending && (
-                  <div className="mt-3 flex items-center gap-2 text-sm text-amber-600 dark:text-amber-400">
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    {intl.formatMessage({ id: 'mcp.oauth.waiting' })}
-                  </div>
-                )}
+                  )}
+                </CardContent>
 
                 {/* Actions */}
-                <div className="mt-4 flex gap-2 border-t border-[var(--panel-border)] pt-3">
+                <div className="flex gap-2 border-t border-surface-border px-4 pt-3">
                   {!provider.configured && (
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      icon={KeyRound}
-                      onClick={() => setConfigureProvider(provider)}
-                    >
+                    <Button variant="brand" size="sm" onClick={() => setConfigureProvider(provider)}>
+                      <KeyRound />
                       {intl.formatMessage({ id: 'mcp.oauth.configure' })}
                     </Button>
                   )}
                   {provider.configured && provider.token_status !== 'authenticated' && !isPending && (
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      icon={Shield}
-                      onClick={() => handleAuthenticate(provider)}
-                    >
+                    <Button variant="brand" size="sm" onClick={() => handleAuthenticate(provider)}>
+                      <Shield />
                       {intl.formatMessage({ id: 'mcp.oauth.authenticate' })}
                     </Button>
                   )}
                   {provider.token_status === 'authenticated' && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      icon={Trash2}
-                      onClick={() => handleRevoke(provider)}
-                      className="text-rose-600 hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-500/10"
-                    >
+                    <Button variant="destructive" size="sm" onClick={() => handleRevoke(provider)}>
+                      <Trash2 />
                       {intl.formatMessage({ id: 'mcp.oauth.revoke' })}
                     </Button>
                   )}
@@ -864,7 +967,7 @@ function OAuthTab({
           showToast={showToast}
         />
       )}
-    </Section>
+    </div>
   );
 }
 
@@ -900,146 +1003,58 @@ function ConfigureOAuthDialog({
   };
 
   return (
-    <Dialog open onClose={onClose} title={intl.formatMessage({ id: 'mcp.oauth.configureTitle' })}>
-      <div className="space-y-4">
-        <FormField label="Provider">
-          <input type="text" value={provider.name} readOnly className={cn(inputClass, 'bg-stone-50 dark:bg-stone-800')} />
-        </FormField>
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'mcp.oauth.configureTitle' })}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">Provider</label>
+            <Input type="text" value={provider.name} readOnly className="bg-muted/50" />
+          </div>
 
-        <FormField label={intl.formatMessage({ id: 'mcp.oauth.clientId' })}>
-          <input
-            type="text"
-            value={clientId}
-            onChange={(e) => setClientId(e.target.value)}
-            placeholder="Client ID"
-            className={inputClass}
-          />
-        </FormField>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'mcp.oauth.clientId' })}
+            </label>
+            <Input
+              type="text"
+              value={clientId}
+              onChange={(e) => setClientId(e.target.value)}
+              placeholder="Client ID"
+            />
+          </div>
 
-        <FormField label={intl.formatMessage({ id: 'mcp.oauth.clientSecret' })}>
-          <input
-            type="password"
-            value={clientSecret}
-            onChange={(e) => setClientSecret(e.target.value)}
-            placeholder="Client Secret"
-            className={inputClass}
-          />
-        </FormField>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'mcp.oauth.clientSecret' })}
+            </label>
+            <Input
+              type="password"
+              value={clientSecret}
+              onChange={(e) => setClientSecret(e.target.value)}
+              placeholder="Client Secret"
+            />
+          </div>
 
-        <p className="text-xs text-stone-400 dark:text-stone-500">
-          {intl.formatMessage({ id: helpKey, defaultMessage: '' })}
-        </p>
-
-        <div className="flex justify-end gap-3 pt-2">
-          <button onClick={onClose} className={buttonSecondary}>
-            {intl.formatMessage({ id: 'mcp.cancel' })}
-          </button>
-          <button
-            onClick={handleSubmit}
-            disabled={submitting || !clientId.trim()}
-            className={buttonPrimary}
-          >
-            {submitting ? intl.formatMessage({ id: 'mcp.adding' }) : intl.formatMessage({ id: 'mcp.oauth.authenticate' })}
-          </button>
+          <p className="text-xs text-muted-foreground">
+            {intl.formatMessage({ id: helpKey, defaultMessage: '' })}
+          </p>
         </div>
-      </div>
+
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'mcp.cancel' })}</Button>} />
+          <Button variant="brand" onClick={handleSubmit} disabled={submitting || !clientId.trim()}>
+            {submitting ? intl.formatMessage({ id: 'mcp.adding' }) : intl.formatMessage({ id: 'mcp.oauth.authenticate' })}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
 
-function CatalogCard({
-  item,
-  installed,
-  CatIcon,
-  agents,
-  onInstall,
-}: {
-  item: McpCatalogItem;
-  installed: boolean;
-  CatIcon: typeof Globe;
-  agents: ReadonlyArray<{ name: string; display_name: string }>;
-  onInstall: (agentId: string) => Promise<void>;
-}) {
-  const intl = useIntl();
-  const [showInstall, setShowInstall] = useState(false);
-  const [targetAgent, setTargetAgent] = useState('');
-  const [installing, setInstalling] = useState(false);
-
-  const handleInstall = async () => {
-    if (!targetAgent) return;
-    setInstalling(true);
-    try {
-      await onInstall(targetAgent);
-      setShowInstall(false);
-      setTargetAgent('');
-    } finally {
-      setInstalling(false);
-    }
-  };
-
-  return (
-    <>
-      <Card>
-        <div className="flex items-start justify-between">
-          <div className="flex items-center gap-3">
-            <div className="rounded-lg bg-stone-500/10 p-2.5">
-              <CatIcon className="h-5 w-5 text-stone-600 dark:text-stone-400" />
-            </div>
-            <div>
-              <h3 className="font-semibold text-stone-900 dark:text-stone-50">{item.name}</h3>
-              <Badge tone="neutral">
-                {intl.formatMessage({ id: `mcp.catalog.${item.category}`, defaultMessage: item.category })}
-              </Badge>
-            </div>
-          </div>
-          {installed && (
-            <CheckCircle2 className="h-5 w-5 text-emerald-500" />
-          )}
-        </div>
-
-        <p className="mt-3 text-sm text-stone-600 dark:text-stone-400">{item.description}</p>
-
-        {item.required_env.length > 0 && (
-          <p className="mt-2 text-xs text-stone-400 dark:text-stone-500">
-            <FormattedMessage id="mcp.catalog.requiresEnv" values={{ vars: item.required_env.join(', ') }} />
-          </p>
-        )}
-
-        <div className="mt-4 border-t border-[var(--panel-border)] pt-3">
-          <Button variant="primary" size="sm" icon={Plus} onClick={() => setShowInstall(true)}>
-            {intl.formatMessage({ id: 'mcp.catalog.install' })}
-          </Button>
-        </div>
-      </Card>
-
-      {/* Install target agent dialog */}
-      <Dialog
-        open={showInstall}
-        onClose={() => { setShowInstall(false); setTargetAgent(''); }}
-        title={intl.formatMessage({ id: 'mcp.catalog.install' })}
-      >
-        <div className="space-y-4">
-          <FormField label={intl.formatMessage({ id: 'mcp.targetAgent' })}>
-            <select value={targetAgent} onChange={(e) => setTargetAgent(e.target.value)} className={selectClass}>
-              <option value="">--</option>
-              {agents.map((a) => (
-                <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
-              ))}
-            </select>
-          </FormField>
-          <div className="flex justify-end gap-3 pt-2">
-            <button onClick={() => { setShowInstall(false); setTargetAgent(''); }} className={buttonSecondary}>
-              {intl.formatMessage({ id: 'mcp.cancel' })}
-            </button>
-            <button onClick={handleInstall} disabled={installing || !targetAgent} className={buttonPrimary}>
-              {installing ? intl.formatMessage({ id: 'mcp.adding' }) : intl.formatMessage({ id: 'mcp.catalog.install' })}
-            </button>
-          </div>
-        </div>
-      </Dialog>
-    </>
-  );
-}
+// ── Add server dialog (catalog / custom) ───────────────────────
 
 function AddServerDialog({
   open,
@@ -1052,7 +1067,7 @@ function AddServerDialog({
   open: boolean;
   onClose: () => void;
   catalog: ReadonlyArray<McpCatalogItem>;
-  agents: ReadonlyArray<{ name: string; display_name: string }>;
+  agents: ReadonlyArray<AgentLite>;
   onAdded: (serverName: string, agentId: string) => void;
   onError: () => void;
 }) {
@@ -1078,7 +1093,7 @@ function AddServerDialog({
         setEnvText(
           Object.entries(item.default_def.env)
             .map(([k, v]) => `${k}=${v}`)
-            .join('\n')
+            .join('\n'),
         );
       }
     }
@@ -1101,11 +1116,11 @@ function AddServerDialog({
     try {
       const parsedEnv: Record<string, string> = {};
       for (const line of envText.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        const eqIdx = trimmed.indexOf('=');
+        const t = line.trim();
+        if (!t) continue;
+        const eqIdx = t.indexOf('=');
         if (eqIdx > 0) {
-          parsedEnv[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
+          parsedEnv[t.slice(0, eqIdx)] = t.slice(eqIdx + 1);
         }
       }
       const def: McpServerDef = {
@@ -1125,133 +1140,133 @@ function AddServerDialog({
     }
   };
 
+  const catalogModeOptions: SegmentedOption<'catalog' | 'custom'>[] = [
+    { value: 'catalog', label: intl.formatMessage({ id: 'mcp.fromCatalog' }) },
+    { value: 'custom', label: intl.formatMessage({ id: 'mcp.custom' }) },
+  ];
+  const selectedCatalogItem = catalog.find((c) => c.id === selectedCatalogId);
+
   return (
-    <Dialog open={open} onClose={() => { onClose(); resetForm(); }} title={intl.formatMessage({ id: 'mcp.addTitle' })}>
-      <div className="space-y-4">
-        {/* Mode toggle */}
-        <div className="flex gap-1 rounded-lg bg-stone-100 p-1 dark:bg-stone-800">
-          <button
-            onClick={() => setMode('catalog')}
-            className={cn(
-              'flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
-              mode === 'catalog'
-                ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-                : 'text-stone-500 dark:text-stone-400'
-            )}
+    <Dialog open={open} onOpenChange={(o) => { if (!o) { onClose(); resetForm(); } }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'mcp.addTitle' })}</DialogTitle>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          {/* Mode toggle */}
+          <Segmented value={mode} onValueChange={setMode} options={catalogModeOptions} className="w-full" />
+
+          {/* Catalog selector */}
+          {mode === 'catalog' && (
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                {intl.formatMessage({ id: 'mcp.fromCatalog' })}
+              </label>
+              <Select value={selectedCatalogId} onValueChange={(v) => setSelectedCatalogId(String(v))}>
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="--">{selectedCatalogItem?.name}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {catalog.map((item) => (
+                    <SelectItem key={item.id} value={item.id}>{item.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
+          {/* Target agent */}
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'mcp.targetAgent' })}
+            </label>
+            <AgentSelect
+              value={targetAgent}
+              onChange={setTargetAgent}
+              agents={agents}
+              placeholder={intl.formatMessage({ id: 'mcp.targetAgent' })}
+            />
+          </div>
+
+          {/* Server name */}
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'mcp.serverName' })}
+            </label>
+            <Input
+              type="text"
+              value={serverName}
+              onChange={(e) => setServerName(e.target.value)}
+              placeholder="e.g. filesystem"
+              readOnly={mode === 'catalog' && !!selectedCatalogId}
+            />
+          </div>
+
+          {/* Command / Args / Env — spawning an MCP server runs a real process on
+              the host, so these live inside a DangerZone. */}
+          <DangerZone
+            title={intl.formatMessage({ id: 'mcp.custom.dangerTitle' })}
+            description={intl.formatMessage({ id: 'mcp.custom.dangerDesc' })}
           >
-            {intl.formatMessage({ id: 'mcp.fromCatalog' })}
-          </button>
-          <button
-            onClick={() => setMode('custom')}
-            className={cn(
-              'flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
-              mode === 'custom'
-                ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-                : 'text-stone-500 dark:text-stone-400'
-            )}
-          >
-            {intl.formatMessage({ id: 'mcp.custom' })}
-          </button>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                {intl.formatMessage({ id: 'mcp.command' })}
+              </label>
+              <Input
+                type="text"
+                value={command}
+                onChange={(e) => setCommand(e.target.value)}
+                placeholder="e.g. npx"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                {intl.formatMessage({ id: 'mcp.args' })}
+              </label>
+              <Input
+                type="text"
+                value={args}
+                onChange={(e) => setArgs(e.target.value)}
+                placeholder="e.g. -y @modelcontextprotocol/server-filesystem /path"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                {intl.formatMessage({ id: 'mcp.env' })}
+              </label>
+              <Textarea
+                value={envText}
+                onChange={(e) => setEnvText(e.target.value)}
+                placeholder={'API_KEY=your-key\nANOTHER_VAR=value'}
+                rows={3}
+                className="resize-none font-mono text-xs"
+              />
+              <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'mcp.env.help' })}</p>
+            </div>
+          </DangerZone>
+
+          {error && (
+            <div className="flex items-start gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
         </div>
 
-        {/* Catalog selector */}
-        {mode === 'catalog' && (
-          <FormField label={intl.formatMessage({ id: 'mcp.fromCatalog' })}>
-            <select
-              value={selectedCatalogId}
-              onChange={(e) => setSelectedCatalogId(e.target.value)}
-              className={selectClass}
-            >
-              <option value="">--</option>
-              {catalog.map((item) => (
-                <option key={item.id} value={item.id}>{item.name}</option>
-              ))}
-            </select>
-          </FormField>
-        )}
-
-        {/* Target agent */}
-        <FormField label={intl.formatMessage({ id: 'mcp.targetAgent' })}>
-          <select value={targetAgent} onChange={(e) => setTargetAgent(e.target.value)} className={selectClass}>
-            <option value="">--</option>
-            {agents.map((a) => (
-              <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
-            ))}
-          </select>
-        </FormField>
-
-        {/* Server name */}
-        <FormField label={intl.formatMessage({ id: 'mcp.serverName' })}>
-          <input
-            type="text"
-            value={serverName}
-            onChange={(e) => setServerName(e.target.value)}
-            placeholder="e.g. filesystem"
-            className={inputClass}
-            readOnly={mode === 'catalog' && !!selectedCatalogId}
-          />
-        </FormField>
-
-        {/* Command / Args / Env — spawning an MCP server runs a real process on
-            the host, so these live inside a DangerZone. */}
-        <DangerZone
-          title={intl.formatMessage({ id: 'mcp.custom.dangerTitle' })}
-          description={intl.formatMessage({ id: 'mcp.custom.dangerDesc' })}
-        >
-          {/* Command */}
-          <FormField label={intl.formatMessage({ id: 'mcp.command' })}>
-            <input
-              type="text"
-              value={command}
-              onChange={(e) => setCommand(e.target.value)}
-              placeholder="e.g. npx"
-              className={inputClass}
-            />
-          </FormField>
-
-          {/* Args */}
-          <FormField label={intl.formatMessage({ id: 'mcp.args' })}>
-            <input
-              type="text"
-              value={args}
-              onChange={(e) => setArgs(e.target.value)}
-              placeholder="e.g. -y @modelcontextprotocol/server-filesystem /path"
-              className={inputClass}
-            />
-          </FormField>
-
-          {/* Env vars */}
-          <FormField label={intl.formatMessage({ id: 'mcp.env' })} hint={intl.formatMessage({ id: 'mcp.env.help' })}>
-            <textarea
-              value={envText}
-              onChange={(e) => setEnvText(e.target.value)}
-              placeholder={"API_KEY=your-key\nANOTHER_VAR=value"}
-              rows={3}
-              className={cn(inputClass, 'resize-none font-mono text-xs')}
-            />
-          </FormField>
-        </DangerZone>
-
-        {error && (
-          <div className="flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
-            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-            <span>{error}</span>
-          </div>
-        )}
-
-        <div className="flex justify-end gap-3 pt-2">
-          <button onClick={() => { onClose(); resetForm(); }} className={buttonSecondary}>
-            {intl.formatMessage({ id: 'mcp.cancel' })}
-          </button>
-          <button
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'mcp.cancel' })}</Button>} />
+          <Button
+            variant="brand"
             onClick={handleSubmit}
             disabled={submitting || !targetAgent || !serverName.trim() || !command.trim()}
-            className={buttonPrimary}
           >
             {submitting ? intl.formatMessage({ id: 'mcp.adding' }) : intl.formatMessage({ id: 'mcp.add' })}
-          </button>
-        </div>
-      </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 }
