@@ -360,8 +360,8 @@
 | 機能 | 説明 |
 |------|------|
 | 23 ページ | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
-| 技術スタック | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui、暖色 amber テーマ |
-| Calm Glass デザインシステム（v1.22.0）| 共有 `web/src/components/ui/` コンポーネントライブラリ + `nav-model.ts` の 6 グループサイドバー + `web/DESIGN.md` 仕様；全ページを共有プリミティブで再構築、en/ja/zh i18n 同期 |
+| 技術スタック | React 19 + TypeScript + Tailwind CSS 4 + Base UI + CVA |
+| DuDuClaw デザインシステム（mds）| 共有 `web/src/components/mds/` コンポーネントライブラリ（OKLCH トークン、4 層サーフェス、3 段シャドウ、Inter／Geist Mono）+ `nav-model.ts` のグループ化サイドバー（個人／作業／会社／設定）+ `web/DESIGN.md` 仕様；全ページを共有プリミティブで構築、en/ja/zh i18n 同期 |
 | リアルタイムログストリーミング | BroadcastLayer tracing → WebSocket push |
 | Memory Key Insights | `key_facts` カード + access_count バッジ + タイムスタンプ + メタデータ |
 | Memory Evolution | SOUL.md バージョン履歴 + 前後メトリクス差分 + 状態バッジ |
