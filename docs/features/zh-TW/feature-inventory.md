@@ -360,8 +360,8 @@
 | 功能 | 說明 |
 |------|------|
 | 23 頁面 | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
-| 技術棧 | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui，暖色 amber 主題 |
-| Calm Glass 設計系統（v1.22.0）| 共用 `web/src/components/ui/` 元件庫 + `nav-model.ts` 六分組側邊欄 + `web/DESIGN.md` 設計規範；全頁面以共用元件重構，en/ja/zh i18n 同步 |
+| 技術棧 | React 19 + TypeScript + Tailwind CSS 4 + Base UI + CVA |
+| DuDuClaw 設計系統（mds）| 共用 `web/src/components/mds/` 元件庫（OKLCH token、四層表面、三層陰影、Inter／Geist Mono）+ `nav-model.ts` 分組側邊欄（個人／工作／公司／設定）+ `web/DESIGN.md` 設計規範；全頁面以共用元件建構，en/ja/zh i18n 同步 |
 | 即時日誌串流 | BroadcastLayer tracing → WebSocket |
 | Memory Key Insights | `key_facts` 卡片 + access_count badge + 時間戳 + 來源 metadata |
 | Memory Evolution | SOUL.md 版本歷史 + 前後度量差異 + 狀態徽章 |

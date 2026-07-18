@@ -2,6 +2,146 @@
 
 ## [Unreleased]
 
+### Added
+- **自主目標迴圈（Goal Loop，2026-07-17）。** 在頻道丟一個目標，AI 員工就自主
+  規劃、執行、自我驗收，做到完成或卡住時回來通知你——把「一問一答」升級為
+  「給目標自主做完、卡住問你」的成套模式。整套預設關閉，靠 `[dispatch] enabled`
+  啟用，不影響現有對話。
+  - **驗收驅動終止**：完成訊號只認驗收判官核可（`LlmAcceptanceJudge` 接上帳號
+    輪替），不信任 AI 自評「做完了」；未通過帶回饋重試（Generator-Verifier）。
+  - **外層迴圈驅動器**（`goal_loop.rs`）：把待辦目標任務派上既有喚醒軌，重試即時
+    推進；硬終止守衛（派工上限 / 牆鐘上限 / 並行上限 / 進度震盪偵測）任一踩線即
+    轉人工，runaway 不可能。
+  - **分級自主**（`AutonomyLevel` 五級 operator→observer，per-agent
+    `agent.toml [capabilities] autonomy_level`，預設 Approver）＋ needs_human /
+    kickoff 審批往返（Telegram / Discord / Slack / LINE 內嵌按鈕，冪等且
+    fail-closed）。
+  - **回饋路徑斷路器**（`duduclaw-core::dispatch_guard`）＋ 級聯 hop-depth 防再生型
+    無限迴圈，`config.toml [dispatch_guard]` 可調。
+  - **`/goal` 使用者入口**：`/goal <目標>`、`/goal <目標> || <驗收標準>`、
+    `/goal status`；任務記住來源頻道＋對話（`tasks.source_channel/source_chat_id`
+    兩欄，idempotent migration），進度與需人工通知推回發起對話。文件：
+    `docs/guides/goal-loop.md`。
+- **自訂 Widget 系統（2026-07-16）。** 儀表板 widget 從固定五款內建擴充為可自訂：
+  - **沙箱執行環境**：自訂 widget 是單檔 HTML，在 `sandbox="allow-scripts"` 的
+    iframe 內執行（無 `allow-same-origin` ⇒ 拿不到 JWT/DOM/localStorage），
+    渲染時注入 CSP（禁外部資源與網路外呼）與 SDK shim；資料只能經
+    postMessage **唯讀允許清單橋**（`agents.summary`／`tasks.summary`／
+    `cost.summary`／`channels.status`／`system.status`，10 req/s 上限，
+    繼承當前使用者的角色與資料範圍）。主題跟隨儀表板明暗、高度自動。
+  - **AI 產生（一般使用者）**：`/widgets/new` 引導式流程（資料來源＋呈現型態＋
+    自由描述）→ `widgets.custom.generate`（走 rotated CLI → Direct API 備援、
+    零工具 caps）→ 沙箱即時預覽 → 不滿意可帶回饋「再改一版」→ 儲存才落庫。
+  - **HTML 完整客製（管理員/經銷商）**：`/widgets/new?mode=html` 原始 HTML
+    編輯＋即時預覽；匯出/匯入 `.json` 讓經銷商跨客戶搬運。
+  - **Widget 工坊（`/widgets`）**：「我的／團隊分享」兩 tab，卡片帶 **lazy 縮圖
+    預覽**（進 viewport 才掛縮放沙箱、不可互動），一鍵加入儀表板、分享/取消
+    分享、複製他人分享、匯出入、刪除（管理員可下架任何分享）。
+  - 首頁 layout 以 `custom:<id>` 引用（fail-closed：只放行自己可見的
+    widget id），編輯模式抽屜可加入自訂 widget。**view-as** 檢視下屬儀表板時
+    自訂 widget 一併渲染（html 隨 `dashboard.layout.view` 內嵌下發——受同一道
+    strict-rank 閘保護，下屬私有 widget 不經 `widgets.custom.get` 外洩）。
+  - 後端：`custom_widgets.rs` SQLite store（256 KB/widget 上限、擁有權在
+    store 層強制）＋ `widgets.custom.list/get/create/update/remove/share/generate`
+    七支 RPC。設計文件：`commercial/docs/custom-widgets-design-2026-07-16.md`、
+    公開文件：`docs/features/30-custom-widgets.md`。
+  - **產生鏈活體驗證過**（claude-sonnet-4-6 真跑兩輪）：第一輪暴露模型會輸出
+    說明文字而非 HTML、且橋接資料缺日期欄位——已補 prompt 尾端輸出紀律、
+    `extract_html_fragment()` 伺服端剝除環繞散文（純散文＝硬錯誤不落庫）、
+    `tasks.summary` 增 `completed_today` 與 `completed_at`；第二輪產出 4.1 KB
+    合規 fragment（`<` 開頭、用橋接、用 CSS 變數、零外部資源）。
+  - **每人 widget 數量上限（2026-07-17）**：`custom_widgets.rs` 新增
+    `max_widgets_per_user()`（預設 20，讀 `DUDUCLAW_MAX_WIDGETS_PER_USER`
+    覆寫、`0`＝無限——與 `EditionProfile::personal_max_agents()` 同款慣例），
+    在 store 層 `create()` 內強制（非只在 RPC 層），達上限回 zh-TW 錯誤訊息；
+    `widgets.custom.list` 回應加 `max_per_user` 供前端顯示，工坊「我的」tab
+    標籤在有上限時顯示「我的（{count}/{cap}）」。
+  - **橋接層結果快取（2026-07-17）**：`widget-bridge.ts` 對唯讀橋接方法加
+    15 秒 TTL 的模組層快取＋in-flight 去重（快取存 promise，同時到達的請求
+    共享同一次呼叫；失敗立即從快取移除、不快取錯誤結果）——避免工坊縮圖
+    同屏掛出數十個 iframe 時對同一 method 重複打 API；rate limit（每 widget
+    10 req/s）維持原邏輯，快取命中一樣計入該 widget 的請求窗口。
+
+- **個人版 Agent 規模策略：軟提示，不設硬上限（2026-07-15 提案、07-16 拍板 B+C）。**
+  維持「self-host 永不設限」的開源承諾：個人版**預設無 Agent 數上限**
+  （`personal_max_agents()` 預設 `0`=無限）。超過建議規模（3 個）時儀表板 Agent
+  頁顯示**溫和升級提示**（可永久關閉、不阻擋任何操作），升級動機交給既有的企業
+  能力閘（部門／簽核／多帳號／白牌）。託管部署若需要硬上限可設
+  `DUDUCLAW_PERSONAL_MAX_AGENTS`（機制保留：`agents.create`、
+  `templates.create_agent` 與 MCP `create_agent` 三個入口都會執行）。企業版不受
+  此機制影響，維持依 license tier（含 self-host 豁免與簽章 override）。
+- **決策/簽核事項主動推播到通道（Feature C，2026-07-15）。** 安裝簽核申請送出或
+  進入下一關時，主動 DM 該關卡的簽核人（依角色＋部門解析：員工→同部門主管；
+  主管關已過→管理員）到其**已綁定的通道**（`channel_identities`）。訊息含功能說明
+  與安全審查摘要。全通道文字投遞（重用 `channel_sender`），best-effort 非阻斷。
+  新模組 `install_notify`（`approvers_for` 有 5 個單元測試）。
+- **通道核准/拒絕按鈕（Feature D，2026-07-15；07-16 補全四通道）。** `channel_format`
+  新增 `duduclaw:install_approve|deny:{id}` 動作與 Telegram/Discord/Slack/LINE 四通道
+  的按鈕 builder。**四通道端到端接通**：通知帶內嵌核准/退回按鈕（Telegram inline
+  keyboard、Slack Block Kit、Discord DM components——自動開 bot↔user DM channel、
+  LINE quickReply postback），點擊經 `install_notify::decide_from_channel` 把點擊者
+  的通道帳號對回儀表板身分、依角色＋部門授權後 `InstallRequestStore::decide`，
+  最終核准即伺服端重掃並安裝（`apply_install_request`，通道路徑略過即時 registry
+  rescan，下次掃描熱載）。無按鈕通道走文字通知＋儀表板提示。
+- **簽核最終結果回報申請人（2026-07-16）。** 申請被退回／核准安裝完成／核准但
+  安裝失敗時，主動 DM 申請人的已綁定通道（`install_notify::notify_requester`），
+  儀表板與通道兩條決策路徑都會觸發。先前申請人送出後只能自己去儀表板刷新。
+- **MCP `create_agent` 補上 Agent 數上限（2026-07-16）。** MCP server 是獨立行程，
+  儀表板的 `tier_limit_message` 閘門管不到它——先前任何 agent 可經 MCP 工具無限建
+  agent，繞過 P-License 簽章 `max_agents` 配額（及託管部署設定的個人版硬上限）。
+  新增 `license_runtime::agent_cap_message_from_disk()`（從磁碟 bootstrap license，
+  與 gateway 同規則），`handle_create_agent` 建立前先過閘。
+- **簽核按鈕點擊後即拆（2026-07-16）。** 決策落地後按鈕不再留在訊息上：Telegram
+  `editMessageText` 改寫原通知並附上結果、Discord 用 interaction type 7
+  UPDATE_MESSAGE 清空 components、Slack 走 `response_url` `replace_original`；
+  未授權／已被他人處理的點擊仍以短訊回覆、按鈕保留給有權限的人。LINE quickReply
+  本身即拋，無需處理。
+- **Edition 背景變化也會推播（2026-07-16）。** 60 秒輪詢 edition 的安全網：
+  phone-home 降級、CRL 撤銷、寬限期到期等**不經 RPC** 的授權轉換，現在也會廣播
+  `system.status_changed` 讓開著的儀表板即時反映（RPC 路徑維持即時 inline 廣播）。
+- **Edition 變更即時推播到儀表板（2026-07-16）。** 授權啟用（`license.activate`）
+  或夥伴碼兌換（`license.redeem`）成功後，後端廣播 `system.status_changed`（帶新的
+  `edition_profile`），開著的儀表板**不需手動重整**即反映 personal→enterprise 的
+  切換（前端 system-store 早已訂閱此事件，先前後端從未發送）。`system.status`
+  payload 抽成共用 `system_status_payload()` 供 RPC 與廣播共用。活體驗證：無 license
+  開機為 personal → activate → 5 秒內收到事件帶 enterprise。
+
+### Fixed
+- **通道通知讀錯 LINE token 欄位（2026-07-16）。** `install_notify` 原以
+  `{channel}_bot_token` 硬組 config 欄位名，LINE 的欄位其實是
+  `line_channel_token`——LINE 簽核通知會靜默跳過。改用與 OTP 投遞相同的
+  `token_field()` 對照表（單一事實來源）。同類掃描：cron 通知的全域 token
+  fallback（`cron_scheduler::resolve_channel_token`）有一樣的硬組欄位名問題，
+  LINE 全域 fallback 一併修正。
+- **無按鈕通道漏掉儀表板提示（2026-07-16）。** 提示旗標語意反轉：WhatsApp／飛書等
+  無按鈕通道的簽核通知反而**沒有**「請至儀表板核准」提示，收到通知的人無從行動。
+- **`apply_install_request` 補齊 fail-closed 驗證（2026-07-16）。** 通道路徑的安裝
+  執行漏了儀表板孿生（`execute_approved_install`）既有的 `agent_id`／
+  `server_name`／department 識別字驗證（識別字會組檔案路徑）；另外 skill
+  frontmatter 的 `name:` 曾直接組 temp 檔名，`name: ../../x` 可逃出 temp 目錄——
+  新增 `sanitize_tmp_file_stem()` 並同步修補儀表板路徑 `run_skill_install` 的同類問題。
+
+### Changed
+- **儀表板全站設計系統重構（2026-07-18）。** 整個網頁儀表板換上全新視覺語言：
+  沉穩的四層表面疊出深度、克制的動效、成體系的圓角與陰影，資訊密度更高卻更
+  好讀。底層改用 `web/src/components/mds/` 新元件庫（一套按鈕／卡片／列表／
+  對話框／設定版型等原語），65+ 個頁面全數遷移到這套原語上，舊的 Calm Glass／
+  Soft Play 設計系統與其殘留元件、CSS 一併移除。功能一個不減，只換外觀與結構。
+  使用者可感知的變化：全新的整體視覺、**側邊欄導航重新分組**（個人／工作／
+  公司／設定四區）、**管理區收斂為統一的「設定式」版型**（左側分組導覽＋設定列）、
+  **AI 員工的設定拆成多個子分頁**（能力與設定分頁瀏覽，不再是一張擠滿欄位的
+  巨型表單）。深淺主題與三語（繁中／英／日）維持同步。設計文件：`web/DESIGN.md`。
+- **Create/Edit Agent 從彈窗改為獨立頁面（2026-07-16）。** `/agents/new` 與
+  `/agents/:id/edit` 取代 AgentsPage 內的兩個巨型 Dialog（頁面可深連結、
+  表單不再擠在彈窗內捲動）；行為與欄位完全保留（含個人版隱藏部門欄位）。
+  `AgentsPage.tsx` 由 2,423 行縮至 452 行，表單拆至 `pages/agent-form/`；
+  順手移除從未能開啟的 `InspectDialog` 死碼。
+- **個人版隱藏部門/企業設定（2026-07-15）。** 個人版是單人形態，無部門概念：
+  導航「部門管理」改 `enterprise` 閘（個人版隱藏）；新建／編輯 Agent 對話框的
+  部門下拉、Skill 安裝的 `department:` scope 選項在個人版一併隱藏（沿用
+  `system.status.edition_profile === 'personal'` 既有 gate 慣例）。多帳號成員頁
+  原本就是 enterprise 閘，個人版本來就看不到。
+
 ## [1.36.0] - 2026-07-15 — Vetted Skill/MCP install-from-URL + department-routed install approvals
 
 ### Added

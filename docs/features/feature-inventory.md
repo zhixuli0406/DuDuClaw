@@ -364,8 +364,8 @@
 | Feature | Description |
 |---------|-------------|
 | 23 Pages | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
-| Tech Stack | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui, warm amber theme |
-| Calm Glass Design System (v1.22.0) | Shared `web/src/components/ui/` component library + `nav-model.ts` 6-group sidebar + `web/DESIGN.md` spec; every page rebuilt on the shared primitives with synchronized en/ja/zh i18n |
+| Tech Stack | React 19 + TypeScript + Tailwind CSS 4 + Base UI + CVA |
+| DuDuClaw Design System (mds) | Shared `web/src/components/mds/` component library (OKLCH tokens, four-layer surfaces, three-tier shadows, Inter / Geist Mono) + `nav-model.ts` grouped sidebar (personal / work / company / settings) + `web/DESIGN.md` spec; every page built on the shared primitives with synchronized en/ja/zh i18n |
 | Real-time Log Streaming | BroadcastLayer tracing → WebSocket push |
 | Memory → Key Insights Tab | `key_facts` cards with access_count badge + timestamp + collapsible source metadata |
 | Memory → Evolution Tab | SOUL.md version history with pre/post metric deltas + status badges |
