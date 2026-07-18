@@ -17,7 +17,7 @@ use crate::claude_runner::{call_claude_for_agent_with_type};
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_container::sandbox;
 
-use duduclaw_core::{MAX_DELEGATION_DEPTH, ENV_DELEGATION_DEPTH, ENV_DELEGATION_ORIGIN, ENV_DELEGATION_SENDER, truncate_bytes};
+use duduclaw_core::{MAX_DELEGATION_DEPTH, ENV_DELEGATION_DEPTH, ENV_DELEGATION_ORIGIN, ENV_DELEGATION_SENDER, ENV_HOP_DEPTH, truncate_bytes};
 
 /// Message envelope stored in `bus_queue.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +42,13 @@ struct BusMessage {
     /// `MAX_DELEGATION_DEPTH` are dropped by the dispatcher.
     #[serde(default)]
     delegation_depth: u8,
+    /// P3 cascade **hop depth** (paper 2607.01641, "Agent tool reentry"). Rides
+    /// the task across the dispatcher's re-spawn boundary and is injected into
+    /// the target agent's CLI via `DUDUCLAW_HOP_DEPTH` so a re-generating
+    /// feedback loop inherits — never resets — its depth. Optional for
+    /// backward-compat with tasks enqueued before this field existed (⇒ 0).
+    #[serde(default)]
+    hop_depth: u8,
     /// The agent that originally initiated the delegation chain.
     /// Remains constant across all hops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +202,10 @@ async fn poll_and_dispatch_sqlite(
             depth: msg.delegation_depth as u8,
             origin: msg.origin_agent.clone().unwrap_or_default(),
             sender: msg.sender_agent.clone().unwrap_or_default(),
+            // SQLite queue rows do not carry hop_depth (no schema column); the
+            // JSONL bus is the hop_depth-bearing rail. Seed from delegation_depth
+            // so a SQLite-dispatched chain still inherits a non-resetting depth.
+            hop_depth: msg.delegation_depth as u8,
         };
 
         // v1.8.16: propagate the originating channel context down into the
@@ -448,6 +459,7 @@ async fn poll_and_dispatch(
                         response: None,
                         in_reply_to: Some(msg.message_id.clone()),
                         delegation_depth: msg.delegation_depth,
+                        hop_depth: msg.hop_depth,
                         origin_agent: msg.origin_agent.clone(),
                         sender_agent: Some(msg.agent_id.clone()),
                         coalesced_ids: vec![],
@@ -539,6 +551,7 @@ async fn poll_and_dispatch(
                 depth: msg.delegation_depth,
                 origin: msg.origin_agent.clone().unwrap_or_default(),
                 sender: msg.sender_agent.clone().unwrap_or_default(),
+                hop_depth: msg.hop_depth,
             };
             let dispatch_fut = dispatch_to_agent(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
@@ -685,6 +698,7 @@ async fn poll_and_dispatch(
                 response: None,
                 in_reply_to: Some(msg.message_id.clone()),
                 delegation_depth: msg.delegation_depth,
+                hop_depth: msg.hop_depth,
                 origin_agent: msg.origin_agent.clone(),
                 sender_agent: Some(msg.agent_id.clone()),
                 coalesced_ids: vec![],
@@ -749,6 +763,9 @@ struct DelegationEnv {
     depth: u8,
     origin: String,
     sender: String,
+    /// P3 cascade hop depth carried from the bus task; injected as
+    /// `DUDUCLAW_HOP_DEPTH` so the target agent's next delegation inherits it.
+    hop_depth: u8,
 }
 
 impl DelegationEnv {
@@ -758,6 +775,7 @@ impl DelegationEnv {
         map.insert(ENV_DELEGATION_DEPTH.to_string(), self.depth.to_string());
         map.insert(ENV_DELEGATION_ORIGIN.to_string(), self.origin.clone());
         map.insert(ENV_DELEGATION_SENDER.to_string(), self.sender.clone());
+        map.insert(ENV_HOP_DEPTH.to_string(), self.hop_depth.to_string());
         map
     }
 }
@@ -1238,6 +1256,7 @@ pub async fn dispatch_taskspec(
             depth: 0,
             origin: spec.agent_id.clone(),
             sender: spec.agent_id.clone(),
+            hop_depth: 0,
         };
         let result = dispatch_to_agent(home_dir, registry, &target_agent, &prompt, &delegation).await;
 
@@ -1337,6 +1356,7 @@ async fn handle_step_failure(
                 depth: 0,
                 origin: spec.agent_id.clone(),
                 sender: "__planner__".to_string(),
+                hop_depth: 0,
             };
             let planner_response = dispatch_to_agent(
                 home_dir, registry, &spec.agent_id, &replan_prompt, &delegation,
@@ -1428,6 +1448,9 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
             // Use the maximum delegation depth from the chunk to prevent
             // a low-depth message from masking a deeper one.
             let max_depth = chunk.iter().map(|m| m.delegation_depth).max().unwrap_or(0);
+            // Same for hop_depth: a coalesced task inherits the deepest cascade
+            // depth of its constituents (never resets it).
+            let max_hop = chunk.iter().map(|m| m.hop_depth).max().unwrap_or(0);
 
             // Collect message_ids from non-first messages so their delegation
             // callbacks can also be consumed when the coalesced response arrives.
@@ -1442,6 +1465,7 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
                 response: None,
                 in_reply_to: None,
                 delegation_depth: max_depth,
+                hop_depth: max_hop,
                 origin_agent: first.origin_agent.clone(),
                 sender_agent: first.sender_agent.clone(),
                 coalesced_ids: extra_ids,
@@ -2807,6 +2831,7 @@ mod tests {
             response: None,
             in_reply_to: None,
             delegation_depth: 0,
+            hop_depth: 0,
             origin_agent: None,
             sender_agent: None,
             coalesced_ids: vec![],
@@ -3179,6 +3204,7 @@ mod tests {
                 response: None,
                 in_reply_to: None,
                 delegation_depth: 2,
+                hop_depth: 0,
                 origin_agent: Some("main".to_string()),
                 sender_agent: Some("researcher".to_string()),
                 coalesced_ids: vec![],
@@ -3194,6 +3220,7 @@ mod tests {
                 response: None,
                 in_reply_to: None,
                 delegation_depth: 4,
+                hop_depth: 0,
                 origin_agent: Some("main".to_string()),
                 sender_agent: Some("analyst".to_string()),
                 coalesced_ids: vec![],

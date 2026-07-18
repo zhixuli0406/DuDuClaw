@@ -813,6 +813,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Start agent dispatcher (consumes bus_queue.jsonl + SQLite queue, spawns sub-agents).
     // Clone the Arc so AutopilotEngine can share the same MessageQueue (delegate action).
     let mq_for_autopilot = message_queue.clone();
+    // Clone for the P1 goal loop driver (spawned below alongside the dispatch
+    // engine); `message_queue` itself is moved into the dispatcher.
+    let mq_for_goal_loop = message_queue.clone();
     // P1 fix (2026-05-09): reuse the shared GvuTriggerCtx built earlier so
     // dispatcher + silence consumer share the same GvuLoop / MistakeNotebook
     // — keeps post-GVU bookkeeping consistent across the two trigger paths.
@@ -880,10 +883,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // bus_queue.jsonl file rail lacks: zombie reclaim (crashed-worker leases) +
     // goal-mode judge acceptance. Atomic claim / dependency unlock are enforced
     // in task_store and reached via the tasks_claim MCP tool.
-    // NOTE: the acceptance judge is not yet wired to the account rotator; goal-mode
-    // `review` tasks sit safely in `review` (never auto-accepted) until an
-    // LlmAcceptanceJudge is injected here (follow-up). Zombie reclaim + dependency
-    // gating are fully live regardless.
+    // The acceptance judge runs through the utility runtime choke-point
+    // (`run_utility_prompt` → account rotator for Claude), so goal-mode `review`
+    // tasks are evaluated on the same rotated LLM plumbing the fork/eval judges
+    // use. Zombie reclaim + dependency gating are live regardless.
     // Default OFF (conservative rollout default — see `dispatch_engine_enabled`).
     // Lease renewal is wired (LeaseRenewalGuard for in-process workers,
     // `tasks_renew` MCP heartbeat for external agents) and reclaim is
@@ -893,9 +896,50 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // regardless of this flag.
     if crate::dispatch_engine::dispatch_engine_enabled(&home_dir) {
         if let Some(ts) = task_store_opt.clone() {
-            let engine = Arc::new(crate::dispatch_engine::DispatchEngine::new(ts, None));
+            let caller = crate::dispatch_engine::GoalAcceptanceCaller {
+                home_dir: home_dir.clone(),
+            };
+            let judge: Arc<dyn crate::dispatch_engine::AcceptanceJudge> =
+                Arc::new(crate::dispatch_engine::LlmAcceptanceJudge::new(caller));
+            let engine = Arc::new(crate::dispatch_engine::DispatchEngine::new(
+                ts.clone(),
+                Some(judge),
+            ));
             bg_handles.push(tokio::spawn(async move { engine.run().await }));
             info!("Dispatch engine started (durable SQLite派工：殭屍回收 + goal-mode 驗收)");
+
+            // ── P1: autonomous goal loop driver ──────────────────
+            // The DispatchEngine only reviews goal-mode completions; it does NOT
+            // drive execution. The goal loop driver is the missing outer loop:
+            // it dispatches todo/pending goal_mode tasks onto the existing
+            // message_queue wake-up rail (the same rail the heartbeat task-board
+            // pull uses), re-dispatches judge-rejected tasks with feedback for the
+            // Generator-Verifier retry, and owns the hard termination guards
+            // (iteration / wall-clock / concurrency caps → needs_human). Gated by
+            // the same `[dispatch] enabled` flag; goal_mode tasks are themselves
+            // opt-in, so no separate flag is needed. Requires the message queue.
+            if let Some(mq) = mq_for_goal_loop.clone() {
+                let cfg = crate::goal_loop::GoalLoopConfig::from_home(&home_dir);
+                // P2a: the driver reads per-agent `autonomy_level` from
+                // agent.toml and pushes needs_human / kickoff approvals to the
+                // agent's channel; the kickoff gate uses the shared HITL broker.
+                let mut driver = crate::goal_loop::GoalLoopDriver::new(ts, mq, cfg)
+                    .with_home_dir(home_dir.clone());
+                match crate::approval::ApprovalBroker::open(&home_dir) {
+                    Ok(broker) => {
+                        driver = driver.with_broker(Arc::new(broker));
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        "Goal loop: ApprovalBroker unavailable — kickoff gate disabled (Collaborator/Consultant proceed)"
+                    ),
+                }
+                let driver = Arc::new(driver);
+                bg_handles.push(tokio::spawn(async move { driver.run().await }));
+                info!("Goal loop driver started (autonomous goal_mode 外層迴圈驅動器)");
+            } else {
+                warn!("Goal loop driver not started: message queue unavailable");
+            }
         }
     } else {
         info!("Dispatch engine disabled (預設關；lease 續租已接上，可用 [dispatch] enabled=true 啟用)");
@@ -1146,6 +1190,33 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             loop {
                 tick.tick().await;
                 bg_state.handler.refresh_audit_index().await;
+            }
+        });
+    }
+
+    // Edition live-watch: license transitions that do NOT flow through an RPC
+    // (phone-home downgrade, CRL revocation, grace-period expiry) must still
+    // reach open dashboards. The RPC paths (`license.activate` /
+    // `license.redeem`) broadcast inline; this 60s poll is the safety net for
+    // background transitions, broadcasting only on an actual change.
+    {
+        let bg_state = state.clone();
+        tokio::spawn(async move {
+            let mut last = bg_state.handler.resolve_edition_profile().await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                let now = bg_state.handler.resolve_edition_profile().await;
+                if now != last {
+                    tracing::info!(
+                        from = %last.as_str(),
+                        to = %now.as_str(),
+                        "edition changed in background — broadcasting system.status"
+                    );
+                    bg_state.handler.broadcast_system_status().await;
+                    last = now;
+                }
             }
         });
     }
@@ -1746,23 +1817,42 @@ fn run_wiki_janitor_pass(
     }
 }
 
-/// Refresh endpoint rate limiter: max 10 per IP per 5 minutes (H9 fix).
+/// Refresh endpoint rate limiter window and budget.
+///
+/// H9 originally set this to 10/5min, but that is far too tight for a real
+/// session: each page (re)load runs `loadFromStorage` (up to 4 retries on a
+/// transient failure) and every open tab plus the 25-min auto-refresh timer
+/// all hit `/api/refresh`. A user navigating and reloading a few times inside
+/// the window exhausted 10 quickly, the client's retries burned the rest, and
+/// `loadFromStorage` fell through to the login screen (Bug#2). 60/5min keeps a
+/// meaningful abuse ceiling (this endpoint only exchanges a valid refresh
+/// token) while leaving ample headroom for legitimate multi-tab use.
+const REFRESH_RATE_WINDOW_SECS: u64 = 300;
+const REFRESH_RATE_MAX: u32 = 60;
+
 static REFRESH_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn check_refresh_rate_limit(ip: IpAddr) -> bool {
+/// Returns `Ok(())` when within budget, or `Err(retry_after_secs)` when the IP
+/// is over the limit (so the caller can emit a `Retry-After` header).
+fn check_refresh_rate_limit(ip: IpAddr) -> Result<(), u64> {
     let mut map = REFRESH_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     if map.len() > 10000 {
-        map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < 300);
+        map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < REFRESH_RATE_WINDOW_SECS);
     }
     let entry = map.entry(ip).or_insert((now, 0));
-    if now.duration_since(entry.0).as_secs() > 300 {
+    let elapsed = now.duration_since(entry.0).as_secs();
+    if elapsed > REFRESH_RATE_WINDOW_SECS {
         *entry = (now, 1);
-        return true;
+        return Ok(());
     }
     entry.1 += 1;
-    entry.1 <= 10
+    if entry.1 <= REFRESH_RATE_MAX {
+        Ok(())
+    } else {
+        Err(REFRESH_RATE_WINDOW_SECS.saturating_sub(elapsed).max(1))
+    }
 }
 
 /// POST /api/refresh — Exchange a refresh token for a new access token.
@@ -1771,10 +1861,11 @@ async fn handle_refresh(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<RefreshRequest>,
 ) -> impl IntoResponse {
-    // H9 fix: rate limit refresh endpoint
-    if !check_refresh_rate_limit(addr.ip()) {
+    // H9 fix: rate limit refresh endpoint (60/5min — see REFRESH_RATE_MAX).
+    if let Err(retry_after) = check_refresh_rate_limit(addr.ip()) {
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
             Json(serde_json::json!({"error": "too many refresh attempts"})),
         ).into_response();
     }

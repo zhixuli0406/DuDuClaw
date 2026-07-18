@@ -67,6 +67,7 @@ pub mod approval;
 pub mod capability;
 pub mod growth;
 pub mod custom_skills;
+pub mod custom_widgets;
 pub mod audit_export;
 pub mod budget;
 pub mod cost_anomaly;
@@ -91,6 +92,7 @@ pub mod cli_auth;
 pub mod handlers;
 pub mod line;
 pub mod local_llm;
+pub mod install_notify;
 pub mod install_requests;
 pub mod mcp_oauth;
 pub mod mcp_scan;
@@ -199,3 +201,10 @@ pub mod night_llm;
 // ── G1: durable multi-agent dispatch engine (atomic claim / zombie reclaim /
 //        dependency unlock / goal-mode judge acceptance) ──
 pub mod dispatch_engine;
+
+// ── P1: autonomous goal loop — outer-loop driver that dispatches goal_mode
+//        tasks, enforces iteration/wall-clock/concurrency caps, and re-dispatches
+//        judge-rejected tasks with feedback ──
+pub mod goal_loop;
+// ── P2a: goal-loop channel push + decision (needs_human exit + autonomy kickoff) ──
+pub mod goal_notify;

@@ -1,11 +1,11 @@
 # TODO:方案 B —「工作空間」雙層體驗(Genspark 對齊)
 
-> **目標**:在現有「Calm Glass」儀表板之上,新增一個 Genspark 風格的**消費級外殼**
+> **目標**:在現有 DuDuClaw Design System（mds）儀表板之上,新增一個 Genspark 風格的**消費級外殼**
 > (中央 prompt bar + 能力啟動網格 + Claw「您的第一位 AI 員工」入口),
 > 同時**完整保留**現有 power-user 儀表板作為「進階模式」。
 > 「一個框」降低門檻;「完整儀表板」留給深度使用者 —— 這是 Genspark 給不了的自架 / 隱私內核。
 >
-> **設計依據**:[web/DESIGN.md](../../web/DESIGN.md)(Calm Glass,本就以 genspark/Linear/Notion 為 clarity 參照)。
+> **設計依據**:[web/DESIGN.md](../../web/DESIGN.md)(DuDuClaw Design System,以 Linear/Notion 等 clarity 參照)。
 > **參照畫面**:Genspark AI 工作空間 4.0(深色底 + 中央 prompt bar + 工具網格)、Genspark Claw(「您的第一位 AI 員工」四張價值卡)。
 > **慣例**:`[ ]` 待辦 / `[~]` 進行中 / `[x]` 完成。括號內為精確切點。
 >

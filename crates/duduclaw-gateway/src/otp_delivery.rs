@@ -27,7 +27,8 @@ pub trait OtpDeliverer: Send + Sync {
 
 /// Maps a channel to its global `[channels]` bot-token config field. Only the
 /// 1:1-DM-capable channels are supported for OTP; anything else is rejected.
-fn token_field(channel: &str) -> Option<&'static str> {
+/// Also reused by `install_notify` (same "DM a linked dashboard user" shape).
+pub(crate) fn token_field(channel: &str) -> Option<&'static str> {
     match channel {
         "telegram" => Some("telegram_bot_token"),
         "line" => Some("line_channel_token"),

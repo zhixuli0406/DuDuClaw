@@ -2,6 +2,7 @@ pub mod agent_guard;
 pub mod config;
 pub mod cron_tz;
 pub mod department;
+pub mod dispatch_guard;
 pub mod error;
 pub mod fs_lock;
 pub mod keychain;
@@ -16,6 +17,9 @@ pub use config::write_minimal_config;
 pub use cron_tz::{parse_timezone, should_fire_in_tz};
 pub use department::{
     department_of_page, department_page_visible, is_valid_department, DEPARTMENTS_NAMESPACE,
+};
+pub use dispatch_guard::{
+    check_and_record as dispatch_guard_check, DispatchGuardConfig, DispatchGuardDecision,
 };
 pub use error::{DuDuClawError, Result};
 pub use fs_lock::with_file_lock;
@@ -39,6 +43,21 @@ pub const MAX_DELEGATION_DEPTH: u8 = 5;
 pub const ENV_DELEGATION_DEPTH: &str = "DUDUCLAW_DELEGATION_DEPTH";
 pub const ENV_DELEGATION_ORIGIN: &str = "DUDUCLAW_DELEGATION_ORIGIN";
 pub const ENV_DELEGATION_SENDER: &str = "DUDUCLAW_DELEGATION_SENDER";
+
+/// Cascade **hop depth** for the goal-loop / feedback path (paper 2607.01641,
+/// "Agent tool reentry"). Distinct from `delegation_depth`: that bounds direct
+/// agent→agent delegation chains inside one MCP call; `hop_depth` rides the bus
+/// task across the dispatcher's re-spawn boundary so a re-generating feedback
+/// loop (dispatch → agent → spawn → dispatch …) inherits — never resets — its
+/// depth. The dispatcher injects the current task's value via [`ENV_HOP_DEPTH`];
+/// the MCP server reads it, writes `hop_depth = value + 1` onto the next bus
+/// task, and rejects once it exceeds [`DEFAULT_MAX_HOP_DEPTH`]
+/// (overridable via `config.toml [dispatch_guard] max_hop_depth`).
+pub const ENV_HOP_DEPTH: &str = "DUDUCLAW_HOP_DEPTH";
+
+/// Default cascade hop-depth ceiling (config-overridable). Exceeding it rejects
+/// the delegating call with an explicit "委派鏈過深" error.
+pub const DEFAULT_MAX_HOP_DEPTH: u8 = 5;
 
 /// Agent identity injected into Claude CLI subprocesses via per-agent
 /// `.mcp.json` so the MCP server knows *which* agent is the current

@@ -676,10 +676,16 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
         // Highest-priority unstarted task for this agent. `pending` = durable
         // dispatch-engine tasks awaiting a claim — without it here they are
         // never surfaced to anyone (MED finding, 2026-07 review).
+        // Goal-mode tasks are driven by the gateway's goal loop driver
+        // (`goal_loop.rs`), which dispatches them without the 1-hour cooldown so
+        // the Generator-Verifier retry loop stays tight. Excluding them here
+        // avoids a double nudge (goal loop + heartbeat) on the same task; the
+        // heartbeat pull remains the fallback wake-up for ordinary tasks.
         let todo: Option<(String, String, String)> = tdb
             .query_row(
                 "SELECT id, title, priority FROM tasks
                  WHERE assigned_to = ?1 AND status IN ('todo', 'pending')
+                   AND COALESCE(goal_mode, 0) = 0
                  ORDER BY CASE priority
                      WHEN 'critical' THEN 0
                      WHEN 'urgent'   THEN 1

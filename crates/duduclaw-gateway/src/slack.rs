@@ -580,6 +580,33 @@ async fn respond_via_response_url(
     }
 }
 
+/// Replace the ORIGINAL message (the one carrying the buttons) via the
+/// interaction's `response_url` — used once an install decision lands, so the
+/// spent approve/deny buttons disappear instead of inviting a second click.
+async fn replace_original_via_response_url(
+    http: &reqwest::Client,
+    response_url: &str,
+    text: &str,
+) {
+    if !is_valid_slack_response_url(response_url) {
+        warn!("Slack: rejecting suspicious response_url");
+        return;
+    }
+    let body = json!({
+        "replace_original": true,
+        "text": text,
+        // A single section block REPLACES the original blocks (including the
+        // actions block with the buttons); an empty blocks array is rejected
+        // by some Slack API surfaces, so always send a valid one.
+        "blocks": [
+            { "type": "section", "text": { "type": "mrkdwn", "text": text } }
+        ],
+    });
+    if let Err(e) = http.post(response_url).json(&body).send().await {
+        error!("Slack response_url replace error: {e}");
+    }
+}
+
 /// Handle a `slash_commands` Socket-Mode envelope (native slash commands).
 ///
 /// Note: Slack slash commands are declared in the app manifest (there is no
@@ -703,6 +730,58 @@ async fn handle_interactive_envelope(
     let response_url = payload["response_url"].as_str().unwrap_or("");
     if response_url.is_empty() {
         return;
+    }
+
+    // Install-approval buttons (Feature D): map the clicking Slack account to
+    // a dashboard user, authorize, and decide. `None` → not an install action,
+    // fall through to the other handlers below.
+    let slack_uid = payload["user"]["id"].as_str().unwrap_or("");
+    if !slack_uid.is_empty() {
+        if let Some(result) = crate::install_notify::decide_from_channel(
+            &ctx.home_dir, "slack", slack_uid, action_id,
+        )
+        .await
+        {
+            match result {
+                // Decision landed → replace the button message with the
+                // outcome so the spent buttons disappear.
+                Ok(m) => {
+                    let original = payload["message"]["text"].as_str().unwrap_or("");
+                    let text =
+                        if original.is_empty() { m } else { format!("{original}\n\n{m}") };
+                    replace_original_via_response_url(http, response_url, &text).await;
+                }
+                // Unauthorized / already handled → quiet ephemeral note; the
+                // message stays for whoever IS allowed to act on it.
+                Err(m) => {
+                    respond_via_response_url(http, response_url, "ephemeral", &format!("⚠️ {m}"))
+                        .await;
+                }
+            }
+            return;
+        }
+    }
+
+    // Goal-loop buttons (P2a): needs_human retry/done/abort + autonomy kickoff.
+    if !slack_uid.is_empty() {
+        if let Some(result) = crate::goal_notify::decide_from_channel(
+            &ctx.home_dir, "slack", slack_uid, action_id,
+        )
+        .await
+        {
+            match result {
+                Ok(m) => {
+                    let original = payload["message"]["text"].as_str().unwrap_or("");
+                    let text = if original.is_empty() { m } else { format!("{original}\n\n{m}") };
+                    replace_original_via_response_url(http, response_url, &text).await;
+                }
+                Err(m) => {
+                    respond_via_response_url(http, response_url, "ephemeral", &format!("⚠️ {m}"))
+                        .await;
+                }
+            }
+            return;
+        }
     }
 
     match action_id {

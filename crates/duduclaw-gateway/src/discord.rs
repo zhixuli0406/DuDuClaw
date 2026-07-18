@@ -1895,6 +1895,82 @@ async fn handle_component_interaction(
     // Ephemeral confirmation helper (flags 64 = only the presser sees it).
     let ephemeral = |msg: String| json!({ "content": msg, "flags": 64 });
 
+    // Install-approval buttons (Feature D): map the clicking Discord account
+    // to a dashboard user, authorize, and decide. DM interactions carry the
+    // user at `user`, guild interactions at `member.user`.
+    if matches!(action, "install_approve" | "install_deny") {
+        let discord_uid = data["user"]["id"]
+            .as_str()
+            .or_else(|| data["member"]["user"]["id"].as_str())
+            .unwrap_or("");
+        let outcome = if discord_uid.is_empty() {
+            Some(Err("無法識別點擊者身分".to_string()))
+        } else {
+            crate::install_notify::decide_from_channel(
+                &ctx.home_dir, "discord", discord_uid, custom_id,
+            )
+            .await
+        };
+        match outcome {
+            // Decision landed → type 7 UPDATE_MESSAGE: append the outcome to
+            // the original notification and clear the spent buttons.
+            Some(Ok(m)) => {
+                let original = data["message"]["content"].as_str().unwrap_or("");
+                let content =
+                    if original.is_empty() { m } else { format!("{original}\n\n{m}") };
+                send_interaction_response(http, interaction_id, interaction_token, 7, Some(json!({
+                    "content": content,
+                    "components": [],
+                }))).await;
+            }
+            // Unauthorized / already handled → ephemeral note; the message
+            // (and its buttons) stays for whoever IS allowed to act.
+            Some(Err(m)) => {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral(format!("⚠️ {m}")))).await;
+            }
+            None => {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral("⚠️ 無效的核准動作".to_string()))).await;
+            }
+        }
+        return;
+    }
+
+    // Goal-loop buttons (P2a): needs_human retry/done/abort + autonomy kickoff.
+    if matches!(
+        action,
+        "goal_retry" | "goal_done" | "goal_abort" | "goal_kickoff_ok" | "goal_kickoff_no"
+    ) {
+        let discord_uid = data["user"]["id"]
+            .as_str()
+            .or_else(|| data["member"]["user"]["id"].as_str())
+            .unwrap_or("");
+        let outcome = crate::goal_notify::decide_from_channel(
+            &ctx.home_dir, "discord", discord_uid, custom_id,
+        )
+        .await;
+        match outcome {
+            Some(Ok(m)) => {
+                let original = data["message"]["content"].as_str().unwrap_or("");
+                let content = if original.is_empty() { m } else { format!("{original}\n\n{m}") };
+                send_interaction_response(http, interaction_id, interaction_token, 7, Some(json!({
+                    "content": content,
+                    "components": [],
+                }))).await;
+            }
+            Some(Err(m)) => {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral(format!("⚠️ {m}")))).await;
+            }
+            None => {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral("⚠️ 無效的目標動作".to_string()))).await;
+            }
+        }
+        return;
+    }
+
     match action {
         "new_session" => {
             let session_id = if payload.is_empty() {

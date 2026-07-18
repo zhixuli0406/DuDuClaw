@@ -639,11 +639,302 @@ pub fn line_quick_reply() -> Value {
     })
 }
 
+// ── Install-approval buttons (approve / deny an install request) ──
+//
+// Action id convention (extends the `duduclaw:{action}` scheme):
+//   duduclaw:install_approve:{request_id}
+//   duduclaw:install_deny:{request_id}
+// Parsed by `parse_install_approval_action`; the per-channel inbound
+// dispatchers pass the raw id to `install_notify::decide_from_channel`.
+
+/// Build the callback/action id for an install-approval button.
+pub fn install_approval_action_id(approve: bool, request_id: &str) -> String {
+    let verb = if approve { "install_approve" } else { "install_deny" };
+    format!("duduclaw:{verb}:{request_id}")
+}
+
+/// Parse an install-approval action id → `(request_id, approve)`.
+/// Returns `None` for any id that is not an install-approval action.
+pub fn parse_install_approval_action(data: &str) -> Option<(String, bool)> {
+    if let Some(id) = data.strip_prefix("duduclaw:install_approve:") {
+        if !id.is_empty() {
+            return Some((id.to_string(), true));
+        }
+    }
+    if let Some(id) = data.strip_prefix("duduclaw:install_deny:") {
+        if !id.is_empty() {
+            return Some((id.to_string(), false));
+        }
+    }
+    None
+}
+
+/// Telegram inline keyboard with approve / deny buttons for a request.
+pub fn telegram_approval_buttons(request_id: &str) -> Value {
+    json!({
+        "inline_keyboard": [[
+            { "text": "✅ 核准", "callback_data": install_approval_action_id(true, request_id) },
+            { "text": "❌ 退回", "callback_data": install_approval_action_id(false, request_id) }
+        ]]
+    })
+}
+
+/// Discord action row with approve / deny buttons (custom_id carries the id).
+pub fn discord_approval_buttons(request_id: &str) -> Value {
+    json!({
+        "type": 1,
+        "components": [
+            { "type": 2, "style": 3, "label": "✅ 核准", "custom_id": install_approval_action_id(true, request_id) },
+            { "type": 2, "style": 4, "label": "❌ 退回", "custom_id": install_approval_action_id(false, request_id) }
+        ]
+    })
+}
+
+/// Slack Block Kit actions block with approve / deny buttons. The request id
+/// travels in both `action_id` and `value` (Slack truncates neither here).
+pub fn slack_approval_buttons(request_id: &str) -> Value {
+    json!({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button", "style": "primary",
+                "text": { "type": "plain_text", "text": "✅ 核准" },
+                "action_id": install_approval_action_id(true, request_id),
+                "value": request_id
+            },
+            {
+                "type": "button", "style": "danger",
+                "text": { "type": "plain_text", "text": "❌ 退回" },
+                "action_id": install_approval_action_id(false, request_id),
+                "value": request_id
+            }
+        ]
+    })
+}
+
+/// LINE quickReply with approve / deny postback actions for a request.
+pub fn line_approval_quick_reply(request_id: &str) -> Value {
+    json!({
+        "items": [
+            {
+                "type": "action",
+                "action": { "type": "postback", "label": "✅ 核准",
+                    "data": install_approval_action_id(true, request_id), "displayText": "核准安裝申請" }
+            },
+            {
+                "type": "action",
+                "action": { "type": "postback", "label": "❌ 退回",
+                    "data": install_approval_action_id(false, request_id), "displayText": "退回安裝申請" }
+            }
+        ]
+    })
+}
+
+// ── Goal-loop approval buttons (P2a needs_human exit + kickoff gate) ──
+//
+// Action id convention (extends the `duduclaw:{action}` scheme, same inbound
+// dispatchers as install-approval):
+//   needs_human exit (carries a task id):
+//     duduclaw:goal_retry:{task_id}   — retry (return to pending, re-dispatch)
+//     duduclaw:goal_done:{task_id}    — accept as done
+//     duduclaw:goal_abort:{task_id}   — give up (cancelled)
+//   kickoff gate (carries an ApprovalBroker approval id):
+//     duduclaw:goal_kickoff_ok:{approval_id}  — approve, start dispatching
+//     duduclaw:goal_kickoff_no:{approval_id}  — deny, abort the goal
+// Parsed by `parse_goal_action`; `goal_notify::decide_from_channel` applies it.
+
+/// A decoded goal-loop button action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalAction {
+    /// needs_human: retry the task (carries the task id).
+    Retry(String),
+    /// needs_human: mark the task done (carries the task id).
+    Done(String),
+    /// needs_human: abandon the task (carries the task id).
+    Abort(String),
+    /// kickoff gate approve/deny (carries the approval id, `true` = approve).
+    Kickoff(String, bool),
+}
+
+/// Parse a goal-loop action id. Returns `None` for anything that is not a
+/// well-formed goal action (fail-closed: unrecognised buttons are ignored).
+pub fn parse_goal_action(data: &str) -> Option<GoalAction> {
+    let non_empty = |id: &str| (!id.is_empty()).then(|| id.to_string());
+    if let Some(id) = data.strip_prefix("duduclaw:goal_retry:") {
+        return non_empty(id).map(GoalAction::Retry);
+    }
+    if let Some(id) = data.strip_prefix("duduclaw:goal_done:") {
+        return non_empty(id).map(GoalAction::Done);
+    }
+    if let Some(id) = data.strip_prefix("duduclaw:goal_abort:") {
+        return non_empty(id).map(GoalAction::Abort);
+    }
+    if let Some(id) = data.strip_prefix("duduclaw:goal_kickoff_ok:") {
+        return non_empty(id).map(|i| GoalAction::Kickoff(i, true));
+    }
+    if let Some(id) = data.strip_prefix("duduclaw:goal_kickoff_no:") {
+        return non_empty(id).map(|i| GoalAction::Kickoff(i, false));
+    }
+    None
+}
+
+fn goal_action_id(verb: &str, id: &str) -> String {
+    format!("duduclaw:{verb}:{id}")
+}
+
+/// Telegram inline keyboard: retry / done / abort for a needs_human goal task.
+pub fn telegram_goal_buttons(task_id: &str) -> Value {
+    json!({
+        "inline_keyboard": [[
+            { "text": "🔄 重試", "callback_data": goal_action_id("goal_retry", task_id) },
+            { "text": "✅ 標記完成", "callback_data": goal_action_id("goal_done", task_id) },
+            { "text": "🗑 放棄", "callback_data": goal_action_id("goal_abort", task_id) }
+        ]]
+    })
+}
+
+/// Telegram inline keyboard: approve / deny a kickoff approval (autonomy gate).
+pub fn telegram_goal_kickoff_buttons(approval_id: &str) -> Value {
+    json!({
+        "inline_keyboard": [[
+            { "text": "▶️ 開始", "callback_data": goal_action_id("goal_kickoff_ok", approval_id) },
+            { "text": "❌ 拒絕", "callback_data": goal_action_id("goal_kickoff_no", approval_id) }
+        ]]
+    })
+}
+
+/// Discord action row: retry / done / abort for a needs_human goal task.
+pub fn discord_goal_buttons(task_id: &str) -> Value {
+    json!({
+        "type": 1,
+        "components": [
+            { "type": 2, "style": 1, "label": "🔄 重試", "custom_id": goal_action_id("goal_retry", task_id) },
+            { "type": 2, "style": 3, "label": "✅ 標記完成", "custom_id": goal_action_id("goal_done", task_id) },
+            { "type": 2, "style": 4, "label": "🗑 放棄", "custom_id": goal_action_id("goal_abort", task_id) }
+        ]
+    })
+}
+
+/// Discord action row: approve / deny a kickoff approval (autonomy gate).
+pub fn discord_goal_kickoff_buttons(approval_id: &str) -> Value {
+    json!({
+        "type": 1,
+        "components": [
+            { "type": 2, "style": 3, "label": "▶️ 開始", "custom_id": goal_action_id("goal_kickoff_ok", approval_id) },
+            { "type": 2, "style": 4, "label": "❌ 拒絕", "custom_id": goal_action_id("goal_kickoff_no", approval_id) }
+        ]
+    })
+}
+
+/// Slack actions block: retry / done / abort for a needs_human goal task.
+pub fn slack_goal_buttons(task_id: &str) -> Value {
+    json!({
+        "type": "actions",
+        "elements": [
+            { "type": "button", "text": { "type": "plain_text", "text": "🔄 重試" },
+              "action_id": goal_action_id("goal_retry", task_id), "value": task_id },
+            { "type": "button", "style": "primary", "text": { "type": "plain_text", "text": "✅ 標記完成" },
+              "action_id": goal_action_id("goal_done", task_id), "value": task_id },
+            { "type": "button", "style": "danger", "text": { "type": "plain_text", "text": "🗑 放棄" },
+              "action_id": goal_action_id("goal_abort", task_id), "value": task_id }
+        ]
+    })
+}
+
+/// Slack actions block: approve / deny a kickoff approval (autonomy gate).
+pub fn slack_goal_kickoff_buttons(approval_id: &str) -> Value {
+    json!({
+        "type": "actions",
+        "elements": [
+            { "type": "button", "style": "primary", "text": { "type": "plain_text", "text": "▶️ 開始" },
+              "action_id": goal_action_id("goal_kickoff_ok", approval_id), "value": approval_id },
+            { "type": "button", "style": "danger", "text": { "type": "plain_text", "text": "❌ 拒絕" },
+              "action_id": goal_action_id("goal_kickoff_no", approval_id), "value": approval_id }
+        ]
+    })
+}
+
+/// LINE quickReply: retry / done / abort postbacks for a needs_human goal task.
+pub fn line_goal_quick_reply(task_id: &str) -> Value {
+    json!({
+        "items": [
+            { "type": "action", "action": { "type": "postback", "label": "🔄 重試",
+                "data": goal_action_id("goal_retry", task_id), "displayText": "重試目標任務" } },
+            { "type": "action", "action": { "type": "postback", "label": "✅ 標記完成",
+                "data": goal_action_id("goal_done", task_id), "displayText": "標記目標完成" } },
+            { "type": "action", "action": { "type": "postback", "label": "🗑 放棄",
+                "data": goal_action_id("goal_abort", task_id), "displayText": "放棄目標任務" } }
+        ]
+    })
+}
+
+/// LINE quickReply: approve / deny a kickoff approval (autonomy gate).
+pub fn line_goal_kickoff_quick_reply(approval_id: &str) -> Value {
+    json!({
+        "items": [
+            { "type": "action", "action": { "type": "postback", "label": "▶️ 開始",
+                "data": goal_action_id("goal_kickoff_ok", approval_id), "displayText": "核准開始目標" } },
+            { "type": "action", "action": { "type": "postback", "label": "❌ 拒絕",
+                "data": goal_action_id("goal_kickoff_no", approval_id), "displayText": "拒絕目標" } }
+        ]
+    })
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_goal_action_roundtrip() {
+        assert_eq!(
+            parse_goal_action("duduclaw:goal_retry:t-1"),
+            Some(GoalAction::Retry("t-1".into()))
+        );
+        assert_eq!(
+            parse_goal_action("duduclaw:goal_done:t-1"),
+            Some(GoalAction::Done("t-1".into()))
+        );
+        assert_eq!(
+            parse_goal_action("duduclaw:goal_abort:t-1"),
+            Some(GoalAction::Abort("t-1".into()))
+        );
+        assert_eq!(
+            parse_goal_action("duduclaw:goal_kickoff_ok:ap-9"),
+            Some(GoalAction::Kickoff("ap-9".into(), true))
+        );
+        assert_eq!(
+            parse_goal_action("duduclaw:goal_kickoff_no:ap-9"),
+            Some(GoalAction::Kickoff("ap-9".into(), false))
+        );
+        // Fail-closed: empty id, install actions, and garbage all → None.
+        assert_eq!(parse_goal_action("duduclaw:goal_retry:"), None);
+        assert_eq!(parse_goal_action("duduclaw:install_approve:x"), None);
+        assert_eq!(parse_goal_action("garbage"), None);
+    }
+
+    #[test]
+    fn test_install_approval_action_roundtrip() {
+        let approve = install_approval_action_id(true, "req-123");
+        let deny = install_approval_action_id(false, "req-123");
+        assert_eq!(approve, "duduclaw:install_approve:req-123");
+        assert_eq!(deny, "duduclaw:install_deny:req-123");
+        assert_eq!(parse_install_approval_action(&approve), Some(("req-123".into(), true)));
+        assert_eq!(parse_install_approval_action(&deny), Some(("req-123".into(), false)));
+        // Non-install actions and malformed ids → None (dispatcher falls through)
+        assert_eq!(parse_install_approval_action("duduclaw:new_session"), None);
+        assert_eq!(parse_install_approval_action("duduclaw:install_approve:"), None);
+        assert_eq!(parse_install_approval_action("garbage"), None);
+    }
+
+    #[test]
+    fn test_telegram_approval_buttons_shape() {
+        let kb = telegram_approval_buttons("r1");
+        let row = &kb["inline_keyboard"][0];
+        assert_eq!(row[0]["callback_data"], "duduclaw:install_approve:r1");
+        assert_eq!(row[1]["callback_data"], "duduclaw:install_deny:r1");
+    }
 
     #[test]
     fn test_discord_short_reply_plain_text() {

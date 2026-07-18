@@ -778,6 +778,62 @@ pub fn agent_cap_enforced(is_self_host: bool, has_max_agents_override: bool) -> 
     !is_self_host || has_max_agents_override
 }
 
+/// Agent-count cap check for processes OUTSIDE the gateway (the MCP server is
+/// a separate `duduclaw mcp-server` process, so [`global()`] is never
+/// initialised there and the dashboard's `tier_limit_message` gate cannot
+/// run). Without this, an agent could `create_agent` its way past both the
+/// Personal-edition cap and a signed P-License `max_agents` quota.
+///
+/// Bootstraps a throwaway runtime from disk and mirrors the gateway's agent
+/// branch: Personal edition → `personal_max_agents()` (unlimited by default
+/// per the 2026-07-16 B+C decision; `DUDUCLAW_PERSONAL_MAX_AGENTS` opts a
+/// hosted deployment into a hard cap); otherwise the license tier /
+/// signed-override path with the self-host exemption. Edition is resolved
+/// the same way the gateway does at boot (env > license tier). The
+/// `ServerConfig`-level edition override is gateway-internal and always
+/// `None` in the open CLI, so it is not consulted here.
+///
+/// Returns the zh-TW refusal message when `current` agents already meet the
+/// effective cap, else `None` (allowed).
+pub async fn agent_cap_message_from_disk(
+    home_dir: &std::path::Path,
+    current: usize,
+) -> Option<String> {
+    let runtime = LicenseRuntime::bootstrap(home_dir.to_path_buf(), production_registry()).await;
+    let snapshot = runtime.snapshot().await;
+    let edition = duduclaw_core::EditionProfile::resolve_from_env(
+        None,
+        Some(snapshot.tier.as_toml_key()),
+    );
+
+    if edition.is_personal() {
+        let cap = duduclaw_core::EditionProfile::personal_max_agents();
+        if cap_exceeded(cap, current) {
+            return Some(format!(
+                "個人版最多可建立 {cap} 個 AI 員工。\
+                 升級企業版以建立更多，並解鎖部門、多帳號等管理功能：\
+                 https://duduclaw.dudustudio.monster#pricing"
+            ));
+        }
+        return None;
+    }
+
+    let agent_override = snapshot.max_agents.is_some();
+    let is_self_host = is_self_host_deployment();
+    if !agent_cap_enforced(is_self_host, agent_override) {
+        return None;
+    }
+    let max = runtime.effective_max_agents().await;
+    if !cap_exceeded(max, current) {
+        return None;
+    }
+    Some(format!(
+        "您的方案（{}）最多可建立 {max} 個 Agent。\
+         請升級方案以新增更多：https://duduclaw.dudustudio.monster#pricing",
+        snapshot.tier
+    ))
+}
+
 // ── Phone-home loop ───────────────────────────────────────────
 
 async fn phone_home_loop(runtime: LicenseRuntime) {

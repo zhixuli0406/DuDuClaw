@@ -651,6 +651,133 @@ pub fn tool_requires_approval(agent_dir: &Path, tool_name: &str) -> bool {
     approval_required_tools(agent_dir).contains(tool_name)
 }
 
+// ── P2b: ActionGuard three-value irreversibility gate ───────────
+//
+// The tool-call approval decision is upgraded from binary (`approval_required_tools`
+// = ask a human) to three-valued (Magentic-UI ActionGuard, arXiv:2507.22358 §
+// action approval):
+//   • Always irreversible (`irreversible_tools`)      → always ask a human.
+//   • Maybe irreversible  (`maybe_irreversible_tools`) → call the ActionGuard LLM
+//     judge on THIS specific call; risky → ask a human, safe → auto-proceed.
+//   • Never (unlisted)                                 → the existing
+//     allowed/denied/policy flow, no new friction.
+//
+// Relationship to the legacy `approval_required_tools`: **take-the-stricter**. The
+// old field keeps its exact semantics (== always) and the new fields are additive,
+// so no existing config changes behavior.
+
+/// Parse `agent.toml [capabilities] irreversible_tools = [...]` — tools that are
+/// **always** irreversible and must obtain human approval before running
+/// (identical enforcement to `approval_required_tools`, but a separate, clearer
+/// field for the ActionGuard model). Same fail-safe as
+/// [`approval_required_tools`]: a missing file/key or malformed table returns an
+/// empty set (additive gate; the primary security boundary stays with the
+/// deny-list).
+pub fn irreversible_tools(agent_dir: &Path) -> HashSet<String> {
+    parse_capability_tool_list(agent_dir, "irreversible_tools")
+}
+
+/// Parse `agent.toml [capabilities] maybe_irreversible_tools = [...]` — tools
+/// whose irreversibility is call-dependent, so the ActionGuard judge decides
+/// per specific call. Same empty-on-error fail-safe as the siblings.
+pub fn maybe_irreversible_tools(agent_dir: &Path) -> HashSet<String> {
+    parse_capability_tool_list(agent_dir, "maybe_irreversible_tools")
+}
+
+/// Shared reader for a `[capabilities]` string-array field. Follows the exact
+/// fail-safe contract of [`approval_required_tools`] (empty on missing/malformed,
+/// `warn!` on malformed TOML). Kept private so the three public parsers share one
+/// implementation without changing their documented semantics.
+fn parse_capability_tool_list(agent_dir: &Path, key: &str) -> HashSet<String> {
+    let path = agent_dir.join("agent.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return HashSet::new();
+    };
+    let value: toml::Value = match toml::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(?path, %key, error = %e, "malformed agent.toml — capability tool list defaults to empty (additive gate)");
+            return HashSet::new();
+        }
+    };
+    value
+        .get("capabilities")
+        .and_then(|c| c.get(key))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when a tool is listed in `irreversible_tools` (always-irreversible).
+/// Exact match — a routing/security decision (project convention 2).
+pub fn tool_is_irreversible(agent_dir: &Path, tool_name: &str) -> bool {
+    irreversible_tools(agent_dir).contains(tool_name)
+}
+
+/// True when a tool is listed in `maybe_irreversible_tools` (judge decides).
+/// Exact match — a routing/security decision (project convention 2).
+pub fn tool_is_maybe_irreversible(agent_dir: &Path, tool_name: &str) -> bool {
+    maybe_irreversible_tools(agent_dir).contains(tool_name)
+}
+
+/// The ActionGuard gate resolved for one tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionGate {
+    /// No new friction: fall through to the existing allowed/denied/policy flow.
+    Auto,
+    /// Must obtain human approval (ApprovalBroker) before running.
+    RequireApproval,
+    /// Ambiguous (maybe-irreversible): run the ActionGuard LLM judge on this
+    /// specific call, then re-resolve with the verdict.
+    ConsultJudge,
+}
+
+/// The ActionGuard judge's ruling on a maybe-irreversible call, already reduced
+/// to a two-way (parse failure / timeout collapse to `Risky`, fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JudgeVerdict {
+    /// Judge deemed this specific call safe / reversible → auto-proceed.
+    Safe,
+    /// Judge deemed it irreversible / risky, OR the judge itself failed
+    /// (fail-closed) → escalate to human approval.
+    Risky,
+}
+
+/// Pure, deterministic resolution of the ActionGuard three-value gate for one
+/// tool call. Separated from the (hard-to-unit-test) dispatch path so the
+/// take-the-stricter merge logic is directly testable.
+///
+/// Inputs:
+/// - `in_always`: tool is in the always-irreversible set. This folds in the
+///   legacy `approval_required_tools` + install-class gate at the call site, so
+///   **always wins** — the strictest outcome regardless of the maybe set.
+/// - `in_maybe`: tool is in `maybe_irreversible_tools`.
+/// - `judge_verdict`: `None` = the judge has not run yet (caller must, hence
+///   `ConsultJudge`); `Some(..)` = re-resolve a maybe-gate with the ruling.
+pub fn resolve_action_gate(
+    in_always: bool,
+    in_maybe: bool,
+    judge_verdict: Option<JudgeVerdict>,
+) -> ActionGate {
+    // Take-the-stricter: always beats maybe beats never.
+    if in_always {
+        return ActionGate::RequireApproval;
+    }
+    if in_maybe {
+        return match judge_verdict {
+            None => ActionGate::ConsultJudge,
+            Some(JudgeVerdict::Risky) => ActionGate::RequireApproval,
+            Some(JudgeVerdict::Safe) => ActionGate::Auto,
+        };
+    }
+    ActionGate::Auto
+}
+
 /// F1: whether the operator has explicitly opted an agent OUT of the
 /// install-class MCP approval gate via `agent.toml [capabilities]
 /// auto_approve_install = true`.
@@ -1002,6 +1129,64 @@ mod tests {
         // Malformed ⇒ empty set (additive gate), never a panic.
         assert!(approval_required_tools(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── P2b: ActionGuard three-value gate ──────────────────────────────────
+
+    #[test]
+    fn irreversible_tool_lists_parse_present() {
+        let dir = tmp_agent_dir();
+        write_agent_toml(
+            &dir,
+            "[capabilities]\nirreversible_tools = [\"send_email\"]\nmaybe_irreversible_tools = [\"Bash\", \"http_post\"]\n",
+        );
+        assert!(tool_is_irreversible(&dir, "send_email"));
+        assert!(!tool_is_irreversible(&dir, "Bash"));
+        assert!(tool_is_maybe_irreversible(&dir, "Bash"));
+        assert!(tool_is_maybe_irreversible(&dir, "http_post"));
+        assert!(!tool_is_maybe_irreversible(&dir, "send_email"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn irreversible_tool_lists_absent_and_missing_are_empty() {
+        // Absent keys.
+        let dir = tmp_agent_dir();
+        write_agent_toml(&dir, "[capabilities]\nallowed_tools = []\n");
+        assert!(irreversible_tools(&dir).is_empty());
+        assert!(maybe_irreversible_tools(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        // Missing file entirely.
+        let dir2 = tmp_agent_dir();
+        let _ = std::fs::remove_dir_all(&dir2); // remove so agent.toml is absent
+        assert!(irreversible_tools(&dir2).is_empty());
+        assert!(maybe_irreversible_tools(&dir2).is_empty());
+    }
+
+    #[test]
+    fn irreversible_tool_lists_malformed_fail_safe_empty() {
+        let dir = tmp_agent_dir();
+        write_agent_toml(&dir, "not = valid toml [[[");
+        assert!(irreversible_tools(&dir).is_empty());
+        assert!(maybe_irreversible_tools(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_action_gate_take_the_stricter() {
+        use ActionGate::*;
+        use JudgeVerdict::*;
+        // Never listed → auto.
+        assert_eq!(resolve_action_gate(false, false, None), Auto);
+        // Always (folds in legacy approval_required_tools) → approval, regardless
+        // of maybe membership or any judge verdict.
+        assert_eq!(resolve_action_gate(true, false, None), RequireApproval);
+        assert_eq!(resolve_action_gate(true, true, Some(Safe)), RequireApproval);
+        // Maybe, judge not yet run → consult judge.
+        assert_eq!(resolve_action_gate(false, true, None), ConsultJudge);
+        // Maybe, judge ruled safe → auto; risky (incl. fail-closed) → approval.
+        assert_eq!(resolve_action_gate(false, true, Some(Safe)), Auto);
+        assert_eq!(resolve_action_gate(false, true, Some(Risky)), RequireApproval);
     }
 
     #[test]

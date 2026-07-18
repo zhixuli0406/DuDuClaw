@@ -364,6 +364,65 @@ impl EditionProfile {
         let env = std::env::var("DUDUCLAW_EDITION").ok();
         Self::resolve(env.as_deref(), config, tier_key)
     }
+
+    /// Default agent cap for the Personal edition: `0` = **unlimited**.
+    ///
+    /// Decision 2026-07-16 (B+C): the self-host / open-core promise ("never
+    /// limit self-host") wins — the Personal edition ships UNCAPPED by
+    /// default. Upgrade desire is driven by the enterprise capability gates
+    /// (departments, approvals, multi-account, white-label) plus a soft
+    /// dashboard hint above [`PERSONAL_RECOMMENDED_AGENTS`] — not by a hard
+    /// block. Managed/hosted deployments that DO want a hard cap set
+    /// `DUDUCLAW_PERSONAL_MAX_AGENTS`. The Enterprise edition is never
+    /// subject to this — it uses the license tier's `max_agents`
+    /// (see `license_runtime`).
+    ///
+    /// [`PERSONAL_RECOMMENDED_AGENTS`]: Self::PERSONAL_RECOMMENDED_AGENTS
+    pub const PERSONAL_MAX_AGENTS_DEFAULT: usize = 0;
+
+    /// Soft threshold above which the dashboard shows a gentle upgrade hint
+    /// on the Personal edition. Informational only — nothing is blocked.
+    pub const PERSONAL_RECOMMENDED_AGENTS: usize = 3;
+
+    /// The effective Personal-edition agent cap. Reads
+    /// `DUDUCLAW_PERSONAL_MAX_AGENTS` (a non-negative integer; `0` =
+    /// unlimited) as an operator override, else
+    /// [`PERSONAL_MAX_AGENTS_DEFAULT`] (unlimited). Only meaningful when the
+    /// active edition is [`Personal`].
+    ///
+    /// [`Personal`]: EditionProfile::Personal
+    pub fn personal_max_agents() -> usize {
+        std::env::var("DUDUCLAW_PERSONAL_MAX_AGENTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(Self::PERSONAL_MAX_AGENTS_DEFAULT)
+    }
+}
+
+#[cfg(test)]
+mod edition_cap_tests {
+    use super::EditionProfile;
+
+    #[test]
+    fn personal_cap_default_is_unlimited() {
+        // B+C decision (2026-07-16): the self-host promise wins — no hard cap
+        // by default (`0` = unlimited, the features.toml convention); the
+        // dashboard shows a soft hint above the recommended size instead. We
+        // assert the constants rather than mutating global env in a parallel
+        // test run.
+        assert_eq!(EditionProfile::PERSONAL_MAX_AGENTS_DEFAULT, 0);
+        assert_eq!(EditionProfile::PERSONAL_RECOMMENDED_AGENTS, 3);
+    }
+
+    #[test]
+    fn enterprise_editions_are_not_personal() {
+        for k in ["business", "enterprise", "oem", "partner", "self_host_pro"] {
+            assert!(!EditionProfile::from_tier_key(k).is_personal(), "{k}");
+        }
+        for k in ["opensource", "hobby", "solo", "studio", "personal_pro_self_host", ""] {
+            assert!(EditionProfile::from_tier_key(k).is_personal(), "{k}");
+        }
+    }
 }
 
 /// Configuration for a local LLM model (per-agent).
