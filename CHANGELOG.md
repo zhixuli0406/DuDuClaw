@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.37.0] - 2026-07-18 — Goal Loop autonomous agents, custom dashboard widgets, DuDuClaw design system
+
 ### Added
 - **自主目標迴圈（Goal Loop，2026-07-17）。** 在頻道丟一個目標，AI 員工就自主
   規劃、執行、自我驗收，做到完成或卡住時回來通知你——把「一問一答」升級為

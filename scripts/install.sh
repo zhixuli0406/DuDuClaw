@@ -13,7 +13,7 @@ set -euo pipefail
 # GitHub API is unreachable. NOTE: do NOT hardcode a version that lacks a
 # published Release — a 404 here silently forces an hour-long source build.
 DUDUCLAW_VERSION="${DUDUCLAW_VERSION:-}"
-FALLBACK_VERSION="1.36.0"
+FALLBACK_VERSION="1.37.0"
 GITHUB_REPO="zhixuli0406/DuDuClaw"
 INSTALL_DIR="${DUDUCLAW_HOME:-$HOME/.duduclaw}/bin"
 BINARY_NAME="duduclaw"
