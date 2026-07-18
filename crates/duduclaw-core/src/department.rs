@@ -18,19 +18,23 @@ pub const DEPARTMENTS_NAMESPACE: &str = "departments";
 
 /// Validate a department identifier used as a filesystem path segment.
 ///
-/// Allowlist: ASCII alphanumeric plus `-` and `_`, 1..=64 bytes. This rejects
-/// `.`, `..`, `/`, `\`, whitespace, NUL and every other traversal shape, so a
-/// path built from a validated department can never escape its parent dir.
+/// Denylist (not an ASCII allowlist): a name is valid when it is 1..=64 bytes,
+/// is not `.`/`..`, and contains no path separator (`/`, `\`), NUL, control
+/// character, or whitespace. This deliberately **allows** non-ASCII printable
+/// Unicode so a zh-TW product can name a department "測試部" (Bug#5) while a
+/// path built from a validated department still can never escape its parent dir
+/// (no separators / traversal names get through).
 ///
 /// The empty string is **invalid** on purpose: "no department" is a distinct
 /// state that callers must handle *before* building any path — never by
 /// passing `""` here.
 pub fn is_valid_department(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    if name.is_empty() || name.len() > 64 || name == "." || name == ".." {
+        return false;
+    }
+    !name.chars().any(|c| {
+        c == '/' || c == '\\' || c == '\0' || c.is_control() || c.is_whitespace()
+    })
 }
 
 /// The department that owns a shared-wiki page, if the page lives under the
@@ -85,10 +89,12 @@ mod tests {
 
     #[test]
     fn valid_department_allowlist() {
-        for good in ["art", "sales", "eng-team", "team_2", "R2D2"] {
+        // ASCII slugs and CJK/Unicode names are both accepted (Bug#5).
+        for good in ["art", "sales", "eng-team", "team_2", "R2D2", "團隊", "測試部", "営業部"] {
             assert!(is_valid_department(good), "must accept {good:?}");
         }
-        for bad in ["", "..", ".", "a/b", "a\\b", "a b", "團隊", &"a".repeat(65), "nul\0"] {
+        // Path-dangerous / whitespace / control shapes stay rejected.
+        for bad in ["", "..", ".", "a/b", "a\\b", "a b", "團 隊", &"a".repeat(65), "nul\0", "tab\ttab", "new\nline"] {
             assert!(!is_valid_department(bad), "must reject {bad:?}");
         }
     }

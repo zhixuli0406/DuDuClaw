@@ -18,7 +18,8 @@ use tracing::info;
 const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_to, created_by, \
      created_at, updated_at, completed_at, blocked_reason, parent_task_id, tags, message_id, \
      claimed_by, claimed_at, lease_expires_at, depends_on, retry_count, max_retries, \
-     goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at";
+     goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
+     source_channel, source_chat_id";
 
 // ── Task row ────────────────────────────────────────────────
 
@@ -85,6 +86,18 @@ pub struct TaskRow {
     /// renewal, so a live worker's ticker is never raced.
     #[serde(default)]
     pub lease_renewed_at: Option<String>,
+
+    // ── P5 goal loop source write-back (v1.37) ──────────────
+    /// Originating channel of a `/goal` command (e.g. `telegram`), so goal-loop
+    /// progress / needs_human notices push back to the conversation that
+    /// launched the goal rather than only the agent's `[proactive]` channel.
+    /// NULL for tasks not created from a channel `/goal` entry.
+    #[serde(default)]
+    pub source_channel: Option<String>,
+    /// Originating chat id of a `/goal` command (the `chat_id` segment of the
+    /// launching session). NULL when no source conversation is known.
+    #[serde(default)]
+    pub source_chat_id: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -132,6 +145,8 @@ impl TaskRow {
             judge_feedback: None,
             goal_id: None,
             lease_renewed_at: None,
+            source_channel: None,
+            source_chat_id: None,
         }
     }
 }
@@ -482,6 +497,9 @@ impl TaskStore {
             // G8 goal chain + G1 lease-renewal anchor (v1.36).
             ("goal_id", "goal_id TEXT"),
             ("lease_renewed_at", "lease_renewed_at TEXT"),
+            // P5 goal-loop source write-back (v1.37).
+            ("source_channel", "source_channel TEXT"),
+            ("source_chat_id", "source_chat_id TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -554,9 +572,9 @@ impl TaskStore {
                  parent_task_id, tags, message_id,
                  claimed_by, claimed_at, lease_expires_at, depends_on, retry_count,
                  max_retries, goal_mode, acceptance_criteria, result_summary, judge_feedback,
-                 goal_id, lease_renewed_at)
+                 goal_id, lease_renewed_at, source_channel, source_chat_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             params![
                 row.id,
                 row.title,
@@ -584,6 +602,8 @@ impl TaskStore {
                 row.judge_feedback,
                 row.goal_id,
                 row.lease_renewed_at,
+                row.source_channel,
+                row.source_chat_id,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -1155,6 +1175,77 @@ impl TaskStore {
             )
             .map_err(|e| format!("mark needs_human: {e}"))?;
         Ok(n > 0)
+    }
+
+    /// P2a: apply a human decision to a `needs_human` goal task from a channel
+    /// button. Only transitions FROM `needs_human` (fail-closed + idempotent:
+    /// a second press on an already-resolved task affects 0 rows → `Ok(false)`).
+    ///
+    /// - `retry` → back to `pending`, claim/lease/result cleared. `note`
+    ///   (optional human instruction) is written to `judge_feedback` so the next
+    ///   driver dispatch carries it; an empty note clears `judge_feedback`.
+    /// - `done`  → `done` + `completed_at`, `note` recorded in `judge_feedback`.
+    /// - `abort` → `cancelled`, `note` recorded in `judge_feedback`.
+    ///
+    /// An unrecognised `decision` is rejected (never silently coerced).
+    pub async fn resolve_needs_human(
+        &self,
+        id: &str,
+        decision: &str,
+        note: &str,
+    ) -> Result<bool, String> {
+        let note_opt: Option<&str> = if note.trim().is_empty() { None } else { Some(note) };
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let n = match decision {
+            "retry" => conn
+                .execute(
+                    "UPDATE tasks
+                        SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
+                            lease_expires_at = NULL, result_summary = NULL,
+                            judge_feedback = ?2, updated_at = ?3
+                      WHERE id = ?1 AND status = 'needs_human'",
+                    params![id, note_opt, now],
+                )
+                .map_err(|e| format!("resolve needs_human (retry): {e}"))?,
+            "done" => conn
+                .execute(
+                    "UPDATE tasks
+                        SET status = 'done', completed_at = ?3, judge_feedback = ?2,
+                            updated_at = ?3
+                      WHERE id = ?1 AND status = 'needs_human'",
+                    params![id, note_opt, now],
+                )
+                .map_err(|e| format!("resolve needs_human (done): {e}"))?,
+            "abort" => conn
+                .execute(
+                    "UPDATE tasks
+                        SET status = 'cancelled', judge_feedback = ?2, updated_at = ?3
+                      WHERE id = ?1 AND status = 'needs_human'",
+                    params![id, note_opt, now],
+                )
+                .map_err(|e| format!("resolve needs_human (abort): {e}"))?,
+            other => return Err(format!("unknown needs_human decision: {other}")),
+        };
+        Ok(n == 1)
+    }
+
+    /// P2a: cancel a task that has not reached a terminal state. Used by the
+    /// goal-loop kickoff gate when a human denies (or lets the approval expire)
+    /// before the first dispatch. Idempotent: a task already
+    /// `done`/`cancelled`/`failed` is left untouched (returns `Ok(false)`).
+    pub async fn cancel_task(&self, id: &str, reason: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let n = conn
+            .execute(
+                "UPDATE tasks
+                    SET status = 'cancelled', judge_feedback = ?2, updated_at = ?3
+                  WHERE id = ?1 AND status NOT IN ('done', 'cancelled', 'failed')",
+                params![id, reason, now],
+            )
+            .map_err(|e| format!("cancel task: {e}"))?;
+        Ok(n == 1)
     }
 
     // ── G8 goal chain ───────────────────────────────────────
@@ -1876,6 +1967,8 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         judge_feedback: row.get(23)?,
         goal_id: row.get(24)?,
         lease_renewed_at: row.get(25)?,
+        source_channel: row.get(26)?,
+        source_chat_id: row.get(27)?,
     })
 }
 

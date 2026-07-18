@@ -218,6 +218,27 @@ async fn dispatch_cron_task(
 ) {
     use crate::condition_eval::{evaluate_condition, evaluate_on_exit, TriggerKind};
 
+    // ── P3 runaway guard: cross-process circuit breaker on the cron feedback
+    //    path (paper 2607.01641). A misconfigured cron (e.g. `* * * * *` that
+    //    re-arms faster than the task completes) or a cron→delegate→cron cycle
+    //    is bounded per target agent. Tripped ⇒ skip this fire and log
+    //    (fail-visible), never silently; the breaker self-closes after cooldown.
+    {
+        let cfg = duduclaw_core::DispatchGuardConfig::from_home(home_dir);
+        let decision =
+            duduclaw_core::dispatch_guard_check(home_dir, "cron", &task.agent_id, &cfg);
+        if let duduclaw_core::DispatchGuardDecision::Trip { reason, retry_after_secs } = decision {
+            warn!(
+                id = %task.id,
+                name = %task.name,
+                agent = %task.agent_id,
+                retry_after_secs,
+                "cron 派工斷路器跳閘,跳過本次觸發(防失控迴圈):{reason}"
+            );
+            return;
+        }
+    }
+
     match TriggerKind::from_db(&task.trigger_kind) {
         TriggerKind::Time => {
             execute_cron_task(home_dir, store, registry, task, None).await;
@@ -557,8 +578,13 @@ async fn resolve_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -
     }
 
     // Global config fallback — only reached when nobody on the chain has
-    // a per-agent token configured.
-    let field_base = format!("{channel}_bot_token");
+    // a per-agent token configured. Field names are NOT uniformly
+    // `{channel}_bot_token` (LINE's is `line_channel_token`), so consult the
+    // canonical mapping first and keep the pattern only as a last resort for
+    // channels outside it.
+    let field_base = crate::otp_delivery::token_field(channel)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{channel}_bot_token"));
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", &field_base)
         .await
         .unwrap_or_default()

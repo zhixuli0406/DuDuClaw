@@ -58,6 +58,57 @@ pub enum ChatCommand {
     SafetyResume,
     /// `!STATUS` / `!狀態` — query failsafe status
     SafetyStatus,
+    /// `/goal ...` — autonomous goal loop entry point (P5).
+    Goal(GoalCommand),
+}
+
+/// The three shapes a `/goal` command can take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalCommand {
+    /// `/goal` with no args → print usage.
+    Usage,
+    /// `/goal status` → list this agent's in-progress goal tasks.
+    Status,
+    /// `/goal <description>` (optionally `<description> || <acceptance criteria>`).
+    /// When no `||` is given the description doubles as the acceptance criteria.
+    Create {
+        description: String,
+        acceptance_criteria: Option<String>,
+    },
+}
+
+/// Parse the argument tail of a `/goal` command into a [`GoalCommand`].
+///
+/// - empty / whitespace → [`GoalCommand::Usage`]
+/// - `status` (case-insensitive) → [`GoalCommand::Status`]
+/// - `<desc> || <criteria>` → split on the first `||`; an empty right side is
+///   treated as "no explicit criteria"
+/// - anything else → the whole tail is the goal description
+fn parse_goal_args(args: Option<&str>) -> GoalCommand {
+    let raw = args.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return GoalCommand::Usage;
+    }
+    if raw.eq_ignore_ascii_case("status") {
+        return GoalCommand::Status;
+    }
+    match raw.split_once("||") {
+        Some((desc, crit)) => {
+            let desc = desc.trim();
+            if desc.is_empty() {
+                return GoalCommand::Usage;
+            }
+            let crit = crit.trim();
+            GoalCommand::Create {
+                description: desc.to_string(),
+                acceptance_criteria: (!crit.is_empty()).then(|| crit.to_string()),
+            }
+        }
+        None => GoalCommand::Create {
+            description: raw.to_string(),
+            acceptance_criteria: None,
+        },
+    }
 }
 
 impl ChatCommand {
@@ -180,6 +231,7 @@ pub fn parse_command(
             Some(ChatCommand::Undo(n))
         }
         "rollback" => Some(ChatCommand::Rollback),
+        "goal" => Some(ChatCommand::Goal(parse_goal_args(args))),
         _ => None,
     }
 }
@@ -252,6 +304,7 @@ pub async fn handle_command(
         ChatCommand::SafetyStopAll => handle_safety_stop_all(ctx).await,
         ChatCommand::SafetyResume => handle_safety_resume(ctx, session_id).await,
         ChatCommand::SafetyStatus => handle_safety_status(ctx, session_id).await,
+        ChatCommand::Goal(goal) => handle_goal(ctx, session_id, agent_id, goal).await,
     }
 }
 
@@ -343,7 +396,8 @@ fn handle_help() -> String {
      `/voice` — Toggle voice reply\n\
      `/handoff <頻道>` — 將對話轉移到其他頻道\n\
      `/undo [次數]` — 撤銷最近 N 輪對話（預設 1，最多 20）\n\
-     `/rollback` — 回退到最近一次檢查點（僅回退對話，不還原檔案）\n\n\
+     `/rollback` — 回退到最近一次檢查點（僅回退對話，不還原檔案）\n\
+     `/goal <目標>` — 交付一個自主目標，AI 自主做到完成、卡住問你（`/goal status` 看進度）\n\n\
      *Safety Words*\n\
      `!STOP` / `!停止` — Stop current agent\n\
      `!STOP ALL` / `!全部停止` — Emergency stop all\n\
@@ -547,6 +601,175 @@ async fn handle_rollback(ctx: &ReplyContext, session_id: &str) -> String {
             warn!(session_id, error = %e, "rollback failed");
             format!("⚠️ 回退失敗：{e}")
         }
+    }
+}
+
+// ── /goal autonomous goal loop entry (P5) ───────────────────────
+
+/// Derive `(channel, chat_id)` from a session id
+/// (`<channel>:<chat_id>[:<thread>]`), matching
+/// `channel_reply::parse_session_id_parts`. Stamped onto a goal task's
+/// `source_channel` / `source_chat_id` so goal-loop progress and needs_human
+/// notices push back to the conversation that launched the goal (falling back to
+/// the agent's `[proactive]` channel when a task has no source).
+fn source_from_session(session_id: &str) -> (String, String) {
+    let parts: Vec<&str> = session_id.splitn(3, ':').collect();
+    match parts.as_slice() {
+        [] | [_] => (String::new(), session_id.to_string()),
+        [ch, cid, ..] => (ch.to_string(), cid.to_string()),
+    }
+}
+
+/// zh-TW label for a goal task status (user-facing; internal status strings must
+/// never leak to the channel).
+fn goal_status_label(status: &str) -> &'static str {
+    match status {
+        "todo" => "待派工",
+        "pending" => "待重試",
+        "in_progress" => "執行中",
+        "review" => "驗收中",
+        "needs_human" => "待你決定",
+        "blocked" => "受阻",
+        "done" => "已完成",
+        "cancelled" => "已放棄",
+        "failed" => "已失敗",
+        _ => "進行中",
+    }
+}
+
+fn goal_usage_text() -> String {
+    "🎯 *自主目標 /goal*\n\
+     `/goal <目標描述>` — 交付一個目標，AI 員工會自主規劃、執行、自我驗收，完成或卡住時通知你\n\
+     `/goal <目標> || <驗收標準>` — 用 `||` 另外指定驗收標準（沒給就用目標本身當驗收基準）\n\
+     `/goal status` — 查看進行中的目標任務\n\n\
+     範例：`/goal 整理這批客戶資料成月報並寄出 || 報表含每月營收圖表，寄到 boss@example.com`"
+        .to_string()
+}
+
+async fn handle_goal(
+    ctx: &ReplyContext,
+    session_id: &str,
+    agent_id: &str,
+    goal: &GoalCommand,
+) -> String {
+    match goal {
+        GoalCommand::Usage => goal_usage_text(),
+        GoalCommand::Status => handle_goal_status(ctx, agent_id).await,
+        GoalCommand::Create {
+            description,
+            acceptance_criteria,
+        } => {
+            handle_goal_create(
+                ctx,
+                session_id,
+                agent_id,
+                description,
+                acceptance_criteria.as_deref(),
+            )
+            .await
+        }
+    }
+}
+
+/// Create a `goal_mode` task assigned to the current conversation's agent and
+/// stamp its source conversation for progress write-back.
+async fn handle_goal_create(
+    ctx: &ReplyContext,
+    session_id: &str,
+    agent_id: &str,
+    description: &str,
+    acceptance_criteria: Option<&str>,
+) -> String {
+    let store = match crate::task_store::TaskStore::open(&ctx.home_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "goal: open task store failed");
+            return format!("⚠️ 無法建立目標任務：{e}");
+        }
+    };
+    let (channel, chat_id) = source_from_session(session_id);
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let short = duduclaw_core::truncate_chars(&task_id, 8);
+    let title = duduclaw_core::truncate_chars(description, 60);
+    // No explicit criteria → the goal text itself is the acceptance basis.
+    let criteria = acceptance_criteria
+        .map(str::to_string)
+        .unwrap_or_else(|| description.to_string());
+
+    let mut task = crate::task_store::TaskRow::new(
+        task_id,
+        title,
+        description.to_string(),
+        "medium".to_string(),
+        agent_id.to_string(),
+        format!("goal:{channel}"),
+    );
+    task.status = "todo".to_string();
+    task.goal_mode = true;
+    task.acceptance_criteria = Some(criteria);
+    if !channel.is_empty() {
+        task.source_channel = Some(channel);
+    }
+    task.source_chat_id = Some(chat_id);
+
+    if let Err(e) = store.insert_task(&task).await {
+        warn!(error = %e, "goal: insert task failed");
+        return format!("⚠️ 無法建立目標任務：{e}");
+    }
+
+    let cap = crate::goal_loop::GoalLoopConfig::from_home(&ctx.home_dir).iteration_cap;
+    let enabled = crate::dispatch_engine::dispatch_engine_enabled(&ctx.home_dir);
+    let mut msg = format!(
+        "🎯 已建立自主目標任務 #{short}\n\
+         目標：{}\n\
+         我會自主嘗試最多 {cap} 輪；完成或卡住時會在這裡通知你。\n\
+         輸入 `/goal status` 可隨時查看進度。",
+        duduclaw_core::truncate_chars(description, 200),
+    );
+    if !enabled {
+        msg.push_str(
+            "\n\n⚠️ 目前尚未啟用自主派工引擎，任務已建立但不會自動開始執行。\
+             請在 config.toml 設定 `[dispatch] enabled = true` 後重啟。",
+        );
+    }
+    msg
+}
+
+/// List the current agent's in-progress goal tasks.
+async fn handle_goal_status(ctx: &ReplyContext, agent_id: &str) -> String {
+    let store = match crate::task_store::TaskStore::open(&ctx.home_dir) {
+        Ok(s) => s,
+        Err(e) => return format!("⚠️ 無法讀取目標任務：{e}"),
+    };
+    let tasks = match store.list_tasks(None, Some(agent_id), None).await {
+        Ok(t) => t,
+        Err(e) => return format!("⚠️ 無法讀取目標任務：{e}"),
+    };
+    const ACTIVE: &[&str] = &[
+        "todo",
+        "pending",
+        "in_progress",
+        "review",
+        "needs_human",
+        "blocked",
+    ];
+    let lines: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.goal_mode && ACTIVE.contains(&t.status.as_str()))
+        .map(|t| {
+            let short = duduclaw_core::truncate_chars(&t.id, 8);
+            format!(
+                "• #{short} [{}] 第 {} 輪 — {}",
+                goal_status_label(&t.status),
+                t.retry_count + 1,
+                duduclaw_core::truncate_chars(&t.title, 40),
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        "📭 目前沒有進行中的自主目標任務。用 `/goal <目標描述>` 交付一個。".to_string()
+    } else {
+        format!("🎯 進行中的自主目標任務：\n{}", lines.join("\n"))
     }
 }
 
@@ -762,6 +985,77 @@ mod tests {
         assert!(!ChatCommand::Handoff(Some("telegram".into())).requires_admin());
         assert!(!ChatCommand::Undo(1).requires_admin());
         assert!(!ChatCommand::Rollback.requires_admin());
+    }
+
+    #[test]
+    fn test_parse_goal() {
+        // Basic: whole tail is the description, no explicit criteria.
+        assert_eq!(
+            parse_command("/goal 整理客戶資料成報表", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "整理客戶資料成報表".to_string(),
+                acceptance_criteria: None,
+            }))
+        );
+
+        // Two-part: `||` separates description and acceptance criteria.
+        assert_eq!(
+            parse_command("/goal 做月報 || 含營收圖表並寄出", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: Some("含營收圖表並寄出".to_string()),
+            }))
+        );
+
+        // Empty right side of `||` → treated as no explicit criteria.
+        assert_eq!(
+            parse_command("/goal 做月報 ||", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: None,
+            }))
+        );
+
+        // status subcommand (case-insensitive).
+        assert_eq!(
+            parse_command("/goal status", None),
+            Some(ChatCommand::Goal(GoalCommand::Status))
+        );
+        assert_eq!(
+            parse_command("/goal STATUS", None),
+            Some(ChatCommand::Goal(GoalCommand::Status))
+        );
+
+        // Empty args → usage.
+        assert_eq!(
+            parse_command("/goal", None),
+            Some(ChatCommand::Goal(GoalCommand::Usage))
+        );
+        assert_eq!(
+            parse_command("/goal   ", None),
+            Some(ChatCommand::Goal(GoalCommand::Usage))
+        );
+
+        // Not an admin-gated command.
+        assert!(!ChatCommand::Goal(GoalCommand::Usage).requires_admin());
+    }
+
+    #[test]
+    fn test_source_from_session() {
+        assert_eq!(
+            source_from_session("telegram:12345"),
+            ("telegram".to_string(), "12345".to_string())
+        );
+        // Extra segments (thread id) are dropped — chat_id is the 2nd segment.
+        assert_eq!(
+            source_from_session("telegram:12345:678"),
+            ("telegram".to_string(), "12345".to_string())
+        );
+        // No colon → empty channel, whole string as chat_id.
+        assert_eq!(
+            source_from_session("solo"),
+            (String::new(), "solo".to_string())
+        );
     }
 
     #[test]

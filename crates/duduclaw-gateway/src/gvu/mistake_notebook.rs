@@ -107,8 +107,21 @@ pub struct MistakeEntry {
     pub resolved: bool,
 }
 
+/// Max chars of `ground_truth` injected into a prompt section (CJK-safe cap).
+/// STV (arXiv:2605.30290): the reference/correct answer is the supervision
+/// signal, so it is worth keeping — but bounded so one long entry can't crowd
+/// out the prompt budget.
+const GROUND_TRUTH_PROMPT_MAX_CHARS: usize = 300;
+
 impl MistakeEntry {
-    /// Format as a prompt section for the GVU Generator.
+    /// Format as a prompt section for the GVU Generator / Reflexion F2a.
+    ///
+    /// When `ground_truth` is present the section carries **two grounded parts**
+    /// — the mistake (`Issue`) and the correct answer (`Correct answer`, the STV
+    /// reference solution) — so the model sees both what went wrong and what
+    /// right looks like. The reference is truncated with
+    /// [`duduclaw_core::truncate_chars`] (codepoint count, CJK-safe) so a long
+    /// entry can't blow the prompt budget or panic on a multi-byte boundary.
     pub fn to_prompt_section(&self) -> String {
         let mut s = format!(
             "- **[{}]** Session `{}`\n  Input: {}\n  Issue: {}",
@@ -118,7 +131,16 @@ impl MistakeEntry {
             self.what_went_wrong,
         );
         if let Some(ref gt) = self.ground_truth {
-            s.push_str(&format!("\n  Ground truth: {gt}"));
+            let gt = gt.trim();
+            if !gt.is_empty() {
+                let shown = duduclaw_core::truncate_chars(gt, GROUND_TRUTH_PROMPT_MAX_CHARS);
+                let ellipsis = if shown.chars().count() < gt.chars().count() {
+                    "…"
+                } else {
+                    ""
+                };
+                s.push_str(&format!("\n  Correct answer: {shown}{ellipsis}"));
+            }
         }
         s
     }
@@ -633,5 +655,60 @@ mod tests {
     fn test_truncate_str() {
         assert_eq!(truncate_str("hello", 10), "hello");
         assert_eq!(truncate_str("hello world, this is long", 10), "hello w...");
+    }
+
+    #[test]
+    fn test_prompt_section_includes_ground_truth() {
+        let entry = build_mistake_entry(
+            "agent-1",
+            "session-abcdef01",
+            MistakeCategory::Capability,
+            "寫 Python sort",
+            "bubble sort",
+            "太慢",
+            Some("Use merge sort or timsort"),
+        );
+        let section = entry.to_prompt_section();
+        assert!(section.contains("Issue: 太慢"));
+        // Ground truth surfaces as the STV "Correct answer" reference part.
+        assert!(section.contains("Correct answer: Use merge sort or timsort"));
+    }
+
+    #[test]
+    fn test_prompt_section_without_ground_truth_unchanged() {
+        let entry = build_mistake_entry(
+            "agent-1",
+            "session-abcdef01",
+            MistakeCategory::Behavioral,
+            "你好嗎",
+            "我是 AI",
+            "太冷漠",
+            None,
+        );
+        let section = entry.to_prompt_section();
+        assert!(section.contains("Issue: 太冷漠"));
+        // No ground truth ⇒ no correct-answer part appended.
+        assert!(!section.contains("Correct answer"));
+    }
+
+    #[test]
+    fn test_prompt_section_truncates_long_cjk_ground_truth() {
+        // A ground truth well past the cap, all multi-byte CJK — must not panic
+        // and must be bounded to the char cap (+ ellipsis).
+        let long_gt: String = "正".repeat(GROUND_TRUTH_PROMPT_MAX_CHARS + 50);
+        let mut entry = sample_entry("agent-1", MistakeCategory::Factual);
+        entry.ground_truth = Some(long_gt);
+        let section = entry.to_prompt_section();
+        assert!(section.contains("Correct answer:"));
+        assert!(section.ends_with('…'), "over-cap ground truth is ellipsized");
+        // Count only the shown ground-truth chars: cap of 正 plus the ellipsis.
+        let shown: String = section
+            .split("Correct answer: ")
+            .nth(1)
+            .unwrap()
+            .chars()
+            .filter(|c| *c == '正')
+            .collect();
+        assert_eq!(shown.chars().count(), GROUND_TRUTH_PROMPT_MAX_CHARS);
     }
 }

@@ -72,7 +72,7 @@ fn scrub_premium_path(err: &str, premium_dir: &Path) -> String {
 }
 
 /// Validate agent ID is safe for filesystem paths (no traversal).
-fn is_valid_agent_id(id: &str) -> bool {
+pub(crate) fn is_valid_agent_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -2993,7 +2993,7 @@ impl MethodHandler {
     /// surfaces. It never gates a core feature.
     ///
     /// [`EditionProfile`]: duduclaw_core::EditionProfile
-    async fn resolve_edition_profile(&self) -> duduclaw_core::EditionProfile {
+    pub(crate) async fn resolve_edition_profile(&self) -> duduclaw_core::EditionProfile {
         let tier_key = match crate::license_runtime::global() {
             Some(runtime) => Some(runtime.snapshot().await.tier.as_toml_key().to_string()),
             None => None,
@@ -3566,6 +3566,14 @@ impl MethodHandler {
             "dashboard.layout.get" => self.handle_dashboard_layout_get(ctx).await,
             "dashboard.layout.set" => self.handle_dashboard_layout_set(params, ctx).await,
             "dashboard.layout.view" => { require_manager!(); self.handle_dashboard_layout_view(params, ctx).await }
+            // ── Custom widgets (sandboxed-iframe HTML cards; 2026-07-16) ──
+            "widgets.custom.list" => self.handle_widgets_custom_list(ctx).await,
+            "widgets.custom.get" => self.handle_widgets_custom_get(params, ctx).await,
+            "widgets.custom.create" => self.handle_widgets_custom_create(params, ctx).await,
+            "widgets.custom.update" => self.handle_widgets_custom_update(params, ctx).await,
+            "widgets.custom.remove" => self.handle_widgets_custom_remove(params, ctx).await,
+            "widgets.custom.share" => self.handle_widgets_custom_share(params, ctx).await,
+            "widgets.custom.generate" => self.handle_widgets_custom_generate(params).await,
             "users.subordinates" => { require_manager!(); self.handle_users_subordinates(ctx).await }
             // ── Departments (org structure for agent create/edit) ──
             "departments.list" => { require_manager!(); self.handle_departments_list().await }
@@ -3931,6 +3939,9 @@ impl MethodHandler {
         match runtime.install_and_reload(license).await {
             Ok(snapshot) => {
                 info!(tier = %snapshot.tier, "license activated via dashboard");
+                // Edition may have flipped (e.g. → enterprise): push a fresh
+                // system.status so open dashboards update without a refresh.
+                self.broadcast_system_status().await;
                 WsFrame::ok_response("", json!({ "success": true, "status": snapshot }))
             }
             Err(e) => WsFrame::error_response("", &e),
@@ -3953,6 +3964,7 @@ impl MethodHandler {
         match crate::license_runtime::redeem_partner_code(runtime, code, email).await {
             Ok(snapshot) => {
                 info!(tier = %snapshot.tier, "partner code redeemed via dashboard");
+                self.broadcast_system_status().await;
                 WsFrame::ok_response("", json!({ "success": true, "status": snapshot }))
             }
             Err(e) => WsFrame::error_response("", &e),
@@ -4105,6 +4117,25 @@ impl MethodHandler {
     /// reached. Self-hosted deployments (Apache 2.0) are NEVER capped; a
     /// `max` of 0 in features.toml means unlimited.
     async fn tier_limit_message(&self, kind: &str, current: usize) -> Option<String> {
+        // Personal-edition agent cap. B+C decision (2026-07-16): UNLIMITED by
+        // default (`personal_max_agents()` = 0, honoring the self-host
+        // promise); the dashboard shows a soft upgrade hint above the
+        // recommended size instead. `DUDUCLAW_PERSONAL_MAX_AGENTS` lets a
+        // managed/hosted deployment opt into a hard cap. Enterprise edition
+        // falls through to the license-tier logic below.
+        if kind == "agent" && self.resolve_edition_profile().await.is_personal() {
+            let cap = duduclaw_core::EditionProfile::personal_max_agents();
+            if crate::license_runtime::cap_exceeded(cap, current) {
+                return Some(format!(
+                    "個人版最多可建立 {cap} 個 AI 員工。\
+                     升級企業版以建立更多，並解鎖部門、多帳號等管理功能：\
+                     https://duduclaw.dudustudio.monster#pricing"
+                ));
+            }
+            // Under the personal cap → allow, without consulting license tiers.
+            return None;
+        }
+
         let rt = crate::license_runtime::global()?;
 
         // P-License §7 decision (b): a signed per-license `max_agents` override is
@@ -5190,7 +5221,7 @@ impl MethodHandler {
                         changes.push(format!("department = \"{v}\""));
                     } else {
                         return Err(format!(
-                            "Invalid department '{v}' (ASCII alphanumeric, '-', '_'; 1..=64 chars)"
+                            "Invalid department '{v}' (1..=64 bytes, no path separators / whitespace / control chars)"
                         ));
                     }
                 }
@@ -9207,6 +9238,12 @@ impl MethodHandler {
         let global_names: std::collections::HashSet<&str> =
             reg.global_skills().iter().map(|s| s.name.as_str()).collect();
 
+        // Scan verdicts recorded at install-approval time (Bug#9) — attach as
+        // `security_status` so the "My Skills" security column shows the real
+        // verdict rather than "Not scanned". Absent entry ⇒ field omitted.
+        let verdicts = self.load_skill_scan_verdicts();
+        let verdict_of = |name: &str| verdicts.get(name).cloned();
+
         match agent_id {
             Some(id) => {
                 match reg.get(id) {
@@ -9216,7 +9253,11 @@ impl MethodHandler {
                         // it made `skill.content.slice(...)` throw whenever an agent had skills.
                         let skills: Vec<Value> = agent.skills.iter().map(|s| {
                             let scope = if global_names.contains(s.name.as_str()) { "global" } else { "agent" };
-                            json!({ "name": s.name, "size": s.content.len(), "scope": scope, "content": s.content })
+                            let mut obj = json!({ "name": s.name, "size": s.content.len(), "scope": scope, "content": s.content });
+                            if let Some(v) = verdict_of(&s.name) {
+                                obj["security_status"] = v;
+                            }
+                            obj
                         }).collect();
                         WsFrame::ok_response("", json!({ "agent_id": id, "skills": skills }))
                     }
@@ -9226,7 +9267,11 @@ impl MethodHandler {
             None => {
                 // Global skills
                 let global: Vec<Value> = reg.global_skills().iter().map(|s| {
-                    json!({ "name": s.name, "size": s.content.len() })
+                    let mut obj = json!({ "name": s.name, "size": s.content.len() });
+                    if let Some(v) = verdict_of(&s.name) {
+                        obj["security_status"] = v;
+                    }
+                    obj
                 }).collect();
 
                 // Per-agent skills
@@ -9234,7 +9279,11 @@ impl MethodHandler {
                 for agent in reg.list() {
                     let skills: Vec<Value> = agent.skills.iter().map(|s| {
                         let scope = if global_names.contains(s.name.as_str()) { "global" } else { "agent" };
-                        json!({ "name": s.name, "size": s.content.len(), "scope": scope })
+                        let mut obj = json!({ "name": s.name, "size": s.content.len(), "scope": scope });
+                        if let Some(v) = verdict_of(&s.name) {
+                            obj["security_status"] = v;
+                        }
+                        obj
                     }).collect();
                     all_skills.push(json!({
                         "agent_id": agent.config.agent.name,
@@ -9354,26 +9403,54 @@ impl MethodHandler {
         let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
         let path = parsed.path().trim_end_matches('/');
 
+        // Does the last path segment name a file (has a `.ext`)? Used to tell a
+        // `/tree/<ref>/<dir>` directory URL (append SKILL.md) apart from a
+        // `/tree/<ref>/<file>` URL (treat like a blob, fetch the file itself).
+        let path_names_file = |p: &str| -> bool {
+            p.rsplit('/')
+                .next()
+                .map(|seg| seg.contains('.'))
+                .unwrap_or(false)
+        };
+
         Ok(match host.as_str() {
-            // github.com/user/repo            -> raw HEAD/SKILL.md
+            // github.com/user/repo             -> raw HEAD/SKILL.md
             // github.com/user/repo/blob/x/f.md -> raw file
+            // github.com/user/repo/tree/x/dir  -> raw dir/SKILL.md (subdir skill —
+            //   the most common share format; a tree URL that names a file is
+            //   treated like a blob)
             "github.com" | "www.github.com" => {
                 if path.contains("/blob/") {
                     format!(
                         "https://raw.githubusercontent.com{}",
                         path.replacen("/blob/", "/", 1)
                     )
+                } else if path.contains("/tree/") {
+                    let raw = path.replacen("/tree/", "/", 1);
+                    if path_names_file(&raw) {
+                        format!("https://raw.githubusercontent.com{raw}")
+                    } else {
+                        format!("https://raw.githubusercontent.com{raw}/SKILL.md")
+                    }
                 } else {
                     format!("https://raw.githubusercontent.com{path}/HEAD/SKILL.md")
                 }
             }
             // gist.github.com/user/id -> gist raw (latest revision)
             "gist.github.com" => format!("https://gist.githubusercontent.com{path}/raw"),
-            // gitlab.com/user/repo             -> raw HEAD/SKILL.md
-            // gitlab.com/user/repo/-/blob/x/f  -> /-/raw/x/f
+            // gitlab.com/user/repo               -> raw HEAD/SKILL.md
+            // gitlab.com/user/repo/-/blob/x/f    -> /-/raw/x/f
+            // gitlab.com/user/repo/-/tree/x/dir  -> /-/raw/x/dir/SKILL.md
             "gitlab.com" | "www.gitlab.com" => {
                 if path.contains("/-/blob/") {
                     format!("https://gitlab.com{}", path.replacen("/-/blob/", "/-/raw/", 1))
+                } else if path.contains("/-/tree/") {
+                    let raw = path.replacen("/-/tree/", "/-/raw/", 1);
+                    if path_names_file(&raw) {
+                        format!("https://gitlab.com{raw}")
+                    } else {
+                        format!("https://gitlab.com{raw}/SKILL.md")
+                    }
                 } else {
                     format!("https://gitlab.com{path}/-/raw/HEAD/SKILL.md")
                 }
@@ -9565,7 +9642,12 @@ impl MethodHandler {
     ) -> Result<String, String> {
         let tmp_dir = std::env::temp_dir().join("duduclaw-skill-install");
         std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create temp dir: {e}"))?;
-        let tmp_file = tmp_dir.join(format!("{skill_name}.md"));
+        // `skill_name` may come from user-supplied frontmatter — sanitize so a
+        // `name: ../../x` can never shape a path outside the temp dir.
+        let tmp_file = tmp_dir.join(format!(
+            "{}.md",
+            crate::install_notify::sanitize_tmp_file_stem(skill_name)
+        ));
         std::fs::write(&tmp_file, content).map_err(|e| format!("write temp file: {e}"))?;
 
         let quarantine_dir = self.home_dir.join("quarantine");
@@ -9634,6 +9716,42 @@ impl MethodHandler {
 
     /// File a Skill install request (non-admin). Scans fail-closed: a
     /// risk ≥ High skill is rejected outright (no request is created).
+    /// Best-effort: proactively DM the request's current-stage approvers on
+    /// their linked channels (Feature C). Spawned detached so channel HTTP
+    /// never delays the RPC response; failures are logged inside.
+    async fn spawn_install_notify(&self, request_id: String) {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        let home = self.home_dir.clone();
+        tokio::spawn(async move {
+            if let Ok(store) = crate::install_requests::InstallRequestStore::open(&home) {
+                if let Ok(Some(req)) = store.get(&request_id).await {
+                    crate::install_notify::notify_install_approvers(&home, &db, &req).await;
+                }
+            }
+        });
+    }
+
+    /// Best-effort: tell the requester the FINAL outcome of their request on
+    /// their linked channels (approved+installed / install failed / denied).
+    /// Spawned detached so channel HTTP never delays the RPC response.
+    async fn spawn_requester_notify(&self, request_id: String, text: String) {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        let home = self.home_dir.clone();
+        tokio::spawn(async move {
+            if let Ok(store) = crate::install_requests::InstallRequestStore::open(&home) {
+                if let Ok(Some(req)) = store.get(&request_id).await {
+                    crate::install_notify::notify_requester(&home, &db, &req, &text).await;
+                }
+            }
+        });
+    }
+
     /// Look up a user's department from the user DB (`None` if unset / no DB).
     async fn user_department(&self, user_id: &str) -> Option<String> {
         let db = self.user_db.read().await.as_ref()?.clone();
@@ -9712,6 +9830,7 @@ impl MethodHandler {
         {
             Ok(id) => {
                 let stage = if ctx.role == UserRole::Employee { "awaiting_manager" } else { "awaiting_admin" };
+                self.spawn_install_notify(id.clone()).await;
                 WsFrame::ok_response("", json!({
                     "request_id": id,
                     "status": "pending",
@@ -9801,6 +9920,7 @@ impl MethodHandler {
         {
             Ok(id) => {
                 let stage = if ctx.role == UserRole::Employee { "awaiting_manager" } else { "awaiting_admin" };
+                self.spawn_install_notify(id.clone()).await;
                 WsFrame::ok_response("", json!({
                     "request_id": id,
                     "status": "pending",
@@ -9886,9 +10006,16 @@ impl MethodHandler {
 
         match outcome {
             crate::install_requests::DecideOutcome::Denied => {
+                self.spawn_requester_notify(
+                    id.clone(),
+                    "❌ 您的安裝申請已被退回。詳情請見儀表板。".to_string(),
+                )
+                .await;
                 WsFrame::ok_response("", json!({ "status": "denied" }))
             }
             crate::install_requests::DecideOutcome::AdvancedToAdmin => {
+                // Manager cleared stage 1 → notify the admins (stage 2).
+                self.spawn_install_notify(id.clone()).await;
                 WsFrame::ok_response("", json!({ "status": "pending", "stage": "awaiting_admin" }))
             }
             crate::install_requests::DecideOutcome::ReadyToExecute => {
@@ -9899,6 +10026,12 @@ impl MethodHandler {
                 let exec = self.execute_approved_install(&req).await;
                 let ok = exec.is_ok();
                 let _ = store.mark_executed(&id, ok, exec.as_ref().err().map(|s| s.as_str())).await;
+                let requester_text = if ok {
+                    format!("✅ 您的安裝申請「{}」已核准並完成安裝。", req.title)
+                } else {
+                    format!("⚠️ 您的安裝申請「{}」已核准，但安裝執行失敗。詳情請見儀表板。", req.title)
+                };
+                self.spawn_requester_notify(id.clone(), requester_text).await;
                 match exec {
                     Ok(detail) => WsFrame::ok_response("", json!({
                         "status": "approved",
@@ -9941,6 +10074,11 @@ impl MethodHandler {
                     .map(|n| n.trim().to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 let installed = self.run_skill_install(scope, content, &skill_name).await?;
+                // Persist the scan verdict so the installed skill's "security"
+                // column reflects that it passed vetting instead of showing
+                // "Not scanned" (Bug#9). Best-effort — a write failure must not
+                // fail an otherwise-successful install.
+                self.record_skill_scan_verdict(&installed, scan.risk_level);
                 Ok(json!({ "skill_name": installed, "scope": scope }))
             }
             "mcp" => {
@@ -9979,6 +10117,58 @@ impl MethodHandler {
             }
             other => Err(format!("unknown request kind: {other}")),
         }
+    }
+
+    /// Sidecar path mapping installed skill name → security-scan verdict
+    /// (`pass` / `warn` / `fail`). Lets `skills.list` surface a real verdict on
+    /// approved installs instead of "Not scanned" (Bug#9).
+    fn skill_scan_verdicts_path(&self) -> std::path::PathBuf {
+        self.home_dir.join("skill_scan_verdicts.json")
+    }
+
+    /// Map a scan risk level to the 3-state frontend verdict.
+    fn risk_to_verdict(
+        risk: crate::skill_lifecycle::security_scanner::RiskLevel,
+    ) -> &'static str {
+        use crate::skill_lifecycle::security_scanner::RiskLevel;
+        match risk {
+            RiskLevel::Clean | RiskLevel::Low => "pass",
+            RiskLevel::Medium => "warn",
+            RiskLevel::High | RiskLevel::Critical => "fail",
+        }
+    }
+
+    /// Record a skill's scan verdict in the sidecar map (cross-process safe via
+    /// an advisory file lock — coding convention #3). Best-effort: any error is
+    /// swallowed so it never blocks an install.
+    fn record_skill_scan_verdict(
+        &self,
+        skill_name: &str,
+        risk: crate::skill_lifecycle::security_scanner::RiskLevel,
+    ) {
+        let path = self.skill_scan_verdicts_path();
+        let name = skill_name.to_string();
+        let verdict = Self::risk_to_verdict(risk).to_string();
+        let _ = duduclaw_core::with_file_lock(&path, || {
+            let mut map: serde_json::Map<String, Value> = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            map.insert(name.clone(), Value::String(verdict.clone()));
+            if let Ok(serialized) = serde_json::to_string(&Value::Object(map)) {
+                let _ = std::fs::write(&path, serialized);
+            }
+            Ok::<(), std::io::Error>(())
+        });
+    }
+
+    /// Load the skill scan-verdict map (name → `pass`/`warn`/`fail`). Missing or
+    /// malformed file ⇒ empty map (no verdict shown, same as before).
+    fn load_skill_scan_verdicts(&self) -> serde_json::Map<String, Value> {
+        std::fs::read_to_string(self.skill_scan_verdicts_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
     // ── Custom skills (human × agent authored; V13-T13.0) ───
@@ -12142,14 +12332,17 @@ impl MethodHandler {
 
     // ── System ───────────────────────────────────────────────
 
-    async fn handle_system_status(&self) -> WsFrame {
+    /// Build the `system.status` payload. Shared by the RPC handler and the
+    /// `system.status_changed` broadcast so an open dashboard reflects a live
+    /// edition change (e.g. license activation) without a manual refresh.
+    async fn system_status_payload(&self) -> Value {
         let reg = self.registry.read().await;
         let uptime = self.start_time.elapsed().as_secs();
         let channel_map = self.channel_status.read().await;
         let channels_connected = channel_map.values().filter(|s| s.connected).count();
         drop(channel_map);
         let edition_profile = self.resolve_edition_profile().await;
-        WsFrame::ok_response("", json!({
+        json!({
             "version": crate::updater::current_version(),
             "uptime_seconds": uptime,
             "agents_count": reg.list().len(),
@@ -12159,7 +12352,20 @@ impl MethodHandler {
             // license `edition` string returned by system.version. The
             // dashboard reads this to hide/show enterprise management surfaces.
             "edition_profile": edition_profile.as_str(),
-        }))
+        })
+    }
+
+    async fn handle_system_status(&self) -> WsFrame {
+        WsFrame::ok_response("", self.system_status_payload().await)
+    }
+
+    /// Push a fresh `system.status` to every connected dashboard so live
+    /// changes to the edition/license reflect without a browser refresh. The
+    /// frontend `system-store` subscribes to `system.status_changed`.
+    /// `pub(crate)`: also fired by the server's background edition watcher.
+    pub(crate) async fn broadcast_system_status(&self) {
+        let payload = self.system_status_payload().await;
+        self.broadcast_event("system.status_changed", payload).await;
     }
 
     async fn handle_system_doctor(&self) -> WsFrame {
@@ -15178,6 +15384,42 @@ impl MethodHandler {
             .into_iter()
             .map(|b| b.agent_name)
             .collect();
+        // Custom widgets referenced by the target's layout, WITH html — the
+        // view-as grant (strict-rank, enforced above) covers rendering the
+        // subordinate's board, and `widgets.custom.get` would deny the viewer
+        // for the target's private widgets. Only ids actually on the layout
+        // are exposed, read-only like everything else here.
+        let custom_widgets: Vec<Value> = {
+            let referenced: Vec<String> = layout
+                .get("widgets")
+                .and_then(|v| v.as_array())
+                .map(|ws| {
+                    ws.iter()
+                        .filter_map(|w| w.get("id").and_then(|i| i.as_str()))
+                        .filter_map(|id| {
+                            id.strip_prefix(crate::custom_widgets::LAYOUT_ID_PREFIX)
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if referenced.is_empty() {
+                Vec::new()
+            } else {
+                match crate::custom_widgets::CustomWidgetStore::open(&self.home_dir) {
+                    Ok(store) => {
+                        let mut out = Vec::new();
+                        for id in referenced {
+                            if let Ok(Some(w)) = store.get(&id).await {
+                                out.push(json!({ "id": w.id, "title": w.title, "html": w.html }));
+                            }
+                        }
+                        out
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+        };
         WsFrame::ok_response("", json!({
             "user": {
                 "id": target.id,
@@ -15187,6 +15429,7 @@ impl MethodHandler {
             "widgets": widgets,
             "layout": layout,
             "bound_agents": bound_agents,
+            "custom_widgets": custom_widgets,
             "read_only": true,
         }))
     }
@@ -15237,6 +15480,18 @@ impl MethodHandler {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
+        // Custom widgets ride the layout as `custom:<uuid>` — allowed when the
+        // widget is VISIBLE to the caller (their own or instance-shared).
+        // Resolved once here so the loop below stays synchronous.
+        let custom_visible: std::collections::HashSet<String> =
+            match crate::custom_widgets::CustomWidgetStore::open(&self.home_dir) {
+                Ok(store) => store
+                    .list_visible(&ctx.user_id)
+                    .await
+                    .map(|ws| ws.into_iter().map(|w| w.id).collect())
+                    .unwrap_or_default(),
+                Err(_) => Default::default(),
+            };
         let mut normalized: Vec<Value> = Vec::with_capacity(widgets.len());
         let mut seen = std::collections::HashSet::new();
         for w in widgets {
@@ -15245,7 +15500,12 @@ impl MethodHandler {
             };
             // Fail-closed: an id outside the caller's own catalogue is refused
             // (never silently dropped — the client should know it drifted).
-            if !allowed.contains(id) {
+            let is_ok = if let Some(cid) = id.strip_prefix(crate::custom_widgets::LAYOUT_ID_PREFIX) {
+                custom_visible.contains(cid)
+            } else {
+                allowed.contains(id)
+            };
+            if !is_ok {
                 return WsFrame::error_response("", &format!("widget '{id}' is not available to you"));
             }
             if !seen.insert(id.to_string()) {
@@ -15271,6 +15531,240 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to commit layout: {e}"));
         }
         WsFrame::ok_response("", json!({ "success": true, "layout": layout }))
+    }
+
+    // ── Custom widgets (sandboxed-iframe HTML cards) ─────────
+    //
+    // Store: `custom_widgets.rs`. The SECURITY boundary is the renderer
+    // (unique-origin sandboxed iframe + injected CSP + allowlisted data
+    // bridge), so any authenticated user may own widgets; the admin-only gate
+    // on `origin = "html"` keeps the raw-HTML authoring surface a
+    // distributor/engineer tool as designed, it is not a security control.
+
+    fn custom_widget_store(&self) -> Result<crate::custom_widgets::CustomWidgetStore, WsFrame> {
+        crate::custom_widgets::CustomWidgetStore::open(&self.home_dir)
+            .map_err(|e| WsFrame::error_response("", &format!("open custom widgets: {e}")))
+    }
+
+    /// Serialize a widget for list payloads — html is stripped (lazy-loaded
+    /// via `widgets.custom.get` at render time) but its size is reported.
+    fn custom_widget_summary(w: &crate::custom_widgets::CustomWidget) -> Value {
+        json!({
+            "id": w.id,
+            "title": w.title,
+            "description": w.description,
+            "origin": w.origin.as_str(),
+            "created_by_user": w.created_by_user,
+            "shared": w.shared,
+            "html_bytes": w.html.len(),
+            "created_at": w.created_at,
+            "updated_at": w.updated_at,
+        })
+    }
+
+    async fn handle_widgets_custom_list(&self, ctx: &UserContext) -> WsFrame {
+        let store = match self.custom_widget_store() {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        match store.list_visible(&ctx.user_id).await {
+            Ok(rows) => {
+                let items: Vec<Value> = rows.iter().map(Self::custom_widget_summary).collect();
+                // 0 = unlimited; the client only renders a "/cap" suffix when > 0.
+                let max_per_user = crate::custom_widgets::max_widgets_per_user();
+                WsFrame::ok_response("", json!({ "widgets": items, "max_per_user": max_per_user }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_widgets_custom_get(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(id) = params.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+            return WsFrame::error_response("", "id is required");
+        };
+        let store = match self.custom_widget_store() {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        match store.get(id).await {
+            Ok(Some(w)) if w.shared || w.created_by_user == ctx.user_id => {
+                let mut v = Self::custom_widget_summary(&w);
+                v["html"] = json!(w.html);
+                WsFrame::ok_response("", v)
+            }
+            Ok(_) => WsFrame::error_response("", "找不到此 widget 或無權檢視"),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_widgets_custom_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let description = params.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let html = params.get("html").and_then(|v| v.as_str()).unwrap_or("");
+        let origin_raw = params.get("origin").and_then(|v| v.as_str()).unwrap_or("ai");
+        let Some(origin) = crate::custom_widgets::WidgetOrigin::parse(origin_raw) else {
+            return WsFrame::error_response("", "origin must be 'html' or 'ai'");
+        };
+        // Product gate (not a security boundary — the sandbox is): the raw
+        // HTML authoring surface is admin-only per the 2026-07-16 design.
+        if origin == crate::custom_widgets::WidgetOrigin::Html && ctx.role != UserRole::Admin {
+            return WsFrame::error_response("", "HTML 自訂 widget 僅限管理員建立");
+        }
+        let store = match self.custom_widget_store() {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        match store.create(title, description, html, origin, &ctx.user_id).await {
+            Ok(id) => WsFrame::ok_response("", json!({ "success": true, "id": id })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_widgets_custom_update(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(id) = params.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+            return WsFrame::error_response("", "id is required");
+        };
+        let title = params.get("title").and_then(|v| v.as_str());
+        let description = params.get("description").and_then(|v| v.as_str());
+        let html = params.get("html").and_then(|v| v.as_str());
+        let store = match self.custom_widget_store() {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        // Editing the HTML of an `origin=html` widget stays admin-only (same
+        // product gate as create); AI widgets are re-generated, and their
+        // owner may still rename/describe them here.
+        if html.is_some() && ctx.role != UserRole::Admin {
+            match store.get(id).await {
+                Ok(Some(w)) if w.origin == crate::custom_widgets::WidgetOrigin::Html => {
+                    return WsFrame::error_response("", "HTML widget 僅限管理員編輯");
+                }
+                Ok(_) => {}
+                Err(e) => return WsFrame::error_response("", &e),
+            }
+        }
+        match store.update(id, &ctx.user_id, title, description, html).await {
+            Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_widgets_custom_remove(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(id) = params.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+            return WsFrame::error_response("", "id is required");
+        };
+        let store = match self.custom_widget_store() {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        match store.remove(id, &ctx.user_id, ctx.role == UserRole::Admin).await {
+            Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_widgets_custom_share(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(id) = params.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+            return WsFrame::error_response("", "id is required");
+        };
+        let shared = params.get("shared").and_then(|v| v.as_bool()).unwrap_or(true);
+        let store = match self.custom_widget_store() {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        match store.set_shared(id, &ctx.user_id, shared).await {
+            Ok(()) => WsFrame::ok_response("", json!({ "success": true, "shared": shared })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `widgets.custom.generate` — the guided natural-language flow (P2).
+    /// Generates widget HTML from the picker answers + freeform description
+    /// (optionally revising a prior draft with feedback). NOTHING is stored —
+    /// the client previews in the sandbox and calls `widgets.custom.create`
+    /// only when the user accepts. Call chain mirrors the night engine:
+    /// rotated Claude CLI (zero-tool caps) → Direct API fallback.
+    async fn handle_widgets_custom_generate(&self, params: Value) -> WsFrame {
+        let freeform = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        let style = params.get("style").and_then(|v| v.as_str()).unwrap_or("");
+        let data_sources: Vec<String> = params
+            .get("data_sources")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let prior_html = params.get("prior_html").and_then(|v| v.as_str());
+        let feedback = params.get("feedback").and_then(|v| v.as_str());
+        if freeform.trim().is_empty() && data_sources.is_empty() && prior_html.is_none() {
+            return WsFrame::error_response("", "請至少選擇一種資料來源或描述需求");
+        }
+        if freeform.chars().count() > 2000 {
+            return WsFrame::error_response("", "需求描述最長 2000 字");
+        }
+
+        let (system, user) = crate::custom_widgets::build_generation_prompt(
+            &data_sources,
+            style,
+            freeform,
+            prior_html,
+            feedback,
+        );
+        // Zero-tool capabilities: generation is pure text-out, the spawned CLI
+        // must not get the default tool/MCP surface. (Named for the night
+        // engine, but it is just the shared "no tools" preset.)
+        let caps = crate::night_llm::night_capabilities();
+        let model = crate::custom_widgets::GENERATE_MODEL;
+
+        let cli_err = match crate::channel_reply::call_claude_cli_rotated(
+            &user,
+            model,
+            &system,
+            &self.home_dir,
+            None,
+            None,
+            Some(&caps),
+            None,
+            &[],
+        )
+        .await
+        {
+            Ok(text) if !text.trim().is_empty() => {
+                let html = match crate::custom_widgets::extract_html_fragment(&text) {
+                    Ok(h) => h,
+                    Err(e) => return WsFrame::error_response("", &format!("產生結果無效：{e}")),
+                };
+                if let Err(e) = crate::custom_widgets::validate_widget_fields("t", "", &html) {
+                    return WsFrame::error_response("", &format!("產生結果無效：{e}"));
+                }
+                return WsFrame::ok_response("", json!({ "html": html }));
+            }
+            Ok(_) => "empty CLI response".to_string(),
+            Err(e) => duduclaw_core::truncate_chars(&e, 200),
+        };
+
+        let api_key = crate::claude_runner::get_api_key_from_home(&self.home_dir).await;
+        if api_key.is_empty() {
+            return WsFrame::error_response(
+                "",
+                &format!("widget 產生失敗（{cli_err}），且未設定 API key 可作備援"),
+            );
+        }
+        match crate::direct_api::call_direct_api(&api_key, model, &system, &user, &[]).await {
+            Ok(resp) if !resp.text.trim().is_empty() => {
+                let html = match crate::custom_widgets::extract_html_fragment(&resp.text) {
+                    Ok(h) => h,
+                    Err(e) => return WsFrame::error_response("", &format!("產生結果無效：{e}")),
+                };
+                if let Err(e) = crate::custom_widgets::validate_widget_fields("t", "", &html) {
+                    return WsFrame::error_response("", &format!("產生結果無效：{e}"));
+                }
+                WsFrame::ok_response("", json!({ "html": html }))
+            }
+            Ok(_) => WsFrame::error_response("", "widget 產生失敗：模型回傳空內容"),
+            Err(e) => WsFrame::error_response(
+                "",
+                &format!("widget 產生失敗：{}", duduclaw_core::truncate_chars(&e, 200)),
+            ),
+        }
     }
 
     // ── Department registry handlers ─────────────────────────
@@ -15397,7 +15891,7 @@ impl MethodHandler {
         let department = params.get("department").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
         if let Some(d) = department {
             if !duduclaw_core::is_valid_department(d) {
-                return WsFrame::error_response("", "invalid department name (allowed: A-Za-z0-9-_, 1-64 chars)");
+                return WsFrame::error_response("", "invalid department name (1-64 bytes, no path separators / whitespace / control chars)");
             }
         }
 
@@ -15452,7 +15946,7 @@ impl MethodHandler {
             Some(Value::String(s)) => {
                 let d = s.trim();
                 if !duduclaw_core::is_valid_department(d) {
-                    return WsFrame::error_response("", "invalid department name (allowed: A-Za-z0-9-_, 1-64 chars)");
+                    return WsFrame::error_response("", "invalid department name (1-64 bytes, no path separators / whitespace / control chars)");
                 }
                 Some(Some(d.to_string()))
             }
@@ -16909,10 +17403,19 @@ impl MethodHandler {
         if title.is_empty() {
             return WsFrame::error_response("", "title is required");
         }
-        let assigned_to = params.get("assigned_to").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if assigned_to.is_empty() {
-            return WsFrame::error_response("", "assigned_to is required");
-        }
+        // `assigned_to` is OPTIONAL — an empty value means "unassigned". An
+        // unassigned task is never auto-dispatched: the heartbeat task-board
+        // pull (`poll_assigned_tasks`, `WHERE assigned_to = <agent>`) and the
+        // goal-loop driver (`!assigned_to.trim().is_empty()`) both filter on a
+        // concrete assignee, so a human-organising task stays on the board
+        // until someone explicitly claims it (Bug#4 — prevents an agent
+        // silently picking up a bookkeeping task and burning LLM spend).
+        let assigned_to = params
+            .get("assigned_to")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let description = params.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let priority = params.get("priority").and_then(|v| v.as_str()).unwrap_or("medium").to_string();
         let tags = params
@@ -19370,6 +19873,7 @@ fn task_row_to_json(r: &TaskRow) -> Value {
         "updated_at": r.updated_at,
         "completed_at": r.completed_at,
         "blocked_reason": r.blocked_reason,
+        "judge_feedback": r.judge_feedback,
         "parent_task_id": r.parent_task_id,
         "tags": r.tags.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
         "message_id": r.message_id,
@@ -19574,6 +20078,37 @@ mod skill_source_url_tests {
         assert_eq!(
             MethodHandler::resolve_skill_source_url("https://github.com/u/r/blob/main/skills/x.md").unwrap(),
             "https://raw.githubusercontent.com/u/r/main/skills/x.md"
+        );
+    }
+
+    #[test]
+    fn github_tree_dir_appends_skill_md() {
+        // The canonical way to share a subdirectory skill (Bug#1 fix).
+        assert_eq!(
+            MethodHandler::resolve_skill_source_url("https://github.com/anthropics/skills/tree/main/skills/pptx").unwrap(),
+            "https://raw.githubusercontent.com/anthropics/skills/main/skills/pptx/SKILL.md"
+        );
+        // Trailing slash tolerated.
+        assert_eq!(
+            MethodHandler::resolve_skill_source_url("https://github.com/anthropics/skills/tree/main/skills/pptx/").unwrap(),
+            "https://raw.githubusercontent.com/anthropics/skills/main/skills/pptx/SKILL.md"
+        );
+    }
+
+    #[test]
+    fn github_tree_file_is_treated_like_blob() {
+        // A tree URL that already names a file must not get SKILL.md appended.
+        assert_eq!(
+            MethodHandler::resolve_skill_source_url("https://github.com/u/r/tree/main/skills/x/SKILL.md").unwrap(),
+            "https://raw.githubusercontent.com/u/r/main/skills/x/SKILL.md"
+        );
+    }
+
+    #[test]
+    fn gitlab_tree_dir_appends_skill_md() {
+        assert_eq!(
+            MethodHandler::resolve_skill_source_url("https://gitlab.com/u/r/-/tree/main/skills/pptx").unwrap(),
+            "https://gitlab.com/u/r/-/raw/main/skills/pptx/SKILL.md"
         );
     }
 
