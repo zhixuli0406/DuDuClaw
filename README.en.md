@@ -11,7 +11,7 @@ DuDuClaw connects AI command-line tools like Claude Code, Codex, and Gemini to n
 All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain for Claude, Codex, Gemini, Antigravity, or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-1.37.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.37.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)

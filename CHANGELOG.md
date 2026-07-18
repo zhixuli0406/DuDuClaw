@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.37.1] - 2026-07-19 — Signed NFR test licenses + distributor self-service
+
 ### Added
 - **NFR(Not-For-Resale)簽章標記(2026-07-18)。** License 新增簽章內 `nfr`
   布林欄位(向後相容:`false` 時序列化位元組與舊版完全一致,舊簽章照常驗證;
