@@ -287,6 +287,27 @@ export function LicensePage() {
 
       {snapshot && (
         <>
+          {/* ── NFR watermark: signed into the license, never hidden by
+              white-label branding — the anti-resale marker ────── */}
+          {snapshot.nfr && (
+            <div
+              role="status"
+              className="flex items-center gap-3 rounded-xl border border-amber-400/50 bg-amber-50 px-4 py-3 text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200"
+            >
+              <span className="text-lg" aria-hidden>
+                🧪
+              </span>
+              <div>
+                <p className="text-sm font-semibold">
+                  {intl.formatMessage({ id: 'license.nfr.title' })}
+                </p>
+                <p className="text-xs opacity-80">
+                  {intl.formatMessage({ id: 'license.nfr.subtitle' })}
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* ── KPI status: tier / expiry / phone-home ────── */}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <StatTile

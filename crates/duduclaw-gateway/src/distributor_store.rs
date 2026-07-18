@@ -717,6 +717,9 @@ fn resign_license_preserving(
         control_url,
         branding_editable,
         max_agents,
+        // NFR marker survives refresh/upgrade — a re-signed test license must
+        // never come back clean.
+        nfr: prev.as_ref().is_some_and(|l| l.nfr),
     };
     sign_and_self_verify(signing_seed, verify_registry, "v2", license)
 }

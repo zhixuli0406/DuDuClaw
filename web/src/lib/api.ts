@@ -805,6 +805,11 @@ export interface LicenseSnapshot {
   days_since_phone_home?: number | null;
   /** `true` when the license fingerprint matches the current machine. */
   fingerprint_match?: boolean | null;
+  /**
+   * NFR (Not-For-Resale) internal-test license. Renders a badge that
+   * white-label branding must never remove — the anti-resale watermark.
+   */
+  nfr?: boolean;
 }
 
 // ── User management types ────────────────────────────────────

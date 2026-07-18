@@ -541,6 +541,8 @@
   "license.loading": "Loading license status…",
   "license.activeTier": "Active tier",
   "license.mode.commercial": "Commercial license",
+  "license.nfr.title": "Internal test license (NFR)",
+  "license.nfr.subtitle": "Not For Resale — for distributor internal testing only; may not be sold or transferred to customers.",
   "license.mode.opensource": "Apache 2.0 open-source mode — core features fully unlocked",
   "license.customerId": "Customer ID",
   "license.subscriptionId": "Subscription ID",

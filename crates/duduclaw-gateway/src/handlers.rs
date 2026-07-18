@@ -3987,6 +3987,7 @@ impl MethodHandler {
                 fingerprint_match: None,
                 branding_editable: None,
                 max_agents: None,
+                nfr: false,
             },
         };
 

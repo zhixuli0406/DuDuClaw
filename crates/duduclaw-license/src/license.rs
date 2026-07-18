@@ -115,6 +115,22 @@ pub struct License {
     /// byte-identically to a pre-P-License key and old signatures still verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_agents: Option<u32>,
+
+    /// NFR (Not-For-Resale) internal-test marker. `true` on free evaluation
+    /// licenses granted to distributors for their own testing — full tier
+    /// features (including white-label, so branded builds are testable), but
+    /// the dashboard renders a "NOT FOR RESALE" badge that branding cannot
+    /// remove, making a resold copy immediately identifiable.
+    ///
+    /// **Part of [`Self::canonical_payload`]** (like `max_agents`): the marker
+    /// is a security boundary — if it were unsigned, stripping it from
+    /// `license.json` would turn a free test license into a clean paid-looking
+    /// one. Because it is signed, removing it invalidates the signature →
+    /// OpenSource (fail-closed). Added at the END of the canonical struct with
+    /// `skip_serializing_if`, so `false` serializes byte-identically to a
+    /// pre-NFR license and old signatures still verify.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nfr: bool,
 }
 
 impl License {
@@ -267,6 +283,7 @@ impl License {
             public_key_id: &self.public_key_id,
             branding_editable: self.branding_editable.as_ref(),
             max_agents: self.max_agents,
+            nfr: self.nfr,
         };
         serde_json::to_vec(&payload)
             .map_err(|e| LicenseError::ParseError(format!("canonical payload: {e}")))
@@ -300,6 +317,7 @@ impl License {
             control_url: None,
             branding_editable: None,
             max_agents: None,
+            nfr: false,
         }
     }
 }
@@ -329,6 +347,11 @@ struct CanonicalPayload<'a> {
     /// license (old signatures keep verifying).
     #[serde(skip_serializing_if = "Option::is_none")]
     max_agents: Option<u32>,
+    /// NFR internal-test marker. Added last with `skip_serializing_if` so
+    /// `false` yields byte-identical canonical bytes to a pre-NFR license
+    /// (old signatures keep verifying).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    nfr: bool,
 }
 
 /// Serde helper for encoding `Vec<u8>` as base64 strings in JSON.
@@ -368,7 +391,39 @@ mod tests {
             control_url: None,
             branding_editable: None,
             max_agents: None,
+            nfr: false,
         }
+    }
+
+    #[test]
+    fn nfr_false_canonical_bytes_match_pre_nfr_schema() {
+        // Backward compat: a non-NFR license must serialize byte-identically to
+        // a license produced before the field existed, so old signatures verify.
+        let license = make_license(LicenseTier::Solo, 30, 0);
+        let payload = String::from_utf8(license.canonical_payload().unwrap()).unwrap();
+        assert!(!payload.contains("nfr"));
+    }
+
+    #[test]
+    fn nfr_true_changes_canonical_payload() {
+        let mut license = make_license(LicenseTier::SelfHostPro, 30, 0);
+        let payload_clean = license.canonical_payload().unwrap();
+        license.nfr = true;
+        let payload_nfr = license.canonical_payload().unwrap();
+        assert_ne!(payload_clean, payload_nfr, "stripping nfr must break the signature");
+    }
+
+    #[test]
+    fn nfr_roundtrips_through_json() {
+        let mut license = make_license(LicenseTier::SelfHostPro, 30, 0);
+        license.nfr = true;
+        let json = serde_json::to_string(&license).unwrap();
+        let back: License = serde_json::from_str(&json).unwrap();
+        assert!(back.nfr);
+        // Old license files without the field deserialize to false.
+        let legacy: License =
+            serde_json::from_str(&json.replace(",\"nfr\":true", "")).unwrap();
+        assert!(!legacy.nfr);
     }
 
     #[test]

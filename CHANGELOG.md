@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+- **NFR(Not-For-Resale)簽章標記(2026-07-18)。** License 新增簽章內 `nfr`
+  布林欄位(向後相容:`false` 時序列化位元組與舊版完全一致,舊簽章照常驗證;
+  從 `license.json` 移除標記即簽章失效 → fail-closed 降級 OpenSource)。用途:
+  經銷商內部測試授權——完整 Self-Host Pro 功能(含白牌,可測 branded build),
+  但授權頁會顯示白牌蓋不掉的「內部測試授權(NFR)— 不得轉售」標記(zh-TW/en/ja),
+  轉售的副本一眼可辨。`LicenseSnapshot` 增列 `nfr`;refresh/rebind 均保留標記,
+  re-sign 後不會「洗白」。
+
 ## [1.37.0] - 2026-07-18 — Goal Loop autonomous agents, custom dashboard widgets, DuDuClaw design system
 
 ### Added
