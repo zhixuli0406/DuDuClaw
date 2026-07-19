@@ -111,6 +111,17 @@ export function WebChatPage() {
   const mainAgentId = useMemo(() => agents.find((a) => a.role === 'main')?.name ?? null, [agents]);
   const historyAgentId = selectedAgentId ?? mainAgentId;
 
+  // The main agent is already represented by the leading DuDu chip (which routes
+  // to it), so it gets no duplicate employee chip in the row.
+  const staffAgents = useMemo(() => agents.filter((a) => a.role !== 'main'), [agents]);
+
+  // A restored/preselected selection (e.g. `?agent=<main>`) may point at the main
+  // agent, whose chip no longer exists — normalize it back to DuDu so the
+  // highlighted entry is always present.
+  useEffect(() => {
+    if (mainAgentId && selectedAgentId === mainAgentId) selectAgent(null);
+  }, [mainAgentId, selectedAgentId, selectAgent]);
+
   // ── Session list (left column) ──────────────────────────────────────────────
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [sessionsState, setSessionsState] = useState<'idle' | 'loading' | 'error' | 'ready'>('idle');
@@ -302,7 +313,7 @@ export function WebChatPage() {
 
       {agents.length > 0 && (
         <div className="shrink-0 border-b border-surface-border">
-          <EmployeeRow agents={agents} selectedId={selectedAgentId} onSelect={selectAgent} />
+          <EmployeeRow agents={staffAgents} selectedId={selectedAgentId} onSelect={selectAgent} />
         </div>
       )}
 
