@@ -412,10 +412,13 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let url = attempt.url().clone();
             let target = url.as_str();
-            // Allow GitHub CDN redirects (objects.githubusercontent.com)
+            // Allow GitHub CDN redirects. Release assets historically
+            // redirected to objects.githubusercontent.com; GitHub now uses
+            // release-assets.githubusercontent.com (Azure-blob-signed URLs).
             let repo = github_repo();
             let repo_prefix = format!("https://github.com/{repo}/");
             if target.starts_with("https://objects.githubusercontent.com/")
+                || target.starts_with("https://release-assets.githubusercontent.com/")
                 || target.starts_with(&repo_prefix)
             {
                 attempt.follow()

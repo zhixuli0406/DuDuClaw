@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+- **儀表板系統更新不再因 GitHub CDN 換域而失敗。** GitHub 已將 release 資產下載的
+  重導向目標從 `objects.githubusercontent.com` 改為
+  `release-assets.githubusercontent.com`(Azure blob 簽名網址),`apply_update`
+  的 redirect 白名單只認得舊網域,導致下載被自身安全政策擋下、儀表板顯示
+  「更新失敗」(audit log:`Download failed: error following redirect`)。白名單
+  加入新網域(舊網域保留以防 GitHub 分階段切換);`check_update` 的 API 端點
+  政策不受影響、維持原樣。注意:已在跑的舊版 binary 仍帶舊白名單,升級到本版
+  需手動安裝一次,之後即可恢復儀表板一鍵更新。
+
 ## [1.38.0] - 2026-07-19 — Dashboard auto-save settings, high-risk toggle confirmations, OAuth PTY defaults
 
 ### Added
