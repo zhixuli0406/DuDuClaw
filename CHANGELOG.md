@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.38.0] - 2026-07-19 — Dashboard auto-save settings, high-risk toggle confirmations, OAuth PTY defaults
+
 ### Added
 - **員工編輯頁改為即時儲存（2026-07-19）。** `/agents/:id/edit` 移除「儲存」按鈕：
   任何修改後 1 秒自動寫入（單一儲存航班＋尾隨補寫，不併發、不漏改），右上角顯示
