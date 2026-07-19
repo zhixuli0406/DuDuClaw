@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.38.1] - 2026-07-19 — Dashboard self-update redirect fix
+
 ### Fixed
 - **儀表板系統更新不再因 GitHub CDN 換域而失敗。** GitHub 已將 release 資產下載的
   重導向目標從 `objects.githubusercontent.com` 改為
