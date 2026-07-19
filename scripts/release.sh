@@ -150,6 +150,35 @@ run_verify() {
         rc=1
     fi
 
+    # Enterprise pro-image + offline OEM tar (commercial checkout only — the
+    # build script is absent on public checkouts, and both artifacts are private).
+    if [[ -x "commercial/duduclaw-pro-gateway/build-image.sh" ]] && command -v gcloud >/dev/null 2>&1; then
+        local proj region bucket img tar
+        proj="${DUDUCLAW_GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
+        region="${DUDUCLAW_GCP_REGION:-asia-east1}"
+        bucket="${DUDUCLAW_IMAGE_TAR_BUCKET:-duduclaw-oem-images}"
+        if [[ -n "$proj" && "$proj" != "(unset)" ]]; then
+            img="${region}-docker.pkg.dev/${proj}/duduclaw/duduclaw-pro:v${want}"
+            if gcloud artifacts docker images describe "$img" >/dev/null 2>&1; then
+                printf "  %-10s %-10s OK\n" "pro-image" "v$want"
+            else
+                printf "  %-10s %-10s MISSING — re-run: commercial/duduclaw-pro-gateway/build-image.sh v%s\n" \
+                    "pro-image" "v$want" "$want"
+                rc=1
+            fi
+            tar="gs://${bucket}/duduclaw-pro/duduclaw-pro-v${want}.tar.gz"
+            if gcloud storage objects describe "$tar" >/dev/null 2>&1; then
+                printf "  %-10s %-10s OK\n" "oem-tar" "v$want"
+            else
+                printf "  %-10s %-10s MISSING (%s) — issued packs fall back to manual docker save\n" \
+                    "oem-tar" "v$want" "$tar"
+                rc=1
+            fi
+        else
+            echo "  pro-image / oem-tar: skipped (no GCP project configured)"
+        fi
+    fi
+
     echo "------------------------------------------------------------------"
     if [[ $rc -ne 0 ]]; then
         echo "One or more registries are behind. The CI release.yml jobs for those"
