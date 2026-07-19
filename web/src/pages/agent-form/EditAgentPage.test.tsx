@@ -122,7 +122,7 @@ describe('EditAgentPage', () => {
     });
   });
 
-  it('a field edit + Save calls updateAgent', async () => {
+  it('a field edit auto-saves via updateAgent after the debounce', async () => {
     const user = userEvent.setup();
     const updateAgent = vi.fn().mockResolvedValue(undefined);
     useAgentsStore.setState({ updateAgent } as never);
@@ -134,14 +134,19 @@ describe('EditAgentPage', () => {
     await user.clear(nameInput);
     await user.type(nameInput, 'Renamed Bot');
 
-    await user.click(screen.getByRole('button', { name: 'Save' }));
+    // No manual Save button — the ~1s debounce fires the single-flight save.
+    expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument();
 
-    await waitFor(() => {
-      expect(updateAgent).toHaveBeenCalledWith(
-        'my-bot',
-        expect.objectContaining({ display_name: 'Renamed Bot' }),
-      );
-    });
+    // Allow the debounce window (1s) to elapse; the save is best-effort async.
+    await waitFor(
+      () => {
+        expect(updateAgent).toHaveBeenCalledWith(
+          'my-bot',
+          expect.objectContaining({ display_name: 'Renamed Bot' }),
+        );
+      },
+      { timeout: 3000 },
+    );
   });
 
   it('shows the not-found state when inspect fails', async () => {

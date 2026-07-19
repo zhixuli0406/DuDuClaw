@@ -29,9 +29,11 @@ export const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = ['claude', 'cod
 
 export const AGENT_ROLES: ReadonlyArray<string> = ['main', 'specialist', 'worker', 'developer', 'qa', 'planner'];
 
-/** RT — runtime form defaults. `agents.inspect` does not return [runtime], so
- *  this tab is write-only: it shows defaults and writes a partial update only
- *  when the operator touches it. */
+/** RT — runtime form defaults. `agents.inspect` now returns the `[runtime]`
+ *  block (only keys present in agent.toml), so the Edit page prefills these
+ *  from `agent.runtime` when available and falls back to these defaults
+ *  otherwise. A partial update is still written only when the operator (or the
+ *  PTY-pool OAuth default-enable) touches the tab. */
 export const DEFAULT_RUNTIME: Required<Omit<AgentRuntime, 'fallback'>> & { fallback: string } = {
   provider: 'claude',
   fallback: '',

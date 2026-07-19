@@ -12,6 +12,7 @@ import {
   type ComputerUseConfig,
   type ContractConfig,
   type RuntimeProvider,
+  type RuntimeDetect,
   type AgentOdooOverride,
 } from '@/lib/api';
 import { ModelSelect } from '@/components/shared/ModelSelect';
@@ -22,6 +23,7 @@ import {
   DurationField,
   ScheduleBuilder,
   DangerZone,
+  ConfirmDialog,
   type SelectOption,
 } from '@/components/settings/controls';
 import { toast, formatError } from '@/lib/toast';
@@ -51,6 +53,7 @@ import {
   SettingsRow,
   SettingsSaveState,
   type SettingsNavGroup,
+  type SettingsSaveStatus,
 } from '@/components/mds';
 import {
   type KvRow,
@@ -143,8 +146,77 @@ export function EditAgentPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // ── Autosave engine ────────────────────────────────────────────────
+  // There is no manual 儲存 button: every user edit schedules a debounced,
+  // single-flight save. `saveStatus` drives the header SettingsSaveState.
+  const [saveStatus, setSaveStatus] = useState<SettingsSaveStatus>('idle');
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // Monotonic change counter — bumped by every USER edit (never by the
+  // programmatic agent-load / lazy prefills). A change reschedules the debounce;
+  // the ref mirror is read synchronously by the single-flight loop.
+  const [changeCounter, setChangeCounter] = useState(0);
+  const changeCounterRef = useRef(0);
+  const bumpChange = useCallback(() => {
+    changeCounterRef.current += 1;
+    setChangeCounter(changeCounterRef.current);
+  }, []);
+  // Cycle-level dirty gates (refs so they read/reset synchronously across the
+  // async save loop). `sectionsDirtyRef` ⇒ call updateAgent; `contractDirtyRef`
+  // ⇒ call contract.update. A contract-only edit thus writes only the contract.
+  const sectionsDirtyRef = useRef(false);
+  const contractDirtyRef = useRef(false);
+  // Every USER edit to a non-contract section marks it dirty and reschedules the
+  // debounce; contract editors mark the contract gate instead.
+  const markSectionEdit = useCallback(() => {
+    sectionsDirtyRef.current = true;
+    bumpChange();
+  }, [bumpChange]);
+  const markContractEdit = useCallback(() => {
+    contractDirtyRef.current = true;
+    bumpChange();
+  }, [bumpChange]);
+  // Single-flight guards: never two saves at once; one trailing save if edits
+  // land while a save is in flight.
+  const saveInFlightRef = useRef(false);
+  const trailingSaveRef = useRef(false);
+  const performSaveRef = useRef<() => Promise<void>>(async () => {});
+  const savedResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Change 2 — one shared confirm dialog for high-risk (DangerZone) switches.
+  // Turning a switch ON opens it; confirming runs `apply` (the normal updater,
+  // so autosave fires too). Turning OFF applies immediately, no dialog.
+  const [dangerConfirm, setDangerConfirm] = useState<{ label: string; apply: () => void } | null>(null);
+  const guardDanger = useCallback(
+    (label: string, apply: (v: boolean) => void) => (v: boolean) => {
+      if (v === true) {
+        setDangerConfirm({ label, apply: () => apply(true) });
+      } else {
+        apply(false);
+      }
+    },
+    [],
+  );
+
+  // Change 3 — cached runtime.detect result (claude_oauth drives PTY default).
+  const [runtimeDetect, setRuntimeDetect] = useState<RuntimeDetect | null>(null);
+  // True for the session when the PTY-pool toggles were auto-enabled by the
+  // OAuth default-enable materialization (surfaces a hint under the PTY section).
+  const [ptyDefaultedThisSession, setPtyDefaultedThisSession] = useState(false);
+  // One-time guard for the PTY-pool OAuth materialization per agent load — reset
+  // in the agent-load effect so switching agents re-evaluates the default.
+  const ptyDefaultAppliedRef = useRef(false);
+  // Fetch runtime.detect once; errors are non-fatal (treat as not detected, so
+  // the PTY default-enable simply never fires).
+  useEffect(() => {
+    let alive = true;
+    api.runtime
+      .detect()
+      .then((d) => alive && setRuntimeDetect(d))
+      .catch(() => {/* not detected → no PTY-pool default-enable */});
+    return () => {
+      alive = false;
+    };
+  }, []);
   // Departments pre-created in the registry (may have no members yet) — merged
   // into the free-input datalist alongside the in-use set below.
   const [registryDepartments, setRegistryDepartments] = useState<string[]>([]);
@@ -190,7 +262,6 @@ export function EditAgentPage() {
   // CON — contract form, loaded lazily via contract.get on first tab open
   const [contract, setContract] = useState<ContractConfig>({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
   const [contractLoaded, setContractLoaded] = useState(false);
-  const [contractSaving, setContractSaving] = useState(false);
 
   // RT — runtime form (write-only; inspect doesn't return [runtime])
   const [runtime, setRuntime] = useState<typeof DEFAULT_RUNTIME>(DEFAULT_RUNTIME);
@@ -261,16 +332,28 @@ export function EditAgentPage() {
         sticker_cooldown_messages: agent.sticker?.cooldown_messages ?? 5,
         sticker_expressiveness: (agent.sticker?.expressiveness ?? 'moderate') as 'minimal' | 'moderate' | 'expressive',
       });
-      setError(null);
+      setSaveError(null);
+      setSaveStatus('idle');
       // Reset CAP/CON state for the newly-loaded agent.
       setCaps(DEFAULT_CAPABILITIES);
       setCapsDirty(false);
       setCapsLoaded(false);
       setContract({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
       setContractLoaded(false);
-      // RT/EVO/CT — reset write-only advanced forms.
-      setRuntime(DEFAULT_RUNTIME);
+      // RT — prefill the runtime form from the `[runtime]` block agents.inspect
+      // now returns (only keys present in agent.toml; missing ones fall back to
+      // DEFAULT_RUNTIME). A pure prefill keeps runtimeDirty false. Re-arm the
+      // one-time PTY-pool OAuth materialization guard for the new agent.
+      const rt = agent.runtime;
+      setRuntime({
+        provider: (rt?.provider as RuntimeProvider) ?? DEFAULT_RUNTIME.provider,
+        fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
+        pty_pool_enabled: rt?.pty_pool_enabled ?? DEFAULT_RUNTIME.pty_pool_enabled,
+        worker_managed: rt?.worker_managed ?? DEFAULT_RUNTIME.worker_managed,
+      });
       setRuntimeDirty(false);
+      ptyDefaultAppliedRef.current = false;
+      setPtyDefaultedThisSession(false);
       setEvoAdv(DEFAULT_EVOLUTION_ADVANCED);
       setEvoAdvDirty(false);
       setCtAdv(DEFAULT_CONTAINER_ADVANCED);
@@ -334,73 +417,92 @@ export function EditAgentPage() {
 
   const updateCap = useCallback(<K extends keyof typeof DEFAULT_CAPABILITIES>(key: K, value: (typeof DEFAULT_CAPABILITIES)[K]) => {
     setCapsDirty(true);
+    markSectionEdit();
     setCaps((prev) => ({ ...prev, [key]: value }));
-  }, []);
+  }, [markSectionEdit]);
 
   const updateCapConfig = useCallback(<K extends keyof Required<ComputerUseConfig>>(key: K, value: Required<ComputerUseConfig>[K]) => {
     setCapsDirty(true);
+    markSectionEdit();
     setCaps((prev) => ({ ...prev, computer_use_config: { ...prev.computer_use_config, [key]: value } }));
-  }, []);
+  }, [markSectionEdit]);
 
   // RT — runtime field updater.
   const updateRuntime = useCallback(<K extends keyof typeof DEFAULT_RUNTIME>(key: K, value: (typeof DEFAULT_RUNTIME)[K]) => {
     setRuntimeDirty(true);
+    markSectionEdit();
     setRuntime((prev) => ({ ...prev, [key]: value }));
-  }, []);
+  }, [markSectionEdit]);
 
   // EVO — advanced evolution field updater.
   const updateEvoAdv = useCallback(<K extends keyof typeof DEFAULT_EVOLUTION_ADVANCED>(key: K, value: (typeof DEFAULT_EVOLUTION_ADVANCED)[K]) => {
     setEvoAdvDirty(true);
+    markSectionEdit();
     setEvoAdv((prev) => ({ ...prev, [key]: value }));
-  }, []);
+  }, [markSectionEdit]);
 
   const updateEvoFactor = useCallback((key: keyof typeof DEFAULT_EVOLUTION_ADVANCED.external_factors, value: boolean) => {
     setEvoAdvDirty(true);
+    markSectionEdit();
     setEvoAdv((prev) => ({ ...prev, external_factors: { ...prev.external_factors, [key]: value } }));
-  }, []);
+  }, [markSectionEdit]);
 
   // CT — advanced container field updater.
   const updateCtAdv = useCallback(<K extends keyof typeof DEFAULT_CONTAINER_ADVANCED>(key: K, value: (typeof DEFAULT_CONTAINER_ADVANCED)[K]) => {
     setCtAdvDirty(true);
+    markSectionEdit();
     setCtAdv((prev) => ({ ...prev, [key]: value }));
-  }, []);
+  }, [markSectionEdit]);
 
   // ODO — per-agent Odoo override field updater.
   const updateOdoo = useCallback(<K extends keyof typeof DEFAULT_ODOO>(key: K, value: (typeof DEFAULT_ODOO)[K]) => {
     setOdooDirty(true);
+    markSectionEdit();
     setOdoo((prev) => ({ ...prev, [key]: value }));
-  }, []);
+  }, [markSectionEdit]);
 
   // Advanced — G.8 field updater.
   const updateAdv = useCallback(<K extends keyof typeof DEFAULT_ADVANCED>(key: K, value: (typeof DEFAULT_ADVANCED)[K]) => {
     setAdvDirty(true);
+    markSectionEdit();
     setAdv((prev) => ({ ...prev, [key]: value }));
-  }, []);
-
-  const handleContractSave = async () => {
-    if (!agent) return;
-    setContractSaving(true);
-    try {
-      await api.contract.update(agent.name, contract);
-      toast.success(intl.formatMessage({ id: 'agents.contract.saved' }));
-    } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
-    } finally {
-      setContractSaving(false);
-    }
-  };
+  }, [markSectionEdit]);
 
   const updateField = useCallback(<K extends keyof AgentUpdateParams>(key: K, value: AgentUpdateParams[K]) => {
+    markSectionEdit();
     setForm((prev) => ({ ...prev, [key]: value }));
-  }, []);
+  }, [markSectionEdit]);
 
-  const handleSave = async () => {
+  // CON — contract editor updater. Marks the contract gate (not the section gate)
+  // so a contract-only edit debounces into a lone contract.update.
+  const editContract = useCallback((updater: (prev: ContractConfig) => ContractConfig) => {
+    markContractEdit();
+    setContract(updater);
+  }, [markContractEdit]);
+
+  // performSave — one autosave pass. Assembles the same partial payload the old
+  // manual 儲存 built (model-ID decomposition + per-section dirty-flag gating),
+  // but does NOT navigate or reset the forms. `sectionsDirtyRef` gates the
+  // updateAgent call and `contractDirtyRef` the contract.update, so a
+  // contract-only edit writes only the contract. Both gates are consumed up
+  // front and re-armed on failure so the next cycle retries.
+  const performSave = useCallback(async () => {
     if (!agent) return;
-    setSaving(true);
-    setError(null);
+    const doSections = sectionsDirtyRef.current;
+    const doContract = contractDirtyRef.current;
+    if (!doSections && !doContract) return;
+    sectionsDirtyRef.current = false;
+    contractDirtyRef.current = false;
+    if (savedResetTimerRef.current) {
+      clearTimeout(savedResetTimerRef.current);
+      savedResetTimerRef.current = null;
+    }
+    setSaveStatus('saving');
+    setSaveError(null);
     try {
-      // Decompose unified model IDs into cloud preferred + local config.
-      const submitForm = { ...form };
+      if (doSections) {
+        // Decompose unified model IDs into cloud preferred + local config.
+        const submitForm = { ...form };
       const pref = submitForm.preferred ?? '';
       const fb = submitForm.fallback ?? '';
 
@@ -546,16 +648,103 @@ export function EditAgentPage() {
         if (Object.keys(cultural).length > 0) submitForm.cultural_context = cultural;
       }
 
-      // updateAgent re-fetches the roster internally — the former dialog's
-      // onSaved (close + fetchAgents) maps to a plain return-to-list here.
-      await updateAgent(agent.name, submitForm);
-      navigate('/agents');
-    } catch {
-      setError(intl.formatMessage({ id: 'common.saveError' }));
-    } finally {
-      setSaving(false);
+      // updateAgent re-fetches the roster internally. Autosave never navigates
+      // away — the header SettingsSaveState indicator is the only feedback.
+        await updateAgent(agent.name, submitForm);
+      }
+      // CON — a dirty contract writes through its own RPC (in addition to the
+      // section update above; a contract-only edit runs only this branch).
+      if (doContract) {
+        await api.contract.update(agent.name, contract);
+      }
+      setSaveStatus('saved');
+      // Fade the 'saved' badge back to idle after ~2s.
+      savedResetTimerRef.current = setTimeout(() => setSaveStatus('idle'), 2000);
+    } catch (e) {
+      // Re-arm the gates so the next edit's cycle retries the failed write.
+      if (doSections) sectionsDirtyRef.current = true;
+      if (doContract) contractDirtyRef.current = true;
+      setSaveStatus('error');
+      setSaveError(formatError(e));
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     }
-  };
+  }, [
+    agent, form, availableModels, updateAgent, intl,
+    capsDirty, caps, runtimeDirty, runtime, evoAdvDirty, evoAdv,
+    ctAdvDirty, ctAdv, odooDirty, odoo, advDirty, adv, contract,
+  ]);
+
+  // Keep the ref pointed at the latest closure so the debounce timer and the
+  // unmount flush always call the current-state save.
+  useEffect(() => {
+    performSaveRef.current = performSave;
+  }, [performSave]);
+
+  // Single-flight save loop. Never two saves at once; if edits land while a save
+  // is in flight (trailing flag) or the change counter advanced mid-save, run
+  // one more pass. Consumes the trailing flag before each attempt.
+  const runSaveCycle = useCallback(async () => {
+    if (saveInFlightRef.current) {
+      trailingSaveRef.current = true;
+      return;
+    }
+    saveInFlightRef.current = true;
+    try {
+      let started: number;
+      do {
+        started = changeCounterRef.current;
+        trailingSaveRef.current = false;
+        await performSaveRef.current();
+      } while (trailingSaveRef.current || changeCounterRef.current !== started);
+    } finally {
+      saveInFlightRef.current = false;
+    }
+  }, []);
+
+  // Debounce: every USER edit bumps changeCounter, which reschedules this ~1s
+  // timer. The programmatic agent-load / lazy prefills never bump it.
+  useEffect(() => {
+    if (changeCounter === 0) return;
+    const timer = setTimeout(() => { void runSaveCycle(); }, 1000);
+    return () => clearTimeout(timer);
+  }, [changeCounter, runSaveCycle]);
+
+  // Flush on exit: fire any pending debounced-but-unsaved edits best-effort.
+  // No await is possible in a cleanup — just invoke the current save closure.
+  useEffect(() => {
+    return () => {
+      if (savedResetTimerRef.current) clearTimeout(savedResetTimerRef.current);
+      if (sectionsDirtyRef.current || contractDirtyRef.current) {
+        void performSaveRef.current();
+      }
+    };
+  }, []);
+
+  // Change 3c — one-time PTY-pool + Worker default-enable. Fires once per agent
+  // load when Claude Code CLI OAuth is detected, the effective runtime provider
+  // is 'claude', api_mode is cli/auto, and pty_pool_enabled was never
+  // materialized in agent.toml (absent from inspect). Marks the runtime section
+  // dirty + bumps the counter so autosave persists it; once written, inspect
+  // returns the explicit value and this never fires again.
+  useEffect(() => {
+    if (!agent || !runtimeDetect || ptyDefaultAppliedRef.current) return;
+    const providerEff = agent.runtime?.provider ?? 'claude';
+    const apiMode = agent.model?.api_mode ?? 'cli';
+    const ptyUnset = agent.runtime?.pty_pool_enabled === undefined;
+    if (
+      runtimeDetect.claude_oauth === true &&
+      providerEff === 'claude' &&
+      (apiMode === 'cli' || apiMode === 'auto') &&
+      ptyUnset
+    ) {
+      ptyDefaultAppliedRef.current = true;
+      setRuntime((prev) => ({ ...prev, pty_pool_enabled: true, worker_managed: true }));
+      setRuntimeDirty(true);
+      setPtyDefaultedThisSession(true);
+      sectionsDirtyRef.current = true;
+      bumpChange();
+    }
+  }, [agent, runtimeDetect, bumpChange]);
 
   if (loading) {
     return (
@@ -671,16 +860,14 @@ export function EditAgentPage() {
         actions={
           <>
             <SettingsSaveState
-              status={saving ? 'saving' : error ? 'error' : 'idle'}
+              status={saveStatus}
               savingLabel={t('common.saving')}
-              errorLabel={error ?? t('common.saveError')}
+              savedLabel={t('agents.edit.saved')}
+              errorLabel={saveError ?? t('common.saveError')}
               className="mr-1"
             />
             <Button variant="ghost" size="sm" onClick={() => navigate('/agents')}>
-              {t('common.cancel')}
-            </Button>
-            <Button variant="brand" size="sm" onClick={handleSave} disabled={saving}>
-              {saving ? t('common.saving') : t('common.save')}
+              {t('common.back')}
             </Button>
           </>
         }
@@ -738,7 +925,7 @@ export function EditAgentPage() {
 
           <DangerZone title={t('agents.perm.danger.title')} description={t('agents.perm.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.skillAutoActivate')} description={t('agents.edit.skillAutoActivate.help')} checked={form.skill_auto_activate ?? false} onChange={(v) => updateField('skill_auto_activate', v)} />
+              <RowSwitch label={t('agents.edit.skillAutoActivate')} description={t('agents.edit.skillAutoActivate.help')} checked={form.skill_auto_activate ?? false} onChange={guardDanger(t('agents.edit.skillAutoActivate'), (v) => updateField('skill_auto_activate', v))} />
             </SettingsCard>
           </DangerZone>
         </SettingsTab>
@@ -778,7 +965,7 @@ export function EditAgentPage() {
                 <FieldBlock label={t('agents.contract.mustNot')} description={t('agents.contract.mustNot.hint')}>
                   <Textarea
                     value={contract.must_not.join('\n')}
-                    onChange={(e) => setContract((p) => ({ ...p, must_not: e.target.value.split('\n').map((s) => s.trimEnd()).filter((s) => s.trim() !== '') }))}
+                    onChange={(e) => editContract((p) => ({ ...p, must_not: e.target.value.split('\n').map((s) => s.trimEnd()).filter((s) => s.trim() !== '') }))}
                     rows={4}
                     placeholder={t('agents.contract.mustNot.placeholder')}
                     className="resize-none font-mono"
@@ -787,36 +974,31 @@ export function EditAgentPage() {
                 <FieldBlock label={t('agents.contract.mustAlways')} description={t('agents.contract.mustAlways.hint')}>
                   <Textarea
                     value={contract.must_always.join('\n')}
-                    onChange={(e) => setContract((p) => ({ ...p, must_always: e.target.value.split('\n').map((s) => s.trimEnd()).filter((s) => s.trim() !== '') }))}
+                    onChange={(e) => editContract((p) => ({ ...p, must_always: e.target.value.split('\n').map((s) => s.trimEnd()).filter((s) => s.trim() !== '') }))}
                     rows={4}
                     placeholder={t('agents.contract.mustAlways.placeholder')}
                     className="resize-none font-mono"
                   />
                 </FieldBlock>
                 <SettingsCard>
-                  <RowNumber label={t('agents.contract.maxToolCalls')} description={t('agents.contract.maxToolCalls.hint')} value={contract.max_tool_calls_per_turn} min={0} max={1000} onChange={(v) => setContract((p) => ({ ...p, max_tool_calls_per_turn: v }))} />
+                  <RowNumber label={t('agents.contract.maxToolCalls')} description={t('agents.contract.maxToolCalls.hint')} value={contract.max_tool_calls_per_turn} min={0} max={1000} onChange={(v) => editContract((p) => ({ ...p, max_tool_calls_per_turn: v }))} />
                 </SettingsCard>
-                <div className="flex justify-end">
-                  <Button variant="outline" size="sm" onClick={handleContractSave} disabled={contractSaving}>
-                    {contractSaving ? t('common.saving') : t('agents.contract.save')}
-                  </Button>
-                </div>
               </>
             )}
           </SettingsSection>
 
           <DangerZone title={t('agents.perm.danger.title')} description={t('agents.perm.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.edit.canCreateAgents.help')} checked={form.can_create_agents ?? false} onChange={(v) => updateField('can_create_agents', v)} />
-              <RowSwitch label={t('agents.edit.canModifySoul')} description={t('agents.edit.canModifySoul.help')} checked={form.can_modify_own_soul ?? false} onChange={(v) => updateField('can_modify_own_soul', v)} />
+              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.edit.canCreateAgents.help')} checked={form.can_create_agents ?? false} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v))} />
+              <RowSwitch label={t('agents.edit.canModifySoul')} description={t('agents.edit.canModifySoul.help')} checked={form.can_modify_own_soul ?? false} onChange={guardDanger(t('agents.edit.canModifySoul'), (v) => updateField('can_modify_own_soul', v))} />
             </SettingsCard>
           </DangerZone>
 
           <DangerZone title={t('agents.cap.danger.title')} description={t('agents.cap.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.cap.computerUse')} description={t('agents.cap.computerUse.help')} checked={caps.computer_use} onChange={(v) => updateCap('computer_use', v)} />
+              <RowSwitch label={t('agents.cap.computerUse')} description={t('agents.cap.computerUse.help')} checked={caps.computer_use} onChange={guardDanger(t('agents.cap.computerUse'), (v) => updateCap('computer_use', v))} />
               <RowSelect label={t('agents.cap.computerUseMode')} description={t('agents.cap.computerUseMode.help')} value={caps.computer_use_mode} onChange={(v) => updateCap('computer_use_mode', v as ComputerUseMode)} options={computerUseModeOptions} />
-              <RowSwitch label={t('agents.cap.browserViaBash')} description={t('agents.cap.browserViaBash.help')} checked={caps.browser_via_bash} onChange={(v) => updateCap('browser_via_bash', v)} />
+              <RowSwitch label={t('agents.cap.browserViaBash')} description={t('agents.cap.browserViaBash.help')} checked={caps.browser_via_bash} onChange={guardDanger(t('agents.cap.browserViaBash'), (v) => updateCap('browser_via_bash', v))} />
             </SettingsCard>
             {caps.computer_use_mode === 'native' && (
               <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.nativeWarning')}</p>
@@ -956,6 +1138,9 @@ export function EditAgentPage() {
               <RowSwitch label={t('agents.runtime.ptyPoolEnabled')} checked={runtime.pty_pool_enabled} onChange={(v) => updateRuntime('pty_pool_enabled', v)} />
               <RowSwitch label={t('agents.runtime.workerManaged')} checked={runtime.worker_managed} onChange={(v) => updateRuntime('worker_managed', v)} />
             </SettingsCard>
+            {ptyDefaultedThisSession && (
+              <p className="rounded-md bg-primary/10 px-3 py-2 text-xs text-primary">{t('agents.runtime.ptyOauthDefault')}</p>
+            )}
           </SettingsSection>
 
           <SettingsSection title={t('settings.container')}>
@@ -980,8 +1165,8 @@ export function EditAgentPage() {
 
           <DangerZone title={t('agents.container.danger.title')} description={t('agents.container.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.networkAccess')} description={t('agents.edit.networkAccess.help')} checked={form.network_access ?? false} onChange={(v) => updateField('network_access', v)} />
-              <RowSwitch label={t('agents.container.worktreeAutoMerge')} description={t('agents.container.worktreeAutoMerge.help')} checked={ctAdv.worktree_auto_merge} onChange={(v) => updateCtAdv('worktree_auto_merge', v)} />
+              <RowSwitch label={t('agents.edit.networkAccess')} description={t('agents.edit.networkAccess.help')} checked={form.network_access ?? false} onChange={guardDanger(t('agents.edit.networkAccess'), (v) => updateField('network_access', v))} />
+              <RowSwitch label={t('agents.container.worktreeAutoMerge')} description={t('agents.container.worktreeAutoMerge.help')} checked={ctAdv.worktree_auto_merge} onChange={guardDanger(t('agents.container.worktreeAutoMerge'), (v) => updateCtAdv('worktree_auto_merge', v))} />
             </SettingsCard>
             <MountTable mounts={ctAdv.additional_mounts} onChange={(v) => updateCtAdv('additional_mounts', v)} />
           </DangerZone>
@@ -1084,6 +1269,21 @@ export function EditAgentPage() {
           </SettingsSection>
         </SettingsTab>
       </SettingsShell>
+
+      {/* Change 2 — shared confirm for enabling any high-risk (DangerZone)
+          switch. Confirm runs the captured `apply` (the normal updater, so
+          autosave fires); cancel leaves the switch off. */}
+      <ConfirmDialog
+        open={dangerConfirm !== null}
+        onClose={() => setDangerConfirm(null)}
+        onConfirm={() => { dangerConfirm?.apply(); setDangerConfirm(null); }}
+        title={t('agents.edit.dangerConfirm.title')}
+        message={intl.formatMessage(
+          { id: 'agents.edit.dangerConfirm.message' },
+          { label: dangerConfirm?.label ?? '' },
+        )}
+        confirmLabel={t('common.confirm')}
+      />
     </div>
   );
 }

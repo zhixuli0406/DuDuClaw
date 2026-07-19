@@ -7531,6 +7531,13 @@ impl MethodHandler {
                     // (effect: allow|forbid|ask, op: equals|contains|starts_with).
                     "capabilities": serde_json::to_value(&cfg.capabilities)
                         .unwrap_or_else(|_| json!({})),
+                    // [runtime] block — read straight from agent.toml (the typed
+                    // config doesn't surface it). Emits ONLY keys present in the
+                    // file so the dashboard tells "unset" from an explicit false
+                    // (drives the PTY-pool OAuth default-enable materialization).
+                    "runtime": crate::runtime_config::read_runtime_json(
+                        &self.home_dir.join("agents").join(&cfg.agent.name),
+                    ),
                 }))
             }
             None => WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
