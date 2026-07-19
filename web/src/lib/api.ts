@@ -92,6 +92,16 @@ export interface AgentDetail extends AgentInfo {
   /** [capabilities] block — returned by agents.inspect so the capability editor
    *  (incl. the Progent policy rules) can prefill existing values. */
   capabilities?: AgentCapabilities;
+  /** [runtime] block — returned by agents.inspect so the runtime editor can
+   *  prefill existing values. Emits ONLY keys present in agent.toml, so an
+   *  absent `pty_pool_enabled` (vs. an explicit `false`) is meaningful: it
+   *  gates the one-time PTY-pool OAuth default-enable materialization. */
+  runtime?: {
+    provider?: string;
+    fallback?: string;
+    pty_pool_enabled?: boolean;
+    worker_managed?: boolean;
+  };
 }
 
 export interface VoiceSettings {

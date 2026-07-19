@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Added
+- **員工編輯頁改為即時儲存（2026-07-19）。** `/agents/:id/edit` 移除「儲存」按鈕：
+  任何修改後 1 秒自動寫入（單一儲存航班＋尾隨補寫，不併發、不漏改），右上角顯示
+  儲存中／已儲存狀態；CONTRACT.toml 區塊併入同一自動儲存循環，離開頁面時盡力補送
+  未儲存變更。高風險開關（技能自動啟用、可建立 agent、可改 SOUL、Computer Use、
+  瀏覽器 via Bash、網路存取、worktree 自動合併）在開啟時彈出二次確認框，關閉則
+  直接生效。
+- **偵測 Claude Code CLI OAuth → PTY 連線池預設開啟。** `agents.inspect` 現在回傳
+  `agent.toml [runtime]` 實際內容（僅含檔案裡存在的 key，執行環境分頁從 write-only
+  變為顯示真實設定值）；當偵測到 Claude OAuth、provider=claude、api_mode=cli/auto
+  且 `pty_pool_enabled` 從未設定過時，一次性把 PTY 連線池＋ Worker 子程序託管預設
+  為開並寫入 agent.toml（寫入後即為明確值，之後手動關閉不會被翻回）。
+
+### Fixed
+- **對話頁員工列不再重複顯示 main agent。** 頂端頭像列的 DuDu 小助理入口本就路由到
+  main agent，員工卡片改為過濾 `role == 'main'`；既有選取若指向 main agent 會自動
+  正規化回 DuDu 入口，避免「員工只有一位、對話卻出現兩顆頭像」的誤解。
+
 ## [1.37.1] - 2026-07-19 — Signed NFR test licenses + distributor self-service
 
 ### Added

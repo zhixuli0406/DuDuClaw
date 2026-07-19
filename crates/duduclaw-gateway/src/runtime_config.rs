@@ -111,6 +111,34 @@ pub fn load_runtime_settings(agent_dir: &Path) -> RuntimeSettings {
     }
 }
 
+/// Read the agent's `[runtime]` section as a JSON object for `agents.inspect`.
+///
+/// Emits ONLY keys actually present in `agent.toml` (`provider`, `fallback`,
+/// `pty_pool_enabled`, `worker_managed`) so the dashboard can distinguish
+/// "unset" from an explicit `false` — the PTY-pool OAuth default-enable logic
+/// materializes the toggle only when it was never written. A missing/malformed
+/// file or absent `[runtime]` table yields an empty object.
+pub fn read_runtime_json(agent_dir: &Path) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(v) = read_agent_toml(agent_dir)
+        && let Some(rt) = v.get("runtime")
+    {
+        if let Some(s) = rt.get("provider").and_then(|x| x.as_str()) {
+            obj.insert("provider".into(), serde_json::Value::String(s.to_string()));
+        }
+        if let Some(s) = rt.get("fallback").and_then(|x| x.as_str()) {
+            obj.insert("fallback".into(), serde_json::Value::String(s.to_string()));
+        }
+        if let Some(b) = rt.get("pty_pool_enabled").and_then(|x| x.as_bool()) {
+            obj.insert("pty_pool_enabled".into(), serde_json::Value::Bool(b));
+        }
+        if let Some(b) = rt.get("worker_managed").and_then(|x| x.as_bool()) {
+            obj.insert("worker_managed".into(), serde_json::Value::Bool(b));
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
 /// Conservative provider↔model compatibility check by model-id naming family.
 /// Only flags *confident* mismatches; unknown families and `openai_compat`
 /// (which proxies arbitrary models) always pass.
@@ -710,6 +738,41 @@ mod tests {
         // Blank / whitespace value → None (fail-safe to preferred).
         write_agent_toml(agent.path(), "[model]\nstandard = \"  \"\n");
         assert_eq!(agent_standard_model(agent.path()), None);
+    }
+
+    #[test]
+    fn read_runtime_json_emits_only_present_keys() {
+        let dir = TempDir::new().unwrap();
+        // Missing file → empty object.
+        assert_eq!(read_runtime_json(dir.path()), serde_json::json!({}));
+        // Present [runtime] but only some keys → only those keys emitted;
+        // absent keys (worker_managed) must stay absent so the frontend can
+        // distinguish "unset" from an explicit false.
+        write_agent_toml(
+            dir.path(),
+            "[runtime]\nprovider = \"claude\"\npty_pool_enabled = false\n",
+        );
+        assert_eq!(
+            read_runtime_json(dir.path()),
+            serde_json::json!({ "provider": "claude", "pty_pool_enabled": false })
+        );
+        // All four keys present → all emitted, correct types.
+        write_agent_toml(
+            dir.path(),
+            "[runtime]\nprovider = \"codex\"\nfallback = \"claude\"\npty_pool_enabled = true\nworker_managed = true\n",
+        );
+        assert_eq!(
+            read_runtime_json(dir.path()),
+            serde_json::json!({
+                "provider": "codex",
+                "fallback": "claude",
+                "pty_pool_enabled": true,
+                "worker_managed": true,
+            })
+        );
+        // Malformed toml → empty object (fail-safe).
+        write_agent_toml(dir.path(), "not valid toml ===");
+        assert_eq!(read_runtime_json(dir.path()), serde_json::json!({}));
     }
 
     #[test]
