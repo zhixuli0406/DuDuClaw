@@ -90,6 +90,7 @@ pub mod message_queue;
 pub mod external_factors;
 pub mod cli_auth;
 pub mod handlers;
+pub mod knowledge_guard;
 pub mod line;
 pub mod local_llm;
 pub mod install_notify;
@@ -206,5 +207,11 @@ pub mod dispatch_engine;
 //        tasks, enforces iteration/wall-clock/concurrency caps, and re-dispatches
 //        judge-rejected tasks with feedback ──
 pub mod goal_loop;
+// ── D4: pluggable dispatch policy (agent selection = data) + LLMCompiler-style
+//        goal decomposition (planner → dependency DAG) ──
+pub mod dispatch_policy;
+// ── D5: semi-automatic topology evolution (edge optimization, human-gated) ──
+pub mod topology_evolution;
+pub mod goal_plan;
 // ── P2a: goal-loop channel push + decision (needs_human exit + autonomy kickoff) ──
 pub mod goal_notify;

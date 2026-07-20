@@ -206,7 +206,8 @@ pub fn count_embedded(
     conn.query_row(
         "SELECT COUNT(*) FROM memories
          WHERE agent_id = ?1 AND embedding IS NOT NULL AND embedding_model = ?2
-           AND (valid_until IS NULL OR valid_until > ?3)",
+           AND (valid_until IS NULL OR valid_until > ?3)
+           AND quarantined = 0",
         params![agent_id, model_id, now_rfc],
         |r| r.get::<_, i64>(0),
     )
@@ -242,6 +243,7 @@ pub fn vector_knn(
             "SELECT id, embedding FROM memories
              WHERE agent_id = ?1 AND embedding IS NOT NULL AND embedding_model = ?2
                AND (valid_until IS NULL OR valid_until > ?3)
+               AND quarantined = 0
              LIMIT ?4",
         )
         .map_err(|e| DuDuClawError::Memory(format!("knn prepare: {e}")))?;

@@ -107,12 +107,38 @@ Without a full triple, `store_temporal` simply records a timestamped fact — no
 
 ### Reading the timeline
 
-Two read APIs expose the chain:
+Two read APIs expose the chain, both also available over MCP as `memory_get_history` / `memory_get_at` (scope `memory:read`):
 
-| API | Returns |
+| API / MCP tool | Returns |
 |-----|---------|
-| `get_history(agent, subject, predicate)` | The full supersession chain, oldest → newest |
-| `get_at(agent, subject, predicate, at)` | The single fact valid at a point in time (`valid_from <= at AND (valid_until IS NULL OR valid_until > at)`) |
+| `get_history(agent, subject, predicate)` — `memory_get_history { subject, predicate }` | The full supersession chain, oldest → newest, incl. per-record `ingested_at`, `invalidated_by_event`/`invalidated_at`, and `reaffirmed_by` |
+| `get_at(agent, subject, predicate, at)` — `memory_get_at { subject, predicate, at }` | The single fact valid at a point in time (`valid_from <= at AND (valid_until IS NULL OR valid_until > at)`) |
+
+### Bi-temporal + build-time provenance (D1)
+
+The temporal store tracks **two** time axes: `valid_from`/`valid_until` (world-time — when a fact is true) and `ingested_at` (transaction-time — when the system learned it). Supersession is decided by world-time `valid_from`, not ingestion order, so scrambled ingestion (learning about a divorce before the earlier marriage) still resolves the correct fact at any point in time — a fact whose `valid_from` predates the current one is inserted as a bounded *historical segment* without disturbing the current fact. Re-observing an identical fact (same subject/predicate/object + content) **reaffirms** it — appending the new `source_event` to `reaffirmed_by` (capped at 20) and bumping `access_count` — instead of churning a new row. When a fact is closed out, the closing `source_event` and time are stamped onto the superseded row (`invalidated_by_event`/`invalidated_at`).
+
+### Source rollback (`memory_invalidate_by_origin`)
+
+`invalidate_by_origin(agent, origin, since)` — MCP `memory_invalidate_by_origin` (scope `admin`) — is the remediation valve for a poisoned source: it expires (never deletes) every currently-valid fact from an **exact** `origin` (equality, never substring), optionally limited to facts learned at/after `since`. Facts whose `derived_from` cites a purged id have their `origin_trust` floored to ≤ 0.1 (a derivation of poisoned input can't stay trusted). `search()` immediately stops returning the purged facts, while `get_history()` preserves the full chain with `invalidated_by_event = "origin_purge"`.
+
+### Write-side poison protection (D2)
+
+D1 lets you *undo* a poisoned source; D2 stops most poison from landing in the first place (PoisonedRAG, arXiv:2402.07867). The auto-distillation write path is guarded at two ends:
+
+- **Write-side scan + burst detection.** Before a distilled fact is stored, its content and `(subject, predicate, object)` are run through the shared prompt-injection rule engine — a match **drops** the fact (fail-closed, never written) and records a `prompt_injection` security-audit event. Separately, a per-`(agent, origin, subject)` sliding-window counter (`knowledge_guard`, same durable + advisory-locked pattern as the dispatch breaker) quarantines a batch when one origin writes `>= max_per_subject` facts about the same subject inside the window (the "One Shot Dominance" / k-doc pattern). Quarantined facts are stored with `quarantined = 1` — **inert**: they never supersede a clean fact and are excluded from every retrieval read path (FTS, graph, vector, `list_recent`, `summarize`) until a human decides.
+- **Processing.** A quarantine raises an `ApprovalBroker` request (`action_kind = "knowledge_quarantine"`) and emits a `knowledge.quarantined` event. Approve → the facts are released (`quarantined = 0`, now retrievable); deny → they are expired (`invalidated_by_event = "quarantine_reject"`) and their `origin_trust` floored to ≤ 0.1; TTL expiry counts as deny (fail-closed).
+
+**Ranking-side trust.** `origin_trust` now participates in retrieval ranking (weight `w_trust`, default 0.10): each candidate's score is multiplied by `(1 − w_trust) + w_trust · origin_trust`, so an unverified channel-distilled fact (trust 0.3) can't outrank a curated one (trust 1.0). In the HippoRAG-lite graph, a triple's edges are weighted by its `origin_trust`, shrinking a low-trust fact's Personalized-PageRank mass — this directly damps the "single poisoned triple amplified two hops by PPR" path. Legacy rows (trust 1.0) rank byte-identically to the pre-D2 path.
+
+### Graph retrieval evolution (D3)
+
+The HippoRAG-lite graph gained four independent refinements (HippoRAG 2 + LightRAG alignment). Each is fail-safe: with no aliases, a small graph, and embedding seeding off, ranking is **byte-identical** to the earlier per-query build.
+
+- **Persistent incremental graph cache.** Rebuilding the Personalized-PageRank graph on every query is wasteful once an agent accumulates many facts. The graph is now cached per agent (`RwLock`) and reused across queries; a per-agent **generation counter** — bumped by every triple-mutating write (`store_temporal`/supersession, quarantine release/reject, origin purge, decision expiry, decay archival, GDPR erase, agent reassignment) — invalidates a stale cache so a query always sees current facts. The cache only engages above `GRAPH_CACHE_MIN_TRIPLES` (500); below that the per-query build is cheaper and is kept.
+- **Entity alias merging.** An `entity_alias(agent_id, canonical, alias)` table folds surface forms onto one node before the graph is built and seeded, so "老闆 / 李老闆 / zhixu" stop being three isolated islands. Both sides are normalized (trim + lowercase) and alias chains are flattened on store. Managed via the `memory_alias_add` / `memory_alias_list` MCP tools (write / read scope). With no aliases the graph is byte-identical.
+- **Predicate edge labels.** Each SPO edge now carries its predicate as an attached label (the PPR math never reads it, so ranking is unchanged). The `engine.export_graph(agent, limit)` API returns a serializable `{ nodes, edges }` snapshot — including quarantined-but-pending facts, flagged — for the D6 knowledge-graph curation UI.
+- **Embedding seeding (opt-in).** When `graph_embed_seed` is on **and** an embedder is attached, PPR seeds become the union of whole-word FTS entity matches and the query embedding's nearest entity vectors (same-model cosine, top-k). Entity vectors are cached lazily in `entity_embedding` and embedding failures fall back to FTS seeding. Off by default (and a no-op with no embedder), following HippoRAG 2's caution that a weak embedder loses recall.
 
 ---
 
@@ -228,6 +254,19 @@ There is nothing to turn on. Memory Intelligence rides on the existing memory en
 - **F3** is exposed as the `memory_fetch_batch` MCP tool, scope-gated like every other memory tool.
 
 The migration runs automatically at engine init — existing databases are upgraded in place by the idempotent ALTER loop.
+
+### Write-side poison protection (D2)
+
+The write-side burst detector is on by default and tunable in `config.toml`. Absent or malformed sections fall back to these defaults (fail-safe — the detector stays ON):
+
+```toml
+[knowledge_guard]
+enabled = true          # master switch for the same-origin burst detector. 預設 true
+window_secs = 3600      # 滑動窗長度（秒）。預設 3600（1 小時）
+max_per_subject = 5     # 一個來源在窗內對同一 subject 可寫入的事實上限，超過即隔離。預設 5
+```
+
+The injection scan on the write path is unconditional (no config). Ranking trust weight `w_trust` (default 0.10) lives in `RetrievalWeights` (per-engine, not a config key); at `w_trust = 0.0` ranking is byte-identical to the pre-D2 path.
 
 ---
 

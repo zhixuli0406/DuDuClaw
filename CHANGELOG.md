@@ -2,6 +2,106 @@
 
 ## [Unreleased]
 
+### Added
+- **記憶系統升級為雙時間軸（bi-temporal）＋建構期溯源（D1）。** 每筆事實新增
+  `ingested_at`（交易時間軸：系統何時得知，與「事實何時在真實世界成立」的
+  `valid_from` 分離）；supersession 發生時在被取代的舊列記錄
+  `invalidated_by_event`／`invalidated_at`（是哪則來源事件、何時把它失效）。
+  同一 `(subject, predicate)` 且 object 與內容實質相同的事實重複出現時不再新增列，
+  改在既有列的 metadata 記 `reaffirmed_by`（上限 20 筆）並累加 access_count，
+  避免記憶膨脹。
+- **新增 `invalidate_by_origin` 按來源回滾原語**（engine + MCP `memory_invalidate_by_origin`）：
+  一次 expire（非刪除）某來源（精確相等比對，非子字串）自某時刻起的全部
+  currently-valid 事實，並沿 `derived_from` 級聯把衍生事實的信任度降到 ≤ 0.1。
+  history 完整保留、仍可查。這是偵測到來源投毒後的止血閥（Admin scope）。
+- **新增 MCP 工具 `memory_get_history` / `memory_get_at`**：查詢某三元組
+  `(subject, predicate)` 的完整 supersession 鏈與任一時點的有效事實（原本 engine-only）。
+- **知識寫入投毒防護管線（D2，對應 PoisonedRAG 2402.07867）。** 自動蒸餾寫入前，
+  對每筆事實的內容與 `(subject, predicate, object)` 跑既有的注入規則引擎；命中即
+  「不寫入」（fail-closed）並記 `prompt_injection` 稽核事件。新增同源突增偵測
+  `knowledge_guard`（沿用 dispatch_guard 的滑窗＋跨行程 advisory lock 模式）：同一
+  `(agent, origin, subject)` 在窗內寫入 ≥ `max_per_subject` 筆即把該批標為隔離。
+  `config.toml [knowledge_guard]`（`enabled`／`window_secs`／`max_per_subject`，缺省
+  一律退回內建預設）。
+- **記憶列新增 `quarantined` 欄（idempotent migration）。** 隔離中的事實一律
+  inert——不 supersede 任何現有事實，且被所有檢索讀路徑排除（FTS、graph、vector、
+  `search`／`search_layer`／`list_recent`／`summarize`／`list_valid_by_source_event`）。
+  依 id 明確取用的 `get_by_id`／`get_by_ids` 與溯源檢視 `get_history`／`get_at` 仍可回傳。
+- **隔離處置走 ApprovalBroker**（`action_kind = "knowledge_quarantine"`）＋發
+  `knowledge.quarantined` 事件到 events.db。核准 → 解除隔離（`quarantined = 0`，恢復可
+  檢索）；拒絕 → expire（`invalidated_by_event = "quarantine_reject"`）並把 `origin_trust`
+  降到 ≤ 0.1；TTL 過期 = 拒絕（fail-closed）。dashboard `approvals.decide` 已接上此側效。
+- **記憶知識圖檢索演進（D3，對應 HippoRAG 2 / LightRAG）。** ① 每 agent 的 SPO 圖
+  改為持久快取（generation counter 失效，>500 條三元組才啟用；快取命中的排序與
+  現建 byte-identical，位元級測試驗證）；② 實體別名歸併：新 `entity_alias` 表把
+  「老闆／李老闆」等表面形式收斂到同一節點，提升建圖與播種命中率，新增 MCP 工具
+  `memory_alias_add`（write scope）／`memory_alias_list`（read scope）；③ 述語（predicate）
+  以邊標籤附掛入圖（PPR 分數不變），並新增 `engine.export_graph(agent, limit)` 可序列化
+  快照（含隔離標記）供策展 UI 使用；④ 可選 embedding 播種（`[memory] graph_embed_seed`，
+  預設關閉）：啟用且掛 embedder 時以 query 向量對實體向量取 top-k 聯集擴充 FTS 播種，
+  關閉或無 embedder 時 byte-identical。
+- **Goal loop 平行派工 DAG（D4，LLMCompiler 式）。** 可選 planner
+  （`[goal_loop] planner_enabled`，預設關閉）把 goal 拆為帶依賴標注的子任務 DAG；
+  依賴全部完成的子任務平行派發（仍受 `max_concurrent` 與 dispatch_guard 約束）。
+  循環／無效計畫整包拒絕、退回單任務模式；上游依賴失敗或升級人工時，下游任務
+  繼承升級為 needs_human（不孤兒化）。
+- **可插拔派工策略（D4）。** `config.toml [dispatch] policy`：`fixed_hierarchy`（預設，
+  行為與先前一致）／`round_robin`（per task-class 輪詢）／`llm_select`（utility LLM 選人，
+  輸出不在 roster 或解析失敗一律 fail-closed 回 fixed_hierarchy；不硬編碼模型）。
+- **動態判官深度（D4，MaAS 式）。** 零 LLM 的本地難度啟發式將 goal 分為 Simple／
+  Complex：Simple 用兩面向判官（correctness + safety，省 completeness 成本）並套
+  `[goal_loop] iteration_cap_simple`（預設 3）；Complex 維持三面向 MAV panel 與既有
+  iteration_cap（預設 8）。**safety 面向在任何深度都保留**，synthesis 仍是全過才
+  accept、缺面向 fail-closed。
+- **半自動拓撲演化（D5，GPTSwarm edge-optimization 的 human-gated 版，預設關閉）。**
+  背景驅動器（`[topology_evolution] enabled`，預設 false）聚合 per (agent, task_class)
+  的拒絕率／needs_human／oscillation 證據，對持續低落的路由產生「改派給 sibling」
+  提案——每個提案永遠經 ApprovalBroker 人工核准（無 LLM judge 裁量、不受
+  autonomy_level 放寬、TTL 過期＝拒絕）；核准後寫入 `routing_overrides.json`
+  （advisory lock＋原子替換，損毀 fail-safe 視為無 override），預設派工層命中即改派；
+  24h 觀察期內新 agent 未優於基準即自動回滾。防提案風暴：同一 (task_class, from_agent)
+  7 天至多一案。新增 `topology.list` dashboard RPC 與 `topology.*` 事件；詳見
+  docs/guides/topology-evolution.md。
+- **知識圖策展台（D6）。** 知識庫新增「策展台」分頁：SPO 知識圖譜可視化（d3 力導向、
+  來源可信度分層配色、點邊看溯源側欄）、事實歷史時間線（supersession 鏈、現任高亮）、
+  待審知識佇列（核准／拒絕／清除此來源三鍵，清除來源有確認框）。新增 dashboard RPC
+  `memory.graph`／`memory.get_at`／`memory.invalidate_origin`（破壞性，僅 dashboard 面），
+  `approvals.list` 支援 `action_kind` 過濾。文案面向終端使用者（zh-TW／en／ja 三語齊）。
+
+### Security
+- **origin_trust 正式參與檢索排序（D2）。** `RetrievalWeights` 新增 `w_trust`（預設 0.10，
+  由 `w_fts` 0.40 → 0.35 讓利，總權重感覺不變）；每筆候選分數乘上
+  `(1 - w_trust) + w_trust · origin_trust`，未驗證的 channel 蒸餾事實（trust 0.3）不再能
+  蓋過人工 curated 事實（trust 1.0）。graph_rank 的邊權乘上該三元組的 `origin_trust`，
+  壓制「單條假 triple 經 PPR 兩跳放大」的攻擊路徑。所有 `origin_trust = 1.0` 的既有資料
+  排序與 D2 前 byte-identical（含 graph PPR 位元級一致，已寫測試驗證）。
+
+### Changed
+- **`store_temporal` 的 supersession 改為依真實世界時間 `valid_from` 判定，具備亂序韌性。**
+  當新事實帶有 `valid_from` 且早於現任事實時，插入為「歷史段」（`valid_until` 設為
+  現任的 `valid_from`），不動現任、不建 supersession 鏈——正確處理離婚／結婚等亂序
+  ingest 的情境。無 `valid_from` 的寫入完全沿用既有 ingestion 順序行為。
+  副作用：以完全相同內容重複 consolidate 使用者側寫時，現在會 reaffirm 既有摘要列
+  （id 穩定）而非每次都新建一列。
+
+### Fixed
+- **分享全域 Skill 不再報「Skill not found」。** 「我的技能」清單同時列出 agent 自有
+  與全域（`~/.duduclaw/skills/`）兩種來源，但 `skills.share` 只到 agent 的 SKILLS
+  目錄找檔案，分享全域 skill（如 pptx/docx）必定失敗。現在 share 依同一聯集解析
+  （agent 版優先、全域版遞補），並補上 agent_id 與 skill_name 的路徑安全驗證
+  （拒絕 traversal 與點開頭名稱，與 `skills.adopt` 既有防護對齊）。
+- **dashboard 導覽補齊 v2 步驟文案（三語）。** v2「嘟嘟事務所」導覽的六站
+  （對話／收件匣／任務看板／Skill／成長／管理）先前在 zh-TW／en／ja-JP 三語
+  皆缺翻譯鍵，導覽走到這些頁會顯示原始鍵名；已全數補齊，並移除十個已無程式
+  引用的 v1 導覽殘留鍵。
+- **ja-JP 介面補完 113 條未翻譯字串。** 先前以 `[EN]` 前綴標記的殘留
+  （voice／proactive／settings.update／sharedWiki／mcp 等區塊）全數翻為日文；
+  三語鍵集合完全一致（各 3,422 鍵）。
+- **部門名稱驗證拒絕所有 `.` 開頭名稱（fail-closed 補洞）。** `is_valid_department`
+  原本只擋 `.`／`..`，導致 `.hidden` 之類的點目錄會被 `departments.list` 列為部門
+  （既有測試 `list_skips_invalid_names_fail_closed` 在乾淨 main 上即失敗）。現改為
+  一律拒絕點開頭名稱，與該測試註解的原始意圖一致。
+
 ## [1.38.1] - 2026-07-19 — Dashboard self-update redirect fix
 
 ### Fixed

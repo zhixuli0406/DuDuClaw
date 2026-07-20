@@ -399,6 +399,11 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         "memory_search"
         | "memory_read"
         | "memory_fetch_batch"
+        // D1 bi-temporal read APIs — same read tier as the rest of the family.
+        | "memory_get_history"
+        | "memory_get_at"
+        // D3.2 entity-alias listing — read tier.
+        | "memory_alias_list"
         | "memory_search_by_layer"
         | "memory_successful_conversations"
         | "memory_consolidation_status"
@@ -407,7 +412,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "user_profile_get"
         | "user_code_profile"
         | "code_map" => Some(Scope::MemoryRead),
-        "memory_store" | "user_profile_record" => Some(Scope::MemoryWrite),
+        // D3.2 entity-alias mutation — write tier.
+        "memory_store" | "memory_alias_add" | "user_profile_record" => Some(Scope::MemoryWrite),
         // ── Wiki: read family ────────────────────────────────────────────
         "wiki_read"
         | "wiki_search"
@@ -493,7 +499,11 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // rewrite, cross-agent dispatch, scheduling, and evolution control.
         // These previously fell through to `None` (no scope), letting any
         // narrowly-scoped internal key invoke them.
-        "execute_program"
+        // D1 source rollback: mass-expires facts + cascades trust downgrades —
+        // high blast radius, so it requires Admin (the strictest reasonable
+        // scope) rather than plain memory:write.
+        "memory_invalidate_by_origin"
+        | "execute_program"
         | "create_agent"
         | "spawn_agent"
         // O2 ephemeral synthesis: same blast radius as spawn_agent (agent
@@ -786,6 +796,25 @@ is_external = {is_external}
             Some(Scope::MemoryRead)
         );
         assert_eq!(tool_requires_scope("send_photo"), Some(Scope::MessagingSend));
+    }
+
+    // ── D3.2: entity-alias tools sit in the memory scope family ──────────────
+    #[test]
+    fn test_entity_alias_tools_scope() {
+        // Adding an alias mutates the knowledge graph → write tier.
+        assert_eq!(
+            tool_requires_scope("memory_alias_add"),
+            Some(Scope::MemoryWrite),
+            "memory_alias_add must require memory:write"
+        );
+        // Listing aliases is read-only.
+        assert_eq!(
+            tool_requires_scope("memory_alias_list"),
+            Some(Scope::MemoryRead),
+            "memory_alias_list must require memory:read"
+        );
+        // A read-only key must NOT satisfy the write tool.
+        assert_ne!(tool_requires_scope("memory_alias_add"), Some(Scope::MemoryRead));
     }
 
     #[test]

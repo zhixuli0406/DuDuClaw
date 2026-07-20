@@ -274,12 +274,21 @@ pub async fn gdpr_erase(
     })();
 
     match txn {
-        Ok((memories_deleted, key_facts_deleted)) => Ok(GdprEraseSummary {
-            contact: contact.to_string(),
-            memories_deleted,
-            key_facts_deleted,
-            tombstone_id,
-        }),
+        Ok((memories_deleted, key_facts_deleted)) => {
+            // D3.1: erasure deletes rows (and may insert a tombstone triple) —
+            // invalidate this agent's cached SPO graph. This maintenance path
+            // bypasses the per-agent write bumps in the engine.
+            if memories_deleted > 0 || tombstone_id.is_some() {
+                drop(conn);
+                engine.bump_graph_generation(agent_id);
+            }
+            Ok(GdprEraseSummary {
+                contact: contact.to_string(),
+                memories_deleted,
+                key_facts_deleted,
+                tombstone_id,
+            })
+        }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(DuDuClawError::Memory(format!("gdpr erase failed: {e}")))

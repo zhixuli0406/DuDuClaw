@@ -63,8 +63,9 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::approval::{ApprovalBroker, ApprovalId, ApprovalStatus};
+use crate::dispatch_policy::DispatchPolicy;
 use crate::message_queue::{MessageQueue, MessageStatus, QueueMessage};
-use crate::task_store::{ActivityRow, TaskRow, TaskStore};
+use crate::task_store::{parse_depends_on, ActivityRow, TaskRow, TaskStore};
 
 /// TTL for a kickoff approval (Collaborator/Consultant autonomy gate). Expiry
 /// counts as a denial (ApprovalBroker fail-closed) ⇒ the goal is aborted.
@@ -157,9 +158,15 @@ enum KickoffGate {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct GoalLoopConfig {
-    /// Hard cap on total dispatches per task (independent of the judge's
-    /// `max_retries`; both apply, stricter wins). Exceed ⇒ `needs_human`.
+    /// Hard cap on total dispatches per task **for Complex goals** (independent
+    /// of the judge's `max_retries`; both apply, stricter wins). Exceed ⇒
+    /// `needs_human`.
     pub iteration_cap: u32,
+    /// D4 item 3: iteration cap for **Simple goals** (MaAS dynamic depth — a
+    /// simple goal that has not converged in a few tries is unlikely to, so it
+    /// escalates sooner and cheaper). The per-task effective cap is chosen by
+    /// [`crate::dispatch_engine::classify_goal_difficulty`].
+    pub iteration_cap_simple: u32,
     /// Wall-clock budget measured from the task's `created_at`, in hours.
     /// Exceed ⇒ `needs_human`.
     pub wall_clock_hours: i64,
@@ -176,6 +183,7 @@ impl Default for GoalLoopConfig {
     fn default() -> Self {
         Self {
             iteration_cap: 8,
+            iteration_cap_simple: 3,
             wall_clock_hours: 24,
             max_concurrent: 3,
             tick_secs: 30,
@@ -245,6 +253,11 @@ pub struct GoalLoopDriver {
     /// gate (Collaborator/Consultant fall back to proceeding — fail-safe: a
     /// missing broker never strands a task).
     broker: Option<Arc<ApprovalBroker>>,
+    /// D4 item 2: agent-selection policy. `None` ⇒ `FixedHierarchy` (dispatch to
+    /// the task's stored `assigned_to`) — the pre-D4 default, byte-identical.
+    /// `Some` ⇒ the configured policy may re-route a task to a different roster
+    /// member before dispatch.
+    policy: Option<Arc<dyn DispatchPolicy>>,
     /// Per-task in-flight bookkeeping. Held behind a mutex so `tick_once` can
     /// take `&self`; there is only ever one tick in flight, so contention is nil.
     inflight: Mutex<HashMap<String, InFlight>>,
@@ -271,6 +284,7 @@ impl GoalLoopDriver {
             config,
             home_dir: PathBuf::from("."),
             broker: None,
+            policy: None,
             inflight: Mutex::new(HashMap::new()),
             kickoff: Mutex::new(HashMap::new()),
             notified_needs_human: Mutex::new(HashSet::new()),
@@ -290,6 +304,28 @@ impl GoalLoopDriver {
     pub fn with_broker(mut self, broker: Arc<ApprovalBroker>) -> Self {
         self.broker = Some(broker);
         self
+    }
+
+    /// Wire a non-default [`DispatchPolicy`] (D4 item 2). Omit for the default
+    /// `FixedHierarchy` behavior (dispatch to `assigned_to` unchanged).
+    pub fn with_policy(mut self, policy: Arc<dyn DispatchPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// The effective iteration cap for a task, chosen by its difficulty (MaAS
+    /// dynamic depth, D4 item 3): Simple goals get the cheaper `iteration_cap_simple`.
+    fn iteration_cap_for(&self, task: &TaskRow) -> u32 {
+        let text = format!(
+            "{}\n{}\n{}",
+            task.title,
+            task.description,
+            task.acceptance_criteria.as_deref().unwrap_or("")
+        );
+        match crate::dispatch_engine::classify_goal_difficulty(&text) {
+            crate::dispatch_engine::Difficulty::Simple => self.config.iteration_cap_simple,
+            crate::dispatch_engine::Difficulty::Complex => self.config.iteration_cap,
+        }
     }
 
     /// Stop the loop after the current tick.
@@ -408,6 +444,32 @@ impl GoalLoopDriver {
         // In-flight goal tasks currently tracked (drives the concurrency admission gate).
         let mut active = inflight.len();
 
+        // ── D4 item 1: dependency-status map (LLMCompiler DAG) ──
+        // Only built when some candidate actually carries dependencies, so the
+        // common (no-DAG) path stays a single query. Maps every task id → status
+        // so a candidate's `depends_on` can be resolved to done / in-flight /
+        // terminally-failed without N per-dep lookups.
+        let any_deps = candidates
+            .iter()
+            .any(|t| !parse_depends_on(&t.depends_on).is_empty());
+        let status_by_id: HashMap<String, String> = if any_deps {
+            self.store
+                .list_tasks(None, None, None)
+                .await?
+                .into_iter()
+                .map(|t| (t.id, t.status))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        // ── D4 item 2: roster (only when a non-default policy is wired) ──
+        let roster: Vec<String> = if self.policy.is_some() {
+            crate::dispatch_policy::list_roster(&self.home_dir)
+        } else {
+            Vec::new()
+        };
+
         for task in &candidates {
             // ── Wall-clock guard (from created_at) ──
             if self.deadline_exceeded(&task.created_at, now) {
@@ -415,6 +477,108 @@ impl GoalLoopDriver {
                 active = inflight.len();
                 continue;
             }
+
+            // ── D4 item 1: dependency gate (LLMCompiler DAG) ──
+            // A task is dispatchable only when every `depends_on` id is `done`.
+            // If a dependency is terminally stuck (failed / cancelled /
+            // needs_human) or missing, the downstream task inherits the
+            // escalation (never orphaned): it is parked `needs_human` too so a
+            // human sees the whole blocked branch. If dependencies are merely
+            // still running, the task is frozen (skipped) this tick.
+            if any_deps {
+                let deps = parse_depends_on(&task.depends_on);
+                if !deps.is_empty() {
+                    let mut unmet: Vec<String> = Vec::new();
+                    let mut blocked_by: Option<String> = None;
+                    for d in &deps {
+                        match status_by_id.get(d).map(String::as_str) {
+                            Some("done") => {}
+                            // Terminally-failed / missing upstream ⇒ inherit escalate.
+                            Some("failed") | Some("cancelled") | Some("needs_human") | None => {
+                                blocked_by = Some(d.clone());
+                                break;
+                            }
+                            // Still in progress (todo/pending/in_progress/review/blocked).
+                            Some(_) => unmet.push(d.clone()),
+                        }
+                    }
+                    if let Some(dep) = blocked_by {
+                        let short = duduclaw_core::truncate_chars(&dep, 8);
+                        self.post_activity(
+                            "goal_loop.dep_blocked",
+                            &task.assigned_to,
+                            Some(&task.id),
+                            &format!("上游依賴 #{short} 未能完成,凍結並轉人工 — {}", task.title),
+                        )
+                        .await;
+                        self.escalate(
+                            &mut inflight,
+                            task,
+                            &format!("goal-loop upstream dependency failed: {dep}"),
+                        )
+                        .await?;
+                        active = inflight.len();
+                        continue;
+                    }
+                    if !unmet.is_empty() {
+                        debug!(
+                            task = %task.id,
+                            unmet = unmet.len(),
+                            "goal loop: task frozen — dependencies not yet done"
+                        );
+                        continue; // frozen: deps still running
+                    }
+                }
+            }
+
+            // ── D4 item 2: resolve the agent via the dispatch policy ──
+            // Default (no policy) ⇒ `task` unchanged (dispatch to `assigned_to`).
+            // A policy may re-route to another roster member; the reassignment is
+            // persisted so downstream (heartbeat pull, activity) is consistent.
+            let reassigned;
+            let task: &TaskRow = match &self.policy {
+                Some(policy) => match policy.select(task, &roster).await {
+                    Some(sel) if !sel.trim().is_empty() && sel != task.assigned_to => {
+                        match self
+                            .store
+                            .update_task(
+                                &task.id,
+                                &serde_json::json!({ "assigned_to": sel.clone() }),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                self.post_activity(
+                                    "goal_loop.reassigned",
+                                    &sel,
+                                    Some(&task.id),
+                                    &format!(
+                                        "dispatch policy {} 改派 {} → {} — {}",
+                                        policy.kind().as_str(),
+                                        task.assigned_to,
+                                        sel,
+                                        task.title
+                                    ),
+                                )
+                                .await;
+                                let mut t = task.clone();
+                                t.assigned_to = sel;
+                                reassigned = t;
+                                &reassigned
+                            }
+                            Err(e) => {
+                                warn!(task = %task.id, error = %e, "goal loop: policy reassignment persist failed — keeping original assignment");
+                                task
+                            }
+                        }
+                    }
+                    _ => task,
+                },
+                None => task,
+            };
+
+            // ── D4 item 3: per-task iteration cap (MaAS dynamic depth) ──
+            let iter_cap = self.iteration_cap_for(task);
 
             // ── Autonomy level (per-agent, from agent.toml) ──
             let level = AutonomyLevel::for_agent(&self.home_dir, &task.assigned_to);
@@ -504,9 +668,9 @@ impl GoalLoopDriver {
                 continue;
             }
 
-            // ── Iteration guard ──
+            // ── Iteration guard (difficulty-scaled cap, D4 item 3) ──
             let current_iter = entry.as_ref().map(|e| e.iter).unwrap_or(0);
-            if current_iter >= self.config.iteration_cap {
+            if current_iter >= iter_cap {
                 self.escalate(&mut inflight, task, "goal-loop iteration cap")
                     .await?;
                 active = inflight.len();
@@ -558,8 +722,8 @@ impl GoalLoopDriver {
                 &task.assigned_to,
                 Some(&task.id),
                 &format!(
-                    "goal-loop {verb} iter {next_iter}/{} — {}",
-                    self.config.iteration_cap, task.title
+                    "goal-loop {verb} iter {next_iter}/{iter_cap} — {}",
+                    task.title
                 ),
             )
             .await;
@@ -568,7 +732,7 @@ impl GoalLoopDriver {
             // judge feedback) reads as a single "未通過，重試中" line; a fresh /
             // stall dispatch reads as "開始執行 / 重試". Keyed by iteration so each
             // round posts exactly once.
-            let cap = self.config.iteration_cap;
+            let cap = iter_cap;
             if is_rejection_redispatch && has_feedback {
                 self.push_progress(
                     task,
@@ -715,7 +879,8 @@ impl GoalLoopDriver {
                 // First encounter: request approval, push, and wait.
                 let summary = format!(
                     "目標:{} — 最多 {} 輪自主嘗試",
-                    task.title, self.config.iteration_cap
+                    task.title,
+                    self.iteration_cap_for(task)
                 );
                 let payload = json!({ "task_id": task.id, "agent": task.assigned_to });
                 let id = broker
@@ -891,6 +1056,9 @@ mod tests {
     fn small_cfg() -> GoalLoopConfig {
         GoalLoopConfig {
             iteration_cap: 2,
+            // Kept equal to `iteration_cap` so the short test goal texts (which
+            // classify as Simple) exercise the same effective cap as before D4.
+            iteration_cap_simple: 2,
             wall_clock_hours: 24,
             max_concurrent: 3,
             tick_secs: 30,
@@ -925,6 +1093,7 @@ mod tests {
         // Absent section ⇒ defaults.
         let d = GoalLoopConfig::default();
         assert_eq!(d.iteration_cap, 8);
+        assert_eq!(d.iteration_cap_simple, 3);
         assert_eq!(d.max_concurrent, 3);
 
         // Partial section ⇒ only the given field overrides; the rest default.
@@ -933,6 +1102,7 @@ mod tests {
         let cfg: GoalLoopConfig =
             table.get("goal_loop").unwrap().clone().try_into().unwrap();
         assert_eq!(cfg.iteration_cap, 5);
+        assert_eq!(cfg.iteration_cap_simple, 3, "unspecified field keeps its default");
         assert_eq!(cfg.max_concurrent, 3, "unspecified field keeps its default");
         assert_eq!(cfg.wall_clock_hours, 24);
     }
@@ -1104,8 +1274,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, queue) = open_stores(dir.path()).await;
 
-        // High iteration cap so ONLY the oscillation guard can escalate here.
-        let cfg = GoalLoopConfig { iteration_cap: 10, ..small_cfg() };
+        // High iteration cap (both difficulty tiers) so ONLY the oscillation
+        // guard can escalate here — the test goal text classifies as Simple.
+        let cfg = GoalLoopConfig { iteration_cap: 10, iteration_cap_simple: 10, ..small_cfg() };
         let mut t = goal_task("g1", "alice");
         t.max_retries = 100; // don't let reject_review self-escalate
         store.insert_task(&t).await.unwrap();
@@ -1148,7 +1319,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, queue) = open_stores(dir.path()).await;
 
-        let cfg = GoalLoopConfig { iteration_cap: 10, ..small_cfg() };
+        // High cap on both tiers (the test goal classifies as Simple) so the
+        // iteration guard never pre-empts the differing-feedback retry path.
+        let cfg = GoalLoopConfig { iteration_cap: 10, iteration_cap_simple: 10, ..small_cfg() };
         let mut t = goal_task("g1", "alice");
         t.max_retries = 100;
         store.insert_task(&t).await.unwrap();
@@ -1306,5 +1479,128 @@ mod tests {
             queue.pending_messages(10).await.unwrap().is_empty(),
             "denied kickoff never dispatches"
         );
+    }
+
+    // ── D4 item 1: dependency DAG gating ────────────────────
+
+    /// A goal task with `depends_on` set is frozen until every dependency is
+    /// `done`, then dispatched. The dependency itself dispatches immediately.
+    #[tokio::test]
+    async fn dependent_task_is_frozen_until_dep_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+        let mut g2 = goal_task("g2", "alice");
+        g2.depends_on = r#"["g1"]"#.into();
+        store.insert_task(&g2).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+        // Only g1 dispatched; g2 frozen (dep not done).
+        let pending = queue.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].payload.contains("task_id=g1"));
+
+        // Mark g1 done → g2 becomes dispatchable next tick.
+        store
+            .update_task("g1", &serde_json::json!({ "status": "done" }))
+            .await
+            .unwrap();
+        d.tick_once().await.unwrap();
+        let pending = queue.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 2, "g2 dispatched once its dependency is done");
+        assert!(pending.iter().any(|m| m.payload.contains("task_id=g2")));
+    }
+
+    /// A downstream task whose dependency ends terminally (failed / needs_human /
+    /// cancelled / missing) inherits the escalation — it is parked `needs_human`
+    /// rather than frozen forever (never orphaned).
+    #[tokio::test]
+    async fn dependency_failure_escalates_downstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+
+        let mut g1 = goal_task("g1", "alice");
+        g1.status = "failed".into();
+        store.insert_task(&g1).await.unwrap();
+        let mut g2 = goal_task("g2", "alice");
+        g2.depends_on = r#"["g1"]"#.into();
+        store.insert_task(&g2).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+
+        let got = store.get_task("g2").await.unwrap().unwrap();
+        assert_eq!(got.status, "needs_human", "downstream inherits escalation");
+        assert!(got
+            .judge_feedback
+            .as_deref()
+            .unwrap_or("")
+            .contains("upstream dependency failed"));
+        // No work message enqueued for the frozen/escalated downstream task.
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
+    }
+
+    /// A missing dependency id (never resolvable) also escalates downstream —
+    /// fail-closed, does not wait forever.
+    #[tokio::test]
+    async fn missing_dependency_escalates_downstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let mut g2 = goal_task("g2", "alice");
+        g2.depends_on = r#"["ghost"]"#.into();
+        store.insert_task(&g2).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+        assert_eq!(
+            store.get_task("g2").await.unwrap().unwrap().status,
+            "needs_human"
+        );
+    }
+
+    // ── D4 item 2: dispatch policy integration ──────────────
+
+    /// With a RoundRobin policy wired, a task assigned to a non-roster agent is
+    /// re-routed to a roster member and the reassignment is persisted.
+    #[tokio::test]
+    async fn round_robin_policy_reassigns_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        // Roster = {alice, bob} (approver so no kickoff gate).
+        write_agent_toml(dir.path(), "alice", "[capabilities]\nautonomy_level = \"approver\"\n");
+        write_agent_toml(dir.path(), "bob", "[capabilities]\nautonomy_level = \"approver\"\n");
+
+        // Task assigned to someone NOT in the roster ⇒ policy must re-route.
+        store.insert_task(&goal_task("g1", "zzz")).await.unwrap();
+
+        let policy: Arc<dyn DispatchPolicy> = Arc::new(crate::dispatch_policy::RoundRobin::new());
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf())
+            .with_policy(policy);
+        d.tick_once().await.unwrap();
+
+        // RoundRobin picks the first roster member (sorted): "alice".
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.assigned_to, "alice", "reassignment persisted to the roster member");
+        let pending = queue.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target, "alice", "work dispatched to the re-routed agent");
+    }
+
+    /// The default (no policy) path is unchanged: dispatch to the stored
+    /// `assigned_to`, no reassignment.
+    #[tokio::test]
+    async fn default_policy_keeps_assigned_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+
+        assert_eq!(store.get_task("g1").await.unwrap().unwrap().assigned_to, "alice");
+        assert_eq!(queue.pending_messages(10).await.unwrap()[0].target, "alice");
     }
 }

@@ -925,6 +925,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 // agent's channel; the kickoff gate uses the shared HITL broker.
                 let mut driver = crate::goal_loop::GoalLoopDriver::new(ts, mq, cfg)
                     .with_home_dir(home_dir.clone());
+                // D4 item 2: wire the configured dispatch policy. `None` ⇒
+                // FixedHierarchy (default; dispatch to `assigned_to` unchanged).
+                if let Some(policy) = crate::dispatch_policy::build_policy(&home_dir) {
+                    info!(
+                        policy = %policy.kind().as_str(),
+                        "Goal loop: dispatch policy active"
+                    );
+                    driver = driver.with_policy(policy);
+                }
                 match crate::approval::ApprovalBroker::open(&home_dir) {
                     Ok(broker) => {
                         driver = driver.with_broker(Arc::new(broker));
@@ -943,6 +952,37 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     } else {
         info!("Dispatch engine disabled (預設關；lease 續租已接上，可用 [dispatch] enabled=true 啟用)");
+    }
+
+    // ── D5: semi-automatic topology evolution (human-gated) ───
+    // Independent of the dispatch engine: a slow background driver that mines
+    // per-(agent, task_class) MAV reject / needs_human / oscillation evidence,
+    // files reroute PROPOSALS (never direct changes) through the ApprovalBroker
+    // as an always-human action, and auto-rolls-back approved overrides that do
+    // not beat the baseline within the 24h observation window. Default OFF —
+    // only runs when `[topology_evolution] enabled = true`.
+    if crate::topology_evolution::enabled(&home_dir) {
+        if let Some(ts) = task_store_opt.clone() {
+            match crate::approval::ApprovalBroker::open(&home_dir) {
+                Ok(broker) => {
+                    let cfg = crate::topology_evolution::TopologyEvolutionConfig::from_home(&home_dir);
+                    let driver = Arc::new(crate::topology_evolution::TopologyEvolutionDriver::new(
+                        ts,
+                        home_dir.clone(),
+                        Arc::new(broker),
+                        cfg,
+                    ));
+                    bg_handles.push(tokio::spawn(async move { driver.run().await }));
+                    info!("Topology evolution driver started (D5 半自動拓撲演化，human-gated)");
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    "Topology evolution: ApprovalBroker unavailable — D5 disabled (proposals require the human gate)"
+                ),
+            }
+        } else {
+            warn!("Topology evolution: task store unavailable — D5 disabled");
+        }
     }
 
     // Pro edition: auto-download + install + graceful restart (unless disabled).

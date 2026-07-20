@@ -412,6 +412,195 @@ pub async fn handle_memory_fetch_batch(
     }
 }
 
+// ── memory_get_history / memory_get_at / memory_invalidate_by_origin (D1) ───────
+
+/// Return the full temporal supersession chain for a `(subject, predicate)`
+/// triple within the caller's namespace (D1 bi-temporal read).
+///
+/// Scope is limited to `ns_ctx.write_namespace`; the engine query filters by
+/// `agent_id`, so chains from other namespaces never surface.
+pub async fn handle_memory_get_history(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+) -> Value {
+    let subject = match params.get("subject").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return mcp_error("Missing required parameter: subject"),
+    };
+    let predicate = match params.get("predicate").and_then(|v| v.as_str()) {
+        Some(p) if !p.trim().is_empty() => p.trim(),
+        _ => return mcp_error("Missing required parameter: predicate"),
+    };
+    let namespace = &ns_ctx.write_namespace;
+
+    match memory.get_history(namespace, subject, predicate).await {
+        Ok(records) => {
+            let total = records.len();
+            let payload = serde_json::json!({
+                "subject": subject,
+                "predicate": predicate,
+                "records": records,
+                "total": total,
+            });
+            serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+        }
+        Err(e) => mcp_error(&format!("Error reading history: {e}")),
+    }
+}
+
+/// Point-in-time lookup: the fact for a `(subject, predicate)` triple valid at
+/// `at` (RFC3339), scoped to the caller's namespace (D1 bi-temporal read).
+pub async fn handle_memory_get_at(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+) -> Value {
+    let subject = match params.get("subject").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return mcp_error("Missing required parameter: subject"),
+    };
+    let predicate = match params.get("predicate").and_then(|v| v.as_str()) {
+        Some(p) if !p.trim().is_empty() => p.trim(),
+        _ => return mcp_error("Missing required parameter: predicate"),
+    };
+    let at = match params.get("at").and_then(|v| v.as_str()) {
+        Some(a) if !a.trim().is_empty() => {
+            match chrono::DateTime::parse_from_rfc3339(a.trim()) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc),
+                Err(e) => return mcp_error(&format!("Invalid 'at' (must be RFC3339): {e}")),
+            }
+        }
+        _ => return mcp_error("Missing required parameter: at (RFC3339 timestamp)"),
+    };
+    let namespace = &ns_ctx.write_namespace;
+
+    match memory.get_at(namespace, subject, predicate, at).await {
+        Ok(Some(record)) => {
+            let payload = serde_json::json!({
+                "subject": subject,
+                "predicate": predicate,
+                "at": at.to_rfc3339(),
+                "record": record,
+                "found": true,
+            });
+            serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+        }
+        Ok(None) => {
+            let payload = serde_json::json!({
+                "subject": subject,
+                "predicate": predicate,
+                "at": at.to_rfc3339(),
+                "record": Value::Null,
+                "found": false,
+            });
+            serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+        }
+        Err(e) => mcp_error(&format!("Error in point-in-time lookup: {e}")),
+    }
+}
+
+/// Rollback primitive: expire (never delete) every currently-valid fact from an
+/// exact `origin` within the caller's namespace, optionally limited to facts
+/// learned at/after `since` (RFC3339). Cascades a trust downgrade to derived
+/// facts. Admin-scoped at the dispatch layer (D1).
+pub async fn handle_memory_invalidate_by_origin(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+) -> Value {
+    let origin = match params.get("origin").and_then(|v| v.as_str()) {
+        Some(o) if !o.trim().is_empty() => o.trim(),
+        _ => return mcp_error("Missing required parameter: origin"),
+    };
+    let since = match params.get("since").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => {
+            match chrono::DateTime::parse_from_rfc3339(s.trim()) {
+                Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+                Err(e) => return mcp_error(&format!("Invalid 'since' (must be RFC3339): {e}")),
+            }
+        }
+        _ => None,
+    };
+    let namespace = &ns_ctx.write_namespace;
+
+    match memory.invalidate_by_origin(namespace, origin, since).await {
+        Ok(expired) => {
+            let payload = serde_json::json!({
+                "origin": origin,
+                "since": since.map(|t| t.to_rfc3339()),
+                "expired": expired,
+            });
+            serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+        }
+        Err(e) => mcp_error(&format!("Error invalidating by origin: {e}")),
+    }
+}
+
+// ── memory_alias_add / memory_alias_list (D3.2 entity alias) ────────────────────
+
+/// Add an entity alias for the caller's namespace (D3.2). Collapses a surface
+/// form (`alias`) onto a `canonical` entity so graph seeding treats
+/// "老闆/李老闆/zhixu" as one node. Both sides are normalized (trim + lowercase)
+/// and alias chains are flattened by the engine.
+///
+/// # Parameters
+/// - `canonical` : `string` — required, the entity to keep
+/// - `alias`     : `string` — required, the surface form to fold in
+pub async fn handle_memory_alias_add(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+) -> Value {
+    let canonical = match params.get("canonical").and_then(|v| v.as_str()) {
+        Some(c) if !c.trim().is_empty() => c,
+        _ => return mcp_error("Missing required parameter: canonical"),
+    };
+    let alias = match params.get("alias").and_then(|v| v.as_str()) {
+        Some(a) if !a.trim().is_empty() => a,
+        _ => return mcp_error("Missing required parameter: alias"),
+    };
+    let namespace = &ns_ctx.write_namespace;
+    match memory.add_entity_alias(namespace, canonical, alias).await {
+        Ok(()) => {
+            let payload = serde_json::json!({
+                "namespace": namespace,
+                "canonical": canonical.trim().to_lowercase(),
+                "alias": alias.trim().to_lowercase(),
+                "added": true,
+            });
+            serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+        }
+        Err(e) => mcp_error(&format!("Error adding entity alias: {e}")),
+    }
+}
+
+/// List the caller namespace's entity aliases (D3.2) as `(canonical, alias)`
+/// pairs. No parameters.
+pub async fn handle_memory_alias_list(
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+) -> Value {
+    let namespace = &ns_ctx.write_namespace;
+    match memory.list_entity_aliases(namespace).await {
+        Ok(pairs) => {
+            let aliases: Vec<Value> = pairs
+                .iter()
+                .map(|(canonical, alias)| {
+                    serde_json::json!({ "canonical": canonical, "alias": alias })
+                })
+                .collect();
+            let payload = serde_json::json!({
+                "namespace": namespace,
+                "aliases": aliases,
+                "total": pairs.len(),
+            });
+            serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+        }
+        Err(e) => mcp_error(&format!("Error listing entity aliases: {e}")),
+    }
+}
+
 // ── memory_improve (RFC-26 §4.4 / P6.4) ────────────────────────────────────────
 
 /// Group memory entries by their tags into `(tag, contents)` clusters, largest

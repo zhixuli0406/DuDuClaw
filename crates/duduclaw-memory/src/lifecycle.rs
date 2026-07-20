@@ -124,7 +124,14 @@ pub async fn reassign_agent(
     })();
 
     match txn {
-        Ok(summary) => Ok(summary),
+        Ok(summary) => {
+            // D3.1: re-keying moves triples between agents — invalidate both
+            // agents' cached SPO graphs (this path bypasses per-agent bumps).
+            drop(conn);
+            engine.bump_graph_generation(from_agent);
+            engine.bump_graph_generation(to_agent);
+            Ok(summary)
+        }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(DuDuClawError::Memory(format!("reassign_agent failed: {e}")))
@@ -294,6 +301,13 @@ pub async fn reassign_agent_cross_db(
     };
     // Always detach, even on failure, so the guard drops clean.
     let _ = conn.execute_batch("DETACH DATABASE hdst");
+    drop(conn);
+    // D3.1: the source engine lost all of `from_agent`'s rows — invalidate its
+    // cached SPO graph. (The destination is a freshly-opened engine with no
+    // live cache.)
+    if result.is_ok() {
+        from_engine.bump_graph_generation(from_agent);
+    }
     result
 }
 
