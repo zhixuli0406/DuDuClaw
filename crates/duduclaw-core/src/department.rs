@@ -19,8 +19,8 @@ pub const DEPARTMENTS_NAMESPACE: &str = "departments";
 /// Validate a department identifier used as a filesystem path segment.
 ///
 /// Denylist (not an ASCII allowlist): a name is valid when it is 1..=64 bytes,
-/// is not `.`/`..`, and contains no path separator (`/`, `\`), NUL, control
-/// character, or whitespace. This deliberately **allows** non-ASCII printable
+/// does not start with `.` (covers `.`/`..` and hidden dot-dirs), and contains
+/// no path separator (`/`, `\`), NUL, control character, or whitespace. This deliberately **allows** non-ASCII printable
 /// Unicode so a zh-TW product can name a department "測試部" (Bug#5) while a
 /// path built from a validated department still can never escape its parent dir
 /// (no separators / traversal names get through).
@@ -29,7 +29,7 @@ pub const DEPARTMENTS_NAMESPACE: &str = "departments";
 /// state that callers must handle *before* building any path — never by
 /// passing `""` here.
 pub fn is_valid_department(name: &str) -> bool {
-    if name.is_empty() || name.len() > 64 || name == "." || name == ".." {
+    if name.is_empty() || name.len() > 64 || name.starts_with('.') {
         return false;
     }
     !name.chars().any(|c| {
