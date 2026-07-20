@@ -191,6 +191,44 @@ const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "memory_alias_add",
+        description: "Add an entity alias so the knowledge graph treats a surface form (e.g. '老闆') as the same entity as its canonical name (e.g. '李老闆'), improving recall. Both sides are normalized; alias chains are flattened.",
+        params: &[
+            ParamDef { name: "canonical", description: "Canonical entity name to keep", required: true },
+            ParamDef { name: "alias", description: "Surface form to fold into the canonical entity", required: true },
+        ],
+    },
+    ToolDef {
+        name: "memory_alias_list",
+        description: "List the entity aliases registered for this agent as (canonical, alias) pairs.",
+        params: &[],
+    },
+    ToolDef {
+        name: "memory_get_history",
+        description: "Return the full temporal supersession chain (oldest → newest, including expired rows) for a (subject, predicate) knowledge triple. Use to inspect how a fact changed over time and which write superseded which.",
+        params: &[
+            ParamDef { name: "subject", description: "The triple subject (e.g. 'user:main', 'person:me')", required: true },
+            ParamDef { name: "predicate", description: "The triple predicate (e.g. 'prefers_language', 'spouse')", required: true },
+        ],
+    },
+    ToolDef {
+        name: "memory_get_at",
+        description: "Point-in-time lookup: return the single fact for a (subject, predicate) triple that was valid at an instant. Bi-temporal — resolves by world-time (valid_from/valid_until), robust to out-of-order ingestion.",
+        params: &[
+            ParamDef { name: "subject", description: "The triple subject", required: true },
+            ParamDef { name: "predicate", description: "The triple predicate", required: true },
+            ParamDef { name: "at", description: "The instant to query, RFC3339 (e.g. '2026-07-20T00:00:00Z')", required: true },
+        ],
+    },
+    ToolDef {
+        name: "memory_invalidate_by_origin",
+        description: "Rollback primitive: expire (never delete) every currently-valid memory fact from a specific origin, optionally limited to facts learned at/after a cutoff time. Facts derived from the purged ones have their trust lowered. History is preserved (still queryable via memory_get_history). Use to remediate a poisoned source. High-impact — Admin scope.",
+        params: &[
+            ParamDef { name: "origin", description: "Exact origin to purge (e.g. 'channel', 'distill'); matched by exact equality, never substring", required: true },
+            ParamDef { name: "since", description: "Optional RFC3339 cutoff; only facts learned at/after this transaction-time are purged", required: false },
+        ],
+    },
+    ToolDef {
         name: "memory_search_by_layer",
         description: "Search agent memory filtered by cognitive layer (episodic or semantic)",
         params: &[
@@ -7658,6 +7696,8 @@ pub(crate) async fn handle_tools_call(
             | "skill_hub_install"
             | "skill_pin"
             | "memory_store"
+            | "memory_invalidate_by_origin"
+            | "memory_alias_add"
             | "model_load"
             | "model_download"
             | "model_unload"
@@ -7677,6 +7717,11 @@ pub(crate) async fn handle_tools_call(
         "user_code_profile" => crate::mcp_memory_handlers::handle_user_code_profile(memory, ns_ctx).await,
         "memory_read"   => crate::mcp_memory_handlers::handle_memory_read(&arguments, memory, ns_ctx).await,
         "memory_fetch_batch" => crate::mcp_memory_handlers::handle_memory_fetch_batch(&arguments, memory, ns_ctx).await,
+        "memory_alias_add" => crate::mcp_memory_handlers::handle_memory_alias_add(&arguments, memory, ns_ctx).await,
+        "memory_alias_list" => crate::mcp_memory_handlers::handle_memory_alias_list(memory, ns_ctx).await,
+        "memory_get_history" => crate::mcp_memory_handlers::handle_memory_get_history(&arguments, memory, ns_ctx).await,
+        "memory_get_at" => crate::mcp_memory_handlers::handle_memory_get_at(&arguments, memory, ns_ctx).await,
+        "memory_invalidate_by_origin" => crate::mcp_memory_handlers::handle_memory_invalidate_by_origin(&arguments, memory, ns_ctx).await,
         "memory_search_by_layer" => handle_memory_search_by_layer(&arguments, memory, default_agent).await,
         "code_map" => crate::mcp_memory_handlers::handle_code_map(&arguments).await,
         "memory_successful_conversations" => handle_memory_successful_conversations(&arguments, memory, default_agent).await,

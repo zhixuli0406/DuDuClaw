@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::RwLock as StdRwLock;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -49,7 +51,9 @@ pub struct RetrievalWeights {
     pub w_recency: f64,
     /// Weight for importance dimension (default 0.35).
     pub w_importance: f64,
-    /// Weight for FTS relevance dimension (default 0.40).
+    /// Weight for FTS relevance dimension (default 0.35 — lowered from 0.40
+    /// when `w_trust` was introduced so total weight "feel" stays constant: the
+    /// 0.05 given up here funds the new `w_trust` trust dimension, D2).
     pub w_fts: f64,
     /// Weight for the HippoRAG-lite graph dimension (normalized Personalized
     /// PageRank mass over the SPO triple graph, arXiv:2405.14831; default 0.15).
@@ -61,6 +65,21 @@ pub struct RetrievalWeights {
     /// exist — otherwise this dimension contributes nothing and ranking is
     /// byte-identical to the FTS/graph path.
     pub w_vec: f64,
+    /// Weight for the origin-trust dimension (D2, PoisonedRAG 2402.07867).
+    /// Each candidate's final score is multiplied by
+    /// `(1 - w_trust) + w_trust * origin_trust`, so a fully-trusted fact
+    /// (`origin_trust = 1.0`, the default for existing rows) is unchanged while
+    /// low-trust channel-distilled facts are gently pushed down. Default 0.10.
+    /// At `w_trust = 0.0` ranking is byte-identical to the pre-D2 path.
+    pub w_trust: f64,
+    /// D3.4 — enable embedding-based graph seeding: when `true` AND an embedder
+    /// is attached, PPR seeds are the union of whole-word FTS entity matches and
+    /// the query embedding's nearest entity vectors. Default `false` — with it
+    /// off (or no embedder) seeding is byte-identical to the whole-word path.
+    pub graph_embed_seed: bool,
+    /// D3.4 — number of embedding-nearest entities to add as seeds when
+    /// `graph_embed_seed` is on. Default 5.
+    pub graph_embed_seed_top_k: usize,
 }
 
 impl Default for RetrievalWeights {
@@ -71,9 +90,12 @@ impl Default for RetrievalWeights {
             max_stability_days: 365.0,
             w_recency: 0.25,
             w_importance: 0.35,
-            w_fts: 0.40,
+            w_fts: 0.35,
             w_graph: 0.15,
             w_vec: 0.15,
+            w_trust: 0.10,
+            graph_embed_seed: false,
+            graph_embed_seed_top_k: 5,
         }
     }
 }
@@ -131,6 +153,16 @@ pub struct TemporalMeta {
     /// (I8: trust is non-malleable — re-derivation/summarization can never
     /// launder a low-trust fact into a higher-trust one).
     pub derived_from: Option<Vec<String>>,
+    /// D1 build-time provenance: the `source_event` id that produced this write.
+    /// On supersession it is stamped onto the superseded row's
+    /// `invalidated_by_event`, and on reaffirm it is appended to the surviving
+    /// row's `reaffirmed_by` list. Defaults to `entry.source_event` when `None`.
+    pub source_event: Option<String>,
+    /// D2 write-side poison quarantine: when `true` the fact is inserted with
+    /// `quarantined = 1` — excluded from every retrieval/ranking read path AND
+    /// held inert (it never supersedes or reaffirms an existing fact) until a
+    /// human releases it via the ApprovalBroker. Default `false`.
+    pub quarantined: bool,
 }
 
 /// A pending/known decision surfaced from the temporal store (RFC-24).
@@ -175,16 +207,84 @@ pub struct TemporalRecord {
     pub superseded_by: Option<String>,
     pub supersedes: Option<String>,
     pub confidence: f64,
+    /// D1 transaction-time axis: when the system learned this fact. Reads fall
+    /// back to `created_at` / `timestamp` for rows written before v1.38.
+    #[serde(default)]
+    pub ingested_at: Option<String>,
+    /// D1 build-time provenance: the `source_event` that closed this row out
+    /// (supersession) or `"origin_purge"` (rollback). `None` while still valid.
+    #[serde(default)]
+    pub invalidated_by_event: Option<String>,
+    /// D1: when the row was invalidated. `None` while still valid.
+    #[serde(default)]
+    pub invalidated_at: Option<String>,
+    /// D1: `source_event` ids that reaffirmed this fact (same triple + object +
+    /// content re-observed instead of superseded). Capped at 20 most-recent.
+    #[serde(default)]
+    pub reaffirmed_by: Vec<String>,
 }
 
 /// SQLite-backed memory engine with FTS5 full-text search.
 ///
 /// Note: `list_recent()` is an inherent method (not on the `MemoryEngine` trait)
 /// that returns entries ordered by recency without requiring an FTS query.
+/// D3.1 — minimum currently-valid triple count before the persistent graph
+/// cache kicks in. Below this the graph is cheap to rebuild per query, so the
+/// cache is skipped and behaviour is identical to the pre-cache path.
+pub const GRAPH_CACHE_MIN_TRIPLES: usize = 500;
+
+/// A per-agent cached SPO graph plus the generation it was built at (D3.1).
+/// Any triple-mutating write bumps the agent's generation; a query whose stored
+/// generation no longer matches rebuilds. `TripleGraph`'s ranking methods are
+/// `&self`-only, so the cached graph is shared read-only across queries.
+struct CachedGraph {
+    graph: crate::graph_rank::TripleGraph,
+    generation: u64,
+}
+
+/// One entity node in a [`GraphExport`] (D3.3): a canonical entity string and
+/// its degree (number of incident valid edges). For the D6 curation UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphExportNode {
+    pub entity: String,
+    pub degree: usize,
+}
+
+/// One labelled edge in a [`GraphExport`] (D3.3): the SPO triple plus its
+/// provenance (`origin_trust`) and whether it is currently quarantined.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphExportEdge {
+    pub subject: String,
+    pub predicate: Option<String>,
+    pub object: Option<String>,
+    pub memory_id: String,
+    pub origin_trust: f64,
+    pub quarantined: bool,
+}
+
+/// Serializable snapshot of an agent's SPO knowledge graph for the D6 curation
+/// UI (D3.3). Includes quarantined-but-pending edges (flagged) so a reviewer can
+/// see what is held for approval. `truncated` is `true` when the edge set hit
+/// `limit` and was cut (newest-first by `created_at`).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GraphExport {
+    pub nodes: Vec<GraphExportNode>,
+    pub edges: Vec<GraphExportEdge>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 pub struct SqliteMemoryEngine {
     conn: Mutex<Connection>,
     /// Configurable retrieval weights for search re-ranking.
     pub retrieval_weights: RetrievalWeights,
+    /// D3.1 per-agent graph generation counter. Bumped by every triple-mutating
+    /// write path; compared against a cached graph's stored generation to detect
+    /// staleness. Absent agent ⇒ generation 0.
+    graph_generations: StdRwLock<HashMap<String, u64>>,
+    /// D3.1 per-agent persistent SPO graph cache (only populated for agents
+    /// above [`GRAPH_CACHE_MIN_TRIPLES`]).
+    graph_cache: StdRwLock<HashMap<String, CachedGraph>>,
     /// Optional semantic embedder. When `None` (default) the vector signal
     /// (`w_vec`) is skipped entirely and ranking is byte-identical to the
     /// FTS/graph-only path. When set, each stored memory is embedded lazily on
@@ -217,6 +317,123 @@ pub fn quota_exceeded_bytes(usage_bytes: u64, quota_bytes: u64) -> bool {
     quota_bytes != 0 && usage_bytes >= quota_bytes
 }
 
+/// A currently-active row for a `(subject, predicate)` triple, loaded during
+/// D1 conflict resolution in [`SqliteMemoryEngine::store_temporal`].
+struct ActiveTriple {
+    id: String,
+    object: Option<String>,
+    content: String,
+    metadata: String,
+    #[allow(dead_code)]
+    access_count: i64,
+    /// `COALESCE(valid_from, timestamp)` as stored (rfc3339 for temporal writes).
+    valid_from: Option<String>,
+}
+
+/// Parse an rfc3339 timestamp into a UTC `DateTime`, ignoring malformed input.
+fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+}
+
+/// Return the earlier of two rfc3339 timestamps by parsed instant (D1 historical
+/// segment bounding). Falls back to lexical order for unparseable input.
+fn min_rfc3339(a: String, b: String) -> String {
+    match (parse_rfc3339(&a), parse_rfc3339(&b)) {
+        (Some(da), Some(db)) => {
+            if da <= db {
+                a
+            } else {
+                b
+            }
+        }
+        _ => {
+            if a <= b {
+                a
+            } else {
+                b
+            }
+        }
+    }
+}
+
+/// Trimmed `Option<String>` equality used for D1 reaffirm object matching.
+/// `None == None`; a present value never equals an absent one.
+fn object_opt_eq(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x.trim() == y.trim(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Append a `source_event` to the `reaffirmed_by` array inside a metadata JSON
+/// blob (D1 reaffirm), keeping at most the 20 most-recent unique ids. Empty
+/// event ids and duplicates are no-ops. Malformed metadata is reset to `{}`.
+fn append_reaffirmed_by(metadata_json: &str, source_event: &str) -> String {
+    let mut v: serde_json::Value =
+        serde_json::from_str(metadata_json).unwrap_or_else(|_| serde_json::json!({}));
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    // Safe: v is guaranteed to be an object here.
+    let obj = v.as_object_mut().expect("metadata is an object");
+    let arr = obj
+        .entry("reaffirmed_by")
+        .or_insert_with(|| serde_json::json!([]));
+    if !arr.is_array() {
+        *arr = serde_json::json!([]);
+    }
+    let list = arr.as_array_mut().expect("reaffirmed_by is an array");
+    if !source_event.is_empty() && !list.iter().any(|x| x.as_str() == Some(source_event)) {
+        list.push(serde_json::Value::String(source_event.to_string()));
+        let len = list.len();
+        if len > 20 {
+            list.drain(0..len - 20);
+        }
+    }
+    v.to_string()
+}
+
+/// Extract the `reaffirmed_by` string array from a metadata JSON blob (D1).
+/// Returns an empty vec for absent / malformed data.
+fn reaffirmed_by_from_metadata(metadata_json: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(metadata_json)
+        .ok()
+        .and_then(|v| {
+            v.get("reaffirmed_by")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+/// Map a `get_history` / `get_at` row into a [`TemporalRecord`] (D1). Column
+/// order: id, content, valid_from, valid_until, superseded_by, supersedes,
+/// confidence, ingested_at (COALESCE'd), invalidated_by_event, invalidated_at,
+/// metadata (source of `reaffirmed_by`).
+fn map_temporal_record(r: &rusqlite::Row) -> rusqlite::Result<TemporalRecord> {
+    let metadata: String = r.get::<_, Option<String>>(10)?.unwrap_or_else(|| "{}".to_string());
+    Ok(TemporalRecord {
+        id: r.get(0)?,
+        content: r.get(1)?,
+        valid_from: r.get(2)?,
+        valid_until: r.get(3)?,
+        superseded_by: r.get(4)?,
+        supersedes: r.get(5)?,
+        confidence: r.get::<_, Option<f64>>(6)?.unwrap_or(1.0),
+        ingested_at: r.get(7)?,
+        invalidated_by_event: r.get(8)?,
+        invalidated_at: r.get(9)?,
+        reaffirmed_by: reaffirmed_by_from_metadata(&metadata),
+    })
+}
+
 impl SqliteMemoryEngine {
     /// Open (or create) a database at `db_path` and initialise tables.
     pub fn new(db_path: &Path) -> Result<Self> {
@@ -228,6 +445,8 @@ impl SqliteMemoryEngine {
         Ok(Self {
             conn: Mutex::new(conn),
             retrieval_weights: RetrievalWeights::default(),
+            graph_generations: StdRwLock::new(HashMap::new()),
+            graph_cache: StdRwLock::new(HashMap::new()),
             embedder: None,
             memory_quota_bytes: 0,
         })
@@ -242,6 +461,8 @@ impl SqliteMemoryEngine {
         Ok(Self {
             conn: Mutex::new(conn),
             retrieval_weights: RetrievalWeights::default(),
+            graph_generations: StdRwLock::new(HashMap::new()),
+            graph_cache: StdRwLock::new(HashMap::new()),
             embedder: None,
             memory_quota_bytes: 0,
         })
@@ -380,6 +601,430 @@ impl SqliteMemoryEngine {
         self.conn.lock().await
     }
 
+    // ── D3.1 persistent graph cache: generation counter ─────────────────────
+    //
+    // Every triple-mutating write path bumps the agent's generation; a query
+    // whose cached graph carries a different generation rebuilds. Reads and
+    // writes are serialized by the `conn` mutex (both `search` and every write
+    // path hold it), so the generation captured at cache-build time always
+    // reflects the exact DB snapshot the graph was built from — no TOCTOU.
+
+    /// Current graph generation for `agent_id` (0 when never bumped).
+    fn graph_generation(&self, agent_id: &str) -> u64 {
+        self.graph_generations
+            .read()
+            .map(|g| g.get(agent_id).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// Bump one agent's graph generation, invalidating its cached graph (D3.1).
+    /// Called by every triple-mutating write path.
+    pub(crate) fn bump_graph_generation(&self, agent_id: &str) {
+        if let Ok(mut g) = self.graph_generations.write() {
+            *g.entry(agent_id.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// Invalidate every cached agent graph (D3.1) — for bulk maintenance
+    /// (decay archival, cross-agent reassignment) that mutates many agents' rows
+    /// through the raw maintenance connection. Bumps the generation of each
+    /// currently-cached agent so the next query rebuilds.
+    pub(crate) fn invalidate_all_graph_caches(&self) {
+        let cached: Vec<String> = self
+            .graph_cache
+            .read()
+            .map(|c| c.keys().cloned().collect())
+            .unwrap_or_default();
+        if let Ok(mut g) = self.graph_generations.write() {
+            for a in cached {
+                *g.entry(a).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// D3.1 — compute PPR scores for `query`, using the persistent graph cache
+    /// when the agent is large enough (> [`GRAPH_CACHE_MIN_TRIPLES`]). Below the
+    /// threshold the graph is rebuilt per query (cheap) exactly as before. The
+    /// returned scores are byte-identical whether served from cache or freshly
+    /// built — the cache only skips the rebuild, never changes the math.
+    ///
+    /// Returns `Ok(None)` (FTS-only, byte-identical) when the agent has zero
+    /// triples or `query` seeds no graph entity — same fail-safe as before.
+    fn graph_rank_cached(
+        &self,
+        conn: &Connection,
+        agent_id: &str,
+        query: &str,
+        now_rfc: &str,
+    ) -> Result<Option<Vec<(String, f64)>>> {
+        let cur_gen = self.graph_generation(agent_id);
+
+        // Fast path: a cache entry whose generation still matches.
+        if let Ok(cache) = self.graph_cache.read() {
+            if let Some(c) = cache.get(agent_id) {
+                if c.generation == cur_gen {
+                    return self.rank_from_graph(conn, &c.graph, agent_id, query, now_rfc);
+                }
+            }
+        }
+
+        // Miss / stale: cheap COUNT gate, then load + build.
+        let count = crate::graph_rank::count_agent_triples(conn, agent_id, now_rfc)?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let triples = crate::graph_rank::load_agent_graph_triples(conn, agent_id, now_rfc)?;
+        let aliases = crate::graph_rank::load_alias_map(conn, agent_id)?;
+        let graph = crate::graph_rank::TripleGraph::from_graph_triples(&triples, &aliases);
+
+        // D3.4: lazily ensure entity vectors exist before this graph is used /
+        // cached (opt-in + embedder attached). Failure-tolerant (warn + skip).
+        if self.retrieval_weights.graph_embed_seed {
+            if let Some(embedder) = self.embedder.clone() {
+                self.ensure_entity_embeddings(conn, &graph, agent_id, embedder.as_ref());
+            }
+        }
+
+        let result = self.rank_from_graph(conn, &graph, agent_id, query, now_rfc)?;
+
+        if count as usize > GRAPH_CACHE_MIN_TRIPLES {
+            // Ensure a generation entry exists so bulk invalidation catches this
+            // agent, then cache the graph at the generation it was built from.
+            if let Ok(mut g) = self.graph_generations.write() {
+                g.entry(agent_id.to_string()).or_insert(cur_gen);
+            }
+            if let Ok(mut cache) = self.graph_cache.write() {
+                cache.insert(
+                    agent_id.to_string(),
+                    CachedGraph {
+                        graph,
+                        generation: cur_gen,
+                    },
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    /// Run seeding + PPR + ranking over an already-built graph (D3.1 shared by
+    /// the cache-hit and fresh-build paths — same code, so results match).
+    fn rank_from_graph(
+        &self,
+        conn: &Connection,
+        graph: &crate::graph_rank::TripleGraph,
+        agent_id: &str,
+        query: &str,
+        now_rfc: &str,
+    ) -> Result<Option<Vec<(String, f64)>>> {
+        if graph.is_empty() {
+            return Ok(None);
+        }
+        let mut seeds = graph.seed_nodes(query);
+
+        // D3.4 embedding seeding (opt-in + embedder attached). Union of the
+        // whole-word FTS seeds and the query embedding's nearest entity vectors.
+        if self.retrieval_weights.graph_embed_seed {
+            if let Some(embedder) = &self.embedder {
+                if let Ok(qvec) = embedder.embed(query) {
+                    let extra = self
+                        .embed_seed_entities(conn, graph, agent_id, embedder.id(), &qvec, now_rfc)
+                        .unwrap_or_default();
+                    seeds.extend(extra);
+                    seeds.sort_unstable();
+                    seeds.dedup();
+                }
+            }
+        }
+
+        if seeds.is_empty() {
+            return Ok(None);
+        }
+        let mass = graph.personalized_pagerank(&seeds);
+        Ok(Some(graph.ranked_memories(&mass)))
+    }
+
+    /// D3.4 — ensure a same-model embedding exists for every entity in `graph`
+    /// (lazy, batched, failure-tolerant). An embed error only warns and skips
+    /// that entity, falling back to FTS-only seeding for it. No-op if all
+    /// entities are already embedded.
+    fn ensure_entity_embeddings(
+        &self,
+        conn: &Connection,
+        graph: &crate::graph_rank::TripleGraph,
+        agent_id: &str,
+        embedder: &dyn crate::vector::EmbeddingProvider,
+    ) {
+        let model = embedder.id();
+        for name in graph.entity_names() {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM entity_embedding
+                     WHERE agent_id = ?1 AND entity = ?2 AND model = ?3 LIMIT 1",
+                    params![agent_id, name, model],
+                    |_| Ok(true),
+                )
+                .optional()
+                .unwrap_or(None)
+                .unwrap_or(false);
+            if exists {
+                continue;
+            }
+            match embedder.embed(name) {
+                Ok(vec) if !vec.iter().all(|x| *x == 0.0) => {
+                    let blob = crate::vector::encode_vec(&vec);
+                    if let Err(e) = conn.execute(
+                        "INSERT OR REPLACE INTO entity_embedding
+                            (agent_id, entity, model, vec) VALUES (?1, ?2, ?3, ?4)",
+                        params![agent_id, name, model, blob],
+                    ) {
+                        warn!(agent_id, entity = %name, "entity embed store failed: {e}");
+                    }
+                }
+                Ok(_) => {} // empty/zero vector — nothing useful to store
+                Err(e) => {
+                    warn!(agent_id, entity = %name, "entity embed failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// D3.4 — entity node indices whose stored embedding is nearest the query
+    /// embedding (cosine, same model only), top-k. Entities without a matching
+    /// vector are skipped. Returns node indices in the supplied `graph`.
+    fn embed_seed_entities(
+        &self,
+        conn: &Connection,
+        graph: &crate::graph_rank::TripleGraph,
+        agent_id: &str,
+        model: &str,
+        query_vec: &[f32],
+        _now_rfc: &str,
+    ) -> Result<Vec<usize>> {
+        let top_k = self.retrieval_weights.graph_embed_seed_top_k.max(1);
+        let mut stmt = conn
+            .prepare(
+                "SELECT entity, vec FROM entity_embedding
+                 WHERE agent_id = ?1 AND model = ?2",
+            )
+            .map_err(|e| DuDuClawError::Memory(format!("entity embed load: {e}")))?;
+        let rows = stmt
+            .query_map(params![agent_id, model], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| DuDuClawError::Memory(format!("entity embed query: {e}")))?;
+
+        let mut scored: Vec<(usize, f32)> = Vec::new();
+        for row in rows {
+            let (entity, blob) = row.map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let v = match crate::vector::decode_vec(&blob) {
+                Some(v) if v.len() == query_vec.len() => v,
+                _ => continue, // malformed / different-dimension: skip
+            };
+            let sim = crate::embedding::cosine_similarity(query_vec, &v);
+            if sim <= 0.0 {
+                continue;
+            }
+            if let Some(idx) = graph.entity_node(&entity) {
+                scored.push((idx, sim));
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        scored.truncate(top_k);
+        Ok(scored.into_iter().map(|(idx, _)| idx).collect())
+    }
+
+    // ── D3.2 entity alias API ───────────────────────────────────────────────
+
+    /// Add (or update) an entity alias for `agent_id` (D3.2). Both `alias` and
+    /// `canonical` are normalized (trim + lowercase). Alias chains are flattened
+    /// on store: if `canonical` is itself an alias of something else, the deeper
+    /// canonical is used, so a lookup never has to chase a chain. A self-alias
+    /// (alias == resolved canonical) or an empty side is rejected. Bumps the
+    /// agent's graph generation so the cache rebuilds with the new mapping.
+    pub async fn add_entity_alias(
+        &self,
+        agent_id: &str,
+        canonical: &str,
+        alias: &str,
+    ) -> Result<()> {
+        let alias_n = alias.trim().to_lowercase();
+        let mut canonical_n = canonical.trim().to_lowercase();
+        if alias_n.is_empty() || canonical_n.is_empty() {
+            return Err(DuDuClawError::Memory(
+                "add_entity_alias: alias and canonical must be non-empty".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        // Flatten: resolve canonical's own canonical (one level is enough since
+        // the table is always kept flat by this same rule).
+        if let Some(deeper) = conn
+            .query_row(
+                "SELECT canonical FROM entity_alias WHERE agent_id = ?1 AND alias = ?2 LIMIT 1",
+                params![agent_id, canonical_n],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?
+        {
+            canonical_n = deeper;
+        }
+        if alias_n == canonical_n {
+            return Err(DuDuClawError::Memory(
+                "add_entity_alias: alias resolves to itself".to_string(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO entity_alias (agent_id, canonical, alias, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_id, alias) DO UPDATE SET canonical = excluded.canonical",
+            params![agent_id, canonical_n, alias_n, now],
+        )
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        drop(conn);
+        self.bump_graph_generation(agent_id);
+        Ok(())
+    }
+
+    /// Remove an entity alias for `agent_id` (D3.2). Returns whether a row was
+    /// removed. Bumps the graph generation when something changed.
+    pub async fn remove_entity_alias(&self, agent_id: &str, alias: &str) -> Result<bool> {
+        let alias_n = alias.trim().to_lowercase();
+        if alias_n.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "DELETE FROM entity_alias WHERE agent_id = ?1 AND alias = ?2",
+                params![agent_id, alias_n],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        drop(conn);
+        if n > 0 {
+            self.bump_graph_generation(agent_id);
+        }
+        Ok(n > 0)
+    }
+
+    /// List an agent's entity aliases as `(canonical, alias)` pairs, sorted by
+    /// canonical then alias for deterministic output (D3.2).
+    pub async fn list_entity_aliases(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT canonical, alias FROM entity_alias WHERE agent_id = ?1
+                 ORDER BY canonical, alias",
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![agent_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// D3.3 — export the agent's SPO knowledge graph for the D6 curation UI.
+    /// Edges are the newest `limit` currently-referenced triples (by memory
+    /// `created_at`, descending); quarantined-but-pending facts are included and
+    /// flagged so a reviewer can see what awaits approval. Node degree counts
+    /// incident edges within the exported set. Entity names are alias-resolved
+    /// so the exported graph matches the ranking graph's node identities.
+    pub async fn export_graph(&self, agent_id: &str, limit: usize) -> Result<GraphExport> {
+        let limit = limit.max(1);
+        let conn = self.conn.lock().await;
+        let now_rfc = Utc::now().to_rfc3339();
+        let aliases = crate::graph_rank::load_alias_map(&conn, agent_id)?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, subject, predicate, object, origin_trust, quarantined
+                 FROM memories
+                 WHERE agent_id = ?1 AND subject IS NOT NULL
+                   AND (valid_until IS NULL OR valid_until > ?2)
+                 ORDER BY COALESCE(ingested_at, created_at, timestamp) DESC, id DESC
+                 LIMIT ?3",
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![agent_id, now_rfc, (limit + 1) as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<f64>>(4)?.unwrap_or(1.0),
+                    r.get::<_, i64>(5)? != 0,
+                ))
+            })
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        let resolve = |raw: &str| -> String {
+            let n = raw.trim().to_lowercase();
+            aliases.get(&n).cloned().unwrap_or(n)
+        };
+
+        let mut edges: Vec<GraphExportEdge> = Vec::new();
+        let mut degree: HashMap<String, usize> = HashMap::new();
+        for row in rows {
+            let (memory_id, subject, predicate, object, origin_trust, quarantined) =
+                row.map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let subject_c = resolve(&subject);
+            if subject_c.is_empty() {
+                continue;
+            }
+            let object_c = object
+                .as_deref()
+                .map(|o| resolve(o))
+                .filter(|o| !o.is_empty());
+            if edges.len() >= limit {
+                // We fetched one extra row to detect truncation; stop here.
+                return Ok(Self::finalize_graph_export(edges, degree, true));
+            }
+            *degree.entry(subject_c.clone()).or_insert(0) += 1;
+            if let Some(o) = &object_c {
+                *degree.entry(o.clone()).or_insert(0) += 1;
+            }
+            edges.push(GraphExportEdge {
+                subject: subject_c,
+                predicate,
+                object: object_c,
+                memory_id,
+                origin_trust,
+                quarantined,
+            });
+        }
+        Ok(Self::finalize_graph_export(edges, degree, false))
+    }
+
+    /// Assemble a [`GraphExport`] from collected edges + degree map (D3.3),
+    /// nodes sorted by degree descending then name for determinism.
+    fn finalize_graph_export(
+        edges: Vec<GraphExportEdge>,
+        degree: HashMap<String, usize>,
+        truncated: bool,
+    ) -> GraphExport {
+        let mut nodes: Vec<GraphExportNode> = degree
+            .into_iter()
+            .map(|(entity, degree)| GraphExportNode { entity, degree })
+            .collect();
+        nodes.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.entity.cmp(&b.entity)));
+        GraphExport {
+            nodes,
+            edges,
+            truncated,
+        }
+    }
+
     /// Select clause for all memory columns (qualified with table alias `m.`).
     const SELECT_COLS: &str = "m.id, m.agent_id, m.content, m.timestamp, m.tags, m.layer, m.importance, m.access_count, m.last_accessed, m.source_event";
 
@@ -388,7 +1033,8 @@ impl SqliteMemoryEngine {
     pub async fn list_recent(&self, agent_id: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
         let conn = self.conn.lock().await;
         let sql = format!(
-            "SELECT {} FROM memories AS m WHERE m.agent_id = ?1 ORDER BY m.timestamp DESC LIMIT ?2",
+            "SELECT {} FROM memories AS m WHERE m.agent_id = ?1 AND m.quarantined = 0 \
+             ORDER BY m.timestamp DESC LIMIT ?2",
             Self::SELECT_COLS
         );
         let mut stmt = conn
@@ -448,6 +1094,7 @@ impl SqliteMemoryEngine {
             "SELECT {cols} FROM memories AS m
              WHERE m.id = ?1 AND m.agent_id = ?2
                AND (m.valid_until IS NULL OR m.valid_until > ?3)
+               AND m.quarantined = 0
              LIMIT 1",
             cols = Self::SELECT_COLS
         );
@@ -595,6 +1242,7 @@ impl SqliteMemoryEngine {
             "SELECT {cols}, m.metadata FROM memories AS m
              WHERE m.agent_id = ?1 AND m.source_event = ?2
                AND (m.valid_until IS NULL OR m.valid_until > ?3)
+               AND m.quarantined = 0
              ORDER BY m.timestamp DESC LIMIT ?4",
             cols = Self::SELECT_COLS
         );
@@ -683,9 +1331,17 @@ impl SqliteMemoryEngine {
         self.enforce_quota(&conn)?;
 
         let now = Utc::now();
+        let now_str = now.to_rfc3339();
         let valid_from = meta.valid_from.unwrap_or(now).to_rfc3339();
-        let valid_until = meta.valid_until.map(|t| t.to_rfc3339());
+        let mut valid_until = meta.valid_until.map(|t| t.to_rfc3339());
         let confidence = meta.confidence.unwrap_or(1.0);
+        // D1: the source_event that drives build-time provenance for this write.
+        // Prefer an explicit `meta.source_event`, else fall back to the entry's.
+        let source_event = meta
+            .source_event
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| entry.source_event.clone());
         let metadata = meta
             .metadata
             .as_ref()
@@ -724,19 +1380,43 @@ impl SqliteMemoryEngine {
         };
 
         // ── Conflict resolution: only when a full triple is supplied ──────────
+        // D2: a quarantined fact is INERT — it must never expire, supersede, or
+        // reaffirm a currently-valid fact (that is exactly the PoisonedRAG
+        // primitive we are defending against: unverified input silently
+        // overwriting curated knowledge). Skip the whole conflict-resolution
+        // block; the row is inserted with `quarantined = 1` and stays isolated
+        // until a human releases it.
         let mut supersedes: Option<String> = None;
+        if !meta.quarantined {
         if let (Some(subj), Some(pred)) = (meta.subject.as_ref(), meta.predicate.as_ref()) {
-            let existing: Vec<String> = {
+            // Load currently-active rows (id + object + content + metadata +
+            // access_count + world-time start), newest world-time first. We need
+            // object/content to decide reaffirm-vs-supersede and valid_from to
+            // decide the out-of-order (historical) insert.
+            let active: Vec<ActiveTriple> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT id FROM memories
+                        "SELECT id, object, content, metadata, access_count,
+                                COALESCE(valid_from, timestamp)
+                         FROM memories
                          WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
                            AND valid_until IS NULL
                          ORDER BY COALESCE(valid_from, timestamp) DESC, created_at DESC, id DESC",
                     )
                     .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
                 let rows = stmt
-                    .query_map(params![agent_id, subj, pred], |r| r.get::<_, String>(0))
+                    .query_map(params![agent_id, subj, pred], |r| {
+                        Ok(ActiveTriple {
+                            id: r.get(0)?,
+                            object: r.get(1)?,
+                            content: r.get(2)?,
+                            metadata: r
+                                .get::<_, Option<String>>(3)?
+                                .unwrap_or_else(|| "{}".to_string()),
+                            access_count: r.get(4)?,
+                            valid_from: r.get(5)?,
+                        })
+                    })
                     .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
                 let mut v = Vec::new();
                 for r in rows {
@@ -744,26 +1424,83 @@ impl SqliteMemoryEngine {
                 }
                 v
             };
-            if existing.len() > 1 {
+
+            // ── Reaffirm: same (subject, predicate, object) + content re-observed.
+            // Don't create a new row — append this write's source_event to the
+            // surviving row's `reaffirmed_by` list (cap 20) and bump access_count.
+            if let Some(row) = active.iter().find(|r| {
+                object_opt_eq(&meta.object, &r.object) && r.content.trim() == entry.content.trim()
+            }) {
+                let new_meta = append_reaffirmed_by(&row.metadata, &source_event);
+                conn.execute(
+                    "UPDATE memories SET metadata = ?1, access_count = access_count + 1
+                     WHERE id = ?2 AND agent_id = ?3",
+                    params![new_meta, row.id, agent_id],
+                )
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                info!(agent_id, entry_id = %row.id, "temporal memory reaffirmed");
+                return Ok(row.id.clone());
+            }
+
+            if active.len() > 1 {
                 warn!(
                     agent_id,
                     subject = %subj,
                     predicate = %pred,
-                    count = existing.len(),
-                    "multiple active memories for the same triple — superseding all"
+                    count = active.len(),
+                    "multiple active memories for the same triple"
                 );
             }
-            let now_str = now.to_rfc3339();
-            for old_id in &existing {
-                conn.execute(
-                    "UPDATE memories SET valid_until = ?1, superseded_by = ?2 WHERE id = ?3",
-                    params![now_str, entry.id, old_id],
-                )
-                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+            // ── Out-of-order resilience: only when the new fact carries a
+            // world-time start. If it predates the reigning active fact, it
+            // belongs to the PAST — insert it as a bounded historical segment
+            // (valid_until = the next-known fact's valid_from) WITHOUT disturbing
+            // the current fact or forming a supersession chain (it was never
+            // current). Facts with no valid_from keep the legacy ingestion-order
+            // behavior byte-for-byte.
+            let mut treat_as_history = false;
+            if let Some(new_vf) = meta.valid_from {
+                if let Some(reigning) = active
+                    .first()
+                    .and_then(|r| r.valid_from.as_deref())
+                    .and_then(parse_rfc3339)
+                {
+                    if new_vf < reigning {
+                        treat_as_history = true;
+                        // Tightest bound: the smallest active valid_from strictly
+                        // after the new fact's start.
+                        let bound = active
+                            .iter()
+                            .filter_map(|r| r.valid_from.as_deref().and_then(parse_rfc3339))
+                            .filter(|dt| *dt > new_vf)
+                            .min()
+                            .map(|dt| dt.to_rfc3339());
+                        valid_until = match (valid_until.take(), bound) {
+                            (Some(a), Some(b)) => Some(min_rfc3339(a, b)),
+                            (a, b) => a.or(b),
+                        };
+                    }
+                }
             }
-            // Record the most-recent superseded id for the new row's back-pointer.
-            supersedes = existing.into_iter().next();
+
+            if !treat_as_history {
+                // The new fact wins — expire all active rows, stamp build-time
+                // provenance, and chain the back-pointer to the most recent one.
+                for row in &active {
+                    conn.execute(
+                        "UPDATE memories
+                         SET valid_until = ?1, superseded_by = ?2,
+                             invalidated_by_event = ?3, invalidated_at = ?4
+                         WHERE id = ?5",
+                        params![now_str, entry.id, source_event, now_str, row.id],
+                    )
+                    .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                }
+                supersedes = active.first().map(|r| r.id.clone());
+            }
         }
+        } // end `if !meta.quarantined`
 
         let tags_json = serde_json::to_string(&entry.tags)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
@@ -776,15 +1513,16 @@ impl SqliteMemoryEngine {
                  last_accessed, source_event,
                  valid_from, valid_until, superseded_by, supersedes,
                  subject, predicate, object, confidence, metadata,
-                 origin, origin_trust, derived_from)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                 origin, origin_trust, derived_from, ingested_at, quarantined)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
             params![
                 entry.id, agent_id, entry.content, timestamp_str, tags_json,
                 entry.layer.as_str(), entry.importance, entry.access_count,
                 last_accessed_str, entry.source_event,
                 valid_from, valid_until, Option::<String>::None, supersedes,
                 meta.subject, meta.predicate, meta.object, confidence, metadata,
-                meta.origin, origin_trust, derived_from_json
+                meta.origin, origin_trust, derived_from_json, now_str,
+                if meta.quarantined { 1i64 } else { 0i64 }
             ],
         )
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
@@ -796,6 +1534,10 @@ impl SqliteMemoryEngine {
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
         self.embed_on_write(&conn, agent_id, &entry.id, &entry.content);
+
+        // D3.1: a new triple (and any supersession expiry above) changed the
+        // currently-valid triple set — invalidate this agent's cached graph.
+        self.bump_graph_generation(agent_id);
 
         info!(agent_id, entry_id = %entry.id, "temporal memory stored");
         Ok(entry.id)
@@ -817,6 +1559,113 @@ impl SqliteMemoryEngine {
                 Err(e) => tracing::warn!(agent_id, memory_id, "embed failed: {e}"),
             }
         }
+    }
+
+    /// Whether a memory id is currently quarantined (D2). `None` when the id is
+    /// not found for this agent. Used by the approval flow / tests.
+    pub async fn is_quarantined(&self, agent_id: &str, memory_id: &str) -> Result<Option<bool>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT quarantined FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
+            params![memory_id, agent_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|opt| opt.map(|n| n != 0))
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))
+    }
+
+    /// D2 approval — RELEASE a quarantined batch. Clears `quarantined` on the
+    /// given ids owned by `agent_id`, making them visible to retrieval again.
+    /// Only rows currently quarantined are touched (idempotent). Returns the
+    /// number of rows released. `ids` is capped at 100 per call.
+    pub async fn release_quarantine(
+        &self,
+        agent_id: &str,
+        ids: &[String],
+    ) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        if ids.len() > 100 {
+            return Err(DuDuClawError::Memory(
+                "release_quarantine limited to 100 ids per call".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        let placeholders = std::iter::repeat("?")
+            .take(ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE memories SET quarantined = 0
+             WHERE agent_id = ? AND quarantined = 1 AND id IN ({placeholders})"
+        );
+        let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+        bind.push(&agent_id);
+        for id in ids {
+            bind.push(id);
+        }
+        let n = conn
+            .execute(&sql, bind.as_slice())
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        drop(conn);
+        if n > 0 {
+            // D3.1: released rows re-enter the valid-triple set.
+            self.bump_graph_generation(agent_id);
+        }
+        Ok(n)
+    }
+
+    /// D2 approval — REJECT a quarantined batch. Expires the given ids
+    /// (`valid_until = now`, `invalidated_by_event = event`,
+    /// `invalidated_at = now`) and downgrades their `origin_trust` to
+    /// `min(current, 0.1)` (no separate origin-trust store exists, so the
+    /// downgrade is applied to the rejected rows themselves). Rows stay
+    /// `quarantined = 1` so they can never resurface via a read path. Returns
+    /// the number of rows rejected. `ids` is capped at 100 per call.
+    pub async fn reject_quarantine(
+        &self,
+        agent_id: &str,
+        ids: &[String],
+        event: &str,
+    ) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        if ids.len() > 100 {
+            return Err(DuDuClawError::Memory(
+                "reject_quarantine limited to 100 ids per call".to_string(),
+            ));
+        }
+        let now_str = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let placeholders = std::iter::repeat("?")
+            .take(ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE memories
+             SET valid_until = ?1, invalidated_by_event = ?2, invalidated_at = ?1,
+                 origin_trust = MIN(origin_trust, 0.1)
+             WHERE agent_id = ? AND quarantined = 1 AND id IN ({placeholders})"
+        );
+        let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 3);
+        bind.push(&now_str);
+        bind.push(&event);
+        bind.push(&agent_id);
+        for id in ids {
+            bind.push(id);
+        }
+        let n = conn
+            .execute(&sql, bind.as_slice())
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        drop(conn);
+        if n > 0 {
+            // D3.1: rejected rows were expired (dropped from the valid set).
+            self.bump_graph_generation(agent_id);
+        }
+        Ok(n)
     }
 
     /// Read back the stored `origin_trust` for a memory id (P2-1). Returns
@@ -843,24 +1692,16 @@ impl SqliteMemoryEngine {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT id, content, valid_from, valid_until, superseded_by, supersedes, confidence
+                "SELECT id, content, valid_from, valid_until, superseded_by, supersedes, confidence,
+                        COALESCE(ingested_at, created_at, timestamp),
+                        invalidated_by_event, invalidated_at, metadata
                  FROM memories
                  WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
                  ORDER BY COALESCE(valid_from, timestamp) ASC",
             )
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let rows = stmt
-            .query_map(params![agent_id, subject, predicate], |r| {
-                Ok(TemporalRecord {
-                    id: r.get(0)?,
-                    content: r.get(1)?,
-                    valid_from: r.get(2)?,
-                    valid_until: r.get(3)?,
-                    superseded_by: r.get(4)?,
-                    supersedes: r.get(5)?,
-                    confidence: r.get::<_, Option<f64>>(6)?.unwrap_or(1.0),
-                })
-            })
+            .query_map(params![agent_id, subject, predicate], map_temporal_record)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let mut out = Vec::new();
         for r in rows {
@@ -871,7 +1712,7 @@ impl SqliteMemoryEngine {
 
     /// Point-in-time lookup for a triple: the memory valid at instant `at`
     /// (`valid_from <= at AND (valid_until IS NULL OR valid_until > at)`) (F1).
-    /// Engine-only for v1.19.0 (not exposed over MCP yet).
+    /// Exposed over MCP as `memory_get_at` since D1 (2026-07).
     pub async fn get_at(
         &self,
         agent_id: &str,
@@ -883,7 +1724,9 @@ impl SqliteMemoryEngine {
         let at_str = at.to_rfc3339();
         let mut stmt = conn
             .prepare(
-                "SELECT id, content, valid_from, valid_until, superseded_by, supersedes, confidence
+                "SELECT id, content, valid_from, valid_until, superseded_by, supersedes, confidence,
+                        COALESCE(ingested_at, created_at, timestamp),
+                        invalidated_by_event, invalidated_at, metadata
                  FROM memories
                  WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
                    AND COALESCE(valid_from, timestamp) <= ?4
@@ -893,22 +1736,131 @@ impl SqliteMemoryEngine {
             )
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let mut rows = stmt
-            .query_map(params![agent_id, subject, predicate, at_str], |r| {
-                Ok(TemporalRecord {
-                    id: r.get(0)?,
-                    content: r.get(1)?,
-                    valid_from: r.get(2)?,
-                    valid_until: r.get(3)?,
-                    superseded_by: r.get(4)?,
-                    supersedes: r.get(5)?,
-                    confidence: r.get::<_, Option<f64>>(6)?.unwrap_or(1.0),
-                })
-            })
+            .query_map(params![agent_id, subject, predicate, at_str], map_temporal_record)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         match rows.next() {
             Some(r) => Ok(Some(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?)),
             None => Ok(None),
         }
+    }
+
+    /// D1 rollback primitive: expire (never delete) every currently-valid fact
+    /// for `agent_id` that originated from exactly `origin`, optionally limited
+    /// to rows learned at/after `since` (transaction-time, `ingested_at`). The
+    /// `origin` match is an **exact equality** — never a substring — so
+    /// `channel-a` can be purged without touching `channel-abc` (project rule:
+    /// no unanchored `contains` for security/routing decisions).
+    ///
+    /// Expired rows get `valid_until = now`, `invalidated_by_event = "origin_purge"`,
+    /// `invalidated_at = now`, so `search()` stops returning them while
+    /// `get_history()` keeps the full chain. Any row whose `derived_from` cites a
+    /// purged id has its `origin_trust` lowered to `min(current, 0.1)` (a derived
+    /// fact of a poisoned source can't stay trusted) — but is **not** expired.
+    ///
+    /// Returns the number of rows expired.
+    pub async fn invalidate_by_origin(
+        &self,
+        agent_id: &str,
+        origin: &str,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let since_str = since.map(|t| t.to_rfc3339());
+
+        // ── 1. Collect the currently-valid rows to expire (exact origin match). ──
+        // `datetime()` normalizes both rfc3339 (ingested_at/timestamp) and the
+        // SQLite "YYYY-MM-DD HH:MM:SS" default of `created_at` so the `since`
+        // comparison is representation-agnostic.
+        let target_ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM memories
+                     WHERE agent_id = ?1 AND origin = ?2 AND valid_until IS NULL
+                       AND (?3 IS NULL
+                            OR datetime(COALESCE(ingested_at, created_at, timestamp))
+                               >= datetime(?3))",
+                )
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![agent_id, origin, since_str], |r| r.get::<_, String>(0))
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+            }
+            v
+        };
+
+        if target_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // ── 2. Expire them (single UPDATE mirroring the SELECT predicate). ──
+        conn.execute(
+            "UPDATE memories
+             SET valid_until = ?1, invalidated_by_event = 'origin_purge', invalidated_at = ?1
+             WHERE agent_id = ?2 AND origin = ?3 AND valid_until IS NULL
+               AND (?4 IS NULL
+                    OR datetime(COALESCE(ingested_at, created_at, timestamp))
+                       >= datetime(?4))",
+            params![now_str, agent_id, origin, since_str],
+        )
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        // ── 3. Cascade: any row deriving from a purged id gets trust ≤ 0.1. ──
+        let purged: std::collections::HashSet<&str> =
+            target_ids.iter().map(|s| s.as_str()).collect();
+        let candidates: Vec<(String, f64, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, origin_trust, derived_from FROM memories
+                     WHERE agent_id = ?1 AND derived_from IS NOT NULL",
+                )
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![agent_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<f64>>(1)?.unwrap_or(1.0),
+                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    ))
+                })
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+            }
+            v
+        };
+        for (id, trust, derived_json) in candidates {
+            if trust <= 0.1 {
+                continue; // already at/below the floor — nothing to lower
+            }
+            let cites_purged = serde_json::from_str::<Vec<String>>(&derived_json)
+                .map(|ids| ids.iter().any(|s| purged.contains(s.as_str())))
+                .unwrap_or(false);
+            if cites_purged {
+                conn.execute(
+                    "UPDATE memories SET origin_trust = ?1 WHERE id = ?2 AND agent_id = ?3",
+                    params![trust.min(0.1), id, agent_id],
+                )
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            }
+        }
+
+        drop(conn);
+        // D3.1: expired rows + lowered-trust derivatives changed the graph.
+        self.bump_graph_generation(agent_id);
+
+        info!(
+            agent_id,
+            origin,
+            expired = target_ids.len(),
+            "invalidate_by_origin"
+        );
+        Ok(target_ids.len() as u64)
     }
 
     /// Resolve the `(subject, predicate)` triple keys for a single memory id
@@ -1060,6 +2012,8 @@ impl SqliteMemoryEngine {
             params![now, agent_id, subject],
         )
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        drop(conn);
+        self.bump_graph_generation(agent_id); // D3.1: decision triples expired
         Ok(())
     }
 
@@ -1089,6 +2043,10 @@ impl SqliteMemoryEngine {
                 params![now_str, agent_id, cutoff],
             )
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        drop(conn);
+        if n > 0 {
+            self.bump_graph_generation(agent_id); // D3.1: stale decisions expired
+        }
         Ok(n)
     }
 
@@ -1107,6 +2065,10 @@ impl SqliteMemoryEngine {
                 params![now, agent_id, subject],
             )
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        drop(conn);
+        if n > 0 {
+            self.bump_graph_generation(agent_id); // D3.1: decision triples closed
+        }
         Ok(n > 0)
     }
 
@@ -1296,6 +2258,7 @@ impl SqliteMemoryEngine {
                AND f.agent_id = ?2
                AND m.layer = ?3
                AND (m.valid_until IS NULL OR m.valid_until > ?4)
+               AND m.quarantined = 0
              ORDER BY rank
              LIMIT ?5",
             cols = Self::SELECT_COLS
@@ -1347,6 +2310,7 @@ impl SqliteMemoryEngine {
                AND f.agent_id = ?2
                AND m.layer = 'episodic'
                AND m.importance >= 5.0
+               AND m.quarantined = 0
              ORDER BY m.timestamp DESC
              LIMIT ?3";
 
@@ -1529,12 +2493,30 @@ impl SqliteMemoryEngine {
             "ALTER TABLE memories ADD COLUMN origin TEXT",
             "ALTER TABLE memories ADD COLUMN origin_trust REAL NOT NULL DEFAULT 1.0",
             "ALTER TABLE memories ADD COLUMN derived_from TEXT",
+            // ── D1 Bi-temporal + build-time provenance (2026-07) ──
+            // `ingested_at` = transaction-time axis (when the system LEARNED the
+            // fact), distinct from `valid_from` (world-time the fact became true).
+            // New writes set it to now; old rows read via
+            // COALESCE(ingested_at, created_at, timestamp), so no backfill UPDATE
+            // is needed. `invalidated_by_event` / `invalidated_at` record which
+            // source_event closed a row out during supersession/purge and when —
+            // the minimal build-time provenance Graphiti calls for.
+            "ALTER TABLE memories ADD COLUMN ingested_at TEXT",
+            "ALTER TABLE memories ADD COLUMN invalidated_by_event TEXT",
+            "ALTER TABLE memories ADD COLUMN invalidated_at TEXT",
             // ── Semantic vector layer (w_vec signal) ──
             // `embedding` = little-endian f32 BLOB; `embedding_model` = the
             // embedder id that produced it (never cross-space compared). Both
             // NULL on old rows ⇒ they skip the vector signal until re-embedded.
             "ALTER TABLE memories ADD COLUMN embedding BLOB",
             "ALTER TABLE memories ADD COLUMN embedding_model TEXT",
+            // ── D2 write-side poison quarantine (2026-07) ──
+            // `quarantined = 1` marks a fact held for human review (write-side
+            // injection hit or same-origin burst). Every retrieval read path
+            // filters `quarantined = 0`; the row stays inert until an approval
+            // releases it (→ 0) or rejects it (→ expired). Default 0 so every
+            // existing row is treated as clean with no backfill.
+            "ALTER TABLE memories ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
         ];
         for sql in &migrations {
             match conn.execute_batch(sql) {
@@ -1557,6 +2539,39 @@ impl SqliteMemoryEngine {
                  ON memories(agent_id, valid_until);",
         )
         .map_err(|e| DuDuClawError::Memory(format!("temporal index: {e}")))?;
+
+        // ── D3.2 entity alias table ──────────────────────────────────────────
+        // Maps a surface form (`alias`) to a canonical entity string per agent,
+        // used to collapse "老闆/李老闆/zhixu" into one graph node. Both sides are
+        // stored pre-normalized (trim + lowercase). Absent ⇒ alias-free graph.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS entity_alias (
+                agent_id TEXT NOT NULL,
+                canonical TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (agent_id, alias)
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_alias_agent
+                ON entity_alias(agent_id);",
+        )
+        .map_err(|e| DuDuClawError::Memory(format!("entity_alias table: {e}")))?;
+
+        // ── D3.4 entity embedding table (opt-in graph seeding) ───────────────
+        // Caches one embedding per (agent, canonical entity, model). Populated
+        // lazily when embedding-seeding is enabled AND an embedder is attached;
+        // never touched otherwise (byte-identical default-off path).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS entity_embedding (
+                agent_id TEXT NOT NULL,
+                entity TEXT NOT NULL,
+                model TEXT NOT NULL,
+                vec BLOB NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (agent_id, entity, model)
+            );",
+        )
+        .map_err(|e| DuDuClawError::Memory(format!("entity_embedding table: {e}")))?;
 
         Ok(())
     }
@@ -1686,6 +2701,7 @@ impl MemoryEngine for SqliteMemoryEngine {
              WHERE f.memories_fts MATCH ?1
                AND f.agent_id = ?2
                AND (m.valid_until IS NULL OR m.valid_until > ?3)
+               AND m.quarantined = 0
              ORDER BY rank
              LIMIT ?4",
             cols = Self::SELECT_COLS
@@ -1712,9 +2728,7 @@ impl MemoryEngine for SqliteMemoryEngine {
         // Fail-safe: zero triples (cheap COUNT gate), a query seeding no graph
         // entity, or any error all yield `None`, leaving the FTS-only result
         // byte-identical to before.
-        let graph_ranked = match crate::graph_rank::graph_rank_scores(
-            &conn, agent_id, query, &now_rfc,
-        ) {
+        let graph_ranked = match self.graph_rank_cached(&conn, agent_id, query, &now_rfc) {
             Ok(ranked) => ranked,
             Err(e) => {
                 tracing::warn!("graph ranking skipped: {e}");
@@ -1811,11 +2825,16 @@ impl MemoryEngine for SqliteMemoryEngine {
             }
         }
 
-        // P2-1: cap low-trust memories in the ranking (I8). Multiply each score
-        // by its `origin_trust` (default 1.0 → existing rows unchanged; only
-        // distilled/channel facts with trust < 1.0 are pushed down). A
-        // multiplier, not a filter, so nothing is silently hidden — a low-trust
-        // fact can still surface if little else competes.
+        // P2-1 / D2: let origin-trust participate in the ranking (I8,
+        // PoisonedRAG 2402.07867). Each score is multiplied by
+        // `(1 - w_trust) + w_trust * origin_trust`, a soft weighting rather than
+        // the old full multiply — a fully-trusted fact (`origin_trust = 1.0`,
+        // the default for every existing row) is unchanged, so behaviour
+        // degrades to the pre-D2 path for legacy data; only distilled/channel
+        // facts with trust < 1.0 are gently pushed down. A multiplier, not a
+        // filter, so nothing is silently hidden — a low-trust fact can still
+        // surface if little else competes.
+        let w_trust = w.w_trust.clamp(0.0, 1.0);
         for (score, entry) in scored.iter_mut() {
             let trust: f64 = conn
                 .query_row(
@@ -1826,8 +2845,9 @@ impl MemoryEngine for SqliteMemoryEngine {
                 .optional()
                 .ok()
                 .flatten()
-                .unwrap_or(1.0);
-            *score *= trust.clamp(0.0, 1.0);
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            *score *= (1.0 - w_trust) + w_trust * trust;
         }
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1856,7 +2876,8 @@ impl MemoryEngine for SqliteMemoryEngine {
             let end_str = window.end.to_rfc3339();
 
             let sql = format!(
-                "SELECT {} FROM memories AS m WHERE m.agent_id = ?1 AND m.timestamp >= ?2 AND m.timestamp <= ?3 ORDER BY m.timestamp ASC",
+                "SELECT {} FROM memories AS m WHERE m.agent_id = ?1 AND m.quarantined = 0 \
+                 AND m.timestamp >= ?2 AND m.timestamp <= ?3 ORDER BY m.timestamp ASC",
                 Self::SELECT_COLS
             );
             let mut stmt = conn
@@ -2819,6 +3840,303 @@ mod tests {
         assert_eq!(engine.get_origin_trust(agent, &derived).await.unwrap(), Some(0.0));
     }
 
+    // ── D1: bi-temporal out-of-order resilience + provenance ────────────────────
+
+    /// Build a spouse triple meta with a world-time `valid_from`.
+    fn spouse_meta(object: &str, valid_from: DateTime<Utc>) -> TemporalMeta {
+        TemporalMeta {
+            subject: Some("person:me".into()),
+            predicate: Some("spouse".into()),
+            object: Some(object.into()),
+            valid_from: Some(valid_from),
+            source_event: Some(format!("ev-{object}")),
+            ..Default::default()
+        }
+    }
+
+    /// The Graphiti marriage→divorce→remarriage example ingested OUT OF ORDER:
+    /// divorce first, then the earlier marriage, then the later one. `get_at`
+    /// must still resolve the correct spouse at every point in time, and the
+    /// supersession chain must stay intact.
+    #[tokio::test]
+    async fn out_of_order_marriage_resolves_by_world_time() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "bitemporal";
+        let now = Utc::now();
+        let t_early = now - Duration::days(3000); // marry Alice
+        let t_mid = now - Duration::days(2000); // divorce
+        let t_late = now - Duration::days(1000); // marry Bob
+
+        // Ingest order deliberately scrambled vs. world-time order.
+        let divorce_id = engine
+            .store_temporal(agent, make_entry(agent, "divorced", vec![]), spouse_meta("none", t_mid))
+            .await
+            .unwrap();
+        engine
+            .store_temporal(agent, make_entry(agent, "married Alice", vec![]), spouse_meta("Alice", t_early))
+            .await
+            .unwrap();
+        let bob_id = engine
+            .store_temporal(agent, make_entry(agent, "married Bob", vec![]), spouse_meta("Bob", t_late))
+            .await
+            .unwrap();
+
+        let at = |r: Option<TemporalRecord>| r.map(|x| x.content);
+        assert_eq!(
+            at(engine.get_at(agent, "person:me", "spouse", t_early + Duration::days(500)).await.unwrap()).as_deref(),
+            Some("married Alice")
+        );
+        assert_eq!(
+            at(engine.get_at(agent, "person:me", "spouse", t_mid + Duration::days(500)).await.unwrap()).as_deref(),
+            Some("divorced")
+        );
+        assert_eq!(
+            at(engine.get_at(agent, "person:me", "spouse", t_late + Duration::days(500)).await.unwrap()).as_deref(),
+            Some("married Bob")
+        );
+
+        // Full chain preserved; the reigning supersession links divorce → Bob.
+        let hist = engine.get_history(agent, "person:me", "spouse").await.unwrap();
+        assert_eq!(hist.len(), 3, "all three world-time segments retained");
+        let bob = hist.iter().find(|r| r.id == bob_id).unwrap();
+        assert_eq!(bob.supersedes.as_deref(), Some(divorce_id.as_str()));
+        let divorce = hist.iter().find(|r| r.id == divorce_id).unwrap();
+        assert_eq!(divorce.superseded_by.as_deref(), Some(bob_id.as_str()));
+
+        // Only the currently-valid (Bob) fact surfaces in ordinary search.
+        let hits = engine.search(agent, "married", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, bob_id);
+    }
+
+    /// A historical-segment insert (earlier valid_from) does NOT disturb the
+    /// reigning fact and is bounded by the next-known fact's start.
+    #[tokio::test]
+    async fn historical_segment_does_not_touch_current() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "hist-seg";
+        let now = Utc::now();
+        let current_id = engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "current spouse", vec![]),
+                spouse_meta("Current", now - Duration::days(100)),
+            )
+            .await
+            .unwrap();
+        // Insert an older fact — it must NOT expire the current one.
+        engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "old spouse", vec![]),
+                spouse_meta("Old", now - Duration::days(500)),
+            )
+            .await
+            .unwrap();
+
+        // Current fact is still the active one.
+        let at_now = engine.get_at(agent, "person:me", "spouse", now).await.unwrap();
+        assert_eq!(at_now.unwrap().id, current_id);
+        // The old fact is bounded and excluded from search.
+        let hits = engine.search(agent, "spouse", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "only the current fact is currently-valid");
+        assert_eq!(hits[0].id, current_id);
+    }
+
+    /// Re-observing the same (subject, predicate, object) + content reaffirms the
+    /// existing row instead of inserting a new one: no chain growth, the new
+    /// source_event lands in `reaffirmed_by`, and access_count is bumped.
+    #[tokio::test]
+    async fn reaffirm_appends_event_and_bumps_access() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "reaffirm";
+        let meta1 = TemporalMeta {
+            subject: Some("user".into()),
+            predicate: Some("lang".into()),
+            object: Some("python".into()),
+            source_event: Some("ev1".into()),
+            ..Default::default()
+        };
+        let id1 = engine
+            .store_temporal(agent, make_entry(agent, "likes python", vec![]), meta1)
+            .await
+            .unwrap();
+
+        let meta2 = TemporalMeta {
+            subject: Some("user".into()),
+            predicate: Some("lang".into()),
+            object: Some("python".into()),
+            source_event: Some("ev2".into()),
+            ..Default::default()
+        };
+        let id2 = engine
+            .store_temporal(agent, make_entry(agent, "likes python", vec![]), meta2)
+            .await
+            .unwrap();
+
+        assert_eq!(id2, id1, "reaffirm returns the surviving row id");
+        let hist = engine.get_history(agent, "user", "lang").await.unwrap();
+        assert_eq!(hist.len(), 1, "no new row inserted on reaffirm");
+        assert!(hist[0].reaffirmed_by.contains(&"ev2".to_string()));
+        assert!(!hist[0].reaffirmed_by.contains(&"ev1".to_string()), "the original write is not a reaffirm");
+
+        let entries = engine.get_by_ids(agent, &[id1.clone()]).await.unwrap();
+        assert_eq!(entries[0].access_count, 1, "access_count bumped on reaffirm");
+    }
+
+    /// A changed object supersedes (not reaffirms) — reaffirm must be object-exact.
+    #[tokio::test]
+    async fn changed_object_supersedes_not_reaffirms() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "reaffirm-neg";
+        engine
+            .store_temporal(agent, make_entry(agent, "old", vec![]), triple_meta("s", "p", "v1"))
+            .await
+            .unwrap();
+        engine
+            .store_temporal(agent, make_entry(agent, "new", vec![]), triple_meta("s", "p", "v2"))
+            .await
+            .unwrap();
+        let hist = engine.get_history(agent, "s", "p").await.unwrap();
+        assert_eq!(hist.len(), 2, "different object → real supersession, two rows");
+    }
+
+    /// `ingested_at` is populated on every temporal write (transaction-time axis).
+    #[tokio::test]
+    async fn ingested_at_is_populated() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "ingested";
+        engine
+            .store_temporal(agent, make_entry(agent, "x", vec![]), triple_meta("s", "p", "o"))
+            .await
+            .unwrap();
+        let hist = engine.get_history(agent, "s", "p").await.unwrap();
+        assert!(hist[0].ingested_at.is_some(), "ingested_at recorded");
+    }
+
+    // ── D1: invalidate_by_origin (source rollback) ──────────────────────────────
+
+    /// Purging an origin expires its currently-valid facts (search no longer
+    /// returns them), preserves the full history, stamps `origin_purge`
+    /// provenance, and cascades a trust downgrade to derived facts.
+    #[tokio::test]
+    async fn invalidate_by_origin_expires_preserves_and_cascades() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "purge";
+
+        // Poisoned fact from a bad channel (has a triple for history lookup).
+        let f1 = engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "poison findmeee", vec![]),
+                TemporalMeta {
+                    subject: Some("topic".into()),
+                    predicate: Some("fact".into()),
+                    object: Some("a".into()),
+                    origin: Some("chan-bad".into()),
+                    origin_trust: Some(0.3),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // A fact derived from the poisoned one (trust clamped to 0.3 at store).
+        let f2 = engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "derived summary", vec![]),
+                TemporalMeta {
+                    origin: Some("distill".into()),
+                    origin_trust: Some(0.9),
+                    derived_from: Some(vec![f1.clone()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.get_origin_trust(agent, &f2).await.unwrap(), Some(0.3));
+
+        // A clean fact from a different origin sharing the search keyword.
+        let f3 = engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "clean findmeee", vec![]),
+                TemporalMeta { origin: Some("chan-good".into()), ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        let expired = engine.invalidate_by_origin(agent, "chan-bad", None).await.unwrap();
+        assert_eq!(expired, 1, "only the exact bad-origin fact is expired");
+
+        // Search no longer returns the poisoned fact, but the clean one remains.
+        let hits = engine.search(agent, "findmeee", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, f3);
+
+        // History is preserved with build-time provenance.
+        let hist = engine.get_history(agent, "topic", "fact").await.unwrap();
+        let purged = hist.iter().find(|r| r.id == f1).unwrap();
+        assert!(purged.valid_until.is_some(), "purged row is expired, not deleted");
+        assert_eq!(purged.invalidated_by_event.as_deref(), Some("origin_purge"));
+
+        // Cascade: the derived fact's trust is floored to 0.1.
+        assert_eq!(engine.get_origin_trust(agent, &f2).await.unwrap(), Some(0.1));
+    }
+
+    /// Origin match is EXACT — `chan` must not purge `chan-extra` (no substring).
+    #[tokio::test]
+    async fn invalidate_by_origin_is_exact_not_substring() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "purge-exact";
+        engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "exact aaa", vec![]),
+                TemporalMeta { origin: Some("chan".into()), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let keep = engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "prefix bbb", vec![]),
+                TemporalMeta { origin: Some("chan-extra".into()), ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        let expired = engine.invalidate_by_origin(agent, "chan", None).await.unwrap();
+        assert_eq!(expired, 1);
+        let hits = engine.search(agent, "bbb", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "the substring-prefixed origin is untouched");
+        assert_eq!(hits[0].id, keep);
+    }
+
+    /// The `since` transaction-time filter bounds what gets purged.
+    #[tokio::test]
+    async fn invalidate_by_origin_honours_since() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "purge-since";
+        engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "sinceable ccc", vec![]),
+                TemporalMeta { origin: Some("chan".into()), ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        // A cutoff in the future matches nothing learned before it.
+        let future = Utc::now() + Duration::days(1);
+        assert_eq!(engine.invalidate_by_origin(agent, "chan", Some(future)).await.unwrap(), 0);
+
+        // A cutoff in the past matches the row.
+        let past = Utc::now() - Duration::days(1);
+        assert_eq!(engine.invalidate_by_origin(agent, "chan", Some(past)).await.unwrap(), 1);
+    }
+
     /// count_active_with_tag counts only valid rows whose tags contain the tag.
     #[tokio::test]
     async fn count_active_with_tag_counts_valid_only() {
@@ -3119,5 +4437,416 @@ mod tests {
         );
         // Sanity: the stored row exists.
         assert_eq!(row.id, new_id);
+    }
+
+    // ── D2 quarantine ─────────────────────────────────────────────────────
+
+    fn quarantined_meta(subject: &str, predicate: &str, object: &str) -> TemporalMeta {
+        TemporalMeta {
+            subject: Some(subject.to_string()),
+            predicate: Some(predicate.to_string()),
+            object: Some(object.to_string()),
+            quarantined: true,
+            ..Default::default()
+        }
+    }
+
+    /// A quarantined fact is invisible to `search` / `search_layer` until it is
+    /// released, then it surfaces.
+    #[tokio::test]
+    async fn quarantined_fact_excluded_from_search_until_released() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "q-agent";
+
+        let e = make_entry(agent, "the vault password is hunter2", vec![]);
+        let id = engine
+            .store_temporal(agent, e, quarantined_meta("vault", "password_is", "hunter2"))
+            .await
+            .unwrap();
+        assert_eq!(engine.is_quarantined(agent, &id).await.unwrap(), Some(true));
+
+        // Excluded from both search entry points.
+        assert!(engine.search(agent, "vault password", 10).await.unwrap().is_empty());
+        assert!(engine
+            .search_layer(agent, "vault password", &duduclaw_core::types::MemoryLayer::Semantic, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Release → now visible.
+        assert_eq!(engine.release_quarantine(agent, &[id.clone()]).await.unwrap(), 1);
+        assert_eq!(engine.is_quarantined(agent, &id).await.unwrap(), Some(false));
+        let hits = engine.search(agent, "vault password", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id);
+    }
+
+    /// A quarantined triple must NOT supersede a currently-valid clean fact —
+    /// the core PoisonedRAG defense.
+    #[tokio::test]
+    async fn quarantined_fact_does_not_supersede_clean_fact() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "q-agent2";
+
+        let clean = make_entry(agent, "capital of france is paris", vec![]);
+        let clean_id = engine
+            .store_temporal(agent, clean, triple_meta("france", "capital_is", "paris"))
+            .await
+            .unwrap();
+
+        // Poison: same (subject, predicate), quarantined.
+        let poison = make_entry(agent, "capital of france is berlin", vec![]);
+        let poison_id = engine
+            .store_temporal(agent, poison, quarantined_meta("france", "capital_is", "berlin"))
+            .await
+            .unwrap();
+
+        // The clean fact is untouched (still valid, not superseded).
+        let clean_row = engine.get_by_id(agent, &clean_id).await.unwrap().unwrap();
+        assert_eq!(clean_row.id, clean_id);
+        let hits = engine.search(agent, "capital of france", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "only the clean fact is retrievable");
+        assert!(hits[0].content.contains("paris"));
+        // Poison stays isolated.
+        assert_eq!(engine.is_quarantined(agent, &poison_id).await.unwrap(), Some(true));
+    }
+
+    /// Rejecting a quarantined batch expires the rows and downgrades trust; the
+    /// rows never resurface.
+    #[tokio::test]
+    async fn reject_quarantine_expires_and_downgrades_trust() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "q-agent3";
+
+        let e = make_entry(agent, "poisoned claim about acme corp", vec![]);
+        let mut meta = quarantined_meta("acme", "status_is", "bankrupt");
+        meta.origin = Some("channel".to_string());
+        meta.origin_trust = Some(0.3);
+        let id = engine.store_temporal(agent, e, meta).await.unwrap();
+
+        let n = engine
+            .reject_quarantine(agent, &[id.clone()], "quarantine_reject")
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // Trust downgraded to ≤ 0.1.
+        let trust = engine.get_origin_trust(agent, &id).await.unwrap().unwrap();
+        assert!(trust <= 0.1 + f64::EPSILON, "trust must be downgraded: {trust}");
+        // Still not retrievable (expired + still quarantined).
+        assert!(engine.search(agent, "acme corp", 10).await.unwrap().is_empty());
+        // The chain records the rejection event.
+        let hist = engine.get_history(agent, "acme", "status_is").await.unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].invalidated_by_event.as_deref(), Some("quarantine_reject"));
+    }
+
+    // ── D2 w_trust ranking ────────────────────────────────────────────────
+
+    /// With a positive `w_trust`, a low-trust fact ranks below a high-trust
+    /// fact of otherwise-identical relevance; with `w_trust = 0` the trust
+    /// dimension is inert and both orderings agree on the non-trust score.
+    #[tokio::test]
+    async fn w_trust_pushes_low_trust_fact_down() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "trust-rank";
+
+        // Two equally-relevant matches, same age/importance, differing only in
+        // origin_trust. The high-trust one must rank first under default weights.
+        let high = make_entry(agent, "widget price is 100 dollars", vec![]);
+        let high_meta = TemporalMeta { origin_trust: Some(1.0), ..Default::default() };
+        engine.store_temporal(agent, high, high_meta).await.unwrap();
+
+        let low = make_entry(agent, "widget price is 999 dollars", vec![]);
+        let low_meta = TemporalMeta {
+            origin: Some("channel".to_string()),
+            origin_trust: Some(0.3),
+            ..Default::default()
+        };
+        engine.store_temporal(agent, low, low_meta).await.unwrap();
+
+        let results = engine.search(agent, "widget price", 10).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0].content.contains("100"),
+            "high-trust fact must rank first, got: {}",
+            results[0].content
+        );
+    }
+
+    /// The default `RetrievalWeights` keeps the same total "budget" feel: the
+    /// 0.05 taken from `w_fts` funds `w_trust`.
+    #[test]
+    fn default_weights_shift_from_fts_to_trust() {
+        let w = RetrievalWeights::default();
+        assert!((w.w_fts - 0.35).abs() < 1e-12);
+        assert!((w.w_trust - 0.10).abs() < 1e-12);
+    }
+
+    // ── D3.1 persistent graph cache ───────────────────────────────────────
+
+    /// Store `n` distinct triples all sharing an "hub" object so a query on
+    /// "hub" seeds a connected component, guaranteeing a non-None graph rank.
+    async fn seed_hub_triples(engine: &SqliteMemoryEngine, agent: &str, n: usize) {
+        for i in 0..n {
+            let e = make_entry(agent, &format!("person {i} knows the hub"), vec![]);
+            engine
+                .store_temporal(agent, e, triple_meta(&format!("person{i}"), "knows", "hub"))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn bits(v: &Option<Vec<(String, f64)>>) -> Vec<(String, u64)> {
+        v.as_ref()
+            .map(|r| r.iter().map(|(id, s)| (id.clone(), s.to_bits())).collect())
+            .unwrap_or_default()
+    }
+
+    /// D3.1 byte-identical guarantee: for a >500-triple agent the cache-hit
+    /// result equals the fresh-build result bit-for-bit.
+    #[tokio::test]
+    async fn graph_cache_hit_is_byte_identical() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "cache-agent";
+        seed_hub_triples(&engine, agent, GRAPH_CACHE_MIN_TRIPLES + 1).await;
+
+        let now = Utc::now().to_rfc3339();
+        let conn = engine.conn_for_maintenance().await;
+        // First call: cache miss → fresh build (also populates the cache).
+        let fresh = engine
+            .graph_rank_cached(&conn, agent, "hub", &now)
+            .unwrap();
+        // Second call: cache hit.
+        let cached = engine
+            .graph_rank_cached(&conn, agent, "hub", &now)
+            .unwrap();
+        assert!(fresh.is_some(), "hub query must seed the connected component");
+        assert_eq!(bits(&fresh), bits(&cached), "cache hit must be byte-identical to fresh build");
+
+        // Cache is actually populated for a large agent.
+        assert!(engine.graph_cache.read().unwrap().contains_key(agent));
+    }
+
+    /// D3.1: below the threshold the cache is never populated (behaviour is the
+    /// per-query fresh build), yet the result is still correct.
+    #[tokio::test]
+    async fn small_graph_is_not_cached() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "small-agent";
+        seed_hub_triples(&engine, agent, 3).await;
+
+        let now = Utc::now().to_rfc3339();
+        let conn = engine.conn_for_maintenance().await;
+        let r = engine.graph_rank_cached(&conn, agent, "hub", &now).unwrap();
+        assert!(r.is_some());
+        assert!(
+            !engine.graph_cache.read().unwrap().contains_key(agent),
+            "sub-threshold agent must not be cached"
+        );
+    }
+
+    /// D3.1: a triple-mutating write bumps the generation so a stale cache is
+    /// rebuilt — the newly-stored fact appears on the next query.
+    #[tokio::test]
+    async fn write_bumps_generation_and_rebuilds_cache() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "gen-agent";
+        seed_hub_triples(&engine, agent, GRAPH_CACHE_MIN_TRIPLES + 1).await;
+
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = engine.conn_for_maintenance().await;
+            let _ = engine.graph_rank_cached(&conn, agent, "hub", &now).unwrap();
+        }
+        let gen_before = engine.graph_generation(agent);
+
+        // A new triple on a fresh subject connected to "hub".
+        let e = make_entry(agent, "newcomer knows the hub", vec![]);
+        engine
+            .store_temporal(agent, e, triple_meta("newcomer", "knows", "hub"))
+            .await
+            .unwrap();
+        assert!(engine.graph_generation(agent) > gen_before, "store must bump generation");
+
+        // Next query rebuilds; "newcomer" now seeds and is retrievable.
+        let now2 = Utc::now().to_rfc3339();
+        let conn = engine.conn_for_maintenance().await;
+        let r = engine
+            .graph_rank_cached(&conn, agent, "newcomer", &now2)
+            .unwrap()
+            .unwrap();
+        assert!(!r.is_empty(), "rebuilt graph must include the new triple");
+    }
+
+    // ── D3.2 entity aliases ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn alias_add_list_remove_roundtrip() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "alias-agent";
+        engine.add_entity_alias(agent, "李老闆", "老闆").await.unwrap();
+        engine.add_entity_alias(agent, "李老闆", "zhixu").await.unwrap();
+        let list = engine.list_entity_aliases(agent).await.unwrap();
+        // Both aliases stored under the canonical, normalized (lowercased).
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|(c, _)| c == "李老闆"));
+        assert!(engine.remove_entity_alias(agent, "老闆").await.unwrap());
+        assert_eq!(engine.list_entity_aliases(agent).await.unwrap().len(), 1);
+        // Removing a non-existent alias is a no-op false.
+        assert!(!engine.remove_entity_alias(agent, "nope").await.unwrap());
+    }
+
+    /// Alias chains are flattened on store: `a → b` where `b → c` stores `a → c`.
+    #[tokio::test]
+    async fn alias_chain_is_flattened() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "alias-chain";
+        engine.add_entity_alias(agent, "c", "b").await.unwrap();
+        engine.add_entity_alias(agent, "b", "a").await.unwrap();
+        let list = engine.list_entity_aliases(agent).await.unwrap();
+        // "a" must resolve directly to "c" (flattened), not to "b".
+        assert!(
+            list.iter().any(|(canon, al)| canon == "c" && al == "a"),
+            "chain must flatten a→c, got {list:?}"
+        );
+    }
+
+    /// A search querying an alias surfaces the fact stored under the canonical
+    /// entity — the seeding-hit-rate win D3.2 is about.
+    #[tokio::test]
+    async fn alias_makes_canonical_fact_retrievable_by_alias() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "alias-search";
+        // A triple keyed on the canonical entity; the memory content deliberately
+        // does NOT contain the alias, so only graph seeding can bridge it.
+        let e = make_entry(agent, "李老闆 prefers oolong", vec![]);
+        engine
+            .store_temporal(agent, e, triple_meta("李老闆", "prefers", "oolong"))
+            .await
+            .unwrap();
+
+        engine.add_entity_alias(agent, "李老闆", "老闆").await.unwrap();
+        // Query the alias only.
+        let hits = engine.search(agent, "老闆", 5).await.unwrap();
+        assert!(
+            hits.iter().any(|m| m.content.contains("oolong")),
+            "alias query must reach the canonical fact via graph seeding"
+        );
+    }
+
+    // ── D3.3 graph export ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn export_graph_reports_nodes_edges_and_quarantine() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "export-agent";
+        engine
+            .store_temporal(agent, make_entry(agent, "alice knows bob", vec![]),
+                triple_meta("alice", "knows", "bob"))
+            .await
+            .unwrap();
+        // A quarantined triple must still appear in the export, flagged.
+        let mut qmeta = triple_meta("mallory", "claims", "admin");
+        qmeta.quarantined = true;
+        engine
+            .store_temporal(agent, make_entry(agent, "mallory claims admin", vec![]), qmeta)
+            .await
+            .unwrap();
+
+        let export = engine.export_graph(agent, 500).await.unwrap();
+        assert_eq!(export.edges.len(), 2);
+        assert!(!export.truncated);
+        assert!(export.edges.iter().any(|e| e.quarantined && e.subject == "mallory"));
+        assert!(export.edges.iter().any(|e| !e.quarantined && e.subject == "alice"));
+        // Degrees: alice, bob, mallory, admin all degree 1.
+        assert!(export.nodes.iter().any(|n| n.entity == "alice" && n.degree == 1));
+        assert_eq!(export.nodes.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn export_graph_truncates_at_limit() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "export-trunc";
+        for i in 0..5 {
+            engine
+                .store_temporal(agent, make_entry(agent, &format!("f{i}"), vec![]),
+                    triple_meta(&format!("s{i}"), "rel", &format!("o{i}")))
+                .await
+                .unwrap();
+        }
+        let export = engine.export_graph(agent, 2).await.unwrap();
+        assert_eq!(export.edges.len(), 2);
+        assert!(export.truncated, "more rows than limit → truncated");
+    }
+
+    // ── D3.4 embedding seeding (default off = byte-identical) ──────────────
+
+    /// With an embedder attached but `graph_embed_seed = false` (default), graph
+    /// ranking is byte-identical to the no-embed-seed path.
+    #[tokio::test]
+    async fn embed_seed_off_is_byte_identical() {
+        use std::sync::Arc;
+        let agent = "embed-off";
+        // Baseline: no embedder.
+        let plain = SqliteMemoryEngine::in_memory().unwrap();
+        seed_hub_triples(&plain, agent, 3).await;
+        // With embedder attached but embed seeding OFF.
+        let mut withemb = SqliteMemoryEngine::in_memory().unwrap();
+        withemb = withemb.with_embedder(Arc::new(crate::vector::NgramHashEmbedder::new()));
+        assert!(!withemb.retrieval_weights.graph_embed_seed);
+        seed_hub_triples(&withemb, agent, 3).await;
+
+        let now = Utc::now().to_rfc3339();
+        let a = {
+            let c = plain.conn_for_maintenance().await;
+            plain.graph_rank_cached(&c, agent, "hub", &now).unwrap()
+        };
+        let b = {
+            let c = withemb.conn_for_maintenance().await;
+            withemb.graph_rank_cached(&c, agent, "hub", &now).unwrap()
+        };
+        // The two engines carry independent random memory ids, so compare the
+        // PPR mass *distribution* (sorted score bits): identical topology ⇒
+        // identical scores whether or not an idle embedder is attached.
+        let score_bits = |v: &Option<Vec<(String, f64)>>| -> Vec<u64> {
+            let mut s: Vec<u64> = v
+                .as_ref()
+                .map(|r| r.iter().map(|(_, sc)| sc.to_bits()).collect())
+                .unwrap_or_default();
+            s.sort_unstable();
+            s
+        };
+        assert_eq!(
+            score_bits(&a),
+            score_bits(&b),
+            "embed-seed-off must not change graph ranking"
+        );
+    }
+
+    /// With `graph_embed_seed = true` + an embedder, entity vectors are lazily
+    /// populated and embedding-nearest entities can seed even when the query
+    /// shares no whole word with an entity name.
+    #[tokio::test]
+    async fn embed_seed_on_populates_and_seeds() {
+        use std::sync::Arc;
+        let agent = "embed-on";
+        let mut engine = SqliteMemoryEngine::in_memory().unwrap();
+        engine = engine.with_embedder(Arc::new(crate::vector::NgramHashEmbedder::new()));
+        engine.retrieval_weights.graph_embed_seed = true;
+        seed_hub_triples(&engine, agent, 3).await;
+
+        let now = Utc::now().to_rfc3339();
+        let conn = engine.conn_for_maintenance().await;
+        // Trigger a build so entity embeddings are lazily populated.
+        let _ = engine.graph_rank_cached(&conn, agent, "hub", &now).unwrap();
+        let embedded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_embedding WHERE agent_id = ?1",
+                params![agent],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(embedded > 0, "entity vectors must be lazily populated when embed seeding is on");
     }
 }

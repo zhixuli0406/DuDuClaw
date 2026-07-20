@@ -1846,6 +1846,33 @@ export interface MemoryHistoryQuery {
   memory_id?: string;
 }
 
+// ── D6: SPO knowledge-graph curation (`memory.graph` / `memory.invalidate_origin`) ──
+
+/** One entity node in the exported SPO graph. `degree` = incident valid edges. */
+export interface MemoryGraphNode {
+  entity: string;
+  degree: number;
+}
+
+/** One labelled edge (SPO triple) with provenance for the curation viewer. */
+export interface MemoryGraphEdge {
+  subject: string;
+  predicate: string | null;
+  object: string | null;
+  memory_id: string;
+  /** Source-confidence tier (0–1) driving the node/edge colour. */
+  origin_trust: number;
+  /** Held for human review (excluded from retrieval until released). */
+  quarantined: boolean;
+}
+
+/** Response of `memory.graph`. `truncated` = the newest-first cut kicked in. */
+export interface MemoryGraphResult {
+  nodes: MemoryGraphNode[];
+  edges: MemoryGraphEdge[];
+  truncated: boolean;
+}
+
 // ── ODO: per-agent Odoo credential override (`odoo.agent_config_*`) ──
 
 /** Response of `odoo.agent_config_get`. `configured:false` = no override, the
@@ -2711,6 +2738,22 @@ export const api = {
         predicate,
         at,
       }) as Promise<MemoryAtResult>,
+    /** D6 — export the agent's SPO knowledge graph for the curation viewer. */
+    graph: (agentId: string, limit = 500) =>
+      client.call('memory.graph', {
+        agent_id: agentId,
+        limit,
+      }) as Promise<MemoryGraphResult>,
+    /**
+     * D6 — DESTRUCTIVE: expire every currently-valid fact from one source.
+     * Dashboard-local only. `since` (RFC-3339) optionally bounds by learn time.
+     */
+    invalidateOrigin: (agentId: string, origin: string, since?: string) =>
+      client.call('memory.invalidate_origin', {
+        agent_id: agentId,
+        origin,
+        ...(since ? { since } : {}),
+      }) as Promise<{ expired: number }>,
   },
   wiki: {
     pages: (agentId: string) =>
@@ -3046,13 +3089,21 @@ export const api = {
   // WP14-T14.7 — HITL approval center. `list` is manager-gated; `decide` errors
   // on already-terminal requests or board-kind requests without admin scope.
   approvals: {
-    list: (agentId?: string) =>
-      client.call('approvals.list', agentId ? { agent_id: agentId } : {}) as Promise<{
+    /** `actionKind` (e.g. 'knowledge_quarantine') filters to one approval kind. */
+    list: (agentId?: string, actionKind?: string) =>
+      client.call('approvals.list', {
+        ...(agentId ? { agent_id: agentId } : {}),
+        ...(actionKind ? { action_kind: actionKind } : {}),
+      }) as Promise<{
         approvals: ApprovalItem[];
         count: number;
       }>,
-    decide: (id: string, approve: boolean) =>
-      client.call('approvals.decide', { id, approve }) as Promise<{
+    decide: (id: string, approve: boolean, reason?: string) =>
+      client.call('approvals.decide', {
+        id,
+        approve,
+        ...(reason ? { reason } : {}),
+      }) as Promise<{
         id: string;
         decided: 'approved' | 'denied';
       }>,

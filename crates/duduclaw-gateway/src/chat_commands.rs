@@ -688,13 +688,35 @@ async fn handle_goal_create(
         }
     };
     let (channel, chat_id) = source_from_session(session_id);
-    let task_id = uuid::Uuid::new_v4().to_string();
-    let short = duduclaw_core::truncate_chars(&task_id, 8);
-    let title = duduclaw_core::truncate_chars(description, 60);
     // No explicit criteria → the goal text itself is the acceptance basis.
     let criteria = acceptance_criteria
         .map(str::to_string)
         .unwrap_or_else(|| description.to_string());
+
+    // ── D4 item 1: optional LLMCompiler-style decomposition ──
+    // Off by default; only attempted when `[goal_loop] planner_enabled = true`.
+    // A valid multi-task DAG is inserted as-is; anything else (declined split,
+    // parse failure, cycle, trivial plan) falls through to the single-task path
+    // below so behavior is byte-identical when the planner is off or unhelpful.
+    if crate::goal_plan::planner_enabled(&ctx.home_dir) {
+        if let Some(reply) = try_decompose_goal(
+            &store,
+            &ctx.home_dir,
+            agent_id,
+            description,
+            &criteria,
+            &channel,
+            &chat_id,
+        )
+        .await
+        {
+            return reply;
+        }
+    }
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let short = duduclaw_core::truncate_chars(&task_id, 8);
+    let title = duduclaw_core::truncate_chars(description, 60);
 
     let mut task = crate::task_store::TaskRow::new(
         task_id,
@@ -733,6 +755,97 @@ async fn handle_goal_create(
         );
     }
     msg
+}
+
+/// Attempt LLMCompiler-style decomposition (D4 item 1). Returns `Some(reply)`
+/// when a valid multi-task DAG was inserted; `None` to fall back to the
+/// single-task path. Fail-safe at every step: a decomposer error, a trivial or
+/// cyclic plan, or an insert failure ⇒ `None` (never partially inserts a broken
+/// DAG — inserts are attempted only after `plan_is_dag` passes; on a mid-insert
+/// error the fallback single task still gets created by the caller).
+async fn try_decompose_goal(
+    store: &crate::task_store::TaskStore,
+    home_dir: &std::path::Path,
+    agent_id: &str,
+    description: &str,
+    criteria: &str,
+    channel: &str,
+    chat_id: &str,
+) -> Option<String> {
+    use crate::goal_plan::{plan_is_dag, plan_to_tasks, GoalDecomposer};
+
+    let decomposer = crate::goal_plan::LlmGoalDecomposer::new(
+        crate::goal_plan::UtilityDecomposeCaller {
+            home_dir: home_dir.to_path_buf(),
+        },
+    );
+    let plan = match decomposer.decompose(description, criteria).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "goal planner: decompose failed — falling back to single task");
+            return None;
+        }
+    };
+    // Topological / range validation. A cycle (or a trivial 0–1 task plan) ⇒
+    // reject the whole DAG and fall back to single-task mode (fail-safe).
+    if !plan_is_dag(&plan) {
+        if plan.len() >= 2 {
+            warn!(
+                subtasks = plan.len(),
+                "goal planner: plan rejected (cycle or invalid deps) — single-task fallback"
+            );
+        }
+        return None;
+    }
+
+    let source_channel = (!channel.is_empty()).then_some(channel);
+    let rows = plan_to_tasks(
+        &plan,
+        agent_id,
+        &format!("goal:{channel}"),
+        criteria,
+        source_channel,
+        Some(chat_id),
+    );
+    for row in &rows {
+        if let Err(e) = store.insert_task(row).await {
+            warn!(error = %e, task = %row.id, "goal planner: subtask insert failed — single-task fallback");
+            return None;
+        }
+    }
+
+    let enabled = crate::dispatch_engine::dispatch_engine_enabled(home_dir);
+    let cap = crate::goal_loop::GoalLoopConfig::from_home(home_dir).iteration_cap;
+    let steps: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let dep_note = if plan[i].deps.is_empty() {
+                String::new()
+            } else {
+                format!("(依賴前 {} 步)", plan[i].deps.len())
+            };
+            format!(
+                "  {}. {} {dep_note}",
+                i + 1,
+                duduclaw_core::truncate_chars(&r.title, 40)
+            )
+        })
+        .collect();
+    let mut msg = format!(
+        "🎯 已把目標拆成 {} 個可平行推進的子任務:\n{}\n\
+         依賴滿足的子任務會並行開跑,每個各自驗收;完成或卡住時會在這裡通知你。\n\
+         我會對每個子任務自主嘗試最多 {cap} 輪。輸入 `/goal status` 可查看進度。",
+        rows.len(),
+        steps.join("\n"),
+    );
+    if !enabled {
+        msg.push_str(
+            "\n\n⚠️ 目前尚未啟用自主派工引擎,子任務已建立但不會自動開始執行。\
+             請在 config.toml 設定 `[dispatch] enabled = true` 後重啟。",
+        );
+    }
+    Some(msg)
 }
 
 /// List the current agent's in-progress goal tasks.

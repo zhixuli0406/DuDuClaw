@@ -81,6 +81,19 @@ pub(crate) fn is_valid_agent_id(id: &str) -> bool {
         && !id.contains("..")
 }
 
+/// Validate a skill file stem is safe to join into a path (no separators, no
+/// leading dot, no traversal). Skill names may keep mixed case and `_`/`.`
+/// (e.g. GitHub-sourced skills), unlike the stricter agent-id charset.
+pub(crate) fn is_valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 // ── WP4 agent avatar upload ───────────────────────────────────────────────
 //
 // Avatars are stored as a single `agents/<id>/avatar.<ext>` file (raw bytes),
@@ -2398,6 +2411,26 @@ fn redaction_table_to_response(table: &toml::Table) -> Value {
     })
 }
 
+/// D3 wiring — fold `config.toml [memory]` graph-seed knobs into
+/// [`RetrievalWeights`]. Pure so it is unit-testable. Starts from engine
+/// defaults; overrides only `graph_embed_seed` (bool) and
+/// `graph_embed_seed_top_k` (usize, floored at 1) when present. `None` table or
+/// absent keys ⇒ engine defaults (seed off, top-k 5), so ranking is unchanged.
+fn memory_retrieval_weights_from_table(
+    table: Option<&toml::Table>,
+) -> duduclaw_memory::engine::RetrievalWeights {
+    let mut weights = duduclaw_memory::engine::RetrievalWeights::default();
+    if let Some(mem) = table.and_then(|t| t.get("memory")).and_then(|v| v.as_table()) {
+        if let Some(seed) = mem.get("graph_embed_seed").and_then(|v| v.as_bool()) {
+            weights.graph_embed_seed = seed;
+        }
+        if let Some(k) = mem.get("graph_embed_seed_top_k").and_then(|v| v.as_integer()) {
+            weights.graph_embed_seed_top_k = k.max(1) as usize;
+        }
+    }
+    weights
+}
+
 /// Parse a config.toml `[skill_synthesis]` section into the
 /// `skill_synthesis.get` response shape. Defaults mirror
 /// `skill_synthesis_pipeline::scheduler::SynthesisScheduleConfig::default()`
@@ -3417,6 +3450,25 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_memory_at(params).await
             }
+            // D6 alias — the D1 point-in-time lookup is also exposed under the
+            // engine method name so the curation UI reads consistently.
+            "memory.get_at" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_memory_at(params).await
+            }
+            // D6 HITL knowledge-graph curation (2026-07): SPO graph export for
+            // the force-directed viewer + a destructive by-origin rollback.
+            "memory.graph" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_memory_graph(params).await
+            }
+            // Destructive: expire every currently-valid fact from one source.
+            // Owner access to the agent + Manager role (dashboard-local only).
+            "memory.invalidate_origin" => {
+                require_manager!();
+                let _ = check_agent!(AccessLevel::Owner);
+                self.handle_memory_invalidate_origin(params).await
+            }
 
             // ── Wiki (agent-scoped — HS4 fix, mirrors memory.*) ───────
             // Each arm reads `agent_id` from params; an Employee bound only to
@@ -3749,6 +3801,9 @@ impl MethodHandler {
             "approvals.list" => { require_manager!(); self.handle_approvals_list(params).await }
             "approvals.decide" => { require_manager!(); self.handle_approvals_decide(params, ctx).await }
 
+            // ── D5 topology evolution: routing overrides + pending reroute proposals ──
+            "topology.list" => { require_manager!(); self.handle_topology_list().await }
+
             // Install approval requests (Skill / MCP two-stage signature chain)
             "install_requests.list" => { require_manager!(); self.handle_install_requests_list(ctx).await }
             "install_requests.mine" => self.handle_install_requests_mine(ctx).await,
@@ -4035,6 +4090,9 @@ impl MethodHandler {
                 { "name": "memory.key_facts", "description": "List extracted key insights (P2 Key-Fact Accumulator)" },
                 { "name": "memory.history", "description": "Fact supersession chain (F1 Temporal Memory)" },
                 { "name": "memory.at", "description": "Point-in-time fact lookup (F1 Temporal Memory)" },
+                { "name": "memory.get_at", "description": "Point-in-time fact lookup (D6 alias of memory.at)" },
+                { "name": "memory.graph", "description": "SPO knowledge-graph export for the D6 curation viewer" },
+                { "name": "memory.invalidate_origin", "description": "Destructive: expire all facts from one source (D6 rollback)" },
                 { "name": "cost.summary", "description": "Cost / cache-efficiency window summary + price-cliff status" },
                 { "name": "cost.agents", "description": "Per-agent cost + cache health" },
                 { "name": "cost.recent", "description": "Recent per-request cost records" },
@@ -8443,6 +8501,19 @@ impl MethodHandler {
 
     // ── Memory ──────────────────────────────────────────────
 
+    /// D3 wiring — read `[memory] graph_embed_seed` / `graph_embed_seed_top_k`
+    /// from `config.toml` and fold them into a [`RetrievalWeights`]. Absent /
+    /// malformed config ⇒ engine defaults (seed off, top-k 5) so ranking stays
+    /// byte-identical to the pre-config path. The seed path is additionally
+    /// gated on an attached embedder inside the engine, so this is latent
+    /// plumbing until a semantic embedder is wired.
+    fn memory_retrieval_weights(&self) -> duduclaw_memory::engine::RetrievalWeights {
+        let table = std::fs::read_to_string(self.home_dir.join("config.toml"))
+            .ok()
+            .and_then(|raw| raw.parse::<toml::Table>().ok());
+        memory_retrieval_weights_from_table(table.as_ref())
+    }
+
     /// Resolve the per-agent memory.db path.
     /// Prefers `agents/<id>/state/memory.db`, falls back to `agents/<id>/memory.db`.
     fn agent_memory_db_path(&self, agent_id: &str) -> PathBuf {
@@ -8465,10 +8536,12 @@ impl MethodHandler {
             return WsFrame::ok_response("", json!({ "entries": [] }));
         }
 
-        let engine = match SqliteMemoryEngine::new(&db_path) {
+        let mut engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
             Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
         };
+        // D3 wiring: config-driven graph seeding weights (default ⇒ unchanged).
+        engine.retrieval_weights = self.memory_retrieval_weights();
 
         match engine.search(agent_id, query, limit).await {
             Ok(entries) => {
@@ -8774,6 +8847,103 @@ impl MethodHandler {
             })),
             Ok(None) => WsFrame::ok_response("", json!({ "found": false, "record": null })),
             Err(e) => WsFrame::error_response("", &format!("Memory point-in-time lookup failed: {e}")),
+        }
+    }
+
+    /// D6 (2026-07) — export the agent's SPO knowledge graph for the curation
+    /// UI's force-directed viewer. `limit` (default 500, capped 2000) bounds the
+    /// edge set; `truncated` flags when the newest-first cut kicked in. Nodes
+    /// carry degree; edges carry `origin_trust` (source-confidence tier colour)
+    /// and `quarantined` (held-for-review). Empty db ⇒ empty graph, not an error.
+    async fn handle_memory_graph(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(500)
+            .clamp(1, 2000) as usize;
+
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "nodes": [], "edges": [], "truncated": false }));
+        }
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+
+        match engine.export_graph(agent_id, limit).await {
+            Ok(g) => {
+                let nodes: Vec<Value> = g
+                    .nodes
+                    .iter()
+                    .map(|n| json!({ "entity": n.entity, "degree": n.degree }))
+                    .collect();
+                let edges: Vec<Value> = g
+                    .edges
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "subject": e.subject,
+                            "predicate": e.predicate,
+                            "object": e.object,
+                            "memory_id": e.memory_id,
+                            "origin_trust": e.origin_trust,
+                            "quarantined": e.quarantined,
+                        })
+                    })
+                    .collect();
+                WsFrame::ok_response("", json!({
+                    "nodes": nodes,
+                    "edges": edges,
+                    "truncated": g.truncated,
+                }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Memory graph export failed: {e}")),
+        }
+    }
+
+    /// D6 (2026-07) — DESTRUCTIVE by-origin rollback. Expires (never deletes)
+    /// every currently-valid fact for `agent_id` that originated from exactly
+    /// `origin`, optionally limited to facts learned at/after `since` (RFC-3339
+    /// transaction time). Manager role + Owner agent access gated at the call
+    /// site. Returns the number of rows expired. Exposed only on the dashboard
+    /// RPC surface (not MCP) — the "清除此來源" queue action lives here.
+    async fn handle_memory_invalidate_origin(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let origin = params.get("origin").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+        if origin.is_empty() {
+            return WsFrame::error_response("", "Missing 'origin' parameter");
+        }
+        // Optional `since` transaction-time bound (RFC-3339). Absent ⇒ all time.
+        let since = match params.get("since").and_then(|v| v.as_str()) {
+            Some(s) if !s.trim().is_empty() => match chrono::DateTime::parse_from_rfc3339(s.trim()) {
+                Ok(dt) => Some(dt.with_timezone(&Utc)),
+                Err(_) => {
+                    return WsFrame::error_response("", "Invalid 'since' parameter (expected RFC-3339 timestamp)");
+                }
+            },
+            _ => None,
+        };
+
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "expired": 0 }));
+        }
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+
+        match engine.invalidate_by_origin(agent_id, origin, since).await {
+            Ok(n) => WsFrame::ok_response("", json!({ "expired": n })),
+            Err(e) => WsFrame::error_response("", &format!("Origin rollback failed: {e}")),
         }
     }
 
@@ -18982,6 +19152,13 @@ impl MethodHandler {
     /// `agent_id` filter. Read-only; opens approvals.db per call.
     async fn handle_approvals_list(&self, params: Value) -> WsFrame {
         let agent_filter = params.get("agent_id").and_then(|v| v.as_str());
+        // Optional exact `action_kind` filter (e.g. "knowledge_quarantine" for the
+        // D6 curation queue). Matches the raw stored action_kind string.
+        let action_kind_filter = params
+            .get("action_kind")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let broker = match crate::approval::ApprovalBroker::open(&self.home_dir) {
             Ok(b) => b,
             Err(e) => return WsFrame::error_response("", &format!("open approvals: {e}")),
@@ -18990,6 +19167,7 @@ impl MethodHandler {
             Ok(rows) => {
                 let items: Vec<Value> = rows
                     .iter()
+                    .filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k))
                     .map(|r| {
                         let kind = crate::governance::ApprovalKind::parse(&r.action_kind);
                         json!({
@@ -19007,6 +19185,57 @@ impl MethodHandler {
             }
             Err(e) => WsFrame::error_response("", &format!("list approvals: {e}")),
         }
+    }
+
+    /// D5: list routing overrides + pending reroute proposals. Read-only view of
+    /// `routing_overrides.json` (fail-safe: missing / corrupt ⇒ empty lists) so
+    /// the dashboard can surface D5 topology-evolution state. Proposals are
+    /// human-gated through the ApprovalBroker; approve/deny goes through the
+    /// generic `approvals.decide` RPC.
+    async fn handle_topology_list(&self) -> WsFrame {
+        let doc = crate::topology_evolution::load_file(&self.home_dir);
+        let overrides: Vec<Value> = doc
+            .overrides
+            .iter()
+            .map(|o| {
+                json!({
+                    "task_class": o.task_class,
+                    "from_agent": o.from_agent,
+                    "to_agent": o.to_agent,
+                    "approved_at": o.approved_at,
+                    "observe_until": o.observe_until,
+                    "status": o.status,
+                    "baseline_reject_rate": o.baseline_reject_rate,
+                    "extended": o.extended,
+                })
+            })
+            .collect();
+        let pending: Vec<Value> = doc
+            .proposals
+            .iter()
+            .filter(|p| p.status == crate::topology_evolution::PROPOSAL_PENDING)
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "task_class": p.task_class,
+                    "from_agent": p.from_agent,
+                    "to_agent": p.to_agent,
+                    "created_at": p.created_at,
+                    "approval_id": p.approval_id,
+                    "samples": p.samples,
+                    "reject_rate": p.reject_rate,
+                })
+            })
+            .collect();
+        WsFrame::ok_response(
+            "",
+            json!({
+                "overrides": overrides,
+                "pending_proposals": pending,
+                "override_count": overrides.len(),
+                "pending_count": pending.len(),
+            }),
+        )
     }
 
     /// WP14-T14.7: decide a pending approval from the dashboard ("就地同意/退回").
@@ -19131,6 +19360,61 @@ impl MethodHandler {
                                 .await;
                         }
                         side_effect = json!({ "custom_skill_rejected": cs_id });
+                    }
+                }
+            }
+        }
+
+        // ── Side-effect: D2 knowledge quarantine (release vs reject) ──
+        // approve → clear `quarantined` (facts become visible to retrieval);
+        // deny    → expire the facts + downgrade their origin trust.
+        if let Some(rec) = &record {
+            if rec.action_kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE {
+                let memory_db = rec
+                    .payload
+                    .get("memory_db")
+                    .and_then(|v| v.as_str())
+                    .map(std::path::PathBuf::from);
+                let q_agent = rec
+                    .payload
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(rec.agent_id.as_str())
+                    .to_string();
+                let ids: Vec<String> = rec
+                    .payload
+                    .get("quarantined_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match memory_db {
+                    Some(db) if !ids.is_empty() => {
+                        match crate::wiki_ingest::apply_quarantine_decision(
+                            db, q_agent, ids, approve,
+                        )
+                        .await
+                        {
+                            Ok(n) => {
+                                side_effect = if approve {
+                                    json!({ "quarantine_released": n })
+                                } else {
+                                    json!({ "quarantine_rejected": n })
+                                };
+                            }
+                            Err(e) => {
+                                return WsFrame::error_response(
+                                    "",
+                                    &format!("decided, but quarantine side-effect failed: {e}"),
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        warn!("knowledge_quarantine approval missing memory_db/ids in payload");
                     }
                 }
             }
@@ -19765,19 +20049,32 @@ impl MethodHandler {
         if agent_id.is_empty() || skill_name.is_empty() {
             return WsFrame::error_response("", "agent_id and skill_name are required");
         }
-        // Read skill from agent's SKILLS directory
-        let skill_path = self
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id");
+        }
+        if !is_valid_skill_name(skill_name) {
+            return WsFrame::error_response("", "Invalid skill_name");
+        }
+        // The my-skills list (`skills.list`) unions the agent's SKILLS dir with
+        // the global `<home>/skills` dir, so share must resolve both: agent
+        // copy wins, global copy is the fallback.
+        let agent_path = self
             .home_dir
             .join("agents")
             .join(agent_id)
             .join("SKILLS")
             .join(format!("{skill_name}.md"));
-        if !skill_path.exists() {
+        let global_path = self.home_dir.join("skills").join(format!("{skill_name}.md"));
+        let skill_path = if agent_path.exists() {
+            agent_path
+        } else if global_path.exists() {
+            global_path
+        } else {
             return WsFrame::error_response(
                 "",
                 &format!("Skill not found: {skill_name} in agent {agent_id}"),
             );
-        }
+        };
         let content = match tokio::fs::read_to_string(&skill_path).await {
             Ok(c) => c,
             Err(e) => return WsFrame::error_response("", &format!("read skill: {e}")),
@@ -22651,6 +22948,192 @@ mod skills_install_scan_tests {
 }
 
 #[cfg(test)]
+mod d6_curation_tests {
+    //! D6 HITL knowledge-graph curation RPCs: memory.graph export,
+    //! memory.invalidate_origin rollback, and the D3 retrieval-weights wiring.
+    use super::*;
+
+    fn frame_ok(frame: &WsFrame) -> bool {
+        matches!(frame, WsFrame::Response { ok: true, .. })
+    }
+
+    fn frame_data(frame: &WsFrame) -> Value {
+        match frame {
+            WsFrame::Response { payload: Some(d), .. } => d.clone(),
+            _ => Value::Null,
+        }
+    }
+
+    fn triple_entry(agent: &str, content: &str) -> duduclaw_core::types::MemoryEntry {
+        duduclaw_core::types::MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: content.to_string(),
+            timestamp: Utc::now(),
+            tags: vec![],
+            embedding: None,
+            layer: Default::default(),
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: String::new(),
+        }
+    }
+
+    /// Seed `agents/<id>/memory.db` with a couple of SPO triples so the graph
+    /// export has nodes + edges. Returns the memory-db path.
+    async fn seed_agent_memory(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
+        let db = home.join("agents").join(agent).join("memory.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        engine
+            .store_temporal(
+                agent,
+                triple_entry(agent, "Alice works at Acme"),
+                duduclaw_memory::TemporalMeta {
+                    subject: Some("alice".into()),
+                    predicate: Some("works_at".into()),
+                    object: Some("acme".into()),
+                    origin: Some("chan-good".into()),
+                    origin_trust: Some(0.9),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .store_temporal(
+                agent,
+                triple_entry(agent, "Bob knows Alice"),
+                duduclaw_memory::TemporalMeta {
+                    subject: Some("bob".into()),
+                    predicate: Some("knows".into()),
+                    object: Some("alice".into()),
+                    origin: Some("chan-bad".into()),
+                    origin_trust: Some(0.3),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn memory_graph_happy_path() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = "agent-graph";
+        seed_agent_memory(home.path(), agent).await;
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_memory_graph(json!({ "agent_id": agent }))
+            .await;
+        assert!(frame_ok(&frame), "graph export must succeed: {frame:?}");
+        let data = frame_data(&frame);
+        let nodes = data.get("nodes").and_then(|v| v.as_array()).unwrap();
+        let edges = data.get("edges").and_then(|v| v.as_array()).unwrap();
+        assert!(!nodes.is_empty(), "expected entity nodes");
+        assert_eq!(edges.len(), 2, "two triples ⇒ two edges");
+        assert_eq!(data.get("truncated").and_then(|v| v.as_bool()), Some(false));
+        // Provenance surfaces on the edge (origin_trust drives the colour tier).
+        let has_trust = edges
+            .iter()
+            .all(|e| e.get("origin_trust").and_then(|v| v.as_f64()).is_some());
+        assert!(has_trust, "every edge carries origin_trust");
+    }
+
+    #[tokio::test]
+    async fn memory_graph_missing_agent_id_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler.handle_memory_graph(json!({})).await;
+        assert!(!frame_ok(&frame), "missing agent_id must be rejected");
+    }
+
+    #[tokio::test]
+    async fn memory_graph_absent_db_is_empty_not_error() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_memory_graph(json!({ "agent_id": "never-seeded" }))
+            .await;
+        assert!(frame_ok(&frame), "absent db ⇒ empty graph, not error");
+        let data = frame_data(&frame);
+        assert_eq!(data.get("edges").and_then(|v| v.as_array()).map(|a| a.len()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn memory_invalidate_origin_happy_path() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = "agent-purge";
+        seed_agent_memory(home.path(), agent).await;
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Purge the bad channel — exactly one currently-valid fact came from it.
+        let frame = handler
+            .handle_memory_invalidate_origin(json!({ "agent_id": agent, "origin": "chan-bad" }))
+            .await;
+        assert!(frame_ok(&frame), "rollback must succeed: {frame:?}");
+        let data = frame_data(&frame);
+        assert_eq!(data.get("expired").and_then(|v| v.as_u64()), Some(1));
+
+        // The graph now excludes the expired fact (currently-valid only).
+        let g = handler.handle_memory_graph(json!({ "agent_id": agent })).await;
+        let edges = frame_data(&g).get("edges").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        assert_eq!(edges.len(), 1, "expired fact drops out of the graph");
+    }
+
+    #[tokio::test]
+    async fn memory_invalidate_origin_missing_origin_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_memory_invalidate_origin(json!({ "agent_id": "agent-x" }))
+            .await;
+        assert!(!frame_ok(&frame), "missing origin must be rejected");
+    }
+
+    #[tokio::test]
+    async fn memory_invalidate_origin_bad_since_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_memory_invalidate_origin(json!({
+                "agent_id": "agent-x", "origin": "chan", "since": "not-a-date"
+            }))
+            .await;
+        assert!(!frame_ok(&frame), "malformed since must be rejected");
+    }
+
+    #[test]
+    fn retrieval_weights_default_when_config_absent() {
+        let w = memory_retrieval_weights_from_table(None);
+        let d = duduclaw_memory::engine::RetrievalWeights::default();
+        assert_eq!(w.graph_embed_seed, d.graph_embed_seed);
+        assert_eq!(w.graph_embed_seed_top_k, d.graph_embed_seed_top_k);
+        assert!(!w.graph_embed_seed, "seed off by default (behaviour unchanged)");
+    }
+
+    #[test]
+    fn retrieval_weights_override_from_config() {
+        let table: toml::Table = "[memory]\ngraph_embed_seed = true\ngraph_embed_seed_top_k = 8\n"
+            .parse()
+            .unwrap();
+        let w = memory_retrieval_weights_from_table(Some(&table));
+        assert!(w.graph_embed_seed);
+        assert_eq!(w.graph_embed_seed_top_k, 8);
+    }
+
+    #[test]
+    fn retrieval_weights_top_k_floored_at_one() {
+        let table: toml::Table = "[memory]\ngraph_embed_seed_top_k = 0\n".parse().unwrap();
+        let w = memory_retrieval_weights_from_table(Some(&table));
+        assert_eq!(w.graph_embed_seed_top_k, 1, "top-k floored at 1");
+    }
+}
+
+#[cfg(test)]
 mod channels_add_enc_only_tests {
     //! Item: channels.add plaintext-beside-_enc parity. When encryption is
     //! available, secrets persist ONLY as `_enc` (plaintext key removed, not
@@ -23319,5 +23802,121 @@ mod identity_dashboard_tests {
         let frame = handler.handle_identity_resolve(json!({})).await;
         assert!(!frame_ok(&frame));
         assert!(frame_error_text(&frame).contains("identifier"));
+    }
+}
+
+#[cfg(test)]
+mod topology_rpc_tests {
+    use super::*;
+
+    fn frame_ok(f: &WsFrame) -> bool {
+        matches!(f, WsFrame::Response { ok: true, .. })
+    }
+
+    /// `topology.list` returns the routing overrides + pending reroute proposals
+    /// from `routing_overrides.json`. Missing file ⇒ empty lists (fail-safe);
+    /// after writing one active override + one pending proposal, they surface.
+    #[tokio::test]
+    async fn topology_list_returns_overrides_and_pending() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        // Empty state ⇒ zero of each (fail-safe on a missing file).
+        let frame = handler.handle("topology.list", json!({}), &ctx).await;
+        assert!(frame_ok(&frame), "got: {frame:?}");
+        if let WsFrame::Response { payload: Some(p), .. } = &frame {
+            assert_eq!(p["override_count"].as_u64(), Some(0));
+            assert_eq!(p["pending_count"].as_u64(), Some(0));
+        }
+
+        // Seed one active override + one pending proposal through the D5 module.
+        crate::topology_evolution::seed_for_test(
+            home.path(),
+            "billing",
+            "alice",
+            "bob",
+        );
+
+        let frame = handler.handle("topology.list", json!({}), &ctx).await;
+        let p = match &frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => p,
+            other => panic!("expected ok response, got: {other:?}"),
+        };
+        assert_eq!(p["override_count"].as_u64(), Some(1));
+        assert_eq!(p["pending_count"].as_u64(), Some(1));
+        assert_eq!(p["overrides"][0]["from_agent"].as_str(), Some("alice"));
+        assert_eq!(p["overrides"][0]["to_agent"].as_str(), Some("bob"));
+        assert_eq!(p["overrides"][0]["status"].as_str(), Some("active"));
+        assert_eq!(p["pending_proposals"][0]["task_class"].as_str(), Some("billing"));
+    }
+}
+
+#[cfg(test)]
+mod skills_share_tests {
+    //! `skills.share` must resolve the same union of sources the my-skills
+    //! list shows (agent SKILLS dir + global `<home>/skills`), and must reject
+    //! traversal-shaped names before touching the filesystem.
+    use super::*;
+
+    #[tokio::test]
+    async fn share_falls_back_to_global_skill() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("skills")).unwrap();
+        std::fs::write(
+            home.path().join("skills").join("pptx.md"),
+            "---\nname: pptx\n---\n\nbody",
+        )
+        .unwrap();
+        // Agent exists but has no local copy of the skill.
+        std::fs::create_dir_all(home.path().join("agents").join("ceo-assistant").join("SKILLS"))
+            .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_skills_share(json!({ "agent_id": "ceo-assistant", "skill_name": "pptx" }))
+            .await;
+        assert!(
+            matches!(frame, WsFrame::Response { ok: true, .. }),
+            "sharing a global-scope skill must succeed: {frame:?}"
+        );
+        assert!(home.path().join("shared").join("skills").join("pptx.md").exists());
+    }
+
+    #[tokio::test]
+    async fn share_prefers_agent_copy_over_global() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("skills")).unwrap();
+        std::fs::write(home.path().join("skills").join("pptx.md"), "global-body").unwrap();
+        let agent_skills = home.path().join("agents").join("ceo-assistant").join("SKILLS");
+        std::fs::create_dir_all(&agent_skills).unwrap();
+        std::fs::write(agent_skills.join("pptx.md"), "agent-body").unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_skills_share(json!({ "agent_id": "ceo-assistant", "skill_name": "pptx" }))
+            .await;
+        assert!(matches!(frame, WsFrame::Response { ok: true, .. }));
+        let shared =
+            std::fs::read_to_string(home.path().join("shared").join("skills").join("pptx.md"))
+                .unwrap();
+        assert!(shared.contains("agent-body"), "agent copy must win: {shared}");
+    }
+
+    #[tokio::test]
+    async fn share_rejects_traversal_names() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        for (agent, skill) in [
+            ("ceo-assistant", "../evil"),
+            ("ceo-assistant", ".hidden"),
+            ("../escape", "pptx"),
+        ] {
+            let frame = handler
+                .handle_skills_share(json!({ "agent_id": agent, "skill_name": skill }))
+                .await;
+            assert!(
+                matches!(frame, WsFrame::Response { ok: false, .. }),
+                "must reject ({agent}, {skill})"
+            );
+        }
     }
 }

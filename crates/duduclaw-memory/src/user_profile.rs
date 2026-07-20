@@ -249,10 +249,13 @@ mod tests {
         let first = consolidate_profile(&engine, "a", "u1", 3).await.unwrap();
         assert!(first.is_some(), "at threshold → summary written");
 
-        // Re-consolidating supersedes: still exactly one valid summary row.
+        // Re-consolidating with identical traits reaffirms the existing summary
+        // (D1: same subject/predicate/object + content are re-observed, not
+        // changed) instead of churning a new row — the id is stable and there is
+        // still exactly one valid summary. (Pre-D1 this always superseded and
+        // minted a new id; reaffirm is the intended anti-bloat behavior.)
         let second = consolidate_profile(&engine, "a", "u1", 3).await.unwrap();
-        assert!(second.is_some());
-        assert_ne!(first, second, "new summary id");
+        assert_eq!(first, second, "identical re-consolidation reaffirms (stable id)");
 
         let history = engine
             .get_history("a", &user_subject("u1"), SUMMARY_PREDICATE)

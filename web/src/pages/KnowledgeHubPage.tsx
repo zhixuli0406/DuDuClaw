@@ -21,6 +21,7 @@ import {
   Link2Icon,
 } from 'lucide-react';
 import { WikiGraph } from '@/components/WikiGraph';
+import { KnowledgeCuration } from './KnowledgeCuration';
 import { timeAgo } from '@/lib/format';
 import {
   CollectionPageHeader,
@@ -46,7 +47,7 @@ import {
   type SegmentedOption,
 } from '@/components/mds';
 
-type ViewId = 'browse' | 'search' | 'graph' | 'health';
+type ViewId = 'browse' | 'search' | 'graph' | 'health' | 'curate';
 
 /** Namespace (top-level dir) of a wiki path; '' for root-level pages. */
 function namespaceOf(path: string): string {
@@ -81,6 +82,7 @@ export function KnowledgeHubPage({ embedded = false }: { embedded?: boolean }) {
     { value: 'search', label: intl.formatMessage({ id: 'wiki.tab.search' }) },
     { value: 'graph', label: intl.formatMessage({ id: 'wiki.tab.graph' }) },
     { value: 'health', label: intl.formatMessage({ id: 'wiki.tab.health' }) },
+    { value: 'curate', label: intl.formatMessage({ id: 'wiki.tab.curate' }) },
   ];
 
   const inner = (
@@ -103,6 +105,7 @@ export function KnowledgeHubPage({ embedded = false }: { embedded?: boolean }) {
       {selectedAgent && view === 'search' && <SearchView agentId={selectedAgent} />}
       {selectedAgent && view === 'graph' && <GraphView agentId={selectedAgent} />}
       {selectedAgent && view === 'health' && <HealthView agentId={selectedAgent} />}
+      {selectedAgent && view === 'curate' && <KnowledgeCuration agentId={selectedAgent} />}
     </div>
   );
 

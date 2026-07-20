@@ -253,6 +253,14 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
         );
     }
 
+    // D3.1: archival DELETEs rows from `memories` (dropping valid triples), so
+    // any cached SPO graph is now stale. This maintenance path bypasses the
+    // per-agent write bumps, so invalidate every cached agent graph.
+    if report.archived > 0 {
+        drop(conn);
+        engine.invalidate_all_graph_caches();
+    }
+
     report
 }
 
