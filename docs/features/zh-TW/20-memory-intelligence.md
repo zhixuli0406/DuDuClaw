@@ -107,12 +107,38 @@ INSERT 新列：  supersedes = <舊 id>
 
 ### 讀取時間軸
 
-兩個讀取 API 揭露這條鏈：
+兩個讀取 API 揭露這條鏈，也都以 MCP 形式提供 `memory_get_history` / `memory_get_at`（scope `memory:read`）：
 
-| API | 回傳 |
+| API / MCP 工具 | 回傳 |
 |-----|------|
-| `get_history(agent, subject, predicate)` | 完整取代鏈，由舊到新 |
-| `get_at(agent, subject, predicate, at)` | 某時間點仍有效的單一事實（`valid_from <= at AND (valid_until IS NULL OR valid_until > at)`） |
+| `get_history(agent, subject, predicate)` — `memory_get_history { subject, predicate }` | 完整取代鏈，由舊到新，含每筆的 `ingested_at`、`invalidated_by_event`/`invalidated_at` 與 `reaffirmed_by` |
+| `get_at(agent, subject, predicate, at)` — `memory_get_at { subject, predicate, at }` | 某時間點仍有效的單一事實（`valid_from <= at AND (valid_until IS NULL OR valid_until > at)`） |
+
+### Bi-temporal + build-time provenance（D1）
+
+時序儲存追蹤**兩條**時間軸：`valid_from`/`valid_until`（world-time，事實為真的時段）與 `ingested_at`（transaction-time，系統得知該事實的時間）。取代由 world-time 的 `valid_from` 決定（非攝入順序），因此就算攝入次序被打亂（先得知離婚、後得知更早的結婚），任一時間點仍能解析出正確的事實：`valid_from` 早於現行事實的一筆，會以有界的*歷史區段*插入，不擾動現行事實。再次觀察到完全相同的事實（相同 subject/predicate/object ＋內容）會**再確認（reaffirm）**它：把新的 `source_event` 附加到 `reaffirmed_by`（上限 20）並累加 `access_count`，而不另開新列。當一筆事實被關閉時，關閉用的 `source_event` 與時間會蓋印到被取代的那一列（`invalidated_by_event`/`invalidated_at`）。
+
+### 來源回溯（`memory_invalidate_by_origin`）
+
+`invalidate_by_origin(agent, origin, since)`（MCP `memory_invalidate_by_origin`，scope `admin`）是投毒來源的補救閥門：它會讓某個**精確** `origin` 的所有現行有效事實過期（只過期、不刪除；比對採等值，絕不用子字串），並可選擇只限於 `since` 之後（含）得知的事實。凡 `derived_from` 引用到被清除 id 的事實，其 `origin_trust` 會被壓到 ≤ 0.1（源自投毒輸入的衍生物不能繼續被信任）。`search()` 會立即停止回傳這些被清除的事實，而 `get_history()` 仍保留完整的鏈，並標記 `invalidated_by_event = "origin_purge"`。
+
+### 寫入端投毒防護（D2）
+
+D1 讓你能*撤銷*一個投毒來源；D2 則在源頭就攔下大部分毒物（PoisonedRAG，arXiv:2402.07867）。自動蒸餾的寫入路徑在兩端設防：
+
+- **寫入端掃描＋爆量偵測。**一筆蒸餾出的事實在儲存前，其內容與 `(subject, predicate, object)` 會先過共用的 prompt-injection 規則引擎：命中即**丟棄**該事實（fail-closed，絕不寫入），並記錄一筆 `prompt_injection` 安全稽核事件。另外有一個 per-`(agent, origin, subject)` 的滑動窗計數器（`knowledge_guard`，與 dispatch 斷路器同樣採持久化 ＋ advisory-lock 模式），當單一來源在窗內對同一 subject 寫入 `>= max_per_subject` 筆事實時，會把整批隔離（即「One Shot Dominance」／k-doc 模式）。被隔離的事實以 `quarantined = 1` 儲存，屬**惰性**：它們永不取代乾淨事實，並在人工裁決前被排除於所有取回讀取路徑（FTS、graph、vector、`list_recent`、`summarize`）之外。
+- **處理流程。**一次隔離會發出一筆 `ApprovalBroker` 請求（`action_kind = "knowledge_quarantine"`）並送出 `knowledge.quarantined` 事件。核准 → 事實被釋放（`quarantined = 0`，現在可取回）；拒絕 → 事實過期（`invalidated_by_event = "quarantine_reject"`），其 `origin_trust` 壓到 ≤ 0.1；TTL 逾時視同拒絕（fail-closed）。
+
+**排序端信任。**`origin_trust` 現在會參與取回排序（權重 `w_trust`，預設 0.10）：每個候選的分數會乘上 `(1 − w_trust) + w_trust · origin_trust`，讓未經驗證的頻道蒸餾事實（trust 0.3）無法勝過策展過的事實（trust 1.0）。在 HippoRAG-lite graph 中，一個三元組的邊會依其 `origin_trust` 加權，縮小低信任事實的 Personalized-PageRank 質量，直接抑制「單一投毒三元組被 PPR 放大兩跳」這條路徑。舊資料列（trust 1.0）的排序與 D2 之前逐位元組相同。
+
+### 圖檢索演進（D3）
+
+HippoRAG-lite graph 獲得四項各自獨立的改良（對齊 HippoRAG 2 + LightRAG）。每一項都是 fail-safe：在沒有 alias、圖很小、且 embedding seeding 關閉時，排序與先前的 per-query 建圖**逐位元組相同**。
+
+- **持久化增量圖快取。**一旦某 Agent 累積大量事實，每次查詢都重建 Personalized-PageRank 圖就很浪費。圖現在會 per agent 快取（`RwLock`）並跨查詢重用；一個 per-agent 的**世代計數器**（generation counter）會被每一筆更動三元組的寫入（`store_temporal`／supersession、隔離釋放/拒絕、origin purge、decision 逾期、decay 歸檔、GDPR 抹除、Agent 重新指派）遞增，藉此讓過時的快取失效，使查詢永遠看到現行事實。快取只在超過 `GRAPH_CACHE_MIN_TRIPLES`（500）時啟用；低於此值時 per-query 建圖較便宜，故保留。
+- **實體別名合併。**一張 `entity_alias(agent_id, canonical, alias)` 表會在建圖與 seeding 之前，把各種表面形式收斂到同一個節點，讓「老闆／李老闆／zhixu」不再是三座孤島。兩側都會正規化（trim + 轉小寫），別名鏈在儲存時攤平。透過 `memory_alias_add` / `memory_alias_list` MCP 工具管理（write／read scope）。沒有任何 alias 時，圖逐位元組相同。
+- **述詞邊標籤。**每條 SPO 邊現在會附帶其 predicate 作為標籤（PPR 運算從不讀取它，故排序不變）。`engine.export_graph(agent, limit)` API 回傳一份可序列化的 `{ nodes, edges }` 快照（含仍待裁決的隔離事實，並加註旗標），供 D6 知識圖譜策展 UI 使用。
+- **Embedding seeding（可選）。**當 `graph_embed_seed` 開啟**且**掛上 embedder 時，PPR 的 seed 會變成「whole-word FTS 實體命中」與「query embedding 最鄰近實體向量」（同模型 cosine，top-k）兩者的聯集。實體向量會惰性快取於 `entity_embedding`，embedding 失敗則回退到 FTS seeding。預設關閉（沒有 embedder 時為 no-op），呼應 HippoRAG 2 對「弱 embedder 會損失 recall」的提醒。
 
 ---
 
@@ -228,6 +254,19 @@ get_by_ids(namespace, ids)
 - **F3** 以 `memory_fetch_batch` MCP 工具揭露，與其他每個記憶工具一樣受 scope 管控。
 
 遷移在引擎初始化時自動執行——既有資料庫由冪等的 ALTER 迴圈就地升級。
+
+### 寫入端投毒防護（D2）
+
+寫入端的爆量偵測器預設開啟，可在 `config.toml` 調整。區段缺失或格式錯誤時會回退到下列預設值（fail-safe，偵測器維持開啟）：
+
+```toml
+[knowledge_guard]
+enabled = true          # 同來源爆量偵測器的總開關。預設 true
+window_secs = 3600      # 滑動窗長度（秒）。預設 3600（1 小時）
+max_per_subject = 5     # 一個來源在窗內對同一 subject 可寫入的事實上限，超過即隔離。預設 5
+```
+
+寫入路徑上的注入掃描是無條件執行的（無設定項）。排序信任權重 `w_trust`（預設 0.10）位於 `RetrievalWeights`（per-engine，非 config 鍵）；當 `w_trust = 0.0` 時，排序與 D2 之前逐位元組相同。
 
 ---
 
