@@ -49,7 +49,6 @@ pub type ChannelStatusMap = Arc<RwLock<std::collections::HashMap<String, Channel
 pub use crate::runtime::ConversationTurn;
 
 /// Maximum character count for a single turn before it gets trimmed.
-/// Inspired by Hermes Agent's tool output trimming (Phase 1 compression).
 const TURN_TRIM_THRESHOLD: usize = 800;
 const TURN_HEAD_CHARS: usize = 300;
 const TURN_TAIL_CHARS: usize = 200;
@@ -147,7 +146,6 @@ fn read_agent_budget_tokens(agent_id: &str) -> u64 {
 ///
 /// Preserves the first and last portions, replacing the middle with a
 /// "[trimmed N chars]" placeholder. Zero LLM cost — pure text surgery.
-/// Inspired by Hermes Agent's 4-phase compression (Phase 1: tool output trimming).
 fn trim_turn_content(content: &str) -> String {
     let char_count = content.chars().count();
     if char_count <= TURN_TRIM_THRESHOLD {
@@ -165,7 +163,7 @@ fn trim_turn_content(content: &str) -> String {
 /// Used by CLI-based runtimes (Gemini, Codex) and as a fallback for Claude CLI
 /// when `--resume` is unavailable (e.g., account rotation changed session store).
 ///
-/// Applies Hermes-inspired optimizations:
+/// Applies token-reduction optimizations:
 /// - Long turns (>800 chars) are trimmed with head/tail preservation
 /// - Keeps conversation structure intact while reducing token usage
 pub(crate) fn format_history_as_prompt(history: &[ConversationTurn], current_message: &str) -> String {

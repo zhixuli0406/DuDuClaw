@@ -3073,7 +3073,7 @@ issue-by-issue audit log with verification evidence.
   Expected cliff reduction: 75% on knowledge-rich agents.
   (`crates/duduclaw-gateway/src/prompt_minimal.rs`)
 - **`[budget] max_input_tokens` enforcement** — when set, an agent's
-  request goes through a compression pipeline (Hermes trim → drop oldest
+  request goes through a compression pipeline (turn trim → drop oldest
   tool echoes → bisect-and-summarize) before send. `cost_pressure` flag
   from §6.3 tightens thresholds automatically. Non-fatal: falls back to
   full history on pipeline failure.
@@ -5246,11 +5246,11 @@ Full workspace lib suite still green.
 - **Native multi-turn session management**: Claude CLI `--resume` with SHA-256
   deterministic session ID mapping. Fallback to XML-delimited history-in-prompt
   when session not found (e.g., account rotation).
-- **Hermes-inspired turn trimming**: Long conversation turns (>800 chars) are
+- **Turn trimming**: Long conversation turns (>800 chars) are
   trimmed to head 300 + tail 200 chars with `[trimmed N chars]` placeholder.
   CJK-safe char-level slicing. Zero LLM cost.
 - **Direct API prompt cache strategy**: "system_and_3" cache breakpoint placement
-  inspired by Hermes Agent for ~75% cache hit rate on multi-turn conversations.
+  for ~75% cache hit rate on multi-turn conversations.
 - **Session compression summary injection**: Post-compression summaries (role=system)
   are now injected into system prompt instead of conversation turns.
 

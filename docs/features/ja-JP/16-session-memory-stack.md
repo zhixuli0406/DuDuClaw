@@ -157,7 +157,7 @@ History-in-prompt (XML-delimited turns)
 
 これは、Agnesが連続したメッセージ間でコンテキストを失っていた以前の挙動（「幫我全部開啟」→「你指的是什麼？」）を修正します。session idは決定論的で、*スレッド全体*のライフタイムを通じて安定しています（v1.8.14のDiscord修正以降：`auto_thread && !is_thread`の代わりに`is_thread || created_thread`）。
 
-### Hermesに着想を得たTurn Trimming
+### Turn Trimming
 
 長い会話ターン（>800文字）は、モデルに送る前にトリミングされます：
 

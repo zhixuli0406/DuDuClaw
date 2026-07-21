@@ -157,7 +157,7 @@ History-in-prompt (XML-delimited turns)
 
 This fixes the previous behavior where Agnes would lose context between consecutive messages ("幫我全部開啟" → "你指的是什麼？"). The session id is deterministic and stable across the *entire* thread lifetime (post-v1.8.14 Discord fix: `is_thread || created_thread` instead of `auto_thread && !is_thread`).
 
-### Hermes-inspired Turn Trimming
+### Turn Trimming
 
 Long conversation turns (>800 chars) are trimmed before being sent to the model:
 
