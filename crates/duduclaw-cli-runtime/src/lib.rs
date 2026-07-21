@@ -17,6 +17,7 @@ pub mod envelope;
 pub mod error;
 pub mod oneshot;
 pub mod platform;
+pub mod progress;
 pub mod pty;
 pub mod session;
 
@@ -31,6 +32,7 @@ pub use envelope::{
 pub use error::{PoolError, PtyError, RuntimeError, SessionError};
 pub use oneshot::{OneshotInvocation, OneshotOutput, oneshot_pty_invoke};
 pub use pool::{AgentKey, PoolConfig, PooledSession, PtyPool};
+pub use progress::ProgressSignature;
 pub use pty::{PtyCommand, PtyHandle, PtySystemKind, spawn_pty};
-pub use session::{CliKind, PtySession, SpawnOpts};
+pub use session::{CliKind, InvokeTimeout, PtySession, SpawnOpts};
 pub use supervisor::{RestartPolicy, Supervisor};

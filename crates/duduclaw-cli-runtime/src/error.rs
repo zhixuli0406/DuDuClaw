@@ -46,6 +46,23 @@ pub enum SessionError {
     #[error("invoke timed out after {0:?}")]
     InvokeTimeout(Duration),
 
+    /// Interactive REPL produced no *substantive progress* (token counter /
+    /// prose) for the whole idle window. Distinct from [`Self::InvokeHardCap`]
+    /// (absolute wall-clock cap) so callers can classify the fallback reason.
+    /// `saw_progress` is true when progress WAS observed earlier this turn (the
+    /// stall happened mid-task) — the caller treats a fallback re-run as
+    /// potentially re-executing side effects.
+    #[error("interactive REPL stalled: no substantive progress for {idle:?} (mid_task={saw_progress})")]
+    InvokeStall { idle: Duration, saw_progress: bool },
+
+    /// Interactive REPL hit the absolute wall-clock hard cap (safety net).
+    /// `saw_progress` mirrors [`Self::InvokeStall`].
+    #[error("interactive REPL exceeded hard cap {hard_cap:?} (mid_task={saw_progress})")]
+    InvokeHardCap {
+        hard_cap: Duration,
+        saw_progress: bool,
+    },
+
     #[error("boot timed out after {0:?}")]
     BootTimeout(Duration),
 
