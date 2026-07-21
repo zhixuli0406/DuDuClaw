@@ -416,6 +416,22 @@ if ! cargo check --workspace 2>/dev/null; then
     exit 1
 fi
 
+# The commercial tree (gitignored, own git repo) builds against this
+# workspace via path deps but is NOT covered by `cargo check --workspace`.
+# A public-struct change that misses it only surfaces inside the pro-image
+# Docker build, long after the tag exists (v1.40.0 lesson: new
+# GatewayConfig field broke duduclaw-pro at image time). Check it here so
+# the release aborts before the bump commit instead.
+if [ -d "commercial/duduclaw-pro-gateway" ]; then
+    echo "Running cargo check (commercial/duduclaw-pro-gateway)..."
+    if ! cargo check --manifest-path commercial/duduclaw-pro-gateway/Cargo.toml 2>/dev/null; then
+        echo "Error: duduclaw-pro-gateway no longer compiles against this workspace."
+        echo "       Fix the commercial tree first (it is not covered by --workspace)."
+        git checkout -- .
+        exit 1
+    fi
+fi
+
 # --- Git commit + tag ---
 echo ""
 echo "Creating git commit and tag..."
