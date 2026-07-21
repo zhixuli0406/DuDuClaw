@@ -64,7 +64,7 @@
 | 機能 | 説明 |
 |------|------|
 | ネイティブマルチターン | Claude CLI `--resume` + SHA-256 決定論的 session ID + history-in-prompt フォールバック |
-| Hermes 流ターントリミング | >800 chars → 先頭 300 + 末尾 200 + `[trimmed N chars]`、CJK セーフ文字スライス |
+| ターントリミング（Turn Trimming） | >800 chars → 先頭 300 + 末尾 200 + `[trimmed N chars]`、CJK セーフ文字スライス |
 | プロンプトキャッシュ戦略 | Direct API "system_and_3" ブレークポイント、マルチターン ~75% ヒット率 |
 | 圧縮サマリー注入 | 圧縮後サマリー（role=system）を system prompt に注入、会話ターンではない |
 | Instruction Pinning | 最初のユーザーメッセージ → 非同期 Haiku 抽出 → `sessions.pinned_instructions` → system prompt 末尾（U字型注意） |

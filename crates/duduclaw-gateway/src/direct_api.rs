@@ -146,7 +146,7 @@ pub struct DirectApiResponse {
 
 /// Call Anthropic Messages API directly with precise cache_control placement.
 ///
-/// Cache strategy (Hermes-inspired "system_and_3"):
+/// Cache strategy ("system_and_3"):
 /// 1. System prompt → single block with `cache_control: ephemeral`
 /// 2. Conversation history → included as prior turns, with cache breakpoint
 ///    on the 3rd-to-last message for optimal cache hit rate
@@ -247,10 +247,10 @@ pub async fn call_direct_api_attributed(
         });
     }
 
-    // Build messages with conversation history (Hermes-inspired cache strategy)
+    // Build messages with conversation history ("system_and_3" cache strategy)
     let mut messages: Vec<Message> = Vec::with_capacity(conversation_history.len() + 1);
 
-    // Add conversation history with Hermes-inspired "system_and_3" cache strategy:
+    // Add conversation history with the "system_and_3" cache strategy:
     // place cache breakpoint on the 3rd-to-last message so the last 3 messages
     // (which change each turn) are re-sent, while everything before is cached.
     // Only set breakpoint when history has enough depth to benefit from caching.

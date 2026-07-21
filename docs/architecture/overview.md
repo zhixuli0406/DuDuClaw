@@ -32,7 +32,7 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 
 ### Session Memory Stack
 - **Native multi-turn**: Claude CLI `--resume <session-id>` with SHA-256 deterministic session ID; auto-fallback to history-in-prompt when `--resume` fails (stale handle, account rotation, unknown stream-json error).
-- **Hermes-inspired turn trimming** (>800 chars → head 300 + tail 200 + `[trimmed N chars]`, CJK-safe).
+- **Turn trimming** (>800 chars → head 300 + tail 200 + `[trimmed N chars]`, CJK-safe).
 - **Direct API prompt cache** ("system_and_3" breakpoint strategy, ~75% cache hit on multi-turn; 95%+ on pure system-prompt cache).
 - **Compression summaries** injected into system prompt (not conversation turns) at 50k token threshold.
 - **Instruction Pinning** (v1.8.6 P0) — first user turn → async Haiku extraction of core task → stored in `sessions.pinned_instructions` → injected at system prompt tail (U-shaped attention). Clarification answers accumulate (≤1000 chars).

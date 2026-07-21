@@ -14,7 +14,7 @@
 //!   and either returns a compressed version or `None` (stage can't help
 //!   further). Callers iterate stages in order until budget is met.
 //! - **Cost-pressure aware** — when an agent has a hot `cost_pressure`
-//!   flag (#6.3), early stages become more aggressive (e.g. HermesTrim
+//!   flag (#6.3), early stages become more aggressive (e.g. TurnTrim
 //!   threshold drops from 800 → 200 chars).
 //! - **Token estimation** uses the 1.5 chars/token CJK-aware heuristic
 //!   already used by `prompt_audit`, sharing the helper to keep the
@@ -23,7 +23,7 @@
 //! ## Stages
 //!
 //! Stages are ordered from cheapest / least lossy to most aggressive:
-//! 1. `HermesTrim` — per-turn 800/200-char tail trim (existing approach,
+//! 1. `TurnTrim` — per-turn 800/200-char tail trim (existing approach,
 //!    just made explicit). Loses no semantic content for short replies.
 //! 2. `DropOldestToolEchoes` — strip the full content of tool results
 //!    older than the last 3 turns, replace with a `[tool_result.id=N]`
@@ -175,7 +175,7 @@ pub fn enforce_budget(
 
 // ── Stages ──────────────────────────────────────────────────────────
 
-/// HermesTrim — tail-trim each message to a length threshold. The
+/// TurnTrim — tail-trim each message to a length threshold. The
 /// threshold drops to 200 chars when `cost_pressure` is set; otherwise
 /// 800. Loses the *prefix* of long tool outputs (the most informative
 /// part is usually the head, but we accept that tradeoff to free budget;
@@ -185,7 +185,7 @@ pub fn enforce_budget(
 /// Implementation is intentionally simple: chop bytes at a char boundary,
 /// add a single-line `[trimmed N chars]` marker so the model knows what
 /// happened.
-pub fn hermes_trim(
+pub fn turn_trim(
     history: Vec<OwnedChatMessage>,
     cost_pressure: bool,
 ) -> Vec<OwnedChatMessage> {
@@ -256,7 +256,7 @@ pub fn default_pipeline() -> &'static [(
     fn(Vec<OwnedChatMessage>, bool) -> Vec<OwnedChatMessage>,
 )] {
     &[
-        ("hermes_trim", hermes_trim),
+        ("turn_trim", turn_trim),
         ("drop_oldest_tool_echoes", drop_oldest_tool_echoes),
         ("bisect_and_summarize", bisect_and_summarize),
     ]
@@ -329,20 +329,20 @@ mod tests {
         assert_eq!(out[0].content, "hi");
     }
 
-    // ── HermesTrim ──
+    // ── TurnTrim ──
 
     #[test]
-    fn hermes_trim_passes_through_short_messages() {
+    fn turn_trim_passes_through_short_messages() {
         let history = vec![msg("user", "short")];
-        let out = hermes_trim(history, false);
+        let out = turn_trim(history, false);
         assert_eq!(out[0].content, "short");
     }
 
     #[test]
-    fn hermes_trim_clips_long_message_at_800_chars_default() {
+    fn turn_trim_clips_long_message_at_800_chars_default() {
         let long = "x".repeat(2000);
         let history = vec![msg("assistant", &long)];
-        let out = hermes_trim(history, false);
+        let out = turn_trim(history, false);
         // 800 chars + trim marker.
         assert!(out[0].content.starts_with("xxxxxxxxxxxxxxxxxxxx"));
         assert!(out[0].content.contains("[trimmed 1200 chars]"));
@@ -350,10 +350,10 @@ mod tests {
     }
 
     #[test]
-    fn hermes_trim_clips_more_aggressively_under_cost_pressure() {
+    fn turn_trim_clips_more_aggressively_under_cost_pressure() {
         let long = "x".repeat(2000);
         let history = vec![msg("assistant", &long)];
-        let out = hermes_trim(history, /* cost_pressure */ true);
+        let out = turn_trim(history, /* cost_pressure */ true);
         assert!(out[0].content.contains("[trimmed 1800 chars]"));
         assert!(out[0].content.chars().count() < 250);
     }
@@ -393,10 +393,10 @@ mod tests {
     // ── Pipeline integration ──
 
     #[test]
-    fn pipeline_compresses_when_over_budget_via_hermes_trim() {
+    fn pipeline_compresses_when_over_budget_via_turn_trim() {
         let huge = "x".repeat(50_000);
         let history = vec![msg("assistant", &huge)];
-        // System + huge user assistant = way over 1000 tokens. HermesTrim
+        // System + huge user assistant = way over 1000 tokens. TurnTrim
         // alone should bring it under 1000.
         let result = enforce_budget(
             "system",
@@ -406,7 +406,7 @@ mod tests {
             default_pipeline(),
             false,
         );
-        let out = result.expect("hermes_trim should suffice");
+        let out = result.expect("turn_trim should suffice");
         assert!(out[0].content.contains("[trimmed"));
     }
 
@@ -431,7 +431,7 @@ mod tests {
             }) => {
                 assert!(estimated_tokens > budget_tokens);
                 assert_eq!(budget_tokens, 10);
-                assert!(stages_tried.contains(&"hermes_trim"));
+                assert!(stages_tried.contains(&"turn_trim"));
             }
             Ok(_) => panic!("expected BudgetExceeded with un-trimmable system prompt"),
         }
@@ -444,7 +444,7 @@ mod tests {
         let mid = "x".repeat(1_500); // ~1000 tokens
         let history = vec![msg("assistant", &mid)];
 
-        // Without cost pressure: hermes_trim caps at 800 chars → ~533
+        // Without cost pressure: turn_trim caps at 800 chars → ~533
         // tokens. With pressure: 200 chars → ~133 tokens.
         let normal = enforce_budget(
             "s",

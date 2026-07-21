@@ -64,7 +64,7 @@
 | 功能 | 說明 |
 |------|------|
 | 原生多輪 Session | Claude CLI `--resume` + SHA-256 確定性 session ID + history-in-prompt fallback（stale session / 帳號輪替 / unknown stream-json error 自動重試）|
-| Hermes turn trimming | >800 chars → 首 300 + 尾 200 + `[trimmed N chars]`，CJK-safe 字元切片 |
+| Turn trimming | >800 chars → 首 300 + 尾 200 + `[trimmed N chars]`，CJK-safe 字元切片 |
 | Prompt Cache 策略 | Direct API 「system_and_3」斷點配置，多輪命中率 ~75% |
 | 壓縮摘要注入 | 壓縮摘要（role=system）注入 system prompt，非對話輪次 |
 | Instruction Pinning | 首訊息 → async Haiku 擷取 → `sessions.pinned_instructions` → 注入 system prompt 尾端（U-shape 高注意力）|

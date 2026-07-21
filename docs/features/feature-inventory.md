@@ -68,7 +68,7 @@
 | Feature | Description |
 |---------|-------------|
 | Native Multi-Turn | Claude CLI `--resume` + SHA-256 deterministic session ID + history-in-prompt fallback (stale session, account rotation, unknown stream-json error) |
-| Hermes Turn Trimming | >800 chars → head 300 + tail 200 + `[trimmed N chars]`, CJK-safe char-level slicing |
+| Turn Trimming | >800 chars → head 300 + tail 200 + `[trimmed N chars]`, CJK-safe char-level slicing |
 | Prompt Cache Strategy | Direct API "system_and_3" breakpoint placement, ~75% multi-turn hit rate |
 | Compression Summary Injection | Post-compression summaries (role=system) injected into system prompt, not conversation turns |
 | Instruction Pinning | First user message → async Haiku extraction → `sessions.pinned_instructions` → injected at system prompt tail |

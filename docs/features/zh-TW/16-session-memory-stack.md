@@ -157,7 +157,7 @@ History-in-prompt (XML-delimited turns)
 
 這修正了先前 Agnes 會在連續訊息之間失去上下文的行為（「幫我全部開啟」→「你指的是什麼？」）。session id 是確定性的，在*整個* thread 生命週期中保持穩定（v1.8.14 Discord 修正後：用 `is_thread || created_thread` 取代 `auto_thread && !is_thread`）。
 
-### 受 Hermes 啟發的 Turn Trimming
+### Turn Trimming
 
 過長的對話輪次（>800 字元）會在送往模型前先被裁剪：
 
