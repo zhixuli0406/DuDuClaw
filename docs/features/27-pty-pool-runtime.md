@@ -18,6 +18,26 @@ This is the heart of the PTY Pool: a real terminal (the open line), a sentinel p
 
 ---
 
+## Status (2026-07): Do You Actually Need This Yet?
+
+**Most agents should leave this OFF — and it is off by default.**
+
+Anthropic had scheduled a 2026-06-15 change that would split programmatic usage (`claude -p`, the Agent SDK, GitHub Actions) onto a separate Agent SDK credit, which would have broken OAuth-subscription channel replies. **On 2026-06-15 that change was paused.** As of this writing `claude -p` still works for OAuth-subscription accounts, so the fresh-spawn (`FreshSpawn`) path — the default — is fully functional and the PTY pool is **not required**.
+
+The PTY pool is therefore kept as a **standby**: if Anthropic re-activates the programmatic-usage split, flipping `pty_pool_enabled = true` restores OAuth channel replies without a code change. Until then, turn it on only if you have a specific reason and have read the limitation below.
+
+---
+
+## Known Limitation: Pool Sessions Are Not Per-Conversation
+
+**Read this before enabling `pty_pool_enabled`.** The pool keys its long-lived REPL sessions by `(agent, cli_kind, bare_mode, account, model)` — **there is no conversation dimension.** A single agent's WebChat conversation A and conversation B share the *same* live `claude` REPL, and that REPL remembers its own prior turns. The result is **cross-conversation context bleed**: conversation B can see workflow state started in conversation A (e.g. B asks for a to-do list and gets A's; two different conversations receive the same weekly report).
+
+This does **not** affect the default `FreshSpawn` (`claude -p`) path. Fresh-spawn carries no CLI-side session state — each turn's context comes solely from `SessionManager::get_messages(session_id)`, and the session id is per-conversation (WebChat composes `webchat:<conn>#agent:<id>#conv:<nonce>`; every external channel keys on its chat/thread id). So the default path isolates conversations correctly; only the opt-in PTY pool shares a REPL across them.
+
+If you enable the pool for a single-conversation workload (one long-running task per agent, no concurrent distinct conversations) this is a non-issue. For multi-conversation agents (a WebChat bot serving many users/threads at once), **do not enable it** until a per-conversation pool key lands.
+
+---
+
 ## Why a Real PTY, Not Scrollback Scraping
 
 Driving an interactive REPL programmatically has two naive failure modes:
@@ -209,9 +229,15 @@ Everything is per-agent in `agent.toml`, default off:
 [runtime]
 pty_pool_enabled = true   # opt in to the interactive PTY pool (default false)
 worker_managed   = true   # run the pool in an out-of-process duduclaw-cli-worker
+
+# Interactive-REPL timeouts (stall detection + hard cap). Both optional.
+pty_idle_timeout_secs        = 120   # fail fast if no substantive progress for this long (default 120)
+pty_interactive_timeout_secs = 1800  # absolute wall-clock hard cap / safety net (default 1800)
 ```
 
-With both unset, the agent runs exactly as before on the `FreshSpawn` legacy path. Setting only `pty_pool_enabled` runs the pool in-process; adding `worker_managed` moves it into the supervised subprocess.
+With both `pty_*` runtime flags unset, the agent runs exactly as before on the `FreshSpawn` legacy path. Setting only `pty_pool_enabled` runs the pool in-process; adding `worker_managed` moves it into the supervised subprocess.
+
+**Interactive-REPL timeouts.** A turn fails on whichever fires first: **stall detection** (`pty_idle_timeout_secs`) when the REPL emits no *substantive progress* — a rising token counter or new answer text; spinner animations and the elapsed-time counter deliberately don't count — for the idle window; or the absolute **hard cap** (`pty_interactive_timeout_secs`). Stall detection means a long-but-working task (multi-minute tool calls, agentic work) is no longer false-killed, while a genuinely wedged session still fails fast into the fresh-spawn `claude -p` fallback (recorded to `channel_failures.jsonl` with a `reason` of `stall`/`hard_cap`/`boot` and a `mid_task` flag). Env overrides: `DUDUCLAW_PTY_IDLE_TIMEOUT_SECS`, `DUDUCLAW_PTY_INTERACTIVE_TIMEOUT_SECS`.
 
 ---
 
@@ -229,9 +255,9 @@ When Anthropic blocked `claude -p` for OAuth subscriptions mid-2026, every chann
 
 The sentinel protocol means the runtime never guesses where an answer ends. No scrollback scraping, no fragile ANSI regex — the answer arrives pre-framed between two markers.
 
-### Safe to Turn On
+### Safe to Turn On — With One Caveat
 
-Default off, fails safe to `FreshSpawn`, and every PTY error degrades to the legacy `claude -p` path. Enabling the pool can only ever match or beat the old behavior — it can't break an agent that was working.
+Default off, fails safe to `FreshSpawn`, and every PTY error degrades to the legacy `claude -p` path. On the *reliability* axis, enabling the pool can only ever match or beat the old behavior. The one caveat is **isolation, not reliability**: pool sessions are keyed without a conversation dimension, so a multi-conversation agent will bleed context across conversations (see [Known Limitation](#known-limitation-pool-sessions-are-not-per-conversation)). Because `claude -p` is still available as of 2026-07 (the programmatic-usage split was paused on 2026-06-15), most deployments should leave this off and stay on the fully-isolated `FreshSpawn` default.
 
 ### Observable
 

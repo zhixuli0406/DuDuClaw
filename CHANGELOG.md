@@ -2,6 +2,142 @@
 
 ## [Unreleased]
 
+### Fixed
+- **中文輸入法（注音/拼音）打字時 Enter 誤送半截訊息 → 組字期間的 Enter 不觸發送出。**
+  IME 組字時第一次 Enter 是「選字/確認」卻被當成送出，訊息只送一半。新增共用工具
+  `web/src/lib/keyboard.ts` 的 `isImeComposing(e)`（同時檢查 `nativeEvent.isComposing`
+  與 Safari 的 `keyCode === 229` 邊緣行為），所有「Enter 送出/確認」的自由文字輸入框
+  都改為 `e.key === 'Enter' && !isImeComposing(e)` 才動作。掃同類共修 14 個檔案 15 處：
+  WebChat 輸入框、workspace PromptBar、標籤 ChipEditor、InlineEditor 改名、CommandPalette
+  篩選、Skill 市集搜尋＋repo URL、共享 Wiki 搜尋、Identity 解析、MCP fetch、部門建立、
+  Knowledge 策展查詢×2、Knowledge Hub 搜尋、系統設定遠端存取白名單、CLI 登入回應。
+  純按鈕啟用（Enter/Space 當點擊，如 Logs/Onboard/Mascot）與全域快捷鍵監聽
+  （CommandPalette/ConnectorChips/AgentModelPicker）、以及會排除可編輯目標的 InboxList
+  導覽鍵不涉及 IME，未動。
+- **WebChat「新對話」完成後不會即時出現在對話列表、切回舊對話就回不去 → 每則回覆入庫後刷新列表。**
+  承接上一版 conv-nonce 架構：新對話 B 的 session bucket（`…#conv:<nonce>`）在伺服器端
+  存在且可 resume，但左側列表沒刷新、B 進不了列表就無法點回。修法：store 新增
+  `sessionsRevision` 計數器，每收到一則 `assistant_done`（含被歸屬守衛丟棄的其他對話）
+  即 +1；WebChat 頁面 watch 此值刷新 `chat.sessions.list`，讓剛建立的對話在第一則回覆
+  落地時就進列表並保持可 resume。已知殘留（cosmetic）：目前開啟中的新對話因 client 端
+  `sessionId` 仍為連線基底 id、列表列為 composed id，列表「使用中」高亮不會標到它——
+  不影響點選 resume 與續聊。
+- **WebChat「新對話」回覆錯投到新對話 → 每個對話有獨立 session bucket＋回覆按對話歸屬。**
+  修復在對話 A 發長任務、任務進行中按「新對話」開對話 B 時，A 的回覆完成後出現在 B
+  裡的問題。根因：WebChat 的 server session 綁「WS 連線 id」而非「對話」，且 `/new`
+  是 `delete_session` 原地刪除、不輪替新 id——A 與 B 共用同一個 session bucket，
+  in-flight 回覆完成時就投到目前打開的對話。修法：
+  - **前端每個對話帶一個 conversation nonce（`conv`）。** `user_message` 帶上 `conv`，
+    在 `/new`、切換 AI 員工、resume 歷史對話時輪替。回覆 frame（`assistant_done` /
+    `progress` / `step`）由伺服器原樣回帶 `conv`；socket 收到與目前對話 `conv` 不符的
+    frame 直接丟棄不渲染（typing/任務板進度/工具步驟同樣受此閘門保護，不會錯投）。
+  - **伺服器端每個對話獨立 session bucket。** new/continue 路徑把消毒過的 `conv`
+    併入 session id（`…#conv:<nonce>`），A 的 in-flight 回覆持久化到 A 的歷史、
+    不再混進剛開的 B。`sanitize_conv_nonce` 只保留 `[A-Za-z0-9_-]`、限長 64、
+    去除 `:`/`#` 結構分隔符（防注入額外 bucket 結構）；resume-ownership 守衛
+    （`starts_with("{session_id}#")`）仍接受這些 id。缺 `conv`（舊 client）→
+    byte-compatible 單 bucket 舊行為。
+  - **「新對話」按鈕改為輪替 nonce、不再送 `/new`。** 舊行為會 `delete_session`
+    刪掉可能仍在跑長任務的對話；新行為改為開一個空的新 bucket（AI 自然從乾淨脈絡
+    開始），並保留舊對話在「對話列表」可 resume。連帶讓 WebChat 的過往對話列表
+    真正可用（先前所有對話共用一個 id，列表形同只有一筆）。`/new` 指令本身不變，
+    其他頻道與手動輸入 `/new` 照舊。
+- **PTY pool 互動 REPL 卡住抓不到回覆 → 快速失敗並降級。** 修復 `[runtime]
+  pty_pool_enabled = true` + OAuth 訂閱帳號時，channel 回覆走互動 REPL 卻抓不到
+  sentinel 回覆、一直轉到 30 分鐘才逾時的問題群：
+  - **互動 REPL 逾時改為「停滯偵測（stall detection）＋寬鬆硬上限」**（取代原本
+    固定 180s deadline，見下方 Changed）。新增可設定的 idle/停滯視窗
+    （`agent.toml [runtime] pty_idle_timeout_secs`，或 env
+    `DUDUCLAW_PTY_IDLE_TIMEOUT_SECS`，缺省 **120s**）：互動 REPL 只在**連續無實質
+    進度**達 idle 視窗才快速失敗降級，長任務（多分鐘工具呼叫／agentic 工作）不再被
+    誤殺。「實質進度」以 **token 計數上升 or 去噪 prose 內容變化**判定（spinner 動畫
+    ＋每秒跳動的經過計時器**不算**進度——依 Claude Code 2.1.173 活體擷取校準）。
+    `pty_interactive_timeout_secs` 改為**絕對硬上限安全網**（缺省 **1800s**）。
+    API-key 的 `claude -p` one-shot 路徑維持原本的長 deadline。
+  - **fallback 紀錄新增 `reason` ＋ `mid_task` 欄位。** `channel_failures.jsonl` 的
+    `pty_pool_fallback` 事件標明失敗原因（`stall`／`hard_cap`／`boot`／`other`）；
+    停滯或硬上限發生在**已觀察到進度之後**（任務執行中段）時 `mid_task=true`，並額外
+    warn「task may have partially executed」（fallback 重跑可能重複副作用，仍以可用性
+    優先照樣降級）。`InvokeStall`／`InvokeHardCap` 兩個新錯誤型別可讓上層分類。
+  - **多行 prompt 送不出去 → 停滯（submit watchdog）。** 多行 prompt 以
+    bracketed-paste 寫入後緊接的 `\r`，實測對真 claude 2.1.173 有約 3/4 機率**不會觸發
+    送出**（TUI 還在吃 paste，`\r` 被丟棄），prompt 躺在輸入框、REPL 空等到停滯逾時。
+    `collect_response_interactive` 新增 submit watchdog：送出後若 1.5s 內未見「turn
+    正在跑」的跡象（spinner／`esc to interrupt`／sentinel），重送 `\r`，有界 3 次、
+    間隔遞增。活體驗證：watchdog 送出成功率 4/4（原 1/4）。
+  - **首回合 TUI welcome box 被當成回覆送出（fail-closed 過濾）。** fresh session
+    首回合的整屏重繪會把「Welcome back／What's new／release-notes／org email／agent
+    路徑」的 welcome box 夾進兩個 sentinel 之間，舊的 chrome filter 不認得而把它當答案
+    送給使用者。改法：payload 逐行過濾時，**任何 box-drawing／block 字元
+    （U+2500–U+259F）或 welcome 關鍵字（Welcome back／What's new／release-notes…）
+    的行一律視為 chrome**；前導 welcome chrome 略過（後面真答案保留），welcome 出現在
+    答案之後則停止收集。全被濾掉時回空 payload → 觸發既有 empty-payload retry／
+    fallback（寧可空也不送 chrome）。fixture 取自 2.1.173 活體擷取。另補 composer
+    輸入框狀態列（`ctrl+g to edit in Vim`、`⏵⏵ automode on (shift+tab to cycle)`、
+    `← for agents`、`? for shortcuts` 等）——這些會黏在答案末尾漏出；改用**整行去空白
+    後精確相等／符號前綴**比對（非子字串），確保「答案內文真的在講 vim 快捷鍵」不被誤殺。
+  - **互動 REPL 失敗自動 fallback 到 fresh-spawn `claude -p`。**
+    `call_claude_cli_pty_rotated` 在 pool 路徑回可復原錯誤（逾時／空 payload／boot
+    失敗／帳號耗盡）時，改走與 `FreshSpawn` 同源的 `call_claude_cli_rotated`，並記
+    warn log ＋寫一筆 `pty_pool_fallback` 到 `channel_failures.jsonl`（不再靜默失敗）。
+    MoA 設定錯誤不 fallback（fresh-spawn 同樣會拒）。
+  - **Boot dance 補指紋並改為快速失敗。** 互動 boot 除 trust 對話框外，新增
+    theme picker／onboarding／login-method 首次啟動畫面的偵測（去 ANSI ＋去空白
+    ＋小寫比對，送 `\r` 接受預設值）；boot 結束仍未見 REPL-ready 指紋即把 session
+    標記不健康並回 `BootTimeout`（取代舊的硬 proceed），讓上層走上述 fallback，把
+    「卡 30 分鐘」變成「數秒失敗＋降級可用」。
+  - **REPL-ready 指紋更新至 Claude Code 2.1.x ＋ MCP 核准畫面處理**（活體驗證
+    2.1.173）。舊指紋（`? for shortcuts`／`Try "edit`）在 2.1.x TUI 已不存在，
+    導致 REPL 明明就緒仍判 boot 逾時；補上 `Try "how does`／`shift+tab to cycle`。
+    另新增「New MCP server found in this project」核准畫面的顯式指紋，`\r` 接受
+    預設選項（Use this MCP server）。
+  - **補 dispatcher 路徑的 per-account 憑證注入（Gap A）。** sub-agent dispatch
+    走 PTY pool 時，`AcquireOptions` 先前沒帶 `account_id`／`env`，會用到 ambient
+    OAuth；改為比照 channel 路徑用 `rotate_cli_spawn` 逐帳號注入 env ＋ account_id。
+  - **keychain 預設 OAuth 帳號給穩定 account_id（Gap B）。** rotator 對預設 keychain
+    帳號只發空字串 `ANTHROPIC_API_KEY` force-OAuth sentinel；先前 `account_id` 解析回
+    None 導致 env 不被 stash／注入，PTY child 可能繼承 gateway 殘留的 API key 而蓋掉
+    OAuth。改為給它 `oauth-keychain-default` 穩定 id，使 sentinel env 被注入。
+
+### Changed
+- **PTY pool 重新定位為「備援、預設關」並補上已知限制說明。** Anthropic 原訂 2026-06-15
+  把程式化用量（`claude -p` / Agent SDK / GitHub Actions）拆到獨立 Agent SDK credit，
+  但**已於當天暫停**，`claude -p` 對 OAuth 訂閱帳號照舊可用 → 預設的 `FreshSpawn` 路徑
+  完整可用、PTY pool 非必要。功能維持保留、預設關（`pty_pool_enabled` 缺省 false，
+  `runtime_mode_for_agent` fail-safe 回 `FreshSpawn`），文件（`docs/features/27-pty-pool-runtime.md`
+  含 zh-TW/ja-JP、`CLAUDE.md`）新增「何時才需要開」與**已知限制**：pool session 以
+  `(agent, cli_kind, bare_mode, account, model)` 為 key、**不含對話維度**，多對話 agent
+  會跨對話共用同一條 REPL 而洩漏脈絡——開啟前必須理解此行為。**預設 fresh-spawn `claude -p`
+  路徑不受影響**：其脈絡完全來自 `get_messages(session_id)`、session id 逐對話
+  （WebChat 含 `#conv:<nonce>`），已驗證無跨對話洩漏；`--resume` 確定性 session id 路徑
+  早已移除（所有呼叫點傳 `None`）。附帶把 WebChat 的 session-id 組合抽成純函式
+  `compose_session_id` 並加單元測試鎖住「conv nonce 參與分桶」不變式。
+- **`agent.toml [runtime] pty_interactive_timeout_secs` 語意變更：從「固定殺 turn 的
+  invoke deadline」改為「絕對硬上限安全網」，缺省值 180s → **1800s**（對齊 fresh-spawn
+  的 `HARD_MAX_TIMEOUT`）。** 日常「session 是否卡住」的判定改由新的停滯偵測負責（新設
+  定 `pty_idle_timeout_secs`，缺省 120s，見 Fixed）。**影響**：先前靠此值在 180s 主動
+  殺掉長任務的使用者，現在長任務會一直跑到 30 分鐘硬上限或先被停滯偵測攔下——若要回到
+  舊的積極上限，自行把 `pty_interactive_timeout_secs` 設回 180。managed-worker 的
+  per-invoke 硬上限 clamp 也從 10 分鐘提高到 31 分鐘以容納新的硬上限；`InvokeParams`
+  新增 `idle_timeout_ms`（向後相容，舊 client 省略時只套硬上限）。
+
+### Added
+- **Dashboard 即時連線的可設定 Origin 白名單。** 新增 config.toml
+  `[gateway] allowed_origins`（陣列，元素可為 `host`、`host:port` 或含 scheme 的
+  完整 origin）與環境變數 `DUDUCLAW_ALLOWED_ORIGINS`（逗號分隔，兩者**合併**）。
+  解決經銷商／使用者透過 tailnet（`*.ts.net`）或反向代理網域開 dashboard 時，HTTP
+  頁面正常但 WebSocket 升級被 403 擋掉一直轉圈圈的問題。內建 loopback 三項
+  （`localhost` / `127.0.0.1` / `[::1]`）永遠有效；清單為空時行為與舊版
+  byte-identical（零回歸、fail-closed）。每個項目做精確 authority 比對，不支援
+  萬用字元，後綴攻擊（`localhost.evil.com`）仍被擋。啟動時印一行 info log 列出
+  生效的額外 origins。文件見 `docs/guides/deployment-guide.md` §5 與
+  `docs/guides/docker.md` §13。
+- **Dashboard 設定頁可直接管理 Origin 白名單。** 設定 → 系統 → 遠端存取網址提供
+  新增／刪除 chip 介面（`system.config` / `system.update_config` RPC），存檔後
+  透過 `set_allowed_origins` **熱生效、免重啟** gateway；`DUDUCLAW_ALLOWED_ORIGINS`
+  環境變數提供的項目在 UI 存檔時會重新併入、不被洗掉。經銷商／使用者不必再手改
+  config.toml。
+
 ## [1.39.0] - 2026-07-20 — Graph Engineering — 雙時間軸記憶、投毒防護、知識圖策展
 
 ### Added

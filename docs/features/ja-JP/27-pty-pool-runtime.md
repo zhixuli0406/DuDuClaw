@@ -18,6 +18,26 @@
 
 ---
 
+## 現状（2026-07）：今、本当に必要か？
+
+**ほとんどのagentはオフのままにすべきで、デフォルトでオフです。**
+
+Anthropicは2026-06-15にプログラム的利用（`claude -p`、Agent SDK、GitHub Actions）を独立したAgent SDKクレジットへ分離する変更を予定しており、これはOAuthサブスクリプションアカウントのchannel replyを壊すはずでした。**しかしその変更は2026-06-15当日に一時停止されました。** 本稿執筆時点で`claude -p`はOAuthサブスクリプションアカウントで従来どおり利用可能であり、デフォルトのfresh-spawn（`FreshSpawn`）パスは完全に機能し、PTY poolは**不要**です。
+
+したがってPTY poolは**予備**として残されています。Anthropicがプログラム的利用の分離を再有効化した場合、`pty_pool_enabled = true`にするだけでコード変更なしにOAuthのchannel replyを復旧できます。それまでは、明確な理由があり、かつ下記の制限を読んだ場合にのみ有効化してください。
+
+---
+
+## 既知の制限：Pool sessionは会話ごとに分離されない
+
+**`pty_pool_enabled`を有効化する前に必ず読んでください。** Poolは長寿命のREPL sessionを`(agent, cli_kind, bare_mode, account, model)`でキーイングします——**会話の次元がありません**。単一agentのWebChat会話Aと会話Bは*同じ*生きた`claude` REPLを共有し、そのREPLは自身の過去のターンを覚えています。結果は**会話間のコンテキスト漏洩**です：会話Bが会話Aで開始したworkflowの状態を見てしまう（例：BがToDoリストを尋ねるとAのものが返る、異なる2つの会話が同じ週報を受け取る）。
+
+これはデフォルトの`FreshSpawn`（`claude -p`）パスには**影響しません**。Fresh-spawnはCLI側のsession状態を一切持たず、各ターンのコンテキストは`SessionManager::get_messages(session_id)`のみに由来し、session idは会話ごとです（WebChatは`webchat:<conn>#agent:<id>#conv:<nonce>`を構成し、各外部チャネルはchat/thread idでキーイング）。よってデフォルトパスは会話を正しく分離し、オプトインのPTY poolだけが会話間でREPLを共有します。
+
+単一会話のワークロード（agentごとに一度に1つの長時間タスク、並行する別会話なし）で有効化するなら問題ありません。マルチ会話agent（多数のユーザー/threadを同時に扱うWebChat bot）では、会話ごとのpool keyが実装されるまで**有効化しないでください**。
+
+---
+
 ## なぜスクロールバックの掻き取りではなく本物のPTYか
 
 対話型REPLをプログラムで駆動するには、2つの素朴な失敗モードがあります：
@@ -209,9 +229,15 @@ $ curl http://127.0.0.1:<port>/api/runtime/status
 [runtime]
 pty_pool_enabled = true   # 対話型PTY poolにオプトイン（デフォルトfalse）
 worker_managed   = true   # プールをプロセス外のduduclaw-cli-workerで実行
+
+# 対話型REPLのタイムアウト（stall検知 + ハードキャップ）。いずれも任意
+pty_idle_timeout_secs        = 120   # 実質的な進捗がこの秒数ない場合に早期失敗（デフォルト120）
+pty_interactive_timeout_secs = 1800  # 絶対的な実時間ハードキャップ／セーフティネット（デフォルト1800）
 ```
 
-両方とも未設定の場合、agentは以前とまったく同じ`FreshSpawn`旧来パスで動作します。`pty_pool_enabled`のみ設定するとプールはプロセス内で動作し、`worker_managed`を追加すると監視されたサブプロセスへ移動します。
+2つの`pty_*` runtimeフラグが両方とも未設定の場合、agentは以前とまったく同じ`FreshSpawn`旧来パスで動作します。`pty_pool_enabled`のみ設定するとプールはプロセス内で動作し、`worker_managed`を追加すると監視されたサブプロセスへ移動します。
+
+**対話型REPLのタイムアウト。** ターンは、先に発火した方で失敗します：**stall検知**（`pty_idle_timeout_secs`）——REPLがidleウィンドウの間、**実質的な進捗**（トークンカウンタの増加や新しい回答テキスト。スピナーのアニメーションや経過時間カウンタは意図的に数えません）を出さないとき；または**絶対的なハードキャップ**（`pty_interactive_timeout_secs`）。stall検知により、長いが動作中のタスク（数分に及ぶツール呼び出し、agentic作業）はもはや誤って強制終了されず、本当にwedgeしたsessionは依然として素早く失敗してfresh-spawn `claude -p`にフォールバックします（`channel_failures.jsonl`に`reason`＝`stall`／`hard_cap`／`boot`と`mid_task`フラグ付きで記録）。環境変数の上書き：`DUDUCLAW_PTY_IDLE_TIMEOUT_SECS`、`DUDUCLAW_PTY_INTERACTIVE_TIMEOUT_SECS`。
 
 ---
 
@@ -229,9 +255,9 @@ worker_managed   = true   # プールをプロセス外のduduclaw-cli-workerで
 
 sentinelプロトコルにより、runtimeは答えがどこで終わるかを推測する必要がありません。スクロールバックの掻き取りも、脆いANSI正規表現もなし——答えは2つの目印の間にframingされた状態で届きます。
 
-### オンにしても安全
+### オンにしても安全——ただし1つの但し書き
 
-デフォルトオフ、`FreshSpawn`へフェイルセーフ、そしてすべてのPTYエラーは旧来の`claude -p`パスへ劣化します。プールを有効にしても、旧来の挙動と同等以上にしかなりません——正常に動いていたagentを壊すことはありません。
+デフォルトオフ、`FreshSpawn`へフェイルセーフ、そしてすべてのPTYエラーは旧来の`claude -p`パスへ劣化します。**信頼性**の軸では、プールを有効にしても旧来の挙動と同等以上にしかなりません。唯一の但し書きは**分離性であって信頼性ではありません**：pool sessionのキーは会話の次元を含まないため、マルチ会話agentでは会話間でコンテキストが漏洩します（〈既知の制限〉参照）。2026-07時点で`claude -p`は依然利用可能（プログラム的利用の分離は2026-06-15に一時停止）なので、ほとんどのデプロイはこれをオフのままにし、完全に分離された`FreshSpawn`デフォルトパスに留まるべきです。
 
 ### 可観測
 

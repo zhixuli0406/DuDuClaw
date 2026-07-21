@@ -18,6 +18,26 @@
 
 ---
 
+## 現況（2026-07）：你現在真的需要它嗎？
+
+**多數 agent 應維持關閉——它預設就是關的。**
+
+Anthropic 原本排定 2026-06-15 的變更，會把程式化用量（`claude -p`、Agent SDK、GitHub Actions）拆到獨立的 Agent SDK credit，這將導致 OAuth 訂閱帳號的 channel reply 失效。**但該變更已於 2026-06-15 當天暫停。** 截至本文撰寫時，`claude -p` 對 OAuth 訂閱帳號照舊可用，因此預設的 fresh-spawn（`FreshSpawn`）路徑完全正常，PTY pool **並非必要**。
+
+所以 PTY pool 被保留為**備援**：若 Anthropic 重新啟動程式化用量拆分，把 `pty_pool_enabled = true` 打開即可在無需改碼的情況下恢復 OAuth channel reply。在那之前，只有在你有明確理由、且已讀過下方限制時才開啟。
+
+---
+
+## 已知限制：Pool Session 不含對話維度
+
+**開啟 `pty_pool_enabled` 前務必讀這段。** Pool 以 `(agent, cli_kind, bare_mode, account, model)` 為 key 管理長生命週期的 REPL session——**沒有對話維度**。同一個 agent 的 WebChat 對話 A 與對話 B 共用**同一條**活的 `claude` REPL，而該 REPL 記得它自己先前的輪次。結果就是**跨對話脈絡洩漏**：對話 B 會看到對話 A 啟動的 workflow 狀態（例如 B 問待辦卻拿到 A 的；兩個不同對話收到同一份週報）。
+
+這**不影響**預設的 `FreshSpawn`（`claude -p`）路徑。Fresh-spawn 不帶任何 CLI 端 session 狀態——每一輪的脈絡完全來自 `SessionManager::get_messages(session_id)`，而 session id 是逐對話的（WebChat 組成 `webchat:<conn>#agent:<id>#conv:<nonce>`；每個外部通道以其 chat/thread id 為 key）。所以預設路徑正確隔離對話；只有 opt-in 的 PTY pool 會跨對話共用 REPL。
+
+若你為單一對話工作負載開啟此池（每個 agent 一次只跑一個長任務、沒有並行的不同對話），這不成問題。但對多對話 agent（同時服務多位使用者／多個 thread 的 WebChat bot），在逐對話 pool key 落地前，**請勿開啟**。
+
+---
+
 ## 為什麼用真正的 PTY，而非刮取 scrollback
 
 以程式方式驅動互動式 REPL，有兩種天真的失敗模式：
@@ -209,9 +229,15 @@ $ curl http://127.0.0.1:<port>/api/runtime/status
 [runtime]
 pty_pool_enabled = true   # 開啟互動式 PTY pool（預設 false）
 worker_managed   = true   # 在 process 外的 duduclaw-cli-worker 中執行池
+
+# 互動 REPL 逾時（停滯偵測 + 硬上限），皆為選填
+pty_idle_timeout_secs        = 120   # 連續無實質進度達此秒數即快速失敗（預設 120）
+pty_interactive_timeout_secs = 1800  # 絕對牆鐘硬上限／安全網（預設 1800）
 ```
 
-兩者皆未設定時，agent 完全照舊走 `FreshSpawn` 舊版路徑。僅設 `pty_pool_enabled` 會在 process 內執行池；再加上 `worker_managed` 則把池移入受監督的子 process。
+兩個 `pty_*` runtime 旗標皆未設定時，agent 完全照舊走 `FreshSpawn` 舊版路徑。僅設 `pty_pool_enabled` 會在 process 內執行池；再加上 `worker_managed` 則把池移入受監督的子 process。
+
+**互動 REPL 逾時。** 一個 turn 會在兩者先到者觸發時失敗：**停滯偵測**（`pty_idle_timeout_secs`）——當 REPL 在 idle 視窗內沒有**實質進度**（token 計數上升或新的回覆文字；spinner 動畫與經過計時器刻意不算）；或**絕對硬上限**（`pty_interactive_timeout_secs`）。停滯偵測讓「長但仍在工作」的任務（多分鐘工具呼叫、agentic 工作）不再被誤殺，真正卡死的 session 則仍會快速失敗、降級到 fresh-spawn `claude -p`（並寫入 `channel_failures.jsonl`，附 `reason`＝`stall`／`hard_cap`／`boot` 與 `mid_task` 旗標）。環境變數覆寫：`DUDUCLAW_PTY_IDLE_TIMEOUT_SECS`、`DUDUCLAW_PTY_INTERACTIVE_TIMEOUT_SECS`。
 
 ---
 
@@ -229,9 +255,9 @@ worker_managed   = true   # 在 process 外的 duduclaw-cli-worker 中執行池
 
 sentinel 協定意味著 runtime 永遠不必猜測答案在哪裡結束。不刮取 scrollback、不依賴脆弱的 ANSI 正則——答案抵達時已被兩個標記預先 framing 好。
 
-### 開啟很安全
+### 開啟很安全——但有一個但書
 
-預設關閉、失敗安全回退到 `FreshSpawn`，且每個 PTY 錯誤都退化到舊版 `claude -p` 路徑。開啟此池只可能與舊行為持平或更好——不會弄壞一個原本正常運作的 agent。
+預設關閉、失敗安全回退到 `FreshSpawn`，且每個 PTY 錯誤都退化到舊版 `claude -p` 路徑。在**可靠性**這條軸上，開啟此池只可能與舊行為持平或更好。唯一的但書是**隔離性，而非可靠性**：pool session 的 key 不含對話維度，所以多對話 agent 會跨對話洩漏脈絡（見〈已知限制〉）。由於截至 2026-07 `claude -p` 仍可用（程式化用量拆分已於 2026-06-15 暫停），多數部署應維持關閉、留在完全隔離的 `FreshSpawn` 預設路徑。
 
 ### 可觀測
 
