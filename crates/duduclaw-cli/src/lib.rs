@@ -3007,11 +3007,47 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         }
     }
 
+    // Dashboard WS/CORS Origin allowlist. Merge config.toml
+    // `[gateway] allowed_origins` (array) with the `DUDUCLAW_ALLOWED_ORIGINS`
+    // env (comma-separated) — both are appended; the gateway normalizes and
+    // dedups semantically at match time. Empty => built-in loopback origins
+    // only (no behaviour change). Needed for tailnet / reverse-proxy hostnames
+    // where the HTTP dashboard loads but the WS upgrade is 403'd on Origin.
+    let allowed_origins: Vec<String> = {
+        let mut list: Vec<String> = Vec::new();
+        if let Ok(content) = std::fs::read_to_string(home.join("config.toml")) {
+            if let Ok(table) = content.parse::<toml::Table>() {
+                if let Some(arr) = table
+                    .get("gateway")
+                    .and_then(|g| g.as_table())
+                    .and_then(|g| g.get("allowed_origins"))
+                    .and_then(|v| v.as_array())
+                {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            list.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(env_val) = std::env::var("DUDUCLAW_ALLOWED_ORIGINS") {
+            for part in env_val.split(',') {
+                let p = part.trim();
+                if !p.is_empty() {
+                    list.push(p.to_string());
+                }
+            }
+        }
+        list
+    };
+
     let config = duduclaw_gateway::GatewayConfig {
         bind,
         port,
         auth_token,
         home_dir: home,
+        allowed_origins,
         extension: Arc::new(duduclaw_gateway::NullExtension),
         // Self-host default: resolve form-factor per-request from
         // DUDUCLAW_EDITION env > license tier > Personal. Cloud control-plane

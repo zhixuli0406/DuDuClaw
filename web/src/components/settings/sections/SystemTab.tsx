@@ -1,7 +1,9 @@
 import { useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
+import { Plus, X } from 'lucide-react';
 import { useAgentsStore } from '@/stores/agents-store';
 import { api } from '@/lib/api';
+import { isImeComposing } from '@/lib/keyboard';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
@@ -13,6 +15,9 @@ import {
 } from '@/components/mds';
 import { AdvancedSection, DangerZone, type SelectOption } from '@/components/settings/controls';
 import { RowSelect } from '@/pages/agent-form/form-rows';
+
+// Secret-manager backends the gateway's system.update_config accepts.
+const SM_BACKENDS = ['local', 'vault', 'env', 'onepassword', 'infisical'];
 
 // ── G — System tab (gateway / rotation / general / logging / secret_manager) ──
 
@@ -32,10 +37,13 @@ export function SystemTab() {
   // [logging]
   const [logFormat, setLogFormat] = useState('pretty');
   // [secret_manager]
-  const [smBackend, setSmBackend] = useState('config');
+  const [smBackend, setSmBackend] = useState('local');
   const [vaultAddr, setVaultAddr] = useState('');
   const [vaultMount, setVaultMount] = useState('');
   const [vaultToken, setVaultToken] = useState('');
+  // [gateway] allowed_origins — remote-access allowlist (chips + draft input).
+  const [origins, setOrigins] = useState<string[]>([]);
+  const [originDraft, setOriginDraft] = useState('');
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -58,14 +66,34 @@ export function SystemTab() {
       setDefaultAgent(m(/default_agent\s*=\s*"([^"]*)"/) ?? '');
       setInferenceMode(m(/inference_mode\s*=\s*"(\w+)"/) ?? 'claude');
       setLogFormat(m(/\bformat\s*=\s*"(\w+)"/) ?? 'pretty');
-      setSmBackend(m(/\bbackend\s*=\s*"(\w+)"/) ?? 'config');
+      // Gateway accepts local/vault/env/onepassword/infisical (serde default:
+      // "local"). Map absent or legacy values (config/keychain) to "local" so
+      // a save never carries a value the gateway rejects.
+      const smRaw = m(/\bbackend\s*=\s*"(\w+)"/) ?? 'local';
+      setSmBackend(SM_BACKENDS.includes(smRaw) ? smRaw : 'local');
       setVaultAddr(m(/vault_addr\s*=\s*"([^"]*)"/) ?? '');
       setVaultMount(m(/vault_mount\s*=\s*"([^"]*)"/) ?? '');
+      // allowed_origins comes back as a structured array (not parsed from TOML).
+      const ao = (res as Record<string, unknown>)?.allowed_origins;
+      setOrigins(Array.isArray(ao) ? (ao.filter((v) => typeof v === 'string') as string[]) : []);
     }).catch((e) => {
       console.warn('[api]', e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     });
   }, [intl]);
+
+  // Add the draft entry to the allowlist (dedup, trim). Called by the Add button
+  // and the Enter key. The gateway re-cleans each entry server-side, so we only
+  // do light trimming here.
+  const addOrigin = () => {
+    const v = originDraft.trim();
+    if (v === '') return;
+    setOrigins((prev) => (prev.includes(v) ? prev : [...prev, v]));
+    setOriginDraft('');
+  };
+  const removeOrigin = (target: string) => {
+    setOrigins((prev) => prev.filter((o) => o !== target));
+  };
 
   const handleSave = async () => {
     setSaving(true);
@@ -83,6 +111,9 @@ export function SystemTab() {
       const sm: Record<string, unknown> = { backend: smBackend, vault_addr: vaultAddr, vault_mount: vaultMount };
       if (vaultToken.trim() !== '') sm.vault_token = vaultToken.trim();
       payload.secret_manager = sm;
+      // Always send the current allowlist so a save reflects add/remove edits.
+      // Empty array = loopback-only (the default). Hot-applied server-side.
+      payload.allowed_origins = origins;
 
       await api.system.updateConfig(payload);
       setAuthToken('');
@@ -107,7 +138,7 @@ export function SystemTab() {
   const logFormatOptions: SelectOption[] = ['pretty', 'json'].map((v) => ({
     value: v, label: intl.formatMessage({ id: `settings.logFormat.${v}` }), raw: v,
   }));
-  const smOptions: SelectOption[] = ['env', 'vault', 'config', 'keychain'].map((v) => ({
+  const smOptions: SelectOption[] = SM_BACKENDS.map((v) => ({
     value: v, label: intl.formatMessage({ id: `settings.smBackend.${v}` }), raw: v,
   }));
 
@@ -132,6 +163,75 @@ export function SystemTab() {
           <SettingsRow label={intl.formatMessage({ id: 'settings.system.authToken' })} description={intl.formatMessage({ id: 'settings.system.writeOnly' })} tier="text">
             <Input type="password" value={authToken} onChange={(e) => setAuthToken(e.target.value)} placeholder="••••••••" autoComplete="off" />
           </SettingsRow>
+        </SettingsCard>
+      </SettingsSection>
+
+      {/* Remote-access allowlist — non-secret, hot-applied (no restart) */}
+      <SettingsSection
+        title={intl.formatMessage({ id: 'settings.system.remoteAccess' })}
+        description={intl.formatMessage({ id: 'settings.system.remoteAccess.desc' })}
+      >
+        <SettingsCard>
+          <SettingsRow
+            label={intl.formatMessage({ id: 'settings.system.remoteAccess.add' })}
+            description={intl.formatMessage({ id: 'settings.system.remoteAccess.help' })}
+            tier="text"
+          >
+            <div className="flex gap-2">
+              <Input
+                type="text"
+                value={originDraft}
+                onChange={(e) => setOriginDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !isImeComposing(e)) {
+                    e.preventDefault();
+                    addOrigin();
+                  }
+                }}
+                placeholder="dash.example.com"
+                aria-label={intl.formatMessage({ id: 'settings.system.remoteAccess.add' })}
+              />
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={addOrigin}
+                disabled={originDraft.trim() === ''}
+              >
+                <Plus className="size-4" />
+                {intl.formatMessage({ id: 'common.add' })}
+              </Button>
+            </div>
+          </SettingsRow>
+          <div className="px-4 py-3.5">
+            {origins.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                {intl.formatMessage({ id: 'settings.system.remoteAccess.empty' })}
+              </p>
+            ) : (
+              <ul className="flex flex-wrap gap-2" aria-label={intl.formatMessage({ id: 'settings.system.remoteAccess' })}>
+                {origins.map((o) => (
+                  <li
+                    key={o}
+                    className="inline-flex items-center gap-1.5 rounded-4xl border border-border bg-secondary px-2.5 py-1 text-xs text-secondary-foreground"
+                  >
+                    <span className="max-w-[16rem] truncate">{o}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeOrigin(o)}
+                      className="rounded-full text-muted-foreground transition-colors hover:text-destructive focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                      aria-label={intl.formatMessage({ id: 'settings.system.remoteAccess.remove' }, { origin: o })}
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="mt-2 text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'settings.system.remoteAccess.builtin' })}
+            </p>
+          </div>
         </SettingsCard>
       </SettingsSection>
 

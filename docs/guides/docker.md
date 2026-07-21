@@ -122,6 +122,7 @@ open http://localhost:18789
 | 變數 | 預設 | 說明 |
 |------|------|------|
 | `DUDUCLAW_BIND` | `0.0.0.0` | Gateway 監聽位址。容器內必須 `0.0.0.0` 外部才打得到 |
+| `DUDUCLAW_ALLOWED_ORIGINS` | （空） | Dashboard WebSocket/CORS 的額外允許 `Origin`，逗號分隔。透過 tailnet／反向代理網域開 dashboard 且 WS 被 403 時填這裡（見 [§13 疑難排解](#dashboard-一直轉圈-websocket-403)）。與 config.toml `[gateway] allowed_origins` 合併 |
 
 Port 在 compose 檔內而非 env var，詳見 [§5 Port 設定詳解](#5-port-設定詳解)。
 
@@ -607,6 +608,29 @@ docker compose exec duduclaw claude auth status
 docker compose exec duduclaw duduclaw --version
 # 確認 1.8.22 以上；若非，拉最新 main + 重 build
 ```
+
+### Dashboard 一直轉圈 WebSocket 403
+
+症狀：透過 tailnet（`*.ts.net`）或反向代理網域開 dashboard，HTTP 頁面正常載入，
+但即時資料一直轉圈圈；瀏覽器 DevTools 的 Network 面板可見 `/ws` 升級回 **403**。
+
+原因：WebSocket 的 `Origin` 白名單預設只含 loopback，你的對外網域不在其中。把它
+加進白名單即可：
+
+```bash
+# compose 的 environment: 或 .env
+DUDUCLAW_ALLOWED_ORIGINS=duduclaw.your-tailnet.ts.net,duduclaw.yourdomain.com
+```
+
+或寫進 `~/.duduclaw/config.toml`：
+
+```toml
+[gateway]
+allowed_origins = ["duduclaw.your-tailnet.ts.net"]
+```
+
+重啟後啟動 log 會印出生效的額外 origins。詳見
+[deployment-guide §5 WebSocket Origin 白名單](../deployment-guide.md#websocket-origin-白名單反向代理--tailnet-必讀)。
 
 ### Channel webhook 沒有觸發 agent
 
