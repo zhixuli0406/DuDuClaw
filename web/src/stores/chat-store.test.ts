@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildUserMessageFrame,
+  frameBelongsToConversation,
   historyToMessages,
   isResumeNotFound,
   useChatStore,
@@ -32,6 +33,26 @@ describe('buildUserMessageFrame (L1 per-agent routing)', () => {
     });
     expect(frame.agent).toBe('sales-bot');
     expect(frame.type).toBe('user_message');
+  });
+
+  it('includes the conv nonce when set, omits it when null', () => {
+    const withConv = buildUserMessageFrame({
+      content: 'hi',
+      sessionId: 'webchat:x',
+      agentId: null,
+      attachments: [],
+      convId: 'c-42',
+    });
+    expect(withConv.conv).toBe('c-42');
+
+    const without = buildUserMessageFrame({
+      content: 'hi',
+      sessionId: 'webchat:x',
+      agentId: null,
+      attachments: [],
+      convId: null,
+    });
+    expect('conv' in without).toBe(false);
   });
 
   it('maps attachments to the wire shape', () => {
@@ -99,11 +120,60 @@ describe('isResumeNotFound (WP3 resume miss)', () => {
   });
 });
 
+describe('frameBelongsToConversation (misrouted-reply attribution guard)', () => {
+  it('accepts a frame whose conv matches the current conversation', () => {
+    expect(frameBelongsToConversation('c-1', 'c-1')).toBe(true);
+  });
+
+  it('drops a frame whose conv belongs to a different conversation', () => {
+    // The reported bug: conversation A's reply (conv c-1) arriving while the user
+    // has opened conversation B (c-2) must NOT render into B.
+    expect(frameBelongsToConversation('c-1', 'c-2')).toBe(false);
+  });
+
+  it('accepts untagged frames (legacy gateway / connection-level)', () => {
+    expect(frameBelongsToConversation(undefined, 'c-2')).toBe(true);
+    expect(frameBelongsToConversation(null, 'c-2')).toBe(true);
+    expect(frameBelongsToConversation('', 'c-2')).toBe(true);
+    expect(frameBelongsToConversation(123, 'c-2')).toBe(true);
+  });
+});
+
+describe('conversation nonce lifecycle (misrouted-reply fix)', () => {
+  it('reset() (New conversation) mints a new conv nonce and does not delete the old', () => {
+    useChatStore.setState({
+      ownSessionId: 'webchat:conn-own',
+      sessionId: 'webchat:conn-own',
+      selectedAgentId: null,
+      convId: 'c-old',
+    });
+    useChatStore.getState().reset();
+    const st = useChatStore.getState();
+    expect(st.convId).not.toBe('c-old');
+    expect(st.sessionId).toBe('webchat:conn-own');
+    expect(st.messages).toEqual([]);
+  });
+
+  it('selectAgent() and resumeSession() each bump the conv nonce', () => {
+    useChatStore.setState({
+      ownSessionId: 'webchat:conn-own',
+      sessionId: 'webchat:conn-own',
+      selectedAgentId: null,
+      convId: 'c-base',
+    });
+    useChatStore.getState().selectAgent('sales-bot');
+    const afterSelect = useChatStore.getState().convId;
+    expect(afterSelect).not.toBe('c-base');
+
+    useChatStore.getState().resumeSession('webchat:past-42', []);
+    expect(useChatStore.getState().convId).not.toBe(afterSelect);
+  });
+});
+
 describe('G1 — leaving a resumed session restores the connection own session', () => {
-  // No live socket in the test env, so wsRef stays null: reset() skips the /new
-  // send (guarded on an OPEN socket) and only mutates store state, which is what
-  // these assertions target. We seed `ownSessionId` directly — it is normally
-  // set from the first `session_info` frame over the wire.
+  // reset() / selectAgent() only mutate store state here (no live socket in the
+  // test env). We seed `ownSessionId` directly — it is normally set from the
+  // first `session_info` frame over the wire.
   it('reset() after a resume points sessionId back at ownSessionId', () => {
     useChatStore.setState({
       ownSessionId: 'webchat:conn-own',

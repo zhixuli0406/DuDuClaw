@@ -30,6 +30,7 @@ import {
   type ApprovalItem,
 } from '@/lib/api';
 import { timeAgo } from '@/lib/format';
+import { isImeComposing } from '@/lib/keyboard';
 
 type CurateTab = 'graph' | 'timeline' | 'queue';
 
@@ -328,7 +329,7 @@ function TimelineTab({ agentId, pinnedFact }: { agentId: string; pinnedFact: Fac
           <Input
             value={subject}
             onChange={(e) => setSubject(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && runQuery(subject, predicate)}
+            onKeyDown={(e) => e.key === 'Enter' && !isImeComposing(e) && runQuery(subject, predicate)}
             placeholder={intl.formatMessage({ id: 'curate.timeline.placeholder.subject' })}
           />
         </label>
@@ -337,7 +338,7 @@ function TimelineTab({ agentId, pinnedFact }: { agentId: string; pinnedFact: Fac
           <Input
             value={predicate}
             onChange={(e) => setPredicate(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && runQuery(subject, predicate)}
+            onKeyDown={(e) => e.key === 'Enter' && !isImeComposing(e) && runQuery(subject, predicate)}
             placeholder={intl.formatMessage({ id: 'curate.timeline.placeholder.predicate' })}
           />
         </label>

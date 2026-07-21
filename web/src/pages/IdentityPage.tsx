@@ -18,6 +18,7 @@ import {
   Database,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { isImeComposing } from '@/lib/keyboard';
 import {
   Card,
   CardHeader,
@@ -368,7 +369,7 @@ export function IdentityPage() {
                 value={resolveInput}
                 onChange={(e) => setResolveInput(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter') handleResolve();
+                  if (e.key === 'Enter' && !isImeComposing(e)) handleResolve();
                 }}
               />
             </Field>

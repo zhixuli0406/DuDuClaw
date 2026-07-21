@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type DepartmentInfo } from '@/lib/api';
+import { isImeComposing } from '@/lib/keyboard';
 import { toast, formatError } from '@/lib/toast';
 import { Network, Plus, Trash2, MoreHorizontal, Loader2 } from 'lucide-react';
 import { ConfirmDialog } from '@/components/settings/controls';
@@ -267,7 +268,7 @@ function CreateDepartmentDialog({
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') void handleCreate();
+              if (e.key === 'Enter' && !isImeComposing(e)) void handleCreate();
             }}
             placeholder={intl.formatMessage({ id: 'departments.create.placeholder' })}
             autoFocus

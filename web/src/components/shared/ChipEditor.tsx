@@ -1,6 +1,7 @@
 import { useState, type KeyboardEvent } from 'react';
 import { X, Plus } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { isImeComposing } from '@/lib/keyboard';
 import { Button } from '@/components/mds';
 import { inputClass } from './controlClass';
 
@@ -37,7 +38,8 @@ export function ChipEditor({ values, onChange, placeholder, addLabel }: ChipEdit
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') {
+    // Skip Enter mid-IME-composition (CJK) — it confirms candidates, not add.
+    if (e.key === 'Enter' && !isImeComposing(e)) {
       e.preventDefault();
       add();
     }

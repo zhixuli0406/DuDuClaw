@@ -5,6 +5,7 @@ import { useChatStore, historyToMessages, type PendingAttachment } from '@/store
 import { api, type ChatSessionSummary } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
 import { cn } from '@/lib/utils';
+import { isImeComposing } from '@/lib/keyboard';
 import { Plus, Paperclip, Eye, EyeOff, MessagesSquare, ArrowLeft, PanelLeftOpen } from 'lucide-react';
 import { toast } from '@/lib/toast';
 import {
@@ -57,6 +58,7 @@ export function WebChatPage() {
     ttsEnabled,
     setTtsEnabled,
     sessionId,
+    sessionsRevision,
     connect,
     send,
     reset,
@@ -142,6 +144,14 @@ export function WebChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyAgentId, connectionState]);
 
+  // Refresh the list whenever a reply lands (`sessionsRevision` bumps once per
+  // completed turn) so a just-created conversation appears — and stays
+  // resumable — without a manual reload.
+  useEffect(() => {
+    if (sessionsRevision > 0 && connectionState === 'connected') void loadSessions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionsRevision]);
+
   const handleResume = async (session: ChatSessionSummary) => {
     try {
       const hist = await api.chatSessions.history(session.session_id);
@@ -187,7 +197,10 @@ export function WebChatPage() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Ignore Enter while a CJK IME is composing (注音/拼音): the first Enter
+    // confirms candidate selection, not send — otherwise a half-composed message
+    // is dispatched. See `isImeComposing`.
+    if (e.key === 'Enter' && !e.shiftKey && !isImeComposing(e)) {
       e.preventDefault();
       handleSend();
     }

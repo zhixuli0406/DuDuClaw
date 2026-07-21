@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { cn } from '@/lib/utils';
+import { isImeComposing } from '@/lib/keyboard';
 
 /**
  * InlineEditor — click-to-edit text (paperclip P2 title/description). Shows the
@@ -85,7 +86,8 @@ export function InlineEditor({
     if (e.key === 'Escape') {
       e.preventDefault();
       cancel();
-    } else if (e.key === 'Enter' && (!multiline || e.metaKey || e.ctrlKey)) {
+    } else if (e.key === 'Enter' && !isImeComposing(e) && (!multiline || e.metaKey || e.ctrlKey)) {
+      // Skip commit while a CJK IME is composing — Enter confirms candidates.
       e.preventDefault();
       commit();
     }
