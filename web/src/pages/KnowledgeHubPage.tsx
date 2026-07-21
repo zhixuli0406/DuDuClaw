@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
+import { isImeComposing } from '@/lib/keyboard';
 import {
   api,
   type WikiPageMeta,
@@ -375,7 +376,7 @@ function SearchView({ agentId }: { agentId: string }) {
         <Input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+          onKeyDown={(e) => e.key === 'Enter' && !isImeComposing(e) && handleSearch()}
           placeholder={intl.formatMessage({ id: 'wiki.search.placeholder' })}
           className="pl-8"
         />

@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { Send, Loader2, Plus, AudioLines } from 'lucide-react';
 import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
 import { isImageMime, readAttachment } from '@/lib/attachments';
+import { isImeComposing } from '@/lib/keyboard';
 import { AttachmentChip } from '@/components/chat';
 import { toast } from '@/lib/toast';
 import { cn } from '@/lib/utils';
@@ -43,7 +44,9 @@ export function PromptBar({ onSent }: { onSent?: () => void }) {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Skip Enter while a CJK IME is composing — the first Enter confirms
+    // candidate selection, not send. See `isImeComposing`.
+    if (e.key === 'Enter' && !e.shiftKey && !isImeComposing(e)) {
       e.preventDefault();
       handleSend();
     }

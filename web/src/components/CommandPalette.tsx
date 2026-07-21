@@ -16,6 +16,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { isImeComposing } from '@/lib/keyboard';
 import { fuzzyMatch, highlightSegments } from '@/lib/fuzzy';
 import { dailyItems, navGroups, manageNav, manageEntry, type NavItem } from '@/components/layout/nav-model';
 import { hasMinRole } from '@/lib/roles';
@@ -273,7 +274,9 @@ export function CommandPalette() {
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       setActiveIndex((i) => (results.length === 0 ? 0 : (i - 1 + results.length) % results.length));
-    } else if (e.key === 'Enter') {
+    } else if (e.key === 'Enter' && !isImeComposing(e)) {
+      // Skip while a CJK IME is composing the filter text — Enter confirms the
+      // candidate, it must not fire the highlighted command.
       e.preventDefault();
       run(results[activeIndex]);
     }

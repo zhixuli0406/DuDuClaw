@@ -130,6 +130,27 @@ interface ChatStore {
    * session) or the next send (read by the server as a cross-agent resume).
    */
   readonly ownSessionId: string | null;
+  /**
+   * The conversation nonce for the conversation currently open (bumped on every
+   * `/new`, partner switch, and resume). Sent on each `user_message` as `conv`;
+   * the gateway (a) scopes the turn to its own server-side session bucket
+   * (`…#conv:<nonce>`) and (b) echoes it on every reply frame. The socket loop
+   * drops any reply frame whose `conv` differs from this — so a long task started
+   * in conversation A finishes into A's history, not into a conversation B the
+   * user opened while it was still running.
+   */
+  readonly convId: string;
+  /**
+   * Monotonic counter bumped once per completed reply (`assistant_done`) for ANY
+   * conversation — including one whose frames were dropped by the attribution
+   * guard. The WebChat page watches it to refresh the past-conversation list, so
+   * a brand-new conversation (and its title) shows up the moment its first reply
+   * lands, instead of only after a manual reload. Without this, opening a new
+   * conversation B, letting it finish, then returning to A left B unreachable
+   * (its `…#conv:<nonce>` session existed server-side but never appeared in the
+   * list to be resumed).
+   */
+  readonly sessionsRevision: number;
   readonly agentName: string;
   readonly agentIcon: string;
   /** The AI staff member currently chosen as the conversation partner, or null
@@ -179,25 +200,40 @@ function nextId(): string {
   return `msg-${Date.now()}-${msgCounter}`;
 }
 
+let convCounter = 0;
+
+/** Mint a fresh conversation nonce. Kept short and `[A-Za-z0-9_-]`-only so it
+ *  survives the gateway's `sanitize_conv_nonce` unchanged. */
+function nextConvId(): string {
+  convCounter += 1;
+  return `c-${Date.now().toString(36)}-${convCounter}`;
+}
+
 /**
  * Assemble the `user_message` wire frame (pure — exported for tests).
  *
  * L1: `agent` is included only when a partner is selected; for the default
  * assistant the key is omitted entirely so the wire stays byte-compatible with
  * the pre-L1 protocol (the gateway treats absent === default agent).
+ *
+ * `conv` is the conversation nonce (see `ChatStore.convId`) — included when set
+ * so the gateway scopes the turn to its own session bucket and echoes it back on
+ * every reply frame for attribution. Omitted when null (legacy single-bucket).
  */
 export function buildUserMessageFrame(opts: {
   content: string;
   sessionId: string | null;
   agentId: string | null;
   attachments: readonly PendingAttachment[];
+  convId?: string | null;
 }): Record<string, unknown> {
-  const { content, sessionId, agentId, attachments } = opts;
+  const { content, sessionId, agentId, attachments, convId } = opts;
   return {
     type: 'user_message',
     content,
     session_id: sessionId,
     ...(agentId ? { agent: agentId } : {}),
+    ...(convId ? { conv: convId } : {}),
     attachments: attachments.map((a) => ({
       filename: a.name,
       mime: a.mime,
@@ -241,9 +277,29 @@ export function isResumeNotFound(message: string | null | undefined): boolean {
   return /conversation not found/i.test(String(message ?? ''));
 }
 
+/**
+ * Decide whether a reply frame belongs to the conversation currently open, so a
+ * long task started in conversation A doesn't render into a conversation B the
+ * user switched to while it ran. Pure — exported for tests.
+ *
+ *  - An untagged frame (`conv` absent — legacy gateway) is always accepted.
+ *  - A tagged frame is accepted only when its `conv` equals `currentConvId`;
+ *    otherwise it belongs to another conversation and is dropped from the view
+ *    (the gateway has already persisted it to that conversation's own history).
+ */
+export function frameBelongsToConversation(frameConv: unknown, currentConvId: string): boolean {
+  if (typeof frameConv !== 'string' || frameConv.length === 0) return true;
+  return frameConv === currentConvId;
+}
+
 // Module-level WebSocket reference — kept outside Zustand to avoid
 // serialization issues and enable reconnection logic.
 let wsRef: WebSocket | null = null;
+
+// True between "user message sent" and "first server frame for that turn".
+// The first frame confirms the server has persisted the user message, so the
+// sessions list is refreshed once more (see the bump in `send`).
+let awaitingFirstServerFrame = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempt = 0;
 let intentionalDisconnect = false;
@@ -278,7 +334,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
     if (wsRef && wsRef.readyState === WebSocket.OPEN) return;
 
     intentionalDisconnect = false;
-    set({ connectionState: 'connecting', ownSessionId: null });
+    // A fresh connection re-derives its own server session id, so start a fresh
+    // conversation nonce too (the previous connection's buckets are unreachable
+    // once the server mints a new suffix).
+    set({ connectionState: 'connecting', ownSessionId: null, convId: nextConvId() });
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws/chat`;
@@ -304,6 +363,38 @@ export const useChatStore = create<ChatStore>((set, get) => {
     socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        // A finished reply — for ANY conversation, even one whose frames are
+        // about to be dropped below — changed the server-side session list
+        // (created/updated a session bucket). Signal the page to refresh the
+        // list so the conversation becomes resumable right away.
+        if (data.type === 'assistant_done') {
+          set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
+        } else if (
+          awaitingFirstServerFrame &&
+          (data.type === 'assistant_chunk' ||
+            data.type === 'step' ||
+            data.type === 'progress')
+        ) {
+          // First server frame after a send: the user message is now
+          // persisted server-side — refresh the list once (persistence-
+          // confirmed complement to the optimistic bump in `send`).
+          awaitingFirstServerFrame = false;
+          set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
+        }
+        // Attribution guard: drop reply frames (chunk/step/progress/done) that
+        // belong to a conversation the user has since left. `session_info` and
+        // `error` are connection-level (untagged) and pass through. Without this,
+        // a long task from conversation A would render into conversation B when it
+        // finishes after the user opened B — the reported bug.
+        if (
+          (data.type === 'assistant_chunk' ||
+            data.type === 'step' ||
+            data.type === 'progress' ||
+            data.type === 'assistant_done') &&
+          !frameBelongsToConversation(data.conv, get().convId)
+        ) {
+          return;
+        }
         switch (data.type) {
           case 'session_info':
             // The first session_info after a fresh connect is this connection's
@@ -490,6 +581,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
     viseme: REST_VISEME,
     sessionId: null,
     ownSessionId: null,
+    convId: nextConvId(),
+    sessionsRevision: 0,
     agentName: effectiveName(),
     agentIcon: effectiveLogoGlyph(),
     selectedAgentId: null,
@@ -524,6 +617,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
         isStreaming: false,
         phase: 'idle',
         viseme: REST_VISEME,
+        // Fresh conversation with the new partner — bump the nonce so any reply
+        // still in flight for the previous partner is dropped from this view.
+        convId: nextConvId(),
         // Restore the active session to this connection's own id. If we were
         // viewing a resumed historical conversation, its `sessionId` belongs to
         // the previous partner; keeping it would make the next send read as a
@@ -542,6 +638,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
         isStreaming: false,
         phase: 'idle',
         viseme: REST_VISEME,
+        // Fresh view token for the resumed conversation so a reply in flight for
+        // the conversation we just left is dropped from this view. (The resumed
+        // turn continues the stored session id server-side; `conv` here is only
+        // the attribution tag, echoed back on reply frames.)
+        convId: nextConvId(),
       });
     },
 
@@ -591,31 +692,35 @@ export const useChatStore = create<ChatStore>((set, get) => {
             sessionId: get().sessionId,
             agentId: get().selectedAgentId,
             attachments: atts,
+            convId: get().convId,
           }),
         ),
       );
+
+      // The user message is what creates/updates the server-side session
+      // bucket — the conversation should appear in the list as soon as the
+      // input lands, not only after the reply completes. The sessions.list
+      // RPC travels over a different socket than the chat frame, so a
+      // just-sent message may not be persisted yet when an immediate fetch
+      // arrives; the first server frame for this turn bumps again as a
+      // persistence-confirmed refresh (see onmessage).
+      awaitingFirstServerFrame = true;
+      set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
     },
 
     reset: () => {
-      const { ownSessionId, sessionId, selectedAgentId } = get();
-      // The "new conversation" button always operates on THIS connection's own
-      // session, never a resumed historical one — otherwise /new would archive
-      // the conversation we were merely viewing (its owner is a different
-      // session/agent). Fall back to the current sessionId only before the first
-      // session_info has established our own id. Include the selected agent so
-      // the gateway clears the SAME per-agent session (else /new would wipe the
-      // default session, not the employee's).
+      const { ownSessionId, sessionId } = get();
+      // "New conversation" simply starts a fresh conversation nonce: the next
+      // message lands in a brand-new server-side session bucket
+      // (`…#conv:<newNonce>`), which is empty, so the AI starts fresh — while the
+      // PREVIOUS conversation is preserved (and resumable from the list), not
+      // deleted. It deliberately does NOT send `/new`: (1) a destructive
+      // delete_session would wipe a conversation whose long task may still be
+      // running, and (2) that in-flight reply, echoed with the OLD nonce, is now
+      // dropped from this view by the attribution guard instead of leaking here.
+      // The active session id points back at this connection's own base id so the
+      // next send is a new-conversation turn (not a resume of a historical one).
       const target = ownSessionId ?? sessionId;
-      if (wsRef && wsRef.readyState === WebSocket.OPEN && target) {
-        wsRef.send(
-          JSON.stringify({
-            type: 'user_message',
-            content: '/new',
-            session_id: target,
-            ...(selectedAgentId ? { agent: selectedAgentId } : {}),
-          })
-        );
-      }
       clearVisemeIdle();
       set({
         messages: [],
@@ -624,9 +729,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
         isStreaming: false,
         phase: 'idle',
         viseme: REST_VISEME,
-        // Point the active session back at our own conversation so the next
-        // message continues the fresh thread, not the resumed historical one.
         sessionId: target,
+        convId: nextConvId(),
       });
     },
   };

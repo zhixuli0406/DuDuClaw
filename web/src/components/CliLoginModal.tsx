@@ -8,6 +8,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { isImeComposing } from '@/lib/keyboard';
 import { client } from '@/lib/ws-client';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, Button, Input } from '@/components/mds';
 
@@ -258,7 +259,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') {
+                if (e.key === 'Enter' && !isImeComposing(e)) {
                   e.preventDefault();
                   void sendInput();
                 }

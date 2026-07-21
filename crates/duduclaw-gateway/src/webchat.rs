@@ -54,6 +54,16 @@ pub enum ChatMessage {
         /// prompt, mirroring the channel attachment pipeline (Telegram/LINE).
         #[serde(default)]
         attachments: Vec<ChatAttachment>,
+        /// Client conversation nonce (dashboard "conversation" id). Two roles:
+        /// ① scopes this turn to its own server-side session bucket
+        /// (`…#conv:<nonce>`), so an in-flight reply from conversation A persists
+        /// to A's history and never bleeds into a freshly-opened conversation B;
+        /// ② echoed back verbatim on every reply frame so the browser renders the
+        /// reply into the conversation that started it — not whichever
+        /// conversation happens to be open when a long task finishes. Absent →
+        /// byte-compatible single-bucket behaviour (pre-fix clients).
+        #[serde(default)]
+        conv: Option<String>,
     },
     /// Server → Client: assistant response chunk (streaming).
     #[serde(rename = "assistant_chunk")]
@@ -74,6 +84,11 @@ pub enum ChatMessage {
         /// File path / search pattern extracted from the tool input, if any.
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// Conversation nonce this progress belongs to (echoed from the
+        /// originating `user_message`). The browser drops frames whose `conv`
+        /// differs from the conversation currently open — see `UserMessage.conv`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conv: Option<String>,
     },
     /// Server → Client: a tool-step boundary in the agent's live task tree
     /// (openhuman-parity project C-P1). Emitted per `tool_use` block (start)
@@ -104,12 +119,21 @@ pub enum ChatMessage {
         summary: Option<String>,
         depth: usize,
         ts: u64,
+        /// Conversation nonce this step belongs to (echoed from the originating
+        /// `user_message`) — see `UserMessage.conv`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conv: Option<String>,
     },
     /// Server → Client: assistant finished responding.
     #[serde(rename = "assistant_done")]
     AssistantDone {
         content: String,
         tokens_used: u32,
+        /// Conversation nonce this reply belongs to (echoed from the originating
+        /// `user_message`). The browser renders it into that conversation only —
+        /// see `UserMessage.conv`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conv: Option<String>,
     },
     /// Server → Client: error occurred.
     #[serde(rename = "error")]
@@ -358,7 +382,12 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                         };
 
                         match chat_msg {
-                            ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments } => {
+                            ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments, conv } => {
+                                // Sanitize the client conversation nonce once —
+                                // it scopes the session bucket AND is echoed on
+                                // every reply frame so the browser attributes the
+                                // reply to the conversation that started it.
+                                let conv_nonce = sanitize_conv_nonce(conv.as_deref());
                                 // ── L1: resolve the requested conversation partner ──
                                 // A non-empty `agent` must resolve to a loaded
                                 // agent; an unknown id fails closed with an error
@@ -537,17 +566,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     }
                                 } else {
                                     // New / continue the current connection's
-                                    // session. Per-agent session isolation: append
-                                    // an `#agent:<id>` suffix so employee A's
-                                    // context never leaks into employee B's session.
-                                    // The channel prefix (split at ':') stays
-                                    // "webchat" so the access gate still classifies
-                                    // it. Default path keeps the bare id.
-                                    let base_sid: &str = session_id.as_str();
-                                    sid_owned = match &effective_agent {
-                                        Some(a) => format!("{base_sid}#agent:{a}"),
-                                        None => base_sid.to_string(),
-                                    };
+                                    // session. Compose the per-agent, per-conversation
+                                    // session id — this id IS the isolation boundary
+                                    // (see `compose_session_id`).
+                                    sid_owned = compose_session_id(
+                                        session_id.as_str(),
+                                        effective_agent.as_deref(),
+                                        conv_nonce.as_deref(),
+                                    );
                                     sid = &sid_owned;
                                 }
 
@@ -579,6 +605,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         let done = ChatMessage::AssistantDone {
                                             content: reply,
                                             tokens_used: 0,
+                                            conv: conv_nonce.clone(),
                                         };
                                         if let Ok(json) = serde_json::to_string(&done) {
                                             let _ = sink.send(Message::Text(json.into())).await;
@@ -630,12 +657,15 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             let msg = match ev {
                                                 ProgressEvent::ToolUse { tool, detail } => ChatMessage::Progress {
                                                     content, kind: Some("tool".into()), tool: Some(tool), detail,
+                                                    conv: conv_nonce.clone(),
                                                 },
                                                 ProgressEvent::TodoUpdate { .. } => ChatMessage::Progress {
                                                     content, kind: Some("todo".into()), tool: None, detail: None,
+                                                    conv: conv_nonce.clone(),
                                                 },
                                                 ProgressEvent::Keepalive => ChatMessage::Progress {
                                                     content, kind: Some("keepalive".into()), tool: None, detail: None,
+                                                    conv: conv_nonce.clone(),
                                                 },
                                                 // C-P1: structured step boundary → dedicated `step` frame.
                                                 ProgressEvent::Step(step) => ChatMessage::Step {
@@ -644,6 +674,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                     summary: step.summary,
                                                     depth: step.depth,
                                                     ts: step.ts_ms,
+                                                    conv: conv_nonce.clone(),
                                                 },
                                             };
                                             if let Ok(json) = serde_json::to_string(&msg) {
@@ -663,6 +694,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let done = ChatMessage::AssistantDone {
                                     content: reply,
                                     tokens_used: tokens,
+                                    conv: conv_nonce.clone(),
                                 };
                                 if let Ok(json) = serde_json::to_string(&done) {
                                     if sink.send(Message::Text(json.into())).await.is_err() {
@@ -748,6 +780,57 @@ async fn build_session_info_frame(
         supports_vision,
         model: model_id,
     }
+}
+
+/// Sanitize a client-supplied conversation nonce (dashboard "conversation" id).
+///
+/// The nonce (a) scopes a webchat turn to its own server-side session bucket and
+/// (b) is echoed on every reply frame so the browser attributes a finished reply
+/// to the conversation that started it. Because it is interpolated into a session
+/// id, it must not carry the `:` / `#` structural separators nor arbitrary text:
+/// keep only `[A-Za-z0-9_-]`, cap the length, and return `None` for empty/garbage
+/// so the caller falls back to the connection's default single-bucket behaviour.
+fn sanitize_conv_nonce(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Compose the per-conversation server-side session id from the connection's
+/// base session id, the (optional) routed agent, and the (optional, already
+/// sanitized) conversation nonce.
+///
+/// Isolation invariant (the reason this is a named, tested function rather than
+/// inline formatting): two dashboard conversations on the same connection must
+/// land in DIFFERENT session buckets so their histories never mix. The channel
+/// reply path derives the model's context solely from
+/// `SessionManager::get_messages(session_id)` and folds it into the prompt — the
+/// fresh-spawn `claude -p` path carries NO CLI-side session state (the legacy
+/// `--resume` path was removed). This id is therefore the ONLY isolation
+/// boundary: a distinct `#conv:<nonce>` yields a distinct history bucket; an
+/// absent nonce keeps the byte-compatible single-bucket id (backward compatible
+/// with clients that don't send one). The channel prefix (everything before the
+/// first `:`) stays `webchat` so the access gate still classifies it.
+fn compose_session_id(base: &str, agent: Option<&str>, conv_nonce: Option<&str>) -> String {
+    let mut composed = base.to_string();
+    if let Some(a) = agent {
+        composed = format!("{composed}#agent:{a}");
+    }
+    if let Some(c) = conv_nonce {
+        composed = format!("{composed}#conv:{c}");
+    }
+    composed
 }
 
 /// Decode, size-check, and persist WebChat attachments to `<home>/attachments/`,
@@ -895,6 +978,95 @@ mod tests {
         assert_eq!(agent, None);
     }
 
+    // ── Conversation-nonce attribution (misrouted-reply fix) ────────
+
+    #[test]
+    fn user_message_carries_conv_nonce() {
+        // The frame parses the `conv` view/bucket token.
+        let msg: ChatMessage = serde_json::from_str(
+            r#"{"type":"user_message","content":"hi","session_id":"webchat:x","conv":"c-42"}"#,
+        )
+        .expect("parse");
+        match msg {
+            ChatMessage::UserMessage { conv, .. } => assert_eq!(conv.as_deref(), Some("c-42")),
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_message_without_conv_is_none() {
+        // Legacy frame (no `conv`) → None → single-bucket byte-compatible path.
+        let msg: ChatMessage =
+            serde_json::from_str(r#"{"type":"user_message","content":"hi","session_id":"webchat:x"}"#)
+                .expect("parse");
+        match msg {
+            ChatMessage::UserMessage { conv, .. } => assert_eq!(conv, None),
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_done_echoes_conv_and_skips_when_absent() {
+        // With a nonce, the wire carries `conv` so the browser can attribute the
+        // reply to the originating conversation.
+        let with = ChatMessage::AssistantDone {
+            content: "done".into(),
+            tokens_used: 3,
+            conv: Some("c-42".into()),
+        };
+        let json = serde_json::to_string(&with).expect("serialize");
+        assert!(json.contains(r#""conv":"c-42""#), "conv must be on the wire: {json}");
+
+        // Without a nonce, `conv` is omitted entirely (old-client compatible).
+        let without = ChatMessage::AssistantDone {
+            content: "done".into(),
+            tokens_used: 3,
+            conv: None,
+        };
+        let json = serde_json::to_string(&without).expect("serialize");
+        assert!(!json.contains("conv"), "absent conv must not serialize: {json}");
+    }
+
+    #[test]
+    fn sanitize_conv_nonce_keeps_safe_chars() {
+        assert_eq!(sanitize_conv_nonce(Some("c-42_AbZ")).as_deref(), Some("c-42_AbZ"));
+    }
+
+    #[test]
+    fn sanitize_conv_nonce_strips_separators_and_garbage() {
+        // `:` / `#` (session-id separators) and other punctuation are removed so
+        // a client can never inject extra bucket structure or break the id.
+        assert_eq!(sanitize_conv_nonce(Some("a:b#c/d e")).as_deref(), Some("abcde"));
+    }
+
+    #[test]
+    fn sanitize_conv_nonce_rejects_empty_and_pure_garbage() {
+        assert_eq!(sanitize_conv_nonce(None), None);
+        assert_eq!(sanitize_conv_nonce(Some("")), None);
+        assert_eq!(sanitize_conv_nonce(Some("   ")), None);
+        assert_eq!(sanitize_conv_nonce(Some("::##")), None);
+    }
+
+    #[test]
+    fn sanitize_conv_nonce_caps_length() {
+        let long = "a".repeat(200);
+        assert_eq!(sanitize_conv_nonce(Some(&long)).map(|s| s.len()), Some(64));
+    }
+
+    #[test]
+    fn conv_bucket_id_is_distinct_per_conversation_and_owned() {
+        // Two conversations on the same connection compose distinct buckets, both
+        // still owned by (prefixed with) the connection's session id — so the
+        // resume-ownership guard (`starts_with("{session_id}#")`) accepts them.
+        let connection = "webchat:webchat:127.0.0.1:00c7766f";
+        let a = format!("{connection}#conv:{}", sanitize_conv_nonce(Some("A1")).unwrap());
+        let b = format!("{connection}#conv:{}", sanitize_conv_nonce(Some("B2")).unwrap());
+        assert_ne!(a, b, "distinct conversations → distinct session buckets");
+        assert!(a.starts_with(&format!("{connection}#")));
+        assert!(b.starts_with(&format!("{connection}#")));
+        assert_eq!(a.split(':').next(), Some("webchat"), "channel prefix preserved");
+    }
+
     #[test]
     fn per_agent_session_suffix_preserves_channel_prefix() {
         // The suffix used for session isolation must keep "webchat" as the
@@ -903,6 +1075,46 @@ mod tests {
         let suffixed = format!("{base}#agent:sales-bot");
         assert_eq!(suffixed.split(':').next(), Some("webchat"));
         assert_ne!(suffixed, base, "distinct agents get distinct session ids");
+    }
+
+    #[test]
+    fn compose_session_id_differs_per_conv_nonce() {
+        // The `-p` fresh-spawn isolation guarantee: same connection, same agent,
+        // two different conversation nonces MUST produce different session ids so
+        // their `get_messages(session_id)` history buckets never mix.
+        let base = "webchat:webchat:127.0.0.1:00c7766f";
+        let a = compose_session_id(base, Some("sales-bot"), Some("A1"));
+        let b = compose_session_id(base, Some("sales-bot"), Some("B2"));
+        assert_ne!(a, b, "distinct conv nonce → distinct session bucket");
+        assert_eq!(a, "webchat:webchat:127.0.0.1:00c7766f#agent:sales-bot#conv:A1");
+    }
+
+    #[test]
+    fn compose_session_id_is_stable_for_same_conv() {
+        // Same inputs → byte-identical id (deterministic history bucket across
+        // turns of one conversation).
+        let base = "webchat:x";
+        let first = compose_session_id(base, Some("bot"), Some("c-42"));
+        let second = compose_session_id(base, Some("bot"), Some("c-42"));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn compose_session_id_absent_nonce_is_single_bucket() {
+        // No nonce → byte-compatible with clients that don't send one. No `#conv`
+        // segment appended.
+        let base = "webchat:x";
+        assert_eq!(compose_session_id(base, None, None), "webchat:x");
+        assert_eq!(compose_session_id(base, Some("bot"), None), "webchat:x#agent:bot");
+        assert!(!compose_session_id(base, Some("bot"), None).contains("#conv:"));
+    }
+
+    #[test]
+    fn compose_session_id_preserves_channel_prefix() {
+        // Channel prefix (before the first `:`) must stay "webchat" so the access
+        // gate still classifies the session.
+        let composed = compose_session_id("webchat:peer:abcd", Some("bot"), Some("c1"));
+        assert_eq!(composed.split(':').next(), Some("webchat"));
     }
 
     #[test]

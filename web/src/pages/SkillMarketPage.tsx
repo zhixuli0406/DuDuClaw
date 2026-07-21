@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
+import { isImeComposing } from '@/lib/keyboard';
 import { api, type SkillIndexEntry, type SharedSkillInfo, type SkillInfo, type SkillLeaderboardEntry } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -166,7 +167,7 @@ export function SkillMarketPage() {
                 activeTab === 'market' ? setQuery(e.target.value) : setMineFilter(e.target.value)
               }
               onKeyDown={(e) => {
-                if (activeTab === 'market' && e.key === 'Enter') runSearch(query);
+                if (activeTab === 'market' && e.key === 'Enter' && !isImeComposing(e)) runSearch(query);
               }}
               placeholder={intl.formatMessage({
                 id: activeTab === 'market' ? 'skills.market.searchPlaceholder' : 'skills.my.filterPlaceholder',
@@ -463,7 +464,7 @@ function UrlImportDialog({
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') handleContinue();
+              if (e.key === 'Enter' && !isImeComposing(e)) handleContinue();
             }}
             placeholder="https://github.com/user/repo"
             autoFocus

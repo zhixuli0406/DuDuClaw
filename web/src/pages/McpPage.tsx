@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
+import { isImeComposing } from '@/lib/keyboard';
 import { useMcpStore } from '@/stores/mcp-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -662,7 +663,7 @@ function ImportFromUrlDialog({
                 type="url"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleFetch(); }}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !isImeComposing(e)) handleFetch(); }}
                 placeholder="https://github.com/user/mcp-server-repo"
                 autoFocus
               />
