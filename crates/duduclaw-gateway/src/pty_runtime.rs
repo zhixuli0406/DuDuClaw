@@ -151,6 +151,156 @@ pub fn is_pty_retry_disabled() -> bool {
     is_env_truthy("DUDUCLAW_PTY_DISABLE_RETRY")
 }
 
+/// Absolute **hard cap** for the OAuth **interactive-REPL** PTY path (seconds).
+///
+/// **Semantics change (2026-07-21)**: `pty_interactive_timeout_secs` used to be
+/// a fixed 180 s deadline that killed the turn regardless of activity — which
+/// false-killed long-but-working tasks (multi-minute tool calls, agentic work)
+/// and forced a fresh-spawn re-run that duplicated side effects. It is now the
+/// absolute wall-clock **hard cap** / safety net, defaulting to 1800 s (30 min)
+/// to match the fresh-spawn `HARD_MAX_TIMEOUT`. The everyday "is this session
+/// wedged?" decision is made by **stall detection** ([`PTY_INTERACTIVE_IDLE_SECS`]),
+/// which fails fast into the fresh-spawn fallback when no substantive progress
+/// appears for the idle window. A user-set `pty_interactive_timeout_secs` still
+/// wins (e.g. to keep the old aggressive 180 s cap).
+pub const PTY_INTERACTIVE_DEADLINE_SECS: u64 = 1800;
+
+/// Default **idle/stall** window for the interactive-REPL path (seconds).
+///
+/// If the REPL emits no *substantive progress* (token counter rising / new
+/// prose — see `duduclaw_cli_runtime::progress`) for this long, the turn fails
+/// early with `InvokeStall` and the caller falls back to fresh-spawn. 120 s is
+/// calibrated from live Claude Code 2.1.173 captures (2026-07-21): a genuine
+/// tool call (e.g. a `sleep`) froze the token counter for ~33 s, and pre-first-
+/// token latency is a few seconds — 120 s comfortably tolerates both while
+/// still killing a truly wedged REPL in ~2 min instead of the old 180 s (now
+/// 1800 s) blanket cap. Chosen conservatively (toward not false-killing) because
+/// a mid-task fallback re-run can re-execute side effects.
+pub const PTY_INTERACTIVE_IDLE_SECS: u64 = 120;
+
+/// Resolve the interactive-REPL **hard cap** (seconds). Precedence:
+/// 1. `DUDUCLAW_PTY_INTERACTIVE_TIMEOUT_SECS` env (emergency override);
+/// 2. `agent.toml [runtime] pty_interactive_timeout_secs`;
+/// 3. [`PTY_INTERACTIVE_DEADLINE_SECS`] (1800).
+///
+/// Non-positive / unparseable values at any layer are ignored (fall through).
+/// Pure — takes the raw env value + raw `agent.toml` text so it is unit-testable
+/// without touching the filesystem or process env.
+pub fn resolve_interactive_deadline_secs(
+    env_override: Option<&str>,
+    agent_toml_text: Option<&str>,
+) -> u64 {
+    if let Some(secs) = env_override
+        .map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+    {
+        return secs;
+    }
+    if let Some(secs) = agent_toml_text
+        .and_then(|t| t.parse::<toml::Value>().ok())
+        .as_ref()
+        .and_then(|v| v.get("runtime"))
+        .and_then(|r| r.get("pty_interactive_timeout_secs"))
+        .and_then(|x| x.as_integer())
+        .filter(|s| *s > 0)
+    {
+        return secs as u64;
+    }
+    PTY_INTERACTIVE_DEADLINE_SECS
+}
+
+/// Resolve the interactive-REPL **idle/stall window** (seconds). Precedence:
+/// 1. `DUDUCLAW_PTY_IDLE_TIMEOUT_SECS` env (emergency override);
+/// 2. `agent.toml [runtime] pty_idle_timeout_secs`;
+/// 3. [`PTY_INTERACTIVE_IDLE_SECS`] (120).
+///
+/// Same shape / same ignore-non-positive rule as
+/// [`resolve_interactive_deadline_secs`].
+pub fn resolve_interactive_idle_secs(
+    env_override: Option<&str>,
+    agent_toml_text: Option<&str>,
+) -> u64 {
+    if let Some(secs) = env_override
+        .map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+    {
+        return secs;
+    }
+    if let Some(secs) = agent_toml_text
+        .and_then(|t| t.parse::<toml::Value>().ok())
+        .as_ref()
+        .and_then(|v| v.get("runtime"))
+        .and_then(|r| r.get("pty_idle_timeout_secs"))
+        .and_then(|x| x.as_integer())
+        .filter(|s| *s > 0)
+    {
+        return secs as u64;
+    }
+    PTY_INTERACTIVE_IDLE_SECS
+}
+
+/// Interactive-REPL **hard cap** for an agent, reading `agent.toml [runtime]
+/// pty_interactive_timeout_secs` (with the env override). Missing dir / file /
+/// key ⇒ the 1800 s default.
+pub fn interactive_repl_deadline(agent_dir: Option<&Path>) -> Duration {
+    let env_override = std::env::var("DUDUCLAW_PTY_INTERACTIVE_TIMEOUT_SECS").ok();
+    let toml_text =
+        agent_dir.and_then(|d| std::fs::read_to_string(d.join("agent.toml")).ok());
+    Duration::from_secs(resolve_interactive_deadline_secs(
+        env_override.as_deref(),
+        toml_text.as_deref(),
+    ))
+}
+
+/// Interactive-REPL **idle/stall window** for an agent, reading `agent.toml
+/// [runtime] pty_idle_timeout_secs` (with the env override). Missing dir / file
+/// / key ⇒ the 120 s default.
+pub fn interactive_repl_idle_timeout(agent_dir: Option<&Path>) -> Duration {
+    let env_override = std::env::var("DUDUCLAW_PTY_IDLE_TIMEOUT_SECS").ok();
+    let toml_text =
+        agent_dir.and_then(|d| std::fs::read_to_string(d.join("agent.toml")).ok());
+    Duration::from_secs(resolve_interactive_idle_secs(
+        env_override.as_deref(),
+        toml_text.as_deref(),
+    ))
+}
+
+/// Classify a PTY-pool fallback error string into a stable `reason` token plus a
+/// `mid_task` flag (whether substantive progress was observed before the
+/// failure — a fallback re-run may then re-execute side effects).
+///
+/// Reasons: `"stall"`, `"hard_cap"`, `"boot"`, `"other"`. Driven off the
+/// `SessionError` Display strings (see `duduclaw_cli_runtime::error`), which
+/// carry `(mid_task=<bool>)` for the two interactive-timeout variants. Pure +
+/// unit-tested so the classification contract is pinned.
+pub fn classify_fallback_reason(err: &str) -> (&'static str, bool) {
+    let low = err.to_ascii_lowercase();
+    let mid_task = low.contains("mid_task=true");
+    let reason = if low.contains("stalled") {
+        "stall"
+    } else if low.contains("hard cap") {
+        "hard_cap"
+    } else if low.contains("boot timed out") {
+        "boot"
+    } else {
+        "other"
+    };
+    (reason, mid_task)
+}
+
+/// True when a PTY-pool invocation error is worth retrying on the fresh-spawn
+/// `claude -p` path. The interactive REPL can wedge (boot screen, dropped
+/// sentinel, empty payload) in ways fresh-spawn is immune to, and the user's
+/// OAuth account is known to work under `claude -p`, so almost every failure
+/// merits the fallback. The one exception is a MoA config error, which
+/// fresh-spawn would reject identically — no point double-attempting.
+pub fn pty_pool_error_should_fallback(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    !lower.contains("moa:") && !lower.contains("moa 模型")
+}
+
 fn is_env_truthy(var: &str) -> bool {
     matches!(
         std::env::var(var)
@@ -379,15 +529,36 @@ pub fn is_managed_worker_active() -> bool {
 pub struct InvokeOptions<'a> {
     pub acquire: AcquireOptions<'a>,
     pub prompt: &'a str,
-    pub deadline: Duration,
+    /// Absolute wall-clock **hard cap** (safety net).
+    pub hard_cap: Duration,
+    /// Idle/stall window. `Some` ⇒ stall detection on (interactive REPL fails
+    /// early if no substantive progress for this long). `None` ⇒ hard cap only.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl<'a> InvokeOptions<'a> {
-    pub fn new(acquire: AcquireOptions<'a>, prompt: &'a str, deadline: Duration) -> Self {
+    /// Hard cap + stall detection (the normal channel/dispatch path).
+    pub fn new(
+        acquire: AcquireOptions<'a>,
+        prompt: &'a str,
+        hard_cap: Duration,
+        idle_timeout: Duration,
+    ) -> Self {
         Self {
             acquire,
             prompt,
-            deadline,
+            hard_cap,
+            idle_timeout: Some(idle_timeout),
+        }
+    }
+
+    /// Hard cap only — no stall detection (legacy behaviour).
+    pub fn hard_cap_only(acquire: AcquireOptions<'a>, prompt: &'a str, hard_cap: Duration) -> Self {
+        Self {
+            acquire,
+            prompt,
+            hard_cap,
+            idle_timeout: None,
         }
     }
 }
@@ -407,7 +578,8 @@ pub async fn acquire_and_invoke_with(options: InvokeOptions<'_>) -> Result<Strin
         options.acquire.model,
         &options.acquire.env,
         options.prompt,
-        options.deadline,
+        options.hard_cap,
+        options.idle_timeout,
     )
     .await
 }
@@ -454,9 +626,18 @@ pub async fn acquire_and_invoke_for_account_with_model(
 ) -> Result<String, String> {
     // Back-compat: callers using this positional variant supply no per-account
     // env. HS14 isolation flows through [`acquire_and_invoke_with`] / the
-    // [`AcquireOptions::env`] builder instead.
+    // [`AcquireOptions::env`] builder instead. Legacy variants keep the old
+    // hard-cap-only semantics (no stall detection).
     acquire_and_invoke_inner(
-        agent_id, cli_kind, bare_mode, account_id, model, &HashMap::new(), prompt, deadline,
+        agent_id,
+        cli_kind,
+        bare_mode,
+        account_id,
+        model,
+        &HashMap::new(),
+        prompt,
+        deadline,
+        None,
     )
     .await
 }
@@ -498,6 +679,7 @@ fn lookup_account_env(account_id: &str) -> Option<HashMap<String, String>> {
     account_spawn_env().lock().ok().and_then(|m| m.get(account_id).cloned())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn acquire_and_invoke_inner(
     agent_id: &str,
     cli_kind: CliKind,
@@ -506,14 +688,21 @@ async fn acquire_and_invoke_inner(
     model: Option<&str>,
     env: &HashMap<String, String>,
     prompt: &str,
-    deadline: Duration,
+    hard_cap: Duration,
+    idle_timeout: Option<Duration>,
 ) -> Result<String, String> {
+    // Build the timeout policy: hard cap always; idle/stall window when set.
+    let invoke_timeout = match idle_timeout {
+        Some(idle) => duduclaw_cli_runtime::InvokeTimeout::with_idle(hard_cap, idle),
+        None => duduclaw_cli_runtime::InvokeTimeout::hard_cap_only(hard_cap),
+    };
     // Phase 7: prefer the out-of-process worker when one was registered
     // via [`set_managed_worker`]. Falls back to the in-process PTY_POOL
     // otherwise (the legacy Phase 3.C.4 path).
     if let Some(client) = MANAGED_WORKER.get() {
         return invoke_via_managed_worker(
-            client, agent_id, cli_kind, bare_mode, account_id, model, env, prompt, deadline,
+            client, agent_id, cli_kind, bare_mode, account_id, model, env, prompt, hard_cap,
+            idle_timeout,
         )
         .await;
     }
@@ -545,7 +734,7 @@ async fn acquire_and_invoke_inner(
     } else {
         metrics.pty_pool_acquire_cache_hit();
     }
-    let result = session.invoke(prompt, Some(deadline)).await;
+    let result = session.invoke_with(prompt, invoke_timeout).await;
     let elapsed_ms = acquire_start.elapsed().as_millis() as u64;
 
     match result {
@@ -568,15 +757,24 @@ async fn acquire_and_invoke_inner(
                 // **Review fix**: budget the retry against the
                 // remaining wall-clock deadline rather than the full
                 // original deadline (which doubled worst-case latency).
-                let remaining = deadline.saturating_sub(acquire_start.elapsed());
+                let remaining = hard_cap.saturating_sub(acquire_start.elapsed());
                 if !is_pty_retry_disabled() && remaining > Duration::from_secs(2) {
                     let reminder = build_retry_reminder(prompt);
+                    // Retry carries the same stall policy, budgeted against the
+                    // remaining hard-cap wall-clock.
+                    let retry_timeout = match idle_timeout {
+                        Some(idle) => duduclaw_cli_runtime::InvokeTimeout::with_idle(
+                            remaining,
+                            idle.min(remaining),
+                        ),
+                        None => duduclaw_cli_runtime::InvokeTimeout::hard_cap_only(remaining),
+                    };
                     debug!(
                         agent_id = %agent_id,
                         remaining_ms = remaining.as_millis() as u64,
                         "pty_runtime: empty payload — retrying with explicit reminder"
                     );
-                    match session.invoke(&reminder, Some(remaining)).await {
+                    match session.invoke_with(&reminder, retry_timeout).await {
                         Ok(retried) if !retried.trim().is_empty() => {
                             metrics.pty_pool_invoke_complete(
                                 elapsed_ms,
@@ -618,6 +816,8 @@ async fn acquire_and_invoke_inner(
             let outcome = if matches!(
                 err,
                 duduclaw_cli_runtime::SessionError::InvokeTimeout(_)
+                    | duduclaw_cli_runtime::SessionError::InvokeStall { .. }
+                    | duduclaw_cli_runtime::SessionError::InvokeHardCap { .. }
                     | duduclaw_cli_runtime::SessionError::BootTimeout(_)
             ) {
                 crate::metrics::PtyInvokeOutcome::Timeout
@@ -669,8 +869,10 @@ async fn invoke_via_managed_worker(
     env: &HashMap<String, String>,
     prompt: &str,
     deadline: Duration,
+    idle_timeout: Option<Duration>,
 ) -> Result<String, String> {
     let metrics = crate::metrics::global_metrics();
+    let idle_ms = idle_timeout.map(|d| d.as_millis() as u64);
 
     // HS14: per-account OAuth isolation. The worker REJECTS any account-rotation
     // request whose `env` is empty (it cannot otherwise scope the spawned CLI to
@@ -704,6 +906,8 @@ async fn invoke_via_managed_worker(
         bare_mode,
         prompt: prompt.to_string(),
         timeout_ms: ms,
+        // Forward the stall/idle window so the worker enables stall detection.
+        idle_timeout_ms: idle_ms,
         account_id: account_id.map(|s| s.to_string()),
         model: model.map(|s| s.to_string()),
         work_dir: work_dir.clone(),
@@ -765,7 +969,12 @@ async fn invoke_via_managed_worker(
         }
         Err(err) => {
             let err_str = err.to_string();
-            let outcome = if err_str.contains("timed out") || err_str.contains("timeout") {
+            let low = err_str.to_ascii_lowercase();
+            let outcome = if low.contains("timed out")
+                || low.contains("timeout")
+                || low.contains("stalled")
+                || low.contains("hard cap")
+            {
                 crate::metrics::PtyInvokeOutcome::Timeout
             } else {
                 crate::metrics::PtyInvokeOutcome::Error
@@ -1093,6 +1302,135 @@ mod tests {
         // Empty env is a no-op (ambient/no-account invokes don't pollute the map).
         stash_account_env("acct-test-empty", &HashMap::new());
         assert!(lookup_account_env("acct-test-empty").is_none());
+    }
+
+    #[test]
+    fn acquire_options_carry_account_id_and_env() {
+        // Gap A: the dispatcher / channel paths must be able to attach the
+        // rotator-resolved account_id + credential env to the acquire.
+        let mut env = HashMap::new();
+        env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "sk-oat".to_string());
+        let opts = AcquireOptions::new("agent-a", CliKind::Claude, false)
+            .account_id(Some("oauth-abc"))
+            .env(env.clone());
+        assert_eq!(opts.account_id, Some("oauth-abc"));
+        assert_eq!(
+            opts.env.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some("sk-oat")
+        );
+    }
+
+    #[test]
+    fn keychain_sentinel_env_is_stashable() {
+        // Gap B: the default-keychain force-OAuth sentinel is a one-entry map
+        // (empty VALUE, not an empty MAP), so it survives stash → lookup and
+        // gets injected into the PTY child — overriding any ambient
+        // ANTHROPIC_API_KEY the gateway inherited.
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        assert!(!env.is_empty());
+        stash_account_env("oauth-keychain-default", &env);
+        let got = lookup_account_env("oauth-keychain-default").expect("sentinel env stashed");
+        assert_eq!(got.get("ANTHROPIC_API_KEY").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn interactive_deadline_defaults_to_hard_cap() {
+        // Semantics change (2026-07-21): the deadline is now the 30-min hard cap.
+        assert_eq!(resolve_interactive_deadline_secs(None, None), 1800);
+        assert_eq!(PTY_INTERACTIVE_DEADLINE_SECS, 1800);
+    }
+
+    #[test]
+    fn interactive_deadline_reads_agent_toml_override() {
+        let toml = "[runtime]\npty_pool_enabled = true\npty_interactive_timeout_secs = 90\n";
+        assert_eq!(resolve_interactive_deadline_secs(None, Some(toml)), 90);
+    }
+
+    #[test]
+    fn interactive_deadline_env_wins_over_toml() {
+        let toml = "[runtime]\npty_interactive_timeout_secs = 90\n";
+        assert_eq!(resolve_interactive_deadline_secs(Some("300"), Some(toml)), 300);
+    }
+
+    #[test]
+    fn interactive_deadline_ignores_nonpositive_and_garbage() {
+        // Zero / negative / unparseable at each layer falls through to default.
+        assert_eq!(resolve_interactive_deadline_secs(Some("0"), None), 1800);
+        assert_eq!(resolve_interactive_deadline_secs(Some("nope"), None), 1800);
+        let toml = "[runtime]\npty_interactive_timeout_secs = 0\n";
+        assert_eq!(resolve_interactive_deadline_secs(None, Some(toml)), 1800);
+        let bad = "[runtime]\npty_interactive_timeout_secs = -5\n";
+        assert_eq!(resolve_interactive_deadline_secs(None, Some(bad)), 1800);
+    }
+
+    #[test]
+    fn interactive_idle_defaults_and_overrides() {
+        assert_eq!(resolve_interactive_idle_secs(None, None), 120);
+        assert_eq!(PTY_INTERACTIVE_IDLE_SECS, 120);
+        let toml = "[runtime]\npty_idle_timeout_secs = 90\n";
+        assert_eq!(resolve_interactive_idle_secs(None, Some(toml)), 90);
+        // env wins over toml.
+        assert_eq!(resolve_interactive_idle_secs(Some("200"), Some(toml)), 200);
+        // non-positive / garbage falls through.
+        assert_eq!(resolve_interactive_idle_secs(Some("0"), None), 120);
+        let bad = "[runtime]\npty_idle_timeout_secs = -3\n";
+        assert_eq!(resolve_interactive_idle_secs(None, Some(bad)), 120);
+    }
+
+    #[test]
+    fn classify_fallback_reason_covers_all_variants() {
+        // Mirrors the SessionError Display strings.
+        assert_eq!(
+            classify_fallback_reason(
+                "interactive REPL stalled: no substantive progress for 120s (mid_task=false)"
+            ),
+            ("stall", false)
+        );
+        assert_eq!(
+            classify_fallback_reason(
+                "interactive REPL stalled: no substantive progress for 120s (mid_task=true)"
+            ),
+            ("stall", true)
+        );
+        assert_eq!(
+            classify_fallback_reason(
+                "interactive REPL exceeded hard cap 1800s (mid_task=true)"
+            ),
+            ("hard_cap", true)
+        );
+        assert_eq!(
+            classify_fallback_reason("boot timed out after 45s"),
+            ("boot", false)
+        );
+        assert_eq!(
+            classify_fallback_reason("pty_runtime: empty payload (session marked unhealthy)"),
+            ("other", false)
+        );
+    }
+
+    #[test]
+    fn fallback_predicate_triggers_on_common_pty_failures() {
+        assert!(pty_pool_error_should_fallback(
+            "pty_runtime: empty payload (session marked unhealthy)"
+        ));
+        assert!(pty_pool_error_should_fallback("invoke timed out after 180s"));
+        assert!(pty_pool_error_should_fallback("boot timed out after 45s"));
+        assert!(pty_pool_error_should_fallback(
+            "All accounts exhausted. Last error: child process exited"
+        ));
+    }
+
+    #[test]
+    fn fallback_predicate_skips_moa_config_error() {
+        // A MoA virtual model can't be served by any CLI spawn — fresh-spawn
+        // would reject it identically, so don't double-attempt.
+        assert!(!pty_pool_error_should_fallback(
+            "MoA 模型 `moa:panel` 需要 API 模式（無法經由 CLI 執行）"
+        ));
+        assert!(!pty_pool_error_should_fallback(
+            "cannot spawn moa: virtual model on CLI path"
+        ));
     }
 
     // Task C.1 — PTY model switching contract: the agent's `[model] preferred`

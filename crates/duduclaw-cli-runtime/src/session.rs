@@ -23,7 +23,45 @@ use crate::envelope::{
 };
 use crate::error::{PtyError, SessionError};
 use crate::platform::ChildGroup;
+use crate::progress::ProgressSignature;
 use crate::pty::{PtyCommand, PtyHandle};
+
+/// Timeout policy for a single interactive invoke.
+///
+/// Replaces the old single-`Duration` deadline. The interactive REPL fails a
+/// turn on whichever fires first:
+/// - **stall**: `idle` elapsed with no *substantive progress* (see
+///   [`crate::progress`]) — the common, fast path that kills a wedged session
+///   without false-killing a long-but-working task;
+/// - **hard cap**: the absolute wall-clock safety net.
+#[derive(Debug, Clone, Copy)]
+pub struct InvokeTimeout {
+    /// Absolute wall-clock cap. The invoke always fails by this.
+    pub hard_cap: Duration,
+    /// Idle/stall window. `Some(d)` ⇒ fail after `d` with no substantive
+    /// progress (interactive mode only). `None` ⇒ stall detection disabled
+    /// (legacy behaviour: only `hard_cap` applies). Non-interactive sessions
+    /// ignore `idle` entirely.
+    pub idle: Option<Duration>,
+}
+
+impl InvokeTimeout {
+    /// Hard cap only — no stall detection (legacy behaviour).
+    pub fn hard_cap_only(hard_cap: Duration) -> Self {
+        Self {
+            hard_cap,
+            idle: None,
+        }
+    }
+
+    /// Hard cap + idle/stall window.
+    pub fn with_idle(hard_cap: Duration, idle: Duration) -> Self {
+        Self {
+            hard_cap,
+            idle: Some(idle),
+        }
+    }
+}
 
 /// **HC13 fix**: bracketed-paste mode delimiters.
 ///
@@ -276,70 +314,120 @@ impl PtySession {
 
     /// **Phase 3.C.2**: interactive boot dance.
     ///
-    /// Validated against `claude` v2.1.138 in the 2026-05-14 spike. Three
-    /// phases:
+    /// Validated against `claude` v2.1.138 in the 2026-05-14 spike, extended in
+    /// 2026-07 to survive the pre-REPL onboarding chain (theme picker → login
+    /// method → trust folder → security notes) that a *first-run* profile shows
+    /// before the input box is ready.
     ///
-    /// 1. Drain banner up to `total_timeout/3`. Look for the trust-folder
-    ///    prompt fingerprint `Yes,Itrustthisfolder` (TUI strips spaces).
-    /// 2. If the prompt was seen and `pre_trusted` is false, send `\r` to
-    ///    accept the default option (`❯ 1. Yes, I trust this folder`).
-    /// 3. Drain another `total_timeout/3`. Look for a REPL-ready
-    ///    fingerprint (`?forshortcuts` or `Try"edit`). Tolerate timeout —
-    ///    some claude versions don't print the hint line.
+    /// Loop, bounded by `total_timeout`: drain a short window, ANSI-strip +
+    /// compact it, then:
+    /// - a REPL-ready fingerprint (`? for shortcuts`, `Try "edit`, …) ⇒ done;
+    /// - a recognised interactive screen (trust / theme / onboarding / login)
+    ///   ⇒ send `\r` to accept the highlighted DEFAULT option and re-check
+    ///   (the default for the login screen is "Claude account with
+    ///   subscription", i.e. OAuth — exactly what the pool wants);
+    /// - neither ⇒ keep draining until the deadline (some `claude` builds
+    ///   simply don't print the hint line).
     ///
-    /// If the child dies at any point (e.g. user picked the wrong option
-    /// or OAuth is missing), return [`SessionError::ChildExited`].
+    /// **2026-07 change — fail fast instead of hard-proceeding.** Previously,
+    /// when the REPL-ready hint never appeared the code proceeded anyway; a
+    /// session wedged on an onboarding screen would then swallow the whole
+    /// per-invoke deadline (up to 30 min on the OAuth path) before the caller
+    /// noticed. Now an unresolved boot marks the session unhealthy and returns
+    /// [`SessionError::BootTimeout`] so the gateway falls back to the
+    /// fresh-spawn `claude -p` path quickly. A dead child still returns
+    /// [`SessionError::ChildExited`].
+    ///
+    /// NOTE: the ready + MCP-approval fingerprints are live-validated against
+    /// Claude Code 2.1.173; the theme/onboarding/login fingerprints are
+    /// inferred from the first-run TUI. All are deliberately broad (multiple
+    /// candidate strings, whitespace-insensitive, case-insensitive) so a copy
+    /// tweak doesn't wedge boot, and any miss degrades to the fresh-spawn
+    /// fallback rather than a hang.
     async fn interactive_boot_dance(
         &self,
         total_timeout: Duration,
         pre_trusted: bool,
     ) -> Result<(), SessionError> {
-        let banner_window = total_timeout / 3;
-        let banner = self.drain_window(banner_window).await;
-        let stripped = strip_ansi(&banner);
-        debug!(
-            agent_id = %self.inner.agent_id,
-            stripped_len = stripped.len(),
-            "interactive_boot_dance: banner drained"
-        );
+        let deadline = Instant::now() + total_timeout;
+        // React promptly to interactive prompts without busy-looping: a small
+        // per-step window, floored so a slow first paint isn't cut short.
+        let step = (total_timeout / 6).max(Duration::from_secs(2));
 
-        let trust_seen = stripped.contains("Yes,Itrustthisfolder")
-            || stripped.contains("trust this folder")
-            || stripped.contains("Quicksafetycheck");
+        let mut ready = false;
+        // Whether the MOST RECENT drain still showed a login-method screen —
+        // an unresolved one means this profile has no usable OAuth session, so
+        // the pool can never drive it (distinct log from a generic no-hint
+        // timeout, though both fail closed).
+        let mut login_unresolved = false;
 
-        if trust_seen && !pre_trusted {
+        // Up to 8 screens can stack before the REPL is ready; each is driven by
+        // a single default-accept `\r`. Bounded by the overall deadline.
+        for _ in 0..8 {
+            if Instant::now() >= deadline {
+                break;
+            }
             if !self.inner.pty.is_alive() {
                 return Err(SessionError::ChildExited { code: None });
             }
-            info!(
-                agent_id = %self.inner.agent_id,
-                "interactive_boot_dance: trust prompt seen — sending '\\r'"
-            );
-            self.inner
-                .pty
-                .write_all(b"\r")
-                .await
-                .map_err(SessionError::Pty)?;
+
+            let window = step.min(deadline.saturating_duration_since(Instant::now()));
+            let chunk = self.drain_window(window).await;
+            let compact = compact_lower(&strip_ansi(&chunk));
+
+            if boot_repl_ready(&compact) {
+                ready = true;
+                break;
+            }
+
+            let login = boot_login_prompt(&compact);
+            login_unresolved = login;
+            let blocking = login
+                || boot_theme_prompt(&compact)
+                || boot_onboarding_prompt(&compact)
+                || boot_mcp_prompt(&compact)
+                || (!pre_trusted && boot_trust_prompt(&compact));
+
+            if blocking {
+                if !self.inner.pty.is_alive() {
+                    return Err(SessionError::ChildExited { code: None });
+                }
+                info!(
+                    agent_id = %self.inner.agent_id,
+                    login,
+                    "interactive_boot_dance: interactive screen seen — sending '\\r' (accept default)"
+                );
+                self.inner
+                    .pty
+                    .write_all(b"\r")
+                    .await
+                    .map_err(SessionError::Pty)?;
+            }
+            // else: no known screen, no ready hint — keep draining.
         }
-
-        // Second drain: wait for REPL ready hint or just silence.
-        let ready_window = total_timeout / 3;
-        let post = self.drain_window(ready_window).await;
-        let post_stripped = strip_ansi(&post);
-        let ready_hint = post_stripped.contains("?forshortcuts")
-            || post_stripped.contains("Try\"edit")
-            || post_stripped.contains("Trytype");
-
-        debug!(
-            agent_id = %self.inner.agent_id,
-            ready_hint,
-            "interactive_boot_dance: post-trust drain complete"
-        );
 
         if !self.inner.pty.is_alive() {
             return Err(SessionError::ChildExited { code: None });
         }
-        Ok(())
+        if ready {
+            debug!(
+                agent_id = %self.inner.agent_id,
+                "interactive_boot_dance: REPL ready"
+            );
+            return Ok(());
+        }
+
+        // Boot never reached the REPL. Fail closed so the caller degrades to
+        // fresh-spawn instead of hanging on the invoke deadline.
+        self.mark_unhealthy();
+        warn!(
+            agent_id = %self.inner.agent_id,
+            login_unresolved,
+            timeout_ms = total_timeout.as_millis() as u64,
+            "interactive_boot_dance: REPL-ready hint never observed — marking session \
+             unhealthy so the caller falls back to fresh-spawn"
+        );
+        Err(SessionError::BootTimeout(total_timeout))
     }
 
     /// Drain stdout for up to `window` returning everything captured. Used by
@@ -446,6 +534,20 @@ impl PtySession {
         prompt: &str,
         deadline: Option<Duration>,
     ) -> Result<String, SessionError> {
+        let hard_cap = deadline.unwrap_or(self.inner.default_invoke_timeout);
+        self.invoke_with(prompt, InvokeTimeout::hard_cap_only(hard_cap))
+            .await
+    }
+
+    /// Like [`Self::invoke`] but with an explicit [`InvokeTimeout`] so callers
+    /// can enable **stall detection** (idle window) on top of the absolute hard
+    /// cap. Interactive sessions honour `timeout.idle`; non-interactive
+    /// (echo-server) sessions apply only `timeout.hard_cap`.
+    pub async fn invoke_with(
+        &self,
+        prompt: &str,
+        timeout: InvokeTimeout,
+    ) -> Result<String, SessionError> {
         // CAS to enforce single-flight.
         if self
             .inner
@@ -489,7 +591,6 @@ impl PtySession {
             return Err(SessionError::ChildExited { code: None });
         }
 
-        let deadline = deadline.unwrap_or(self.inner.default_invoke_timeout);
         let envelope = Envelope::new(prompt).with_format(ResponseFormat::Text);
 
         let result = if self.inner.interactive {
@@ -539,7 +640,7 @@ impl PtySession {
                 .write_all(b"\r")
                 .await
                 .map_err(SessionError::Pty)?;
-            self.collect_response_interactive(envelope.req_id, deadline)
+            self.collect_response_interactive(envelope.req_id, timeout)
                 .await
         } else {
             let wire = frame_request(&envelope);
@@ -548,7 +649,9 @@ impl PtySession {
                 .write_all(wire.as_bytes())
                 .await
                 .map_err(SessionError::Pty)?;
-            self.collect_response(envelope.req_id, deadline).await
+            // Non-interactive (echo-server) sessions have no TUI progress signal;
+            // apply only the hard cap.
+            self.collect_response(envelope.req_id, timeout.hard_cap).await
         };
 
         if result.is_ok() {
@@ -574,9 +677,11 @@ impl PtySession {
     async fn collect_response_interactive(
         &self,
         req_id: Uuid,
-        deadline: Duration,
+        timeout: InvokeTimeout,
     ) -> Result<String, SessionError> {
         let start = Instant::now();
+        let hard_cap = timeout.hard_cap;
+        let idle_window = timeout.idle;
         let mut raw = String::new();
         raw.push_str(&self.inner.pty.drain_residual());
 
@@ -587,28 +692,69 @@ impl PtySession {
             return Ok(answer);
         }
 
+        // Stall detection (see `crate::progress`): track the last moment of
+        // *substantive* progress (token counter rising / new prose). Spinner
+        // and elapsed-timer redraws deliberately do NOT reset this — a wedged
+        // REPL keeps animating its spinner, so only content-bearing changes
+        // count. `saw_progress` records whether ANY progress landed this turn,
+        // so a stall/hard-cap after real output is flagged mid-task (a fallback
+        // re-run may re-execute side effects).
+        let mut last_progress = Instant::now();
+        let mut last_sig = ProgressSignature::from_raw(&raw);
+        let mut saw_progress = false;
+
+        // **Bug1 fix (2026-07-21): submit watchdog.** A multi-line prompt is
+        // written as a bracketed-paste block followed by a single `\r`. Live PTY
+        // captures against claude 2.1.173 showed that trailing `\r` FAILS to
+        // submit ~75% of the time (3/4 runs) — the TUI is still ingesting the
+        // paste when the `\r` lands, so it is dropped and the prompt sits in the
+        // composer while the REPL idles (production Bug1: a 120 s stall on a
+        // prompt that never ran). Fix: if no sign of a running turn (spinner /
+        // sentinel) appears within `SUBMIT_PROBE`, resend `\r` — bounded to
+        // `MAX_SUBMIT_RESENDS` with a growing gap. Captures: the watchdog
+        // submitted 4/4 runs (3 needed exactly one resend at ~1.5 s, one
+        // first-shot). Once a turn is visibly running we never resend, so a
+        // successful first submit is untouched and we can't inject a stray empty
+        // turn.
+        const SUBMIT_PROBE: Duration = Duration::from_millis(1500);
+        const MAX_SUBMIT_RESENDS: u32 = 3;
+        let mut submit_confirmed = false;
+        let mut submit_resends: u32 = 0;
+        let mut next_submit_probe = start + SUBMIT_PROBE;
+
         loop {
-            let remaining = match deadline.checked_sub(start.elapsed()) {
-                Some(r) if !r.is_zero() => r,
-                _ => {
-                    diagnostic_dump_on_timeout(&raw, req_id, deadline);
-                    return Err(SessionError::InvokeTimeout(deadline));
-                }
-            };
+            let elapsed = start.elapsed();
+            // Absolute wall-clock safety net.
+            if elapsed >= hard_cap {
+                diagnostic_dump_on_timeout(
+                    &raw,
+                    req_id,
+                    hard_cap,
+                    "hard_cap",
+                    last_progress.elapsed(),
+                );
+                return Err(SessionError::InvokeHardCap {
+                    hard_cap,
+                    saw_progress,
+                });
+            }
+            let hard_remaining = hard_cap - elapsed;
 
             // Use the closing sentinel as the read-until probe. False
             // positives just cause the inner extractor to keep looking;
             // misses fall back to the timeout drain path.
             //
-            // **M47 fix**: floor the per-read window at 200 ms. Without a floor,
-            // as `start.elapsed()` approaches the deadline, `remaining` shrinks
-            // toward zero and each `read_until` returns `ReadTimeout` almost
-            // instantly. The `continue` below would then spin tightly (burning
-            // CPU while still holding the semaphore permit) until the outer
-            // deadline check finally fires. `read_until` blocks on `recv()`
-            // inside this window, so a healthy floor turns the would-be spin
-            // into a proper blocking wait.
-            let read_window = remaining.min(Duration::from_secs(3)).max(Duration::from_millis(200));
+            // **M47 fix**: floor the per-read window at 200 ms so a genuinely
+            // idle child turns into a proper blocking wait (on `recv()`) rather
+            // than a tight spin. Also cap it at the smaller of 3 s and the
+            // remaining idle budget so a stall is detected promptly instead of
+            // waiting up to 3 s past the idle deadline.
+            let mut read_window = hard_remaining.min(Duration::from_secs(3));
+            if let Some(idle) = idle_window {
+                let idle_remaining = idle.saturating_sub(last_progress.elapsed());
+                read_window = read_window.min(idle_remaining.max(Duration::from_millis(1)));
+            }
+            let read_window = read_window.max(Duration::from_millis(200));
             let chunk = match self
                 .inner
                 .pty
@@ -621,26 +767,72 @@ impl PtySession {
                     s
                 }
                 Err(PtyError::ReadTimeout(_)) => {
-                    // Drain whatever buffered up + keep trying.
-                    let drained = self.inner.pty.drain_buffer();
-                    if drained.is_empty() {
-                        // Nothing arrived during the whole `read_window` — the
-                        // child is genuinely idle. `read_until` already blocked
-                        // (awaiting `recv()`) for the window, so simply looping
-                        // back is a proper blocking wait, not a busy-spin.
-                        continue;
-                    }
-                    drained
+                    // Drain whatever buffered up (may be empty when the child is
+                    // idle) and fall through to the stall/hard-cap evaluation.
+                    self.inner.pty.drain_buffer()
                 }
                 Err(PtyError::Closed) => {
                     return Err(SessionError::ChildExited { code: None });
                 }
                 Err(e) => return Err(SessionError::Pty(e)),
             };
-            raw.push_str(&chunk);
+            if !chunk.is_empty() {
+                raw.push_str(&chunk);
+                if let Some(answer) = try_extract_interactive_answer(&raw, req_id) {
+                    return Ok(answer);
+                }
+            }
 
-            if let Some(answer) = try_extract_interactive_answer(&raw, req_id) {
-                return Ok(answer);
+            // Single strip per iteration, shared by the submit watchdog and the
+            // progress evaluation below.
+            let stripped = strip_ansi(&raw);
+
+            // Submit watchdog: resend `\r` if the prompt never got submitted.
+            if !submit_confirmed {
+                if submission_visible(&stripped) {
+                    submit_confirmed = true;
+                } else if Instant::now() >= next_submit_probe
+                    && submit_resends < MAX_SUBMIT_RESENDS
+                {
+                    self.inner
+                        .pty
+                        .write_all(b"\r")
+                        .await
+                        .map_err(SessionError::Pty)?;
+                    submit_resends += 1;
+                    // Growing gap between resends so a slow-but-working submit
+                    // isn't spammed.
+                    next_submit_probe = Instant::now() + SUBMIT_PROBE * (submit_resends + 1);
+                    debug!(
+                        agent_id = %self.inner.agent_id,
+                        resend = submit_resends,
+                        "collect_response_interactive: no turn started — resending Enter (submit watchdog)"
+                    );
+                }
+            }
+
+            // Evaluate substantive progress vs the idle window. Skipped entirely
+            // when stall detection is disabled (`idle == None`) — then only the
+            // hard cap applies (top of loop).
+            if let Some(idle) = idle_window {
+                let sig = ProgressSignature::from_stripped(&stripped);
+                if sig.advanced_from(&last_sig) {
+                    last_sig = sig;
+                    last_progress = Instant::now();
+                    saw_progress = true;
+                } else if last_progress.elapsed() >= idle {
+                    diagnostic_dump_on_timeout(
+                        &raw,
+                        req_id,
+                        hard_cap,
+                        "stall",
+                        last_progress.elapsed(),
+                    );
+                    return Err(SessionError::InvokeStall {
+                        idle,
+                        saw_progress,
+                    });
+                }
             }
         }
     }
@@ -871,10 +1063,135 @@ pub(crate) fn inject_protocol_args(args: &mut Vec<String>, kind: CliKind) {
     }
 }
 
-/// Diagnostic helper: when `collect_response_interactive` times out, dump
-/// a tail of the ANSI-stripped buffer at warn level so operators can see
-/// what claude was emitting. Truncated to 2 KB to keep logs readable.
-fn diagnostic_dump_on_timeout(raw: &str, req_id: Uuid, deadline: Duration) {
+/// Normalise a (already ANSI-stripped) TUI buffer for fingerprint matching:
+/// drop ALL whitespace and lowercase. The Claude TUI positions text with
+/// cursor-move escapes rather than literal spaces, so the same visible line can
+/// arrive with or without spaces depending on render path — removing whitespace
+/// entirely makes the boot fingerprints robust to both.
+fn compact_lower(stripped: &str) -> String {
+    stripped
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// REPL-ready fingerprints — the input box has painted and the model can
+/// accept a turn. `compact` is whitespace-stripped + lowercased.
+fn boot_repl_ready(compact: &str) -> bool {
+    const READY: &[&str] = &[
+        "?forshortcuts",    // bottom hint bar "? for shortcuts" (pre-2.1 TUI)
+        "try\"edit",        // "Try "edit ...""
+        "trytype",          // "Try typing ..."
+        "try\"howdoes",     // 2.1.x prompt hint: Try "how does <filepath> work?"
+        "shift+tabtocycle", // 2.1.x footer: ⏵⏵ automode on (shift+tab to cycle)
+    ];
+    READY.iter().any(|m| compact.contains(m))
+}
+
+/// Trust-folder prompt fingerprints (default option = "Yes, I trust this
+/// folder"). `compact` is whitespace-stripped + lowercased.
+fn boot_trust_prompt(compact: &str) -> bool {
+    const TRUST: &[&str] = &[
+        "trustthisfolder",
+        "doyoutrustthefiles",
+        "quicksafetycheck",
+    ];
+    TRUST.iter().any(|m| compact.contains(m))
+}
+
+/// Theme-picker fingerprints (first-run "Choose the text style / theme"
+/// screen; default option is highlighted, `\r` accepts it). NOT re-validated
+/// against a live binary in this change — see [`interactive_boot_dance`] note.
+fn boot_theme_prompt(compact: &str) -> bool {
+    const THEME: &[&str] = &[
+        "chooseyourtheme",
+        "choosethetext", // "Choose the text style that looks best"
+        "lettersonthescreen",
+        "darkmode✔",
+    ];
+    THEME.iter().any(|m| compact.contains(m))
+}
+
+/// Onboarding / security-notes fingerprints ("Let's get started", "Press Enter
+/// to continue", security notice). `\r` advances. NOT live-validated — see note.
+fn boot_onboarding_prompt(compact: &str) -> bool {
+    const ONBOARD: &[&str] = &[
+        "pressentertocontinue",
+        "let'sgetstarted",
+        "letsgetstarted",
+        "securitynotes",
+        "usesyourcredits", // usage/billing notice shown once
+    ];
+    ONBOARD.iter().any(|m| compact.contains(m))
+}
+
+/// MCP-server approval prompt fingerprints ("New MCP server found in this
+/// project: ..."; default highlighted option is "1. Use this MCP server",
+/// which is exactly what the pool wants — the duduclaw MCP server — so `\r`
+/// accepts it). Live-validated against Claude Code 2.1.173.
+fn boot_mcp_prompt(compact: &str) -> bool {
+    const MCP: &[&str] = &[
+        "newmcpserverfound",
+        "usethismcpserver",
+        "mcpserversmayexecute",
+    ];
+    MCP.iter().any(|m| compact.contains(m))
+}
+
+/// Login-method fingerprints ("Select login method"; default option is "Claude
+/// account with subscription" = OAuth, which is what the pool wants, so `\r`
+/// accepts it). An UNRESOLVED login screen means the profile has no OAuth
+/// session and the pool can't drive it. NOT live-validated — see note.
+fn boot_login_prompt(compact: &str) -> bool {
+    const LOGIN: &[&str] = &[
+        "selectloginmethod",
+        "loginmethod",
+        "claudeaccountwithsubscription",
+        "anthropicconsoleaccount",
+        "howwouldyouliketologin",
+    ];
+    LOGIN.iter().any(|m| compact.contains(m))
+}
+
+/// True when the (ANSI-stripped) buffer shows a turn is actually RUNNING — a
+/// spinner glyph, the "esc to interrupt" hint, or the answer sentinel. Used by
+/// the submit watchdog to decide whether the prompt was accepted: the idle
+/// composer shows none of these. Deliberately broad so a submitted-but-still-
+/// rendering turn is recognised before the watchdog would resend.
+fn submission_visible(stripped: &str) -> bool {
+    const SPINNERS: &[char] = &[
+        '✶', '✳', '✢', '✻', '✽', '✺', '✷', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧',
+        '⠇', '⠏',
+    ];
+    if stripped.contains(INTERACTIVE_SENTINEL) {
+        return true;
+    }
+    if stripped.chars().any(|c| SPINNERS.contains(&c)) {
+        return true;
+    }
+    let compact: String = stripped
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    compact.contains("esctointerrupt")
+}
+
+/// Diagnostic helper: when `collect_response_interactive` fails on a stall or
+/// hard cap, dump a tail of the ANSI-stripped buffer at warn level so operators
+/// can see what claude was emitting, plus the time since last substantive
+/// progress. Truncated to 2 KB to keep logs readable.
+///
+/// `kind` is `"stall"` or `"hard_cap"`; `stalled_for` is how long since the
+/// last observed progress (the idle duration on a stall).
+fn diagnostic_dump_on_timeout(
+    raw: &str,
+    req_id: Uuid,
+    hard_cap: Duration,
+    kind: &str,
+    stalled_for: Duration,
+) {
     let stripped = strip_ansi(raw);
     let len = stripped.chars().count();
     let take = 2048;
@@ -892,11 +1209,13 @@ fn diagnostic_dump_on_timeout(raw: &str, req_id: Uuid, deadline: Duration) {
     let occurrences = tail.matches(&sentinel_open).count();
     warn!(
         req_id = %req_id,
-        deadline_ms = deadline.as_millis() as u64,
+        kind,
+        hard_cap_ms = hard_cap.as_millis() as u64,
+        stalled_for_ms = stalled_for.as_millis() as u64,
         raw_bytes = raw.len(),
         stripped_chars = len,
         sentinel_occurrences_in_tail = occurrences,
-        "invoke timed out — stripped buffer tail follows:\n{tail}"
+        "interactive invoke failed ({kind}) — stripped buffer tail follows:\n{tail}"
     );
 }
 
@@ -986,6 +1305,79 @@ impl Drop for CancelHealthGuard<'_> {
             // error return too. Operators see the eviction event via
             // the pool's metrics once the next acquire respawns.
         }
+    }
+}
+
+#[cfg(test)]
+mod boot_fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn compact_lower_strips_whitespace_and_lowercases() {
+        assert_eq!(compact_lower("Yes, I Trust This Folder"), "yes,itrustthisfolder");
+        assert_eq!(compact_lower("? for shortcuts"), "?forshortcuts");
+    }
+
+    #[test]
+    fn repl_ready_detects_shortcut_hint_both_render_forms() {
+        // Spaced (literal spaces) and cursor-positioned (no spaces) both
+        // normalise to the same compacted form.
+        assert!(boot_repl_ready(&compact_lower("? for shortcuts")));
+        assert!(boot_repl_ready(&compact_lower("?forshortcuts")));
+        assert!(boot_repl_ready(&compact_lower("Try \"edit the file\"")));
+        assert!(!boot_repl_ready(&compact_lower("Select login method")));
+    }
+
+    #[test]
+    fn repl_ready_detects_2_1_x_screens() {
+        // Live-captured from Claude Code 2.1.173.
+        assert!(boot_repl_ready(&compact_lower(
+            "❯ Try \"how does <filepath> work?\""
+        )));
+        assert!(boot_repl_ready(&compact_lower(
+            "⏵⏵ automode on (shift+tab to cycle) · ← for agents"
+        )));
+        // The MCP approval screen is NOT ready.
+        assert!(!boot_repl_ready(&compact_lower(
+            "New MCP server found in this project: duduclaw"
+        )));
+    }
+
+    #[test]
+    fn mcp_prompt_detects_approval_screen() {
+        // Live-captured from Claude Code 2.1.173.
+        assert!(boot_mcp_prompt(&compact_lower(
+            "New MCP server found in this project: duduclaw"
+        )));
+        assert!(boot_mcp_prompt(&compact_lower("❯ 1. Use this MCP server")));
+        assert!(boot_mcp_prompt(&compact_lower(
+            "MCP servers may execute code or access system resources."
+        )));
+        assert!(!boot_mcp_prompt(&compact_lower("? for shortcuts")));
+    }
+
+    #[test]
+    fn trust_prompt_detects_folder_dialog() {
+        assert!(boot_trust_prompt(&compact_lower("Do you trust the files in this folder?")));
+        assert!(boot_trust_prompt(&compact_lower("Yes, I trust this folder")));
+        assert!(!boot_trust_prompt(&compact_lower("? for shortcuts")));
+    }
+
+    #[test]
+    fn theme_and_onboarding_and_login_prompts_detected() {
+        assert!(boot_theme_prompt(&compact_lower("Choose the text style that looks best")));
+        assert!(boot_onboarding_prompt(&compact_lower("Press Enter to continue")));
+        assert!(boot_login_prompt(&compact_lower("Select login method")));
+        assert!(boot_login_prompt(&compact_lower(
+            "Claude account with subscription"
+        )));
+        // A plain answer must not trip any interactive-screen fingerprint.
+        let ans = compact_lower("The capital of France is Paris.");
+        assert!(!boot_trust_prompt(&ans));
+        assert!(!boot_theme_prompt(&ans));
+        assert!(!boot_onboarding_prompt(&ans));
+        assert!(!boot_login_prompt(&ans));
+        assert!(!boot_repl_ready(&ans));
     }
 }
 
@@ -1355,6 +1747,38 @@ mod tests {
         );
         let answer = try_extract_interactive_answer(&raw, bogus_id).expect("must extract");
         assert_eq!(answer, "real answer");
+    }
+
+    #[test]
+    fn invoke_timeout_selects_idle_vs_hard_cap() {
+        let hard = Duration::from_secs(1800);
+        let idle = Duration::from_secs(120);
+        let with_idle = InvokeTimeout::with_idle(hard, idle);
+        assert_eq!(with_idle.hard_cap, hard);
+        assert_eq!(with_idle.idle, Some(idle));
+        let hard_only = InvokeTimeout::hard_cap_only(hard);
+        assert_eq!(hard_only.hard_cap, hard);
+        assert_eq!(hard_only.idle, None, "hard-cap-only disables stall detection");
+    }
+
+    #[test]
+    fn submission_visible_distinguishes_idle_composer_from_running_turn() {
+        // Bug1 fixture: the prompt sits in the composer, no turn running — the
+        // watchdog must see this as NOT submitted (so it resends Enter).
+        let idle_composer =
+            "❯ [sender_id: webchat:test] 幫我深度搜尋有關於AGI相關論文\n  ctrl+g to edit in Vim   ● high · /effort";
+        assert!(
+            !submission_visible(idle_composer),
+            "idle composer must not look submitted"
+        );
+        // A running turn shows a spinner…
+        assert!(submission_visible("✻ Cogitating (2s · ↓ 40 tokens)"));
+        // …or the esc-to-interrupt hint…
+        assert!(submission_visible("Working  esc to interrupt"));
+        // …or the answer sentinel already present.
+        assert!(submission_visible(&format!("{INTERACTIVE_SENTINEL}\nhi")));
+        // Plain empty-ish composer is not submitted.
+        assert!(!submission_visible("❯ Try \"fix lint errors\""));
     }
 
     #[test]

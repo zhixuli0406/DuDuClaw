@@ -591,15 +591,25 @@ async fn handle_invoke(
         None => None,
     };
 
-    // **Round 4 security fix (HIGH-2)**: cap the per-invoke timeout
+    // **Round 4 security fix (HIGH-2)**: cap the per-invoke HARD timeout
     // so a caller can't pin an agent's PTY slot forever by passing
-    // `timeout_ms = u64::MAX`. 10 minutes is comfortably longer than
-    // any legitimate single-prompt completion; the default invoke
-    // timeout in `PoolConfig` is 5 minutes.
-    const MAX_INVOKE_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+    // `timeout_ms = u64::MAX`. Bumped from 10 min to 31 min (2026-07-21) so
+    // the gateway's new 30-min interactive hard cap survives the worker path
+    // instead of being silently clamped to 10 min. Stall detection (below) is
+    // what keeps a wedged session from actually occupying a slot that long.
+    const MAX_INVOKE_TIMEOUT_MS: u64 = 31 * 60 * 1000;
     let timeout = Duration::from_millis(
         params.timeout_ms.max(1).min(MAX_INVOKE_TIMEOUT_MS),
     );
+    // Idle/stall window (optional). Clamp to the hard cap so a caller can't ask
+    // for an idle window longer than the invoke can possibly run.
+    let invoke_timeout = match params.idle_timeout_ms {
+        Some(ms) if ms > 0 => duduclaw_cli_runtime::InvokeTimeout::with_idle(
+            timeout,
+            Duration::from_millis(ms.min(timeout.as_millis() as u64)),
+        ),
+        _ => duduclaw_cli_runtime::InvokeTimeout::hard_cap_only(timeout),
+    };
 
     let key = AgentKey::with_account_and_model(
         &params.agent_id,
@@ -657,7 +667,7 @@ async fn handle_invoke(
             }
         }
     }
-    let result = session.invoke(&params.prompt, Some(timeout)).await;
+    let result = session.invoke_with(&params.prompt, invoke_timeout).await;
     match result {
         Ok(text) => {
             if text.trim().is_empty() {

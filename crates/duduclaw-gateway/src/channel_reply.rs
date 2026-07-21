@@ -6540,7 +6540,110 @@ async fn spawn_claude_cli_pty_with_env(
 ///   leak). API-key accounts emit `ANTHROPIC_API_KEY = <hex secret>`.
 /// - `CLAUDE_CODE_OAUTH_TOKEN` presence is an additional positive
 ///   signal for OAuth-via-setup-token accounts.
+///
+/// **Fresh-spawn fallback (2026-07)**: the interactive REPL can wedge in ways
+/// the fresh-spawn `claude -p` path is immune to (a boot screen it can't get
+/// past, a dropped sentinel, an empty payload). When the whole pool path
+/// returns a recoverable error, this wrapper falls back to
+/// [`call_claude_cli_rotated`] (the legacy fresh-spawn path) so an OAuth user
+/// still gets an answer instead of the CLI going dark. The fallback is logged
+/// and recorded to `channel_failures.jsonl` so it is never silent.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_claude_cli_pty_rotated(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    session_id: Option<&str>,
+    conversation_history: &[ConversationTurn],
+) -> Result<String, String> {
+    match call_claude_cli_pty_rotated_pool(
+        user_message,
+        model,
+        system_prompt,
+        home_dir,
+        work_dir,
+        on_progress,
+        capabilities,
+        session_id,
+        conversation_history,
+    )
+    .await
+    {
+        Ok(reply) => Ok(reply),
+        Err(e) if crate::pty_runtime::pty_pool_error_should_fallback(&e) => {
+            let (reason, mid_task) = crate::pty_runtime::classify_fallback_reason(&e);
+            if mid_task {
+                // Stall / hard-cap AFTER substantive progress: the interactive
+                // turn may have partially executed (tool calls, writes). We still
+                // fall back for availability, but flag the re-run risk loudly.
+                warn!(
+                    agent = %agent_id_from_work_dir(work_dir),
+                    reason,
+                    error = %e,
+                    "channel_reply: PTY pool path failed MID-TASK — task may have partially \
+                     executed; falling back to fresh-spawn `claude -p` (side effects may repeat)"
+                );
+            } else {
+                warn!(
+                    agent = %agent_id_from_work_dir(work_dir),
+                    reason,
+                    error = %e,
+                    "channel_reply: PTY pool path failed — falling back to fresh-spawn `claude -p`"
+                );
+            }
+            record_pty_pool_fallback(home_dir, work_dir, &e, reason, mid_task);
+            call_claude_cli_rotated(
+                user_message,
+                model,
+                system_prompt,
+                home_dir,
+                work_dir,
+                on_progress,
+                capabilities,
+                session_id,
+                conversation_history,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Append a structured record to `channel_failures.jsonl` when the PTY-pool
+/// path failed and we fell back to fresh-spawn. Best-effort; a failure here must
+/// never break the reply. Uses the advisory file lock (project convention 3).
+fn record_pty_pool_fallback(
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    err: &str,
+    reason: &str,
+    mid_task: bool,
+) {
+    let record = serde_json::json!({
+        "event": "pty_pool_fallback",
+        "agent": agent_id_from_work_dir(work_dir),
+        "error": duduclaw_core::truncate_bytes(err, 300),
+        // `reason`: stall | hard_cap | boot | other. `mid_task`: substantive
+        // progress was observed before the failure ⇒ a re-run may repeat side
+        // effects.
+        "reason": reason,
+        "mid_task": mid_task,
+        "fallback_to": "fresh_spawn_p",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Err(e) = crate::trajectory_guard::append_anomaly(home_dir, &record) {
+        warn!(error = %e, "pty_pool_fallback: 寫入 channel_failures.jsonl 失敗");
+    }
+}
+
+/// Inner pool-only path (no fresh-spawn fallback). See
+/// [`call_claude_cli_pty_rotated`] for the wrapper that adds the fallback.
+#[allow(clippy::too_many_arguments)]
+async fn call_claude_cli_pty_rotated_pool(
     user_message: &str,
     model: &str,
     system_prompt: &str,
@@ -6660,7 +6763,13 @@ async fn invoke_pty_branch(
         // pairing is owned by `PtySession`; we feed it the user message
         // and let the pool reuse / respawn as needed.
         let agent_id = agent_id_from_work_dir(work_dir);
-        let deadline = std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS);
+        // Stall detection: a wedged REPL fails fast (no substantive progress for
+        // the idle window) into the fresh-spawn fallback, while a long-but-working
+        // task survives up to the absolute hard cap. Both configurable via
+        // `agent.toml [runtime] pty_idle_timeout_secs` (default 120 s) /
+        // `pty_interactive_timeout_secs` (hard cap, default 1800 s) + env.
+        let hard_cap = crate::pty_runtime::interactive_repl_deadline(work_dir);
+        let idle_timeout = crate::pty_runtime::interactive_repl_idle_timeout(work_dir);
         // Phase 3.D.2 — segregate pool sessions per OAuth account so
         // multi-account rotation produces distinct sessions instead of
         // sharing one (which silently pinned all accounts to whichever
@@ -6703,7 +6812,12 @@ async fn invoke_pty_branch(
         // correct account instead of a shared ambient OAuth.
         .env(env_vars.clone());
         crate::pty_runtime::acquire_and_invoke_with(
-            crate::pty_runtime::InvokeOptions::new(acquire, user_message, deadline),
+            crate::pty_runtime::InvokeOptions::new(
+                acquire,
+                user_message,
+                hard_cap,
+                idle_timeout,
+            ),
         )
         .await
     } else {
@@ -6745,7 +6859,7 @@ async fn invoke_pty_branch(
 /// A 12-char hex prefix has ~48 bits of entropy, far short of being a
 /// useful secret (the rotator stores the full token; only the gateway
 /// sees this prefix in its memory). It's NEVER logged to disk.
-fn account_id_from_env_vars(
+pub(crate) fn account_id_from_env_vars(
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
     if let Some(token) = env_vars.get("CLAUDE_CODE_OAUTH_TOKEN")
@@ -6757,6 +6871,18 @@ fn account_id_from_env_vars(
         && !dir.is_empty()
     {
         return Some(format!("dir-{dir}"));
+    }
+    // Default keychain OAuth account: the rotator emits ONLY the empty
+    // `ANTHROPIC_API_KEY` force-OAuth sentinel (no token, default config dir).
+    // Give it a stable synthetic id so the sentinel env is stashed + injected
+    // into the PTY child. Without an id the child inherits the gateway's ambient
+    // env, and a stale `ANTHROPIC_API_KEY` there would silently override OAuth
+    // (the empty sentinel is exactly what neutralises it). The env is non-empty
+    // (one key), so the HS14 "account_id set but env empty" fail-fast never trips.
+    if let Some(v) = env_vars.get("ANTHROPIC_API_KEY")
+        && v.is_empty()
+    {
+        return Some("oauth-keychain-default".to_string());
     }
     None
 }
@@ -7748,12 +7874,17 @@ mod routing_helper_tests {
     }
 
     #[test]
-    fn account_id_from_env_vars_returns_none_for_default_keychain() {
-        // Default OAuth keychain account: rotator emits empty
-        // ANTHROPIC_API_KEY but no token + no profile dir.
+    fn account_id_from_env_vars_gives_stable_id_for_default_keychain() {
+        // Default OAuth keychain account: rotator emits ONLY the empty
+        // ANTHROPIC_API_KEY sentinel (no token, no profile dir). It must get a
+        // stable synthetic id so the sentinel env is stashed + injected into the
+        // PTY child (guarding against ambient ANTHROPIC_API_KEY leaking in).
         let mut env = HashMap::new();
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
-        assert!(account_id_from_env_vars(&env).is_none());
+        assert_eq!(
+            account_id_from_env_vars(&env).as_deref(),
+            Some("oauth-keychain-default")
+        );
     }
 
     #[test]

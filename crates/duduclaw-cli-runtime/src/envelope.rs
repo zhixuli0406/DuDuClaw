@@ -300,6 +300,83 @@ const CHROME_MARKERS: &[&str] = &[
     "tokensused",
 ];
 
+/// Boot / welcome-screen chrome fingerprints (whitespace-insensitive, lowercased).
+///
+/// On a FRESH session's first turn, the full-screen redraw of the "Welcome back
+/// …" box + "What's new" panel + release-notes / org / agent-path lines can land
+/// BETWEEN the two answer sentinels, and the plain `CHROME_MARKERS` above don't
+/// recognise it — so the box text was surfaced to the user as the "answer"
+/// (production Bug2, 2026-07-21). These are matched against a whitespace-stripped
+/// + lowercased line so both the spaced and cursor-positioned render forms hit.
+/// Deliberately welcome-box-specific so a normal answer can't trip them.
+const BOOT_CHROME_MARKERS: &[&str] = &[
+    "welcomeback",       // "Welcome back Louis!"
+    "what'snew",         // "What's new"
+    "whatsnew",
+    "tipsforgetting",    // "Tips for getting started"
+    "run/inittocreate",  // "Run /init to create a ..."
+    "release-notes",     // "/release-notes for more"
+    "releasenotes",
+    "claudecodev",       // box header "Claude Code v2.1.173"
+    "improvedautomode",  // What's-new bullet
+    "automodeon",        // footer "auto mode on (shift+tab to cycle)"
+    "foragents",         // footer "← for agents"
+];
+
+/// Composer input-box status-line fingerprints matched by **whole-line
+/// equality** on the whitespace-stripped, lowercased line.
+///
+/// These are the footer/status strings the TUI paints under the input box; on a
+/// full-screen redraw they can stick to the tail of the answer between the
+/// sentinels (production 2026-07-21: `ctrl+g to edit in Vim` appeared at the end
+/// of a reply). Matched by EQUALITY, never substring — so an answer that merely
+/// *mentions* one ("Ctrl+G to edit in Vim opens the editor", or a reply about
+/// vim shortcuts) is not misclassified as chrome.
+const COMPOSER_STATUS_EXACT: &[&str] = &[
+    "ctrl+gtoeditinvim",  // "ctrl+g to edit in Vim"
+    "←foragents",         // "← for agents" footer
+    "?forshortcuts",      // "? for shortcuts"
+    "shift+tabtocycle",   // "shift+tab to cycle" (when shown on its own line)
+];
+
+/// Composer status lines matched by **whole-line prefix** — reserved for
+/// symbol-led footers a normal answer cannot begin with (so the prefix match is
+/// still safe from misclassifying real answer text).
+const COMPOSER_STATUS_PREFIX: &[&str] = &[
+    "⏵⏵", // "⏵⏵ automode on (shift+tab to cycle) · ← for agents"
+];
+
+/// True for box-drawing (U+2500–U+257F) and block-element (U+2580–U+259F)
+/// glyphs. Any of these on a line marks it as TUI frame chrome — the welcome
+/// box, panels, and the logo (`▐▛███▜▌`) are all built from them, and a normal
+/// chat answer never contains them. Fail-closed: dropping such a line can at
+/// worst empty the payload, which routes to the empty-payload retry/fallback
+/// rather than surfacing chrome as an answer.
+fn is_box_or_block_glyph(c: char) -> bool {
+    ('\u{2500}'..='\u{259F}').contains(&c)
+}
+
+/// True when a line is BOOT/WELCOME chrome specifically (as opposed to input-box
+/// / status chrome). Only this kind is skipped when it *leads* the payload; see
+/// [`extract_payload_with_chrome_filter`]. Box-drawing / block glyphs (welcome
+/// box + logo, and the full-width `────` separators around it) and the welcome
+/// keyword list qualify.
+fn is_boot_welcome_chrome_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.chars().any(is_box_or_block_glyph) {
+        return true;
+    }
+    let compact: String = trimmed
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    BOOT_CHROME_MARKERS.iter().any(|m| compact.contains(m))
+}
+
 /// Filter TUI chrome out of a sentinel-bounded payload.
 ///
 /// Strategy:
@@ -317,16 +394,33 @@ const CHROME_MARKERS: &[&str] = &[
 /// new TUI states emerge.
 pub fn extract_payload_with_chrome_filter(stripped_between_sentinels: &str) -> String {
     let mut kept_lines: Vec<String> = Vec::new();
+    // **Bug2 fix (2026-07-21)**: distinguish LEADING boot/welcome chrome (skip
+    // it — the real answer may follow) from chrome AFTER the answer (stop — it's
+    // the input-box redraw). Before this, the first chrome line always broke the
+    // loop, so a first-turn welcome box that preceded the answer either wiped the
+    // payload or, when the box itself sat between the sentinels, was surfaced as
+    // the answer. Now leading chrome is dropped and collection continues.
+    let mut seen_content = false;
     for line in stripped_between_sentinels.lines() {
         let truncated = truncate_at_inline_chrome(line);
         let trimmed = truncated.trim_end();
-        // If the original line had content but truncation reduced it to
-        // empty/whitespace, the entire line is chrome — stop here.
-        if !line.trim().is_empty() && trimmed.trim().is_empty() {
+        // A line whose content was entirely truncated as inline chrome, OR that
+        // classifies as a chrome line, is chrome.
+        let is_chrome = (!line.trim().is_empty() && trimmed.trim().is_empty())
+            || is_chrome_line(trimmed);
+        if is_chrome {
+            // Only BOOT/WELCOME chrome (box-drawing rows, "What's new", etc.) is
+            // skipped when it LEADS — the real answer may follow it on the first
+            // turn. Input-box / status chrome (❯ cursor, spinner, esc-to-interrupt,
+            // separators) always stops collection, matching the pre-Bug2 contract
+            // (a leading input-box line means there's no answer to keep).
+            if !seen_content && is_boot_welcome_chrome_line(trimmed) {
+                continue;
+            }
             break;
         }
-        if is_chrome_line(trimmed) {
-            break;
+        if !trimmed.trim().is_empty() {
+            seen_content = true;
         }
         kept_lines.push(trimmed.to_string());
     }
@@ -404,8 +498,36 @@ fn is_chrome_line(line: &str) -> bool {
         return false; // empty lines aren't chrome, just whitespace
     }
 
+    // **Bug2 fix**: ANY box-drawing / block-element glyph ⇒ TUI frame chrome
+    // (welcome box, "What's new" panel, logo). A normal answer never contains
+    // these, so this cleanly drops the entire multi-line welcome box (every row
+    // of which carries a `│`), including the org/email/agent-path rows inside it.
+    if trimmed.chars().any(is_box_or_block_glyph) {
+        return true;
+    }
+
     // Separator line of box-drawing horizontals or hyphens.
     if trimmed.chars().all(|c| matches!(c, '─' | '━' | '-' | '=' | '·')) {
+        return true;
+    }
+
+    // Boot / welcome-screen fingerprints (whitespace-insensitive, lowercased).
+    let compact: String = trimmed
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if BOOT_CHROME_MARKERS.iter().any(|m| compact.contains(m)) {
+        return true;
+    }
+
+    // Composer input-box status lines (e.g. "ctrl+g to edit in Vim",
+    // "⏵⏵ automode on (shift+tab to cycle) · ← for agents"). WHOLE-LINE match
+    // only (equality, or a symbol-led prefix) so an answer that merely mentions
+    // one of these shortcuts is never misclassified as chrome.
+    if COMPOSER_STATUS_EXACT.contains(&compact.as_str())
+        || COMPOSER_STATUS_PREFIX.iter().any(|p| compact.starts_with(p))
+    {
         return true;
     }
 
@@ -745,6 +867,94 @@ mod tests {
     fn chrome_filter_truncates_inline_named_marker() {
         let payload = "Real answer Inferring… 4s · ↓ 255 tokens";
         assert_eq!(extract_payload_with_chrome_filter(payload), "Real answer");
+    }
+
+    // ── Bug2 (2026-07-21): boot/welcome chrome must never surface as answer ──
+
+    /// Real welcome box captured from claude 2.1.173 via python PTY (2026-07-21).
+    /// Every row carries box-drawing/block glyphs; this is what leaked to the
+    /// user as a 217-token "answer" on a fresh session's first turn.
+    const WELCOME_FIXTURE: &str = "\
+╭───ClaudeCodev2.1.173─────────────────────────────────────────────────────╮
+││Tipsforgetting│
+│WelcomebackLouis!│started│
+││Run/inittocreatea…│
+│▐▛███▜▌│───────────────────────│
+│▝▜█████▛▘│What'snew│
+│▘▘▝▝│Improvedautomodesaf…│
+│Haiku4.5·ClaudeMax·a6693432@gmail.com's│Addedawarningwhent…│
+│Organization│Added`attribution.ses…│
+│/…/scratchpad/bugdir│/release-notesformore│
+╰──────────────────────────────────────────────────────────────────────────────╯";
+
+    #[test]
+    fn welcome_box_alone_yields_empty_payload_fail_closed() {
+        // The whole welcome box is chrome → empty payload → routes to the
+        // empty-payload retry/fallback rather than being surfaced as the answer.
+        assert_eq!(extract_payload_with_chrome_filter(WELCOME_FIXTURE), "");
+    }
+
+    #[test]
+    fn welcome_box_before_answer_is_skipped_answer_kept() {
+        // First-turn full-screen redraw: welcome box precedes the real answer.
+        // Leading welcome chrome is dropped; the answer is preserved.
+        let payload = format!("{WELCOME_FIXTURE}\n你好，我可以幫你深度搜尋 AGI 論文。");
+        assert_eq!(
+            extract_payload_with_chrome_filter(&payload),
+            "你好，我可以幫你深度搜尋 AGI 論文。"
+        );
+    }
+
+    #[test]
+    fn welcome_box_after_answer_stops_collection() {
+        // Answer first, then a welcome/panel redraw → stop at the box.
+        let payload = format!("The answer is 42.\n{WELCOME_FIXTURE}");
+        assert_eq!(extract_payload_with_chrome_filter(&payload), "The answer is 42.");
+    }
+
+    #[test]
+    fn composer_status_lines_are_chrome_whole_line_only() {
+        // Real composer footers (claude 2.1.173). The `ctrl+g to edit in Vim`
+        // one leaked to a user at the end of a reply (production 2026-07-21).
+        assert!(is_chrome_line("ctrl+g to edit in Vim"));
+        assert!(is_chrome_line("⏵⏵ automode on (shift+tab to cycle) · ← for agents"));
+        assert!(is_chrome_line("← for agents"));
+        assert!(is_chrome_line("? for shortcuts"));
+        assert!(is_chrome_line("shift+tab to cycle"));
+        // MUST NOT misclassify an answer that MENTIONS a shortcut (whole-line
+        // equality / symbol-prefix only, never substring).
+        assert!(!is_chrome_line(
+            "Ctrl+G to edit in Vim opens the editor and drops you into insert mode."
+        ));
+        assert!(!is_chrome_line("你可以用 Ctrl+G 在 Vim 裡編輯這個檔案。"));
+        assert!(!is_chrome_line("The shortcut you want is shift+tab to cycle modes."));
+    }
+
+    #[test]
+    fn answer_with_trailing_composer_status_is_trimmed() {
+        // The exact production shape: answer text then the input-box footer.
+        let payload = "AGI 指通用人工智慧。\nctrl+g to edit in Vim";
+        assert_eq!(
+            extract_payload_with_chrome_filter(payload),
+            "AGI 指通用人工智慧。"
+        );
+        let payload2 = "Here is your answer.\n⏵⏵ automode on (shift+tab to cycle) · ← for agents";
+        assert_eq!(
+            extract_payload_with_chrome_filter(payload2),
+            "Here is your answer."
+        );
+    }
+
+    #[test]
+    fn box_and_block_glyphs_flag_chrome() {
+        assert!(is_chrome_line("│ Welcome back │"));
+        assert!(is_chrome_line("▐▛███▜▌"));
+        assert!(is_chrome_line("╰────────╯"));
+        assert!(is_chrome_line("What's new"));
+        assert!(is_chrome_line("/release-notes for more"));
+        // A normal answer with an em-dash or hyphen is NOT box chrome.
+        assert!(!is_chrome_line("The result — surprisingly — was 42."));
+        assert!(!is_chrome_line("Use foo-bar-baz style names."));
     }
 
     #[test]

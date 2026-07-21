@@ -44,9 +44,16 @@ pub struct InvokeParams {
     #[serde(default)]
     pub bare_mode: bool,
     pub prompt: String,
-    /// Per-call deadline in milliseconds. The server enforces it on top of
-    /// any PtyPool default invoke timeout.
+    /// Per-call **hard cap** in milliseconds — the absolute wall-clock safety
+    /// net. The server enforces it on top of any PtyPool default invoke timeout.
     pub timeout_ms: u64,
+    /// Per-call **idle/stall** window in milliseconds. When `Some`, the worker
+    /// enables stall detection: the interactive REPL fails early if no
+    /// substantive progress is seen for this long (see the gateway's
+    /// `pty_idle_timeout_secs`). `None` (legacy / older clients) ⇒ only the hard
+    /// cap applies. Back-compat: older clients omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
     /// Phase 3.D.2 — optional OAuth account scope. When `Some`, the
     /// worker's PtyPool keys sessions per-account so multi-account
     /// rotation gets distinct sessions. `None` keeps the legacy
@@ -186,6 +193,7 @@ mod tests {
             bare_mode: false,
             prompt: "Say hi".into(),
             timeout_ms: 60_000,
+            idle_timeout_ms: None,
             account_id: None,
             model: None,
             work_dir: None,
@@ -256,6 +264,7 @@ mod tests {
             bare_mode: false,
             prompt: "hi".into(),
             timeout_ms: 1000,
+            idle_timeout_ms: None,
             account_id: Some("alice@example.com".into()),
             model: None,
             work_dir: None,
@@ -276,6 +285,7 @@ mod tests {
             bare_mode: false,
             prompt: "hi".into(),
             timeout_ms: 1000,
+            idle_timeout_ms: None,
             account_id: None,
             model: None,
             work_dir: None,

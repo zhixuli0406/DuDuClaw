@@ -642,7 +642,10 @@ async fn call_claude_for_agent_impl(
                 mode = runtime_mode.as_str(),
                 "dispatcher: short-circuit through PTY pool (skipping local offload + hybrid routing)"
             );
-            let deadline = std::time::Duration::from_secs(180);
+            // Stall detection + hard cap, same policy as the channel path
+            // (per-agent configurable via `agent.toml [runtime]`).
+            let hard_cap = crate::pty_runtime::interactive_repl_deadline(Some(&agent_dir));
+            let idle_timeout = crate::pty_runtime::interactive_repl_idle_timeout(Some(&agent_dir));
             // Round 4 deferred-cleanup (LOW F-3): canonical options entry.
             // Unbind from hardcoded Claude: the PtyPool kind follows the agent's
             // configured provider. Non-Claude providers are short-circuited to
@@ -652,15 +655,65 @@ async fn call_claude_for_agent_impl(
                 delegation_settings.provider,
             )
             .unwrap_or(duduclaw_cli_runtime::CliKind::Claude);
-            let acquire = crate::pty_runtime::AcquireOptions::new(
-                agent_id,
-                cli_kind,
-                cli_bare_mode,
-            );
-            return crate::pty_runtime::acquire_and_invoke_with(
-                crate::pty_runtime::InvokeOptions::new(acquire, prompt, deadline),
-            )
-            .await;
+            // Gap A fix: route each rotator-selected account's credential env
+            // into the PTY pool (per-account `account_id` + `env`), mirroring the
+            // channel-reply path. Previously this dispatcher short-circuit called
+            // `acquire_and_invoke_with` with NO account_id / env, so PTY-pooled
+            // sub-agent dispatch ran under whatever ambient OAuth happened to live
+            // in `~/.claude/` — breaking multi-account isolation and the managed
+            // worker's HS14 per-account scoping. Use the same `rotate_cli_spawn`
+            // primitive the channel path uses so failover + per-account cooldown
+            // apply here too.
+            match get_rotator(home_dir).await {
+                Ok(rotator) if rotator.count().await > 0 => {
+                    return crate::channel_reply::rotate_cli_spawn(
+                        &rotator,
+                        move |env_vars, _retry_hint| {
+                            let account_id =
+                                crate::channel_reply::account_id_from_env_vars(&env_vars);
+                            async move {
+                                let acquire = crate::pty_runtime::AcquireOptions::new(
+                                    agent_id,
+                                    cli_kind,
+                                    cli_bare_mode,
+                                )
+                                .account_id(account_id.as_deref())
+                                .env(env_vars.clone());
+                                crate::pty_runtime::acquire_and_invoke_with(
+                                    crate::pty_runtime::InvokeOptions::new(
+                                        acquire,
+                                        prompt,
+                                        hard_cap,
+                                        idle_timeout,
+                                    ),
+                                )
+                                .await
+                            }
+                        },
+                        prompt.len(),
+                    )
+                    .await;
+                }
+                _ => {
+                    // No rotator accounts / rotator unavailable → ambient-env
+                    // fallback (the user's default `claude auth login` session),
+                    // matching the pre-fix behaviour.
+                    let acquire = crate::pty_runtime::AcquireOptions::new(
+                        agent_id,
+                        cli_kind,
+                        cli_bare_mode,
+                    );
+                    return crate::pty_runtime::acquire_and_invoke_with(
+                        crate::pty_runtime::InvokeOptions::new(
+                            acquire,
+                            prompt,
+                            hard_cap,
+                            idle_timeout,
+                        ),
+                    )
+                    .await;
+                }
+            }
         }
     }
 
