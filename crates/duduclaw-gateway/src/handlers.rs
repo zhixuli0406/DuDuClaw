@@ -4118,7 +4118,7 @@ impl MethodHandler {
                 { "name": "models.refresh", "description": "Re-probe installed CLIs/APIs for live model lists" },
                 { "name": "runtime.detect", "description": "Detect installed AI runtimes (claude/codex/gemini/antigravity) + Claude OAuth" },
                 { "name": "system.config", "description": "View system config" },
-                { "name": "system.update_config", "description": "Update system config (log_level, rotation)" },
+                { "name": "system.update_config", "description": "Update system config (log_level, rotation, allowed_origins)" },
                 { "name": "accounts.add", "description": "Add a new account" },
                 { "name": "accounts.update_budget", "description": "Update account monthly budget" },
                 { "name": "system.version", "description": "Version info" },
@@ -12590,6 +12590,24 @@ impl MethodHandler {
             }).unwrap_or(Value::Null)
         };
 
+        // Structured [gateway] allowed_origins array so the dashboard can render
+        // the remote-access allowlist as editable chips (the masked TOML string
+        // is display-only). Absent / malformed => empty (loopback-only).
+        let allowed_origins: Vec<String> = {
+            let table = self.read_config_table(&config_path).await;
+            table
+                .get("gateway")
+                .and_then(|g| g.as_table())
+                .and_then(|g| g.get("allowed_origins"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
         match tokio::fs::read_to_string(&config_path).await {
             Ok(content) => {
                 // Mask sensitive fields
@@ -12597,7 +12615,7 @@ impl MethodHandler {
                     Ok(mut table) => {
                         Self::mask_sensitive_fields(&mut table);
                         let masked = toml::to_string_pretty(&table).unwrap_or_else(|_| content.clone());
-                        WsFrame::ok_response("", json!({ "config": masked, "voice": voice }))
+                        WsFrame::ok_response("", json!({ "config": masked, "voice": voice, "allowed_origins": allowed_origins }))
                     }
                     Err(_) => {
                         // Do NOT return raw content — it may contain unmasked tokens (MCP-H5)
@@ -13880,6 +13898,9 @@ impl MethodHandler {
         let config_path = self.home_dir.join("config.toml");
         let mut table = self.read_config_table(&config_path).await;
         let mut changes: Vec<String> = Vec::new();
+        // Cleaned remote-access allowlist to hot-apply AFTER a successful write
+        // (Some(..) iff the payload carried `allowed_origins`).
+        let mut applied_origins: Option<Vec<String>> = None;
 
         // ── log_level ──
         if let Some(v) = params.get("log_level").and_then(|v| v.as_str()) {
@@ -13970,6 +13991,32 @@ impl MethodHandler {
                     }
                 }
             }
+        }
+
+        // ── G.1b [gateway] allowed_origins (remote-access allowlist, hot-applied) ──
+        // Array of remote dashboard origins (host / host:port / full URL). Each
+        // entry is cleaned via the gateway's normalize step (scheme + trailing
+        // slash stripped, empties dropped); the cleaned list is persisted and,
+        // on a successful write, hot-applied via `set_allowed_origins` (which
+        // re-merges the DUDUCLAW_ALLOWED_ORIGINS env) — no restart needed.
+        if let Some(arr) = params.get("allowed_origins").and_then(|v| v.as_array()) {
+            let cleaned: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(crate::server::normalize_origin_entry)
+                .collect();
+            let gateway = table
+                .entry("gateway")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            let toml_arr: Vec<toml::Value> = cleaned
+                .iter()
+                .map(|s| toml::Value::String(s.clone()))
+                .collect();
+            gateway.insert("allowed_origins".into(), toml::Value::Array(toml_arr));
+            changes.push(format!("gateway.allowed_origins = {} entr{}", cleaned.len(), if cleaned.len() == 1 { "y" } else { "ies" }));
+            applied_origins = Some(cleaned);
         }
 
         // ── G.2 [rotation] health_check_interval_seconds / cooldown_after_rate_limit_seconds ──
@@ -14150,7 +14197,7 @@ impl MethodHandler {
         }
 
         if changes.is_empty() {
-            return WsFrame::error_response("", "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode), secret_manager");
+            return WsFrame::error_response("", "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode), secret_manager");
         }
 
         // Atomic write: temp + rename
@@ -14163,10 +14210,22 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
         }
 
+        // Hot-apply the remote-access allowlist so the dashboard save takes
+        // effect immediately — no gateway restart. Only reached once the config
+        // write above committed successfully.
+        let origins_applied = if let Some(cleaned) = applied_origins {
+            crate::server::set_allowed_origins(cleaned);
+            true
+        } else {
+            false
+        };
+
         info!(?changes, "system.update_config completed");
         WsFrame::ok_response("", json!({
             "success": true,
             "changes": changes,
+            // Signals the UI that allowed_origins took effect live (no restart).
+            "applied": origins_applied,
         }))
     }
 

@@ -2884,9 +2884,11 @@ export const api = {
       client.call('system.config') as Promise<{
         config?: string;
         voice?: Partial<VoiceSettings> | null;
+        // Structured [gateway] allowed_origins for the remote-access allowlist UI.
+        allowed_origins?: string[];
       }>,
     updateConfig: (fields: Record<string, unknown>) =>
-      client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[] }>,
+      client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean }>,
     checkUpdate: () =>
       client.call('system.check_update') as Promise<{
         available: boolean;

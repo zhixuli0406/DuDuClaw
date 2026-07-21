@@ -175,6 +175,34 @@ server {
 }
 ```
 
+### WebSocket Origin 白名單（反向代理 / tailnet 必讀）
+
+Dashboard 的即時連線（WebSocket、WebChat）預設只接受來自
+loopback（`localhost` / `127.0.0.1` / `[::1]`）的瀏覽器 `Origin`。當你透過
+**反向代理網域**或 **Tailscale/tailnet 網址**開啟 dashboard 時，HTTP 頁面會正常
+載入，但 WebSocket 升級會被 403 擋掉、畫面持續轉圈圈。把對外網域加進白名單即可
+解決：
+
+```toml
+# ~/.duduclaw/config.toml
+[gateway]
+# host、host:port，或含 scheme 的完整 origin 都可（載入時會正規化）
+allowed_origins = ["duduclaw.yourdomain.com", "box.your-tailnet.ts.net"]
+```
+
+或用環境變數（逗號分隔，與 config.toml 的清單**合併**，不是二選一）：
+
+```bash
+DUDUCLAW_ALLOWED_ORIGINS="duduclaw.yourdomain.com,box.your-tailnet.ts.net"
+```
+
+- 內建 loopback 三項永遠有效，不需列出；清單為空時行為與舊版完全一致。
+- 每個項目是**精確**的 host 或 host:port 比對，不支援萬用字元；port-less 項目
+  匹配該 host 的任意 port。後綴攻擊（`duduclaw.yourdomain.com.evil.com`）會被擋。
+- 啟動時會印一行 info log 列出生效的額外 origins，方便排錯。
+- 也可直接在 dashboard **設定 → 系統 → 遠端存取網址**新增／刪除，不必手改 config.toml；
+  **存檔即時生效，不用重開 gateway**（環境變數提供的項目仍會保留）。
+
 ---
 
 ## 6. Docker Compose

@@ -106,6 +106,12 @@ pub struct GatewayConfig {
     pub auth_token: Option<String>,
     /// Path to the DuDuClaw home directory (e.g. `~/.duduclaw`).
     pub home_dir: std::path::PathBuf,
+    /// Extra allowed dashboard `Origin`s for WebSocket/CORS, beyond the built-in
+    /// loopback hosts. Sourced from config.toml `[gateway] allowed_origins` +
+    /// `DUDUCLAW_ALLOWED_ORIGINS`. Empty (default) => loopback-only, zero change.
+    /// Entries may be `host`, `host:port`, or a full origin (scheme stripped on
+    /// load). Needed when the dashboard is reached over a tailnet/proxy hostname.
+    pub allowed_origins: Vec<String>,
     /// Plugin extension point. Defaults to [`NullExtension`].
     pub extension: Arc<dyn GatewayExtension>,
     /// Explicit product form-factor override. `None` means resolve at request
@@ -152,6 +158,19 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             None,
         );
         info!("edition_profile={}", boot_edition.as_str());
+    }
+
+    // Install operator-configured extra allowed Origins for dashboard WS/CORS.
+    // Empty by default => built-in loopback origins only (no behaviour change).
+    let extra_origins = init_allowed_origins(config.allowed_origins.clone());
+    if extra_origins.is_empty() {
+        info!("dashboard WS/CORS: loopback origins only (localhost / 127.0.0.1 / [::1])");
+    } else {
+        info!(
+            "dashboard WS/CORS: {} extra allowed origin(s): {}",
+            extra_origins.len(),
+            extra_origins.join(", ")
+        );
     }
 
     // ── BUG-2 fix: anchor EvolutionEvents audit log to home_dir, not cwd ──
@@ -2131,16 +2150,118 @@ async fn handle_first_run_claim(
     }
 }
 
-/// Whether the request's `Origin` is an allowed local dashboard origin.
+/// Built-in loopback origins that are always allowed for the local dashboard,
+/// independent of any operator configuration.
+const BUILTIN_ALLOWED_ORIGINS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
+
+/// Operator-configured *extra* allowed origins (config.toml
+/// `[gateway] allowed_origins` merged with the `DUDUCLAW_ALLOWED_ORIGINS` env).
+/// Stored normalized to the `host[:port]` form `origin_host_matches` expects.
+/// Empty (the default) => behaviour is byte-identical to loopback-only.
 ///
-/// HS3/C5: uses exact authority matching (any port on localhost / 127.0.0.1 /
-/// [::1]). Absent Origin (non-browser clients like curl/SDK) is allowed. Rejects
-/// suffix-attack origins such as `http://localhost.evil.com`.
+/// Wrapped in an `RwLock` so the dashboard (`system.update_config`) can hot-apply
+/// a new allowlist without a gateway restart: `origin_is_allowed` takes a read
+/// lock per request, [`set_allowed_origins`] takes the write lock. The read cost
+/// is a single uncontended lock acquisition on the WS-upgrade path.
+static ALLOWED_ORIGINS: std::sync::OnceLock<std::sync::RwLock<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+/// Lazily-initialized backing cell for [`ALLOWED_ORIGINS`]. Starts empty
+/// (loopback-only) until [`init_allowed_origins`] runs at startup.
+fn allowed_origins_cell() -> &'static std::sync::RwLock<Vec<String>> {
+    ALLOWED_ORIGINS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// Read + normalize the `DUDUCLAW_ALLOWED_ORIGINS` env entries (comma-separated).
+/// Re-read on every hot-update so a dashboard save never drops env-provided
+/// origins (the UI only ever knows about the config.toml portion).
+fn env_allowed_origins() -> Vec<String> {
+    std::env::var("DUDUCLAW_ALLOWED_ORIGINS")
+        .ok()
+        .map(|v| v.split(',').filter_map(normalize_origin_entry).collect())
+        .unwrap_or_default()
+}
+
+/// Normalize a user-supplied origin allowlist entry into the `host[:port]`
+/// form `origin_host_matches` expects: trim, strip a leading scheme
+/// (`http://` / `https://` / `ws://` / `wss://`, case-insensitive), strip a
+/// trailing `/`. Returns `None` for entries that are empty after cleaning.
+/// No wildcard support — each entry is an exact host or host:port.
+pub(crate) fn normalize_origin_entry(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let mut start = 0;
+    for scheme in ["http://", "https://", "ws://", "wss://"] {
+        if lower.starts_with(scheme) {
+            start = scheme.len();
+            break;
+        }
+    }
+    let cleaned = trimmed[start..].trim_end_matches('/').trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+/// Install the operator-configured extra allowed origins once at startup.
+/// `raw` is the already-merged config.toml + env list from the CLI. Raw entries
+/// are normalized (see [`normalize_origin_entry`]) and empties dropped. Returns
+/// the normalized list so the caller can log it.
+pub(crate) fn init_allowed_origins(raw: Vec<String>) -> Vec<String> {
+    let normalized: Vec<String> = raw
+        .iter()
+        .filter_map(|s| normalize_origin_entry(s))
+        .collect();
+    *allowed_origins_cell().write().unwrap() = normalized.clone();
+    normalized
+}
+
+/// Hot-apply a new operator allowlist from the given config.toml `[gateway]
+/// allowed_origins` entries — used by `system.update_config` so a dashboard save
+/// takes effect immediately (no restart). The `DUDUCLAW_ALLOWED_ORIGINS` env
+/// entries are re-merged so a UI save never drops env-provided origins. Entries
+/// are normalized, empties dropped, deduped (config first, then env). Returns the
+/// resulting live list.
+pub(crate) fn set_allowed_origins(config_entries: Vec<String>) -> Vec<String> {
+    let mut merged: Vec<String> = config_entries
+        .iter()
+        .filter_map(|s| normalize_origin_entry(s))
+        .collect();
+    for e in env_allowed_origins() {
+        if !merged.contains(&e) {
+            merged.push(e);
+        }
+    }
+    *allowed_origins_cell().write().unwrap() = merged.clone();
+    merged
+}
+
+/// Whether the request's `Origin` is an allowed dashboard origin.
+///
+/// HS3/C5: uses exact authority matching (any port on the built-in loopback
+/// hosts + any operator-configured `allowed_origins`). Absent Origin
+/// (non-browser clients like curl/SDK) is allowed. Rejects suffix-attack
+/// origins such as `http://localhost.evil.com`.
 pub(crate) fn origin_is_allowed(headers: &axum::http::HeaderMap) -> bool {
+    let guard = allowed_origins_cell().read().unwrap();
+    origin_is_allowed_with(headers, guard.as_slice())
+}
+
+/// Testable core of [`origin_is_allowed`]: matches against the built-in
+/// loopback origins plus the given `extra` list (already normalized to
+/// `host[:port]`), without touching the process-wide `OnceLock`.
+pub(crate) fn origin_is_allowed_with(
+    headers: &axum::http::HeaderMap,
+    extra: &[String],
+) -> bool {
     match headers.get("origin").and_then(|v| v.to_str().ok()) {
         None => true,
         Some(origin) => {
-            duduclaw_core::origin_host_matches(origin, &["localhost", "127.0.0.1", "[::1]"])
+            let mut allowed: Vec<&str> = BUILTIN_ALLOWED_ORIGINS.to_vec();
+            allowed.extend(extra.iter().map(String::as_str));
+            duduclaw_core::origin_host_matches(origin, &allowed)
         }
     }
 }
@@ -3199,6 +3320,162 @@ mod login_rate_limit_tests {
         assert!(!check_login_rate_limit(attacker, email), "attacker should be blocked");
         // Victim on a different IP is unaffected.
         assert!(check_login_rate_limit(victim, email), "victim should still pass");
+    }
+}
+
+#[cfg(test)]
+mod origin_allowlist_tests {
+    use super::*;
+
+    /// Build a `HeaderMap` carrying a single `Origin` header.
+    fn origin_headers(origin: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("origin", origin.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn absent_origin_is_allowed() {
+        // Non-browser clients (curl/SDK) send no Origin — always allowed.
+        let h = axum::http::HeaderMap::new();
+        assert!(origin_is_allowed_with(&h, &[]));
+    }
+
+    #[test]
+    fn loopback_allowed_by_default_external_blocked() {
+        // (a) With an empty extra list, only built-in loopback origins pass.
+        assert!(origin_is_allowed_with(&origin_headers("http://localhost:18789"), &[]));
+        assert!(origin_is_allowed_with(&origin_headers("http://127.0.0.1:5173"), &[]));
+        assert!(!origin_is_allowed_with(
+            &origin_headers("http://evil.example.com"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn configured_origin_allows_exact_match() {
+        // (b) After configuring a tailnet host, its Origin is accepted.
+        let extra = vec!["box.tailscale.ts.net".to_string()];
+        assert!(origin_is_allowed_with(
+            &origin_headers("https://box.tailscale.ts.net"),
+            &extra
+        ));
+        // A different host is still blocked.
+        assert!(!origin_is_allowed_with(
+            &origin_headers("https://other.tailscale.ts.net"),
+            &extra
+        ));
+    }
+
+    #[test]
+    fn suffix_attacks_still_blocked() {
+        // (c) Suffix/prefix attacks against a configured host must not pass.
+        let extra = vec!["localhost".to_string(), "dash.example.com".to_string()];
+        assert!(!origin_is_allowed_with(
+            &origin_headers("http://localhost.evil.com"),
+            &extra
+        ));
+        assert!(!origin_is_allowed_with(
+            &origin_headers("http://evil-localhost.com"),
+            &extra
+        ));
+        assert!(!origin_is_allowed_with(
+            &origin_headers("http://dash.example.com.evil.com"),
+            &extra
+        ));
+        assert!(!origin_is_allowed_with(
+            &origin_headers("http://evildash.example.com"),
+            &extra
+        ));
+    }
+
+    #[test]
+    fn scheme_and_trailing_slash_are_normalized() {
+        // (d) Config values with scheme / trailing slash normalize correctly.
+        assert_eq!(
+            normalize_origin_entry("https://dash.example.com:8080/"),
+            Some("dash.example.com:8080".to_string())
+        );
+        assert_eq!(
+            normalize_origin_entry("  ws://box.tailnet.ts.net/  "),
+            Some("box.tailnet.ts.net".to_string())
+        );
+        assert_eq!(normalize_origin_entry("HTTP://Host.Example"), Some("Host.Example".to_string()));
+        assert_eq!(normalize_origin_entry("   "), None);
+        assert_eq!(normalize_origin_entry("https://"), None);
+
+        // A normalized host:port entry matches only that exact port.
+        let extra = vec![
+            normalize_origin_entry("https://dash.example.com:8080/").unwrap(),
+        ];
+        assert!(origin_is_allowed_with(
+            &origin_headers("https://dash.example.com:8080"),
+            &extra
+        ));
+        assert!(!origin_is_allowed_with(
+            &origin_headers("https://dash.example.com:9090"),
+            &extra
+        ));
+    }
+
+    #[test]
+    fn init_filters_empty_entries() {
+        // Empty/whitespace/scheme-only entries are dropped during normalization.
+        let normalized: Vec<String> = vec![
+            "  ".to_string(),
+            "https://".to_string(),
+            "http://good.host/".to_string(),
+        ]
+        .iter()
+        .filter_map(|s| normalize_origin_entry(s))
+        .collect();
+        assert_eq!(normalized, vec!["good.host".to_string()]);
+    }
+
+    #[test]
+    fn hot_update_reflects_immediately_and_preserves_env() {
+        // This test drives the process-wide ALLOWED_ORIGINS cell (init + set),
+        // so keep it self-contained and restore the env at the end. It is the
+        // only test that mutates the global cell / DUDUCLAW_ALLOWED_ORIGINS env.
+        let saved_env = std::env::var("DUDUCLAW_ALLOWED_ORIGINS").ok();
+        // SAFETY: single-threaded test body; env restored before returning.
+        unsafe { std::env::set_var("DUDUCLAW_ALLOWED_ORIGINS", "env.host.ts.net") };
+
+        // Startup: CLI merges config + env, then init installs the combined list.
+        init_allowed_origins(vec![
+            "https://dash.example.com/".to_string(),
+            "env.host.ts.net".to_string(),
+        ]);
+        assert!(origin_is_allowed(&origin_headers("https://dash.example.com")));
+        assert!(origin_is_allowed(&origin_headers("https://env.host.ts.net")));
+        assert!(!origin_is_allowed(&origin_headers("https://new.example.com")));
+
+        // Dashboard save: only the config.toml portion is sent (env unknown to UI).
+        // A newly-added host is allowed immediately, WITHOUT a restart...
+        set_allowed_origins(vec!["https://new.example.com/".to_string()]);
+        assert!(origin_is_allowed(&origin_headers("https://new.example.com")));
+        // ...the removed config host is now blocked...
+        assert!(!origin_is_allowed(&origin_headers("https://dash.example.com")));
+        // ...and the env-provided host survives the save (re-merged in the setter).
+        assert!(origin_is_allowed(&origin_headers("https://env.host.ts.net")));
+
+        // Clearing the config list back to empty keeps env, drops config hosts.
+        set_allowed_origins(vec![]);
+        assert!(!origin_is_allowed(&origin_headers("https://new.example.com")));
+        assert!(origin_is_allowed(&origin_headers("https://env.host.ts.net")));
+        // Loopback always allowed regardless.
+        assert!(origin_is_allowed(&origin_headers("http://localhost:8080")));
+
+        // Restore global state so other tests / cargo test ordering is unaffected.
+        // SAFETY: single-threaded test body restoring the pre-test env value.
+        unsafe {
+            match saved_env {
+                Some(v) => std::env::set_var("DUDUCLAW_ALLOWED_ORIGINS", v),
+                None => std::env::remove_var("DUDUCLAW_ALLOWED_ORIGINS"),
+            }
+        }
+        // Reset the cell to empty for a clean slate.
+        *allowed_origins_cell().write().unwrap() = Vec::new();
     }
 }
 
