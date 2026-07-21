@@ -11,7 +11,7 @@ DuDuClaw 把 Claude Code、Codex、Gemini 這些 AI 指令列工具,接上 Teleg
 你只需要一個 Rust binary。通道路由、對話記憶、多帳號輪替、行為安全邊界、本地推論、Web 管理後台全部內建;AI 大腦要用 Claude、Codex、Gemini、Antigravity 還是任何 OpenAI 相容 API 隨你換,設定和記憶都留在你自己的機器上。核心採 Apache 2.0 授權。
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-1.39.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.40.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
