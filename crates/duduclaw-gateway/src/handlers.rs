@@ -6047,27 +6047,39 @@ impl MethodHandler {
                 format!("Failed to commit agent.toml: {e}")
             })?;
 
-        // Trigger registry re-scan for hot-reload. Track success so the caller
-        // can surface `hot_reloaded: false` to the user instead of pretending
-        // the change took effect immediately.
-        let hot_reloaded = match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            self.registry.write(),
-        ).await {
-            Ok(mut reg) => {
-                match reg.scan().await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        warn!(agent_id, error = %e, "registry rescan failed after agent.toml write — change persisted but not yet visible to in-memory consumers");
-                        false
-                    }
+        // Registry re-scan for hot-reload. This must be RELIABLE, not
+        // best-effort: the gateway has no periodic rescan, so a skipped scan
+        // here leaves the in-memory registry stale forever (agents answer —
+        // and WebChat displays — the OLD model until the next unrelated
+        // update/create or a restart; distributor-reported bug). The write
+        // lock is acquired unconditionally — reader guards are all bounded
+        // (longest: one system-prompt build), so this waits, it cannot hang.
+        // Scan failures (transient IO) retry inline before giving up.
+        let mut hot_reloaded = false;
+        for attempt in 1..=3u32 {
+            let mut reg = self.registry.write().await;
+            match reg.scan().await {
+                Ok(()) => {
+                    hot_reloaded = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(agent_id, attempt, error = %e, "registry rescan failed after agent.toml write — retrying");
+                    drop(reg);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
-            Err(_) => {
-                warn!(agent_id, "registry write lock timeout (500ms) after agent.toml write — hot reload deferred to next periodic sync");
-                false
-            }
-        };
+        }
+        if hot_reloaded {
+            // Nudge live WebChat sockets to re-send their session_info frame
+            // so open dashboard tabs reflect the change without a reconnect.
+            let _ = crate::channel_reply::agent_config_events().send(agent_id.to_string());
+        } else {
+            warn!(
+                agent_id,
+                "registry rescan failed 3× — change persisted to agent.toml but in-memory consumers are stale until the next successful scan"
+            );
+        }
 
         Ok(hot_reloaded)
     }
