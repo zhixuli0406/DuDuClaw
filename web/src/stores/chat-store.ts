@@ -397,6 +397,20 @@ export const useChatStore = create<ChatStore>((set, get) => {
         }
         switch (data.type) {
           case 'session_info':
+            // `refresh: true` marks a server-initiated re-announcement after an
+            // agent-config change (name/icon/model edited in the dashboard).
+            // Update only the agent metadata — the session state (sessionId /
+            // ownSessionId) belongs to this client's navigation and must not
+            // be clobbered mid-conversation.
+            if (data.refresh) {
+              set({
+                agentName: data.agent_name,
+                agentIcon: data.agent_icon,
+                supportsVision: data.supports_vision ?? false,
+                model: data.model ?? '',
+              });
+              break;
+            }
             // The first session_info after a fresh connect is this connection's
             // own session — remember it so a later resume miss / new-conversation
             // / partner-switch can fall back to it. Resume-confirmation frames (a
@@ -509,6 +523,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 isStreaming: false,
                 phase: 'done' as ChatPhase,
                 viseme: REST_VISEME,
+                // The backend reported the model that ACTUALLY produced this
+                // reply (post CLI-side substitution) — trust it over the
+                // configured intent from session_info.
+                ...(typeof data.model === 'string' && data.model
+                  ? { model: data.model }
+                  : {}),
               };
             });
             clearVisemeIdle();

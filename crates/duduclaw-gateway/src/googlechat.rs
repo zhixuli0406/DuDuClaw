@@ -307,9 +307,13 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     ));
     let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
         let Some(name) = progress_name.clone() else { return };
-        // Step events are a dashboard-only agentic-tree signal — never rendered
+        // Step / ModelInfo events are dashboard-only signals — never rendered
         // as channel text (would be an empty message).
-        if matches!(event, crate::channel_reply::ProgressEvent::Step { .. }) {
+        if matches!(
+            event,
+            crate::channel_reply::ProgressEvent::Step { .. }
+                | crate::channel_reply::ProgressEvent::ModelInfo { .. }
+        ) {
             return;
         }
         let is_todo = matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. });

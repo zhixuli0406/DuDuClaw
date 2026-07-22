@@ -591,7 +591,11 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
             .unwrap_or_else(std::time::Instant::now),
     ));
     let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
-        if matches!(event, crate::channel_reply::ProgressEvent::Step { .. }) {
+        if matches!(
+            event,
+            crate::channel_reply::ProgressEvent::Step { .. }
+                | crate::channel_reply::ProgressEvent::ModelInfo { .. }
+        ) {
             return;
         }
         let is_todo = matches!(

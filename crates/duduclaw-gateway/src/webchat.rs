@@ -134,6 +134,12 @@ pub enum ChatMessage {
         /// see `UserMessage.conv`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conv: Option<String>,
+        /// The model that ACTUALLY produced this reply (parsed from the CLI
+        /// stream-json `message.model`) — may differ from `session_info.model`
+        /// (the configured intent) after CLI-side substitution. Absent when
+        /// the backend didn't report one (chat commands, local inference).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// Server → Client: error occurred.
     #[serde(rename = "error")]
@@ -150,6 +156,12 @@ pub enum ChatMessage {
         supports_vision: bool,
         /// The agent's preferred model id (for display next to the upload control).
         model: String,
+        /// `true` when this frame is a server-initiated refresh after an
+        /// agent-config change (not a connect/resume announcement). The client
+        /// updates only the agent metadata (name / icon / vision / model) and
+        /// leaves its session state untouched.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        refresh: bool,
     },
 }
 
@@ -338,6 +350,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
         let _ = sink.send(Message::Text(json.into())).await;
     }
 
+    // The (session_id, agent) pair the LAST session_info frame announced —
+    // when an agent-config change lands, we rebuild + re-send exactly this
+    // pair (as a `refresh: true` frame) so an open tab picks up new
+    // name/icon/model without touching the client's session state.
+    let mut announced_sid = session_id.clone();
+    let mut announced_agent: Option<String> = None;
+    let mut cfg_rx = crate::channel_reply::agent_config_events().subscribe();
+
     // Heartbeat: send ping every 30s, close if no pong in 60s
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut last_pong = std::time::Instant::now();
@@ -353,6 +373,27 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                 }
                 if sink.send(Message::Ping(vec![].into())).await.is_err() {
                     break;
+                }
+            }
+            // Agent config changed (dashboard `agents.update` → registry
+            // re-scan) — re-announce the current header so the open tab
+            // reflects the new name/icon/model immediately. `Lagged` still
+            // refreshes (we only need "something changed", not each event);
+            // `Closed` is unreachable (static sender) but harmless to ignore.
+            cfg_ev = cfg_rx.recv() => {
+                use tokio::sync::broadcast::error::RecvError;
+                if !matches!(cfg_ev, Err(RecvError::Closed)) {
+                    let mut info = build_session_info_frame(
+                        &state, &announced_sid, announced_agent.as_deref(),
+                    ).await;
+                    if let ChatMessage::SessionInfo { ref mut refresh, .. } = info {
+                        *refresh = true;
+                    }
+                    if let Ok(json) = serde_json::to_string(&info) {
+                        if sink.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             msg_opt = stream.next() => {
@@ -543,6 +584,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             if let Ok(json) = serde_json::to_string(&info) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
                                             }
+                                            announced_sid = sid_owned.clone();
+                                            announced_agent = effective_agent.clone();
                                         }
                                         Ok(None) => {
                                             let err = ChatMessage::Error {
@@ -606,6 +649,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             content: reply,
                                             tokens_used: 0,
                                             conv: conv_nonce.clone(),
+                                            model: None,
                                         };
                                         if let Ok(json) = serde_json::to_string(&done) {
                                             let _ = sink.send(Message::Text(json.into())).await;
@@ -648,6 +692,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     }
                                 };
                                 tokio::pin!(work);
+                                // The model the backend ACTUALLY answered with
+                                // (ProgressEvent::ModelInfo) — stamped onto the
+                                // assistant_done frame below.
+                                let mut actual_model: Option<String> = None;
                                 let reply = loop {
                                     tokio::select! {
                                         r = &mut work => break r,
@@ -655,6 +703,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             use crate::channel_reply::ProgressEvent;
                                             let content = ev.to_display();
                                             let msg = match ev {
+                                                ProgressEvent::ModelInfo { model } => {
+                                                    actual_model = Some(model);
+                                                    continue;
+                                                }
                                                 ProgressEvent::ToolUse { tool, detail } => ChatMessage::Progress {
                                                     content, kind: Some("tool".into()), tool: Some(tool), detail,
                                                     conv: conv_nonce.clone(),
@@ -695,6 +747,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     content: reply,
                                     tokens_used: tokens,
                                     conv: conv_nonce.clone(),
+                                    model: actual_model,
                                 };
                                 if let Ok(json) = serde_json::to_string(&done) {
                                     if sink.send(Message::Text(json.into())).await.is_err() {
@@ -762,7 +815,9 @@ async fn build_session_info_frame(
                 crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home()),
                 "🐾".to_string(),
                 String::new(),
-                String::new(),
+                // No agent ⇒ the reply path falls back to this same default
+                // (channel_reply), so display it instead of an empty label.
+                duduclaw_core::types::DEFAULT_PREFERRED_MODEL.to_string(),
             ),
         }
     };
@@ -779,6 +834,7 @@ async fn build_session_info_frame(
         agent_icon,
         supports_vision,
         model: model_id,
+        refresh: false,
     }
 }
 
@@ -1013,18 +1069,25 @@ mod tests {
             content: "done".into(),
             tokens_used: 3,
             conv: Some("c-42".into()),
+            model: Some("claude-sonnet-4-6".into()),
         };
         let json = serde_json::to_string(&with).expect("serialize");
         assert!(json.contains(r#""conv":"c-42""#), "conv must be on the wire: {json}");
+        assert!(
+            json.contains(r#""model":"claude-sonnet-4-6""#),
+            "actual model must be on the wire: {json}"
+        );
 
         // Without a nonce, `conv` is omitted entirely (old-client compatible).
         let without = ChatMessage::AssistantDone {
             content: "done".into(),
             tokens_used: 3,
             conv: None,
+            model: None,
         };
         let json = serde_json::to_string(&without).expect("serialize");
         assert!(!json.contains("conv"), "absent conv must not serialize: {json}");
+        assert!(!json.contains("model"), "absent model must not serialize: {json}");
     }
 
     #[test]

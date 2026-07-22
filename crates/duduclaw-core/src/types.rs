@@ -187,6 +187,11 @@ fn default_utility_model() -> String {
     DEFAULT_UTILITY_MODEL.to_string()
 }
 
+/// Single source of truth for the default "preferred" chat model, used when a
+/// reply is built with no resolved agent (and therefore no `[model] preferred`).
+/// Matches the `agents.create` scaffold default so display and execution agree.
+pub const DEFAULT_PREFERRED_MODEL: &str = "claude-sonnet-4-6";
+
 /// Which agent runtime backend executes a prompt (RFC-25 multi-runtime).
 ///
 /// Used as the `RuntimeRegistry` key and parsed from `agent.toml [runtime] provider`.

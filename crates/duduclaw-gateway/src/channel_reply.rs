@@ -264,6 +264,19 @@ pub(crate) struct TeamMember {
 // ── Shared state ────────────────────────────────────────────
 
 /// Shared context for building replies, initialized once at gateway start.
+/// Process-wide broadcast of agent-config changes (`agent_id` payload).
+///
+/// `handlers::update_agent_toml` sends here after a successful registry
+/// re-scan; live WebChat sockets subscribe and re-send their `session_info`
+/// frame so the header (name / icon / model) reflects the change immediately —
+/// without this, an open dashboard tab shows the stale model until reconnect.
+/// A lagged/closed receiver is harmless: the socket just misses one refresh
+/// and re-syncs on the next event or reconnect.
+pub fn agent_config_events() -> &'static tokio::sync::broadcast::Sender<String> {
+    static TX: OnceLock<tokio::sync::broadcast::Sender<String>> = OnceLock::new();
+    TX.get_or_init(|| tokio::sync::broadcast::channel(32).0)
+}
+
 pub struct ReplyContext {
     pub registry: Arc<RwLock<AgentRegistry>>,
     pub home_dir: PathBuf,
@@ -929,7 +942,7 @@ async fn build_reply_with_session_inner(
 
     let model = agent
         .map(|a| a.config.model.preferred.clone())
-        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+        .unwrap_or_else(|| duduclaw_core::types::DEFAULT_PREFERRED_MODEL.to_string());
 
     let agent_id = agent.map(|a| a.config.agent.name.clone()).unwrap_or_default();
     // OTel: record resolved agent/model on the `invoke_agent` span. The
@@ -4325,6 +4338,14 @@ pub enum ProgressEvent {
     /// early-returns on it. Only the WebChat socket forwards it (as a `step`
     /// frame). See [`StepEvent`] / [`StepTracker`].
     Step(StepEvent),
+    /// The model id the backend ACTUALLY answered with, parsed from the
+    /// stream-json `assistant` event's `message.model` (which reflects any
+    /// CLI-side substitution — account tier, alias resolution, fallback).
+    /// **Dashboard-only** like [`ProgressEvent::Step`]: text channels ignore
+    /// it; the WebChat socket records it and stamps the `assistant_done`
+    /// frame's `model` field so the UI shows the real model, not the
+    /// configured intent.
+    ModelInfo { model: String },
 }
 
 /// Phase of a tool step in the agentic task tree.
@@ -4684,6 +4705,8 @@ impl ProgressEvent {
             // Text channels early-return on this variant; WebChat forwards it
             // as a `step` frame instead.
             Self::Step(_) => String::new(),
+            // Dashboard-only metadata — same contract as `Step`.
+            Self::ModelInfo { .. } => String::new(),
         }
     }
 }
@@ -5624,6 +5647,9 @@ async fn spawn_claude_cli_with_env(
     let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
     // Track last tool type to suppress duplicate progress messages
     let mut last_tool_reported: Option<String> = None;
+    // The model the CLI actually answered with (from `message.model`), reported
+    // once via ProgressEvent::ModelInfo so the dashboard shows the real model.
+    let mut reported_model: Option<String> = None;
 
     // Diagnostic counters — included in the "Empty response" error message
     // so the next occurrence is immediately actionable (no more needing to
@@ -5971,6 +5997,22 @@ async fn spawn_claude_cli_with_env(
                                     {
                                         last_stop_reason = Some(sr.to_string());
                                     }
+                                    // Surface the model the CLI ACTUALLY used —
+                                    // may differ from the requested `--model`
+                                    // (tier substitution, alias resolution).
+                                    if let Some(m) = event
+                                        .pointer("/message/model")
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        if reported_model.as_deref() != Some(m) {
+                                            reported_model = Some(m.to_string());
+                                            if let Some(cb) = on_progress {
+                                                cb(ProgressEvent::ModelInfo {
+                                                    model: m.to_string(),
+                                                });
+                                            }
+                                        }
+                                    }
                                     if let Some(content) = event
                                         .pointer("/message/content")
                                         .and_then(|c| c.as_array())
@@ -6277,6 +6319,10 @@ pub(crate) struct StreamParseResult {
     pub text: String,
     /// Token usage from the `result` event when present.
     pub usage: Option<crate::cost_telemetry::TokenUsage>,
+    /// The model the CLI actually answered with (`assistant` event
+    /// `message.model`) — reflects CLI-side substitution, unlike the
+    /// requested `--model`.
+    pub model: Option<String>,
     pub diagnostics: StreamDiagnostics,
 }
 
@@ -6292,6 +6338,7 @@ pub(crate) fn parse_claude_stream_json_complete(
 ) -> Result<StreamParseResult, String> {
     let mut text = String::new();
     let mut usage: Option<crate::cost_telemetry::TokenUsage> = None;
+    let mut model: Option<String> = None;
     let mut diag = StreamDiagnostics::default();
 
     for raw_line in stdout.split('\n') {
@@ -6348,6 +6395,12 @@ pub(crate) fn parse_claude_stream_json_complete(
                 {
                     diag.last_stop_reason = Some(sr.to_string());
                 }
+                if let Some(m) = event
+                    .pointer("/message/model")
+                    .and_then(|v| v.as_str())
+                {
+                    model = Some(m.to_string());
+                }
                 if let Some(content) = event
                     .pointer("/message/content")
                     .and_then(|c| c.as_array())
@@ -6380,6 +6433,7 @@ pub(crate) fn parse_claude_stream_json_complete(
     Ok(StreamParseResult {
         text,
         usage,
+        model,
         diagnostics: diag,
     })
 }
@@ -6461,7 +6515,7 @@ async fn spawn_claude_cli_pty_with_env(
     system_prompt: &str,
     home_dir: &Path,
     work_dir: Option<&Path>,
-    _on_progress: Option<&ProgressCallback>,
+    on_progress: Option<&ProgressCallback>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     env_vars: &std::collections::HashMap<String, String>,
     claude_session_id: Option<&str>,
@@ -6593,6 +6647,12 @@ async fn spawn_claude_cli_pty_with_env(
     if text.is_empty() {
         let diag = parsed.diagnostics.render(0, "");
         return Err(format!("Empty response from claude CLI PTY ({diag})"));
+    }
+    // Report the model the CLI actually answered with (one-shot parse has no
+    // mid-stream callback, so emit it post-hoc — arrives before the reply is
+    // returned, which is all the WebChat `assistant_done` stamping needs).
+    if let (Some(cb), Some(m)) = (on_progress, parsed.model.as_deref()) {
+        cb(ProgressEvent::ModelInfo { model: m.to_string() });
     }
 
     // Record cost telemetry — same pattern as the streaming variant.
