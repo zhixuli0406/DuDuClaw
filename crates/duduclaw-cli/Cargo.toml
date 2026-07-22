@@ -38,6 +38,7 @@ duduclaw-memory = { workspace = true }
 duduclaw-identity = { workspace = true }
 duduclaw-redaction = { workspace = true }
 duduclaw-license = { workspace = true }
+duduclaw-os = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }

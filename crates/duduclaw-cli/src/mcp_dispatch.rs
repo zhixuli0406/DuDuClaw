@@ -40,26 +40,53 @@ struct PolicyOnlyConfig {
     capabilities: duduclaw_core::types::CapabilitiesConfig,
 }
 
-/// Load an agent's static tool policy from `<home>/agents/<id>/agent.toml`.
+/// The `os_*` MCP tools gated by the `[capabilities] os_native` master switch.
+const OS_NATIVE_TOOLS: &[&str] = &["os_notify", "os_watch_status", "os_open"];
+
+/// Per-agent gate inputs resolved from a SINGLE read+parse of `agent.toml`.
+/// Both the PolicyKernel reference monitor (§3.5) and the OS-native capability
+/// gate (§3.62) consume this, so one dispatch reads/parses the file at most once
+/// instead of the two independent reads it used to do.
 ///
-/// Missing file or malformed TOML → empty policy (the PolicyKernel then
-/// abstains; the scope / injection / `denied_tools` layers remain the hard
-/// gates). This mirrors the documented fail-safe of `approval_required_tools`:
-/// the policy layer is additive friction, so a typo must not brick the agent —
-/// the primary deny-list independently fails closed.
-async fn load_agent_policy(home_dir: &Path, agent_id: &str) -> Vec<ToolPolicy> {
+/// Fail-closed (I5): a missing file or malformed TOML yields an EMPTY policy and
+/// `os_native = false`. A broken config must never silently grant OS
+/// integration; the policy layer is additive friction whose absence leaves the
+/// scope / injection / `denied_tools` layers as the hard gates.
+#[derive(Default)]
+struct AgentGateConfig {
+    policy: Vec<ToolPolicy>,
+    os_native: bool,
+}
+
+/// Read `<home>/agents/<id>/agent.toml` once and extract the gate-relevant
+/// `[capabilities]` fields.
+///
+/// NOTE: deliberately performs NO cross-request caching — an operator may edit
+/// the file between dispatches, and each dispatch must see the current config.
+/// This only removes the duplicate read/parse *within* a single dispatch.
+/// Deserializing just `[capabilities]` (via `PolicyOnlyConfig`) keeps policy
+/// enforcement robust against an unrelated malformed/absent section.
+async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateConfig {
     if agent_id.is_empty() {
-        return Vec::new();
+        return AgentGateConfig::default();
     }
     let toml_path = home_dir.join("agents").join(agent_id).join("agent.toml");
     let Ok(content) = tokio::fs::read_to_string(&toml_path).await else {
-        return Vec::new();
+        return AgentGateConfig::default();
     };
     match toml::from_str::<PolicyOnlyConfig>(&content) {
-        Ok(cfg) => cfg.capabilities.policy,
+        Ok(cfg) => AgentGateConfig {
+            policy: cfg.capabilities.policy,
+            os_native: cfg.capabilities.os_native,
+        },
         Err(e) => {
-            warn!(agent = %agent_id, error = %e, "malformed agent.toml [capabilities] — PolicyKernel abstains (empty policy)");
-            Vec::new()
+            warn!(
+                agent = %agent_id,
+                error = %e,
+                "malformed agent.toml [capabilities] — PolicyKernel abstains (empty policy) \
+                 and os_native defaults to false (fail-closed)"
+            );
+            AgentGateConfig::default()
         }
     }
 }
@@ -315,78 +342,64 @@ impl McpDispatcher {
             }
         }
 
+        // Resolve the per-agent gate config ONCE for this dispatch — both the
+        // PolicyKernel gate (§3.5) and the OS-native gate (§3.62) read it, so we
+        // avoid parsing agent.toml twice. External clients aren't agents (no
+        // per-agent config), so they get the empty default without a fs read.
+        let agent_gate = if principal.is_external {
+            AgentGateConfig::default()
+        } else {
+            load_agent_gate_config(&self.home_dir, &principal.client_id).await
+        };
+
         // ── 3.5 PolicyKernel reference monitor (deterministic, zero-LLM) ─────
         // Per-agent static policy from agent.toml [capabilities].policy. Empty
         // policy → the kernel abstains (Allow). External clients aren't agents,
         // so they carry no per-agent policy. High-risk `Ask` decisions block on
         // the ApprovalBroker (fail-closed: TTL-expiry counts as denial).
-        if !principal.is_external {
-            let policy = load_agent_policy(&self.home_dir, &principal.client_id).await;
-            if !policy.is_empty() {
-                let args_val =
-                    params_owned.get("arguments").cloned().unwrap_or(Value::Null);
-                let event = duduclaw_security::policy_kernel::ToolCallEvent {
-                    tool_name,
-                    arguments: &args_val,
-                    agent_id: &principal.client_id,
-                };
-                match duduclaw_security::policy_kernel::evaluate(&event, &policy) {
-                    duduclaw_security::policy_kernel::Decision::Allow => {}
-                    duduclaw_security::policy_kernel::Decision::AllowRewritten(new_args) => {
-                        if let Some(obj) = params_owned.as_object_mut() {
-                            obj.insert("arguments".to_string(), new_args);
-                        }
+        if !principal.is_external && !agent_gate.policy.is_empty() {
+            let args_val = params_owned
+                .get("arguments")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let event = duduclaw_security::policy_kernel::ToolCallEvent {
+                tool_name,
+                arguments: &args_val,
+                agent_id: &principal.client_id,
+            };
+            match duduclaw_security::policy_kernel::evaluate(&event, &agent_gate.policy) {
+                duduclaw_security::policy_kernel::Decision::Allow => {}
+                duduclaw_security::policy_kernel::Decision::AllowRewritten(new_args) => {
+                    if let Some(obj) = params_owned.as_object_mut() {
+                        obj.insert("arguments".to_string(), new_args);
                     }
-                    duduclaw_security::policy_kernel::Decision::Deny { reason } => {
-                        warn!(
-                            agent = %principal.client_id,
-                            tool = %tool_name,
-                            %reason,
-                            "PolicyKernel denied tool call"
-                        );
-                        duduclaw_gateway::otel::record_tool_outcome(
-                            &tracing::Span::current(),
-                            false,
-                        );
-                        return jsonrpc_error(
-                            id,
-                            -32003,
-                            &format!("Denied by policy: {reason}"),
-                        );
-                    }
-                    duduclaw_security::policy_kernel::Decision::Ask { risk } => {
-                        // D-2: lazily open the broker only on escalation (rare),
-                        // avoiding a constructor/signature change on every
-                        // McpDispatcher::new call site.
-                        let broker =
-                            match duduclaw_gateway::approval::ApprovalBroker::open(&self.home_dir) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    warn!(error = %e, "ApprovalBroker unavailable — denying (fail-closed)");
-                                    duduclaw_gateway::otel::record_tool_outcome(
-                                        &tracing::Span::current(),
-                                        false,
-                                    );
-                                    return jsonrpc_error(
-                                        id,
-                                        -32003,
-                                        "Approval required but broker unavailable (fail-closed deny)",
-                                    );
-                                }
-                            };
-                        let approval_id = match broker
-                            .request(
-                                &principal.client_id,
-                                "mcp_call",
-                                &risk,
-                                params_owned.clone(),
-                                POLICY_ASK_TTL_SECONDS,
-                            )
-                            .await
-                        {
-                            Ok(aid) => aid,
+                }
+                duduclaw_security::policy_kernel::Decision::Deny { reason } => {
+                    warn!(
+                        agent = %principal.client_id,
+                        tool = %tool_name,
+                        %reason,
+                        "PolicyKernel denied tool call"
+                    );
+                    duduclaw_gateway::otel::record_tool_outcome(
+                        &tracing::Span::current(),
+                        false,
+                    );
+                    return jsonrpc_error(
+                        id,
+                        -32003,
+                        &format!("Denied by policy: {reason}"),
+                    );
+                }
+                duduclaw_security::policy_kernel::Decision::Ask { risk } => {
+                    // D-2: lazily open the broker only on escalation (rare),
+                    // avoiding a constructor/signature change on every
+                    // McpDispatcher::new call site.
+                    let broker =
+                        match duduclaw_gateway::approval::ApprovalBroker::open(&self.home_dir) {
+                            Ok(b) => b,
                             Err(e) => {
-                                warn!(error = %e, "approval request failed — denying (fail-closed)");
+                                warn!(error = %e, "ApprovalBroker unavailable — denying (fail-closed)");
                                 duduclaw_gateway::otel::record_tool_outcome(
                                     &tracing::Span::current(),
                                     false,
@@ -394,16 +407,23 @@ impl McpDispatcher {
                                 return jsonrpc_error(
                                     id,
                                     -32003,
-                                    "Approval request failed (fail-closed deny)",
+                                    "Approval required but broker unavailable (fail-closed deny)",
                                 );
                             }
                         };
-                        let granted = broker
-                            .await_decision(&approval_id, POLICY_ASK_POLL)
-                            .await
-                            .map(|s| s.is_granted())
-                            .unwrap_or(false);
-                        if !granted {
+                    let approval_id = match broker
+                        .request(
+                            &principal.client_id,
+                            "mcp_call",
+                            &risk,
+                            params_owned.clone(),
+                            POLICY_ASK_TTL_SECONDS,
+                        )
+                        .await
+                    {
+                        Ok(aid) => aid,
+                        Err(e) => {
+                            warn!(error = %e, "approval request failed — denying (fail-closed)");
                             duduclaw_gateway::otel::record_tool_outcome(
                                 &tracing::Span::current(),
                                 false,
@@ -411,9 +431,25 @@ impl McpDispatcher {
                             return jsonrpc_error(
                                 id,
                                 -32003,
-                                "Tool call denied or expired at human approval (fail-closed)",
+                                "Approval request failed (fail-closed deny)",
                             );
                         }
+                    };
+                    let granted = broker
+                        .await_decision(&approval_id, POLICY_ASK_POLL)
+                        .await
+                        .map(|s| s.is_granted())
+                        .unwrap_or(false);
+                    if !granted {
+                        duduclaw_gateway::otel::record_tool_outcome(
+                            &tracing::Span::current(),
+                            false,
+                        );
+                        return jsonrpc_error(
+                            id,
+                            -32003,
+                            "Tool call denied or expired at human approval (fail-closed)",
+                        );
                     }
                 }
             }
@@ -480,6 +516,25 @@ impl McpDispatcher {
                     }
                 }
             }
+        }
+
+        // ── 3.62 OS-native capability gate (deny-by-default, I5) ─────────────
+        // The `os_*` tools require the agent's `[capabilities] os_native = true`.
+        // Enforced here at the shared choke point so every transport honours it.
+        // External clients never reach these tools (not in the whitelist), so we
+        // only check agent principals. Fail-closed: a missing/malformed config
+        // resolved to `os_native = false` in `load_agent_gate_config` above
+        // (the same single read that fed the PolicyKernel gate).
+        if !principal.is_external && OS_NATIVE_TOOLS.contains(&tool_name) && !agent_gate.os_native {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            return jsonrpc_error(
+                id,
+                -32003,
+                &format!(
+                    "工具「{tool_name}」需要 OS 原生整合能力，但此代理未啟用。請在 agent.toml \
+                     設定 [capabilities] os_native = true 後再使用。"
+                ),
+            );
         }
 
         // ── 3.65 Task-scoped capability grant gate (WP3, PORTICO) ────────────
@@ -936,6 +991,78 @@ effect = "forbid"
         assert!(
             !msg.contains("capability_request"),
             "non-scoped agent must never hit the WP3 gate, got: {result}"
+        );
+    }
+
+    // ── OS-native Phase 1: os_native capability gate ───────────────────────────
+
+    /// os_notify with os_native absent (no agent.toml) is denied fail-closed,
+    /// with guidance to enable the capability.
+    #[tokio::test]
+    async fn os_tool_denied_when_os_native_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+
+        // Admin bypasses the scope check so the call reaches the os_native gate.
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params(
+            "os_notify",
+            serde_json::json!({ "title": "hi", "body": "there" }),
+        );
+        let id = serde_json::json!(40);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "os_notify without os_native must be denied, got: {result}"
+        );
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("os_native"), "denial must mention os_native, got: {msg}");
+    }
+
+    /// os_native = false explicitly is also denied.
+    #[tokio::test]
+    async fn os_tool_denied_when_os_native_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nos_native = false\n");
+
+        let principal = make_principal(vec![Scope::OsNative], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("os_open", serde_json::json!({ "target": "https://x.com" }));
+        let id = serde_json::json!(41);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "os_open with os_native=false must be denied, got: {result}"
+        );
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("os_native"), "got: {msg}");
+    }
+
+    /// os_native = true lets os_watch_status pass the gate (it reads a stats file,
+    /// no host side-effect) — must NOT be denied with the os_native message.
+    #[tokio::test]
+    async fn os_tool_passes_gate_when_os_native_true() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nos_native = true\n");
+
+        let principal = make_principal(vec![Scope::OsNative], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("os_watch_status", serde_json::json!({}));
+        let id = serde_json::json!(42);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        // Reaches the handler; returns a normal tool result (no error object).
+        assert!(
+            result.get("error").is_none(),
+            "os_watch_status with os_native=true must pass the gate, got: {result}"
         );
     }
 

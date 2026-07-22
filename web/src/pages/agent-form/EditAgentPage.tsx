@@ -63,6 +63,7 @@ import {
   DEFAULT_EVOLUTION_ADVANCED,
   DEFAULT_CONTAINER_ADVANCED,
   DEFAULT_CAPABILITIES,
+  DEFAULT_OS_WATCH,
   DEFAULT_ODOO,
   DEFAULT_ADVANCED,
 } from './defaults';
@@ -259,6 +260,14 @@ export function EditAgentPage() {
   // visible and editable rather than reset to defaults.
   const [capsLoaded, setCapsLoaded] = useState(false);
 
+  // OW — v1.39 OS-native [os_watch] form. Prefilled from agents.inspect
+  // (`os_watch`) alongside caps; only written when the operator edits it, so an
+  // untouched tab never clobbers the agent's existing paths.
+  const [osWatch, setOsWatch] = useState<typeof DEFAULT_OS_WATCH>(DEFAULT_OS_WATCH);
+  const [osWatchDirty, setOsWatchDirty] = useState(false);
+  const osWatchDirtyRef = useRef(false);
+  useEffect(() => { osWatchDirtyRef.current = osWatchDirty; }, [osWatchDirty]);
+
   // CON — contract form, loaded lazily via contract.get on first tab open
   const [contract, setContract] = useState<ContractConfig>({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
   const [contractLoaded, setContractLoaded] = useState(false);
@@ -406,6 +415,16 @@ export function EditAgentPage() {
           computer_use_config: { ...prev.computer_use_config, ...(c.computer_use_config ?? {}) },
         }));
       }
+      // OW — prefill [os_watch] from the raw table (null when unset).
+      const ow = detail.os_watch;
+      if (ow && !osWatchDirtyRef.current) {
+        setOsWatch((prev) => ({
+          paths: ow.paths ?? prev.paths,
+          ignore: ow.ignore ?? prev.ignore,
+          debounce_ms: ow.debounce_ms ?? prev.debounce_ms,
+          max_events_per_min: ow.max_events_per_min ?? prev.max_events_per_min,
+        }));
+      }
       setCapsLoaded(true);
     }).catch((e) => {
       if (cancelled) return;
@@ -425,6 +444,13 @@ export function EditAgentPage() {
     setCapsDirty(true);
     markSectionEdit();
     setCaps((prev) => ({ ...prev, computer_use_config: { ...prev.computer_use_config, [key]: value } }));
+  }, [markSectionEdit]);
+
+  // OW — v1.39 [os_watch] field updater.
+  const updateOsWatch = useCallback(<K extends keyof typeof DEFAULT_OS_WATCH>(key: K, value: (typeof DEFAULT_OS_WATCH)[K]) => {
+    setOsWatchDirty(true);
+    markSectionEdit();
+    setOsWatch((prev) => ({ ...prev, [key]: value }));
   }, [markSectionEdit]);
 
   // RT — runtime field updater.
@@ -545,7 +571,19 @@ export function EditAgentPage() {
           wiki_visible_to: caps.wiki_visible_to,
           native_sandbox: caps.native_sandbox,
           policy: caps.policy,
+          os_native: caps.os_native,
           computer_use_config: { ...caps.computer_use_config },
+        };
+      }
+
+      // OW — only include [os_watch] when the operator edited it. The backend
+      // hot stop/starts the agent's watcher after the write (os_native gates it).
+      if (osWatchDirty) {
+        submitForm.os_watch = {
+          paths: osWatch.paths,
+          ignore: osWatch.ignore,
+          debounce_ms: osWatch.debounce_ms,
+          max_events_per_min: osWatch.max_events_per_min,
         };
       }
 
@@ -1017,6 +1055,28 @@ export function EditAgentPage() {
               <RowSwitch label={t('agents.cap.autoConfirmTrusted')} description={t('agents.cap.autoConfirmTrusted.help')} checked={caps.computer_use_config.auto_confirm_trusted ?? false} onChange={(v) => updateCapConfig('auto_confirm_trusted', v)} />
             </SettingsCard>
           </DangerZone>
+
+          {/* OW — v1.39 OS-native filesystem watch ([os_watch]) */}
+          <SettingsSection title={t('agents.osWatch')} description={t('agents.osWatch.desc')}>
+            <SettingsCard>
+              <RowSwitch label={t('agents.cap.osNative')} description={t('agents.cap.osNative.help')} checked={caps.os_native} onChange={(v) => updateCap('os_native', v)} />
+            </SettingsCard>
+            {caps.os_native && (
+              <>
+                <FieldBlock label={t('agents.osWatch.paths')} description={t('agents.osWatch.paths.help')}>
+                  <ChipEditor values={osWatch.paths} onChange={(v) => updateOsWatch('paths', v)} placeholder="~/Downloads" addLabel={t('common.add')} />
+                </FieldBlock>
+                <FieldBlock label={t('agents.osWatch.ignore')} description={t('agents.osWatch.ignore.help')}>
+                  <ChipEditor values={osWatch.ignore} onChange={(v) => updateOsWatch('ignore', v)} placeholder="*.part" addLabel={t('common.add')} />
+                </FieldBlock>
+                <SettingsCard>
+                  <RowNumber label={t('agents.osWatch.debounceMs')} description={t('agents.osWatch.debounceMs.help')} value={osWatch.debounce_ms} min={1} max={3600000} onChange={(v) => updateOsWatch('debounce_ms', v)} />
+                  <RowNumber label={t('agents.osWatch.maxEventsPerMin')} description={t('agents.osWatch.maxEventsPerMin.help')} value={osWatch.max_events_per_min} min={1} max={1000000} onChange={(v) => updateOsWatch('max_events_per_min', v)} />
+                </SettingsCard>
+                <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">{t('agents.osWatch.hotReloadHint')}</p>
+              </>
+            )}
+          </SettingsSection>
         </SettingsTab>
 
         {/* ── 整合 ─────────────────────────────────────────── */}

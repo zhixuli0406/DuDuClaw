@@ -1,8 +1,8 @@
 use axum::{
     Json, Router,
-    extract::{Query, State},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{ConnectInfo, DefaultBodyLimit, Multipart},
+    extract::{Query, State},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -76,7 +76,9 @@ static OTP_VERIFY_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<IpAddr, (Insta
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn check_otp_verify_rate_limit(ip: IpAddr) -> bool {
-    let mut map = OTP_VERIFY_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = OTP_VERIFY_RATE_LIMITER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     if map.len() > 10000 {
         map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < 60);
@@ -186,14 +188,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // (no other tasks have been spawned yet). Setting env vars here is
         // safe; later threads only read.
         if std::env::var_os("EVOLUTION_EVENTS_DIR").is_none() {
-            unsafe { std::env::set_var("EVOLUTION_EVENTS_DIR", &events_dir); }
-            info!(
-                "EVOLUTION_EVENTS_DIR defaulted to {}",
-                events_dir.display()
-            );
+            unsafe {
+                std::env::set_var("EVOLUTION_EVENTS_DIR", &events_dir);
+            }
+            info!("EVOLUTION_EVENTS_DIR defaulted to {}", events_dir.display());
         }
         if std::env::var_os("DUDUCLAW_HOME").is_none() {
-            unsafe { std::env::set_var("DUDUCLAW_HOME", &home_dir); }
+            unsafe {
+                std::env::set_var("DUDUCLAW_HOME", &home_dir);
+            }
         }
         // Run a synchronous-ish self-test so a misconfigured path surfaces at
         // boot rather than after the first prediction error.
@@ -223,9 +226,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // `redaction.update` can later hot-swap them without a restart).
     {
         let cfg_path = home_dir.join("config.toml");
-        let parsed: Option<duduclaw_redaction::RedactionConfig> = std::fs::read_to_string(&cfg_path)
-            .ok()
-            .and_then(|s| {
+        let parsed: Option<duduclaw_redaction::RedactionConfig> =
+            std::fs::read_to_string(&cfg_path).ok().and_then(|s| {
                 #[derive(serde::Deserialize)]
                 struct Wrap {
                     #[serde(default)]
@@ -236,7 +238,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
         match parsed {
             Some(rcfg) if rcfg.enabled => {
-                match crate::redaction_integration::build_manager_from_home(&home_dir, rcfg.clone()) {
+                match crate::redaction_integration::build_manager_from_home(&home_dir, rcfg.clone())
+                {
                     Ok(manager) => {
                         info!(
                             rules = manager.engine().rule_count(),
@@ -297,11 +300,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // license.json → restart". Env-only + OpenSource until the v2 pubkey is
         // baked (see license_runtime::PROD_ISSUER_PUBKEY_HEX).
         let registry = crate::license_runtime::production_registry();
-        let runtime = crate::license_runtime::LicenseRuntime::bootstrap(
-            home_dir.clone(),
-            registry,
-        )
-        .await;
+        let runtime =
+            crate::license_runtime::LicenseRuntime::bootstrap(home_dir.clone(), registry).await;
         // Publish the runtime to the process-global slot so dashboard
         // RPCs and other gateway services can read the current tier
         // without having to thread a handle through the entire
@@ -349,9 +349,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
         // R4 DEBT-3: propagate the configured tracker cap to the
         // process-global feedback module before any traffic arrives.
-        duduclaw_memory::feedback::set_max_active_conversations(
-            trust_cfg.max_active_conversations,
-        );
+        duduclaw_memory::feedback::set_max_active_conversations(trust_cfg.max_active_conversations);
         match duduclaw_memory::trust_store::init_global_trust_store_with_config(
             &trust_db, trust_cfg,
         ) {
@@ -372,8 +370,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                     if agents_dir.exists() {
                         match store.bootstrap_from_wiki(&agents_dir) {
                             Ok((inserted, skipped)) => info!(
-                                inserted, skipped,
-                                "Wiki trust store bootstrapped from frontmatter"
+                                inserted,
+                                skipped, "Wiki trust store bootstrapped from frontmatter"
                             ),
                             Err(e) => warn!(error = %e, "Wiki trust bootstrap failed"),
                         }
@@ -389,8 +387,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 let agents_dir = home_dir.join("agents");
                 let janitor_store = store.clone();
                 tokio::spawn(async move {
-                    const INTERVAL: std::time::Duration =
-                        std::time::Duration::from_secs(24 * 3600);
+                    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
                     let last_run = janitor_store
                         .meta_get("last_janitor_run_at")
@@ -444,12 +441,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // ── Initialize user database & JWT ───────────────────────
     let user_db_path = home_dir.join("users.db");
-    let user_db = Arc::new(
-        UserDb::new(&user_db_path)
-            .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(
-                format!("Failed to initialize user database: {e}")
-            ))?,
-    );
+    let user_db = Arc::new(UserDb::new(&user_db_path).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Gateway(format!(
+            "Failed to initialize user database: {e}"
+        ))
+    })?);
     // Ensure a default admin exists on first run
     match user_db.ensure_default_admin() {
         Ok(Some(password)) => {
@@ -460,14 +456,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             // it just confuses the setup. Only a non-loopback bind (where the
             // loopback-only claim endpoint is unreachable from the operator's
             // browser) still needs the printed value to get in at all.
-            let loopback_only =
-                matches!(config.bind.as_str(), "127.0.0.1" | "::1" | "localhost");
+            let loopback_only = matches!(config.bind.as_str(), "127.0.0.1" | "::1" | "localhost");
             if loopback_only {
-                println!("\n  🔑 First-run setup: open the dashboard and set the admin password there (admin@local).");
+                println!(
+                    "\n  🔑 First-run setup: open the dashboard and set the admin password there (admin@local)."
+                );
                 println!();
                 let _ = password; // superseded by the dashboard claim flow
             } else {
-                println!("\n  🔑 First-run admin — log in with this, you'll be asked to change it:");
+                println!(
+                    "\n  🔑 First-run admin — log in with this, you'll be asked to change it:"
+                );
                 println!("     Email:    admin@local");
                 println!("     Password: {password}");
                 println!();
@@ -476,26 +475,24 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         Ok(None) => {} // Admin already exists
         Err(e) => {
             // C2 fix: fail hard if we can't create admin — don't silently continue
-            return Err(duduclaw_core::error::DuDuClawError::Gateway(
-                format!("Failed to initialize user database: {e}")
-            ));
+            return Err(duduclaw_core::error::DuDuClawError::Gateway(format!(
+                "Failed to initialize user database: {e}"
+            )));
         }
     }
-    let jwt_config = Arc::new(
-        JwtConfig::load_or_generate(&home_dir)
-            .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(
-                format!("Failed to initialize JWT: {e}")
-            ))?,
-    );
+    let jwt_config = Arc::new(JwtConfig::load_or_generate(&home_dir).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Gateway(format!("Failed to initialize JWT: {e}"))
+    })?);
     info!("User authentication system initialized");
 
     // Initialize session manager
     let session_db_path = home_dir.join("sessions.db");
     let session_manager = Arc::new(
-        crate::session::SessionManager::new(&session_db_path)
-            .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(
-                format!("Failed to initialize session manager: {e}")
-            ))?,
+        crate::session::SessionManager::new(&session_db_path).map_err(|e| {
+            duduclaw_core::error::DuDuClawError::Gateway(format!(
+                "Failed to initialize session manager: {e}"
+            ))
+        })?,
     );
 
     // Start periodic session cleanup (every 6 hours, remove sessions older than 72 hours)
@@ -540,12 +537,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // pass Some(Arc::new(OnnxEmbeddingProvider::load(...))) here.
     let prediction_db_path = home_dir.join("prediction.db");
     let metacognition_path = home_dir.join("metacognition.json");
-    let prediction_engine = Arc::new(
-        crate::prediction::engine::PredictionEngine::new(
-            prediction_db_path,
-            Some(metacognition_path.clone()),
-        )
-    );
+    let prediction_engine = Arc::new(crate::prediction::engine::PredictionEngine::new(
+        prediction_db_path,
+        Some(metacognition_path.clone()),
+    ));
     info!("Prediction engine initialized (embedding: none, using vocabulary_novelty fallback)");
 
     // ── Initialize GVU loop (Phase 2) ────────────────────────
@@ -558,7 +553,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         None, // max_generations — will be set per-agent from config
         gvu_encryption_key.as_ref(),
     ));
-    info!("GVU evolution loop initialized (encryption: {})", if gvu_encryption_key.is_some() { "enabled" } else { "disabled" });
+    info!(
+        "GVU evolution loop initialized (encryption: {})",
+        if gvu_encryption_key.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 
     // ── BUG-1 fix: schedule ObservationFinalizer (30 min ticks) ───────────
     // Closes expired SOUL.md observation windows (confirmed / rolled_back /
@@ -597,7 +599,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .with_prediction_engine(prediction_engine.clone())
         .with_gvu_loop(gvu_loop.clone())
         .with_memory_db(home_dir.join("memory.db"))
-        .with_redaction_manager(handler.get_redaction_manager().await)
+        .with_redaction_manager(handler.get_redaction_manager().await),
     );
     // Inject reply context into handler for channel hot-start/stop
     handler.set_reply_ctx(reply_ctx.clone()).await;
@@ -611,8 +613,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // MCP call. Off by default — enable via `config.toml [skill_synthesis]
     // auto_run = true` (still dry-run unless `dry_run = false`). The flag is
     // re-read each poll, so it can be toggled without a gateway restart.
-    bg_handles.push(crate::skill_synthesis_pipeline::scheduler::spawn(home_dir.clone()));
-    info!("Skill synthesis auto-run scheduler started (gated by config [skill_synthesis] auto_run)");
+    bg_handles.push(crate::skill_synthesis_pipeline::scheduler::spawn(
+        home_dir.clone(),
+    ));
+    info!(
+        "Skill synthesis auto-run scheduler started (gated by config [skill_synthesis] auto_run)"
+    );
 
     // Validate default_agent before wiring channels — a dangling default_agent
     // is the root cause of channel "identity mixing" (wrong agent answers).
@@ -632,12 +638,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // DingTalk) — global only for now. Per-agent webhook routing requires
     // multi-path routers (TODO-per-agent-channels.md)
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
-    let whatsapp_router = crate::whatsapp::start_whatsapp_webhook(&home_dir, reply_ctx.clone()).await;
+    let whatsapp_router =
+        crate::whatsapp::start_whatsapp_webhook(&home_dir, reply_ctx.clone()).await;
     let feishu_router = crate::feishu::start_feishu_webhook(&home_dir, reply_ctx.clone()).await;
-    let googlechat_router = crate::googlechat::start_googlechat_webhook(&home_dir, reply_ctx.clone()).await;
+    let googlechat_router =
+        crate::googlechat::start_googlechat_webhook(&home_dir, reply_ctx.clone()).await;
     let teams_router = crate::msteams::start_teams_webhook(&home_dir, reply_ctx.clone()).await;
     let wecom_router = crate::wecom::start_wecom_webhook(&home_dir, reply_ctx.clone()).await;
-    let dingtalk_router = crate::dingtalk::start_dingtalk_webhook(&home_dir, reply_ctx.clone()).await;
+    let dingtalk_router =
+        crate::dingtalk::start_dingtalk_webhook(&home_dir, reply_ctx.clone()).await;
     let webchat_ctx = reply_ctx.clone();
 
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
@@ -678,22 +687,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // through the same plumbing (loop / notebook / home dir). Constructed
     // before the silence consumer spawn — see #3.3 in
     // commercial/docs/TODO-runtime-health-fixes-202605.md for context.
-    let shared_gvu_ctx =
-        Arc::new(crate::prediction::subagent_prediction::GvuTriggerCtx {
-            gvu_loop: gvu_loop.clone(),
-            notebook: Some(Arc::new(
-                crate::gvu::mistake_notebook::MistakeNotebook::new(
-                    &home_dir.join("evolution.db"),
-                ),
-            )),
-            home_dir: home_dir.clone(),
-        });
+    let shared_gvu_ctx = Arc::new(crate::prediction::subagent_prediction::GvuTriggerCtx {
+        gvu_loop: gvu_loop.clone(),
+        notebook: Some(Arc::new(
+            crate::gvu::mistake_notebook::MistakeNotebook::new(&home_dir.join("evolution.db")),
+        )),
+        home_dir: home_dir.clone(),
+    });
 
     // Consume SilenceBreakerEvent → forced reflection event → optional GVU
     {
-        let cooldown = Arc::new(
-            crate::prediction::forced_reflection::SilenceBreakerCooldown::default_4h(),
-        );
+        let cooldown =
+            Arc::new(crate::prediction::forced_reflection::SilenceBreakerCooldown::default_4h());
         crate::prediction::forced_reflection::spawn_silence_event_consumer(
             silence_rx,
             prediction_engine.clone(),
@@ -736,12 +741,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
     // Start cron scheduler (reads from SQLite cron_tasks.db, fires on schedule)
-    let cron_store = Arc::new(
-        crate::cron_store::CronStore::open(&home_dir)
-            .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(
-                format!("Failed to open cron store: {e}")
-            ))?,
-    );
+    let cron_store = Arc::new(crate::cron_store::CronStore::open(&home_dir).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Gateway(format!("Failed to open cron store: {e}"))
+    })?);
     handler.set_cron_store(cron_store.clone()).await;
 
     // Initialize task board store (SQLite tasks.db + activity feed)
@@ -793,10 +795,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         let probe_interval = std::fs::read_to_string(home_dir.join("config.toml"))
             .ok()
             .and_then(|s| s.parse::<toml::Table>().ok())
-            .and_then(|t| t.get("rotation")?.as_table()?.get("health_check_interval_seconds")?.as_integer())
+            .and_then(|t| {
+                t.get("rotation")?
+                    .as_table()?
+                    .get("health_check_interval_seconds")?
+                    .as_integer()
+            })
             .unwrap_or(60) as u64;
         crate::claude_runner::spawn_health_probe(home_dir.clone(), probe_interval);
-        info!(interval_secs = probe_interval, "Account health probe started");
+        info!(
+            interval_secs = probe_interval,
+            "Account health probe started"
+        );
     }
 
     // Ensure every agent has a `.mcp.json` with the duduclaw MCP server entry.
@@ -813,7 +823,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         let agents_dir = home_dir.join("agents");
         let fixed = duduclaw_agent::mcp_template::ensure_mcp_absolute_paths_all(&agents_dir);
         if fixed > 0 {
-            info!(count = fixed, "Fixed/created .mcp.json for agent MCP server discovery");
+            info!(
+                count = fixed,
+                "Fixed/created .mcp.json for agent MCP server discovery"
+            );
         }
     }
 
@@ -835,6 +848,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Clone for the P1 goal loop driver (spawned below alongside the dispatch
     // engine); `message_queue` itself is moved into the dispatcher.
     let mq_for_goal_loop = message_queue.clone();
+    // Inject the queue into the handler so `system.update_config` can rebuild the
+    // goal-loop driver on a hot config reload (iteration_cap_simple / policy).
+    if let Some(mq) = mq_for_goal_loop.clone() {
+        handler.set_message_queue(mq).await;
+    }
     // P1 fix (2026-05-09): reuse the shared GvuTriggerCtx built earlier so
     // dispatcher + silence consumer share the same GvuLoop / MistakeNotebook
     // — keeps post-GVU bookkeeping consistent across the two trigger paths.
@@ -846,7 +864,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         Some(prediction_engine.clone()),
         Some(shared_gvu_ctx.clone()),
     ));
-    info!("Agent dispatcher started ({} background tasks)", bg_handles.len());
+    info!(
+        "Agent dispatcher started ({} background tasks)",
+        bg_handles.len()
+    );
 
     // ── Autopilot trigger engine (Multica-inspired event-driven automation) ──
     // Subscribes to a typed broadcast bus. Events come from:
@@ -862,6 +883,21 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             tokio::sync::broadcast::channel::<crate::autopilot_engine::AutopilotEvent>(8192);
         handler.set_autopilot_event_tx(ap_tx.clone()).await;
 
+        // ── OS-native Phase 1: filesystem watchers → autopilot bus ──────────
+        // Populate the shared OsWatcherRegistry (held in the handler so
+        // `agents.update` can hot stop/start a single agent's watcher) with one
+        // watcher per `os_native` agent that declares `[os_watch] paths`, then
+        // spawn the periodic stats writer for the `os_watch_status` MCP tool.
+        // No-op when no agent opts in.
+        let os_registry = handler.os_watchers();
+        crate::os_events::init_os_watchers(
+            os_registry.clone(),
+            handler.registry().clone(),
+            ap_tx.clone(),
+        )
+        .await;
+        bg_handles.push(crate::os_events::spawn_stats_writer(os_registry));
+
         // Poll SQLite event bus for events appended by MCP subprocesses.
         match crate::events_store::EventBusStore::open(&home_dir) {
             Ok(bus) => {
@@ -873,7 +909,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 info!("Event bus (events.db) poll task started");
             }
             Err(e) => {
-                warn!("events.db open failed: {e} — MCP-originated events will not reach Autopilot");
+                warn!(
+                    "events.db open failed: {e} — MCP-originated events will not reach Autopilot"
+                );
             }
         }
 
@@ -933,46 +971,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             // The DispatchEngine only reviews goal-mode completions; it does NOT
             // drive execution. The goal loop driver is the missing outer loop:
             // it dispatches todo/pending goal_mode tasks onto the existing
-            // message_queue wake-up rail (the same rail the heartbeat task-board
-            // pull uses), re-dispatches judge-rejected tasks with feedback for the
-            // Generator-Verifier retry, and owns the hard termination guards
-            // (iteration / wall-clock / concurrency caps → needs_human). Gated by
-            // the same `[dispatch] enabled` flag; goal_mode tasks are themselves
-            // opt-in, so no separate flag is needed. Requires the message queue.
-            if let Some(mq) = mq_for_goal_loop.clone() {
-                let cfg = crate::goal_loop::GoalLoopConfig::from_home(&home_dir);
-                // P2a: the driver reads per-agent `autonomy_level` from
-                // agent.toml and pushes needs_human / kickoff approvals to the
-                // agent's channel; the kickoff gate uses the shared HITL broker.
-                let mut driver = crate::goal_loop::GoalLoopDriver::new(ts, mq, cfg)
-                    .with_home_dir(home_dir.clone());
-                // D4 item 2: wire the configured dispatch policy. `None` ⇒
-                // FixedHierarchy (default; dispatch to `assigned_to` unchanged).
-                if let Some(policy) = crate::dispatch_policy::build_policy(&home_dir) {
-                    info!(
-                        policy = %policy.kind().as_str(),
-                        "Goal loop: dispatch policy active"
-                    );
-                    driver = driver.with_policy(policy);
-                }
-                match crate::approval::ApprovalBroker::open(&home_dir) {
-                    Ok(broker) => {
-                        driver = driver.with_broker(Arc::new(broker));
-                    }
-                    Err(e) => warn!(
-                        error = %e,
-                        "Goal loop: ApprovalBroker unavailable — kickoff gate disabled (Collaborator/Consultant proceed)"
-                    ),
-                }
-                let driver = Arc::new(driver);
-                bg_handles.push(tokio::spawn(async move { driver.run().await }));
-                info!("Goal loop driver started (autonomous goal_mode 外層迴圈驅動器)");
-            } else {
-                warn!("Goal loop driver not started: message queue unavailable");
-            }
+            // message_queue wake-up rail, re-dispatches judge-rejected tasks with
+            // feedback, and owns the hard termination guards. Build + spawn logic
+            // lives on the handler so gateway startup and the `system.update_config`
+            // hot reload (iteration_cap_simple / dispatch.policy) share one path;
+            // the registered handle is abort+respawned on reload.
+            handler.respawn_goal_loop_driver().await;
         }
     } else {
-        info!("Dispatch engine disabled (預設關；lease 續租已接上，可用 [dispatch] enabled=true 啟用)");
+        info!(
+            "Dispatch engine disabled (預設關；lease 續租已接上，可用 [dispatch] enabled=true 啟用)"
+        );
     }
 
     // ── D5: semi-automatic topology evolution (human-gated) ───
@@ -981,30 +990,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // files reroute PROPOSALS (never direct changes) through the ApprovalBroker
     // as an always-human action, and auto-rolls-back approved overrides that do
     // not beat the baseline within the 24h observation window. Default OFF —
-    // only runs when `[topology_evolution] enabled = true`.
-    if crate::topology_evolution::enabled(&home_dir) {
-        if let Some(ts) = task_store_opt.clone() {
-            match crate::approval::ApprovalBroker::open(&home_dir) {
-                Ok(broker) => {
-                    let cfg = crate::topology_evolution::TopologyEvolutionConfig::from_home(&home_dir);
-                    let driver = Arc::new(crate::topology_evolution::TopologyEvolutionDriver::new(
-                        ts,
-                        home_dir.clone(),
-                        Arc::new(broker),
-                        cfg,
-                    ));
-                    bg_handles.push(tokio::spawn(async move { driver.run().await }));
-                    info!("Topology evolution driver started (D5 半自動拓撲演化，human-gated)");
-                }
-                Err(e) => warn!(
-                    error = %e,
-                    "Topology evolution: ApprovalBroker unavailable — D5 disabled (proposals require the human gate)"
-                ),
-            }
-        } else {
-            warn!("Topology evolution: task store unavailable — D5 disabled");
-        }
-    }
+    // only runs when `[topology_evolution] enabled = true`. Build + spawn lives
+    // on the handler (self-gating on `enabled`) so startup and the
+    // `system.update_config` hot reload of `topology_evolution.enabled` share one
+    // path (false→true first spawn, true→false teardown, both without a restart).
+    handler.respawn_topology_driver().await;
 
     // Pro edition: auto-download + install + graceful restart (unless disabled).
     // CE edition: notify dashboard only.
@@ -1061,7 +1051,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                             match crate::updater::apply_update(
                                 &info.download_url,
                                 &info.checksum_url,
-                            ).await {
+                            )
+                            .await
+                            {
                                 Ok(result) if result.success => {
                                     info!("Auto-update installed v{}", info.latest_version);
 
@@ -1100,7 +1092,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                         // re-exec the new binary (works with or
                                         // without launchd/systemd supervision).
                                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                        info!("Auto-update: restarting for v{}", info.latest_version);
+                                        info!(
+                                            "Auto-update: restarting for v{}",
+                                            info.latest_version
+                                        );
                                         duduclaw_core::platform::request_restart_after_shutdown();
                                         duduclaw_core::platform::self_interrupt();
                                     }
@@ -1147,8 +1142,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         });
         info!(
             auto_update,
-            "Periodic update checker started (every 6h, auto_update={})",
-            auto_update,
+            "Periodic update checker started (every 6h, auto_update={})", auto_update,
         );
     }
 
@@ -1222,13 +1216,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         };
 
     // Inject user_db into handler for user management RPC methods
-    handler.set_user_db(user_db.clone(), jwt_config.clone()).await;
+    handler
+        .set_user_db(user_db.clone(), jwt_config.clone())
+        .await;
 
-    let otp_delivery: Arc<dyn crate::otp_delivery::OtpDeliverer> =
-        Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
-            home_dir.clone(),
-            reqwest::Client::new(),
-        ));
+    let otp_delivery: Arc<dyn crate::otp_delivery::OtpDeliverer> = Arc::new(
+        crate::otp_delivery::ConfigOtpDeliverer::new(home_dir.clone(), reqwest::Client::new()),
+    );
 
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
@@ -1310,12 +1304,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(crate::metrics::metrics_handler))
-        .route(
-            "/api/runtime/status",
-            get(crate::runtime_status::handler),
-        )
+        .route("/api/runtime/status", get(crate::runtime_status::handler))
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
-        .route("/api/reliability/summary", get(handle_reliability_summary_http))
+        .route(
+            "/api/reliability/summary",
+            get(handle_reliability_summary_http),
+        )
         // Voice endpoints (openhuman-parity B): STT (multipart audio → text) +
         // TTS (text → audio). Bearer-JWT gated. STT gets a raised body limit so
         // a short voice clip (≤10 MiB) is accepted; the default axum 2 MiB cap
@@ -1370,7 +1364,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // ── .well-known endpoints for protocol discovery ──────────────
     app = app
-        .route("/.well-known/mcp-server.json", get(well_known_mcp_server_card))
+        .route(
+            "/.well-known/mcp-server.json",
+            get(well_known_mcp_server_card),
+        )
         // A2A v1.0 signed Agent Card (G6). `agent-card.json` is the v1.0 path;
         // `agent.json` is kept as a legacy alias. Both serve the signed card.
         .route("/.well-known/agent-card.json", get(well_known_agent_card))
@@ -1429,21 +1426,26 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let pe_for_shutdown = prediction_engine.clone();
     let meta_path_for_shutdown = metacognition_path.clone();
     let supervisor_for_shutdown = worker_supervisor;
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Shutdown signal received, flushing state...");
-            pe_for_shutdown.flush_all().await;
-            pe_for_shutdown.persist_metacognition(&meta_path_for_shutdown).await;
-            info!("Prediction engine state flushed");
-            if let Some(supervisor) = supervisor_for_shutdown {
-                info!("Shutting down worker supervisor...");
-                supervisor.shutdown().await;
-                info!("Worker supervisor shut down");
-            }
-        })
-        .await
-        .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Shutdown signal received, flushing state...");
+        pe_for_shutdown.flush_all().await;
+        pe_for_shutdown
+            .persist_metacognition(&meta_path_for_shutdown)
+            .await;
+        info!("Prediction engine state flushed");
+        if let Some(supervisor) = supervisor_for_shutdown {
+            info!("Shutting down worker supervisor...");
+            supervisor.shutdown().await;
+            info!("Worker supervisor shut down");
+        }
+    })
+    .await
+    .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
 
     // Self-update installed a new binary during this run: re-exec into it
     // now that the graceful shutdown sequence (prediction flush → worker
@@ -1488,7 +1490,8 @@ async fn handle_login(
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "too many login attempts, try again in 15 minutes"})),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Verify credentials
@@ -1510,7 +1513,8 @@ async fn handle_login(
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "invalid email or password"})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -1529,7 +1533,8 @@ async fn handle_login(
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "token generation failed"})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -1540,7 +1545,8 @@ async fn handle_login(
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "token generation failed"})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -1553,19 +1559,16 @@ async fn handle_login(
 
     // Audit log
     let ip_str = ip.to_string();
-    let _ = state.user_db.log_action(
-        Some(&user.id),
-        "login",
-        None,
-        None,
-        Some(&ip_str),
-    );
+    let _ = state
+        .user_db
+        .log_action(Some(&user.id), "login", None, None, Some(&ip_str));
 
     Json(serde_json::json!({
         "access_token": access_token,
         "refresh_token": refresh_token,
         "user": user,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -1603,12 +1606,17 @@ async fn handle_otp_request(
                 challenge.code.clone(),
             );
             tokio::spawn(async move {
-                let text = format!(
-                    "🐾 DuDuClaw 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。"
-                );
+                let text =
+                    format!("🐾 DuDuClaw 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。");
                 match deliverer.deliver(&channel, &chat_id, &text).await {
                     Ok(()) => {
-                        let _ = user_db.log_action(Some(&user_id), "otp_sent", Some(&channel), None, None);
+                        let _ = user_db.log_action(
+                            Some(&user_id),
+                            "otp_sent",
+                            Some(&channel),
+                            None,
+                            None,
+                        );
                     }
                     Err(e) => {
                         warn!("OTP delivery failed: {e}");
@@ -1797,10 +1805,12 @@ async fn handle_channel_bind(
         )
             .into_response();
     }
-    match state
-        .user_db
-        .bind_channel_identity(&body.user_id, &body.channel, &body.channel_user_id, true)
-    {
+    match state.user_db.bind_channel_identity(
+        &body.user_id,
+        &body.channel,
+        &body.channel_user_id,
+        true,
+    ) {
         Ok(()) => {
             let _ = state.user_db.log_action(
                 Some(&caller.id),
@@ -1897,7 +1907,9 @@ static REFRESH_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<IpAddr, (Instant,
 /// Returns `Ok(())` when within budget, or `Err(retry_after_secs)` when the IP
 /// is over the limit (so the caller can emit a `Retry-After` header).
 fn check_refresh_rate_limit(ip: IpAddr) -> Result<(), u64> {
-    let mut map = REFRESH_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = REFRESH_RATE_LIMITER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     if map.len() > 10000 {
         map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < REFRESH_RATE_WINDOW_SECS);
@@ -1928,7 +1940,8 @@ async fn handle_refresh(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
             Json(serde_json::json!({"error": "too many refresh attempts"})),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Verify refresh token — generic error messages to prevent info leakage
@@ -1938,7 +1951,8 @@ async fn handle_refresh(
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "invalid or expired refresh token"})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -1949,7 +1963,8 @@ async fn handle_refresh(
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "user not found or inactive"})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -1966,7 +1981,8 @@ async fn handle_refresh(
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "token generation failed"})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -1984,7 +2000,8 @@ async fn handle_me(
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "missing Authorization header"})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -1994,7 +2011,8 @@ async fn handle_me(
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "invalid or expired token"})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -2004,7 +2022,8 @@ async fn handle_me(
             return (
                 axum::http::StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "user not found"})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -2013,7 +2032,8 @@ async fn handle_me(
     Json(serde_json::json!({
         "user": user,
         "bindings": bindings,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -2067,9 +2087,10 @@ async fn handle_change_password(
         .update_user(&claims.sub, None, None, Some(&body.new_password))
     {
         Ok(()) => {
-            let _ = state
-                .user_db
-                .log_action(Some(&claims.sub), "change_password", None, None, None);
+            let _ =
+                state
+                    .user_db
+                    .log_action(Some(&claims.sub), "change_password", None, None, None);
             Json(serde_json::json!({"ok": true})).into_response()
         }
         Err(e) => {
@@ -2254,10 +2275,7 @@ pub(crate) fn origin_is_allowed(headers: &axum::http::HeaderMap) -> bool {
 /// Testable core of [`origin_is_allowed`]: matches against the built-in
 /// loopback origins plus the given `extra` list (already normalized to
 /// `host[:port]`), without touching the process-wide `OnceLock`.
-pub(crate) fn origin_is_allowed_with(
-    headers: &axum::http::HeaderMap,
-    extra: &[String],
-) -> bool {
+pub(crate) fn origin_is_allowed_with(headers: &axum::http::HeaderMap, extra: &[String]) -> bool {
     match headers.get("origin").and_then(|v| v.to_str().ok()) {
         None => true,
         Some(origin) => {
@@ -2284,7 +2302,10 @@ const STT_MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Authenticate a request from its `Authorization: Bearer <jwt>` header.
 /// Returns `Ok(())` for a valid active-user access token, else an
 /// `into_response()`-ready 401. Same stance as `handle_me`.
-fn require_bearer(state: &AppState, headers: &axum::http::HeaderMap) -> Result<(), axum::response::Response> {
+fn require_bearer(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), axum::response::Response> {
     let token = extract_bearer_token(headers).ok_or_else(|| {
         (
             axum::http::StatusCode::UNAUTHORIZED,
@@ -2365,7 +2386,9 @@ async fn handle_stt(
                 }
                 match field.bytes().await {
                     Ok(data) => {
-                        if let Err(msg) = crate::stt::check_audio_size(data.len(), STT_MAX_UPLOAD_BYTES) {
+                        if let Err(msg) =
+                            crate::stt::check_audio_size(data.len(), STT_MAX_UPLOAD_BYTES)
+                        {
                             return (
                                 axum::http::StatusCode::PAYLOAD_TOO_LARGE,
                                 Json(serde_json::json!({ "error": msg })),
@@ -2401,7 +2424,10 @@ async fn handle_stt(
         }
     };
 
-    match provider.transcribe(&audio, &filename, language.as_deref()).await {
+    match provider
+        .transcribe(&audio, &filename, language.as_deref())
+        .await
+    {
         Ok(text) => Json(serde_json::json!({ "text": text })).into_response(),
         Err(e) => (
             axum::http::StatusCode::BAD_GATEWAY,
@@ -2453,10 +2479,24 @@ async fn handle_tts(
             .ok()
             .and_then(|c| c.parse().ok())
             .unwrap_or_default();
-        let voice = table.get("voice").and_then(|v| v.as_table()).cloned().unwrap_or_default();
+        let voice = table
+            .get("voice")
+            .and_then(|v| v.as_table())
+            .cloned()
+            .unwrap_or_default();
         (
-            voice.get("tts_provider").and_then(|v| v.as_str()).unwrap_or("").trim().to_ascii_lowercase(),
-            voice.get("tts_voice").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
+            voice
+                .get("tts_provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase(),
+            voice
+                .get("tts_voice")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string(),
         )
     };
 
@@ -2571,7 +2611,13 @@ async fn handle_voice_config_get(
         .and_then(|v| v.as_table())
         .cloned()
         .unwrap_or_default();
-    let s = |k: &str| voice.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let s = |k: &str| {
+        voice
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let key_set = voice
         .get("stt_api_key_enc")
         .and_then(|v| v.as_str())
@@ -2652,7 +2698,10 @@ async fn handle_voice_config_set(
         }
     };
 
-    voice.insert("stt_provider".into(), toml::Value::String(provider.to_string()));
+    voice.insert(
+        "stt_provider".into(),
+        toml::Value::String(provider.to_string()),
+    );
     voice.insert(
         "stt_base_url".into(),
         toml::Value::String(body.stt_base_url.trim().to_string()),
@@ -2740,12 +2789,15 @@ async fn ws_handler(
     // Non-browser clients (curl, SDK) don't send Origin, so absent is OK.
     // HS3 fix: exact host match — `starts_with` accepted `localhost.evil.com`.
     if !origin_is_allowed(&headers) {
-        let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let origin = headers
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         warn!(origin, "WebSocket connection rejected: invalid origin");
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
     ws.max_message_size(1024 * 1024) // 1MB max WebSocket message
-      .on_upgrade(move |socket| handle_socket(socket, state))
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 /// Process a single WebSocket connection.
@@ -2770,140 +2822,193 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 return;
             }
             Ok(recv_result) => match recv_result {
-            Some(Ok(Message::Text(text))) => {
-                match serde_json::from_str::<WsFrame>(&text) {
-                    Ok(WsFrame::Request { id, method, params }) if method == "connect" => {
-                        // ── JWT authentication (new) ─────────────────────
-                        if let Some(jwt_str) = params.get("jwt").and_then(|v| v.as_str()) {
-                            match authenticate_jwt(&state, jwt_str) {
-                                Ok(ctx) => {
-                                    let ok = WsFrame::ok_response(
-                                        &id,
-                                        serde_json::json!({
-                                            "status": "authenticated",
-                                            "user": {
-                                                "id": ctx.user_id,
-                                                "email": ctx.email,
-                                                "role": ctx.role.to_string(),
-                                            }
-                                        }),
-                                    );
-                                    let _ = socket.send(Message::Text(
-                                        serde_json::to_string(&ok).unwrap_or_default().into(),
-                                    )).await;
-                                    Ok(ctx)
-                                }
-                                Err(e) => {
-                                    let err = WsFrame::error_response(&id, &format!("JWT authentication failed: {e}"));
-                                    let _ = socket.send(Message::Text(
-                                        serde_json::to_string(&err).unwrap_or_default().into(),
-                                    )).await;
-                                    Err(())
-                                }
-                            }
-                        }
-                        // ── Ed25519 challenge-response ──────────────────────
-                        else if state.auth.is_ed25519() {
-                            // M23: challenge is per-connection — held in this
-                            // local and threaded into verify_ed25519 below, so
-                            // concurrent handshakes never clobber each other.
-                            let (challenge_b64, challenge) = state.auth.issue_challenge();
-                            let resp = WsFrame::ok_response(
-                                &id,
-                                serde_json::json!({ "challenge": challenge_b64 }),
-                            );
-                            let _ = socket.send(Message::Text(
-                                serde_json::to_string(&resp).unwrap_or_default().into(),
-                            )).await;
-
-                            // Wait for the `authenticate` message (with timeout)
-                            match tokio::time::timeout(auth_timeout, socket.recv()).await.unwrap_or(None) {
-                                Some(Ok(Message::Text(auth_text))) => {
-                                    match serde_json::from_str::<WsFrame>(&auth_text) {
-                                        Ok(WsFrame::Request { id: auth_id, method: auth_method, params: auth_params })
-                                            if auth_method == "authenticate" =>
-                                        {
-                                            let sig = auth_params
-                                                .get("signature")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-                                            match state.auth.verify_ed25519(sig, &challenge) {
-                                                Ok(()) => {
-                                                    let ok = WsFrame::ok_response(
-                                                        &auth_id,
-                                                        serde_json::json!({"status": "authenticated"}),
-                                                    );
-                                                    let _ = socket.send(Message::Text(
-                                                        serde_json::to_string(&ok).unwrap_or_default().into(),
-                                                    )).await;
-                                                    // Ed25519 users get admin context (backward compat)
-                                                    Ok(UserContext::admin_fallback())
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<WsFrame>(&text) {
+                        Ok(WsFrame::Request { id, method, params }) if method == "connect" => {
+                            // ── JWT authentication (new) ─────────────────────
+                            if let Some(jwt_str) = params.get("jwt").and_then(|v| v.as_str()) {
+                                match authenticate_jwt(&state, jwt_str) {
+                                    Ok(ctx) => {
+                                        let ok = WsFrame::ok_response(
+                                            &id,
+                                            serde_json::json!({
+                                                "status": "authenticated",
+                                                "user": {
+                                                    "id": ctx.user_id,
+                                                    "email": ctx.email,
+                                                    "role": ctx.role.to_string(),
                                                 }
-                                                Err(_) => {
-                                                    let err = WsFrame::error_response(&auth_id, "Ed25519 authentication failed");
-                                                    let _ = socket.send(Message::Text(
-                                                        serde_json::to_string(&err).unwrap_or_default().into(),
-                                                    )).await;
-                                                    Err(())
-                                                }
-                                            }
-                                        }
-                                        _ => {
-                                            let err = WsFrame::error_response("", "expected authenticate message");
-                                            let _ = socket.send(Message::Text(
-                                                serde_json::to_string(&err).unwrap_or_default().into(),
-                                            )).await;
-                                            Err(())
-                                        }
+                                            }),
+                                        );
+                                        let _ = socket
+                                            .send(Message::Text(
+                                                serde_json::to_string(&ok)
+                                                    .unwrap_or_default()
+                                                    .into(),
+                                            ))
+                                            .await;
+                                        Ok(ctx)
+                                    }
+                                    Err(e) => {
+                                        let err = WsFrame::error_response(
+                                            &id,
+                                            &format!("JWT authentication failed: {e}"),
+                                        );
+                                        let _ = socket
+                                            .send(Message::Text(
+                                                serde_json::to_string(&err)
+                                                    .unwrap_or_default()
+                                                    .into(),
+                                            ))
+                                            .await;
+                                        Err(())
                                     }
                                 }
-                                _ => Err(()),
                             }
-                        }
-                        // ── Legacy token authentication ────────────────────
-                        else if state.auth.is_auth_required() {
-                            let token = params.get("token").and_then(|v| v.as_str()).unwrap_or("");
-                            match state.auth.validate(token) {
-                                Ok(()) => {
-                                    let ok = WsFrame::ok_response(
-                                        &id,
-                                        serde_json::json!({"status": "authenticated"}),
-                                    );
-                                    let _ = socket.send(Message::Text(
-                                        serde_json::to_string(&ok).unwrap_or_default().into(),
-                                    )).await;
-                                    // Legacy token users get admin context (backward compat)
-                                    Ok(UserContext::admin_fallback())
+                            // ── Ed25519 challenge-response ──────────────────────
+                            else if state.auth.is_ed25519() {
+                                // M23: challenge is per-connection — held in this
+                                // local and threaded into verify_ed25519 below, so
+                                // concurrent handshakes never clobber each other.
+                                let (challenge_b64, challenge) = state.auth.issue_challenge();
+                                let resp = WsFrame::ok_response(
+                                    &id,
+                                    serde_json::json!({ "challenge": challenge_b64 }),
+                                );
+                                let _ = socket
+                                    .send(Message::Text(
+                                        serde_json::to_string(&resp).unwrap_or_default().into(),
+                                    ))
+                                    .await;
+
+                                // Wait for the `authenticate` message (with timeout)
+                                match tokio::time::timeout(auth_timeout, socket.recv())
+                                    .await
+                                    .unwrap_or(None)
+                                {
+                                    Some(Ok(Message::Text(auth_text))) => {
+                                        match serde_json::from_str::<WsFrame>(&auth_text) {
+                                            Ok(WsFrame::Request {
+                                                id: auth_id,
+                                                method: auth_method,
+                                                params: auth_params,
+                                            }) if auth_method == "authenticate" => {
+                                                let sig = auth_params
+                                                    .get("signature")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("");
+                                                match state.auth.verify_ed25519(sig, &challenge) {
+                                                    Ok(()) => {
+                                                        let ok = WsFrame::ok_response(
+                                                            &auth_id,
+                                                            serde_json::json!({"status": "authenticated"}),
+                                                        );
+                                                        let _ = socket
+                                                            .send(Message::Text(
+                                                                serde_json::to_string(&ok)
+                                                                    .unwrap_or_default()
+                                                                    .into(),
+                                                            ))
+                                                            .await;
+                                                        // Ed25519 users get admin context (backward compat)
+                                                        Ok(UserContext::admin_fallback())
+                                                    }
+                                                    Err(_) => {
+                                                        let err = WsFrame::error_response(
+                                                            &auth_id,
+                                                            "Ed25519 authentication failed",
+                                                        );
+                                                        let _ = socket
+                                                            .send(Message::Text(
+                                                                serde_json::to_string(&err)
+                                                                    .unwrap_or_default()
+                                                                    .into(),
+                                                            ))
+                                                            .await;
+                                                        Err(())
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                let err = WsFrame::error_response(
+                                                    "",
+                                                    "expected authenticate message",
+                                                );
+                                                let _ = socket
+                                                    .send(Message::Text(
+                                                        serde_json::to_string(&err)
+                                                            .unwrap_or_default()
+                                                            .into(),
+                                                    ))
+                                                    .await;
+                                                Err(())
+                                            }
+                                        }
+                                    }
+                                    _ => Err(()),
                                 }
-                                Err(_) => {
-                                    let err = WsFrame::error_response(&id, "authentication failed");
-                                    let _ = socket.send(Message::Text(
+                            }
+                            // ── Legacy token authentication ────────────────────
+                            else if state.auth.is_auth_required() {
+                                let token =
+                                    params.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                                match state.auth.validate(token) {
+                                    Ok(()) => {
+                                        let ok = WsFrame::ok_response(
+                                            &id,
+                                            serde_json::json!({"status": "authenticated"}),
+                                        );
+                                        let _ = socket
+                                            .send(Message::Text(
+                                                serde_json::to_string(&ok)
+                                                    .unwrap_or_default()
+                                                    .into(),
+                                            ))
+                                            .await;
+                                        // Legacy token users get admin context (backward compat)
+                                        Ok(UserContext::admin_fallback())
+                                    }
+                                    Err(_) => {
+                                        let err =
+                                            WsFrame::error_response(&id, "authentication failed");
+                                        let _ = socket
+                                            .send(Message::Text(
+                                                serde_json::to_string(&err)
+                                                    .unwrap_or_default()
+                                                    .into(),
+                                            ))
+                                            .await;
+                                        Err(())
+                                    }
+                                }
+                            }
+                            // ── User DB exists but no legacy auth — require JWT ──
+                            else {
+                                let err = WsFrame::error_response(
+                                    &id,
+                                    "authentication required — provide jwt parameter",
+                                );
+                                let _ = socket
+                                    .send(Message::Text(
                                         serde_json::to_string(&err).unwrap_or_default().into(),
-                                    )).await;
-                                    Err(())
-                                }
+                                    ))
+                                    .await;
+                                Err(())
                             }
                         }
-                        // ── User DB exists but no legacy auth — require JWT ──
-                        else {
-                            let err = WsFrame::error_response(&id, "authentication required — provide jwt parameter");
-                            let _ = socket.send(Message::Text(
-                                serde_json::to_string(&err).unwrap_or_default().into(),
-                            )).await;
+                        _ => {
+                            let err = WsFrame::error_response("", "expected connect message");
+                            let _ = socket
+                                .send(Message::Text(
+                                    serde_json::to_string(&err).unwrap_or_default().into(),
+                                ))
+                                .await;
                             Err(())
                         }
                     }
-                    _ => {
-                        let err = WsFrame::error_response("", "expected connect message");
-                        let _ = socket.send(Message::Text(
-                            serde_json::to_string(&err).unwrap_or_default().into(),
-                        )).await;
-                        Err(())
-                    }
                 }
-            }
-            _ => Err(()),
-        } // match recv_result
+                _ => Err(()),
+            }, // match recv_result
         }; // match tokio::time::timeout
 
         match result {
@@ -3138,10 +3243,7 @@ async fn handle_reliability_summary_http(
         }
     };
 
-    let window_days = params
-        .window_days
-        .unwrap_or(7)
-        .clamp(1, 365);
+    let window_days = params.window_days.unwrap_or(7).clamp(1, 365);
 
     // M1/M60: reuse the shared, background-synced index instead of opening a
     // fresh DB connection and running a full sync on every request.
@@ -3156,7 +3258,10 @@ async fn handle_reliability_summary_http(
         }
     };
 
-    match idx.compute_reliability_summary(&agent_id, window_days).await {
+    match idx
+        .compute_reliability_summary(&agent_id, window_days)
+        .await
+    {
         Ok(s) => Json(serde_json::json!({
             "agent_id":              s.agent_id,
             "window_days":           s.window_days,
@@ -3291,7 +3396,10 @@ mod login_rate_limit_tests {
         for i in 1..=5 {
             assert!(check_login_rate_limit(ip, email), "attempt {i} should pass");
         }
-        assert!(!check_login_rate_limit(ip, email), "6th attempt must be blocked");
+        assert!(
+            !check_login_rate_limit(ip, email),
+            "6th attempt must be blocked"
+        );
     }
 
     #[test]
@@ -3303,7 +3411,10 @@ mod login_rate_limit_tests {
         for _ in 0..5 {
             assert!(check_login_rate_limit(ip, email));
         }
-        assert!(!check_login_rate_limit(ip, email), "should be blocked before reset");
+        assert!(
+            !check_login_rate_limit(ip, email),
+            "should be blocked before reset"
+        );
         reset_login_rate_limit(ip, email);
         // After reset the budget is replenished.
         assert!(check_login_rate_limit(ip, email), "should pass after reset");
@@ -3319,9 +3430,15 @@ mod login_rate_limit_tests {
         for _ in 0..6 {
             let _ = check_login_rate_limit(attacker, email);
         }
-        assert!(!check_login_rate_limit(attacker, email), "attacker should be blocked");
+        assert!(
+            !check_login_rate_limit(attacker, email),
+            "attacker should be blocked"
+        );
         // Victim on a different IP is unaffected.
-        assert!(check_login_rate_limit(victim, email), "victim should still pass");
+        assert!(
+            check_login_rate_limit(victim, email),
+            "victim should still pass"
+        );
     }
 }
 
@@ -3346,8 +3463,14 @@ mod origin_allowlist_tests {
     #[test]
     fn loopback_allowed_by_default_external_blocked() {
         // (a) With an empty extra list, only built-in loopback origins pass.
-        assert!(origin_is_allowed_with(&origin_headers("http://localhost:18789"), &[]));
-        assert!(origin_is_allowed_with(&origin_headers("http://127.0.0.1:5173"), &[]));
+        assert!(origin_is_allowed_with(
+            &origin_headers("http://localhost:18789"),
+            &[]
+        ));
+        assert!(origin_is_allowed_with(
+            &origin_headers("http://127.0.0.1:5173"),
+            &[]
+        ));
         assert!(!origin_is_allowed_with(
             &origin_headers("http://evil.example.com"),
             &[]
@@ -3402,14 +3525,15 @@ mod origin_allowlist_tests {
             normalize_origin_entry("  ws://box.tailnet.ts.net/  "),
             Some("box.tailnet.ts.net".to_string())
         );
-        assert_eq!(normalize_origin_entry("HTTP://Host.Example"), Some("Host.Example".to_string()));
+        assert_eq!(
+            normalize_origin_entry("HTTP://Host.Example"),
+            Some("Host.Example".to_string())
+        );
         assert_eq!(normalize_origin_entry("   "), None);
         assert_eq!(normalize_origin_entry("https://"), None);
 
         // A normalized host:port entry matches only that exact port.
-        let extra = vec![
-            normalize_origin_entry("https://dash.example.com:8080/").unwrap(),
-        ];
+        let extra = vec![normalize_origin_entry("https://dash.example.com:8080/").unwrap()];
         assert!(origin_is_allowed_with(
             &origin_headers("https://dash.example.com:8080"),
             &extra
@@ -3448,23 +3572,39 @@ mod origin_allowlist_tests {
             "https://dash.example.com/".to_string(),
             "env.host.ts.net".to_string(),
         ]);
-        assert!(origin_is_allowed(&origin_headers("https://dash.example.com")));
-        assert!(origin_is_allowed(&origin_headers("https://env.host.ts.net")));
-        assert!(!origin_is_allowed(&origin_headers("https://new.example.com")));
+        assert!(origin_is_allowed(&origin_headers(
+            "https://dash.example.com"
+        )));
+        assert!(origin_is_allowed(&origin_headers(
+            "https://env.host.ts.net"
+        )));
+        assert!(!origin_is_allowed(&origin_headers(
+            "https://new.example.com"
+        )));
 
         // Dashboard save: only the config.toml portion is sent (env unknown to UI).
         // A newly-added host is allowed immediately, WITHOUT a restart...
         set_allowed_origins(vec!["https://new.example.com/".to_string()]);
-        assert!(origin_is_allowed(&origin_headers("https://new.example.com")));
+        assert!(origin_is_allowed(&origin_headers(
+            "https://new.example.com"
+        )));
         // ...the removed config host is now blocked...
-        assert!(!origin_is_allowed(&origin_headers("https://dash.example.com")));
+        assert!(!origin_is_allowed(&origin_headers(
+            "https://dash.example.com"
+        )));
         // ...and the env-provided host survives the save (re-merged in the setter).
-        assert!(origin_is_allowed(&origin_headers("https://env.host.ts.net")));
+        assert!(origin_is_allowed(&origin_headers(
+            "https://env.host.ts.net"
+        )));
 
         // Clearing the config list back to empty keeps env, drops config hosts.
         set_allowed_origins(vec![]);
-        assert!(!origin_is_allowed(&origin_headers("https://new.example.com")));
-        assert!(origin_is_allowed(&origin_headers("https://env.host.ts.net")));
+        assert!(!origin_is_allowed(&origin_headers(
+            "https://new.example.com"
+        )));
+        assert!(origin_is_allowed(&origin_headers(
+            "https://env.host.ts.net"
+        )));
         // Loopback always allowed regardless.
         assert!(origin_is_allowed(&origin_headers("http://localhost:8080")));
 

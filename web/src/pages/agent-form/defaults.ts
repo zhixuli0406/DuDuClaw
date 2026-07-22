@@ -112,6 +112,7 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
   wiki_visible_to: [],
   native_sandbox: false,
   policy: [],
+  os_native: false,
   computer_use_config: {
     allowed_apps: [],
     blocked_actions: [],
@@ -121,6 +122,20 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
     display_height: 800,
     auto_confirm_trusted: false,
   },
+};
+
+/** v1.39 — default `[os_watch]` form values. Prefilled from agents.inspect
+ *  (`os_watch`) on tab open; only written when the operator edits the section. */
+export const DEFAULT_OS_WATCH: {
+  paths: string[];
+  ignore: string[];
+  debounce_ms: number;
+  max_events_per_min: number;
+} = {
+  paths: [],
+  ignore: [],
+  debounce_ms: 300,
+  max_events_per_min: 60,
 };
 
 /** ODO — per-agent Odoo override (write-only tab; inspect doesn't return it). */

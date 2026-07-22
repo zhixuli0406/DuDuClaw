@@ -78,6 +78,7 @@ pub mod mast;
 pub mod foresight;
 pub mod security_posture;
 pub mod events_store;
+pub mod os_events;
 pub mod canvas;
 pub mod direct_api;
 pub mod delegation;

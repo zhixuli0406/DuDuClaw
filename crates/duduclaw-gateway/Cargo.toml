@@ -17,6 +17,7 @@ duduclaw-redaction = { workspace = true }
 duduclaw-cli-runtime = { workspace = true }
 duduclaw-cli-worker = { workspace = true }
 duduclaw-license = { workspace = true }
+duduclaw-os = { workspace = true }
 duduclaw-llm = { workspace = true }
 duduclaw-sandbox = { workspace = true }
 thiserror = { workspace = true }

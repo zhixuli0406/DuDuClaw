@@ -4,7 +4,7 @@
 //! rest of the codebase compiles and runs on both Unix and Windows.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ── Home directory ───────────────────────────────────────────
 
@@ -15,6 +15,24 @@ pub fn home_dir() -> String {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_default()
+}
+
+/// Expand a leading `~` / `~/` segment against the user [`home_dir`].
+///
+/// Only the leading segment is expanded (`~` alone, or `~/rest`); any other
+/// value — including a tilde that is not at the start (`/a/~x`) or a `~user`
+/// form — is returned verbatim as a [`PathBuf`]. This is the single canonical
+/// home-relative path expander for the workspace; call it wherever a config or
+/// tool argument may carry a `~`-relative path (`std::fs::canonicalize` does NOT
+/// expand `~` itself, so an unexpanded `~/…` would spuriously fail to resolve).
+pub fn expand_tilde(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return PathBuf::from(home_dir());
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return PathBuf::from(home_dir()).join(rest);
+    }
+    PathBuf::from(raw)
 }
 
 /// Resolve the DuDuClaw state root, honouring the `DUDUCLAW_HOME` override.
@@ -883,6 +901,20 @@ mod home_tests {
                 None => std::env::remove_var("DUDUCLAW_HOME"),
             }
         }
+    }
+
+    #[test]
+    fn expand_tilde_expands_only_leading_segment() {
+        use super::expand_tilde;
+        let home = std::path::PathBuf::from(super::home_dir());
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/Documents/x.md"), home.join("Documents/x.md"));
+        // No leading tilde → verbatim.
+        assert_eq!(expand_tilde("/abs/path"), std::path::PathBuf::from("/abs/path"));
+        // A tilde not at the start is NOT expanded.
+        assert_eq!(expand_tilde("/a/~x"), std::path::PathBuf::from("/a/~x"));
+        // A `~user` form is not expanded (only `~` / `~/`).
+        assert_eq!(expand_tilde("~root/x"), std::path::PathBuf::from("~root/x"));
     }
 
     #[test]

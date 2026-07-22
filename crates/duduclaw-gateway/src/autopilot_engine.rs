@@ -69,6 +69,20 @@ pub enum AutopilotEvent {
         level: String,
         reasons: Vec<String>,
     },
+    /// OS-native Phase 1: a debounced, rate-limited filesystem change observed
+    /// by the agent's `[os_watch]` watcher (`duduclaw-os`). Emitted in-process
+    /// by `os_events::spawn_os_watchers`; also reachable out-of-process via the
+    /// events.db bridge (the `os_file` trigger name, with the legacy dotted
+    /// `os.file` key still accepted for external writers) so MCP/external
+    /// writers stay symmetric.
+    /// `change` is one of `created` / `modified` / `removed` / `renamed`
+    /// (the field is named `change`, not `kind`, to avoid colliding with the
+    /// enum's internal serde tag; it is exposed to rules under the `kind` field).
+    OsFileEvent {
+        agent_id: String,
+        path: String,
+        change: String,
+    },
 }
 
 impl AutopilotEvent {
@@ -82,6 +96,7 @@ impl AutopilotEvent {
             Self::AgentIdle { .. } => "agent_idle",
             Self::CronTick { .. } => "cron_tick",
             Self::RunAtRisk { .. } => "run_at_risk",
+            Self::OsFileEvent { .. } => "os_file",
         }
     }
 
@@ -139,6 +154,24 @@ impl AutopilotEvent {
                         reasons.iter().map(|r| Value::String(r.clone())).collect(),
                     ),
                 );
+            }
+            Self::OsFileEvent { agent_id, path, change } => {
+                map.insert("agent_id".into(), Value::String(agent_id.clone()));
+                map.insert("path".into(), Value::String(path.clone()));
+                map.insert("kind".into(), Value::String(change.clone()));
+                // Convenience fields for rule authors: exact file name and
+                // lowercase extension (so `{ field: "extension", op: "eq",
+                // value: "pdf" }` works without string surgery in the rule).
+                let p = std::path::Path::new(path);
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    map.insert("file_name".into(), Value::String(name.to_string()));
+                }
+                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                    map.insert(
+                        "extension".into(),
+                        Value::String(ext.to_ascii_lowercase()),
+                    );
+                }
             }
         }
         map
@@ -928,6 +961,29 @@ fn row_to_event(event: &str, payload_json: &str) -> Option<AutopilotEvent> {
                 })
                 .unwrap_or_default(),
         }),
+        // OS-native Phase 1: filesystem events written to events.db by an
+        // out-of-process producer. Symmetric with the in-process
+        // `AutopilotEvent::OsFileEvent` path. Accept BOTH the underscore
+        // trigger name (`os_file`, matching `event_name()` and the autopilot
+        // rule whitelist) and the legacy dotted `os.file` key, so external
+        // writers using either spelling map correctly.
+        "os_file" | "os.file" => Some(AutopilotEvent::OsFileEvent {
+            agent_id: payload
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            path: payload
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            change: payload
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("modified")
+                .to_string(),
+        }),
         _ => None,
     }
 }
@@ -1013,6 +1069,69 @@ mod tests {
     fn eval_null_is_true() {
         let m = serde_json::Map::new();
         assert!(evaluate(&Value::Null, &m));
+    }
+
+    #[test]
+    fn os_file_event_name_and_fields() {
+        let ev = AutopilotEvent::OsFileEvent {
+            agent_id: "scout".into(),
+            path: "/home/u/inbox/Report.PDF".into(),
+            change: "created".into(),
+        };
+        assert_eq!(ev.event_name(), "os_file");
+        let f = ev.to_fields();
+        assert_eq!(f.get("agent_id").unwrap(), "scout");
+        assert_eq!(f.get("path").unwrap(), "/home/u/inbox/Report.PDF");
+        assert_eq!(f.get("kind").unwrap(), "created");
+        assert_eq!(f.get("file_name").unwrap(), "Report.PDF");
+        // Extension is lowercased so rule conditions can match "pdf".
+        assert_eq!(f.get("extension").unwrap(), "pdf");
+    }
+
+    #[test]
+    fn row_to_event_maps_os_file() {
+        let payload = serde_json::json!({
+            "agent_id": "scout",
+            "path": "/inbox/a.pdf",
+            "kind": "modified"
+        })
+        .to_string();
+        // Both the underscore trigger name and the legacy dotted key must map.
+        for key in ["os_file", "os.file"] {
+            let ev = row_to_event(key, &payload).unwrap_or_else(|| panic!("{key} must map"));
+            // The typed event always reports the underscore trigger name,
+            // regardless of which key spelling produced it.
+            assert_eq!(ev.event_name(), "os_file");
+            match ev {
+                AutopilotEvent::OsFileEvent { agent_id, path, change } => {
+                    assert_eq!(agent_id, "scout");
+                    assert_eq!(path, "/inbox/a.pdf");
+                    assert_eq!(change, "modified");
+                }
+                other => panic!("expected OsFileEvent, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn os_file_extension_rule_matches() {
+        // A rule "extension == pdf → act" evaluates true for a .pdf event and
+        // false for a .txt event. This is the delegate-on-pdf trigger contract.
+        let cond = serde_json::json!({
+            "field": "extension", "op": "eq", "value": "pdf"
+        });
+        let pdf = AutopilotEvent::OsFileEvent {
+            agent_id: "scout".into(),
+            path: "/inbox/deck.pdf".into(),
+            change: "created".into(),
+        };
+        let txt = AutopilotEvent::OsFileEvent {
+            agent_id: "scout".into(),
+            path: "/inbox/notes.txt".into(),
+            change: "created".into(),
+        };
+        assert!(evaluate(&cond, &pdf.to_fields()));
+        assert!(!evaluate(&cond, &txt.to_fields()));
     }
 
     /// L29: only numeric, non-zero, sanely-sized snowflakes are accepted.

@@ -15,6 +15,7 @@ import {
   EyeOff,
   Download,
   KeyRound,
+  Bot,
 } from 'lucide-react';
 import {
   SettingsShell,
@@ -34,12 +35,13 @@ import { RedactionTab } from '@/components/settings/sections/RedactionTab';
 import { DoctorTab } from '@/components/settings/sections/DoctorTab';
 import { UpdateTab } from '@/components/settings/sections/UpdateTab';
 import { BrowserTab } from '@/components/settings/sections/BrowserTab';
+import { AutomationTab } from '@/components/settings/sections/AutomationTab';
 
 /** Settings sub-tab whitelist (spec §5.3 式3). `?tab=` is validated against this
  *  set; unknown values fall back to `general`. */
 const VALID_TABS = [
   'general', 'account', 'system', 'container', 'heartbeat', 'voice',
-  'proactive', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'update', 'browser',
+  'proactive', 'automation', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'update', 'browser',
 ] as const;
 type TabId = (typeof VALID_TABS)[number];
 
@@ -97,6 +99,7 @@ export function SettingsPage() {
         { value: 'system', label: t('settings.system'), icon: Server },
         { value: 'container', label: t('settings.container'), icon: Container },
         { value: 'heartbeat', label: t('settings.heartbeat'), icon: HeartPulse },
+        { value: 'automation', label: t('settings.automation.tab'), icon: Bot },
         { value: 'autopilot', label: t('settings.autopilot'), icon: Workflow },
         { value: 'skillSynthesis', label: t('settings.skillSynthesis'), icon: Sparkles },
         { value: 'redaction', label: t('settings.redaction'), icon: EyeOff },
@@ -129,6 +132,9 @@ export function SettingsPage() {
         </SettingsTab>
         <SettingsTab value="proactive" title={t('proactive.title')}>
           <ProactiveTab />
+        </SettingsTab>
+        <SettingsTab value="automation" title={t('settings.automation.tab')} description={t('settings.automation.tab.desc')}>
+          <AutomationTab />
         </SettingsTab>
         <SettingsTab value="autopilot" title={t('settings.autopilot')} description={t('settings.autopilot.desc')}>
           <AutopilotTab />
