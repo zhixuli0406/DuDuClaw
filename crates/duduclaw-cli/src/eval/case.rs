@@ -30,6 +30,9 @@ fn default_min_score() -> f64 {
 fn default_true() -> bool {
     true
 }
+fn default_min_overlap_chars() -> usize {
+    12
+}
 
 /// A whole `<case>.toml` file.
 #[derive(Debug, Deserialize)]
@@ -97,6 +100,11 @@ pub struct ExpectSpec {
     /// Upper bound on total `tool_use` blocks (budget guard).
     #[serde(default)]
     pub max_tool_calls: Option<u32>,
+    /// Trace-grounding assertions (WP4 GroundEval, arXiv:2606.22737): the
+    /// final answer must be traceable to actual tool evidence, not merely
+    /// asserted. `[[expect.grounded]]` array-of-tables, zero or more.
+    #[serde(default)]
+    pub grounded: Vec<GroundedSpec>,
 }
 
 impl ExpectSpec {
@@ -109,7 +117,28 @@ impl ExpectSpec {
             && self.output_regex.is_none()
             && self.min_text_blocks.is_none()
             && self.max_tool_calls.is_none()
+            && self.grounded.is_empty()
     }
+}
+
+/// `[[expect.grounded]]` — one trace-grounding assertion: `tool` must have
+/// been called at least once without erroring, and the final answer must
+/// share a contiguous run of `min_overlap_chars` (CJK-safe, counted in
+/// `char`s) with at least one of that tool's `tool_result` texts.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroundedSpec {
+    /// Tool name, matched the same way as `must_use_tools` (exact or final
+    /// `__`-delimited segment).
+    pub tool: String,
+    /// Minimum length (in chars) of the shared contiguous run between the
+    /// final answer and a `tool_result`. Default 12.
+    #[serde(default = "default_min_overlap_chars")]
+    pub min_overlap_chars: usize,
+    /// Optional: the substring matched by this regex in the final answer
+    /// must also appear verbatim in one of the tool's `tool_result` texts.
+    #[serde(default)]
+    pub output_regex: Option<String>,
 }
 
 /// `[judge]` — LLM rubric scoring of the final answer.
@@ -157,6 +186,21 @@ impl EvalCaseFile {
         if let Some(re) = &self.expect.output_regex {
             regex::Regex::new(re)
                 .map_err(|e| format!("[expect] output_regex does not compile: {e}"))?;
+        }
+        for (i, g) in self.expect.grounded.iter().enumerate() {
+            if g.tool.trim().is_empty() {
+                return Err(format!("[[expect.grounded]] #{i} tool must not be empty"));
+            }
+            if g.min_overlap_chars == 0 {
+                return Err(format!(
+                    "[[expect.grounded]] #{i} min_overlap_chars must be >= 1"
+                ));
+            }
+            if let Some(re) = &g.output_regex {
+                regex::Regex::new(re).map_err(|e| {
+                    format!("[[expect.grounded]] #{i} output_regex does not compile: {e}")
+                })?;
+            }
         }
         if let Some(j) = &self.judge {
             if j.enabled && j.rubric.trim().is_empty() {
@@ -333,6 +377,52 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         let toml = minimal("[expect]\nno_such_assertion = true\n");
+        assert!(toml::from_str::<EvalCaseFile>(&toml).is_err());
+    }
+
+    // ── WP4 GroundEval: `[[expect.grounded]]` ───────────────────
+
+    #[test]
+    fn parses_grounded_with_defaults() {
+        let toml = minimal("[[expect.grounded]]\ntool = \"memory_search\"\n");
+        let case: EvalCaseFile = toml::from_str(&toml).unwrap();
+        case.validate().unwrap();
+        assert_eq!(case.expect.grounded.len(), 1);
+        assert_eq!(case.expect.grounded[0].tool, "memory_search");
+        assert_eq!(case.expect.grounded[0].min_overlap_chars, 12);
+        assert!(case.expect.grounded[0].output_regex.is_none());
+        assert!(!case.expect.is_empty());
+    }
+
+    #[test]
+    fn parses_grounded_with_overrides() {
+        let toml = minimal(
+            "[[expect.grounded]]\ntool = \"memory_search\"\nmin_overlap_chars = 20\noutput_regex = \"(?i)refund\"\n",
+        );
+        let case: EvalCaseFile = toml::from_str(&toml).unwrap();
+        case.validate().unwrap();
+        assert_eq!(case.expect.grounded[0].min_overlap_chars, 20);
+        assert_eq!(case.expect.grounded[0].output_regex.as_deref(), Some("(?i)refund"));
+    }
+
+    #[test]
+    fn rejects_grounded_bad_regex_zero_overlap_and_empty_tool() {
+        let bad_re = minimal("[[expect.grounded]]\ntool = \"x\"\noutput_regex = \"(\"\n");
+        let case: EvalCaseFile = toml::from_str(&bad_re).unwrap();
+        assert!(case.validate().unwrap_err().contains("output_regex"));
+
+        let zero = minimal("[[expect.grounded]]\ntool = \"x\"\nmin_overlap_chars = 0\n");
+        let case: EvalCaseFile = toml::from_str(&zero).unwrap();
+        assert!(case.validate().unwrap_err().contains("min_overlap_chars"));
+
+        let empty_tool = minimal("[[expect.grounded]]\ntool = \"\"\n");
+        let case: EvalCaseFile = toml::from_str(&empty_tool).unwrap();
+        assert!(case.validate().unwrap_err().contains("tool"));
+    }
+
+    #[test]
+    fn rejects_grounded_unknown_field() {
+        let toml = minimal("[[expect.grounded]]\ntool = \"x\"\nbogus = true\n");
         assert!(toml::from_str::<EvalCaseFile>(&toml).is_err());
     }
 

@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### Added
+- **記憶寫入來源綁定（TMA-NM，arXiv:2606.24322）**：新增 `duduclaw-memory` origin 分類表
+  （`origin.rs`，8 類 + trust 天花板），`store_temporal` 強制 non-malleable 上限——
+  最終 `origin_trust = min(呼叫端值, 該來源類別天花板, derived_from 最小值)`，呼叫端
+  只能調低不能超標；未標註來源一律落 `unattributed`（0.6），不再預設滿信任。
+  reaffirm 佐證改為 Sybil-resistant：僅 ≥2 個相異且非自我衍生的來源類別可小幅上調
+  confidence（+0.1/次，cap 1.0），agent 自我摘要與工具回聲互相佐證不再加分。
+  全部 production 寫入路徑（MCP `memory_store`、`log_mood`、GVU StoreEpisodic、
+  reflexion 整併、decision capture、night engine、批次匯入）補上顯式 origin。
+- **階段性可撤銷 capability（PORTICO，arXiv:2606.22504）**：`agent.toml [capabilities]
+  scoped_tools` 清單中的工具改為「持有效 grant 才可用」。新增 `capability_grants.rs`
+  grant store（`approvals.db`，fail-closed）、MCP 工具 `capability_request`（走
+  ApprovalBroker 人工核准，TTL 預設 1h 可由 `grant_ttl_secs` 覆寫）、goal kickoff
+  核准時可依 task tags `grant:<tool>` 原子性授予。任務終態（accept / reject /
+  needs_human / cancel / escalate）自動撤銷該 task 的全部 grant——授權活不過任務階段。
+  MCP dispatch 主閘 + CLI spawn disallowedTools 雙層強制執行。
+- **eval trace-grounding 斷言（GroundEval，arXiv:2606.22737）**：`duduclaw eval` 新增
+  `[[expect.grounded]]` 確定性斷言——要求指定工具有 ≥1 次非錯誤呼叫，且最終回答與
+  該工具的 result 共享 ≥N 字元連續片段（CJK-safe），可選 `output_regex` 要求命中片段
+  出現在工具結果中。transcript parser 補上 `tool_use`↔`tool_result` 配對（舊 transcript
+  相容）。失敗歸類 MAST FM-3.3（驗證缺失）。
+- **MAV 判官證據區塊**：goal task 驗收判官 prompt 附上 `<tool_activity>`（自
+  `tool_calls.jsonl` 審計取 claim→review 時間窗的工具活動摘要）；correctness 面向指令
+  明確要求「worker 聲稱的動作未出現在 tool_activity 視為未證實」，堵住自報 result_summary
+  無法查證的盲點。
+
+### Changed
+- **規則整併加 GovMem 晉升門（arXiv:2607.02579）**：reflexion 整併前按 `source_kind`
+  分組獨立計數（RFC-24 決策缺失與一般任務失敗不再互相湊數），且需 ≥2 個相異 session
+  與 ≥2 種相異錯誤描述才視為獨立佐證充分——同一 session 連續重複的相關觀測不再被
+  當成獨立證據觸發整併。`mistakes` 表新增 `source_kind` 欄（idempotent migration）。
+- **新規則試用期（Janus，arXiv:2606.31121）**：整併規則 seed 由 helpful=2 降為 1 並帶
+  `probation-rule` 標籤；試用期內首次 harmful 即退休、累計 helpful≥3 轉正；注入排序
+  同分時試用規則排後。壞規則從「需扣兩次才退場」變為「一次即退場」。
+- **cache-aware 壓縮守門（arXiv:2607.12161 實證：激進壓縮破壞 prompt cache 反而更貴）**：
+  `maybe_compress_history` 在 agent 近 1h cache 效率 >50% 且預算超標 <15% 時跳過壓縮
+  管線（門檻可由 `[budget] cache_guard_min_eff` / `cache_guard_max_overshoot` 覆寫，
+  0 停用）。`token_usage` 表新增 `compressed` / `compression_stages` 欄；新增
+  Prometheus 計數器（壓縮次數 per stage、守門跳過、疑似 cache-break）；
+  `cache_attribution_snapshot()` 接上消費者（每小時 adaptive routing check 記錄
+  top-10 破 cache 原因 + evolution event）。
+
+### Security
+- 記憶投毒防護強化：見 Added 的來源綁定（寫入端）與 GovMem 晉升門（整併端）。
+  scoped_tools 授權閘全程 fail-closed（grant store 不可讀 = 無授權）。
+
 ## [1.40.0] - 2026-07-21 — 經銷商實測修復：遠端存取白名單、PTY 韌性與 WebChat 對話隔離
 
 ### Fixed

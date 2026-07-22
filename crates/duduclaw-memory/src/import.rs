@@ -14,10 +14,20 @@ use tracing::info;
 use uuid::Uuid;
 
 use duduclaw_core::error::{DuDuClawError, Result};
+#[allow(unused_imports)]
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_core::types::{MemoryEntry, MemoryLayer};
 
-use crate::engine::SqliteMemoryEngine;
+use crate::engine::{SqliteMemoryEngine, TemporalMeta};
+
+/// WP1: bulk-imported records carry the `import` origin (ceiling 0.7) — external
+/// pre-existing data, trusted less than user-direct input but more than chat.
+fn import_meta() -> TemporalMeta {
+    TemporalMeta {
+        origin: Some(crate::origin::IMPORT.name.to_string()),
+        ..Default::default()
+    }
+}
 
 // ── File size guard ─────────────────────────────────────────
 
@@ -119,7 +129,7 @@ pub async fn import_csv(
             let content = format!("Q: {}\nA: {}", row.question.trim(), row.answer.trim());
             let tags = vec!["faq".to_string()];
             let entry = build_memory_entry(agent_id, &content, &tags, 5.0);
-            engine.store(agent_id, entry).await?;
+            engine.store_temporal(agent_id, entry, import_meta()).await?;
             count += 1;
         }
     } else {
@@ -135,7 +145,7 @@ pub async fn import_csv(
                 .filter(|s| !s.is_empty())
                 .collect();
             let entry = build_memory_entry(agent_id, row.content.trim(), &tags, 5.0);
-            engine.store(agent_id, entry).await?;
+            engine.store_temporal(agent_id, entry, import_meta()).await?;
             count += 1;
         }
     }
@@ -165,7 +175,7 @@ pub async fn import_json(
         let tags = record.tags.unwrap_or_default();
         let importance = record.importance.unwrap_or(5.0).clamp(0.0, 10.0);
         let entry = build_memory_entry(agent_id, record.content.trim(), &tags, importance);
-        engine.store(agent_id, entry).await?;
+        engine.store_temporal(agent_id, entry, import_meta()).await?;
         count += 1;
     }
 
@@ -198,7 +208,7 @@ pub async fn import_jsonl(
         let tags = record.tags.unwrap_or_default();
         let importance = record.importance.unwrap_or(5.0).clamp(0.0, 10.0);
         let entry = build_memory_entry(agent_id, record.content.trim(), &tags, importance);
-        engine.store(agent_id, entry).await?;
+        engine.store_temporal(agent_id, entry, import_meta()).await?;
         count += 1;
     }
 

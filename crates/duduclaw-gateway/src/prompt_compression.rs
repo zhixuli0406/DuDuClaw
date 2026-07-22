@@ -44,6 +44,132 @@
 
 use tracing::{info, warn};
 
+// ── WP5: cache-aware compression gate (2607.12161) ─────────────────────
+//
+// The pipeline above is purely token-budget driven — it has no notion of
+// prompt-cache health. That's a problem for agents whose system prompt +
+// history are already hitting a healthy cache (Anthropic `cache_control:
+// ephemeral`): rewriting even a small tail of the history changes the
+// bytes the cache is keyed on, which forces a full cache-prefix rebuild.
+// The paper's empirical finding is that cache-rebuild cost dominates
+// (~87%) the overhead in that regime, i.e. the tokens compression saves
+// are smaller than the cache-miss tax it triggers. `should_skip_for_cache`
+// is the deterministic gate `maybe_compress_history` (channel_reply.rs)
+// consults before entering the pipeline at all.
+
+/// Compression info threaded from `maybe_compress_history` down to the
+/// eventual `cost_telemetry` record call, which happens several async
+/// frames away (inside `spawn_claude_cli_with_env` / the PTY variant).
+/// Mirrors the existing `CHANNEL_REPLY_AGENT_ID` / `CHANNEL_REPLY_USER_ID`
+/// task-locals in `claude_runner.rs` — same problem, same fix shape.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompressionInfo {
+    /// Whether the request that's about to be sent was actually rewritten
+    /// by the compression pipeline (false for: budget disabled, cache
+    /// guard skipped the pipeline, request was already under budget, or
+    /// the pipeline ran but couldn't bring it under budget — in that last
+    /// case the caller falls back to the original uncompressed history,
+    /// so nothing compressed actually went out).
+    pub compressed: bool,
+    /// Comma-joined stage names that ran (e.g. `"turn_trim"` or
+    /// `"turn_trim,drop_oldest_tool_echoes"`). Empty when `compressed` is
+    /// false.
+    pub stages: String,
+}
+
+tokio::task_local! {
+    /// See [`CompressionInfo`]. Scoped by `channel_reply::maybe_compress_history`'s
+    /// caller alongside `CHANNEL_REPLY_AGENT_ID`.
+    pub static CHANNEL_REPLY_COMPRESSION: CompressionInfo;
+}
+
+/// Cache-aware gate thresholds. Defaults match the WP5 design doc:
+/// skip compression when the agent's trailing cache efficiency is > 50%
+/// and the budget overshoot is < 15%.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheGuardConfig {
+    pub min_eff: f64,
+    pub max_overshoot: f64,
+}
+
+/// Default minimum cache efficiency for the guard to engage (50%).
+pub const DEFAULT_CACHE_GUARD_MIN_EFF: f64 = 0.5;
+/// Default maximum budget overshoot the guard tolerates (15%).
+pub const DEFAULT_CACHE_GUARD_MAX_OVERSHOOT: f64 = 0.15;
+
+impl Default for CacheGuardConfig {
+    fn default() -> Self {
+        Self {
+            min_eff: DEFAULT_CACHE_GUARD_MIN_EFF,
+            max_overshoot: DEFAULT_CACHE_GUARD_MAX_OVERSHOOT,
+        }
+    }
+}
+
+/// Read `[budget] cache_guard_min_eff` / `cache_guard_max_overshoot` from
+/// `agent.toml`. Fail-safe in the same shape as
+/// `prompt_audit::read_max_input_tokens`: a missing file, unparseable
+/// TOML, or an absent key falls back to the module default (**gate
+/// enabled** at the paper's thresholds) — only an explicit
+/// `cache_guard_min_eff = 0` disables the gate. This differs from
+/// `read_max_input_tokens`'s "missing ⇒ disabled" convention on purpose:
+/// the gate is a safety optimization that should protect agents by
+/// default, not require explicit opt-in per agent.
+pub fn read_cache_guard_config(agent_dir: &std::path::Path) -> CacheGuardConfig {
+    let toml_path = agent_dir.join("agent.toml");
+    let raw = match std::fs::read_to_string(&toml_path) {
+        Ok(r) => r,
+        Err(_) => return CacheGuardConfig::default(),
+    };
+    let value: toml::Value = match raw.parse() {
+        Ok(v) => v,
+        Err(_) => return CacheGuardConfig::default(),
+    };
+    let budget = value.get("budget");
+    let as_f64 = |v: &toml::Value| -> Option<f64> {
+        v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
+    };
+    let min_eff = budget
+        .and_then(|b| b.get("cache_guard_min_eff"))
+        .and_then(as_f64)
+        .unwrap_or(DEFAULT_CACHE_GUARD_MIN_EFF);
+    let max_overshoot = budget
+        .and_then(|b| b.get("cache_guard_max_overshoot"))
+        .and_then(as_f64)
+        .unwrap_or(DEFAULT_CACHE_GUARD_MAX_OVERSHOOT);
+    CacheGuardConfig { min_eff, max_overshoot }
+}
+
+/// How far the estimated prompt is over budget, as a ratio (`0.15` = 15%
+/// over). Returns `0.0` for a zero budget (disabled budget enforcement —
+/// the gate is never consulted in that case anyway, but this keeps the
+/// function total instead of panicking on division by zero).
+pub fn overshoot_ratio(estimated_tokens: u64, budget_tokens: u64) -> f64 {
+    if budget_tokens == 0 {
+        return 0.0;
+    }
+    (estimated_tokens as f64 / budget_tokens as f64) - 1.0
+}
+
+/// Deterministic cache-aware gate decision. `min_eff <= 0.0` means the
+/// gate is disabled (config convention: `cache_guard_min_eff = 0`) and
+/// always returns `false` (never skip — behave exactly like pre-WP5).
+/// Otherwise skips the pipeline when the cache is already healthy
+/// (`cache_eff > min_eff`) AND the overshoot is mild
+/// (`overshoot < max_overshoot`) — the regime where the paper found
+/// cache-rebuild cost exceeds compression's savings.
+pub fn should_skip_for_cache(
+    cache_eff: f64,
+    overshoot: f64,
+    min_eff: f64,
+    max_overshoot: f64,
+) -> bool {
+    if min_eff <= 0.0 {
+        return false;
+    }
+    cache_eff > min_eff && overshoot < max_overshoot
+}
+
 /// Estimate the number of tokens in a chunk of text using the same
 /// 1.5 chars/token heuristic the rest of the gateway uses. CJK-safe via
 /// `chars().count()`.
@@ -116,6 +242,12 @@ pub struct BudgetExceeded {
 /// with the *current* history and may rewrite it. Stage functions are
 /// pure: same input → same output. This keeps the pipeline testable
 /// without mocking I/O.
+///
+/// Thin wrapper over [`enforce_budget_traced`] that drops the stage-trace
+/// on success — kept byte-identical to preserve the existing call sites
+/// and tests (WP5, 2607.12161: the traced sibling exists so
+/// `cost_telemetry` can record *which* stages actually ran without
+/// forcing every caller to consume that extra info).
 #[allow(clippy::type_complexity)]
 pub fn enforce_budget(
     system_prompt: &str,
@@ -125,13 +257,33 @@ pub fn enforce_budget(
     stages: &[(&'static str, fn(Vec<OwnedChatMessage>, bool) -> Vec<OwnedChatMessage>)],
     cost_pressure: bool,
 ) -> Result<Vec<OwnedChatMessage>, BudgetExceeded> {
+    enforce_budget_traced(system_prompt, history, user_message, budget_tokens, stages, cost_pressure)
+        .map(|(messages, _stages_ran)| messages)
+}
+
+/// Traced sibling of [`enforce_budget`] — identical behavior, but the
+/// success case also returns the names of the stages that actually ran
+/// (empty when the fast path applied, i.e. the request was already under
+/// budget). `cost_telemetry::record_attributed_with_compression` uses
+/// this to persist "was this reply compressed, and by which stages" per
+/// request row instead of only inferring it from the cache-efficiency
+/// trend after the fact.
+#[allow(clippy::type_complexity)]
+pub fn enforce_budget_traced(
+    system_prompt: &str,
+    history: Vec<OwnedChatMessage>,
+    user_message: &str,
+    budget_tokens: u64,
+    stages: &[(&'static str, fn(Vec<OwnedChatMessage>, bool) -> Vec<OwnedChatMessage>)],
+    cost_pressure: bool,
+) -> Result<(Vec<OwnedChatMessage>, Vec<&'static str>), BudgetExceeded> {
     let initial = {
         let views: Vec<ChatMessage<'_>> = history.iter().map(|m| m.as_view()).collect();
         estimate_request_tokens(system_prompt, &views, user_message)
     };
     if initial <= budget_tokens {
         // Fast path — no compression needed.
-        return Ok(history);
+        return Ok((history, Vec::new()));
     }
 
     info!(
@@ -154,7 +306,7 @@ pub fn enforce_budget(
             "compression stage applied"
         );
         if after <= budget_tokens {
-            return Ok(current);
+            return Ok((current, stages_tried));
         }
     }
 
@@ -470,5 +622,149 @@ mod tests {
             pressured_len < normal_len,
             "cost_pressure should produce shorter trim ({normal_len} vs {pressured_len})"
         );
+    }
+
+    // ── enforce_budget_traced ──
+
+    #[test]
+    fn enforce_budget_traced_fast_path_returns_empty_stages() {
+        let history = vec![msg("user", "hi")];
+        let (out, stages) = enforce_budget_traced(
+            "s", history, "u", 10_000, default_pipeline(), false,
+        )
+        .expect("under budget");
+        assert!(stages.is_empty());
+        assert_eq!(out[0].content, "hi");
+    }
+
+    #[test]
+    fn enforce_budget_traced_reports_stages_that_ran() {
+        let huge = "x".repeat(50_000);
+        let history = vec![msg("assistant", &huge)];
+        let (out, stages) = enforce_budget_traced(
+            "system", history, "ask question", 1_000, default_pipeline(), false,
+        )
+        .expect("turn_trim should suffice");
+        assert_eq!(stages, vec!["turn_trim"]);
+        assert!(out[0].content.contains("[trimmed"));
+    }
+
+    #[test]
+    fn enforce_budget_and_traced_agree_on_success_payload() {
+        // `enforce_budget` must stay byte-identical to the traced sibling
+        // minus the stage list — regression guard for the delegation.
+        let huge = "x".repeat(50_000);
+        let plain = enforce_budget(
+            "system", vec![msg("assistant", &huge)], "ask question", 1_000,
+            default_pipeline(), false,
+        )
+        .unwrap();
+        let (traced, _stages) = enforce_budget_traced(
+            "system", vec![msg("assistant", &huge)], "ask question", 1_000,
+            default_pipeline(), false,
+        )
+        .unwrap();
+        assert_eq!(plain[0].content, traced[0].content);
+    }
+
+    // ── WP5: cache-aware compression gate ──
+
+    #[test]
+    fn should_skip_for_cache_disabled_when_min_eff_zero() {
+        // min_eff=0 is the documented "gate disabled" config value —
+        // must never skip regardless of how healthy the cache looks.
+        assert!(!should_skip_for_cache(0.99, 0.0, 0.0, 0.15));
+    }
+
+    #[test]
+    fn should_skip_for_cache_skips_when_hot_and_mild_overshoot() {
+        assert!(should_skip_for_cache(0.6, 0.1, 0.5, 0.15));
+    }
+
+    #[test]
+    fn should_skip_for_cache_does_not_skip_when_cache_cold() {
+        // Cache efficiency below threshold — compression should still run.
+        assert!(!should_skip_for_cache(0.2, 0.1, 0.5, 0.15));
+    }
+
+    #[test]
+    fn should_skip_for_cache_does_not_skip_when_overshoot_large() {
+        // Cache is healthy but the request is way over budget — still
+        // compress, since the token savings likely outweigh a cache miss.
+        assert!(!should_skip_for_cache(0.9, 0.5, 0.5, 0.15));
+    }
+
+    #[test]
+    fn should_skip_for_cache_boundary_is_exclusive() {
+        // Exactly at the thresholds should NOT skip (strict `>` / `<`).
+        assert!(!should_skip_for_cache(0.5, 0.15, 0.5, 0.15));
+    }
+
+    #[test]
+    fn overshoot_ratio_computes_fraction_over_budget() {
+        // 1150 / 1000 - 1 = 0.15
+        assert!((overshoot_ratio(1150, 1000) - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overshoot_ratio_negative_when_under_budget() {
+        assert!(overshoot_ratio(500, 1000) < 0.0);
+    }
+
+    #[test]
+    fn overshoot_ratio_zero_budget_is_total_not_panicking() {
+        assert_eq!(overshoot_ratio(500, 0), 0.0);
+    }
+
+    // ── read_cache_guard_config (fail-safe) ──
+
+    #[test]
+    fn read_cache_guard_config_defaults_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = read_cache_guard_config(dir.path());
+        assert_eq!(cfg, CacheGuardConfig::default());
+    }
+
+    #[test]
+    fn read_cache_guard_config_defaults_when_toml_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), "not valid toml =====").unwrap();
+        let cfg = read_cache_guard_config(dir.path());
+        assert_eq!(cfg, CacheGuardConfig::default());
+    }
+
+    #[test]
+    fn read_cache_guard_config_reads_explicit_values() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[budget]\ncache_guard_min_eff = 0.4\ncache_guard_max_overshoot = 0.2\n",
+        )
+        .unwrap();
+        let cfg = read_cache_guard_config(dir.path());
+        assert_eq!(cfg.min_eff, 0.4);
+        assert_eq!(cfg.max_overshoot, 0.2);
+    }
+
+    #[test]
+    fn read_cache_guard_config_explicit_zero_disables_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[budget]\ncache_guard_min_eff = 0\n",
+        )
+        .unwrap();
+        let cfg = read_cache_guard_config(dir.path());
+        assert_eq!(cfg.min_eff, 0.0);
+        // Downstream gate check confirms this actually disables it.
+        assert!(!should_skip_for_cache(0.9, 0.0, cfg.min_eff, cfg.max_overshoot));
+    }
+
+    #[test]
+    fn read_cache_guard_config_missing_budget_section_uses_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), "[other]\nfoo = 1\n").unwrap();
+        let cfg = read_cache_guard_config(dir.path());
+        assert_eq!(cfg, CacheGuardConfig::default());
     }
 }

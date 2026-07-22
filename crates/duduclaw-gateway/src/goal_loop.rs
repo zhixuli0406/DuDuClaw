@@ -612,7 +612,12 @@ impl GoalLoopDriver {
             if is_new && level.requires_kickoff() {
                 match self.kickoff_gate(task).await? {
                     KickoffGate::Waiting | KickoffGate::Aborted => continue,
-                    KickoffGate::Proceed => {}
+                    KickoffGate::Proceed => {
+                        // WP3 (PORTICO): kickoff cleared → mint any task-scoped
+                        // grants the task declared (tags `grant:<tool>`). Idempotent
+                        // per (task, tool) so a concurrency-deferred re-entry is safe.
+                        self.grant_kickoff_tools(task).await;
+                    }
                 }
             }
 
@@ -784,6 +789,11 @@ impl GoalLoopDriver {
         reason: &str,
     ) -> Result<(), String> {
         self.store.mark_needs_human(&task.id, reason).await?;
+        // WP3 (PORTICO): escalation ends the autonomous phase (iteration cap /
+        // oscillation) → revoke the task's grants. Mirrors the DispatchEngine
+        // needs_human revocation for the goal-loop-side escalation path.
+        self.revoke_task_grants(&task.id, crate::capability_grants::REVOKE_REASON_PHASE_END)
+            .await;
         inflight.remove(&task.id);
         self.post_activity(
             "goal_loop.needs_human",
@@ -935,6 +945,9 @@ impl GoalLoopDriver {
                     if let Err(e) = self.store.cancel_task(&task.id, &reason).await {
                         warn!(task = %task.id, error = %e, "goal loop: kickoff abort cancel failed");
                     }
+                    // WP3 (PORTICO): task abandoned at kickoff → revoke any grants.
+                    self.revoke_task_grants(&task.id, crate::capability_grants::REVOKE_REASON_PHASE_END)
+                        .await;
                     self.post_activity(
                         "goal_loop.kickoff_denied",
                         &task.assigned_to,
@@ -945,6 +958,109 @@ impl GoalLoopDriver {
                     Ok(KickoffGate::Aborted)
                 }
             },
+        }
+    }
+
+    /// Whether a real (non-test) home dir is wired. The driver defaults
+    /// `home_dir` to `"."` in tests; touching the shared `approvals.db` under
+    /// that sentinel would pollute the working tree, so all capability-grant
+    /// side effects are gated on this.
+    fn has_real_home(&self) -> bool {
+        self.home_dir != Path::new(".")
+    }
+
+    /// WP3 (PORTICO): revoke every capability grant bound to a task when the
+    /// goal loop abandons it (kickoff denial → `cancel_task`). Best-effort;
+    /// a store error just lets the grants die at their hard TTL.
+    async fn revoke_task_grants(&self, task_id: &str, reason: &str) {
+        if !self.has_real_home() {
+            return;
+        }
+        match crate::capability_grants::CapabilityGrantStore::open(&self.home_dir) {
+            Ok(store) => {
+                if let Err(e) = store.revoke_for_task(task_id, reason).await {
+                    warn!(task = %task_id, error = %e, "goal loop: capability grant revoke failed");
+                }
+            }
+            Err(e) => {
+                warn!(task = %task_id, error = %e, "goal loop: capability grant store open failed for revoke")
+            }
+        }
+    }
+
+    /// WP3 (PORTICO): when a kickoff approval clears, atomically mint the
+    /// task-scoped grants the task declared via `tags` entries of the form
+    /// `grant:<tool>`. Idempotent per (task, tool): a grant already bound to
+    /// THIS task for that tool is not re-minted (so a dispatch deferred by the
+    /// concurrency cap, which re-enters this path next tick, does not stack
+    /// duplicate rows). Best-effort + fail-safe: a store error is logged and
+    /// the agent falls back to `capability_request`.
+    async fn grant_kickoff_tools(&self, task: &TaskRow) {
+        if !self.has_real_home() {
+            return;
+        }
+        let tools: Vec<String> = task
+            .tags
+            .split(',')
+            .filter_map(|t| t.trim().strip_prefix("grant:"))
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tools.is_empty() {
+            return;
+        }
+        let store = match crate::capability_grants::CapabilityGrantStore::open(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(task = %task.id, error = %e, "goal loop: grant store open failed for kickoff grants");
+                return;
+            }
+        };
+        let agent_dir = self.home_dir.join("agents").join(&task.assigned_to);
+        let ttl = crate::capability_grants::grant_ttl_secs(&agent_dir);
+        // Existing grants already bound to THIS task (for per-task idempotency).
+        let existing = store.active_grants(&task.assigned_to).await.unwrap_or_default();
+        for tool in tools {
+            let already = existing.iter().any(|g| {
+                g.task_id.as_deref() == Some(task.id.as_str())
+                    && crate::capability_grants::tool_token_matches(&g.tool, &tool)
+            });
+            if already {
+                continue;
+            }
+            match store
+                .grant(
+                    &task.assigned_to,
+                    Some(&task.id),
+                    &tool,
+                    crate::capability_grants::GRANTED_BY_KICKOFF,
+                    ttl,
+                )
+                .await
+            {
+                Ok(grant_id) => {
+                    duduclaw_security::audit::append_tool_call_with_extras(
+                        &self.home_dir,
+                        &task.assigned_to,
+                        "capability_request",
+                        &format!("kickoff grant {tool}"),
+                        true,
+                        &[
+                            ("grant_id", json!(grant_id)),
+                            ("granted_tool", json!(tool)),
+                            ("task_id", json!(task.id)),
+                            (
+                                "granted_by",
+                                json!(crate::capability_grants::GRANTED_BY_KICKOFF),
+                            ),
+                        ],
+                    );
+                    info!(task = %task.id, %tool, "goal loop: kickoff-approved capability grant minted");
+                }
+                Err(e) => {
+                    warn!(task = %task.id, %tool, error = %e, "goal loop: kickoff grant write failed")
+                }
+            }
         }
     }
 
@@ -1448,6 +1564,45 @@ mod tests {
         let dispatched = queue.pending_messages(10).await.unwrap();
         assert_eq!(dispatched.len(), 1, "dispatched after kickoff approval");
         assert_eq!(dispatched[0].target, "alice");
+    }
+
+    // WP3 (PORTICO): when a kickoff approval clears, the task's declared
+    // `grant:<tool>` tags are atomically minted as task-scoped grants.
+    #[tokio::test]
+    async fn kickoff_approval_mints_declared_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        write_agent_toml(
+            dir.path(),
+            "alice",
+            "[capabilities]\nautonomy_level = \"collaborator\"\n",
+        );
+        let mut task = goal_task("g1", "alice");
+        task.tags = "grant:send_message, other-tag".into();
+        store.insert_task(&task).await.unwrap();
+
+        let broker = Arc::new(crate::approval::ApprovalBroker::open(dir.path()).unwrap());
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf())
+            .with_broker(broker.clone());
+
+        let grants =
+            crate::capability_grants::CapabilityGrantStore::open(dir.path()).unwrap();
+
+        // Tick 1: kickoff filed, no grant yet.
+        d.tick_once().await.unwrap();
+        assert!(!grants.has_active_grant("alice", "send_message").await);
+        let approval_id = broker.list_pending(Some("alice")).await.unwrap()[0].id.clone();
+
+        // Approve → tick 2 dispatches AND mints the declared grant.
+        broker.decide(&approval_id, true, "test:alice").await.unwrap();
+        d.tick_once().await.unwrap();
+        assert!(
+            grants.has_active_grant("alice", "send_message").await,
+            "kickoff approval must mint the declared grant:send_message"
+        );
+        // A non-grant tag never becomes a grant.
+        assert!(!grants.has_active_grant("alice", "other-tag").await);
     }
 
     #[tokio::test]

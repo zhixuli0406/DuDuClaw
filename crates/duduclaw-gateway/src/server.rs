@@ -920,10 +920,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             };
             let judge: Arc<dyn crate::dispatch_engine::AcceptanceJudge> =
                 Arc::new(crate::dispatch_engine::LlmAcceptanceJudge::new(caller));
-            let engine = Arc::new(crate::dispatch_engine::DispatchEngine::new(
-                ts.clone(),
-                Some(judge),
-            ));
+            let engine = Arc::new(
+                crate::dispatch_engine::DispatchEngine::new(ts.clone(), Some(judge))
+                    // WP4 GroundEval: fold `tool_calls.jsonl` evidence into
+                    // the goal-mode acceptance judge prompt.
+                    .with_home_dir(home_dir.clone()),
+            );
             bg_handles.push(tokio::spawn(async move { engine.run().await }));
             info!("Dispatch engine started (durable SQLite派工：殭屍回收 + goal-mode 驗收)");
 

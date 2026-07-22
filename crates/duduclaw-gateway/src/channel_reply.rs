@@ -15,7 +15,6 @@ use duduclaw_agent::resolver::AgentResolver;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use duduclaw_core::MemoryEngine;
 use duduclaw_core::types::{Message, MessageType};
 use duduclaw_security::circuit_breaker::CircuitBreakerRegistry;
 use duduclaw_security::failsafe::FailsafeManager;
@@ -56,24 +55,34 @@ const TURN_TAIL_CHARS: usize = 200;
 /// #12 glue (2026-05-12) — apply the prompt-compression pipeline when an
 /// agent's `[budget] max_input_tokens` is set AND the request is over
 /// budget. Returns either the compressed history (success) or the
-/// original history (no budget configured / not over / pipeline failed).
+/// original history (no budget configured / not over / pipeline failed),
+/// plus a [`crate::prompt_compression::CompressionInfo`] describing what
+/// (if anything) happened, for the caller to thread down to
+/// `cost_telemetry`.
 ///
 /// Why not propagate errors: the 200K cliff doubles input price but
 /// doesn't break the call. Silent fallback preserves availability;
 /// the `cost_pressure` event surfaces the regression for auditing.
-fn maybe_compress_history(
+///
+/// WP5 (2607.12161) adds a cache-aware guard in front of the pipeline:
+/// when the agent's trailing cache efficiency is healthy and the budget
+/// overshoot is mild, compression is skipped outright, because rewriting
+/// history in that regime tends to cost more (cache-prefix rebuild) than
+/// it saves (fewer tokens). This is why the function is now `async` —
+/// the guard needs a `cost_telemetry::summary_by_agent` read.
+async fn maybe_compress_history(
     system_prompt: &str,
     history: Vec<ConversationTurn>,
     user_message: &str,
     agent_id: &str,
-) -> Vec<ConversationTurn> {
+) -> (Vec<ConversationTurn>, crate::prompt_compression::CompressionInfo) {
     // Look up the budget from cost_telemetry's cached agent config. We
     // can't get the LoadedAgent at this point without re-acquiring the
     // registry lock — instead let the per-agent budget read happen via
     // a small helper. Default 0 (= disabled) preserves prior behaviour.
     let budget = read_agent_budget_tokens(agent_id);
     if budget == 0 {
-        return history;
+        return (history, crate::prompt_compression::CompressionInfo::default());
     }
 
     // Snapshot of the cost_pressure flag so the pipeline can pick a
@@ -92,7 +101,47 @@ fn maybe_compress_history(
         })
         .collect();
 
-    match crate::prompt_compression::enforce_budget(
+    // WP5 cache-aware gate — fail-safe: any missing telemetry / config
+    // simply falls through to the pipeline exactly like pre-WP5 behaviour.
+    let home = duduclaw_core::duduclaw_home();
+    let agent_dir = home.join("agents").join(agent_id);
+    let guard_cfg = crate::prompt_compression::read_cache_guard_config(&agent_dir);
+    if guard_cfg.min_eff > 0.0 {
+        let views: Vec<crate::prompt_compression::ChatMessage<'_>> =
+            owned.iter().map(|m| m.as_view()).collect();
+        let estimated =
+            crate::prompt_compression::estimate_request_tokens(system_prompt, &views, user_message);
+        let overshoot = crate::prompt_compression::overshoot_ratio(estimated, budget);
+        let cache_eff = match crate::cost_telemetry::get_telemetry() {
+            Some(t) => t
+                .summary_by_agent(agent_id, 1)
+                .await
+                .map(|s| s.summary.avg_cache_efficiency)
+                .unwrap_or(0.0),
+            None => 0.0,
+        };
+        if crate::prompt_compression::should_skip_for_cache(
+            cache_eff,
+            overshoot,
+            guard_cfg.min_eff,
+            guard_cfg.max_overshoot,
+        ) {
+            info!(
+                agent_id,
+                cache_eff,
+                overshoot,
+                estimated,
+                budget,
+                "prompt compression: cache-aware guard skipped pipeline \
+                 (cache hot + mild overshoot — rebuilding the cache prefix \
+                 would cost more than compression saves)"
+            );
+            crate::metrics::global_metrics().prompt_compression_skipped_cache_guard();
+            return (history, crate::prompt_compression::CompressionInfo::default());
+        }
+    }
+
+    match crate::prompt_compression::enforce_budget_traced(
         system_prompt,
         owned,
         user_message,
@@ -100,22 +149,35 @@ fn maybe_compress_history(
         crate::prompt_compression::default_pipeline(),
         cost_pressure,
     ) {
-        Ok(compressed) => {
+        Ok((compressed, stages_ran)) => {
+            for stage in &stages_ran {
+                crate::metrics::global_metrics().prompt_compression_run(stage).await;
+            }
+            let info = crate::prompt_compression::CompressionInfo {
+                compressed: !stages_ran.is_empty(),
+                stages: stages_ran.join(","),
+            };
             // If the pipeline didn't need to do anything (under budget),
             // it returns the input unchanged — caller doesn't care.
-            compressed
+            let turns = compressed
                 .into_iter()
                 .map(|m| ConversationTurn {
                     role: m.role,
                     content: m.content,
                 })
-                .collect()
+                .collect();
+            (turns, info)
         }
         Err(exceeded) => {
             // Non-fatal degradation: log, emit a cost-pressure-like
             // signal, fall through with original history. This keeps
             // the call working at higher cost rather than mysteriously
-            // failing.
+            // failing. `compressed=false` in the returned info reflects
+            // what's actually sent (the ORIGINAL history) — the
+            // insufficient compressed version is discarded, not shipped.
+            for stage in &exceeded.stages_tried {
+                crate::metrics::global_metrics().prompt_compression_run(stage).await;
+            }
             tracing::warn!(
                 agent_id,
                 estimated = exceeded.estimated_tokens,
@@ -124,7 +186,7 @@ fn maybe_compress_history(
                 "budget enforcement: compression pipeline insufficient; \
                  proceeding with full history (request will be expensive)"
             );
-            history
+            (history, crate::prompt_compression::CompressionInfo::default())
         }
     }
 }
@@ -1673,12 +1735,13 @@ async fn build_reply_with_session_inner(
     // surprise the user with a silent failure mid-conversation; the
     // 200 K cliff merely doubles input price, it doesn't break the
     // call. Future work can flip this to hard-reject behind a flag.
-    let conversation_history = maybe_compress_history(
+    let (conversation_history, compression_info) = maybe_compress_history(
         &full_system_prompt,
         conversation_history,
         &effective_message,
         &agent_id,
-    );
+    )
+    .await;
 
     // Phase 3.C.4 (2026-05-14) — interactive PTY routing for OAuth.
     //
@@ -1900,6 +1963,12 @@ async fn build_reply_with_session_inner(
     // spend per employee. Empty user_id ⇒ recorded as unattributed.
     let cli_future = crate::claude_runner::CHANNEL_REPLY_USER_ID
         .scope(user_id.to_string(), cli_future);
+    // WP5: scope the compression outcome computed above so the eventual
+    // `cost_telemetry` record call (several async frames away, inside
+    // `spawn_claude_cli_with_env` / the PTY variant) can persist whether
+    // this request's history was compressed and by which stages.
+    let cli_future = crate::prompt_compression::CHANNEL_REPLY_COMPRESSION
+        .scope(compression_info.clone(), cli_future);
     let local_first_answered = local_first_reply.is_some();
     let reply = match local_first_reply {
         // Local-first already answered (inference_mode=local): skip the CLI
@@ -2278,6 +2347,11 @@ async fn build_reply_with_session_inner(
                                     "使用者引用了某個方案/選項，但沒有任何未決決策可對應。\
                                      不可從歷史記錄模糊比對臆測；應承認缺漏並向使用者確認。",
                                     None,
+                                    // WP2: RFC-24 decision-gap detections are a
+                                    // distinct failure mode from general task
+                                    // failures — counted separately so they
+                                    // don't pool into the same consolidation.
+                                    "decision_gap",
                                 );
                                 if let Err(e) = nb.record(&entry) {
                                     tracing::warn!(error = %e, "decision gap: record mistake failed");
@@ -2580,6 +2654,10 @@ async fn build_reply_with_session_inner(
                                 &reply_clone_for_pred,
                                 what_wrong,
                                 None,
+                                // WP2: general task-outcome failures are a
+                                // separate failure mode from RFC-24
+                                // decision-gap detections above.
+                                "task_failure",
                             );
                             if let Err(e) = nb.record(&entry) {
                                 warn!(agent = %agent_id_for_pred, "Failed to record mistake: {e}");
@@ -2900,7 +2978,14 @@ async fn build_reply_with_session_inner(
                                         last_accessed: None,
                                         source_event: "prediction_episodic".to_string(),
                                     };
-                                    if let Err(e) = engine.store(&agent_id_for_pred, entry).await {
+                                    // WP1: prediction-driven episodic writes are
+                                    // agent self-derived; route through
+                                    // store_temporal so the origin is bound.
+                                    let ep_meta = duduclaw_memory::TemporalMeta {
+                                        origin: Some("agent_derived".to_string()),
+                                        ..Default::default()
+                                    };
+                                    if let Err(e) = engine.store_temporal(&agent_id_for_pred, entry, ep_meta).await {
                                         warn!(agent = %agent_id_for_pred, "Failed to store episodic memory: {e}");
                                     }
                                 }
@@ -6086,14 +6171,26 @@ async fn spawn_claude_cli_with_env(
                 .try_with(|c| c.clone())
                 .ok()
                 .filter(|c| !c.is_empty());
+            // WP5: thread the compression outcome computed in
+            // `maybe_compress_history` (scoped as a task-local — this call
+            // happens several async frames away from that computation) so
+            // `token_usage.compressed` / `compression_stages` reflect what
+            // was actually sent for this request. Missing scope (e.g. this
+            // fn invoked outside the channel_reply path) falls back to
+            // "not compressed", matching pre-WP5 behaviour.
+            let compression = crate::prompt_compression::CHANNEL_REPLY_COMPRESSION
+                .try_with(|c| c.clone())
+                .unwrap_or_default();
             telemetry
-                .record_attributed(
+                .record_attributed_with_compression(
                     &agent_id,
                     crate::cost_telemetry::RequestType::Chat,
                     model,
                     usage,
                     user_id.as_deref(),
                     channel.as_deref(),
+                    compression.compressed,
+                    &compression.stages,
                 )
                 .await;
         }
@@ -6506,12 +6603,22 @@ async fn spawn_claude_cli_pty_with_env(
         if !agent_id.is_empty()
             && let Some(telemetry) = crate::cost_telemetry::get_telemetry()
         {
+            // WP5: same compression-info threading as the streaming variant
+            // above — this PTY path shares the same `maybe_compress_history`
+            // caller and task-local scope.
+            let compression = crate::prompt_compression::CHANNEL_REPLY_COMPRESSION
+                .try_with(|c| c.clone())
+                .unwrap_or_default();
             telemetry
-                .record(
+                .record_attributed_with_compression(
                     &agent_id,
                     crate::cost_telemetry::RequestType::Chat,
                     model,
                     usage,
+                    None,
+                    None,
+                    compression.compressed,
+                    &compression.stages,
                 )
                 .await;
         }

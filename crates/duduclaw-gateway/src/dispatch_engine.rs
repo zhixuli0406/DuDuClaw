@@ -355,7 +355,9 @@ fn aspect_instruction(name: &str) -> &'static str {
         "correctness" => {
             "\"correctness\": does the result satisfy the acceptance criteria? \
 Treat the criteria as a REFERENCE SOLUTION and check it item by item — do not \
-judge in the abstract."
+judge in the abstract. If a <tool_activity> evidence block is present below, \
+treat any action the worker CLAIMS to have taken that does not appear there \
+as UNVERIFIED and weigh it accordingly."
         }
         "completeness" => {
             "\"completeness\": is the task ACTUALLY finished, not merely claimed \
@@ -542,6 +544,134 @@ pub fn parse_verdict(raw: &str) -> AcceptanceVerdict {
     AcceptanceVerdict { passed, feedback }
 }
 
+// ── WP4 GroundEval: judge-side tool_activity evidence (arXiv:2606.22737) ──
+//
+// The MAV judge previously scored a worker's self-reported `result_summary`
+// against the acceptance criteria with zero independent evidence — a worker
+// that merely *claims* to have called a tool was indistinguishable from one
+// that actually did. This reads the existing `tool_calls.jsonl` audit trail
+// (already written by every MCP tool invocation) for the claim→review
+// window and folds a compact `<tool_activity>` summary into the judge
+// prompt. Best-effort: a missing/unreadable audit file omits the block
+// (never fails the review over an observability gap — current behavior is
+// otherwise unchanged).
+
+/// Cap on distinct tool lines rendered into `<tool_activity>` (keeps a
+/// chatty task from ballooning the judge prompt).
+const TOOL_ACTIVITY_LINE_CAP: usize = 20;
+/// Safety char budget for the whole `<tool_activity>` block.
+const TOOL_ACTIVITY_CHAR_CAP: usize = 4000;
+
+/// One `tool_calls.jsonl` line's fields relevant to the review window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolActivityRecord {
+    tool_name: String,
+    success: bool,
+}
+
+/// Filter raw `tool_calls.jsonl` content (one JSON object per line, written
+/// by `duduclaw_security::audit::append_tool_call*`) down to the records for
+/// `agent_id` whose `timestamp` falls in `[since, until]` inclusive.
+/// Malformed lines, other agents, and out-of-window records are silently
+/// dropped — this is a best-effort evidence summary, not a second audit
+/// trail (the canonical trail is the file itself). A bad `since`/`until`
+/// bound (should never happen — both are RFC3339 stamps from the task
+/// store / `Utc::now()`) yields an empty result rather than panicking.
+fn filter_tool_activity(
+    jsonl: &str,
+    agent_id: &str,
+    since: &str,
+    until: &str,
+) -> Vec<ToolActivityRecord> {
+    let (Ok(since_dt), Ok(until_dt)) = (
+        chrono::DateTime::parse_from_rfc3339(since),
+        chrono::DateTime::parse_from_rfc3339(until),
+    ) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("agent_id").and_then(|a| a.as_str()) != Some(agent_id) {
+            continue;
+        }
+        let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let Ok(ts_dt) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            continue;
+        };
+        if ts_dt < since_dt || ts_dt > until_dt {
+            continue;
+        }
+        let Some(tool_name) = v.get("tool_name").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+        out.push(ToolActivityRecord {
+            tool_name: tool_name.to_string(),
+            success,
+        });
+    }
+    out
+}
+
+/// Aggregate filtered records into the `<tool_activity>` prompt block: one
+/// line per distinct tool (`name: N ok, M err`, sorted by name for
+/// determinism), capped at [`TOOL_ACTIVITY_LINE_CAP`] lines and
+/// [`TOOL_ACTIVITY_CHAR_CAP`] chars (CJK-safe truncation). `None` when there
+/// is nothing to show — the caller omits the block entirely.
+fn format_tool_activity(records: &[ToolActivityRecord]) -> Option<String> {
+    if records.is_empty() {
+        return None;
+    }
+    let mut counts: std::collections::BTreeMap<&str, (u32, u32)> = std::collections::BTreeMap::new();
+    for r in records {
+        let entry = counts.entry(r.tool_name.as_str()).or_insert((0, 0));
+        if r.success {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+        }
+    }
+    let total_tools = counts.len();
+    let mut lines: Vec<String> = counts
+        .into_iter()
+        .take(TOOL_ACTIVITY_LINE_CAP)
+        .map(|(name, (ok, err))| format!("{name}: {ok} ok, {err} err"))
+        .collect();
+    if total_tools > TOOL_ACTIVITY_LINE_CAP {
+        lines.push(format!(
+            "… ({} more tool(s) omitted)",
+            total_tools - TOOL_ACTIVITY_LINE_CAP
+        ));
+    }
+    let body = duduclaw_core::truncate_chars(&lines.join("\n"), TOOL_ACTIVITY_CHAR_CAP);
+    Some(format!("<tool_activity>\n{body}\n</tool_activity>"))
+}
+
+/// Read `tool_calls.jsonl` under `home_dir` and build the `<tool_activity>`
+/// block for one task's claim→review window. Missing/unreadable/unparseable
+/// audit file ⇒ `None` (omit the block; the judge behaves exactly as before
+/// this feature existed — reviews never fail over an observability gap).
+fn read_tool_activity_block(
+    home_dir: &std::path::Path,
+    agent_id: &str,
+    since: &str,
+    until: &str,
+) -> Option<String> {
+    let path = home_dir.join("tool_calls.jsonl");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let records = filter_tool_activity(&raw, agent_id, since, until);
+    format_tool_activity(&records)
+}
+
 // ── Engine ──────────────────────────────────────────────────
 
 /// The durable dispatch engine background task.
@@ -553,6 +683,10 @@ pub struct DispatchEngine {
     lease_secs: i64,
     tick_secs: u64,
     running: Arc<AtomicBool>,
+    /// Home dir to read `tool_calls.jsonl` from for the WP4 `<tool_activity>`
+    /// judge evidence block. `None` ⇒ the block is never built (same
+    /// behavior as a missing audit file).
+    home_dir: Option<std::path::PathBuf>,
 }
 
 impl DispatchEngine {
@@ -563,6 +697,7 @@ impl DispatchEngine {
             lease_secs: DEFAULT_LEASE_SECS,
             tick_secs: DEFAULT_TICK_SECS,
             running: Arc::new(AtomicBool::new(false)),
+            home_dir: None,
         }
     }
 
@@ -573,6 +708,13 @@ impl DispatchEngine {
 
     pub fn with_tick_secs(mut self, secs: u64) -> Self {
         self.tick_secs = secs;
+        self
+    }
+
+    /// Enable the WP4 `<tool_activity>` judge evidence block, read from
+    /// `<home_dir>/tool_calls.jsonl`.
+    pub fn with_home_dir(mut self, home_dir: std::path::PathBuf) -> Self {
+        self.home_dir = Some(home_dir);
         self
     }
 
@@ -624,6 +766,23 @@ impl DispatchEngine {
 
         // 2) Goal-mode acceptance review.
         self.review_goal_tasks().await?;
+
+        // 3) WP3 (PORTICO): sweep expired capability grants (hard-TTL backstop).
+        // Piggy-backs on this existing periodic tick — no new timer. Gated on a
+        // wired home_dir (tests without one skip it); best-effort (a sweep error
+        // never fails the tick, active-grant checks already exclude expired rows).
+        if let Some(home) = &self.home_dir {
+            match crate::capability_grants::CapabilityGrantStore::open(home) {
+                Ok(store) => {
+                    if let Err(e) = store.expire_stale().await {
+                        warn!(error = %e, "capability grant expire_stale sweep failed");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "capability grant store open failed for expire sweep")
+                }
+            }
+        }
         Ok(())
     }
 
@@ -641,18 +800,42 @@ impl DispatchEngine {
             return Ok(());
         };
 
+        let now = Utc::now().to_rfc3339();
         for task in self.store.tasks_in_status("review").await? {
             let criteria = task.acceptance_criteria.clone().unwrap_or_default();
             let result = task.result_summary.clone().unwrap_or_default();
-            let task_desc = format!("{}\n{}", task.title, task.description);
+            let mut task_desc = format!("{}\n{}", task.title, task.description);
+
+            // WP4 GroundEval: fold tool-call evidence for this task's
+            // claim→review window into the prompt (best-effort, never
+            // fails the review — see `read_tool_activity_block`).
+            if let Some(home) = &self.home_dir {
+                let agent_id = task
+                    .claimed_by
+                    .clone()
+                    .unwrap_or_else(|| task.assigned_to.clone());
+                let since = task
+                    .claimed_at
+                    .clone()
+                    .unwrap_or_else(|| task.created_at.clone());
+                if let Some(block) = read_tool_activity_block(home, &agent_id, &since, &now) {
+                    task_desc = format!("{task_desc}\n\n{block}");
+                }
+            }
 
             match judge.judge(&criteria, &task_desc, &result).await {
                 Ok(v) if v.passed => {
                     self.store.accept_review(&task.id, &v.feedback).await?;
+                    // WP3 (PORTICO): task phase closed → auto-revoke its grants.
+                    self.revoke_task_grants(&task.id).await;
                     info!(task = %task.id, "goal-mode 驗收通過 → done");
                 }
                 Ok(v) => {
                     let status = self.store.reject_review(&task.id, &v.feedback).await?;
+                    // WP3 (PORTICO): a rejection re-opens the loop for a retry,
+                    // but the review phase closed — revoke so the retry must
+                    // re-request any scoped tool it still needs.
+                    self.revoke_task_grants(&task.id).await;
                     info!(task = %task.id, %status, "goal-mode 驗收未通過");
                 }
                 Err(e) => {
@@ -662,10 +845,36 @@ impl DispatchEngine {
                     self.store
                         .mark_needs_human(&task.id, &format!("judge unavailable: {e}"))
                         .await?;
+                    // WP3 (PORTICO): parked for a human → revoke task grants.
+                    self.revoke_task_grants(&task.id).await;
                 }
             }
         }
         Ok(())
+    }
+
+    /// WP3 (PORTICO): revoke every capability grant bound to a task when its
+    /// phase closes (accept / reject / needs_human). No-op when no `home_dir`
+    /// is wired (tests) or when the store cannot be opened — a grant that fails
+    /// to revoke still dies at its hard TTL (bounded), so a store error here
+    /// degrades gracefully rather than failing the review tick.
+    async fn revoke_task_grants(&self, task_id: &str) {
+        let Some(home) = &self.home_dir else {
+            return;
+        };
+        match crate::capability_grants::CapabilityGrantStore::open(home) {
+            Ok(store) => {
+                if let Err(e) = store
+                    .revoke_for_task(task_id, crate::capability_grants::REVOKE_REASON_PHASE_END)
+                    .await
+                {
+                    warn!(task = %task_id, error = %e, "capability grant revoke on task phase end failed");
+                }
+            }
+            Err(e) => {
+                warn!(task = %task_id, error = %e, "capability grant store open failed on task phase end")
+            }
+        }
     }
 }
 
@@ -1021,6 +1230,222 @@ mod tests {
         assert_eq!(
             store.get_task("g4").await.unwrap().unwrap().status,
             "review"
+        );
+    }
+
+    // ── WP4 GroundEval: `<tool_activity>` judge evidence ────────
+
+    #[test]
+    fn filter_tool_activity_scopes_to_agent_and_window() {
+        let jsonl = concat!(
+            "{\"timestamp\":\"2026-07-11T10:02:00Z\",\"agent_id\":\"w\",\"tool_name\":\"memory_search\",\"success\":true}\n",
+            "{\"timestamp\":\"2026-07-11T10:03:00Z\",\"agent_id\":\"w\",\"tool_name\":\"memory_search\",\"success\":false}\n",
+            // other agent — excluded
+            "{\"timestamp\":\"2026-07-11T10:02:30Z\",\"agent_id\":\"other\",\"tool_name\":\"Bash\",\"success\":true}\n",
+            // before the window — excluded
+            "{\"timestamp\":\"2026-07-11T09:00:00Z\",\"agent_id\":\"w\",\"tool_name\":\"Bash\",\"success\":true}\n",
+            // after the window — excluded
+            "{\"timestamp\":\"2026-07-11T12:00:00Z\",\"agent_id\":\"w\",\"tool_name\":\"Bash\",\"success\":true}\n",
+            // malformed — skipped, no panic
+            "not json\n",
+            "{\"agent_id\":\"w\"}\n", // missing timestamp/tool_name
+        );
+        let records = filter_tool_activity(
+            jsonl,
+            "w",
+            "2026-07-11T10:00:00Z",
+            "2026-07-11T10:05:00Z",
+        );
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].tool_name, "memory_search");
+        assert!(records[0].success);
+        assert!(!records[1].success);
+    }
+
+    #[test]
+    fn filter_tool_activity_window_boundaries_are_inclusive() {
+        let jsonl = concat!(
+            "{\"timestamp\":\"2026-07-11T10:00:00Z\",\"agent_id\":\"w\",\"tool_name\":\"Read\",\"success\":true}\n",
+            "{\"timestamp\":\"2026-07-11T10:05:00Z\",\"agent_id\":\"w\",\"tool_name\":\"Read\",\"success\":true}\n",
+        );
+        let records = filter_tool_activity(jsonl, "w", "2026-07-11T10:00:00Z", "2026-07-11T10:05:00Z");
+        assert_eq!(records.len(), 2, "both boundary timestamps are in-window");
+    }
+
+    #[test]
+    fn filter_tool_activity_bad_bounds_yields_empty_not_panic() {
+        let jsonl = "{\"timestamp\":\"2026-07-11T10:00:00Z\",\"agent_id\":\"w\",\"tool_name\":\"Read\",\"success\":true}\n";
+        assert!(filter_tool_activity(jsonl, "w", "not-a-date", "also-not-a-date").is_empty());
+    }
+
+    #[test]
+    fn format_tool_activity_none_when_empty() {
+        assert!(format_tool_activity(&[]).is_none());
+    }
+
+    #[test]
+    fn format_tool_activity_aggregates_ok_err_per_tool() {
+        let records = vec![
+            ToolActivityRecord { tool_name: "memory_search".into(), success: true },
+            ToolActivityRecord { tool_name: "memory_search".into(), success: false },
+            ToolActivityRecord { tool_name: "Bash".into(), success: true },
+        ];
+        let block = format_tool_activity(&records).unwrap();
+        assert!(block.starts_with("<tool_activity>\n"));
+        assert!(block.ends_with("\n</tool_activity>"));
+        assert!(block.contains("memory_search: 1 ok, 1 err"));
+        assert!(block.contains("Bash: 1 ok, 0 err"));
+    }
+
+    #[test]
+    fn format_tool_activity_caps_at_line_limit() {
+        let records: Vec<ToolActivityRecord> = (0..25)
+            .map(|i| ToolActivityRecord {
+                tool_name: format!("tool_{i:02}"),
+                success: true,
+            })
+            .collect();
+        let block = format_tool_activity(&records).unwrap();
+        let line_count = block.lines().count();
+        // 20 tool lines + the "N more omitted" line + 2 XML fence lines.
+        assert_eq!(line_count, 20 + 1 + 2);
+        assert!(block.contains("5 more tool(s) omitted"));
+    }
+
+    #[test]
+    fn read_tool_activity_block_missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_tool_activity_block(
+            dir.path(),
+            "w",
+            "2026-07-11T10:00:00Z",
+            "2026-07-11T10:05:00Z"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn read_tool_activity_block_reads_and_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tool_calls.jsonl"),
+            "{\"timestamp\":\"2026-07-11T10:02:00Z\",\"agent_id\":\"w\",\"tool_name\":\"Read\",\"success\":true}\n",
+        )
+        .unwrap();
+        let block = read_tool_activity_block(
+            dir.path(),
+            "w",
+            "2026-07-11T10:00:00Z",
+            "2026-07-11T10:05:00Z",
+        )
+        .unwrap();
+        assert!(block.contains("Read: 1 ok, 0 err"));
+    }
+
+    /// Judge stub that records the `task` string it was called with, so the
+    /// integration test can assert the `<tool_activity>` block actually
+    /// reached the judge prompt (not just that the pure functions work in
+    /// isolation).
+    struct CapturingJudge {
+        outcome: Result<AcceptanceVerdict, String>,
+        captured_task: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl AcceptanceJudge for CapturingJudge {
+        async fn judge(
+            &self,
+            _criteria: &str,
+            task: &str,
+            _result: &str,
+        ) -> Result<AcceptanceVerdict, String> {
+            *self.captured_task.lock().unwrap() = Some(task.to_string());
+            self.outcome.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn review_prompt_includes_tool_activity_when_audit_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "g5").await; // claimed_by="w", claimed_at="2026-07-11T10:00:00Z"
+
+        std::fs::write(
+            dir.path().join("tool_calls.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-07-11T10:02:00Z\",\"agent_id\":\"w\",\"tool_name\":\"memory_search\",\"success\":true}\n",
+                "{\"timestamp\":\"2026-07-11T10:03:00Z\",\"agent_id\":\"w\",\"tool_name\":\"memory_search\",\"success\":false}\n",
+                "{\"timestamp\":\"2026-07-11T10:02:30Z\",\"agent_id\":\"other\",\"tool_name\":\"Bash\",\"success\":true}\n",
+            ),
+        )
+        .unwrap();
+
+        let judge = Arc::new(CapturingJudge {
+            outcome: Ok(AcceptanceVerdict { passed: true, feedback: "ok".into() }),
+            captured_task: std::sync::Mutex::new(None),
+        });
+        let engine = DispatchEngine::new(store.clone(), Some(judge.clone() as Arc<dyn AcceptanceJudge>))
+            .with_home_dir(dir.path().to_path_buf());
+        engine.tick_once().await.unwrap();
+
+        let captured = judge.captured_task.lock().unwrap().clone().unwrap();
+        assert!(captured.contains("<tool_activity>"), "{captured}");
+        assert!(captured.contains("memory_search: 1 ok, 1 err"), "{captured}");
+        assert!(!captured.contains("Bash"), "{captured}");
+    }
+
+    #[tokio::test]
+    async fn review_prompt_omits_tool_activity_without_home_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "g6").await;
+        std::fs::write(
+            dir.path().join("tool_calls.jsonl"),
+            "{\"timestamp\":\"2026-07-11T10:02:00Z\",\"agent_id\":\"w\",\"tool_name\":\"memory_search\",\"success\":true}\n",
+        )
+        .unwrap();
+
+        let judge = Arc::new(CapturingJudge {
+            outcome: Ok(AcceptanceVerdict { passed: true, feedback: "ok".into() }),
+            captured_task: std::sync::Mutex::new(None),
+        });
+        // No `.with_home_dir(...)` — behavior must match pre-WP4 (no block).
+        let engine = DispatchEngine::new(store.clone(), Some(judge.clone() as Arc<dyn AcceptanceJudge>));
+        engine.tick_once().await.unwrap();
+
+        let captured = judge.captured_task.lock().unwrap().clone().unwrap();
+        assert!(!captured.contains("<tool_activity>"), "{captured}");
+    }
+
+    // WP3 (PORTICO): a task reaching a terminal review phase (accept) revokes
+    // every capability grant bound to it. Requires a wired home_dir.
+    #[tokio::test]
+    async fn task_completion_revokes_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "g7").await; // claimed_by = "w"
+
+        // Mint a grant bound to this task for agent "w".
+        let grants =
+            crate::capability_grants::CapabilityGrantStore::open(dir.path()).unwrap();
+        grants
+            .grant("w", Some("g7"), "send_message", "capability_request", 3600)
+            .await
+            .unwrap();
+        assert!(grants.has_active_grant("w", "send_message").await);
+
+        let judge = Arc::new(StubJudge {
+            outcome: Ok(AcceptanceVerdict { passed: true, feedback: "ok".into() }),
+        });
+        let engine = DispatchEngine::new(store.clone(), Some(judge))
+            .with_home_dir(dir.path().to_path_buf());
+        engine.tick_once().await.unwrap();
+
+        assert_eq!(store.get_task("g7").await.unwrap().unwrap().status, "done");
+        // The task-scoped grant is revoked once its phase closed.
+        assert!(
+            !grants.has_active_grant("w", "send_message").await,
+            "task completion must revoke its capability grants"
         );
     }
 

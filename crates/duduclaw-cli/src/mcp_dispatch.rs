@@ -482,6 +482,53 @@ impl McpDispatcher {
             }
         }
 
+        // ── 3.65 Task-scoped capability grant gate (WP3, PORTICO) ────────────
+        // A tool listed in `agent.toml [capabilities] scoped_tools` is denied
+        // unless the agent currently holds an active task-scoped grant for it
+        // (minted by the `capability_request` MCP tool after human approval, or
+        // atomically at a goal-loop kickoff; auto-revoked at task-phase-end).
+        // This is the PRIMARY, complete-mediation enforcement point — every
+        // runtime's MCP call funnels through here. External clients carry no
+        // per-agent scoped config and are already whitelist-confined, so they
+        // skip this. Fail-closed: a scoped tool whose grant store cannot be
+        // opened/queried is denied (`has_active_grant` returns false on error).
+        // Zero-overhead for the vast majority of agents: an empty `scoped_tools`
+        // set short-circuits before any DB work.
+        if !principal.is_external {
+            let agent_dir = self
+                .home_dir
+                .join("agents")
+                .join(&principal.client_id);
+            let scoped = duduclaw_gateway::capability_grants::scoped_tools(&agent_dir);
+            if duduclaw_gateway::capability_grants::set_contains_tool(&scoped, tool_name) {
+                let has_grant = match duduclaw_gateway::capability_grants::CapabilityGrantStore::open(
+                    &self.home_dir,
+                ) {
+                    Ok(store) => store.has_active_grant(&principal.client_id, tool_name).await,
+                    Err(e) => {
+                        warn!(
+                            agent = %principal.client_id,
+                            tool = %tool_name,
+                            error = %e,
+                            "capability grant store unavailable — denying scoped tool (fail-closed)"
+                        );
+                        false
+                    }
+                };
+                if !has_grant {
+                    duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+                    return jsonrpc_error(
+                        id,
+                        -32003,
+                        &format!(
+                            "工具「{tool_name}」為階段性授權工具，目前無有效授權。請先呼叫 \
+                             capability_request（附 tool 與 reason）取得人工核准後再執行。"
+                        ),
+                    );
+                }
+            }
+        }
+
         // ── 3.7 Install / operator-required approval (WP5 elevation, I3) ─────
         // Elevated from the individual tool handlers to this shared choke point
         // so `agent.toml [capabilities] approval_required_tools` is honoured for
@@ -800,6 +847,95 @@ effect = "forbid"
         assert!(
             !msg.contains("Denied by policy"),
             "no policy must not deny, got: {msg}"
+        );
+    }
+
+    // ── WP3: task-scoped capability grant gate ─────────────────────────────────
+
+    /// Write `agent.toml` for the dispatcher's `test-client` principal.
+    fn write_scoped_toml(tmp: &tempfile::TempDir, body: &str) {
+        let agent_dir = tmp.path().join("agents").join("test-client");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), body).unwrap();
+    }
+
+    // A scoped tool with NO active grant is denied (fail-closed) with guidance
+    // to call capability_request.
+    #[tokio::test]
+    async fn scoped_tool_without_grant_is_denied_fail_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nscoped_tools = [\"memory_search\"]\n");
+
+        // Admin bypasses scope so the call reaches the WP3 gate.
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(30);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "scoped tool without a grant must be denied, got: {result}"
+        );
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("capability_request"),
+            "denial must guide to capability_request, got: {msg}"
+        );
+    }
+
+    // A scoped tool WITH an active grant passes the WP3 gate (may fail
+    // downstream for unrelated reasons, but NOT with the capability guidance).
+    #[tokio::test]
+    async fn scoped_tool_with_active_grant_passes_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nscoped_tools = [\"memory_search\"]\n");
+
+        // Mint an active grant for (test-client, memory_search).
+        let store =
+            duduclaw_gateway::capability_grants::CapabilityGrantStore::open(tmp.path()).unwrap();
+        store
+            .grant("test-client", Some("task-1"), "memory_search", "capability_request", 3600)
+            .await
+            .unwrap();
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(31);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("capability_request"),
+            "a granted scoped tool must pass the WP3 gate, got: {result}"
+        );
+    }
+
+    // Regression: an agent with NO scoped_tools is unaffected — a normal tool is
+    // never denied by the WP3 gate (byte-identical to pre-WP3 behavior).
+    #[tokio::test]
+    async fn non_scoped_tools_unaffected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        // agent.toml exists but declares no scoped_tools.
+        write_scoped_toml(&tmp, "[capabilities]\nallowed_tools = []\n");
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(32);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("capability_request"),
+            "non-scoped agent must never hit the WP3 gate, got: {result}"
         );
     }
 

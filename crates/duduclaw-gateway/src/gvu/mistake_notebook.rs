@@ -26,7 +26,10 @@ use uuid::Uuid;
 use super::text_gradient::TextGradient;
 
 /// Maximum unresolved entries kept per agent (FIFO eviction beyond this).
-const MAX_UNRESOLVED_PER_AGENT: u32 = 50;
+///
+/// `pub(crate)` so `reflexion.rs` can size its per-category fetch to the same
+/// upper bound when grouping mistakes by `source_kind` (WP2).
+pub(crate) const MAX_UNRESOLVED_PER_AGENT: u32 = 50;
 
 /// Category of mistake — determines GVU response priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -105,6 +108,19 @@ pub struct MistakeEntry {
     pub gradient: TextGradient,
     /// Whether a GVU cycle has addressed this mistake.
     pub resolved: bool,
+    /// Origin of the failure signal within `category` (WP2, GovMem 2607.02579).
+    ///
+    /// `category` groups mistakes by *kind of error* (Capability/Factual/...);
+    /// `source_kind` further distinguishes *how the failure was detected*
+    /// within that category — e.g. `"decision_gap"` (RFC-24 unresolved
+    /// decision reference) vs `"task_failure"` (general task-outcome
+    /// failure) both land in `MistakeCategory::Capability` today but are
+    /// unrelated failure modes and must not be pooled together for
+    /// consolidation counting. Empty string = unattributed / legacy rows —
+    /// they form their own group rather than silently joining another
+    /// (fail-safe, backward compatible with pre-WP2 data).
+    #[serde(default)]
+    pub source_kind: String,
 }
 
 /// Max chars of `ground_truth` injected into a prompt section (CJK-safe cap).
@@ -191,7 +207,24 @@ impl MistakeNotebook {
             CREATE INDEX IF NOT EXISTS idx_mistake_agent
                 ON mistakes(agent_id, resolved, timestamp DESC);",
         )
-        .map_err(|e| format!("Init mistakes table: {e}"))
+        .map_err(|e| format!("Init mistakes table: {e}"))?;
+
+        // WP2 (GovMem 2607.02579): distinguish *how* a mistake within the same
+        // `category` was detected, so unrelated failure modes (e.g. RFC-24
+        // decision-gap vs. generic task-failure — both land in `Capability`)
+        // aren't pooled into one consolidation count. Idempotent migration:
+        // SQLite has no `ADD COLUMN IF NOT EXISTS`, so a duplicate-column
+        // error on re-run is expected and ignored.
+        match conn.execute_batch("ALTER TABLE mistakes ADD COLUMN source_kind TEXT NOT NULL DEFAULT ''") {
+            Ok(()) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(format!("Migrate mistakes.source_kind: {e}"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Record a new mistake entry.
@@ -203,8 +236,9 @@ impl MistakeNotebook {
         conn.execute(
             "INSERT OR REPLACE INTO mistakes
              (id, agent_id, timestamp, category, session_id, input_summary,
-              agent_response_summary, what_went_wrong, ground_truth, gradient_json, resolved)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              agent_response_summary, what_went_wrong, ground_truth, gradient_json, resolved,
+              source_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 entry.id,
                 entry.agent_id,
@@ -217,6 +251,7 @@ impl MistakeNotebook {
                 entry.ground_truth,
                 gradient_json,
                 entry.resolved as i32,
+                entry.source_kind,
             ],
         )
         .map_err(|e| format!("Insert mistake: {e}"))?;
@@ -245,7 +280,8 @@ impl MistakeNotebook {
 
         let mut stmt = match conn.prepare(
             "SELECT id, agent_id, timestamp, category, session_id, input_summary,
-                    agent_response_summary, what_went_wrong, ground_truth, gradient_json, resolved
+                    agent_response_summary, what_went_wrong, ground_truth, gradient_json, resolved,
+                    source_kind
              FROM mistakes
              WHERE agent_id = ?1 AND resolved = 0
              ORDER BY
@@ -280,6 +316,7 @@ impl MistakeNotebook {
                     ground_truth: row.get(8)?,
                     gradient_json: row.get(9)?,
                     resolved: row.get(10)?,
+                    source_kind: row.get(11)?,
                 })
             })
             .ok();
@@ -445,6 +482,10 @@ impl MistakeNotebook {
                 source_layer: "action_claim_verifier".to_string(),
             },
             resolved: false,
+            // Not one of the two WP2-attributed paths (decision_gap /
+            // task_failure) — leave unattributed so it groups on its own
+            // rather than joining either bucket (fail-safe default).
+            source_kind: String::new(),
         };
         self.record(&entry)
     }
@@ -478,6 +519,7 @@ struct MistakeEntryRow {
     ground_truth: Option<String>,
     gradient_json: String,
     resolved: i32,
+    source_kind: String,
 }
 
 impl MistakeEntryRow {
@@ -509,11 +551,18 @@ impl MistakeEntryRow {
             ground_truth: self.ground_truth,
             gradient,
             resolved: self.resolved != 0,
+            source_kind: self.source_kind,
         })
     }
 }
 
 /// Helper to create a MistakeEntry from conversation data.
+///
+/// `source_kind` (WP2) records *how* this mistake was detected within its
+/// `category` — e.g. `"decision_gap"` / `"task_failure"` — so consolidation
+/// can count independent failure modes separately instead of pooling them.
+/// Pass `""` when the call site has no such distinction to make.
+#[allow(clippy::too_many_arguments)]
 pub fn build_mistake_entry(
     agent_id: &str,
     session_id: &str,
@@ -522,6 +571,7 @@ pub fn build_mistake_entry(
     agent_response: &str,
     what_went_wrong: &str,
     ground_truth: Option<&str>,
+    source_kind: &str,
 ) -> MistakeEntry {
     MistakeEntry {
         id: Uuid::new_v4().to_string(),
@@ -540,6 +590,7 @@ pub fn build_mistake_entry(
             &format!("Address this {category} issue in SOUL.md", category = category.as_str()),
         ),
         resolved: false,
+        source_kind: source_kind.to_string(),
     }
 }
 
@@ -575,6 +626,7 @@ mod tests {
             "好的，這是 bubble sort...",
             "User wanted O(n log n) but agent gave O(n²)",
             Some("Use merge sort or timsort"),
+            "",
         )
     }
 
@@ -608,11 +660,11 @@ mod tests {
 
         let e1 = build_mistake_entry(
             "agent-1", "s1", MistakeCategory::Capability,
-            "寫 Python sort", "bubble sort", "太慢", Some("merge sort"),
+            "寫 Python sort", "bubble sort", "太慢", Some("merge sort"), "",
         );
         let e2 = build_mistake_entry(
             "agent-1", "s2", MistakeCategory::Behavioral,
-            "你好嗎", "我是 AI", "太冷漠", None,
+            "你好嗎", "我是 AI", "太冷漠", None, "",
         );
         nb.record(&e1).unwrap();
         nb.record(&e2).unwrap();
@@ -667,6 +719,7 @@ mod tests {
             "bubble sort",
             "太慢",
             Some("Use merge sort or timsort"),
+            "",
         );
         let section = entry.to_prompt_section();
         assert!(section.contains("Issue: 太慢"));
@@ -684,6 +737,7 @@ mod tests {
             "我是 AI",
             "太冷漠",
             None,
+            "",
         );
         let section = entry.to_prompt_section();
         assert!(section.contains("Issue: 太冷漠"));
@@ -710,5 +764,60 @@ mod tests {
             .filter(|c| *c == '正')
             .collect();
         assert_eq!(shown.chars().count(), GROUND_TRUTH_PROMPT_MAX_CHARS);
+    }
+
+    #[test]
+    fn test_source_kind_round_trips() {
+        let (_tmp, nb) = test_db();
+        let entry = build_mistake_entry(
+            "agent-1",
+            "s1",
+            MistakeCategory::Capability,
+            "user text",
+            "agent text",
+            "wrong thing",
+            None,
+            "decision_gap",
+        );
+        nb.record(&entry).unwrap();
+
+        let results = nb.query_by_agent("agent-1", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_kind, "decision_gap");
+    }
+
+    #[test]
+    fn test_source_kind_defaults_to_empty_string() {
+        // A default `MistakeEntry` (e.g. legacy pre-WP2 construction path)
+        // must not fail to record/query — empty source_kind is its own group.
+        let (_tmp, nb) = test_db();
+        let entry = sample_entry("agent-1", MistakeCategory::Capability);
+        assert_eq!(entry.source_kind, "");
+        nb.record(&entry).unwrap();
+
+        let results = nb.query_by_agent("agent-1", 10);
+        assert_eq!(results[0].source_kind, "");
+    }
+
+    #[test]
+    fn test_source_kind_migration_is_idempotent_across_reopen() {
+        // Re-opening a notebook on the same db file re-runs `init_table`,
+        // which re-issues the `ALTER TABLE ... ADD COLUMN source_kind`
+        // migration. The duplicate-column error must be swallowed, not
+        // propagated as a fatal failure.
+        let tmp = NamedTempFile::new().unwrap();
+        let nb1 = MistakeNotebook::new(tmp.path());
+        let entry = build_mistake_entry(
+            "agent-1", "s1", MistakeCategory::Capability,
+            "u", "a", "w", None, "task_failure",
+        );
+        nb1.record(&entry).unwrap();
+        drop(nb1);
+
+        // Second open on the same file re-runs the (now no-op) migration.
+        let nb2 = MistakeNotebook::new(tmp.path());
+        let results = nb2.query_by_agent("agent-1", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_kind, "task_failure");
     }
 }

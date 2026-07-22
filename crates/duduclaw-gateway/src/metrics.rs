@@ -80,6 +80,20 @@ pub struct MetricsRegistry {
     pub decision_expired_total: AtomicU64,
     /// Captured decisions manually dismissed as false positives (precision signal).
     pub decision_false_positive_total: AtomicU64,
+
+    // ── WP5: cache-aware compression gate (2607.12161) ────────────────
+    /// Compression stage runs, keyed by stage name (`turn_trim`,
+    /// `drop_oldest_tool_echoes`, `bisect_and_summarize`). A HashMap
+    /// (rather than fixed atomics) because the stage set is defined in
+    /// `prompt_compression::default_pipeline` and this stays decoupled.
+    pub prompt_compression_runs: RwLock<std::collections::HashMap<String, u64>>,
+    /// Requests where the cache-aware guard skipped the pipeline entirely
+    /// (cache already hot + mild overshoot — see `prompt_compression`).
+    pub prompt_compression_skipped_cache_guard_total: AtomicU64,
+    /// Requests flagged as a likely cache-break: compressed, and cache
+    /// efficiency cratered right after a previously-healthy row for the
+    /// same agent.
+    pub prompt_compression_cache_break_suspect_total: AtomicU64,
 }
 
 const DURATION_BOUNDS_MS: [u64; 7] = [100, 250, 500, 1000, 2500, 5000, 10000];
@@ -146,6 +160,9 @@ impl MetricsRegistry {
             decision_resolved_total: AtomicU64::new(0),
             decision_expired_total: AtomicU64::new(0),
             decision_false_positive_total: AtomicU64::new(0),
+            prompt_compression_runs: RwLock::new(std::collections::HashMap::new()),
+            prompt_compression_skipped_cache_guard_total: AtomicU64::new(0),
+            prompt_compression_cache_break_suspect_total: AtomicU64::new(0),
         }
     }
 
@@ -163,6 +180,27 @@ impl MetricsRegistry {
     }
     pub fn decision_false_positive(&self) {
         self.decision_false_positive_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── WP5: cache-aware compression gate (2607.12161) ────────────────
+
+    /// Record one compression stage run (`stage` matches the pipeline's
+    /// static stage names, e.g. `"turn_trim"`).
+    pub async fn prompt_compression_run(&self, stage: &str) {
+        let mut map = self.prompt_compression_runs.write().await;
+        *map.entry(stage.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record a request where the cache-aware guard skipped the pipeline.
+    pub fn prompt_compression_skipped_cache_guard(&self) {
+        self.prompt_compression_skipped_cache_guard_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a suspected compression-induced cache break.
+    pub fn prompt_compression_cache_break_suspect(&self) {
+        self.prompt_compression_cache_break_suspect_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -554,6 +592,33 @@ impl MetricsRegistry {
             self.decision_false_positive_total.load(Ordering::Relaxed)
         ));
 
+        // ── WP5: cache-aware compression gate (2607.12161) ──
+        out.push_str(
+            "# HELP prompt_compression_runs_total Compression pipeline stage runs, by stage.\n",
+        );
+        out.push_str("# TYPE prompt_compression_runs_total counter\n");
+        for (stage, count) in self.prompt_compression_runs.read().await.iter() {
+            out.push_str(&format!(
+                "prompt_compression_runs_total{{stage=\"{stage}\"}} {count}\n"
+            ));
+        }
+        out.push_str(
+            "# HELP prompt_compression_skipped_cache_guard_total Requests where the cache-aware guard skipped compression.\n",
+        );
+        out.push_str("# TYPE prompt_compression_skipped_cache_guard_total counter\n");
+        out.push_str(&format!(
+            "prompt_compression_skipped_cache_guard_total {}\n",
+            self.prompt_compression_skipped_cache_guard_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP prompt_compression_cache_break_suspect_total Requests where compression likely broke a healthy cache prefix.\n",
+        );
+        out.push_str("# TYPE prompt_compression_cache_break_suspect_total counter\n");
+        out.push_str(&format!(
+            "prompt_compression_cache_break_suspect_total {}\n",
+            self.prompt_compression_cache_break_suspect_total.load(Ordering::Relaxed)
+        ));
+
         out
     }
 }
@@ -825,5 +890,47 @@ mod tests {
         assert!(output.contains("duduclaw_worker_restarts_total 1"));
         assert!(output.contains("duduclaw_pty_pool_managed_worker_active 1"));
         assert!(output.contains("duduclaw_pty_pool_invoke_duration_seconds_bucket"));
+    }
+
+    // ── WP5: cache-aware compression gate (2607.12161) ──
+
+    #[tokio::test]
+    async fn prompt_compression_run_counts_by_stage() {
+        let r = MetricsRegistry::new();
+        r.prompt_compression_run("turn_trim").await;
+        r.prompt_compression_run("turn_trim").await;
+        r.prompt_compression_run("drop_oldest_tool_echoes").await;
+        let map = r.prompt_compression_runs.read().await;
+        assert_eq!(map.get("turn_trim"), Some(&2));
+        assert_eq!(map.get("drop_oldest_tool_echoes"), Some(&1));
+    }
+
+    #[test]
+    fn prompt_compression_skip_and_break_counters_increment() {
+        let r = MetricsRegistry::new();
+        r.prompt_compression_skipped_cache_guard();
+        r.prompt_compression_skipped_cache_guard();
+        r.prompt_compression_cache_break_suspect();
+        assert_eq!(
+            r.prompt_compression_skipped_cache_guard_total.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            r.prompt_compression_cache_break_suspect_total.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn render_emits_prompt_compression_metrics() {
+        let r = MetricsRegistry::new();
+        r.prompt_compression_run("turn_trim").await;
+        r.prompt_compression_skipped_cache_guard();
+        r.prompt_compression_cache_break_suspect();
+
+        let output = r.render().await;
+        assert!(output.contains("prompt_compression_runs_total{stage=\"turn_trim\"} 1"));
+        assert!(output.contains("prompt_compression_skipped_cache_guard_total 1"));
+        assert!(output.contains("prompt_compression_cache_break_suspect_total 1"));
     }
 }

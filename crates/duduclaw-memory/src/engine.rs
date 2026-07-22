@@ -328,6 +328,9 @@ struct ActiveTriple {
     access_count: i64,
     /// `COALESCE(valid_from, timestamp)` as stored (rfc3339 for temporal writes).
     valid_from: Option<String>,
+    /// The surviving row's own `origin` (WP1) — counts as one corroborating
+    /// class when deciding whether a reaffirm may raise confidence.
+    origin: Option<String>,
 }
 
 /// Parse an rfc3339 timestamp into a UTC `DateTime`, ignoring malformed input.
@@ -368,10 +371,23 @@ fn object_opt_eq(a: &Option<String>, b: &Option<String>) -> bool {
     }
 }
 
-/// Append a `source_event` to the `reaffirmed_by` array inside a metadata JSON
-/// blob (D1 reaffirm), keeping at most the 20 most-recent unique ids. Empty
-/// event ids and duplicates are no-ops. Malformed metadata is reset to `{}`.
-fn append_reaffirmed_by(metadata_json: &str, source_event: &str) -> String {
+/// Read the `source_event` id from one `reaffirmed_by` list element, tolerating
+/// both formats (WP1): the legacy bare-string element `"ev1"` and the new
+/// object element `{"source_event": "ev1", "origin": "channel"}`.
+fn reaffirm_source_event(el: &serde_json::Value) -> Option<&str> {
+    match el {
+        serde_json::Value::String(s) => Some(s.as_str()),
+        serde_json::Value::Object(_) => el.get("source_event").and_then(|v| v.as_str()),
+        _ => None,
+    }
+}
+
+/// Append a `{source_event, origin}` record to the `reaffirmed_by` array inside
+/// a metadata JSON blob (D1 reaffirm, WP1 origin-tagged), keeping at most the 20
+/// most-recent unique source events. Empty event ids and duplicate source
+/// events are no-ops. Malformed metadata is reset to `{}`. Backward compatible:
+/// existing legacy bare-string elements are preserved as-is and still dedup.
+fn append_reaffirmed_by(metadata_json: &str, source_event: &str, origin: &str) -> String {
     let mut v: serde_json::Value =
         serde_json::from_str(metadata_json).unwrap_or_else(|_| serde_json::json!({}));
     if !v.is_object() {
@@ -386,8 +402,11 @@ fn append_reaffirmed_by(metadata_json: &str, source_event: &str) -> String {
         *arr = serde_json::json!([]);
     }
     let list = arr.as_array_mut().expect("reaffirmed_by is an array");
-    if !source_event.is_empty() && !list.iter().any(|x| x.as_str() == Some(source_event)) {
-        list.push(serde_json::Value::String(source_event.to_string()));
+    let already = list
+        .iter()
+        .any(|x| reaffirm_source_event(x) == Some(source_event));
+    if !source_event.is_empty() && !already {
+        list.push(serde_json::json!({ "source_event": source_event, "origin": origin }));
         let len = list.len();
         if len > 20 {
             list.drain(0..len - 20);
@@ -396,8 +415,9 @@ fn append_reaffirmed_by(metadata_json: &str, source_event: &str) -> String {
     v.to_string()
 }
 
-/// Extract the `reaffirmed_by` string array from a metadata JSON blob (D1).
-/// Returns an empty vec for absent / malformed data.
+/// Extract the `reaffirmed_by` source-event ids from a metadata JSON blob (D1).
+/// Reads both the legacy bare-string and the new `{source_event, origin}`
+/// element formats. Returns an empty vec for absent / malformed data.
 fn reaffirmed_by_from_metadata(metadata_json: &str) -> Vec<String> {
     serde_json::from_str::<serde_json::Value>(metadata_json)
         .ok()
@@ -406,11 +426,31 @@ fn reaffirmed_by_from_metadata(metadata_json: &str) -> Vec<String> {
                 .and_then(|a| a.as_array())
                 .map(|a| {
                     a.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .filter_map(|x| reaffirm_source_event(x).map(|s| s.to_string()))
                         .collect()
                 })
         })
         .unwrap_or_default()
+}
+
+/// Extract the distinct corroborating origin CLASS names already recorded in a
+/// row's `reaffirmed_by` list (WP1 Sybil-resistant boost). Legacy bare-string
+/// elements have no origin → skipped. Non-corroborating classes (agent_derived
+/// / tool_echo) are excluded.
+fn reaffirmed_origins_from_metadata(metadata_json: &str) -> std::collections::BTreeSet<String> {
+    let mut set = std::collections::BTreeSet::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(metadata_json) {
+        if let Some(arr) = v.get("reaffirmed_by").and_then(|a| a.as_array()) {
+            for el in arr {
+                if let Some(o) = el.get("origin").and_then(|x| x.as_str()) {
+                    if crate::origin::is_corroborating(o) {
+                        set.insert(crate::origin::class_name(o).to_string());
+                    }
+                }
+            }
+        }
+    }
+    set
 }
 
 /// Map a `get_history` / `get_at` row into a [`TemporalRecord`] (D1). Column
@@ -1311,6 +1351,46 @@ impl SqliteMemoryEngine {
         Ok(n > 0)
     }
 
+    /// Remove a single tag from an entry's tag list (ownership enforced).
+    ///
+    /// Returns `Ok(true)` when the tag was present and removed, `Ok(false)`
+    /// when the entry does not exist, belongs to another agent, or did not
+    /// carry the tag (mirrors `set_importance_and_add_tag`'s idempotent
+    /// no-op-is-not-an-error contract; WP2 Janus probation-tag graduation).
+    pub async fn remove_tag(&self, agent_id: &str, memory_id: &str, tag: &str) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let existing: Option<String> = {
+            let mut stmt = conn
+                .prepare("SELECT tags FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1")
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let mut rows = stmt
+                .query_map(params![memory_id, agent_id], |r| r.get::<_, String>(0))
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            match rows.next() {
+                Some(row) => Some(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?),
+                None => None,
+            }
+        };
+        let Some(tags_json) = existing else {
+            return Ok(false);
+        };
+        let mut tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        let before = tags.len();
+        tags.retain(|t| t != tag);
+        if tags.len() == before {
+            return Ok(false);
+        }
+        let new_tags =
+            serde_json::to_string(&tags).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let n = conn
+            .execute(
+                "UPDATE memories SET tags = ?1 WHERE id = ?2 AND agent_id = ?3",
+                params![new_tags, memory_id, agent_id],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Ok(n > 0)
+    }
+
     /// Store a memory with temporal / knowledge-graph metadata and automatic
     /// conflict resolution (F1, v1.19.0).
     ///
@@ -1348,12 +1428,28 @@ impl SqliteMemoryEngine {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "{}".to_string());
 
-        // ── P2-1: origin-bound trust (I8, non-malleable) ─────────────────────
-        // Start from the caller's declared trust, clamped to [0,1]. If the fact
-        // is derived from source memories, clamp further to ≤ the MINIMUM trust
-        // across those sources — a derived/summarized fact can never be more
-        // trusted than its least-trusted input.
-        let mut origin_trust = meta.origin_trust.unwrap_or(1.0).clamp(0.0, 1.0);
+        // ── WP1: origin binding ──────────────────────────────────────────────
+        // Every write is attributed. An absent origin is recorded as the string
+        // "unattributed" (NOT NULL) so D6 can roll back by origin and so trust
+        // fails safe to the UNATTRIBUTED ceiling rather than to 1.0.
+        let origin_str: String = meta
+            .origin
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::origin::UNATTRIBUTED.name.to_string());
+
+        // ── P2-1 / WP1: origin-bound trust (I8, non-malleable) ───────────────
+        // Start from the caller's declared trust, clamped to [0,1], then clamp
+        // to the origin CLASS ceiling — a caller may only *lower* trust below
+        // what its provenance warrants, never claim more. If the fact is derived
+        // from source memories, clamp further to ≤ the MINIMUM trust across those
+        // sources — a derived/summarized fact can never be more trusted than its
+        // least-trusted input.
+        let mut origin_trust = meta
+            .origin_trust
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0)
+            .min(crate::origin::trust_ceiling(&origin_str));
         let derived_from_json = match &meta.derived_from {
             Some(sources) if !sources.is_empty() => {
                 let mut min_source: f64 = 1.0;
@@ -1397,7 +1493,7 @@ impl SqliteMemoryEngine {
                 let mut stmt = conn
                     .prepare(
                         "SELECT id, object, content, metadata, access_count,
-                                COALESCE(valid_from, timestamp)
+                                COALESCE(valid_from, timestamp), origin
                          FROM memories
                          WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
                            AND valid_until IS NULL
@@ -1415,6 +1511,7 @@ impl SqliteMemoryEngine {
                                 .unwrap_or_else(|| "{}".to_string()),
                             access_count: r.get(4)?,
                             valid_from: r.get(5)?,
+                            origin: r.get(6)?,
                         })
                     })
                     .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
@@ -1426,19 +1523,55 @@ impl SqliteMemoryEngine {
             };
 
             // ── Reaffirm: same (subject, predicate, object) + content re-observed.
-            // Don't create a new row — append this write's source_event to the
-            // surviving row's `reaffirmed_by` list (cap 20) and bump access_count.
+            // Don't create a new row — append this write's {source_event, origin}
+            // to the surviving row's `reaffirmed_by` list (cap 20) and bump
+            // access_count.
             if let Some(row) = active.iter().find(|r| {
                 object_opt_eq(&meta.object, &r.object) && r.content.trim() == entry.content.trim()
             }) {
-                let new_meta = append_reaffirmed_by(&row.metadata, &source_event);
-                conn.execute(
-                    "UPDATE memories SET metadata = ?1, access_count = access_count + 1
-                     WHERE id = ?2 AND agent_id = ?3",
-                    params![new_meta, row.id, agent_id],
-                )
-                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-                info!(agent_id, entry_id = %row.id, "temporal memory reaffirmed");
+                let new_meta = append_reaffirmed_by(&row.metadata, &source_event, &origin_str);
+
+                // WP1 Sybil-resistant corroboration: only raise confidence when
+                // this reaffirmation adds an INDEPENDENT, trustworthy origin —
+                // i.e. its origin class is corroborating (not agent_derived /
+                // tool_echo), is not already among the recorded corroborators,
+                // and the total distinct corroborating classes (row origin +
+                // reaffirmations) reaches ≥ 2. Same-origin repeats never boost
+                // (a source cannot vouch for itself N times).
+                let mut corroborators = reaffirmed_origins_from_metadata(&row.metadata);
+                if let Some(o) = row.origin.as_deref() {
+                    if crate::origin::is_corroborating(o) {
+                        corroborators.insert(crate::origin::class_name(o).to_string());
+                    }
+                }
+                let new_class = crate::origin::class_name(&origin_str);
+                let new_is_corroborating = crate::origin::is_corroborating(&origin_str);
+                let is_novel = !corroborators.contains(new_class);
+                let mut projected = corroborators.clone();
+                if new_is_corroborating {
+                    projected.insert(new_class.to_string());
+                }
+                let boost = new_is_corroborating && is_novel && projected.len() >= 2;
+
+                if boost {
+                    conn.execute(
+                        "UPDATE memories
+                         SET metadata = ?1, access_count = access_count + 1,
+                             confidence = MIN(COALESCE(confidence, 1.0) + 0.1, 1.0)
+                         WHERE id = ?2 AND agent_id = ?3",
+                        params![new_meta, row.id, agent_id],
+                    )
+                    .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                    info!(agent_id, entry_id = %row.id, "temporal memory reaffirmed (confidence boosted)");
+                } else {
+                    conn.execute(
+                        "UPDATE memories SET metadata = ?1, access_count = access_count + 1
+                         WHERE id = ?2 AND agent_id = ?3",
+                        params![new_meta, row.id, agent_id],
+                    )
+                    .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                    info!(agent_id, entry_id = %row.id, "temporal memory reaffirmed");
+                }
                 return Ok(row.id.clone());
             }
 
@@ -1521,7 +1654,7 @@ impl SqliteMemoryEngine {
                 last_accessed_str, entry.source_event,
                 valid_from, valid_until, Option::<String>::None, supersedes,
                 meta.subject, meta.predicate, meta.object, confidence, metadata,
-                meta.origin, origin_trust, derived_from_json, now_str,
+                origin_str, origin_trust, derived_from_json, now_str,
                 if meta.quarantined { 1i64 } else { 0i64 }
             ],
         )
@@ -1676,6 +1809,21 @@ impl SqliteMemoryEngine {
             "SELECT origin_trust FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
             params![memory_id, agent_id],
             |r| r.get::<_, f64>(0),
+        )
+        .optional()
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))
+    }
+
+    /// Read back the stored `origin` string for a memory id (WP1). The outer
+    /// `Option` is `None` when the id is not found; the inner `Option` is `None`
+    /// only for legacy rows written before origin binding (new writes always
+    /// stamp at least "unattributed").
+    pub async fn get_origin(&self, agent_id: &str, memory_id: &str) -> Result<Option<Option<String>>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT origin FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
+            params![memory_id, agent_id],
+            |r| r.get::<_, Option<String>>(0),
         )
         .optional()
         .map_err(|e| DuDuClawError::Memory(e.to_string()))
@@ -3747,14 +3895,51 @@ mod tests {
 
     // ── P2-1: origin-bound trust (I8, non-malleable) ────────────────────────────
 
-    /// A plain store defaults origin_trust to 1.0 (backward compatible).
+    /// WP1: an unattributed write (no origin) fails safe to the UNATTRIBUTED
+    /// ceiling (0.6), NOT full trust, and its origin column reads "unattributed"
+    /// (never NULL) so D6 can roll back by origin. (Renamed from
+    /// `origin_trust_defaults_to_one` — the old 1.0 default was the洞1 gap.)
     #[tokio::test]
-    async fn origin_trust_defaults_to_one() {
+    async fn origin_trust_defaults_to_unattributed_ceiling() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "trust-default";
         let e = make_entry(agent, "x", vec![]);
         let id = engine.store_temporal(agent, e, TemporalMeta::default()).await.unwrap();
-        assert_eq!(engine.get_origin_trust(agent, &id).await.unwrap(), Some(1.0));
+        assert_eq!(engine.get_origin_trust(agent, &id).await.unwrap(), Some(0.6));
+        // origin is stamped, not left NULL.
+        let origin = engine.get_origin(agent, &id).await.unwrap().flatten();
+        assert_eq!(origin.as_deref(), Some("unattributed"));
+    }
+
+    /// WP1 redteam: a plain store no longer mints a maximally-trusted fact.
+    #[tokio::test]
+    async fn plain_store_no_longer_defaults_full_trust() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "trust-plain";
+        let id = engine
+            .store_temporal(agent, make_entry(agent, "y", vec![]), TemporalMeta::default())
+            .await
+            .unwrap();
+        let trust = engine.get_origin_trust(agent, &id).await.unwrap().unwrap();
+        assert!(trust < 1.0, "unattributed write must not be fully trusted: {trust}");
+    }
+
+    /// WP1 redteam: an agent-derived write claiming trust 1.0 is capped to the
+    /// AGENT_DERIVED ceiling (0.6) — a caller cannot launder up its provenance.
+    #[tokio::test]
+    async fn redteam_agent_derived_cannot_claim_full_trust() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "trust-agent-derived";
+        let meta = TemporalMeta {
+            origin: Some("agent_derived".into()),
+            origin_trust: Some(1.0),
+            ..Default::default()
+        };
+        let id = engine
+            .store_temporal(agent, make_entry(agent, "self claim", vec![]), meta)
+            .await
+            .unwrap();
+        assert_eq!(engine.get_origin_trust(agent, &id).await.unwrap(), Some(0.6));
     }
 
     /// A declared low origin_trust is stored and clamped to [0,1].
@@ -3771,10 +3956,20 @@ mod tests {
         let id = engine.store_temporal(agent, e, meta).await.unwrap();
         assert_eq!(engine.get_origin_trust(agent, &id).await.unwrap(), Some(0.3));
 
-        // Above-range trust is clamped to 1.0.
+        // Above-range trust is clamped to 1.0 — under a full-trust origin
+        // (operator ceiling 1.0) so the [0,1] clamp is what caps it here, not
+        // the WP1 origin ceiling.
         let e2 = make_entry(agent, "y", vec![]);
         let id2 = engine
-            .store_temporal(agent, e2, TemporalMeta { origin_trust: Some(5.0), ..Default::default() })
+            .store_temporal(
+                agent,
+                e2,
+                TemporalMeta {
+                    origin: Some("operator".into()),
+                    origin_trust: Some(5.0),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(engine.get_origin_trust(agent, &id2).await.unwrap(), Some(1.0));
@@ -3982,6 +4177,94 @@ mod tests {
 
         let entries = engine.get_by_ids(agent, &[id1.clone()]).await.unwrap();
         assert_eq!(entries[0].access_count, 1, "access_count bumped on reaffirm");
+    }
+
+    /// Build a reaffirmable triple meta with a given origin + source_event.
+    fn reaffirm_meta(origin: &str, event: &str) -> TemporalMeta {
+        TemporalMeta {
+            subject: Some("user".into()),
+            predicate: Some("lang".into()),
+            object: Some("python".into()),
+            origin: Some(origin.into()),
+            source_event: Some(event.into()),
+            confidence: Some(0.85),
+            ..Default::default()
+        }
+    }
+
+    /// WP1 redteam: re-observing a fact from the SAME origin class never raises
+    /// confidence (a source cannot vouch for itself N times — Sybil defense).
+    #[tokio::test]
+    async fn redteam_same_origin_reaffirm_does_not_boost_confidence() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "reaffirm-sybil";
+        let content = "likes python";
+
+        engine
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", "e0"))
+            .await
+            .unwrap();
+
+        // Three reaffirmations, all from the SAME origin class.
+        for ev in ["e1", "e2", "e3"] {
+            engine
+                .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", ev))
+                .await
+                .unwrap();
+        }
+
+        let hist = engine.get_history(agent, "user", "lang").await.unwrap();
+        assert_eq!(hist.len(), 1, "no new rows — all reaffirms");
+        assert!(
+            (hist[0].confidence - 0.85).abs() < 1e-9,
+            "same-origin reaffirm must not boost, got {}",
+            hist[0].confidence
+        );
+    }
+
+    /// WP1: corroboration from ≥2 DISTINCT trustworthy origin classes raises
+    /// confidence (+0.1 each novel distinct class), capped at 1.0; a
+    /// non-corroborating (agent_derived) reaffirm and a repeat class do not.
+    #[tokio::test]
+    async fn distinct_origin_corroboration_boosts_capped() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "reaffirm-corrob";
+        let content = "likes python";
+        let conf = |h: &[TemporalRecord]| h[0].confidence;
+
+        // Row origin = operator (corroborating class #1), confidence 0.85.
+        engine
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("operator", "e0"))
+            .await
+            .unwrap();
+
+        // Reaffirm from import (distinct class #2) → boost to 0.95.
+        engine
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("import", "e1"))
+            .await
+            .unwrap();
+        let h = engine.get_history(agent, "user", "lang").await.unwrap();
+        assert!((conf(&h) - 0.95).abs() < 1e-9, "first distinct corroboration boosts: {}", conf(&h));
+
+        // Reaffirm from channel (distinct class #3) → +0.1 but capped at 1.0.
+        engine
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", "e2"))
+            .await
+            .unwrap();
+        let h = engine.get_history(agent, "user", "lang").await.unwrap();
+        assert!((conf(&h) - 1.0).abs() < 1e-9, "capped at 1.0: {}", conf(&h));
+
+        // Agent-derived reaffirm never corroborates; repeat-class does not boost.
+        engine
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("agent_derived", "e3"))
+            .await
+            .unwrap();
+        engine
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", "e4"))
+            .await
+            .unwrap();
+        let h = engine.get_history(agent, "user", "lang").await.unwrap();
+        assert!((conf(&h) - 1.0).abs() < 1e-9, "stays capped: {}", conf(&h));
     }
 
     /// A changed object supersedes (not reaffirms) — reaffirm must be object-exact.

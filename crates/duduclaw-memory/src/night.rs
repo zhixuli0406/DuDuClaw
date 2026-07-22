@@ -432,6 +432,8 @@ pub async fn induce_schema(
             predicate: Some("night_induced".to_string()),
             object: None,
             confidence: Some(0.8),
+            // WP1: night induction is the agent's own self-consolidation.
+            origin: Some(crate::origin::AGENT_DERIVED.name.to_string()),
             metadata: Some(serde_json::json!({
                 "support": theme.support,
                 "source_ids": theme.source_ids,
@@ -512,6 +514,8 @@ pub async fn consolidate_recurrent(
                 predicate: Some("night_consolidated".to_string()),
                 object: None,
                 confidence: Some(0.85),
+                // WP1: night consolidation is the agent's own self-consolidation.
+                origin: Some(crate::origin::AGENT_DERIVED.name.to_string()),
                 metadata: Some(serde_json::json!({
                     "support": theme.support,
                     "source_ids": theme.source_ids,

@@ -1,0 +1,23 @@
+# Offline replay example for the WP4 GroundEval `[[expect.grounded]]`
+# assertion (arXiv:2606.22737): the final answer must be traceable to real
+# tool evidence, not merely asserted.
+#
+#   duduclaw eval evals/examples/grounded-replay.toml --replay
+
+[case]
+name = "grounded-replay"
+agent = "support-bot"
+prompt = "查詢退款政策，並告訴我期限是幾天。"
+timeout_secs = 60
+max_turns = 5
+
+[expect]
+must_use_tools = ["memory_search"]
+
+# The final answer must (a) come from a non-error memory_search call whose
+# result shares a >=12-char run with the answer, and (b) the "30天內" the
+# answer cites must itself appear in that tool's result — not fabricated.
+[[expect.grounded]]
+tool = "memory_search"
+min_overlap_chars = 12
+output_regex = "30天內"
