@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Added
+- **OS-native agent Phase 1**：新增 `duduclaw-os` crate——跨平台檔案系統監看
+  （notify）、原生桌面通知、開啟目標 helper。Gateway `os_events.rs` 將 per-agent
+  `[os_watch]` 檔案事件串入 autopilot bus（新 `os_file` 觸發器 + stats 檔），由
+  opt-in `[capabilities] os_native` 閘控（預設關閉；未開啟時 `os_notify` /
+  `os_watch_status` / `os_open` MCP 工具在 dispatch 主閘直接拒絕）。CLI 新增
+  `duduclaw os` 子指令（通知 helper、doctor 診斷）；dashboard 新增
+  Settings › Automation 分頁與 agent 表單 os_native 開關 + `[os_watch]` 編輯器
+  （i18n en/ja/zh-TW）。`system.update_config` 熱重載 goal-loop / topology driver。
+
 - **記憶寫入來源綁定（TMA-NM，arXiv:2606.24322）**：新增 `duduclaw-memory` origin 分類表
   （`origin.rs`，8 類 + trust 天花板），`store_temporal` 強制 non-malleable 上限——
   最終 `origin_trust = min(呼叫端值, 該來源類別天花板, derived_from 最小值)`，呼叫端
@@ -43,6 +52,19 @@
   Prometheus 計數器（壓縮次數 per stage、守門跳過、疑似 cache-break）；
   `cache_attribution_snapshot()` 接上消費者（每小時 adaptive routing check 記錄
   top-10 破 cache 原因 + evolution event）。
+
+### Fixed
+- **WebChat model 顯示與 Agent 設定不一致（經銷商回報）**：四項根治——
+  ① `agents.update` 後的 registry re-scan 從 500ms best-effort 改為保證完成
+  （無條件取寫鎖 + 3 次重試；gateway 無週期性 rescan，漏掉一次就永久顯示舊
+  model 直到重啟）；② 設定變更即時廣播（`agent_config_events`）至活躍 WebChat
+  連線，重發帶 `refresh: true` 的 `session_info`——開著的分頁立即更新名稱/圖示/
+  model，且前端只更新 agent metadata、不動 session 狀態；③ 新增 dashboard-only
+  `ProgressEvent::ModelInfo`：解析 stream-json `message.model`（反映 CLI 端替換），
+  WebChat 蓋章到 `assistant_done.model`，UI 以實際值優先於設定意圖，文字頻道比照
+  Step 忽略；④ 無 agent 時的 hardcoded fallback `claude-sonnet-4-20250514` 統一為
+  `DEFAULT_PREFERRED_MODEL`（`claude-sonnet-4-6`，與 scaffold 預設一致），
+  `session_info` 同步顯示該值而非空白。
 
 ### Security
 - 記憶投毒防護強化：見 Added 的來源綁定（寫入端）與 GovMem 晉升門（整併端）。
