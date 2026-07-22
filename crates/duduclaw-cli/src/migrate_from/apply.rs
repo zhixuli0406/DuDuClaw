@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use duduclaw_core::error::{DuDuClawError, Result};
+#[allow(unused_imports)]
 use duduclaw_core::traits::MemoryEngine as _;
 use duduclaw_core::types::{MemoryEntry, MemoryLayer, RuntimeType};
 use duduclaw_memory::SqliteMemoryEngine;
@@ -62,7 +63,12 @@ pub(super) async fn import_facts(
     let mut ok = 0usize;
     for f in facts {
         let entry = build_semantic_entry(agent_id, f, ctx.platform);
-        if eng.store(agent_id, entry).await.is_ok() {
+        // WP1: migrated facts carry the `import` origin (ceiling 0.7).
+        let meta = duduclaw_memory::TemporalMeta {
+            origin: Some("import".to_string()),
+            ..Default::default()
+        };
+        if eng.store_temporal(agent_id, entry, meta).await.is_ok() {
             ok += 1;
         }
     }

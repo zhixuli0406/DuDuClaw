@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"00000000-0000-0000-0000-000000000002"}
+{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__duduclaw__memory_search","input":{"query":"退款政策"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"退款政策:訂單完成後30天內可申請退款,需附上原始收據。","is_error":false}]}}
+{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"根據查詢結果,退款政策:訂單完成後30天內可申請退款,需附上原始收據。"}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"根據查詢結果,退款政策:訂單完成後30天內可申請退款,需附上原始收據。","usage":{"input_tokens":80,"output_tokens":30}}

@@ -28,7 +28,9 @@ evals/
 ├── examples/                      # runnable samples
 │   ├── refund-flow.toml           # live case (needs an agent + credentials)
 │   ├── greeting-replay.toml       # offline replay case
-│   └── greeting-replay.transcript.jsonl
+│   ├── greeting-replay.transcript.jsonl
+│   ├── grounded-replay.toml       # offline replay case ([[expect.grounded]])
+│   └── grounded-replay.transcript.jsonl
 └── <suite>/                       # your suites: one .toml per case
     ├── <case>.toml
     └── <case>.transcript.jsonl    # recorded baseline (via --record)
@@ -60,6 +62,17 @@ output_not_contains = ["sk-ant-"]
 output_regex = "(?i)refund"           # Rust regex over the final answer
 min_text_blocks = 1
 max_tool_calls = 10
+
+# Zero or more trace-grounding assertions (GroundEval, arXiv:2606.22737):
+# the final answer must be traceable to real tool evidence, not merely
+# asserted. Requires a transcript with tool_result capture (record with a
+# CLI build that includes WP4; older recorded transcripts fail closed with
+# an actionable detail).
+[[expect.grounded]]
+tool = "memory_search"        # must be called >=1 time without erroring
+min_overlap_chars = 12        # default 12; CJK-safe char count
+# output_regex = "30 days"    # optional: the matched fragment of the final
+                               # answer must also appear in the tool result
 
 [judge]                       # optional LLM rubric
 enabled = true                # default true when the section exists
@@ -94,4 +107,5 @@ Notes:
 ```bash
 # Offline, no credentials needed:
 duduclaw eval evals/examples/greeting-replay.toml --replay
+duduclaw eval evals/examples/grounded-replay.toml --replay
 ```

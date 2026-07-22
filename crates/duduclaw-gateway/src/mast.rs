@@ -293,6 +293,15 @@ pub fn classify_eval_assertion(name: &str) -> MastLabel {
         "output_not_contains:",
         "output_regex:",
     ];
+    // WP4 GroundEval (arXiv:2606.22737): a `grounded:` assertion failure
+    // means the final answer could not be traced back to real tool
+    // evidence — the task-verification failure to check the agent's own
+    // claims, i.e. FM-3.3. This is a structural classification (the
+    // assertion *type* itself is deterministic evidence), not a semantic
+    // guess about the content.
+    if name.starts_with("grounded:") {
+        return MastLabel::Mode(MastMode::NoOrIncorrectVerification);
+    }
     if SPEC_PREFIXES.iter().any(|p| name.starts_with(p)) {
         return MastLabel::Mode(MastMode::DisobeyTaskSpecification);
     }
@@ -514,6 +523,10 @@ mod tests {
             ("max_tool_calls: 3", MastLabel::Unclassified),
             ("min_text_blocks: 2", MastLabel::Unclassified),
             ("something_new: x", MastLabel::Unclassified),
+            (
+                "grounded: tool=memory_search min_overlap_chars=12",
+                MastLabel::Mode(MastMode::NoOrIncorrectVerification),
+            ),
         ];
         for (name, want) in cases {
             assert_eq!(classify_eval_assertion(name), *want, "name: {name}");

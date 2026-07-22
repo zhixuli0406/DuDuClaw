@@ -1088,7 +1088,16 @@ async fn spawn_session_for_key(
     // cadence as model/account keying). `None` (agent.toml missing — synthetic
     // test ids) keeps the legacy capability-less args.
     let agent_dir = home.join("agents").join(&key.agent_id);
-    if let Some(caps) = crate::runtime::load_agent_capabilities(&agent_dir) {
+    if let Some(mut caps) = crate::runtime::load_agent_capabilities(&agent_dir) {
+        // WP3 (PORTICO) auxiliary enforcement: fold `scoped_tools` without an
+        // active task-scoped grant into the denied set BEFORE mapping to CLI
+        // flags, so the interactive spawn also omits ungranted scoped tools from
+        // its allow surface. Fail-closed inside the helper (store error → all
+        // scoped disallowed). The MCP dispatch gate is the primary enforcement.
+        let scoped_disallow = crate::capability_grants::scoped_disallow_for_agent_dir(&agent_dir);
+        if !scoped_disallow.is_empty() {
+            caps.denied_tools.extend(scoped_disallow);
+        }
         let cap_args = capability_extra_args(key.cli_kind, &caps);
         if matches!(key.cli_kind, CliKind::Antigravity) {
             warn!(

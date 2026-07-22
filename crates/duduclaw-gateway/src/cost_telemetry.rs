@@ -273,6 +273,12 @@ pub struct CostRecord {
     /// Estimated savings from prompt caching (millicents).
     pub cache_savings_millicents: u64,
     pub created_at: String,
+    /// WP5: whether the prompt-compression pipeline rewrote this request's
+    /// history before sending.
+    pub compressed: bool,
+    /// WP5: comma-joined compression stage names that ran (empty when
+    /// `compressed` is false).
+    pub compression_stages: String,
 }
 
 /// Aggregated cost summary for a time window.
@@ -484,6 +490,21 @@ impl CostTelemetry {
         )
         .map_err(|e| format!("token_usage user index: {e}"))?;
 
+        // WP5 additive migration (2607.12161): per-request compression
+        // observability. Idempotent — same "duplicate column name" ignore
+        // pattern as the WP6 migration above.
+        for stmt in [
+            "ALTER TABLE token_usage ADD COLUMN compressed INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE token_usage ADD COLUMN compression_stages TEXT NOT NULL DEFAULT ''",
+        ] {
+            if let Err(e) = conn.execute(stmt, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(format!("token_usage compression migration failed: {e}"));
+                }
+            }
+        }
+
         // Ephemeral-agent parent attribution (2026-07): `eph-<uuid>` scaffolds
         // record their parent here at scaffold time (see
         // `crate::ephemeral::scaffold` → [`record_ephemeral_parent`]). Raw
@@ -528,19 +549,63 @@ impl CostTelemetry {
         user_id: Option<&str>,
         channel: Option<&str>,
     ) {
+        self.record_attributed_with_compression(
+            agent_id, request_type, model, usage, user_id, channel, false, "",
+        )
+        .await;
+    }
+
+    /// Full recorder with WP5 compression observability. `compressed`
+    /// marks whether the prompt-compression pipeline actually rewrote the
+    /// history sent for this request; `stages` is a comma-joined list of
+    /// the stage names that ran (pass `""` when `compressed` is false).
+    ///
+    /// [`Self::record`] / [`Self::record_attributed`] keep their original
+    /// signatures and delegate here with `compressed=false` — every
+    /// existing caller stays byte-identical.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_attributed_with_compression(
+        &self,
+        agent_id: &str,
+        request_type: RequestType,
+        model: &str,
+        usage: &TokenUsage,
+        user_id: Option<&str>,
+        channel: Option<&str>,
+        compressed: bool,
+        stages: &str,
+    ) {
         let now = chrono::Utc::now().to_rfc3339();
         let efficiency = usage.cache_efficiency();
         let cost = cost_for(model, usage);
         let cache_hit_rate = usage.cache_efficiency();
         let cache_savings = usage.cache_savings_millicents();
 
+        // WP5 cache-break detection: capture the agent's most recent
+        // cache_efficiency BEFORE inserting this row, so "previous" means
+        // the prior request, not this one. Best-effort — a read failure
+        // (e.g. brand-new agent with no rows yet) just skips the check.
+        let prev_efficiency: Option<f64> = if compressed {
+            let conn = self.conn.lock().await;
+            conn.query_row(
+                "SELECT cache_efficiency FROM token_usage
+                 WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .ok()
+        } else {
+            None
+        };
+
         let conn = self.conn.lock().await;
         let result = conn.execute(
             "INSERT INTO token_usage
              (agent_id, request_type, model, input_tokens, cache_read_tokens,
               cache_creation_tokens, output_tokens, cache_efficiency, cost_millicents,
-              cache_hit_rate, cache_savings_millicents, created_at, user_id, channel)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              cache_hit_rate, cache_savings_millicents, created_at, user_id, channel,
+              compressed, compression_stages)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 agent_id,
                 request_type.as_str(),
@@ -556,12 +621,34 @@ impl CostTelemetry {
                 now,
                 user_id,
                 channel,
+                compressed as i64,
+                stages,
             ],
         );
+        drop(conn);
 
         if let Err(e) = result {
             warn!(error = %e, "Failed to record token usage");
             return;
+        }
+
+        // WP5 (2607.12161): a compressed request whose cache efficiency
+        // craters right after a previously-healthy row for the same agent
+        // is the cache-break signature the paper describes — compression
+        // likely rewrote content inside the cached prefix, forcing a full
+        // rebuild instead of the incremental cache-read it expected.
+        if compressed
+            && efficiency < 0.1
+            && prev_efficiency.is_some_and(|prev| prev > 0.5)
+        {
+            warn!(
+                agent_id,
+                stages,
+                cache_efficiency = %format!("{:.1}%", efficiency * 100.0),
+                prev_cache_efficiency = %format!("{:.1}%", prev_efficiency.unwrap_or(0.0) * 100.0),
+                "compression likely broke cache prefix"
+            );
+            crate::metrics::global_metrics().prompt_compression_cache_break_suspect();
         }
 
         // Log warnings for anomalies
@@ -834,7 +921,8 @@ impl CostTelemetry {
             .prepare(
                 "SELECT agent_id, request_type, model, input_tokens, cache_read_tokens,
                         cache_creation_tokens, output_tokens, cache_efficiency,
-                        cost_millicents, cache_hit_rate, cache_savings_millicents, created_at
+                        cost_millicents, cache_hit_rate, cache_savings_millicents, created_at,
+                        compressed, compression_stages
                  FROM token_usage
                  ORDER BY id DESC
                  LIMIT ?1",
@@ -856,6 +944,8 @@ impl CostTelemetry {
                     cache_hit_rate: row.get(9)?,
                     cache_savings_millicents: safe_u64(row.get::<_, i64>(10)?),
                     created_at: row.get(11)?,
+                    compressed: row.get::<_, i64>(12)? != 0,
+                    compression_stages: row.get(13)?,
                 })
             })
             .map_err(|e| format!("recent_records query: {e}"))?;
@@ -1164,6 +1254,42 @@ fn safe_u64(val: i64) -> u64 {
     val.max(0) as u64
 }
 
+/// WP5 — best-effort `cache_attribution_summary` evolution-event write.
+/// Mirrors [`spawn_evolution_event_write`]'s pattern (spawn_blocking, off
+/// the hot path, silently skipped if `prediction.db` can't be opened).
+/// `agent_id` is `"(system)"` since cache attribution scopes are
+/// `agent:model` pairs, not a single owning agent.
+fn spawn_cache_attribution_event_write(telemetry_db: &Path, top: Vec<(String, String, u64)>) {
+    let prediction_db = resolve_prediction_db_path(telemetry_db);
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let ts = chrono::Utc::now().to_rfc3339();
+    let summary = top
+        .iter()
+        .take(10)
+        .map(|(scope, cause, count)| format!("{scope}:{cause}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let trigger_ctx = format!("[cache_attribution] top invalidation causes: {summary}");
+    tokio::task::spawn_blocking(move || {
+        let conn = match rusqlite::Connection::open(&prediction_db) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(?prediction_db, error = %e, "cache_attribution event write skipped — open failed");
+                return;
+            }
+        };
+        if let Err(e) = conn.execute(
+            "INSERT INTO evolution_events
+             (event_id, agent_id, event_type, composite_error, error_category,
+              trigger_context, version_id, rollback_reason, timestamp)
+             VALUES (?1, '(system)', 'cache_attribution_summary', NULL, NULL, ?2, NULL, NULL, ?3)",
+            params![event_id, trigger_ctx, ts],
+        ) {
+            warn!(error = %e, "cache_attribution event insert failed");
+        }
+    });
+}
+
 /// Runtime adaptive routing overrides — agents with degraded cache get prefer_local=true.
 ///
 /// Stored in-memory (not persisted) — resets on restart. Agents with cache
@@ -1243,6 +1369,22 @@ pub async fn adaptive_routing_check(home_dir: &std::path::Path) {
     // Also clean up old telemetry records (keep 30 days)
     if let Err(e) = telemetry.cleanup_old_records(30).await {
         warn!(error = %e, "Telemetry cleanup failed");
+    }
+
+    // WP5 (2607.12161): surface which system-prompt block keeps breaking
+    // the Direct API cache prefix. `cache_attribution_snapshot` has had
+    // zero consumers since it was added — this hourly tick is the first
+    // one. Log the top 10 causes and persist a best-effort evolution
+    // event so "which block keeps breaking cache" is at least visible,
+    // instead of only the aggregate cache_efficiency trend this function
+    // already tracks.
+    let mut attribution = crate::direct_api::cache_attribution_snapshot();
+    attribution.sort_by(|a, b| b.2.cmp(&a.2)); // count desc
+    for (scope, cause, count) in attribution.iter().take(10) {
+        info!(scope, cause, count, "cache attribution: top invalidation cause");
+    }
+    if !attribution.is_empty() {
+        spawn_cache_attribution_event_write(&telemetry.db_path, attribution);
     }
 }
 
@@ -1468,6 +1610,149 @@ mod tests {
         let usage = TokenUsage { input_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 1 };
         t2.record("a", RequestType::Chat, "claude-sonnet-4-6", &usage).await;
         assert_eq!(t2.summary_global(1).await.unwrap().total_requests, 1);
+    }
+
+    // ── WP5: cache-aware compression gate (2607.12161) ──────────────────────
+
+    #[tokio::test]
+    async fn wp5_migration_is_idempotent() {
+        // Same guard as wp6_migration_is_idempotent, for the compressed /
+        // compression_stages columns: opening the same DB twice must not
+        // fail on the additive ALTERs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wp5_mig.db");
+        let _t1 = CostTelemetry::new(&path).unwrap();
+        drop(_t1);
+        let t2 = CostTelemetry::new(&path).unwrap();
+        let usage = TokenUsage { input_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 1 };
+        t2.record("a", RequestType::Chat, "claude-sonnet-4-6", &usage).await;
+        let records = t2.recent_records(1).await.unwrap();
+        assert!(!records[0].compressed);
+        assert_eq!(records[0].compression_stages, "");
+    }
+
+    #[tokio::test]
+    async fn wp5_compression_fields_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("wp5.db")).unwrap();
+        let usage = TokenUsage {
+            input_tokens: 100,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 10,
+        };
+        telemetry
+            .record_attributed_with_compression(
+                "agent_x",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &usage,
+                Some("u-1"),
+                Some("telegram:1"),
+                true,
+                "turn_trim,drop_oldest_tool_echoes",
+            )
+            .await;
+
+        let records = telemetry.recent_records(1).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].compressed);
+        assert_eq!(records[0].compression_stages, "turn_trim,drop_oldest_tool_echoes");
+    }
+
+    #[tokio::test]
+    async fn wp5_record_attributed_defaults_to_not_compressed() {
+        // The legacy `record_attributed` entry point must keep behaving
+        // exactly as before — compressed=false, stages="".
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("wp5b.db")).unwrap();
+        let usage = TokenUsage { input_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 1 };
+        telemetry
+            .record_attributed("agent_y", RequestType::Chat, "claude-sonnet-4-6", &usage, None, None)
+            .await;
+        let records = telemetry.recent_records(1).await.unwrap();
+        assert!(!records[0].compressed);
+        assert_eq!(records[0].compression_stages, "");
+    }
+
+    #[tokio::test]
+    async fn wp5_cache_break_suspect_counter_fires_on_craters_after_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("wp5c.db")).unwrap();
+        let before = crate::metrics::global_metrics()
+            .prompt_compression_cache_break_suspect_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // First row: healthy cache (cache_read dominates → efficiency > 0.5).
+        let healthy = TokenUsage {
+            input_tokens: 100,
+            cache_read_tokens: 900,
+            cache_creation_tokens: 0,
+            output_tokens: 10,
+        };
+        telemetry
+            .record_attributed_with_compression(
+                "agent_break", RequestType::Chat, "claude-sonnet-4-6", &healthy, None, None, false, "",
+            )
+            .await;
+
+        // Second row: compressed, and cache efficiency craters (all fresh
+        // input, no cache read) — the cache-break signature.
+        let cratered = TokenUsage {
+            input_tokens: 1000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 10,
+        };
+        telemetry
+            .record_attributed_with_compression(
+                "agent_break", RequestType::Chat, "claude-sonnet-4-6", &cratered, None, None, true, "turn_trim",
+            )
+            .await;
+
+        let after = crate::metrics::global_metrics()
+            .prompt_compression_cache_break_suspect_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before + 1, "cache-break suspect counter should increment exactly once");
+    }
+
+    #[tokio::test]
+    async fn wp5_cache_break_suspect_does_not_fire_when_not_compressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("wp5d.db")).unwrap();
+        let before = crate::metrics::global_metrics()
+            .prompt_compression_cache_break_suspect_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let healthy = TokenUsage {
+            input_tokens: 100,
+            cache_read_tokens: 900,
+            cache_creation_tokens: 0,
+            output_tokens: 10,
+        };
+        telemetry
+            .record_attributed_with_compression(
+                "agent_no_break", RequestType::Chat, "claude-sonnet-4-6", &healthy, None, None, false, "",
+            )
+            .await;
+        let cratered = TokenUsage {
+            input_tokens: 1000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 10,
+        };
+        // NOT compressed — even though the efficiency pattern matches, the
+        // gate must not fire because compression didn't happen.
+        telemetry
+            .record_attributed_with_compression(
+                "agent_no_break", RequestType::Chat, "claude-sonnet-4-6", &cratered, None, None, false, "",
+            )
+            .await;
+
+        let after = crate::metrics::global_metrics()
+            .prompt_compression_cache_break_suspect_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before, "must not fire when compressed=false");
     }
 
     // ── W1: registry-based per-model pricing ────────────────────────────────

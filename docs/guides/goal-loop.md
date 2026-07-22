@@ -63,6 +63,26 @@ autonomy_level = "approver"
 
 ---
 
+## 階段性授權工具（scoped_tools，v1.41）
+
+高風險工具可以宣告為「持授權才可用」：列在 `scoped_tools` 的工具，AI 員工沒有拿到有效授權（grant）前一律拒絕，且授權只活在單一任務的生命週期內——任務結束（通過、駁回、轉人工、取消）時全部自動撤銷，不會殘留到下一件事。
+
+```toml
+# agent.toml
+[capabilities]
+scoped_tools = ["shared_wiki_delete", "odoo_execute"]  # 這些工具需逐任務授權
+grant_ttl_secs = 3600                                   # 授權硬性存活上限（秒），預設 3600
+```
+
+取得授權的兩條路：
+
+1. **AI 員工自行申請**：呼叫 MCP 工具 `capability_request { tool, reason, task_id? }`，會轉成一則審批（與其他審批走同一個通知/儀表板介面）；你核准後授權生效，逾時未決視同拒絕。
+2. **目標任務開工時一併授予**：goal 任務的 tags 加 `grant:<工具名>`，kickoff 審批（collaborator/consultant 級）通過時原子性授予，任務結束自動收回。
+
+判定一律 fail-closed：授權資料庫讀不到就是沒有授權。未列入 `scoped_tools` 的工具完全不受影響。
+
+---
+
 ## 設定鍵
 
 ### `config.toml`（全域）

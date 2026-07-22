@@ -65,6 +65,7 @@ pub mod autopilot_store;
 pub mod autopilot_engine;
 pub mod approval;
 pub mod capability;
+pub mod capability_grants;
 pub mod growth;
 pub mod custom_skills;
 pub mod custom_widgets;

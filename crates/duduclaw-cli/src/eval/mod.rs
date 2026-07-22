@@ -524,7 +524,7 @@ mod tests {
     }
 
     /// The shipped `evals/examples/` files must always load, and the
-    /// replay-ready example must pass end-to-end offline.
+    /// replay-ready examples must pass end-to-end offline.
     #[tokio::test]
     async fn shipped_examples_stay_valid_and_replayable() {
         let examples = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -532,6 +532,7 @@ mod tests {
 
         case::load_case(&examples.join("refund-flow.toml")).unwrap();
         case::load_case(&examples.join("greeting-replay.toml")).unwrap();
+        case::load_case(&examples.join("grounded-replay.toml")).unwrap();
 
         let judge = StubJudge("unused");
         let o = EvalOptions {
@@ -550,6 +551,36 @@ mod tests {
             reports[0].error, reports[0].assertions
         );
         assert_eq!(reports[0].tool_calls.len(), 1);
+    }
+
+    /// WP4 GroundEval: the shipped `grounded-replay` example must pass its
+    /// `[[expect.grounded]]` assertion end-to-end offline (regression guard
+    /// for the transcript pairing + assertion logic together, not just each
+    /// in isolation).
+    #[tokio::test]
+    async fn shipped_grounded_example_stays_replayable() {
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../evals/examples");
+        let judge = StubJudge("unused");
+        let o = EvalOptions {
+            path: Some(examples.join("grounded-replay.toml")),
+            filter: None,
+            replay: true,
+            record: false,
+            no_judge: true,
+            report: None,
+        };
+        let reports = run_eval(&examples, &o, &judge).await;
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].passed,
+            "shipped grounded example failed: error={:?} assertions={:?}",
+            reports[0].error, reports[0].assertions
+        );
+        assert!(reports[0]
+            .assertions
+            .iter()
+            .any(|a| a.name.starts_with("grounded:") && a.passed));
     }
 
     #[tokio::test]

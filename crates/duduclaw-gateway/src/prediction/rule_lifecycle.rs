@@ -9,14 +9,24 @@
 //! stored in the entry's metadata JSON (`{"rule_stats":{...}}`, no schema
 //! migration). The lifecycle is fully deterministic (zero LLM cost):
 //!
-//! 1. F2b seeds new rules with `helpful = 2` (ExpeL initial importance).
+//! 1. F2b seeds new rules with `helpful = 1` and tags them
+//!    [`PROBATION_RULE_TAG`] (WP2 Janus arXiv:2606.31121 trial period — a
+//!    freshly consolidated rule hasn't earned trust yet; the old
+//!    `helpful = 2` seed let one bad rule survive two harmful outcomes
+//!    while polluting the injected prompt the whole time).
 //! 2. F2a injection selects non-retired rules ranked by net score
-//!    (`helpful − harmful`, descending) and records the injected ids.
+//!    (`helpful − harmful`, descending; ties put probation rules after
+//!    graduated ones) and records the injected ids.
 //! 3. At prediction-outcome settlement the turn's final [`ErrorCategory`]
 //!    credits (Negligible/Moderate → `helpful += 1`) or blames
 //!    (Significant/Critical → `harmful += 1`) each injected rule.
-//! 4. When `helpful.saturating_sub(harmful) == 0` the rule is retired:
-//!    importance dropped and tagged [`RETIRED_RULE_TAG`] so F2a skips it.
+//! 4. Probation rules retire on their **first** harmful outcome, full stop
+//!    (Janus one-strike trial), regardless of any helpful credit banked so
+//!    far. They **graduate** — [`PROBATION_RULE_TAG`] is removed — once
+//!    `helpful >= `[`PROBATION_GRADUATE_HELPFUL`] with zero harmful strikes.
+//!    Graduated (non-probation) rules keep the original generic rule:
+//!    `helpful.saturating_sub(harmful) == 0` retires (importance dropped,
+//!    tagged [`RETIRED_RULE_TAG`], so F2a skips it).
 
 use std::path::{Path, PathBuf};
 
@@ -31,10 +41,22 @@ use super::engine::ErrorCategory;
 pub const RULE_SOURCE_EVENT: &str = "reflexion_consolidation";
 /// Tag appended on retirement; F2a selection excludes entries carrying it.
 pub const RETIRED_RULE_TAG: &str = "retired-rule";
+/// Tag appended to a freshly consolidated rule (WP2 Janus trial period).
+/// Removed on graduation (`helpful >= PROBATION_GRADUATE_HELPFUL` with no
+/// harmful strikes yet); any harmful strike while present retires the rule
+/// immediately regardless of accumulated helpful credit.
+pub const PROBATION_RULE_TAG: &str = "probation-rule";
+/// Cumulative helpful settlements (with zero harmful strikes) required for a
+/// probation rule to graduate — i.e. lose [`PROBATION_RULE_TAG`].
+pub const PROBATION_GRADUATE_HELPFUL: u32 = 3;
 /// Max rules injected per turn — mirrors the F2a mistake-injection cap.
 pub const INJECTION_LIMIT: usize = 3;
-/// ExpeL: new rules start with importance 2 → `helpful = 2, harmful = 0`.
-const INITIAL_HELPFUL: u32 = 2;
+/// Janus trial period (WP2): new rules start on probation with the minimum
+/// possible credit → `helpful = 1, harmful = 0`. A single harmful strike
+/// during probation retires the rule outright (see [`settle_injected_rules`]);
+/// this replaces the old ExpeL `helpful = 2` seed which let one bad rule
+/// survive two harmful outcomes before demotion.
+const INITIAL_HELPFUL: u32 = 1;
 /// Importance assigned on retirement (fresh rules are stored at 8.0).
 const RETIRED_IMPORTANCE: f64 = 1.0;
 /// Metadata JSON key holding the counters.
@@ -107,14 +129,19 @@ pub struct InjectedRule {
     pub id: String,
     pub content: String,
     pub net: i64,
+    /// Still on the Janus trial period (carries [`PROBATION_RULE_TAG`]).
+    pub probation: bool,
 }
 
 /// Select active (non-retired) consolidated rules for F2a injection, ranked
 /// by net score descending, capped at `limit`.
 ///
-/// Ties keep newest-first order (the underlying listing is newest-first and
-/// the sort is stable). Errors degrade to an empty selection — rule injection
-/// is an enhancement, never a reply blocker.
+/// At equal net score, graduated rules are preferred over probation rules
+/// (WP2 Janus — a trial-period rule hasn't earned the same trust as a
+/// graduated one even if its score currently ties). Beyond that, ties keep
+/// newest-first order (the underlying listing is newest-first and the sort
+/// is stable). Errors degrade to an empty selection — rule injection is an
+/// enhancement, never a reply blocker.
 pub async fn select_rules(
     engine: &SqliteMemoryEngine,
     agent_id: &str,
@@ -136,11 +163,12 @@ pub async fn select_rules(
         .filter(|(entry, _)| !entry.tags.iter().any(|t| t == RETIRED_RULE_TAG))
         .map(|(entry, metadata)| InjectedRule {
             net: RuleStats::from_metadata(&metadata).net(),
+            probation: entry.tags.iter().any(|t| t == PROBATION_RULE_TAG),
             id: entry.id,
             content: entry.content,
         })
         .collect();
-    rules.sort_by(|a, b| b.net.cmp(&a.net));
+    rules.sort_by(|a, b| b.net.cmp(&a.net).then(a.probation.cmp(&b.probation)));
     rules.truncate(limit);
     rules
 }
@@ -172,14 +200,25 @@ pub fn build_rules_section_blocking(
 /// Settle lifecycle counters for the rules injected into a finished turn.
 ///
 /// For each rule id: bump helpful/harmful per `category`, persist the merged
-/// metadata, and retire the rule (low importance + [`RETIRED_RULE_TAG`]) when
-/// its credit is spent. Returns the ids retired by this settlement.
+/// metadata, then apply the Janus trial-period rule (WP2):
+/// - **Probation** rule (carries [`PROBATION_RULE_TAG`]) hit by a harmful
+///   outcome this turn → retire immediately (low importance +
+///   [`RETIRED_RULE_TAG`]), regardless of any helpful credit banked so far.
+/// - Probation rule with a helpful outcome this turn and
+///   `helpful >= `[`PROBATION_GRADUATE_HELPFUL`] → graduate: remove
+///   [`PROBATION_RULE_TAG`], stays active.
+/// - Graduated (non-probation) rule → original generic rule: retire when
+///   `helpful.saturating_sub(harmful) == 0`.
+///
+/// Returns the ids retired by this settlement.
 pub async fn settle_injected_rules(
     engine: &SqliteMemoryEngine,
     agent_id: &str,
     rule_ids: &[String],
     category: ErrorCategory,
 ) -> Vec<String> {
+    let is_harmful_event =
+        matches!(category, ErrorCategory::Significant | ErrorCategory::Critical);
     let mut retired = Vec::new();
     for id in rule_ids {
         // Rule may have been superseded/deleted between injection and
@@ -192,6 +231,17 @@ pub async fn settle_injected_rules(
                 continue;
             }
         };
+        // Tags live on the entry row, not in the metadata blob — a separate
+        // read is needed to know whether this rule is still on probation.
+        let entry = match engine.get_by_id(agent_id, id).await {
+            Ok(Some(e)) => e,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(agent = %agent_id, rule = %id, "rule lifecycle: read entry failed: {e}");
+                continue;
+            }
+        };
+        let is_probation = entry.tags.iter().any(|t| t == PROBATION_RULE_TAG);
 
         let mut stats = RuleStats::from_metadata(&metadata);
         stats.record(category);
@@ -202,7 +252,29 @@ pub async fn settle_injected_rules(
             continue;
         }
 
-        if stats.is_spent() {
+        if is_probation && is_harmful_event {
+            // Janus one-strike trial: any harmful outcome during probation
+            // retires the rule outright, no net-score grace period.
+            match engine
+                .set_importance_and_add_tag(agent_id, id, RETIRED_IMPORTANCE, RETIRED_RULE_TAG)
+                .await
+            {
+                Ok(true) => retired.push(id.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(agent = %agent_id, rule = %id, "rule lifecycle: retire failed: {e}");
+                }
+            }
+        } else if is_probation {
+            // Helpful outcome while on probation — graduate once enough
+            // credit is banked (zero harmful strikes by construction, since
+            // any harmful strike above already retired the rule this turn).
+            if stats.helpful >= PROBATION_GRADUATE_HELPFUL {
+                if let Err(e) = engine.remove_tag(agent_id, id, PROBATION_RULE_TAG).await {
+                    warn!(agent = %agent_id, rule = %id, "rule lifecycle: graduate failed: {e}");
+                }
+            }
+        } else if stats.is_spent() {
             match engine
                 .set_importance_and_add_tag(agent_id, id, RETIRED_IMPORTANCE, RETIRED_RULE_TAG)
                 .await
@@ -254,19 +326,26 @@ mod tests {
     use duduclaw_memory::TemporalMeta;
 
     /// Store a consolidated rule with explicit counters; returns its id.
+    /// `probation` tags the entry [`PROBATION_RULE_TAG`] to simulate a
+    /// freshly F2b-consolidated rule under the Janus trial period.
     async fn store_rule(
         engine: &SqliteMemoryEngine,
         agent: &str,
         content: &str,
         stats: RuleStats,
         age_secs: i64,
+        probation: bool,
     ) -> String {
+        let mut tags = vec!["reflexion".to_string(), "consolidated".to_string()];
+        if probation {
+            tags.push(PROBATION_RULE_TAG.to_string());
+        }
         let entry = MemoryEntry {
             id: uuid::Uuid::new_v4().to_string(),
             agent_id: agent.to_string(),
             content: content.to_string(),
             timestamp: chrono::Utc::now() - chrono::Duration::seconds(age_secs),
-            tags: vec!["reflexion".to_string(), "consolidated".to_string()],
+            tags,
             embedding: None,
             layer: MemoryLayer::Semantic,
             importance: 8.0,
@@ -293,20 +372,22 @@ mod tests {
     async fn settlement_increments_correct_counter_per_category() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-rl";
-        let id = store_rule(&engine, agent, "rule A", RuleStats::initial(), 0).await;
+        // Non-probation (graduated-style) rule: exercises the generic
+        // net-score accounting path in isolation from Janus probation rules.
+        let id = store_rule(&engine, agent, "rule A", RuleStats::initial(), 0, false).await;
         let ids = vec![id.clone()];
 
         settle_injected_rules(&engine, agent, &ids, ErrorCategory::Negligible).await;
-        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 3, harmful: 0 });
+        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 2, harmful: 0 });
 
         settle_injected_rules(&engine, agent, &ids, ErrorCategory::Moderate).await;
-        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 4, harmful: 0 });
+        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 3, harmful: 0 });
 
         settle_injected_rules(&engine, agent, &ids, ErrorCategory::Significant).await;
-        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 4, harmful: 1 });
+        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 3, harmful: 1 });
 
         settle_injected_rules(&engine, agent, &ids, ErrorCategory::Critical).await;
-        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 4, harmful: 2 });
+        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 3, harmful: 2 });
 
         // Sibling metadata keys survive the counter round-trips.
         let meta = engine.get_metadata(agent, &id).await.unwrap().unwrap();
@@ -317,18 +398,18 @@ mod tests {
     async fn net_zero_rule_is_retired_and_excluded_from_selection() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-retire";
-        let id = store_rule(&engine, agent, "rule B", RuleStats::initial(), 0).await;
+        // Non-probation rule seeded at the new Janus `helpful = 1` floor —
+        // a single harmful settlement alone already zeroes net credit.
+        let id = store_rule(&engine, agent, "rule B", RuleStats::initial(), 0, false).await;
         let ids = vec![id.clone()];
 
-        // helpful=2 → two harmful settlements drive net credit to zero.
         let retired =
             settle_injected_rules(&engine, agent, &ids, ErrorCategory::Critical).await;
-        assert!(retired.is_empty(), "net still positive after one harmful");
-        assert_eq!(select_rules(&engine, agent, INJECTION_LIMIT).await.len(), 1);
-
-        let retired =
-            settle_injected_rules(&engine, agent, &ids, ErrorCategory::Significant).await;
-        assert_eq!(retired, vec![id.clone()], "second harmful must retire");
+        assert_eq!(
+            retired,
+            vec![id.clone()],
+            "helpful=1 seed → a single harmful settlement retires (net = 1 - 1 = 0)"
+        );
 
         // Tag + low importance persisted on the entry.
         let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
@@ -344,11 +425,14 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-rank";
         let low =
-            store_rule(&engine, agent, "low", RuleStats { helpful: 3, harmful: 2 }, 10).await;
+            store_rule(&engine, agent, "low", RuleStats { helpful: 3, harmful: 2 }, 10, false)
+                .await;
         let high =
-            store_rule(&engine, agent, "high", RuleStats { helpful: 7, harmful: 2 }, 20).await;
+            store_rule(&engine, agent, "high", RuleStats { helpful: 7, harmful: 2 }, 20, false)
+                .await;
         let mid =
-            store_rule(&engine, agent, "mid", RuleStats { helpful: 5, harmful: 2 }, 30).await;
+            store_rule(&engine, agent, "mid", RuleStats { helpful: 5, harmful: 2 }, 30, false)
+                .await;
 
         let all = select_rules(&engine, agent, INJECTION_LIMIT).await;
         let got: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
@@ -358,13 +442,34 @@ mod tests {
         let capped = select_rules(&engine, agent, 2).await;
         let got: Vec<&str> = capped.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(got, vec![high.as_str(), mid.as_str()]);
+
+        // WP2: at an equal net score, a probation rule sorts after a
+        // graduated (non-probation) one.
+        let grad_tie = store_rule(
+            &engine, agent, "graduated-tie", RuleStats { helpful: 5, harmful: 0 }, 5, false,
+        )
+        .await;
+        let probation_tie = store_rule(
+            &engine, agent, "probation-tie", RuleStats { helpful: 5, harmful: 0 }, 1, true,
+        )
+        .await;
+        let all2 = select_rules(&engine, agent, 10).await;
+        let idx_grad = all2.iter().position(|r| r.id == grad_tie).unwrap();
+        let idx_probation = all2.iter().position(|r| r.id == probation_tie).unwrap();
+        assert!(
+            idx_grad < idx_probation,
+            "graduated rule must rank before a probation rule at equal net score"
+        );
+        assert!(!all2[idx_grad].probation);
+        assert!(all2[idx_probation].probation);
     }
 
     #[tokio::test]
     async fn settlement_skips_unknown_and_foreign_ids() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-own";
-        let foreign = store_rule(&engine, "other-agent", "theirs", RuleStats::initial(), 0).await;
+        let foreign =
+            store_rule(&engine, "other-agent", "theirs", RuleStats::initial(), 0, false).await;
 
         let retired = settle_injected_rules(
             &engine,
@@ -379,5 +484,68 @@ mod tests {
             read_stats(&engine, "other-agent", &foreign).await,
             RuleStats::initial()
         );
+    }
+
+    #[tokio::test]
+    async fn probation_rule_retires_on_first_harmful() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-probation-retire";
+        let id = store_rule(&engine, agent, "rule P", RuleStats::initial(), 0, true).await;
+        let ids = vec![id.clone()];
+
+        // Bank one helpful credit first (helpful=2, harmful=0). A generic
+        // net-score check would NOT retire on the next harmful outcome
+        // (net = 2 - 1 = 1), but Janus one-strike trial retires *any*
+        // probation rule on its first harmful outcome regardless of banked
+        // credit.
+        settle_injected_rules(&engine, agent, &ids, ErrorCategory::Negligible).await;
+        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 2, harmful: 0 });
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(entry.tags.iter().any(|t| t == PROBATION_RULE_TAG), "still on probation");
+
+        let retired = settle_injected_rules(&engine, agent, &ids, ErrorCategory::Significant).await;
+        assert_eq!(
+            retired,
+            vec![id.clone()],
+            "first harmful outcome during probation retires immediately"
+        );
+
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(entry.tags.iter().any(|t| t == RETIRED_RULE_TAG));
+        assert!(entry.importance < 2.0, "importance demoted on retirement");
+        assert!(select_rules(&engine, agent, INJECTION_LIMIT).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn probation_rule_graduates_after_three_helpful() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-probation-graduate";
+        let id = store_rule(&engine, agent, "rule Q", RuleStats::initial(), 0, true).await;
+        let ids = vec![id.clone()];
+
+        // helpful=1 seed → two more helpful settlements (zero harmful
+        // strikes) reach PROBATION_GRADUATE_HELPFUL = 3.
+        settle_injected_rules(&engine, agent, &ids, ErrorCategory::Negligible).await;
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(entry.tags.iter().any(|t| t == PROBATION_RULE_TAG), "not yet graduated");
+
+        let retired = settle_injected_rules(&engine, agent, &ids, ErrorCategory::Moderate).await;
+        assert!(retired.is_empty(), "graduation must not be reported as retirement");
+        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 3, harmful: 0 });
+
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(
+            !entry.tags.iter().any(|t| t == PROBATION_RULE_TAG),
+            "probation tag removed on graduation"
+        );
+        assert!(
+            !entry.tags.iter().any(|t| t == RETIRED_RULE_TAG),
+            "graduation must not retire the rule"
+        );
+
+        // Still selectable, now ranked as a normal (non-probation) rule.
+        let selected = select_rules(&engine, agent, INJECTION_LIMIT).await;
+        assert_eq!(selected.len(), 1);
+        assert!(!selected[0].probation);
     }
 }

@@ -2521,7 +2521,22 @@ fn prepare_claude_cmd(
     };
     cmd.args(["--allowedTools", &allowed_csv]);
 
-    let denied = caps.disallowed_tools();
+    let mut denied = caps.disallowed_tools();
+    // WP3 (PORTICO) auxiliary enforcement: fold in any `scoped_tools` that lack
+    // an active task-scoped grant. `work_dir` is the agent directory, from which
+    // the helper derives home + agent_id and reads the shared grant store
+    // (fail-closed: on any store error every scoped tool is disallowed). The MCP
+    // dispatch gate is the PRIMARY enforcement; this is defense-in-depth so a
+    // scoped tool is also absent from the CLI's own allow surface. `None`
+    // work_dir or a non-agent dir yields an empty list (zero effect).
+    if let Some(dir) = work_dir {
+        let scoped_disallow = crate::capability_grants::scoped_disallow_for_agent_dir(dir);
+        if !scoped_disallow.is_empty() {
+            denied.extend(scoped_disallow);
+            denied.sort();
+            denied.dedup();
+        }
+    }
     if !denied.is_empty() {
         let denied_csv = denied.join(",");
         cmd.args(["--disallowedTools", &denied_csv]);

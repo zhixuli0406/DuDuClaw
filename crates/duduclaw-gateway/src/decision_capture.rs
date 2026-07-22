@@ -413,6 +413,8 @@ async fn write_triple(
         valid_from: None,
         valid_until: None,
         confidence: Some(1.0),
+        // WP1: decision-capture triples are agent self-derived from the turn.
+        origin: Some("agent_derived".to_string()),
         metadata: Some(ctx_meta.clone()),
         ..Default::default()
     };

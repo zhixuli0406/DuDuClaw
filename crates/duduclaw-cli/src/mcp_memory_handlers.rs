@@ -154,10 +154,22 @@ pub async fn handle_memory_store(
         source_event,
     };
 
-    // store() uses the `agent_id` parameter — not entry.agent_id — for the SQL
+    // WP1: bind the write origin. An `external/` namespace is an untrusted MCP
+    // client (mcp_external, ceiling 0.3); internal writes are agent-derived
+    // (0.6). store_temporal without a triple is a plain insert that also stamps
+    // the origin. It uses the `namespace` arg — not entry.agent_id — for the SQL
     // INSERT, so namespace enforcement is doubly guaranteed.
-    match memory.store(&namespace, entry).await {
-        Ok(()) => {
+    let origin = if namespace.starts_with("external/") {
+        "mcp_external"
+    } else {
+        "agent_derived"
+    };
+    let store_meta = duduclaw_memory::TemporalMeta {
+        origin: Some(origin.to_string()),
+        ..Default::default()
+    };
+    match memory.store_temporal(&namespace, entry, store_meta).await {
+        Ok(_) => {
             // MCP spec requires top-level `memory_id` for client-side chaining
             // (e.g. immediate memory_read after memory_store).
             // `id` is preserved for backward compat; `memory_id` is the canonical field.

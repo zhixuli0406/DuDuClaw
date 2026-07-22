@@ -25,6 +25,7 @@ so regressions are catchable without spending tokens.
 ```bash
 # Offline — no agent, no credentials needed (deterministic regression):
 duduclaw eval evals/examples/greeting-replay.toml --replay
+duduclaw eval evals/examples/grounded-replay.toml --replay
 
 # Live — run a real agent and record a baseline transcript for later replay:
 duduclaw eval evals/examples/refund-flow.toml --record
@@ -78,6 +79,12 @@ output_regex        = "(?i)refund"     # Rust regex the final answer must match
 min_text_blocks     = 1                # ≥ N assistant text blocks
 max_tool_calls      = 10               # ≤ N tool_use blocks (budget guard)
 
+# Zero or more trace-grounding assertions — see "Trace grounding" below.
+[[expect.grounded]]
+tool               = "memory_search"   # must be called ≥1 time without erroring
+min_overlap_chars  = 12                # default 12; CJK-safe char count
+# output_regex     = "30 days"         # optional, see below
+
 [judge]                         # optional LLM rubric (Braintrust scorer style)
 enabled   = true                # default true when the [judge] section exists
 rubric    = "Politely acknowledges the refund and cites the order number."
@@ -111,6 +118,55 @@ transcript (a non‑empty `result` event wins; otherwise the last assistant text
 block) — the same precedence the gateway's own stream parser uses. Tool
 assertions run against the ordered list of `tool_use` blocks. Regex and
 substring checks are UTF‑8/CJK‑safe (Rust `regex`, no byte slicing).
+
+---
+
+## Trace grounding (`[[expect.grounded]]`, GroundEval)
+
+A worker can produce a fluent, on-topic final answer that simply **fabricates**
+the underlying fact — "checked the refund policy: 30 days" without ever
+calling `memory_search`, or calling it and then citing a number the tool never
+returned. `must_use_tools` only checks that a tool was *invoked*; it says
+nothing about whether the final answer actually reflects what the tool
+returned. `[[expect.grounded]]` closes that gap (GroundEval, arXiv:2606.22737):
+
+```toml
+[[expect.grounded]]
+tool              = "memory_search"  # matched like must_use_tools (exact or
+                                      # final `__`-segment)
+min_overlap_chars = 12               # default 12
+output_regex      = "30 days"        # optional
+```
+
+A grounded assertion passes only when **all** of the following hold:
+
+1. `tool` was called at least once **without** `is_error` on its `tool_result`.
+2. The final answer shares a **contiguous run of ≥ `min_overlap_chars` chars**
+   with at least one of that tool's result texts (CJK-safe: counted in
+   `char`s, not bytes — a 12-char Chinese passage is 12, not 36).
+3. If `output_regex` is set, the substring it matches in the final answer must
+   itself appear verbatim in one of the tool's result texts — a regex match
+   on the *answer* alone is not enough if the cited fact was never in the
+   evidence.
+
+This needs a transcript with `tool_result` capture (added alongside this
+feature). A transcript recorded before `tool_result` capture existed — or
+loaded via a case whose `tool_calls.jsonl`-equivalent result stream got
+dropped — fails the assertion **closed**, with a detail telling you to
+`--record` a fresh transcript, rather than silently passing on missing
+evidence.
+
+### Where this evidence also shows up: goal-mode acceptance
+
+The same tool-call evidence feeds the **goal-mode acceptance judge**
+(`DispatchEngine::review_goal_tasks`, WP4): before scoring a `review` task,
+the judge reads `tool_calls.jsonl` for that task's claim→review window and
+attaches a compact `<tool_activity>` block (`tool: N ok, M err`, per tool,
+capped at 20 lines) to the acceptance prompt. The `correctness` aspect is
+instructed to treat any action the worker *claims* but that never shows up in
+`<tool_activity>` as unverified. This is best-effort: a missing/unreadable
+audit file simply omits the block — the review is never blocked on an
+observability gap.
 
 ---
 
@@ -214,6 +270,8 @@ evals/                              # your eval suites (repo-relative)
 ├── examples/
 │   ├── greeting-replay.toml        #   offline replay sample
 │   ├── greeting-replay.transcript.jsonl
+│   ├── grounded-replay.toml        #   offline replay sample ([[expect.grounded]])
+│   ├── grounded-replay.transcript.jsonl
 │   └── refund-flow.toml            #   live sample (needs an agent)
 └── <suite>/
     ├── <case>.toml

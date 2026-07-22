@@ -9,15 +9,36 @@
 //! Keep the error semantics in lockstep with the gateway parser: a `result`
 //! event with `is_error: true` or an assistant-level `error` field is a hard
 //! `Err` (fail closed), not a silently-empty transcript.
+//!
+//! ## `tool_result` pairing (WP4 GroundEval, arXiv:2606.22737)
+//!
+//! `user` events carry `tool_result` blocks that answer a prior `tool_use`.
+//! Pairing mirrors the gateway's `StepTracker::ingest`
+//! (`channel_reply.rs`): match by `tool_use_id` when present, otherwise fall
+//! back to the most recently opened, still-unresolved call. This keeps the
+//! shipped `evals/examples/greeting-replay.transcript.jsonl` fixture (which
+//! predates ids on either block) working unchanged.
 
 /// One `tool_use` content block observed in the transcript, in order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolInvocation {
     /// Tool name as reported by the CLI (e.g. `Bash`,
     /// `mcp__duduclaw__tasks_create`).
     pub name: String,
     /// The tool input payload (opaque JSON; kept for report context).
     pub input: serde_json::Value,
+    /// `tool_use` block id (`message.content[].id`), when the CLI emitted
+    /// one. Used to pair this call with its `tool_result`; retained after
+    /// pairing so reports can reference the originating block.
+    #[allow(dead_code)]
+    pub id: Option<String>,
+    /// The paired `tool_result` content, when the transcript has one. `None`
+    /// for legacy transcripts recorded before result capture existed, or
+    /// when no `tool_result` block ever referenced this call.
+    pub result_text: Option<String>,
+    /// Whether the paired `tool_result` carried `is_error: true`. `false`
+    /// when unpaired (never treat an unproven call as an error).
+    pub is_error: bool,
 }
 
 /// Everything the assertion layer needs from one agent run.
@@ -63,6 +84,10 @@ impl EvalTranscript {
 /// progress noise on some paths); in-band errors fail closed.
 pub fn parse_stream_json(stdout: &str) -> Result<EvalTranscript, String> {
     let mut t = EvalTranscript::default();
+    // Outstanding (unresolved) tool calls, innermost last:
+    // (tool_use_id-or-empty, index into `t.tool_uses`). Mirrors
+    // `channel_reply::StepTracker::open`.
+    let mut open: Vec<(String, usize)> = Vec::new();
 
     for raw_line in stdout.split('\n') {
         let line = raw_line.trim_end_matches('\r');
@@ -139,10 +164,62 @@ pub fn parse_stream_json(stdout: &str) -> Result<EvalTranscript, String> {
                                 .get("input")
                                 .cloned()
                                 .unwrap_or(serde_json::Value::Null);
-                            t.tool_uses.push(ToolInvocation { name, input });
+                            let id = block
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let idx = t.tool_uses.len();
+                            open.push((id.clone().unwrap_or_default(), idx));
+                            t.tool_uses.push(ToolInvocation {
+                                name,
+                                input,
+                                id,
+                                result_text: None,
+                                is_error: false,
+                            });
                         }
                         _ => {}
                     }
+                }
+            }
+            Some("user") => {
+                let Some(content) = event
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                else {
+                    continue;
+                };
+                for block in content {
+                    if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                        continue;
+                    }
+                    let id = block
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    // Match by id when present; otherwise (or when the id
+                    // doesn't match any outstanding call) fall back to the
+                    // most recently opened call — same tolerant fallback as
+                    // `StepTracker::ingest`.
+                    let popped = if !id.is_empty() {
+                        open.iter()
+                            .rposition(|(oid, _)| oid == id)
+                            .map(|pos| open.remove(pos))
+                    } else {
+                        open.pop()
+                    }
+                    .or_else(|| open.pop());
+                    if let Some((_, idx)) = popped {
+                        if let Some(inv) = t.tool_uses.get_mut(idx) {
+                            inv.result_text = extract_tool_result_text(block);
+                            inv.is_error = block
+                                .get("is_error")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                        }
+                    }
+                    // No outstanding call to match (empty stack) — ignore;
+                    // never panics on a malformed/reordered transcript.
                 }
             }
             _ => {}
@@ -150,6 +227,29 @@ pub fn parse_stream_json(stdout: &str) -> Result<EvalTranscript, String> {
     }
 
     Ok(t)
+}
+
+/// Extract the human-readable text of a `tool_result` block. `content` is
+/// either a plain string or an array of content blocks (Anthropic Messages
+/// API `tool_result` shape); text blocks are concatenated in order.
+/// Anything else (missing, non-text array, etc.) is `None` — never a panic.
+fn extract_tool_result_text(block: &serde_json::Value) -> Option<String> {
+    match block.get("content") {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Array(items)) => {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .map(String::from)
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -225,5 +325,118 @@ mod tests {
         let empty = parse_stream_json("").unwrap();
         assert_eq!(empty.final_text, "");
         assert_eq!(empty.lines_seen, 0);
+    }
+
+    // ── WP4 GroundEval: tool_result pairing ─────────────────────
+
+    fn user_tool_result(inner: &str) -> String {
+        format!("{{\"type\":\"user\",\"message\":{{\"content\":[{inner}]}}}}")
+    }
+
+    #[test]
+    fn pairs_tool_result_by_id() {
+        let stdout = [
+            assistant(
+                "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"mcp__duduclaw__memory_search\",\"input\":{}}",
+            ),
+            user_tool_result(
+                "{\"type\":\"tool_result\",\"tool_use_id\":\"tu_1\",\"content\":\"policy: 30 days\",\"is_error\":false}",
+            ),
+        ]
+        .join("\n");
+        let t = parse_stream_json(&stdout).unwrap();
+        assert_eq!(t.tool_uses.len(), 1);
+        assert_eq!(t.tool_uses[0].id.as_deref(), Some("tu_1"));
+        assert_eq!(t.tool_uses[0].result_text.as_deref(), Some("policy: 30 days"));
+        assert!(!t.tool_uses[0].is_error);
+    }
+
+    #[test]
+    fn pairs_tool_result_by_fallback_when_id_absent() {
+        // Mirrors the shipped `greeting-replay.transcript.jsonl` fixture:
+        // neither block carries an id.
+        let stdout = [
+            assistant("{\"type\":\"tool_use\",\"name\":\"mcp__duduclaw__tasks_create\",\"input\":{}}"),
+            user_tool_result("{\"type\":\"tool_result\",\"content\":\"task created: #42\"}"),
+        ]
+        .join("\n");
+        let t = parse_stream_json(&stdout).unwrap();
+        assert_eq!(
+            t.tool_uses[0].result_text.as_deref(),
+            Some("task created: #42")
+        );
+        assert!(!t.tool_uses[0].is_error);
+    }
+
+    #[test]
+    fn tool_result_content_array_of_text_blocks_is_concatenated() {
+        let stdout = [
+            assistant(
+                "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Read\",\"input\":{}}",
+            ),
+            user_tool_result(
+                "{\"type\":\"tool_result\",\"tool_use_id\":\"tu_1\",\"content\":[{\"type\":\"text\",\"text\":\"line1\"},{\"type\":\"text\",\"text\":\"line2\"}]}",
+            ),
+        ]
+        .join("\n");
+        let t = parse_stream_json(&stdout).unwrap();
+        assert_eq!(t.tool_uses[0].result_text.as_deref(), Some("line1\nline2"));
+    }
+
+    #[test]
+    fn tool_result_is_error_flag_is_captured() {
+        let stdout = [
+            assistant("{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Bash\",\"input\":{}}"),
+            user_tool_result(
+                "{\"type\":\"tool_result\",\"tool_use_id\":\"tu_1\",\"content\":\"command not found\",\"is_error\":true}",
+            ),
+        ]
+        .join("\n");
+        let t = parse_stream_json(&stdout).unwrap();
+        assert!(t.tool_uses[0].is_error);
+    }
+
+    #[test]
+    fn unmatched_tool_result_does_not_panic_or_pair() {
+        // A `tool_result` with no outstanding open call (empty stack) —
+        // must be silently ignored, not panic.
+        let stdout = user_tool_result(
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"ghost\",\"content\":\"x\"}",
+        );
+        let t = parse_stream_json(&stdout).unwrap();
+        assert!(t.tool_uses.is_empty());
+    }
+
+    #[test]
+    fn legacy_transcript_without_user_events_leaves_result_text_none() {
+        // Old-format transcripts (no `user`/tool_result events at all) must
+        // parse cleanly with result_text=None, never panic.
+        let stdout = assistant(
+            "{\"type\":\"tool_use\",\"name\":\"mcp__duduclaw__memory_search\",\"input\":{}}",
+        );
+        let t = parse_stream_json(&stdout).unwrap();
+        assert_eq!(t.tool_uses.len(), 1);
+        assert!(t.tool_uses[0].result_text.is_none());
+        assert!(!t.tool_uses[0].is_error);
+    }
+
+    #[test]
+    fn nested_parallel_calls_pair_by_id_independently() {
+        // Two tool_use blocks in one assistant turn (parallel calls), each
+        // with a distinct id — results must not cross-pair.
+        let stdout = [
+            assistant(
+                "{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"Read\",\"input\":{}},\
+                 {\"type\":\"tool_use\",\"id\":\"b\",\"name\":\"Bash\",\"input\":{}}",
+            ),
+            user_tool_result(
+                "{\"type\":\"tool_result\",\"tool_use_id\":\"b\",\"content\":\"bash out\"},\
+                 {\"type\":\"tool_result\",\"tool_use_id\":\"a\",\"content\":\"read out\"}",
+            ),
+        ]
+        .join("\n");
+        let t = parse_stream_json(&stdout).unwrap();
+        assert_eq!(t.tool_uses[0].result_text.as_deref(), Some("read out"));
+        assert_eq!(t.tool_uses[1].result_text.as_deref(), Some("bash out"));
     }
 }

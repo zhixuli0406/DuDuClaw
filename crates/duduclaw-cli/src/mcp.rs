@@ -1262,6 +1262,20 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "reason", description: "Blocker reason (required, shown on the card)", required: true },
         ],
     },
+    // ── Task-scoped capability grants (WP3, PORTICO) ────────────
+    ToolDef {
+        name: "capability_request",
+        description: "Request a task-scoped grant for a tool listed in your agent's scoped_tools. \
+            Tools in scoped_tools are denied by default; calling this files a human approval and, \
+            once approved, mints a grant that lets you use the tool until the task phase ends (or \
+            its TTL elapses). Pass task_id to bind the grant to the current task (recommended); \
+            without it the grant is agent-level. A denied/expired approval means the tool stays blocked.",
+        params: &[
+            ParamDef { name: "tool", description: "The tool name you need a grant for (must be in your scoped_tools)", required: true },
+            ParamDef { name: "reason", description: "Why you need this tool now (shown to the human approver)", required: true },
+            ParamDef { name: "task_id", description: "Bind the grant to this task; revoked when the task phase ends. Omit for an agent-level grant.", required: false },
+        ],
+    },
     // ── Goal chain tools (G8 — agents see the WHY) ──────────────
     ToolDef {
         name: "goals_create",
@@ -2300,7 +2314,6 @@ async fn handle_log_mood(
     memory: &duduclaw_memory::SqliteMemoryEngine,
     default_agent: &str,
 ) -> Value {
-    use duduclaw_core::traits::MemoryEngine;
     use duduclaw_core::types::MemoryEntry;
 
     let mood = params.get("mood").and_then(|v| v.as_str()).unwrap_or("neutral");
@@ -2328,8 +2341,14 @@ async fn handle_log_mood(
         source_event: "agent_mood".to_string(),
     };
 
-    match memory.store(agent_id, entry).await {
-        Ok(()) => serde_json::json!({
+    // WP1: mood logs are agent self-derived (ceiling 0.6). store_temporal
+    // without a triple is a plain insert that also stamps the origin.
+    let mood_meta = duduclaw_memory::TemporalMeta {
+        origin: Some("agent_derived".to_string()),
+        ..Default::default()
+    };
+    match memory.store_temporal(agent_id, entry, mood_meta).await {
+        Ok(_) => serde_json::json!({
             "content": [{"type": "text", "text": format!("Mood '{mood}' logged for agent '{agent_id}'")}]
         }),
         Err(e) => serde_json::json!({
@@ -6300,6 +6319,172 @@ pub(crate) async fn gate_tool_approval_dispatch(
     }
 }
 
+// ── WP3: capability_request MCP tool (task-scoped grants, PORTICO) ──────────
+
+/// TTL (seconds) the human approval behind `capability_request` waits for a
+/// decision. Expiry counts as a denial (ApprovalBroker fail-closed).
+const CAPABILITY_REQUEST_APPROVAL_TTL_SECS: i64 = 300;
+/// Poll interval while blocking on that approval.
+const CAPABILITY_REQUEST_APPROVAL_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Max chars of the (agent-authored) reason persisted / surfaced to the human
+/// approver. CJK-safe via `truncate_chars` — never a raw byte slice.
+const CAPABILITY_REQUEST_REASON_MAX_CHARS: usize = 300;
+
+/// `capability_request { tool, reason, task_id? }` — an agent asks for a
+/// task-scoped grant for a tool listed in its `scoped_tools`. Files a human
+/// approval via the [`ApprovalBroker`](duduclaw_gateway::approval::ApprovalBroker)
+/// and, once approved, mints a grant in the
+/// [`CapabilityGrantStore`](duduclaw_gateway::capability_grants::CapabilityGrantStore).
+///
+/// Scope: relies on the `tool_requires_scope` Admin fall-through (unlisted
+/// tools default to Admin, which the internal MCP principal always holds and no
+/// external client can reach — fail-closed by construction), so no scope-table
+/// entry is required.
+///
+/// Fail-closed throughout: a broker/store that will not open, a denied/expired
+/// approval, or a grant-write failure all return an error result and mint no
+/// grant.
+async fn handle_capability_request(
+    args: &Value,
+    home_dir: &Path,
+    agent_id: &str,
+) -> Value {
+    use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStatus};
+    use duduclaw_gateway::capability_grants::{self, CapabilityGrantStore, GRANTED_BY_REQUEST};
+
+    let tool = args.get("tool").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let task_id: Option<String> = args
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if tool.is_empty() {
+        return tool_error("capability_request 需要 tool 參數（要申請授權的工具名稱）");
+    }
+    if reason.is_empty() {
+        return tool_error("capability_request 需要 reason 參數（向人工說明用途）");
+    }
+
+    // The tool must actually be listed in scoped_tools — otherwise a grant is
+    // meaningless (the tool is either freely allowed or hard-denied elsewhere).
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let scoped = capability_grants::scoped_tools(&agent_dir);
+    if !capability_grants::set_contains_tool(&scoped, tool) {
+        return tool_error(&format!(
+            "工具「{tool}」不在此代理的 scoped_tools 清單，無需（也無法）申請階段性授權。"
+        ));
+    }
+
+    // Open the broker + grant store; either unavailable ⇒ fail-closed deny.
+    let broker = match ApprovalBroker::open(home_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "capability_request: ApprovalBroker unavailable — denying (fail-closed)");
+            return tool_error("審批系統暫時無法使用，已拒絕授權申請（fail-closed）。");
+        }
+    };
+    let store = match CapabilityGrantStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "capability_request: grant store unavailable — denying (fail-closed)");
+            return tool_error("授權存放區暫時無法使用，已拒絕授權申請（fail-closed）。");
+        }
+    };
+
+    let reason_trunc = duduclaw_core::truncate_chars(reason, CAPABILITY_REQUEST_REASON_MAX_CHARS);
+    let summary = format!("代理 {agent_id} 申請階段性工具授權：{tool}（{reason_trunc}）");
+    let payload = serde_json::json!({
+        "tool": tool,
+        "reason": reason_trunc,
+        "task_id": task_id,
+    });
+
+    let approval_id = match broker
+        .request(
+            agent_id,
+            "capability_grant",
+            &summary,
+            payload,
+            CAPABILITY_REQUEST_APPROVAL_TTL_SECS,
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "capability_request: approval request failed — denying (fail-closed)");
+            return tool_error("無法建立授權審核請求，已拒絕（fail-closed）。");
+        }
+    };
+
+    match broker
+        .await_decision(&approval_id, CAPABILITY_REQUEST_APPROVAL_POLL)
+        .await
+    {
+        Ok(ApprovalStatus::Approved) => {
+            let ttl = capability_grants::grant_ttl_secs(&agent_dir);
+            match store
+                .grant(agent_id, task_id.as_deref(), tool, GRANTED_BY_REQUEST, ttl)
+                .await
+            {
+                Ok(grant_id) => {
+                    duduclaw_security::audit::append_tool_call_with_extras(
+                        home_dir,
+                        agent_id,
+                        "capability_request",
+                        &format!("grant {tool}"),
+                        true,
+                        &[
+                            ("grant_id", Value::String(grant_id.clone())),
+                            ("granted_tool", Value::String(tool.to_string())),
+                            (
+                                "task_id",
+                                task_id
+                                    .as_deref()
+                                    .map(|t| Value::String(t.to_string()))
+                                    .unwrap_or(Value::Null),
+                            ),
+                            ("granted_by", Value::String(GRANTED_BY_REQUEST.to_string())),
+                        ],
+                    );
+                    tool_text(&format!(
+                        "已核准：工具「{tool}」授權 {ttl} 秒（授權編號 {grant_id}）。\
+                         任務階段結束或逾時後自動撤銷。"
+                    ))
+                }
+                Err(e) => {
+                    warn!(error = %e, "capability_request: grant write failed after approval");
+                    tool_error(&format!(
+                        "授權雖經核准，但寫入失敗，已拒絕使用（fail-closed）：{e}"
+                    ))
+                }
+            }
+        }
+        Ok(ApprovalStatus::Denied) => {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir,
+                agent_id,
+                "capability_request",
+                &format!("deny {tool}"),
+                false,
+                &[("granted_tool", Value::String(tool.to_string()))],
+            );
+            tool_error(&format!("授權申請已被拒絕（審核編號 {approval_id}）。"))
+        }
+        Ok(ApprovalStatus::Expired) => tool_error(&format!(
+            "授權申請逾時未核可，已自動拒絕（fail-closed，審核編號 {approval_id}）。"
+        )),
+        Ok(ApprovalStatus::Pending) => {
+            tool_error("審核狀態異常（仍為待審），已拒絕授權申請（fail-closed）。")
+        }
+        Err(e) => {
+            warn!(error = %e, "capability_request: await_decision failed — denying (fail-closed)");
+            tool_error("等待授權決定時發生錯誤，已拒絕（fail-closed）。")
+        }
+    }
+}
+
 /// Max bytes of the (untrusted) tool-args JSON handed to the ActionGuard judge.
 /// CJK-safe via [`duduclaw_core::truncate_bytes`] — never a raw byte slice.
 const ACTION_GUARD_ARGS_MAX_BYTES: usize = 2048;
@@ -7766,6 +7951,7 @@ pub(crate) async fn handle_tools_call(
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir).await,
         "evolution_status" => handle_evolution_status_tool(&arguments, home_dir, default_agent).await,
+        "capability_request" => handle_capability_request(&arguments, home_dir, caller_client_id).await,
         "audit_trail_query" => handle_audit_trail_query(&arguments, home_dir, caller_client_id, caller_is_admin).await,
         "reliability_summary" => handle_reliability_summary(&arguments, home_dir, caller_client_id, caller_is_admin).await,
         // Channel settings tools
