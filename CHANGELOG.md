@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.41.0] - 2026-07-22 — 信任記憶強化、OS 原生整合 Phase 1 與 WebChat model 顯示根治
+
 ### Added
 - **OS-native agent Phase 1**：新增 `duduclaw-os` crate——跨平台檔案系統監看
   （notify）、原生桌面通知、開啟目標 helper。Gateway `os_events.rs` 將 per-agent
