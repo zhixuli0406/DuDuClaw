@@ -2,33 +2,33 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::{Datelike, Utc};
 use duduclaw_agent::registry::AgentRegistry;
-use duduclaw_auth::{self, UserContext, UserDb, JwtConfig};
 use duduclaw_auth::acl;
-use duduclaw_auth::models::{UserRole, AccessLevel};
+use duduclaw_auth::models::{AccessLevel, UserRole};
+use duduclaw_auth::{self, JwtConfig, UserContext, UserDb};
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_core::truncate_bytes;
 use duduclaw_memory::SqliteMemoryEngine;
-use chrono::{Datelike, Utc};
 use rusqlite::params;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::autopilot_store::{AutopilotStore, AutopilotRuleRow};
+use crate::autopilot_store::{AutopilotRuleRow, AutopilotStore};
 use crate::cron_scheduler::CronScheduler;
 use crate::cron_store::{CronStore, CronTaskRow};
-use crate::extension::GatewayExtension;
-use crate::gvu::version_store::VersionStore;
-use crate::protocol::WsFrame;
-use crate::task_store::{TaskStore, TaskRow, ActivityRow, CommentRow, PlanRow, PlanStepRow};
-use crate::partner_store::{
-    PartnerStore, PartnerProfileInput, PartnerCustomerInput, PartnerCustomerPatch,
-};
 use crate::distributor_store::{
     DistributorInput, DistributorPatch, DistributorStore, IssuedLicense,
 };
 use crate::evolution_events::schema::StagnationDetectionConfig;
+use crate::extension::GatewayExtension;
+use crate::gvu::version_store::VersionStore;
+use crate::partner_store::{
+    PartnerCustomerInput, PartnerCustomerPatch, PartnerProfileInput, PartnerStore,
+};
+use crate::protocol::WsFrame;
+use crate::task_store::{ActivityRow, CommentRow, PlanRow, PlanStepRow, TaskRow, TaskStore};
 
 /// Copy an industry pack's knowledge extras (FAQ.json + flat wiki/) into a
 /// freshly-created agent directory. Editable core files (SOUL.md /
@@ -53,7 +53,9 @@ async fn copy_template_extras(src: &Path, dst: &Path) -> Result<(), String> {
         while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
             let path = entry.path();
             if path.is_file() {
-                let Some(fname) = path.file_name() else { continue };
+                let Some(fname) = path.file_name() else {
+                    continue;
+                };
                 tokio::fs::copy(&path, wiki_dst.join(fname))
                     .await
                     .map_err(|e| format!("wiki/{}: {e}", fname.to_string_lossy()))?;
@@ -75,7 +77,9 @@ fn scrub_premium_path(err: &str, premium_dir: &Path) -> String {
 pub(crate) fn is_valid_agent_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && !id.starts_with('-')
         && !id.ends_with('-')
         && !id.contains("..")
@@ -106,8 +110,11 @@ pub(crate) fn is_valid_skill_name(name: &str) -> bool {
 const AVATAR_EXTS: &[&str] = &["png", "jpg", "webp"];
 
 /// Extension → mime for reconstructing the data URI on read.
-const AVATAR_EXT_MIME: &[(&str, &str)] =
-    &[("png", "image/png"), ("jpg", "image/jpeg"), ("webp", "image/webp")];
+const AVATAR_EXT_MIME: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("webp", "image/webp"),
+];
 
 /// Maximum decoded avatar size (512 KB) — matches the branding-logo ceiling.
 const MAX_AVATAR_DECODED_BYTES: usize = 512 * 1024;
@@ -175,7 +182,9 @@ fn normalize_outfit(raw: &Value) -> Result<Value, String> {
 /// agent has never been dressed — the client renders the seeded default.
 fn read_agent_outfit(agent_dir: &std::path::Path) -> Option<Value> {
     let raw = std::fs::read_to_string(agent_dir.join("outfit.json")).ok()?;
-    serde_json::from_str::<Value>(&raw).ok().filter(|v| v.is_object())
+    serde_json::from_str::<Value>(&raw)
+        .ok()
+        .filter(|v| v.is_object())
 }
 
 // ── F6: archive/unarchive evolution+heartbeat snapshot round-trip ────────────
@@ -239,8 +248,14 @@ fn offboard_freeze_table(table: &mut toml::Table, status: &str) -> Result<(), St
             .entry("restore".to_string())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         if let Some(r) = restore.as_table_mut() {
-            r.insert("evolution_enabled".into(), toml::Value::Boolean(snap_evolution));
-            r.insert("heartbeat_enabled".into(), toml::Value::Boolean(snap_heartbeat));
+            r.insert(
+                "evolution_enabled".into(),
+                toml::Value::Boolean(snap_evolution),
+            );
+            r.insert(
+                "heartbeat_enabled".into(),
+                toml::Value::Boolean(snap_heartbeat),
+            );
         }
     }
     Ok(())
@@ -258,9 +273,10 @@ fn unarchive_restore_table(table: &mut toml::Table) -> Result<(), String> {
         .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
     agent_section.insert("status".into(), toml::Value::String("active".into()));
 
-    for (section, restored) in
-        [("evolution", restore_evolution), ("heartbeat", restore_heartbeat)]
-    {
+    for (section, restored) in [
+        ("evolution", restore_evolution),
+        ("heartbeat", restore_heartbeat),
+    ] {
         let sub = table
             .entry(section.to_string())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -313,7 +329,10 @@ fn is_valid_mcp_key_format(key: &str) -> bool {
     } else {
         return false;
     };
-    hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    hex.len() == 32
+        && hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 /// Generate a fresh MCP API key of the form `ddc_<env>_<32hex>`.
@@ -377,13 +396,20 @@ fn apply_capabilities_to_table(
             _ => {
                 return Err(format!(
                     "Invalid computer_use_mode '{v}'. Valid: container, native, auto"
-                ))
+                ));
             }
         }
     }
     if let Some(v) = cap.get("browser_via_bash").and_then(|v| v.as_bool()) {
         section.insert("browser_via_bash".into(), toml::Value::Boolean(v));
         changes.push(format!("capabilities.browser_via_bash = {v}"));
+    }
+    // ── os_native (bool) — opt-in OS-native features (filesystem watchers) ──
+    // The actual `[os_watch]` paths live in a top-level table written by
+    // `apply_os_watch_to_table`; this flag gates whether the watcher runs.
+    if let Some(v) = cap.get("os_native").and_then(|v| v.as_bool()) {
+        section.insert("os_native".into(), toml::Value::Boolean(v));
+        changes.push(format!("capabilities.os_native = {v}"));
     }
 
     // ── Array fields (tool names must be non-empty strings) ──
@@ -400,7 +426,9 @@ fn apply_capabilities_to_table(
                     .ok_or_else(|| format!("capabilities.{param_key} entries must be strings"))?;
                 let s = s.trim();
                 if s.is_empty() {
-                    return Err(format!("capabilities.{param_key} entries must be non-empty"));
+                    return Err(format!(
+                        "capabilities.{param_key} entries must be non-empty"
+                    ));
                 }
                 out.push(toml::Value::String(s.into()));
             }
@@ -448,32 +476,42 @@ fn apply_capabilities_to_table(
                 return Err("max_session_minutes must be 1-1440".into());
             }
             sub.insert("max_session_minutes".into(), toml::Value::Integer(v as i64));
-            changes.push(format!("capabilities.computer_use_config.max_session_minutes = {v}"));
+            changes.push(format!(
+                "capabilities.computer_use_config.max_session_minutes = {v}"
+            ));
         }
         if let Some(v) = cfg.get("max_actions").and_then(|v| v.as_u64()) {
             if v == 0 || v > 10000 {
                 return Err("max_actions must be 1-10000".into());
             }
             sub.insert("max_actions".into(), toml::Value::Integer(v as i64));
-            changes.push(format!("capabilities.computer_use_config.max_actions = {v}"));
+            changes.push(format!(
+                "capabilities.computer_use_config.max_actions = {v}"
+            ));
         }
         if let Some(v) = cfg.get("display_width").and_then(|v| v.as_u64()) {
             if !(320..=7680).contains(&v) {
                 return Err("display_width must be 320-7680".into());
             }
             sub.insert("display_width".into(), toml::Value::Integer(v as i64));
-            changes.push(format!("capabilities.computer_use_config.display_width = {v}"));
+            changes.push(format!(
+                "capabilities.computer_use_config.display_width = {v}"
+            ));
         }
         if let Some(v) = cfg.get("display_height").and_then(|v| v.as_u64()) {
             if !(240..=4320).contains(&v) {
                 return Err("display_height must be 240-4320".into());
             }
             sub.insert("display_height".into(), toml::Value::Integer(v as i64));
-            changes.push(format!("capabilities.computer_use_config.display_height = {v}"));
+            changes.push(format!(
+                "capabilities.computer_use_config.display_height = {v}"
+            ));
         }
         if let Some(v) = cfg.get("auto_confirm_trusted").and_then(|v| v.as_bool()) {
             sub.insert("auto_confirm_trusted".into(), toml::Value::Boolean(v));
-            changes.push(format!("capabilities.computer_use_config.auto_confirm_trusted = {v}"));
+            changes.push(format!(
+                "capabilities.computer_use_config.auto_confirm_trusted = {v}"
+            ));
         }
     }
 
@@ -500,7 +538,9 @@ fn apply_capabilities_to_table(
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| format!("capabilities.policy[{i}].tool must be a non-empty string"))?;
+                .ok_or_else(|| {
+                    format!("capabilities.policy[{i}].tool must be a non-empty string")
+                })?;
 
             let effect = match obj.get("effect").and_then(|v| v.as_str()) {
                 Some("allow") => "allow",
@@ -509,7 +549,7 @@ fn apply_capabilities_to_table(
                 _ => {
                     return Err(format!(
                         "capabilities.policy[{i}].effect must be one of: allow, forbid, ask"
-                    ))
+                    ));
                 }
             };
 
@@ -531,7 +571,9 @@ fn apply_capabilities_to_table(
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .ok_or_else(|| {
-                            format!("capabilities.policy[{i}].when[{j}].arg must be a non-empty string")
+                            format!(
+                                "capabilities.policy[{i}].when[{j}].arg must be a non-empty string"
+                            )
                         })?;
                     let op = match cobj.get("op").and_then(|v| v.as_str()) {
                         Some("equals") => "equals",
@@ -540,16 +582,13 @@ fn apply_capabilities_to_table(
                         _ => {
                             return Err(format!(
                                 "capabilities.policy[{i}].when[{j}].op must be one of: equals, contains, starts_with"
-                            ))
+                            ));
                         }
                     };
                     // `value` is required but may legitimately be an empty string.
-                    let value = cobj
-                        .get("value")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            format!("capabilities.policy[{i}].when[{j}].value must be a string")
-                        })?;
+                    let value = cobj.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
+                        format!("capabilities.policy[{i}].when[{j}].value must be a string")
+                    })?;
                     let mut cond_tbl = toml::map::Map::new();
                     cond_tbl.insert("arg".into(), toml::Value::String(arg.into()));
                     cond_tbl.insert("op".into(), toml::Value::String(op.into()));
@@ -569,6 +608,68 @@ fn apply_capabilities_to_table(
     Ok(changes)
 }
 
+/// Validate + write the top-level `[os_watch]` table into an agent.toml from the
+/// `agents.update` `os_watch` param object. Returns the change list (empty if no
+/// `os_watch` object was present). Path values are format-checked only (non-empty
+/// strings); existence is left to the watcher's `canonicalize` warning at start.
+///
+/// Mirrors the additive raw-TOML shape that `os_events::read_os_watch_config`
+/// parses: `paths` (string[]), `ignore` (string[]), `debounce_ms` (int ≥1),
+/// `max_events_per_min` (int ≥1).
+fn apply_os_watch_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+
+    let ow = match params.get("os_watch").and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return Ok(changes),
+    };
+
+    let section = table
+        .entry("os_watch")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "Invalid [os_watch] section".to_string())?;
+
+    // ── Array fields (non-empty strings) ──
+    for (param_key, toml_key) in &[("paths", "paths"), ("ignore", "ignore")] {
+        if let Some(arr) = ow.get(*param_key).and_then(|v| v.as_array()) {
+            let mut out: Vec<toml::Value> = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| format!("os_watch.{param_key} entries must be strings"))?;
+                let s = s.trim();
+                if s.is_empty() {
+                    return Err(format!("os_watch.{param_key} entries must be non-empty"));
+                }
+                out.push(toml::Value::String(s.into()));
+            }
+            section.insert((*toml_key).into(), toml::Value::Array(out));
+            changes.push(format!("os_watch.{toml_key} = [{} entries]", arr.len()));
+        }
+    }
+
+    // ── debounce_ms (int ≥1) ──
+    if let Some(v) = ow.get("debounce_ms").and_then(|v| v.as_u64()) {
+        if v == 0 || v > 3_600_000 {
+            return Err("os_watch.debounce_ms must be 1-3600000".into());
+        }
+        section.insert("debounce_ms".into(), toml::Value::Integer(v as i64));
+        changes.push(format!("os_watch.debounce_ms = {v}"));
+    }
+
+    // ── max_events_per_min (int ≥1) ──
+    if let Some(v) = ow.get("max_events_per_min").and_then(|v| v.as_u64()) {
+        if v == 0 || v > 1_000_000 {
+            return Err("os_watch.max_events_per_min must be 1-1000000".into());
+        }
+        section.insert("max_events_per_min".into(), toml::Value::Integer(v as i64));
+        changes.push(format!("os_watch.max_events_per_min = {v}"));
+    }
+
+    Ok(changes)
+}
+
 // ── P1 dashboard-config helpers (RT / EVO / CT) ───────────────────────────────
 //
 // Same contract as `apply_capabilities_to_table`: pure functions that mutate a
@@ -582,8 +683,14 @@ fn apply_capabilities_to_table(
 // readonly_project/timeout_ms/max_concurrent.
 
 /// Valid AI runtime providers (mirrors the `AgentRuntime` registry backends).
-const VALID_RUNTIME_PROVIDERS: &[&str] =
-    &["claude", "codex", "gemini", "antigravity", "grok", "openai_compat"];
+const VALID_RUNTIME_PROVIDERS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "antigravity",
+    "grok",
+    "openai_compat",
+];
 
 /// Detect a Claude Code OAuth session. Returns `(has_oauth, subscription_tier)`.
 /// Never returns the token itself — only its presence — so this is safe to
@@ -604,7 +711,9 @@ async fn detect_claude_oauth(claude_bin: Option<&str>) -> (bool, Option<String>)
     };
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(8),
-        tokio::process::Command::new(bin).args(["auth", "status"]).output(),
+        tokio::process::Command::new(bin)
+            .args(["auth", "status"])
+            .output(),
     )
     .await;
     let Ok(Ok(out)) = output else {
@@ -613,7 +722,10 @@ async fn detect_claude_oauth(claude_bin: Option<&str>) -> (bool, Option<String>)
     let Ok(json) = serde_json::from_slice::<Value>(&out.stdout) else {
         return (false, None);
     };
-    let logged_in = json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+    let logged_in = json
+        .get("loggedIn")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let sub = json
         .get("subscriptionType")
         .and_then(|v| v.as_str())
@@ -659,10 +771,7 @@ fn detect_claude_oauth_from_file() -> Option<(bool, Option<String>)> {
 /// Validate + write the `[runtime]` section from the `runtime` params object.
 /// Fields: `provider` (enum), `fallback` (string), `pty_pool_enabled` (bool),
 /// `worker_managed` (bool). (RT.1)
-fn apply_runtime_to_table(
-    table: &mut toml::Table,
-    params: &Value,
-) -> Result<Vec<String>, String> {
+fn apply_runtime_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec<String>, String> {
     let mut changes: Vec<String> = Vec::new();
 
     let rt = match params.get("runtime").and_then(|v| v.as_object()) {
@@ -842,11 +951,16 @@ fn parse_mount_entry(item: &Value) -> Result<toml::Value, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "additional_mounts.container must be a non-empty string".to_string())?;
-    let readonly = obj.get("readonly").and_then(|v| v.as_bool()).unwrap_or(false);
+    let readonly = obj
+        .get("readonly")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     for pat in BLOCKED_PATTERNS {
         if host.contains(pat) {
-            return Err(format!("additional_mounts.host '{host}' matches blocked pattern '{pat}'"));
+            return Err(format!(
+                "additional_mounts.host '{host}' matches blocked pattern '{pat}'"
+            ));
         }
     }
 
@@ -948,7 +1062,10 @@ fn apply_container_advanced_to_table(
             out.push(parse_mount_entry(entry)?);
         }
         ct.insert("additional_mounts".into(), toml::Value::Array(out));
-        changes.push(format!("container.additional_mounts = [{} entries]", arr.len()));
+        changes.push(format!(
+            "container.additional_mounts = [{} entries]",
+            arr.len()
+        ));
     }
 
     // ── env (CT.2) ──
@@ -989,7 +1106,9 @@ type GovPolicy = serde_json::Map<String, Value>;
 fn gov_valid_policy_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
 /// Validate a governance policy object per its `policy_type`, returning a
@@ -1007,14 +1126,24 @@ fn gov_validate_policy(p: &Value) -> Result<GovPolicy, String> {
             GOV_POLICY_TYPES.join(", ")
         ));
     }
-    let policy_id = obj.get("policy_id").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let policy_id = obj
+        .get("policy_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if !gov_valid_policy_id(policy_id) {
         return Err("policy_id must be 1-128 chars of [a-zA-Z0-9._-]".into());
     }
-    let agent_id = obj.get("agent_id").and_then(|v| v.as_str()).unwrap_or("*").trim();
+    let agent_id = obj
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("*")
+        .trim();
     // agent_id is "*" (global) or a valid agent id.
     if agent_id != "*" && !is_valid_agent_id(agent_id) {
-        return Err(format!("Invalid agent_id '{agent_id}' (use '*' for global)"));
+        return Err(format!(
+            "Invalid agent_id '{agent_id}' (use '*' for global)"
+        ));
     }
 
     let mut out = GovPolicy::new();
@@ -1024,9 +1153,9 @@ fn gov_validate_policy(p: &Value) -> Result<GovPolicy, String> {
 
     // Helper closures for required numeric fields.
     let req_u64 = |key: &str| -> Result<u64, String> {
-        obj.get(key)
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| format!("{policy_type} policy missing/invalid '{key}' (positive integer)"))
+        obj.get(key).and_then(|v| v.as_u64()).ok_or_else(|| {
+            format!("{policy_type} policy missing/invalid '{key}' (positive integer)")
+        })
     };
     let str_arr = |key: &str| -> Vec<Value> {
         obj.get(key)
@@ -1087,7 +1216,10 @@ fn gov_validate_policy(p: &Value) -> Result<GovPolicy, String> {
             }
             out.insert("allowed_scopes".into(), json!(allowed));
             out.insert("denied_scopes".into(), json!(denied));
-            out.insert("requires_approval".into(), json!(str_arr("requires_approval")));
+            out.insert(
+                "requires_approval".into(),
+                json!(str_arr("requires_approval")),
+            );
         }
         "quota" => {
             let budget = req_u64("daily_token_budget")?;
@@ -1098,7 +1230,10 @@ fn gov_validate_policy(p: &Value) -> Result<GovPolicy, String> {
             if max_tasks == 0 {
                 return Err("max_concurrent_tasks must be > 0".into());
             }
-            let max_mem = obj.get("max_memory_entries").and_then(|v| v.as_u64()).unwrap_or(0);
+            let max_mem = obj
+                .get("max_memory_entries")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let reset_cron = obj
                 .get("reset_cron")
                 .and_then(|v| v.as_str())
@@ -1142,7 +1277,8 @@ fn gov_yaml_quote(s: &str) -> String {
 /// Serialise an ordered list of validated policies into the canonical
 /// `policies:` YAML document (matches `duduclaw-governance::PolicyFile`).
 fn gov_emit_yaml(policies: &[GovPolicy]) -> String {
-    let mut out = String::from("# DuDuClaw Governance policies — managed by dashboard (governance.upsert)\n");
+    let mut out =
+        String::from("# DuDuClaw Governance policies — managed by dashboard (governance.upsert)\n");
     out.push_str("policies:\n");
     if policies.is_empty() {
         out.push_str("  []\n");
@@ -1225,7 +1361,9 @@ fn gov_parse_yaml(raw: &str) -> Result<Vec<GovPolicy>, String> {
     let unquote = |s: &str| -> String {
         let t = s.trim();
         if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
-            t[1..t.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\")
+            t[1..t.len() - 1]
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\")
         } else if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
             t[1..t.len() - 1].to_string()
         } else {
@@ -1331,7 +1469,10 @@ fn scp_table_to_response(table: &toml::Table) -> Value {
                 Some(t) => t,
                 None => continue,
             };
-            let mode = t.get("mode").and_then(|v| v.as_str()).unwrap_or("agent_writable");
+            let mode = t
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("agent_writable");
             let synced_from = t.get("synced_from").and_then(|v| v.as_str());
             out.push(json!({
                 "namespace": name,
@@ -1341,7 +1482,10 @@ fn scp_table_to_response(table: &toml::Table) -> Value {
         }
     }
     out.sort_by(|a, b| {
-        a["namespace"].as_str().unwrap_or("").cmp(b["namespace"].as_str().unwrap_or(""))
+        a["namespace"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["namespace"].as_str().unwrap_or(""))
     });
     json!({ "namespaces": out })
 }
@@ -1368,11 +1512,16 @@ fn scp_apply_namespace(
 
     if remove {
         ns_table.remove(namespace);
-        return Ok(format!("namespace '{namespace}' policy removed (defaults to agent_writable)"));
+        return Ok(format!(
+            "namespace '{namespace}' policy removed (defaults to agent_writable)"
+        ));
     }
 
     if !SCP_MODES.contains(&mode) {
-        return Err(format!("Invalid mode '{mode}'. Valid: {}", SCP_MODES.join(", ")));
+        return Err(format!(
+            "Invalid mode '{mode}'. Valid: {}",
+            SCP_MODES.join(", ")
+        ));
     }
     let mut entry = toml::map::Map::new();
     entry.insert("mode".into(), toml::Value::String(mode.into()));
@@ -1407,7 +1556,8 @@ fn odo_valid_action(action: &str) -> bool {
         Some(m) => {
             !m.is_empty()
                 && m.len() <= 128
-                && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+                && m.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
         }
     }
 }
@@ -1438,7 +1588,10 @@ fn apply_odoo_to_table(
         if v.is_empty() {
             section.remove("profile");
             changes.push("odoo.profile cleared".into());
-        } else if v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        } else if v.len() <= 64
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
             section.insert("profile".into(), toml::Value::String(v.into()));
             changes.push(format!("odoo.profile = \"{v}\""));
         } else {
@@ -1517,7 +1670,9 @@ fn apply_odoo_to_table(
                     );
                 }
                 if *toml_key == "db"
-                    && !(v.len() < 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                    && !(v.len() < 64
+                        && v.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
                 {
                     return Err("odoo.db must be ≤63 chars of [a-zA-Z0-9_-]".into());
                 }
@@ -2062,7 +2217,11 @@ fn contract_table_to_response(table: &toml::Table) -> Value {
         boundaries
             .and_then(|b| b.get(key))
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let max_calls = boundaries
@@ -2084,7 +2243,10 @@ fn is_valid_source_mode(v: &str) -> bool {
 /// Apply a `redaction.update` payload onto a config.toml table's `[redaction]`
 /// section. Returns the change list. Validates ttl/purge ranges + source-mode
 /// + tool-egress restore-args enums.
-fn apply_redaction_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec<String>, String> {
+fn apply_redaction_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+) -> Result<Vec<String>, String> {
     let mut changes: Vec<String> = Vec::new();
 
     let red = table
@@ -2105,11 +2267,17 @@ fn apply_redaction_to_table(table: &mut toml::Table, params: &Value) -> Result<V
         red.insert("vault_ttl_hours".into(), toml::Value::Integer(v));
         changes.push(format!("redaction.vault_ttl_hours = {v}"));
     }
-    if let Some(v) = params.get("purge_after_expire_days").and_then(|v| v.as_u64()) {
+    if let Some(v) = params
+        .get("purge_after_expire_days")
+        .and_then(|v| v.as_u64())
+    {
         if v > 3650 {
             return Err("purge_after_expire_days must be 0-3650".into());
         }
-        red.insert("purge_after_expire_days".into(), toml::Value::Integer(v as i64));
+        red.insert(
+            "purge_after_expire_days".into(),
+            toml::Value::Integer(v as i64),
+        );
         changes.push(format!("redaction.purge_after_expire_days = {v}"));
     }
     if let Some(arr) = params.get("profiles").and_then(|v| v.as_array()) {
@@ -2138,7 +2306,9 @@ fn apply_redaction_to_table(table: &mut toml::Table, params: &Value) -> Result<V
                                 key: &str,
                                 field: &str|
          -> Result<Vec<String>, String> {
-            let Some(arr) = obj.get(field) else { return Ok(Vec::new()) };
+            let Some(arr) = obj.get(field) else {
+                return Ok(Vec::new());
+            };
             let arr = arr
                 .as_array()
                 .ok_or_else(|| format!("sources.{key}.{field} must be an array"))?;
@@ -2155,7 +2325,9 @@ fn apply_redaction_to_table(table: &mut toml::Table, params: &Value) -> Result<V
                         format!("sources.{key}.{field} entries must be non-empty strings")
                     })?;
                 if s.len() > 64 {
-                    return Err(format!("sources.{key}.{field} entry too long (max 64 chars)"));
+                    return Err(format!(
+                        "sources.{key}.{field} entry too long (max 64 chars)"
+                    ));
                 }
                 out.push(s.to_string());
             }
@@ -2206,7 +2378,9 @@ fn apply_redaction_to_table(table: &mut toml::Table, params: &Value) -> Result<V
                     detail.insert(
                         "only_categories".into(),
                         toml::Value::Array(
-                            only.iter().map(|c| toml::Value::String(c.clone())).collect(),
+                            only.iter()
+                                .map(|c| toml::Value::String(c.clone()))
+                                .collect(),
                         ),
                     );
                 }
@@ -2214,7 +2388,10 @@ fn apply_redaction_to_table(table: &mut toml::Table, params: &Value) -> Result<V
                     detail.insert(
                         "exclude_categories".into(),
                         toml::Value::Array(
-                            exclude.iter().map(|c| toml::Value::String(c.clone())).collect(),
+                            exclude
+                                .iter()
+                                .map(|c| toml::Value::String(c.clone()))
+                                .collect(),
                         ),
                     );
                 }
@@ -2317,10 +2494,14 @@ fn redaction_available_profiles(home_dir: &std::path::Path) -> Vec<Value> {
             .collect();
         files.sort();
         for path in files {
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             match duduclaw_redaction::config::Profile::from_path(&path) {
                 Ok(p) => out.push(summary(name, &p, false)),
-                Err(e) => warn!(profile = %name, error = %e, "custom redaction profile unreadable — skipped from catalogue"),
+                Err(e) => {
+                    warn!(profile = %name, error = %e, "custom redaction profile unreadable — skipped from catalogue")
+                }
             }
         }
     }
@@ -2331,7 +2512,10 @@ fn redaction_available_profiles(home_dir: &std::path::Path) -> Vec<Value> {
 /// response shape.
 fn redaction_table_to_response(table: &toml::Table) -> Value {
     let red = table.get("redaction").and_then(|v| v.as_table());
-    let enabled = red.and_then(|r| r.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(false);
+    let enabled = red
+        .and_then(|r| r.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let vault_ttl = red
         .and_then(|r| r.get("vault_ttl_hours"))
         .and_then(|v| v.as_integer())
@@ -2343,17 +2527,27 @@ fn redaction_table_to_response(table: &toml::Table) -> Value {
     let profiles: Vec<String> = red
         .and_then(|r| r.get("profiles"))
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let sources = red.and_then(|r| r.get("sources")).and_then(|v| v.as_table());
+    let sources = red
+        .and_then(|r| r.get("sources"))
+        .and_then(|v| v.as_table());
     // Sources round-trip both TOML forms (bare mode string / detail table);
     // the wire response is always the detail-object form.
     let source_setting = |key: &str, default: &str| -> Value {
         let toml_cats = |t: &toml::Table, field: &str| -> Vec<String> {
             t.get(field)
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         match sources.and_then(|s| s.get(key)) {
@@ -2375,7 +2569,9 @@ fn redaction_table_to_response(table: &toml::Table) -> Value {
         }
     };
 
-    let egress = red.and_then(|r| r.get("tool_egress")).and_then(|v| v.as_table());
+    let egress = red
+        .and_then(|r| r.get("tool_egress"))
+        .and_then(|v| v.as_table());
     let mut egress_out = serde_json::Map::new();
     if let Some(eg) = egress {
         for (tool, rule) in eg {
@@ -2420,11 +2616,17 @@ fn memory_retrieval_weights_from_table(
     table: Option<&toml::Table>,
 ) -> duduclaw_memory::engine::RetrievalWeights {
     let mut weights = duduclaw_memory::engine::RetrievalWeights::default();
-    if let Some(mem) = table.and_then(|t| t.get("memory")).and_then(|v| v.as_table()) {
+    if let Some(mem) = table
+        .and_then(|t| t.get("memory"))
+        .and_then(|v| v.as_table())
+    {
         if let Some(seed) = mem.get("graph_embed_seed").and_then(|v| v.as_bool()) {
             weights.graph_embed_seed = seed;
         }
-        if let Some(k) = mem.get("graph_embed_seed_top_k").and_then(|v| v.as_integer()) {
+        if let Some(k) = mem
+            .get("graph_embed_seed_top_k")
+            .and_then(|v| v.as_integer())
+        {
             weights.graph_embed_seed_top_k = k.max(1) as usize;
         }
     }
@@ -2527,7 +2729,10 @@ fn apply_skill_synthesis_to_table(
 
 /// Validate + apply a `killswitch.update` payload onto a KILLSWITCH.toml table.
 /// Returns the change list. Validates numeric ranges across all sub-sections.
-fn apply_killswitch_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec<String>, String> {
+fn apply_killswitch_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+) -> Result<Vec<String>, String> {
     let mut changes: Vec<String> = Vec::new();
 
     // Helper: get-or-create a sub-table.
@@ -2546,14 +2751,20 @@ fn apply_killswitch_to_table(table: &mut toml::Table, params: &Value) -> Result<
             if v == 0 || v > 10000 {
                 return Err("triggers.max_replies_per_minute must be 1-10000".into());
             }
-            sect.insert("max_replies_per_minute".into(), toml::Value::Integer(v as i64));
+            sect.insert(
+                "max_replies_per_minute".into(),
+                toml::Value::Integer(v as i64),
+            );
             changes.push(format!("triggers.max_replies_per_minute = {v}"));
         }
         if let Some(v) = t.get("max_consecutive_errors").and_then(|v| v.as_u64()) {
             if v == 0 || v > 1000 {
                 return Err("triggers.max_consecutive_errors must be 1-1000".into());
             }
-            sect.insert("max_consecutive_errors".into(), toml::Value::Integer(v as i64));
+            sect.insert(
+                "max_consecutive_errors".into(),
+                toml::Value::Integer(v as i64),
+            );
             changes.push(format!("triggers.max_consecutive_errors = {v}"));
         }
         if let Some(v) = t.get("error_rate_threshold").and_then(|v| v.as_f64()) {
@@ -2579,14 +2790,20 @@ fn apply_killswitch_to_table(table: &mut toml::Table, params: &Value) -> Result<
             if v == 0 || v > 86400 {
                 return Err("circuit_breaker.frequency_window_secs must be 1-86400".into());
             }
-            sect.insert("frequency_window_secs".into(), toml::Value::Integer(v as i64));
+            sect.insert(
+                "frequency_window_secs".into(),
+                toml::Value::Integer(v as i64),
+            );
             changes.push(format!("circuit_breaker.frequency_window_secs = {v}"));
         }
         if let Some(v) = c.get("frequency_max_replies").and_then(|v| v.as_u64()) {
             if v == 0 || v > 10000 {
                 return Err("circuit_breaker.frequency_max_replies must be 1-10000".into());
             }
-            sect.insert("frequency_max_replies".into(), toml::Value::Integer(v as i64));
+            sect.insert(
+                "frequency_max_replies".into(),
+                toml::Value::Integer(v as i64),
+            );
             changes.push(format!("circuit_breaker.frequency_max_replies = {v}"));
         }
         if let Some(v) = c.get("similarity_threshold").and_then(|v| v.as_f64()) {
@@ -2614,7 +2831,10 @@ fn apply_killswitch_to_table(table: &mut toml::Table, params: &Value) -> Result<
             if v == 0 || v > 1000 {
                 return Err("circuit_breaker.half_open_allow_count must be 1-1000".into());
             }
-            sect.insert("half_open_allow_count".into(), toml::Value::Integer(v as i64));
+            sect.insert(
+                "half_open_allow_count".into(),
+                toml::Value::Integer(v as i64),
+            );
             changes.push(format!("circuit_breaker.half_open_allow_count = {v}"));
         }
     }
@@ -2622,7 +2842,11 @@ fn apply_killswitch_to_table(table: &mut toml::Table, params: &Value) -> Result<
     // ── [failsafe] ──
     if let Some(f) = params.get("failsafe").and_then(|v| v.as_object()) {
         let sect = sub(table, "failsafe")?;
-        for key in &["l1_auto_recover_secs", "l2_auto_recover_secs", "l3_auto_recover_secs"] {
+        for key in &[
+            "l1_auto_recover_secs",
+            "l2_auto_recover_secs",
+            "l3_auto_recover_secs",
+        ] {
             if let Some(v) = f.get(*key).and_then(|v| v.as_u64()) {
                 if v > 86400 {
                     return Err(format!("failsafe.{key} must be 0-86400 (0 = manual only)"));
@@ -2674,9 +2898,9 @@ fn apply_killswitch_to_table(table: &mut toml::Table, params: &Value) -> Result<
         if let Some(arr) = d.get("languages").and_then(|v| v.as_array()) {
             let mut out = Vec::with_capacity(arr.len());
             for item in arr {
-                let l = item
-                    .as_str()
-                    .ok_or_else(|| "defensive_prompt.languages entries must be strings".to_string())?;
+                let l = item.as_str().ok_or_else(|| {
+                    "defensive_prompt.languages entries must be strings".to_string()
+                })?;
                 let l = l.trim();
                 if l.is_empty() {
                     return Err("defensive_prompt.languages entries must be non-empty".into());
@@ -2684,7 +2908,10 @@ fn apply_killswitch_to_table(table: &mut toml::Table, params: &Value) -> Result<
                 out.push(toml::Value::String(l.into()));
             }
             sect.insert("languages".into(), toml::Value::Array(out));
-            changes.push(format!("defensive_prompt.languages = [{} entries]", arr.len()));
+            changes.push(format!(
+                "defensive_prompt.languages = [{} entries]",
+                arr.len()
+            ));
         }
     }
 
@@ -2722,21 +2949,34 @@ fn killswitch_table_to_response(table: &toml::Table) -> Value {
     let au = table.get("audit").and_then(|v| v.as_table());
 
     let int = |tbl: Option<&toml::Table>, key: &str, default: i64| -> i64 {
-        tbl.and_then(|t| t.get(key)).and_then(|v| v.as_integer()).unwrap_or(default)
+        tbl.and_then(|t| t.get(key))
+            .and_then(|v| v.as_integer())
+            .unwrap_or(default)
     };
     let flt = |tbl: Option<&toml::Table>, key: &str, default: f64| -> f64 {
-        tbl.and_then(|t| t.get(key)).and_then(|v| v.as_float()).unwrap_or(default)
+        tbl.and_then(|t| t.get(key))
+            .and_then(|v| v.as_float())
+            .unwrap_or(default)
     };
     let boolean = |tbl: Option<&toml::Table>, key: &str, default: bool| -> bool {
-        tbl.and_then(|t| t.get(key)).and_then(|v| v.as_bool()).unwrap_or(default)
+        tbl.and_then(|t| t.get(key))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default)
     };
     let strv = |tbl: Option<&toml::Table>, key: &str, default: &str| -> String {
-        tbl.and_then(|t| t.get(key)).and_then(|v| v.as_str()).unwrap_or(default).to_string()
+        tbl.and_then(|t| t.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+            .to_string()
     };
     let arr = |tbl: Option<&toml::Table>, key: &str, default: &[String]| -> Vec<String> {
         tbl.and_then(|t| t.get(key))
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_else(|| default.to_vec())
     };
 
@@ -2790,9 +3030,11 @@ fn killswitch_table_to_response(table: &toml::Table) -> Value {
 fn scrub_secrets_from_text(raw: &str) -> String {
     fn is_sensitive_key(key: &str) -> bool {
         let k = key.to_ascii_lowercase();
-        ["api_key", "apikey", "token", "password", "passwd", "pwd", "secret", "auth", "key"]
-            .iter()
-            .any(|s| k.contains(s))
+        [
+            "api_key", "apikey", "token", "password", "passwd", "pwd", "secret", "auth", "key",
+        ]
+        .iter()
+        .any(|s| k.contains(s))
     }
 
     fn scrub_token(token: &str) -> String {
@@ -2801,10 +3043,7 @@ fn scrub_secrets_from_text(raw: &str) -> String {
             let scheme = &token[..scheme_idx];
             let rest = &token[scheme_idx + 3..];
             // Drop everything from the first query/fragment marker onward.
-            let rest = rest
-                .split(['?', '#'])
-                .next()
-                .unwrap_or("");
+            let rest = rest.split(['?', '#']).next().unwrap_or("");
             // Drop userinfo (anything up to and including '@' in the authority).
             // The authority ends at the first '/'.
             let (authority, path) = match rest.find('/') {
@@ -2841,8 +3080,7 @@ fn hours_since_month_start() -> u64 {
         .unwrap_or(now.date_naive())
         .and_hms_opt(0, 0, 0)
         .unwrap_or_default();
-    let month_start_utc =
-        chrono::DateTime::<Utc>::from_naive_utc_and_offset(month_start, Utc);
+    let month_start_utc = chrono::DateTime::<Utc>::from_naive_utc_and_offset(month_start, Utc);
     (now - month_start_utc).num_hours().max(1) as u64
 }
 
@@ -2873,7 +3111,8 @@ pub struct MethodHandler {
     /// Reply context for hot-starting channels after config changes.
     reply_ctx: RwLock<Option<Arc<crate::channel_reply::ReplyContext>>>,
     /// Handles for running channel bot tasks (for hot-stop on remove).
-    channel_handles: tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+    channel_handles:
+        tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     /// [M2] Server-side cached pending update (set by check_update, consumed by apply_update).
     pending_update: RwLock<Option<PendingUpdate>>,
     /// User database for multi-user auth (injected after gateway start).
@@ -2903,9 +3142,8 @@ pub struct MethodHandler {
     /// Event broadcast sender for real-time task/activity events.
     event_tx: RwLock<Option<tokio::sync::broadcast::Sender<String>>>,
     /// Typed event broadcast sender consumed by `AutopilotEngine`.
-    autopilot_event_tx: RwLock<
-        Option<tokio::sync::broadcast::Sender<crate::autopilot_engine::AutopilotEvent>>,
-    >,
+    autopilot_event_tx:
+        RwLock<Option<tokio::sync::broadcast::Sender<crate::autopilot_engine::AutopilotEvent>>>,
     /// RFC-23 redaction manager. `None` ⇒ pipeline disabled at this layer.
     redaction_manager: RwLock<Option<Arc<duduclaw_redaction::RedactionManager>>>,
     /// Vault GC task paired with the live redaction manager — restarted on
@@ -2915,9 +3153,19 @@ pub struct MethodHandler {
     /// once and synced by a background task — so audit/reliability RPCs and the
     /// `/api/reliability/summary` HTTP endpoint reuse one connection instead of
     /// opening a fresh DB + running a full `sync_from_files` on every request.
-    audit_index: tokio::sync::OnceCell<
-        Arc<crate::evolution_events::query::AuditEventIndex>,
-    >,
+    audit_index: tokio::sync::OnceCell<Arc<crate::evolution_events::query::AuditEventIndex>>,
+    /// SQLite message queue shared with the goal-loop driver (injected after
+    /// gateway start). Needed to rebuild the driver on a hot config reload.
+    message_queue: RwLock<Option<Arc<crate::message_queue::MessageQueue>>>,
+    /// Handles for the long-lived background drivers whose config is read once
+    /// at startup (`goal_loop`, `topology_evolution`). Keyed by a stable
+    /// `&'static str`. Hot config reload aborts the old handle and re-spawns
+    /// with fresh config (same abort+respawn pattern as `channel_handles`).
+    driver_handles:
+        tokio::sync::Mutex<std::collections::HashMap<&'static str, tokio::task::JoinHandle<()>>>,
+    /// Shared registry of per-agent OS filesystem watchers. Lets `agents.update`
+    /// hot stop/start one agent's `[os_watch]` watcher without a gateway restart.
+    os_watchers: Arc<crate::os_events::OsWatcherRegistry>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -2952,10 +3200,7 @@ impl MethodHandler {
     }
 
     /// Create a new handler with a custom extension (used by Pro binary).
-    pub async fn with_extension(
-        home_dir: PathBuf,
-        extension: Arc<dyn GatewayExtension>,
-    ) -> Self {
+    pub async fn with_extension(home_dir: PathBuf, extension: Arc<dyn GatewayExtension>) -> Self {
         let agents_dir = home_dir.join("agents");
         let mut registry = AgentRegistry::new(agents_dir.clone());
         if let Err(e) = registry.scan().await {
@@ -2977,7 +3222,9 @@ impl MethodHandler {
                 if name.starts_with('_') || name.is_empty() {
                     continue;
                 }
-                if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(&path, &bin).await {
+                if let Err(e) =
+                    crate::agent_hook_installer::ensure_agent_hook_settings(&path, &bin).await
+                {
                     tracing::warn!(
                         agent = %name,
                         error = %e,
@@ -2986,6 +3233,7 @@ impl MethodHandler {
                 }
             }
         }
+        let home_dir_for_registry = home_dir.clone();
         Self {
             registry: Arc::new(RwLock::new(registry)),
             home_dir,
@@ -3010,6 +3258,9 @@ impl MethodHandler {
             redaction_manager: RwLock::new(None),
             redaction_gc: tokio::sync::Mutex::new(None),
             audit_index: tokio::sync::OnceCell::new(),
+            message_queue: RwLock::new(None),
+            driver_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            os_watchers: crate::os_events::OsWatcherRegistry::new(home_dir_for_registry),
         }
     }
 
@@ -3105,9 +3356,7 @@ impl MethodHandler {
     }
 
     /// Read the redaction manager handle.
-    pub async fn get_redaction_manager(
-        &self,
-    ) -> Option<Arc<duduclaw_redaction::RedactionManager>> {
+    pub async fn get_redaction_manager(&self) -> Option<Arc<duduclaw_redaction::RedactionManager>> {
         self.redaction_manager.read().await.clone()
     }
 
@@ -3151,6 +3400,147 @@ impl MethodHandler {
         *self.cron_scheduler.write().await = Some(scheduler);
     }
 
+    /// Inject the SQLite message queue (called once after gateway start). Needed
+    /// so the goal-loop driver can be rebuilt on a hot config reload.
+    pub async fn set_message_queue(&self, mq: Arc<crate::message_queue::MessageQueue>) {
+        *self.message_queue.write().await = Some(mq);
+    }
+
+    /// Shared OS-watcher registry (for server.rs startup wiring + status).
+    pub fn os_watchers(&self) -> Arc<crate::os_events::OsWatcherRegistry> {
+        self.os_watchers.clone()
+    }
+
+    /// Register a background driver handle keyed by a stable name, aborting any
+    /// prior handle for that key first (abort+respawn hot-reload pattern).
+    async fn register_driver_handle(&self, key: &'static str, handle: tokio::task::JoinHandle<()>) {
+        let mut map = self.driver_handles.lock().await;
+        if let Some(old) = map.insert(key, handle) {
+            old.abort();
+        }
+    }
+
+    /// Abort and deregister a background driver handle. Returns whether one was
+    /// running.
+    async fn abort_driver_handle(&self, key: &'static str) -> bool {
+        if let Some(old) = self.driver_handles.lock().await.remove(key) {
+            old.abort();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// (Re)build and spawn the autonomous goal-loop driver from current config.
+    ///
+    /// Shared by gateway startup and the `system.update_config` hot reload of
+    /// `[goal_loop] iteration_cap_simple` / `[dispatch] policy`. The driver is a
+    /// stateless periodic poller (durable state lives in SQLite / the task rows),
+    /// so aborting the old task between ticks and respawning with fresh config is
+    /// safe. Gated by `[dispatch] enabled` (the same gate as startup): when
+    /// dispatch is disabled, any existing driver is aborted and none is spawned.
+    ///
+    /// Returns `true` iff a driver is now running.
+    pub async fn respawn_goal_loop_driver(&self) -> bool {
+        if !crate::dispatch_engine::dispatch_engine_enabled(&self.home_dir) {
+            self.abort_driver_handle("goal_loop").await;
+            return false;
+        }
+        let (Some(ts), Some(mq)) = (
+            self.task_store.read().await.clone(),
+            self.message_queue.read().await.clone(),
+        ) else {
+            warn!("goal loop driver not (re)started: task store or message queue unavailable");
+            self.abort_driver_handle("goal_loop").await;
+            return false;
+        };
+
+        let cfg = crate::goal_loop::GoalLoopConfig::from_home(&self.home_dir);
+        let mut driver =
+            crate::goal_loop::GoalLoopDriver::new(ts, mq, cfg).with_home_dir(self.home_dir.clone());
+        if let Some(policy) = crate::dispatch_policy::build_policy(&self.home_dir) {
+            info!(policy = %policy.kind().as_str(), "Goal loop: dispatch policy active");
+            driver = driver.with_policy(policy);
+        }
+        match crate::approval::ApprovalBroker::open(&self.home_dir) {
+            Ok(broker) => driver = driver.with_broker(Arc::new(broker)),
+            Err(e) => warn!(
+                error = %e,
+                "Goal loop: ApprovalBroker unavailable — kickoff gate disabled"
+            ),
+        }
+        let driver = Arc::new(driver);
+        let handle = tokio::spawn(async move { driver.run().await });
+        self.register_driver_handle("goal_loop", handle).await;
+        info!("Goal loop driver (re)started");
+        true
+    }
+
+    /// (Re)build and spawn the semi-automatic topology-evolution driver from
+    /// current config. Shared by startup and the `system.update_config` hot
+    /// reload of `[topology_evolution] enabled`. Like the goal loop it is a
+    /// stateless periodic poller (durable state in SQLite / the ApprovalBroker),
+    /// so abort-between-ticks + respawn is safe. When `enabled = false`, any
+    /// existing driver is aborted and none is spawned (true→false teardown;
+    /// false→true first spawn). Returns `true` iff a driver is now running.
+    pub async fn respawn_topology_driver(&self) -> bool {
+        if !crate::topology_evolution::enabled(&self.home_dir) {
+            self.abort_driver_handle("topology").await;
+            return false;
+        }
+        let Some(ts) = self.task_store.read().await.clone() else {
+            warn!("topology evolution driver not (re)started: task store unavailable");
+            self.abort_driver_handle("topology").await;
+            return false;
+        };
+        let broker = match crate::approval::ApprovalBroker::open(&self.home_dir) {
+            Ok(b) => Arc::new(b),
+            Err(e) => {
+                warn!(error = %e, "Topology evolution: ApprovalBroker unavailable — D5 disabled");
+                self.abort_driver_handle("topology").await;
+                return false;
+            }
+        };
+        let cfg = crate::topology_evolution::TopologyEvolutionConfig::from_home(&self.home_dir);
+        let driver = Arc::new(crate::topology_evolution::TopologyEvolutionDriver::new(
+            ts,
+            self.home_dir.clone(),
+            broker,
+            cfg,
+        ));
+        let handle = tokio::spawn(async move { driver.run().await });
+        self.register_driver_handle("topology", handle).await;
+        info!("Topology evolution driver (re)started");
+        true
+    }
+
+    /// Hot stop/start one agent's OS filesystem watcher after an `os_native` /
+    /// `[os_watch]` edit committed to `agent.toml`. Reads the freshly-scanned
+    /// registry: when the agent has `os_native = true`, (re)starts the watcher
+    /// from its current `[os_watch]` config; otherwise stops any running one.
+    /// Returns whether a watcher is running for the agent after the reload.
+    async fn hot_reload_os_watcher(&self, agent_id: &str) -> bool {
+        let (os_native, agent_dir) = {
+            let reg = self.registry.read().await;
+            match reg.get(agent_id) {
+                Some(a) => (a.config.capabilities.os_native, a.dir.clone()),
+                None => return false,
+            }
+        };
+        if !os_native {
+            self.os_watchers.stop_agent(agent_id).await;
+            return false;
+        }
+        let Some(tx) = self.autopilot_event_tx.read().await.clone() else {
+            // No autopilot event bus (task/autopilot store missing) — watchers
+            // have nowhere to forward. Ensure none is left running.
+            self.os_watchers.stop_agent(agent_id).await;
+            warn!(agent = %agent_id, "os_watch hot reload skipped: autopilot event bus unavailable");
+            return false;
+        };
+        self.os_watchers.start_agent(agent_id, &agent_dir, tx).await
+    }
+
     /// Notify the cron scheduler to reload immediately. Call this after any
     /// mutation (add / update / delete / enable-toggle). No-op if the
     /// scheduler has not been injected yet.
@@ -3189,11 +3579,14 @@ impl MethodHandler {
     /// Update a channel's runtime connection state (called by channel bots).
     pub async fn set_channel_state(&self, name: &str, connected: bool, error: Option<String>) {
         let mut map = self.channel_status.write().await;
-        map.insert(name.to_string(), ChannelState {
-            connected,
-            last_event: Some(chrono::Utc::now()),
-            error,
-        });
+        map.insert(
+            name.to_string(),
+            ChannelState {
+                connected,
+                last_event: Some(chrono::Utc::now()),
+                error,
+            },
+        );
     }
 
     /// Get the shared channel status map for use by channel bots.
@@ -3212,7 +3605,9 @@ impl MethodHandler {
     }
 
     /// Get the pending OAuth flows map (used by HTTP callback handler).
-    pub fn mcp_oauth_pending(&self) -> &RwLock<std::collections::HashMap<String, crate::mcp_oauth::PendingOAuth>> {
+    pub fn mcp_oauth_pending(
+        &self,
+    ) -> &RwLock<std::collections::HashMap<String, crate::mcp_oauth::PendingOAuth>> {
         &self.mcp_oauth_pending
     }
 
@@ -3234,7 +3629,11 @@ impl MethodHandler {
     async fn dispatch(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
         // ── Plugin extension dispatch ──────
         // Try extension first; if it returns Some, the method is handled.
-        if let Some(frame) = self.extension.handle_method(method, params.clone(), ctx).await {
+        if let Some(frame) = self
+            .extension
+            .handle_method(method, params.clone(), ctx)
+            .await
+        {
             return frame;
         }
 
@@ -3286,10 +3685,7 @@ impl MethodHandler {
                             }
                         }
                         _ => {
-                            return WsFrame::error_response(
-                                "",
-                                "agent_id parameter is required",
-                            );
+                            return WsFrame::error_response("", "agent_id parameter is required");
                         }
                     }
                 }
@@ -3309,26 +3705,56 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_agents_status(params).await
             }
-            "agents.create" => { require_admin!(); self.handle_agents_create(params).await }
+            "agents.create" => {
+                require_admin!();
+                self.handle_agents_create(params).await
+            }
             "agents.delegate" => {
                 // H1 fix: delegate is high-risk — requires operator-level access
                 let _ = check_agent!(AccessLevel::Operator);
                 self.handle_agents_delegate(params).await
             }
-            "agents.pause" => { require_manager!(); self.handle_agents_pause(params).await }
-            "agents.resume" => { require_manager!(); self.handle_agents_resume(params).await }
+            "agents.pause" => {
+                require_manager!();
+                self.handle_agents_pause(params).await
+            }
+            "agents.resume" => {
+                require_manager!();
+                self.handle_agents_resume(params).await
+            }
             "agents.update" => {
                 let _ = check_agent!(AccessLevel::Owner);
                 self.handle_agents_update(params).await
             }
-            "agents.remove" => { require_admin!(); self.handle_agents_remove(params).await }
+            "agents.remove" => {
+                require_admin!();
+                self.handle_agents_remove(params).await
+            }
             // ── WP4 off-boarding lifecycle (all admin-gated) ──
-            "agents.archive" => { require_admin!(); self.handle_agents_archive(params).await }
-            "agents.unarchive" => { require_admin!(); self.handle_agents_unarchive(params).await }
-            "agents.handoff" => { require_admin!(); self.handle_agents_handoff(params).await }
-            "agents.set_avatar" => { require_admin!(); self.handle_agents_set_avatar(params).await }
-            "agents.set_outfit" => { require_admin!(); self.handle_agents_set_outfit(params).await }
-            "agents.clear_avatar" => { require_admin!(); self.handle_agents_clear_avatar(params).await }
+            "agents.archive" => {
+                require_admin!();
+                self.handle_agents_archive(params).await
+            }
+            "agents.unarchive" => {
+                require_admin!();
+                self.handle_agents_unarchive(params).await
+            }
+            "agents.handoff" => {
+                require_admin!();
+                self.handle_agents_handoff(params).await
+            }
+            "agents.set_avatar" => {
+                require_admin!();
+                self.handle_agents_set_avatar(params).await
+            }
+            "agents.set_outfit" => {
+                require_admin!();
+                self.handle_agents_set_outfit(params).await
+            }
+            "agents.clear_avatar" => {
+                require_admin!();
+                self.handle_agents_clear_avatar(params).await
+            }
             "agents.inspect" => {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_agents_inspect(params).await
@@ -3340,59 +3766,152 @@ impl MethodHandler {
             }
 
             // ── Premium team templates (dashboard onboarding staging flow) ──
-            "templates.industries" => { require_admin!(); self.handle_templates_industries().await }
-            "templates.stage" => { require_admin!(); self.handle_templates_stage(params).await }
-            "templates.roster" => { require_admin!(); self.handle_templates_roster(params).await }
-            "templates.role" => { require_admin!(); self.handle_templates_role(params).await }
-            "templates.create_agent" => { require_admin!(); self.handle_templates_create_agent(params).await }
+            "templates.industries" => {
+                require_admin!();
+                self.handle_templates_industries().await
+            }
+            "templates.stage" => {
+                require_admin!();
+                self.handle_templates_stage(params).await
+            }
+            "templates.roster" => {
+                require_admin!();
+                self.handle_templates_roster(params).await
+            }
+            "templates.role" => {
+                require_admin!();
+                self.handle_templates_role(params).await
+            }
+            "templates.create_agent" => {
+                require_admin!();
+                self.handle_templates_create_agent(params).await
+            }
 
             // ── Behavioral contract (per-agent CONTRACT.toml, CON.1–CON.3) ──
-            "contract.get" => { require_admin!(); self.handle_contract_get(params).await }
-            "contract.update" => { require_admin!(); self.handle_contract_update(params).await }
+            "contract.get" => {
+                require_admin!();
+                self.handle_contract_get(params).await
+            }
+            "contract.update" => {
+                require_admin!();
+                self.handle_contract_update(params).await
+            }
 
             // ── Redaction / privacy (global config.toml [redaction], RED.1–RED.4) ──
-            "redaction.get" => { require_admin!(); self.handle_redaction_get().await }
-            "redaction.update" => { require_admin!(); self.handle_redaction_update(params).await }
+            "redaction.get" => {
+                require_admin!();
+                self.handle_redaction_get().await
+            }
+            "redaction.update" => {
+                require_admin!();
+                self.handle_redaction_update(params).await
+            }
 
             // IDR: identity resolution (RFC-21 §1 dashboard surface)
-            "identity.config_get" => { require_admin!(); self.handle_identity_config_get().await }
-            "identity.config_set" => { require_admin!(); self.handle_identity_config_set(params).await }
-            "identity.resolve" => { require_admin!(); self.handle_identity_resolve(params).await }
+            "identity.config_get" => {
+                require_admin!();
+                self.handle_identity_config_get().await
+            }
+            "identity.config_set" => {
+                require_admin!();
+                self.handle_identity_config_set(params).await
+            }
+            "identity.resolve" => {
+                require_admin!();
+                self.handle_identity_resolve(params).await
+            }
 
             // ── Skill synthesis auto-run (global config.toml [skill_synthesis], W19-P1) ──
-            "skill_synthesis.get" => { require_admin!(); self.handle_skill_synthesis_get().await }
-            "skill_synthesis.update" => { require_admin!(); self.handle_skill_synthesis_update(params).await }
+            "skill_synthesis.get" => {
+                require_admin!();
+                self.handle_skill_synthesis_get().await
+            }
+            "skill_synthesis.update" => {
+                require_admin!();
+                self.handle_skill_synthesis_update(params).await
+            }
 
             // ── Inference (global ~/.duduclaw/inference.toml, INF.1–INF.5) ──
-            "inference.get" => { require_admin!(); self.handle_inference_get().await }
-            "inference.update" => { require_admin!(); self.handle_inference_update(params).await }
+            "inference.get" => {
+                require_admin!();
+                self.handle_inference_get().await
+            }
+            "inference.update" => {
+                require_admin!();
+                self.handle_inference_update(params).await
+            }
 
             // ── MCP API keys (global config.toml [mcp_keys], MK.1–MK.4) ──
-            "mcp_keys.list" => { require_admin!(); self.handle_mcp_keys_list().await }
-            "mcp_keys.create" => { require_admin!(); self.handle_mcp_keys_create(params).await }
-            "mcp_keys.revoke" => { require_admin!(); self.handle_mcp_keys_revoke(params).await }
+            "mcp_keys.list" => {
+                require_admin!();
+                self.handle_mcp_keys_list().await
+            }
+            "mcp_keys.create" => {
+                require_admin!();
+                self.handle_mcp_keys_create(params).await
+            }
+            "mcp_keys.revoke" => {
+                require_admin!();
+                self.handle_mcp_keys_revoke(params).await
+            }
 
             // ── Kill switch (global ~/.duduclaw/KILLSWITCH.toml, KS.1–KS.2) ──
-            "killswitch.get" => { require_admin!(); self.handle_killswitch_get().await }
-            "killswitch.update" => { require_admin!(); self.handle_killswitch_update(params).await }
+            "killswitch.get" => {
+                require_admin!();
+                self.handle_killswitch_get().await
+            }
+            "killswitch.update" => {
+                require_admin!();
+                self.handle_killswitch_update(params).await
+            }
 
             // ── Governance policies (policies/*.yaml, GOV.1–GOV.2) ──
-            "governance.list" => { require_admin!(); self.handle_governance_list(params).await }
-            "governance.upsert" => { require_admin!(); self.handle_governance_upsert(params).await }
-            "governance.remove" => { require_admin!(); self.handle_governance_remove(params).await }
+            "governance.list" => {
+                require_admin!();
+                self.handle_governance_list(params).await
+            }
+            "governance.upsert" => {
+                require_admin!();
+                self.handle_governance_upsert(params).await
+            }
+            "governance.remove" => {
+                require_admin!();
+                self.handle_governance_remove(params).await
+            }
 
             // ── Wiki namespace scope (.scope.toml, SCP.1) ──
-            "wiki_scope.get" => { require_admin!(); self.handle_wiki_scope_get().await }
-            "wiki_scope.update" => { require_admin!(); self.handle_wiki_scope_update(params).await }
+            "wiki_scope.get" => {
+                require_admin!();
+                self.handle_wiki_scope_get().await
+            }
+            "wiki_scope.update" => {
+                require_admin!();
+                self.handle_wiki_scope_update(params).await
+            }
 
             // ── Channel methods (admin only) ─────────────────
-            "channels.status" => { require_admin!(); self.handle_channels_status().await }
-            "channels.add" => { require_admin!(); self.handle_channels_add(params).await }
-            "channels.test" => { require_admin!(); self.handle_channels_test(params).await }
-            "channels.remove" => { require_admin!(); self.handle_channels_remove(params).await }
+            "channels.status" => {
+                require_admin!();
+                self.handle_channels_status().await
+            }
+            "channels.add" => {
+                require_admin!();
+                self.handle_channels_add(params).await
+            }
+            "channels.test" => {
+                require_admin!();
+                self.handle_channels_test(params).await
+            }
+            "channels.remove" => {
+                require_admin!();
+                self.handle_channels_remove(params).await
+            }
             // WP9: mint a one-time Telegram deep-link/QR bind token for a
             // specific AI employee (shared-bot onboarding). Admin only.
-            "channels.telegram_bind_token" => { require_admin!(); self.handle_telegram_bind_token(params).await }
+            "channels.telegram_bind_token" => {
+                require_admin!();
+                self.handle_telegram_bind_token(params).await
+            }
 
             // ── Account methods (admin only) ─────────────────
             // ── License (read-only snapshot of the gateway LicenseRuntime) ──
@@ -3402,31 +3921,76 @@ impl MethodHandler {
             // directly. Manager-level access — the snapshot intentionally
             // omits the raw signature and customer email, so it is safe to
             // show to anyone who can already see operational metrics.
-            "license.status" => { require_manager!(); self.handle_license_status().await }
+            "license.status" => {
+                require_manager!();
+                self.handle_license_status().await
+            }
             // Dashboard upgrade flow — install/redeem a commercial license
             // without touching the CLI. Admin-only: this changes what the
             // whole install is allowed to do.
-            "license.fingerprint" => { require_admin!(); self.handle_license_fingerprint().await }
-            "license.activate" => { require_admin!(); self.handle_license_activate(params).await }
-            "license.redeem" => { require_admin!(); self.handle_license_redeem(params).await }
+            "license.fingerprint" => {
+                require_admin!();
+                self.handle_license_fingerprint().await
+            }
+            "license.activate" => {
+                require_admin!();
+                self.handle_license_activate(params).await
+            }
+            "license.redeem" => {
+                require_admin!();
+                self.handle_license_redeem(params).await
+            }
 
-            "accounts.list" => { require_admin!(); self.handle_accounts_list().await }
-            "accounts.budget_summary" => { require_manager!(); self.handle_budget_summary().await }
+            "accounts.list" => {
+                require_admin!();
+                self.handle_accounts_list().await
+            }
+            "accounts.budget_summary" => {
+                require_manager!();
+                self.handle_budget_summary().await
+            }
             "accounts.rotate" => {
                 require_admin!();
                 self.handle_accounts_rotate(params).await
             }
-            "accounts.health" => { require_admin!(); self.handle_accounts_health().await }
-            "accounts.add" => { require_admin!(); self.handle_accounts_add(params).await }
-            "accounts.update_budget" => { require_admin!(); self.handle_accounts_update_budget(params).await }
-            "accounts.update" => { require_admin!(); self.handle_accounts_update(params).await }
+            "accounts.health" => {
+                require_admin!();
+                self.handle_accounts_health().await
+            }
+            "accounts.add" => {
+                require_admin!();
+                self.handle_accounts_add(params).await
+            }
+            "accounts.update_budget" => {
+                require_admin!();
+                self.handle_accounts_update_budget(params).await
+            }
+            "accounts.update" => {
+                require_admin!();
+                self.handle_accounts_update(params).await
+            }
             // Interactive CLI login ("Dashboard 一鍵登入") — drives the CLI's
             // native login in a PTY and streams it to the dashboard.
-            "auth.cli_login.start" => { require_admin!(); self.handle_cli_login_start(params).await }
-            "auth.cli_login.input" => { require_admin!(); self.handle_cli_login_input(params).await }
-            "auth.cli_login.status" => { require_admin!(); self.handle_cli_login_status(params).await }
-            "auth.cli_login.cancel" => { require_admin!(); self.handle_cli_login_cancel(params).await }
-            "auth.cli_login.finalize" => { require_admin!(); self.handle_cli_login_finalize(params).await }
+            "auth.cli_login.start" => {
+                require_admin!();
+                self.handle_cli_login_start(params).await
+            }
+            "auth.cli_login.input" => {
+                require_admin!();
+                self.handle_cli_login_input(params).await
+            }
+            "auth.cli_login.status" => {
+                require_admin!();
+                self.handle_cli_login_status(params).await
+            }
+            "auth.cli_login.cancel" => {
+                require_admin!();
+                self.handle_cli_login_cancel(params).await
+            }
+            "auth.cli_login.finalize" => {
+                require_admin!();
+                self.handle_cli_login_finalize(params).await
+            }
 
             // ── Memory (agent-scoped, H2 fix) ────────────────
             "memory.search" => {
@@ -3496,9 +4060,18 @@ impl MethodHandler {
             // Phase 4: trust feedback inspection + manual override.
             // Trust state exposes per-conversation citation history that
             // can correlate with user activity → manager+ only (review H1).
-            "wiki.trust_audit" => { require_manager!(); self.handle_wiki_trust_audit(params).await }
-            "wiki.trust_override" => { require_admin!(); self.handle_wiki_trust_override(params).await }
-            "wiki.trust_history" => { require_manager!(); self.handle_wiki_trust_history(params).await }
+            "wiki.trust_audit" => {
+                require_manager!();
+                self.handle_wiki_trust_audit(params).await
+            }
+            "wiki.trust_override" => {
+                require_admin!();
+                self.handle_wiki_trust_override(params).await
+            }
+            "wiki.trust_history" => {
+                require_manager!();
+                self.handle_wiki_trust_history(params).await
+            }
 
             // ── Shared Wiki ─────────────────────────────────
             "shared_wiki.pages" => self.handle_shared_wiki_pages().await,
@@ -3519,32 +4092,74 @@ impl MethodHandler {
             // authenticated user may scan a skill before requesting install.
             "skills.vet" => self.handle_skills_vet(params).await,
             // Direct install stays admin-only; non-admins file an install request.
-            "skills.install" => { require_admin!(); self.handle_skills_install(params).await }
+            "skills.install" => {
+                require_admin!();
+                self.handle_skills_install(params).await
+            }
             "skills.install_request" => self.handle_skills_install_request(params, ctx).await,
 
             // ── Cron (admin only) ────────────────────────────
-            "cron.list" => { require_admin!(); self.handle_cron_list().await }
-            "cron.add" => { require_admin!(); self.handle_cron_add(params).await }
-            "cron.update" => { require_admin!(); self.handle_cron_update(params).await }
-            "cron.pause" => { require_admin!(); self.handle_cron_set_enabled(params, false).await }
-            "cron.resume" => { require_admin!(); self.handle_cron_set_enabled(params, true).await }
-            "cron.remove" => { require_admin!(); self.handle_cron_remove(params).await }
+            "cron.list" => {
+                require_admin!();
+                self.handle_cron_list().await
+            }
+            "cron.add" => {
+                require_admin!();
+                self.handle_cron_add(params).await
+            }
+            "cron.update" => {
+                require_admin!();
+                self.handle_cron_update(params).await
+            }
+            "cron.pause" => {
+                require_admin!();
+                self.handle_cron_set_enabled(params, false).await
+            }
+            "cron.resume" => {
+                require_admin!();
+                self.handle_cron_set_enabled(params, true).await
+            }
+            "cron.remove" => {
+                require_admin!();
+                self.handle_cron_remove(params).await
+            }
 
             // ── System (admin only for config changes) ───────
             "system.status" => self.handle_system_status().await,
-            "system.doctor" => { require_admin!(); self.handle_system_doctor().await }
-            "system.doctor_repair" => { require_admin!(); self.handle_system_doctor_repair().await }
+            "system.doctor" => {
+                require_admin!();
+                self.handle_system_doctor().await
+            }
+            "system.doctor_repair" => {
+                require_admin!();
+                self.handle_system_doctor_repair().await
+            }
             "models.list" => self.handle_models_list().await,
             "models.refresh" => self.handle_models_refresh().await,
             "runtime.detect" => self.handle_runtime_detect().await,
-            "system.config" => { require_admin!(); self.handle_system_config().await }
-            "system.update_config" => { require_admin!(); self.handle_system_update_config(params).await }
+            "system.config" => {
+                require_admin!();
+                self.handle_system_config().await
+            }
+            "system.update_config" => {
+                require_admin!();
+                self.handle_system_update_config(params).await
+            }
             "system.version" => self.handle_system_version().await,
-            "system.check_update" => { require_admin!(); self.handle_system_check_update().await }
-            "system.apply_update" => { require_admin!(); self.handle_system_apply_update(params).await }
+            "system.check_update" => {
+                require_admin!();
+                self.handle_system_check_update().await
+            }
+            "system.apply_update" => {
+                require_admin!();
+                self.handle_system_apply_update(params).await
+            }
 
             // ── Logs (manager+) ──────────────────────────────
-            "logs.subscribe" => { require_manager!(); self.handle_logs_subscribe(params) }
+            "logs.subscribe" => {
+                require_manager!();
+                self.handle_logs_subscribe(params)
+            }
             "logs.unsubscribe" => self.handle_logs_unsubscribe(params),
 
             // ── Security (admin only) ────────────────────────
@@ -3594,30 +4209,69 @@ impl MethodHandler {
             }
 
             // ── Evolution (manager+, H3 fix) ─────────────────
-            "evolution.status" => { require_manager!(); self.handle_evolution_status().await }
-            "evolution.history" => { require_manager!(); self.handle_evolution_history(params).await }
+            "evolution.status" => {
+                require_manager!();
+                self.handle_evolution_status().await
+            }
+            "evolution.history" => {
+                require_manager!();
+                self.handle_evolution_history(params).await
+            }
 
             // ── Cost / cache-efficiency telemetry (admin only) ──
-            "cost.summary" => { require_admin!(); self.handle_cost_summary(params).await }
-            "cost.agents" => { require_admin!(); self.handle_cost_agents(params).await }
-            "cost.recent" => { require_admin!(); self.handle_cost_recent(params).await }
+            "cost.summary" => {
+                require_admin!();
+                self.handle_cost_summary(params).await
+            }
+            "cost.agents" => {
+                require_admin!();
+                self.handle_cost_agents(params).await
+            }
+            "cost.recent" => {
+                require_admin!();
+                self.handle_cost_recent(params).await
+            }
 
             // ── Odoo (admin only) ────────────────────────────
-            "odoo.status" => { require_admin!(); self.handle_odoo_status().await }
-            "odoo.config" => { require_admin!(); self.handle_odoo_config().await }
-            "odoo.configure" => { require_admin!(); self.handle_odoo_configure(params).await }
-            "odoo.test" => { require_admin!(); self.handle_odoo_test(params).await }
+            "odoo.status" => {
+                require_admin!();
+                self.handle_odoo_status().await
+            }
+            "odoo.config" => {
+                require_admin!();
+                self.handle_odoo_config().await
+            }
+            "odoo.configure" => {
+                require_admin!();
+                self.handle_odoo_configure(params).await
+            }
+            "odoo.test" => {
+                require_admin!();
+                self.handle_odoo_test(params).await
+            }
             // RFC-21 §2: per-agent Odoo credential isolation.
-            "odoo.agent_config_get" => { require_admin!(); self.handle_odoo_agent_config_get(params).await }
-            "odoo.agent_config_set" => { require_admin!(); self.handle_odoo_agent_config_set(params).await }
-            "odoo.agent_test" => { require_admin!(); self.handle_odoo_agent_test(params).await }
+            "odoo.agent_config_get" => {
+                require_admin!();
+                self.handle_odoo_agent_config_get(params).await
+            }
+            "odoo.agent_config_set" => {
+                require_admin!();
+                self.handle_odoo_agent_config_set(params).await
+            }
+            "odoo.agent_test" => {
+                require_admin!();
+                self.handle_odoo_agent_test(params).await
+            }
 
             // ── User management (admin only) ─────────────────
             // ── Personal dashboard (WP15) — per-user, no extra gate ──
             "dashboard.widgets.catalog" => self.handle_dashboard_widgets_catalog(ctx).await,
             "dashboard.layout.get" => self.handle_dashboard_layout_get(ctx).await,
             "dashboard.layout.set" => self.handle_dashboard_layout_set(params, ctx).await,
-            "dashboard.layout.view" => { require_manager!(); self.handle_dashboard_layout_view(params, ctx).await }
+            "dashboard.layout.view" => {
+                require_manager!();
+                self.handle_dashboard_layout_view(params, ctx).await
+            }
             // ── Custom widgets (sandboxed-iframe HTML cards; 2026-07-16) ──
             "widgets.custom.list" => self.handle_widgets_custom_list(ctx).await,
             "widgets.custom.get" => self.handle_widgets_custom_get(params, ctx).await,
@@ -3626,40 +4280,97 @@ impl MethodHandler {
             "widgets.custom.remove" => self.handle_widgets_custom_remove(params, ctx).await,
             "widgets.custom.share" => self.handle_widgets_custom_share(params, ctx).await,
             "widgets.custom.generate" => self.handle_widgets_custom_generate(params).await,
-            "users.subordinates" => { require_manager!(); self.handle_users_subordinates(ctx).await }
+            "users.subordinates" => {
+                require_manager!();
+                self.handle_users_subordinates(ctx).await
+            }
             // ── Departments (org structure for agent create/edit) ──
-            "departments.list" => { require_manager!(); self.handle_departments_list().await }
-            "departments.create" => { require_admin!(); self.handle_departments_create(params).await }
-            "departments.remove" => { require_admin!(); self.handle_departments_remove(params).await }
-            "users.list" => { require_admin!(); self.handle_users_list().await }
-            "users.create" => { require_admin!(); self.handle_users_create(params, ctx).await }
-            "users.update" => { require_admin!(); self.handle_users_update(params, ctx).await }
-            "users.remove" => { require_admin!(); self.handle_users_remove(params, ctx).await }
-            "users.bind_agent" => { require_admin!(); self.handle_users_bind_agent(params, ctx).await }
-            "users.unbind_agent" => { require_admin!(); self.handle_users_unbind_agent(params, ctx).await }
-            "users.offboard" => { require_admin!(); self.handle_users_offboard(params, ctx).await }
+            "departments.list" => {
+                require_manager!();
+                self.handle_departments_list().await
+            }
+            "departments.create" => {
+                require_admin!();
+                self.handle_departments_create(params).await
+            }
+            "departments.remove" => {
+                require_admin!();
+                self.handle_departments_remove(params).await
+            }
+            "users.list" => {
+                require_admin!();
+                self.handle_users_list().await
+            }
+            "users.create" => {
+                require_admin!();
+                self.handle_users_create(params, ctx).await
+            }
+            "users.update" => {
+                require_admin!();
+                self.handle_users_update(params, ctx).await
+            }
+            "users.remove" => {
+                require_admin!();
+                self.handle_users_remove(params, ctx).await
+            }
+            "users.bind_agent" => {
+                require_admin!();
+                self.handle_users_bind_agent(params, ctx).await
+            }
+            "users.unbind_agent" => {
+                require_admin!();
+                self.handle_users_unbind_agent(params, ctx).await
+            }
+            "users.offboard" => {
+                require_admin!();
+                self.handle_users_offboard(params, ctx).await
+            }
             "users.me" => self.handle_users_me(ctx).await,
             // Self-service: any logged-in user changes their OWN password. Not
             // admin-gated on purpose — it only ever mutates the caller's account,
             // and it's the sole password path in the single-owner edition (the
             // multi-user Users page is hidden there).
             "users.change_password" => self.handle_users_change_password(params, ctx).await,
-            "users.audit_log" => { require_admin!(); self.handle_users_audit_log(params).await }
+            "users.audit_log" => {
+                require_admin!();
+                self.handle_users_audit_log(params).await
+            }
 
-            "mcp.list" => { require_admin!(); self.handle_mcp_list().await }
-            "mcp.update" => { require_admin!(); self.handle_mcp_update(&params).await }
+            "mcp.list" => {
+                require_admin!();
+                self.handle_mcp_list().await
+            }
+            "mcp.update" => {
+                require_admin!();
+                self.handle_mcp_update(&params).await
+            }
             // Read-only preview (fetch + scan): any authenticated user may
             // browse and scan candidates before requesting install.
             "mcp.import.fetch" => self.handle_mcp_import_fetch(params).await,
             // Direct install stays admin-only; non-admins file an install request.
-            "mcp.import.install" => { require_admin!(); self.handle_mcp_import_install(params).await }
+            "mcp.import.install" => {
+                require_admin!();
+                self.handle_mcp_import_install(params).await
+            }
             "mcp.install_request" => self.handle_mcp_install_request(params, ctx).await,
 
             // ── MCP OAuth (admin only) ──────────────────────────
-            "mcp.oauth.providers" => { require_admin!(); self.handle_mcp_oauth_providers().await }
-            "mcp.oauth.start" => { require_admin!(); self.handle_mcp_oauth_start(params).await }
-            "mcp.oauth.status" => { require_admin!(); self.handle_mcp_oauth_status(params).await }
-            "mcp.oauth.revoke" => { require_admin!(); self.handle_mcp_oauth_revoke(params).await }
+            "mcp.oauth.providers" => {
+                require_admin!();
+                self.handle_mcp_oauth_providers().await
+            }
+            "mcp.oauth.start" => {
+                require_admin!();
+                self.handle_mcp_oauth_start(params).await
+            }
+            "mcp.oauth.status" => {
+                require_admin!();
+                self.handle_mcp_oauth_status(params).await
+            }
+            "mcp.oauth.revoke" => {
+                require_admin!();
+                self.handle_mcp_oauth_revoke(params).await
+            }
 
             // ── Task Board (agent-scoped — HS4 fix) ────
             "tasks.list" => {
@@ -3701,7 +4412,10 @@ impl MethodHandler {
             "plans.create" => {
                 // The owning agent is `agent_id`; creating a shared plan for
                 // an agent is side-effecting → Operator binding required.
-                let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+                let agent_id = params
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if agent_id.is_empty() {
                     return WsFrame::error_response("", "agent_id is required");
                 }
@@ -3723,11 +4437,14 @@ impl MethodHandler {
             // activity event to every authenticated WS client unconditionally. This
             // RPC exists purely as a client-intent signal and future-compat hook so
             // callers can declare interest without guessing at server state.
-            "activity.subscribe" => WsFrame::ok_response("", json!({
-                "subscribed": true,
-                "broadcast_mode": "all_events",
-                "note": "All authenticated WS clients receive activity events automatically; no per-client filter is in effect.",
-            })),
+            "activity.subscribe" => WsFrame::ok_response(
+                "",
+                json!({
+                    "subscribed": true,
+                    "broadcast_mode": "all_events",
+                    "note": "All authenticated WS clients receive activity events automatically; no per-client filter is in effect.",
+                }),
+            ),
 
             // ── Work Timeline (G11) — company Gantt view. Same gate
             //    as activity.list: viewing is read-only, agent-scoped.
@@ -3788,42 +4505,96 @@ impl MethodHandler {
             "fork.list" => self.handle_fork_list(params),
             "fork.inspect" => self.handle_fork_inspect(params),
             // Resolving a fork promotes a winner's workspace → side-effecting.
-            "fork.resolve" => { require_manager!(); self.handle_fork_resolve(params) }
+            "fork.resolve" => {
+                require_manager!();
+                self.handle_fork_resolve(params)
+            }
 
             // ── Migrate-from (spawns the CLI's `migrate-from --json`) ──
             // scan = dry-run plan; apply = actual writes. Both shell out to
             // this same binary (`current_exe`) so the gateway never has to
             // depend on the duduclaw-cli crate.
-            "migrate.scan" => { require_manager!(); self.handle_migrate_scan(params).await }
-            "migrate.apply" => { require_manager!(); self.handle_migrate_apply(params).await }
+            "migrate.scan" => {
+                require_manager!();
+                self.handle_migrate_scan(params).await
+            }
+            "migrate.apply" => {
+                require_manager!();
+                self.handle_migrate_apply(params).await
+            }
 
             // ── Approvals (WP14-T14.7 approval center) ──────
-            "approvals.list" => { require_manager!(); self.handle_approvals_list(params).await }
-            "approvals.decide" => { require_manager!(); self.handle_approvals_decide(params, ctx).await }
+            "approvals.list" => {
+                require_manager!();
+                self.handle_approvals_list(params).await
+            }
+            "approvals.decide" => {
+                require_manager!();
+                self.handle_approvals_decide(params, ctx).await
+            }
 
             // ── D5 topology evolution: routing overrides + pending reroute proposals ──
-            "topology.list" => { require_manager!(); self.handle_topology_list().await }
+            "topology.list" => {
+                require_manager!();
+                self.handle_topology_list().await
+            }
 
             // Install approval requests (Skill / MCP two-stage signature chain)
-            "install_requests.list" => { require_manager!(); self.handle_install_requests_list(ctx).await }
+            "install_requests.list" => {
+                require_manager!();
+                self.handle_install_requests_list(ctx).await
+            }
             "install_requests.mine" => self.handle_install_requests_mine(ctx).await,
-            "install_requests.decide" => { require_manager!(); self.handle_install_requests_decide(params, ctx).await }
+            "install_requests.decide" => {
+                require_manager!();
+                self.handle_install_requests_decide(params, ctx).await
+            }
 
             // ── Budget incidents (WP14-T14.6) ───────────────
-            "budget.incidents" => { require_manager!(); self.handle_budget_incidents(params).await }
+            "budget.incidents" => {
+                require_manager!();
+                self.handle_budget_incidents(params).await
+            }
 
             // ── Autopilot (admin only) ──────────────────────
-            "autopilot.list" => { require_admin!(); self.handle_autopilot_list().await }
-            "autopilot.create" => { require_admin!(); self.handle_autopilot_create(params).await }
-            "autopilot.update" => { require_admin!(); self.handle_autopilot_update(params).await }
-            "autopilot.remove" => { require_admin!(); self.handle_autopilot_remove(params).await }
-            "autopilot.history" => { require_admin!(); self.handle_autopilot_history(params).await }
+            "autopilot.list" => {
+                require_admin!();
+                self.handle_autopilot_list().await
+            }
+            "autopilot.create" => {
+                require_admin!();
+                self.handle_autopilot_create(params).await
+            }
+            "autopilot.update" => {
+                require_admin!();
+                self.handle_autopilot_update(params).await
+            }
+            "autopilot.remove" => {
+                require_admin!();
+                self.handle_autopilot_remove(params).await
+            }
+            "autopilot.history" => {
+                require_admin!();
+                self.handle_autopilot_history(params).await
+            }
 
             // ── Redaction (RFC-23, manager-only) ──────────────
-            "redaction.stats" => { require_manager!(); self.handle_redaction_stats().await }
-            "redaction.recent_audit" => { require_manager!(); self.handle_redaction_recent_audit(params).await }
-            "redaction.override_status" => { require_manager!(); self.handle_redaction_override_status().await }
-            "redaction.policy_status" => { require_manager!(); self.handle_redaction_policy_status().await }
+            "redaction.stats" => {
+                require_manager!();
+                self.handle_redaction_stats().await
+            }
+            "redaction.recent_audit" => {
+                require_manager!();
+                self.handle_redaction_recent_audit(params).await
+            }
+            "redaction.override_status" => {
+                require_manager!();
+                self.handle_redaction_override_status().await
+            }
+            "redaction.policy_status" => {
+                require_manager!();
+                self.handle_redaction_policy_status().await
+            }
 
             // ── Shared Skills (open to all authenticated) ───
             "skills.leaderboard" => self.handle_skills_leaderboard(params).await,
@@ -3930,13 +4701,22 @@ impl MethodHandler {
 
             // ── Billing ──────────────────────────────────────
             "billing.usage" => self.handle_billing_usage().await,
-            "billing.history" | "billing.plan" =>
-                WsFrame::error_response("", "Billing features are not available in the current edition"),
-            "browser.audit_log" | "browser.emergency_stop" | "browser.tool_approve"
-            | "browser.browserbase_sessions" | "browser.browserbase_cost" =>
-                WsFrame::error_response("", "Browser automation features require the Pro edition"),
+            "billing.history" | "billing.plan" => WsFrame::error_response(
+                "",
+                "Billing features are not available in the current edition",
+            ),
+            "browser.audit_log"
+            | "browser.emergency_stop"
+            | "browser.tool_approve"
+            | "browser.browserbase_sessions"
+            | "browser.browserbase_cost" => {
+                WsFrame::error_response("", "Browser automation features require the Pro edition")
+            }
             "marketplace.list" => self.handle_marketplace_list().await,
-            "marketplace.install" => { require_admin!(); self.handle_marketplace_install(params).await }
+            "marketplace.install" => {
+                require_admin!();
+                self.handle_marketplace_install(params).await
+            }
 
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
@@ -3950,8 +4730,14 @@ impl MethodHandler {
     }
 
     fn handle_connect(&self, params: Value) -> WsFrame {
-        let version = params.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
-        WsFrame::ok_response("", json!({ "version": crate::updater::current_version(), "client_version": version, "status": "connected" }))
+        let version = params
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        WsFrame::ok_response(
+            "",
+            json!({ "version": crate::updater::current_version(), "client_version": version, "status": "connected" }),
+        )
     }
 
     fn handle_hello_ok(&self, _params: Value) -> WsFrame {
@@ -3970,9 +4756,12 @@ impl MethodHandler {
     /// `license.fingerprint` — this machine's fingerprint, shown in the
     /// dashboard upgrade card so the operator can have a license issued.
     async fn handle_license_fingerprint(&self) -> WsFrame {
-        WsFrame::ok_response("", json!({
-            "fingerprint": duduclaw_license::generate_fingerprint(),
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "fingerprint": duduclaw_license::generate_fingerprint(),
+            }),
+        )
     }
 
     /// `license.activate {key}` — install a purchased license from the
@@ -4049,10 +4838,7 @@ impl MethodHandler {
         let payload = match serde_json::to_value(&snapshot) {
             Ok(v) => v,
             Err(e) => {
-                return WsFrame::error_response(
-                    "",
-                    &format!("serialize license snapshot: {e}"),
-                );
+                return WsFrame::error_response("", &format!("serialize license snapshot: {e}"));
             }
         };
 
@@ -4060,111 +4846,120 @@ impl MethodHandler {
     }
 
     fn handle_tools_catalog(&self, _params: Value) -> WsFrame {
-        WsFrame::ok_response("", json!({
-            "tools": [
-                { "name": "agents.list", "description": "List all registered agents" },
-                { "name": "agents.status", "description": "Get agent status" },
-                { "name": "agents.create", "description": "Create a new agent" },
-                { "name": "agents.delegate", "description": "Delegate a task" },
-                { "name": "agents.pause", "description": "Pause an agent" },
-                { "name": "agents.resume", "description": "Resume an agent" },
-                { "name": "agents.update", "description": "Update agent config fields" },
-                { "name": "agents.remove", "description": "Soft-delete an agent (hidden, data retained)" },
-                { "name": "agents.archive", "description": "Archive an agent (recoverable off-board)" },
-                { "name": "agents.unarchive", "description": "Restore an archived agent" },
-                { "name": "agents.handoff", "description": "Hand off memory/wiki/tasks to another agent" },
-                { "name": "agents.set_avatar", "description": "Upload an agent avatar image (data URI)" },
-                { "name": "agents.clear_avatar", "description": "Remove an agent's uploaded avatar" },
-                { "name": "agents.inspect", "description": "Inspect agent details" },
-                { "name": "agents.avatar", "description": "Fetch an agent's uploaded avatar as a data URI (lightweight)" },
-                { "name": "channels.status", "description": "Channel connection status" },
-                { "name": "channels.add", "description": "Add a channel" },
-                { "name": "channels.test", "description": "Test a channel" },
-                { "name": "channels.remove", "description": "Remove a channel" },
-                { "name": "accounts.list", "description": "List accounts" },
-                { "name": "accounts.budget_summary", "description": "Budget overview" },
-                { "name": "accounts.rotate", "description": "Rotate account key" },
-                { "name": "accounts.health", "description": "Account health check" },
-                { "name": "memory.search", "description": "Search agent memory" },
-                { "name": "memory.browse", "description": "Browse recent memory entries" },
-                { "name": "memory.key_facts", "description": "List extracted key insights (P2 Key-Fact Accumulator)" },
-                { "name": "memory.history", "description": "Fact supersession chain (F1 Temporal Memory)" },
-                { "name": "memory.at", "description": "Point-in-time fact lookup (F1 Temporal Memory)" },
-                { "name": "memory.get_at", "description": "Point-in-time fact lookup (D6 alias of memory.at)" },
-                { "name": "memory.graph", "description": "SPO knowledge-graph export for the D6 curation viewer" },
-                { "name": "memory.invalidate_origin", "description": "Destructive: expire all facts from one source (D6 rollback)" },
-                { "name": "cost.summary", "description": "Cost / cache-efficiency window summary + price-cliff status" },
-                { "name": "cost.agents", "description": "Per-agent cost + cache health" },
-                { "name": "cost.recent", "description": "Recent per-request cost records" },
-                { "name": "wiki.pages", "description": "List wiki pages for an agent" },
-                { "name": "wiki.read", "description": "Read a wiki page" },
-                { "name": "wiki.search", "description": "Search wiki pages" },
-                { "name": "wiki.lint", "description": "Wiki health check" },
-                { "name": "wiki.stats", "description": "Wiki statistics" },
-                { "name": "shared_wiki.pages", "description": "List shared wiki pages" },
-                { "name": "shared_wiki.read", "description": "Read a shared wiki page" },
-                { "name": "shared_wiki.search", "description": "Search shared wiki" },
-                { "name": "shared_wiki.stats", "description": "Shared wiki statistics" },
-                { "name": "skills.list", "description": "List agent skills" },
-                { "name": "skills.content", "description": "Read skill content" },
-                { "name": "cron.list", "description": "List cron jobs" },
-                { "name": "cron.add", "description": "Add a cron job" },
-                { "name": "cron.pause", "description": "Pause a cron job" },
-                { "name": "cron.remove", "description": "Remove a cron job" },
-                { "name": "system.status", "description": "System status" },
-                { "name": "system.doctor", "description": "Health checks" },
-                { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
-                { "name": "models.list", "description": "List available cloud and local models" },
-                { "name": "models.refresh", "description": "Re-probe installed CLIs/APIs for live model lists" },
-                { "name": "runtime.detect", "description": "Detect installed AI runtimes (claude/codex/gemini/antigravity) + Claude OAuth" },
-                { "name": "system.config", "description": "View system config" },
-                { "name": "system.update_config", "description": "Update system config (log_level, rotation, allowed_origins)" },
-                { "name": "accounts.add", "description": "Add a new account" },
-                { "name": "accounts.update_budget", "description": "Update account monthly budget" },
-                { "name": "system.version", "description": "Version info" },
-                { "name": "system.check_update", "description": "Check for available updates" },
-                { "name": "system.apply_update", "description": "Download and apply update" },
-                { "name": "heartbeat.status", "description": "Per-agent heartbeat status" },
-                { "name": "heartbeat.trigger", "description": "Manually trigger heartbeat for an agent" },
-                { "name": "mcp.list", "description": "List MCP servers for all agents + catalog" },
-                { "name": "mcp.update", "description": "Add or remove an MCP server for an agent" },
-                { "name": "mcp.import.fetch", "description": "Fetch + security-scan MCP server defs from a GitHub/URL manifest" },
-                { "name": "mcp.import.install", "description": "Install a scanned MCP server def (fail-closed re-scan)" },
-                { "name": "skills.install_request", "description": "File a Skill install request for approval (non-admin)" },
-                { "name": "mcp.install_request", "description": "File an MCP install request for approval (non-admin)" },
-                { "name": "install_requests.list", "description": "List install requests actionable by the caller (manager+)" },
-                { "name": "install_requests.mine", "description": "The caller's own install requests + status" },
-                { "name": "install_requests.decide", "description": "Approve/deny an install request; executes on final approval" },
-                { "name": "mcp.oauth.providers", "description": "List available OAuth providers and their auth status" },
-                { "name": "mcp.oauth.start", "description": "Start OAuth flow for a provider" },
-                { "name": "mcp.oauth.status", "description": "Check OAuth status for a provider" },
-                { "name": "mcp.oauth.revoke", "description": "Revoke OAuth token for a provider" },
-                { "name": "logs.subscribe", "description": "Subscribe to logs" },
-                { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
-                { "name": "security.status", "description": "Security system status" },
-                { "name": "analytics.summary", "description": "Analytics summary for a period" },
-                { "name": "analytics.conversations", "description": "Daily conversation counts" },
-                { "name": "analytics.cost_savings", "description": "Monthly cost savings" },
-                { "name": "migrate.scan", "description": "Preview a migration from OpenClaw/Hermes/Paperclip (dry-run)" },
-                { "name": "migrate.apply", "description": "Apply a migration from OpenClaw/Hermes/Paperclip" },
-            ]
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "tools": [
+                    { "name": "agents.list", "description": "List all registered agents" },
+                    { "name": "agents.status", "description": "Get agent status" },
+                    { "name": "agents.create", "description": "Create a new agent" },
+                    { "name": "agents.delegate", "description": "Delegate a task" },
+                    { "name": "agents.pause", "description": "Pause an agent" },
+                    { "name": "agents.resume", "description": "Resume an agent" },
+                    { "name": "agents.update", "description": "Update agent config fields" },
+                    { "name": "agents.remove", "description": "Soft-delete an agent (hidden, data retained)" },
+                    { "name": "agents.archive", "description": "Archive an agent (recoverable off-board)" },
+                    { "name": "agents.unarchive", "description": "Restore an archived agent" },
+                    { "name": "agents.handoff", "description": "Hand off memory/wiki/tasks to another agent" },
+                    { "name": "agents.set_avatar", "description": "Upload an agent avatar image (data URI)" },
+                    { "name": "agents.clear_avatar", "description": "Remove an agent's uploaded avatar" },
+                    { "name": "agents.inspect", "description": "Inspect agent details" },
+                    { "name": "agents.avatar", "description": "Fetch an agent's uploaded avatar as a data URI (lightweight)" },
+                    { "name": "channels.status", "description": "Channel connection status" },
+                    { "name": "channels.add", "description": "Add a channel" },
+                    { "name": "channels.test", "description": "Test a channel" },
+                    { "name": "channels.remove", "description": "Remove a channel" },
+                    { "name": "accounts.list", "description": "List accounts" },
+                    { "name": "accounts.budget_summary", "description": "Budget overview" },
+                    { "name": "accounts.rotate", "description": "Rotate account key" },
+                    { "name": "accounts.health", "description": "Account health check" },
+                    { "name": "memory.search", "description": "Search agent memory" },
+                    { "name": "memory.browse", "description": "Browse recent memory entries" },
+                    { "name": "memory.key_facts", "description": "List extracted key insights (P2 Key-Fact Accumulator)" },
+                    { "name": "memory.history", "description": "Fact supersession chain (F1 Temporal Memory)" },
+                    { "name": "memory.at", "description": "Point-in-time fact lookup (F1 Temporal Memory)" },
+                    { "name": "memory.get_at", "description": "Point-in-time fact lookup (D6 alias of memory.at)" },
+                    { "name": "memory.graph", "description": "SPO knowledge-graph export for the D6 curation viewer" },
+                    { "name": "memory.invalidate_origin", "description": "Destructive: expire all facts from one source (D6 rollback)" },
+                    { "name": "cost.summary", "description": "Cost / cache-efficiency window summary + price-cliff status" },
+                    { "name": "cost.agents", "description": "Per-agent cost + cache health" },
+                    { "name": "cost.recent", "description": "Recent per-request cost records" },
+                    { "name": "wiki.pages", "description": "List wiki pages for an agent" },
+                    { "name": "wiki.read", "description": "Read a wiki page" },
+                    { "name": "wiki.search", "description": "Search wiki pages" },
+                    { "name": "wiki.lint", "description": "Wiki health check" },
+                    { "name": "wiki.stats", "description": "Wiki statistics" },
+                    { "name": "shared_wiki.pages", "description": "List shared wiki pages" },
+                    { "name": "shared_wiki.read", "description": "Read a shared wiki page" },
+                    { "name": "shared_wiki.search", "description": "Search shared wiki" },
+                    { "name": "shared_wiki.stats", "description": "Shared wiki statistics" },
+                    { "name": "skills.list", "description": "List agent skills" },
+                    { "name": "skills.content", "description": "Read skill content" },
+                    { "name": "cron.list", "description": "List cron jobs" },
+                    { "name": "cron.add", "description": "Add a cron job" },
+                    { "name": "cron.pause", "description": "Pause a cron job" },
+                    { "name": "cron.remove", "description": "Remove a cron job" },
+                    { "name": "system.status", "description": "System status" },
+                    { "name": "system.doctor", "description": "Health checks" },
+                    { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
+                    { "name": "models.list", "description": "List available cloud and local models" },
+                    { "name": "models.refresh", "description": "Re-probe installed CLIs/APIs for live model lists" },
+                    { "name": "runtime.detect", "description": "Detect installed AI runtimes (claude/codex/gemini/antigravity) + Claude OAuth" },
+                    { "name": "system.config", "description": "View system config" },
+                    { "name": "system.update_config", "description": "Update system config (log_level, rotation, allowed_origins)" },
+                    { "name": "accounts.add", "description": "Add a new account" },
+                    { "name": "accounts.update_budget", "description": "Update account monthly budget" },
+                    { "name": "system.version", "description": "Version info" },
+                    { "name": "system.check_update", "description": "Check for available updates" },
+                    { "name": "system.apply_update", "description": "Download and apply update" },
+                    { "name": "heartbeat.status", "description": "Per-agent heartbeat status" },
+                    { "name": "heartbeat.trigger", "description": "Manually trigger heartbeat for an agent" },
+                    { "name": "mcp.list", "description": "List MCP servers for all agents + catalog" },
+                    { "name": "mcp.update", "description": "Add or remove an MCP server for an agent" },
+                    { "name": "mcp.import.fetch", "description": "Fetch + security-scan MCP server defs from a GitHub/URL manifest" },
+                    { "name": "mcp.import.install", "description": "Install a scanned MCP server def (fail-closed re-scan)" },
+                    { "name": "skills.install_request", "description": "File a Skill install request for approval (non-admin)" },
+                    { "name": "mcp.install_request", "description": "File an MCP install request for approval (non-admin)" },
+                    { "name": "install_requests.list", "description": "List install requests actionable by the caller (manager+)" },
+                    { "name": "install_requests.mine", "description": "The caller's own install requests + status" },
+                    { "name": "install_requests.decide", "description": "Approve/deny an install request; executes on final approval" },
+                    { "name": "mcp.oauth.providers", "description": "List available OAuth providers and their auth status" },
+                    { "name": "mcp.oauth.start", "description": "Start OAuth flow for a provider" },
+                    { "name": "mcp.oauth.status", "description": "Check OAuth status for a provider" },
+                    { "name": "mcp.oauth.revoke", "description": "Revoke OAuth token for a provider" },
+                    { "name": "logs.subscribe", "description": "Subscribe to logs" },
+                    { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
+                    { "name": "security.status", "description": "Security system status" },
+                    { "name": "analytics.summary", "description": "Analytics summary for a period" },
+                    { "name": "analytics.conversations", "description": "Daily conversation counts" },
+                    { "name": "analytics.cost_savings", "description": "Monthly cost savings" },
+                    { "name": "migrate.scan", "description": "Preview a migration from OpenClaw/Hermes/Paperclip (dry-run)" },
+                    { "name": "migrate.apply", "description": "Apply a migration from OpenClaw/Hermes/Paperclip" },
+                ]
+            }),
+        )
     }
 
     // ── Agents ───────────────────────────────────────────────
 
     async fn handle_agents_status(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let reg = self.registry.read().await;
         match reg.get(agent_id) {
             Some(a) => {
                 let cfg = &a.config;
-                WsFrame::ok_response("", json!({
-                    "name": cfg.agent.name,
-                    "display_name": cfg.agent.display_name,
-                    "status": format!("{:?}", cfg.agent.status).to_lowercase(),
-                    "role": format!("{:?}", cfg.agent.role).to_lowercase(),
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "name": cfg.agent.name,
+                        "display_name": cfg.agent.display_name,
+                        "status": format!("{:?}", cfg.agent.status).to_lowercase(),
+                        "role": format!("{:?}", cfg.agent.role).to_lowercase(),
+                    }),
+                )
             }
             None => WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
         }
@@ -4245,11 +5040,18 @@ impl MethodHandler {
             && let Ok(config) = content.parse::<toml::Table>()
             && let Some(ch) = config.get("channels").and_then(|v| v.as_table())
         {
-            for key in ["line_channel_token", "telegram_bot_token", "discord_bot_token"] {
+            for key in [
+                "line_channel_token",
+                "telegram_bot_token",
+                "discord_bot_token",
+            ] {
                 // Presence = plaintext OR `_enc` (2026-07 MED: channels.add is
                 // now enc-only for these too; a plaintext-only check would
                 // undercount freshly-saved channels).
-                let plain = ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+                let plain = ch
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty());
                 let enc = ch
                     .get(&format!("{key}_enc"))
                     .and_then(|v| v.as_str())
@@ -4262,12 +5064,24 @@ impl MethodHandler {
         let reg = self.registry.read().await;
         for agent in reg.list() {
             if let Some(ch) = &agent.config.channels {
-                if ch.discord.as_ref().is_some_and(|d| !d.bot_token.is_empty()
-                    || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())) { n += 1; }
-                if ch.telegram.as_ref().is_some_and(|t| !t.bot_token.is_empty()
-                    || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())) { n += 1; }
-                if ch.slack.as_ref().is_some_and(|s| !s.bot_token.is_empty()
-                    || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())) { n += 1; }
+                if ch.discord.as_ref().is_some_and(|d| {
+                    !d.bot_token.is_empty()
+                        || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+                }) {
+                    n += 1;
+                }
+                if ch.telegram.as_ref().is_some_and(|t| {
+                    !t.bot_token.is_empty()
+                        || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+                }) {
+                    n += 1;
+                }
+                if ch.slack.as_ref().is_some_and(|s| {
+                    !s.bot_token.is_empty()
+                        || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+                }) {
+                    n += 1;
+                }
             }
         }
         n
@@ -4275,16 +5089,29 @@ impl MethodHandler {
 
     async fn handle_agents_create(&self, params: Value) -> WsFrame {
         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let display_name = params.get("display_name").and_then(|v| v.as_str()).unwrap_or(name);
-        let role = params.get("role").and_then(|v| v.as_str()).unwrap_or("specialist");
+        let display_name = params
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(name);
+        let role = params
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("specialist");
         let trigger = params.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
-        let trigger = if trigger.is_empty() { format!("@{display_name}") } else { trigger.to_string() };
+        let trigger = if trigger.is_empty() {
+            format!("@{display_name}")
+        } else {
+            trigger.to_string()
+        };
 
         if name.is_empty() {
             return WsFrame::error_response("", "Agent name is required");
         }
         if !is_valid_agent_id(name) {
-            return WsFrame::error_response("", "Agent name must be lowercase alphanumeric with hyphens, max 64 chars");
+            return WsFrame::error_response(
+                "",
+                "Agent name must be lowercase alphanumeric with hyphens, max 64 chars",
+            );
         }
 
         // Optional org placement, validated BEFORE any filesystem effect.
@@ -4309,10 +5136,7 @@ impl MethodHandler {
                 .iter()
                 .any(|a| a.config.agent.name == reports_to);
             if !exists {
-                return WsFrame::error_response(
-                    "",
-                    &format!("上級 AI 員工「{reports_to}」不存在"),
-                );
+                return WsFrame::error_response("", &format!("上級 AI 員工「{reports_to}」不存在"));
             }
         }
         let department = params
@@ -4322,10 +5146,7 @@ impl MethodHandler {
             .trim()
             .to_string();
         if !department.is_empty() && !duduclaw_core::is_valid_department(&department) {
-            return WsFrame::error_response(
-                "",
-                "部門名稱只能使用英數字、'-'、'_'（1–64 字元）",
-            );
+            return WsFrame::error_response("", "部門名稱只能使用英數字、'-'、'_'（1–64 字元）");
         }
 
         // Cloud-tier agent cap (self-host is never capped — Apache 2.0).
@@ -4447,14 +5268,23 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .map(|s| format!("# {display_name}\n\n{}\n", duduclaw_core::truncate_chars(s, 8000)))
-            .unwrap_or_else(|| format!("# {display_name}\n\nI am {display_name}, a specialist AI agent.\n"));
+            .map(|s| {
+                format!(
+                    "# {display_name}\n\n{}\n",
+                    duduclaw_core::truncate_chars(s, 8000)
+                )
+            })
+            .unwrap_or_else(|| {
+                format!("# {display_name}\n\nI am {display_name}, a specialist AI agent.\n")
+            });
         let _ = tokio::fs::write(agent_dir.join("SOUL.md"), &soul).await;
 
         // Install the agent-file-guard PreToolUse hook so this newly-created
         // agent immediately gets protected against out-of-tree Write/Edit.
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
-        if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await {
+        if let Err(e) =
+            crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await
+        {
             tracing::warn!(
                 agent = %name,
                 error = %e,
@@ -4476,10 +5306,13 @@ impl MethodHandler {
         }
 
         info!(name, "Agent created");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "agent": { "name": name, "display_name": display_name, "role": role, "status": "active" }
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "agent": { "name": name, "display_name": display_name, "role": role, "status": "active" }
+            }),
+        )
     }
 
     // ── Premium team templates ─────────────────────────────────────────────
@@ -4504,10 +5337,16 @@ impl MethodHandler {
 
     /// The industry the admin staged during onboarding, if any.
     async fn read_staged_industry(&self) -> Option<String> {
-        let raw = tokio::fs::read_to_string(self.team_staging_path()).await.ok()?;
+        let raw = tokio::fs::read_to_string(self.team_staging_path())
+            .await
+            .ok()?;
         let v: Value = serde_json::from_str(&raw).ok()?;
         let industry = v.get("industry")?.as_str()?;
-        if industry.is_empty() { None } else { Some(industry.to_string()) }
+        if industry.is_empty() {
+            None
+        } else {
+            Some(industry.to_string())
+        }
     }
 
     /// Resolve the premium templates dir behind the license gate, or the
@@ -4519,9 +5358,8 @@ impl MethodHandler {
                 "Premium 產業板模未解鎖：需要 Pro 以上授權",
             ));
         }
-        crate::premium_templates::find_premium_templates_dir().ok_or_else(|| {
-            WsFrame::error_response("", "此安裝未附 Premium 板模資源")
-        })
+        crate::premium_templates::find_premium_templates_dir()
+            .ok_or_else(|| WsFrame::error_response("", "此安裝未附 Premium 板模資源"))
     }
 
     /// Build the roster payload for a (possibly absent) staged team: CEO kit
@@ -4613,18 +5451,21 @@ impl MethodHandler {
             }
             None => (Vec::new(), false, false),
         };
-        WsFrame::ok_response("", json!({
-            "unlocked": unlocked,
-            "present_but_locked": !unlocked && present,
-            "staged": staged,
-            "ceo_available": ceo,
-            "industries": industries.iter().map(|t| json!({
-                "industry": t.industry,
-                "label": t.label,
-                "pack": t.pack,
-                "worker_count": t.worker_count,
-            })).collect::<Vec<_>>(),
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "unlocked": unlocked,
+                "present_but_locked": !unlocked && present,
+                "staged": staged,
+                "ceo_available": ceo,
+                "industries": industries.iter().map(|t| json!({
+                    "industry": t.industry,
+                    "label": t.label,
+                    "pack": t.pack,
+                    "worker_count": t.worker_count,
+                })).collect::<Vec<_>>(),
+            }),
+        )
     }
 
     /// `templates.stage` — record the chosen industry and return its roster.
@@ -4632,7 +5473,10 @@ impl MethodHandler {
     /// explicitly afterwards).
     async fn handle_templates_stage(&self, params: Value) -> WsFrame {
         use crate::premium_templates as pt;
-        let industry = params.get("industry").and_then(|v| v.as_str()).unwrap_or("");
+        let industry = params
+            .get("industry")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let premium_dir = match self.premium_dir_unlocked().await {
             Ok(d) => d,
             Err(frame) => return frame,
@@ -4732,20 +5576,26 @@ impl MethodHandler {
             Ok(d) => d,
             Err(frame) => return frame,
         };
-        match self.assemble_template_role(&premium_dir, &params, role_id).await {
-            Ok(r) => WsFrame::ok_response("", json!({
-                "role_id": r.role_id,
-                "kind": r.kind.as_str(),
-                "name": r.name,
-                "display_name": r.display_name,
-                "trigger": r.trigger,
-                "reports_to": r.reports_to,
-                "summary": r.summary,
-                "soul_md": r.soul_md,
-                "contract_toml": r.contract_toml,
-                "agent_toml": r.agent_toml,
-                "has_extras": r.extras_dir.is_some(),
-            })),
+        match self
+            .assemble_template_role(&premium_dir, &params, role_id)
+            .await
+        {
+            Ok(r) => WsFrame::ok_response(
+                "",
+                json!({
+                    "role_id": r.role_id,
+                    "kind": r.kind.as_str(),
+                    "name": r.name,
+                    "display_name": r.display_name,
+                    "trigger": r.trigger,
+                    "reports_to": r.reports_to,
+                    "summary": r.summary,
+                    "soul_md": r.soul_md,
+                    "contract_toml": r.contract_toml,
+                    "agent_toml": r.agent_toml,
+                    "has_extras": r.extras_dir.is_some(),
+                }),
+            ),
             Err(e) => {
                 warn!(role_id, error = %e, "templates.role: assembly failed");
                 WsFrame::error_response(
@@ -4771,7 +5621,10 @@ impl MethodHandler {
             Ok(d) => d,
             Err(frame) => return frame,
         };
-        let assembled = match self.assemble_template_role(&premium_dir, &params, role_id).await {
+        let assembled = match self
+            .assemble_template_role(&premium_dir, &params, role_id)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!(role_id, error = %e, "templates.create_agent: assembly failed");
@@ -4794,7 +5647,10 @@ impl MethodHandler {
                 "Agent name must be lowercase alphanumeric with hyphens, max 64 chars",
             );
         }
-        let display_name = params.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
+        let display_name = params
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let trigger = params.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
 
         // Optional org placement overrides. Absent/empty ⇒ keep the template's
@@ -4874,11 +5730,15 @@ impl MethodHandler {
             department_override.as_deref(),
         ) {
             Ok(t) => t,
-            Err(e) => return WsFrame::error_response("", &format!("agent.toml 格式錯誤，未寫入：{e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("agent.toml 格式錯誤，未寫入：{e}"));
+            }
         };
         let parsed_agent: toml::Table = match agent_toml.parse() {
             Ok(t) => t,
-            Err(e) => return WsFrame::error_response("", &format!("agent.toml 格式錯誤，未寫入：{e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("agent.toml 格式錯誤，未寫入：{e}"));
+            }
         };
         let final_role = parsed_agent
             .get("agent")
@@ -4966,7 +5826,9 @@ impl MethodHandler {
 
         // Same protections as agents.create: file-guard hook + registry rescan.
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
-        if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await {
+        if let Err(e) =
+            crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await
+        {
             warn!(agent = %name, error = %e, "Failed to install agent-file-guard hook on templates.create_agent");
         }
         {
@@ -4977,29 +5839,44 @@ impl MethodHandler {
         }
 
         info!(name, role_id, "Agent created from premium template");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "warning": extras_warning,
-            "agent": {
-                "name": name,
-                "role": final_role,
-                "role_id": role_id,
-            }
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "warning": extras_warning,
+                "agent": {
+                    "name": name,
+                    "role": final_role,
+                    "role_id": role_id,
+                }
+            }),
+        )
     }
 
     /// Dashboard-initiated delegation.  Supervisor pattern is NOT enforced here
     /// because this RPC is an operator-level action (depth always starts at 0).
     /// Agent-to-agent delegation goes through MCP `send_to_agent` which IS enforced.
     async fn handle_agents_delegate(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-        let wait = params.get("wait_for_response").and_then(|v| v.as_bool()).unwrap_or(false);
+        let wait = params
+            .get("wait_for_response")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Enforce prompt length limit to prevent abuse (MCP-H1)
         const MAX_PROMPT_LEN: usize = 100_000;
         if prompt.len() > MAX_PROMPT_LEN {
-            return WsFrame::error_response("", &format!("Prompt too long: {} chars (max {MAX_PROMPT_LEN})", prompt.len()));
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "Prompt too long: {} chars (max {MAX_PROMPT_LEN})",
+                    prompt.len()
+                ),
+            );
         }
 
         info!(agent_id, "agents.delegate requested (dashboard)");
@@ -5017,7 +5894,9 @@ impl MethodHandler {
             let status = format!("{:?}", agent.config.agent.status).to_lowercase();
             return WsFrame::error_response(
                 "",
-                &format!("Agent '{agent_id}' is not operational (status: {status}); cannot delegate."),
+                &format!(
+                    "Agent '{agent_id}' is not operational (status: {status}); cannot delegate."
+                ),
             );
         }
         let model = agent.config.model.preferred.clone();
@@ -5028,15 +5907,29 @@ impl MethodHandler {
         if wait {
             // Synchronous delegation: Rust-native Direct API call (no Python).
             let home = self.home_dir.clone();
-            let system_prompt = agent.soul.as_deref().unwrap_or("You are a helpful AI agent.").to_string();
-            match crate::channel_reply::call_direct_api_delegate(prompt, &model, &system_prompt, &home).await {
-                Ok(response) => WsFrame::ok_response("", json!({
-                    "success": true,
-                    "message_id": message_id,
-                    "target_agent": agent_id,
-                    "response": response,
-                    "status": "completed",
-                })),
+            let system_prompt = agent
+                .soul
+                .as_deref()
+                .unwrap_or("You are a helpful AI agent.")
+                .to_string();
+            match crate::channel_reply::call_direct_api_delegate(
+                prompt,
+                &model,
+                &system_prompt,
+                &home,
+            )
+            .await
+            {
+                Ok(response) => WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": true,
+                        "message_id": message_id,
+                        "target_agent": agent_id,
+                        "response": response,
+                        "status": "completed",
+                    }),
+                ),
                 Err(e) => WsFrame::error_response("", &format!("Delegate execution failed: {e}")),
             }
         } else {
@@ -5057,35 +5950,50 @@ impl MethodHandler {
                 return WsFrame::error_response("", &format!("Failed to queue delegation: {e}"));
             }
 
-            WsFrame::ok_response("", json!({
-                "success": true,
-                "message_id": message_id,
-                "target_agent": agent_id,
-                "status": "queued",
-            }))
+            WsFrame::ok_response(
+                "",
+                json!({
+                    "success": true,
+                    "message_id": message_id,
+                    "target_agent": agent_id,
+                    "status": "queued",
+                }),
+            )
         }
     }
 
     async fn handle_agents_pause(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         info!(agent_id, "agents.pause requested");
 
         if let Err(e) = self.update_agent_status(agent_id, "paused").await {
             return WsFrame::error_response("", &format!("Failed to pause agent: {e}"));
         }
 
-        WsFrame::ok_response("", json!({ "success": true, "name": agent_id, "status": "paused" }))
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "name": agent_id, "status": "paused" }),
+        )
     }
 
     async fn handle_agents_resume(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         info!(agent_id, "agents.resume requested");
 
         if let Err(e) = self.update_agent_status(agent_id, "active").await {
             return WsFrame::error_response("", &format!("Failed to resume agent: {e}"));
         }
 
-        WsFrame::ok_response("", json!({ "success": true, "name": agent_id, "status": "active" }))
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "name": agent_id, "status": "active" }),
+        )
     }
 
     /// Read-modify-write an agent's `agent.toml` using the provided mutation closure.
@@ -5108,15 +6016,18 @@ impl MethodHandler {
         }
 
         let reg = self.registry.read().await;
-        let agent = reg.get(agent_id)
+        let agent = reg
+            .get(agent_id)
             .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
         let agent_toml_path = agent.dir.join("agent.toml");
         drop(reg);
 
-        let content = tokio::fs::read_to_string(&agent_toml_path).await
+        let content = tokio::fs::read_to_string(&agent_toml_path)
+            .await
             .map_err(|e| format!("Failed to read agent.toml: {e}"))?;
 
-        let mut table: toml::Table = content.parse()
+        let mut table: toml::Table = content
+            .parse()
             .map_err(|e| format!("Failed to parse agent.toml: {e}"))?;
 
         mutate(&mut table)?;
@@ -5126,9 +6037,11 @@ impl MethodHandler {
 
         // Atomic write: temp file + rename
         let tmp_path = agent_toml_path.with_extension("toml.tmp");
-        tokio::fs::write(&tmp_path, &new_content).await
+        tokio::fs::write(&tmp_path, &new_content)
+            .await
             .map_err(|e| format!("Failed to write agent.toml.tmp: {e}"))?;
-        tokio::fs::rename(&tmp_path, &agent_toml_path).await
+        tokio::fs::rename(&tmp_path, &agent_toml_path)
+            .await
             .map_err(|e| {
                 let _ = std::fs::remove_file(&tmp_path);
                 format!("Failed to commit agent.toml: {e}")
@@ -5163,13 +6076,15 @@ impl MethodHandler {
     async fn update_agent_status(&self, agent_id: &str, status: &str) -> Result<(), String> {
         let status = status.to_string();
         self.update_agent_toml(agent_id, move |table| {
-            let agent_section = table.get_mut("agent")
+            let agent_section = table
+                .get_mut("agent")
                 .and_then(|v| v.as_table_mut())
                 .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
             agent_section.insert("status".to_string(), toml::Value::String(status.clone()));
             info!("Agent status updated to {status}");
             Ok(())
-        }).await?;
+        })
+        .await?;
         Ok(())
     }
 
@@ -5183,14 +6098,19 @@ impl MethodHandler {
                 .map(|a| a.config.agent.name.clone())
         };
         if let Some(old_main) = current_main {
-            info!(old_main = old_main.as_str(), "Demoting current main agent to specialist");
+            info!(
+                old_main = old_main.as_str(),
+                "Demoting current main agent to specialist"
+            );
             self.update_agent_toml(&old_main, |table| {
-                let agent_section = table.get_mut("agent")
+                let agent_section = table
+                    .get_mut("agent")
                     .and_then(|v| v.as_table_mut())
                     .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
                 agent_section.insert("role".into(), toml::Value::String("specialist".into()));
                 Ok(())
-            }).await?;
+            })
+            .await?;
         }
         Ok(())
     }
@@ -5215,17 +6135,41 @@ impl MethodHandler {
         // Detect per-agent channel token changes BEFORE the closure consumes
         // params — so we know what to hot-restart after the write succeeds.
         let mut channels_to_restart: Vec<&'static str> = Vec::new();
-        if params.get("discord_bot_token").and_then(|v| v.as_str()).is_some() {
+        if params
+            .get("discord_bot_token")
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
             channels_to_restart.push("discord");
         }
-        if params.get("telegram_bot_token").and_then(|v| v.as_str()).is_some() {
+        if params
+            .get("telegram_bot_token")
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
             channels_to_restart.push("telegram");
         }
-        if params.get("slack_bot_token").and_then(|v| v.as_str()).is_some()
-            || params.get("slack_app_token").and_then(|v| v.as_str()).is_some()
+        if params
+            .get("slack_bot_token")
+            .and_then(|v| v.as_str())
+            .is_some()
+            || params
+                .get("slack_app_token")
+                .and_then(|v| v.as_str())
+                .is_some()
         {
             channels_to_restart.push("slack");
         }
+
+        // Detect an OS-watch-relevant edit (the `os_native` capability flag or
+        // any `[os_watch]` field) so we can hot stop/start the agent's watcher
+        // after the write succeeds.
+        let os_watch_touched = params.get("os_watch").is_some()
+            || params
+                .get("capabilities")
+                .and_then(|c| c.as_object())
+                .map(|c| c.contains_key("os_native"))
+                .unwrap_or(false);
 
         let params_clone = params.clone();
         let mut changes: Vec<String> = Vec::new();
@@ -5748,6 +6692,12 @@ impl MethodHandler {
             let cap_changes = apply_capabilities_to_table(table, &params_clone)?;
             changes.extend(cap_changes);
 
+            // ── OS-native filesystem watch ([os_watch] table) ──
+            // paths / ignore / debounce_ms / max_events_per_min. Gated at runtime
+            // by `capabilities.os_native`; hot-reloaded after the write below.
+            let os_watch_changes = apply_os_watch_to_table(table, &params_clone)?;
+            changes.extend(os_watch_changes);
+
             // ── Runtime ([runtime] section, RT.1) ──
             // provider enum / fallback / pty_pool_enabled / worker_managed.
             let rt_changes = apply_runtime_to_table(table, &params_clone)?;
@@ -5916,28 +6866,44 @@ impl MethodHandler {
                 // until gateway restart, so user-visible behavior diverges
                 // from agent.toml on disk.
                 let restarted = if !channels_to_restart.is_empty() {
-                    self.hot_restart_agent_channels(&channels_to_restart, &agent_id).await
+                    self.hot_restart_agent_channels(&channels_to_restart, &agent_id)
+                        .await
                 } else {
                     Vec::new()
+                };
+
+                // Hot stop/start the agent's OS filesystem watcher when the
+                // os_native flag or [os_watch] config changed — no restart. Only
+                // meaningful once the registry rescan picked up the new config.
+                let os_watch_hot_reloaded = if os_watch_touched && hot_reloaded {
+                    self.hot_reload_os_watcher(&agent_id).await;
+                    true
+                } else {
+                    false
                 };
 
                 info!(
                     agent_id = agent_id.as_str(),
                     hot_reloaded,
                     channels_restarted = ?restarted,
+                    os_watch_hot_reloaded,
                     "agents.update completed"
                 );
-                WsFrame::ok_response("", json!({
-                    "success": true,
-                    "agent_id": agent_id,
-                    "hot_reloaded": hot_reloaded,
-                    "channels_restarted": restarted,
-                    "message": if hot_reloaded {
-                        "Agent updated successfully"
-                    } else {
-                        "Agent updated successfully — registry hot reload deferred to next periodic sync (≤5min)"
-                    },
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": true,
+                        "agent_id": agent_id,
+                        "hot_reloaded": hot_reloaded,
+                        "channels_restarted": restarted,
+                        "os_watch_hot_reloaded": os_watch_hot_reloaded,
+                        "message": if hot_reloaded {
+                            "Agent updated successfully"
+                        } else {
+                            "Agent updated successfully — registry hot reload deferred to next periodic sync (≤5min)"
+                        },
+                    }),
+                )
             }
             Err(e) => WsFrame::error_response("", &e),
         }
@@ -6080,8 +7046,7 @@ impl MethodHandler {
             });
         let (applied, warning) = match parsed {
             Some(rcfg) if rcfg.enabled => {
-                match crate::redaction_integration::build_manager_from_home(&self.home_dir, rcfg)
-                {
+                match crate::redaction_integration::build_manager_from_home(&self.home_dir, rcfg) {
                     Ok(m) => {
                         info!(rules = m.engine().rule_count(), "redaction hot-reloaded");
                         self.swap_redaction_manager(Some(m)).await;
@@ -6338,7 +7303,10 @@ impl MethodHandler {
         let channel = duduclaw_identity::ChannelKind::parse_wire(channel_str);
 
         let (provider, provider_label) = self.build_identity_provider().await;
-        match provider.resolve_by_channel(channel.clone(), &identifier).await {
+        match provider
+            .resolve_by_channel(channel.clone(), &identifier)
+            .await
+        {
             Ok(Some(person)) => {
                 let is_member = !person.project_ids.is_empty();
                 let person_json = serde_json::to_value(&person).unwrap_or_else(|_| json!({}));
@@ -6488,12 +7456,19 @@ impl MethodHandler {
                     None => continue,
                 };
                 let client_id = t.get("client_id").and_then(|v| v.as_str()).unwrap_or("");
-                let is_external = t.get("is_external").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_external = t
+                    .get("is_external")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let created_at = t.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
                 let scopes: Vec<String> = t
                     .get("scopes")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 // 30-day rotation reminder (MK.4).
                 let rotate_recommended = chrono::DateTime::parse_from_rfc3339(created_at)
@@ -6518,9 +7493,15 @@ impl MethodHandler {
     /// Response: `{ success, key (cleartext, once), masked, client_id,
     /// is_external, created_at, scopes[] }`.
     async fn handle_mcp_keys_create(&self, params: Value) -> WsFrame {
-        let client_id = match params.get("client_id").and_then(|v| v.as_str()).map(str::trim) {
+        let client_id = match params
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+        {
             Some(c) if !c.is_empty() && c.len() <= 128 => c.to_string(),
-            _ => return WsFrame::error_response("", "Missing or invalid 'client_id' (1-128 chars)"),
+            _ => {
+                return WsFrame::error_response("", "Missing or invalid 'client_id' (1-128 chars)");
+            }
         };
         let env = match params.get("env").and_then(|v| v.as_str()) {
             Some("prod") | None => "prod",
@@ -6530,15 +7511,20 @@ impl MethodHandler {
                 return WsFrame::error_response(
                     "",
                     &format!("Invalid env '{other}'. Valid: prod, staging, dev"),
-                )
+                );
             }
         };
-        let is_external = params.get("is_external").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_external = params
+            .get("is_external")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Validate scopes against the known scope list (MK.4).
         let scopes_arr = match params.get("scopes").and_then(|v| v.as_array()) {
             Some(a) => a,
-            None => return WsFrame::error_response("", "Missing 'scopes' (array of scope strings)"),
+            None => {
+                return WsFrame::error_response("", "Missing 'scopes' (array of scope strings)");
+            }
         };
         let mut scopes: Vec<String> = Vec::with_capacity(scopes_arr.len());
         for s in scopes_arr {
@@ -6549,7 +7535,10 @@ impl MethodHandler {
             if !KNOWN_MCP_SCOPES.contains(&s) {
                 return WsFrame::error_response(
                     "",
-                    &format!("Unknown scope '{s}'. Valid: {}", KNOWN_MCP_SCOPES.join(", ")),
+                    &format!(
+                        "Unknown scope '{s}'. Valid: {}",
+                        KNOWN_MCP_SCOPES.join(", ")
+                    ),
                 );
             }
             if !scopes.contains(&s.to_string()) {
@@ -6563,7 +7552,10 @@ impl MethodHandler {
         let key = generate_mcp_key(env);
         // Defence-in-depth: ensure the generated key matches the canonical format.
         if !is_valid_mcp_key_format(&key) {
-            return WsFrame::error_response("", "Internal error: generated key failed format check");
+            return WsFrame::error_response(
+                "",
+                "Internal error: generated key failed format check",
+            );
         }
         let created_at = Utc::now().to_rfc3339();
 
@@ -6574,7 +7566,9 @@ impl MethodHandler {
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
         let mcp_keys = match mcp_keys.as_table_mut() {
             Some(t) => t,
-            None => return WsFrame::error_response("", "Invalid [mcp_keys] section in config.toml"),
+            None => {
+                return WsFrame::error_response("", "Invalid [mcp_keys] section in config.toml");
+            }
         };
         let mut entry = toml::map::Map::new();
         entry.insert("client_id".into(), toml::Value::String(client_id.clone()));
@@ -6582,25 +7576,36 @@ impl MethodHandler {
         entry.insert("created_at".into(), toml::Value::String(created_at.clone()));
         entry.insert(
             "scopes".into(),
-            toml::Value::Array(scopes.iter().map(|s| toml::Value::String(s.clone())).collect()),
+            toml::Value::Array(
+                scopes
+                    .iter()
+                    .map(|s| toml::Value::String(s.clone()))
+                    .collect(),
+            ),
         );
         mcp_keys.insert(key.clone(), toml::Value::Table(entry));
 
         if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
             return WsFrame::error_response("", &e);
         }
-        info!(client_id = client_id.as_str(), env, "mcp_keys.create completed");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            // Returned exactly once — the gateway never stores or echoes it again.
-            "key": key,
-            "masked": mask_mcp_key(&key),
-            "client_id": client_id,
-            "is_external": is_external,
-            "created_at": created_at,
-            "scopes": scopes,
-            "message": "Store this key now — it cannot be retrieved again.",
-        }))
+        info!(
+            client_id = client_id.as_str(),
+            env, "mcp_keys.create completed"
+        );
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                // Returned exactly once — the gateway never stores or echoes it again.
+                "key": key,
+                "masked": mask_mcp_key(&key),
+                "client_id": client_id,
+                "is_external": is_external,
+                "created_at": created_at,
+                "scopes": scopes,
+                "message": "Store this key now — it cannot be retrieved again.",
+            }),
+        )
     }
 
     /// `mcp_keys.revoke` — remove an `[mcp_keys.<key>]` entry. Params:
@@ -6623,7 +7628,10 @@ impl MethodHandler {
             return WsFrame::error_response("", &e);
         }
         info!("mcp_keys.revoke completed");
-        WsFrame::ok_response("", json!({ "success": true, "revoked": mask_mcp_key(&key) }))
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "revoked": mask_mcp_key(&key) }),
+        )
     }
 
     // ── KS: global ~/.duduclaw/KILLSWITCH.toml ────────────────────────────────
@@ -6654,11 +7662,14 @@ impl MethodHandler {
             return WsFrame::error_response("", &e);
         }
         info!(?changes, "killswitch.update completed");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "changes": changes,
-            "message": "Kill switch updated — most thresholds apply on gateway restart",
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "changes": changes,
+                "message": "Kill switch updated — most thresholds apply on gateway restart",
+            }),
+        )
     }
 
     // ── GOV: governance policies (policies/*.yaml) ────────────────────────────
@@ -6689,26 +7700,31 @@ impl MethodHandler {
         let dir = self.home_dir.join("policies");
         let mut out: Vec<Value> = Vec::new();
 
-        let mut read_scope = |scope: &str, path: &Path, out: &mut Vec<Value>| -> Result<(), String> {
-            let raw = match std::fs::read_to_string(path) {
-                Ok(r) => r,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+        let mut read_scope =
+            |scope: &str, path: &Path, out: &mut Vec<Value>| -> Result<(), String> {
+                let raw = match std::fs::read_to_string(path) {
+                    Ok(r) => r,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+                };
+                for p in gov_parse_yaml(&raw)? {
+                    let mut obj = p;
+                    obj.insert("scope".into(), json!(scope));
+                    out.push(Value::Object(obj));
+                }
+                Ok(())
             };
-            for p in gov_parse_yaml(&raw)? {
-                let mut obj = p;
-                obj.insert("scope".into(), json!(scope));
-                out.push(Value::Object(obj));
-            }
-            Ok(())
-        };
 
         if let Some(agent_id) = params.get("agent_id").and_then(|v| v.as_str()) {
             let path = match self.gov_policy_path(agent_id) {
                 Ok(p) => p,
                 Err(e) => return WsFrame::error_response("", &e),
             };
-            let scope = if agent_id.is_empty() || agent_id == "*" { "global".to_string() } else { agent_id.to_string() };
+            let scope = if agent_id.is_empty() || agent_id == "*" {
+                "global".to_string()
+            } else {
+                agent_id.to_string()
+            };
             if let Err(e) = read_scope(&scope, &path, &mut out) {
                 return WsFrame::error_response("", &e);
             }
@@ -6746,8 +7762,16 @@ impl MethodHandler {
             Ok(v) => v,
             Err(e) => return WsFrame::error_response("", &e),
         };
-        let agent_id = validated.get("agent_id").and_then(|v| v.as_str()).unwrap_or("*").to_string();
-        let policy_id = validated.get("policy_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let agent_id = validated
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("*")
+            .to_string();
+        let policy_id = validated
+            .get("policy_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let path = match self.gov_policy_path(&agent_id) {
             Ok(p) => p,
             Err(e) => return WsFrame::error_response("", &e),
@@ -6756,10 +7780,20 @@ impl MethodHandler {
         let mut policies = match std::fs::read_to_string(&path) {
             Ok(raw) => match gov_parse_yaml(&raw) {
                 Ok(p) => p,
-                Err(e) => return WsFrame::error_response("", &format!("Failed to parse {}: {e}", path.display())),
+                Err(e) => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Failed to parse {}: {e}", path.display()),
+                    );
+                }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return WsFrame::error_response("", &format!("Failed to read {}: {e}", path.display())),
+            Err(e) => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Failed to read {}: {e}", path.display()),
+                );
+            }
         };
 
         let mut created = true;
@@ -6779,25 +7813,48 @@ impl MethodHandler {
                 return WsFrame::error_response("", &format!("Failed to create policies dir: {e}"));
             }
         }
-        if let Err(e) = self.gov_atomic_write_yaml(&path, &gov_emit_yaml(&policies)).await {
+        if let Err(e) = self
+            .gov_atomic_write_yaml(&path, &gov_emit_yaml(&policies))
+            .await
+        {
             return WsFrame::error_response("", &e);
         }
-        let scope = if agent_id == "*" { "global".to_string() } else { agent_id };
-        info!(scope = scope.as_str(), policy_id = policy_id.as_str(), created, "governance.upsert completed");
-        WsFrame::ok_response("", json!({
-            "success": true, "scope": scope, "policy_id": policy_id, "created": created,
-            "message": "Policy saved — applies on next PolicyRegistry reload",
-        }))
+        let scope = if agent_id == "*" {
+            "global".to_string()
+        } else {
+            agent_id
+        };
+        info!(
+            scope = scope.as_str(),
+            policy_id = policy_id.as_str(),
+            created,
+            "governance.upsert completed"
+        );
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true, "scope": scope, "policy_id": policy_id, "created": created,
+                "message": "Policy saved — applies on next PolicyRegistry reload",
+            }),
+        )
     }
 
     /// `governance.remove` — delete a policy by `policy_id` from its scope.
     /// Params: `{ policy_id, agent_id? }`. Response: `{ success, removed }`.
     async fn handle_governance_remove(&self, params: Value) -> WsFrame {
-        let policy_id = match params.get("policy_id").and_then(|v| v.as_str()).map(str::trim) {
+        let policy_id = match params
+            .get("policy_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+        {
             Some(p) if !p.is_empty() => p.to_string(),
             _ => return WsFrame::error_response("", "Missing 'policy_id' parameter"),
         };
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("*").to_string();
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("*")
+            .to_string();
         let path = match self.gov_policy_path(&agent_id) {
             Ok(p) => p,
             Err(e) => return WsFrame::error_response("", &e),
@@ -6806,26 +7863,39 @@ impl MethodHandler {
         let mut policies = match std::fs::read_to_string(&path) {
             Ok(raw) => match gov_parse_yaml(&raw) {
                 Ok(p) => p,
-                Err(e) => return WsFrame::error_response("", &format!("Failed to parse {}: {e}", path.display())),
+                Err(e) => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Failed to parse {}: {e}", path.display()),
+                    );
+                }
             },
             Err(_) => return WsFrame::error_response("", "Policy not found"),
         };
         let before = policies.len();
-        policies.retain(|p| p.get("policy_id").and_then(|v| v.as_str()) != Some(policy_id.as_str()));
+        policies
+            .retain(|p| p.get("policy_id").and_then(|v| v.as_str()) != Some(policy_id.as_str()));
         if policies.len() == before {
             return WsFrame::error_response("", &format!("Policy not found: {policy_id}"));
         }
-        if let Err(e) = self.gov_atomic_write_yaml(&path, &gov_emit_yaml(&policies)).await {
+        if let Err(e) = self
+            .gov_atomic_write_yaml(&path, &gov_emit_yaml(&policies))
+            .await
+        {
             return WsFrame::error_response("", &e);
         }
-        info!(policy_id = policy_id.as_str(), "governance.remove completed");
+        info!(
+            policy_id = policy_id.as_str(),
+            "governance.remove completed"
+        );
         WsFrame::ok_response("", json!({ "success": true, "removed": policy_id }))
     }
 
     /// Atomic write of a YAML string (temp + rename).
     async fn gov_atomic_write_yaml(&self, path: &Path, content: &str) -> Result<(), String> {
         let tmp = path.with_extension("yaml.tmp");
-        tokio::fs::write(&tmp, content).await
+        tokio::fs::write(&tmp, content)
+            .await
             .map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
         tokio::fs::rename(&tmp, path).await.map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
@@ -6840,7 +7910,11 @@ impl MethodHandler {
     /// `wiki_scope.get` — read the shared wiki `.scope.toml`. Response:
     /// `{ namespaces: [{ namespace, mode, synced_from }] }`. Absent file → `[]`.
     async fn handle_wiki_scope_get(&self) -> WsFrame {
-        let path = self.home_dir.join("shared").join("wiki").join(".scope.toml");
+        let path = self
+            .home_dir
+            .join("shared")
+            .join("wiki")
+            .join(".scope.toml");
         let table = self.read_config_table(&path).await;
         WsFrame::ok_response("", scp_table_to_response(&table))
     }
@@ -6850,15 +7924,29 @@ impl MethodHandler {
     /// remove? }`. `remove=true` deletes the entry (reverts to agent_writable
     /// default). Atomic write. Response: `{ success, change }`.
     async fn handle_wiki_scope_update(&self, params: Value) -> WsFrame {
-        let namespace = match params.get("namespace").and_then(|v| v.as_str()).map(str::trim) {
+        let namespace = match params
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+        {
             Some(n) if !n.is_empty() => n.to_string(),
             _ => return WsFrame::error_response("", "Missing 'namespace' parameter"),
         };
-        let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("agent_writable");
+        let mode = params
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("agent_writable");
         let synced_from = params.get("synced_from").and_then(|v| v.as_str());
-        let remove = params.get("remove").and_then(|v| v.as_bool()).unwrap_or(false);
+        let remove = params
+            .get("remove")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        let path = self.home_dir.join("shared").join("wiki").join(".scope.toml");
+        let path = self
+            .home_dir
+            .join("shared")
+            .join("wiki")
+            .join(".scope.toml");
         let mut table = self.read_config_table(&path).await;
         let change = match scp_apply_namespace(&mut table, &namespace, mode, synced_from, remove) {
             Ok(c) => c,
@@ -6872,7 +7960,10 @@ impl MethodHandler {
         if let Err(e) = self.atomic_write_toml(&path, &table).await {
             return WsFrame::error_response("", &e);
         }
-        info!(namespace = namespace.as_str(), mode, "wiki_scope.update completed");
+        info!(
+            namespace = namespace.as_str(),
+            mode, "wiki_scope.update completed"
+        );
         WsFrame::ok_response("", json!({ "success": true, "change": change }))
     }
 
@@ -6896,11 +7987,16 @@ impl MethodHandler {
             let reg = self.registry.read().await;
             match reg.get(&agent_id) {
                 Some(agent) => {
-                    if matches!(agent.config.agent.role, duduclaw_core::types::AgentRole::Main) {
+                    if matches!(
+                        agent.config.agent.role,
+                        duduclaw_core::types::AgentRole::Main
+                    ) {
                         return WsFrame::error_response("", "Cannot remove the main agent");
                     }
                 }
-                None => return WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
+                None => {
+                    return WsFrame::error_response("", &format!("Agent not found: {agent_id}"));
+                }
             }
         }
 
@@ -6918,13 +8014,19 @@ impl MethodHandler {
             ),
         );
 
-        info!(agent_id = agent_id.as_str(), "Agent soft-deleted (data retained on disk)");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "agent_id": agent_id,
-            "status": "deleted",
-            "data_retained": true,
-        }))
+        info!(
+            agent_id = agent_id.as_str(),
+            "Agent soft-deleted (data retained on disk)"
+        );
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "agent_id": agent_id,
+                "status": "deleted",
+                "data_retained": true,
+            }),
+        )
     }
 
     /// Set `status` **and** flip the freeze kill-switch (`heartbeat.enabled` /
@@ -6952,11 +8054,16 @@ impl MethodHandler {
             let reg = self.registry.read().await;
             match reg.get(&agent_id) {
                 Some(agent) => {
-                    if matches!(agent.config.agent.role, duduclaw_core::types::AgentRole::Main) {
+                    if matches!(
+                        agent.config.agent.role,
+                        duduclaw_core::types::AgentRole::Main
+                    ) {
                         return WsFrame::error_response("", "Cannot archive the main agent");
                     }
                 }
-                None => return WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
+                None => {
+                    return WsFrame::error_response("", &format!("Agent not found: {agent_id}"));
+                }
             }
         }
         if let Err(e) = self.offboard_agent_toml(&agent_id, "archived").await {
@@ -6972,11 +8079,14 @@ impl MethodHandler {
             ),
         );
         info!(agent_id = agent_id.as_str(), "Agent archived (recoverable)");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "agent_id": agent_id,
-            "status": "archived",
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "agent_id": agent_id,
+                "status": "archived",
+            }),
+        )
     }
 
     /// Restore an archived (or soft-deleted) agent to `active` and re-enable the
@@ -7010,12 +8120,18 @@ impl MethodHandler {
                 json!({ "status": "active", "source": "dashboard" }),
             ),
         );
-        info!(agent_id = agent_id.as_str(), "Agent unarchived (restored to active)");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "agent_id": agent_id,
-            "status": "active",
-        }))
+        info!(
+            agent_id = agent_id.as_str(),
+            "Agent unarchived (restored to active)"
+        );
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "agent_id": agent_id,
+                "status": "active",
+            }),
+        )
     }
 
     /// Hand off an off-boarding agent's work to a successor (WP4). Moves any
@@ -7048,10 +8164,19 @@ impl MethodHandler {
             }
         }
 
-        let do_memory = params.get("memory").and_then(|v| v.as_bool()).unwrap_or(true);
+        let do_memory = params
+            .get("memory")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let do_wiki = params.get("wiki").and_then(|v| v.as_bool()).unwrap_or(true);
-        let do_tasks = params.get("tasks").and_then(|v| v.as_bool()).unwrap_or(true);
-        let auto_archive = params.get("auto_archive").and_then(|v| v.as_bool()).unwrap_or(true);
+        let do_tasks = params
+            .get("tasks")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let auto_archive = params
+            .get("auto_archive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         let mut result = json!({
             "success": true,
@@ -7091,7 +8216,10 @@ impl MethodHandler {
             match self.task_store().await {
                 Ok(store) => {
                     let now = chrono::Utc::now().to_rfc3339();
-                    match store.reassign_open_tasks(&from_agent, &to_agent, &now).await {
+                    match store
+                        .reassign_open_tasks(&from_agent, &to_agent, &now)
+                        .await
+                    {
                         Ok(n) => result["tasks"] = json!({ "reassigned": n }),
                         Err(e) => {
                             result["tasks"] = json!({ "error": e });
@@ -7117,7 +8245,11 @@ impl MethodHandler {
             result["auto_archive"] = json!({ "skipped": "handoff had errors" });
         }
 
-        result["status"] = json!(if errors.is_empty() { "COMPLETE" } else { "PARTIAL" });
+        result["status"] = json!(if errors.is_empty() {
+            "COMPLETE"
+        } else {
+            "PARTIAL"
+        });
         if !errors.is_empty() {
             result["success"] = json!(false);
             result["errors"] = json!(errors);
@@ -7132,9 +8264,11 @@ impl MethodHandler {
             // hand rather than believing the handoff finished.
             let mut moved: Vec<&str> = Vec::new();
             let mut not_moved: Vec<&str> = Vec::new();
-            for (attempted, name) in
-                [(do_memory, "memory"), (do_wiki, "wiki"), (do_tasks, "tasks")]
-            {
+            for (attempted, name) in [
+                (do_memory, "memory"),
+                (do_wiki, "wiki"),
+                (do_tasks, "tasks"),
+            ] {
                 if !attempted {
                     continue;
                 }
@@ -7203,8 +8337,8 @@ impl MethodHandler {
         };
 
         if same_file {
-            let engine = SqliteMemoryEngine::new(&from_db)
-                .map_err(|e| format!("open memory db: {e}"))?;
+            let engine =
+                SqliteMemoryEngine::new(&from_db).map_err(|e| format!("open memory db: {e}"))?;
             duduclaw_memory::reassign_agent(&engine, from_agent, to_agent)
                 .await
                 .map_err(|e| e.to_string())
@@ -7337,7 +8471,10 @@ impl MethodHandler {
                     return WsFrame::error_response("", &format!("Failed to clear outfit: {e}"));
                 }
             }
-            return WsFrame::ok_response("", json!({ "success": true, "agent_id": agent_id, "outfit": Value::Null }));
+            return WsFrame::ok_response(
+                "",
+                json!({ "success": true, "agent_id": agent_id, "outfit": Value::Null }),
+            );
         }
         let normalized = match normalize_outfit(outfit) {
             Ok(v) => v,
@@ -7354,7 +8491,10 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to commit outfit: {e}"));
         }
         info!(agent = %agent_id, "agent outfit saved");
-        WsFrame::ok_response("", json!({ "success": true, "agent_id": agent_id, "outfit": normalized }))
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "agent_id": agent_id, "outfit": normalized }),
+        )
     }
 
     async fn handle_agents_set_avatar(&self, params: Value) -> WsFrame {
@@ -7406,13 +8546,21 @@ impl MethodHandler {
             }
         }
 
-        info!(agent_id = agent_id.as_str(), bytes = bytes.len(), ext, "Agent avatar set");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "agent_id": agent_id,
-            "has_avatar": true,
-            "bytes": bytes.len(),
-        }))
+        info!(
+            agent_id = agent_id.as_str(),
+            bytes = bytes.len(),
+            ext,
+            "Agent avatar set"
+        );
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "agent_id": agent_id,
+                "has_avatar": true,
+                "bytes": bytes.len(),
+            }),
+        )
     }
 
     /// Remove an agent's uploaded avatar (WP4). No-op-safe.
@@ -7427,17 +8575,26 @@ impl MethodHandler {
         let agent_dir = self.home_dir.join("agents").join(&agent_id);
         let mut removed = false;
         for e in AVATAR_EXTS {
-            if tokio::fs::remove_file(agent_dir.join(format!("avatar.{e}"))).await.is_ok() {
+            if tokio::fs::remove_file(agent_dir.join(format!("avatar.{e}")))
+                .await
+                .is_ok()
+            {
                 removed = true;
             }
         }
-        info!(agent_id = agent_id.as_str(), removed, "Agent avatar cleared");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "agent_id": agent_id,
-            "has_avatar": false,
-            "removed": removed,
-        }))
+        info!(
+            agent_id = agent_id.as_str(),
+            removed, "Agent avatar cleared"
+        );
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "agent_id": agent_id,
+                "has_avatar": false,
+                "removed": removed,
+            }),
+        )
     }
 
     /// Read an agent's stored avatar (if any) back into a data URI. Mirrors the
@@ -7448,7 +8605,7 @@ impl MethodHandler {
         for (ext, mime) in AVATAR_EXT_MIME {
             let path = agent_dir.join(format!("avatar.{ext}"));
             if let Ok(bytes) = std::fs::read(&path) {
-                use base64::{engine::general_purpose::STANDARD as B64, Engine};
+                use base64::{Engine, engine::general_purpose::STANDARD as B64};
                 return Some(format!("data:{mime};base64,{}", B64.encode(&bytes)));
             }
         }
@@ -7487,116 +8644,134 @@ impl MethodHandler {
     /// returns it as an inline data URI (or null). Agent visibility is enforced at
     /// dispatch by `check_agent!(Viewer)` (fail-closed), same gate as `inspect`.
     async fn handle_agents_avatar(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() {
             return WsFrame::error_response("", "Missing 'agent_id' parameter");
         }
         let avatar = self.agent_avatar_data_uri(agent_id);
-        WsFrame::ok_response("", json!({
-            "agent_id": agent_id,
-            "has_avatar": avatar.is_some(),
-            "avatar": avatar,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "agent_id": agent_id,
+                "has_avatar": avatar.is_some(),
+                "avatar": avatar,
+            }),
+        )
     }
 
     async fn handle_agents_inspect(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         // Real month-to-date spend for THIS agent (not the all-account aggregate).
         let spent = self.telemetry_spent_cents_for_agent(agent_id).await;
         let reg = self.registry.read().await;
         match reg.get(agent_id) {
             Some(a) => {
                 let cfg = &a.config;
-                WsFrame::ok_response("", json!({
-                    "name": cfg.agent.name,
-                    "display_name": cfg.agent.display_name,
-                    "role": format!("{:?}", cfg.agent.role).to_lowercase(),
-                    "status": format!("{:?}", cfg.agent.status).to_lowercase(),
-                    "archived": matches!(cfg.agent.status, duduclaw_core::types::AgentStatus::Archived),
-                    // WP4: full avatar as an inline data URI (branding-logo model)
-                    // + a cheap boolean the list view also uses.
-                    "has_avatar": self.agent_has_avatar(&cfg.agent.name),
-                    "avatar": self.agent_avatar_data_uri(&cfg.agent.name),
-                    "outfit": read_agent_outfit(&self.home_dir.join("agents").join(&cfg.agent.name)),
-                    "department": cfg.agent.department,
-                    "trigger": cfg.agent.trigger,
-                    "icon": cfg.agent.icon,
-                    "reports_to": cfg.agent.reports_to,
-                    "soul_preview": a.soul.as_ref().map(|s| {
-                        let t = truncate_bytes(s, 500);
-                        if t.len() < s.len() { format!("{t}…") } else { s.clone() }
-                    }),
-                    "identity_preview": a.identity.as_ref().map(|s| {
-                        let t = truncate_bytes(s, 500);
-                        if t.len() < s.len() { format!("{t}…") } else { s.clone() }
-                    }),
-                    "memory_summary": a.memory,
-                    "skills": a.skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
-                    "model": {
-                        "preferred": cfg.model.preferred,
-                        "fallback": cfg.model.fallback,
-                        "account_pool": cfg.model.account_pool,
-                        "api_mode": cfg.model.api_mode,
-                        "local": cfg.model.local.as_ref().map(|l| json!({
-                            "model": l.model,
-                            "backend": l.backend,
-                            "context_length": l.context_length,
-                            "gpu_layers": l.gpu_layers,
-                            "prefer_local": l.prefer_local,
-                            "use_router": l.use_router,
-                        })),
-                    },
-                    "budget": { "monthly_limit_cents": cfg.budget.monthly_limit_cents, "spent_cents": spent, "warn_threshold_percent": cfg.budget.warn_threshold_percent, "hard_stop": cfg.budget.hard_stop },
-                    "heartbeat": { "enabled": cfg.heartbeat.enabled, "interval_seconds": cfg.heartbeat.interval_seconds },
-                    "proactive": {
-                        "enabled": cfg.proactive.enabled,
-                        "check_interval": cfg.proactive.check_interval,
-                        "quiet_hours_start": cfg.proactive.quiet_hours_start,
-                        "quiet_hours_end": cfg.proactive.quiet_hours_end,
-                        "max_messages_per_hour": cfg.proactive.max_messages_per_hour,
-                        "notify_channel": cfg.proactive.notify_channel,
-                        "notify_chat_id": cfg.proactive.notify_chat_id,
-                    },
-                    "permissions": {
-                        "can_create_agents": cfg.permissions.can_create_agents,
-                        "can_send_cross_agent": cfg.permissions.can_send_cross_agent,
-                        "can_modify_own_skills": cfg.permissions.can_modify_own_skills,
-                        "can_modify_own_soul": cfg.permissions.can_modify_own_soul,
-                        "can_schedule_tasks": cfg.permissions.can_schedule_tasks,
-                    },
-                    "sticker": {
-                        "enabled": cfg.sticker.enabled,
-                        "probability": cfg.sticker.probability,
-                        "intensity_threshold": cfg.sticker.intensity_threshold,
-                        "cooldown_messages": cfg.sticker.cooldown_messages,
-                        "expressiveness": match cfg.sticker.expressiveness {
-                            duduclaw_core::types::Expressiveness::Minimal => "minimal",
-                            duduclaw_core::types::Expressiveness::Moderate => "moderate",
-                            duduclaw_core::types::Expressiveness::Expressive => "expressive",
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "name": cfg.agent.name,
+                        "display_name": cfg.agent.display_name,
+                        "role": format!("{:?}", cfg.agent.role).to_lowercase(),
+                        "status": format!("{:?}", cfg.agent.status).to_lowercase(),
+                        "archived": matches!(cfg.agent.status, duduclaw_core::types::AgentStatus::Archived),
+                        // WP4: full avatar as an inline data URI (branding-logo model)
+                        // + a cheap boolean the list view also uses.
+                        "has_avatar": self.agent_has_avatar(&cfg.agent.name),
+                        "avatar": self.agent_avatar_data_uri(&cfg.agent.name),
+                        "outfit": read_agent_outfit(&self.home_dir.join("agents").join(&cfg.agent.name)),
+                        "department": cfg.agent.department,
+                        "trigger": cfg.agent.trigger,
+                        "icon": cfg.agent.icon,
+                        "reports_to": cfg.agent.reports_to,
+                        "soul_preview": a.soul.as_ref().map(|s| {
+                            let t = truncate_bytes(s, 500);
+                            if t.len() < s.len() { format!("{t}…") } else { s.clone() }
+                        }),
+                        "identity_preview": a.identity.as_ref().map(|s| {
+                            let t = truncate_bytes(s, 500);
+                            if t.len() < s.len() { format!("{t}…") } else { s.clone() }
+                        }),
+                        "memory_summary": a.memory,
+                        "skills": a.skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
+                        "model": {
+                            "preferred": cfg.model.preferred,
+                            "fallback": cfg.model.fallback,
+                            "account_pool": cfg.model.account_pool,
+                            "api_mode": cfg.model.api_mode,
+                            "local": cfg.model.local.as_ref().map(|l| json!({
+                                "model": l.model,
+                                "backend": l.backend,
+                                "context_length": l.context_length,
+                                "gpu_layers": l.gpu_layers,
+                                "prefer_local": l.prefer_local,
+                                "use_router": l.use_router,
+                            })),
                         },
-                    },
-                    "evolution": {
-                        "gvu_enabled": cfg.evolution.gvu_enabled,
-                        "cognitive_memory": cfg.evolution.cognitive_memory,
-                        "skill_auto_activate": cfg.evolution.skill_auto_activate,
-                        "skill_security_scan": cfg.evolution.skill_security_scan,
-                        "max_silence_hours": cfg.evolution.max_silence_hours,
-                    },
-                    // #6: full capabilities incl. native_sandbox + Progent policy.
-                    // Serialized straight from CapabilitiesConfig so the dashboard
-                    // gets the exact ToolPolicy shape it must round-trip via
-                    // agents.update. `serde` renders snake_case enums
-                    // (effect: allow|forbid|ask, op: equals|contains|starts_with).
-                    "capabilities": serde_json::to_value(&cfg.capabilities)
-                        .unwrap_or_else(|_| json!({})),
-                    // [runtime] block — read straight from agent.toml (the typed
-                    // config doesn't surface it). Emits ONLY keys present in the
-                    // file so the dashboard tells "unset" from an explicit false
-                    // (drives the PTY-pool OAuth default-enable materialization).
-                    "runtime": crate::runtime_config::read_runtime_json(
-                        &self.home_dir.join("agents").join(&cfg.agent.name),
-                    ),
-                }))
+                        "budget": { "monthly_limit_cents": cfg.budget.monthly_limit_cents, "spent_cents": spent, "warn_threshold_percent": cfg.budget.warn_threshold_percent, "hard_stop": cfg.budget.hard_stop },
+                        "heartbeat": { "enabled": cfg.heartbeat.enabled, "interval_seconds": cfg.heartbeat.interval_seconds },
+                        "proactive": {
+                            "enabled": cfg.proactive.enabled,
+                            "check_interval": cfg.proactive.check_interval,
+                            "quiet_hours_start": cfg.proactive.quiet_hours_start,
+                            "quiet_hours_end": cfg.proactive.quiet_hours_end,
+                            "max_messages_per_hour": cfg.proactive.max_messages_per_hour,
+                            "notify_channel": cfg.proactive.notify_channel,
+                            "notify_chat_id": cfg.proactive.notify_chat_id,
+                        },
+                        "permissions": {
+                            "can_create_agents": cfg.permissions.can_create_agents,
+                            "can_send_cross_agent": cfg.permissions.can_send_cross_agent,
+                            "can_modify_own_skills": cfg.permissions.can_modify_own_skills,
+                            "can_modify_own_soul": cfg.permissions.can_modify_own_soul,
+                            "can_schedule_tasks": cfg.permissions.can_schedule_tasks,
+                        },
+                        "sticker": {
+                            "enabled": cfg.sticker.enabled,
+                            "probability": cfg.sticker.probability,
+                            "intensity_threshold": cfg.sticker.intensity_threshold,
+                            "cooldown_messages": cfg.sticker.cooldown_messages,
+                            "expressiveness": match cfg.sticker.expressiveness {
+                                duduclaw_core::types::Expressiveness::Minimal => "minimal",
+                                duduclaw_core::types::Expressiveness::Moderate => "moderate",
+                                duduclaw_core::types::Expressiveness::Expressive => "expressive",
+                            },
+                        },
+                        "evolution": {
+                            "gvu_enabled": cfg.evolution.gvu_enabled,
+                            "cognitive_memory": cfg.evolution.cognitive_memory,
+                            "skill_auto_activate": cfg.evolution.skill_auto_activate,
+                            "skill_security_scan": cfg.evolution.skill_security_scan,
+                            "max_silence_hours": cfg.evolution.max_silence_hours,
+                        },
+                        // #6: full capabilities incl. native_sandbox + Progent policy.
+                        // Serialized straight from CapabilitiesConfig so the dashboard
+                        // gets the exact ToolPolicy shape it must round-trip via
+                        // agents.update. `serde` renders snake_case enums
+                        // (effect: allow|forbid|ask, op: equals|contains|starts_with).
+                        "capabilities": serde_json::to_value(&cfg.capabilities)
+                            .unwrap_or_else(|_| json!({})),
+                        // [runtime] block — read straight from agent.toml (the typed
+                        // config doesn't surface it). Emits ONLY keys present in the
+                        // file so the dashboard tells "unset" from an explicit false
+                        // (drives the PTY-pool OAuth default-enable materialization).
+                        "runtime": crate::runtime_config::read_runtime_json(
+                            &self.home_dir.join("agents").join(&cfg.agent.name),
+                        ),
+                        // [os_watch] table — raw from agent.toml (typed config doesn't
+                        // surface it), so the OS-native watch editor prefills the
+                        // operator's own paths/ignore/debounce rather than defaults.
+                        "os_watch": crate::os_events::read_os_watch_json(
+                            &self.home_dir.join("agents").join(&cfg.agent.name),
+                        ),
+                    }),
+                )
             }
             None => WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
         }
@@ -7621,7 +8796,10 @@ impl MethodHandler {
             for (key, name) in token_map {
                 // Enc-aware presence (2026-07 MED) — matches
                 // `count_configured_channels` so enc-only saves show up here.
-                let configured = ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+                let configured = ch
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
                     || ch
                         .get(&format!("{key}_enc"))
                         .and_then(|v| v.as_str())
@@ -7654,9 +8832,27 @@ impl MethodHandler {
                 if let Some(ch) = &agent.config.channels {
                     let name = &agent.config.agent.name;
                     let pairs: &[(&str, bool)] = &[
-                        ("discord", ch.discord.as_ref().is_some_and(|d| !d.bot_token.is_empty() || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty()))),
-                        ("telegram", ch.telegram.as_ref().is_some_and(|t| !t.bot_token.is_empty() || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty()))),
-                        ("slack", ch.slack.as_ref().is_some_and(|s| !s.bot_token.is_empty() || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty()))),
+                        (
+                            "discord",
+                            ch.discord.as_ref().is_some_and(|d| {
+                                !d.bot_token.is_empty()
+                                    || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+                            }),
+                        ),
+                        (
+                            "telegram",
+                            ch.telegram.as_ref().is_some_and(|t| {
+                                !t.bot_token.is_empty()
+                                    || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+                            }),
+                        ),
+                        (
+                            "slack",
+                            ch.slack.as_ref().is_some_and(|s| {
+                                !s.bot_token.is_empty()
+                                    || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+                            }),
+                        ),
                     ];
                     for &(platform, configured) in pairs {
                         if configured {
@@ -7703,8 +8899,14 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "Missing 'type' parameter"),
         };
         let config_obj = params.get("config").cloned().unwrap_or(json!({}));
-        let token = config_obj.get("token").and_then(|v| v.as_str()).unwrap_or("");
-        let secret = config_obj.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+        let token = config_obj
+            .get("token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let secret = config_obj
+            .get("secret")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let agent_name = params.get("agent").and_then(|v| v.as_str()).unwrap_or("");
 
         if token.is_empty() {
@@ -7728,7 +8930,12 @@ impl MethodHandler {
                 "discord" => ("bot_token", None),
                 "telegram" => ("bot_token", None),
                 "slack" => ("bot_token", Some("app_token")),
-                _ => return WsFrame::error_response("", &format!("Per-agent channels not supported for: {channel_type}")),
+                _ => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Per-agent channels not supported for: {channel_type}"),
+                    );
+                }
             };
 
             let token_owned = token.to_string();
@@ -7736,53 +8943,60 @@ impl MethodHandler {
             let channel_type_owned = channel_type.to_string();
             let home = self.home_dir.clone();
 
-            if let Err(e) = self.update_agent_toml(agent_name, move |table| {
-                let channels = table.entry("channels")
-                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                    .as_table_mut()
-                    .ok_or("Invalid [channels] section")?;
-                let section = channels.entry(&channel_type_owned)
-                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                    .as_table_mut()
-                    .ok_or_else(|| format!("Invalid [channels.{}] section", channel_type_owned))?;
+            if let Err(e) = self
+                .update_agent_toml(agent_name, move |table| {
+                    let channels = table
+                        .entry("channels")
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .ok_or("Invalid [channels] section")?;
+                    let section = channels
+                        .entry(&channel_type_owned)
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .ok_or_else(|| {
+                            format!("Invalid [channels.{}] section", channel_type_owned)
+                        })?;
 
-                // Parity with the wecom/dingtalk MED-B fix: when encryption
-                // succeeds, persist ONLY the `_enc` copy and REMOVE the
-                // plaintext key (never blank it — the enc-aware readers treat
-                // a present-but-empty plaintext as "channel removed"). All
-                // per-agent readers (telegram.rs / discord.rs / slack.rs /
-                // config_crypto::resolve_agent_token) prefer `_enc`.
-                // Keyfile-unavailable falls back to legacy plaintext.
-                match crate::config_crypto::encrypt_value(&token_owned, &home) {
-                    Some(enc) => {
-                        section.remove(token_field); // drop any stale plaintext copy
-                        section.insert(format!("{token_field}_enc"), toml::Value::String(enc));
+                    // Parity with the wecom/dingtalk MED-B fix: when encryption
+                    // succeeds, persist ONLY the `_enc` copy and REMOVE the
+                    // plaintext key (never blank it — the enc-aware readers treat
+                    // a present-but-empty plaintext as "channel removed"). All
+                    // per-agent readers (telegram.rs / discord.rs / slack.rs /
+                    // config_crypto::resolve_agent_token) prefer `_enc`.
+                    // Keyfile-unavailable falls back to legacy plaintext.
+                    match crate::config_crypto::encrypt_value(&token_owned, &home) {
+                        Some(enc) => {
+                            section.remove(token_field); // drop any stale plaintext copy
+                            section.insert(format!("{token_field}_enc"), toml::Value::String(enc));
+                        }
+                        None => {
+                            section.insert(
+                                token_field.to_string(),
+                                toml::Value::String(token_owned.clone()),
+                            );
+                        }
                     }
-                    None => {
-                        section.insert(
-                            token_field.to_string(),
-                            toml::Value::String(token_owned.clone()),
-                        );
-                    }
-                }
-                if let Some(sf) = secret_field {
-                    if !secret_owned.is_empty() {
-                        match crate::config_crypto::encrypt_value(&secret_owned, &home) {
-                            Some(enc) => {
-                                section.remove(sf); // drop any stale plaintext copy
-                                section.insert(format!("{sf}_enc"), toml::Value::String(enc));
-                            }
-                            None => {
-                                section.insert(
-                                    sf.to_string(),
-                                    toml::Value::String(secret_owned.clone()),
-                                );
+                    if let Some(sf) = secret_field {
+                        if !secret_owned.is_empty() {
+                            match crate::config_crypto::encrypt_value(&secret_owned, &home) {
+                                Some(enc) => {
+                                    section.remove(sf); // drop any stale plaintext copy
+                                    section.insert(format!("{sf}_enc"), toml::Value::String(enc));
+                                }
+                                None => {
+                                    section.insert(
+                                        sf.to_string(),
+                                        toml::Value::String(secret_owned.clone()),
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                Ok(())
-            }).await {
+                    Ok(())
+                })
+                .await
+            {
                 return WsFrame::error_response("", &format!("Failed to update agent config: {e}"));
             }
 
@@ -7798,17 +9012,22 @@ impl MethodHandler {
                     _ => Vec::new(),
                 };
                 for (l, h) in handles {
-                    if l == label { hot_started = true; }
+                    if l == label {
+                        hot_started = true;
+                    }
                     self.register_channel_handle(&l, h).await;
                 }
             }
 
             info!(channel_type, agent_name, "Per-agent channel config saved");
-            return WsFrame::ok_response("", json!({
-                "success": true,
-                "type": label,
-                "hot_started": hot_started,
-            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "success": true,
+                    "type": label,
+                    "hot_started": hot_started,
+                }),
+            );
         }
 
         // Global channel: write to config.toml [channels]
@@ -7820,14 +9039,22 @@ impl MethodHandler {
             "whatsapp" => ("whatsapp_access_token", Some("whatsapp_phone_number_id")),
             "feishu" => ("feishu_app_id", Some("feishu_app_secret")),
             // token = service-account JSON key; secret = Cloud project number
-            "googlechat" => ("googlechat_service_account_json", Some("googlechat_project_number")),
+            "googlechat" => (
+                "googlechat_service_account_json",
+                Some("googlechat_project_number"),
+            ),
             // token = client secret; secret = Microsoft App ID
             "teams" => ("teams_app_password", Some("teams_app_id")),
             // token = corpsecret; secret = corpid (identifier, plain)
             "wecom" => ("wecom_corp_secret", Some("wecom_corp_id")),
             // token = robot AppSecret; secret = AppKey (identifier, plain)
             "dingtalk" => ("dingtalk_app_secret", Some("dingtalk_app_key")),
-            _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Unknown channel type: {channel_type}"),
+                );
+            }
         };
 
         // Encrypt the primary token before storing (H3).
@@ -7841,8 +9068,11 @@ impl MethodHandler {
         // ARE encrypted.
         let secret_is_plain = matches!(
             secret_key,
-            Some("whatsapp_phone_number_id") | Some("googlechat_project_number")
-                | Some("teams_app_id") | Some("wecom_corp_id") | Some("dingtalk_app_key")
+            Some("whatsapp_phone_number_id")
+                | Some("googlechat_project_number")
+                | Some("teams_app_id")
+                | Some("wecom_corp_id")
+                | Some("dingtalk_app_key")
         );
 
         let config_path = self.home_dir.join("config.toml");
@@ -7855,7 +9085,9 @@ impl MethodHandler {
 
         let channels = match channels {
             Some(ch) => ch,
-            None => return WsFrame::error_response("", "Invalid [channels] section in config.toml"),
+            None => {
+                return WsFrame::error_response("", "Invalid [channels] section in config.toml");
+            }
         };
 
         // MED-B (extended to all channels, 2026-07 nit sweep): secrets never
@@ -7877,7 +9109,10 @@ impl MethodHandler {
                 channels.insert(enc_token_key, toml::Value::String(enc.clone()));
             }
             None => {
-                channels.insert(token_key.to_string(), toml::Value::String(token.to_string()));
+                channels.insert(
+                    token_key.to_string(),
+                    toml::Value::String(token.to_string()),
+                );
             }
         }
         if let Some(sk) = secret_key {
@@ -7907,7 +9142,11 @@ impl MethodHandler {
             "whatsapp" => &["whatsapp_verify_token", "whatsapp_app_secret"],
             "feishu" => &["feishu_verification_token"],
             "teams" => &["teams_tenant_id"],
-            "wecom" => &["wecom_agent_id", "wecom_callback_token", "wecom_encoding_aes_key"],
+            "wecom" => &[
+                "wecom_agent_id",
+                "wecom_callback_token",
+                "wecom_encoding_aes_key",
+            ],
             _ => &[],
         };
         for field in extra_secret_fields {
@@ -7938,8 +9177,7 @@ impl MethodHandler {
                         if forbid_plain {
                             channels.remove(*field); // drop any stale plaintext copy
                         } else {
-                            channels
-                                .insert((*field).to_string(), toml::Value::String(v.into()));
+                            channels.insert((*field).to_string(), toml::Value::String(v.into()));
                         }
                     }
                     None => {
@@ -7976,15 +9214,21 @@ impl MethodHandler {
         // Hot-start: launch the channel bot immediately without gateway restart
         let hot_started = self.hot_start_channel(channel_type).await;
 
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "type": channel_type,
-            "hot_started": hot_started,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "type": channel_type,
+                "hot_started": hot_started,
+            }),
+        )
     }
 
     async fn handle_channels_test(&self, params: Value) -> WsFrame {
-        let channel_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let channel_type = params
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         info!(channel_type, "channels.test requested");
 
         // Per-agent channel test: check agent.toml
@@ -7992,16 +9236,30 @@ impl MethodHandler {
             let token_field = match platform {
                 "discord" | "telegram" => "bot_token",
                 "slack" => "bot_token",
-                _ => return WsFrame::error_response("", &format!("Unknown channel platform: {platform}")),
+                _ => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Unknown channel platform: {platform}"),
+                    );
+                }
             };
 
             let reg = self.registry.read().await;
             let configured = reg.get(agent_name).is_some_and(|agent| {
                 if let Some(ch) = &agent.config.channels {
                     match platform {
-                        "discord" => ch.discord.as_ref().is_some_and(|d| !d.bot_token.is_empty() || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())),
-                        "telegram" => ch.telegram.as_ref().is_some_and(|t| !t.bot_token.is_empty() || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())),
-                        "slack" => ch.slack.as_ref().is_some_and(|s| !s.bot_token.is_empty() || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())),
+                        "discord" => ch.discord.as_ref().is_some_and(|d| {
+                            !d.bot_token.is_empty()
+                                || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+                        }),
+                        "telegram" => ch.telegram.as_ref().is_some_and(|t| {
+                            !t.bot_token.is_empty()
+                                || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+                        }),
+                        "slack" => ch.slack.as_ref().is_some_and(|s| {
+                            !s.bot_token.is_empty()
+                                || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+                        }),
                         _ => false,
                     }
                 } else {
@@ -8010,11 +9268,14 @@ impl MethodHandler {
             });
             drop(reg);
 
-            return WsFrame::ok_response("", json!({
-                "success": configured,
-                "type": channel_type,
-                "message": if configured { format!("{channel_type} {token_field} is configured") } else { format!("{channel_type} token 未設定") },
-            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "success": configured,
+                    "type": channel_type,
+                    "message": if configured { format!("{channel_type} {token_field} is configured") } else { format!("{channel_type} token 未設定") },
+                }),
+            );
         }
 
         // Global channel test
@@ -8029,29 +9290,45 @@ impl MethodHandler {
             "teams" => "teams_app_password",
             "wecom" => "wecom_corp_secret",
             "dingtalk" => "dingtalk_app_secret",
-            _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Unknown channel type: {channel_type}"),
+                );
+            }
         };
 
         let config_path = self.home_dir.join("config.toml");
         let table = self.read_config_table(&config_path).await;
 
         // Check both plaintext and encrypted token
-        let has_token = crate::config_crypto::decrypt_config_field(&table, "channels", token_key, &self.home_dir)
-            .is_some_and(|t| !t.is_empty());
+        let has_token = crate::config_crypto::decrypt_config_field(
+            &table,
+            "channels",
+            token_key,
+            &self.home_dir,
+        )
+        .is_some_and(|t| !t.is_empty());
 
         if !has_token {
-            return WsFrame::ok_response("", json!({
-                "success": false,
-                "type": channel_type,
-                "message": format!("{channel_type} token 未設定"),
-            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "success": false,
+                    "type": channel_type,
+                    "message": format!("{channel_type} token 未設定"),
+                }),
+            );
         }
 
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "type": channel_type,
-            "message": format!("{channel_type} token is configured"),
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "type": channel_type,
+                "message": format!("{channel_type} token is configured"),
+            }),
+        )
     }
 
     /// WP9: mint a one-time bind token + Telegram deep-link for a target AI
@@ -8059,7 +9336,11 @@ impl MethodHandler {
     /// QR of the returned `deep_link`. The bot username is resolved live from
     /// the configured global token via getMe — never hardcoded. Admin only.
     async fn handle_telegram_bind_token(&self, params: Value) -> WsFrame {
-        let agent = params.get("agent").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let agent = params
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if agent.is_empty() {
             return WsFrame::error_response("", "缺少 agent 參數");
         }
@@ -8111,7 +9392,9 @@ impl MethodHandler {
         let store = crate::agent_binding::AgentBindingStore::with_persistence(
             self.home_dir.join("agent_bindings.json"),
         );
-        let bind_token = store.generate_bind_token("telegram", agent, ttl_minutes, max_uses).await;
+        let bind_token = store
+            .generate_bind_token("telegram", agent, ttl_minutes, max_uses)
+            .await;
         let deep_link = format!("https://t.me/{bot_username}?start={bind_token}");
 
         let effective_ttl = if ttl_minutes <= 0 {
@@ -8148,18 +9431,27 @@ impl MethodHandler {
         if let Some((platform, agent_name)) = channel_type.split_once(':') {
             let channel_section = match platform {
                 "discord" | "telegram" | "slack" => platform,
-                _ => return WsFrame::error_response("", &format!("Unknown channel platform: {platform}")),
+                _ => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Unknown channel platform: {platform}"),
+                    );
+                }
             };
 
             // Clear the [channels.{platform}] section in the agent's agent.toml
             let agent_name_owned = agent_name.to_string();
             let channel_section_owned = channel_section.to_string();
-            if let Err(e) = self.update_agent_toml(&agent_name_owned, |table| {
-                if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut()) {
-                    channels.remove(&channel_section_owned);
-                }
-                Ok(())
-            }).await {
+            if let Err(e) = self
+                .update_agent_toml(&agent_name_owned, |table| {
+                    if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut())
+                    {
+                        channels.remove(&channel_section_owned);
+                    }
+                    Ok(())
+                })
+                .await
+            {
                 return WsFrame::error_response("", &format!("Failed to update agent config: {e}"));
             }
 
@@ -8167,10 +9459,13 @@ impl MethodHandler {
             self.hot_stop_channel(channel_type).await;
 
             info!(channel_type, "Per-agent channel removed and stopped");
-            return WsFrame::ok_response("", json!({
-                "success": true,
-                "type": channel_type,
-            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "success": true,
+                    "type": channel_type,
+                }),
+            );
         }
 
         // Global channel removal
@@ -8185,18 +9480,32 @@ impl MethodHandler {
             "teams" => "teams_app_password",
             "wecom" => "wecom_corp_secret",
             "dingtalk" => "dingtalk_app_secret",
-            _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Unknown channel type: {channel_type}"),
+                );
+            }
         };
 
         // Companion fields cleared alongside the primary token.
         let companion_fields: &[&str] = match channel_type {
             "line" => &["line_channel_secret"],
             "slack" => &["slack_app_token"],
-            "whatsapp" => &["whatsapp_phone_number_id", "whatsapp_verify_token", "whatsapp_app_secret"],
+            "whatsapp" => &[
+                "whatsapp_phone_number_id",
+                "whatsapp_verify_token",
+                "whatsapp_app_secret",
+            ],
             "feishu" => &["feishu_app_secret", "feishu_verification_token"],
             "googlechat" => &["googlechat_project_number"],
             "teams" => &["teams_app_id", "teams_tenant_id"],
-            "wecom" => &["wecom_corp_id", "wecom_agent_id", "wecom_callback_token", "wecom_encoding_aes_key"],
+            "wecom" => &[
+                "wecom_corp_id",
+                "wecom_agent_id",
+                "wecom_callback_token",
+                "wecom_encoding_aes_key",
+            ],
             "dingtalk" => &["dingtalk_app_key"],
             _ => &[],
         };
@@ -8240,11 +9549,14 @@ impl MethodHandler {
         }
 
         info!(channel_type, restarted = ?restarted_agents, "Channel removed and stopped");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "type": channel_type,
-            "restarted_per_agent": restarted_agents,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "type": channel_type,
+                "restarted_per_agent": restarted_agents,
+            }),
+        )
     }
 
     // ── Channel hot-start/stop ────────────────────────────────
@@ -8254,7 +9566,10 @@ impl MethodHandler {
         let ctx = match self.reply_ctx.read().await.clone() {
             Some(ctx) => ctx,
             None => {
-                warn!(channel_type, "Cannot hot-start channel: ReplyContext not available");
+                warn!(
+                    channel_type,
+                    "Cannot hot-start channel: ReplyContext not available"
+                );
                 return false;
             }
         };
@@ -8292,11 +9607,17 @@ impl MethodHandler {
         match handle {
             Some(h) => {
                 info!(channel_type, "Channel hot-started successfully");
-                self.channel_handles.lock().await.insert(channel_type.to_string(), h);
+                self.channel_handles
+                    .lock()
+                    .await
+                    .insert(channel_type.to_string(), h);
                 true
             }
             None => {
-                warn!(channel_type, "Channel hot-start failed (check token validity)");
+                warn!(
+                    channel_type,
+                    "Channel hot-start failed (check token validity)"
+                );
                 false
             }
         }
@@ -8323,7 +9644,11 @@ impl MethodHandler {
     /// LINE / WhatsApp / Feishu are not handled here — LINE is webhook-based
     /// (no background task), the others lack hot-restart helpers and still
     /// require gateway restart for token changes.
-    async fn hot_restart_agent_channels(&self, channel_types: &[&str], agent_name: &str) -> Vec<String> {
+    async fn hot_restart_agent_channels(
+        &self,
+        channel_types: &[&str],
+        agent_name: &str,
+    ) -> Vec<String> {
         let ctx = match self.reply_ctx.read().await.clone() {
             Some(ctx) => ctx,
             None => return Vec::new(),
@@ -8336,12 +9661,16 @@ impl MethodHandler {
 
             let handles: Vec<(String, tokio::task::JoinHandle<()>)> = match *ch {
                 "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx.clone()).await,
-                "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx.clone()).await,
+                "telegram" => {
+                    crate::telegram::start_telegram_bots(&self.home_dir, ctx.clone()).await
+                }
                 "slack" => crate::slack::start_slack_bots(&self.home_dir, ctx.clone()).await,
                 _ => Vec::new(),
             };
             for (l, h) in handles {
-                if l == label { restarted.push(l.clone()); }
+                if l == label {
+                    restarted.push(l.clone());
+                }
                 self.register_channel_handle(&l, h).await;
             }
         }
@@ -8353,21 +9682,26 @@ impl MethodHandler {
     async fn handle_accounts_list(&self) -> WsFrame {
         let rotator = self.cached_rotator().await;
         let accounts = rotator.status().await;
-        let accounts_json: Vec<Value> = accounts.iter().map(|a| json!({
-            "id": a.id,
-            "auth_method": a.auth_method,
-            "priority": a.priority,
-            "is_healthy": a.is_healthy,
-            "spent_this_month": a.spent_this_month,
-            "monthly_budget_cents": a.monthly_budget_cents,
-            "total_requests": a.total_requests,
-            "is_available": a.is_available,
-            "label": a.label,
-            "email": a.email,
-            "subscription": a.subscription,
-            "expires_at": a.expires_at,
-            "days_until_expiry": a.days_until_expiry,
-        })).collect();
+        let accounts_json: Vec<Value> = accounts
+            .iter()
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "auth_method": a.auth_method,
+                    "priority": a.priority,
+                    "is_healthy": a.is_healthy,
+                    "spent_this_month": a.spent_this_month,
+                    "monthly_budget_cents": a.monthly_budget_cents,
+                    "total_requests": a.total_requests,
+                    "is_available": a.is_available,
+                    "label": a.label,
+                    "email": a.email,
+                    "subscription": a.subscription,
+                    "expires_at": a.expires_at,
+                    "days_until_expiry": a.days_until_expiry,
+                })
+            })
+            .collect();
         WsFrame::ok_response("", json!({ "accounts": accounts_json }))
     }
 
@@ -8386,33 +9720,42 @@ impl MethodHandler {
         // bar (the figure users actually read) is now correct.
         let total_spent = self.telemetry_spent_cents_total().await;
 
-        let accounts_json: Vec<Value> = accounts.iter().map(|a| json!({
-            "id": a.id,
-            "auth_method": a.auth_method,
-            "priority": a.priority,
-            "is_healthy": a.is_healthy,
-            "spent_this_month": a.spent_this_month,
-            "monthly_budget_cents": a.monthly_budget_cents,
-        })).collect();
+        let accounts_json: Vec<Value> = accounts
+            .iter()
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "auth_method": a.auth_method,
+                    "priority": a.priority,
+                    "is_healthy": a.is_healthy,
+                    "spent_this_month": a.spent_this_month,
+                    "monthly_budget_cents": a.monthly_budget_cents,
+                })
+            })
+            .collect();
 
-        WsFrame::ok_response("", json!({
-            "total_budget_cents": total_budget,
-            "total_spent_cents": total_spent,
-            "accounts": accounts_json,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "total_budget_cents": total_budget,
+                "total_spent_cents": total_spent,
+                "accounts": accounts_json,
+            }),
+        )
     }
 
     async fn handle_accounts_rotate(&self, _params: Value) -> WsFrame {
         let rotator = self.cached_rotator().await;
         match rotator.select().await {
-            Some(selected) => {
-                WsFrame::ok_response("", json!({
+            Some(selected) => WsFrame::ok_response(
+                "",
+                json!({
                     "success": true,
                     "selected_account": selected.id,
                     "strategy": "configured",
                     "message": format!("Rotated to account '{}'", selected.id),
-                }))
-            }
+                }),
+            ),
             None => WsFrame::error_response("", "No available accounts for rotation"),
         }
     }
@@ -8421,30 +9764,45 @@ impl MethodHandler {
         let rotator = self.cached_rotator().await;
         let accounts = rotator.status().await;
         let healthy_count = accounts.iter().filter(|a| a.is_healthy).count();
-        let status = if accounts.is_empty() { "no_accounts" }
-            else if healthy_count == accounts.len() { "healthy" }
-            else if healthy_count > 0 { "degraded" }
-            else { "unhealthy" };
+        let status = if accounts.is_empty() {
+            "no_accounts"
+        } else if healthy_count == accounts.len() {
+            "healthy"
+        } else if healthy_count > 0 {
+            "degraded"
+        } else {
+            "unhealthy"
+        };
 
-        let accounts_json: Vec<Value> = accounts.iter().map(|a| json!({
-            "id": a.id,
-            "healthy": a.is_healthy,
-            "available": a.is_available,
-            "spent": a.spent_this_month,
-            "budget": a.monthly_budget_cents,
-            "requests": a.total_requests,
-        })).collect();
+        let accounts_json: Vec<Value> = accounts
+            .iter()
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "healthy": a.is_healthy,
+                    "available": a.is_available,
+                    "spent": a.spent_this_month,
+                    "budget": a.monthly_budget_cents,
+                    "requests": a.total_requests,
+                })
+            })
+            .collect();
 
-        WsFrame::ok_response("", json!({
-            "status": status,
-            "healthy_count": healthy_count,
-            "total_count": accounts.len(),
-            "accounts": accounts_json,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "status": status,
+                "healthy_count": healthy_count,
+                "total_count": accounts.len(),
+                "accounts": accounts_json,
+            }),
+        )
     }
 
     /// Get or create a cached rotator (uses the same static cache as claude_runner).
-    async fn cached_rotator(&self) -> std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator> {
+    async fn cached_rotator(
+        &self,
+    ) -> std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator> {
         // Reuse the global cache from claude_runner to avoid redundant disk reads
         match crate::claude_runner::get_rotator_cached(&self.home_dir).await {
             Ok(r) => r,
@@ -8519,16 +9877,30 @@ impl MethodHandler {
     fn agent_memory_db_path(&self, agent_id: &str) -> PathBuf {
         let agent_dir = self.home_dir.join("agents").join(agent_id);
         let state_path = agent_dir.join("state").join("memory.db");
-        if state_path.exists() { state_path } else { agent_dir.join("memory.db") }
+        if state_path.exists() {
+            state_path
+        } else {
+            agent_dir.join("memory.db")
+        }
     }
 
     async fn handle_memory_search(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(200) as usize;
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(200) as usize;
 
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) || query.is_empty() {
-            return WsFrame::error_response("", "Missing or invalid 'agent_id' or 'query' parameter");
+            return WsFrame::error_response(
+                "",
+                "Missing or invalid 'agent_id' or 'query' parameter",
+            );
         }
 
         let db_path = self.agent_memory_db_path(agent_id);
@@ -8538,22 +9910,27 @@ impl MethodHandler {
 
         let mut engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
         };
         // D3 wiring: config-driven graph seeding weights (default ⇒ unchanged).
         engine.retrieval_weights = self.memory_retrieval_weights();
 
         match engine.search(agent_id, query, limit).await {
             Ok(entries) => {
-                let results: Vec<Value> = entries.iter().map(|e| {
-                    json!({
-                        "id": e.id,
-                        "agent_id": e.agent_id,
-                        "content": e.content,
-                        "timestamp": e.timestamp.to_rfc3339(),
-                        "tags": e.tags,
+                let results: Vec<Value> = entries
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "id": e.id,
+                            "agent_id": e.agent_id,
+                            "content": e.content,
+                            "timestamp": e.timestamp.to_rfc3339(),
+                            "tags": e.tags,
+                        })
                     })
-                }).collect();
+                    .collect();
                 WsFrame::ok_response("", json!({ "entries": results }))
             }
             Err(e) => WsFrame::error_response("", &format!("Memory search failed: {e}")),
@@ -8561,8 +9938,15 @@ impl MethodHandler {
     }
 
     async fn handle_memory_browse(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(200) as usize;
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(200) as usize;
 
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
@@ -8575,20 +9959,25 @@ impl MethodHandler {
 
         let engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
         };
 
         match engine.list_recent(agent_id, limit).await {
             Ok(entries) => {
-                let rows: Vec<Value> = entries.iter().map(|e| {
-                    json!({
-                        "id": e.id,
-                        "agent_id": e.agent_id,
-                        "content": e.content,
-                        "timestamp": e.timestamp.to_rfc3339(),
-                        "tags": e.tags,
+                let rows: Vec<Value> = entries
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "id": e.id,
+                            "agent_id": e.agent_id,
+                            "content": e.content,
+                            "timestamp": e.timestamp.to_rfc3339(),
+                            "tags": e.tags,
+                        })
                     })
-                }).collect();
+                    .collect();
                 WsFrame::ok_response("", json!({ "entries": rows }))
             }
             Err(e) => WsFrame::error_response("", &format!("Memory browse failed: {e}")),
@@ -8597,8 +9986,15 @@ impl MethodHandler {
 
     /// RFC-24: list an agent's currently-open decisions for the Dashboard panel.
     async fn handle_decisions_list(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(50) as usize;
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(50) as usize;
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
@@ -8608,7 +10004,9 @@ impl MethodHandler {
         }
         let engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
         };
         match engine.list_open_decisions(agent_id, limit).await {
             Ok(decisions) => {
@@ -8633,8 +10031,14 @@ impl MethodHandler {
     /// of its still-valid rows and bumps the `decision_false_positive` counter so
     /// detector precision can be tracked from real labels.
     async fn handle_decisions_dismiss(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let decision_id = params.get("decision_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let decision_id = params
+            .get("decision_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) || decision_id.is_empty() {
             return WsFrame::error_response("", "Missing 'agent_id' or 'decision_id'");
         }
@@ -8644,7 +10048,9 @@ impl MethodHandler {
         }
         let engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
         };
         match engine.dismiss_decision(agent_id, decision_id).await {
             Ok(true) => {
@@ -8663,8 +10069,15 @@ impl MethodHandler {
     /// is created on demand by `SqliteMemoryEngine::new`, but we want this RPC to
     /// work even against older databases that were created before P2 landed.
     async fn handle_memory_key_facts(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).min(200) as i64;
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .min(200) as i64;
 
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
@@ -8677,7 +10090,9 @@ impl MethodHandler {
 
         let conn = match rusqlite::Connection::open(&db_path) {
             Ok(c) => c,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
         };
 
         let mut stmt = match conn.prepare(
@@ -8696,7 +10111,10 @@ impl MethodHandler {
                 if msg.contains("no such table") {
                     return WsFrame::ok_response("", json!({ "entries": [] }));
                 }
-                return WsFrame::error_response("", &format!("Key facts query prepare failed: {e}"));
+                return WsFrame::error_response(
+                    "",
+                    &format!("Key facts query prepare failed: {e}"),
+                );
             }
         };
 
@@ -8721,7 +10139,10 @@ impl MethodHandler {
             match row {
                 Ok(v) => entries.push(v),
                 Err(e) => {
-                    return WsFrame::error_response("", &format!("Key facts row decode failed: {e}"));
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Key facts row decode failed: {e}"),
+                    );
                 }
             }
         }
@@ -8733,40 +10154,70 @@ impl MethodHandler {
     /// pair or a `memory_id` (resolved to its triple first). Reuses the engine's
     /// `get_history` — the ranking / validity logic is not re-implemented here.
     async fn handle_memory_history(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
 
         let db_path = self.agent_memory_db_path(agent_id);
         if !db_path.exists() {
-            return WsFrame::ok_response("", json!({ "subject": null, "predicate": null, "chain": [], "current_id": null }));
+            return WsFrame::ok_response(
+                "",
+                json!({ "subject": null, "predicate": null, "chain": [], "current_id": null }),
+            );
         }
         let engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
         };
 
         // Resolve (subject, predicate): explicit params win; otherwise derive
         // from a supplied memory_id.
         let (subject, predicate) = {
-            let s = params.get("subject").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
-            let p = params.get("predicate").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            let s = params
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let p = params
+                .get("predicate")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
             match (s, p) {
                 (Some(s), Some(p)) => (s.to_string(), p.to_string()),
                 _ => {
-                    let memory_id = params.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let memory_id = params
+                        .get("memory_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if memory_id.is_empty() {
-                        return WsFrame::error_response("", "Provide either (subject, predicate) or memory_id");
+                        return WsFrame::error_response(
+                            "",
+                            "Provide either (subject, predicate) or memory_id",
+                        );
                     }
                     match engine.triple_for_id(agent_id, memory_id).await {
                         Ok(Some(t)) => t,
                         Ok(None) => {
                             // Fail-safe: not a temporal triple (or not owned) →
                             // empty chain, not an error.
-                            return WsFrame::ok_response("", json!({ "subject": null, "predicate": null, "chain": [], "current_id": null }));
+                            return WsFrame::ok_response(
+                                "",
+                                json!({ "subject": null, "predicate": null, "chain": [], "current_id": null }),
+                            );
                         }
-                        Err(e) => return WsFrame::error_response("", &format!("Triple lookup failed: {e}")),
+                        Err(e) => {
+                            return WsFrame::error_response(
+                                "",
+                                &format!("Triple lookup failed: {e}"),
+                            );
+                        }
                     }
                 }
             }
@@ -8775,28 +10226,34 @@ impl MethodHandler {
         match engine.get_history(agent_id, &subject, &predicate).await {
             Ok(records) => {
                 let mut current_id: Option<String> = None;
-                let chain: Vec<Value> = records.iter().map(|r| {
-                    let is_current = r.valid_until.is_none();
-                    if is_current {
-                        current_id = Some(r.id.clone());
-                    }
-                    json!({
-                        "id": r.id,
-                        "content": r.content,
-                        "valid_from": r.valid_from,
-                        "valid_until": r.valid_until,
-                        "superseded_by": r.superseded_by,
-                        "supersedes": r.supersedes,
-                        "confidence": r.confidence,
-                        "is_current": is_current,
+                let chain: Vec<Value> = records
+                    .iter()
+                    .map(|r| {
+                        let is_current = r.valid_until.is_none();
+                        if is_current {
+                            current_id = Some(r.id.clone());
+                        }
+                        json!({
+                            "id": r.id,
+                            "content": r.content,
+                            "valid_from": r.valid_from,
+                            "valid_until": r.valid_until,
+                            "superseded_by": r.superseded_by,
+                            "supersedes": r.supersedes,
+                            "confidence": r.confidence,
+                            "is_current": is_current,
+                        })
                     })
-                }).collect();
-                WsFrame::ok_response("", json!({
-                    "subject": subject,
-                    "predicate": predicate,
-                    "chain": chain,
-                    "current_id": current_id,
-                }))
+                    .collect();
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "subject": subject,
+                        "predicate": predicate,
+                        "chain": chain,
+                        "current_id": current_id,
+                    }),
+                )
             }
             Err(e) => WsFrame::error_response("", &format!("Memory history failed: {e}")),
         }
@@ -8807,9 +10264,20 @@ impl MethodHandler {
     /// engine's `get_at`. Returns `found: false` (not an error) when no version
     /// was valid at that instant.
     async fn handle_memory_at(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let subject = params.get("subject").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
-        let predicate = params.get("predicate").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let subject = params
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        let predicate = params
+            .get("predicate")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
         let at_raw = params.get("at").and_then(|v| v.as_str()).unwrap_or("");
 
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
@@ -8820,7 +10288,12 @@ impl MethodHandler {
         }
         let at = match chrono::DateTime::parse_from_rfc3339(at_raw) {
             Ok(dt) => dt.with_timezone(&Utc),
-            Err(_) => return WsFrame::error_response("", "Missing or invalid 'at' parameter (expected RFC-3339 timestamp)"),
+            Err(_) => {
+                return WsFrame::error_response(
+                    "",
+                    "Missing or invalid 'at' parameter (expected RFC-3339 timestamp)",
+                );
+            }
         };
 
         let db_path = self.agent_memory_db_path(agent_id);
@@ -8829,24 +10302,31 @@ impl MethodHandler {
         }
         let engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
         };
 
         match engine.get_at(agent_id, subject, predicate, at).await {
-            Ok(Some(r)) => WsFrame::ok_response("", json!({
-                "found": true,
-                "record": {
-                    "id": r.id,
-                    "content": r.content,
-                    "valid_from": r.valid_from,
-                    "valid_until": r.valid_until,
-                    "superseded_by": r.superseded_by,
-                    "supersedes": r.supersedes,
-                    "confidence": r.confidence,
-                },
-            })),
+            Ok(Some(r)) => WsFrame::ok_response(
+                "",
+                json!({
+                    "found": true,
+                    "record": {
+                        "id": r.id,
+                        "content": r.content,
+                        "valid_from": r.valid_from,
+                        "valid_until": r.valid_until,
+                        "superseded_by": r.superseded_by,
+                        "supersedes": r.supersedes,
+                        "confidence": r.confidence,
+                    },
+                }),
+            ),
             Ok(None) => WsFrame::ok_response("", json!({ "found": false, "record": null })),
-            Err(e) => WsFrame::error_response("", &format!("Memory point-in-time lookup failed: {e}")),
+            Err(e) => {
+                WsFrame::error_response("", &format!("Memory point-in-time lookup failed: {e}"))
+            }
         }
     }
 
@@ -8856,7 +10336,10 @@ impl MethodHandler {
     /// carry degree; edges carry `origin_trust` (source-confidence tier colour)
     /// and `quarantined` (held-for-review). Empty db ⇒ empty graph, not an error.
     async fn handle_memory_graph(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
@@ -8868,11 +10351,16 @@ impl MethodHandler {
 
         let db_path = self.agent_memory_db_path(agent_id);
         if !db_path.exists() {
-            return WsFrame::ok_response("", json!({ "nodes": [], "edges": [], "truncated": false }));
+            return WsFrame::ok_response(
+                "",
+                json!({ "nodes": [], "edges": [], "truncated": false }),
+            );
         }
         let engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
         };
 
         match engine.export_graph(agent_id, limit).await {
@@ -8896,11 +10384,14 @@ impl MethodHandler {
                         })
                     })
                     .collect();
-                WsFrame::ok_response("", json!({
-                    "nodes": nodes,
-                    "edges": edges,
-                    "truncated": g.truncated,
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "nodes": nodes,
+                        "edges": edges,
+                        "truncated": g.truncated,
+                    }),
+                )
             }
             Err(e) => WsFrame::error_response("", &format!("Memory graph export failed: {e}")),
         }
@@ -8913,8 +10404,15 @@ impl MethodHandler {
     /// site. Returns the number of rows expired. Exposed only on the dashboard
     /// RPC surface (not MCP) — the "清除此來源" queue action lives here.
     async fn handle_memory_invalidate_origin(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let origin = params.get("origin").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let origin = params
+            .get("origin")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
@@ -8923,10 +10421,14 @@ impl MethodHandler {
         }
         // Optional `since` transaction-time bound (RFC-3339). Absent ⇒ all time.
         let since = match params.get("since").and_then(|v| v.as_str()) {
-            Some(s) if !s.trim().is_empty() => match chrono::DateTime::parse_from_rfc3339(s.trim()) {
+            Some(s) if !s.trim().is_empty() => match chrono::DateTime::parse_from_rfc3339(s.trim())
+            {
                 Ok(dt) => Some(dt.with_timezone(&Utc)),
                 Err(_) => {
-                    return WsFrame::error_response("", "Invalid 'since' parameter (expected RFC-3339 timestamp)");
+                    return WsFrame::error_response(
+                        "",
+                        "Invalid 'since' parameter (expected RFC-3339 timestamp)",
+                    );
                 }
             },
             _ => None,
@@ -8938,7 +10440,9 @@ impl MethodHandler {
         }
         let engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
         };
 
         match engine.invalidate_by_origin(agent_id, origin, since).await {
@@ -8950,7 +10454,10 @@ impl MethodHandler {
     // ── Wiki Knowledge Base ──────────────────────────────────
 
     async fn handle_wiki_pages(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() {
             return WsFrame::error_response("", "Missing 'agent_id' parameter");
         }
@@ -8966,14 +10473,17 @@ impl MethodHandler {
         let store = duduclaw_memory::WikiStore::new(wiki_dir);
         match store.list_pages() {
             Ok(pages) => {
-                let items: Vec<Value> = pages.iter().map(|p| {
-                    json!({
-                        "path": p.path,
-                        "title": p.title,
-                        "updated": p.updated.to_rfc3339(),
-                        "tags": p.tags,
+                let items: Vec<Value> = pages
+                    .iter()
+                    .map(|p| {
+                        json!({
+                            "path": p.path,
+                            "title": p.title,
+                            "updated": p.updated.to_rfc3339(),
+                            "tags": p.tags,
+                        })
                     })
-                }).collect();
+                    .collect();
                 WsFrame::ok_response("", json!({ "pages": items, "exists": true }))
             }
             Err(e) => WsFrame::error_response("", &format!("Failed to list wiki pages: {e}")),
@@ -8981,8 +10491,14 @@ impl MethodHandler {
     }
 
     async fn handle_wiki_read(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let page_path = params
+            .get("page_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() || page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'agent_id' or 'page_path' parameter");
         }
@@ -8995,13 +10511,18 @@ impl MethodHandler {
 
         // Allow reading reserved files like _index.md, _schema.md
         match store.read_raw(page_path) {
-            Ok(content) => WsFrame::ok_response("", json!({ "content": content, "path": page_path })),
+            Ok(content) => {
+                WsFrame::ok_response("", json!({ "content": content, "path": page_path }))
+            }
             Err(e) => WsFrame::error_response("", &format!("Failed to read page: {e}")),
         }
     }
 
     async fn handle_wiki_search(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(100);
         // Optional conversation_id — when supplied, every returned hit is
@@ -9034,18 +10555,21 @@ impl MethodHandler {
         };
         match result {
             Ok(hits) => {
-                let items: Vec<Value> = hits.iter().map(|h| {
-                    json!({
-                        "path": h.path,
-                        "title": h.title,
-                        "score": h.score,
-                        "weighted_score": h.weighted_score,
-                        "trust": h.trust,
-                        "layer": h.layer.to_string(),
-                        "source_type": h.source_type.to_string(),
-                        "context_lines": h.context_lines,
+                let items: Vec<Value> = hits
+                    .iter()
+                    .map(|h| {
+                        json!({
+                            "path": h.path,
+                            "title": h.title,
+                            "score": h.score,
+                            "weighted_score": h.weighted_score,
+                            "trust": h.trust,
+                            "layer": h.layer.to_string(),
+                            "source_type": h.source_type.to_string(),
+                            "context_lines": h.context_lines,
+                        })
                     })
-                }).collect();
+                    .collect();
                 WsFrame::ok_response("", json!({ "hits": items }))
             }
             Err(e) => WsFrame::error_response("", &format!("Wiki search failed: {e}")),
@@ -9053,7 +10577,10 @@ impl MethodHandler {
     }
 
     async fn handle_wiki_lint(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() {
             return WsFrame::error_response("", "Missing 'agent_id' parameter");
         }
@@ -9068,20 +10595,26 @@ impl MethodHandler {
 
         let store = duduclaw_memory::WikiStore::new(wiki_dir);
         match store.lint() {
-            Ok(report) => WsFrame::ok_response("", json!({
-                "total_pages": report.total_pages,
-                "index_entries": report.index_entries,
-                "orphan_pages": report.orphan_pages,
-                "broken_links": report.broken_links,
-                "stale_pages": report.stale_pages,
-                "healthy": report.orphan_pages.is_empty() && report.broken_links.is_empty(),
-            })),
+            Ok(report) => WsFrame::ok_response(
+                "",
+                json!({
+                    "total_pages": report.total_pages,
+                    "index_entries": report.index_entries,
+                    "orphan_pages": report.orphan_pages,
+                    "broken_links": report.broken_links,
+                    "stale_pages": report.stale_pages,
+                    "healthy": report.orphan_pages.is_empty() && report.broken_links.is_empty(),
+                }),
+            ),
             Err(e) => WsFrame::error_response("", &format!("Wiki lint failed: {e}")),
         }
     }
 
     async fn handle_wiki_stats(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() {
             return WsFrame::error_response("", "Missing 'agent_id' parameter");
         }
@@ -9110,18 +10643,23 @@ impl MethodHandler {
             *by_dir.entry(dir).or_insert(0) += 1;
         }
 
-        let most_recent = pages.first().map(|p| json!({
-            "title": p.title,
-            "path": p.path,
-            "updated": p.updated.to_rfc3339(),
-        }));
+        let most_recent = pages.first().map(|p| {
+            json!({
+                "title": p.title,
+                "path": p.path,
+                "updated": p.updated.to_rfc3339(),
+            })
+        });
 
-        WsFrame::ok_response("", json!({
-            "exists": true,
-            "total_pages": pages.len(),
-            "by_directory": by_dir,
-            "most_recent": most_recent,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "exists": true,
+                "total_pages": pages.len(),
+                "by_directory": by_dir,
+                "most_recent": most_recent,
+            }),
+        )
     }
 
     // ── Phase 4: Wiki RL Trust inspection / override ────────
@@ -9129,8 +10667,14 @@ impl MethodHandler {
     /// `wiki.trust_audit` — list low-trust pages for an agent, with citation
     /// + signal counters. Read-only; safe for any authenticated user.
     async fn handle_wiki_trust_audit(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let max_trust = params.get("max_trust").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let max_trust = params
+            .get("max_trust")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.3) as f32;
         let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize).min(500);
 
         if agent_id.is_empty() {
@@ -9142,30 +10686,38 @@ impl MethodHandler {
 
         let store = match duduclaw_memory::trust_store::global_trust_store() {
             Some(s) => s,
-            None => return WsFrame::ok_response("", json!({
-                "rows": [],
-                "available": false,
-                "note": "Trust store not initialized — wiki trust feedback disabled",
-            })),
+            None => {
+                return WsFrame::ok_response(
+                    "",
+                    json!({
+                        "rows": [],
+                        "available": false,
+                        "note": "Trust store not initialized — wiki trust feedback disabled",
+                    }),
+                );
+            }
         };
 
         match store.list_low_trust(agent_id, max_trust, limit) {
             Ok(rows) => {
-                let items: Vec<Value> = rows.iter().map(|s| {
-                    json!({
-                        "page_path": s.page_path,
-                        "agent_id": s.agent_id,
-                        "trust": s.trust,
-                        "citation_count": s.citation_count,
-                        "error_signal_count": s.error_signal_count,
-                        "success_signal_count": s.success_signal_count,
-                        "last_signal_at": s.last_signal_at.map(|d| d.to_rfc3339()),
-                        "last_verified": s.last_verified.map(|d| d.to_rfc3339()),
-                        "do_not_inject": s.do_not_inject,
-                        "locked": s.locked,
-                        "updated_at": s.updated_at.to_rfc3339(),
+                let items: Vec<Value> = rows
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "page_path": s.page_path,
+                            "agent_id": s.agent_id,
+                            "trust": s.trust,
+                            "citation_count": s.citation_count,
+                            "error_signal_count": s.error_signal_count,
+                            "success_signal_count": s.success_signal_count,
+                            "last_signal_at": s.last_signal_at.map(|d| d.to_rfc3339()),
+                            "last_verified": s.last_verified.map(|d| d.to_rfc3339()),
+                            "do_not_inject": s.do_not_inject,
+                            "locked": s.locked,
+                            "updated_at": s.updated_at.to_rfc3339(),
+                        })
                     })
-                }).collect();
+                    .collect();
                 WsFrame::ok_response("", json!({ "rows": items, "available": true }))
             }
             Err(e) => WsFrame::error_response("", &format!("trust audit failed: {e}")),
@@ -9177,13 +10729,22 @@ impl MethodHandler {
     /// Admin-only because it can mask drift the feedback loop is trying to
     /// communicate.
     async fn handle_wiki_trust_override(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let page_path = params
+            .get("page_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let trust = params
             .get("trust")
             .and_then(|v| v.as_f64())
             .map(|f| f as f32);
-        let lock = params.get("lock").and_then(|v| v.as_bool()).unwrap_or(false);
+        let lock = params
+            .get("lock")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let do_not_inject = params.get("do_not_inject").and_then(|v| v.as_bool());
         let reason = params.get("reason").and_then(|v| v.as_str());
 
@@ -9222,16 +10783,19 @@ impl MethodHandler {
         };
 
         match store.manual_set(page_path, agent_id, trust, lock, do_not_inject, reason_ref) {
-            Ok(outcome) => WsFrame::ok_response("", json!({
-                "page_path": outcome.page_path,
-                "agent_id": outcome.agent_id,
-                "old_trust": outcome.old_trust,
-                "new_trust": outcome.new_trust,
-                "applied_delta": outcome.applied_delta,
-                "locked": outcome.locked,
-                "became_archived": outcome.became_archived,
-                "became_recovered": outcome.became_recovered,
-            })),
+            Ok(outcome) => WsFrame::ok_response(
+                "",
+                json!({
+                    "page_path": outcome.page_path,
+                    "agent_id": outcome.agent_id,
+                    "old_trust": outcome.old_trust,
+                    "new_trust": outcome.new_trust,
+                    "applied_delta": outcome.applied_delta,
+                    "locked": outcome.locked,
+                    "became_archived": outcome.became_archived,
+                    "became_recovered": outcome.became_recovered,
+                }),
+            ),
             Err(e) => WsFrame::error_response("", &format!("trust override failed: {e}")),
         }
     }
@@ -9239,8 +10803,14 @@ impl MethodHandler {
     /// `wiki.trust_history` — recent audit log rows for a page, useful for
     /// dashboards or post-mortem analysis.
     async fn handle_wiki_trust_history(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let page_path = params
+            .get("page_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize).min(500);
 
         if agent_id.is_empty() || page_path.is_empty() {
@@ -9260,18 +10830,21 @@ impl MethodHandler {
 
         match store.history(agent_id, page_path, limit) {
             Ok(rows) => {
-                let items: Vec<Value> = rows.iter().map(|h| {
-                    json!({
-                        "ts": h.ts.to_rfc3339(),
-                        "old_trust": h.old_trust,
-                        "new_trust": h.new_trust,
-                        "applied_delta": h.applied_delta,
-                        "trigger": h.trigger,
-                        "conversation_id": h.conversation_id,
-                        "composite_error": h.composite_error,
-                        "signal_kind": h.signal_kind,
+                let items: Vec<Value> = rows
+                    .iter()
+                    .map(|h| {
+                        json!({
+                            "ts": h.ts.to_rfc3339(),
+                            "old_trust": h.old_trust,
+                            "new_trust": h.new_trust,
+                            "applied_delta": h.applied_delta,
+                            "trigger": h.trigger,
+                            "conversation_id": h.conversation_id,
+                            "composite_error": h.composite_error,
+                            "signal_kind": h.signal_kind,
+                        })
                     })
-                }).collect();
+                    .collect();
                 WsFrame::ok_response("", json!({ "rows": items, "available": true }))
             }
             Err(e) => WsFrame::error_response("", &format!("trust history failed: {e}")),
@@ -9289,29 +10862,39 @@ impl MethodHandler {
         let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
         match store.list_pages() {
             Ok(pages) => {
-                let items: Vec<Value> = pages.iter().map(|p| {
-                    json!({
-                        "path": p.path,
-                        "title": p.title,
-                        "updated": p.updated.to_rfc3339(),
-                        "tags": p.tags,
+                let items: Vec<Value> = pages
+                    .iter()
+                    .map(|p| {
+                        json!({
+                            "path": p.path,
+                            "title": p.title,
+                            "updated": p.updated.to_rfc3339(),
+                            "tags": p.tags,
+                        })
                     })
-                }).collect();
+                    .collect();
                 WsFrame::ok_response("", json!({ "pages": items, "exists": true }))
             }
-            Err(e) => WsFrame::error_response("", &format!("Failed to list shared wiki pages: {e}")),
+            Err(e) => {
+                WsFrame::error_response("", &format!("Failed to list shared wiki pages: {e}"))
+            }
         }
     }
 
     async fn handle_shared_wiki_read(&self, params: Value) -> WsFrame {
-        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        let page_path = params
+            .get("page_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if page_path.is_empty() {
             return WsFrame::error_response("", "Missing 'page_path' parameter");
         }
 
         let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
         match store.read_raw(page_path) {
-            Ok(content) => WsFrame::ok_response("", json!({ "content": content, "path": page_path })),
+            Ok(content) => {
+                WsFrame::ok_response("", json!({ "content": content, "path": page_path }))
+            }
             Err(e) => WsFrame::error_response("", &format!("Failed to read shared wiki page: {e}")),
         }
     }
@@ -9319,7 +10902,10 @@ impl MethodHandler {
     async fn handle_shared_wiki_search(&self, params: Value) -> WsFrame {
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(100);
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let conversation_id = params
             .get("conversation_id")
             .and_then(|v| v.as_str())
@@ -9344,18 +10930,21 @@ impl MethodHandler {
         };
         match result {
             Ok(hits) => {
-                let items: Vec<Value> = hits.iter().map(|h| {
-                    json!({
-                        "path": h.path,
-                        "title": h.title,
-                        "score": h.score,
-                        "weighted_score": h.weighted_score,
-                        "trust": h.trust,
-                        "layer": h.layer.to_string(),
-                        "source_type": h.source_type.to_string(),
-                        "context_lines": h.context_lines,
+                let items: Vec<Value> = hits
+                    .iter()
+                    .map(|h| {
+                        json!({
+                            "path": h.path,
+                            "title": h.title,
+                            "score": h.score,
+                            "weighted_score": h.weighted_score,
+                            "trust": h.trust,
+                            "layer": h.layer.to_string(),
+                            "source_type": h.source_type.to_string(),
+                            "context_lines": h.context_lines,
+                        })
                     })
-                }).collect();
+                    .collect();
                 WsFrame::ok_response("", json!({ "hits": items }))
             }
             Err(e) => WsFrame::error_response("", &format!("Shared wiki search failed: {e}")),
@@ -9371,10 +10960,16 @@ impl MethodHandler {
         let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
         let pages = match store.list_pages() {
             Ok(p) => p,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to list shared wiki pages: {e}")),
+            Err(e) => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Failed to list shared wiki pages: {e}"),
+                );
+            }
         };
 
-        let mut by_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut by_author: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut by_dir: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         for p in &pages {
@@ -9390,20 +10985,25 @@ impl MethodHandler {
             *by_dir.entry(dir).or_default() += 1;
         }
 
-        let most_recent = pages.first().map(|p| json!({
-            "title": p.title,
-            "path": p.path,
-            "updated": p.updated.to_rfc3339(),
-            "author": p.author,
-        }));
+        let most_recent = pages.first().map(|p| {
+            json!({
+                "title": p.title,
+                "path": p.path,
+                "updated": p.updated.to_rfc3339(),
+                "author": p.author,
+            })
+        });
 
-        WsFrame::ok_response("", json!({
-            "exists": true,
-            "total_pages": pages.len(),
-            "by_author": by_author,
-            "by_directory": by_dir,
-            "most_recent": most_recent,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "exists": true,
+                "total_pages": pages.len(),
+                "by_author": by_author,
+                "by_directory": by_dir,
+                "most_recent": most_recent,
+            }),
+        )
     }
 
     // ── Skills ──────────────────────────────────────────────
@@ -9413,8 +11013,11 @@ impl MethodHandler {
         let reg = self.registry.read().await;
 
         // Collect global skill names for scope tagging
-        let global_names: std::collections::HashSet<&str> =
-            reg.global_skills().iter().map(|s| s.name.as_str()).collect();
+        let global_names: std::collections::HashSet<&str> = reg
+            .global_skills()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
 
         // Scan verdicts recorded at install-approval time (Bug#9) — attach as
         // `security_status` so the "My Skills" security column shows the real
@@ -9444,34 +11047,50 @@ impl MethodHandler {
             }
             None => {
                 // Global skills
-                let global: Vec<Value> = reg.global_skills().iter().map(|s| {
-                    let mut obj = json!({ "name": s.name, "size": s.content.len() });
-                    if let Some(v) = verdict_of(&s.name) {
-                        obj["security_status"] = v;
-                    }
-                    obj
-                }).collect();
-
-                // Per-agent skills
-                let mut all_skills = Vec::new();
-                for agent in reg.list() {
-                    let skills: Vec<Value> = agent.skills.iter().map(|s| {
-                        let scope = if global_names.contains(s.name.as_str()) { "global" } else { "agent" };
-                        let mut obj = json!({ "name": s.name, "size": s.content.len(), "scope": scope });
+                let global: Vec<Value> = reg
+                    .global_skills()
+                    .iter()
+                    .map(|s| {
+                        let mut obj = json!({ "name": s.name, "size": s.content.len() });
                         if let Some(v) = verdict_of(&s.name) {
                             obj["security_status"] = v;
                         }
                         obj
-                    }).collect();
+                    })
+                    .collect();
+
+                // Per-agent skills
+                let mut all_skills = Vec::new();
+                for agent in reg.list() {
+                    let skills: Vec<Value> = agent
+                        .skills
+                        .iter()
+                        .map(|s| {
+                            let scope = if global_names.contains(s.name.as_str()) {
+                                "global"
+                            } else {
+                                "agent"
+                            };
+                            let mut obj =
+                                json!({ "name": s.name, "size": s.content.len(), "scope": scope });
+                            if let Some(v) = verdict_of(&s.name) {
+                                obj["security_status"] = v;
+                            }
+                            obj
+                        })
+                        .collect();
                     all_skills.push(json!({
                         "agent_id": agent.config.agent.name,
                         "skills": skills,
                     }));
                 }
-                WsFrame::ok_response("", json!({
-                    "global_skills": global,
-                    "agents": all_skills,
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "global_skills": global,
+                        "agents": all_skills,
+                    }),
+                )
             }
         }
     }
@@ -9513,7 +11132,8 @@ impl MethodHandler {
         }
 
         // Collect local skill names for dedup (MCP-L3)
-        let local_names: std::collections::HashSet<String> = results.iter()
+        let local_names: std::collections::HashSet<String> = results
+            .iter()
             .filter_map(|r| r["name"].as_str().map(|s| s.to_string()))
             .collect();
 
@@ -9531,11 +11151,14 @@ impl MethodHandler {
             }
         }
 
-        WsFrame::ok_response("", json!({
-            "skills": results,
-            "source": registry.source(),
-            "total_indexed": registry.count(),
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "skills": results,
+                "source": registry.source(),
+                "total_indexed": registry.count(),
+            }),
+        )
     }
 
     async fn handle_skills_content(&self, params: Value) -> WsFrame {
@@ -9550,16 +11173,17 @@ impl MethodHandler {
 
         let reg = self.registry.read().await;
         match reg.get(agent_id) {
-            Some(agent) => {
-                match agent.skills.iter().find(|s| s.name == skill_name) {
-                    Some(skill) => WsFrame::ok_response("", json!({
+            Some(agent) => match agent.skills.iter().find(|s| s.name == skill_name) {
+                Some(skill) => WsFrame::ok_response(
+                    "",
+                    json!({
                         "agent_id": agent_id,
                         "skill_name": skill_name,
                         "content": skill.content,
-                    })),
-                    None => WsFrame::error_response("", &format!("Skill not found: {skill_name}")),
-                }
-            }
+                    }),
+                ),
+                None => WsFrame::error_response("", &format!("Skill not found: {skill_name}")),
+            },
             None => WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
         }
     }
@@ -9621,7 +11245,10 @@ impl MethodHandler {
             // gitlab.com/user/repo/-/tree/x/dir  -> /-/raw/x/dir/SKILL.md
             "gitlab.com" | "www.gitlab.com" => {
                 if path.contains("/-/blob/") {
-                    format!("https://gitlab.com{}", path.replacen("/-/blob/", "/-/raw/", 1))
+                    format!(
+                        "https://gitlab.com{}",
+                        path.replacen("/-/blob/", "/-/raw/", 1)
+                    )
                 } else if path.contains("/-/tree/") {
                     let raw = path.replacen("/-/tree/", "/-/raw/", 1);
                     if path_names_file(&raw) {
@@ -9671,13 +11298,19 @@ impl MethodHandler {
                 return Err(format!("response too large ({len} bytes, max {max_bytes})"));
             }
         }
-        let bytes = resp.bytes().await.map_err(|e| format!("read failed: {e}"))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("read failed: {e}"))?;
         if bytes.len() > max_bytes {
-            return Err(format!("response too large ({} bytes, max {max_bytes})", bytes.len()));
+            return Err(format!(
+                "response too large ({} bytes, max {max_bytes})",
+                bytes.len()
+            ));
         }
-        String::from_utf8(bytes.to_vec()).map_err(|_| "response is not valid UTF-8 text".to_string())
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| "response is not valid UTF-8 text".to_string())
     }
-
 
     async fn handle_skills_vet(&self, params: Value) -> WsFrame {
         let url = match params.get("url").and_then(|v| v.as_str()) {
@@ -9690,20 +11323,27 @@ impl MethodHandler {
         // private ranges, cloud metadata endpoints, non-http schemes).
         let raw_url = match Self::resolve_skill_source_url(url) {
             Ok(u) => u,
-            Err(e) => return WsFrame::error_response("", &format!("Invalid skill source URL: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Invalid skill source URL: {e}"));
+            }
         };
         if let Err(e) = crate::web_fetch::validate_url(&raw_url) {
             return WsFrame::error_response("", &format!("Skill source URL rejected: {e}"));
         }
         let content = match Self::fetch_remote_text(&raw_url, Self::SKILL_FETCH_MAX_BYTES).await {
             Ok(text) => text,
-            Err(e) => return WsFrame::error_response("", &format!("Failed to fetch skill content: {e}")),
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to fetch skill content: {e}"));
+            }
         };
 
         // An HTML page means the URL points at a web view, not raw content —
         // scanning rendered HTML would produce a garbage verdict.
         let head = content.trim_start();
-        if head.starts_with("<!DOCTYPE") || head.starts_with("<!doctype") || head.starts_with("<html") {
+        if head.starts_with("<!DOCTYPE")
+            || head.starts_with("<!doctype")
+            || head.starts_with("<html")
+        {
             return WsFrame::error_response(
                 "",
                 "URL returned an HTML page, not raw SKILL.md content. Use a raw file link (e.g. raw.githubusercontent.com) or the repo root.",
@@ -9736,12 +11376,15 @@ impl MethodHandler {
             })).collect::<Vec<_>>(),
         });
 
-        WsFrame::ok_response("", json!({
-            "skill_name": skill_name,
-            "content": content,
-            "vet_result": vet_result,
-            "passed": passed,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "skill_name": skill_name,
+                "content": content,
+                "vet_result": vet_result,
+                "passed": passed,
+            }),
+        )
     }
 
     async fn handle_skills_install(&self, params: Value) -> WsFrame {
@@ -9798,11 +11441,14 @@ impl MethodHandler {
         match self.run_skill_install(&scope, &content, &skill_name).await {
             Ok(installed_name) => {
                 info!(skill = %installed_name, scope = %scope, url = %url, "Skill installed via dashboard");
-                WsFrame::ok_response("", json!({
-                    "success": true,
-                    "skill_name": installed_name,
-                    "scope": scope,
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": true,
+                        "skill_name": installed_name,
+                        "scope": scope,
+                    }),
+                )
             }
             Err(e) => WsFrame::error_response("", &format!("Install failed: {e}")),
         }
@@ -9830,16 +11476,32 @@ impl MethodHandler {
 
         let quarantine_dir = self.home_dir.join("quarantine");
         let install_result = if scope == "global" {
-            duduclaw_agent::skill_loader::install_skill_global(&tmp_file, &self.home_dir, &quarantine_dir).await
+            duduclaw_agent::skill_loader::install_skill_global(
+                &tmp_file,
+                &self.home_dir,
+                &quarantine_dir,
+            )
+            .await
         } else if let Some(dept) = scope.strip_prefix("department:") {
-            duduclaw_agent::skill_loader::install_skill_department(&tmp_file, &self.home_dir, dept, &quarantine_dir).await
+            duduclaw_agent::skill_loader::install_skill_department(
+                &tmp_file,
+                &self.home_dir,
+                dept,
+                &quarantine_dir,
+            )
+            .await
         } else {
             if !is_valid_agent_id(scope) {
                 let _ = std::fs::remove_file(&tmp_file);
                 return Err("Invalid agent_id for scope".into());
             }
             let agent_skills_dir = self.home_dir.join("agents").join(scope).join("SKILLS");
-            duduclaw_agent::skill_loader::install_skill(&tmp_file, &agent_skills_dir, &quarantine_dir).await
+            duduclaw_agent::skill_loader::install_skill(
+                &tmp_file,
+                &agent_skills_dir,
+                &quarantine_dir,
+            )
+            .await
         };
         let _ = std::fs::remove_file(&tmp_file);
 
@@ -9883,13 +11545,20 @@ impl MethodHandler {
         duduclaw_core::truncate_chars(prose, 300)
     }
 
-    fn scan_findings_json(scan: &crate::skill_lifecycle::security_scanner::SecurityScanResult) -> Value {
-        json!(scan.findings.iter().map(|f| json!({
-            "category": format!("{:?}", f.category),
-            "severity": format!("{:?}", f.severity).to_lowercase(),
-            "description": f.description,
-            "pattern": f.matched_pattern,
-        })).collect::<Vec<_>>())
+    fn scan_findings_json(
+        scan: &crate::skill_lifecycle::security_scanner::SecurityScanResult,
+    ) -> Value {
+        json!(
+            scan.findings
+                .iter()
+                .map(|f| json!({
+                    "category": format!("{:?}", f.category),
+                    "severity": format!("{:?}", f.severity).to_lowercase(),
+                    "description": f.description,
+                    "pattern": f.matched_pattern,
+                }))
+                .collect::<Vec<_>>()
+        )
     }
 
     /// File a Skill install request (non-admin). Scans fail-closed: a
@@ -9942,7 +11611,11 @@ impl MethodHandler {
     }
 
     async fn handle_skills_install_request(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let url = params
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let scope = match params.get("scope").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return WsFrame::error_response("", "Missing 'scope' parameter"),
@@ -10007,14 +11680,21 @@ impl MethodHandler {
             .await
         {
             Ok(id) => {
-                let stage = if ctx.role == UserRole::Employee { "awaiting_manager" } else { "awaiting_admin" };
+                let stage = if ctx.role == UserRole::Employee {
+                    "awaiting_manager"
+                } else {
+                    "awaiting_admin"
+                };
                 self.spawn_install_notify(id.clone()).await;
-                WsFrame::ok_response("", json!({
-                    "request_id": id,
-                    "status": "pending",
-                    "stage": stage,
-                    "scan": scan_json,
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "request_id": id,
+                        "status": "pending",
+                        "stage": stage,
+                        "scan": scan_json,
+                    }),
+                )
             }
             Err(e) => WsFrame::error_response("", &format!("建立申請失敗：{e}")),
         }
@@ -10038,7 +11718,12 @@ impl MethodHandler {
         }
         let server_name = match params.get("server_name").and_then(|v| v.as_str()) {
             Some(s) if crate::mcp_scan::is_valid_mcp_server_name(s) => s.to_string(),
-            _ => return WsFrame::error_response("", "Invalid server_name (allowed: A-Za-z0-9._- max 64)"),
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "Invalid server_name (allowed: A-Za-z0-9._- max 64)",
+                );
+            }
         };
         let def: McpServerDef = match params.get("server_def") {
             Some(v) => match serde_json::from_value(v.clone()) {
@@ -10097,14 +11782,21 @@ impl MethodHandler {
             .await
         {
             Ok(id) => {
-                let stage = if ctx.role == UserRole::Employee { "awaiting_manager" } else { "awaiting_admin" };
+                let stage = if ctx.role == UserRole::Employee {
+                    "awaiting_manager"
+                } else {
+                    "awaiting_admin"
+                };
                 self.spawn_install_notify(id.clone()).await;
-                WsFrame::ok_response("", json!({
-                    "request_id": id,
-                    "status": "pending",
-                    "stage": stage,
-                    "scan": scan_json,
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "request_id": id,
+                        "status": "pending",
+                        "stage": stage,
+                        "scan": scan_json,
+                    }),
+                )
             }
             Err(e) => WsFrame::error_response("", &format!("建立申請失敗：{e}")),
         }
@@ -10124,7 +11816,11 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("list: {e}")),
         };
         let is_admin = ctx.role == UserRole::Admin;
-        let mgr_dept = if is_admin { None } else { self.user_department(&ctx.user_id).await };
+        let mgr_dept = if is_admin {
+            None
+        } else {
+            self.user_department(&ctx.user_id).await
+        };
         let actionable: Vec<Value> = pending
             .iter()
             .filter(|r| {
@@ -10140,7 +11836,10 @@ impl MethodHandler {
             })
             .map(|r| r.to_json())
             .collect();
-        WsFrame::ok_response("", json!({ "requests": actionable, "count": actionable.len() }))
+        WsFrame::ok_response(
+            "",
+            json!({ "requests": actionable, "count": actionable.len() }),
+        )
     }
 
     /// The caller's own install requests (any authenticated user).
@@ -10165,8 +11864,15 @@ impl MethodHandler {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return WsFrame::error_response("", "id is required"),
         };
-        let approve = params.get("approve").and_then(|v| v.as_bool()).unwrap_or(false);
-        let reason = params.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let approve = params
+            .get("approve")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let reason = params
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         let store = match crate::install_requests::InstallRequestStore::open(&self.home_dir) {
             Ok(s) => s,
@@ -10175,7 +11881,14 @@ impl MethodHandler {
         let decider = format!("{}:{}", ctx.role, ctx.user_id);
         let decider_dept = self.user_department(&ctx.user_id).await;
         let outcome = match store
-            .decide(&id, &decider, &ctx.role.to_string(), decider_dept.as_deref(), approve, &reason)
+            .decide(
+                &id,
+                &decider,
+                &ctx.role.to_string(),
+                decider_dept.as_deref(),
+                approve,
+                &reason,
+            )
             .await
         {
             Ok(o) => o,
@@ -10194,34 +11907,54 @@ impl MethodHandler {
             crate::install_requests::DecideOutcome::AdvancedToAdmin => {
                 // Manager cleared stage 1 → notify the admins (stage 2).
                 self.spawn_install_notify(id.clone()).await;
-                WsFrame::ok_response("", json!({ "status": "pending", "stage": "awaiting_admin" }))
+                WsFrame::ok_response(
+                    "",
+                    json!({ "status": "pending", "stage": "awaiting_admin" }),
+                )
             }
             crate::install_requests::DecideOutcome::ReadyToExecute => {
                 let req = match store.get(&id).await {
                     Ok(Some(r)) => r,
-                    _ => return WsFrame::error_response("", "approved, but the request vanished before execution"),
+                    _ => {
+                        return WsFrame::error_response(
+                            "",
+                            "approved, but the request vanished before execution",
+                        );
+                    }
                 };
                 let exec = self.execute_approved_install(&req).await;
                 let ok = exec.is_ok();
-                let _ = store.mark_executed(&id, ok, exec.as_ref().err().map(|s| s.as_str())).await;
+                let _ = store
+                    .mark_executed(&id, ok, exec.as_ref().err().map(|s| s.as_str()))
+                    .await;
                 let requester_text = if ok {
                     format!("✅ 您的安裝申請「{}」已核准並完成安裝。", req.title)
                 } else {
-                    format!("⚠️ 您的安裝申請「{}」已核准，但安裝執行失敗。詳情請見儀表板。", req.title)
+                    format!(
+                        "⚠️ 您的安裝申請「{}」已核准，但安裝執行失敗。詳情請見儀表板。",
+                        req.title
+                    )
                 };
-                self.spawn_requester_notify(id.clone(), requester_text).await;
+                self.spawn_requester_notify(id.clone(), requester_text)
+                    .await;
                 match exec {
-                    Ok(detail) => WsFrame::ok_response("", json!({
-                        "status": "approved",
-                        "executed": true,
-                        "detail": detail,
-                    })),
-                    Err(e) => WsFrame::ok_response("", json!({
-                        "status": "approved",
-                        "executed": false,
-                        // Honest partial: the signatures landed, execution failed.
-                        "warning": format!("已完成簽核，但安裝執行失敗：{e}"),
-                    })),
+                    Ok(detail) => WsFrame::ok_response(
+                        "",
+                        json!({
+                            "status": "approved",
+                            "executed": true,
+                            "detail": detail,
+                        }),
+                    ),
+                    Err(e) => WsFrame::ok_response(
+                        "",
+                        json!({
+                            "status": "approved",
+                            "executed": false,
+                            // Honest partial: the signatures landed, execution failed.
+                            "warning": format!("已完成簽核，但安裝執行失敗：{e}"),
+                        }),
+                    ),
                 }
             }
         }
@@ -10236,14 +11969,25 @@ impl MethodHandler {
     ) -> Result<Value, String> {
         match req.kind.as_str() {
             "skill" => {
-                let scope = req.payload.get("scope").and_then(|v| v.as_str()).unwrap_or("");
-                let content = req.payload.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let scope = req
+                    .payload
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let content = req
+                    .payload
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if scope.is_empty() || content.is_empty() {
                     return Err("request payload missing scope/content".into());
                 }
                 let scan = crate::skill_lifecycle::security_scanner::scan_skill(content, None);
                 if !scan.passed {
-                    return Err(format!("re-scan rejected skill: risk {:?}", scan.risk_level));
+                    return Err(format!(
+                        "re-scan rejected skill: risk {:?}",
+                        scan.risk_level
+                    ));
                 }
                 let skill_name = content
                     .lines()
@@ -10260,21 +12004,34 @@ impl MethodHandler {
                 Ok(json!({ "skill_name": installed, "scope": scope }))
             }
             "mcp" => {
-                use duduclaw_agent::mcp_template::{add_server_to_config, McpServerDef};
-                let agent_id = req.payload.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-                let server_name = req.payload.get("server_name").and_then(|v| v.as_str()).unwrap_or("");
+                use duduclaw_agent::mcp_template::{McpServerDef, add_server_to_config};
+                let agent_id = req
+                    .payload
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let server_name = req
+                    .payload
+                    .get("server_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let def: McpServerDef = req
                     .payload
                     .get("server_def")
                     .cloned()
                     .and_then(|v| serde_json::from_value(v).ok())
                     .ok_or_else(|| "request payload missing server_def".to_string())?;
-                if !is_valid_agent_id(agent_id) || !crate::mcp_scan::is_valid_mcp_server_name(server_name) {
+                if !is_valid_agent_id(agent_id)
+                    || !crate::mcp_scan::is_valid_mcp_server_name(server_name)
+                {
                     return Err("invalid agent_id/server_name in payload".into());
                 }
                 let scan = crate::mcp_scan::scan_mcp_server_def(server_name, &def);
                 if !scan.passed {
-                    return Err(format!("re-scan rejected MCP server: risk {:?}", scan.risk_level));
+                    return Err(format!(
+                        "re-scan rejected MCP server: risk {:?}",
+                        scan.risk_level
+                    ));
                 }
                 let agent_dir = self.home_dir.join("agents").join(agent_id);
                 if !agent_dir.is_dir() {
@@ -10286,10 +12043,25 @@ impl MethodHandler {
                 tokio::task::spawn_blocking(move || add_server_to_config(&ad, &sn, &d))
                     .await
                     .map_err(|e| format!("join: {e}"))??;
-                if req.payload.get("add_to_catalog").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    let description = req.payload.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                    let source_url = req.payload.get("source_url").and_then(|v| v.as_str()).unwrap_or("");
-                    let _ = self.append_to_user_marketplace(server_name, &def, description, source_url).await;
+                if req
+                    .payload
+                    .get("add_to_catalog")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let description = req
+                        .payload
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let source_url = req
+                        .payload
+                        .get("source_url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let _ = self
+                        .append_to_user_marketplace(server_name, &def, description, source_url)
+                        .await;
                 }
                 Ok(json!({ "server_name": server_name, "agent_id": agent_id }))
             }
@@ -10305,9 +12077,7 @@ impl MethodHandler {
     }
 
     /// Map a scan risk level to the 3-state frontend verdict.
-    fn risk_to_verdict(
-        risk: crate::skill_lifecycle::security_scanner::RiskLevel,
-    ) -> &'static str {
+    fn risk_to_verdict(risk: crate::skill_lifecycle::security_scanner::RiskLevel) -> &'static str {
         use crate::skill_lifecycle::security_scanner::RiskLevel;
         match risk {
             RiskLevel::Clean | RiskLevel::Low => "pass",
@@ -10388,7 +12158,8 @@ impl MethodHandler {
     fn is_valid_skill_slug(s: &str) -> bool {
         !s.is_empty()
             && s.len() <= 64
-            && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     }
 
     /// Look up a custom skill and enforce that the caller is the creator or an
@@ -10408,14 +12179,21 @@ impl MethodHandler {
                 }
             }
             Ok(None) => Err(WsFrame::error_response("", "custom skill not found")),
-            Err(e) => Err(WsFrame::error_response("", &format!("get custom skill: {e}"))),
+            Err(e) => Err(WsFrame::error_response(
+                "",
+                &format!("get custom skill: {e}"),
+            )),
         }
     }
 
     /// `skills.custom_create` — record a new draft. Human fields are captured
     /// now; the SKILL.md body is authored later by an agent (`custom_generate`).
     async fn handle_skills_custom_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let display_name = params.get("display_name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let display_name = params
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if display_name.is_empty() {
             return WsFrame::error_response("", "display_name is required");
         }
@@ -10434,7 +12212,11 @@ impl MethodHandler {
         if !Self::is_valid_skill_slug(&slug) {
             return WsFrame::error_response("", "invalid slug (use a-z, 0-9, -, _)");
         }
-        let built_by_agent = params.get("built_by_agent").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let built_by_agent = params
+            .get("built_by_agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if !built_by_agent.is_empty() && !is_valid_agent_id(&built_by_agent) {
             return WsFrame::error_response("", "invalid built_by_agent");
         }
@@ -10445,16 +12227,26 @@ impl MethodHandler {
             slug,
             display_name: duduclaw_core::truncate_chars(display_name, 120),
             description_human: duduclaw_core::truncate_chars(
-                params.get("description_human").and_then(|v| v.as_str()).unwrap_or(""),
+                params
+                    .get("description_human")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
                 2000,
             ),
-            time_saved_value: params.get("time_saved_value").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            time_saved_value: params
+                .get("time_saved_value")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
             time_saved_unit: params
                 .get("time_saved_unit")
                 .and_then(|v| v.as_str())
                 .unwrap_or("minutes_per_use")
                 .to_string(),
-            tags: params.get("tags").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            tags: params
+                .get("tags")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             created_by_user: ctx.user_id.clone(),
             built_by_agent,
             status: crate::custom_skills::CustomSkillStatus::Draft,
@@ -10508,7 +12300,11 @@ impl MethodHandler {
                 return WsFrame::error_response("", &format!("Agent not found: {agent_id}"));
             }
         }
-        let instruction = params.get("instruction").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let instruction = params
+            .get("instruction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
 
         // Ensure the isolated draft dir exists for the agent to write into.
         let draft_dir = crate::custom_skills::draft_dir(&self.home_dir, &id);
@@ -10554,14 +12350,17 @@ impl MethodHandler {
             let _ = store.transition(&id, to, None, None, false).await;
         }
 
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "id": id,
-            "message_id": message_id,
-            "target_agent": agent_id,
-            "draft_path": draft_path.display().to_string(),
-            "status": "generating",
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "id": id,
+                "message_id": message_id,
+                "target_agent": agent_id,
+                "draft_path": draft_path.display().to_string(),
+                "status": "generating",
+            }),
+        )
     }
 
     /// `skills.custom_update` — edit the human-facing fields only.
@@ -10583,7 +12382,14 @@ impl MethodHandler {
         let time_saved_unit = params.get("time_saved_unit").and_then(|v| v.as_str());
         let tags = params.get("tags").and_then(|v| v.as_str());
         match store
-            .update_human_fields(&id, display_name, description_human, time_saved_value, time_saved_unit, tags)
+            .update_human_fields(
+                &id,
+                display_name,
+                description_human,
+                time_saved_value,
+                time_saved_unit,
+                tags,
+            )
             .await
         {
             Ok(_) => match store.get(&id).await {
@@ -10616,10 +12422,12 @@ impl MethodHandler {
         let draft_path = crate::custom_skills::draft_skill_path(&self.home_dir, &id);
         let content = match std::fs::read_to_string(&draft_path) {
             Ok(c) if !c.trim().is_empty() => c,
-            _ => return WsFrame::error_response(
-                "",
-                "draft SKILL.md not found or empty — run skills.custom_generate first",
-            ),
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "draft SKILL.md not found or empty — run skills.custom_generate first",
+                );
+            }
         };
 
         // Mandatory safety scan (same scanner as skills.vet; includes the
@@ -10628,12 +12436,14 @@ impl MethodHandler {
         let findings: Vec<Value> = scan
             .findings
             .iter()
-            .map(|f| json!({
-                "category": format!("{:?}", f.category),
-                "severity": format!("{:?}", f.severity).to_lowercase(),
-                "description": f.description,
-                "line_number": f.line_number,
-            }))
+            .map(|f| {
+                json!({
+                    "category": format!("{:?}", f.category),
+                    "severity": format!("{:?}", f.severity).to_lowercase(),
+                    "description": f.description,
+                    "line_number": f.line_number,
+                })
+            })
             .collect();
         let safety_report = json!({
             "passed": scan.passed,
@@ -10655,8 +12465,7 @@ impl MethodHandler {
                 "",
                 &format!(
                     "safety scan blocked submission: risk {:?} (high/critical). Fix the SKILL.md and regenerate. Report: {}",
-                    scan.risk_level,
-                    safety_report
+                    scan.risk_level, safety_report
                 ),
             );
         }
@@ -10713,17 +12522,23 @@ impl MethodHandler {
                 &format!("cannot submit from status {}", rec.status.as_str()),
             );
         }
-        if let Err(e) = store.transition(&id, to, Some(approval_id.as_str()), None, false).await {
+        if let Err(e) = store
+            .transition(&id, to, Some(approval_id.as_str()), None, false)
+            .await
+        {
             return WsFrame::error_response("", &format!("transition to pending: {e}"));
         }
 
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "id": id,
-            "approval_id": approval_id.as_str(),
-            "status": "pending_approval",
-            "safety_report": safety_report,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "id": id,
+                "approval_id": approval_id.as_str(),
+                "status": "pending_approval",
+                "safety_report": safety_report,
+            }),
+        )
     }
 
     /// `skills.custom_list` — admins see all; other users see only their own.
@@ -10732,7 +12547,11 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
-        let creator = if ctx.is_admin() { None } else { Some(ctx.user_id.as_str()) };
+        let creator = if ctx.is_admin() {
+            None
+        } else {
+            Some(ctx.user_id.as_str())
+        };
         match store.list(creator).await {
             Ok(mut rows) => {
                 // The drafting agent writes SKILL.md via bus_queue with no
@@ -10743,7 +12562,9 @@ impl MethodHandler {
                 for rec in rows.iter_mut() {
                     if rec.status == crate::custom_skills::CustomSkillStatus::Generating {
                         let path = crate::custom_skills::draft_skill_path(&self.home_dir, &rec.id);
-                        let done = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+                        let done = std::fs::metadata(&path)
+                            .map(|m| m.len() > 0)
+                            .unwrap_or(false);
                         if done
                             && store
                                 .transition(
@@ -10789,7 +12610,10 @@ impl MethodHandler {
             );
         }
         match store.transition(&id, to, None, None, false).await {
-            Ok(()) => WsFrame::ok_response("", json!({ "success": true, "id": id, "status": "retired" })),
+            Ok(()) => WsFrame::ok_response(
+                "",
+                json!({ "success": true, "id": id, "status": "retired" }),
+            ),
             Err(e) => WsFrame::error_response("", &format!("retire custom skill: {e}")),
         }
     }
@@ -10949,10 +12773,7 @@ impl MethodHandler {
         // Validate (accept 5- or 6-field). `normalise_cron` turns 5 fields into 6.
         let normalised = crate::cron_scheduler::normalise_cron(&cron_expr);
         if normalised.parse::<cron::Schedule>().is_err() {
-            return WsFrame::error_response(
-                "",
-                &format!("Invalid cron expression: {cron_expr}"),
-            );
+            return WsFrame::error_response("", &format!("Invalid cron expression: {cron_expr}"));
         }
         let agent_id = params
             .get("agent_id")
@@ -11093,7 +12914,10 @@ impl MethodHandler {
         }
         self.notify_cron_reload().await;
         info!(name = %name, cron = %cron_expr, agent_id = %agent_id, "Cron task added");
-        WsFrame::ok_response("", json!({ "success": true, "task": Self::cron_row_to_json(&row) }))
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "task": Self::cron_row_to_json(&row) }),
+        )
     }
 
     async fn handle_cron_update(&self, params: Value) -> WsFrame {
@@ -11143,10 +12967,7 @@ impl MethodHandler {
         // Validate cron expression before persisting.
         let normalised = crate::cron_scheduler::normalise_cron(&cron_expr);
         if normalised.parse::<cron::Schedule>().is_err() {
-            return WsFrame::error_response(
-                "",
-                &format!("Invalid cron expression: {cron_expr}"),
-            );
+            return WsFrame::error_response("", &format!("Invalid cron expression: {cron_expr}"));
         }
 
         match store
@@ -11228,18 +13049,19 @@ impl MethodHandler {
                 Some(v) => v.as_str().map(str::trim).unwrap_or("").to_string(),
                 None => existing.trigger_kind.clone(),
             };
-            let trigger_kind =
-                match crate::condition_eval::TriggerKind::parse_strict(&trigger_kind_str) {
-                    Some(k) => k,
-                    None => {
-                        return WsFrame::error_response(
-                            "",
-                            &format!(
-                                "Unknown trigger_kind '{trigger_kind_str}'. Use 'time', 'condition', or 'on_exit'."
-                            ),
-                        );
-                    }
-                };
+            let trigger_kind = match crate::condition_eval::TriggerKind::parse_strict(
+                &trigger_kind_str,
+            ) {
+                Some(k) => k,
+                None => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!(
+                            "Unknown trigger_kind '{trigger_kind_str}'. Use 'time', 'condition', or 'on_exit'."
+                        ),
+                    );
+                }
+            };
             let condition_script: Option<String> = match params.get("condition_script") {
                 Some(v) => v
                     .as_str()
@@ -11425,10 +13247,7 @@ impl MethodHandler {
         let input: PartnerCustomerInput = match serde_json::from_value(params.clone()) {
             Ok(v) => v,
             Err(e) => {
-                return WsFrame::error_response(
-                    "",
-                    &format!("Invalid customer payload: {e}"),
-                )
+                return WsFrame::error_response("", &format!("Invalid customer payload: {e}"));
             }
         };
         let store = self.partner_store();
@@ -11443,18 +13262,10 @@ impl MethodHandler {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return WsFrame::error_response("", "Missing 'id' parameter"),
         };
-        let patch_value = params
-            .get("patch")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let patch_value = params.get("patch").cloned().unwrap_or_else(|| json!({}));
         let patch: PartnerCustomerPatch = match serde_json::from_value(patch_value) {
             Ok(v) => v,
-            Err(e) => {
-                return WsFrame::error_response(
-                    "",
-                    &format!("Invalid patch payload: {e}"),
-                )
-            }
+            Err(e) => return WsFrame::error_response("", &format!("Invalid patch payload: {e}")),
         };
         let store = self.partner_store();
         match store.update_customer(&id, &patch) {
@@ -11591,14 +13402,12 @@ impl MethodHandler {
                 return WsFrame::error_response(
                     "",
                     "白牌功能需經銷商授權（未取得 white_label 授權）",
-                )
+                );
             }
         };
         let input: crate::branding::BrandingInput = match serde_json::from_value(params) {
             Ok(v) => v,
-            Err(e) => {
-                return WsFrame::error_response("", &format!("品牌設定欄位無效：{e}"))
-            }
+            Err(e) => return WsFrame::error_response("", &format!("品牌設定欄位無效：{e}")),
         };
         // WP8: reject (do NOT silently drop) any field the scope cannot edit.
         let violations = crate::branding::disallowed_fields(&scope, &input);
@@ -11620,9 +13429,7 @@ impl MethodHandler {
         }
         match serde_json::to_value(&cfg) {
             Ok(v) => WsFrame::ok_response("", json!({ "ok": true, "branding": v })),
-            Err(e) => {
-                WsFrame::error_response("", &format!("serialize branding: {e}"))
-            }
+            Err(e) => WsFrame::error_response("", &format!("serialize branding: {e}")),
         }
     }
 
@@ -11635,7 +13442,7 @@ impl MethodHandler {
                 return WsFrame::error_response(
                     "",
                     "白牌功能需經銷商授權（未取得 white_label 授權）",
-                )
+                );
             }
         };
         match crate::branding::reset_scoped(&self.home_dir, &scope) {
@@ -11649,10 +13456,7 @@ impl MethodHandler {
     /// gated + fail-closed, same as `branding.set`.
     async fn handle_branding_preview(&self, params: Value) -> WsFrame {
         if !self.white_label_active().await {
-            return WsFrame::error_response(
-                "",
-                "白牌功能需經銷商授權（未取得 white_label 授權）",
-            );
+            return WsFrame::error_response("", "白牌功能需經銷商授權（未取得 white_label 授權）");
         }
         let raw = params
             .get("about_html")
@@ -11673,10 +13477,7 @@ impl MethodHandler {
     /// `/v1/branding/sign`, and hand the signed bundle back for download.
     async fn handle_branding_bundle_create(&self) -> WsFrame {
         if !self.white_label_active().await {
-            return WsFrame::error_response(
-                "",
-                "白牌功能需經銷商授權（未取得 white_label 授權）",
-            );
+            return WsFrame::error_response("", "白牌功能需經銷商授權（未取得 white_label 授權）");
         }
         let runtime = match crate::license_runtime::global() {
             Some(rt) => rt,
@@ -11684,7 +13485,7 @@ impl MethodHandler {
                 return WsFrame::error_response(
                     "",
                     "尚未載入授權資訊，無法產生散發包（請確認已啟用有效授權）",
-                )
+                );
             }
         };
         let snapshot = runtime.snapshot().await;
@@ -11694,7 +13495,7 @@ impl MethodHandler {
                 return WsFrame::error_response(
                     "",
                     "找不到訂閱識別碼（subscription_id）；散發包需要有效的經銷商授權",
-                )
+                );
             }
         };
         let machine_fingerprint = duduclaw_license::generate_fingerprint();
@@ -11716,9 +13517,7 @@ impl MethodHandler {
             .build()
         {
             Ok(c) => c,
-            Err(e) => {
-                return WsFrame::error_response("", &format!("建立 HTTP 用戶端失敗：{e}"))
-            }
+            Err(e) => return WsFrame::error_response("", &format!("建立 HTTP 用戶端失敗：{e}")),
         };
         let response = match client.post(&endpoint).json(&request_body).send().await {
             Ok(r) => r,
@@ -11728,15 +13527,13 @@ impl MethodHandler {
                     &format!(
                         "無法連線簽發端點（{endpoint}）：{e}。請確認 DUDUCLAW_CONTROL_URL 或金鑰內建的續期端點可連線，或改用 owner 端「代簽散發包」"
                     ),
-                )
+                );
             }
         };
         let status = response.status();
         let body: Value = match response.json().await {
             Ok(v) => v,
-            Err(e) => {
-                return WsFrame::error_response("", &format!("簽發端點回應解析失敗：{e}"))
-            }
+            Err(e) => return WsFrame::error_response("", &format!("簽發端點回應解析失敗：{e}")),
         };
         if !status.is_success() {
             let reason = body
@@ -11853,9 +13650,7 @@ impl MethodHandler {
     async fn handle_distributor_add(&self, params: Value) -> WsFrame {
         let input: DistributorInput = match serde_json::from_value(params) {
             Ok(v) => v,
-            Err(e) => {
-                return WsFrame::error_response("", &format!("經銷商欄位無效：{e}"))
-            }
+            Err(e) => return WsFrame::error_response("", &format!("經銷商欄位無效：{e}")),
         };
         let store = self.distributor_store();
         match store.add_distributor(&input) {
@@ -11878,9 +13673,7 @@ impl MethodHandler {
         let patch_value = params.get("patch").cloned().unwrap_or_else(|| json!({}));
         let patch: DistributorPatch = match serde_json::from_value(patch_value) {
             Ok(v) => v,
-            Err(e) => {
-                return WsFrame::error_response("", &format!("patch 欄位無效：{e}"))
-            }
+            Err(e) => return WsFrame::error_response("", &format!("patch 欄位無效：{e}")),
         };
         match self.distributor_store().update_distributor(&id, &patch) {
             Ok(()) => WsFrame::ok_response("", json!({ "ok": true })),
@@ -11912,16 +13705,15 @@ impl MethodHandler {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return WsFrame::error_response("", "缺少 'distributor_id' 參數"),
         };
-        let machine_fingerprint =
-            match params.get("machine_fingerprint").and_then(|v| v.as_str()) {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => {
-                    return WsFrame::error_response(
-                        "",
-                        "缺少 'machine_fingerprint'（請經銷商執行 duduclaw license fingerprint 提供）",
-                    )
-                }
-            };
+        let machine_fingerprint = match params.get("machine_fingerprint").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "缺少 'machine_fingerprint'（請經銷商執行 duduclaw license fingerprint 提供）",
+                );
+            }
+        };
         // Default 365 days; clamp to a sane 1..=36500 window.
         let expires_days = params
             .get("expires_days")
@@ -11961,10 +13753,7 @@ impl MethodHandler {
                 Some(list)
             }
             Some(_) => {
-                return WsFrame::error_response(
-                    "",
-                    "branding_editable 必須是欄位名稱的字串陣列",
-                )
+                return WsFrame::error_response("", "branding_editable 必須是欄位名稱的字串陣列");
             }
         };
 
@@ -11978,10 +13767,7 @@ impl MethodHandler {
             Some(v) => match v.as_u64() {
                 Some(n) => Some(n.min(100_000) as u32),
                 None => {
-                    return WsFrame::error_response(
-                        "",
-                        "max_agents 必須是非負整數（0 = 不限量）",
-                    )
+                    return WsFrame::error_response("", "max_agents 必須是非負整數（0 = 不限量）");
                 }
             },
         };
@@ -11999,12 +13785,10 @@ impl MethodHandler {
                 return WsFrame::error_response(
                     "",
                     "尚未配置簽發金鑰：請在 config.toml 設定 [distributor] issuer_key_path 指向 license-signing-v2.key",
-                )
+                );
             }
         };
-        let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(
-            &key_path,
-        )) {
+        let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(&key_path)) {
             Ok(s) => s,
             Err(e) => return WsFrame::error_response("", &e),
         };
@@ -12142,10 +13926,7 @@ impl MethodHandler {
             Some(v) => match v.as_u64() {
                 Some(n) => n.min(100_000) as u32,
                 None => {
-                    return WsFrame::error_response(
-                        "",
-                        "max_agents 必須是非負整數（0 = 不限量）",
-                    )
+                    return WsFrame::error_response("", "max_agents 必須是非負整數（0 = 不限量）");
                 }
             },
             None => return WsFrame::error_response("", "缺少 'max_agents' 參數"),
@@ -12161,7 +13942,7 @@ impl MethodHandler {
         }
 
         // Prior signed quota (for the audit old→new line), decoded from the blob.
-        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
         let old_max_agents = B64
             .decode(rec.license_blob.trim())
             .ok()
@@ -12175,7 +13956,7 @@ impl MethodHandler {
                 return WsFrame::error_response(
                     "",
                     "尚未配置簽發金鑰：請在 config.toml 設定 [distributor] issuer_key_path 指向 license-signing-v2.key",
-                )
+                );
             }
         };
         let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(&key_path)) {
@@ -12240,9 +14021,7 @@ impl MethodHandler {
         let submitted: crate::branding::BrandingConfig = match params.get("branding") {
             Some(v) => match serde_json::from_value(v.clone()) {
                 Ok(c) => c,
-                Err(e) => {
-                    return WsFrame::error_response("", &format!("branding 欄位無效：{e}"))
-                }
+                Err(e) => return WsFrame::error_response("", &format!("branding 欄位無效：{e}")),
             },
             None => crate::branding::BrandingConfig::default(),
         };
@@ -12265,7 +14044,7 @@ impl MethodHandler {
                 return WsFrame::error_response(
                     "",
                     "尚未配置簽發金鑰：請在 config.toml 設定 [distributor] issuer_key_path 指向 license-signing-v2.key",
-                )
+                );
             }
         };
         let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(&key_path)) {
@@ -12311,12 +14090,20 @@ impl MethodHandler {
     async fn handle_cli_login_start(&self, params: Value) -> WsFrame {
         let runtime_str = params.get("runtime").and_then(|v| v.as_str()).unwrap_or("");
         if runtime_str.is_empty() {
-            return WsFrame::error_response("", "runtime is required (claude|codex|gemini|antigravity)");
+            return WsFrame::error_response(
+                "",
+                "runtime is required (claude|codex|gemini|antigravity)",
+            );
         }
         let runtime = duduclaw_core::types::RuntimeType::parse(runtime_str);
         let spec = match crate::cli_auth::spec_for(runtime) {
             Some(s) => s,
-            None => return WsFrame::error_response("", "this runtime has no interactive login (use an API key)"),
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    "this runtime has no interactive login (use an API key)",
+                );
+            }
         };
 
         let session_id = uuid::Uuid::new_v4().simple().to_string();
@@ -12327,7 +14114,10 @@ impl MethodHandler {
         ) {
             Ok(s) => s,
             Err(crate::cli_auth::AuthError::NotInstalled) => {
-                return WsFrame::error_response("", &format!("{runtime_str} CLI not installed on this host"));
+                return WsFrame::error_response(
+                    "",
+                    &format!("{runtime_str} CLI not installed on this host"),
+                );
             }
             Err(e) => return WsFrame::error_response("", &format!("failed to start login: {e}")),
         };
@@ -12355,10 +14145,15 @@ impl MethodHandler {
                     let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
                 };
                 loop {
-                    match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                        .await
+                    {
                         Ok(Ok(bytes)) => {
                             let data = String::from_utf8_lossy(&bytes).to_string();
-                            emit("auth.cli_login.output", json!({"session_id": sid, "data": data}));
+                            emit(
+                                "auth.cli_login.output",
+                                json!({"session_id": sid, "data": data}),
+                            );
                         }
                         Ok(Err(RecvError::Lagged(_))) => continue,
                         Ok(Err(RecvError::Closed)) => break,
@@ -12375,18 +14170,24 @@ impl MethodHandler {
             });
         }
 
-        WsFrame::ok_response("", json!({
-            "session_id": session_id,
-            "runtime": runtime_str,
-            "program": program,
-            "remote_safe": spec.remote_safe,
-            "hint": spec.hint,
-            "status": "running",
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "session_id": session_id,
+                "runtime": runtime_str,
+                "program": program,
+                "remote_safe": spec.remote_safe,
+                "hint": spec.hint,
+                "status": "running",
+            }),
+        )
     }
 
     async fn handle_cli_login_input(&self, params: Value) -> WsFrame {
-        let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let sid = params
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let data = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
         // Clone the Arc and drop the map lock — we sleep between writes below and
         // must not hold the registry lock across the await.
@@ -12420,7 +14221,11 @@ impl MethodHandler {
         };
         let write_res = match body_and_term {
             Some((body, term)) => {
-                let r1 = if body.is_empty() { Ok(()) } else { session.write_input(body.as_bytes()) };
+                let r1 = if body.is_empty() {
+                    Ok(())
+                } else {
+                    session.write_input(body.as_bytes())
+                };
                 if r1.is_ok() {
                     tokio::time::sleep(std::time::Duration::from_millis(350)).await;
                     session.write_input(term.as_bytes())
@@ -12437,19 +14242,28 @@ impl MethodHandler {
     }
 
     async fn handle_cli_login_status(&self, params: Value) -> WsFrame {
-        let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let sid = params
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let sessions = self.cli_auth_sessions.read().await;
         let Some(session) = sessions.get(sid) else {
             return WsFrame::error_response("", "login session not found");
         };
-        WsFrame::ok_response("", json!({
-            "session_id": sid,
-            "status": session.status().as_str(),
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "session_id": sid,
+                "status": session.status().as_str(),
+            }),
+        )
     }
 
     async fn handle_cli_login_cancel(&self, params: Value) -> WsFrame {
-        let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let sid = params
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if let Some(session) = self.cli_auth_sessions.write().await.remove(sid) {
             session.kill();
         }
@@ -12463,7 +14277,10 @@ impl MethodHandler {
     /// each call makes a uniquely-named account. No-op (not an error) when the
     /// session didn't succeed or no token was captured.
     async fn handle_cli_login_finalize(&self, params: Value) -> WsFrame {
-        let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let sid = params
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let session = {
             let sessions = self.cli_auth_sessions.read().await;
             match sessions.get(sid) {
@@ -12472,12 +14289,18 @@ impl MethodHandler {
             }
         };
         if session.status() != crate::cli_auth::AuthStatus::Succeeded {
-            return WsFrame::ok_response("", json!({"registered": false, "reason": "login not succeeded"}));
+            return WsFrame::ok_response(
+                "",
+                json!({"registered": false, "reason": "login not succeeded"}),
+            );
         }
         let Some(token) = session.captured_token() else {
             // Success without a scrapeable token (e.g. localhost-callback CLIs that
             // persist to their own store). Nothing to register here.
-            return WsFrame::ok_response("", json!({"registered": false, "reason": "no token captured"}));
+            return WsFrame::ok_response(
+                "",
+                json!({"registered": false, "reason": "no token captured"}),
+            );
         };
 
         let secs = std::time::SystemTime::now()
@@ -12551,7 +14374,10 @@ impl MethodHandler {
         let pass = checks.iter().filter(|c| c["status"] == "pass").count();
         let warn = checks.iter().filter(|c| c["status"] == "warn").count();
         let fail = checks.iter().filter(|c| c["status"] == "fail").count();
-        WsFrame::ok_response("", json!({ "checks": checks, "summary": { "pass": pass, "warn": warn, "fail": fail } }))
+        WsFrame::ok_response(
+            "",
+            json!({ "checks": checks, "summary": { "pass": pass, "warn": warn, "fail": fail } }),
+        )
     }
 
     async fn handle_system_doctor_repair(&self) -> WsFrame {
@@ -12560,22 +14386,29 @@ impl MethodHandler {
         let warn = checks.iter().filter(|c| c["status"] == "warn").count();
         let fail = checks.iter().filter(|c| c["status"] == "fail").count();
 
-        let repair_hints: Vec<Value> = checks.iter().filter(|c| c["status"] != "pass").map(|c| {
-            let name = c["name"].as_str().unwrap_or("unknown");
-            let hint = match name {
-                "agents" => "Run 'duduclaw agent create <name>' to create your first agent.",
-                "api_key" => "Set ANTHROPIC_API_KEY environment variable with a valid key.",
-                "config_file" => "Run 'duduclaw init' to create a default config.toml.",
-                _ => "Check the documentation for repair instructions.",
-            };
-            json!({ "check": name, "hint": hint })
-        }).collect();
+        let repair_hints: Vec<Value> = checks
+            .iter()
+            .filter(|c| c["status"] != "pass")
+            .map(|c| {
+                let name = c["name"].as_str().unwrap_or("unknown");
+                let hint = match name {
+                    "agents" => "Run 'duduclaw agent create <name>' to create your first agent.",
+                    "api_key" => "Set ANTHROPIC_API_KEY environment variable with a valid key.",
+                    "config_file" => "Run 'duduclaw init' to create a default config.toml.",
+                    _ => "Check the documentation for repair instructions.",
+                };
+                json!({ "check": name, "hint": hint })
+            })
+            .collect();
 
-        WsFrame::ok_response("", json!({
-            "checks": checks,
-            "summary": { "pass": pass, "warn": warn, "fail": fail },
-            "repair_hints": repair_hints,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "checks": checks,
+                "summary": { "pass": pass, "warn": warn, "fail": fail },
+                "repair_hints": repair_hints,
+            }),
+        )
     }
 
     async fn handle_system_config(&self) -> WsFrame {
@@ -12584,10 +14417,13 @@ impl MethodHandler {
         // Current voice settings from inference.toml [voice] so the
         // dashboard Voice tab can show saved values instead of defaults.
         let voice = {
-            let inf_table = self.read_config_table(&self.home_dir.join("inference.toml")).await;
-            inf_table.get("voice").and_then(|v| {
-                serde_json::to_value(v.clone()).ok()
-            }).unwrap_or(Value::Null)
+            let inf_table = self
+                .read_config_table(&self.home_dir.join("inference.toml"))
+                .await;
+            inf_table
+                .get("voice")
+                .and_then(|v| serde_json::to_value(v.clone()).ok())
+                .unwrap_or(Value::Null)
         };
 
         // Structured [gateway] allowed_origins array so the dashboard can render
@@ -12614,12 +14450,19 @@ impl MethodHandler {
                 match content.parse::<toml::Table>() {
                     Ok(mut table) => {
                         Self::mask_sensitive_fields(&mut table);
-                        let masked = toml::to_string_pretty(&table).unwrap_or_else(|_| content.clone());
-                        WsFrame::ok_response("", json!({ "config": masked, "voice": voice, "allowed_origins": allowed_origins }))
+                        let masked =
+                            toml::to_string_pretty(&table).unwrap_or_else(|_| content.clone());
+                        WsFrame::ok_response(
+                            "",
+                            json!({ "config": masked, "voice": voice, "allowed_origins": allowed_origins }),
+                        )
                     }
                     Err(_) => {
                         // Do NOT return raw content — it may contain unmasked tokens (MCP-H5)
-                        WsFrame::error_response("", "Failed to parse config.toml — cannot safely display")
+                        WsFrame::error_response(
+                            "",
+                            "Failed to parse config.toml — cannot safely display",
+                        )
                     }
                 }
             }
@@ -12642,13 +14485,16 @@ impl MethodHandler {
             None => "community".to_string(),
         };
         let edition_profile = self.resolve_edition_profile().await;
-        WsFrame::ok_response("", json!({
-            "version": crate::updater::current_version(),
-            "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
-            "edition": edition,
-            // Product form-factor (personal|enterprise); see system.status.
-            "edition_profile": edition_profile.as_str(),
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "version": crate::updater::current_version(),
+                "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
+                "edition": edition,
+                // Product form-factor (personal|enterprise); see system.status.
+                "edition_profile": edition_profile.as_str(),
+            }),
+        )
     }
 
     async fn handle_system_check_update(&self) -> WsFrame {
@@ -12666,18 +14512,21 @@ impl MethodHandler {
                 } else {
                     None
                 };
-                WsFrame::ok_response("", json!({
-                    "available": info.available,
-                    "current_version": info.current_version,
-                    "latest_version": info.latest_version,
-                    "release_notes": info.release_notes,
-                    "published_at": info.published_at,
-                    "download_url": info.download_url,
-                    "checksum_url": info.checksum_url,
-                    "install_method": info.install_method,
-                    "brew_formula": crate::updater::brew_formula_name(),
-                    "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "available": info.available,
+                        "current_version": info.current_version,
+                        "latest_version": info.latest_version,
+                        "release_notes": info.release_notes,
+                        "published_at": info.published_at,
+                        "download_url": info.download_url,
+                        "checksum_url": info.checksum_url,
+                        "install_method": info.install_method,
+                        "brew_formula": crate::updater::brew_formula_name(),
+                        "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
+                    }),
+                )
             }
             Err(e) => WsFrame::error_response("", &format!("Update check failed: {e}")),
         }
@@ -12688,10 +14537,12 @@ impl MethodHandler {
         let pending = self.pending_update.read().await.clone();
         let pending = match pending {
             Some(p) if !p.download_url.is_empty() => p,
-            _ => return WsFrame::error_response(
-                "",
-                "No pending update. Call system.check_update first.",
-            ),
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "No pending update. Call system.check_update first.",
+                );
+            }
         };
 
         // [R2:NM1] TTL check — reject stale cached URLs
@@ -12736,7 +14587,9 @@ impl MethodHandler {
                     }
                     tokio::spawn(async {
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        tracing::info!("Shutting down for update — will re-exec new binary after graceful shutdown");
+                        tracing::info!(
+                            "Shutting down for update — will re-exec new binary after graceful shutdown"
+                        );
                         duduclaw_core::platform::request_restart_after_shutdown();
                         duduclaw_core::platform::self_interrupt();
                     });
@@ -12752,11 +14605,14 @@ impl MethodHandler {
                     ),
                 );
 
-                WsFrame::ok_response("", json!({
-                    "success": result.success,
-                    "message": result.message,
-                    "needs_restart": result.needs_restart,
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": result.success,
+                        "message": result.message,
+                        "needs_restart": result.needs_restart,
+                    }),
+                )
             }
             Err(e) => {
                 // [R2:NM5] Clear stale pending on failure so user must re-check
@@ -12783,15 +14639,18 @@ impl MethodHandler {
     async fn handle_security_audit_log(&self, params: Value) -> WsFrame {
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let events = duduclaw_security::audit::read_recent_events(&self.home_dir, limit);
-        let events_json: Vec<Value> = events.iter().map(|e| {
-            json!({
-                "timestamp": e.timestamp,
-                "event_type": e.event_type,
-                "agent_id": e.agent_id,
-                "severity": e.severity,
-                "details": e.details,
+        let events_json: Vec<Value> = events
+            .iter()
+            .map(|e| {
+                json!({
+                    "timestamp": e.timestamp,
+                    "event_type": e.event_type,
+                    "agent_id": e.agent_id,
+                    "severity": e.severity,
+                    "details": e.details,
+                })
             })
-        }).collect();
+            .collect();
         WsFrame::ok_response("", json!({ "events": events_json }))
     }
 
@@ -12838,8 +14697,10 @@ impl MethodHandler {
 
         // Initialize counts for every source so the frontend always sees the
         // key even when the caller whitelisted a subset.
-        let mut source_counts: std::collections::HashMap<String, usize> =
-            all_sources.iter().map(|s| ((*s).to_string(), 0usize)).collect();
+        let mut source_counts: std::collections::HashMap<String, usize> = all_sources
+            .iter()
+            .map(|s| ((*s).to_string(), 0usize))
+            .collect();
 
         let mut events: Vec<Value> = Vec::new();
 
@@ -12931,10 +14792,7 @@ impl MethodHandler {
                     .get("tool_name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let success = row
-                    .get("success")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                let success = row.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
                 let params_summary = row
                     .get("params_summary")
                     .and_then(|v| v.as_str())
@@ -12989,10 +14847,7 @@ impl MethodHandler {
                     .get("reason")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown");
-                let error_msg = row
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let error_msg = row.get("error").and_then(|v| v.as_str()).unwrap_or("");
 
                 let event_type = format!("channel.{reason}");
                 let summary = truncate_bytes(error_msg, SUMMARY_MAX_BYTES).to_string();
@@ -13123,14 +14978,32 @@ impl MethodHandler {
         use crate::evolution_events::query::AuditQueryFilter;
 
         let filter = AuditQueryFilter {
-            agent_id:   params.get("agent_id").and_then(|v| v.as_str()).map(|s| s.to_owned()),
-            event_type: params.get("event_type").and_then(|v| v.as_str()).map(|s| s.to_owned()),
-            outcome:    params.get("outcome").and_then(|v| v.as_str()).map(|s| s.to_owned()),
-            skill_id:   params.get("skill_id").and_then(|v| v.as_str()).map(|s| s.to_owned()),
-            since:      params.get("since").and_then(|v| v.as_str()).map(|s| s.to_owned()),
-            until:      params.get("until").and_then(|v| v.as_str()).map(|s| s.to_owned()),
-            limit:      params.get("limit").and_then(|v| v.as_i64()),
-            offset:     params.get("offset").and_then(|v| v.as_i64()),
+            agent_id: params
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned()),
+            event_type: params
+                .get("event_type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned()),
+            outcome: params
+                .get("outcome")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned()),
+            skill_id: params
+                .get("skill_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned()),
+            since: params
+                .get("since")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned()),
+            until: params
+                .get("until")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned()),
+            limit: params.get("limit").and_then(|v| v.as_i64()),
+            offset: params.get("offset").and_then(|v| v.as_i64()),
         };
 
         // M60: reuse the shared, background-synced index (no per-request open +
@@ -13213,7 +15086,10 @@ impl MethodHandler {
             }
         };
 
-        match idx.compute_reliability_summary(&agent_id, window_days).await {
+        match idx
+            .compute_reliability_summary(&agent_id, window_days)
+            .await
+        {
             Ok(s) => WsFrame::ok_response(
                 "",
                 json!({
@@ -13241,9 +15117,7 @@ impl MethodHandler {
 
         // Credential proxy: count env-injected secrets from config
         let secret_count = std::env::vars()
-            .filter(|(k, _)| {
-                k.contains("API_KEY") || k.contains("TOKEN") || k.contains("SECRET")
-            })
+            .filter(|(k, _)| k.contains("API_KEY") || k.contains("TOKEN") || k.contains("SECRET"))
             .count();
 
         // Mount guard: read from agent container configs
@@ -13280,14 +15154,18 @@ impl MethodHandler {
         // Rate limiter: read from config
         let config_path = self.home_dir.join("config").join("duduclaw.toml");
         let rate_limit = if config_path.exists() {
-            let content = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
+            let content = tokio::fs::read_to_string(&config_path)
+                .await
+                .unwrap_or_default();
             // Parse basic rate limit values from config
-            let rpm = content.lines()
+            let rpm = content
+                .lines()
                 .find(|l| l.contains("rate_limit_rpm"))
                 .and_then(|l| l.split('=').nth(1))
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .unwrap_or(60);
-            let concurrent = content.lines()
+            let concurrent = content
+                .lines()
                 .find(|l| l.contains("max_concurrent"))
                 .and_then(|l| l.split('=').nth(1))
                 .and_then(|v| v.trim().parse::<u32>().ok())
@@ -13304,29 +15182,39 @@ impl MethodHandler {
         };
 
         // SOUL.md drift detection status
-        let soul_status: Vec<Value> = agents.iter().map(|a| {
-            let soul_path = self.home_dir.join("agents").join(&a.config.agent.name).join("SOUL.md");
-            let exists = soul_path.exists();
-            json!({
-                "agent_id": a.config.agent.name,
-                "soul_exists": exists,
-                "gvu_enabled": a.config.evolution.gvu_enabled,
+        let soul_status: Vec<Value> = agents
+            .iter()
+            .map(|a| {
+                let soul_path = self
+                    .home_dir
+                    .join("agents")
+                    .join(&a.config.agent.name)
+                    .join("SOUL.md");
+                let exists = soul_path.exists();
+                json!({
+                    "agent_id": a.config.agent.name,
+                    "soul_exists": exists,
+                    "gvu_enabled": a.config.evolution.gvu_enabled,
+                })
             })
-        }).collect();
+            .collect();
 
-        WsFrame::ok_response("", json!({
-            "credential_proxy": {
-                "active": secret_count > 0,
-                "vault_backend": "env",
-                "injected_secrets": secret_count,
-            },
-            "mount_guard": {
-                "rules": mount_rules,
-            },
-            "rbac": rbac_entries,
-            "rate_limiter": rate_limit,
-            "soul_drift": soul_status,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "credential_proxy": {
+                    "active": secret_count > 0,
+                    "vault_backend": "env",
+                    "injected_secrets": secret_count,
+                },
+                "mount_guard": {
+                    "rules": mount_rules,
+                },
+                "rbac": rbac_entries,
+                "rate_limiter": rate_limit,
+                "soul_drift": soul_status,
+            }),
+        )
     }
 
     // ── Analytics ────────────────────────────────────────────
@@ -13335,7 +15223,10 @@ impl MethodHandler {
     ///
     /// Aggregates data from CostTelemetry (SQLite) and session counts.
     async fn handle_analytics_summary(&self, params: Value) -> WsFrame {
-        let period = params.get("period").and_then(|v| v.as_str()).unwrap_or("month");
+        let period = params
+            .get("period")
+            .and_then(|v| v.as_str())
+            .unwrap_or("month");
         let hours: u64 = match period {
             "day" => 24,
             "week" => 168,
@@ -13344,57 +15235,76 @@ impl MethodHandler {
 
         // Session counts from sessions.db
         let session_db = self.home_dir.join("sessions.db");
-        let (total_conversations, total_messages, auto_reply_count, avg_response_ms, p95_response_ms) =
-            if session_db.exists() {
-                match rusqlite::Connection::open(&session_db) {
-                    Ok(conn) => {
-                        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(hours as i64)).to_rfc3339();
-                        let convos: i64 = conn.query_row(
+        let (
+            total_conversations,
+            total_messages,
+            auto_reply_count,
+            avg_response_ms,
+            p95_response_ms,
+        ) = if session_db.exists() {
+            match rusqlite::Connection::open(&session_db) {
+                Ok(conn) => {
+                    let cutoff =
+                        (chrono::Utc::now() - chrono::Duration::hours(hours as i64)).to_rfc3339();
+                    let convos: i64 = conn
+                        .query_row(
                             "SELECT COUNT(*) FROM sessions WHERE last_active >= ?1",
-                            params![cutoff], |r| r.get(0),
-                        ).unwrap_or(0);
-                        // 2026-07 MED: exclude hide/undo tombstones so the
-                        // dashboard counts match runs.list / runs.get. Older
-                        // DBs without the columns fall back to plain counts
-                        // (never silently 0).
-                        let msgs: i64 = conn.query_row(
+                            params![cutoff],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    // 2026-07 MED: exclude hide/undo tombstones so the
+                    // dashboard counts match runs.list / runs.get. Older
+                    // DBs without the columns fall back to plain counts
+                    // (never silently 0).
+                    let msgs: i64 = conn
+                        .query_row(
                             "SELECT COUNT(*) FROM session_messages sm
                              JOIN sessions s ON sm.session_id = s.id
                              WHERE s.last_active >= ?1
                                AND COALESCE(sm.hidden, 0) = 0 AND sm.undone_at IS NULL",
-                            params![cutoff], |r| r.get(0),
-                        ).or_else(|e| match e {
+                            params![cutoff],
+                            |r| r.get(0),
+                        )
+                        .or_else(|e| match e {
                             rusqlite::Error::SqliteFailure(..) => conn.query_row(
                                 "SELECT COUNT(*) FROM session_messages sm
                                  JOIN sessions s ON sm.session_id = s.id
                                  WHERE s.last_active >= ?1",
-                                params![cutoff], |r| r.get(0),
+                                params![cutoff],
+                                |r| r.get(0),
                             ),
                             other => Err(other),
-                        }).unwrap_or(0);
-                        // auto_reply: messages from assistant role
-                        let auto: i64 = conn.query_row(
+                        })
+                        .unwrap_or(0);
+                    // auto_reply: messages from assistant role
+                    let auto: i64 = conn
+                        .query_row(
                             "SELECT COUNT(*) FROM session_messages sm
                              JOIN sessions s ON sm.session_id = s.id
                              WHERE s.last_active >= ?1 AND sm.role = 'assistant'
                                AND COALESCE(sm.hidden, 0) = 0 AND sm.undone_at IS NULL",
-                            params![cutoff], |r| r.get(0),
-                        ).or_else(|e| match e {
+                            params![cutoff],
+                            |r| r.get(0),
+                        )
+                        .or_else(|e| match e {
                             rusqlite::Error::SqliteFailure(..) => conn.query_row(
                                 "SELECT COUNT(*) FROM session_messages sm
                                  JOIN sessions s ON sm.session_id = s.id
                                  WHERE s.last_active >= ?1 AND sm.role = 'assistant'",
-                                params![cutoff], |r| r.get(0),
+                                params![cutoff],
+                                |r| r.get(0),
                             ),
                             other => Err(other),
-                        }).unwrap_or(0);
-                        (convos, msgs, auto, 850_u64, 2400_u64)
-                    }
-                    Err(_) => (0, 0, 0, 0, 0),
+                        })
+                        .unwrap_or(0);
+                    (convos, msgs, auto, 850_u64, 2400_u64)
                 }
-            } else {
-                (0, 0, 0, 0, 0)
-            };
+                Err(_) => (0, 0, 0, 0, 0),
+            }
+        } else {
+            (0, 0, 0, 0, 0)
+        };
 
         // Cost data from CostTelemetry
         let (zero_cost_ratio, estimated_savings_cents) =
@@ -13422,16 +15332,19 @@ impl MethodHandler {
             0.0
         };
 
-        WsFrame::ok_response("", json!({
-            "total_conversations": total_conversations,
-            "total_messages": total_messages,
-            "auto_reply_rate": auto_reply_rate,
-            "avg_response_ms": avg_response_ms,
-            "p95_response_ms": p95_response_ms,
-            "zero_cost_ratio": zero_cost_ratio,
-            "estimated_savings_cents": estimated_savings_cents,
-            "period": period,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "total_conversations": total_conversations,
+                "total_messages": total_messages,
+                "auto_reply_rate": auto_reply_rate,
+                "avg_response_ms": avg_response_ms,
+                "p95_response_ms": p95_response_ms,
+                "zero_cost_ratio": zero_cost_ratio,
+                "estimated_savings_cents": estimated_savings_cents,
+                "period": period,
+            }),
+        )
     }
 
     /// Daily conversation counts for the trend chart.
@@ -13440,25 +15353,29 @@ impl MethodHandler {
         let daily: Vec<Value> = if session_db.exists() {
             match rusqlite::Connection::open(&session_db) {
                 Ok(conn) => {
-                    let mut stmt = conn.prepare(
-                        "SELECT DATE(last_active) as day,
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT DATE(last_active) as day,
                                 COUNT(*) as total,
                                 COUNT(CASE WHEN total_tokens > 0 THEN 1 END) as auto
                          FROM sessions
                          WHERE last_active >= DATE('now', '-30 days')
                          GROUP BY day
-                         ORDER BY day ASC"
-                    ).unwrap();
-                    let rows = stmt.query_map([], |row| {
-                        let date: String = row.get(0)?;
-                        let count: i64 = row.get(1)?;
-                        let auto_count: i64 = row.get(2)?;
-                        Ok(json!({
-                            "date": date,
-                            "count": count,
-                            "auto_count": auto_count,
-                        }))
-                    }).unwrap();
+                         ORDER BY day ASC",
+                        )
+                        .unwrap();
+                    let rows = stmt
+                        .query_map([], |row| {
+                            let date: String = row.get(0)?;
+                            let count: i64 = row.get(1)?;
+                            let auto_count: i64 = row.get(2)?;
+                            Ok(json!({
+                                "date": date,
+                                "count": count,
+                                "auto_count": auto_count,
+                            }))
+                        })
+                        .unwrap();
                     rows.filter_map(|r| r.ok()).collect()
                 }
                 Err(_) => Vec::new(),
@@ -13484,8 +15401,12 @@ impl MethodHandler {
 
                 let (period_cost, period_savings) = match (start_summary, end_summary) {
                     (Ok(start), Ok(end)) => {
-                        let cost = start.total_cost_millicents.saturating_sub(end.total_cost_millicents);
-                        let savings = start.total_cache_savings_millicents.saturating_sub(end.total_cache_savings_millicents);
+                        let cost = start
+                            .total_cost_millicents
+                            .saturating_sub(end.total_cost_millicents);
+                        let savings = start
+                            .total_cache_savings_millicents
+                            .saturating_sub(end.total_cache_savings_millicents);
                         (cost, savings)
                     }
                     _ => (0, 0),
@@ -13532,10 +15453,8 @@ impl MethodHandler {
             .unwrap_or(now.date_naive())
             .and_hms_opt(0, 0, 0)
             .unwrap_or_default();
-        let month_start_utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            month_start,
-            chrono::Utc,
-        );
+        let month_start_utc =
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(month_start, chrono::Utc);
         let hours_since_start = hours_since_month_start();
 
         // Conversations this month from sessions.db
@@ -13602,21 +15521,30 @@ impl MethodHandler {
         match hb.as_ref() {
             Some(scheduler) => {
                 let statuses = scheduler.status().await;
-                WsFrame::ok_response("", json!({
-                    "heartbeats": statuses,
-                    "count": statuses.len(),
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "heartbeats": statuses,
+                        "count": statuses.len(),
+                    }),
+                )
             }
-            None => WsFrame::ok_response("", json!({
-                "heartbeats": [],
-                "count": 0,
-                "message": "Heartbeat scheduler not started",
-            })),
+            None => WsFrame::ok_response(
+                "",
+                json!({
+                    "heartbeats": [],
+                    "count": 0,
+                    "message": "Heartbeat scheduler not started",
+                }),
+            ),
         }
     }
 
     async fn handle_heartbeat_trigger(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() {
             return WsFrame::error_response("", "agent_id is required");
         }
@@ -13626,12 +15554,18 @@ impl MethodHandler {
             Some(scheduler) => {
                 let triggered = scheduler.trigger(agent_id).await;
                 if triggered {
-                    WsFrame::ok_response("", json!({
-                        "success": true,
-                        "message": format!("Heartbeat triggered for agent '{agent_id}'"),
-                    }))
+                    WsFrame::ok_response(
+                        "",
+                        json!({
+                            "success": true,
+                            "message": format!("Heartbeat triggered for agent '{agent_id}'"),
+                        }),
+                    )
                 } else {
-                    WsFrame::error_response("", &format!("Agent '{agent_id}' not found in heartbeat scheduler"))
+                    WsFrame::error_response(
+                        "",
+                        &format!("Agent '{agent_id}' not found in heartbeat scheduler"),
+                    )
                 }
             }
             None => WsFrame::error_response("", "Heartbeat scheduler not started"),
@@ -13642,23 +15576,35 @@ impl MethodHandler {
 
     fn handle_logs_subscribe(&self, params: Value) -> WsFrame {
         let filter = params.get("filter").and_then(|v| v.as_str()).unwrap_or("*");
-        info!(filter, "logs.subscribe activated — WebSocket push enabled for this connection");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "subscribed": true,
-            "filter": filter,
-            "message": "Log push active — events will stream on this WebSocket connection",
-        }))
+        info!(
+            filter,
+            "logs.subscribe activated — WebSocket push enabled for this connection"
+        );
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "subscribed": true,
+                "filter": filter,
+                "message": "Log push active — events will stream on this WebSocket connection",
+            }),
+        )
     }
 
     fn handle_logs_unsubscribe(&self, params: Value) -> WsFrame {
         let filter = params.get("filter").and_then(|v| v.as_str()).unwrap_or("*");
-        info!(filter, "logs.unsubscribe — WebSocket push disabled for this connection");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "subscribed": false,
-            "filter": filter,
-        }))
+        info!(
+            filter,
+            "logs.unsubscribe — WebSocket push disabled for this connection"
+        );
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "subscribed": false,
+                "filter": filter,
+            }),
+        )
     }
 
     // ── Evolution ────────────────────────────────────────────
@@ -13666,22 +15612,32 @@ impl MethodHandler {
     async fn handle_evolution_status(&self) -> WsFrame {
         let reg = self.registry.read().await;
         let mut gvu_enabled_count = 0usize;
-        let agents: Vec<Value> = reg.list().iter().map(|a| {
-            let cfg = &a.config;
-            if cfg.evolution.gvu_enabled { gvu_enabled_count += 1; }
-            json!({
-                "agent_id": cfg.agent.name,
-                "gvu_enabled": cfg.evolution.gvu_enabled,
-                "cognitive_memory": cfg.evolution.cognitive_memory,
-                "skill_auto_activate": cfg.evolution.skill_auto_activate,
-                "skill_security_scan": cfg.evolution.skill_security_scan,
-                "max_silence_hours": cfg.evolution.max_silence_hours,
-                "max_gvu_generations": cfg.evolution.max_gvu_generations,
-                "observation_period_hours": cfg.evolution.observation_period_hours,
+        let agents: Vec<Value> = reg
+            .list()
+            .iter()
+            .map(|a| {
+                let cfg = &a.config;
+                if cfg.evolution.gvu_enabled {
+                    gvu_enabled_count += 1;
+                }
+                json!({
+                    "agent_id": cfg.agent.name,
+                    "gvu_enabled": cfg.evolution.gvu_enabled,
+                    "cognitive_memory": cfg.evolution.cognitive_memory,
+                    "skill_auto_activate": cfg.evolution.skill_auto_activate,
+                    "skill_security_scan": cfg.evolution.skill_security_scan,
+                    "max_silence_hours": cfg.evolution.max_silence_hours,
+                    "max_gvu_generations": cfg.evolution.max_gvu_generations,
+                    "observation_period_hours": cfg.evolution.observation_period_hours,
+                })
             })
-        }).collect();
+            .collect();
         let total_agents = agents.len();
-        let agent_ids: Vec<String> = reg.list().iter().map(|a| a.config.agent.name.clone()).collect();
+        let agent_ids: Vec<String> = reg
+            .list()
+            .iter()
+            .map(|a| a.config.agent.name.clone())
+            .collect();
         drop(reg);
 
         // Aggregate real version stats from evolution.db (if any GVU run has persisted).
@@ -13706,20 +15662,30 @@ impl MethodHandler {
         };
 
         let enabled = gvu_enabled_count > 0;
-        WsFrame::ok_response("", json!({
-            "enabled": enabled,
-            "mode": if enabled { "prediction_driven" } else { "disabled" },
-            "total_agents": total_agents,
-            "gvu_enabled_count": gvu_enabled_count,
-            "total_versions": total_versions,
-            "last_applied_at": last_applied_at,
-            "agents": agents,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "enabled": enabled,
+                "mode": if enabled { "prediction_driven" } else { "disabled" },
+                "total_agents": total_agents,
+                "gvu_enabled_count": gvu_enabled_count,
+                "total_versions": total_versions,
+                "last_applied_at": last_applied_at,
+                "agents": agents,
+            }),
+        )
     }
 
     async fn handle_evolution_history(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(100) as usize;
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(100) as usize;
 
         let db_path = self.home_dir.join("evolution.db");
         if !db_path.exists() {
@@ -13731,7 +15697,10 @@ impl MethodHandler {
         // If agent_id is specified, show that agent's history; otherwise show all agents
         let reg = self.registry.read().await;
         let agent_ids: Vec<String> = if agent_id.is_empty() {
-            reg.list().iter().map(|a| a.config.agent.name.clone()).collect()
+            reg.list()
+                .iter()
+                .map(|a| a.config.agent.name.clone())
+                .collect()
         } else {
             vec![agent_id.to_string()]
         };
@@ -13804,18 +15773,20 @@ impl MethodHandler {
         let grok = duduclaw_core::which_grok()
             .or_else(|| duduclaw_core::which_grok_in_home(&user_home))
             .is_some();
-        let (claude_oauth, claude_subscription) =
-            detect_claude_oauth(claude_bin.as_deref()).await;
+        let (claude_oauth, claude_subscription) = detect_claude_oauth(claude_bin.as_deref()).await;
 
-        WsFrame::ok_response("", json!({
-            "claude_cli": claude_cli,
-            "codex": codex,
-            "gemini": gemini,
-            "antigravity": antigravity,
-            "grok": grok,
-            "claude_oauth": claude_oauth,
-            "claude_subscription": claude_subscription,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "claude_cli": claude_cli,
+                "codex": codex,
+                "gemini": gemini,
+                "antigravity": antigravity,
+                "grok": grok,
+                "claude_oauth": claude_oauth,
+                "claude_subscription": claude_subscription,
+            }),
+        )
     }
 
     /// List all available models (cloud + local GGUF files).
@@ -13856,7 +15827,8 @@ impl MethodHandler {
                 if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
                     continue;
                 }
-                let name = path.file_stem()
+                let name = path
+                    .file_stem()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
@@ -13875,17 +15847,22 @@ impl MethodHandler {
         // Also read default_model from inference.toml if it exists
         let inf_path = self.home_dir.join("inference.toml");
         let default_model = if let Ok(content) = tokio::fs::read_to_string(&inf_path).await {
-            content.parse::<toml::Table>().ok()
+            content
+                .parse::<toml::Table>()
+                .ok()
                 .and_then(|t| t.get("default_model")?.as_str().map(|s| s.to_string()))
         } else {
             None
         };
 
-        WsFrame::ok_response("", json!({
-            "models": models,
-            "default_local": default_model,
-            "discovered_at": cache.fetched_at,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "models": models,
+                "default_local": default_model,
+                "discovered_at": cache.fetched_at,
+            }),
+        )
     }
 
     // ── System Config Update ─────────────────────────────────
@@ -13906,7 +15883,8 @@ impl MethodHandler {
         if let Some(v) = params.get("log_level").and_then(|v| v.as_str()) {
             match v {
                 "trace" | "debug" | "info" | "warn" | "error" => {
-                    let logging = table.entry("logging")
+                    let logging = table
+                        .entry("logging")
                         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                         .as_table_mut();
                     if let Some(logging) = logging {
@@ -13914,9 +15892,12 @@ impl MethodHandler {
                         changes.push(format!("logging.level = \"{v}\""));
                     }
                 }
-                _ => return WsFrame::error_response("", &format!(
-                    "Invalid log_level '{v}'. Valid: trace, debug, info, warn, error"
-                )),
+                _ => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Invalid log_level '{v}'. Valid: trace, debug, info, warn, error"),
+                    );
+                }
             }
         }
 
@@ -13924,7 +15905,8 @@ impl MethodHandler {
         if let Some(v) = params.get("rotation_strategy").and_then(|v| v.as_str()) {
             match v {
                 "priority" | "round_robin" | "least_cost" | "failover" => {
-                    let rotation = table.entry("rotation")
+                    let rotation = table
+                        .entry("rotation")
                         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                         .as_table_mut();
                     if let Some(rotation) = rotation {
@@ -13932,15 +15914,21 @@ impl MethodHandler {
                         changes.push(format!("rotation.strategy = \"{v}\""));
                     }
                 }
-                _ => return WsFrame::error_response("", &format!(
-                    "Invalid rotation_strategy '{v}'. Valid: priority, round_robin, least_cost, failover"
-                )),
+                _ => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!(
+                            "Invalid rotation_strategy '{v}'. Valid: priority, round_robin, least_cost, failover"
+                        ),
+                    );
+                }
             }
         }
 
         // ── auto_update (Pro only) ──
         if let Some(v) = params.get("auto_update").and_then(|v| v.as_bool()) {
-            let gateway = table.entry("gateway")
+            let gateway = table
+                .entry("gateway")
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                 .as_table_mut();
             if let Some(gateway) = gateway {
@@ -13953,9 +15941,12 @@ impl MethodHandler {
         // bind/port/auth_token change the listening socket + admin token, which
         // are read once at gateway start — we persist + flag, never hot-apply.
         {
-            let has_gw = ["bind", "port", "auth_token"].iter().any(|k| params.get(*k).is_some());
+            let has_gw = ["bind", "port", "auth_token"]
+                .iter()
+                .any(|k| params.get(*k).is_some());
             if has_gw {
-                let gateway = table.entry("gateway")
+                let gateway = table
+                    .entry("gateway")
                     .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                     .as_table_mut()
                     .unwrap();
@@ -13983,7 +15974,8 @@ impl MethodHandler {
                         changes.push("gateway.auth_token cleared (restart required)".into());
                     } else if v == SECRET_MASK_SET {
                         // untouched — leave existing value
-                    } else if let Some(enc) = crate::config_crypto::encrypt_value(v, &self.home_dir) {
+                    } else if let Some(enc) = crate::config_crypto::encrypt_value(v, &self.home_dir)
+                    {
                         gateway.insert("auth_token_enc".into(), toml::Value::String(enc));
                         changes.push("gateway.auth_token = [ENCRYPTED] (restart required)".into());
                     } else {
@@ -14015,24 +16007,38 @@ impl MethodHandler {
                 .map(|s| toml::Value::String(s.clone()))
                 .collect();
             gateway.insert("allowed_origins".into(), toml::Value::Array(toml_arr));
-            changes.push(format!("gateway.allowed_origins = {} entr{}", cleaned.len(), if cleaned.len() == 1 { "y" } else { "ies" }));
+            changes.push(format!(
+                "gateway.allowed_origins = {} entr{}",
+                cleaned.len(),
+                if cleaned.len() == 1 { "y" } else { "ies" }
+            ));
             applied_origins = Some(cleaned);
         }
 
         // ── G.2 [rotation] health_check_interval_seconds / cooldown_after_rate_limit_seconds ──
         {
-            let has_rot = ["health_check_interval_seconds", "cooldown_after_rate_limit_seconds"]
-                .iter()
-                .any(|k| params.get(*k).is_some());
+            let has_rot = [
+                "health_check_interval_seconds",
+                "cooldown_after_rate_limit_seconds",
+            ]
+            .iter()
+            .any(|k| params.get(*k).is_some());
             if has_rot {
-                let rotation = table.entry("rotation")
+                let rotation = table
+                    .entry("rotation")
                     .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                     .as_table_mut()
                     .unwrap();
-                for key in &["health_check_interval_seconds", "cooldown_after_rate_limit_seconds"] {
+                for key in &[
+                    "health_check_interval_seconds",
+                    "cooldown_after_rate_limit_seconds",
+                ] {
                     if let Some(v) = params.get(*key).and_then(|v| v.as_u64()) {
                         if v == 0 || v > 86400 {
-                            return WsFrame::error_response("", &format!("rotation.{key} must be 1-86400"));
+                            return WsFrame::error_response(
+                                "",
+                                &format!("rotation.{key} must be 1-86400"),
+                            );
                         }
                         rotation.insert((*key).into(), toml::Value::Integer(v as i64));
                         changes.push(format!("rotation.{key} = {v}"));
@@ -14043,9 +16049,12 @@ impl MethodHandler {
 
         // ── G.3 [general] default_agent / inference_mode ──
         {
-            let has_gen = ["default_agent", "inference_mode"].iter().any(|k| params.get(*k).is_some());
+            let has_gen = ["default_agent", "inference_mode"]
+                .iter()
+                .any(|k| params.get(*k).is_some());
             if has_gen {
-                let general = table.entry("general")
+                let general = table
+                    .entry("general")
                     .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                     .as_table_mut()
                     .unwrap();
@@ -14063,7 +16072,12 @@ impl MethodHandler {
                             general.insert("inference_mode".into(), toml::Value::String(v.into()));
                             changes.push(format!("general.inference_mode = \"{v}\""));
                         }
-                        _ => return WsFrame::error_response("", "Invalid inference_mode. Valid: local, claude, hybrid"),
+                        _ => {
+                            return WsFrame::error_response(
+                                "",
+                                "Invalid inference_mode. Valid: local, claude, hybrid",
+                            );
+                        }
                     }
                 }
             }
@@ -14073,7 +16087,8 @@ impl MethodHandler {
         if let Some(v) = params.get("log_format").and_then(|v| v.as_str()) {
             match v {
                 "pretty" | "json" => {
-                    let logging = table.entry("logging")
+                    let logging = table
+                        .entry("logging")
                         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                         .as_table_mut()
                         .unwrap();
@@ -14086,7 +16101,8 @@ impl MethodHandler {
 
         // ── G.7 [secret_manager] backend / vault_addr / vault_token(→_enc) / vault_mount ──
         if let Some(sm) = params.get("secret_manager").and_then(|v| v.as_object()) {
-            let section = table.entry("secret_manager")
+            let section = table
+                .entry("secret_manager")
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                 .as_table_mut()
                 .unwrap();
@@ -14100,10 +16116,17 @@ impl MethodHandler {
                         section.insert("backend".into(), toml::Value::String(v.into()));
                         changes.push(format!("secret_manager.backend = \"{v}\""));
                     }
-                    _ => return WsFrame::error_response("", "Invalid secret_manager.backend. Valid: local, vault, env, onepassword, infisical"),
+                    _ => {
+                        return WsFrame::error_response(
+                            "",
+                            "Invalid secret_manager.backend. Valid: local, vault, env, onepassword, infisical",
+                        );
+                    }
                 }
             }
-            for (param_key, toml_key) in &[("vault_addr", "vault_addr"), ("vault_mount", "vault_mount")] {
+            for (param_key, toml_key) in
+                &[("vault_addr", "vault_addr"), ("vault_mount", "vault_mount")]
+            {
                 if let Some(v) = sm.get(*param_key).and_then(|v| v.as_str()) {
                     section.insert((*toml_key).into(), toml::Value::String(v.trim().into()));
                     changes.push(format!("secret_manager.{toml_key} = \"{}\"", v.trim()));
@@ -14122,8 +16145,141 @@ impl MethodHandler {
                     section.insert("vault_token_enc".into(), toml::Value::String(enc));
                     changes.push("secret_manager.vault_token = [ENCRYPTED]".into());
                 } else {
-                    return WsFrame::error_response("", "Failed to encrypt secret_manager.vault_token");
+                    return WsFrame::error_response(
+                        "",
+                        "Failed to encrypt secret_manager.vault_token",
+                    );
                 }
+            }
+        }
+
+        // ── v1.39 config knobs ─────────────────────────────────────────────
+        // knowledge_guard / goal_loop / dispatch / memory / topology_evolution.
+        // Sent as nested objects (like `secret_manager` / `voice`). Two classes:
+        //   • "easy" per-use-read knobs (knowledge_guard.*, goal_loop.planner_enabled,
+        //     memory.graph_embed_seed) — the consumer re-reads config.toml on every
+        //     use, so the write alone takes effect; surfaced to the UI as `applied`.
+        //   • "hard" startup-read knobs (goal_loop.iteration_cap_simple,
+        //     dispatch.policy, topology_evolution.enabled) — a long-lived driver
+        //     captured the value at boot, so we abort+respawn the driver after the
+        //     write; surfaced as `hot_reloaded`.
+        let mut applied_immediate = false;
+        let mut reload_goal_loop = false;
+        let mut reload_topology = false;
+
+        // [knowledge_guard] enabled / window_secs / max_per_subject
+        if let Some(kg) = params.get("knowledge_guard").and_then(|v| v.as_object()) {
+            let section = table
+                .entry("knowledge_guard")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            if let Some(v) = kg.get("enabled").and_then(|v| v.as_bool()) {
+                section.insert("enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("knowledge_guard.enabled = {v}"));
+                applied_immediate = true;
+            }
+            if let Some(v) = kg.get("window_secs").and_then(|v| v.as_u64()) {
+                if v == 0 || v > 604_800 {
+                    return WsFrame::error_response(
+                        "",
+                        "knowledge_guard.window_secs must be 1-604800",
+                    );
+                }
+                section.insert("window_secs".into(), toml::Value::Integer(v as i64));
+                changes.push(format!("knowledge_guard.window_secs = {v}"));
+                applied_immediate = true;
+            }
+            if let Some(v) = kg.get("max_per_subject").and_then(|v| v.as_u64()) {
+                if v == 0 || v > 10_000 {
+                    return WsFrame::error_response(
+                        "",
+                        "knowledge_guard.max_per_subject must be 1-10000",
+                    );
+                }
+                section.insert("max_per_subject".into(), toml::Value::Integer(v as i64));
+                changes.push(format!("knowledge_guard.max_per_subject = {v}"));
+                applied_immediate = true;
+            }
+        }
+
+        // [goal_loop] planner_enabled (easy) / iteration_cap_simple (hard)
+        if let Some(gl) = params.get("goal_loop").and_then(|v| v.as_object()) {
+            let section = table
+                .entry("goal_loop")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            if let Some(v) = gl.get("planner_enabled").and_then(|v| v.as_bool()) {
+                section.insert("planner_enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("goal_loop.planner_enabled = {v}"));
+                applied_immediate = true;
+            }
+            if let Some(v) = gl.get("iteration_cap_simple").and_then(|v| v.as_u64()) {
+                if !(1..=20).contains(&v) {
+                    return WsFrame::error_response(
+                        "",
+                        "goal_loop.iteration_cap_simple must be 1-20",
+                    );
+                }
+                section.insert(
+                    "iteration_cap_simple".into(),
+                    toml::Value::Integer(v as i64),
+                );
+                changes.push(format!("goal_loop.iteration_cap_simple = {v} (hot reload)"));
+                reload_goal_loop = true;
+            }
+        }
+
+        // [dispatch] policy (hard — captured by the goal-loop driver at boot)
+        if let Some(dp) = params.get("dispatch").and_then(|v| v.as_object()) {
+            if let Some(v) = dp.get("policy").and_then(|v| v.as_str()) {
+                match v {
+                    "fixed_hierarchy" | "round_robin" | "llm_select" => {
+                        let section = table
+                            .entry("dispatch")
+                            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                            .as_table_mut()
+                            .unwrap();
+                        section.insert("policy".into(), toml::Value::String(v.into()));
+                        changes.push(format!("dispatch.policy = \"{v}\" (hot reload)"));
+                        reload_goal_loop = true;
+                    }
+                    _ => {
+                        return WsFrame::error_response(
+                            "",
+                            "Invalid dispatch.policy. Valid: fixed_hierarchy, round_robin, llm_select",
+                        );
+                    }
+                }
+            }
+        }
+
+        // [memory] graph_embed_seed (easy — re-read on every memory RPC)
+        if let Some(mem) = params.get("memory").and_then(|v| v.as_object()) {
+            if let Some(v) = mem.get("graph_embed_seed").and_then(|v| v.as_bool()) {
+                let section = table
+                    .entry("memory")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                section.insert("graph_embed_seed".into(), toml::Value::Boolean(v));
+                changes.push(format!("memory.graph_embed_seed = {v}"));
+                applied_immediate = true;
+            }
+        }
+
+        // [topology_evolution] enabled (hard — gates the D5 driver at boot)
+        if let Some(te) = params.get("topology_evolution").and_then(|v| v.as_object()) {
+            if let Some(v) = te.get("enabled").and_then(|v| v.as_bool()) {
+                let section = table
+                    .entry("topology_evolution")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                section.insert("enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("topology_evolution.enabled = {v} (hot reload)"));
+                reload_topology = true;
             }
         }
 
@@ -14138,24 +16294,33 @@ impl MethodHandler {
             let inference_path = self.home_dir.join("inference.toml");
             let mut inf_table = self.read_config_table(&inference_path).await;
             let mut voice_dirty = false;
-            let voice_table = inf_table.entry("voice")
+            let voice_table = inf_table
+                .entry("voice")
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                 .as_table_mut();
             if let Some(voice_table) = voice_table {
                 if let Some(v) = voice.get("asr_provider").and_then(|v| v.as_str()) {
                     if !VALID_ASR.contains(&v) {
-                        return WsFrame::error_response("", &format!(
-                            "Invalid asr_provider '{v}'. Valid: {}", VALID_ASR.join(", ")
-                        ));
+                        return WsFrame::error_response(
+                            "",
+                            &format!(
+                                "Invalid asr_provider '{v}'. Valid: {}",
+                                VALID_ASR.join(", ")
+                            ),
+                        );
                     }
                     voice_table.insert("asr_provider".into(), toml::Value::String(v.into()));
                     voice_dirty = true;
                 }
                 if let Some(v) = voice.get("tts_provider").and_then(|v| v.as_str()) {
                     if !VALID_TTS.contains(&v) {
-                        return WsFrame::error_response("", &format!(
-                            "Invalid tts_provider '{v}'. Valid: {}", VALID_TTS.join(", ")
-                        ));
+                        return WsFrame::error_response(
+                            "",
+                            &format!(
+                                "Invalid tts_provider '{v}'. Valid: {}",
+                                VALID_TTS.join(", ")
+                            ),
+                        );
                     }
                     voice_table.insert("tts_provider".into(), toml::Value::String(v.into()));
                     voice_dirty = true;
@@ -14177,11 +16342,17 @@ impl MethodHandler {
             if voice_dirty {
                 let tmp = inference_path.with_extension("toml.tmp");
                 if let Err(e) = self.write_config_table(&tmp, &inf_table).await {
-                    return WsFrame::error_response("", &format!("Failed to write inference.toml: {e}"));
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Failed to write inference.toml: {e}"),
+                    );
                 }
                 if let Err(e) = tokio::fs::rename(&tmp, &inference_path).await {
                     let _ = tokio::fs::remove_file(&tmp).await;
-                    return WsFrame::error_response("", &format!("Failed to commit inference.toml: {e}"));
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Failed to commit inference.toml: {e}"),
+                    );
                 }
                 changes.push("voice (inference.toml)".to_string());
             }
@@ -14197,7 +16368,10 @@ impl MethodHandler {
         }
 
         if changes.is_empty() {
-            return WsFrame::error_response("", "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode), secret_manager");
+            return WsFrame::error_response(
+                "",
+                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple), dispatch(policy), memory(graph_embed_seed), topology_evolution(enabled)",
+            );
         }
 
         // Atomic write: temp + rename
@@ -14220,13 +16394,33 @@ impl MethodHandler {
             false
         };
 
-        info!(?changes, "system.update_config completed");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "changes": changes,
-            // Signals the UI that allowed_origins took effect live (no restart).
-            "applied": origins_applied,
-        }))
+        // Hot reload the long-lived background drivers whose config was captured
+        // at boot. abort+respawn with the freshly-written config (drivers are
+        // stateless periodic pollers — durable state lives in SQLite, so an abort
+        // between ticks is safe). Report which reloaded so the UI can confirm.
+        let mut hot_reloaded: Vec<&'static str> = Vec::new();
+        if reload_goal_loop {
+            self.respawn_goal_loop_driver().await;
+            hot_reloaded.push("goal_loop");
+        }
+        if reload_topology {
+            self.respawn_topology_driver().await;
+            hot_reloaded.push("topology_evolution");
+        }
+
+        info!(?changes, ?hot_reloaded, "system.update_config completed");
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "changes": changes,
+                // Signals the UI that a live-applied field took effect without a
+                // restart: allowed_origins hot-apply OR an "easy" per-use-read knob.
+                "applied": origins_applied || applied_immediate,
+                // Drivers that were abort+respawned with the new config.
+                "hot_reloaded": hot_reloaded,
+            }),
+        )
     }
 
     /// Add a new account to config.toml [[accounts]] array.
@@ -14237,27 +16431,40 @@ impl MethodHandler {
             Some(id) if !id.is_empty() => id,
             _ => return WsFrame::error_response("", "Missing 'id' parameter"),
         };
-        let auth_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("api_key");
+        let auth_type = params
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("api_key");
         let key = match params.get("key").and_then(|v| v.as_str()) {
             Some(k) if !k.is_empty() => k,
             _ => return WsFrame::error_response("", "Missing 'key' parameter"),
         };
-        let budget_cents = params.get("monthly_budget_cents").and_then(|v| v.as_u64()).unwrap_or(5000);
+        let budget_cents = params
+            .get("monthly_budget_cents")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5000);
         let priority = params.get("priority").and_then(|v| v.as_u64()).unwrap_or(1);
 
         let config_path = self.home_dir.join("config.toml");
         let mut table = self.read_config_table(&config_path).await;
 
         // Ensure [[accounts]] array exists
-        let accounts = table.entry("accounts")
+        let accounts = table
+            .entry("accounts")
             .or_insert_with(|| toml::Value::Array(Vec::new()));
         let arr = match accounts.as_array_mut() {
             Some(a) => a,
-            None => return WsFrame::error_response("", "Invalid 'accounts' section in config.toml"),
+            None => {
+                return WsFrame::error_response("", "Invalid 'accounts' section in config.toml");
+            }
         };
 
         // Check for duplicate id
-        if arr.iter().any(|a| a.as_table().and_then(|t| t.get("id").and_then(|v| v.as_str())) == Some(id)) {
+        if arr.iter().any(|a| {
+            a.as_table()
+                .and_then(|t| t.get("id").and_then(|v| v.as_str()))
+                == Some(id)
+        }) {
             return WsFrame::error_response("", &format!("Account '{id}' already exists"));
         }
 
@@ -14267,10 +16474,17 @@ impl MethodHandler {
         let mut account = toml::map::Map::new();
         account.insert("id".into(), toml::Value::String(id.into()));
         account.insert("type".into(), toml::Value::String(auth_type.into()));
-        account.insert("monthly_budget_cents".into(), toml::Value::Integer(budget_cents as i64));
+        account.insert(
+            "monthly_budget_cents".into(),
+            toml::Value::Integer(budget_cents as i64),
+        );
         account.insert("priority".into(), toml::Value::Integer(priority as i64));
         // Store plaintext key for runtime use + encrypted version for security
-        let key_field = if auth_type == "oauth" { "oauth_token" } else { "anthropic_api_key" };
+        let key_field = if auth_type == "oauth" {
+            "oauth_token"
+        } else {
+            "anthropic_api_key"
+        };
         account.insert(key_field.into(), toml::Value::String(key.into()));
         if let Some(enc) = &encrypted {
             account.insert(format!("{key_field}_enc"), toml::Value::String(enc.clone()));
@@ -14288,11 +16502,14 @@ impl MethodHandler {
         }
 
         info!(id, auth_type, "accounts.add completed");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "id": id,
-            "type": auth_type,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "id": id,
+                "type": auth_type,
+            }),
+        )
     }
 
     /// Update the monthly budget for a specific account in config.toml.
@@ -14303,7 +16520,12 @@ impl MethodHandler {
         };
         let budget_cents = match params.get("monthly_budget_cents").and_then(|v| v.as_u64()) {
             Some(v) => v,
-            None => return WsFrame::error_response("", "Missing 'monthly_budget_cents' parameter (integer)"),
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    "Missing 'monthly_budget_cents' parameter (integer)",
+                );
+            }
         };
 
         let config_path = self.home_dir.join("config.toml");
@@ -14324,10 +16546,15 @@ impl MethodHandler {
         match target {
             Some(account) => {
                 if let Some(t) = account.as_table_mut() {
-                    t.insert("monthly_budget_cents".into(), toml::Value::Integer(budget_cents as i64));
+                    t.insert(
+                        "monthly_budget_cents".into(),
+                        toml::Value::Integer(budget_cents as i64),
+                    );
                 }
             }
-            None => return WsFrame::error_response("", &format!("Account not found: {account_id}")),
+            None => {
+                return WsFrame::error_response("", &format!("Account not found: {account_id}"));
+            }
         }
 
         // Atomic write
@@ -14341,11 +16568,14 @@ impl MethodHandler {
         }
 
         info!(account_id, budget_cents, "accounts.update_budget completed");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "account_id": account_id,
-            "monthly_budget_cents": budget_cents,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "account_id": account_id,
+                "monthly_budget_cents": budget_cents,
+            }),
+        )
     }
 
     /// `accounts.update` — general edit of a `[[accounts]]` entry (G.5).
@@ -14366,11 +16596,15 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "No [[accounts]] section in config.toml"),
         };
         let target = accounts.iter_mut().find(|a| {
-            a.as_table().and_then(|t| t.get("id").and_then(|v| v.as_str())) == Some(account_id.as_str())
+            a.as_table()
+                .and_then(|t| t.get("id").and_then(|v| v.as_str()))
+                == Some(account_id.as_str())
         });
         let account = match target.and_then(|a| a.as_table_mut()) {
             Some(t) => t,
-            None => return WsFrame::error_response("", &format!("Account not found: {account_id}")),
+            None => {
+                return WsFrame::error_response("", &format!("Account not found: {account_id}"));
+            }
         };
 
         let mut changes: Vec<String> = Vec::new();
@@ -14379,7 +16613,10 @@ impl MethodHandler {
             changes.push(format!("priority = {v}"));
         }
         if let Some(v) = params.get("monthly_budget_cents").and_then(|v| v.as_u64()) {
-            account.insert("monthly_budget_cents".into(), toml::Value::Integer(v as i64));
+            account.insert(
+                "monthly_budget_cents".into(),
+                toml::Value::Integer(v as i64),
+            );
             changes.push(format!("monthly_budget_cents = {v}"));
         }
         for key in &["profile", "email", "subscription", "label"] {
@@ -14391,23 +16628,32 @@ impl MethodHandler {
         if let Some(arr) = params.get("tags").and_then(|v| v.as_array()) {
             let tags: Vec<toml::Value> = arr
                 .iter()
-                .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(|s| toml::Value::String(s.into())))
+                .filter_map(|v| {
+                    v.as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| toml::Value::String(s.into()))
+                })
                 .collect();
             account.insert("tags".into(), toml::Value::Array(tags.clone()));
             changes.push(format!("tags = [{} entries]", tags.len()));
         }
 
         if changes.is_empty() {
-            return WsFrame::error_response("", "No valid fields to update (priority/tags/profile/email/subscription/label/monthly_budget_cents)");
+            return WsFrame::error_response(
+                "",
+                "No valid fields to update (priority/tags/profile/email/subscription/label/monthly_budget_cents)",
+            );
         }
 
         if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
             return WsFrame::error_response("", &e);
         }
         info!(account_id, ?changes, "accounts.update completed");
-        WsFrame::ok_response("", json!({ "success": true, "account_id": account_id, "changes": changes }))
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "account_id": account_id, "changes": changes }),
+        )
     }
-
 
     // ── Helpers ─────────────────────────────────────────────
 
@@ -14418,9 +16664,14 @@ impl MethodHandler {
             return true;
         }
         // 2. Check config.toml [api] section
-        let table = self.read_config_table(&self.home_dir.join("config.toml")).await;
+        let table = self
+            .read_config_table(&self.home_dir.join("config.toml"))
+            .await;
         if let Some(api) = table.get("api").and_then(|v| v.as_table())
-            && api.get("anthropic_api_key").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+            && api
+                .get("anthropic_api_key")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
         {
             return true;
         }
@@ -14448,9 +16699,8 @@ impl MethodHandler {
         path: &std::path::Path,
         table: &toml::Table,
     ) -> std::io::Result<()> {
-        let content = toml::to_string_pretty(table).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let content = toml::to_string_pretty(table)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         tokio::fs::write(path, content).await
     }
 
@@ -14553,28 +16803,31 @@ impl MethodHandler {
             }
         }
 
-        WsFrame::ok_response("", json!({
-            "available": true,
-            "period": summary.period,
-            "total_requests": summary.total_requests,
-            "total_input_tokens": summary.total_input_tokens,
-            "total_cache_read_tokens": summary.total_cache_read_tokens,
-            "total_cache_creation_tokens": summary.total_cache_creation_tokens,
-            "total_output_tokens": summary.total_output_tokens,
-            "avg_cache_efficiency": summary.avg_cache_efficiency,
-            // Alias: cache_efficiency == cache_hit_rate (both from the same formula).
-            "cache_hit_rate": summary.avg_cache_hit_rate,
-            "total_cost_millicents": summary.total_cost_millicents,
-            "total_cache_savings_millicents": summary.total_cache_savings_millicents,
-            "price_cliff": {
-                // Legacy model-agnostic warn threshold (registry may use a
-                // per-model one internally); surfaced for the UI copy.
-                "threshold_input_tokens": 180_000,
-                "requests_near_cliff": requests_near_cliff,
-                "max_input_tokens": max_input_tokens,
-                "warning": requests_near_cliff > 0,
-            },
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "available": true,
+                "period": summary.period,
+                "total_requests": summary.total_requests,
+                "total_input_tokens": summary.total_input_tokens,
+                "total_cache_read_tokens": summary.total_cache_read_tokens,
+                "total_cache_creation_tokens": summary.total_cache_creation_tokens,
+                "total_output_tokens": summary.total_output_tokens,
+                "avg_cache_efficiency": summary.avg_cache_efficiency,
+                // Alias: cache_efficiency == cache_hit_rate (both from the same formula).
+                "cache_hit_rate": summary.avg_cache_hit_rate,
+                "total_cost_millicents": summary.total_cost_millicents,
+                "total_cache_savings_millicents": summary.total_cache_savings_millicents,
+                "price_cliff": {
+                    // Legacy model-agnostic warn threshold (registry may use a
+                    // per-model one internally); surfaced for the UI copy.
+                    "threshold_input_tokens": 180_000,
+                    "requests_near_cliff": requests_near_cliff,
+                    "max_input_tokens": max_input_tokens,
+                    "warning": requests_near_cliff > 0,
+                },
+            }),
+        )
     }
 
     /// `cost.agents` — per-agent cost + cache-health rollup. `hours` defaults
@@ -14607,25 +16860,34 @@ impl MethodHandler {
     /// `cost.recent` — the last `limit` (≤500, default 20) per-request cost
     /// records, newest first.
     async fn handle_cost_recent(&self, params: Value) -> WsFrame {
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(500) as u32;
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(500) as u32;
         let Some(tel) = self.cost_telemetry() else {
             return WsFrame::ok_response("", json!({ "available": false, "records": [] }));
         };
         match tel.recent_records(limit).await {
             Ok(records) => {
-                let rows: Vec<Value> = records.iter().map(|r| json!({
-                    "agent_id": r.agent_id,
-                    "request_type": r.request_type,
-                    "model": r.model,
-                    "input_tokens": r.input_tokens,
-                    "cache_read_tokens": r.cache_read_tokens,
-                    "cache_creation_tokens": r.cache_creation_tokens,
-                    "output_tokens": r.output_tokens,
-                    "cache_efficiency": r.cache_efficiency,
-                    "cost_millicents": r.cost_millicents,
-                    "cache_savings_millicents": r.cache_savings_millicents,
-                    "created_at": r.created_at,
-                })).collect();
+                let rows: Vec<Value> = records
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "agent_id": r.agent_id,
+                            "request_type": r.request_type,
+                            "model": r.model,
+                            "input_tokens": r.input_tokens,
+                            "cache_read_tokens": r.cache_read_tokens,
+                            "cache_creation_tokens": r.cache_creation_tokens,
+                            "output_tokens": r.output_tokens,
+                            "cache_efficiency": r.cache_efficiency,
+                            "cost_millicents": r.cost_millicents,
+                            "cache_savings_millicents": r.cache_savings_millicents,
+                            "created_at": r.created_at,
+                        })
+                    })
+                    .collect();
                 WsFrame::ok_response("", json!({ "available": true, "records": rows }))
             }
             Err(e) => WsFrame::error_response("", &format!("Cost recent failed: {e}")),
@@ -14638,36 +16900,50 @@ impl MethodHandler {
         let odoo_cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
 
         if !odoo_cfg.is_configured() {
-            return WsFrame::ok_response("", json!({
-                "connected": false,
-            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "connected": false,
+                }),
+            );
         }
 
         // Decrypt credential
         let credential = match self.resolve_odoo_credential(&table) {
             Some(c) if !c.is_empty() => c,
-            _ => return WsFrame::ok_response("", json!({
-                "connected": false,
-                "error": "No credential configured",
-            })),
+            _ => {
+                return WsFrame::ok_response(
+                    "",
+                    json!({
+                        "connected": false,
+                        "error": "No credential configured",
+                    }),
+                );
+            }
         };
 
         match duduclaw_odoo::OdooConnector::connect(&odoo_cfg, &credential).await {
             Ok(conn) => {
                 let st = conn.status();
-                WsFrame::ok_response("", json!({
-                    "connected": st.connected,
-                    "edition": st.edition,
-                    "version": st.version,
-                    "uid": st.uid,
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "connected": st.connected,
+                        "edition": st.edition,
+                        "version": st.version,
+                        "uid": st.uid,
+                    }),
+                )
             }
             Err(e) => {
                 warn!("Odoo connection failed: {e}");
-                WsFrame::ok_response("", json!({
-                    "connected": false,
-                    "error": "Connection failed",
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "connected": false,
+                        "error": "Connection failed",
+                    }),
+                )
             }
         }
     }
@@ -14683,23 +16959,26 @@ impl MethodHandler {
             return WsFrame::ok_response("", json!(null));
         }
 
-        WsFrame::ok_response("", json!({
-            "url": cfg.url,
-            "db": cfg.db,
-            "protocol": cfg.protocol,
-            "auth_method": cfg.auth_method,
-            "username": cfg.username,
-            "poll_enabled": cfg.poll_enabled,
-            "poll_interval_seconds": cfg.poll_interval_seconds,
-            "poll_models": cfg.poll_models,
-            "webhook_enabled": cfg.webhook_enabled,
-            "features_crm": cfg.features_crm,
-            "features_sale": cfg.features_sale,
-            "features_inventory": cfg.features_inventory,
-            "features_accounting": cfg.features_accounting,
-            "features_project": cfg.features_project,
-            "features_hr": cfg.features_hr,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "url": cfg.url,
+                "db": cfg.db,
+                "protocol": cfg.protocol,
+                "auth_method": cfg.auth_method,
+                "username": cfg.username,
+                "poll_enabled": cfg.poll_enabled,
+                "poll_interval_seconds": cfg.poll_interval_seconds,
+                "poll_models": cfg.poll_models,
+                "webhook_enabled": cfg.webhook_enabled,
+                "features_crm": cfg.features_crm,
+                "features_sale": cfg.features_sale,
+                "features_inventory": cfg.features_inventory,
+                "features_accounting": cfg.features_accounting,
+                "features_project": cfg.features_project,
+                "features_hr": cfg.features_hr,
+            }),
+        )
     }
 
     /// Validate an Odoo model name (e.g. `crm.lead`, `sale.order`).
@@ -14707,7 +16986,9 @@ impl MethodHandler {
     fn is_valid_odoo_model(name: &str) -> bool {
         !name.is_empty()
             && name.len() < 100
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
             && !duduclaw_odoo::OdooConnector::is_model_blocked(name)
     }
 
@@ -14753,7 +17034,8 @@ impl MethodHandler {
 
         // Hostname-based checks
         let lower = host.to_ascii_lowercase();
-        lower == "localhost" || lower.ends_with(".localhost")
+        lower == "localhost"
+            || lower.ends_with(".localhost")
             || lower == "metadata.google.internal"
             || lower == "metadata.azure.internal"
     }
@@ -14791,14 +17073,30 @@ impl MethodHandler {
         // Validate URL
         let url = match params.get("url").and_then(|v| v.as_str()).map(str::trim) {
             Some(u) if Self::is_safe_odoo_url(u) => u,
-            Some(_) => return WsFrame::error_response("", "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1)"),
+            Some(_) => {
+                return WsFrame::error_response(
+                    "",
+                    "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1)",
+                );
+            }
             _ => return WsFrame::error_response("", "Missing 'url' parameter"),
         };
         // Validate database name
         let db = match params.get("db").and_then(|v| v.as_str()).map(str::trim) {
-            Some(d) if !d.is_empty() && d.len() < 64
-                && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') => d,
-            Some(_) => return WsFrame::error_response("", "Invalid database name (alphanumeric, _, - only, max 63 chars)"),
+            Some(d)
+                if !d.is_empty()
+                    && d.len() < 64
+                    && d.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+            {
+                d
+            }
+            Some(_) => {
+                return WsFrame::error_response(
+                    "",
+                    "Invalid database name (alphanumeric, _, - only, max 63 chars)",
+                );
+            }
             _ => return WsFrame::error_response("", "Missing 'db' parameter"),
         };
 
@@ -14806,14 +17104,24 @@ impl MethodHandler {
         let protocol = match params.get("protocol").and_then(|v| v.as_str()) {
             Some("xmlrpc") => "xmlrpc",
             Some("jsonrpc") | None => "jsonrpc",
-            _ => return WsFrame::error_response("", "Invalid protocol: must be 'jsonrpc' or 'xmlrpc'"),
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "Invalid protocol: must be 'jsonrpc' or 'xmlrpc'",
+                );
+            }
         };
 
         // Validate auth_method (whitelist)
         let auth_method = match params.get("auth_method").and_then(|v| v.as_str()) {
             Some("password") => "password",
             Some("api_key") | None => "api_key",
-            _ => return WsFrame::error_response("", "Invalid auth_method: must be 'api_key' or 'password'"),
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "Invalid auth_method: must be 'api_key' or 'password'",
+                );
+            }
         };
 
         let config_path = self.home_dir.join("config.toml");
@@ -14824,22 +17132,41 @@ impl MethodHandler {
         odoo.insert("url".into(), toml::Value::String(url.into()));
         odoo.insert("db".into(), toml::Value::String(db.into()));
         odoo.insert("protocol".into(), toml::Value::String(protocol.into()));
-        odoo.insert("auth_method".into(), toml::Value::String(auth_method.into()));
-        let username = params.get("username").and_then(|v| v.as_str()).unwrap_or("").trim();
+        odoo.insert(
+            "auth_method".into(),
+            toml::Value::String(auth_method.into()),
+        );
+        let username = params
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if username.len() > 256 {
             return WsFrame::error_response("", "Username too long (max 256 chars)");
         }
         odoo.insert("username".into(), toml::Value::String(username.into()));
 
         // Encrypt credentials — refuse to store if encryption is unavailable (CRIT-1)
-        if let Some(api_key) = params.get("api_key").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(api_key) = params
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             match crate::config_crypto::encrypt_value(api_key, &self.home_dir) {
-                Some(enc) => { odoo.insert("api_key_enc".into(), toml::Value::String(enc)); }
-                None => return WsFrame::error_response("", "Could not encrypt API key — keyfile write failed (disk full or permission denied). See gateway log."),
+                Some(enc) => {
+                    odoo.insert("api_key_enc".into(), toml::Value::String(enc));
+                }
+                None => {
+                    return WsFrame::error_response(
+                        "",
+                        "Could not encrypt API key — keyfile write failed (disk full or permission denied). See gateway log.",
+                    );
+                }
             }
         } else {
             // Preserve existing encrypted key if not provided
-            if let Some(existing) = table.get("odoo")
+            if let Some(existing) = table
+                .get("odoo")
                 .and_then(|v| v.as_table())
                 .and_then(|t| t.get("api_key_enc"))
                 .and_then(|v| v.as_str())
@@ -14848,14 +17175,26 @@ impl MethodHandler {
             }
         }
 
-        if let Some(password) = params.get("password").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(password) = params
+            .get("password")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             match crate::config_crypto::encrypt_value(password, &self.home_dir) {
-                Some(enc) => { odoo.insert("password_enc".into(), toml::Value::String(enc)); }
-                None => return WsFrame::error_response("", "Could not encrypt password — keyfile write failed (disk full or permission denied). See gateway log."),
+                Some(enc) => {
+                    odoo.insert("password_enc".into(), toml::Value::String(enc));
+                }
+                None => {
+                    return WsFrame::error_response(
+                        "",
+                        "Could not encrypt password — keyfile write failed (disk full or permission denied). See gateway log.",
+                    );
+                }
             }
         } else {
             // Preserve existing encrypted password if not provided
-            if let Some(existing) = table.get("odoo")
+            if let Some(existing) = table
+                .get("odoo")
                 .and_then(|v| v.as_table())
                 .and_then(|t| t.get("password_enc"))
                 .and_then(|v| v.as_str())
@@ -14867,12 +17206,18 @@ impl MethodHandler {
         // Polling config
         odoo.insert(
             "poll_enabled".into(),
-            toml::Value::Boolean(params.get("poll_enabled").and_then(|v| v.as_bool()).unwrap_or(false)),
+            toml::Value::Boolean(
+                params
+                    .get("poll_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            ),
         );
         odoo.insert(
             "poll_interval_seconds".into(),
             toml::Value::Integer(
-                params.get("poll_interval_seconds")
+                params
+                    .get("poll_interval_seconds")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(300)
                     .clamp(60, 86400),
@@ -14882,9 +17227,11 @@ impl MethodHandler {
             let arr: Vec<toml::Value> = models
                 .iter()
                 .take(50) // cap at 50 models to prevent oversized config
-                .filter_map(|v| v.as_str()
-                    .filter(|s| Self::is_valid_odoo_model(s))
-                    .map(|s| toml::Value::String(s.into())))
+                .filter_map(|v| {
+                    v.as_str()
+                        .filter(|s| Self::is_valid_odoo_model(s))
+                        .map(|s| toml::Value::String(s.into()))
+                })
                 .collect();
             odoo.insert("poll_models".into(), toml::Value::Array(arr));
         }
@@ -14892,26 +17239,53 @@ impl MethodHandler {
         // Webhook config
         odoo.insert(
             "webhook_enabled".into(),
-            toml::Value::Boolean(params.get("webhook_enabled").and_then(|v| v.as_bool()).unwrap_or(false)),
+            toml::Value::Boolean(
+                params
+                    .get("webhook_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            ),
         );
-        if let Some(secret) = params.get("webhook_secret").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(secret) = params
+            .get("webhook_secret")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             match crate::config_crypto::encrypt_value(secret, &self.home_dir) {
-                Some(enc) => { odoo.insert("webhook_secret_enc".into(), toml::Value::String(enc)); }
-                None => return WsFrame::error_response("", "Could not encrypt webhook secret — keyfile write failed (disk full or permission denied). See gateway log."),
+                Some(enc) => {
+                    odoo.insert("webhook_secret_enc".into(), toml::Value::String(enc));
+                }
+                None => {
+                    return WsFrame::error_response(
+                        "",
+                        "Could not encrypt webhook secret — keyfile write failed (disk full or permission denied). See gateway log.",
+                    );
+                }
             }
         } else {
             // Preserve existing webhook secret
-            if let Some(existing) = table.get("odoo")
+            if let Some(existing) = table
+                .get("odoo")
                 .and_then(|v| v.as_table())
                 .and_then(|t| t.get("webhook_secret_enc"))
                 .and_then(|v| v.as_str())
             {
-                odoo.insert("webhook_secret_enc".into(), toml::Value::String(existing.into()));
+                odoo.insert(
+                    "webhook_secret_enc".into(),
+                    toml::Value::String(existing.into()),
+                );
             }
         }
 
         // Feature toggles
-        for feature in &["features_crm", "features_sale", "features_inventory", "features_accounting", "features_project", "features_hr"] {
+        for feature in &[
+            "features_crm",
+            "features_sale",
+            "features_inventory",
+            "features_accounting",
+            "features_project",
+            "features_hr",
+        ] {
             if let Some(v) = params.get(*feature).and_then(|v| v.as_bool()) {
                 odoo.insert((*feature).into(), toml::Value::Boolean(v));
             }
@@ -14967,35 +17341,47 @@ impl MethodHandler {
                     match self.resolve_odoo_credential(&table) {
                         Some(c) if !c.is_empty() => (cfg, c),
                         _ => {
-                            return WsFrame::ok_response("", json!({
-                                "success": false,
-                                "message": "No credential — enter API key/password, or save once first",
-                            }))
+                            return WsFrame::ok_response(
+                                "",
+                                json!({
+                                    "success": false,
+                                    "message": "No credential — enter API key/password, or save once first",
+                                }),
+                            );
                         }
                     }
                 }
                 Err(msg) => {
-                    return WsFrame::ok_response("", json!({
-                        "success": false,
-                        "message": msg,
-                    }))
+                    return WsFrame::ok_response(
+                        "",
+                        json!({
+                            "success": false,
+                            "message": msg,
+                        }),
+                    );
                 }
             }
         } else {
             let cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
             if !cfg.is_configured() {
-                return WsFrame::ok_response("", json!({
-                    "success": false,
-                    "message": "Odoo not configured — fill URL and database, or save first",
-                }));
+                return WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": false,
+                        "message": "Odoo not configured — fill URL and database, or save first",
+                    }),
+                );
             }
             let credential = match self.resolve_odoo_credential(&table) {
                 Some(c) if !c.is_empty() => c,
                 _ => {
-                    return WsFrame::ok_response("", json!({
-                        "success": false,
-                        "message": "No API key or password configured",
-                    }))
+                    return WsFrame::ok_response(
+                        "",
+                        json!({
+                            "success": false,
+                            "message": "No API key or password configured",
+                        }),
+                    );
                 }
             };
             (cfg, credential)
@@ -15004,17 +17390,23 @@ impl MethodHandler {
         match duduclaw_odoo::OdooConnector::connect(&odoo_cfg, &credential).await {
             Ok(conn) => {
                 let st = conn.status();
-                WsFrame::ok_response("", json!({
-                    "success": true,
-                    "message": format!("Connected — {} {}", st.edition, st.version),
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": true,
+                        "message": format!("Connected — {} {}", st.edition, st.version),
+                    }),
+                )
             }
             Err(e) => {
                 warn!("Odoo test connection failed: {e}");
-                WsFrame::ok_response("", json!({
-                    "success": false,
-                    "message": format!("Connection failed: {}", Self::scrub_odoo_error(&e)),
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": false,
+                        "message": format!("Connection failed: {}", Self::scrub_odoo_error(&e)),
+                    }),
+                )
             }
         }
     }
@@ -15034,9 +17426,8 @@ impl MethodHandler {
             Some(u) if Self::is_safe_odoo_url(u) => u,
             Some(_) => {
                 return Err(
-                    "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1)"
-                        .into(),
-                )
+                    "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1)".into(),
+                );
             }
             _ => return Err("Missing 'url' parameter".into()),
         };
@@ -15046,12 +17437,13 @@ impl MethodHandler {
             Some(d)
                 if !d.is_empty()
                     && d.len() < 64
-                    && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+                    && d.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
             {
                 d
             }
             Some(_) => {
-                return Err("Invalid database name (alphanumeric, _, - only, max 63 chars)".into())
+                return Err("Invalid database name (alphanumeric, _, - only, max 63 chars)".into());
             }
             _ => return Err("Missing 'db' parameter".into()),
         };
@@ -15077,7 +17469,11 @@ impl MethodHandler {
             return Err("Username too long (max 256 chars)".into());
         }
 
-        let credential_field = if auth_method == "password" { "password" } else { "api_key" };
+        let credential_field = if auth_method == "password" {
+            "password"
+        } else {
+            "api_key"
+        };
         let credential = params
             .get(credential_field)
             .and_then(|v| v.as_str())
@@ -15122,7 +17518,8 @@ impl MethodHandler {
     /// Returns `None` if decryption fails — never returns raw ciphertext (CRIT-2).
     fn resolve_odoo_credential(&self, table: &toml::Table) -> Option<String> {
         let odoo_section = table.get("odoo")?.as_table()?;
-        let auth_method = odoo_section.get("auth_method")
+        let auth_method = odoo_section
+            .get("auth_method")
             .and_then(|v| v.as_str())
             .unwrap_or("api_key");
 
@@ -15133,7 +17530,11 @@ impl MethodHandler {
         };
 
         // Try encrypted first
-        if let Some(enc_val) = odoo_section.get(enc_field).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(enc_val) = odoo_section
+            .get(enc_field)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             if let Some(key) = crate::config_crypto::load_keyfile_public(&self.home_dir) {
                 if let Ok(engine) = duduclaw_security::crypto::CryptoEngine::new(&key) {
                     if let Ok(decrypted) = engine.decrypt_string(enc_val) {
@@ -15147,12 +17548,16 @@ impl MethodHandler {
         }
 
         // Fallback to plaintext field (legacy / dev environments)
-        let plain = odoo_section.get(plain_field)
+        let plain = odoo_section
+            .get(plain_field)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         if plain.is_some() {
-            warn!(field = plain_field, "Odoo credential stored in plaintext — re-save config to encrypt");
+            warn!(
+                field = plain_field,
+                "Odoo credential stored in plaintext — re-save config to encrypt"
+            );
         }
         plain
     }
@@ -15165,7 +17570,9 @@ impl MethodHandler {
             return Err(format!("Invalid agent_id: {agent_id}"));
         }
         let reg = self.registry.read().await;
-        let agent = reg.get(agent_id).ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+        let agent = reg
+            .get(agent_id)
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
         let path = agent.dir.join("agent.toml");
         drop(reg);
         let content = tokio::fs::read_to_string(&path)
@@ -15181,7 +17588,10 @@ impl MethodHandler {
     /// placeholder; cleartext / ciphertext is never returned. Absent block →
     /// `{ configured: false }` (fail-safe, not an error).
     async fn handle_odoo_agent_config_get(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
@@ -15192,19 +17602,31 @@ impl MethodHandler {
         let section = match table.get("odoo").and_then(|v| v.as_table()) {
             Some(s) => s,
             None => {
-                return WsFrame::ok_response("", json!({
-                    "agent_id": agent_id,
-                    "configured": false,
-                }))
+                return WsFrame::ok_response(
+                    "",
+                    json!({
+                        "agent_id": agent_id,
+                        "configured": false,
+                    }),
+                );
             }
         };
 
-        let get_str = |k: &str| section.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let get_str = |k: &str| {
+            section
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
         let get_arr = |k: &str| -> Vec<String> {
             section
                 .get(k)
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         let company_ids: Vec<i64> = section
@@ -15215,25 +17637,40 @@ impl MethodHandler {
 
         // Credential presence — never the value. `_enc` (encrypted or a
         // `secret://` ref) or legacy plaintext both count as "set".
-        let api_key_set = section.get("api_key_enc").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
-            || section.get("api_key").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
-        let password_set = section.get("password_enc").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
-            || section.get("password").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+        let api_key_set = section
+            .get("api_key_enc")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+            || section
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty());
+        let password_set = section
+            .get("password_enc")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+            || section
+                .get("password")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty());
 
-        WsFrame::ok_response("", json!({
-            "agent_id": agent_id,
-            "configured": true,
-            "profile": get_str("profile"),
-            "url": get_str("url"),
-            "db": get_str("db"),
-            "username": get_str("username"),
-            "allowed_models": get_arr("allowed_models"),
-            "allowed_actions": get_arr("allowed_actions"),
-            "company_ids": company_ids,
-            "api_key_set": api_key_set,
-            "api_key": if api_key_set { Some(SECRET_MASK_SET) } else { None },
-            "password_set": password_set,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "agent_id": agent_id,
+                "configured": true,
+                "profile": get_str("profile"),
+                "url": get_str("url"),
+                "db": get_str("db"),
+                "username": get_str("username"),
+                "allowed_models": get_arr("allowed_models"),
+                "allowed_actions": get_arr("allowed_actions"),
+                "company_ids": company_ids,
+                "api_key_set": api_key_set,
+                "api_key": if api_key_set { Some(SECRET_MASK_SET) } else { None },
+                "password_set": password_set,
+            }),
+        )
     }
 
     /// `odoo.agent_config_set {agent_id, url, db, user/username, api_key,
@@ -15244,7 +17681,11 @@ impl MethodHandler {
     /// overwrite the stored key. url/db go through the same SSRF/HTTPS/db-name
     /// validators as the global path (via `apply_odoo_to_table`).
     async fn handle_odoo_agent_config_set(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if agent_id.is_empty() || !is_valid_agent_id(&agent_id) {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
@@ -15254,8 +17695,15 @@ impl MethodHandler {
         // `username`.
         let mut odoo_obj = serde_json::Map::new();
         for key in [
-            "url", "db", "username", "api_key", "password", "profile",
-            "allowed_models", "allowed_actions", "company_ids",
+            "url",
+            "db",
+            "username",
+            "api_key",
+            "password",
+            "profile",
+            "allowed_models",
+            "allowed_actions",
+            "company_ids",
         ] {
             if let Some(v) = params.get(key) {
                 odoo_obj.insert(key.to_string(), v.clone());
@@ -15282,12 +17730,15 @@ impl MethodHandler {
             .await;
 
         match result {
-            Ok(hot_reloaded) => WsFrame::ok_response("", json!({
-                "success": true,
-                "agent_id": agent_id,
-                "changes": applied_changes,
-                "hot_reloaded": hot_reloaded,
-            })),
+            Ok(hot_reloaded) => WsFrame::ok_response(
+                "",
+                json!({
+                    "success": true,
+                    "agent_id": agent_id,
+                    "changes": applied_changes,
+                    "hot_reloaded": hot_reloaded,
+                }),
+            ),
             Err(e) => WsFrame::error_response("", &e),
         }
     }
@@ -15298,7 +17749,10 @@ impl MethodHandler {
     /// if present, else the global one. Reuses the same SSRF-safe URL validator
     /// as `odoo.configure`. Never writes to disk.
     async fn handle_odoo_agent_test(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
@@ -15314,35 +17768,61 @@ impl MethodHandler {
         let mut cfg = duduclaw_odoo::OdooConfig::from_toml(&global_table);
 
         if let Some(a) = agent_table.get("odoo").and_then(|v| v.as_table()) {
-            if let Some(u) = a.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(u) = a
+                .get("url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 cfg.url = u.to_string();
             }
-            if let Some(d) = a.get("db").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(d) = a
+                .get("db")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 cfg.db = d.to_string();
             }
-            if let Some(un) = a.get("username").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(un) = a
+                .get("username")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 cfg.username = un.to_string();
             }
-            if let Some(pr) = a.get("protocol").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(pr) = a
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 cfg.protocol = pr.to_string();
             }
-            if let Some(am) = a.get("auth_method").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(am) = a
+                .get("auth_method")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 cfg.auth_method = am.to_string();
             }
         }
 
         if !cfg.is_configured() {
-            return WsFrame::ok_response("", json!({
-                "success": false,
-                "message": "Odoo not configured for this agent (no url/db — set an override or configure the global Odoo first)",
-            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "success": false,
+                    "message": "Odoo not configured for this agent (no url/db — set an override or configure the global Odoo first)",
+                }),
+            );
         }
         // Fail-closed SSRF/HTTPS re-check on the EFFECTIVE url actually dialed.
         if !Self::is_safe_odoo_url(&cfg.url) {
-            return WsFrame::ok_response("", json!({
-                "success": false,
-                "message": "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1) and must not target a private/reserved host",
-            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "success": false,
+                    "message": "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1) and must not target a private/reserved host",
+                }),
+            );
         }
 
         // Credential: prefer the agent's, else the global one.
@@ -15354,27 +17834,36 @@ impl MethodHandler {
         let credential = match credential {
             Some(c) => c,
             None => {
-                return WsFrame::ok_response("", json!({
-                    "success": false,
-                    "message": "No API key/password — set one on this agent or on the global Odoo config",
-                }))
+                return WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": false,
+                        "message": "No API key/password — set one on this agent or on the global Odoo config",
+                    }),
+                );
             }
         };
 
         match duduclaw_odoo::OdooConnector::connect(&cfg, &credential).await {
             Ok(conn) => {
                 let st = conn.status();
-                WsFrame::ok_response("", json!({
-                    "success": true,
-                    "message": format!("Connected — {} {}", st.edition, st.version),
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": true,
+                        "message": format!("Connected — {} {}", st.edition, st.version),
+                    }),
+                )
             }
             Err(e) => {
                 warn!("Odoo agent test connection failed: {e}");
-                WsFrame::ok_response("", json!({
-                    "success": false,
-                    "message": format!("Connection failed: {}", Self::scrub_odoo_error(&e)),
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": false,
+                        "message": format!("Connection failed: {}", Self::scrub_odoo_error(&e)),
+                    }),
+                )
             }
         }
     }
@@ -15383,7 +17872,9 @@ impl MethodHandler {
     fn mask_sensitive_fields(table: &mut toml::Table) {
         let sensitive_patterns = ["token", "secret", "key", "password"];
         for (key, value) in table.iter_mut() {
-            let is_sensitive = sensitive_patterns.iter().any(|p| key.to_lowercase().contains(p));
+            let is_sensitive = sensitive_patterns
+                .iter()
+                .any(|p| key.to_lowercase().contains(p));
             match value {
                 toml::Value::String(s) if is_sensitive && !s.is_empty() => {
                     // Fully mask sensitive values — do NOT leak any prefix chars (MCP-M7)
@@ -15399,10 +17890,9 @@ impl MethodHandler {
 
     async fn handle_agents_list_filtered(&self, ctx: &UserContext, params: Value) -> WsFrame {
         // Re-scan to pick up changes
-        if let Ok(mut reg) = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            self.registry.write(),
-        ).await {
+        if let Ok(mut reg) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), self.registry.write()).await
+        {
             let _ = reg.scan().await;
         }
 
@@ -15419,7 +17909,8 @@ impl MethodHandler {
         // Real per-agent month-to-date spend from CostTelemetry. Computed once
         // per visible agent below (the rotator counter is unusable — see
         // `telemetry_spent_cents_for_agent`).
-        let mut agent_spent: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut agent_spent: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         for a in reg.list().iter() {
             let name = a.config.agent.name.clone();
             let visible_here = match &visible {
@@ -15515,7 +18006,11 @@ impl MethodHandler {
                 })
             }).collect();
 
-        info!("agents.list: returning {} agents for user {}", agents.len(), ctx.email);
+        info!(
+            "agents.list: returning {} agents for user {}",
+            agents.len(),
+            ctx.email
+        );
         WsFrame::ok_response("", json!({ "agents": agents }))
     }
 
@@ -15590,7 +18085,11 @@ impl MethodHandler {
     /// path only ever touches the caller's own layout, so "view but never edit
     /// on their behalf" is structural, not a UI courtesy.
     async fn handle_dashboard_layout_view(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let Some(target_id) = params.get("user_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+        let Some(target_id) = params
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
             return WsFrame::error_response("", "user_id is required");
         };
         let db = match self.user_db.read().await.as_ref() {
@@ -15657,18 +18156,21 @@ impl MethodHandler {
                 }
             }
         };
-        WsFrame::ok_response("", json!({
-            "user": {
-                "id": target.id,
-                "display_name": target.display_name,
-                "role": target.role.to_string().to_lowercase(),
-            },
-            "widgets": widgets,
-            "layout": layout,
-            "bound_agents": bound_agents,
-            "custom_widgets": custom_widgets,
-            "read_only": true,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "user": {
+                    "id": target.id,
+                    "display_name": target.display_name,
+                    "role": target.role.to_string().to_lowercase(),
+                },
+                "widgets": widgets,
+                "layout": layout,
+                "bound_agents": bound_agents,
+                "custom_widgets": custom_widgets,
+                "read_only": true,
+            }),
+        )
     }
 
     /// Path for a user's saved layout. The user id comes from a verified JWT
@@ -15676,7 +18178,9 @@ impl MethodHandler {
     fn dashboard_layout_path(&self, user_id: &str) -> Result<std::path::PathBuf, String> {
         let ok = !user_id.is_empty()
             && user_id.len() <= 64
-            && user_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            && user_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
         if !ok {
             return Err("invalid user id".into());
         }
@@ -15737,13 +18241,17 @@ impl MethodHandler {
             };
             // Fail-closed: an id outside the caller's own catalogue is refused
             // (never silently dropped — the client should know it drifted).
-            let is_ok = if let Some(cid) = id.strip_prefix(crate::custom_widgets::LAYOUT_ID_PREFIX) {
+            let is_ok = if let Some(cid) = id.strip_prefix(crate::custom_widgets::LAYOUT_ID_PREFIX)
+            {
                 custom_visible.contains(cid)
             } else {
                 allowed.contains(id)
             };
             if !is_ok {
-                return WsFrame::error_response("", &format!("widget '{id}' is not available to you"));
+                return WsFrame::error_response(
+                    "",
+                    &format!("widget '{id}' is not available to you"),
+                );
             }
             if !seen.insert(id.to_string()) {
                 continue; // duplicates collapse to first occurrence
@@ -15809,14 +18317,21 @@ impl MethodHandler {
                 let items: Vec<Value> = rows.iter().map(Self::custom_widget_summary).collect();
                 // 0 = unlimited; the client only renders a "/cap" suffix when > 0.
                 let max_per_user = crate::custom_widgets::max_widgets_per_user();
-                WsFrame::ok_response("", json!({ "widgets": items, "max_per_user": max_per_user }))
+                WsFrame::ok_response(
+                    "",
+                    json!({ "widgets": items, "max_per_user": max_per_user }),
+                )
             }
             Err(e) => WsFrame::error_response("", &e),
         }
     }
 
     async fn handle_widgets_custom_get(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let Some(id) = params.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+        let Some(id) = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
             return WsFrame::error_response("", "id is required");
         };
         let store = match self.custom_widget_store() {
@@ -15836,9 +18351,15 @@ impl MethodHandler {
 
     async fn handle_widgets_custom_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let description = params.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let description = params
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let html = params.get("html").and_then(|v| v.as_str()).unwrap_or("");
-        let origin_raw = params.get("origin").and_then(|v| v.as_str()).unwrap_or("ai");
+        let origin_raw = params
+            .get("origin")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ai");
         let Some(origin) = crate::custom_widgets::WidgetOrigin::parse(origin_raw) else {
             return WsFrame::error_response("", "origin must be 'html' or 'ai'");
         };
@@ -15851,14 +18372,21 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
-        match store.create(title, description, html, origin, &ctx.user_id).await {
+        match store
+            .create(title, description, html, origin, &ctx.user_id)
+            .await
+        {
             Ok(id) => WsFrame::ok_response("", json!({ "success": true, "id": id })),
             Err(e) => WsFrame::error_response("", &e),
         }
     }
 
     async fn handle_widgets_custom_update(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let Some(id) = params.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+        let Some(id) = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
             return WsFrame::error_response("", "id is required");
         };
         let title = params.get("title").and_then(|v| v.as_str());
@@ -15880,31 +18408,48 @@ impl MethodHandler {
                 Err(e) => return WsFrame::error_response("", &e),
             }
         }
-        match store.update(id, &ctx.user_id, title, description, html).await {
+        match store
+            .update(id, &ctx.user_id, title, description, html)
+            .await
+        {
             Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
             Err(e) => WsFrame::error_response("", &e),
         }
     }
 
     async fn handle_widgets_custom_remove(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let Some(id) = params.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+        let Some(id) = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
             return WsFrame::error_response("", "id is required");
         };
         let store = match self.custom_widget_store() {
             Ok(s) => s,
             Err(f) => return f,
         };
-        match store.remove(id, &ctx.user_id, ctx.role == UserRole::Admin).await {
+        match store
+            .remove(id, &ctx.user_id, ctx.role == UserRole::Admin)
+            .await
+        {
             Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
             Err(e) => WsFrame::error_response("", &e),
         }
     }
 
     async fn handle_widgets_custom_share(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let Some(id) = params.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+        let Some(id) = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
             return WsFrame::error_response("", "id is required");
         };
-        let shared = params.get("shared").and_then(|v| v.as_bool()).unwrap_or(true);
+        let shared = params
+            .get("shared")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let store = match self.custom_widget_store() {
             Ok(s) => s,
             Err(f) => return f,
@@ -15927,7 +18472,11 @@ impl MethodHandler {
         let data_sources: Vec<String> = params
             .get("data_sources")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
         let prior_html = params.get("prior_html").and_then(|v| v.as_str());
         let feedback = params.get("feedback").and_then(|v| v.as_str());
@@ -15999,7 +18548,10 @@ impl MethodHandler {
             Ok(_) => WsFrame::error_response("", "widget 產生失敗：模型回傳空內容"),
             Err(e) => WsFrame::error_response(
                 "",
-                &format!("widget 產生失敗：{}", duduclaw_core::truncate_chars(&e, 200)),
+                &format!(
+                    "widget 產生失敗：{}",
+                    duduclaw_core::truncate_chars(&e, 200)
+                ),
             ),
         }
     }
@@ -16029,7 +18581,11 @@ impl MethodHandler {
     }
 
     async fn handle_departments_create(&self, params: Value) -> WsFrame {
-        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let pairs = self.agent_department_pairs().await;
         let existing = crate::departments::list_departments(&self.home_dir, &pairs);
         match crate::departments::create_department(&self.home_dir, name, &existing) {
@@ -16042,8 +18598,15 @@ impl MethodHandler {
     }
 
     async fn handle_departments_remove(&self, params: Value) -> WsFrame {
-        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
-        let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let force = params
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let pairs = self.agent_department_pairs().await;
         let existing = crate::departments::list_departments(&self.home_dir, &pairs);
         let Some(info) = existing.iter().find(|d| d.name == name) else {
@@ -16096,9 +18659,18 @@ impl MethodHandler {
         };
 
         let email = params.get("email").and_then(|v| v.as_str()).unwrap_or("");
-        let display_name = params.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
-        let password = params.get("password").and_then(|v| v.as_str()).unwrap_or("");
-        let role_str = params.get("role").and_then(|v| v.as_str()).unwrap_or("employee");
+        let display_name = params
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let password = params
+            .get("password")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let role_str = params
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("employee");
 
         if email.is_empty() || display_name.is_empty() || password.is_empty() {
             return WsFrame::error_response("", "email, display_name, and password are required");
@@ -16125,10 +18697,17 @@ impl MethodHandler {
 
         // Optional department (install-approval routing). Validate the slug
         // if present; empty / absent ⇒ no department.
-        let department = params.get("department").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
+        let department = params
+            .get("department")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
         if let Some(d) = department {
             if !duduclaw_core::is_valid_department(d) {
-                return WsFrame::error_response("", "invalid department name (1-64 bytes, no path separators / whitespace / control chars)");
+                return WsFrame::error_response(
+                    "",
+                    "invalid department name (1-64 bytes, no path separators / whitespace / control chars)",
+                );
             }
         }
 
@@ -16136,11 +18715,20 @@ impl MethodHandler {
             Ok(mut user) => {
                 if let Some(d) = department {
                     if let Err(e) = db.set_department(&user.id, Some(d)) {
-                        return WsFrame::error_response("", &format!("user created but setting department failed: {e}"));
+                        return WsFrame::error_response(
+                            "",
+                            &format!("user created but setting department failed: {e}"),
+                        );
                     }
                     user.department = Some(d.to_string());
                 }
-                let _ = db.log_action(Some(&ctx.user_id), "user.create", Some(&user.id), Some(&format!("email={email}")), None);
+                let _ = db.log_action(
+                    Some(&ctx.user_id),
+                    "user.create",
+                    Some(&user.id),
+                    Some(&format!("email={email}")),
+                    None,
+                );
                 WsFrame::ok_response("", json!({ "user": user }))
             }
             Err(e) => WsFrame::error_response("", &format!("failed to create user: {e}")),
@@ -16159,7 +18747,10 @@ impl MethodHandler {
         };
 
         let display_name = params.get("display_name").and_then(|v| v.as_str());
-        let role = params.get("role").and_then(|v| v.as_str()).and_then(|r| r.parse::<UserRole>().ok());
+        let role = params
+            .get("role")
+            .and_then(|v| v.as_str())
+            .and_then(|r| r.parse::<UserRole>().ok());
         let password = params.get("password").and_then(|v| v.as_str());
 
         if let Some(pw) = password {
@@ -16183,7 +18774,10 @@ impl MethodHandler {
             Some(Value::String(s)) => {
                 let d = s.trim();
                 if !duduclaw_core::is_valid_department(d) {
-                    return WsFrame::error_response("", "invalid department name (1-64 bytes, no path separators / whitespace / control chars)");
+                    return WsFrame::error_response(
+                        "",
+                        "invalid department name (1-64 bytes, no path separators / whitespace / control chars)",
+                    );
                 }
                 Some(Some(d.to_string()))
             }
@@ -16195,7 +18789,10 @@ impl MethodHandler {
             Ok(()) => {
                 if let Some(dept) = department_change {
                     if let Err(e) = db.set_department(user_id, dept.as_deref()) {
-                        return WsFrame::error_response("", &format!("failed to update department: {e}"));
+                        return WsFrame::error_response(
+                            "",
+                            &format!("failed to update department: {e}"),
+                        );
                     }
                 }
                 let _ = db.log_action(Some(&ctx.user_id), "user.update", Some(user_id), None, None);
@@ -16218,7 +18815,13 @@ impl MethodHandler {
 
         match db.set_user_status(user_id, duduclaw_auth::UserStatus::Suspended) {
             Ok(()) => {
-                let _ = db.log_action(Some(&ctx.user_id), "user.suspend", Some(user_id), None, None);
+                let _ = db.log_action(
+                    Some(&ctx.user_id),
+                    "user.suspend",
+                    Some(user_id),
+                    None,
+                    None,
+                );
                 WsFrame::ok_response("", json!({"status": "suspended"}))
             }
             Err(e) => WsFrame::error_response("", &format!("failed to suspend user: {e}")),
@@ -16239,7 +18842,10 @@ impl MethodHandler {
             Some(n) => n,
             None => return WsFrame::error_response("", "agent_name is required"),
         };
-        let access_level_str = params.get("access_level").and_then(|v| v.as_str()).unwrap_or("owner");
+        let access_level_str = params
+            .get("access_level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("owner");
         let access_level: AccessLevel = match access_level_str.parse() {
             Ok(l) => l,
             Err(e) => return WsFrame::error_response("", &e),
@@ -16254,8 +18860,13 @@ impl MethodHandler {
 
         match db.bind_agent(user_id, agent_name, access_level) {
             Ok(()) => {
-                let _ = db.log_action(Some(&ctx.user_id), "user.bind_agent", Some(agent_name),
-                    Some(&format!("user={user_id}, level={access_level}")), None);
+                let _ = db.log_action(
+                    Some(&ctx.user_id),
+                    "user.bind_agent",
+                    Some(agent_name),
+                    Some(&format!("user={user_id}, level={access_level}")),
+                    None,
+                );
                 WsFrame::ok_response("", json!({"status": "bound"}))
             }
             Err(e) => WsFrame::error_response("", &format!("failed to bind agent: {e}")),
@@ -16279,8 +18890,13 @@ impl MethodHandler {
 
         match db.unbind_agent(user_id, agent_name) {
             Ok(()) => {
-                let _ = db.log_action(Some(&ctx.user_id), "user.unbind_agent", Some(agent_name),
-                    Some(&format!("user={user_id}")), None);
+                let _ = db.log_action(
+                    Some(&ctx.user_id),
+                    "user.unbind_agent",
+                    Some(agent_name),
+                    Some(&format!("user={user_id}")),
+                    None,
+                );
                 WsFrame::ok_response("", json!({"status": "unbound"}))
             }
             Err(e) => WsFrame::error_response("", &format!("failed to unbind agent: {e}")),
@@ -16319,13 +18935,23 @@ impl MethodHandler {
             }
         }
 
-        let _ = db.log_action(Some(&ctx.user_id), "user.offboard", Some(user_id),
-            Some(&format!("transferred_agents={transferred:?}, transfer_to={transfer_to:?}")), None);
+        let _ = db.log_action(
+            Some(&ctx.user_id),
+            "user.offboard",
+            Some(user_id),
+            Some(&format!(
+                "transferred_agents={transferred:?}, transfer_to={transfer_to:?}"
+            )),
+            None,
+        );
 
-        WsFrame::ok_response("", json!({
-            "status": "offboarded",
-            "transferred_agents": transferred,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "status": "offboarded",
+                "transferred_agents": transferred,
+            }),
+        )
     }
 
     async fn handle_users_me(&self, ctx: &UserContext) -> WsFrame {
@@ -16333,33 +18959,42 @@ impl MethodHandler {
             Some(db) => db.clone(),
             None => {
                 // No user DB — return context from JWT
-                return WsFrame::ok_response("", json!({
-                    "user": {
-                        "id": ctx.user_id,
-                        "email": ctx.email,
-                        "role": ctx.role.to_string(),
-                    },
-                    "bindings": [],
-                }));
+                return WsFrame::ok_response(
+                    "",
+                    json!({
+                        "user": {
+                            "id": ctx.user_id,
+                            "email": ctx.email,
+                            "role": ctx.role.to_string(),
+                        },
+                        "bindings": [],
+                    }),
+                );
             }
         };
 
         match db.get_user(&ctx.user_id) {
             Ok(Some(user)) => {
                 let bindings = db.get_user_agents(&user.id).unwrap_or_default();
-                WsFrame::ok_response("", json!({
-                    "user": user,
-                    "bindings": bindings,
-                }))
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "user": user,
+                        "bindings": bindings,
+                    }),
+                )
             }
-            _ => WsFrame::ok_response("", json!({
-                "user": {
-                    "id": ctx.user_id,
-                    "email": ctx.email,
-                    "role": ctx.role.to_string(),
-                },
-                "bindings": [],
-            })),
+            _ => WsFrame::ok_response(
+                "",
+                json!({
+                    "user": {
+                        "id": ctx.user_id,
+                        "email": ctx.email,
+                        "role": ctx.role.to_string(),
+                    },
+                    "bindings": [],
+                }),
+            ),
         }
     }
 
@@ -16375,7 +19010,10 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "user system not initialized"),
         };
 
-        let current = params.get("current_password").and_then(|v| v.as_str()).unwrap_or("");
+        let current = params
+            .get("current_password")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let new_password = match params.get("new_password").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return WsFrame::error_response("", "new_password is required"),
@@ -16396,7 +19034,13 @@ impl MethodHandler {
 
         // Verify the current password (timing-safe inside verify_password).
         if db.verify_password(&user.email, current).is_err() {
-            let _ = db.log_action(Some(&ctx.user_id), "password.change_failed", Some(&ctx.user_id), None, None);
+            let _ = db.log_action(
+                Some(&ctx.user_id),
+                "password.change_failed",
+                Some(&ctx.user_id),
+                None,
+                None,
+            );
             return WsFrame::error_response("", "current password is incorrect");
         }
 
@@ -16406,7 +19050,13 @@ impl MethodHandler {
 
         match db.update_user(&ctx.user_id, None, None, Some(new_password)) {
             Ok(()) => {
-                let _ = db.log_action(Some(&ctx.user_id), "password.change", Some(&ctx.user_id), None, None);
+                let _ = db.log_action(
+                    Some(&ctx.user_id),
+                    "password.change",
+                    Some(&ctx.user_id),
+                    None,
+                    None,
+                );
                 WsFrame::ok_response("", json!({"status": "changed"}))
             }
             Err(e) => WsFrame::error_response("", &format!("failed to change password: {e}")),
@@ -16421,7 +19071,11 @@ impl MethodHandler {
 
         let user_id = params.get("user_id").and_then(|v| v.as_str());
         let action = params.get("action").and_then(|v| v.as_str());
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).min(1000) as u32;
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(100)
+            .min(1000) as u32;
 
         match db.query_audit_log(user_id, action, limit) {
             Ok(entries) => WsFrame::ok_response("", json!({ "entries": entries })),
@@ -16442,7 +19096,7 @@ impl MethodHandler {
     /// are skipped with a warning so a malformed user file never breaks
     /// the dashboard.
     async fn handle_marketplace_list(&self) -> WsFrame {
-        use duduclaw_agent::mcp_template::{marketplace_catalog, McpCatalogItem};
+        use duduclaw_agent::mcp_template::{McpCatalogItem, marketplace_catalog};
 
         let mut servers: Vec<McpCatalogItem> = marketplace_catalog();
 
@@ -16489,16 +19143,22 @@ impl MethodHandler {
         let mut servers_json = match serde_json::to_value(&servers) {
             Ok(Value::Array(arr)) => arr,
             Ok(_) => Vec::new(),
-            Err(e) => return WsFrame::error_response(
-                "",
-                &format!("Failed to serialize marketplace catalog: {e}"),
-            ),
+            Err(e) => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Failed to serialize marketplace catalog: {e}"),
+                );
+            }
         };
 
         // Annotate each server with its backend-derived installed_by list so the
         // dashboard reflects real `.mcp.json` state instead of ephemeral UI state.
         for entry in servers_json.iter_mut() {
-            let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let agents = installed_by.get(&id).cloned().unwrap_or_default();
             if let Value::Object(map) = entry {
                 map.insert("installed_by".to_string(), json!(agents));
@@ -16514,7 +19174,8 @@ impl MethodHandler {
     async fn marketplace_installed_map(&self) -> std::collections::HashMap<String, Vec<String>> {
         use duduclaw_agent::mcp_template::read_mcp_config;
 
-        let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         let agents_dir = self.home_dir.join("agents");
         if let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
@@ -16547,7 +19208,9 @@ impl MethodHandler {
     /// user-contributed `~/.duduclaw/marketplace.json`, then reuses the
     /// same `add_server_to_config` path as `mcp.update`.
     async fn handle_marketplace_install(&self, params: Value) -> WsFrame {
-        use duduclaw_agent::mcp_template::{add_server_to_config, marketplace_catalog, McpCatalogItem};
+        use duduclaw_agent::mcp_template::{
+            McpCatalogItem, add_server_to_config, marketplace_catalog,
+        };
 
         let id = match params.get("id").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -16582,7 +19245,12 @@ impl MethodHandler {
 
         let item = match catalog.into_iter().find(|c| c.id == id) {
             Some(c) => c,
-            None => return WsFrame::error_response("", &format!("Marketplace server '{id}' not found")),
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Marketplace server '{id}' not found"),
+                );
+            }
         };
 
         let server_name = item.id.clone();
@@ -16598,11 +19266,20 @@ impl MethodHandler {
                 &format!(
                     "Security scan rejected MCP server '{server_name}': risk {:?}: {}",
                     scan.risk_level,
-                    scan.findings.iter().take(5).map(|f| f.description.as_str()).collect::<Vec<_>>().join("; "),
+                    scan.findings
+                        .iter()
+                        .take(5)
+                        .map(|f| f.description.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
                 ),
             );
         }
-        match tokio::task::spawn_blocking(move || add_server_to_config(&agent_dir, &server_name, &def)).await {
+        match tokio::task::spawn_blocking(move || {
+            add_server_to_config(&agent_dir, &server_name, &def)
+        })
+        .await
+        {
             Ok(Ok(())) => {
                 info!(server = %id, agent = %agent_id, "Marketplace server installed");
                 WsFrame::ok_response("", json!({ "success": true, "agent_id": agent_id }))
@@ -16630,8 +19307,8 @@ impl MethodHandler {
         text: &str,
         fallback_name: &str,
     ) -> Result<Vec<(String, duduclaw_agent::mcp_template::McpServerDef, String)>, String> {
-        let value: Value = serde_json::from_str(text)
-            .map_err(|e| format!("not valid JSON: {e}"))?;
+        let value: Value =
+            serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
         Self::parse_mcp_manifest_value(&value, fallback_name)
     }
 
@@ -16649,12 +19326,22 @@ impl MethodHandler {
     fn sanitize_mcp_name(raw: &str, fallback: &str) -> String {
         let cleaned: String = raw
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .take(64)
             .collect::<String>()
             .trim_matches('-')
             .to_string();
-        if cleaned.is_empty() { fallback.to_string() } else { cleaned }
+        if cleaned.is_empty() {
+            fallback.to_string()
+        } else {
+            cleaned
+        }
     }
 
     fn parse_mcp_manifest_value(
@@ -16697,7 +19384,10 @@ impl MethodHandler {
         let has_registry_arrays = value.get("packages").map(|v| v.is_array()).unwrap_or(false)
             || value.get("remotes").map(|v| v.is_array()).unwrap_or(false);
         if has_registry_arrays {
-            let reg_name = value.get("name").and_then(|v| v.as_str()).unwrap_or(fallback_name);
+            let reg_name = value
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(fallback_name);
             let base_name = Self::sanitize_mcp_name(reg_name, fallback_name);
             let description = value
                 .get("description")
@@ -16706,7 +19396,12 @@ impl MethodHandler {
                 .to_string();
             let mut out = Vec::new();
 
-            for pkg in value.get("packages").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]) {
+            for pkg in value
+                .get("packages")
+                .and_then(|v| v.as_array())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+            {
                 let registry = pkg
                     .get("registryType")
                     .or_else(|| pkg.get("registry_name"))
@@ -16734,7 +19429,12 @@ impl MethodHandler {
                     },
                     "oci" => McpServerDef {
                         command: "docker".into(),
-                        args: vec!["run".into(), "-i".into(), "--rm".into(), identifier.to_string()],
+                        args: vec![
+                            "run".into(),
+                            "-i".into(),
+                            "--rm".into(),
+                            identifier.to_string(),
+                        ],
                         env: std::collections::HashMap::new(),
                     },
                     _ => continue,
@@ -16742,7 +19442,12 @@ impl MethodHandler {
                 out.push((base_name.clone(), def, description.clone()));
             }
 
-            for remote in value.get("remotes").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]) {
+            for remote in value
+                .get("remotes")
+                .and_then(|v| v.as_array())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+            {
                 if let Some(url) = remote.get("url").and_then(|v| v.as_str()) {
                     out.push((
                         base_name.clone(),
@@ -16817,7 +19522,9 @@ impl MethodHandler {
     }
 
     /// Serialize a scan result into the same JSON shape as skill vetting.
-    fn mcp_scan_to_json(scan: &crate::skill_lifecycle::security_scanner::SecurityScanResult) -> Value {
+    fn mcp_scan_to_json(
+        scan: &crate::skill_lifecycle::security_scanner::SecurityScanResult,
+    ) -> Value {
         json!({
             "passed": scan.passed,
             "risk_level": format!("{:?}", scan.risk_level),
@@ -16852,8 +19559,13 @@ impl MethodHandler {
         // snippets in fenced code blocks — how most MCP repos document setup);
         // blob/direct -> one URL (markdown content also gets snippet
         // extraction via manifest_from_text).
-        const MANIFEST_FILES: [&str; 5] =
-            [".mcp.json", "mcp.json", "server.json", "mcp-server.json", "README.md"];
+        const MANIFEST_FILES: [&str; 5] = [
+            ".mcp.json",
+            "mcp.json",
+            "server.json",
+            "mcp-server.json",
+            "README.md",
+        ];
         let is_github = host == "github.com" || host == "www.github.com";
         let is_gitlab = host == "gitlab.com" || host == "www.gitlab.com";
         let github_repo_root = is_github && !path.contains("/blob/");
@@ -16866,14 +19578,20 @@ impl MethodHandler {
             None
         };
         let candidates: Vec<String> = if let Some(base) = &raw_base {
-            MANIFEST_FILES.iter().map(|f| format!("{base}/{f}")).collect()
+            MANIFEST_FILES
+                .iter()
+                .map(|f| format!("{base}/{f}"))
+                .collect()
         } else if is_github {
             vec![format!(
                 "https://raw.githubusercontent.com{}",
                 path.replacen("/blob/", "/", 1)
             )]
         } else if is_gitlab {
-            vec![format!("https://gitlab.com{}", path.replacen("/-/blob/", "/-/raw/", 1))]
+            vec![format!(
+                "https://gitlab.com{}",
+                path.replacen("/-/blob/", "/-/raw/", 1)
+            )]
         } else {
             vec![url.clone()]
         };
@@ -16885,15 +19603,28 @@ impl MethodHandler {
             .unwrap_or("imported")
             .trim_end_matches(".json")
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .take(64)
             .collect::<String>()
             .trim_matches('-')
             .to_string();
-        let fallback_name = if fallback_name.is_empty() { "imported".to_string() } else { fallback_name };
+        let fallback_name = if fallback_name.is_empty() {
+            "imported".to_string()
+        } else {
+            fallback_name
+        };
 
         let mut tried: Vec<String> = Vec::new();
-        let mut found: Option<(String, Vec<(String, duduclaw_agent::mcp_template::McpServerDef, String)>)> = None;
+        let mut found: Option<(
+            String,
+            Vec<(String, duduclaw_agent::mcp_template::McpServerDef, String)>,
+        )> = None;
 
         for candidate in &candidates {
             if let Err(e) = crate::web_fetch::validate_url(candidate) {
@@ -16941,7 +19672,11 @@ impl MethodHandler {
                                 };
                                 found = Some((
                                     pkg_url.clone(),
-                                    vec![(server_name, def, format!("{desc} (inferred from package.json)"))],
+                                    vec![(
+                                        server_name,
+                                        def,
+                                        format!("{desc} (inferred from package.json)"),
+                                    )],
                                 ));
                             } else {
                                 tried.push("package.json: no bin field (not npx-runnable)".into());
@@ -16980,11 +19715,14 @@ impl MethodHandler {
             })
             .collect();
         info!(url = %resolved, servers = servers_json.len(), "MCP import manifest fetched and scanned");
-        WsFrame::ok_response("", json!({
-            "source_url": url,
-            "resolved_url": resolved,
-            "servers": servers_json,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "source_url": url,
+                "resolved_url": resolved,
+                "servers": servers_json,
+            }),
+        )
     }
 
     /// Trailing path segment of a candidate URL for compact error reporting.
@@ -17041,9 +19779,15 @@ impl MethodHandler {
             if !block.contains("\"mcpServers\"") {
                 continue;
             }
-            let Some(json_str) = Self::first_json_object(block) else { continue };
-            let Ok(value) = serde_json::from_str::<Value>(&json_str) else { continue };
-            let Ok(servers) = Self::parse_mcp_manifest_value(&value, fallback_name) else { continue };
+            let Some(json_str) = Self::first_json_object(block) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&json_str) else {
+                continue;
+            };
+            let Ok(servers) = Self::parse_mcp_manifest_value(&value, fallback_name) else {
+                continue;
+            };
             for (name, def, desc) in servers {
                 let key = format!("{name}|{}|{}", def.command, def.args.join("\u{1f}"));
                 if seen.insert(key) {
@@ -17093,7 +19837,7 @@ impl MethodHandler {
     /// The definition is re-scanned server-side and rejected fail-closed at
     /// risk ≥ High — the fetch RPC's verdict cannot be replayed or tampered.
     async fn handle_mcp_import_install(&self, params: Value) -> WsFrame {
-        use duduclaw_agent::mcp_template::{add_server_to_config, McpServerDef};
+        use duduclaw_agent::mcp_template::{McpServerDef, add_server_to_config};
 
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -17108,7 +19852,12 @@ impl MethodHandler {
         }
         let server_name = match params.get("server_name").and_then(|v| v.as_str()) {
             Some(s) if crate::mcp_scan::is_valid_mcp_server_name(s) => s.to_string(),
-            _ => return WsFrame::error_response("", "Invalid server_name (allowed: A-Za-z0-9._- max 64)"),
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "Invalid server_name (allowed: A-Za-z0-9._- max 64)",
+                );
+            }
         };
         let def: McpServerDef = match params.get("server_def") {
             Some(v) => match serde_json::from_value(v.clone()) {
@@ -17132,7 +19881,12 @@ impl MethodHandler {
                     "Security scan rejected MCP server '{server_name}': risk {:?}, {} finding(s): {}",
                     scan.risk_level,
                     scan.findings.len(),
-                    scan.findings.iter().take(5).map(|f| f.description.as_str()).collect::<Vec<_>>().join("; "),
+                    scan.findings
+                        .iter()
+                        .take(5)
+                        .map(|f| f.description.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
                 ),
             );
         }
@@ -17149,7 +19903,11 @@ impl MethodHandler {
         // Optionally persist into the user marketplace catalog so the server
         // shows up alongside the built-ins for future installs.
         let mut catalog_added = false;
-        if params.get("add_to_catalog").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if params
+            .get("add_to_catalog")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             let description = params
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -17160,30 +19918,39 @@ impl MethodHandler {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            match self.append_to_user_marketplace(&server_name, &def, &description, &source_url).await {
+            match self
+                .append_to_user_marketplace(&server_name, &def, &description, &source_url)
+                .await
+            {
                 Ok(added) => catalog_added = added,
                 Err(e) => {
                     // Install already succeeded — report the partial failure
                     // honestly instead of failing the whole call.
                     warn!(server = %server_name, error = %e, "installed but failed to update marketplace.json");
-                    return WsFrame::ok_response("", json!({
-                        "success": true,
-                        "agent_id": agent_id,
-                        "server_name": server_name,
-                        "catalog_added": false,
-                        "warning": format!("installed, but adding to the marketplace catalog failed: {e}"),
-                    }));
+                    return WsFrame::ok_response(
+                        "",
+                        json!({
+                            "success": true,
+                            "agent_id": agent_id,
+                            "server_name": server_name,
+                            "catalog_added": false,
+                            "warning": format!("installed, but adding to the marketplace catalog failed: {e}"),
+                        }),
+                    );
                 }
             }
         }
 
         info!(server = %server_name, agent = %agent_id, catalog = catalog_added, "MCP server imported from URL");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "agent_id": agent_id,
-            "server_name": server_name,
-            "catalog_added": catalog_added,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "agent_id": agent_id,
+                "server_name": server_name,
+                "catalog_added": catalog_added,
+            }),
+        )
     }
 
     /// Append an imported server to `~/.duduclaw/marketplace.json` (dedup by id).
@@ -17268,14 +20035,18 @@ impl MethodHandler {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                let servers: Vec<Value> = config.mcp_servers.iter().map(|(k, v)| {
-                    json!({
-                        "name": k,
-                        "command": v.command,
-                        "args": v.args,
-                        "env": v.env,
+                let servers: Vec<Value> = config
+                    .mcp_servers
+                    .iter()
+                    .map(|(k, v)| {
+                        json!({
+                            "name": k,
+                            "command": v.command,
+                            "args": v.args,
+                            "env": v.env,
+                        })
                     })
-                }).collect();
+                    .collect();
                 agents.push(json!({
                     "agent_id": name,
                     "servers": servers,
@@ -17283,27 +20054,32 @@ impl MethodHandler {
             }
         }
 
-        let catalog: Vec<Value> = marketplace_catalog().iter().map(|item| {
-            json!({
-                "id": item.id,
-                "name": item.name,
-                "description": item.description,
-                "category": item.category,
-                "requires_oauth": item.requires_oauth,
-                "default_def": {
-                    "command": item.default_def.command,
-                    "args": item.default_def.args,
-                    "env": item.default_def.env,
-                },
-                "required_env": item.required_env,
+        let catalog: Vec<Value> = marketplace_catalog()
+            .iter()
+            .map(|item| {
+                json!({
+                    "id": item.id,
+                    "name": item.name,
+                    "description": item.description,
+                    "category": item.category,
+                    "requires_oauth": item.requires_oauth,
+                    "default_def": {
+                        "command": item.default_def.command,
+                        "args": item.default_def.args,
+                        "env": item.default_def.env,
+                    },
+                    "required_env": item.required_env,
+                })
             })
-        }).collect();
+            .collect();
 
         WsFrame::ok_response("", json!({ "agents": agents, "catalog": catalog }))
     }
 
     async fn handle_mcp_update(&self, params: &Value) -> WsFrame {
-        use duduclaw_agent::mcp_template::{add_server_to_config, remove_server_from_config, McpServerDef};
+        use duduclaw_agent::mcp_template::{
+            McpServerDef, add_server_to_config, remove_server_from_config,
+        };
 
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) => id,
@@ -17332,9 +20108,19 @@ impl MethodHandler {
                 let def: McpServerDef = match params.get("server_def") {
                     Some(v) => match serde_json::from_value(v.clone()) {
                         Ok(d) => d,
-                        Err(e) => return WsFrame::error_response("", &format!("Invalid server_def: {e}")),
+                        Err(e) => {
+                            return WsFrame::error_response(
+                                "",
+                                &format!("Invalid server_def: {e}"),
+                            );
+                        }
                     },
-                    None => return WsFrame::error_response("", "server_def is required for add action"),
+                    None => {
+                        return WsFrame::error_response(
+                            "",
+                            "server_def is required for add action",
+                        );
+                    }
                 };
                 // Same fail-closed gate as mcp.import.install — spawning an MCP
                 // server runs a real process, so a shell/downloader definition
@@ -17347,13 +20133,20 @@ impl MethodHandler {
                         &format!(
                             "Security scan rejected MCP server '{server_name}': risk {:?}: {}",
                             scan.risk_level,
-                            scan.findings.iter().take(5).map(|f| f.description.as_str()).collect::<Vec<_>>().join("; "),
+                            scan.findings
+                                .iter()
+                                .take(5)
+                                .map(|f| f.description.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; "),
                         ),
                     );
                 }
                 let ad = agent_dir.clone();
                 let sn = server_name.to_string();
-                match tokio::task::spawn_blocking(move || add_server_to_config(&ad, &sn, &def)).await {
+                match tokio::task::spawn_blocking(move || add_server_to_config(&ad, &sn, &def))
+                    .await
+                {
                     Ok(Ok(())) => WsFrame::ok_response("", json!({ "success": true })),
                     Ok(Err(e)) => WsFrame::error_response("", &e),
                     Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
@@ -17362,13 +20155,17 @@ impl MethodHandler {
             "remove" => {
                 let ad = agent_dir.clone();
                 let sn = server_name.to_string();
-                match tokio::task::spawn_blocking(move || remove_server_from_config(&ad, &sn)).await {
+                match tokio::task::spawn_blocking(move || remove_server_from_config(&ad, &sn)).await
+                {
                     Ok(Ok(())) => WsFrame::ok_response("", json!({ "success": true })),
                     Ok(Err(e)) => WsFrame::error_response("", &e),
                     Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
                 }
             }
-            _ => WsFrame::error_response("", &format!("Unknown action: {action}. Use 'add' or 'remove'")),
+            _ => WsFrame::error_response(
+                "",
+                &format!("Unknown action: {action}. Use 'add' or 'remove'"),
+            ),
         }
     }
 
@@ -17381,31 +20178,34 @@ impl MethodHandler {
         let redirect_uri = format!("http://localhost:3000/api/mcp/oauth/callback");
         let providers = mcp_oauth::builtin_providers(&redirect_uri);
 
-        let results: Vec<Value> = providers.iter().map(|p| {
-            let token = mcp_oauth::get_token(&self.home_dir, &p.provider_id);
-            let status = match &token {
-                Some(t) => {
-                    if let Some(exp) = t.expires_at {
-                        if chrono::Utc::now() >= exp {
-                            "expired"
+        let results: Vec<Value> = providers
+            .iter()
+            .map(|p| {
+                let token = mcp_oauth::get_token(&self.home_dir, &p.provider_id);
+                let status = match &token {
+                    Some(t) => {
+                        if let Some(exp) = t.expires_at {
+                            if chrono::Utc::now() >= exp {
+                                "expired"
+                            } else {
+                                "authenticated"
+                            }
                         } else {
                             "authenticated"
                         }
-                    } else {
-                        "authenticated"
                     }
-                }
-                None => "none",
-            };
-            json!({
-                "provider_id": p.provider_id,
-                "auth_url": p.auth_url,
-                "scopes": p.scopes,
-                "configured": !p.client_id.is_empty(),
-                "status": status,
-                "expires_at": token.and_then(|t| t.expires_at),
+                    None => "none",
+                };
+                json!({
+                    "provider_id": p.provider_id,
+                    "auth_url": p.auth_url,
+                    "scopes": p.scopes,
+                    "configured": !p.client_id.is_empty(),
+                    "status": status,
+                    "expires_at": token.and_then(|t| t.expires_at),
+                })
             })
-        }).collect();
+            .collect();
 
         WsFrame::ok_response("", json!({ "providers": results }))
     }
@@ -17419,8 +20219,16 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "provider_id is required"),
         };
 
-        let client_id = params.get("client_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let client_secret = params.get("client_secret").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let client_id = params
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let client_secret = params
+            .get("client_secret")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         // Find the built-in provider or create a custom one
         let redirect_uri = format!("http://localhost:3000/api/mcp/oauth/callback");
@@ -17431,11 +20239,24 @@ impl MethodHandler {
                 provider_id: provider_id.clone(),
                 client_id: String::new(),
                 client_secret: String::new(),
-                auth_url: params.get("auth_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                token_url: params.get("token_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                scopes: params.get("scopes")
+                auth_url: params
+                    .get("auth_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                token_url: params
+                    .get("token_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                scopes: params
+                    .get("scopes")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 redirect_uri: redirect_uri.clone(),
             });
@@ -17449,10 +20270,16 @@ impl MethodHandler {
         }
 
         if config.client_id.is_empty() {
-            return WsFrame::error_response("", "client_id is required (provide in params or pre-configure)");
+            return WsFrame::error_response(
+                "",
+                "client_id is required (provide in params or pre-configure)",
+            );
         }
         if config.auth_url.is_empty() || config.token_url.is_empty() {
-            return WsFrame::error_response("", "auth_url and token_url are required for custom providers");
+            return WsFrame::error_response(
+                "",
+                "auth_url and token_url are required for custom providers",
+            );
         }
 
         // Generate PKCE
@@ -17479,10 +20306,13 @@ impl MethodHandler {
 
         info!(provider = %provider_id, "MCP OAuth flow started");
 
-        WsFrame::ok_response("", json!({
-            "auth_url": auth_url,
-            "state": state,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "auth_url": auth_url,
+                "state": state,
+            }),
+        )
     }
 
     /// Check if a provider's OAuth flow has completed (token exists).
@@ -17496,14 +20326,20 @@ impl MethodHandler {
 
         let token = mcp_oauth::get_token(&self.home_dir, provider_id);
         match token {
-            Some(t) => WsFrame::ok_response("", json!({
-                "authenticated": true,
-                "expires_at": t.expires_at,
-                "scopes": t.scopes,
-            })),
-            None => WsFrame::ok_response("", json!({
-                "authenticated": false,
-            })),
+            Some(t) => WsFrame::ok_response(
+                "",
+                json!({
+                    "authenticated": true,
+                    "expires_at": t.expires_at,
+                    "scopes": t.scopes,
+                }),
+            ),
+            None => WsFrame::ok_response(
+                "",
+                json!({
+                    "authenticated": false,
+                }),
+            ),
         }
     }
 
@@ -17567,13 +20403,19 @@ async fn check_docker() -> (&'static str, String) {
                 return ("pass", format!("{cmd_name} daemon is running"));
             }
             Ok(_) => {
-                return ("warn", format!("{cmd_name} found but daemon is not running"));
+                return (
+                    "warn",
+                    format!("{cmd_name} found but daemon is not running"),
+                );
             }
             Err(_) => {} // try next
         }
     }
 
-    ("warn", "No container runtime (docker/podman) found in PATH".to_string())
+    (
+        "warn",
+        "No container runtime (docker/podman) found in PATH".to_string(),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -17636,7 +20478,11 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
-        let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if title.is_empty() {
             return WsFrame::error_response("", "title is required");
         }
@@ -17653,8 +20499,16 @@ impl MethodHandler {
             .unwrap_or("")
             .trim()
             .to_string();
-        let description = params.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let priority = params.get("priority").and_then(|v| v.as_str()).unwrap_or("medium").to_string();
+        let description = params
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let priority = params
+            .get("priority")
+            .and_then(|v| v.as_str())
+            .unwrap_or("medium")
+            .to_string();
         let tags = params
             .get("tags")
             .and_then(|v| v.as_array())
@@ -17672,10 +20526,18 @@ impl MethodHandler {
             description,
             priority,
             assigned_to.clone(),
-            if ctx.user_id.is_empty() { "system" } else { &ctx.user_id }.to_string(),
+            if ctx.user_id.is_empty() {
+                "system"
+            } else {
+                &ctx.user_id
+            }
+            .to_string(),
         );
         row.tags = tags;
-        row.parent_task_id = params.get("parent_task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        row.parent_task_id = params
+            .get("parent_task_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         if let Err(e) = store.insert_task(&row).await {
             return WsFrame::error_response("", &format!("create task: {e}"));
@@ -17694,8 +20556,10 @@ impl MethodHandler {
         let _ = store.append_activity(&activity).await;
 
         let task_json = task_row_to_json(&row);
-        self.broadcast_event("task.created", task_json.clone()).await;
-        self.broadcast_event("activity.new", activity_row_to_json(&activity)).await;
+        self.broadcast_event("task.created", task_json.clone())
+            .await;
+        self.broadcast_event("activity.new", activity_row_to_json(&activity))
+            .await;
         self.emit_autopilot_event(crate::autopilot_engine::AutopilotEvent::TaskCreated {
             task: task_json.clone(),
         })
@@ -17757,14 +20621,14 @@ impl MethodHandler {
                         return WsFrame::error_response(
                             "",
                             "depends_on must be a JSON array of task ids",
-                        )
+                        );
                     }
                 },
                 _ => {
                     return WsFrame::error_response(
                         "",
                         "depends_on must be a JSON array of task ids",
-                    )
+                    );
                 }
             };
             for dep in &deps {
@@ -17774,10 +20638,10 @@ impl MethodHandler {
                         return WsFrame::error_response(
                             "",
                             &format!("depends_on task not found: {dep}"),
-                        )
+                        );
                     }
                     Err(e) => {
-                        return WsFrame::error_response("", &format!("validate depends_on: {e}"))
+                        return WsFrame::error_response("", &format!("validate depends_on: {e}"));
                     }
                 }
             }
@@ -17789,12 +20653,11 @@ impl MethodHandler {
         match store.update_task(task_id, &params).await {
             Ok(Some(row)) => {
                 let task_json = task_row_to_json(&row);
-                self.broadcast_event("task.updated", task_json.clone()).await;
-                self.emit_autopilot_event(
-                    crate::autopilot_engine::AutopilotEvent::TaskUpdated {
-                        task: task_json.clone(),
-                    },
-                )
+                self.broadcast_event("task.updated", task_json.clone())
+                    .await;
+                self.emit_autopilot_event(crate::autopilot_engine::AutopilotEvent::TaskUpdated {
+                    task: task_json.clone(),
+                })
                 .await;
 
                 // Emit TaskStatusChanged when status actually changed.
@@ -17833,7 +20696,8 @@ impl MethodHandler {
                             metadata: None,
                         };
                         let _ = store.append_activity(&activity).await;
-                        self.broadcast_event("activity.new", activity_row_to_json(&activity)).await;
+                        self.broadcast_event("activity.new", activity_row_to_json(&activity))
+                            .await;
                     }
 
                     // ── S1 (PORTICO): subgoal closed ⇒ auto-revoke caps ──
@@ -17844,7 +20708,11 @@ impl MethodHandler {
                         match crate::capability::CapabilityBroker::open(&self.home_dir) {
                             Ok(caps) => match caps.close_scope(task_id).await {
                                 Ok(n) if n > 0 => {
-                                    tracing::info!(task_id, revoked = n, "task done — capabilities auto-revoked");
+                                    tracing::info!(
+                                        task_id,
+                                        revoked = n,
+                                        "task done — capabilities auto-revoked"
+                                    );
                                 }
                                 Ok(_) => {}
                                 Err(e) => {
@@ -17890,7 +20758,8 @@ impl MethodHandler {
         }
         match store.remove_task(task_id).await {
             Ok(true) => {
-                self.broadcast_event("task.removed", json!({ "task_id": task_id })).await;
+                self.broadcast_event("task.removed", json!({ "task_id": task_id }))
+                    .await;
                 WsFrame::ok_response("", json!({ "success": true }))
             }
             Ok(false) => WsFrame::error_response("", &format!("Task not found: {task_id}")),
@@ -17900,7 +20769,10 @@ impl MethodHandler {
 
     async fn handle_tasks_assign(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if task_id.is_empty() || agent_id.is_empty() {
             return WsFrame::error_response("", "task_id and agent_id are required");
         }
@@ -17935,7 +20807,10 @@ impl MethodHandler {
             }
             Ok(None) => {
                 if ctx.is_admin() {
-                    Err(WsFrame::error_response("", &format!("Task not found: {task_id}")))
+                    Err(WsFrame::error_response(
+                        "",
+                        &format!("Task not found: {task_id}"),
+                    ))
                 } else {
                     Err(WsFrame::error_response("", "permission denied"))
                 }
@@ -17967,7 +20842,11 @@ impl MethodHandler {
         }
         // CJK-safe length cap on the char count (never slices mid-codepoint).
         let body = duduclaw_core::truncate_chars(body_raw.trim(), Self::MAX_COMMENT_CHARS);
-        let author = if ctx.user_id.is_empty() { "system" } else { ctx.user_id.as_str() };
+        let author = if ctx.user_id.is_empty() {
+            "system"
+        } else {
+            ctx.user_id.as_str()
+        };
         let row = CommentRow {
             id: uuid::Uuid::new_v4().to_string(),
             task_id: task_id.to_string(),
@@ -17980,7 +20859,8 @@ impl MethodHandler {
         }
         let comment_json = comment_row_to_json(&row);
         // Surface the new comment to every open dashboard tab in real time.
-        self.broadcast_event("task.comment", comment_json.clone()).await;
+        self.broadcast_event("task.comment", comment_json.clone())
+            .await;
         WsFrame::ok_response("", json!({ "comment": comment_json }))
     }
 
@@ -18037,7 +20917,10 @@ impl MethodHandler {
             }
             Ok(None) => {
                 if ctx.is_admin() {
-                    Err(WsFrame::error_response("", &format!("Plan not found: {plan_id}")))
+                    Err(WsFrame::error_response(
+                        "",
+                        &format!("Plan not found: {plan_id}"),
+                    ))
                 } else {
                     Err(WsFrame::error_response("", "permission denied"))
                 }
@@ -18065,7 +20948,8 @@ impl MethodHandler {
             metadata: Some(json!({ "plan_id": plan.id }).to_string()),
         };
         let _ = store.append_activity(&activity).await;
-        self.broadcast_event("activity.new", activity_row_to_json(&activity)).await;
+        self.broadcast_event("activity.new", activity_row_to_json(&activity))
+            .await;
         self.broadcast_event(
             "plan.updated",
             json!({ "plan_id": plan.id, "agent_id": plan.agent_id }),
@@ -18075,7 +20959,11 @@ impl MethodHandler {
 
     /// Actor label for activity summaries: the logged-in user or "system".
     fn plan_actor(ctx: &UserContext) -> &str {
-        if ctx.user_id.is_empty() { "system" } else { ctx.user_id.as_str() }
+        if ctx.user_id.is_empty() {
+            "system"
+        } else {
+            ctx.user_id.as_str()
+        }
     }
 
     async fn handle_plans_list(&self, params: Value) -> WsFrame {
@@ -18083,8 +20971,14 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-        let status = params.get("status").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let status = params
+            .get("status")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         let plans = match store.list_plans(agent_id, status).await {
             Ok(rows) => rows,
             Err(e) => return WsFrame::error_response("", &format!("list plans: {e}")),
@@ -18144,7 +21038,11 @@ impl MethodHandler {
             return WsFrame::error_response("", "title is required");
         }
         // agent_id presence + Operator binding already enforced at dispatch.
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let mut plan = PlanRow::new(
             uuid::Uuid::new_v4().to_string(),
             duduclaw_core::truncate_chars(title_raw.trim(), 200),
@@ -18155,10 +21053,16 @@ impl MethodHandler {
             plan.description = duduclaw_core::truncate_chars(desc, Self::MAX_PLAN_TEXT_CHARS);
         }
         // Optional G8 goal linkage — fail-closed on a dangling goal id.
-        if let Some(goal_id) = params.get("goal_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(goal_id) = params
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             match store.get_goal(goal_id).await {
                 Ok(Some(_)) => plan.goal_id = Some(goal_id.to_string()),
-                Ok(None) => return WsFrame::error_response("", &format!("goal not found: {goal_id}")),
+                Ok(None) => {
+                    return WsFrame::error_response("", &format!("goal not found: {goal_id}"));
+                }
                 Err(e) => return WsFrame::error_response("", &format!("validate goal_id: {e}")),
             }
         }
@@ -18173,11 +21077,18 @@ impl MethodHandler {
                 if text.trim().is_empty() {
                     continue;
                 }
-                let kind = s.get("assignee_kind").and_then(|v| v.as_str()).unwrap_or("agent");
-                let assignee = s
-                    .get("assignee")
+                let kind = s
+                    .get("assignee_kind")
                     .and_then(|v| v.as_str())
-                    .unwrap_or(if kind == "agent" { plan.agent_id.as_str() } else { "" });
+                    .unwrap_or("agent");
+                let assignee =
+                    s.get("assignee")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(if kind == "agent" {
+                            plan.agent_id.as_str()
+                        } else {
+                            ""
+                        });
                 match store
                     .add_plan_step(
                         &plan.id,
@@ -18201,7 +21112,10 @@ impl MethodHandler {
             format!("{} created plan: {}", Self::plan_actor(ctx), plan.title),
         )
         .await;
-        WsFrame::ok_response("", json!({ "plan": plan_row_to_json(&plan), "steps": steps_out }))
+        WsFrame::ok_response(
+            "",
+            json!({ "plan": plan_row_to_json(&plan), "steps": steps_out }),
+        )
     }
 
     async fn handle_plans_update(&self, params: Value, ctx: &UserContext) -> WsFrame {
@@ -18287,11 +21201,19 @@ impl MethodHandler {
         if text.trim().is_empty() {
             return WsFrame::error_response("", "text is required");
         }
-        let kind = params.get("assignee_kind").and_then(|v| v.as_str()).unwrap_or("agent");
-        let assignee = params
-            .get("assignee")
+        let kind = params
+            .get("assignee_kind")
             .and_then(|v| v.as_str())
-            .unwrap_or(if kind == "agent" { plan.agent_id.as_str() } else { "" });
+            .unwrap_or("agent");
+        let assignee =
+            params
+                .get("assignee")
+                .and_then(|v| v.as_str())
+                .unwrap_or(if kind == "agent" {
+                    plan.agent_id.as_str()
+                } else {
+                    ""
+                });
         let position = params
             .get("position")
             .and_then(|v| v.as_u64())
@@ -18339,7 +21261,7 @@ impl MethodHandler {
         let step = match store.get_plan_step(step_id).await {
             Ok(Some(s)) => s,
             Ok(None) if ctx.is_admin() => {
-                return WsFrame::error_response("", &format!("Step not found: {step_id}"))
+                return WsFrame::error_response("", &format!("Step not found: {step_id}"));
             }
             Ok(None) => return WsFrame::error_response("", "permission denied"),
             Err(e) => return WsFrame::error_response("", &format!("get step: {e}")),
@@ -18362,10 +21284,13 @@ impl MethodHandler {
             }
         }
         if let Some(pos) = params.get("position").and_then(|v| v.as_u64()) {
-            match store.move_plan_step(&step.plan_id, step_id, pos as usize).await {
+            match store
+                .move_plan_step(&step.plan_id, step_id, pos as usize)
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => {
-                    return WsFrame::error_response("", &format!("Step not found: {step_id}"))
+                    return WsFrame::error_response("", &format!("Step not found: {step_id}"));
                 }
                 Err(e) => return WsFrame::error_response("", &format!("move plan step: {e}")),
             }
@@ -18404,7 +21329,7 @@ impl MethodHandler {
         let step = match store.get_plan_step(step_id).await {
             Ok(Some(s)) => s,
             Ok(None) if ctx.is_admin() => {
-                return WsFrame::error_response("", &format!("Step not found: {step_id}"))
+                return WsFrame::error_response("", &format!("Step not found: {step_id}"));
             }
             Ok(None) => return WsFrame::error_response("", "permission denied"),
             Err(e) => return WsFrame::error_response("", &format!("get step: {e}")),
@@ -18449,7 +21374,10 @@ impl MethodHandler {
         let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
         let offset = params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
 
-        match store.list_activity(agent_id, event_type, limit, offset).await {
+        match store
+            .list_activity(agent_id, event_type, limit, offset)
+            .await
+        {
             Ok((rows, total)) => {
                 let events: Vec<Value> = rows.iter().map(|r| activity_row_to_json(r)).collect();
                 WsFrame::ok_response("", json!({ "events": events, "total": total }))
@@ -18518,7 +21446,8 @@ impl MethodHandler {
             }
         };
 
-        let (rows, truncated) = derive_timeline_rows(&tasks, &activities, &heartbeats, from, to, now);
+        let (rows, truncated) =
+            derive_timeline_rows(&tasks, &activities, &heartbeats, from, to, now);
         WsFrame::ok_response(
             "",
             json!({
@@ -18591,7 +21520,10 @@ impl MethodHandler {
         // so adding them would double-count.
         let tool_rows = load_tool_call_rows(&self.home_dir);
         let step_metas = crate::run_steps::shared_store(&self.home_dir)
-            .and_then(|s| s.recent_tool_step_meta(&agent_filter, RUN_STEPS_SCAN_CAP).ok())
+            .and_then(|s| {
+                s.recent_tool_step_meta(&agent_filter, RUN_STEPS_SCAN_CAP)
+                    .ok()
+            })
             .unwrap_or_default();
         let runs_json: Vec<Value> = runs
             .iter()
@@ -18768,7 +21700,9 @@ impl MethodHandler {
                 if t.agent_id != agent_id {
                     continue;
                 }
-                let Some(ts) = parse_timeline_ts(&t.ts) else { continue };
+                let Some(ts) = parse_timeline_ts(&t.ts) else {
+                    continue;
+                };
                 if ts >= ws && ts <= we {
                     events.push(json!({
                         "kind": "tool_use",
@@ -18984,7 +21918,10 @@ impl MethodHandler {
     fn open_fork_store(&self) -> Result<duduclaw_fork::ForkStore, WsFrame> {
         let path = self.home_dir.join("fork_store.db");
         if !path.exists() {
-            return Err(WsFrame::error_response("", "no forks yet (fork store not created)"));
+            return Err(WsFrame::error_response(
+                "",
+                "no forks yet (fork store not created)",
+            ));
         }
         duduclaw_fork::ForkStore::open(&path)
             .map_err(|e| WsFrame::error_response("", &format!("open fork store: {e}")))
@@ -19001,7 +21938,11 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).min(500) as usize;
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .min(500) as usize;
         match store.list_forks(limit) {
             Ok(forks) => {
                 let rows: Vec<Value> = forks
@@ -19054,16 +21995,19 @@ impl MethodHandler {
                 })
             })
             .collect();
-        WsFrame::ok_response("", json!({
-            "fork_id": fork.fork_id,
-            "agent_id": fork.agent_id,
-            "prompt": duduclaw_core::truncate_bytes(&fork.prompt, 4000),
-            "merge_mode": fork.merge_mode,
-            "resolved": fork.resolved,
-            "winner": fork.winner,
-            "promoted": fork.promoted,
-            "branches": branch_json,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "fork_id": fork.fork_id,
+                "agent_id": fork.agent_id,
+                "prompt": duduclaw_core::truncate_bytes(&fork.prompt, 4000),
+                "merge_mode": fork.merge_mode,
+                "resolved": fork.resolved,
+                "winner": fork.winner,
+                "promoted": fork.promoted,
+                "branches": branch_json,
+            }),
+        )
     }
 
     fn handle_fork_resolve(&self, params: Value) -> WsFrame {
@@ -19093,9 +22037,12 @@ impl MethodHandler {
         }
         let aggregate = branches.iter().map(|b| b.spent_usd).sum();
         match store.set_resolution(fork_id, Some(branch_id), true, true, aggregate) {
-            Ok(_) => WsFrame::ok_response("", json!({
-                "fork_id": fork_id, "resolved": true, "winner": branch_id,
-            })),
+            Ok(_) => WsFrame::ok_response(
+                "",
+                json!({
+                    "fork_id": fork_id, "resolved": true, "winner": branch_id,
+                }),
+            ),
             Err(e) => WsFrame::error_response("", &format!("resolve fork: {e}")),
         }
     }
@@ -19136,7 +22083,11 @@ impl MethodHandler {
         if let Err(e) = validate_migrate_source(source) {
             return WsFrame::error_response("", &e);
         }
-        let rename = apply && params.get("rename").and_then(|v| v.as_bool()).unwrap_or(false);
+        let rename = apply
+            && params
+                .get("rename")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
         let exe = match std::env::current_exe() {
             Ok(p) => p,
@@ -19306,8 +22257,15 @@ impl MethodHandler {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return WsFrame::error_response("", "id is required"),
         };
-        let approve = params.get("approve").and_then(|v| v.as_bool()).unwrap_or(false);
-        let reason = params.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let approve = params
+            .get("approve")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let reason = params
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let broker = match crate::approval::ApprovalBroker::open(&self.home_dir) {
             Ok(b) => b,
             Err(e) => return WsFrame::error_response("", &format!("open approvals: {e}")),
@@ -19385,7 +22343,10 @@ impl MethodHandler {
         if let Some(rec) = &record {
             if rec.action_kind == crate::custom_skills::ACTION_KIND_SKILL_CREATE {
                 if approve {
-                    match self.install_approved_custom_skill(&id, rec, &ctx.user_id).await {
+                    match self
+                        .install_approved_custom_skill(&id, rec, &ctx.user_id)
+                        .await
+                    {
                         Ok(name) => {
                             let created_by = rec
                                 .payload
@@ -19406,14 +22367,19 @@ impl MethodHandler {
                     }
                 } else {
                     // Deny → mark the registry row rejected with the reason.
-                    if let Some(cs_id) = rec.payload.get("custom_skill_id").and_then(|v| v.as_str()) {
+                    if let Some(cs_id) = rec.payload.get("custom_skill_id").and_then(|v| v.as_str())
+                    {
                         if let Ok(store) = self.custom_skill_store() {
                             let _ = store
                                 .transition(
                                     cs_id,
                                     crate::custom_skills::CustomSkillStatus::Rejected,
                                     None,
-                                    Some(if reason.is_empty() { "rejected by approver" } else { &reason }),
+                                    Some(if reason.is_empty() {
+                                        "rejected by approver"
+                                    } else {
+                                        &reason
+                                    }),
                                     false,
                                 )
                                 .await;
@@ -19479,12 +22445,15 @@ impl MethodHandler {
             }
         }
 
-        WsFrame::ok_response("", json!({
-            "id": id,
-            "decided": if approve { "approved" } else { "denied" },
-            "side_effect": side_effect,
-            "capability_handle": capability_handle,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "id": id,
+                "decided": if approve { "approved" } else { "denied" },
+                "side_effect": side_effect,
+                "capability_handle": capability_handle,
+            }),
+        )
     }
 
     /// WP14-T14.6: recent budget-breaker incidents from `budget_events.jsonl`,
@@ -19499,7 +22468,8 @@ impl MethodHandler {
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .collect();
         events.reverse(); // newest first
-        let mut per_agent: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut per_agent: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         for e in &events {
             if let Some(a) = e.get("agent_id").and_then(|v| v.as_str()) {
                 *per_agent.entry(a.to_string()).or_insert(0) += 1;
@@ -19537,7 +22507,8 @@ impl MethodHandler {
         for (dir, scope, owner) in targets {
             for sk in duduclaw_agent::registry::AgentRegistry::load_skills(&dir).await {
                 let meta = duduclaw_agent::skill_loader::parse_skill_meta_from_content(
-                    &sk.content, &sk.name,
+                    &sk.content,
+                    &sk.name,
                 );
                 if let Some(mins) = meta.estimated_minutes_saved {
                     rows.push(json!({
@@ -19552,15 +22523,20 @@ impl MethodHandler {
         }
 
         rows.sort_by(|a, b| {
-            b["estimated_minutes_saved"].as_u64().unwrap_or(0)
+            b["estimated_minutes_saved"]
+                .as_u64()
+                .unwrap_or(0)
                 .cmp(&a["estimated_minutes_saved"].as_u64().unwrap_or(0))
         });
         rows.truncate(limit);
-        WsFrame::ok_response("", json!({
-            "leaderboard": rows,
-            "metric": "estimated_minutes_saved",
-            "note": "Ranked by per-use minutes saved; usage-count multiplication pending a persisted counter.",
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "leaderboard": rows,
+                "metric": "estimated_minutes_saved",
+                "note": "Ranked by per-use minutes saved; usage-count multiplication pending a persisted counter.",
+            }),
+        )
     }
 
     // ── Growth / gamification (V10-T10.0) ───────────────────
@@ -19613,9 +22589,9 @@ impl MethodHandler {
             for entry in rd.flatten() {
                 if entry.path().is_dir() {
                     let dir = entry.path().join("SKILLS");
-                    skills_acquired +=
-                        duduclaw_agent::registry::AgentRegistry::load_skills(&dir).await.len()
-                            as u64;
+                    skills_acquired += duduclaw_agent::registry::AgentRegistry::load_skills(&dir)
+                        .await
+                        .len() as u64;
                 }
             }
         }
@@ -19671,7 +22647,11 @@ impl MethodHandler {
     /// as work).
     async fn count_actionable_inbox(&self) -> u64 {
         let pending = match crate::approval::ApprovalBroker::open(&self.home_dir) {
-            Ok(b) => b.list_pending(None).await.map(|v| v.len() as u64).unwrap_or(0),
+            Ok(b) => b
+                .list_pending(None)
+                .await
+                .map(|v| v.len() as u64)
+                .unwrap_or(0),
             Err(_) => 0,
         };
         let blocked = match self.task_store.read().await.as_ref().cloned() {
@@ -19729,14 +22709,17 @@ impl MethodHandler {
                 })
             })
             .collect();
-        WsFrame::ok_response("", json!({
-            "xp": snap.xp,
-            "level": snap.level,
-            "xp_into_level": snap.xp_into_level,
-            "xp_for_next_level": snap.xp_for_next_level,
-            "facts": facts,
-            "achievements": achievements,
-        }))
+        WsFrame::ok_response(
+            "",
+            json!({
+                "xp": snap.xp,
+                "level": snap.level,
+                "xp_into_level": snap.xp_into_level,
+                "xp_for_next_level": snap.xp_for_next_level,
+                "facts": facts,
+                "achievements": achievements,
+            }),
+        )
     }
 
     /// `growth.daily_report` — yesterday's settlement card: completed tasks,
@@ -19768,7 +22751,10 @@ impl MethodHandler {
         let (tasks_done_yesterday, most_active_agent) =
             match self.task_store.read().await.as_ref().cloned() {
                 Some(ts) => {
-                    let done = ts.list_tasks(Some("done"), None, None).await.unwrap_or_default();
+                    let done = ts
+                        .list_tasks(Some("done"), None, None)
+                        .await
+                        .unwrap_or_default();
                     let count = done
                         .iter()
                         .filter(|t| {
@@ -19791,10 +22777,7 @@ impl MethodHandler {
                             *by_agent.entry(t.assigned_to.clone()).or_insert(0) += 1;
                         }
                     }
-                    let top = by_agent
-                        .into_iter()
-                        .max_by_key(|(_, c)| *c)
-                        .map(|(a, _)| a);
+                    let top = by_agent.into_iter().max_by_key(|(_, c)| *c).map(|(a, _)| a);
                     (count, top)
                 }
                 None => (0, None),
@@ -19816,7 +22799,8 @@ impl MethodHandler {
             for entry in rd.flatten() {
                 let wiki_dir = entry.path().join("wiki");
                 if wiki_dir.exists() {
-                    new_knowledge_yesterday += count_pages_on(duduclaw_memory::WikiStore::new(wiki_dir));
+                    new_knowledge_yesterday +=
+                        count_pages_on(duduclaw_memory::WikiStore::new(wiki_dir));
                 }
             }
         }
@@ -19827,7 +22811,10 @@ impl MethodHandler {
 
         // Cost over report_date (rolling 24h telemetry approximation, in cents).
         let cost_cents = if let Some(t) = crate::cost_telemetry::get_telemetry() {
-            t.summary_global(24).await.map(|s| s.total_cost_millicents).unwrap_or(0)
+            t.summary_global(24)
+                .await
+                .map(|s| s.total_cost_millicents)
+                .unwrap_or(0)
         } else {
             0
         };
@@ -19880,11 +22867,19 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
-        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if name.is_empty() {
             return WsFrame::error_response("", "name is required");
         }
-        let trigger_event = params.get("trigger_event").and_then(|v| v.as_str()).unwrap_or("task_created").to_string();
+        let trigger_event = params
+            .get("trigger_event")
+            .and_then(|v| v.as_str())
+            .unwrap_or("task_created")
+            .to_string();
         if let Err(e) = validate_autopilot_trigger_event(&trigger_event) {
             return WsFrame::error_response("", &e);
         }
@@ -19935,7 +22930,9 @@ impl MethodHandler {
             }
         }
         match store.update_rule(rule_id, &params).await {
-            Ok(Some(row)) => WsFrame::ok_response("", json!({ "rule": autopilot_rule_to_json(&row) })),
+            Ok(Some(row)) => {
+                WsFrame::ok_response("", json!({ "rule": autopilot_rule_to_json(&row) }))
+            }
             Ok(None) => WsFrame::error_response("", &format!("Rule not found: {rule_id}")),
             Err(e) => WsFrame::error_response("", &format!("update rule: {e}")),
         }
@@ -19989,11 +22986,14 @@ impl MethodHandler {
 
     async fn handle_redaction_stats(&self) -> WsFrame {
         let Some(manager) = self.get_redaction_manager().await else {
-            return WsFrame::ok_response("", json!({
-                "enabled": false,
-                "vault": { "total": 0, "active": 0, "expired": 0, "by_category": [] },
-                "rule_count": 0,
-            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "enabled": false,
+                    "vault": { "total": 0, "active": 0, "expired": 0, "by_category": [] },
+                    "rule_count": 0,
+                }),
+            );
         };
         match duduclaw_redaction::dashboard::handle_stats(&manager) {
             Ok(s) => match serde_json::to_value(&s) {
@@ -20008,10 +23008,7 @@ impl MethodHandler {
         let Some(manager) = self.get_redaction_manager().await else {
             return WsFrame::ok_response("", json!({ "entries": [] }));
         };
-        let limit = params
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(50) as usize;
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let req = duduclaw_redaction::dashboard::RecentAuditRequest { limit };
         match duduclaw_redaction::dashboard::handle_recent_audit(&manager, req) {
             Ok(r) => match serde_json::to_value(&r) {
@@ -20024,11 +23021,14 @@ impl MethodHandler {
 
     async fn handle_redaction_override_status(&self) -> WsFrame {
         let Some(manager) = self.get_redaction_manager().await else {
-            return WsFrame::ok_response("", json!({
-                "active": false,
-                "banner": null,
-                "record": null,
-            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "active": false,
+                    "banner": null,
+                    "record": null,
+                }),
+            );
         };
         match duduclaw_redaction::dashboard::handle_override_status(&manager) {
             Ok(s) => match serde_json::to_value(&s) {
@@ -20041,13 +23041,16 @@ impl MethodHandler {
 
     async fn handle_redaction_policy_status(&self) -> WsFrame {
         let Some(manager) = self.get_redaction_manager().await else {
-            return WsFrame::ok_response("", json!({
-                "config_enabled": false,
-                "vault_ttl_hours": 0,
-                "purge_after_expire_days": 0,
-                "rule_count": 0,
-                "override_active": false,
-            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "config_enabled": false,
+                    "vault_ttl_hours": 0,
+                    "purge_after_expire_days": 0,
+                    "rule_count": 0,
+                    "override_active": false,
+                }),
+            );
         };
         match duduclaw_redaction::dashboard::handle_policy_status(&manager) {
             Ok(s) => match serde_json::to_value(&s) {
@@ -20072,17 +23075,31 @@ impl MethodHandler {
                 if path.extension().and_then(|e| e.to_str()) != Some("md") {
                     continue;
                 }
-                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
                 let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
                 // Parse frontmatter for metadata
                 let description = extract_frontmatter(&content, "description").unwrap_or_default();
                 let shared_by = extract_frontmatter(&content, "shared_by").unwrap_or_default();
                 let shared_at = extract_frontmatter(&content, "shared_at").unwrap_or_default();
                 let tags: Vec<String> = extract_frontmatter(&content, "tags")
-                    .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                    .map(|t| {
+                        t.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let adopted_by: Vec<String> = extract_frontmatter(&content, "adopted_by")
-                    .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                    .map(|t| {
+                        t.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let usage_count: i64 = extract_frontmatter(&content, "usage_count")
                     .and_then(|s| s.parse().ok())
@@ -20103,8 +23120,14 @@ impl MethodHandler {
     }
 
     async fn handle_skills_share(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let skill_name = params.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let skill_name = params
+            .get("skill_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() || skill_name.is_empty() {
             return WsFrame::error_response("", "agent_id and skill_name are required");
         }
@@ -20123,7 +23146,10 @@ impl MethodHandler {
             .join(agent_id)
             .join("SKILLS")
             .join(format!("{skill_name}.md"));
-        let global_path = self.home_dir.join("skills").join(format!("{skill_name}.md"));
+        let global_path = self
+            .home_dir
+            .join("skills")
+            .join(format!("{skill_name}.md"));
         let skill_path = if agent_path.exists() {
             agent_path
         } else if global_path.exists() {
@@ -20157,8 +23183,14 @@ impl MethodHandler {
     }
 
     async fn handle_skills_adopt(&self, params: Value) -> WsFrame {
-        let skill_name = params.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
-        let target_agent = params.get("target_agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let skill_name = params
+            .get("skill_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let target_agent = params
+            .get("target_agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if skill_name.is_empty() || target_agent.is_empty() {
             return WsFrame::error_response("", "skill_name and target_agent_id are required");
         }
@@ -20168,13 +23200,22 @@ impl MethodHandler {
             return WsFrame::error_response("", "Invalid target_agent_id format");
         }
         // skill_name is used in a filename — restrict to a safe charset.
-        if !skill_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        if !skill_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             || skill_name.len() > 128
         {
-            return WsFrame::error_response("", "Invalid skill_name (alphanumeric, _, -; ≤128 chars)");
+            return WsFrame::error_response(
+                "",
+                "Invalid skill_name (alphanumeric, _, -; ≤128 chars)",
+            );
         }
         // Read from shared
-        let shared_path = self.home_dir.join("shared").join("skills").join(format!("{skill_name}.md"));
+        let shared_path = self
+            .home_dir
+            .join("shared")
+            .join("skills")
+            .join(format!("{skill_name}.md"));
         if !shared_path.exists() {
             return WsFrame::error_response("", &format!("Shared skill not found: {skill_name}"));
         }
@@ -20210,7 +23251,11 @@ impl MethodHandler {
             (count + 1).to_string()
         });
         let updated = update_frontmatter_field(&updated, "adopted_by", |old| {
-            let mut agents: Vec<&str> = old.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let mut agents: Vec<&str> = old
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
             if !agents.contains(&target_agent) {
                 agents.push(target_agent);
             }
@@ -20410,7 +23455,11 @@ fn extract_frontmatter(content: &str, key: &str) -> Option<String> {
 }
 
 /// Update a field in YAML-style frontmatter with a transform function.
-fn update_frontmatter_field(content: &str, key: &str, transform: impl Fn(&str) -> String) -> String {
+fn update_frontmatter_field(
+    content: &str,
+    key: &str,
+    transform: impl Fn(&str) -> String,
+) -> String {
     let prefix = format!("{key}:");
     content
         .lines()
@@ -20440,7 +23489,8 @@ mod skill_source_url_tests {
     #[test]
     fn github_blob_becomes_raw() {
         assert_eq!(
-            MethodHandler::resolve_skill_source_url("https://github.com/u/r/blob/main/skills/x.md").unwrap(),
+            MethodHandler::resolve_skill_source_url("https://github.com/u/r/blob/main/skills/x.md")
+                .unwrap(),
             "https://raw.githubusercontent.com/u/r/main/skills/x.md"
         );
     }
@@ -20449,12 +23499,18 @@ mod skill_source_url_tests {
     fn github_tree_dir_appends_skill_md() {
         // The canonical way to share a subdirectory skill (Bug#1 fix).
         assert_eq!(
-            MethodHandler::resolve_skill_source_url("https://github.com/anthropics/skills/tree/main/skills/pptx").unwrap(),
+            MethodHandler::resolve_skill_source_url(
+                "https://github.com/anthropics/skills/tree/main/skills/pptx"
+            )
+            .unwrap(),
             "https://raw.githubusercontent.com/anthropics/skills/main/skills/pptx/SKILL.md"
         );
         // Trailing slash tolerated.
         assert_eq!(
-            MethodHandler::resolve_skill_source_url("https://github.com/anthropics/skills/tree/main/skills/pptx/").unwrap(),
+            MethodHandler::resolve_skill_source_url(
+                "https://github.com/anthropics/skills/tree/main/skills/pptx/"
+            )
+            .unwrap(),
             "https://raw.githubusercontent.com/anthropics/skills/main/skills/pptx/SKILL.md"
         );
     }
@@ -20463,7 +23519,10 @@ mod skill_source_url_tests {
     fn github_tree_file_is_treated_like_blob() {
         // A tree URL that already names a file must not get SKILL.md appended.
         assert_eq!(
-            MethodHandler::resolve_skill_source_url("https://github.com/u/r/tree/main/skills/x/SKILL.md").unwrap(),
+            MethodHandler::resolve_skill_source_url(
+                "https://github.com/u/r/tree/main/skills/x/SKILL.md"
+            )
+            .unwrap(),
             "https://raw.githubusercontent.com/u/r/main/skills/x/SKILL.md"
         );
     }
@@ -20471,7 +23530,10 @@ mod skill_source_url_tests {
     #[test]
     fn gitlab_tree_dir_appends_skill_md() {
         assert_eq!(
-            MethodHandler::resolve_skill_source_url("https://gitlab.com/u/r/-/tree/main/skills/pptx").unwrap(),
+            MethodHandler::resolve_skill_source_url(
+                "https://gitlab.com/u/r/-/tree/main/skills/pptx"
+            )
+            .unwrap(),
             "https://gitlab.com/u/r/-/raw/main/skills/pptx/SKILL.md"
         );
     }
@@ -20491,7 +23553,8 @@ mod skill_source_url_tests {
             "https://gitlab.com/u/r/-/raw/HEAD/SKILL.md"
         );
         assert_eq!(
-            MethodHandler::resolve_skill_source_url("https://gitlab.com/u/r/-/blob/main/SKILL.md").unwrap(),
+            MethodHandler::resolve_skill_source_url("https://gitlab.com/u/r/-/blob/main/SKILL.md")
+                .unwrap(),
             "https://gitlab.com/u/r/-/raw/main/SKILL.md"
         );
     }
@@ -20508,7 +23571,8 @@ mod skill_source_url_tests {
     fn lookalike_host_is_not_rewritten() {
         // Anchored host matching: github.com.evil.example must NOT be treated
         // as GitHub (no raw.githubusercontent rewrite).
-        let out = MethodHandler::resolve_skill_source_url("https://github.com.evil.example/u/r").unwrap();
+        let out =
+            MethodHandler::resolve_skill_source_url("https://github.com.evil.example/u/r").unwrap();
         assert_eq!(out, "https://github.com.evil.example/u/r");
     }
 
@@ -20525,7 +23589,8 @@ mod mcp_manifest_tests {
 
     #[test]
     fn parses_standard_mcp_json() {
-        let text = r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["-y", "pkg"], "env": {} } } }"#;
+        let text =
+            r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["-y", "pkg"], "env": {} } } }"#;
         let out = MethodHandler::parse_mcp_manifest(text, "fallback").unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "fs");
@@ -20573,7 +23638,10 @@ mod mcp_manifest_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "ai.getperspective-mcp");
         assert_eq!(out[0].1.command, "npx");
-        assert_eq!(out[0].1.args, vec!["-y", "mcp-remote", "https://getperspective.ai/mcp"]);
+        assert_eq!(
+            out[0].1.args,
+            vec!["-y", "mcp-remote", "https://getperspective.ai/mcp"]
+        );
     }
 
     #[test]
@@ -20648,7 +23716,9 @@ The same snippet works in Cursor and VS Code:
 
     #[test]
     fn markdown_without_snippets_keeps_json_error() {
-        assert!(MethodHandler::manifest_from_text("# just a readme\nno config here", "fb").is_err());
+        assert!(
+            MethodHandler::manifest_from_text("# just a readme\nno config here", "fb").is_err()
+        );
     }
 
     #[test]
@@ -20678,13 +23748,13 @@ mod outfit_tests {
     #[test]
     fn rejects_bad_shapes_fail_closed() {
         for bad in [
-            json!("cap"),                              // not an object
-            json!({ "hat": 3 }),                       // non-string slot
-            json!({ "hat": "CAP" }),                   // uppercase
-            json!({ "hat": "a".repeat(25) }),          // too long
-            json!({ "hat": "../x" }),                  // traversal chars
-            json!({ "tint": 11 }),                     // out of range
-            json!({ "sneaky_extra": "x" }),            // unknown key
+            json!("cap"),                     // not an object
+            json!({ "hat": 3 }),              // non-string slot
+            json!({ "hat": "CAP" }),          // uppercase
+            json!({ "hat": "a".repeat(25) }), // too long
+            json!({ "hat": "../x" }),         // traversal chars
+            json!({ "tint": 11 }),            // out of range
+            json!({ "sneaky_extra": "x" }),   // unknown key
         ] {
             assert!(normalize_outfit(&bad).is_err(), "{bad}");
         }
@@ -20714,7 +23784,10 @@ mod redaction_config_tests {
             },
         });
         let changes = apply_redaction_to_table(&mut table, &params).unwrap();
-        assert!(changes.iter().any(|c| c.contains("tool_results")), "{changes:?}");
+        assert!(
+            changes.iter().any(|c| c.contains("tool_results")),
+            "{changes:?}"
+        );
 
         // The written TOML must parse under the crate's SourceSetting (both forms).
         let toml_str = toml::to_string(&table).unwrap();
@@ -20723,8 +23796,14 @@ mod redaction_config_tests {
             redaction: duduclaw_redaction::config::RedactionConfig,
         }
         let w: W = toml::from_str(&toml_str).unwrap();
-        assert_eq!(w.redaction.sources.tool_results.only_categories, ["TW_ID", "CREDIT_CARD"]);
-        assert_eq!(w.redaction.sources.cron_context.exclude_categories, ["EMAIL"]);
+        assert_eq!(
+            w.redaction.sources.tool_results.only_categories,
+            ["TW_ID", "CREDIT_CARD"]
+        );
+        assert_eq!(
+            w.redaction.sources.cron_context.exclude_categories,
+            ["EMAIL"]
+        );
         assert!(w.redaction.sources.user_input.is_mode_only());
 
         // Response always uses the detail-object form.
@@ -20734,7 +23813,10 @@ mod redaction_config_tests {
         assert_eq!(tr["only_categories"][1], "CREDIT_CARD");
         assert_eq!(resp["sources"]["user_input"]["mode"], "off");
         assert_eq!(
-            resp["sources"]["user_input"]["only_categories"].as_array().unwrap().len(),
+            resp["sources"]["user_input"]["only_categories"]
+                .as_array()
+                .unwrap()
+                .len(),
             0
         );
     }
@@ -20767,24 +23849,30 @@ mod redaction_config_tests {
     fn builtin_profile_catalogue_lists_categories() {
         let tmp = tempfile::tempdir().unwrap();
         let profiles = super::redaction_available_profiles(tmp.path());
-        assert!(profiles.len() >= 5, "expected the 5 built-ins, got {}", profiles.len());
+        assert!(
+            profiles.len() >= 5,
+            "expected the 5 built-ins, got {}",
+            profiles.len()
+        );
         let general = profiles
             .iter()
             .find(|p| p["name"] == "general")
             .expect("general profile present");
         assert!(general["builtin"].as_bool().unwrap());
-        assert!(general["categories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| c == "EMAIL"));
+        assert!(
+            general["categories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == "EMAIL")
+        );
     }
 }
 
 #[cfg(test)]
 mod avatar_validation_tests {
-    use super::{decode_avatar_data_uri, MAX_AVATAR_DECODED_BYTES};
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use super::{MAX_AVATAR_DECODED_BYTES, decode_avatar_data_uri};
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
 
     /// Smallest valid PNG header (8 magic bytes + a bit of filler).
     fn png_bytes() -> Vec<u8> {
@@ -20835,12 +23923,16 @@ mod avatar_validation_tests {
         webp.extend_from_slice(b"WEBP");
         webp.extend_from_slice(&[0u8; 4]);
         assert_eq!(
-            decode_avatar_data_uri(&data_uri("image/webp", &webp)).unwrap().1,
+            decode_avatar_data_uri(&data_uri("image/webp", &webp))
+                .unwrap()
+                .1,
             "webp"
         );
         let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
         assert_eq!(
-            decode_avatar_data_uri(&data_uri("image/jpeg", &jpeg)).unwrap().1,
+            decode_avatar_data_uri(&data_uri("image/jpeg", &jpeg))
+                .unwrap()
+                .1,
             "jpg"
         );
     }
@@ -20875,8 +23967,14 @@ mod archive_restore_tests {
         assert!(!enabled(&t, "heartbeat"), "archive freezes heartbeat");
 
         unarchive_restore_table(&mut t).unwrap();
-        assert!(!enabled(&t, "evolution"), "unarchive must NOT force evolution on");
-        assert!(!enabled(&t, "heartbeat"), "unarchive must NOT force heartbeat on");
+        assert!(
+            !enabled(&t, "evolution"),
+            "unarchive must NOT force evolution on"
+        );
+        assert!(
+            !enabled(&t, "heartbeat"),
+            "unarchive must NOT force heartbeat on"
+        );
         assert_eq!(
             t.get("agent").unwrap().get("status").unwrap().as_str(),
             Some("active")
@@ -20892,11 +23990,20 @@ mod archive_restore_tests {
              [evolution]\nenabled = true\n[heartbeat]\nenabled = true\n",
         );
         offboard_freeze_table(&mut t, "archived").unwrap();
-        assert!(!enabled(&t, "evolution"), "archive still freezes while off-boarded");
+        assert!(
+            !enabled(&t, "evolution"),
+            "archive still freezes while off-boarded"
+        );
 
         unarchive_restore_table(&mut t).unwrap();
-        assert!(enabled(&t, "evolution"), "unarchive restores the original ON");
-        assert!(enabled(&t, "heartbeat"), "unarchive restores the original ON");
+        assert!(
+            enabled(&t, "evolution"),
+            "unarchive restores the original ON"
+        );
+        assert!(
+            enabled(&t, "heartbeat"),
+            "unarchive restores the original ON"
+        );
     }
 
     /// F6: a double-archive must not lose the true original value.
@@ -20910,8 +24017,14 @@ mod archive_restore_tests {
         // Re-archive the already-frozen agent (enabled is now false).
         offboard_freeze_table(&mut t, "deleted").unwrap();
         unarchive_restore_table(&mut t).unwrap();
-        assert!(enabled(&t, "evolution"), "original ON survives double-archive");
-        assert!(!enabled(&t, "heartbeat"), "original OFF survives double-archive");
+        assert!(
+            enabled(&t, "evolution"),
+            "original ON survives double-archive"
+        );
+        assert!(
+            !enabled(&t, "heartbeat"),
+            "original OFF survives double-archive"
+        );
     }
 
     /// F6: no snapshot present (legacy archived agent) ⇒ conservative OFF.
@@ -21027,7 +24140,10 @@ mod skill_synthesis_config_tests {
         apply_skill_synthesis_to_table(&mut table, &json!({ "target_agent": "agnes" })).unwrap();
         let changes =
             apply_skill_synthesis_to_table(&mut table, &json!({ "target_agent": "  " })).unwrap();
-        assert!(changes.iter().any(|c| c.contains("cleared")), "got: {changes:?}");
+        assert!(
+            changes.iter().any(|c| c.contains("cleared")),
+            "got: {changes:?}"
+        );
         let resp = skill_synthesis_table_to_response(&table);
         assert_eq!(resp["target_agent"], json!(""));
     }
@@ -21038,7 +24154,10 @@ mod skill_synthesis_config_tests {
         for bad in ["../etc", "a/b", "a\\b"] {
             let err = apply_skill_synthesis_to_table(&mut table, &json!({ "target_agent": bad }))
                 .unwrap_err();
-            assert!(err.contains("invalid characters"), "expected reject for {bad}, got: {err}");
+            assert!(
+                err.contains("invalid characters"),
+                "expected reject for {bad}, got: {err}"
+            );
         }
     }
 
@@ -21066,7 +24185,10 @@ mod autopilot_validation_tests {
             "cron_tick",
             "run_at_risk",
         ] {
-            assert!(validate_autopilot_trigger_event(ev).is_ok(), "should accept {ev}");
+            assert!(
+                validate_autopilot_trigger_event(ev).is_ok(),
+                "should accept {ev}"
+            );
         }
     }
 
@@ -21181,7 +24303,10 @@ mod odoo_test_params_tests {
     fn private_ip_is_rejected() {
         let p = json!({ "url": "https://10.0.0.1", "db": "x" });
         let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
-        assert!(err.contains("HTTPS") || err.contains("localhost"), "got: {err}");
+        assert!(
+            err.contains("HTTPS") || err.contains("localhost"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -21286,7 +24411,11 @@ mod odoo_test_params_tests {
     fn scrub_long_error_truncates_with_ellipsis() {
         let long_err = "x".repeat(300);
         let out = MethodHandler::scrub_odoo_error(&long_err);
-        assert!(out.chars().count() <= 241, "got len {}", out.chars().count());
+        assert!(
+            out.chars().count() <= 241,
+            "got len {}",
+            out.chars().count()
+        );
         assert!(out.ends_with('…'));
     }
 
@@ -21302,10 +24431,14 @@ mod odoo_test_params_tests {
     #[test]
     fn scrub_short_error_removes_url_query_string() {
         // The reqwest error echoes the full URL incl. a leaking query string.
-        let err = "error sending request for url (https://erp.example.com/jsonrpc?api_key=topsecret)";
+        let err =
+            "error sending request for url (https://erp.example.com/jsonrpc?api_key=topsecret)";
         let out = MethodHandler::scrub_odoo_error(err);
         assert!(!out.contains("topsecret"), "token leaked: {out}");
-        assert!(!out.contains("api_key=topsecret"), "query string leaked: {out}");
+        assert!(
+            !out.contains("api_key=topsecret"),
+            "query string leaked: {out}"
+        );
         // Host is retained so the user can still act on the error.
         assert!(out.contains("erp.example.com"), "host should remain: {out}");
     }
@@ -21325,7 +24458,10 @@ mod odoo_test_params_tests {
         let out = MethodHandler::scrub_odoo_error(err);
         assert!(!out.contains("abc123"), "token leaked: {out}");
         assert!(!out.contains("p@ss"), "password leaked: {out}");
-        assert!(out.contains("[REDACTED]"), "expected redaction marker: {out}");
+        assert!(
+            out.contains("[REDACTED]"),
+            "expected redaction marker: {out}"
+        );
     }
 }
 
@@ -21373,11 +24509,14 @@ mod p1_config_helper_tests {
     #[test]
     fn runtime_empty_fallback_clears() {
         let mut t = toml::Table::new();
-        t.insert("runtime".into(), toml::Value::Table({
-            let mut m = toml::map::Map::new();
-            m.insert("fallback".into(), toml::Value::String("claude".into()));
-            m
-        }));
+        t.insert(
+            "runtime".into(),
+            toml::Value::Table({
+                let mut m = toml::map::Map::new();
+                m.insert("fallback".into(), toml::Value::String("claude".into()));
+                m
+            }),
+        );
         let params = json!({ "runtime": { "fallback": "" } });
         let changes = apply_runtime_to_table(&mut t, &params).unwrap();
         assert!(changes.iter().any(|c| c.contains("cleared")));
@@ -21411,15 +24550,26 @@ mod p1_config_helper_tests {
         let ef = evo.get("external_factors").unwrap().as_table().unwrap();
         assert_eq!(ef.get("user_feedback").unwrap().as_bool(), Some(true));
         assert_eq!(ef.get("peer_signals").unwrap().as_bool(), Some(false));
-        assert_eq!(evo.get("skill_synthesis_enabled").unwrap().as_bool(), Some(true));
+        assert_eq!(
+            evo.get("skill_synthesis_enabled").unwrap().as_bool(),
+            Some(true)
+        );
         // skill_synthesis_threshold is a u32 gap-count, not a unit threshold —
         // it must serialize as a TOML integer (see apply_evolution_advanced_to_table).
         assert_eq!(
             evo.get("skill_synthesis_threshold").unwrap().as_integer(),
             Some(3)
         );
-        assert_eq!(evo.get("skill_synthesis_cooldown_hours").unwrap().as_integer(), Some(12));
-        assert_eq!(evo.get("curiosity_max_daily").unwrap().as_integer(), Some(5));
+        assert_eq!(
+            evo.get("skill_synthesis_cooldown_hours")
+                .unwrap()
+                .as_integer(),
+            Some(12)
+        );
+        assert_eq!(
+            evo.get("curiosity_max_daily").unwrap().as_integer(),
+            Some(5)
+        );
     }
 
     #[test]
@@ -21536,11 +24686,14 @@ mod p1_config_helper_tests {
     fn inference_router_uses_existing_fast_for_cross_check() {
         // Existing fast=0.7; incoming strong=0.8 only → must still be rejected.
         let mut t = toml::Table::new();
-        t.insert("router".into(), toml::Value::Table({
-            let mut m = toml::map::Map::new();
-            m.insert("fast_threshold".into(), toml::Value::Float(0.7));
-            m
-        }));
+        t.insert(
+            "router".into(),
+            toml::Value::Table({
+                let mut m = toml::map::Map::new();
+                m.insert("fast_threshold".into(), toml::Value::Float(0.7));
+                m
+            }),
+        );
         let params = json!({ "router": { "strong_threshold": 0.8 } });
         let err = apply_inference_to_table(&mut t, &params).unwrap_err();
         assert!(err.contains("must be <"), "got: {err}");
@@ -21575,16 +24728,25 @@ mod p1_config_helper_tests {
     #[test]
     fn inference_response_masks_api_key_cleartext() {
         let mut t = toml::Table::new();
-        t.insert("openai_compat".into(), toml::Value::Table({
-            let mut m = toml::map::Map::new();
-            m.insert("base_url".into(), toml::Value::String("http://x/v1".into()));
-            m.insert("api_key".into(), toml::Value::String("sk-supersecret".into()));
-            m
-        }));
+        t.insert(
+            "openai_compat".into(),
+            toml::Value::Table({
+                let mut m = toml::map::Map::new();
+                m.insert("base_url".into(), toml::Value::String("http://x/v1".into()));
+                m.insert(
+                    "api_key".into(),
+                    toml::Value::String("sk-supersecret".into()),
+                );
+                m
+            }),
+        );
         let resp = inference_table_to_response(&t);
         let oc = resp.get("openai_compat").unwrap();
         let serialised = serde_json::to_string(&resp).unwrap();
-        assert!(!serialised.contains("sk-supersecret"), "cleartext leaked: {serialised}");
+        assert!(
+            !serialised.contains("sk-supersecret"),
+            "cleartext leaked: {serialised}"
+        );
         assert_eq!(oc.get("api_key").unwrap().as_str(), Some(SECRET_MASK_SET));
         assert_eq!(oc.get("api_key_set").unwrap().as_bool(), Some(true));
         assert!(oc.get("api_key_enc").is_none());
@@ -21593,11 +24755,17 @@ mod p1_config_helper_tests {
     #[test]
     fn inference_response_masks_encrypted_key_too() {
         let mut t = toml::Table::new();
-        t.insert("openai_compat".into(), toml::Value::Table({
-            let mut m = toml::map::Map::new();
-            m.insert("api_key_enc".into(), toml::Value::String("ENCBLOB==".into()));
-            m
-        }));
+        t.insert(
+            "openai_compat".into(),
+            toml::Value::Table({
+                let mut m = toml::map::Map::new();
+                m.insert(
+                    "api_key_enc".into(),
+                    toml::Value::String("ENCBLOB==".into()),
+                );
+                m
+            }),
+        );
         let resp = inference_table_to_response(&t);
         let serialised = serde_json::to_string(&resp).unwrap();
         assert!(!serialised.contains("ENCBLOB"), "enc leaked: {serialised}");
@@ -21608,11 +24776,14 @@ mod p1_config_helper_tests {
     #[test]
     fn inference_response_no_secret_reports_unset() {
         let mut t = toml::Table::new();
-        t.insert("openai_compat".into(), toml::Value::Table({
-            let mut m = toml::map::Map::new();
-            m.insert("base_url".into(), toml::Value::String("http://x/v1".into()));
-            m
-        }));
+        t.insert(
+            "openai_compat".into(),
+            toml::Value::Table({
+                let mut m = toml::map::Map::new();
+                m.insert("base_url".into(), toml::Value::String("http://x/v1".into()));
+                m
+            }),
+        );
         let resp = inference_table_to_response(&t);
         let oc = resp.get("openai_compat").unwrap();
         assert_eq!(oc.get("api_key_set").unwrap().as_bool(), Some(false));
@@ -21675,8 +24846,16 @@ mod p2_dashboard_config_tests {
 
     #[test]
     fn gov_rejects_unknown_type_and_bad_id() {
-        assert!(gov_validate_policy(&json!({"policy_type": "nuke", "policy_id": "x", "agent_id": "*"})).is_err());
-        assert!(gov_validate_policy(&json!({"policy_type": "rate", "policy_id": "bad id!", "agent_id": "*"})).is_err());
+        assert!(
+            gov_validate_policy(&json!({"policy_type": "nuke", "policy_id": "x", "agent_id": "*"}))
+                .is_err()
+        );
+        assert!(
+            gov_validate_policy(
+                &json!({"policy_type": "rate", "policy_id": "bad id!", "agent_id": "*"})
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -21707,7 +24886,10 @@ policies:
         assert_eq!(parsed[0]["window_seconds"].as_u64(), Some(60));
         let perm = &parsed[1];
         assert_eq!(perm["allowed_scopes"].as_array().unwrap().len(), 2);
-        assert_eq!(perm["denied_scopes"].as_array().unwrap()[0].as_str(), Some("admin"));
+        assert_eq!(
+            perm["denied_scopes"].as_array().unwrap()[0].as_str(),
+            Some("admin")
+        );
     }
 
     // ── ODO: qualified-action parse ──────────────────────────────────────────
@@ -21747,10 +24929,19 @@ policies:
         assert!(odoo.get("api_key").is_none());
         assert!(odoo.get("api_key_enc").is_some());
         // Qualified action preserved.
-        let actions: Vec<&str> = odoo.get("allowed_actions").unwrap().as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let actions: Vec<&str> = odoo
+            .get("allowed_actions")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(actions.contains(&"write:crm.lead"));
-        assert_eq!(odoo.get("company_ids").unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(
+            odoo.get("company_ids").unwrap().as_array().unwrap().len(),
+            2
+        );
         assert!(changes.iter().any(|c| c.contains("[ENCRYPTED]")));
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -21802,28 +24993,29 @@ policies:
         let tmp = std::env::temp_dir();
         // http:// to a non-localhost host must be refused (SSRF/HTTPS gate).
         let mut t1 = toml::Table::new();
-        assert!(apply_odoo_to_table(
-            &mut t1,
-            &json!({ "odoo": { "url": "http://169.254.169.254/latest" } }),
-            &tmp,
-        )
-        .is_err());
+        assert!(
+            apply_odoo_to_table(
+                &mut t1,
+                &json!({ "odoo": { "url": "http://169.254.169.254/latest" } }),
+                &tmp,
+            )
+            .is_err()
+        );
         // https:// to a private IP must be refused.
         let mut t2 = toml::Table::new();
-        assert!(apply_odoo_to_table(
-            &mut t2,
-            &json!({ "odoo": { "url": "https://10.0.0.5" } }),
-            &tmp,
-        )
-        .is_err());
+        assert!(
+            apply_odoo_to_table(
+                &mut t2,
+                &json!({ "odoo": { "url": "https://10.0.0.5" } }),
+                &tmp,
+            )
+            .is_err()
+        );
         // Bad db name must be refused.
         let mut t3 = toml::Table::new();
-        assert!(apply_odoo_to_table(
-            &mut t3,
-            &json!({ "odoo": { "db": "bad db!" } }),
-            &tmp,
-        )
-        .is_err());
+        assert!(
+            apply_odoo_to_table(&mut t3, &json!({ "odoo": { "db": "bad db!" } }), &tmp,).is_err()
+        );
         // A safe https url + clean db round-trips.
         let mut t4 = toml::Table::new();
         let changes = apply_odoo_to_table(
@@ -21833,7 +25025,10 @@ policies:
         )
         .expect("safe config applies");
         let odoo = t4.get("odoo").unwrap().as_table().unwrap();
-        assert_eq!(odoo.get("url").unwrap().as_str(), Some("https://odoo.example.com"));
+        assert_eq!(
+            odoo.get("url").unwrap().as_str(),
+            Some("https://odoo.example.com")
+        );
         assert_eq!(odoo.get("db").unwrap().as_str(), Some("prod_db"));
         assert!(changes.iter().any(|c| c.contains("odoo.url")));
     }
@@ -21873,7 +25068,10 @@ policies:
             .and_then(|t| t.get("api_key_enc"))
             .and_then(|v| v.as_str())
             .unwrap();
-        assert_eq!(enc_before, enc_after, "masked placeholder must not clobber real secret");
+        assert_eq!(
+            enc_before, enc_after,
+            "masked placeholder must not clobber real secret"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -21904,14 +25102,19 @@ policies:
         assert_eq!(first.get("tool").unwrap().as_str(), Some("shell_exec"));
         assert_eq!(first.get("effect").unwrap().as_str(), Some("forbid"));
         let when = first.get("when").unwrap().as_array().unwrap();
-        assert_eq!(when[0].as_table().unwrap().get("op").unwrap().as_str(), Some("contains"));
+        assert_eq!(
+            when[0].as_table().unwrap().get("op").unwrap().as_str(),
+            Some("contains")
+        );
         assert!(changes.iter().any(|c| c.contains("native_sandbox")));
         assert!(changes.iter().any(|c| c.contains("policy = [2 rules]")));
 
         // The written section must deserialize back into a real
         // CapabilitiesConfig (proves the on-disk shape is valid, not just JSON).
-        let cfg: duduclaw_core::types::CapabilitiesConfig =
-            cap.clone().try_into().expect("deserializes into CapabilitiesConfig");
+        let cfg: duduclaw_core::types::CapabilitiesConfig = cap
+            .clone()
+            .try_into()
+            .expect("deserializes into CapabilitiesConfig");
         assert!(cfg.native_sandbox);
         assert_eq!(cfg.policy.len(), 2);
     }
@@ -21920,11 +25123,13 @@ policies:
     fn cap_policy_fail_closed_on_bad_effect_op_and_missing_tool() {
         // Unknown effect.
         let mut t1 = toml::Table::new();
-        assert!(apply_capabilities_to_table(
-            &mut t1,
-            &json!({ "capabilities": { "policy": [{ "tool": "x", "effect": "nuke" }] } }),
-        )
-        .is_err());
+        assert!(
+            apply_capabilities_to_table(
+                &mut t1,
+                &json!({ "capabilities": { "policy": [{ "tool": "x", "effect": "nuke" }] } }),
+            )
+            .is_err()
+        );
         // Unknown op.
         let mut t2 = toml::Table::new();
         assert!(apply_capabilities_to_table(
@@ -21936,11 +25141,95 @@ policies:
         .is_err());
         // Missing/empty tool.
         let mut t3 = toml::Table::new();
-        assert!(apply_capabilities_to_table(
-            &mut t3,
-            &json!({ "capabilities": { "policy": [{ "tool": "", "effect": "allow" }] } }),
+        assert!(
+            apply_capabilities_to_table(
+                &mut t3,
+                &json!({ "capabilities": { "policy": [{ "tool": "", "effect": "allow" }] } }),
+            )
+            .is_err()
+        );
+    }
+
+    // ── v1.39: os_native capability + [os_watch] table ───────────────────────
+
+    #[test]
+    fn cap_os_native_round_trips_into_capabilities_config() {
+        let mut table = toml::Table::new();
+        let changes = apply_capabilities_to_table(
+            &mut table,
+            &json!({ "capabilities": { "os_native": true } }),
         )
-        .is_err());
+        .expect("apply");
+        let cap = table.get("capabilities").unwrap().as_table().unwrap();
+        assert_eq!(cap.get("os_native").unwrap().as_bool(), Some(true));
+        assert!(changes.iter().any(|c| c.contains("os_native = true")));
+        // Must deserialize back into a real CapabilitiesConfig.
+        let cfg: duduclaw_core::types::CapabilitiesConfig = cap
+            .clone()
+            .try_into()
+            .expect("deserializes into CapabilitiesConfig");
+        assert!(cfg.os_native);
+    }
+
+    #[test]
+    fn os_watch_apply_writes_all_fields() {
+        let mut table = toml::Table::new();
+        let changes = apply_os_watch_to_table(
+            &mut table,
+            &json!({
+                "os_watch": {
+                    "paths": ["~/Downloads", "/abs/inbox"],
+                    "ignore": ["*.part"],
+                    "debounce_ms": 500,
+                    "max_events_per_min": 12,
+                }
+            }),
+        )
+        .expect("apply");
+        let ow = table.get("os_watch").unwrap().as_table().unwrap();
+        assert_eq!(ow.get("paths").unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(ow.get("ignore").unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(ow.get("debounce_ms").unwrap().as_integer(), Some(500));
+        assert_eq!(ow.get("max_events_per_min").unwrap().as_integer(), Some(12));
+        assert!(changes.iter().any(|c| c.contains("os_watch.paths")));
+        // Absent os_watch object ⇒ no-op, empty change list.
+        let mut empty = toml::Table::new();
+        assert!(
+            apply_os_watch_to_table(&mut empty, &json!({}))
+                .expect("no-op")
+                .is_empty()
+        );
+        assert!(empty.get("os_watch").is_none());
+    }
+
+    #[test]
+    fn os_watch_apply_rejects_bad_values() {
+        // Empty path string.
+        let mut t1 = toml::Table::new();
+        assert!(
+            apply_os_watch_to_table(&mut t1, &json!({ "os_watch": { "paths": ["ok", "  "] } }),)
+                .is_err()
+        );
+        // Non-string path entry.
+        let mut t2 = toml::Table::new();
+        assert!(
+            apply_os_watch_to_table(&mut t2, &json!({ "os_watch": { "paths": [123] } }),).is_err()
+        );
+        // debounce_ms out of range (0).
+        let mut t3 = toml::Table::new();
+        assert!(
+            apply_os_watch_to_table(&mut t3, &json!({ "os_watch": { "debounce_ms": 0 } }),)
+                .is_err()
+        );
+        // max_events_per_min out of range.
+        let mut t4 = toml::Table::new();
+        assert!(
+            apply_os_watch_to_table(
+                &mut t4,
+                &json!({ "os_watch": { "max_events_per_min": 2_000_000 } }),
+            )
+            .is_err()
+        );
     }
 
     // ── SCP: namespace mode parse ────────────────────────────────────────────
@@ -21948,10 +25237,18 @@ policies:
     #[test]
     fn scp_apply_sets_read_only_with_synced_from() {
         let mut table = toml::Table::new();
-        let change = scp_apply_namespace(&mut table, "identity", "read_only", Some("identity-provider"), false)
-            .expect("apply");
+        let change = scp_apply_namespace(
+            &mut table,
+            "identity",
+            "read_only",
+            Some("identity-provider"),
+            false,
+        )
+        .expect("apply");
         assert!(change.contains("read_only"));
-        let ns = table["namespaces"].as_table().unwrap()["identity"].as_table().unwrap();
+        let ns = table["namespaces"].as_table().unwrap()["identity"]
+            .as_table()
+            .unwrap();
         assert_eq!(ns["mode"].as_str(), Some("read_only"));
         assert_eq!(ns["synced_from"].as_str(), Some("identity-provider"));
     }
@@ -21973,9 +25270,19 @@ policies:
     fn scp_remove_deletes_entry() {
         let mut table = toml::Table::new();
         scp_apply_namespace(&mut table, "policies", "operator_only", None, false).unwrap();
-        assert!(table["namespaces"].as_table().unwrap().contains_key("policies"));
+        assert!(
+            table["namespaces"]
+                .as_table()
+                .unwrap()
+                .contains_key("policies")
+        );
         scp_apply_namespace(&mut table, "policies", "agent_writable", None, true).unwrap();
-        assert!(!table["namespaces"].as_table().unwrap().contains_key("policies"));
+        assert!(
+            !table["namespaces"]
+                .as_table()
+                .unwrap()
+                .contains_key("policies")
+        );
     }
 
     #[test]
@@ -21996,7 +25303,8 @@ policies:
         // The per-agent set_channel_token path only encrypts keys containing
         // "token"/"secret"/"app_id". phone_number_id does NOT match → plaintext.
         let field = "phone_number_id";
-        let should_encrypt = field.contains("token") || field.contains("secret") || field == "app_id";
+        let should_encrypt =
+            field.contains("token") || field.contains("secret") || field == "app_id";
         assert!(!should_encrypt, "phone_number_id must not be encrypted");
     }
 
@@ -22416,10 +25724,8 @@ pub(crate) fn run_window_end(
     match &run.ended_at {
         Some(e) => parse_timeline_ts(e),
         None if run.status == "running" => Some(now),
-        None => {
-            parse_timeline_ts(&run.started_at)
-                .map(|s| s + chrono::Duration::seconds(RUN_RUNNING_WINDOW_SECS))
-        }
+        None => parse_timeline_ts(&run.started_at)
+            .map(|s| s + chrono::Duration::seconds(RUN_RUNNING_WINDOW_SECS)),
     }
 }
 
@@ -22531,13 +25837,15 @@ pub(crate) fn query_run_msg_rows(
     agent_filter: &str,
     cap: usize,
 ) -> rusqlite::Result<Vec<RunMsgRow>> {
-    const WITH_TOMBSTONES: &str = "SELECT m.id, m.session_id, s.agent_id, m.role, substr(m.content, 1, 400), m.timestamp
+    const WITH_TOMBSTONES: &str =
+        "SELECT m.id, m.session_id, s.agent_id, m.role, substr(m.content, 1, 400), m.timestamp
          FROM session_messages m JOIN sessions s ON s.id = m.session_id
          WHERE m.role IN ('user','assistant')
            AND (?1 = '' OR s.agent_id = ?1)
            AND COALESCE(m.hidden, 0) = 0 AND m.undone_at IS NULL
          ORDER BY m.id DESC LIMIT ?2";
-    const PLAIN: &str = "SELECT m.id, m.session_id, s.agent_id, m.role, substr(m.content, 1, 400), m.timestamp
+    const PLAIN: &str =
+        "SELECT m.id, m.session_id, s.agent_id, m.role, substr(m.content, 1, 400), m.timestamp
          FROM session_messages m JOIN sessions s ON s.id = m.session_id
          WHERE m.role IN ('user','assistant')
            AND (?1 = '' OR s.agent_id = ?1)
@@ -22594,28 +25902,37 @@ mod runs_tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].id, "telegram:1#1");
         assert_eq!(runs[0].status, "completed");
-        assert_eq!(runs[0].ended_at.as_deref(), Some(ts(1, 2).to_rfc3339().as_str()));
+        assert_eq!(
+            runs[0].ended_at.as_deref(),
+            Some(ts(1, 2).to_rfc3339().as_str())
+        );
         assert_eq!(runs[0].channel, "telegram");
     }
 
     #[test]
     fn superseded_user_turn_is_no_reply_and_trailing_recent_turn_is_running() {
         let rows = vec![
-            msg(1, "discord:9", "user", ts(1, 0)),  // superseded, never answered
+            msg(1, "discord:9", "user", ts(1, 0)), // superseded, never answered
             msg(2, "discord:9", "user", ts(8, 59)), // trailing, 1 min before "now"
         ];
         let runs = fold_session_runs(&rows, ts(9, 0));
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].status, "no_reply");
         assert!(runs[0].ended_at.is_none());
-        assert_eq!(runs[1].status, "running", "recent unanswered trailing turn is live");
+        assert_eq!(
+            runs[1].status, "running",
+            "recent unanswered trailing turn is live"
+        );
     }
 
     #[test]
     fn stale_trailing_turn_is_no_reply_not_running() {
         let rows = vec![msg(1, "line:5", "user", ts(1, 0))];
         let runs = fold_session_runs(&rows, ts(9, 0));
-        assert_eq!(runs[0].status, "no_reply", "8h old with no reply is not 'running'");
+        assert_eq!(
+            runs[0].status, "no_reply",
+            "8h old with no reply is not 'running'"
+        );
     }
 
     #[test]
@@ -22653,8 +25970,14 @@ mod runs_tests {
             ok: true,
             preview: "path=sop".into(),
         };
-        let wrong_agent = ToolCallRow { agent_id: "agnes".into(), ..inside.clone() };
-        let too_late = ToolCallRow { ts: ts(2, 0).to_rfc3339(), ..inside.clone() };
+        let wrong_agent = ToolCallRow {
+            agent_id: "agnes".into(),
+            ..inside.clone()
+        };
+        let too_late = ToolCallRow {
+            ts: ts(2, 0).to_rfc3339(),
+            ..inside.clone()
+        };
         let now = ts(9, 0);
         assert!(tool_row_in_run_window(&inside, &run, now));
         assert!(!tool_row_in_run_window(&wrong_agent, &run, now));
@@ -22734,7 +26057,12 @@ mod runs_tests {
         assert!(step_meta_in_run_window("telegram:1", &inside, &run, now));
         // Exact session key equality — never substring (convention 2).
         assert!(!step_meta_in_run_window("telegram:12", &inside, &run, now));
-        assert!(!step_meta_in_run_window("telegram:1", &ts(2, 0).to_rfc3339(), &run, now));
+        assert!(!step_meta_in_run_window(
+            "telegram:1",
+            &ts(2, 0).to_rfc3339(),
+            &run,
+            now
+        ));
         assert!(!step_meta_in_run_window("telegram:1", "garbage", &run, now));
     }
 
@@ -22752,15 +26080,30 @@ mod runs_tests {
         };
         let now = ts(9, 0);
         assert_eq!(run_window_end(&base, now), Some(ts(1, 5)));
-        let running = RunSummary { ended_at: None, status: "running".into(), ..base.clone() };
+        let running = RunSummary {
+            ended_at: None,
+            status: "running".into(),
+            ..base.clone()
+        };
         assert_eq!(run_window_end(&running, now), Some(now));
-        let no_reply = RunSummary { ended_at: None, status: "no_reply".into(), ..base.clone() };
+        let no_reply = RunSummary {
+            ended_at: None,
+            status: "no_reply".into(),
+            ..base.clone()
+        };
         assert_eq!(
             run_window_end(&no_reply, now),
             Some(ts(1, 0) + chrono::Duration::seconds(RUN_RUNNING_WINDOW_SECS)),
         );
-        let bad_end = RunSummary { ended_at: Some("garbage".into()), ..base };
-        assert_eq!(run_window_end(&bad_end, now), None, "unparseable end fails closed");
+        let bad_end = RunSummary {
+            ended_at: Some("garbage".into()),
+            ..base
+        };
+        assert_eq!(
+            run_window_end(&bad_end, now),
+            None,
+            "unparseable end fails closed"
+        );
     }
 }
 
@@ -22807,7 +26150,10 @@ mod timeline_tests {
         t.completed_at = Some(ts(3, 0).to_rfc3339());
         let row = timeline_row_from_task(&t, ts(0, 0), ts(23, 0), ts(23, 0)).unwrap();
         assert_eq!(row.started_at, ts(1, 30).to_rfc3339()); // claim wins over creation
-        assert_eq!(row.ended_at.as_deref(), Some(ts(3, 0).to_rfc3339().as_str()));
+        assert_eq!(
+            row.ended_at.as_deref(),
+            Some(ts(3, 0).to_rfc3339().as_str())
+        );
         assert_eq!(row.kind, "task");
         assert_eq!(row.status, "done");
     }
@@ -22817,7 +26163,10 @@ mod timeline_tests {
         let mut t = task("t2", "in_progress");
         t.claimed_at = Some(ts(4, 0).to_rfc3339());
         let row = timeline_row_from_task(&t, ts(0, 0), ts(23, 0), ts(23, 0)).unwrap();
-        assert_eq!(row.ended_at, None, "running bar must stay open (null = extends to now)");
+        assert_eq!(
+            row.ended_at, None,
+            "running bar must stay open (null = extends to now)"
+        );
     }
 
     #[test]
@@ -22865,18 +26214,27 @@ mod timeline_tests {
     fn activity_instants_map_kinds_and_skip_task_created() {
         let from = ts(0, 0);
         let to = ts(23, 0);
-        let deleg = timeline_row_from_activity(&activity("a1", "delegation_forwarded", ts(6, 0)), from, to)
-            .unwrap();
+        let deleg =
+            timeline_row_from_activity(&activity("a1", "delegation_forwarded", ts(6, 0)), from, to)
+                .unwrap();
         assert_eq!(deleg.kind, "delegation");
         assert_eq!(deleg.ended_at.as_deref(), Some(deleg.started_at.as_str()));
-        let skill = timeline_row_from_activity(&activity("a2", "skill_activate", ts(6, 5)), from, to).unwrap();
+        let skill =
+            timeline_row_from_activity(&activity("a2", "skill_activate", ts(6, 5)), from, to)
+                .unwrap();
         assert_eq!(skill.kind, "skill");
         assert!(
-            timeline_row_from_activity(&activity("a3", "task_created", ts(6, 10)), from, to).is_none(),
+            timeline_row_from_activity(&activity("a3", "task_created", ts(6, 10)), from, to)
+                .is_none(),
             "task_created duplicates the task bar start edge"
         );
         assert!(
-            timeline_row_from_activity(&activity("a4", "autopilot_triggered", ts(23, 30)), from, to).is_none(),
+            timeline_row_from_activity(
+                &activity("a4", "autopilot_triggered", ts(23, 30)),
+                from,
+                to
+            )
+            .is_none(),
             "outside window"
         );
     }
@@ -22889,7 +26247,8 @@ mod timeline_tests {
             ("bruno".to_string(), Some(ts(0, 10).to_rfc3339())),
             ("mia".to_string(), None), // never ran → no row
         ];
-        let (rows, truncated) = derive_timeline_rows(&tasks, &acts, &hbs, ts(0, 0), ts(23, 0), ts(23, 0));
+        let (rows, truncated) =
+            derive_timeline_rows(&tasks, &acts, &hbs, ts(0, 0), ts(23, 0), ts(23, 0));
         assert!(!truncated);
         assert_eq!(rows.len(), 3);
         // Chronological: heartbeat 00:10 → governance 00:30 → task created 01:00.
@@ -22903,7 +26262,8 @@ mod timeline_tests {
         let acts: Vec<ActivityRow> = (0..(TIMELINE_ROW_CAP + 5))
             .map(|i| activity(&format!("a{i}"), "note", ts(1, 0)))
             .collect();
-        let (rows, truncated) = derive_timeline_rows(&[], &acts, &[], ts(0, 0), ts(23, 0), ts(23, 0));
+        let (rows, truncated) =
+            derive_timeline_rows(&[], &acts, &[], ts(0, 0), ts(23, 0), ts(23, 0));
         assert!(truncated);
         assert_eq!(rows.len(), TIMELINE_ROW_CAP);
     }
@@ -22921,7 +26281,10 @@ mod timeline_tests {
         let (rows, truncated) =
             derive_timeline_rows(&[], &acts, &[], ts(0, 0), ts(23, 0), ts(23, 0));
         assert_eq!(rows.len(), TIMELINE_ROW_CAP);
-        assert!(truncated, "cap-full fetch newer than `from` hides older events");
+        assert!(
+            truncated,
+            "cap-full fetch newer than `from` hides older events"
+        );
     }
 
     #[test]
@@ -23018,7 +26381,9 @@ mod d6_curation_tests {
 
     fn frame_data(frame: &WsFrame) -> Value {
         match frame {
-            WsFrame::Response { payload: Some(d), .. } => d.clone(),
+            WsFrame::Response {
+                payload: Some(d), ..
+            } => d.clone(),
             _ => Value::Null,
         }
     }
@@ -23110,6 +26475,106 @@ mod d6_curation_tests {
         assert!(!frame_ok(&frame), "missing agent_id must be rejected");
     }
 
+    // ── v1.39: system.update_config new knobs ────────────────────────────────
+
+    #[tokio::test]
+    async fn system_update_config_v139_knobs_persist_and_validate() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Valid nested payload across all five sections.
+        let frame = handler
+            .handle_system_update_config(json!({
+                "knowledge_guard": { "enabled": false, "window_secs": 7200, "max_per_subject": 3 },
+                "goal_loop": { "planner_enabled": true, "iteration_cap_simple": 5 },
+                "dispatch": { "policy": "round_robin" },
+                "memory": { "graph_embed_seed": true },
+                "topology_evolution": { "enabled": false },
+            }))
+            .await;
+        assert!(frame_ok(&frame), "valid knobs must persist: {frame:?}");
+        let data = frame_data(&frame);
+        // iteration_cap_simple / dispatch.policy → goal_loop driver hot reload.
+        let hot: Vec<String> = data
+            .get("hot_reloaded")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            hot.contains(&"goal_loop".to_string()),
+            "goal_loop reload flagged: {hot:?}"
+        );
+        // "easy" knobs (knowledge_guard/memory/planner) → applied:true.
+        assert_eq!(data.get("applied").and_then(|v| v.as_bool()), Some(true));
+
+        // The values landed in config.toml.
+        let cfg: toml::Table = std::fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            cfg["knowledge_guard"]["window_secs"].as_integer(),
+            Some(7200)
+        );
+        assert_eq!(
+            cfg["goal_loop"]["iteration_cap_simple"].as_integer(),
+            Some(5)
+        );
+        assert_eq!(cfg["dispatch"]["policy"].as_str(), Some("round_robin"));
+        assert_eq!(cfg["memory"]["graph_embed_seed"].as_bool(), Some(true));
+
+        // Re-read through GoalLoopConfig / DispatchPolicyKind to prove the shape
+        // is what the consumers parse.
+        assert_eq!(
+            crate::goal_loop::GoalLoopConfig::from_home(home.path()).iteration_cap_simple,
+            5
+        );
+        assert_eq!(
+            crate::dispatch_policy::DispatchPolicyKind::from_home(home.path()).as_str(),
+            "round_robin"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_update_config_rejects_bad_dispatch_policy_and_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Unknown dispatch.policy enum value → rejected.
+        let bad_policy = handler
+            .handle_system_update_config(json!({ "dispatch": { "policy": "chaos_monkey" } }))
+            .await;
+        assert!(
+            !frame_ok(&bad_policy),
+            "invalid dispatch.policy must be rejected"
+        );
+
+        // iteration_cap_simple out of the 1..=20 range → rejected.
+        let bad_cap = handler
+            .handle_system_update_config(json!({ "goal_loop": { "iteration_cap_simple": 99 } }))
+            .await;
+        assert!(
+            !frame_ok(&bad_cap),
+            "out-of-range iteration_cap_simple must be rejected"
+        );
+
+        // knowledge_guard.window_secs = 0 → rejected.
+        let bad_win = handler
+            .handle_system_update_config(json!({ "knowledge_guard": { "window_secs": 0 } }))
+            .await;
+        assert!(!frame_ok(&bad_win), "window_secs=0 must be rejected");
+
+        // A rejected payload must not create config.toml.
+        assert!(
+            !home.path().join("config.toml").exists(),
+            "no partial write on validation failure"
+        );
+    }
+
     #[tokio::test]
     async fn memory_graph_absent_db_is_empty_not_error() {
         let home = tempfile::tempdir().unwrap();
@@ -23119,7 +26584,12 @@ mod d6_curation_tests {
             .await;
         assert!(frame_ok(&frame), "absent db ⇒ empty graph, not error");
         let data = frame_data(&frame);
-        assert_eq!(data.get("edges").and_then(|v| v.as_array()).map(|a| a.len()), Some(0));
+        assert_eq!(
+            data.get("edges")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(0)
+        );
     }
 
     #[tokio::test]
@@ -23138,8 +26608,14 @@ mod d6_curation_tests {
         assert_eq!(data.get("expired").and_then(|v| v.as_u64()), Some(1));
 
         // The graph now excludes the expired fact (currently-valid only).
-        let g = handler.handle_memory_graph(json!({ "agent_id": agent })).await;
-        let edges = frame_data(&g).get("edges").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let g = handler
+            .handle_memory_graph(json!({ "agent_id": agent }))
+            .await;
+        let edges = frame_data(&g)
+            .get("edges")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         assert_eq!(edges.len(), 1, "expired fact drops out of the graph");
     }
 
@@ -23171,7 +26647,10 @@ mod d6_curation_tests {
         let d = duduclaw_memory::engine::RetrievalWeights::default();
         assert_eq!(w.graph_embed_seed, d.graph_embed_seed);
         assert_eq!(w.graph_embed_seed_top_k, d.graph_embed_seed_top_k);
-        assert!(!w.graph_embed_seed, "seed off by default (behaviour unchanged)");
+        assert!(
+            !w.graph_embed_seed,
+            "seed off by default (behaviour unchanged)"
+        );
     }
 
     #[test]
@@ -23223,23 +26702,36 @@ mod channels_add_enc_only_tests {
             json!({ "token": "xoxb-bot-token", "secret": "xapp-app-token" }),
         )
         .await;
-        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+        assert!(
+            matches!(frame, WsFrame::Response { ok: true, .. }),
+            "{frame:?}"
+        );
 
         let ch = channels_table(home.path());
         // Plaintext removed, _enc present.
-        assert!(!ch.contains_key("slack_bot_token"), "plaintext bot token must be dropped");
+        assert!(
+            !ch.contains_key("slack_bot_token"),
+            "plaintext bot token must be dropped"
+        );
         assert!(ch.contains_key("slack_bot_token_enc"));
-        assert!(!ch.contains_key("slack_app_token"), "plaintext app token must be dropped");
+        assert!(
+            !ch.contains_key("slack_app_token"),
+            "plaintext app token must be dropped"
+        );
         assert!(ch.contains_key("slack_app_token_enc"));
 
         // enc-only read path returns the original values.
         let bot = crate::config_crypto::read_encrypted_config_field(
-            home.path(), "channels", "slack_bot_token",
+            home.path(),
+            "channels",
+            "slack_bot_token",
         )
         .await;
         assert_eq!(bot.as_deref(), Some("xoxb-bot-token"));
         let app = crate::config_crypto::read_encrypted_config_field(
-            home.path(), "channels", "slack_app_token",
+            home.path(),
+            "channels",
+            "slack_app_token",
         )
         .await;
         assert_eq!(app.as_deref(), Some("xapp-app-token"));
@@ -23261,7 +26753,10 @@ mod channels_add_enc_only_tests {
             }),
         )
         .await;
-        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+        assert!(
+            matches!(frame, WsFrame::Response { ok: true, .. }),
+            "{frame:?}"
+        );
 
         let ch = channels_table(home.path());
         assert!(!ch.contains_key("whatsapp_access_token"));
@@ -23278,12 +26773,16 @@ mod channels_add_enc_only_tests {
         assert!(ch.contains_key("whatsapp_app_secret_enc"));
 
         let tok = crate::config_crypto::read_encrypted_config_field(
-            home.path(), "channels", "whatsapp_access_token",
+            home.path(),
+            "channels",
+            "whatsapp_access_token",
         )
         .await;
         assert_eq!(tok.as_deref(), Some("wa-access-token"));
         let verify = crate::config_crypto::read_encrypted_config_field(
-            home.path(), "channels", "whatsapp_verify_token",
+            home.path(),
+            "channels",
+            "whatsapp_verify_token",
         )
         .await;
         assert_eq!(verify.as_deref(), Some("verify-me"));
@@ -23299,7 +26798,10 @@ mod channels_add_enc_only_tests {
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
         let frame = add_channel(&handler, "telegram", json!({ "token": "tg-token" })).await;
-        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+        assert!(
+            matches!(frame, WsFrame::Response { ok: true, .. }),
+            "{frame:?}"
+        );
 
         let ch = channels_table(home.path());
         assert!(
@@ -23310,7 +26812,9 @@ mod channels_add_enc_only_tests {
 
         // enc-only read path returns the original value.
         let tok = crate::config_crypto::read_encrypted_config_field(
-            home.path(), "channels", "telegram_bot_token",
+            home.path(),
+            "channels",
+            "telegram_bot_token",
         )
         .await;
         assert_eq!(tok.as_deref(), Some("tg-token"));
@@ -23323,12 +26827,18 @@ mod channels_add_enc_only_tests {
         );
         let status = handler.handle_channels_status().await;
         let listed = match &status {
-            WsFrame::Response { payload: Some(payload), .. } => payload["channels"]
+            WsFrame::Response {
+                payload: Some(payload),
+                ..
+            } => payload["channels"]
                 .as_array()
                 .is_some_and(|arr| arr.iter().any(|c| c["name"] == "telegram")),
             _ => false,
         };
-        assert!(listed, "enc-only telegram must appear in channels.status: {status:?}");
+        assert!(
+            listed,
+            "enc-only telegram must appear in channels.status: {status:?}"
+        );
     }
 
     #[tokio::test]
@@ -23343,7 +26853,10 @@ mod channels_add_enc_only_tests {
         let created = handler
             .handle_agents_create(json!({ "name": "enc-bot", "display_name": "EncBot" }))
             .await;
-        assert!(matches!(created, WsFrame::Response { ok: true, .. }), "{created:?}");
+        assert!(
+            matches!(created, WsFrame::Response { ok: true, .. }),
+            "{created:?}"
+        );
 
         let updated = handler
             .handle_agents_update(json!({
@@ -23354,24 +26867,29 @@ mod channels_add_enc_only_tests {
                 "dingtalk_app_secret": "ding-secret-value",
             }))
             .await;
-        assert!(matches!(updated, WsFrame::Response { ok: true, .. }), "{updated:?}");
+        assert!(
+            matches!(updated, WsFrame::Response { ok: true, .. }),
+            "{updated:?}"
+        );
 
         let raw = std::fs::read_to_string(
-            home.path().join("agents").join("enc-bot").join("agent.toml"),
+            home.path()
+                .join("agents")
+                .join("enc-bot")
+                .join("agent.toml"),
         )
         .expect("agent.toml");
         let table: toml::Table = raw.parse().expect("parse agent.toml");
         let channels = table["channels"].as_table().expect("[channels]");
 
         let tg = channels["telegram"].as_table().unwrap();
-        assert!(!tg.contains_key("bot_token"), "plaintext must be stripped: {tg:?}");
+        assert!(
+            !tg.contains_key("bot_token"),
+            "plaintext must be stripped: {tg:?}"
+        );
         let enc = tg["bot_token_enc"].as_str().unwrap();
         assert_eq!(
-            crate::config_crypto::resolve_agent_token(
-                &Some(enc.to_string()),
-                "",
-                home.path(),
-            ),
+            crate::config_crypto::resolve_agent_token(&Some(enc.to_string()), "", home.path(),),
             "tg-agent-token",
             "enc-only roundtrip must recover the original token"
         );
@@ -23379,11 +26897,17 @@ mod channels_add_enc_only_tests {
         let wecom = channels["wecom"].as_table().unwrap();
         // corp_id is an identifier → plaintext canonical copy.
         assert_eq!(wecom["corp_id"].as_str(), Some("corp-id-plain"));
-        assert!(!wecom.contains_key("corp_secret"), "wecom secret must be enc-only");
+        assert!(
+            !wecom.contains_key("corp_secret"),
+            "wecom secret must be enc-only"
+        );
         assert!(wecom.contains_key("corp_secret_enc"));
 
         let dingtalk = channels["dingtalk"].as_table().unwrap();
-        assert!(!dingtalk.contains_key("app_secret"), "dingtalk secret must be enc-only");
+        assert!(
+            !dingtalk.contains_key("app_secret"),
+            "dingtalk secret must be enc-only"
+        );
         assert!(dingtalk.contains_key("app_secret_enc"));
     }
 }
@@ -23401,7 +26925,10 @@ impl MethodHandler {
     /// time (`canvas::CanvasStore::push` is the only write path); the
     /// dashboard renders it inside `<iframe sandbox="">` as defense-in-depth.
     async fn handle_canvas_get(&self, params: Value) -> WsFrame {
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if agent_id.is_empty() {
             return WsFrame::error_response("", "agent_id is required");
         }
@@ -23492,14 +27019,21 @@ mod canvas_rpc_tests {
         let frame = handler
             .handle("canvas.get", json!({ "agent_id": "beta" }), &ctx)
             .await;
-        assert!(error_text(&frame).contains("permission denied"), "got: {frame:?}");
+        assert!(
+            error_text(&frame).contains("permission denied"),
+            "got: {frame:?}"
+        );
 
         // Bound agent → allowed; empty store yields a null canvas.
         let frame = handler
             .handle("canvas.get", json!({ "agent_id": "alpha" }), &ctx)
             .await;
         match frame {
-            WsFrame::Response { ok: true, payload: Some(p), .. } => {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => {
                 assert!(p["canvas"].is_null());
                 assert_eq!(p["history"].as_array().map(Vec::len), Some(0));
             }
@@ -23517,12 +27051,13 @@ mod canvas_rpc_tests {
         let ctx = viewer_ctx("alpha");
 
         let store = crate::canvas::CanvasStore::open(home.path()).unwrap();
-        let v1 = store
-            .push("alpha", "v1", "<p>第一版</p>")
-            .await
-            .unwrap();
+        let v1 = store.push("alpha", "v1", "<p>第一版</p>").await.unwrap();
         store
-            .push("alpha", "儀表板", "<h1>KPI</h1><script>alert(1)</script><p>營收 100</p>")
+            .push(
+                "alpha",
+                "儀表板",
+                "<h1>KPI</h1><script>alert(1)</script><p>營收 100</p>",
+            )
             .await
             .unwrap();
 
@@ -23530,21 +27065,36 @@ mod canvas_rpc_tests {
             .handle("canvas.get", json!({ "agent_id": "alpha" }), &ctx)
             .await;
         let payload = match frame {
-            WsFrame::Response { ok: true, payload: Some(p), .. } => p,
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => p,
             other => panic!("expected ok response, got: {other:?}"),
         };
         let html = payload["canvas"]["html"].as_str().unwrap();
-        assert!(!html.contains("script"), "stored html must be sanitized: {html}");
+        assert!(
+            !html.contains("script"),
+            "stored html must be sanitized: {html}"
+        );
         assert!(html.contains("<h1>KPI</h1>") && html.contains("營收 100"));
         assert_eq!(payload["canvas"]["title"].as_str(), Some("儀表板"));
         assert_eq!(payload["history"].as_array().map(Vec::len), Some(2));
 
         // Fetch the older version explicitly by seq.
         let frame = handler
-            .handle("canvas.get", json!({ "agent_id": "alpha", "seq": v1.seq }), &ctx)
+            .handle(
+                "canvas.get",
+                json!({ "agent_id": "alpha", "seq": v1.seq }),
+                &ctx,
+            )
             .await;
         match frame {
-            WsFrame::Response { ok: true, payload: Some(p), .. } => {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => {
                 assert_eq!(p["canvas"]["title"].as_str(), Some("v1"));
                 assert!(p["canvas"]["html"].as_str().unwrap().contains("第一版"));
             }
@@ -23597,7 +27147,11 @@ mod agents_avatar_rpc_tests {
             .handle("agents.avatar", json!({ "agent_id": "alpha" }), &ctx)
             .await;
         match frame {
-            WsFrame::Response { ok: true, payload: Some(p), .. } => {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => {
                 assert_eq!(p["has_avatar"].as_bool(), Some(true));
                 let uri = p["avatar"].as_str().expect("avatar data uri");
                 assert!(uri.starts_with("data:image/png;base64,"), "got: {uri}");
@@ -23611,7 +27165,11 @@ mod agents_avatar_rpc_tests {
             .handle("agents.avatar", json!({ "agent_id": "beta" }), &ctx)
             .await;
         match frame {
-            WsFrame::Response { ok: true, payload: Some(p), .. } => {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => {
                 assert_eq!(p["has_avatar"].as_bool(), Some(false));
                 assert!(p["avatar"].is_null());
             }
@@ -23642,7 +27200,9 @@ mod identity_dashboard_tests {
 
     fn frame_payload(frame: &WsFrame) -> Value {
         match frame {
-            WsFrame::Response { payload: Some(p), .. } => p.clone(),
+            WsFrame::Response {
+                payload: Some(p), ..
+            } => p.clone(),
             _ => Value::Null,
         }
     }
@@ -23667,14 +27227,20 @@ mod identity_dashboard_tests {
         // field_map defaults present.
         let fm = notion.get("field_map").unwrap();
         assert_eq!(fm.get("name").unwrap().as_str(), Some("Name"));
-        assert_eq!(fm.get("projects_kind").unwrap().as_str(), Some("multi_select"));
+        assert_eq!(
+            fm.get("projects_kind").unwrap().as_str(),
+            Some("multi_select")
+        );
     }
 
     #[test]
     fn response_masks_notion_secret() {
         let mut t = toml::Table::new();
         let mut notion = toml::map::Map::new();
-        notion.insert("api_key_enc".into(), toml::Value::String("ENCBLOB==".into()));
+        notion.insert(
+            "api_key_enc".into(),
+            toml::Value::String("ENCBLOB==".into()),
+        );
         let mut idt = toml::map::Map::new();
         idt.insert("provider".into(), toml::Value::String("notion".into()));
         idt.insert("notion".into(), toml::Value::Table(notion));
@@ -23682,10 +27248,16 @@ mod identity_dashboard_tests {
 
         let resp = identity_table_to_response(&t);
         let serialised = serde_json::to_string(&resp).unwrap();
-        assert!(!serialised.contains("ENCBLOB"), "enc secret leaked: {serialised}");
+        assert!(
+            !serialised.contains("ENCBLOB"),
+            "enc secret leaked: {serialised}"
+        );
         let notion = resp.get("notion").unwrap();
         assert_eq!(notion.get("api_key_set").unwrap().as_bool(), Some(true));
-        assert_eq!(notion.get("api_key").unwrap().as_str(), Some(SECRET_MASK_SET));
+        assert_eq!(
+            notion.get("api_key").unwrap().as_str(),
+            Some(SECRET_MASK_SET)
+        );
     }
 
     #[test]
@@ -23762,8 +27334,14 @@ mod identity_dashboard_tests {
 
         // Raw config.toml must NOT contain the cleartext secret.
         let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
-        assert!(!raw.contains("secret_topsecret"), "cleartext leaked to disk: {raw}");
-        assert!(raw.contains("api_key_enc"), "secret should persist encrypted");
+        assert!(
+            !raw.contains("secret_topsecret"),
+            "cleartext leaked to disk: {raw}"
+        );
+        assert!(
+            raw.contains("api_key_enc"),
+            "secret should persist encrypted"
+        );
 
         let get = handler.handle_identity_config_get().await;
         assert!(frame_ok(&get));
@@ -23772,7 +27350,10 @@ mod identity_dashboard_tests {
         let notion = p.get("notion").unwrap();
         assert_eq!(notion.get("database_id").unwrap().as_str(), Some("db_abc"));
         assert_eq!(notion.get("api_key_set").unwrap().as_bool(), Some(true));
-        assert_eq!(notion.get("api_key").unwrap().as_str(), Some(SECRET_MASK_SET));
+        assert_eq!(
+            notion.get("api_key").unwrap().as_str(),
+            Some(SECRET_MASK_SET)
+        );
     }
 
     #[tokio::test]
@@ -23795,7 +27376,10 @@ mod identity_dashboard_tests {
             .await;
 
         let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
-        assert!(!raw.contains(SECRET_MASK_SET), "placeholder must not be stored: {raw}");
+        assert!(
+            !raw.contains(SECRET_MASK_SET),
+            "placeholder must not be stored: {raw}"
+        );
         assert!(raw.contains("api_key_enc"), "original secret must survive");
     }
 
@@ -23839,7 +27423,10 @@ mod identity_dashboard_tests {
         assert_eq!(p.get("is_project_member").unwrap().as_bool(), Some(true));
         assert_eq!(p.get("provider").unwrap().as_str(), Some("wiki-cache"));
         let person = p.get("person").unwrap();
-        assert_eq!(person.get("display_name").unwrap().as_str(), Some("Ruby Lin"));
+        assert_eq!(
+            person.get("display_name").unwrap().as_str(),
+            Some("Ruby Lin")
+        );
     }
 
     #[tokio::test]
@@ -23884,22 +27471,24 @@ mod topology_rpc_tests {
         // Empty state ⇒ zero of each (fail-safe on a missing file).
         let frame = handler.handle("topology.list", json!({}), &ctx).await;
         assert!(frame_ok(&frame), "got: {frame:?}");
-        if let WsFrame::Response { payload: Some(p), .. } = &frame {
+        if let WsFrame::Response {
+            payload: Some(p), ..
+        } = &frame
+        {
             assert_eq!(p["override_count"].as_u64(), Some(0));
             assert_eq!(p["pending_count"].as_u64(), Some(0));
         }
 
         // Seed one active override + one pending proposal through the D5 module.
-        crate::topology_evolution::seed_for_test(
-            home.path(),
-            "billing",
-            "alice",
-            "bob",
-        );
+        crate::topology_evolution::seed_for_test(home.path(), "billing", "alice", "bob");
 
         let frame = handler.handle("topology.list", json!({}), &ctx).await;
         let p = match &frame {
-            WsFrame::Response { ok: true, payload: Some(p), .. } => p,
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => p,
             other => panic!("expected ok response, got: {other:?}"),
         };
         assert_eq!(p["override_count"].as_u64(), Some(1));
@@ -23907,7 +27496,10 @@ mod topology_rpc_tests {
         assert_eq!(p["overrides"][0]["from_agent"].as_str(), Some("alice"));
         assert_eq!(p["overrides"][0]["to_agent"].as_str(), Some("bob"));
         assert_eq!(p["overrides"][0]["status"].as_str(), Some("active"));
-        assert_eq!(p["pending_proposals"][0]["task_class"].as_str(), Some("billing"));
+        assert_eq!(
+            p["pending_proposals"][0]["task_class"].as_str(),
+            Some("billing")
+        );
     }
 }
 
@@ -23928,8 +27520,13 @@ mod skills_share_tests {
         )
         .unwrap();
         // Agent exists but has no local copy of the skill.
-        std::fs::create_dir_all(home.path().join("agents").join("ceo-assistant").join("SKILLS"))
-            .unwrap();
+        std::fs::create_dir_all(
+            home.path()
+                .join("agents")
+                .join("ceo-assistant")
+                .join("SKILLS"),
+        )
+        .unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
         let frame = handler
             .handle_skills_share(json!({ "agent_id": "ceo-assistant", "skill_name": "pptx" }))
@@ -23938,7 +27535,13 @@ mod skills_share_tests {
             matches!(frame, WsFrame::Response { ok: true, .. }),
             "sharing a global-scope skill must succeed: {frame:?}"
         );
-        assert!(home.path().join("shared").join("skills").join("pptx.md").exists());
+        assert!(
+            home.path()
+                .join("shared")
+                .join("skills")
+                .join("pptx.md")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -23946,7 +27549,11 @@ mod skills_share_tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("skills")).unwrap();
         std::fs::write(home.path().join("skills").join("pptx.md"), "global-body").unwrap();
-        let agent_skills = home.path().join("agents").join("ceo-assistant").join("SKILLS");
+        let agent_skills = home
+            .path()
+            .join("agents")
+            .join("ceo-assistant")
+            .join("SKILLS");
         std::fs::create_dir_all(&agent_skills).unwrap();
         std::fs::write(agent_skills.join("pptx.md"), "agent-body").unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
@@ -23957,7 +27564,10 @@ mod skills_share_tests {
         let shared =
             std::fs::read_to_string(home.path().join("shared").join("skills").join("pptx.md"))
                 .unwrap();
-        assert!(shared.contains("agent-body"), "agent copy must win: {shared}");
+        assert!(
+            shared.contains("agent-body"),
+            "agent copy must win: {shared}"
+        );
     }
 
     #[tokio::test]

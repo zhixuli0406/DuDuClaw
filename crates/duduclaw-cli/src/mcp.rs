@@ -1432,6 +1432,31 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "fork_id", description: "Fork id", required: true },
         ],
     },
+    // ── OS-native Phase 1 (requires [capabilities] os_native = true) ──────────
+    ToolDef {
+        name: "os_notify",
+        description: "Show a native desktop notification on the host (macOS osascript / Linux notify-send). \
+            Requires the agent's [capabilities] os_native = true. Title/body are sanitized (injection-safe).",
+        params: &[
+            ParamDef { name: "title", description: "Notification title", required: true },
+            ParamDef { name: "body", description: "Notification body text", required: true },
+        ],
+    },
+    ToolDef {
+        name: "os_watch_status",
+        description: "Report this agent's filesystem watcher status: watched paths and emitted / dropped \
+            event counts. Reads the gateway-maintained os_watch_stats.json. Requires [capabilities] os_native = true.",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_open",
+        description: "Open a file path or an http(s) URL with the OS default handler (macOS open / Linux xdg-open). \
+            Only http/https URLs and existing file paths are allowed (file:/javascript: etc. are rejected). \
+            Requires [capabilities] os_native = true; treated as maybe-irreversible (ActionGuard judge may require approval).",
+        params: &[
+            ParamDef { name: "target", description: "An existing file path, or an http(s):// URL", required: true },
+        ],
+    },
 ];
 
 // ── External tool whitelist (W19-P0 BUG-QA-001) ─────────────
@@ -6244,7 +6269,12 @@ pub(crate) async fn gate_tool_approval_dispatch(
     // what WP5 must gate).
     let in_always = install_approval_required(&agent_dir, tool_name, false)
         || duduclaw_gateway::approval::tool_is_irreversible(&agent_dir, tool_name);
-    let in_maybe = duduclaw_gateway::approval::tool_is_maybe_irreversible(&agent_dir, tool_name);
+    // OS-native Phase 1: `os_open` performs a host side-effect whose reversibility
+    // is target-dependent, so it is ALWAYS routed through the ActionGuard judge
+    // (take-the-stricter with any operator config — if the agent additionally
+    // lists it in `irreversible_tools`, `in_always` already forces human review).
+    let in_maybe = duduclaw_gateway::approval::tool_is_maybe_irreversible(&agent_dir, tool_name)
+        || tool_name == "os_open";
 
     use duduclaw_gateway::approval::{resolve_action_gate, ActionGate, JudgeVerdict};
 
@@ -8084,6 +8114,26 @@ pub(crate) async fn handle_tools_call(
         "merge_or_select" => crate::mcp_fork::handle_merge_or_select(&arguments, home_dir, default_agent).await,
         "terminate_branch" => crate::mcp_fork::handle_terminate_branch(&arguments, home_dir, default_agent).await,
         "fork_cost" => crate::mcp_fork::handle_fork_cost(&arguments, home_dir, default_agent).await,
+        // OS-native Phase 1 tools. The os_native capability + scope + (for
+        // os_open) ActionGuard gates are enforced upstream in mcp_dispatch;
+        // these handlers are the mechanism.
+        "os_notify" => handle_os_notify(&arguments).await,
+        "os_watch_status" => {
+            // Report the CALLER's watch stats, not the process-level default
+            // agent. The os_native gate authorizes on `principal.client_id`
+            // (== `caller_client_id`) and the stats file is keyed by agent
+            // directory name, so using `default_agent` here would leak another
+            // agent's watched paths (or wrongly report "no watch"). Internal
+            // stdio callers may present an empty client_id → fall back to the
+            // default agent so single-agent setups keep working.
+            let watch_agent = if caller_client_id.is_empty() {
+                default_agent
+            } else {
+                caller_client_id
+            };
+            handle_os_watch_status(home_dir, watch_agent).await
+        }
+        "os_open" => handle_os_open(&arguments).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => {
             handle_odoo_tool(t, &arguments, home_dir, odoo, default_agent).await
@@ -11031,6 +11081,72 @@ fn tool_error(msg: &str) -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// OS-native Phase 1 tool handlers (os_notify / os_watch_status / os_open).
+// The os_native capability, scope, and (for os_open) ActionGuard gates are all
+// enforced upstream in mcp_dispatch; these functions are pure mechanism.
+// ─────────────────────────────────────────────────────────────────
+
+async fn handle_os_notify(args: &Value) -> Value {
+    let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    if title.trim().is_empty() && body.trim().is_empty() {
+        return tool_error("os_notify 需要至少一個非空的 title 或 body。");
+    }
+    match duduclaw_os::send_notification(title, body).await {
+        Ok(()) => tool_text(
+            "通知已送出。若系統未顯示，請至「系統設定 → 通知」確認權限；\
+             在 launchd 情境下 osascript 通知可能被系統靜音（無法程式化偵測，請人工確認）。",
+        ),
+        Err(e) => tool_error(&format!("通知送出失敗：{e}")),
+    }
+}
+
+async fn handle_os_open(args: &Value) -> Value {
+    let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+    if target.trim().is_empty() {
+        return tool_error("os_open 需要非空的 `target`（檔案路徑或 http/https URL）。");
+    }
+    match duduclaw_os::open_path_or_url(target).await {
+        Ok(()) => tool_text(&format!("已開啟：{target}")),
+        Err(e) => tool_error(&format!("開啟失敗：{e}")),
+    }
+}
+
+async fn handle_os_watch_status(home_dir: &Path, agent_id: &str) -> Value {
+    let path = home_dir.join(duduclaw_gateway::os_events::STATS_FILE_NAME);
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(t) => t,
+        Err(_) => {
+            return tool_text(
+                "目前沒有檔案監看統計（os_watch 尚未啟動，或 gateway 尚未寫入第一份統計；\
+                 統計每 60 秒更新一次）。",
+            );
+        }
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return tool_error(&format!("os_watch_stats.json 解析失敗：{e}")),
+    };
+    let updated_at = value.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+    // Namespace isolation: only ever surface the calling agent's own stats.
+    match value.get("agents").and_then(|a| a.get(agent_id)) {
+        Some(entry) => {
+            let out = serde_json::json!({
+                "agent_id": agent_id,
+                "updated_at": updated_at,
+                "watched_paths": entry.get("watched_paths").cloned().unwrap_or(Value::Array(vec![])),
+                "emitted": entry.get("emitted").cloned().unwrap_or_else(|| Value::from(0)),
+                "dropped": entry.get("dropped").cloned().unwrap_or_else(|| Value::from(0)),
+            });
+            tool_text(&serde_json::to_string_pretty(&out).unwrap_or_default())
+        }
+        None => tool_text(&format!(
+            "代理「{agent_id}」目前沒有啟用中的檔案監看（未設定 [os_watch] paths，或 os_native 未啟用）。"
+        )),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Task Board / Activity Feed / Autopilot / Shared Skills MCP tools
 // (Multica-inspired "Agent-as-teammate" integration, v1.8.27+)
 // ─────────────────────────────────────────────────────────────────
@@ -12188,6 +12304,42 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// `os_watch_status` must key its lookup on the *calling* agent (the value
+    /// the dispatch now threads through from `principal.client_id` /
+    /// `caller_client_id`), never a shared default. A wrong-agent key would leak
+    /// one agent's watched paths to another or spuriously report "no watch".
+    #[tokio::test]
+    async fn os_watch_status_reports_caller_agent_only() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let stats = serde_json::json!({
+            "updated_at": "2026-07-22T00:00:00Z",
+            "agents": {
+                "alice": { "watched_paths": ["/home/alice/inbox"], "emitted": 3, "dropped": 0 },
+                "bob":   { "watched_paths": ["/home/bob/downloads"], "emitted": 7, "dropped": 1 }
+            }
+        });
+        fs::write(
+            home.join(duduclaw_gateway::os_events::STATS_FILE_NAME),
+            serde_json::to_string(&stats).unwrap(),
+        )
+        .unwrap();
+
+        // Bob's call surfaces Bob's paths, never Alice's (cross-agent leak).
+        let out = handle_os_watch_status(home, "bob").await;
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("/home/bob/downloads"), "bob sees own paths: {text}");
+        assert!(!text.contains("/home/alice/inbox"), "bob must NOT see alice: {text}");
+
+        // An agent with no entry is told it has no active watch — not handed
+        // another agent's data.
+        let out = handle_os_watch_status(home, "carol").await;
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("carol"), "carol gets own no-watch notice: {text}");
+        assert!(!text.contains("/home/alice/inbox"));
+        assert!(!text.contains("/home/bob/downloads"));
     }
 
     /// Create a minimal agent directory for testing.
@@ -14933,6 +15085,10 @@ mod mcp_scope_dispatch_tests {
         assert_eq!(tool_requires_scope("send_message"), Some(Scope::MessagingSend));
         assert_eq!(tool_requires_scope("memory_search"),Some(Scope::MemoryRead));
         assert_eq!(tool_requires_scope("wiki_read"),    Some(Scope::WikiRead));
+        // OS-native Phase 1 tools map to the dedicated os:native scope.
+        assert_eq!(tool_requires_scope("os_notify"),       Some(Scope::OsNative));
+        assert_eq!(tool_requires_scope("os_watch_status"), Some(Scope::OsNative));
+        assert_eq!(tool_requires_scope("os_open"),         Some(Scope::OsNative));
         // C2 fail-closed: unmapped tools require Admin, not None.
         assert_eq!(tool_requires_scope("totally_unknown"), Some(Scope::Admin));
     }

@@ -576,6 +576,10 @@ enum Commands {
     #[command(subcommand)]
     Evolution(EvolutionCommands),
 
+    /// OS-native integration helpers (native notifications, doctor).
+    #[command(subcommand)]
+    Os(OsCommands),
+
     /// Long-term context lifecycle management (#16: quarterly flush).
     ///
     /// Periodic cold/hot separation of wiki pages so the system prompt
@@ -804,6 +808,24 @@ enum AgentCommands {
         /// Agent name
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum OsCommands {
+    /// Send a native desktop notification (local operator; bypasses the MCP
+    /// os_native capability gate — this is a direct host-side command).
+    Notify {
+        /// Notification title.
+        #[arg(long)]
+        title: String,
+        /// Notification body text.
+        #[arg(long)]
+        body: String,
+    },
+
+    /// Diagnose OS-native integration: notification helper availability, a live
+    /// test notification, and per-agent os_native / [os_watch] path status.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -1390,6 +1412,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Evolution(ev_cmd) => {
             cmd_evolution(ev_cmd, &duduclaw_home()).await
         }
+        Commands::Os(os_cmd) => {
+            cmd_os(os_cmd, &duduclaw_home()).await
+        }
         Commands::Lifecycle(lc_cmd) => {
             cmd_lifecycle(lc_cmd, &duduclaw_home()).await
         }
@@ -1528,6 +1553,121 @@ async fn cmd_evolution(
                     d.post.positive_feedback_ratio,
                 );
             }
+            Ok(())
+        }
+    }
+}
+
+/// `duduclaw os …` — OS-native integration helpers (Phase 1).
+///
+/// `notify` sends a native desktop notification directly (local operator
+/// authority; not gated by the MCP `os_native` capability). `doctor` reports
+/// notification-helper availability, sends one live test notification, and lists
+/// each agent's `os_native` / `[os_watch]` status.
+async fn cmd_os(
+    cmd: OsCommands,
+    home_dir: &PathBuf,
+) -> duduclaw_core::error::Result<()> {
+    match cmd {
+        OsCommands::Notify { title, body } => {
+            match duduclaw_os::send_notification(&title, &body).await {
+                Ok(()) => println!("Notification sent."),
+                Err(e) => println!("Notification failed: {e}"),
+            }
+            Ok(())
+        }
+        OsCommands::Doctor => {
+            println!("DuDuClaw OS-native Doctor");
+            println!("{}", "=".repeat(40));
+
+            // 1) Notification helper availability + a live test.
+            let helper = if cfg!(target_os = "macos") {
+                "osascript"
+            } else if cfg!(target_os = "linux") {
+                "notify-send"
+            } else {
+                ""
+            };
+            if helper.is_empty() {
+                println!("[warn] Native notifications are not supported on this platform.");
+            } else {
+                println!("Notification helper: {helper}");
+                match duduclaw_os::send_notification(
+                    "DuDuClaw",
+                    "OS doctor test notification",
+                )
+                .await
+                {
+                    Ok(()) => println!(
+                        "[ok]  Test notification dispatched. NOTE: a successful dispatch does NOT \
+                         guarantee display — under launchd, osascript notifications are attributed \
+                         to Script Editor / Terminal's TCC context and may be silently suppressed. \
+                         Confirm manually, and check System Settings → Notifications if nothing appeared."
+                    ),
+                    Err(e) => println!("[fail] Test notification failed: {e}"),
+                }
+            }
+
+            // 2) Per-agent os_native + [os_watch] status.
+            println!();
+            println!("Per-agent OS-native status:");
+            let agents_dir = home_dir.join("agents");
+            let mut any = false;
+            if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+                let mut dirs: Vec<_> = entries
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .collect();
+                dirs.sort_by_key(|e| e.file_name());
+                for entry in dirs {
+                    let dir = entry.path();
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with('_') {
+                        continue;
+                    }
+                    let toml_path = dir.join("agent.toml");
+                    if !toml_path.exists() {
+                        continue;
+                    }
+                    any = true;
+                    let os_native = std::fs::read_to_string(&toml_path)
+                        .ok()
+                        .and_then(|c| c.parse::<toml::Table>().ok())
+                        .and_then(|t| {
+                            t.get("capabilities")?
+                                .as_table()?
+                                .get("os_native")?
+                                .as_bool()
+                        })
+                        .unwrap_or(false);
+
+                    match duduclaw_gateway::os_events::read_os_watch_config(&dir) {
+                        Some(cfg) => {
+                            println!(
+                                "  {name}: os_native={os_native}, [os_watch] {} path(s)",
+                                cfg.paths.len()
+                            );
+                            for p in &cfg.paths {
+                                let exists = p.exists();
+                                let mark = if exists { "ok" } else { "MISSING" };
+                                println!("      - {} [{mark}]", p.display());
+                            }
+                            if !os_native {
+                                println!(
+                                    "      (note: [os_watch] present but os_native=false — watcher will NOT start)"
+                                );
+                            }
+                        }
+                        None => {
+                            println!("  {name}: os_native={os_native}, [os_watch] none");
+                        }
+                    }
+                }
+            }
+            if !any {
+                println!("  (no agents found under {})", agents_dir.display());
+            }
+
             Ok(())
         }
     }

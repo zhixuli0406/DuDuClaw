@@ -638,6 +638,14 @@ pub struct CapabilitiesConfig {
     /// rather than run unconfined (fail-closed, I5).
     #[serde(default)]
     pub native_sandbox: bool,
+
+    /// Opt-in OS-native integration (Phase 1 of the OS-native agent track).
+    /// Master switch: when `false` (default), the agent's filesystem watcher is
+    /// not started and the `os_notify` / `os_watch_status` / `os_open` MCP tools
+    /// are denied at the dispatch gate. Filesystem watching additionally requires
+    /// a non-empty `[os_watch] paths` list in the agent's `agent.toml`.
+    #[serde(default)]
+    pub os_native: bool,
 }
 
 /// Effect of a [`ToolPolicy`] rule.
@@ -775,6 +783,7 @@ impl Default for CapabilitiesConfig {
             wiki_visible_to: default_wiki_visible_to(),
             policy: Vec::new(),
             native_sandbox: false,
+            os_native: false,
         }
     }
 }

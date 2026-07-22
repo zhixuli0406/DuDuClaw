@@ -25,7 +25,7 @@ pub use error::{DuDuClawError, Result};
 pub use fs_lock::with_file_lock;
 pub use keychain::{resolve_master_key, KeychainError, MasterKeySource};
 pub use match_utils::{is_valid_egress_host, origin_host_matches, word_contains_ci};
-pub use platform::{duduclaw_home, duduclaw_instance, home_dir, mcp_server_key};
+pub use platform::{duduclaw_home, duduclaw_instance, expand_tilde, home_dir, mcp_server_key};
 pub use text_utils::{truncate_bytes, truncate_chars};
 pub use traits::{Channel, ContainerRuntime, MemoryEngine};
 pub use types::*;

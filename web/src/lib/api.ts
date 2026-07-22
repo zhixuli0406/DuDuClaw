@@ -92,6 +92,10 @@ export interface AgentDetail extends AgentInfo {
   /** [capabilities] block — returned by agents.inspect so the capability editor
    *  (incl. the Progent policy rules) can prefill existing values. */
   capabilities?: AgentCapabilities;
+  /** [os_watch] table — returned raw by agents.inspect so the OS-native watch
+   *  editor can prefill the operator's own paths/ignore/debounce. Null/absent
+   *  when the agent declares no `[os_watch]`. */
+  os_watch?: OsWatchConfig | null;
   /** [runtime] block — returned by agents.inspect so the runtime editor can
    *  prefill existing values. Emits ONLY keys present in agent.toml, so an
    *  absent `pty_pool_enabled` (vs. an explicit `false`) is meaningful: it
@@ -1126,6 +1130,8 @@ export interface AgentUpdateParams {
   sticker_expressiveness?: 'minimal' | 'moderate' | 'expressive';
   // Capabilities ([capabilities] section, nested object)
   capabilities?: AgentCapabilities;
+  // v1.39 — OS-native filesystem watch ([os_watch] top-level table)
+  os_watch?: OsWatchConfig;
   // RT — Runtime ([runtime] section, nested object)
   runtime?: AgentRuntime;
   // EVO — advanced evolution ([evolution.*] fields, nested object)
@@ -1488,6 +1494,17 @@ export interface AgentCapabilities {
   native_sandbox?: boolean;
   /** Progent tool-authorization policy. Empty/absent = not enforced. */
   policy?: ToolPolicyRule[];
+  /** v1.39 — opt-in OS-native features (filesystem watchers via [os_watch]). */
+  os_native?: boolean;
+}
+
+/** v1.39 — top-level `[os_watch]` table (gated by `capabilities.os_native`).
+ *  Paths are format-checked only; existence is verified at watcher start. */
+export interface OsWatchConfig {
+  paths?: string[];
+  ignore?: string[];
+  debounce_ms?: number;
+  max_events_per_min?: number;
 }
 
 // ── CON: per-agent CONTRACT.toml ────────────────────────────────
@@ -2888,7 +2905,7 @@ export const api = {
         allowed_origins?: string[];
       }>,
     updateConfig: (fields: Record<string, unknown>) =>
-      client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean }>,
+      client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean; hot_reloaded?: string[] }>,
     checkUpdate: () =>
       client.call('system.check_update') as Promise<{
         available: boolean;

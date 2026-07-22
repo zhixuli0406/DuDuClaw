@@ -37,6 +37,11 @@ pub enum Scope {
     /// Distinct from `Admin` so operators can grant an agent the ability to fork
     /// its own runs without granting full superuser scope.
     ForkExecute,
+    /// OS-native Phase 1: gates the `os_notify` / `os_watch_status` / `os_open`
+    /// MCP tools. Distinct scope so operators can grant OS integration without
+    /// granting `Admin`; enforcement additionally requires the per-agent
+    /// `[capabilities] os_native` flag at the dispatch gate (defence-in-depth).
+    OsNative,
     Admin,
 }
 
@@ -53,6 +58,7 @@ impl std::fmt::Display for Scope {
             Scope::OdooWrite => "odoo:write",
             Scope::OdooExecute => "odoo:execute",
             Scope::ForkExecute => "fork:execute",
+            Scope::OsNative => "os:native",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -374,6 +380,9 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
             "fork:execute" => {
                 result.insert(Scope::ForkExecute);
             }
+            "os:native" => {
+                result.insert(Scope::OsNative);
+            }
             "admin" => {
                 result.insert(Scope::Admin);
             }
@@ -494,6 +503,10 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "merge_or_select"
         | "terminate_branch"
         | "fork_cost" => Some(Scope::ForkExecute),
+        // OS-native Phase 1: native notification, watch-status read, and open.
+        // Gated by their own scope so OS integration can be granted without
+        // Admin; the dispatch gate ALSO requires `[capabilities] os_native`.
+        "os_notify" | "os_watch_status" | "os_open" => Some(Scope::OsNative),
         // ── High-impact tools — explicitly Admin (C2 fix) ────────────────
         // Arbitrary code execution, agent lifecycle/identity mutation, prompt
         // rewrite, cross-agent dispatch, scheduling, and evolution control.
@@ -718,6 +731,15 @@ is_external = {is_external}
     fn test_parse_scopes_unknown_returns_invalid_scope() {
         let result = parse_scopes("unknown:scope");
         assert!(matches!(result, Err(AuthError::InvalidScope(_))));
+    }
+
+    // ── OS-native Phase 1: os:native scope round-trips ───────────────────────
+    #[test]
+    fn test_os_native_scope_parse_and_display() {
+        let scopes = parse_scopes("os:native").expect("should parse");
+        assert!(scopes.contains(&Scope::OsNative));
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(Scope::OsNative.to_string(), "os:native");
     }
 
     // ── Test 8: tool_requires_scope memory_store → MemoryWrite ───────────────

@@ -1,0 +1,29 @@
+[package]
+name = "duduclaw-os"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "OS environment integration for DuDuClaw (filesystem watch, native notifications, open) — Phase 1 of the OS-native agent track"
+
+[dependencies]
+# Cross-platform filesystem watch (FSEvents / inotify / ReadDirectoryChangesW),
+# with burst debouncing. `notify-debouncer-mini` re-exports the `notify` crate,
+# so we don't pull `notify` separately. Deliberately light: no objc/cocoa — all
+# macOS-specific capabilities shell out (osascript / open) like duduclaw-desktop.
+notify-debouncer-mini = "0.7"
+
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Minimal tokio surface: mpsc (sync), subprocess (process), timeout (time),
+# and a runtime handle for spawning. NOT the full feature set — this crate
+# stays lightweight per the OS-native design.
+tokio = { version = "1", features = ["sync", "process", "time", "rt"] }
+
+duduclaw-core = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tempfile = "3"
