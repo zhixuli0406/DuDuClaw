@@ -237,6 +237,18 @@ impl AgentRuntime for GrokRuntime {
 
         let content = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
+        // Empty stdout with exit 0 is a FAILURE: an Ok("") would be silently
+        // dropped by every channel (empty sends are skipped) and would append an
+        // empty assistant turn to the session. Surface it so failover + the
+        // classified "空回應" user message fire.
+        if content.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Empty response from Grok CLI (exit 0); stderr tail: {}",
+                duduclaw_core::truncate_bytes(stderr.trim(), 300)
+            ));
+        }
+
         // Plain stdout is captured; `--output-format json|streaming-json` is
         // verified to exist but its usage-stats schema is unconfirmed (residual
         // #3), so tokens are ESTIMATED with the gateway's CJK-aware heuristic.

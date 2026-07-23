@@ -2,6 +2,314 @@
 
 ## [Unreleased]
 
+### Added
+- **API-mode 非 Claude 模型獲得完整 MCP 工具面**（根治性缺口）：多 runtime 匯流點的 openai-compat
+  `AgentRuntime`（`crates/duduclaw-gateway/src/runtime/openai_compat.rs`）過去只送純 messages（無
+  `tools`），導致以 API 直連的 Grok／DeepSeek／MiniMax 等 agent 永遠碰不到 15 個 Odoo／memory／channel
+  等 MCP 工具——問 Odoo 客戶資料只會回「我先找出 Odoo 設定」就停。現在當 agent 有可用工具時，
+  `execute()` 改走 `duduclaw-llm` 的 openai-compat provider ＋ `run_tool_loop`：spawn 一個 duduclaw
+  `mcp-server` stdio child（帶 `DUDUCLAW_AGENT_ID`／`HOME`／`PORT`／`INSTANCE`，比照 CLI runtime 慣例）、
+  掛 `ToolRegistry`，工具表先過 capabilities 過濾（deny-by-default：`denied_tools` 一律剔除、
+  `allowed_tools` 非空取交集）再暴露給模型，並套用靜態 `PolicyKernel` 政策；迴圈上限沿
+  `DEFAULT_MAX_TOOL_ITERS`，多輪 token 用量累計進 `RuntimeResponse`。`[capabilities] scoped_tools`／
+  `approval_required_tools` 等 dispatch 層閘門在 mcp-server 端本來就會執行（MCP dispatch 是強制點），
+  此路徑不重複實作。**失敗降級**：MCP child 起不來／registry 空／capability 過濾後無工具 → warn log
+  後回退到現行純 messages 路徑（沒有工具總比不回好）；provider／model 傳輸錯誤則向上傳播交給 failover。
+  現行未 commit 的空 content⇒Err、歷史空 turn 過濾行為全數保留；tool_use-only 回合不誤判為空回覆
+  （只有迴圈終了仍無文字才算 EmptyResponse）。新增 6 個單元測試涵蓋工具過濾、迴圈終止、tool-only
+  回合、token 累計與 provider-prefixed model id。
+- **Server 映像內建 Grok CLI（xAI Grok Build）**：`container/Dockerfile.server` 比照 `agy`（Antigravity）
+  段落樣式，新增 `grok` 官方安裝步驟——`curl -fsSL https://x.ai/cli/install.sh | bash` 下載/驗證後，
+  以 `install -m 0755` 從 `$HOME/.grok/bin/grok`（installer 產生的符號連結，`install` 會解引用取得
+  真正的 binary）relocate 到 `/usr/local/bin/grok`，再跑 `grok --version` 驗證可執行；未內建
+  `XAI_API_KEY`（runtime env 才提供，與其餘 CLI 一致）。同步補上 `~/.grok` 目錄（比照
+  `.claude`/`.codex`/`.gemini` 慣例）的 `mkdir` + `VOLUME` 宣告，以及根目錄 `docker-compose.yml`
+  的 `duduclaw-grok` 具名 volume 與 `XAI_API_KEY` env 轉發（`docker-compose.quickstart.yml` 因本就
+  未列 `OPENAI_API_KEY`/`GEMINI_API_KEY`，維持精簡未變動）。
+- **OS-native agent P4-3+：dashboard「OS」頁事件即時流**：「近期感知事件」面板從純快照＋手動刷新
+  升級成 WS 即時流。新增 dashboard RPC `os.events.subscribe`／`os.events.unsubscribe`
+  （`require_admin`，與其餘 `os.*` 同門檻——os_file／os_frontmost 事件帶檔案路徑與視窗標題，
+  敏感度比一般活動事件高，因此沿用 `logs.subscribe` 的每連線旗標訂閱模式，而非
+  `activity.new`／`task.*` 的無條件全連線廣播）；訂閱後即時推送 `os.events.entry` frame
+  （與 `os.events.recent` 的 `EventRow` 同形狀，僅少一個尚未寫入 `events.db` 的 `id`）；
+  每連線滑動 1 秒視窗限速 20 筆，超過丟棄＋計數，斷線重連天然重置；連線關閉隨 task 結束自動
+  取消訂閱。前端 `OSPage.tsx` 認證後自動訂閱，推播事件前插進列表（合成負數 id 兼作進場動效
+  標記，複用既有 `.animate-fade-up`、`prefers-reduced-motion` 全域已 gate）、環狀緩衝上限 200
+  筆；連線離開 `authenticated` 時降級顯示「即時更新已中斷，顯示快照」並保留手動刷新鈕。後端新增
+  9 個單元測試（`cargo test -p duduclaw-gateway --lib` 2649 passed / 0 failed）、前端新增 2 個
+  （`npx vitest run` 680 passed）。契約詳見 `commercial/docs/TODO-os-native-agent.md`
+  「P4-3+ 事件即時流已接線」。
+- **OS-native agent P4-3：dashboard「OS」頁後端（RPC＋個人版配額＋主動功能熱重載）**：交付
+  dashboard OS 頁的全部後端（前端 `web/` 待接）。**五個 dashboard WebSocket RPC**（`require_admin`）：
+  `os.status`（全 agent os_native／watch 路徑＋即時統計／frontmost 輪詢秒數＋running／footprint／
+  proactive 三欄／induced 規則數，外加 fleet 配額 `{limit, used}` ＋ edition）、`os.settings.update`
+  （per-agent 寫 `os_native`／`[os_watch] footprint`＋`frontmost_poll_secs`／`[proactive]`
+  `enabled`＋`base_threshold`(1–5)＋`max_per_hour`(0–1000) → 走配額閘＋熱重載，remap 到既有
+  `agents.update` 寫入路徑複用驗證器）、`os.gate.recent`（`proactive_gate.jsonl` 尾部 N 行〈預設
+  50、上限 200〉＋四象限聚合）、`os.events.recent`（`events.db` 近 N 筆 `os_*` 事件、newest first）、
+  `os.doctor.run`（on-demand 昂貴呼叫：複用 `duduclaw-os` 的 notification／frontmost／calendar 探針
+  ＋`mdfind` 存在性，TCC 拒絕 report-only 不繞過）。**個人版 os_native 配額＝1**（鎖 quota 不鎖能力）：
+  新增 `license_runtime::os_native_agent_quota(edition)`（個人版 `Some(1)`／企業版 `None`＝無限，
+  未發明不存在的 license 欄位），寫入面（設 `os_native=true` 超額 → 結構化錯誤
+  `os_native_quota_exceeded`＋zh-TW 文案）與啟動面（`os_events::resolve_os_native_allowed` 穩定
+  排序取前 N，其餘跳過＋warn＋audit `os_native_quota_skipped`）**共用同一 quota helper**，fail-closed
+  一致。**主動功能熱重載**：新增 `OsFrontmostRegistry`（補齊 P2-4 遺留的 frontmost 輪詢 hot-reload
+  債）、`FootprintTracker` 成員資格改 interior-mutable ＋ `set_enabled`（就地啟停聚合，停用丟棄當日
+  bucket）、`[proactive]` 三欄因 `ProactiveGate` per-evaluate 讀檔而寫檔即生效（無需 registry，已查
+  證）；三者統一走 `agents.update` 既有 `hot_reload_os_watcher` hook，改配置不需重啟 gateway。
+  `events_store` 新增 `fetch_recent_by_prefix`。新增 ~18 個單元測試全綠。介面文件（完整 RPC 契約表）
+  見 `commercial/docs/TODO-os-native-agent.md`「P4-3 後端已實作」。
+- **OS-native agent P4-1：PBD 規則歸納（最小版）**：新增
+  `duduclaw-gateway/src/rule_induction.rs`——從 `events.db` 近 7 天事件確定性（零 LLM）歸納
+  重複的「OS 感知 → 使用者反應」模式，經 HITL 確認後才生效（ALLOY arXiv:2510.10049 /
+  TaskMind CHI'25；設計取捨見 `commercial/docs/research-os-native-agent-methodology.md` §3.2）。
+  **偵測**：同一 `(agent, 事件型態, 檔案副檔名／路徑前綴／app)` 的 `os_file`／`os_frontmost`
+  感知事件，若在其後固定時間窗（預設 600s）內出現同 agent 的使用者互動（`task.created`／
+  `activity.new`）達 ≥N 次（預設 5），即命中——取不到反應訊號就不歸納（不腦補）。
+  **候選**：命中模式 → 生成候選 autopilot 規則，action 一律 `proactive_notify`（最保守，建議
+  而非代做，天然過 ProactiveGate），複用 dashboard 既有 `validate_autopilot_trigger_event`／
+  `validate_autopilot_action` 寫入前驗證；指紋去重，狀態存 `<home>/rule_induction_state.json`
+  （`with_file_lock`）。**HITL**：候選走 `ApprovalBroker` request（zh-TW 白話提案文字，感知
+  token 過 `sanitize_perception_text`）——核准才寫入 autopilot_store（`enabled=true` + metadata
+  `induced=true`/`induced_at`/`fingerprint`/`source`），拒絕／TTL 過期則指紋進 blocklist 不再提；
+  **任何候選未經核准絕不生效（fail-closed：無 broker／無可投遞頻道／偵測異常皆壓下）**。頻率
+  上限每 agent 每日 2 個候選。`autopilot_rules` 加 additive `metadata` 欄（冪等 migration，
+  dashboard rule JSON 增 `metadata` 欄供未來標示與退場）；`EventBusStore` 加 `append_with_ts`
+  以保留原始事件時間。**events.db 接線（同批完成）**：新增 `os_events::spawn_os_event_persistence`
+  訂閱橋，把 `os_file`／`os_frontmost` 廣播事件持久化進 `events.db`（`EventBusStore` 加 `source`
+  欄 + `append_with_source`，冪等 `ALTER TABLE` migration），標記 `source=internal_broadcast`；
+  `autopilot_engine::spawn_events_db_poll` 新增 `should_rebroadcast()` 檢查該標記並跳過，避免
+  同一事件被 in-process 廣播與 events.db poll 雙重派發。30 分鐘歸納 tick 掛進 `server.rs`
+  （`rule_induction::spawn_induction_loop`，master 開關 `config.toml [rule_induction] enabled`，
+  `RuleInductionConfig::from_home` 每 tick 重讀），生產 channel resolver 複用既有
+  `goal_notify::agent_notify_target`。新增 26 測試（P4-1 本體 16：7 純偵測＋3 候選 JSON＋6 HITL
+  整合；events.db 接線 10：rule_induction config load 3＋events_store 3＋os_events 3＋
+  autopilot_engine 1），gateway lib 全綠、零回歸。
+- **OS-native agent P4-2：persona 抑制規則自動化**：新增
+  `duduclaw-gateway/src/persona_induction.rs`——把「主動介入被打槍」的歷史確定性（零 LLM）歸納成
+  「何時別打擾」的 persona 規則餵回 `ProactiveGate`（ContextAgent arXiv:2505.14668 persona
+  ablation −12.3% F1；設計取捨見 `commercial/docs/research-os-native-agent-methodology.md`
+  §1.3/§②-3）。**歸納**：讀 `proactive_gate.jsonl`，按時段（Asia/Taipei `工作時間`/`深夜`）×
+  事件型態×interruptibility 三分位分群，同群 `false_alarm` 累計 **≥3 次且跨 ≥2 個不同 UTC 日**
+  （GovMem arXiv:2607.02579 式獨立證據門檻，同日多次不算）→ 生成「{時段}的 {event} 類主動通知
+  曾被多次忽略/打槍，預設沉默」規則。**雙寫**：`store_temporal` 落地治理記錄（origin=`agent_derived`，
+  confidence／origin_trust 依 v1.41 origin ceiling 0.6，掛既有 `PROBATION_RULE_TAG`）；橋接寫入
+  `key_facts`（`store_fact`）讓規則實際可被 `ProactiveGate` 既有的
+  `autopilot_engine::fetch_persona_lines`→`search_facts` 路徑檢索到——`store_temporal` 寫的
+  `memories` 表與 `search_facts` 查的 `key_facts` 表是兩個不同 store，此橋接補上這道落差。
+  **Janus probation（撤銷）**：同情境後續若出現 `correct_detection`（證明其實該打擾），下次歸納
+  時偵測到晚於規則產生時間的正確偵測 → 對同一 `(subject,predicate)` 再寫一筆 `object="lifted"`
+  的 temporal memory row，觸發既有 supersession 鏈自動撤銷。指紋去重（同群不重複歸納）＋
+  每 agent 上限 10 條，滿了淘汰最舊現行規則。獨立每小時 tick 迴圈、實際聚合工作每 UTC 日僅跑一次
+  （`last_run_day` 短路，不掛進 P2-3 既有 60s 迴圈本體）。**已知限制**：`key_facts` 無
+  delete-by-id API，撤銷時橋接的舊規則文字靠既有 `purge_stale_facts` janitor 自然汰除，非立即
+  移除；時段固定台灣時區，無 per-agent 設定。未碰 `proactive_gate.rs` 本體／`channel_reply.rs`／
+  `failover.rs`／`runtime/`／`situation_classifier.rs`／`rule_induction.rs`／`os_events.rs`。
+  新增 19 測試（分組聚合、GovMem 門檻、`plan_induction` 純規劃去重/撤銷/淘汰、`store_temporal`
+  寫入形態、key_facts 橋接可檢索、supersession 鏈、端到端流程、daily-tick 閘門），既有
+  `proactive_gate`/`proactive_feedback`/`reflexion`/`rule_lifecycle` 69 測試零回歸。
+- **OS-native agent P4-4：數位足跡 memory 化**：新增 `duduclaw-gateway/src/footprint_distill.rs`——
+  把 `os_file`/`os_frontmost` 感知事件流聚合成溫故式 temporal memory（Memory for Autonomous LLM
+  Agents arXiv:2603.07670；設計取捨見
+  `commercial/docs/research-os-native-agent-methodology.md` §4.2/§②-5）。**聚合不逐事件寫**：
+  `FootprintTracker` 純記憶體按 UTC 日累計每 agent 的前景 app 秒數、活躍目錄事件數、活躍小時分佈；
+  背景 ticker 每 15 分鐘檢查一次 UTC 日界，跨界才蒸餾（寫入頻率 O(agents × days) 不是
+  O(events)）。**三個 predicate**：`subject="user"`、`daily_active_app` / `active_directory` /
+  `active_hours`，Top-N 依統計量排序後編碼進 `object`，同 `(subject,predicate)` 靠既有
+  `store_temporal` supersession 自動取代前一天、`get_history` 保留完整鏈。**origin/sensitivity**：
+  `origin="agent_derived"`（v1.41 既有類別 ceiling 0.6，未新增 origin class）；
+  `daily_active_app`/`active_hours`（源自 `os_frontmost`）標 `Sensitivity::Personal`，
+  `active_directory`（源自 `os_file`）標 `Sensitivity::Internal`，對齊 P3-2 既有感知源分級表；
+  `stamp_metadata` 的第一個生產呼叫點。**data minimization**：`directory_of()` 在原始路徑上先丟棄
+  檔名只留目錄，之後才過 `sanitize_perception_text`——下游從未接觸過檔名任一子字串。**opt-in**：
+  `[os_watch] footprint = true`（deny-by-default，疊在 `os_native` 之上，且在聚合層就拒絕，未選用
+  的 agent 從不進入追蹤集合，不只是寫入層跳過）；啟動時一次性掃描決定追蹤集合，無 dashboard
+  熱重載（同 P2-4 `frontmost_poll_secs` 既有取捨）。`handlers.rs` 的 `apply_os_watch_to_table` 加
+  `footprint` 布林寫入，`read_os_watch_json` 原樣回顯整個表故自動帶出新欄位、免改動。**已知限制**：
+  聚合狀態純記憶體、重啟遺失當日未蒸餾部分（影響最多一天）；`memory_search`/`search_layer` 尚無
+  retrieval-side 依 `sensitivity` 過濾結果的消費者（P3-2 的群聊剝除只做在 persona 區塊/wiki
+  namespace 兩層），本次以 `Sensitivity::allowed_in_session()` 組合測試證明寫入面打標正確、可供
+  未來消費者使用。未碰 `channel_reply.rs`/`failover.rs`/`runtime/`/`proactive_*.rs`/
+  `situation_classifier.rs`/`rule_induction.rs`/`persona_induction.rs`。新增 24 測試（config
+  reader、目錄丟檔名、聚合、渲染、origin/sensitivity 打標、群聊剝除組合證明、跨日
+  supersession、carry-forward、檢索面 `search_layer` 驗證），既有 `duduclaw-gateway`/
+  `duduclaw-memory` 測試零回歸。
+- **OS-native agent P3-1：VeriOS 情境五分類 ASK gate**：新增
+  `duduclaw-gateway/src/situation_classifier.rs`——OS **行動類**工具（`os_open`，未來 L5b
+  原生桌面動作）執行前先做情境五分類 `normal` / `anomaly` / `sensitive` / `missing_info` /
+  `user_choice`，**分類標籤即決策依據，明確取代「用機率信心分數決定要不要問人」路線**
+  （VeriOS arXiv:2509.07553；不用 confidence 的理由見
+  `commercial/docs/research-os-native-agent-methodology.md` §④-5）。兩層分類器：**第一層**
+  確定性零 LLM（target 落在敏感集合＝路徑含 credentials/keys/.env/.ssh/系統目錄、非 https URL、
+  或被 perception sanitizer 標 suspicious → `sensitive`；缺／空 target → `missing_info`；含萬用字元或
+  多候選 → `user_choice`；路徑比對 component-anchored 非裸 substring allow-check，方向 fail-safe），
+  **第二層**規則判不出時一次 utility LLM 分類呼叫（account rotator，JSON 輸出，parse **fail-closed
+  → `anomaly`**）。決策映射：`normal` → 放行（仍疊 ActionGuard 靜態 always-list，`merge_with_force_approval`
+  取更嚴者）；`anomaly`/`sensitive` → ApprovalBroker 人工核准（走既有審批通道，**TTL 過期 = DENY**）；
+  `missing_info`/`user_choice` → 不執行、回明確追問訊息給 agent 由上層 LLM 補參數。**每次分類寫
+  `tool_calls.jsonl` 審計**（`situation_class` / `situation_source` / `situation_decision` /
+  `force_approval`）。**兩套機制收斂定奪**（`os_open` 原走 ActionGuard maybe-irreversible，尚未接
+  task-scoped grant 的欠帳）：兩閘**層次分明不平行**——依既有 MCP dispatch 順序，`[capabilities]
+  scoped_tools` 若列了 OS 工具則 §3.65 task-scoped grant 閘**先行**（授權此 task 階段可用），本 ASK
+  gate 於 §3.7 **其後**處理「授權已核發但此次呼叫情境異常」的殘餘問題；沒列則 ASK gate 全責。grant-gating
+  維持 operator opt-in，不強制掛在 OS 工具上。`os_open` 由 ASK gate **取代**原 ActionGuard maybe-judge
+  （殘餘情境仍只做一次 utility LLM 呼叫，無雙判），仍與 ActionGuard 靜態 `irreversible_tools` /
+  `approval_required_tools` 取更嚴者。18 個模組單測（含 CJK 敏感路徑、注入樣本、正常樣本零誤殺、
+  LLM parse fail-closed、決策映射與 merge）＋ 4 個 dispatch 級測試（missing_info/user_choice 追問、
+  sensitive→approval 流活體核准 proceed、TTL=DENY）。
+- **OS-native agent P3-3：輕量 CEP 時序 pattern matcher**：新增
+  `duduclaw-gateway/src/cep_matcher.rs`——autopilot 規則 JSON 新增可選欄位 `sequence`
+  （`{"first":{event,match},"then":{event,match},"within_secs":N,"negate":bool}`），
+  「A 事件後 N 秒內出現 B」或（`negate=true`）「N 秒內未出現 B」的 in-process 時間窗匹配，
+  **100% 確定性 Rust code，不引入任何串流平台（Kafka/Flink/Autogen）也不讓 LLM 生成時序邏輯**
+  （arXiv:2501.00906 只借「事件序列模式」概念，`[verified-caveat]` 見
+  `commercial/docs/research-os-native-agent-methodology.md` §3.1）。State 完全 in-process
+  （`HashMap<rule_id, VecDeque<PendingMatch>>`）、每規則 pending 上限 100（超過丟最舊 + log，
+  no-silent-caps）、30s tick 掃描 negate 到期。解析出的 pattern 以合成事件
+  `AutopilotEvent::CepTrigger` 重新送回既有 autopilot broadcast bus，`AutopilotEngine` 對此變體
+  走與一般規則完全相同的觸發尾段（三態斷路器 → `execute_action` → history/activity），因此
+  `proactive_notify` 仍過 `ProactiveGate`、斷路器計數也共用同一計數路徑，未繞過任何既有 gate。
+  `autopilot_store.rs` 新增 `sequence` 欄位（additive migration）；write-time 結構驗證（事件名／
+  運算子／`within_secs` 範圍）擋掉打不到的規則於建立時，而非首次匹配才發現。24 個單元測試。
+- **OS-native agent P3-4：`[os_watch] goal_template` 從檔案事件自主 kickoff goal loop**：`agent.toml
+  [os_watch]` 新增可選 `goal_template`（`{path}`/`{file_name}`/`{kind}` 佔位符，沿用
+  `AutopilotEvent::OsFileEvent` 已曝露給規則作者的同一組欄位名）與可選 `goal_acceptance`
+  （缺省時渲染後的目標描述本身兼作驗收基準）。`os_file` 事件觸發時，`AutopilotEngine` 獨立於一般
+  `trigger_event`/`conditions` 規則派發迴圈跑一次 kickoff 檢查：同 `(agent, path)` 10 分鐘內只允許
+  成功建立一次（純函式防抖，只有真正建立成功才起算冷卻）→ 佔位符值（`path`/`file_name`/`kind`）
+  全部先過 `sanitize_perception_text`（P2-5，含跨進程 `events.db` 橋接可能塞入的任意 `kind` 字串）
+  → 渲染模板 → **過 `ProactiveGate`**（P3-4 是 P2-2 文件早已點名的「goal kickoff 前門」——沿用同一份
+  `[proactive] enabled` 開關與每小時頻率上限，與 `proactive_notify` 共用同一預算；gate 未接線或
+  `[proactive]` 未啟用 → deny-by-default 直接壓下，零 LLM 呼叫）→ Allow 才建立 `goal_mode=true` 的
+  任務（`created_by = "goal:os_watch"` 區分於 `/goal` 聊天指令），完全走既有 `GoalLoopDriver` 的
+  autonomy_level 核准流／iteration cap／MAV 判官驗收，不重新實作任何 kickoff 後治理。**P1 遺留小修**：
+  `validate_autopilot_trigger_event` 的 `KNOWN` 清單一併補上 `os_file`/`os_frontmost`（engine 早就會
+  發出這兩個事件，但 dashboard 建立的一般規則此前完全訂閱不到，與先前修過的 `run_at_risk` 同一類
+  回歸）。31 個相關單元測試（防抖、CJK 路徑＋注入檔名消毒後渲染零外洩、無模板零成本 no-op、
+  無 gate deny-by-default、`[proactive]` disabled 真實走 gate 零 LLM 呼叫、Allow/Suppress 分別驗證
+  建立/不建立、dashboard 讀寫欄位同步、trigger_event 白名單修正）。
+- **OS-native agent P3-5：隱私回歸案例納入 `duduclaw eval`**：新增 `evals/_privacy/README.md`
+  索引 + 3 個獨立 Rust 整合測試檔（**刻意**放在被測 crate 的 `tests/`，不是被測原始檔自己的
+  `#[cfg(test)]`，也不是 `duduclaw eval` TOML／transcript——後者是給「agent 行為」用的，這四條是
+  gateway/security in-process 不變量，硬湊 transcript 等於零覆蓋，見 README 說明），16 案全綠：
+  (a) `os_native=false`（缺／明確 false／TOML 損毀）→ 6 個 `os_*` MCP 工具全數 fail-closed 拒絕
+  （`crates/duduclaw-cli/tests/privacy_regression_os_native_gate.rs`，4 案，走真實
+  `McpDispatcher::dispatch_tool_call`）；(b) 注入檔名（instruction-override、`<system>`／ChatML／
+  `[INST]` 標記）經 `sanitize_perception_text` 中和後不含原始結構性突破字元，含正常 CJK 檔名零誤殺
+  對照（`crates/duduclaw-cli/tests/privacy_regression_perception_neutralize.rs`，4 案）；
+  (c) `[proactive] enabled=false` 不消耗 LLM 呼叫即壓下、LLM 錯誤／無法解析／超出值域皆
+  fail-closed 壓下，含高分放行正對照與注入事件文字不繞過（`crates/duduclaw-gateway/tests/
+  privacy_regression_proactive_gate.rs`，6 案，走真實 `ProactiveGate::evaluate_with`）；
+  (d) `os_notify` 注入載荷中和但不丟棄、寫入 `security_audit.jsonl`，乾淨內容零審計雜訊
+  （同 (b) 檔案，2 案；刻意不跑真實 `osascript` 發送以免每次 `cargo test` 跳出真實桌面通知，
+  改直接呼叫生產程式碼實際串接的 `sanitize_perception_text` → `sanitize_osascript` →
+  `audit::log_injection_detected` 三段）。未觸碰任何 gateway/security 生產程式碼。
+- **OS-native agent P2-1：interruptibility 打擾成本分數**：新增
+  `duduclaw-gateway/src/interruptibility.rs`——`InterruptibilityTracker` 訂閱既有 autopilot
+  broadcast（`os_frontmost` / `os_file` / `agent_idle`），維護每 agent 15 分鐘滑動視窗，
+  `score() -> 0.0..=1.0`（0=可打擾、1=勿擾）。確定性公式：switch 頻率權重最高（0.6，依 CHI'18
+  「切換頻率為最強訊號」）＋ file 密度（0.4）＋ idle 乘法 relief；無訊號回中性 0.5。**只讀**
+  既有 `AgentIdle` 訊號、不自建第二條 idle 判斷源。8 個單測。
+- **OS-native agent P2-2：ProactiveGate 主動介入閘門**：新增
+  `duduclaw-gateway/src/proactive_gate.rs` ＋ autopilot 新 action `proactive_notify`（既有
+  `notify`/`delegate`/`run_skill` 確定性規則不受影響）。感知文字先過 `sanitize_perception_text`
+  → 組 prompt（sanitized 事件 XML DATA + persona 偏好 `search_facts` Ebbinghaus 排序 +
+  interruptibility）→ 一次 utility LLM 呼叫（account rotator）算 `proactive_score` 1–5，JSON
+  parse fail-closed → 動態閾值 `𝒯ℛ = base(3) + round(interruptibility × 2)` → `≥𝒯ℛ` 才放行原
+  notify，否則壓下。**fail-closed**：LLM error / 30s timeout / parse fail → 不打擾。每次決策寫
+  `<home>/proactive_gate.jsonl`（`with_file_lock`，含保留給 P2-3 的 `outcome` 欄位）。
+  `[proactive]` 新表（`enabled=false` deny-by-default / `base_threshold` / `max_per_hour`
+  頻率上限）。MetaCognition base 校準以「可注入 base + `metacognition_base()` mapping + 掛鉤點」
+  最小接入。12 個單測。
+- **OS-native agent P2-3：四象限成效追蹤 + 校準回饋**：新增
+  `duduclaw-gateway/src/proactive_feedback.rs`——把 P2-2 保留的 `proactive_gate.jsonl`
+  `outcome=null` 回填成 ProactiveAgent（arXiv:2410.12361）四象限：`correct_detection` /
+  `false_alarm`（allow 決策 + 顯式 dismiss 或 session 活動判定，取自既有 `feedback.jsonl` /
+  session 資料，訊號缺失一律 `unknown` 不腦補）、`missed_need` / `correct_silence`（suppress
+  決策 + 使用者是否於窗內對同 agent 發起事件關鍵詞相關請求，CJK-safe `word_contains_ci`）。
+  每 60 秒背景迴圈掃描（只對尾部 500 行嘗試訊號蒐集，冪等回填），`quadrant_stats()` 聚合 + 新
+  evolution event（`proactive_quadrant`）。**校準回饋**：False-Alarm / Missed-Need 率 EMA
+  平滑後透過既有 `metacognition_base()` mapping 換算，`published_base` 每 UTC 日曆天最多移動
+  ±1，存 `<home>/proactive_calibration.json`；`autopilot_engine.rs::action_proactive_notify`
+  改讀 `effective_proactive_config()` 疊加校準值（`proactive_gate::read_proactive_config` 本身
+  零改動，12 個既有測試零回歸）。25 個新單測，`cargo test -p duduclaw-gateway --lib -- proactive`
+  全綠（37 個）。
+- **OS-native agent P2-4：結構化感知源**：`duduclaw-os` 新增三個唯讀 shell-out 模組——
+  `frontmost.rs`（macOS `osascript`/System Events 取前景 app + 視窗標題，Linux
+  `xdotool` 取視窗標題，Windows 不支援）、`spotlight.rs`（`mdfind` 包裝，query 一律走
+  argv 陣列不經 shell、上限 20/200 筆、scope 目錄需存在）、`calendar.rs`（`osascript -l
+  JavaScript` 唯讀取今日行事曆事件，JXA 腳本為固定字面量無注入面）。三者皆
+  CJK-safe 截斷（`truncate_chars`），TCC 拒絕從 stderr 分類為 `PermissionDenied`。
+  Gateway 新增 `os_frontmost.rs`：per-agent `[os_watch] frontmost_poll_secs`
+  （opt-in，0/缺省=不輪詢）低頻輪詢前景視窗，僅在 app/標題實際變化時發出新
+  `AutopilotEvent::OsFrontmostEvent`（`os_frontmost` 觸發器），是純感知訊號、
+  不另開 idle 判斷源。MCP 新增三個唯讀工具 `os_frontmost` / `os_spotlight_search`
+  / `os_calendar_today`（`Scope::OsNative` + `[capabilities] os_native` 閘控，同
+  P1 工具的 dispatch 主閘，無 ActionGuard）。`duduclaw os doctor` 增加 System
+  Events 自動化權限、行事曆權限（皆為活體試呼叫）、`mdfind` 可用性三項檢查，
+  缺權限時輸出系統設定路徑指引，不嘗試繞過。
+
+### Fixed
+- **空回覆靜默斷鏈（經銷商回報，Grok 幾乎必現）**：非 Claude runtime（Grok CLI /
+  OpenAI-compat（xAI）/ Codex / Gemini / Antigravity）回傳空內容時，先前被當作
+  「成功」——failover 記成健康、通道端（Telegram/WebChat 等全通道）直接跳過空訊息
+  不發送，使用者看到的就是「已讀不回」；且空的 assistant turn 被寫入 session 歷史，
+  下一輪帶著空 turn 送回上游，模型學著繼續回空——session 鏈自此斷裂。修正四層：
+  ① `failover.rs` 將「Ok 但空內容」視為失敗（觸發 fallback runtime，雙雙落空則回
+  可分類的 `Empty response` 錯誤）；② OpenAI-compat runtime 空 `content` 改回 Err，
+  診斷附 `finish_reason` 與 `reasoning_content` 長度（Grok/DeepSeek 推理模型把
+  8192 max_tokens 全燒在思考、正文為空即 `finish_reason=length`），且組歷史時過濾
+  空 turn（已污染的 session 自動復原）；③ 四個 CLI runtime（grok/codex/gemini/agy）
+  exit 0 但 stdout 為空改回 Err 並附 stderr tail；④ `channel_reply` 匯流點最後防線：
+  空回覆一律轉入 fallback 鏈，使用者收到分類後的「空回應」錯誤訊息，事件寫入
+  `channel_failures.jsonl`，不再無聲失蹤。
+- **failover 靜默頂替無可觀測性（同一經銷商實測：容器內無 `grok` CLI，`GrokRuntime`
+  未註冊，failover 靜默頂替成 Claude 回答，使用者以為在跟 Grok 對話）**：
+  ① `failover.rs::execute_with_failover` 的 `registry.get(primary)` 回 `None`（CLI
+  未安裝／偵測失敗）先前完全無聲直接落到 fallback；現在會 `warn!` 並呼叫
+  `record_failover()` 記入 `duduclaw_failover_total` 指標，且以 `reason` 欄位
+  區分「未註冊」（`not_registered`）與既有的「執行失敗」（`execution_failed`）
+  「空回應」（`empty_response`）三種 fallback 成因；fallback 端同樣未註冊時也補
+  `warn!`。② `channel_reply.rs` 非 Claude 分支改用 `run_agent_prompt`（保留完整
+  `RuntimeResponse`，不再用丟棄 metadata 的 `run_agent_prompt_text`）：當實際回答
+  的 `runtime_name` 與 agent 設定的 provider 不一致時，記一行
+  `channel_failures.jsonl`（`event: "runtime_fallback_substitution"`，含
+  requested/actual/agent/session）＋ `warn!`，並在有 `on_progress` 時發
+  `ProgressEvent::ModelInfo { model: "<實際模型>（備援）" }`，讓 WebChat 顯示
+  「備援」而非讓使用者誤以為在跟原設定的模型對話；provider 一致時行為不變。
+
+### Security
+- **感知輸入安全（OS 原生 Agent P2-5，indirect prompt injection 防護）**：所有 OS 感知取得的
+  文字（檔名/路徑/通知文字，未來的視窗標題/行事曆/搜尋結果）一律降格為不可信 DATA。新增
+  `duduclaw-security::perception::sanitize_perception_text`（純函式）：CJK-safe 截斷 → 剝控制
+  字元/ANSI/零寬 → 複用既有 `input_guard` 規則引擎＋新增「檔名即攻擊面」規則類
+  （`filename_role_marker` 抓 `<system>`/ChatML/`[INST]`、`filename_tool_call` 抓 tool-call 樣式
+  JSON）→ **中和不阻擋**：角括號 defang、標記 `suspicious`＋附 warning，fail-closed（全被剝光
+  → placeholder，絕不回原文，IPIGuard 2508.15310 / Firewalls 2510.05244 精神）。接線三處：
+  ① autopilot `os_file` 事件的 `path`/`file_name` 進 delegate/notify/run_skill prompt 前清洗並前置
+  安全 banner——**規則匹配走原文、進 prompt 走清洗後文字，兩者分離**；② `os_notify` MCP 的
+  `title`/`body` 在 dispatch 層過同一清洗（防污染 agent 用通知社工使用者），仍發送中和後文字；
+  命中一律寫 `security_audit.jsonl`（warning 級、不阻擋事件）。正常中英文/CJK 檔名零誤殺（測試涵蓋）。
+- **Sensitivity label + context-collapse 防護（OS 原生 Agent P3-2，最小版）**：防止 agent 把某位
+  使用者的個人 context 縫進其他人看得到的群聊 prompt（Local-Is-Not-Sufficient arXiv:2606.10173
+  §5.1 六風險之 **context collapse**）。新增 `duduclaw_core::Sensitivity`（`Public < Internal <
+  Personal < Restricted`，serde 小寫）＋感知源常數表（os_file/spotlight=Internal、frontmost/
+  calendar=Personal、clipboard/screen=Restricted、未知源 fail-closed=Personal）。新增純函式
+  `duduclaw_core::is_private_session(session_id, user_id)`——**fail-closed** 判定 1:1 私聊 vs
+  群組/共享 session（`slack:group:`/`discord:thread:`/telegram 負數 chat id 為群組標記；否則
+  「群組 id 與 user id 不同構」，`rest == user_id` 才判私聊；discord/feishu/gchat/teams 無法證明私聊
+  → 當群聊）。`channel_reply` 每輪算一次 `is_private`：`## Key Facts About This User` 與
+  `## About This User` 兩個 persona 塊在群聊 session **完全不注入**（並 `debug!` 記剝除）；wiki 注入
+  `ranked_wiki_injection` 收 `allow_personal`，`.scope.toml` 標 `sensitivity = "personal"/"restricted"`
+  的 namespace 在群聊剝除整個 namespace 的頁（仍可搜尋），私聊/群聊各自 cache key 不互污。
+  Memory 面 additive：`duduclaw_memory::sensitivity::{stamp_metadata, read_from_metadata}` 把分級
+  存進既有 `metadata` JSON blob（不動 schema，同 origin binding 慣例；讀取預設 Internal 保舊資料相容）。
+  ProactiveGate 提供 `persona_lines_for_destination` 純helper（目的地非私聊回空 persona）。`.scope.toml`
+  `sensitivity` 沿用 `knowledge_owner` 同一表與解析慣例，malformed → fail-safe。26 個新單測（core 17／
+  memory 5／gateway 4，含各通道私聊判定、感知表、malformed fail-safe）＋既有 channel_reply/proactive_gate/
+  ranked_wiki 測試零回歸。**未竟**：剪貼簿/螢幕感知源本身、感知→memory 寫入打標（P4-4）、per-user
+  加密、ProactiveGate 目的地隱私接線——本輪只做 context-collapse 一條最小閉環。
+
 ## [1.41.0] - 2026-07-22 — 信任記憶強化、OS 原生整合 Phase 1 與 WebChat model 顯示根治
 
 ### Added
@@ -10,9 +318,11 @@
   `[os_watch]` 檔案事件串入 autopilot bus（新 `os_file` 觸發器 + stats 檔），由
   opt-in `[capabilities] os_native` 閘控（預設關閉；未開啟時 `os_notify` /
   `os_watch_status` / `os_open` MCP 工具在 dispatch 主閘直接拒絕）。CLI 新增
-  `duduclaw os` 子指令（通知 helper、doctor 診斷）；dashboard 新增
-  Settings › Automation 分頁與 agent 表單 os_native 開關 + `[os_watch]` 編輯器
-  （i18n en/ja/zh-TW）。`system.update_config` 熱重載 goal-loop / topology driver。
+  `duduclaw os` 子指令（通知 helper、doctor 診斷）；dashboard agent 表單新增 os_native
+  開關 + `[os_watch]` 編輯器（i18n en/ja/zh-TW），設定變更透過既有 `agents.update`
+  RPC 即時熱重載對應 watcher，不需重啟 gateway。另外 Settings › Automation 分頁
+  （既有的 goal-loop / dispatch / topology 等自動化設定頁，與 os_native 無關）本次
+  透過 `system.update_config` 加上熱重載能力。
 
 - **記憶寫入來源綁定（TMA-NM，arXiv:2606.24322）**：新增 `duduclaw-memory` origin 分類表
   （`origin.rs`，8 類 + trust 天花板），`store_temporal` 強制 non-malleable 上限——

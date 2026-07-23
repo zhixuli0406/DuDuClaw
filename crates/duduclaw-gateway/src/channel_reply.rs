@@ -1025,6 +1025,13 @@ async fn build_reply_with_session_inner(
     // `shared_wiki_read("identity/discord-users.md")` mid-reasoning.
     let sender_block = build_sender_block(&ctx.home_dir, session_id, user_id).await;
 
+    // P3-2 context-collapse defence: is this a 1:1 private chat (personal
+    // context may be injected) or a group/shared session (Personal+ context
+    // must be stripped)? Computed once per turn, fail-closed — anything not
+    // provably 1:1 is treated as shared. Drives both the persona-block gate
+    // below and the sensitivity-aware wiki injection inside build_system_prompt.
+    let is_private = duduclaw_core::is_private_session(session_id, user_id);
+
     // Build progressive system prompt
     let system_prompt = {
         let cache = ctx.skill_cache.lock().await;
@@ -1036,7 +1043,8 @@ async fn build_reply_with_session_inner(
         let citation_ctx = Some((agent_id.as_str(), turn_id.as_str(), Some(session_id)));
         if compressed.is_empty() {
             build_system_prompt(
-                agent, None, None, None, skill_token_budget, team_ref, "", citation_ctx, &sender_block,
+                agent, None, None, None, skill_token_budget, team_ref, "", citation_ctx,
+                &sender_block, is_private,
             )
         } else {
             build_system_prompt(
@@ -1049,6 +1057,7 @@ async fn build_reply_with_session_inner(
                 "",
                 citation_ctx,
                 &sender_block,
+                is_private,
             )
         }
     };
@@ -1416,7 +1425,17 @@ async fn build_reply_with_session_inner(
         // P2 Key-Fact Accumulator: inject cross-session facts (middle position —
         // stable reference data that doesn't need U-shaped peak attention).
         // Uses spawn_blocking because SqliteMemoryEngine is !Send (rusqlite).
-        if let Some(db_path) = cognitive_memory_db.clone() {
+        //
+        // P3-2 context-collapse: these are facts *about this user* (persona,
+        // Personal sensitivity). In a group/shared session they must not be
+        // stitched into a prompt other members see — withhold entirely.
+        if !is_private && cognitive_memory_db.is_some() {
+            tracing::debug!(
+                session_id,
+                "P3-2 context-collapse: withholding persona 'Key Facts About This User' from a shared session"
+            );
+        }
+        if let Some(db_path) = cognitive_memory_db.clone().filter(|_| is_private) {
             let aid = agent_id.clone();
             let query = sanitized_text.clone();
             if let Ok(facts) = tokio::task::spawn_blocking(move || {
@@ -1499,7 +1518,17 @@ async fn build_reply_with_session_inner(
         // traits (subject = `user:<user_id>`). Keyed by (agent_id, user_id);
         // deterministic bytes → prompt-cache friendly. Empty profile ⇒ no-op.
         // !Send → spawn_blocking.
-        if let Some(db_path) = cognitive_memory_db.clone() {
+        //
+        // P3-2 context-collapse: this is a Personal-sensitivity persona block —
+        // withheld from group/shared sessions (only the 1:1 sender should see
+        // their own accumulated profile).
+        if !is_private && cognitive_memory_db.is_some() {
+            tracing::debug!(
+                session_id,
+                "P3-2 context-collapse: withholding persona '## About This User' from a shared session"
+            );
+        }
+        if let Some(db_path) = cognitive_memory_db.clone().filter(|_| is_private) {
             let aid = agent_id.clone();
             let uid = user_id.to_string();
             if let Ok(Some(section)) = tokio::task::spawn_blocking(move || {
@@ -1853,9 +1882,17 @@ async fn build_reply_with_session_inner(
         let hb_model = model.as_str();
         let hb_history = conversation_history.as_slice();
         let hb_settings = runtime_settings.as_ref();
+        // Observability fix (2026-07-23 distributor incident): a silent
+        // failover — the configured provider's CLI missing/unavailable so
+        // `execute_with_failover` fell through to Claude — used to be
+        // invisible to the end user (they think they're talking to Grok while
+        // Claude actually answered). `run_agent_prompt` (not the `_text`
+        // convenience wrapper) is used here so `RuntimeResponse::runtime_name`
+        // / `model_used` survive to compare against what was requested.
+        let hb_session_id = session_id;
         Box::pin(async move {
-            let work = crate::runtime_dispatch::run_agent_prompt_text(
-                crate::runtime_dispatch::AgentPrompt {
+            let work =
+                crate::runtime_dispatch::run_agent_prompt(crate::runtime_dispatch::AgentPrompt {
                     agent_dir: hb_agent_dir,
                     home_dir: hb_home,
                     agent_id: hb_agent_id,
@@ -1870,13 +1907,12 @@ async fn build_reply_with_session_inner(
                     request_type: crate::cost_telemetry::RequestType::Chat,
                     // L7 followup: reuse the settings parsed above (1 read/reply).
                     runtime_settings: hb_settings,
-                },
-            );
+                });
             tokio::pin!(work);
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
             ticker.tick().await; // consume the immediate first tick
-            loop {
+            let resp = loop {
                 tokio::select! {
                     res = &mut work => break res,
                     _ = ticker.tick() => {
@@ -1885,7 +1921,41 @@ async fn build_reply_with_session_inner(
                         }
                     }
                 }
+            }?;
+            // Detect and surface a runtime substitution — the response was
+            // actually produced by a different backend than `[runtime]
+            // provider` configured (failover happened inside the choke-point,
+            // e.g. primary CLI not registered). Byte-identical behavior when
+            // no substitution occurred.
+            if is_runtime_substitution(provider.as_str(), &resp.runtime_name) {
+                warn!(
+                    agent_id = %hb_agent_id,
+                    requested = provider.as_str(),
+                    actual = %resp.runtime_name,
+                    "channel_reply: non-Claude runtime substituted by failover — user is receiving \
+                     a reply from a different backend than the agent's configured provider"
+                );
+                let record = serde_json::json!({
+                    "event": "runtime_fallback_substitution",
+                    "agent": hb_agent_id,
+                    "session_id": hb_session_id,
+                    "requested": provider.as_str(),
+                    "actual": resp.runtime_name,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                if let Err(e) = crate::trajectory_guard::append_anomaly(hb_home, &record) {
+                    warn!(error = %e, "runtime_fallback_substitution: 寫入 channel_failures.jsonl 失敗");
+                }
+                // Dashboard-only signal (WebChat), same channel as the
+                // stream-json ModelInfo events — tells the user which model
+                // actually answered instead of silently substituting.
+                if let Some(cb) = hb_progress {
+                    cb(ProgressEvent::ModelInfo {
+                        model: format!("{}（備援）", resp.model_used),
+                    });
+                }
             }
+            Ok(resp.content)
         })
     } else {
         match runtime_mode {
@@ -1993,6 +2063,17 @@ async fn build_reply_with_session_inner(
         None => cli_future.await,
     };
     let reply = match reply {
+        // Last-line defense: an empty "success" must NOT flow onward — the
+        // channels all skip empty sends (user sees nothing) and an empty
+        // assistant turn would be appended to the session, teaching the model
+        // to keep answering with nothing (the "session chain break" bug).
+        // Convert to the error path so the classified 空回應 fallback message
+        // is sent and channel_failures.jsonl gets an audit row.
+        Ok(reply) if reply.trim().is_empty() => {
+            warn!("Reply pipeline returned empty response — routing to fallback chain");
+            last_cli_error = Some("Empty response from reply pipeline".to_string());
+            None
+        }
         Ok(reply) => {
             if !local_first_answered {
                 info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
@@ -3412,6 +3493,52 @@ async fn build_reply_with_session_inner(
     }
 
     format_fallback_message(&name, reason)
+}
+
+/// True when a non-Claude reply's actual answering runtime differs from the
+/// agent's configured `[runtime] provider` — i.e. `execute_with_failover`
+/// silently substituted a fallback runtime (primary CLI not registered /
+/// unavailable, or primary execution failed and a fallback answered instead).
+///
+/// `requested` is `RuntimeType::as_str()` (e.g. `"grok"`); `actual` is
+/// `RuntimeResponse::runtime_name` (e.g. `"claude"`). The SSE sub-mode of
+/// `openai_compat` (`"openai_compat_sse"`) is normalized to `"openai_compat"`
+/// first so it is never flagged as a substitution — it's the same provider,
+/// just a different transport.
+///
+/// Pure and side-effect free so the substitution decision itself is unit
+/// tested independent of the async plumbing that calls it.
+pub(crate) fn is_runtime_substitution(requested: &str, actual: &str) -> bool {
+    let normalized_actual = actual.strip_suffix("_sse").unwrap_or(actual);
+    normalized_actual != requested
+}
+
+#[cfg(test)]
+mod runtime_substitution_tests {
+    use super::is_runtime_substitution;
+
+    #[test]
+    fn matching_provider_is_not_a_substitution() {
+        assert!(!is_runtime_substitution("codex", "codex"));
+        assert!(!is_runtime_substitution("claude", "claude"));
+    }
+
+    #[test]
+    fn mismatched_provider_is_a_substitution() {
+        // The distributor incident this fixes: agent configured for `grok`,
+        // but grok's CLI wasn't registered so the choke-point's failover
+        // silently answered via Claude.
+        assert!(is_runtime_substitution("grok", "claude"));
+        assert!(is_runtime_substitution("gemini", "codex"));
+    }
+
+    #[test]
+    fn openai_compat_sse_is_the_same_provider_not_a_substitution() {
+        assert!(!is_runtime_substitution(
+            "openai_compat",
+            "openai_compat_sse"
+        ));
+    }
 }
 
 /// Classified failure category for `claude` CLI / Python SDK calls.
@@ -7295,6 +7422,11 @@ fn build_system_prompt(
     // string means "no resolution" — agents fall back to treating the sender
     // as a stranger, which matches v1.10.1 behaviour exactly.
     sender_block: &str,
+    // P3-2 context-collapse: `true` when this turn is a 1:1 private session,
+    // so Personal-or-higher `.scope.toml` wiki namespaces may be injected.
+    // `false` (a group/shared session) withholds them. Fail-closed by the
+    // caller — see `duduclaw_core::is_private_session`.
+    allow_personal: bool,
 ) -> String {
     // #11 (2026-05-12) — Minimal mode: short-circuit to the lean assembler.
     // Agents opt in via `agent.toml [prompt] mode = "minimal"`. See
@@ -7479,8 +7611,12 @@ fn build_system_prompt(
             // (agent, session) so the wiki section bytes don't churn
             // every turn and break the prompt-cache prefix. Falls back
             // to per-turn ranking when no session identity is known.
+            // P3-2: fold the private/shared bit into the cache key so a
+            // session's chat type never serves the other type's cached
+            // (stripped vs full) page selection.
             let cache_key = citation_ctx.map(|(agent_id, conv_id, session_id)| {
-                format!("{agent_id}:{}", session_id.unwrap_or(conv_id))
+                let priv_tag = if allow_personal { "p" } else { "g" };
+                format!("{agent_id}:{}:{priv_tag}", session_id.unwrap_or(conv_id))
             });
             // WP7: department-scope the injection so a `departments/<dept>/`
             // page never reaches an agent outside that department.
@@ -7499,6 +7635,7 @@ fn build_system_prompt(
                 citation_context,
                 cache_key.as_deref(),
                 viewer_department.as_deref(),
+                allow_personal,
             );
             // The helper returns "" on error or no pages — wrap the
             // non-empty case identically to before so prompt shape

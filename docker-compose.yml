@@ -12,6 +12,7 @@ services:
       - duduclaw-claude:/home/duduclaw/.claude
       - duduclaw-codex:/home/duduclaw/.codex
       - duduclaw-gemini:/home/duduclaw/.gemini
+      - duduclaw-grok:/home/duduclaw/.grok
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       # Claude: OAuth token (preferred — from `claude setup-token`) or API key fallback
@@ -21,6 +22,8 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       # Gemini (Google): API key fallback — Google OAuth lives in duduclaw-gemini volume
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      # Grok (xAI): API key — deployment-key/OIDC login lives in duduclaw-grok volume
+      - XAI_API_KEY=${XAI_API_KEY:-}
       - DUDUCLAW_BIND=0.0.0.0
       - LINE_CHANNEL_TOKEN=${LINE_CHANNEL_TOKEN:-}
       - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET:-}
@@ -64,4 +67,5 @@ volumes:
   duduclaw-claude:
   duduclaw-codex:
   duduclaw-gemini:
+  duduclaw-grok:
   tailscale-state:
