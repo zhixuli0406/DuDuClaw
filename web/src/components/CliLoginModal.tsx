@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useIntl } from 'react-intl';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -6,6 +7,7 @@ import {
   Loader2,
   SendHorizonal,
   ExternalLink,
+  Info,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { isImeComposing } from '@/lib/keyboard';
@@ -50,13 +52,14 @@ function extractAuthUrl(clean: string): string | null {
   return pick.replace(/[.,)\]]+$/, ''); // drop trailing punctuation the TUI may append
 }
 
-export type LoginRuntime = 'claude' | 'codex' | 'gemini' | 'antigravity';
+export type LoginRuntime = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok';
 
 const RUNTIME_LABELS: Record<LoginRuntime, string> = {
   claude: 'Claude',
   codex: 'Codex',
   gemini: 'Gemini',
   antigravity: 'Antigravity (agy)',
+  grok: 'Grok（SuperGrok 訂閱）',
 };
 
 interface Props {
@@ -75,6 +78,7 @@ type UiStatus = 'idle' | 'running' | 'succeeded' | 'failed' | 'exited' | 'error'
  * from a remote dashboard).
  */
 export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
+  const intl = useIntl();
   const [output, setOutput] = useState('');
   const [status, setStatus] = useState<UiStatus>('idle');
   const [remoteSafe, setRemoteSafe] = useState(true);
@@ -225,6 +229,16 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
             </div>
           )}
           {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+
+          {/* Docker deployment caveat — grok's device-code login writes into
+              whichever ~/.grok the gateway process sees, which is the
+              container's volume when the gateway runs in Docker. */}
+          {runtime === 'grok' && (
+            <div className="flex items-start gap-2 rounded-lg border border-surface-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              <Info className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{intl.formatMessage({ id: 'cliLogin.grok.dockerHint' })}</span>
+            </div>
+          )}
 
           {/* One-click auth link — surfaces the URL buried in the CLI output. */}
           {authUrl && status === 'running' && (

@@ -2804,7 +2804,7 @@ export const api = {
   // Interactive CLI login ("Dashboard 一鍵登入") — drives a CLI's native login
   // in a PTY on the gateway and streams it back via `auth.cli_login.*` events.
   auth: {
-    cliLoginStart: (runtime: 'claude' | 'codex' | 'gemini' | 'antigravity') =>
+    cliLoginStart: (runtime: 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok') =>
       client.call('auth.cli_login.start', { runtime }) as Promise<{
         session_id: string;
         runtime: string;

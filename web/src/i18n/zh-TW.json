@@ -332,6 +332,7 @@
   "channels.setup.teams.step3": "3. 貼上 App Password 與 App ID;單一租戶可填 Tenant ID,多租戶留空",
   "channels.setup.teams.note": "備註:App Password 會加密儲存。",
   "channels.setup.teams.tenantHint": "單一租戶填 Azure Tenant ID;留空 = 多租戶",
+  "cliLogin.grok.dockerHint": "若 gateway 跑在 Docker 中，這次登入寫入的是 container 內的 ~/.grok（duduclaw-grok volume），主機端的登入不會生效。",
   "accounts.title": "帳號與預算",
   "accounts.add": "新增帳號",
   "accounts.rotate": "手動輪替",
