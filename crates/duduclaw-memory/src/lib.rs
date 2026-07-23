@@ -12,6 +12,7 @@ pub mod lifecycle;
 pub mod origin;
 pub mod router;
 pub mod search;
+pub mod sensitivity;
 pub mod trust_store;
 pub mod user_code;
 pub mod user_profile;
@@ -32,6 +33,9 @@ pub use janitor::{JanitorConfig, JanitorReport, WikiJanitor};
 pub use lifecycle::{reassign_agent, reassign_agent_cross_db, ReassignSummary};
 pub use origin::{trust_ceiling, OriginClass};
 pub use router::classify;
+pub use sensitivity::{
+    read_from_metadata as read_sensitivity_metadata, stamp_metadata as stamp_sensitivity_metadata,
+};
 pub use trust_store::{TrustUpdateOutcome, UpsertResult, WikiTrustSnapshot, WikiTrustStore};
 pub use user_code::{
     compile_user_profile, ActionDescriptor, Condition, Conflict, Polarity, Provenance, RuleHit,

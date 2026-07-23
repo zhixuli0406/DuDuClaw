@@ -507,6 +507,11 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // Gated by their own scope so OS integration can be granted without
         // Admin; the dispatch gate ALSO requires `[capabilities] os_native`.
         "os_notify" | "os_watch_status" | "os_open" => Some(Scope::OsNative),
+        // OS-native P2-4: structured sensing sources (frontmost app/window,
+        // Spotlight search, today's calendar events). Read-only — same scope
+        // as the P1 tools, gated by [capabilities] os_native at the dispatch
+        // gate; no ActionGuard (they have no host side-effect).
+        "os_frontmost" | "os_spotlight_search" | "os_calendar_today" => Some(Scope::OsNative),
         // ── High-impact tools — explicitly Admin (C2 fix) ────────────────
         // Arbitrary code execution, agent lifecycle/identity mutation, prompt
         // rewrite, cross-agent dispatch, scheduling, and evolution control.

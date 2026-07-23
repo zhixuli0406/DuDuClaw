@@ -33,6 +33,7 @@ import {
   Store,
   ScrollText,
   Presentation,
+  MonitorCog,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -136,6 +137,10 @@ export const navGroups: NavGroup[] = [
       // G11 Work Timeline — company-level Gantt of every AI staff member's runs.
       { to: '/timeline', icon: ChartGantt, label: 'nav.timeline', desc: 'nav.timeline.desc', minRole: 'manager' },
       { to: '/reports', icon: BarChart3, label: 'nav.reports', desc: 'nav.reports.desc', minRole: 'manager' },
+      // P4-3 — OS-native fleet report + settings (filesystem watch / frontmost
+      // polling / footprint / proactive gate). All os.* RPCs are admin-gated
+      // server-side (require_admin!); minRole mirrors that here.
+      { to: '/os', icon: MonitorCog, label: 'nav.os', desc: 'nav.os.desc', minRole: 'admin' },
       // Progressive disclosure: hidden until the first fork ever runs — a
       // dormant RFC-26 surface shouldn't occupy nav space with a dead page.
       { to: '/forks', icon: GitFork, label: 'nav.forks', desc: 'nav.forks.desc', minRole: 'manager', requiresData: 'forks' },

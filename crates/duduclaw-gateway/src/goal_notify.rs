@@ -45,7 +45,12 @@ fn channel_supports_buttons(channel: &str) -> bool {
 /// The agent's default notification destination — `agent.toml [proactive]
 /// notify_channel` + `notify_chat_id`. Returns `None` when either is unset
 /// (the agent has no configured control channel; nothing to push to).
-fn agent_notify_target(home_dir: &Path, agent_id: &str) -> Option<(String, String)> {
+///
+/// `pub(crate)`: also reused as `rule_induction::spawn_induction_loop`'s
+/// production `ChannelResolver` (P4-1) — the same "deliverable destination"
+/// convention proactive-style pushes already use here, rather than a second
+/// resolver reading a different config shape.
+pub(crate) fn agent_notify_target(home_dir: &Path, agent_id: &str) -> Option<(String, String)> {
     let agent_toml = home_dir.join("agents").join(agent_id).join("agent.toml");
     let content = std::fs::read_to_string(&agent_toml).ok()?;
     let table: toml::Value = content.parse().ok()?;

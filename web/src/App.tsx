@@ -75,6 +75,7 @@ const GrowthPage = lazyPage(() => import('./pages/GrowthPage'), 'GrowthPage');
 const MascotOverlayPage = lazyPage(() => import('./pages/MascotOverlayPage'), 'MascotOverlayPage');
 const AboutPage = lazyPage(() => import('./pages/AboutPage'), 'AboutPage');
 const DistributorsPage = lazyPage(() => import('./pages/DistributorsPage'), 'DistributorsPage');
+const OSPage = lazyPage(() => import('./pages/OSPage'), 'OSPage');
 
 /** Lightweight route-transition fallback while a lazy page chunk loads. */
 function PageFallback() {
@@ -173,6 +174,12 @@ export function App() {
                 <Route path="timeline" element={<TimelinePage />} />
                 <Route path="reports" element={<ReportPage />} />
                 <Route path="org" element={<OrgChartPage />} />
+              </Route>
+
+              {/* P4-3 — OS-native fleet report + settings. All five os.* RPCs
+                  are `require_admin!`-gated server-side; this mirrors that. */}
+              <Route element={<RoleGuard minRole="admin" />}>
+                <Route path="os" element={<OSPage />} />
               </Route>
 
               {/* ── Zone D 管理 — single entry, ManageShell subnav tree ──

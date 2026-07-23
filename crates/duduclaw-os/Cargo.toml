@@ -14,6 +14,8 @@ description = "OS environment integration for DuDuClaw (filesystem watch, native
 notify-debouncer-mini = "0.7"
 
 serde = { workspace = true }
+# JSON parsing for `calendar.rs` (the JXA script's `JSON.stringify`d stdout).
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

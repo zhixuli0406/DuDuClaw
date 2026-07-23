@@ -17,13 +17,22 @@
 //! - [`watch`]        — [`watch::OsWatcher`]: debounced, rate-limited FS events.
 //! - [`notify_native`]— [`notify_native::send_notification`]: native desktop toast.
 //! - [`open_target`]  — [`open_target::open_path_or_url`]: open a file / http(s) URL.
+//! - [`frontmost`]    — [`frontmost::frontmost_info`]: foreground app + window title (P2-4).
+//! - [`spotlight`]    — [`spotlight::spotlight_search`]: `mdfind` metadata search (P2-4).
+//! - [`calendar`]     — [`calendar::today_events`]: read-only today's calendar events via JXA (P2-4).
 
+pub mod calendar;
+pub mod frontmost;
 pub mod notify_native;
 pub mod open_target;
+pub mod spotlight;
 pub mod watch;
 
+pub use calendar::{CalendarError, CalendarEvent, today_events};
+pub use frontmost::{FrontmostError, FrontmostInfo, frontmost_info};
 pub use notify_native::{NotifyError, send_notification};
 pub use open_target::{OpenError, OpenTarget, classify_target, open_path_or_url};
+pub use spotlight::{SpotlightError, spotlight_search};
 pub use watch::{
     FileEventKind, OsFileEvent, OsWatcher, WatchConfig, WatchError, WatchHandle, WatchStats,
 };

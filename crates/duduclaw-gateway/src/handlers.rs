@@ -615,7 +615,13 @@ fn apply_capabilities_to_table(
 ///
 /// Mirrors the additive raw-TOML shape that `os_events::read_os_watch_config`
 /// parses: `paths` (string[]), `ignore` (string[]), `debounce_ms` (int ≥1),
-/// `max_events_per_min` (int ≥1).
+/// `max_events_per_min` (int ≥1). Also carries `frontmost_poll_secs` (int ≥0,
+/// P2-4, `os_frontmost::read_frontmost_poll_secs`), `goal_template` /
+/// `goal_acceptance` (P3-4, `os_events::read_goal_template_config`) and
+/// `footprint` (P4-4, `footprint_distill::read_footprint_enabled`) — a past
+/// audit flagged this function and its `[os_watch]` readers as a pair that must
+/// gain/lose fields together, or a dashboard edit silently can't reach a field
+/// the reader honors.
 fn apply_os_watch_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec<String>, String> {
     let mut changes: Vec<String> = Vec::new();
 
@@ -667,7 +673,137 @@ fn apply_os_watch_to_table(table: &mut toml::Table, params: &Value) -> Result<Ve
         changes.push(format!("os_watch.max_events_per_min = {v}"));
     }
 
+    // ── frontmost_poll_secs (int ≥0; P2-4, `os_frontmost::read_frontmost_poll_secs`) ──
+    // 0 is the explicit "disabled" value (mirrors the reader's `secs <= 0 =>
+    // None`); a positive value starts low-frequency foreground polling. Cap at
+    // one hour — anything larger is a config mistake, not a real interval.
+    if let Some(v) = ow.get("frontmost_poll_secs").and_then(|v| v.as_u64()) {
+        if v > 3600 {
+            return Err("os_watch.frontmost_poll_secs must be 0-3600 (0 = disabled)".into());
+        }
+        section.insert("frontmost_poll_secs".into(), toml::Value::Integer(v as i64));
+        changes.push(format!("os_watch.frontmost_poll_secs = {v}"));
+    }
+
+    // ── goal_template / goal_acceptance (string, P3-4) ──
+    // Mirrors `os_events::read_goal_template_config`: a non-empty string sets
+    // the field; an explicit JSON `null` clears it (same convention as the
+    // outfit-clear RPC elsewhere in this file) so the dashboard can remove a
+    // previously-configured template without hand-editing agent.toml.
+    for (param_key, toml_key) in &[
+        ("goal_template", "goal_template"),
+        ("goal_acceptance", "goal_acceptance"),
+    ] {
+        let Some(v) = ow.get(*param_key) else {
+            continue;
+        };
+        if v.is_null() {
+            if section.remove(*toml_key).is_some() {
+                changes.push(format!("os_watch.{toml_key} cleared"));
+            }
+            continue;
+        }
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("os_watch.{param_key} must be a string or null"))?;
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(format!("os_watch.{param_key} must be non-empty (use null to clear)"));
+        }
+        if s.chars().count() > 2000 {
+            return Err(format!("os_watch.{param_key} must be ≤2000 characters"));
+        }
+        section.insert((*toml_key).into(), toml::Value::String(s.into()));
+        changes.push(format!("os_watch.{toml_key} = set"));
+    }
+
+    // ── footprint (bool, P4-4) ──
+    // Deny-by-default digital-footprint memory distillation, layered on top
+    // of `os_native` / `[os_watch] paths` — mirrors the `capabilities.os_native`
+    // bool-write pattern in `apply_capabilities_to_table` above.
+    if let Some(v) = ow.get("footprint").and_then(|v| v.as_bool()) {
+        section.insert("footprint".into(), toml::Value::Boolean(v));
+        changes.push(format!("os_watch.footprint = {v}"));
+    }
+
     Ok(changes)
+}
+
+/// Machine-readable code the dashboard OS page matches on for the OS-native
+/// quota rejection. Stable string — the frontend keys UI copy off it.
+pub const OS_NATIVE_QUOTA_ERROR_CODE: &str = "os_native_quota_exceeded";
+
+/// Build the structured error frame returned when a write would push the number
+/// of OS-native ("OS 原生員工") agents past the edition quota. The message is
+/// end-user zh-TW copy — no internal terms (capability keys, dir names) leak
+/// into it. Pure so the code + message are unit-testable.
+fn os_native_quota_reject_frame(limit: u32) -> WsFrame {
+    let message = format!(
+        "個人版僅能將 {limit} 個 AI 員工註冊為 OS 原生員工，請先停用其他員工的 OS 能力，\
+         或升級方案以解鎖更多名額。"
+    );
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(json!({
+            "code": OS_NATIVE_QUOTA_ERROR_CODE,
+            "message": message,
+        })),
+    }
+}
+
+/// Read the last `n` non-empty lines of a JSONL file, parsing each as a JSON
+/// value (unparseable lines skipped). Oldest-first within the returned tail.
+/// Missing file ⇒ empty. Used by `os.gate.recent`.
+fn read_jsonl_tail(path: &std::path::Path, n: usize) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..]
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect()
+}
+
+/// Whether an autopilot rule row was produced by PBD rule induction (P4-1) —
+/// its `metadata` JSON carries `induced == true` or an induction `source`.
+/// Used by `os.status` to count a fleet's induced rules.
+fn rule_is_induced(row: &AutopilotRuleRow) -> bool {
+    let Some(meta) = row.metadata.as_deref() else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(meta) else {
+        return false;
+    };
+    v.get("induced").and_then(|x| x.as_bool()) == Some(true)
+        || v.get("source")
+            .and_then(|x| x.as_str())
+            .map(|s| s.contains("induction") || s.contains("pbd"))
+            .unwrap_or(false)
+}
+
+/// Whether an autopilot rule's `conditions` reference `agent_id` as a value —
+/// a best-effort attribution for the `os.status` induced-rule count. Walks the
+/// parsed conditions JSON for a string leaf equal to `agent_id`.
+fn rule_targets_agent(row: &AutopilotRuleRow, agent_id: &str) -> bool {
+    if agent_id.is_empty() {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(&row.conditions) else {
+        return false;
+    };
+    fn walk(v: &Value, needle: &str) -> bool {
+        match v {
+            Value::String(s) => s == needle,
+            Value::Array(a) => a.iter().any(|x| walk(x, needle)),
+            Value::Object(o) => o.values().any(|x| walk(x, needle)),
+            _ => false,
+        }
+    }
+    walk(&v, agent_id)
 }
 
 // ── P1 dashboard-config helpers (RT / EVO / CT) ───────────────────────────────
@@ -3166,6 +3302,16 @@ pub struct MethodHandler {
     /// Shared registry of per-agent OS filesystem watchers. Lets `agents.update`
     /// hot stop/start one agent's `[os_watch]` watcher without a gateway restart.
     os_watchers: Arc<crate::os_events::OsWatcherRegistry>,
+    /// Shared registry of per-agent frontmost (foreground app/window) poll
+    /// tasks (P4-3). Symmetric with `os_watchers` — `agents.update` /
+    /// `os.settings.update` hot stop/start one agent's polling after a
+    /// `frontmost_poll_secs` / `os_native` edit.
+    os_frontmost: Arc<crate::os_frontmost::OsFrontmostRegistry>,
+    /// Handler-held digital-footprint aggregation tracker (P4-3). Membership is
+    /// interior-mutable so `os.settings.update` can hot enable/disable an
+    /// agent's `[os_watch] footprint` without a gateway restart. Background
+    /// ingest + distill tasks are spawned once in `server.rs`.
+    footprint: Arc<crate::footprint_distill::FootprintTracker>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -3260,7 +3406,12 @@ impl MethodHandler {
             audit_index: tokio::sync::OnceCell::new(),
             message_queue: RwLock::new(None),
             driver_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            os_watchers: crate::os_events::OsWatcherRegistry::new(home_dir_for_registry),
+            os_watchers: crate::os_events::OsWatcherRegistry::new(home_dir_for_registry.clone()),
+            os_frontmost: crate::os_frontmost::OsFrontmostRegistry::new(),
+            footprint: crate::footprint_distill::FootprintTracker::new(
+                home_dir_for_registry,
+                std::collections::HashSet::new(),
+            ),
         }
     }
 
@@ -3395,6 +3546,19 @@ impl MethodHandler {
         }
     }
 
+    /// Read access to the autopilot event broadcast sender, for the dashboard
+    /// WebSocket's live `os.events.subscribe` tail (P4-3+). The caller clones
+    /// the returned `Sender` and calls `.subscribe()` to get a fresh
+    /// `Receiver` scoped to one connection — dropping it (connection close)
+    /// unsubscribes automatically, no manual bookkeeping required. `None`
+    /// only in the narrow startup window before `set_autopilot_event_tx` has
+    /// run (the WS loop treats that as "never resolves" — see `server.rs`).
+    pub async fn autopilot_event_tx(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Sender<crate::autopilot_engine::AutopilotEvent>> {
+        self.autopilot_event_tx.read().await.clone()
+    }
+
     /// Inject the running cron scheduler handle (called once after gateway start).
     pub async fn set_cron_scheduler(&self, scheduler: Arc<CronScheduler>) {
         *self.cron_scheduler.write().await = Some(scheduler);
@@ -3409,6 +3573,18 @@ impl MethodHandler {
     /// Shared OS-watcher registry (for server.rs startup wiring + status).
     pub fn os_watchers(&self) -> Arc<crate::os_events::OsWatcherRegistry> {
         self.os_watchers.clone()
+    }
+
+    /// Shared frontmost-poll registry (for server.rs startup wiring + P4-3
+    /// hot reload + `os.status`).
+    pub fn os_frontmost(&self) -> Arc<crate::os_frontmost::OsFrontmostRegistry> {
+        self.os_frontmost.clone()
+    }
+
+    /// Handler-held footprint tracker (for server.rs startup wiring + P4-3
+    /// hot reload + `os.status`).
+    pub fn footprint_tracker(&self) -> Arc<crate::footprint_distill::FootprintTracker> {
+        self.footprint.clone()
     }
 
     /// Register a background driver handle keyed by a stable name, aborting any
@@ -3514,31 +3690,87 @@ impl MethodHandler {
         true
     }
 
-    /// Hot stop/start one agent's OS filesystem watcher after an `os_native` /
-    /// `[os_watch]` edit committed to `agent.toml`. Reads the freshly-scanned
-    /// registry: when the agent has `os_native = true`, (re)starts the watcher
-    /// from its current `[os_watch]` config; otherwise stops any running one.
-    /// Returns whether a watcher is running for the agent after the reload.
+    /// Hot stop/start one agent's OS-native background work after an
+    /// `os_native` / `[os_watch]` edit committed to `agent.toml`. Reads the
+    /// freshly-scanned registry and reconciles all three OS-native subsystems
+    /// (P4-3) — filesystem watcher, frontmost poll task, and footprint
+    /// aggregation membership — so a dashboard edit takes effect without a
+    /// gateway restart. When `os_native = false`, everything is stopped;
+    /// otherwise each subsystem (re)starts from its current `[os_watch]`
+    /// config (a missing `paths` / `frontmost_poll_secs` / `footprint` field
+    /// simply leaves that one subsystem idle). Returns whether a filesystem
+    /// watcher is running after the reload.
+    ///
+    /// The `[proactive]` table needs no reload path here — `ProactiveGate`
+    /// re-reads `read_proactive_config(agent_dir)` per evaluation, so a written
+    /// toggle is effective on the next event with no cached state to bust.
     async fn hot_reload_os_watcher(&self, agent_id: &str) -> bool {
-        let (os_native, agent_dir) = {
+        let (os_native, footprint_on, agent_dir) = {
             let reg = self.registry.read().await;
             match reg.get(agent_id) {
-                Some(a) => (a.config.capabilities.os_native, a.dir.clone()),
+                Some(a) => (
+                    a.config.capabilities.os_native,
+                    crate::footprint_distill::read_footprint_enabled(&a.dir),
+                    a.dir.clone(),
+                ),
                 None => return false,
             }
         };
+        // Footprint membership is reconciled regardless of the event bus
+        // (aggregation is in-process, not bus-dependent).
+        self.footprint
+            .set_enabled(agent_id, os_native && footprint_on);
+
         if !os_native {
             self.os_watchers.stop_agent(agent_id).await;
+            self.os_frontmost.stop_agent(agent_id).await;
             return false;
         }
         let Some(tx) = self.autopilot_event_tx.read().await.clone() else {
             // No autopilot event bus (task/autopilot store missing) — watchers
             // have nowhere to forward. Ensure none is left running.
             self.os_watchers.stop_agent(agent_id).await;
+            self.os_frontmost.stop_agent(agent_id).await;
             warn!(agent = %agent_id, "os_watch hot reload skipped: autopilot event bus unavailable");
             return false;
         };
+        // Frontmost polling reconciles from frontmost_poll_secs (0/absent ⇒ off).
+        self.os_frontmost
+            .start_agent(agent_id, &agent_dir, tx.clone())
+            .await;
         self.os_watchers.start_agent(agent_id, &agent_dir, tx).await
+    }
+
+    /// Count agents (other than `except_agent_id`, by registry name) that
+    /// already have `[capabilities] os_native = true` on disk. The "used"
+    /// figure for the OS-native quota; `os.status` reports the total (no
+    /// exclusion).
+    async fn count_os_native_agents(&self, except_agent_id: Option<&str>) -> usize {
+        self.registry
+            .read()
+            .await
+            .list()
+            .iter()
+            .filter(|a| a.config.capabilities.os_native)
+            .filter(|a| except_agent_id != Some(a.config.agent.name.as_str()))
+            .count()
+    }
+
+    /// Fail-closed OS-native quota gate for the write path (`agents.update` /
+    /// `os.settings.update`). Returns `Some(error_frame)` when setting
+    /// `agent_id`'s `os_native` to `true` would exceed the edition quota
+    /// (`license_runtime::os_native_agent_quota`), else `None` (allowed).
+    /// Unlimited editions (Enterprise) always allow. Re-saving an agent that is
+    /// already OS-native is never blocked (it is excluded from the count).
+    async fn os_native_quota_reject(&self, agent_id: &str) -> Option<WsFrame> {
+        let edition = self.resolve_edition_profile().await;
+        let limit = crate::license_runtime::os_native_agent_quota(edition)?;
+        let used_others = self.count_os_native_agents(Some(agent_id)).await;
+        if used_others as u32 >= limit {
+            Some(os_native_quota_reject_frame(limit))
+        } else {
+            None
+        }
     }
 
     /// Notify the cron scheduler to reload immediately. Call this after any
@@ -4576,6 +4808,42 @@ impl MethodHandler {
             "autopilot.history" => {
                 require_admin!();
                 self.handle_autopilot_history(params).await
+            }
+
+            // ── OS-native page (P4-3, admin management surface) ─
+            "os.status" => {
+                require_admin!();
+                self.handle_os_status().await
+            }
+            "os.settings.update" => {
+                require_admin!();
+                self.handle_os_settings_update(params).await
+            }
+            "os.gate.recent" => {
+                require_admin!();
+                self.handle_os_gate_recent(params).await
+            }
+            "os.events.recent" => {
+                require_admin!();
+                self.handle_os_events_recent(params).await
+            }
+            "os.doctor.run" => {
+                require_admin!();
+                self.handle_os_doctor_run().await
+            }
+            // P4-3+: opt this WebSocket connection into the live os_file/
+            // os_frontmost tail. `require_admin!` here is the ONLY authority
+            // check — `server.rs`'s WS loop only flips the per-connection
+            // forwarding flag when this call's response is `ok: true`, so a
+            // denied subscribe (non-admin) never starts the tail. Consistent
+            // with every other `os.*` RPC on this page.
+            "os.events.subscribe" => {
+                require_admin!();
+                self.handle_os_events_subscribe(params)
+            }
+            "os.events.unsubscribe" => {
+                require_admin!();
+                self.handle_os_events_unsubscribe(params)
             }
 
             // ── Redaction (RFC-23, manager-only) ──────────────
@@ -6137,6 +6405,22 @@ impl MethodHandler {
             _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
         };
 
+        // ── OS-native quota gate (write side) ────────────────────────────
+        // Setting this agent's os_native capability to true must not exceed
+        // the edition quota (Personal = 1 OS-native seat). Fail-closed before
+        // any write. A no-op / false write is never blocked.
+        let setting_os_native_true = params
+            .get("capabilities")
+            .and_then(|c| c.as_object())
+            .and_then(|c| c.get("os_native"))
+            .and_then(|v| v.as_bool())
+            == Some(true);
+        if setting_os_native_true {
+            if let Some(reject) = self.os_native_quota_reject(&agent_id).await {
+                return reject;
+            }
+        }
+
         // If promoting to main, demote the current main agent first
         if let Some("main") = params.get("role").and_then(|v| v.as_str()) {
             if let Err(e) = self.demote_current_main(&agent_id).await {
@@ -6793,17 +7077,49 @@ impl MethodHandler {
                 }
             }
 
-            // [proactive].token_budget_per_check / timezone / max_turns
+            // [proactive].enabled / base_threshold / max_per_hour (P2-2 gate,
+            // `proactive_gate::read_proactive_config`) + token_budget_per_check
+            // / timezone / max_turns. These are read per-evaluate by
+            // ProactiveGate, so a written toggle is effective on the next event
+            // with no hot-reload needed (see `hot_reload_os_watcher` doc).
             if let Some(p) = params_clone.get("proactive").and_then(|v| v.as_object()) {
-                let has_pro_extra = ["token_budget_per_check", "timezone", "max_turns"]
-                    .iter()
-                    .any(|k| p.contains_key(*k));
+                let has_pro_extra = [
+                    "enabled",
+                    "base_threshold",
+                    "max_per_hour",
+                    "token_budget_per_check",
+                    "timezone",
+                    "max_turns",
+                ]
+                .iter()
+                .any(|k| p.contains_key(*k));
                 if has_pro_extra {
                     let pt = table
                         .entry("proactive")
                         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                         .as_table_mut()
                         .ok_or("Invalid [proactive] section")?;
+                    if let Some(v) = p.get("enabled").and_then(|v| v.as_bool()) {
+                        pt.insert("enabled".into(), toml::Value::Boolean(v));
+                        changes.push(format!("proactive.enabled = {v}"));
+                    }
+                    if let Some(v) = p.get("base_threshold").and_then(|v| v.as_u64()) {
+                        // ProactiveGate scores are 1..=5; reject out-of-range so
+                        // the dashboard surfaces the error rather than the reader
+                        // silently clamping.
+                        if !(1..=5).contains(&v) {
+                            return Err("proactive.base_threshold must be 1-5".into());
+                        }
+                        pt.insert("base_threshold".into(), toml::Value::Integer(v as i64));
+                        changes.push(format!("proactive.base_threshold = {v}"));
+                    }
+                    if let Some(v) = p.get("max_per_hour").and_then(|v| v.as_u64()) {
+                        if v > 1000 {
+                            return Err("proactive.max_per_hour must be 0-1000".into());
+                        }
+                        pt.insert("max_per_hour".into(), toml::Value::Integer(v as i64));
+                        changes.push(format!("proactive.max_per_hour = {v}"));
+                    }
                     if let Some(v) = p.get("token_budget_per_check").and_then(|v| v.as_u64()) {
                         pt.insert("token_budget_per_check".into(), toml::Value::Integer(v as i64));
                         changes.push(format!("proactive.token_budget_per_check = {v}"));
@@ -22903,6 +23219,19 @@ impl MethodHandler {
         if let Err(e) = validate_autopilot_action(&action) {
             return WsFrame::error_response("", &e);
         }
+        // P3-3: optional lightweight-CEP `sequence` spec — validated
+        // structurally at write time (unknown event names / operators / an
+        // out-of-range `within_secs` are all rejected here, not silently at
+        // first-match time). Absent or explicit `null` → ordinary rule.
+        let sequence: Option<String> = match params.get("sequence") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                if let Err(e) = crate::cep_matcher::validate_sequence_spec(v) {
+                    return WsFrame::error_response("", &e);
+                }
+                Some(v.to_string())
+            }
+        };
 
         let row = AutopilotRuleRow {
             id: uuid::Uuid::new_v4().to_string(),
@@ -22914,6 +23243,8 @@ impl MethodHandler {
             created_at: Utc::now().to_rfc3339(),
             last_triggered_at: None,
             trigger_count: 0,
+            sequence,
+            metadata: None,
         };
         if let Err(e) = store.insert_rule(&row).await {
             return WsFrame::error_response("", &format!("create autopilot rule: {e}"));
@@ -22939,6 +23270,15 @@ impl MethodHandler {
         if let Some(a) = params.get("action") {
             if let Err(e) = validate_autopilot_action(a) {
                 return WsFrame::error_response("", &e);
+            }
+        }
+        // P3-3: `sequence: null` clears an existing rule back to ordinary
+        // dispatch — only a non-null replacement needs structural validation.
+        if let Some(s) = params.get("sequence") {
+            if !s.is_null() {
+                if let Err(e) = crate::cep_matcher::validate_sequence_spec(s) {
+                    return WsFrame::error_response("", &e);
+                }
             }
         }
         match store.update_rule(rule_id, &params).await {
@@ -22992,6 +23332,406 @@ impl MethodHandler {
             }
             Err(e) => WsFrame::error_response("", &format!("autopilot history: {e}")),
         }
+    }
+
+    // ── OS-native page RPCs (P4-3) ──────────────────────────
+
+    /// `os.status` — whole-fleet OS-native snapshot for the dashboard OS page.
+    /// Per agent: os_native flag, watch paths + live stats, frontmost poll
+    /// interval + running flag, footprint flag, proactive config, and induced
+    /// rule count; plus fleet-level quota (limit/used) and edition.
+    async fn handle_os_status(&self) -> WsFrame {
+        let edition = self.resolve_edition_profile().await;
+        let quota = crate::license_runtime::os_native_agent_quota(edition);
+
+        // Live in-process watch stats + frontmost running set (dir-name keyed).
+        let watch_snap = self.os_watchers.snapshot().await;
+
+        // Induced autopilot rules (PBD, P4-1) grouped by the agent id their
+        // conditions reference — best-effort deterministic count for the page.
+        let induced_rules: Vec<AutopilotRuleRow> = match self.autopilot_store.read().await.as_ref()
+        {
+            Some(store) => store
+                .list_rules()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| rule_is_induced(r))
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let mut agents: Vec<Value> = Vec::new();
+        let mut used = 0usize;
+        {
+            let reg = self.registry.read().await;
+            let mut list: Vec<&duduclaw_agent::registry::LoadedAgent> = reg.list();
+            // Stable order so the page and the startup quota gate agree on
+            // which agent holds the single Personal seat.
+            list.sort_by(|a, b| a.config.agent.name.cmp(&b.config.agent.name));
+            for a in list {
+                let name = a.config.agent.name.clone();
+                let dir_id = a
+                    .dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let os_native = a.config.capabilities.os_native;
+                if os_native {
+                    used += 1;
+                }
+
+                // Watch paths + stats (only present while a watcher runs).
+                let (watch_paths, watch_events, watch_dropped) = match watch_snap.get(&dir_id) {
+                    Some(s) => (s.watched_paths.clone(), s.emitted, s.dropped),
+                    None => (Vec::new(), 0, 0),
+                };
+
+                let frontmost_running = self.os_frontmost.status(&dir_id).await;
+                let frontmost_poll_secs =
+                    crate::os_frontmost::read_frontmost_poll_secs(&a.dir).unwrap_or(0);
+                let footprint = crate::footprint_distill::read_footprint_enabled(&a.dir);
+                let pcfg = crate::proactive_gate::read_proactive_config(&a.dir);
+                let induced_count = induced_rules
+                    .iter()
+                    .filter(|r| rule_targets_agent(r, &dir_id) || rule_targets_agent(r, &name))
+                    .count();
+
+                agents.push(json!({
+                    "agent_id": name,
+                    "os_native": os_native,
+                    "watch": {
+                        "paths": watch_paths,
+                        "events": watch_events,
+                        "dropped": watch_dropped,
+                    },
+                    "frontmost": {
+                        "poll_secs": frontmost_poll_secs,
+                        "running": frontmost_running.is_some(),
+                    },
+                    "footprint": footprint,
+                    "proactive": {
+                        "enabled": pcfg.enabled,
+                        "base_threshold": pcfg.base_threshold,
+                        "max_per_hour": pcfg.max_per_hour,
+                    },
+                    "induced_rules_count": induced_count,
+                }));
+            }
+        }
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "edition": edition.as_str(),
+                "quota": {
+                    // null limit ⇒ unlimited (Enterprise).
+                    "limit": quota,
+                    "used": used,
+                },
+                "agents": agents,
+            }),
+        )
+    }
+
+    /// `os.settings.update` — per-agent OS-native settings write. Remaps the
+    /// flat OS-page params onto the canonical `agents.update` shape and
+    /// delegates, so the quota gate, `[os_watch]` / `[proactive]` validators,
+    /// and the three-subsystem hot reload are reused verbatim (one write path,
+    /// no divergence).
+    async fn handle_os_settings_update(&self, params: Value) -> WsFrame {
+        let Some(agent_id) = params.get("agent_id").and_then(|v| v.as_str()) else {
+            return WsFrame::error_response("", "Missing 'agent_id' parameter");
+        };
+
+        let mut mapped = serde_json::Map::new();
+        mapped.insert("agent_id".into(), json!(agent_id));
+
+        if let Some(v) = params.get("os_native").and_then(|v| v.as_bool()) {
+            mapped.insert("capabilities".into(), json!({ "os_native": v }));
+        }
+        if let Some(p) = params.get("proactive") {
+            mapped.insert("proactive".into(), p.clone());
+        }
+        // footprint / frontmost_poll_secs live under [os_watch].
+        let mut ow = serde_json::Map::new();
+        if let Some(v) = params.get("footprint") {
+            ow.insert("footprint".into(), v.clone());
+        }
+        if let Some(v) = params.get("frontmost_poll_secs") {
+            ow.insert("frontmost_poll_secs".into(), v.clone());
+        }
+        if let Some(os_watch) = params.get("os_watch").and_then(|v| v.as_object()) {
+            // Allow a nested os_watch object too (paths/ignore/debounce/etc.).
+            for (k, v) in os_watch {
+                ow.insert(k.clone(), v.clone());
+            }
+        }
+        if !ow.is_empty() {
+            mapped.insert("os_watch".into(), Value::Object(ow));
+        }
+
+        self.handle_agents_update(Value::Object(mapped)).await
+    }
+
+    /// `os.gate.recent` — tail of `proactive_gate.jsonl` (default 50, max 200)
+    /// plus the four-quadrant outcome aggregation for the OS page's proactivity
+    /// panel.
+    async fn handle_os_gate_recent(&self, params: Value) -> WsFrame {
+        let n = params
+            .get("n")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 200) as usize;
+        let agent = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let path = self.home_dir.join("proactive_gate.jsonl");
+        let recent = read_jsonl_tail(&path, n);
+        // Optional per-agent filter on the parsed rows.
+        let rows: Vec<Value> = match &agent {
+            Some(a) => recent
+                .into_iter()
+                .filter(|r| r.get("agent").and_then(|v| v.as_str()) == Some(a.as_str()))
+                .collect(),
+            None => recent,
+        };
+
+        // Quadrant aggregation (pure read of the same file). `quadrant_stats`
+        // filters to one agent; with no filter we sum it across the fleet so
+        // the OS page can show a whole-team confusion matrix.
+        let lookback = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        let agent_ids: Vec<String> = match &agent {
+            Some(a) => vec![a.clone()],
+            None => {
+                let reg = self.registry.read().await;
+                reg.list()
+                    .iter()
+                    .map(|a| a.config.agent.name.clone())
+                    .collect()
+            }
+        };
+        let mut agg = crate::proactive_feedback::QuadrantStats::default();
+        for aid in &agent_ids {
+            if let Ok(s) = crate::proactive_feedback::quadrant_stats(&self.home_dir, aid, lookback)
+            {
+                agg.cd += s.cd;
+                agg.fa += s.fa;
+                agg.mn += s.mn;
+                agg.nr += s.nr;
+                agg.cs += s.cs;
+                agg.unknown += s.unknown;
+            }
+        }
+        let quadrants = json!({
+            "correct_detection": agg.cd,
+            "false_alarm": agg.fa,
+            "missed_need": agg.mn,
+            "non_response": agg.nr,
+            "correct_silence": agg.cs,
+            "unknown": agg.unknown,
+        });
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "recent": rows,
+                "quadrants": quadrants,
+            }),
+        )
+    }
+
+    /// `os.events.recent` — most recent os_* perception events from `events.db`
+    /// (default 50, max 200), newest first.
+    async fn handle_os_events_recent(&self, params: Value) -> WsFrame {
+        let n = params
+            .get("n")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 200) as i64;
+        let store = match crate::events_store::EventBusStore::open(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &format!("open events.db: {e}")),
+        };
+        match store.fetch_recent_by_prefix("os_", n).await {
+            Ok(rows) => {
+                let events: Vec<Value> = rows
+                    .into_iter()
+                    .map(|r| {
+                        let payload: Value =
+                            serde_json::from_str(&r.payload).unwrap_or(Value::Null);
+                        json!({
+                            "id": r.id,
+                            "event": r.event,
+                            "ts": r.ts,
+                            "source": r.source,
+                            "payload": payload,
+                        })
+                    })
+                    .collect();
+                WsFrame::ok_response("", json!({ "events": events }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("os events: {e}")),
+        }
+    }
+
+    /// `os.events.subscribe` (P4-3+) — opt this WebSocket connection into a
+    /// live tail of `os_file`/`os_frontmost` events, pushed as `os.events.entry`
+    /// frames shaped like one `os.events.recent` row (minus `id`, which only
+    /// exists once the async persistence bridge — `os_events::
+    /// spawn_os_event_persistence` — has written the row; live pushes race
+    /// that write, so they never carry one). This handler only authorizes
+    /// (`require_admin!` at the dispatch site) and acks; the actual
+    /// subscribe/forward loop lives in `server.rs`'s WS handler, mirroring
+    /// `logs.subscribe`'s per-connection-flag pattern. A per-connection
+    /// forwarding cap (`os_events::OS_EVENTS_PUSH_CAP_PER_SEC`) guards against
+    /// a runaway watcher flooding the socket.
+    fn handle_os_events_subscribe(&self, _params: Value) -> WsFrame {
+        info!("os.events.subscribe activated — live OS event push enabled for this connection");
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "subscribed": true,
+                "message": "Live OS event push active — os_file/os_frontmost events will stream as os.events.entry on this WebSocket connection",
+            }),
+        )
+    }
+
+    /// `os.events.unsubscribe` (P4-3+) — counterpart to
+    /// [`Self::handle_os_events_subscribe`].
+    fn handle_os_events_unsubscribe(&self, _params: Value) -> WsFrame {
+        info!("os.events.unsubscribe — live OS event push disabled for this connection");
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "subscribed": false,
+            }),
+        )
+    }
+
+    /// `os.doctor.run` — on-demand OS-native environment probes (the only
+    /// expensive OS RPC). Reuses the `duduclaw-os` probe functions directly (no
+    /// shell-out to the CLI binary): a live native notification, a live
+    /// frontmost/System-Events probe, a live calendar probe, and an `mdfind`
+    /// existence check. Each returns a structured `{status, detail}` — never a
+    /// bypass or auto-grant on a TCC denial (report-only, fail-closed).
+    async fn handle_os_doctor_run(&self) -> WsFrame {
+        let mut checks: Vec<Value> = Vec::new();
+
+        // 1) Native notification helper + a live test dispatch.
+        let helper = if cfg!(target_os = "macos") {
+            "osascript"
+        } else if cfg!(target_os = "linux") {
+            "notify-send"
+        } else {
+            ""
+        };
+        if helper.is_empty() {
+            checks.push(json!({
+                "id": "notification",
+                "status": "warn",
+                "detail": "此平台不支援原生桌面通知。",
+            }));
+        } else {
+            match duduclaw_os::send_notification("DuDuClaw", "OS doctor test notification").await {
+                Ok(()) => checks.push(json!({
+                    "id": "notification",
+                    "status": "ok",
+                    "detail": "已送出測試通知。注意：送出成功不代表一定顯示——在背景服務下，通知的權限歸屬可能被系統靜音，請手動確認是否跳出。",
+                })),
+                Err(e) => checks.push(json!({
+                    "id": "notification",
+                    "status": "fail",
+                    "detail": format!("測試通知失敗：{e}"),
+                })),
+            }
+        }
+
+        // 2) Frontmost (System Events automation) — live probe.
+        match duduclaw_os::frontmost_info().await {
+            Ok(info) => checks.push(json!({
+                "id": "frontmost",
+                "status": "ok",
+                "detail": format!(
+                    "前景偵測正常（目前：{} — 「{}」）。",
+                    if info.app.is_empty() { "(未知)" } else { &info.app },
+                    info.window_title
+                ),
+            })),
+            Err(duduclaw_os::FrontmostError::Unsupported) => checks.push(json!({
+                "id": "frontmost",
+                "status": "skip",
+                "detail": "此平台不支援前景視窗偵測。",
+            })),
+            Err(duduclaw_os::FrontmostError::PermissionDenied(msg)) => checks.push(json!({
+                "id": "frontmost",
+                "status": "fail",
+                "detail": format!(
+                    "尚未授權自動化權限（{msg}）。請到「系統設定 → 隱私權與安全性 → 自動化」允許終端機控制「System Events」。"
+                ),
+            })),
+            Err(e) => checks.push(json!({
+                "id": "frontmost",
+                "status": "fail",
+                "detail": format!("前景偵測失敗：{e}"),
+            })),
+        }
+
+        // 3) Calendar (automation) — live probe.
+        match duduclaw_os::today_events().await {
+            Ok(events) => checks.push(json!({
+                "id": "calendar",
+                "status": "ok",
+                "detail": format!("行事曆讀取正常（今日 {} 筆事件）。", events.len()),
+            })),
+            Err(duduclaw_os::CalendarError::Unsupported) => checks.push(json!({
+                "id": "calendar",
+                "status": "skip",
+                "detail": "此平台不支援行事曆讀取。",
+            })),
+            Err(duduclaw_os::CalendarError::PermissionDenied(msg)) => checks.push(json!({
+                "id": "calendar",
+                "status": "fail",
+                "detail": format!(
+                    "尚未授權行事曆權限（{msg}）。請到「系統設定 → 隱私權與安全性 → 行事曆」允許存取。"
+                ),
+            })),
+            Err(e) => checks.push(json!({
+                "id": "calendar",
+                "status": "fail",
+                "detail": format!("行事曆讀取失敗：{e}"),
+            })),
+        }
+
+        // 4) Spotlight (mdfind) existence check — macOS only, no TCC prompt.
+        if cfg!(target_os = "macos") {
+            if std::path::Path::new("/usr/bin/mdfind").exists() {
+                checks.push(json!({
+                    "id": "spotlight",
+                    "status": "ok",
+                    "detail": "已找到 /usr/bin/mdfind。",
+                }));
+            } else {
+                checks.push(json!({
+                    "id": "spotlight",
+                    "status": "fail",
+                    "detail": "找不到 /usr/bin/mdfind — Spotlight 搜尋將無法使用。",
+                }));
+            }
+        } else {
+            checks.push(json!({
+                "id": "spotlight",
+                "status": "skip",
+                "detail": "Spotlight 搜尋僅支援 macOS。",
+            }));
+        }
+
+        WsFrame::ok_response("", json!({ "checks": checks }))
     }
 
     // ── RFC-23 Redaction read-only RPCs ─────────────────────
@@ -23364,6 +24104,11 @@ fn autopilot_rule_to_json(r: &AutopilotRuleRow) -> Value {
         "created_at": r.created_at,
         "last_triggered_at": r.last_triggered_at,
         "trigger_count": r.trigger_count,
+        // P3-3: present only for CEP sequence rules; null for ordinary rules.
+        "sequence": r.sequence.as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        // P4-1: induced-rule provenance ({induced, induced_at, fingerprint, source});
+        // null for hand-authored rules. Lets the dashboard badge PBD-induced rules.
+        "metadata": r.metadata.as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
     })
 }
 
@@ -23371,7 +24116,7 @@ fn autopilot_rule_to_json(r: &AutopilotRuleRow) -> Value {
 /// Validate a trigger_event string against the set understood by AutopilotEngine.
 /// Rejecting unknown values at write time avoids rules that are stored
 /// successfully but can never fire.
-fn validate_autopilot_trigger_event(ev: &str) -> Result<(), String> {
+pub(crate) fn validate_autopilot_trigger_event(ev: &str) -> Result<(), String> {
     const KNOWN: &[&str] = &[
         "task_created",
         "task_updated",
@@ -23383,6 +24128,12 @@ fn validate_autopilot_trigger_event(ev: &str) -> Result<(), String> {
         // Foresight signal (see `autopilot_engine::Event::RunAtRisk`) — was
         // missing here, so rules could never subscribe to it (2026-07 MED).
         "run_at_risk",
+        // OS-native perception events (`autopilot_engine::AutopilotEvent::OsFileEvent`
+        // / `OsFrontmostEvent`) — same class of gap as `run_at_risk` above: the
+        // engine has fired these since P1/P2-4 but a dashboard-authored rule
+        // could never subscribe to either (2026-07-23 P3-4 audit follow-up).
+        "os_file",
+        "os_frontmost",
     ];
     if KNOWN.iter().any(|k| *k == ev) {
         Ok(())
@@ -23399,7 +24150,7 @@ fn validate_autopilot_trigger_event(ev: &str) -> Result<(), String> {
 /// Requires `type` ∈ {delegate, notify, run_skill} and the fields the
 /// engine will eventually need. Catches misconfiguration immediately
 /// rather than silently during the first fire.
-fn validate_autopilot_action(action: &Value) -> Result<(), String> {
+pub(crate) fn validate_autopilot_action(action: &Value) -> Result<(), String> {
     let obj = action
         .as_object()
         .ok_or_else(|| "action must be a JSON object".to_string())?;
@@ -23427,6 +24178,13 @@ fn validate_autopilot_action(action: &Value) -> Result<(), String> {
         "run_skill" => {
             require_str("target_agent")?;
             require_str("skill_name")?;
+        }
+        // P2-2 proactive path: same shape as `notify` (the underlying action the
+        // gate performs on Allow), but routed through the ProactiveGate first.
+        "proactive_notify" => {
+            require_str("channel")?;
+            require_str("chat_id")?;
+            require_str("text")?;
         }
         other => return Err(format!("unknown action.type '{other}'")),
     }
@@ -24196,6 +24954,8 @@ mod autopilot_validation_tests {
             "agent_idle",
             "cron_tick",
             "run_at_risk",
+            "os_file",
+            "os_frontmost",
         ] {
             assert!(
                 validate_autopilot_trigger_event(ev).is_ok(),
@@ -24210,6 +24970,16 @@ mod autopilot_validation_tests {
         // (`Event::RunAtRisk.event_name()`) but was rejected at rule-write
         // time, so no rule could ever subscribe to the foresight event.
         assert!(validate_autopilot_trigger_event("run_at_risk").is_ok());
+    }
+
+    #[test]
+    fn trigger_event_accepts_os_native_events() {
+        // P1 leftover gap fixed alongside P3-4: `os_file` (P1) / `os_frontmost`
+        // (P2-4) have been emitted by the engine since their respective work
+        // packages, but a dashboard-authored rule could never subscribe to
+        // either — same class of bug as the `run_at_risk` regression above.
+        assert!(validate_autopilot_trigger_event("os_file").is_ok());
+        assert!(validate_autopilot_trigger_event("os_frontmost").is_ok());
     }
 
     #[test]
@@ -25242,6 +26012,239 @@ policies:
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn os_watch_apply_writes_goal_template_and_acceptance() {
+        let mut table = toml::Table::new();
+        let changes = apply_os_watch_to_table(
+            &mut table,
+            &json!({
+                "os_watch": {
+                    "goal_template": "整理 {file_name}（{kind}）到月報",
+                    "goal_acceptance": "月報已含 {file_name} 的資料",
+                }
+            }),
+        )
+        .expect("apply");
+        let ow = table.get("os_watch").unwrap().as_table().unwrap();
+        assert_eq!(
+            ow.get("goal_template").unwrap().as_str(),
+            Some("整理 {file_name}（{kind}）到月報")
+        );
+        assert_eq!(
+            ow.get("goal_acceptance").unwrap().as_str(),
+            Some("月報已含 {file_name} 的資料")
+        );
+        assert!(changes.iter().any(|c| c.contains("goal_template")));
+        assert!(changes.iter().any(|c| c.contains("goal_acceptance")));
+    }
+
+    #[test]
+    fn os_watch_apply_goal_template_null_clears() {
+        let mut table = toml::Table::new();
+        apply_os_watch_to_table(
+            &mut table,
+            &json!({ "os_watch": { "goal_template": "do {path}" } }),
+        )
+        .expect("apply");
+        assert!(
+            table
+                .get("os_watch")
+                .unwrap()
+                .as_table()
+                .unwrap()
+                .contains_key("goal_template")
+        );
+        let changes = apply_os_watch_to_table(
+            &mut table,
+            &json!({ "os_watch": { "goal_template": null } }),
+        )
+        .expect("apply clear");
+        assert!(
+            !table
+                .get("os_watch")
+                .unwrap()
+                .as_table()
+                .unwrap()
+                .contains_key("goal_template")
+        );
+        assert!(changes.iter().any(|c| c.contains("cleared")));
+    }
+
+    #[test]
+    fn os_watch_apply_goal_template_rejects_bad_values() {
+        // Empty string (use null to clear instead).
+        let mut t1 = toml::Table::new();
+        assert!(
+            apply_os_watch_to_table(&mut t1, &json!({ "os_watch": { "goal_template": "" } }),)
+                .is_err()
+        );
+        // Non-string.
+        let mut t2 = toml::Table::new();
+        assert!(
+            apply_os_watch_to_table(&mut t2, &json!({ "os_watch": { "goal_template": 123 } }),)
+                .is_err()
+        );
+        // Over the 2000-char cap.
+        let mut t3 = toml::Table::new();
+        let long = "x".repeat(2001);
+        assert!(
+            apply_os_watch_to_table(
+                &mut t3,
+                &json!({ "os_watch": { "goal_acceptance": long } }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn os_watch_apply_writes_footprint_flag() {
+        let mut table = toml::Table::new();
+        let changes = apply_os_watch_to_table(
+            &mut table,
+            &json!({ "os_watch": { "footprint": true } }),
+        )
+        .expect("apply");
+        let ow = table.get("os_watch").unwrap().as_table().unwrap();
+        assert_eq!(ow.get("footprint").unwrap().as_bool(), Some(true));
+        assert!(changes.iter().any(|c| c.contains("footprint = true")));
+
+        // Explicit false also round-trips (not a "clear", a real write).
+        let changes2 = apply_os_watch_to_table(
+            &mut table,
+            &json!({ "os_watch": { "footprint": false } }),
+        )
+        .expect("apply");
+        assert_eq!(
+            table
+                .get("os_watch")
+                .unwrap()
+                .as_table()
+                .unwrap()
+                .get("footprint")
+                .unwrap()
+                .as_bool(),
+            Some(false)
+        );
+        assert!(changes2.iter().any(|c| c.contains("footprint = false")));
+
+        // Non-bool value is silently ignored (matches the `.and_then(as_bool)`
+        // guard — same convention as `capabilities.os_native`), not an error.
+        let mut t3 = toml::Table::new();
+        let changes3 =
+            apply_os_watch_to_table(&mut t3, &json!({ "os_watch": { "footprint": "yes" } }))
+                .expect("apply");
+        assert!(changes3.is_empty());
+    }
+
+    #[test]
+    fn os_watch_apply_writes_frontmost_poll_secs() {
+        let mut table = toml::Table::new();
+        let changes = apply_os_watch_to_table(
+            &mut table,
+            &json!({ "os_watch": { "frontmost_poll_secs": 30 } }),
+        )
+        .expect("apply");
+        let ow = table.get("os_watch").unwrap().as_table().unwrap();
+        assert_eq!(
+            ow.get("frontmost_poll_secs").unwrap().as_integer(),
+            Some(30)
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("frontmost_poll_secs = 30"))
+        );
+
+        // 0 is a valid "disabled" write (mirrors the reader's `<=0 => None`).
+        let mut t0 = toml::Table::new();
+        let c0 = apply_os_watch_to_table(
+            &mut t0,
+            &json!({ "os_watch": { "frontmost_poll_secs": 0 } }),
+        )
+        .expect("apply");
+        assert!(c0.iter().any(|c| c.contains("frontmost_poll_secs = 0")));
+
+        // Out-of-range (> 3600) is rejected so the dashboard surfaces it.
+        let mut tbad = toml::Table::new();
+        assert!(
+            apply_os_watch_to_table(
+                &mut tbad,
+                &json!({ "os_watch": { "frontmost_poll_secs": 99999 } }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn os_native_quota_reject_frame_carries_code_and_clean_message() {
+        let frame = os_native_quota_reject_frame(1);
+        match frame {
+            WsFrame::Response {
+                ok: false,
+                error: Some(err),
+                ..
+            } => {
+                assert_eq!(
+                    err.get("code").and_then(|v| v.as_str()),
+                    Some(OS_NATIVE_QUOTA_ERROR_CODE)
+                );
+                let msg = err.get("message").and_then(|v| v.as_str()).unwrap();
+                assert!(msg.contains("1"), "limit should appear: {msg}");
+                assert!(msg.contains("AI 員工"), "user-facing term: {msg}");
+                // No internal terms leak into the UI copy.
+                assert!(!msg.contains("os_native"));
+                assert!(!msg.contains("capabilit"));
+            }
+            other => panic!("expected structured error response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_jsonl_tail_returns_last_n_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gate.jsonl");
+        std::fs::write(&path, "{\"a\":1}\n\nnot json\n{\"a\":2}\n{\"a\":3}\n").unwrap();
+        // Last 2 valid → {a:2},{a:3} (unparseable line skipped, blank skipped).
+        let rows = read_jsonl_tail(&path, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("a").unwrap().as_i64(), Some(2));
+        assert_eq!(rows[1].get("a").unwrap().as_i64(), Some(3));
+
+        // Missing file → empty, not an error.
+        assert!(read_jsonl_tail(&dir.path().join("nope.jsonl"), 5).is_empty());
+    }
+
+    #[test]
+    fn rule_induced_and_target_detection() {
+        let base = AutopilotRuleRow {
+            id: "r1".into(),
+            name: "n".into(),
+            enabled: true,
+            trigger_event: "os_file".into(),
+            conditions: json!({ "all": [{ "field": "agent_id", "op": "eq", "value": "bruno" }] })
+                .to_string(),
+            action: "{}".into(),
+            created_at: "".into(),
+            last_triggered_at: None,
+            trigger_count: 0,
+            sequence: None,
+            metadata: Some(json!({ "induced": true, "source": "pbd_rule_induction" }).to_string()),
+        };
+        assert!(rule_is_induced(&base));
+        assert!(rule_targets_agent(&base, "bruno"));
+        assert!(!rule_targets_agent(&base, "alice"));
+
+        // Non-induced (no metadata) rule.
+        let mut plain = base.clone();
+        plain.metadata = None;
+        assert!(!rule_is_induced(&plain));
+
+        // `source` alone (no induced flag) still counts as induced.
+        let mut via_source = base.clone();
+        via_source.metadata = Some(json!({ "source": "pbd_rule_induction" }).to_string());
+        assert!(rule_is_induced(&via_source));
     }
 
     // ── SCP: namespace mode parse ────────────────────────────────────────────
@@ -27599,5 +28602,341 @@ mod skills_share_tests {
                 "must reject ({agent}, {skill})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod os_native_page_tests {
+    //! P4-3 OS page: quota gate (write side) + os.* RPC handlers.
+    use super::*;
+
+    /// Seed an agent dir with a complete, scannable agent.toml BEFORE the
+    /// handler scans (all required sections present — the registry loads it
+    /// through the full `AgentConfig` deserializer, not a raw table).
+    fn seed_agent(home: &std::path::Path, name: &str, os_native: bool) {
+        let dir = home.join("agents").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let caps = if os_native {
+            "[capabilities]\nos_native = true\n"
+        } else {
+            ""
+        };
+        let toml = format!(
+            r#"[agent]
+name = "{name}"
+display_name = "{name}"
+role = "specialist"
+status = "active"
+trigger = ""
+reports_to = ""
+icon = "🤖"
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 5000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = ["*"]
+
+[evolution]
+micro_reflection = false
+meso_reflection = false
+macro_reflection = false
+skill_auto_activate = false
+skill_security_scan = true
+
+{caps}"#
+        );
+        std::fs::write(dir.join("agent.toml"), toml).unwrap();
+    }
+
+    fn frame_ok(f: &WsFrame) -> bool {
+        matches!(f, WsFrame::Response { ok: true, .. })
+    }
+
+    fn error_code(f: &WsFrame) -> Option<String> {
+        match f {
+            WsFrame::Response { error: Some(e), .. } => {
+                e.get("code").and_then(|c| c.as_str()).map(String::from)
+            }
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn personal_quota_rejects_second_os_native_agent() {
+        // SAFETY: single-threaded test; ensure Personal edition regardless of
+        // the ambient env so the quota is a deterministic 1.
+        unsafe {
+            std::env::set_var("DUDUCLAW_EDITION", "personal");
+        }
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "alpha", true); // already OS-native
+        seed_agent(home.path(), "bravo", false);
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Turning bravo os_native ON would make 2 > quota(1) → structured reject.
+        let frame = handler
+            .handle_agents_update(json!({
+                "agent_id": "bravo",
+                "capabilities": { "os_native": true },
+            }))
+            .await;
+        assert!(!frame_ok(&frame));
+        assert_eq!(
+            error_code(&frame).as_deref(),
+            Some(OS_NATIVE_QUOTA_ERROR_CODE)
+        );
+
+        // The write must NOT have happened (fail-closed).
+        let toml =
+            std::fs::read_to_string(home.path().join("agents").join("bravo").join("agent.toml"))
+                .unwrap();
+        assert!(!toml.contains("os_native = true"));
+        unsafe {
+            std::env::remove_var("DUDUCLAW_EDITION");
+        }
+    }
+
+    #[tokio::test]
+    async fn re_saving_already_os_native_agent_is_allowed_under_quota() {
+        unsafe {
+            std::env::set_var("DUDUCLAW_EDITION", "personal");
+        }
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "alpha", true);
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Re-saving alpha (already the one OS-native seat) must not be blocked.
+        let frame = handler
+            .handle_agents_update(json!({
+                "agent_id": "alpha",
+                "capabilities": { "os_native": true },
+            }))
+            .await;
+        assert_ne!(
+            error_code(&frame).as_deref(),
+            Some(OS_NATIVE_QUOTA_ERROR_CODE),
+            "idempotent re-save must not hit the quota gate: {frame:?}"
+        );
+        unsafe {
+            std::env::remove_var("DUDUCLAW_EDITION");
+        }
+    }
+
+    #[tokio::test]
+    async fn os_status_reports_quota_edition_and_agents() {
+        unsafe {
+            std::env::set_var("DUDUCLAW_EDITION", "personal");
+        }
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "alpha", true);
+        seed_agent(home.path(), "bravo", false);
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler.handle_os_status().await;
+        let payload = match frame {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => p,
+            other => panic!("expected ok, got {other:?}"),
+        };
+        assert_eq!(payload.get("edition").unwrap().as_str(), Some("personal"));
+        assert_eq!(payload["quota"]["limit"].as_u64(), Some(1));
+        assert_eq!(payload["quota"]["used"].as_u64(), Some(1)); // only alpha
+        let agents = payload["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 2);
+        // Sorted by name → alpha first.
+        assert_eq!(agents[0]["agent_id"].as_str(), Some("alpha"));
+        assert_eq!(agents[0]["os_native"].as_bool(), Some(true));
+        assert!(agents[0].get("proactive").is_some());
+        assert!(agents[0].get("frontmost").is_some());
+        assert_eq!(agents[1]["agent_id"].as_str(), Some("bravo"));
+        assert_eq!(agents[1]["os_native"].as_bool(), Some(false));
+        unsafe {
+            std::env::remove_var("DUDUCLAW_EDITION");
+        }
+    }
+
+    #[tokio::test]
+    async fn os_settings_update_remaps_and_writes_footprint() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "alpha", true);
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_os_settings_update(json!({
+                "agent_id": "alpha",
+                "footprint": true,
+                "frontmost_poll_secs": 45,
+                "proactive": { "enabled": true, "base_threshold": 4 },
+            }))
+            .await;
+        assert!(
+            frame_ok(&frame),
+            "settings update should succeed: {frame:?}"
+        );
+
+        let toml =
+            std::fs::read_to_string(home.path().join("agents").join("alpha").join("agent.toml"))
+                .unwrap();
+        assert!(toml.contains("footprint = true"));
+        assert!(toml.contains("frontmost_poll_secs = 45"));
+        assert!(toml.contains("base_threshold = 4"));
+    }
+
+    #[tokio::test]
+    async fn os_gate_recent_clamps_n_and_reads_tail() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "alpha", true);
+        // Write a few gate decisions.
+        let lines = (0..5)
+            .map(|i| {
+                json!({
+                    "ts": Utc::now().to_rfc3339(),
+                    "agent": "alpha",
+                    "event": "os_file",
+                    "score": i,
+                    "decision": "suppress",
+                    "outcome": null,
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(home.path().join("proactive_gate.jsonl"), lines).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler.handle_os_gate_recent(json!({ "n": 2 })).await;
+        let payload = match frame {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => p,
+            other => panic!("expected ok, got {other:?}"),
+        };
+        assert_eq!(payload["recent"].as_array().unwrap().len(), 2);
+        assert!(payload.get("quadrants").is_some());
+
+        // n over the max clamps to 200 (all 5 rows returned here).
+        let frame2 = handler.handle_os_gate_recent(json!({ "n": 99999 })).await;
+        if let WsFrame::Response {
+            payload: Some(p), ..
+        } = frame2
+        {
+            assert_eq!(p["recent"].as_array().unwrap().len(), 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn os_events_recent_reads_os_events_only() {
+        let home = tempfile::tempdir().unwrap();
+        // Pre-populate events.db with one os_ and one non-os event.
+        {
+            let store = crate::events_store::EventBusStore::open(home.path()).unwrap();
+            store
+                .append("task.created", r#"{"id":"t1"}"#)
+                .await
+                .unwrap();
+            store
+                .append(
+                    "os_file",
+                    r#"{"agent_id":"alpha","path":"/x.pdf","kind":"created"}"#,
+                )
+                .await
+                .unwrap();
+        }
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler.handle_os_events_recent(json!({ "n": 10 })).await;
+        let payload = match frame {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => p,
+            other => panic!("expected ok, got {other:?}"),
+        };
+        let events = payload["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"].as_str(), Some("os_file"));
+        assert_eq!(events[0]["payload"]["agent_id"].as_str(), Some("alpha"));
+    }
+
+    // ── P4-3+: os.events.subscribe / unsubscribe (live tail opt-in) ──────
+
+    fn manager_ctx() -> UserContext {
+        UserContext {
+            user_id: "m1".to_string(),
+            email: "m1@test.local".to_string(),
+            role: UserRole::Manager,
+            agent_access: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn os_events_subscribe_acks_for_admin() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        let frame = handler.handle("os.events.subscribe", json!({}), &ctx).await;
+        assert!(frame_ok(&frame), "expected ok, got {frame:?}");
+        let payload = match frame {
+            WsFrame::Response {
+                payload: Some(p), ..
+            } => p,
+            other => panic!("expected payload, got {other:?}"),
+        };
+        assert_eq!(payload["subscribed"].as_bool(), Some(true));
+
+        let frame2 = handler
+            .handle("os.events.unsubscribe", json!({}), &ctx)
+            .await;
+        assert!(frame_ok(&frame2), "expected ok, got {frame2:?}");
+    }
+
+    /// A non-admin (manager) caller must be denied — os_file/os_frontmost
+    /// events can carry filesystem paths and window titles, so the live tail
+    /// must stay behind the SAME `require_admin!` gate as every other `os.*`
+    /// RPC (`os.status`, `os.gate.recent`, etc.), not a lower bar.
+    #[tokio::test]
+    async fn os_events_subscribe_denies_non_admin() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = manager_ctx();
+
+        let frame = handler.handle("os.events.subscribe", json!({}), &ctx).await;
+        assert!(!frame_ok(&frame), "manager must be denied, got {frame:?}");
+
+        let frame2 = handler
+            .handle("os.events.unsubscribe", json!({}), &ctx)
+            .await;
+        assert!(!frame_ok(&frame2), "manager must be denied, got {frame2:?}");
     }
 }

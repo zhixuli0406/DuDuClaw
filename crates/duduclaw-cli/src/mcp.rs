@@ -1452,10 +1452,36 @@ const TOOLS: &[ToolDef] = &[
         name: "os_open",
         description: "Open a file path or an http(s) URL with the OS default handler (macOS open / Linux xdg-open). \
             Only http/https URLs and existing file paths are allowed (file:/javascript: etc. are rejected). \
-            Requires [capabilities] os_native = true; treated as maybe-irreversible (ActionGuard judge may require approval).",
+            Requires [capabilities] os_native = true; each call passes the VeriOS situation ASK gate (normal → run; sensitive/anomaly → human approval; missing/ambiguous target → returned to you to clarify).",
         params: &[
             ParamDef { name: "target", description: "An existing file path, or an http(s):// URL", required: true },
         ],
+    },
+    // ── OS-native P2-4: structured sensing sources (read-only, no ActionGuard) ──
+    ToolDef {
+        name: "os_frontmost",
+        description: "Report the host's current frontmost (foreground) application and its focused window title \
+            (macOS: System Events; Linux: xdotool; Windows: unsupported). Read-only. \
+            Requires the agent's [capabilities] os_native = true.",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_spotlight_search",
+        description: "Search the macOS Spotlight metadata index (`mdfind`) for files matching a query, \
+            optionally scoped to a directory. Read-only, macOS only. \
+            Requires the agent's [capabilities] os_native = true.",
+        params: &[
+            ParamDef { name: "query", description: "Search query text", required: true },
+            ParamDef { name: "scope_dir", description: "Optional directory to scope the search to (must exist)", required: false },
+            ParamDef { name: "limit", description: "Max results to return (default 20, max 200)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "os_calendar_today",
+        description: "Read today's calendar events (title / start / end / calendar name) from the host's \
+            Calendar.app via JXA, read-only, macOS only. \
+            Requires the agent's [capabilities] os_native = true.",
+        params: &[],
     },
 ];
 
@@ -6269,12 +6295,25 @@ pub(crate) async fn gate_tool_approval_dispatch(
     // what WP5 must gate).
     let in_always = install_approval_required(&agent_dir, tool_name, false)
         || duduclaw_gateway::approval::tool_is_irreversible(&agent_dir, tool_name);
-    // OS-native Phase 1: `os_open` performs a host side-effect whose reversibility
-    // is target-dependent, so it is ALWAYS routed through the ActionGuard judge
-    // (take-the-stricter with any operator config — if the agent additionally
-    // lists it in `irreversible_tools`, `in_always` already forces human review).
-    let in_maybe = duduclaw_gateway::approval::tool_is_maybe_irreversible(&agent_dir, tool_name)
-        || tool_name == "os_open";
+
+    // ── P3-1 VeriOS situation five-classification ASK gate ───────────────────
+    // OS ACTION tools (`os_open`, future L5b native desktop actions) route
+    // through the situation classifier INSTEAD of the ActionGuard
+    // maybe-irreversibility judge. The classifier makes exactly one utility LLM
+    // call in the residual case (superseding the maybe-judge — no double LLM
+    // call for `os_open`) and its outcome merges take-the-stricter with the
+    // ActionGuard STATIC always-list via `in_always`. Grant-gating (§3.65) has
+    // already run before this stage, so the two mechanisms are layered, not
+    // parallel: grant = "may this agent use the tool this task-phase", ASK gate
+    // = "is THIS invocation's situation safe to auto-run". See
+    // `situation_classifier.rs` module docs.
+    if duduclaw_gateway::situation_classifier::is_os_action_tool(tool_name) {
+        return gate_os_situation_dispatch(home_dir, agent_id, &agent_dir, tool_name, payload, in_always)
+            .await;
+    }
+
+    // Non-OS maybe-irreversible tools stay on the ActionGuard judge path.
+    let in_maybe = duduclaw_gateway::approval::tool_is_maybe_irreversible(&agent_dir, tool_name);
 
     use duduclaw_gateway::approval::{resolve_action_gate, ActionGate, JudgeVerdict};
 
@@ -6346,6 +6385,104 @@ pub(crate) async fn gate_tool_approval_dispatch(
         }
         // Resolved to a concrete gate above; ConsultJudge cannot reach here.
         ActionGate::ConsultJudge => Ok(()),
+    }
+}
+
+/// P3-1: the OS-action situation ASK gate (VeriOS five-classification). Called
+/// from [`gate_tool_approval_dispatch`] for OS action tools instead of the
+/// ActionGuard maybe-judge. Classifies the call (deterministic Layer 1 → one
+/// utility LLM call in the residual case, fail-closed to `anomaly`), audits the
+/// classification, then maps the class → decision merged take-the-stricter with
+/// the ActionGuard static always-list (`force_approval`):
+///
+/// - `normal`      → `Ok(())` (proceed; a forced approval still upgrades this).
+/// - `anomaly` / `sensitive` → ApprovalBroker human approval (TTL-expiry = DENY).
+/// - `missing_info` / `user_choice` → `Err(追問)` — the action does NOT run; the
+///   zh-TW message returns to the agent so its LLM can supply the missing target
+///   / disambiguate.
+///
+/// Returns `Ok(())` to proceed or `Err(zh-TW message)` on a fail-closed denial /
+/// ask. Fully fail-closed: an unavailable broker denies.
+async fn gate_os_situation_dispatch(
+    home_dir: &Path,
+    agent_id: &str,
+    agent_dir: &Path,
+    tool_name: &str,
+    payload: Value,
+    force_approval: bool,
+) -> std::result::Result<(), String> {
+    use duduclaw_gateway::situation_classifier as sc;
+
+    let args = payload
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    // Two-layer classification (deterministic → residual utility LLM call).
+    let cr = sc::classify_os_action(home_dir, agent_dir, tool_name, &args).await;
+    let decision = sc::merge_with_force_approval(sc::decision_for(cr.class), force_approval);
+
+    // Audit EVERY classification (VeriOS: the label is the auditable decision).
+    duduclaw_security::audit::append_tool_call_with_extras(
+        home_dir,
+        agent_id,
+        tool_name,
+        &format!(
+            "situation gate → {} ({}) ⇒ {}",
+            cr.class.as_str(),
+            cr.source.as_str(),
+            decision.kind_str()
+        ),
+        matches!(decision, sc::SituationDecision::Proceed),
+        &[
+            (
+                "situation_class",
+                Value::String(cr.class.as_str().to_string()),
+            ),
+            (
+                "situation_source",
+                Value::String(cr.source.as_str().to_string()),
+            ),
+            (
+                "situation_decision",
+                Value::String(decision.kind_str().to_string()),
+            ),
+            ("force_approval", Value::Bool(force_approval)),
+        ],
+    );
+
+    match decision {
+        sc::SituationDecision::Proceed => Ok(()),
+        sc::SituationDecision::Ask(msg) => Err(msg),
+        sc::SituationDecision::RequireApproval => {
+            let summary = format!(
+                "工具「{tool_name}」情境判定為「{}」，需經管理員核可後才能執行（VeriOS 情境分類 ASK 閘）",
+                cr.class.as_str()
+            );
+            let broker = match duduclaw_gateway::approval::ApprovalBroker::open(home_dir) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "ApprovalBroker unavailable — denying OS action (fail-closed)");
+                    return Err(
+                        "審批系統暫時無法使用，已拒絕執行（fail-closed）。請稍後再試或由管理員手動處理。"
+                            .to_string(),
+                    );
+                }
+            };
+            match run_install_approval(
+                &broker,
+                agent_id,
+                &summary,
+                payload,
+                sc::SITUATION_APPROVAL_TTL_SECS,
+                INSTALL_APPROVAL_POLL,
+            )
+            .await
+            {
+                InstallApprovalOutcome::Proceed => Ok(()),
+                InstallApprovalOutcome::Denied(msg) => Err(msg),
+            }
+        }
     }
 }
 
@@ -8134,6 +8271,12 @@ pub(crate) async fn handle_tools_call(
             handle_os_watch_status(home_dir, watch_agent).await
         }
         "os_open" => handle_os_open(&arguments).await,
+        // OS-native P2-4: structured sensing sources. Read-only, no
+        // ActionGuard — gated only by [capabilities] os_native + Scope::OsNative
+        // (enforced upstream in mcp_dispatch, same choke point as the P1 tools).
+        "os_frontmost" => handle_os_frontmost().await,
+        "os_spotlight_search" => handle_os_spotlight_search(&arguments).await,
+        "os_calendar_today" => handle_os_calendar_today().await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => {
             handle_odoo_tool(t, &arguments, home_dir, odoo, default_agent).await
@@ -11147,6 +11290,77 @@ async fn handle_os_watch_status(home_dir: &Path, agent_id: &str) -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// OS-native P2-4 tool handlers (os_frontmost / os_spotlight_search /
+// os_calendar_today). All three are read-only structured sensing sources
+// (research doc §②-6: "structured API over pixels") — no ActionGuard, only
+// the [capabilities] os_native + Scope::OsNative gate enforced upstream in
+// mcp_dispatch.
+// ─────────────────────────────────────────────────────────────────
+
+async fn handle_os_frontmost() -> Value {
+    match duduclaw_os::frontmost_info().await {
+        Ok(info) => {
+            let out = serde_json::json!({
+                "app": info.app,
+                "window_title": info.window_title,
+            });
+            tool_text(&serde_json::to_string_pretty(&out).unwrap_or_default())
+        }
+        Err(e) => tool_error(&format!("取得前景視窗失敗：{e}")),
+    }
+}
+
+async fn handle_os_spotlight_search(args: &Value) -> Value {
+    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    if query.trim().is_empty() {
+        return tool_error("os_spotlight_search 需要非空的 `query`。");
+    }
+    // `scope_dir` is expanded (`~` → home) the same way `[os_watch] paths` is,
+    // before being handed to `duduclaw_os::spotlight_search`, which itself
+    // canonicalizes it fail-closed (a non-existent scope is an error, not a
+    // silently-unscoped search).
+    let scope_dir = args
+        .get("scope_dir")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(duduclaw_core::expand_tilde);
+    let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+
+    match duduclaw_os::spotlight_search(query, scope_dir.as_deref(), limit).await {
+        Ok(paths) => {
+            let results: Vec<String> = paths
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let out = serde_json::json!({ "count": results.len(), "results": results });
+            tool_text(&serde_json::to_string_pretty(&out).unwrap_or_default())
+        }
+        Err(e) => tool_error(&format!("Spotlight 搜尋失敗：{e}")),
+    }
+}
+
+async fn handle_os_calendar_today() -> Value {
+    match duduclaw_os::today_events().await {
+        Ok(events) => {
+            let out_events: Vec<Value> = events
+                .into_iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "title": e.title,
+                        "start": e.start,
+                        "end": e.end,
+                        "calendar": e.calendar,
+                    })
+                })
+                .collect();
+            let out = serde_json::json!({ "count": out_events.len(), "events": out_events });
+            tool_text(&serde_json::to_string_pretty(&out).unwrap_or_default())
+        }
+        Err(e) => tool_error(&format!("讀取行事曆失敗：{e}")),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Task Board / Activity Feed / Autopilot / Shared Skills MCP tools
 // (Multica-inspired "Agent-as-teammate" integration, v1.8.27+)
 // ─────────────────────────────────────────────────────────────────
@@ -12025,6 +12239,8 @@ async fn handle_autopilot_list(args: &Value, home_dir: &Path) -> Value {
                 "created_at": r.created_at,
                 "last_triggered_at": r.last_triggered_at,
                 "trigger_count": r.trigger_count,
+                // P3-3: present only for CEP sequence rules; null for ordinary rules.
+                "sequence": r.sequence.as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
             })
         })
         .collect();
@@ -14594,6 +14810,8 @@ mod task_board_tests {
             created_at: now.clone(),
             last_triggered_at: None,
             trigger_count: 0,
+            sequence: None,
+            metadata: None,
         };
         store.insert_rule(&enabled).await.unwrap();
         enabled.id = "r2".into();
@@ -15089,6 +15307,10 @@ mod mcp_scope_dispatch_tests {
         assert_eq!(tool_requires_scope("os_notify"),       Some(Scope::OsNative));
         assert_eq!(tool_requires_scope("os_watch_status"), Some(Scope::OsNative));
         assert_eq!(tool_requires_scope("os_open"),         Some(Scope::OsNative));
+        // OS-native P2-4 sensing tools map to the same os:native scope.
+        assert_eq!(tool_requires_scope("os_frontmost"),         Some(Scope::OsNative));
+        assert_eq!(tool_requires_scope("os_spotlight_search"),  Some(Scope::OsNative));
+        assert_eq!(tool_requires_scope("os_calendar_today"),    Some(Scope::OsNative));
         // C2 fail-closed: unmapped tools require Admin, not None.
         assert_eq!(tool_requires_scope("totally_unknown"), Some(Scope::Admin));
     }
@@ -16924,6 +17146,119 @@ mod wp5_install_approval_tests {
             "dudu",
             "安裝技能「slow」",
             serde_json::json!({}),
+            1,
+            Duration::from_millis(20),
+        )
+        .await;
+        match out {
+            InstallApprovalOutcome::Denied(msg) => {
+                assert!(msg.contains("逾時") || msg.contains("fail-closed"), "got: {msg}")
+            }
+            InstallApprovalOutcome::Proceed => panic!("TTL expiry must deny (fail-closed)"),
+        }
+    }
+
+    // ── P3-1 situation ASK gate: dispatch-level orchestration ───────────────
+
+    /// A missing target (deterministic `missing_info`) is refused with a追問
+    /// message — no LLM call, no approval broker, action does NOT run.
+    #[tokio::test]
+    async fn os_situation_missing_info_asks_agent() {
+        let tmp = TempHome::new();
+        let home = tmp.0.clone();
+        write_agent_toml(&home, "agentx", "[capabilities]\nos_native = true\n");
+        let payload = serde_json::json!({ "name": "os_open", "arguments": { "target": "" } });
+        let res = super::gate_os_situation_dispatch(
+            &home,
+            "agentx",
+            &home.join("agents").join("agentx"),
+            "os_open",
+            payload,
+            false,
+        )
+        .await;
+        let err = res.expect_err("missing target must be refused with a追問");
+        assert!(err.contains("缺少必要參數"), "got: {err}");
+        // The classification was audited.
+        let audit = std::fs::read_to_string(home.join("tool_calls.jsonl")).unwrap_or_default();
+        assert!(audit.contains("\"situation_class\":\"missing_info\""), "audit: {audit}");
+        assert!(audit.contains("\"situation_decision\":\"ask_agent\""), "audit: {audit}");
+    }
+
+    /// A globbed target (deterministic `user_choice`) is refused with a追問.
+    #[tokio::test]
+    async fn os_situation_user_choice_asks_agent() {
+        let tmp = TempHome::new();
+        let home = tmp.0.clone();
+        let payload =
+            serde_json::json!({ "name": "os_open", "arguments": { "target": "~/Downloads/*.pdf" } });
+        let res = super::gate_os_situation_dispatch(
+            &home,
+            "agentx",
+            &home.join("agents").join("agentx"),
+            "os_open",
+            payload,
+            false,
+        )
+        .await;
+        let err = res.expect_err("ambiguous target must be refused with a追問");
+        assert!(err.contains("目標不唯一"), "got: {err}");
+    }
+
+    /// A sensitive target (deterministic `~/.ssh/id_rsa`) routes to the
+    /// ApprovalBroker; approving it lets the action proceed. Exercises the full
+    /// sensitive → approval orchestration (real on-disk broker, no LLM).
+    #[tokio::test]
+    async fn os_situation_sensitive_routes_to_approval_then_approve_proceeds() {
+        let tmp = TempHome::new();
+        let home = tmp.0.clone();
+        let payload = serde_json::json!({
+            "name": "os_open",
+            "arguments": { "target": "/Users/me/.ssh/id_rsa" }
+        });
+        let agent_dir = home.join("agents").join("agentx");
+        let h = home.clone();
+        let gate = tokio::spawn(async move {
+            super::gate_os_situation_dispatch(&h, "agentx", &agent_dir, "os_open", payload, false)
+                .await
+        });
+        // Poll the same on-disk broker until the pending approval is filed, then
+        // approve it. `run_install_approval` polls every 2s, so allow headroom.
+        let broker = ApprovalBroker::open(&home).unwrap();
+        let mut filed = false;
+        for _ in 0..60 {
+            let pending = broker.list_pending(Some("agentx")).await.unwrap();
+            if let Some(rec) = pending.first() {
+                assert_eq!(rec.agent_id, "agentx");
+                broker.decide(&rec.id, true, "test-approver").await.unwrap();
+                filed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(filed, "sensitive action must file a pending approval");
+        let res = gate.await.unwrap();
+        assert!(res.is_ok(), "approved sensitive action must proceed: {res:?}");
+        // Audited as sensitive → require_approval.
+        let audit = std::fs::read_to_string(home.join("tool_calls.jsonl")).unwrap_or_default();
+        assert!(audit.contains("\"situation_class\":\"sensitive\""), "audit: {audit}");
+        assert!(audit.contains("\"situation_decision\":\"require_approval\""), "audit: {audit}");
+    }
+
+    /// TTL expiry on a filed situation approval denies fail-closed (the shared
+    /// `run_install_approval` primitive `gate_os_situation_dispatch` reuses is
+    /// also covered by `approval_ttl_expiry_denies`; this asserts the sensitive
+    /// branch honours TTL=DENY end-to-end with a short TTL).
+    #[tokio::test]
+    async fn os_situation_approval_ttl_expiry_denies() {
+        let broker = in_mem_broker();
+        // Reuse the exact primitive the sensitive branch calls, with a 1s TTL and
+        // nobody deciding ⇒ Expired ⇒ Denied (fail-closed).
+        let out = run_install_approval(
+            &broker,
+            "agentx",
+            "工具「os_open」情境判定為「sensitive」，需經管理員核可後才能執行（VeriOS 情境分類 ASK 閘）",
+            serde_json::json!({ "name": "os_open", "arguments": { "target": "/x/.env" } }),
             1,
             Duration::from_millis(20),
         )

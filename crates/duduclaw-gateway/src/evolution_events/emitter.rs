@@ -388,6 +388,22 @@ impl EvolutionEventEmitter {
         );
     }
 
+    // ── OS-native P2-3: proactive four-quadrant domain helper ───────────────────
+
+    /// Emit a `proactive_quadrant` event (non-blocking).
+    ///
+    /// Call from `proactive_feedback::quadrant_stats_and_emit` after
+    /// aggregating `<home>/proactive_gate.jsonl` outcomes for one agent.
+    /// Always `Outcome::Success` — this reports a measurement, not a pass/fail
+    /// action.
+    pub fn emit_proactive_quadrant(&self, agent_id: &str, metadata: Json) {
+        self.spawn(
+            AuditEvent::now(AuditEventType::ProactiveQuadrant, agent_id, Outcome::Success)
+                .with_trigger_signal("proactive_gate_calibration")
+                .with_metadata(metadata),
+        );
+    }
+
     // ── Internal ──────────────────────────────────────────────────────────────
 
     /// Fire-and-forget: log `event` via [`tokio::spawn`].

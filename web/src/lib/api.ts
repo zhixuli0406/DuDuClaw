@@ -1507,6 +1507,147 @@ export interface OsWatchConfig {
   max_events_per_min?: number;
 }
 
+// ── OS: dashboard "OS" page (P4-3) — OS-native fleet status + settings ──
+
+/** Machine-readable code the gateway returns when a write would push the
+ *  number of OS-native agents past the edition quota. Stable string — the
+ *  dashboard keys UI copy off it (never displays it directly). */
+export const OS_NATIVE_QUOTA_ERROR_CODE = 'os_native_quota_exceeded';
+
+export interface OsQuota {
+  /** null ⇒ unlimited (Enterprise). */
+  limit: number | null;
+  used: number;
+}
+
+export interface OsAgentWatch {
+  paths: string[];
+  events: number;
+  dropped: number;
+}
+
+export interface OsAgentFrontmost {
+  /** 0 ⇒ polling not configured. */
+  poll_secs: number;
+  running: boolean;
+}
+
+export interface OsAgentProactive {
+  enabled: boolean;
+  base_threshold: number;
+  max_per_hour: number;
+}
+
+/** One row of `os.status` — a fleet member's OS-native snapshot. */
+export interface OsAgentStatus {
+  /** Registry name — also what `os.settings.update` expects as `agent_id`. */
+  agent_id: string;
+  os_native: boolean;
+  watch: OsAgentWatch;
+  frontmost: OsAgentFrontmost;
+  footprint: boolean;
+  proactive: OsAgentProactive;
+  /** PBD-induced (P4-1) autopilot rules that target this agent (best-effort). */
+  induced_rules_count: number;
+}
+
+export interface OsStatusResult {
+  edition: 'personal' | 'enterprise';
+  quota: OsQuota;
+  agents: OsAgentStatus[];
+}
+
+/** Partial update payload for `os.settings.update`. Mirrors the flat OS-page
+ *  shape the gateway remaps onto `agents.update` internally. */
+export interface OsSettingsUpdateParams {
+  agent_id: string;
+  os_native?: boolean;
+  footprint?: boolean;
+  /** 0 = disabled, 1-3600. */
+  frontmost_poll_secs?: number;
+  proactive?: {
+    enabled?: boolean;
+    /** 1-5. */
+    base_threshold?: number;
+    /** 0-1000. */
+    max_per_hour?: number;
+  };
+  os_watch?: OsWatchConfig;
+}
+
+export interface OsSettingsUpdateResult {
+  success: true;
+  agent_id: string;
+  hot_reloaded: boolean;
+  os_watch_hot_reloaded: boolean;
+  message: string;
+}
+
+export type OsGateDecision = 'allow' | 'suppress';
+
+/** One `proactive_gate.jsonl` row (raw shape — the gate's own log format). */
+export interface OsGateRow {
+  ts: string;
+  agent: string;
+  event: string;
+  score: number;
+  threshold: number;
+  interruptibility: number;
+  decision: OsGateDecision;
+  reason: string;
+  latency_ms?: number;
+  outcome?: string | null;
+}
+
+/** Four-quadrant (plus non-response / unknown) outcome tally for the
+ *  proactivity confusion matrix. */
+export interface OsGateQuadrants {
+  correct_detection: number;
+  false_alarm: number;
+  missed_need: number;
+  non_response: number;
+  correct_silence: number;
+  unknown: number;
+}
+
+export interface OsGateRecentResult {
+  recent: OsGateRow[];
+  quadrants: OsGateQuadrants;
+}
+
+export type OsEventKind = 'os_file' | 'os_frontmost' | string;
+
+export interface OsEventRow {
+  id: number;
+  event: OsEventKind;
+  ts: string;
+  source: string | null;
+  payload: Record<string, unknown>;
+}
+
+export interface OsEventsRecentResult {
+  events: OsEventRow[];
+}
+
+/** `os.events.entry` live-push payload (P4-3+) — same shape as one
+ *  `OsEventRow`, minus `id`: a live push races the async `events.db`
+ *  persistence bridge, so there is no DB id to report yet. The caller
+ *  synthesizes its own list key. */
+export type OsEventPush = Omit<OsEventRow, 'id'>;
+
+export type OsDoctorCheckId = 'notification' | 'frontmost' | 'calendar' | 'spotlight';
+export type OsDoctorStatus = 'ok' | 'warn' | 'fail' | 'skip';
+
+export interface OsDoctorCheck {
+  id: OsDoctorCheckId;
+  status: OsDoctorStatus;
+  detail: string;
+}
+
+export interface OsDoctorRunResult {
+  checks: OsDoctorCheck[];
+}
+
 // ── CON: per-agent CONTRACT.toml ────────────────────────────────
 
 export interface ContractConfig {
@@ -3658,5 +3799,35 @@ export const api = {
           bundle: BrandingBundle;
         }>,
     },
+  },
+  // ── OS-native page (P4-3) ───────────────────────────────────────
+  os: {
+    /** Whole-fleet OS-native snapshot: edition, quota, per-agent status. */
+    status: () => client.call('os.status') as Promise<OsStatusResult>,
+    /** Per-agent OS-native settings write. Rejects with a structured
+     *  `{ code: OS_NATIVE_QUOTA_ERROR_CODE, message }` error when the write
+     *  would exceed the edition's OS-native seat quota. */
+    settingsUpdate: (params: OsSettingsUpdateParams) =>
+      client.call('os.settings.update', { ...params }) as Promise<OsSettingsUpdateResult>,
+    /** Proactivity gate decision tail + four-quadrant outcome tally.
+     *  `n` defaults to 50, clamped 1-200 server-side. */
+    gateRecent: (params?: { n?: number; agent_id?: string }) =>
+      client.call('os.gate.recent', params ?? {}) as Promise<OsGateRecentResult>,
+    /** Most recent `os_*` perception events, newest first. `n` defaults to
+     *  50, clamped 1-200 server-side. */
+    eventsRecent: (params?: { n?: number }) =>
+      client.call('os.events.recent', params ?? {}) as Promise<OsEventsRecentResult>,
+    /** Opt this WebSocket connection into a live `os.events.entry` tail of
+     *  os_file/os_frontmost events. Admin-gated, same as every other `os.*`
+     *  RPC. Pair with `client.subscribe('os.events.entry', ...)`. */
+    eventsSubscribe: () =>
+      client.call('os.events.subscribe') as Promise<{ success: true; subscribed: true }>,
+    /** Counterpart to `eventsSubscribe` — stops the live push for this
+     *  connection. */
+    eventsUnsubscribe: () =>
+      client.call('os.events.unsubscribe') as Promise<{ success: true; subscribed: false }>,
+    /** On-demand OS-native environment probes — the only expensive OS RPC
+     *  (live notification / frontmost / calendar / mdfind checks). */
+    doctorRun: () => client.call('os.doctor.run') as Promise<OsDoctorRunResult>,
   },
 };

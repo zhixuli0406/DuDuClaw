@@ -783,6 +783,26 @@ pub fn agent_cap_enforced(is_self_host: bool, has_max_agents_override: bool) -> 
     !is_self_host || has_max_agents_override
 }
 
+/// How many agents may be registered as OS-native ("OS 原生員工") for the given
+/// edition. This is a **quota** lock, not a capability lock — the `os_native`
+/// capability itself is never removed or crippled on any edition; the free core
+/// keeps every feature, we only cap *how many seats* may use it at once
+/// (`edition-split-moat`: 鎖 quota 不鎖能力).
+///
+/// - **Personal** → `Some(1)`: exactly one AI employee may be the OS-native one.
+/// - **Enterprise** → `None`: uncapped. The signed license schema carries no
+///   os-native-specific field, so there is nothing to read here — paid tiers are
+///   simply unlimited. (Do NOT invent a license field that doesn't exist; the
+///   whole-fleet `max_agents` quota is a *separate* concern enforced elsewhere.)
+///
+/// `None` means unlimited; a `Some(n)` return is the number of agents that may
+/// have `[capabilities] os_native = true` simultaneously. Pure so both the
+/// write-time gate (`agents.update` / `os.settings.update`) and the startup
+/// gate (`resolve_os_native_allowed`) consult one identical decision.
+pub fn os_native_agent_quota(edition: duduclaw_core::EditionProfile) -> Option<u32> {
+    if edition.is_personal() { Some(1) } else { None }
+}
+
 /// Agent-count cap check for processes OUTSIDE the gateway (the MCP server is
 /// a separate `duduclaw mcp-server` process, so [`global()`] is never
 /// initialised there and the dashboard's `tier_limit_message` gate cannot
@@ -1591,6 +1611,17 @@ mod tests {
         // ...but a signed per-license max_agents override DOES enforce on
         // self-host (§7(b)) — this is the whole point of P-License.
         assert!(agent_cap_enforced(true, true));
+    }
+
+    #[test]
+    fn os_native_quota_personal_is_one_enterprise_unlimited() {
+        use duduclaw_core::EditionProfile;
+        // Personal edition: exactly one OS-native seat (quota lock, not a
+        // capability lock).
+        assert_eq!(os_native_agent_quota(EditionProfile::Personal), Some(1));
+        // Enterprise edition: uncapped — the license schema has no os-native
+        // field, so there is nothing to gate on.
+        assert_eq!(os_native_agent_quota(EditionProfile::Enterprise), None);
     }
 
     #[test]

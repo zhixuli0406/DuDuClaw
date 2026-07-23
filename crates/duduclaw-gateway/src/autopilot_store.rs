@@ -23,6 +23,21 @@ pub struct AutopilotRuleRow {
     pub created_at: String,
     pub last_triggered_at: Option<String>,
     pub trigger_count: i64,
+    /// P3-3 lightweight CEP: optional JSON-encoded
+    /// `cep_matcher::SequenceSpec` (`{"first":{...},"then":{...},
+    /// "within_secs":N,"negate":bool}`). `None` for ordinary single-event
+    /// rules. When `Some`, `AutopilotEngine::process_event` never dispatches
+    /// this rule via the literal `trigger_event`/`conditions` path — it fires
+    /// exclusively through `CepMatcher`'s synthetic `CepTrigger` event once
+    /// the temporal pattern resolves. `trigger_event` is still required (by
+    /// the existing dashboard write-time validator) but is an unused
+    /// placeholder for sequence rules.
+    pub sequence: Option<String>,
+    /// P4-1 PBD rule induction: optional JSON metadata blob. Induced rules
+    /// carry `{"induced":true,"induced_at":"<rfc3339>","fingerprint":"…",
+    /// "source":"pbd_rule_induction"}` so the dashboard can badge them and a
+    /// future lifecycle pass can retire them. `None` for hand-authored rules.
+    pub metadata: Option<String>,
 }
 
 // ── History row ─────────────────────────────────────────────
@@ -87,6 +102,27 @@ impl AutopilotStore {
              CREATE INDEX IF NOT EXISTS idx_ap_history_ts   ON autopilot_history(triggered_at DESC);",
         )
         .map_err(|e| format!("init autopilot schema: {e}"))?;
+
+        // P3-3 additive migration: optional CEP sequence pattern spec (JSON).
+        // Idempotent — a "duplicate column name" error on an already-migrated
+        // DB is expected and ignored (same pattern as cost_telemetry.rs /
+        // session.rs / custom_skills.rs).
+        if let Err(e) = conn.execute("ALTER TABLE autopilot_rules ADD COLUMN sequence TEXT", []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(format!("autopilot_rules sequence migration failed: {e}"));
+            }
+        }
+
+        // P4-1 additive migration: optional JSON metadata blob (induced-rule
+        // provenance). Same idempotent "duplicate column name" tolerance as the
+        // `sequence` migration above.
+        if let Err(e) = conn.execute("ALTER TABLE autopilot_rules ADD COLUMN metadata TEXT", []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(format!("autopilot_rules metadata migration failed: {e}"));
+            }
+        }
         Ok(())
     }
 
@@ -97,7 +133,7 @@ impl AutopilotStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, enabled, trigger_event, conditions, action,
-                        created_at, last_triggered_at, trigger_count
+                        created_at, last_triggered_at, trigger_count, sequence, metadata
                  FROM autopilot_rules ORDER BY created_at ASC",
             )
             .map_err(|e| format!("prepare list rules: {e}"))?;
@@ -113,7 +149,7 @@ impl AutopilotStore {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT id, name, enabled, trigger_event, conditions, action,
-                    created_at, last_triggered_at, trigger_count
+                    created_at, last_triggered_at, trigger_count, sequence, metadata
              FROM autopilot_rules WHERE id = ?1",
             params![id],
             row_to_rule,
@@ -127,8 +163,8 @@ impl AutopilotStore {
         conn.execute(
             "INSERT INTO autopilot_rules
                 (id, name, enabled, trigger_event, conditions, action,
-                 created_at, last_triggered_at, trigger_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 created_at, last_triggered_at, trigger_count, sequence, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 row.id,
                 row.name,
@@ -139,6 +175,8 @@ impl AutopilotStore {
                 row.created_at,
                 row.last_triggered_at,
                 row.trigger_count,
+                row.sequence,
+                row.metadata,
             ],
         )
         .map_err(|e| format!("insert rule: {e}"))?;
@@ -172,6 +210,30 @@ impl AutopilotStore {
             if let Some(v) = fields.get("action") {
                 binds.push(v.to_string());
                 sets.push(format!("action = ?{}", binds.len()));
+            }
+            // P3-3: `sequence` accepts either a JSON object (stored as its
+            // string form, mirroring `conditions`/`action`) or an explicit
+            // `null` to clear a rule back to ordinary single-event dispatch.
+            // `null` needs no bind parameter — it's a hardcoded SQL literal,
+            // not caller-controlled, so there is no injection concern.
+            if let Some(v) = fields.get("sequence") {
+                if v.is_null() {
+                    sets.push("sequence = NULL".to_string());
+                } else {
+                    binds.push(v.to_string());
+                    sets.push(format!("sequence = ?{}", binds.len()));
+                }
+            }
+            // P4-1: `metadata` follows the same object-or-null contract as
+            // `sequence`. Hardcoded NULL literal — not caller-controlled — so
+            // no injection concern.
+            if let Some(v) = fields.get("metadata") {
+                if v.is_null() {
+                    sets.push("metadata = NULL".to_string());
+                } else {
+                    binds.push(v.to_string());
+                    sets.push(format!("metadata = ?{}", binds.len()));
+                }
             }
 
             if sets.is_empty() {
@@ -267,6 +329,8 @@ fn row_to_rule(row: &rusqlite::Row) -> rusqlite::Result<AutopilotRuleRow> {
         created_at: row.get(6)?,
         last_triggered_at: row.get(7)?,
         trigger_count: row.get(8)?,
+        sequence: row.get(9)?,
+        metadata: row.get(10)?,
     })
 }
 
