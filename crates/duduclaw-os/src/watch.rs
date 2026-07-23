@@ -437,8 +437,11 @@ mod tests {
     #[test]
     fn classify_kind_transitions() {
         // Anchor the watcher start before creating the file so its first
-        // sighting classifies as Created (born after start).
-        let start = SystemTime::now();
+        // sighting classifies as Created (born after start). Back-date the
+        // anchor by 2s: on filesystems without birthtime (Linux CI) the
+        // fallback compares mtime, whose whole-second granularity can round
+        // below a sub-second `now()` and misclassify as Modified.
+        let start = SystemTime::now() - std::time::Duration::from_secs(2);
         let mut seen = HashSet::new();
         // A path that does not exist → Removed.
         let ghost = Path::new("/nonexistent/duduclaw-os/ghost-xyz");
