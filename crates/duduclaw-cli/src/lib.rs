@@ -1608,8 +1608,73 @@ async fn cmd_os(
                 }
             }
 
-            // 2) Per-agent os_native + [os_watch] status.
+            // 2) P2-4: System Events automation permission (frontmost) — a
+            // live call, not a static file check, because TCC state is not
+            // otherwise observable. Fail-closed: report the denial and stop —
+            // never attempt to bypass or auto-grant (opus-playbook §6:
+            // "tool 失效停工上報，不繞過"; research doc §5.2 "絕不做 TCC bypass").
             println!();
+            println!("System Events automation permission (frontmost):");
+            match duduclaw_os::frontmost_info().await {
+                Ok(info) => println!(
+                    "[ok]  Frontmost detection works (currently: {} — \"{}\").",
+                    if info.app.is_empty() { "(unknown)" } else { &info.app },
+                    info.window_title
+                ),
+                Err(duduclaw_os::FrontmostError::Unsupported) => {
+                    println!("[skip] Frontmost detection is not supported on this platform.");
+                }
+                Err(duduclaw_os::FrontmostError::PermissionDenied(msg)) => {
+                    println!(
+                        "[fail] Automation permission NOT granted ({msg}). \
+                         前往「系統設定 → 隱私權與安全性 → 自動化」，允許執行 duduclaw 的程式（Terminal / \
+                         你的終端機 App）控制「System Events」。"
+                    );
+                }
+                Err(e) => println!("[fail] Frontmost detection failed: {e}"),
+            }
+
+            // 3) P2-4: Calendar automation permission — same fail-closed,
+            // report-only pattern as the frontmost check above.
+            println!();
+            println!("Calendar automation permission (today's events):");
+            match duduclaw_os::today_events().await {
+                Ok(events) => println!("[ok]  Calendar read works ({} event(s) today).", events.len()),
+                Err(duduclaw_os::CalendarError::Unsupported) => {
+                    println!("[skip] Calendar reading is not supported on this platform.");
+                }
+                Err(duduclaw_os::CalendarError::PermissionDenied(msg)) => {
+                    println!(
+                        "[fail] Calendar permission NOT granted ({msg}). \
+                         前往「系統設定 → 隱私權與安全性 → 行事曆」，允許執行 duduclaw 的程式（Terminal / \
+                         你的終端機 App）存取行事曆。"
+                    );
+                }
+                Err(e) => println!("[fail] Calendar read failed: {e}"),
+            }
+
+            // 4) P2-4: Spotlight (`mdfind`) availability. Existence-only check
+            // (no live search) — `mdfind` has no TCC prompt of its own, it
+            // just needs the macOS Spotlight index, which is always present
+            // when the binary is.
+            println!();
+            println!("Spotlight search (mdfind) availability:");
+            if cfg!(target_os = "macos") {
+                if std::path::Path::new("/usr/bin/mdfind").exists() {
+                    println!("[ok]  mdfind found at /usr/bin/mdfind.");
+                } else {
+                    println!("[fail] mdfind not found at the expected path — Spotlight search will be unavailable.");
+                }
+            } else {
+                println!("[skip] Spotlight search is macOS-only.");
+            }
+
+            // 5) Per-agent os_native + [os_watch] status.
+            println!();
+            println!(
+                "[提示] [os_watch] 監看路徑建議指向本地磁碟；網路磁碟（NAS/SMB）或 iCloud Drive \
+                 上的 FSEvents 行為不穩定（事件可能延遲、遺漏或不觸發），不建議用於監看目錄。"
+            );
             println!("Per-agent OS-native status:");
             let agents_dir = home_dir.join("agents");
             let mut any = false;

@@ -883,42 +883,194 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             tokio::sync::broadcast::channel::<crate::autopilot_engine::AutopilotEvent>(8192);
         handler.set_autopilot_event_tx(ap_tx.clone()).await;
 
+        // ── OS-native per-edition quota (P4-3) ──────────────────────────────
+        // Resolve, ONCE, which os_native agents may run OS-native features
+        // under the edition quota (Personal = 1 seat). This single decision is
+        // shared by all three init paths below so they agree on exactly which
+        // agents are live (fail-closed consistency with the write-time gate —
+        // both consult `license_runtime::os_native_agent_quota`). Over-quota
+        // agents are warn-logged in the resolver and audited here.
+        let os_native_quota =
+            crate::license_runtime::os_native_agent_quota(handler.resolve_edition_profile().await);
+        let os_allowed = crate::os_events::resolve_os_native_allowed(
+            handler.registry().as_ref(),
+            os_native_quota,
+        )
+        .await;
+        for skipped in &os_allowed.skipped {
+            duduclaw_security::audit::append_audit_event(
+                &home_dir,
+                &duduclaw_security::audit::AuditEvent::new(
+                    "os_native_quota_skipped",
+                    skipped,
+                    duduclaw_security::audit::Severity::Warning,
+                    serde_json::json!({
+                        "quota": os_native_quota,
+                        "reason": "os_native quota exceeded at startup; agent skipped",
+                    }),
+                ),
+            );
+        }
+        let os_allowed_set = os_allowed.allowed;
+
         // ── OS-native Phase 1: filesystem watchers → autopilot bus ──────────
         // Populate the shared OsWatcherRegistry (held in the handler so
         // `agents.update` can hot stop/start a single agent's watcher) with one
-        // watcher per `os_native` agent that declares `[os_watch] paths`, then
-        // spawn the periodic stats writer for the `os_watch_status` MCP tool.
-        // No-op when no agent opts in.
+        // watcher per quota-allowed `os_native` agent that declares `[os_watch]
+        // paths`, then spawn the periodic stats writer for the
+        // `os_watch_status` MCP tool. No-op when no agent opts in.
         let os_registry = handler.os_watchers();
         crate::os_events::init_os_watchers(
             os_registry.clone(),
             handler.registry().clone(),
             ap_tx.clone(),
+            &os_allowed_set,
         )
         .await;
         bg_handles.push(crate::os_events::spawn_stats_writer(os_registry));
 
+        // ── OS-native P2-4: frontmost app/window polling → autopilot bus ────
+        // One low-frequency poll task per quota-allowed agent with `[os_watch]
+        // frontmost_poll_secs > 0` (opt-in). Held in the handler's
+        // OsFrontmostRegistry so `os.settings.update` can hot stop/start it
+        // (P4-3). No-op when no agent opts in.
+        crate::os_frontmost::init_frontmost_polling(
+            handler.os_frontmost(),
+            handler.registry().clone(),
+            ap_tx.clone(),
+            &os_allowed_set,
+        )
+        .await;
+
+        // ── OS-native P4-4: digital-footprint memory distillation ───────────
+        // Aggregates os_file/os_frontmost into per-agent daily stats and
+        // distills them into temporal memory once a UTC day boundary is
+        // crossed. Opt-in via `[os_watch] footprint = true`, additionally
+        // layered on top of `os_native` + quota (deny-by-default at the write
+        // AND the aggregation layer). The tracker is held in the handler so
+        // `os.settings.update` can hot enable/disable an agent (P4-3); its two
+        // background tasks are always armed for a later hot opt-in.
+        bg_handles.extend(
+            crate::footprint_distill::init_footprint_distill(
+                handler.footprint_tracker(),
+                handler.registry().clone(),
+                ap_tx.clone(),
+                &os_allowed_set,
+            )
+            .await,
+        );
+
         // Poll SQLite event bus for events appended by MCP subprocesses.
-        match crate::events_store::EventBusStore::open(&home_dir) {
-            Ok(bus) => {
-                let bus = Arc::new(bus);
-                bg_handles.push(crate::autopilot_engine::spawn_events_db_poll(
-                    bus,
-                    ap_tx.clone(),
-                ));
-                info!("Event bus (events.db) poll task started");
-            }
-            Err(e) => {
-                warn!(
-                    "events.db open failed: {e} — MCP-originated events will not reach Autopilot"
-                );
-            }
+        // Captured as `events_bus` (not dropped after this block) so the
+        // P4-1 wiring below — the persistence bridge and the rule-induction
+        // tick — can reuse the SAME `Arc<EventBusStore>` handle rather than
+        // opening a second SQLite connection to the same file.
+        let events_bus: Option<Arc<crate::events_store::EventBusStore>> =
+            match crate::events_store::EventBusStore::open(&home_dir) {
+                Ok(bus) => {
+                    let bus = Arc::new(bus);
+                    bg_handles.push(crate::autopilot_engine::spawn_events_db_poll(
+                        bus.clone(),
+                        ap_tx.clone(),
+                    ));
+                    info!("Event bus (events.db) poll task started");
+                    Some(bus)
+                }
+                Err(e) => {
+                    warn!(
+                        "events.db open failed: {e} — MCP-originated events will not reach Autopilot"
+                    );
+                    None
+                }
+            };
+
+        // ── P4-1: persist os_file/os_frontmost onto events.db ───────────────
+        // Subscribes to the SAME broadcast the watchers/frontmost-poller above
+        // feed. See `os_events::spawn_os_event_persistence` doc for why a
+        // subscriber bridge (rather than a direct write in either forwarder)
+        // and why its `source` marker is what keeps `spawn_events_db_poll`
+        // above from re-dispatching the same event a second time. No-op
+        // (nothing to persist to) when `events.db` failed to open.
+        if let Some(bus) = events_bus.clone() {
+            bg_handles.push(crate::os_events::spawn_os_event_persistence(
+                bus,
+                ap_tx.subscribe(),
+            ));
+        }
+
+        // ── P4-1: PBD rule induction (30-minute tick) ───────────────────────
+        // Closes the `rule_induction.rs` "known integration gap": now that
+        // os_file/os_frontmost perception history lands in `events.db` (just
+        // above), `RuleInductor` has rows to scan. Gated by its own
+        // `config.toml [rule_induction] enabled` (default off — deny-safe;
+        // see `RuleInductionConfig::from_home`), re-checked every tick. No-op
+        // when `events.db` failed to open (nothing to scan).
+        if let Some(bus) = events_bus {
+            bg_handles.push(crate::rule_induction::spawn_induction_loop(
+                home_dir.clone(),
+                bus,
+                ap_store.clone(),
+            ));
         }
 
         // One-shot cleanup of legacy file bus. Any in-flight events
         // during the upgrade window are lost; this is a one-time cost.
         let _ = tokio::fs::remove_file(home_dir.join("events.jsonl")).await;
         let _ = tokio::fs::remove_file(home_dir.join("events.jsonl.1")).await;
+
+        // ── OS-native P2-1/P2-2: interruptibility tracker + ProactiveGate ───
+        // The tracker ingests the SAME autopilot broadcast (os_frontmost /
+        // os_file / agent_idle) to estimate cost-of-interruption; the gate reads
+        // that score to raise its proactive threshold. Both are always
+        // constructed — the gate only activates per-agent via `[proactive]
+        // enabled = true` (deny-by-default), so wiring them unconditionally is
+        // zero-cost for agents that never opt in.
+        let interruptibility =
+            Arc::new(crate::interruptibility::InterruptibilityTracker::new());
+        bg_handles.push(interruptibility.clone().spawn(ap_tx.subscribe()));
+        let proactive_gate = Arc::new(crate::proactive_gate::ProactiveGate::new(
+            home_dir.clone(),
+            interruptibility,
+        ));
+
+        // ── OS-native P2-3: outcome backfill + calibration loop ─────────────
+        // Backfills `outcome` on due `proactive_gate.jsonl` lines and feeds the
+        // False-Alarm / Missed-Need rate back into each opted-in agent's
+        // base_threshold (see `proactive_feedback` module doc). Always
+        // spawned — per-agent `[proactive] enabled` gates which agents it
+        // calibrates, so this is zero-cost for agents that never opt in (same
+        // rationale as the tracker/gate above).
+        bg_handles.push(crate::proactive_feedback::spawn_feedback_loop(
+            home_dir.clone(),
+            session_manager.clone(),
+            handler.registry().clone(),
+        ));
+
+        // ── P4-2: persona suppression rule induction ────────────────────
+        // Aggregates false_alarm outcomes (the P2-3 backfill above) into
+        // deterministic "when not to interrupt" persona rules. Independent
+        // daily-gated loop — see `persona_induction` module doc "Cost: daily
+        // tick". Same per-agent `[proactive] enabled` gate as the tracker/
+        // gate/feedback loop above, so zero-cost for agents that never opt
+        // in.
+        bg_handles.push(crate::persona_induction::spawn_induction_loop(
+            home_dir.clone(),
+            handler.registry().clone(),
+        ));
+
+        // ── P3-3: lightweight CEP sequence matcher ──────────────────────
+        // Subscribes to the SAME broadcast bus the engine consumes and
+        // re-emits resolved `sequence` rule patterns as a synthetic
+        // `AutopilotEvent::CepTrigger` onto that same bus — the engine's
+        // `process_event` special-cases that variant so a resolved pattern
+        // goes through the identical circuit-breaker / execute_action /
+        // history tail as an ordinary single-event rule match. Purely
+        // additive: rules without a `sequence` column are untouched.
+        bg_handles.push(crate::cep_matcher::CepMatcher::spawn(
+            ap_store.clone(),
+            ap_tx.subscribe(),
+            ap_tx.clone(),
+        ));
 
         // Spawn the engine loop
         let engine = crate::autopilot_engine::AutopilotEngine::new(
@@ -927,11 +1079,24 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             ts,
             mq_for_autopilot,
             ap_rx,
-        );
+        )
+        .with_proactive_gate(proactive_gate);
         bg_handles.push(tokio::spawn(async move { engine.run().await }));
         info!("Autopilot trigger engine started");
     } else {
         info!("Autopilot engine disabled (missing task or autopilot store)");
+        // OS-native Phase 1 watchers are only started inside the block above
+        // (they forward onto the same broadcast bus the autopilot engine
+        // consumes), so a missing task/autopilot store silently skips them too.
+        // Warn explicitly when that's masking a real os_native config, so a
+        // lean "no task board" deployment doesn't look like a silent bug.
+        if crate::os_events::any_os_native_agents(handler.registry()).await {
+            warn!(
+                "os_native agent(s) configured but autopilot store/task store is not \
+                 initialized — OS filesystem watchers were NOT started. Enable the task board / \
+                 autopilot store to activate [os_watch]."
+            );
+        }
     }
 
     // ── Periodic update check (every 6 hours) — broadcast to dashboard ──
@@ -3032,6 +3197,28 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut event_rx = state.event_tx.subscribe();
     let mut logs_subscribed = false;
 
+    // ── P4-3+: OS-native live event tail (opt-in, admin-gated) ────────────
+    // A fresh `Receiver` scoped to THIS connection — dropping it (loop exit /
+    // connection close, below) unsubscribes from the broadcast automatically,
+    // so there is no separate cleanup path to forget. `None` only in the
+    // narrow startup window before the gateway has called
+    // `set_autopilot_event_tx`; the `os_ev` select arm below never resolves
+    // in that case (see its `std::future::pending()` fallback), so it is safe
+    // to leave permanently `None` for this connection's lifetime rather than
+    // re-checking on every loop iteration.
+    let mut os_rx = state
+        .handler
+        .autopilot_event_tx()
+        .await
+        .map(|tx| tx.subscribe());
+    let mut os_events_subscribed = false;
+    // Per-connection sliding-1s forwarding cap (os_events::rate_limit_tick) —
+    // `conn_start` is an arbitrary zero point; only elapsed-ms deltas matter.
+    let conn_start = std::time::Instant::now();
+    let mut os_window_start_ms: u64 = 0;
+    let mut os_window_count: u32 = 0;
+    let mut os_dropped: u32 = 0;
+
     // Heartbeat: send ping every 30s, close if no pong in 60s
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut last_pong = std::time::Instant::now();
@@ -3080,6 +3267,27 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 }
 
                                 let mut response = state.handler.handle(&method, params, &user_ctx).await;
+
+                                // P4-3+ OS live event tail: unlike `logs.subscribe` above (which
+                                // flips its flag on the method NAME alone, before authorization
+                                // runs), gate this flag on the ACTUAL response outcome. os_file/
+                                // os_frontmost events can carry filesystem paths and window
+                                // titles, so a denied (non-admin) `os.events.subscribe` must never
+                                // start the forwarding tail.
+                                match method.as_str() {
+                                    "os.events.subscribe" => {
+                                        if matches!(&response, WsFrame::Response { ok: true, .. }) {
+                                            os_events_subscribed = true;
+                                            os_window_start_ms = 0;
+                                            os_window_count = 0;
+                                        }
+                                    }
+                                    "os.events.unsubscribe" => {
+                                        os_events_subscribed = false;
+                                    }
+                                    _ => {}
+                                }
+
                                 if let WsFrame::Response { id: ref mut resp_id, .. } = response {
                                     *resp_id = id;
                                 }
@@ -3130,6 +3338,61 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
                     Err(_) => break,
+                }
+            }
+
+            // ── Outbound OS live-event tail (P4-3+; admin-gated opt-in, rate-capped) ─
+            // Wrapped in an async block so the `Option<Receiver>` unwrap only ever
+            // runs while the guard is true; when `os_rx` is `None` (autopilot event
+            // bus not wired yet) the branch pends forever instead of panicking.
+            os_ev = async {
+                match os_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if os_events_subscribed => {
+                match os_ev {
+                    Ok(ev) => {
+                        if let Some(payload) = crate::os_events::os_event_push_payload(&ev) {
+                            let now_ms = conn_start.elapsed().as_millis() as u64;
+                            let (allow, new_start, new_count) = crate::os_events::rate_limit_tick(
+                                os_window_start_ms,
+                                os_window_count,
+                                crate::os_events::OS_EVENTS_PUSH_CAP_PER_SEC,
+                                now_ms,
+                            );
+                            os_window_start_ms = new_start;
+                            os_window_count = new_count;
+                            if allow {
+                                let push = WsFrame::Event {
+                                    event: "os.events.entry".to_string(),
+                                    payload,
+                                    seq: None,
+                                    state_version: None,
+                                };
+                                let text = serde_json::to_string(&push).unwrap_or_default();
+                                if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                            } else {
+                                os_dropped += 1;
+                                if os_dropped == 1 || os_dropped % 100 == 0 {
+                                    warn!(
+                                        dropped = os_dropped,
+                                        "os.events live tail: per-connection rate cap ({} /s) exceeded — dropping",
+                                        crate::os_events::OS_EVENTS_PUSH_CAP_PER_SEC,
+                                    );
+                                }
+                            }
+                        }
+                        // Non-OS AutopilotEvent variants (TaskCreated, AgentIdle, ...)
+                        // are silently ignored — this tail forwards os_file/os_frontmost only.
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Autopilot event bus torn down — stop polling a dead
+                        // receiver instead of hot-looping on repeated `Closed`.
+                        os_rx = None;
+                        os_events_subscribed = false;
+                    }
                 }
             }
         }

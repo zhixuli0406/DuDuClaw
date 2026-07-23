@@ -13,6 +13,11 @@
 //! - Rate limiting drops events past `max_events_per_min` but **counts** every
 //!   drop and logs a per-minute summary — no silent caps.
 //! - Missing watch paths are warned + skipped, never fatal to the watcher.
+//! - Watch paths should point at local disks: FSEvents (macOS) is known to
+//!   behave inconsistently over network mounts (NAS/SMB) and iCloud Drive —
+//!   events may be delayed, coalesced away, or not fire at all. `duduclaw os
+//!   doctor` surfaces this as an operator-facing tip; it is not detectable
+//!   programmatically, so no runtime check is added here.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -437,7 +442,10 @@ mod tests {
         let mut seen = HashSet::new();
         // A path that does not exist → Removed.
         let ghost = Path::new("/nonexistent/duduclaw-os/ghost-xyz");
-        assert_eq!(classify_kind(ghost, &mut seen, start), FileEventKind::Removed);
+        assert_eq!(
+            classify_kind(ghost, &mut seen, start),
+            FileEventKind::Removed
+        );
 
         // Use a real temp file to exercise Created → Modified.
         let dir = tempfile::tempdir().unwrap();

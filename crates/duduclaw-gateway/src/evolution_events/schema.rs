@@ -114,6 +114,15 @@ pub enum AuditEventType {
     /// `outcome`: `success` | `failure`
     /// `metadata`: `{"dlq_id", "operation_type", "replayed_by"}`
     DurabilityDlqReplayed,
+
+    // ── OS-native P2-3: proactive four-quadrant tracking (1 new variant) ─────
+    /// A `proactive_feedback::quadrant_stats` aggregation ran for an agent.
+    ///
+    /// `outcome`: `success`
+    /// `metadata`: `{"correct_detection", "false_alarm", "missed_need",
+    /// "non_response", "correct_silence", "unknown", "fa_rate", "mn_rate",
+    /// "lookback_secs"}`
+    ProactiveQuadrant,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -140,6 +149,8 @@ impl std::fmt::Display for AuditEventType {
             Self::DurabilityCircuitRecovered => "durability_circuit_recovered",
             Self::DurabilityCheckpointSaved => "durability_checkpoint_saved",
             Self::DurabilityDlqReplayed => "durability_dlq_replayed",
+            // OS-native P2-3
+            Self::ProactiveQuadrant => "proactive_quadrant",
         };
         f.write_str(s)
     }
@@ -955,6 +966,31 @@ mod tests {
                 ev.event_type
             );
         }
+    }
+
+    // ── OS-native P2-3: ProactiveQuadrant EventType ───────────────────────────
+
+    #[test]
+    fn test_proactive_quadrant_serialises() {
+        let ev = AuditEvent::now(AuditEventType::ProactiveQuadrant, "agent-x", Outcome::Success)
+            .with_trigger_signal("proactive_gate_calibration")
+            .with_metadata(serde_json::json!({
+                "correct_detection": 3,
+                "false_alarm": 1,
+                "missed_need": 0,
+                "non_response": 2,
+                "correct_silence": 5,
+                "unknown": 0,
+                "fa_rate": 0.25,
+                "mn_rate": null,
+                "lookback_secs": 86400
+            }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "proactive_quadrant");
+        assert_eq!(v["outcome"], "success");
+        assert_eq!(v["metadata"]["false_alarm"], 1);
+        assert!(validate(&ev).is_ok());
     }
 
     #[test]

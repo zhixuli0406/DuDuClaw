@@ -28,6 +28,16 @@
 //! searchable via wiki tools). Default / absent → wiki-owned, injected
 //! as before. Same file and table shape as the RFC-21 §3 write policy
 //! (`[namespaces."x"]`), so operators manage one file.
+//!
+//! ## Sensitivity (P3-2 context-collapse defence)
+//!
+//! The same `[namespaces."x"]` table may also declare `sensitivity =
+//! "personal"` (or `"restricted"`). Pages under a Personal-or-higher
+//! namespace are **excluded from injection in a shared/group session**
+//! (`allow_personal = false`) — they must not collapse a user's personal
+//! context into a prompt other people see. In a 1:1 private session they
+//! inject as normal. Absent / malformed / lower levels → no change
+//! (fail-safe). See `duduclaw_core::sensitivity`.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -73,6 +83,11 @@ const SESSION_CACHE_CAP: usize = 256;
 /// Company-layer pages are always eligible. Department is a stable property of
 /// the agent, so it does not perturb the session-stable selection cache
 /// (the cache key already scopes per agent).
+/// `allow_personal` (P3-2) — when `false` (a shared/group session), pages under
+/// a namespace whose `.scope.toml` `sensitivity` is Personal-or-higher are
+/// excluded from injection (context-collapse defence). `true` (a 1:1 private
+/// session) injects them as before. The flag is folded into the session cache
+/// key by the caller, so a session's chat type never mixes cached selections.
 pub fn ranked_wiki_injection(
     store: &WikiStore,
     query: &str,
@@ -80,16 +95,17 @@ pub fn ranked_wiki_injection(
     citation: Option<CitationContext<'_>>,
     cache_key: Option<&str>,
     viewer_department: Option<&str>,
+    allow_personal: bool,
 ) -> String {
     if let Some(key) = cache_key {
         if let Some(pages) = cached_selection(key) {
             return render_and_cite(&pages, citation);
         }
-        let pages = select_pages(store, query, max_chars, viewer_department);
+        let pages = select_pages(store, query, max_chars, viewer_department, allow_personal);
         store_selection(key, pages.clone());
         return render_and_cite(&pages, citation);
     }
-    let pages = select_pages(store, query, max_chars, viewer_department);
+    let pages = select_pages(store, query, max_chars, viewer_department, allow_personal);
     render_and_cite(&pages, citation)
 }
 
@@ -109,10 +125,19 @@ fn select_pages(
     query: &str,
     max_chars: usize,
     viewer_department: Option<&str>,
+    allow_personal: bool,
 ) -> Vec<RankedPage> {
     // Gather all candidate pages first. Identity and Core layers are
     // both eligible; L2/L3 stay search-only as the wiki contract states.
     let memory_owned = load_memory_owned_namespaces(store.wiki_dir());
+    // P3-2: namespaces the operator marked Personal-or-higher. In a shared
+    // session (`!allow_personal`) their pages are withheld from injection.
+    let personal_ns = if allow_personal {
+        HashSet::new()
+    } else {
+        load_personal_namespaces(store.wiki_dir())
+    };
+    let mut stripped_personal = 0usize;
     let mut candidates: Vec<RankedPage> = Vec::new();
     for layer in [WikiLayer::Identity, WikiLayer::Core] {
         match store.collect_by_layer_with_meta(layer) {
@@ -120,6 +145,10 @@ fn select_pages(
                 for (path, body, trust) in pages {
                     if is_memory_owned(&path, &memory_owned) {
                         continue; // memory system is SoT for this namespace
+                    }
+                    if namespace_in_set(&path, &personal_ns) {
+                        stripped_personal += 1;
+                        continue; // P3-2: context-collapse — withhold in group
                     }
                     // WP7: never inject another department's page (or any
                     // department page for a no-department viewer). Company
@@ -139,6 +168,12 @@ fn select_pages(
                 tracing::warn!(?layer, error = %e, "wiki collect_by_layer_with_meta failed");
             }
         }
+    }
+    if stripped_personal > 0 {
+        tracing::debug!(
+            stripped_personal,
+            "P3-2 context-collapse: withheld Personal+ wiki pages from a shared session"
+        );
     }
     if candidates.is_empty() {
         return Vec::new();
@@ -251,13 +286,52 @@ fn load_memory_owned_namespaces(wiki_root: &Path) -> HashSet<String> {
 /// A page belongs to a memory-owned namespace when its first path
 /// segment matches. Top-level files (no `/`) are never filtered.
 fn is_memory_owned(page_path: &str, memory_owned: &HashSet<String>) -> bool {
-    if memory_owned.is_empty() {
+    namespace_in_set(page_path, memory_owned)
+}
+
+/// Whether `page_path`'s top-level namespace is in `set`. Top-level files
+/// (no `/`) are never filtered. Shared by the memory-owned and P3-2
+/// personal-namespace filters.
+fn namespace_in_set(page_path: &str, set: &HashSet<String>) -> bool {
+    if set.is_empty() {
         return false;
     }
     match page_path.split('/').next() {
-        Some(ns) if ns != page_path => memory_owned.contains(ns),
+        Some(ns) if ns != page_path => set.contains(ns),
         _ => false,
     }
+}
+
+/// Read the set of top-level namespaces whose `.scope.toml` `sensitivity` is
+/// Personal-or-higher. Absent / malformed file, or a namespace with no/lower
+/// `sensitivity`, contributes nothing (fail-safe: inject as before). Same file
+/// and table shape as `knowledge_owner`, so operators manage one file.
+fn load_personal_namespaces(wiki_root: &Path) -> HashSet<String> {
+    let path = wiki_root.join(".scope.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return HashSet::new();
+    };
+    let table: toml::Table = match content.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, ".scope.toml malformed — ignoring sensitivity");
+            return HashSet::new();
+        }
+    };
+    let Some(namespaces) = table.get("namespaces").and_then(|v| v.as_table()) else {
+        return HashSet::new();
+    };
+    namespaces
+        .iter()
+        .filter(|(_, v)| {
+            v.get("sensitivity")
+                .and_then(|s| s.as_str())
+                .and_then(duduclaw_core::Sensitivity::parse)
+                .map(|s| s.is_personal_or_higher())
+                .unwrap_or(false)
+        })
+        .map(|(ns, _)| ns.clone())
+        .collect()
 }
 
 // ── Session-stable selection cache ───────────────────────────────────
@@ -339,6 +413,66 @@ mode = "agent_writable"
         assert!(load_memory_owned_namespaces(dir.path()).is_empty());
         std::fs::write(dir.path().join(".scope.toml"), "not [ valid toml").unwrap();
         assert!(load_memory_owned_namespaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn scope_toml_parses_personal_sensitivity_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".scope.toml"),
+            r#"
+[namespaces."calendar"]
+mode = "agent_writable"
+sensitivity = "personal"
+
+[namespaces."health"]
+mode = "agent_writable"
+sensitivity = "restricted"
+
+[namespaces."sop"]
+mode = "agent_writable"
+sensitivity = "internal"
+
+[namespaces."faq"]
+mode = "agent_writable"
+"#,
+        )
+        .unwrap();
+        let personal = load_personal_namespaces(dir.path());
+        // Personal + Restricted are withheld; Internal / unset are not.
+        assert_eq!(personal.len(), 2);
+        assert!(personal.contains("calendar"));
+        assert!(personal.contains("health"));
+        assert!(!personal.contains("sop"));
+        assert!(!personal.contains("faq"));
+    }
+
+    #[test]
+    fn personal_namespace_filter_matches_by_top_segment() {
+        let personal: HashSet<String> = ["calendar".to_string()].into_iter().collect();
+        assert!(namespace_in_set("calendar/2026-07.md", &personal));
+        assert!(!namespace_in_set("sop/deploy.md", &personal));
+        // Top-level files are never filtered.
+        assert!(!namespace_in_set("calendar.md", &personal));
+        // Empty set never matches.
+        assert!(!namespace_in_set("calendar/x.md", &HashSet::new()));
+    }
+
+    #[test]
+    fn scope_toml_sensitivity_absent_or_malformed_is_failsafe_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent → empty.
+        assert!(load_personal_namespaces(dir.path()).is_empty());
+        // Malformed → empty (fail-safe, never panics).
+        std::fs::write(dir.path().join(".scope.toml"), "not [ valid toml").unwrap();
+        assert!(load_personal_namespaces(dir.path()).is_empty());
+        // Unknown sensitivity value → treated as no restriction.
+        std::fs::write(
+            dir.path().join(".scope.toml"),
+            "[namespaces.\"x\"]\nmode = \"agent_writable\"\nsensitivity = \"bogus\"\n",
+        )
+        .unwrap();
+        assert!(load_personal_namespaces(dir.path()).is_empty());
     }
 
     #[test]

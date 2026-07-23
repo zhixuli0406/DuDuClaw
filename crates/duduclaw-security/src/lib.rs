@@ -11,6 +11,7 @@ pub mod keyfile;
 pub mod killswitch;
 pub mod mount_guard;
 pub mod os_reconcile;
+pub mod perception;
 pub mod policy_kernel;
 pub mod rate_limiter;
 pub mod rbac;
