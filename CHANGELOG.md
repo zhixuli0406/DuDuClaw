@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.42.0] - 2026-07-23 — OS 原生主動感知（P2–P4）、API 模型 MCP 工具面與空回覆斷鏈根治
+
 ### Added
 - **API-mode 非 Claude 模型獲得完整 MCP 工具面**（根治性缺口）：多 runtime 匯流點的 openai-compat
   `AgentRuntime`（`crates/duduclaw-gateway/src/runtime/openai_compat.rs`）過去只送純 messages（無
