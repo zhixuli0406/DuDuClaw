@@ -3532,7 +3532,7 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
     // Check 2: agents directory
     let agents_dir = home.join("agents");
     if agents_dir.exists() {
-        match AgentRunner::new(home).await {
+        match AgentRunner::new(home.clone()).await {
             Ok(runner) => {
                 let count = runner.list_agents().len();
                 if count > 0 {
@@ -3668,7 +3668,178 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
         println!("All checks passed!");
     }
 
+    // Verbose Grok CLI runtime diagnostic (only prints detail when grok is
+    // installed). Kept out of the compact checks table because it emits a
+    // multi-line evidence bundle for remote debugging.
+    grok_cli_diagnostic(&home).await;
+
     Ok(())
+}
+
+/// Verbose Grok CLI runtime diagnostic for `duduclaw doctor`.
+///
+/// Reproduces the exact headless path `GrokRuntime` uses and dumps the full
+/// evidence bundle for remotely debugging the "grok interactive works but
+/// `grok -p` returns empty" class (which we cannot reproduce locally — no grok
+/// CLI / SuperGrok account on the dev box): binary path + version, a live
+/// `grok -p "ping"` (15s cap) reporting exit / stdout length / stderr tail, an
+/// auth-signature verdict, and — when the pipe run comes back empty on exit 0 —
+/// a one-shot PTY retry result (the same recovery the runtime applies). Output
+/// is zh-TW. Reuses the runtime's own home/env + auth helpers so the diagnostic
+/// can never drift from what actually runs in production.
+async fn grok_cli_diagnostic(home: &std::path::Path) {
+    use duduclaw_gateway::runtime::grok;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    println!();
+    println!("Grok CLI 診斷");
+    println!("{}", "-".repeat(40));
+
+    let Some(path) =
+        duduclaw_core::which_grok().or_else(|| duduclaw_core::which_grok_in_home(home))
+    else {
+        println!("  [skip] grok CLI 未安裝（PATH 與 HOME 皆找不到），略過此段。");
+        return;
+    };
+    println!("  binary : {path}");
+
+    // Version (5s cap).
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        duduclaw_core::platform::async_command_for(&path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => {
+            let v = String::from_utf8_lossy(&out.stdout);
+            let v = v.trim();
+            println!("  version: {}", if v.is_empty() { "(空)" } else { v });
+        }
+        Ok(Err(e)) => println!("  version: [fail] 無法執行：{e}"),
+        Err(_) => println!("  version: [fail] --version 逾時（5s）"),
+    }
+
+    // Resolve the SAME home/env the runtime stamps (launchd/Docker HOME fix).
+    let user_home = grok::resolve_user_home(home, std::env::var("HOME").ok().as_deref());
+    let grok_home_override = std::env::var("GROK_HOME").ok();
+    let home_env = grok::build_home_env(&user_home, grok_home_override.as_deref());
+    println!(
+        "  HOME   : {} （grok 會在此尋找 ~/.grok 憑證）",
+        user_home.display()
+    );
+    if let Some(gh) = grok_home_override
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        println!("  GROK_HOME: {gh}");
+    }
+    let api_key_set = std::env::var("XAI_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    println!(
+        "  XAI_API_KEY: {}",
+        if api_key_set {
+            "已設定"
+        } else {
+            "未設定（改用 grok login 憑證）"
+        }
+    );
+
+    // Live `grok -p "ping"` (15s cap) — the exact headless path DuDuClaw uses.
+    println!();
+    println!("  活體試跑：grok -p \"ping\"（15s 上限）");
+    let args = ["-p".to_string(), "ping".to_string()];
+    let mut cmd = duduclaw_core::platform::async_command_for(&path);
+    cmd.args(&args).stdin(Stdio::null());
+    for (k, v) in &home_env {
+        cmd.env(k, v);
+    }
+    let run = tokio::time::timeout(Duration::from_secs(15), cmd.output()).await;
+    let (empty_exit0, is_auth) = match run {
+        Ok(Ok(out)) => {
+            let code = out.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout_len = stdout.trim().chars().count();
+            let stderr_tail = duduclaw_core::truncate_bytes(stderr.trim(), 300);
+            let is_auth = grok::looks_like_grok_auth_failure(&stderr);
+            println!("    exit code   : {code}");
+            println!("    stdout 長度 : {stdout_len} 字元");
+            println!(
+                "    stderr tail : {}",
+                if stderr_tail.is_empty() {
+                    "(空)"
+                } else {
+                    &stderr_tail
+                }
+            );
+            println!(
+                "    auth 判定   : {}",
+                if is_auth {
+                    "偵測到未登入/憑證失效 → 請執行 `grok login --device-auth` 重新登入"
+                } else {
+                    "無 auth 失敗跡象"
+                }
+            );
+            let empty_exit0 = out.status.success() && stdout.trim().is_empty();
+            if !empty_exit0 && out.status.success() && stdout_len > 0 {
+                println!("    結果        : [ok] 一般管道即回傳非空回應，headless 正常。");
+            }
+            (empty_exit0, is_auth)
+        }
+        Ok(Err(e)) => {
+            println!("    [fail] 無法啟動 grok：{e}");
+            (false, false)
+        }
+        Err(_) => {
+            println!("    [fail] grok -p 逾時（15s）— 可能卡在互動流程或憑證提示。");
+            (false, false)
+        }
+    };
+
+    // PTY one-shot retry — only for the empty-stdout / exit-0 / non-auth shape,
+    // matching the runtime's own retry gate.
+    if empty_exit0 && !is_auth {
+        println!();
+        println!("  PTY 一次性重試（真 TTY 下重跑 grok -p \"ping\"，30s 上限）");
+        let mut env: std::collections::HashMap<String, String> = home_env.iter().cloned().collect();
+        if api_key_set {
+            if let Ok(k) = std::env::var("XAI_API_KEY") {
+                env.insert("XAI_API_KEY".to_string(), k);
+            }
+        }
+        match duduclaw_gateway::pty_runtime::invoke_oneshot(
+            path.clone(),
+            args.to_vec(),
+            env,
+            None,
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(out) => {
+                let text = out.stdout.trim();
+                let len = text.chars().count();
+                if len > 0 {
+                    println!(
+                        "    結果 : [ok] PTY 重試回傳 {len} 字元 → 判定為 headless-under-pipe 問題，PTY 重試路徑可救回。"
+                    );
+                } else {
+                    println!(
+                        "    結果 : [warn] PTY 重試仍為空（{} bytes 原始輸出）→ 非單純 TTY 問題，請附上上方 stderr 回報。",
+                        out.bytes
+                    );
+                }
+            }
+            Err(e) => println!("    結果 : [fail] PTY 重試執行失敗：{e}"),
+        }
+    } else if empty_exit0 && is_auth {
+        println!("  → 空輸出且偵測到 auth 失敗，跳過 PTY 重試（重登才有用）。");
+    }
 }
 
 /// `duduclaw agent create <name>` - Create a new agent from template.
