@@ -272,6 +272,16 @@ impl AgentRuntime for GeminiRuntime {
             content = stdout.trim().to_string();
         }
 
+        // Still empty ⇒ FAILURE, not success: Ok("") would be silently dropped
+        // by every channel and poison the session with an empty assistant turn.
+        if content.trim().is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Empty response from Gemini CLI (exit 0); stderr tail: {}",
+                duduclaw_core::truncate_bytes(stderr.trim(), 300)
+            ));
+        }
+
         Ok(RuntimeResponse {
             content,
             input_tokens,

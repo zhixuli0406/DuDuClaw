@@ -67,6 +67,24 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash && \
     install -m 0755 "$HOME/.local/bin/agy" /usr/local/bin/agy && \
     agy --version
 
+# Grok CLI (`grok`, aka "Grok Build") — xAI's official installer. Bundled as a
+# first-class runtime alongside claude/codex/gemini/agy so the Grok backend
+# works out of the box. There is no npm/apt package (see
+# crates/duduclaw-gateway/src/runtime/grok.rs header for the verification
+# notes); the official install method is this curl|bash script. It resolves
+# the latest stable release, downloads the linux amd64/arm64 (glibc) binary,
+# self-tests it (`--version`) before linking, and drops the canonical symlink
+# at $HOME/.grok/bin/grok — which we resolve+relocate to /usr/local/bin so
+# every user (incl. `duduclaw`) finds it on PATH, matching
+# `duduclaw-core::which_grok`. `install` dereferences the symlink so the real
+# binary (not a dangling link into $HOME/.grok/downloads) lands in
+# /usr/local/bin. NOTE: `XAI_API_KEY` auth is NOT baked in here — it is
+# supplied at container **runtime** via env / agent.toml, same as the other
+# CLIs (ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY).
+RUN curl -fsSL https://x.ai/cli/install.sh | bash && \
+    install -m 0755 "$HOME/.grok/bin/grok" /usr/local/bin/grok && \
+    grok --version
+
 # Copy entrypoint
 COPY container/server-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -75,7 +93,8 @@ RUN mkdir -p \
         /home/duduclaw/.duduclaw \
         /home/duduclaw/.claude \
         /home/duduclaw/.codex \
-        /home/duduclaw/.gemini && \
+        /home/duduclaw/.gemini \
+        /home/duduclaw/.grok && \
     chown -R duduclaw:duduclaw /home/duduclaw
 
 USER duduclaw
@@ -84,6 +103,7 @@ VOLUME /home/duduclaw/.duduclaw
 VOLUME /home/duduclaw/.claude
 VOLUME /home/duduclaw/.codex
 VOLUME /home/duduclaw/.gemini
+VOLUME /home/duduclaw/.grok
 EXPOSE 18789
 
 ENTRYPOINT ["/entrypoint.sh"]

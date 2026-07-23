@@ -156,6 +156,13 @@ impl RuntimeRegistry {
         Self { runtimes }
     }
 
+    /// Test-only constructor: build a registry from explicit stub runtimes so
+    /// failover behavior can be exercised without real CLIs/APIs.
+    #[cfg(test)]
+    pub(crate) fn with_runtimes(runtimes: HashMap<RuntimeType, Box<dyn AgentRuntime>>) -> Self {
+        Self { runtimes }
+    }
+
     /// Get a runtime by type.
     pub fn get(&self, runtime_type: &RuntimeType) -> Option<&dyn AgentRuntime> {
         self.runtimes.get(runtime_type).map(|r| r.as_ref())

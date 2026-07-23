@@ -307,6 +307,17 @@ impl AgentRuntime for AntigravityRuntime {
 
         let content = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
+        // Empty stdout with exit 0 is a FAILURE: an Ok("") would be silently
+        // dropped by every channel and poison the session with an empty
+        // assistant turn.
+        if content.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Empty response from Antigravity CLI (exit 0); stderr tail: {}",
+                duduclaw_core::truncate_bytes(stderr.trim(), 300)
+            ));
+        }
+
         // agy's print mode exposes no usage stats (no JSON surface), so we
         // estimate with the gateway's shared CJK-aware heuristic. These feed
         // CostTelemetry as approximations — the input estimate is the payload we
