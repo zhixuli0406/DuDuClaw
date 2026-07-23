@@ -64,4 +64,9 @@ jobs:
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # ignore-error: the GHA cache backend's export step has failed twice
+          # in a row with `not_found` AFTER a fully successful 3.5h QEMU build
+          # (v1.42.0 + v1.43.0), killing the whole run at the finish line. A
+          # cache-export failure must never fail the publish — the cache is an
+          # optimization, the pushed image is the product.
+          cache-to: type=gha,mode=max,ignore-error=true
