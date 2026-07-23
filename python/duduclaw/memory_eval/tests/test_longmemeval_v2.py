@@ -14,7 +14,6 @@ import pytest
 from duduclaw.memory_eval.longmemeval_v2 import (
     ABILITIES,
     LMEResult,
-    LongMemEvalQuestion,
     SAMPLE_PATH,
     compute_longmemeval,
     evaluate_lme_alerts,
