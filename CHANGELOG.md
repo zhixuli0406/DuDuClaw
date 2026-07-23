@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.43.0] - 2026-07-23 — Grok 訂閱帳號全鏈路：headless 根治、dashboard 裝置碼登入與 doctor 診斷
+
 ### Fixed
 - **Grok CLI headless 空輸出根治**：經銷商客戶機上 `grok` 互動模式正常、SuperGrok device-auth 已登入，但 DuDuClaw spawn 的 `grok -p` 一直回空 stdout（exit 0）——與 2026 Claude `-p` OAuth 訂閱被擋同構。`GrokRuntime` 現在（1）顯式注入使用者真實 `HOME`/`USERPROFILE`（優先取 gateway 已解析的 `<user>/.duduclaw` 之父，launchd/Docker 下 `$HOME` 錯誤時仍正確）並轉發 `GROK_HOME`，讓 grok 找得到 `~/.grok` 憑證；（2）以 word-boundary、大小寫不敏感的樣式集辨識未登入/憑證過期 stderr（含誤殺防護），命中即回傳含 "not logged in"/"authentication" 的錯誤讓 `classify_cli_failure` 落 `AuthFailed`（zh-TW 指引「請執行 `grok login --device-auth`」）；（3）空 stdout+exit 0 且非 auth 錯誤時，用 portable-pty 在真 TTY 下一次性重跑同一 `grok -p`（`pty_retry=true/false` tracing 供遠端判讀），救回 headless-under-pipe 這一類；native sandbox 需求時 fail-closed 跳過重試。`duduclaw doctor` 新增「Grok CLI 診斷」段：binary/版本 + 活體 `grok -p "ping"`（15s）回報 exit/stdout 長度/stderr tail/auth 判定/PTY 重試結果，一條指令產出遠端除錯全部證據。
 
