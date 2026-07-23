@@ -14420,7 +14420,7 @@ impl MethodHandler {
         if runtime_str.is_empty() {
             return WsFrame::error_response(
                 "",
-                "runtime is required (claude|codex|gemini|antigravity)",
+                "runtime is required (claude|codex|gemini|antigravity|grok)",
             );
         }
         let runtime = duduclaw_core::types::RuntimeType::parse(runtime_str);

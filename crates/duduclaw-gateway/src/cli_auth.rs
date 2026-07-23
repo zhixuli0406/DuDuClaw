@@ -203,12 +203,53 @@ pub fn spec_for(runtime: RuntimeType) -> Option<CliAuthSpec> {
             hint: "於同機瀏覽器完成 Antigravity 登入。遠端請改用 ANTIGRAVITY_API_KEY。",
             success_file: None,
         }),
-        // R4 phase 1: Grok CLI detection + headless spawn only. The SuperGrok
-        // OAuth device-flow (accounts.x.ai) is a phase-2 follow-up, and its exact
-        // `grok` login subcommand/markers are UNVERIFIED, so no interactive login
-        // spec is wired yet (fail-closed: `None` means "no verified login flow").
-        // The binary is still discoverable via `resolve_program` below.
-        RuntimeType::Grok => None,
+        // R4 phase 2 (v1.41): SuperGrok device-code login, verified live against
+        // grok 0.2.111 (`grok login --device-code`; `--device-auth` is the same
+        // flag, `--device-code` is documented as its alias in `grok login --help`).
+        //
+        // Confirmed by a sandboxed-HOME live run (never against the real
+        // account — this machine already has a real `~/.grok/auth.json` and was
+        // never touched): stderr prints
+        //   "To sign in, open this URL in your browser:\n\n  <url>\n\n
+        //    Confirm this code in your browser:\n\n  <code>\n\n
+        //    ...\nWaiting for authorization..."
+        // then polls `/oauth2/token` in the background — no paste-back needed,
+        // unlike `claude setup-token`.
+        RuntimeType::Grok => Some(CliAuthSpec {
+            runtime,
+            login_args: v(&["login", "--device-code"]),
+            // The completed-run success wording could not be captured live
+            // (doing so would require completing a real device-code approval
+            // against this machine's live SuperGrok account — not attempted).
+            // Extracted instead via `strings` on the grok 0.2.111 binary:
+            // `xai_grok_shell::auth::flow` shares one "Signed in as <email>"
+            // confirmation across every login method (browser / device-code /
+            // OIDC); the device-code path is internally tagged
+            // `GROK_LOGIN_DEVICE_FLOW`. Best-effort per the module doc — the
+            // deterministic `success_file` watcher below is the primary signal.
+            success_markers: v(&["signed in as"]),
+            // From `xai_grok_shell::auth::device_code` (same `strings` pass):
+            // the ways a device-code flow terminates without success —
+            // "Device code expired. Run `grok login --device-auth` again.",
+            // "device auth authorization denied" / "Authorization denied. The
+            // user rejected the request.", "device auth token exchange failed".
+            failure_markers: v(&[
+                "device code expired",
+                "authorization denied",
+                "the user rejected the request",
+                "token exchange failed",
+            ]),
+            // Device-code / paste-back-free flow: the user approves in their
+            // own browser using the printed URL + code; the CLI polls in the
+            // background. Same remote-safe class as `claude setup-token`.
+            remote_safe: true,
+            hint: "開啟下方網址，在瀏覽器輸入驗證碼完成授權即可——CLI 會自動偵測完成，不需要在這裡貼回代碼。",
+            // `grok login` persists to `~/.grok/auth.json` on success (verified:
+            // this file exists — mode 0600 — on this already-logged-in
+            // machine). Same deterministic watcher pattern as Codex/Gemini,
+            // independent of the marker strings above.
+            success_file: Some(".grok/auth.json"),
+        }),
         RuntimeType::OpenAiCompat => None,
     }
 }
@@ -527,6 +568,7 @@ mod tests {
             RuntimeType::Codex,
             RuntimeType::Gemini,
             RuntimeType::Antigravity,
+            RuntimeType::Grok,
         ] {
             let spec = spec_for(rt).unwrap_or_else(|| panic!("{rt:?} must have a login spec"));
             assert!(!spec.login_args.is_empty(), "{rt:?} login_args empty");
@@ -537,9 +579,13 @@ mod tests {
     }
 
     #[test]
-    fn claude_is_remote_safe_others_are_not() {
-        // setup-token is paste-back → remote ok; the rest use localhost callbacks.
+    fn claude_and_grok_are_remote_safe_others_are_not() {
+        // setup-token / device-code are both paste-back-free (or paste-back-only)
+        // flows the user completes in their own browser → remote ok; the rest use
+        // localhost callbacks that only work when the dashboard and browser share
+        // a machine.
         assert!(spec_for(RuntimeType::Claude).unwrap().remote_safe);
+        assert!(spec_for(RuntimeType::Grok).unwrap().remote_safe);
         assert!(!spec_for(RuntimeType::Codex).unwrap().remote_safe);
         assert!(!spec_for(RuntimeType::Gemini).unwrap().remote_safe);
         assert!(!spec_for(RuntimeType::Antigravity).unwrap().remote_safe);
@@ -615,6 +661,103 @@ mod tests {
     #[test]
     fn openai_compat_has_no_program() {
         assert!(resolve_program(RuntimeType::OpenAiCompat).is_none());
+    }
+
+    /// Verbatim (modulo the URL/code values) capture from a real sandboxed-HOME
+    /// run: `env HOME=$(mktemp -d) grok login --device-code` — the intermediate
+    /// "waiting" state must NOT trip either outcome, matching the existing CLIs'
+    /// "authorize prompt doesn't look like success" contract.
+    #[test]
+    fn grok_scan_outcome_ignores_the_live_captured_waiting_state() {
+        let spec = spec_for(RuntimeType::Grok).unwrap();
+        let tail = "\nTo sign in, open this URL in your browser:\n\n  https://accounts.x.ai/oauth2/device?user_code=CXXD-DR2F\n\nConfirm this code in your browser:\n\n  CXXD-DR2F\n\nOnly continue with a code you requested. Don't share it with anyone.\n\nWaiting for authorization...\n";
+        assert_eq!(scan_outcome(tail, &spec), None);
+    }
+
+    #[test]
+    fn grok_scan_outcome_detects_success() {
+        let spec = spec_for(RuntimeType::Grok).unwrap();
+        // Best-effort marker (see cli_auth spec doc comment): extracted via
+        // `strings` on the grok binary, not from a completed live run.
+        assert_eq!(
+            scan_outcome("...\nSigned in as someone@example.com\n", &spec),
+            Some(AuthStatus::Succeeded)
+        );
+    }
+
+    #[test]
+    fn grok_scan_outcome_detects_failure_variants() {
+        let spec = spec_for(RuntimeType::Grok).unwrap();
+        assert_eq!(
+            scan_outcome(
+                "Device code expired. Run `grok login --device-auth` again.",
+                &spec
+            ),
+            Some(AuthStatus::Failed)
+        );
+        assert_eq!(
+            scan_outcome("device auth authorization denied", &spec),
+            Some(AuthStatus::Failed)
+        );
+        assert_eq!(
+            scan_outcome("Authorization denied. The user rejected the request.", &spec),
+            Some(AuthStatus::Failed)
+        );
+        assert_eq!(
+            scan_outcome("device auth token exchange failed", &spec),
+            Some(AuthStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn grok_scan_outcome_failure_wins_over_success() {
+        let spec = spec_for(RuntimeType::Grok).unwrap();
+        assert_eq!(
+            scan_outcome("Signed in as x@example.com, but then device code expired", &spec),
+            Some(AuthStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn grok_success_file_is_grok_auth_json() {
+        // `grok login` persists to `~/.grok/auth.json` (confirmed on a live,
+        // already-authenticated machine — see spec doc comment). Same
+        // deterministic-watcher pattern as Codex/Gemini.
+        assert_eq!(
+            spec_for(RuntimeType::Grok).unwrap().success_file,
+            Some(".grok/auth.json")
+        );
+    }
+
+    #[test]
+    fn grok_login_args_use_device_code_not_device_auth() {
+        // `--device-code` is the documented alias of `--device-auth` (`grok
+        // login --help`); either resolves identically, but the task spec
+        // pins `--device-code` explicitly.
+        assert_eq!(
+            spec_for(RuntimeType::Grok).unwrap().login_args,
+            vec!["login", "--device-code"]
+        );
+    }
+
+    /// Error-path: a runtime whose binary cannot be resolved must fail with a
+    /// clear, distinguishable error rather than panicking or silently no-op'ing.
+    /// `resolve_program` is exercised for real per-runtime (`which_*`); the
+    /// terminal-facing error message is asserted here as the deterministic,
+    /// environment-independent part of the contract (unit-testing "binary
+    /// truly absent" would require mutating global PATH/HOME, which is unsafe
+    /// under parallel test execution — not attempted, consistent with this
+    /// module's existing test set).
+    #[test]
+    fn not_installed_error_message_is_clear() {
+        let msg = AuthError::NotInstalled.to_string();
+        assert_eq!(msg, "CLI binary not found");
+    }
+
+    #[test]
+    fn no_login_error_message_is_clear() {
+        let msg = AuthError::NoLogin.to_string();
+        assert!(msg.contains("no interactive login"));
     }
 
     #[test]

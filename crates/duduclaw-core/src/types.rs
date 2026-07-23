@@ -208,8 +208,9 @@ pub enum RuntimeType {
     Antigravity,
     /// xAI Grok CLI ("Grok Build", beta 2026-05) — terminal coding agent driving
     /// `grok-build-0.1` behind a SuperGrok / X Premium+ subscription. MCP-native,
-    /// `-p` headless mode. R4 wires CLI *detection + headless spawn*; the
-    /// SuperGrok OAuth device-flow (accounts.x.ai) is a follow-up (phase 2).
+    /// `-p` headless mode. R4 phase 1 wired CLI detection + headless spawn;
+    /// phase 2 (v1.41) added the dashboard one-click SuperGrok device-code
+    /// login (`grok login --device-code`, see `cli_auth.rs`).
     Grok,
     #[serde(rename = "openai_compat")]
     OpenAiCompat,

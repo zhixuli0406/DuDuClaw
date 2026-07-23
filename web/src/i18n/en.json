@@ -333,6 +333,7 @@
   "channels.setup.teams.step3": "3. Paste the App Password and App ID; set a Tenant ID for single-tenant, leave blank for multi-tenant",
   "channels.setup.teams.note": "Note: the App Password is stored encrypted.",
   "channels.setup.teams.tenantHint": "Azure Tenant ID for single-tenant; blank = multi-tenant",
+  "cliLogin.grok.dockerHint": "If the gateway runs in Docker, this login writes to the container's ~/.grok (the duduclaw-grok volume) — a host-side login won't take effect here.",
   "accounts.title": "Accounts & Budget",
   "accounts.add": "Add Account",
   "accounts.rotate": "Manual Rotate",

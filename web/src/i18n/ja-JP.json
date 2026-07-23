@@ -332,6 +332,7 @@
   "channels.setup.teams.step3": "3. App Password と App ID を貼り付け。シングルテナントは Tenant ID を入力、マルチテナントは空欄",
   "channels.setup.teams.note": "注:App Password は暗号化して保存されます。",
   "channels.setup.teams.tenantHint": "シングルテナントは Azure Tenant ID、空欄 = マルチテナント",
+  "cliLogin.grok.dockerHint": "gateway が Docker で動いている場合、このログインは container 内の ~/.grok（duduclaw-grok volume）に書き込まれます。ホスト側のログインはここには反映されません。",
   "accounts.title": "アカウントと予算",
   "accounts.add": "アカウントを追加",
   "accounts.rotate": "手動ローテーション",

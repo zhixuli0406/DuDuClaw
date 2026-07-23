@@ -91,6 +91,7 @@ const CLI_OPTIONS: ReadonlyArray<[LoginRuntime, string]> = [
   ['codex', 'Codex'],
   ['gemini', 'Gemini'],
   ['antigravity', 'Antigravity (agy)'],
+  ['grok', 'Grok（SuperGrok 訂閱）'],
 ];
 
 /**
