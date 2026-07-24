@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+### Added
+- **Dashboard 健康診斷納入 MCP／Grok 活體探測**：`system.doctor`（設定 → 健康診斷）
+  新增兩張卡片——「MCP 工具服務」（spawn 一次 `mcp-server` 送 initialize，判定 M6
+  認證斷鏈，即「agent 叫不到工具」根因）與「Grok CLI」（binary＋版本＋活體
+  `grok -p "ping"`＋登入判定；未安裝則不顯示）。探測邏輯抽成
+  `duduclaw-gateway::doctor_probes` 共用模組，CLI `duduclaw doctor` 與 dashboard
+  讀同一份實作不再漂移；三個外部探測並行執行、前端 doctor RPC timeout 提高到
+  60s；DoctorTab 卡片標題改走 i18n（zh-TW／en／ja，未知檢查名 fallback 原字串）。
+  Docker 部署的經銷商從此不必進 container 跑 CLI 即可取得診斷證據。
+
+### Fixed
+- **非 Claude runtime 的 MCP 工具面在 v1.31 之後全滅（Grok「查 Odoo 不行」根因）**：
+  M6 fail-closed 認證（v1.31）讓 `duduclaw mcp-server` 沒有 `DUDUCLAW_MCP_API_KEY`
+  就拒絕啟動，但全產品沒有任何 spawn 路徑注入這把 key——Grok 這類 CLI 只用 config
+  宣告的 env 區塊起 MCP child（不繼承父環境），duduclaw MCP server 開機即死，agent
+  無聲失去整個工具面（Claude 因 CLI 會傳完整 env、在 gateway 環境有 key 時才「碰巧」
+  存活）。修法：① gateway 啟動時自動 provision 一把 internal key（`config.toml
+  [mcp_keys]`，client_id=`gateway-internal`，首次生成、之後重用，`with_file_lock`
+  防多實例競態；operator 自設的 env key 永遠優先）；② 新增
+  `duduclaw_core::mcp_forward_env_vars()` 作為所有 MCP env 組裝點的單一事實來源
+  （home/port/instance + MCP 認證），並套用到全部六個組裝點——grok
+  `.grok/config.toml`、codex `-c` overrides、gemini/antigravity settings.json、
+  Claude `.mcp.json` template（含 global settings 註冊）、direct tool-loop
+  `mcp_client_envs`；③ `duduclaw doctor` 新增「MCP Server 冷啟動診斷」：跑與 gateway
+  相同的 provisioning 鏈後實際 spawn 一次 `mcp-server` 送 initialize，一條指令判定
+  「agent 叫不到工具」是不是認證斷鏈。外部／stdio 呼叫者沒 key 仍被拒（M6 的安全
+  目標不變）。另澄清：Odoo `allowed_actions = []` 空清單語義是全放行（permissive），
+  截圖中「空白名單會擋工具」為模型誤述，非本次斷鏈原因。
+- **Homebrew tap 凍結在 v1.8.8（落後 35 個版本）**：tap formula 過去靠手動更新、
+  不在 release.sh 的任何清單裡，v1.8.8 之後就再也沒人記得——`brew install
+  zhixuli0406/tap/duduclaw` 一直裝到 2026-05 的舊版。現在 release.sh 補上完整
+  Homebrew 流程：`audit`／`verify` 各多一列 tap 版本檢查（drift 會被點名），新增
+  `./scripts/release.sh homebrew [version]` 子指令——抓 release assets 的官方
+  `.sha256`（缺任一平台即 fail-closed 中止）、重新產生 formula、commit + push 到
+  tap，冪等可重跑；bump 後的 next steps 也加入此步驟。formula 本身同步改為
+  **預編譯二進位安裝**（macOS／Linux × arm64／x64 四平台，含 Python SDK），
+  不再要求使用者裝 rust + node 從源碼編譯。
+
 ## [1.43.0] - 2026-07-23 — Grok 訂閱帳號全鏈路：headless 根治、dashboard 裝置碼登入與 doctor 診斷
 
 ### Fixed

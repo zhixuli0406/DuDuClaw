@@ -64,7 +64,11 @@ export function DoctorTab() {
                 {statusIcon[check.status]}
                 <div className="flex-1">
                   <h4 className="font-medium text-foreground">
-                    {check.name}
+                    {/* Translated title when a key exists; raw name as fallback
+                        so unknown backend checks still render. */}
+                    {intl.messages[`settings.doctor.check.${check.name}`]
+                      ? intl.formatMessage({ id: `settings.doctor.check.${check.name}` })
+                      : check.name}
                   </h4>
                   <p className="mt-1 text-sm text-muted-foreground">
                     {check.message}
