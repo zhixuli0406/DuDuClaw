@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.44.0] - 2026-07-24 — MCP 工具面認證斷鏈根治、dashboard 健康診斷活體探測、Homebrew 通路復活
+
 ### Added
 - **Dashboard 健康診斷納入 MCP／Grok 活體探測**：`system.doctor`（設定 → 健康診斷）
   新增兩張卡片——「MCP 工具服務」（spawn 一次 `mcp-server` 送 initialize，判定 M6
