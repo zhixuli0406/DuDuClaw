@@ -3025,7 +3025,10 @@ export const api = {
     status: () =>
       client.call('system.status') as Promise<SystemStatus>,
     doctor: () =>
-      client.call('system.doctor') as Promise<{
+      // Extended timeout: the gateway runs live probes concurrently (MCP
+      // server cold-start ~10s, grok -p ping ~15s+version 5s) — worst case
+      // ~20s, above the 30s default's comfort zone once queueing is added.
+      client.call('system.doctor', {}, false, 60000) as Promise<{
         checks: DoctorCheck[];
         summary: { pass: number; warn: number; fail: number };
       }>,

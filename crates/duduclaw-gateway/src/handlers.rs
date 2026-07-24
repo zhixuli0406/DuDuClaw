@@ -17039,7 +17039,16 @@ impl MethodHandler {
         let has_key = self.has_api_key().await;
         let config_exists = self.home_dir.join("config.toml").exists();
 
-        vec![
+        // The three spawning probes run concurrently — worst case the RPC
+        // costs max(docker, grok ping 15s+version 5s, mcp cold-start 10s),
+        // not the sum. The dashboard passes an extended per-call timeout.
+        let (docker, mcp, grok) = tokio::join!(
+            check_docker(),
+            crate::doctor_probes::mcp_cold_start_probe(&self.home_dir),
+            crate::doctor_probes::grok_probe(&self.home_dir),
+        );
+
+        let mut checks = vec![
             json!({
                 "name": "config_file",
                 "status": if config_exists { "pass" } else { "fail" },
@@ -17059,7 +17068,7 @@ impl MethodHandler {
                 "can_repair": false,
             }),
             {
-                let (docker_status, docker_msg) = check_docker().await;
+                let (docker_status, docker_msg) = docker;
                 json!({
                     "name": "container_runtime",
                     "status": docker_status,
@@ -17067,7 +17076,93 @@ impl MethodHandler {
                     "can_repair": false,
                 })
             },
-        ]
+        ];
+
+        // MCP server cold-start (the "agent has no tools" class): spawns
+        // `duduclaw mcp-server` with a runtime-shaped env and checks it
+        // survives the M6 fail-closed auth gate. zh-TW messages — this card
+        // exists for operators (distributor deployments) whose only surface
+        // is the dashboard.
+        {
+            use crate::doctor_probes::McpColdStartOutcome as O;
+            let (status, message) = match &mcp.outcome {
+                O::Pass => ("pass", "MCP server 啟動並回應 initialize，工具面可用。".to_string()),
+                O::AuthFailed => (
+                    "fail",
+                    format!(
+                        "MCP server 因認證被拒而終止 — agent 會完全叫不到 duduclaw 工具。{}重啟 gateway 讓它自動配發 internal key，或設定 env DUDUCLAW_MCP_API_KEY。",
+                        mcp.provision_error
+                            .as_deref()
+                            .map(|e| format!("（internal key 配發失敗：{e}）"))
+                            .unwrap_or_default()
+                    ),
+                ),
+                O::BinaryUnresolved => (
+                    "fail",
+                    "duduclaw binary 無法解析為絕對路徑 — CLI runtime 無法註冊 MCP server。".to_string(),
+                ),
+                O::SpawnFailed(e) => ("fail", format!("mcp-server 無法啟動：{e}")),
+                O::Timeout => (
+                    "warn",
+                    "mcp-server 10 秒內未結束（stdin 已關閉），無法確認 initialize 是否成功。".to_string(),
+                ),
+                O::Abnormal { exit, stderr_tail } => (
+                    "fail",
+                    format!(
+                        "mcp-server 異常結束（exit={}，無 initialize 回應）。stderr：{}",
+                        exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                        if stderr_tail.is_empty() { "(空)" } else { stderr_tail }
+                    ),
+                ),
+            };
+            checks.push(json!({
+                "name": "mcp_server",
+                "status": status,
+                "message": message,
+                "can_repair": false,
+            }));
+        }
+
+        // Grok CLI live probe — only when grok is installed (mirrors the CLI
+        // doctor: absence is not a failure, the card is simply omitted).
+        if let Some(g) = grok {
+            use crate::doctor_probes::GrokProbeOutcome as O;
+            let ver = g.version.as_deref().unwrap_or("?");
+            let (status, message) = match &g.outcome {
+                O::Ok { stdout_chars } => (
+                    "pass",
+                    format!("grok -p 活體試跑正常（版本 {ver}，回應 {stdout_chars} 字元）。"),
+                ),
+                O::AuthFailed { stderr_tail } => (
+                    "fail",
+                    format!(
+                        "grok 未登入或憑證失效 — 請在主機執行 `grok login --device-auth`（Docker 部署用 dashboard 的 Grok 登入）。stderr：{stderr_tail}"
+                    ),
+                ),
+                O::EmptyExit0 => (
+                    "warn",
+                    "grok -p 回傳空輸出（exit 0）— headless 管道問題，runtime 會自動以 PTY 重試；若對話持續空回覆請執行 `duduclaw doctor` 取得完整證據包。".to_string(),
+                ),
+                O::Failed { exit, stderr_tail } => (
+                    "fail",
+                    format!(
+                        "grok -p 執行失敗（exit={}）。stderr：{}",
+                        exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                        if stderr_tail.is_empty() { "(空)" } else { stderr_tail }
+                    ),
+                ),
+                O::SpawnFailed(e) => ("fail", format!("grok 無法啟動：{e}")),
+                O::Timeout => ("warn", "grok -p 15 秒內無回應（逾時）。".to_string()),
+            };
+            checks.push(json!({
+                "name": "grok_cli",
+                "status": status,
+                "message": message,
+                "can_repair": false,
+            }));
+        }
+
+        checks
     }
 
     // ── Odoo ERP ─────────────────────────────────────────────────
@@ -27331,6 +27426,30 @@ mod skills_install_scan_tests {
             WsFrame::Response { error: Some(e), .. } => e.to_string(),
             _ => String::new(),
         }
+    }
+
+    /// `system.doctor` must include the MCP cold-start card (the "agent has
+    /// no tools" class) with a valid status. The grok card is only present
+    /// when a grok CLI exists on the machine, so it is not asserted here.
+    #[tokio::test]
+    async fn system_doctor_includes_mcp_server_check() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let checks = handler.run_doctor_checks().await;
+        let mcp = checks
+            .iter()
+            .find(|c| c["name"] == "mcp_server")
+            .expect("mcp_server check missing from system.doctor");
+        let status = mcp["status"].as_str().unwrap_or("");
+        assert!(
+            ["pass", "warn", "fail"].contains(&status),
+            "unexpected status: {status}"
+        );
+        assert!(
+            !mcp["message"].as_str().unwrap_or("").is_empty(),
+            "mcp_server check must carry a message"
+        );
     }
 
     #[tokio::test]
