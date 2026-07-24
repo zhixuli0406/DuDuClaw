@@ -362,12 +362,8 @@ impl AgentRuntime for GrokRuntime {
         // (spawned by grok, inheriting this env) resolves the right agent even if
         // Grok doesn't pick up the per-agent project config (residual #2).
         cmd.env(duduclaw_core::ENV_AGENT_ID, &context.agent_id);
-        for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
-            if let Ok(v) = std::env::var(var) {
-                if !v.trim().is_empty() {
-                    cmd.env(var, v);
-                }
-            }
+        for (k, v) in duduclaw_core::mcp_forward_env_vars() {
+            cmd.env(k, v);
         }
 
         cmd.stdout(std::process::Stdio::piped())
@@ -664,12 +660,13 @@ impl GrokRuntime {
             duduclaw_core::ENV_AGENT_ID.to_string(),
             toml::Value::String(agent_id.to_string()),
         );
-        for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
-            if let Ok(v) = std::env::var(var) {
-                if !v.trim().is_empty() {
-                    env.insert(var.to_string(), toml::Value::String(v));
-                }
-            }
+        // Shared forward set (home/port/instance + MCP auth). Grok spawns MCP
+        // children with ONLY this declared env block — omitting
+        // DUDUCLAW_MCP_API_KEY here was the root cause of "grok 查 odoo 不行":
+        // the duduclaw mcp-server died at boot (M6 fail-closed) and the agent
+        // silently lost its whole tool surface.
+        for (k, v) in duduclaw_core::mcp_forward_env_vars() {
+            env.insert(k, toml::Value::String(v));
         }
         let mut table = toml::map::Map::new();
         table.insert(

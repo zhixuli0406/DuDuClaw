@@ -75,6 +75,69 @@ pub const DEFAULT_MAX_HOP_DEPTH: u8 = 5;
 /// `duduclaw_agent::mcp_template::ensure_duduclaw_absolute_path`.
 pub const ENV_AGENT_ID: &str = "DUDUCLAW_AGENT_ID";
 
+/// MCP server authentication (M6 fail-closed): `duduclaw mcp-server` refuses
+/// to start unless this env var carries a key registered in `config.toml
+/// [mcp_keys]` (or the explicit unauthenticated opt-in below is set). The
+/// gateway provisions an internal key at startup and every CLI-runtime MCP
+/// config writer forwards it, because CLIs like Grok spawn MCP children with
+/// ONLY the declared env block (no parent-env inheritance) — an env block
+/// without this var means the duduclaw MCP server dies on boot and the agent
+/// silently loses its whole tool surface.
+pub const ENV_MCP_API_KEY: &str = "DUDUCLAW_MCP_API_KEY";
+
+/// Explicit operator opt-in to run the MCP server without key auth (M6).
+pub const ENV_MCP_ALLOW_UNAUTHENTICATED: &str = "DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED";
+
+/// Process-global override for the internal MCP API key, set once by the
+/// gateway after provisioning it in `config.toml [mcp_keys]`. Used instead of
+/// `std::env::set_var` (unsafe/UB-prone once the tokio runtime is
+/// multi-threaded): every MCP env assembly point goes through
+/// [`mcp_forward_env_vars`], which folds this override in, so mutating the
+/// real process env is unnecessary. An operator-provided
+/// `DUDUCLAW_MCP_API_KEY` env var always wins over this override.
+static INTERNAL_MCP_API_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the gateway-provisioned internal MCP API key for this process.
+/// First call wins; later calls are no-ops (the key never rotates mid-run).
+pub fn set_internal_mcp_api_key(key: String) {
+    let _ = INTERNAL_MCP_API_KEY.set(key);
+}
+
+/// The env vars every spawned `duduclaw mcp-server` child needs forwarded
+/// from the current process, as `(name, value)` pairs (present + non-empty
+/// only). Single source of truth for ALL MCP env assembly points — the
+/// per-runtime config writers (grok/codex/gemini/antigravity), the Claude
+/// `.mcp.json` template, and the direct tool-loop client. `DUDUCLAW_AGENT_ID`
+/// is intentionally NOT included (it is per-call, not process-wide).
+///
+/// History: each assembly point used to hand-roll its own subset; all of them
+/// missed `DUDUCLAW_MCP_API_KEY`, so every non-Claude runtime lost its MCP
+/// tool surface after the M6 fail-closed auth change (v1.31).
+pub fn mcp_forward_env_vars() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for var in [
+        "DUDUCLAW_HOME",
+        "DUDUCLAW_PORT",
+        "DUDUCLAW_INSTANCE",
+        ENV_MCP_API_KEY,
+        ENV_MCP_ALLOW_UNAUTHENTICATED,
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                out.push((var.to_string(), v));
+                continue;
+            }
+        }
+        // Env absent/empty: fall back to the gateway-provisioned internal key.
+        if var == ENV_MCP_API_KEY {
+            if let Some(k) = INTERNAL_MCP_API_KEY.get() {
+                out.push((var.to_string(), k.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// Channel context for delegation callback.
 /// Format: `<channel_type>:<channel_id>[:<thread_id>]`
 /// e.g. `telegram:12345` or `discord:thread:98765`
@@ -854,5 +917,24 @@ mod version_pick_tests {
     fn all_unversioned_falls_back_to_source_order() {
         let all = vec!["/nonexistent/a".to_string(), "/nonexistent/b".to_string()];
         assert_eq!(pick_newest_version(&all), Some("/nonexistent/a".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod mcp_forward_env_tests {
+    use super::*;
+
+    /// The internal-key override must surface through `mcp_forward_env_vars`
+    /// (this is the channel every MCP env assembly point reads). Regression
+    /// for the v1.31 M6 gap where no assembly point carried the key and every
+    /// non-Claude runtime lost its MCP tool surface.
+    #[test]
+    fn forward_env_vars_include_internal_key_override() {
+        set_internal_mcp_api_key("ddc_prod_0123456789abcdef0123456789abcdef".to_string());
+        let vars = mcp_forward_env_vars();
+        assert!(
+            vars.iter().any(|(k, v)| k == ENV_MCP_API_KEY && !v.trim().is_empty()),
+            "override key missing from forward set: {vars:?}"
+        );
     }
 }

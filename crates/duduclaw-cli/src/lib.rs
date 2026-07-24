@@ -3673,6 +3673,9 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
     // multi-line evidence bundle for remote debugging.
     grok_cli_diagnostic(&home).await;
 
+    // MCP server cold-start (auth) diagnostic — the "agent has no tools" class.
+    mcp_server_diagnostic(&home).await;
+
     Ok(())
 }
 
@@ -3839,6 +3842,62 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
         }
     } else if empty_exit0 && is_auth {
         println!("  → 空輸出且偵測到 auth 失敗，跳過 PTY 重試（重登才有用）。");
+    }
+}
+
+/// Verbose MCP server cold-start diagnostic for `duduclaw doctor`.
+///
+/// Spawns `duduclaw mcp-server` exactly the way a CLI runtime would (declared
+/// env block only: agent id + `mcp_forward_env_vars`), sends one JSON-RPC
+/// `initialize`, and reports whether the server survives its M6 fail-closed
+/// auth gate. This is the one-command evidence bundle for the "Grok/Codex/
+/// Gemini agent has no tools" class: when the spawned mcp-server dies at boot
+/// with a missing/unknown `DUDUCLAW_MCP_API_KEY`, every duduclaw MCP tool
+/// silently vanishes from the agent while Claude (full-env inheritance from a
+/// keyed gateway) keeps working. Output is zh-TW.
+async fn mcp_server_diagnostic(home: &std::path::Path) {
+    use duduclaw_gateway::doctor_probes::{mcp_cold_start_probe, McpColdStartOutcome as O};
+
+    println!();
+    println!("MCP Server 冷啟動診斷");
+    println!("{}", "-".repeat(40));
+
+    // Shared probe — the exact logic the dashboard `system.doctor` card runs
+    // (provision internal key → runtime-shaped env → spawn + initialize), so
+    // the two surfaces can never drift apart.
+    let report = mcp_cold_start_probe(home).await;
+
+    if let Some(bin) = &report.binary {
+        println!("  binary : {}", bin.display());
+    }
+    if let Some(e) = &report.provision_error {
+        println!("  [warn] internal key provisioning 失敗：{e}");
+    }
+    println!(
+        "  env    : DUDUCLAW_MCP_API_KEY {}",
+        if report.key_ready { "已就緒" } else { "未設定" }
+    );
+
+    match &report.outcome {
+        O::Pass => println!("  [pass] mcp-server 啟動並回應 initialize — 工具面可用。"),
+        O::BinaryUnresolved => println!(
+            "  [fail] duduclaw binary 無法解析為絕對路徑 — CLI runtime 無法註冊 MCP server。"
+        ),
+        O::SpawnFailed(e) => println!("  [fail] mcp-server spawn 失敗：{e}"),
+        O::Timeout => println!("  [warn] 10s 內未結束（stdin 已關閉）— 無法確認 initialize 是否成功。"),
+        O::AuthFailed => {
+            println!("  [fail] mcp-server 因認證被拒而終止（M6 fail-closed）。");
+            println!("         這正是「agent 完全叫不到 duduclaw 工具」的根因：");
+            println!("         1. 升級後先跑一次 `duduclaw run`（gateway 會自動配發 internal key");
+            println!("            並寫入 config.toml [mcp_keys]，spawn 的 CLI 全部自動帶上）。");
+            println!("         2. 或手動設定 env DUDUCLAW_MCP_API_KEY=<config.toml [mcp_keys] 其中一把>。");
+        }
+        O::Abnormal { exit, stderr_tail } => {
+            println!(
+                "  [fail] mcp-server 異常結束（exit={exit:?}，無 initialize 回應）。stderr tail："
+            );
+            println!("         {}", stderr_tail.replace('\n', "\n         "));
+        }
     }
 }
 

@@ -266,12 +266,12 @@ pub fn duduclaw_mcp_server_json(agent_id: &str) -> Option<serde_json::Value> {
         duduclaw_core::ENV_AGENT_ID.to_string(),
         serde_json::Value::String(agent_id.to_string()),
     );
-    for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.trim().is_empty() {
-                env.insert(var.to_string(), serde_json::Value::String(v));
-            }
-        }
+    // Shared forward set (home/port/instance + MCP auth). CLIs like Grok spawn
+    // MCP children with ONLY this declared env block — a missing
+    // DUDUCLAW_MCP_API_KEY here means the server dies at boot (M6 fail-closed)
+    // and the agent silently loses every duduclaw tool.
+    for (k, v) in duduclaw_core::mcp_forward_env_vars() {
+        env.insert(k, serde_json::Value::String(v));
     }
     Some(serde_json::json!({
         "command": bin.to_string_lossy(),

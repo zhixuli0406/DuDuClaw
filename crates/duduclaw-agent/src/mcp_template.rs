@@ -196,12 +196,8 @@ pub fn ensure_global_mcp_server() -> Result<bool, String> {
         "args": ["mcp-server"],
     });
     let mut env = serde_json::Map::new();
-    for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.trim().is_empty() {
-                env.insert(var.to_string(), serde_json::Value::String(v));
-            }
-        }
+    for (k, v) in duduclaw_core::mcp_forward_env_vars() {
+        env.insert(k, serde_json::Value::String(v));
     }
     if !env.is_empty() {
         desired
@@ -280,6 +276,12 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
         .ok_or_else(|| format!("agent dir has no file_name: {}", agent_dir.display()))?
         .to_string();
 
+    // Shared forward set (home/port/instance + MCP auth). Claude CLI passes
+    // its full env to MCP children, but writing the pairs into `.mcp.json`
+    // keeps the agent dir working standalone (claude launched from a terminal
+    // that lacks the gateway env). See `duduclaw_core::mcp_forward_env_vars`.
+    let forward_env = duduclaw_core::mcp_forward_env_vars();
+
     // Case 1: No .mcp.json exists → create with duduclaw server entry
     if !path.exists() {
         let mut env = std::collections::HashMap::new();
@@ -287,6 +289,7 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
             duduclaw_core::ENV_AGENT_ID.to_string(),
             agent_id.clone(),
         );
+        env.extend(forward_env.iter().cloned());
         let mut servers = std::collections::HashMap::new();
         servers.insert("duduclaw".to_string(), McpServerDef {
             command: abs_str.clone(),
@@ -336,7 +339,10 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
                 .get(duduclaw_core::ENV_AGENT_ID)
                 .map(|v| v != &agent_id)
                 .unwrap_or(true);
-            wrong_command || missing_agent_id
+            let missing_forward = forward_env
+                .iter()
+                .any(|(k, v)| entry.env.get(k) != Some(v));
+            wrong_command || missing_agent_id || missing_forward
         }
     };
 
@@ -349,11 +355,12 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
         .entry(target_key.clone())
         .and_modify(|e| {
             e.command = abs_str.clone();
-            // Preserve other env vars, only upsert DUDUCLAW_AGENT_ID.
+            // Preserve other env vars; upsert DUDUCLAW_AGENT_ID + forward set.
             e.env.insert(
                 duduclaw_core::ENV_AGENT_ID.to_string(),
                 agent_id.clone(),
             );
+            e.env.extend(forward_env.iter().cloned());
         })
         .or_insert_with(|| {
             let mut env = std::collections::HashMap::new();
@@ -361,6 +368,7 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
                 duduclaw_core::ENV_AGENT_ID.to_string(),
                 agent_id.clone(),
             );
+            env.extend(forward_env.iter().cloned());
             McpServerDef {
                 command: abs_str.clone(),
                 args: vec!["mcp-server".to_string()],
