@@ -5,6 +5,8 @@
 #                                                          # bump + sync all platforms
 #   ./scripts/release.sh audit                              # show every platform's version + drift
 #   ./scripts/release.sh verify [version]                  # confirm registries published <version>
+#   ./scripts/release.sh homebrew [version] [--dry-run]    # sync the Homebrew tap formula
+#                                                          # (run AFTER CI publishes the release)
 #
 # --title "<theme>" sets the one-line release theme in the CHANGELOG version
 # header (house style: "## [1.36.0] - 2026-07-15 — <theme>"). On a bump the
@@ -34,6 +36,10 @@ set -euo pipefail
 WORKSPACE_TOML="Cargo.toml"
 PYPI_PKG="duduclaw"   # PyPI + npm package name (used by `verify`)
 NPM_PKG="duduclaw"
+GH_REPO="zhixuli0406/DuDuClaw"          # release-asset source for the brew formula
+TAP_REPO="zhixuli0406/homebrew-tap"     # Homebrew tap (brew install zhixuli0406/tap/duduclaw)
+TAP_FORMULA="Formula/duduclaw.rb"
+TAP_DIR_DEFAULT="$HOME/Project/homebrew-tap"   # override with DUDUCLAW_TAP_DIR
 DRY_RUN=false
 
 # Extended-regex semver matcher (no leading anchor — reused in several patterns).
@@ -101,10 +107,29 @@ extract_version() {
     esac
 }
 
+# --- Homebrew tap: read the formula version actually published on the tap. ---
+# The tap lives in a SEPARATE repo, so it is not covered by platform_manifests
+# (which enumerates files in this checkout). Prefer the GitHub API (no cache) —
+# the raw.githubusercontent fallback has a ~5 min CDN cache, which would show a
+# stale MISMATCH right after a successful push. Empty string on network failure.
+published_tap_version() {
+    local body=""
+    if command -v gh >/dev/null 2>&1; then
+        body="$(gh api "repos/$TAP_REPO/contents/$TAP_FORMULA" --jq '.content' 2>/dev/null \
+            | base64 -d 2>/dev/null)" || true
+    fi
+    if [[ -z "$body" ]]; then
+        body="$(curl -fsSL "https://raw.githubusercontent.com/$TAP_REPO/main/$TAP_FORMULA" 2>/dev/null)" || true
+    fi
+    { printf '%s\n' "$body" \
+        | grep -m1 -E "^[[:space:]]*version \"$SEMVER\"" \
+        | sed -E "s/.*version \"($SEMVER)\".*/\1/"; } || true
+}
+
 # --- Audit: print each platform's current version, flagging drift vs Cargo. ---
 # Returns non-zero if any manifest disagrees with the Cargo workspace version.
 run_audit() {
-    local truth="$1" drift=0 kind file v flag
+    local truth="$1" drift=0 kind file v flag brew_v
     echo "Platform version audit (source of truth: Cargo workspace = $truth)"
     echo "------------------------------------------------------------------"
     while IFS='|' read -r kind file; do
@@ -116,6 +141,19 @@ run_audit() {
         fi
         printf "  %-34s %-10s [%s]%s\n" "$file" "${v:-?}" "$kind" "$flag"
     done < <(platform_manifests)
+    # Homebrew tap (remote repo — audited from the published formula, not a local
+    # file). This is how the tap froze at 1.8.8 for ~35 releases: it was updated
+    # by hand, never enumerated anywhere, so nothing ever flagged it.
+    brew_v="$(published_tap_version)"
+    flag=""
+    if [[ -z "$brew_v" ]]; then
+        brew_v="?"
+        flag="   (tap unreachable — not checked)"
+    elif [[ "$brew_v" != "$truth" ]]; then
+        flag="   <-- DRIFT (brew installs $brew_v; fix: $0 homebrew)"
+        drift=1
+    fi
+    printf "  %-34s %-10s [%s]%s\n" "tap:$TAP_REPO" "$brew_v" "brew" "$flag"
     echo "------------------------------------------------------------------"
     return $drift
 }
@@ -147,6 +185,17 @@ run_verify() {
         printf "  %-10s %-10s OK\n" "npm" "$npm"
     else
         printf "  %-10s %-10s MISMATCH (expected %s)\n" "npm" "${npm:-unreachable}" "$want"
+        rc=1
+    fi
+
+    # Homebrew tap formula
+    local brew_v
+    brew_v="$(published_tap_version)"
+    if [[ "$brew_v" == "$want" ]]; then
+        printf "  %-10s %-10s OK\n" "homebrew" "$brew_v"
+    else
+        printf "  %-10s %-10s MISMATCH (expected %s) — fix: %s homebrew %s\n" \
+            "homebrew" "${brew_v:-unreachable}" "$want" "$0" "$want"
         rc=1
     fi
 
@@ -188,13 +237,160 @@ run_verify() {
     return $rc
 }
 
+# --- Homebrew: regenerate + push the tap formula for an already-published release. ---
+# The formula installs the PREBUILT release tarballs (macOS/Linux, arm64/x64) —
+# no rust/node source build on the user's machine. That means the GitHub release
+# assets must exist BEFORE this runs, so it is a post-CI step (next-steps item),
+# not part of the bump commit. Fail-closed: any missing/invalid sha256 aborts.
+run_homebrew() {
+    local want="$1" tag="v$1"
+    echo "Syncing Homebrew tap $TAP_REPO -> duduclaw $want"
+
+    # 1. Collect the official per-platform sha256 from the release assets.
+    local plat sha
+    local -a plats=(darwin-arm64 darwin-x64 linux-arm64 linux-x64) shas=()
+    for plat in "${plats[@]}"; do
+        sha="$(curl -fsSL "https://github.com/$GH_REPO/releases/download/$tag/duduclaw-$plat.tar.gz.sha256" 2>/dev/null \
+            | awk '{print $1}')" || true
+        if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Error: no valid sha256 for duduclaw-$plat.tar.gz on release $tag."
+            echo "       The GitHub release (with binaries) must exist before the tap sync."
+            echo "       Push the tag, wait for CI release.yml to finish, then re-run:"
+            echo "         $0 homebrew $want"
+            return 1
+        fi
+        shas+=("$sha")
+        echo "  sha256 $plat: $sha"
+    done
+
+    # 2. Locate (or clone) the tap checkout.
+    local tap_dir="${DUDUCLAW_TAP_DIR:-$TAP_DIR_DEFAULT}"
+    if [[ ! -d "$tap_dir/.git" ]]; then
+        tap_dir="$(mktemp -d)/homebrew-tap"
+        echo "  No local tap checkout — cloning into $tap_dir"
+        git clone --quiet --depth 1 "https://github.com/$TAP_REPO.git" "$tap_dir"
+    fi
+    # 3. Regenerate the formula to a temp file first, so a dirty working copy
+    #    can be told apart: identical to what we generate (our own earlier
+    #    dry-run leftover) is fine; anything else is a hand edit — abort.
+    local tmp_formula
+    tmp_formula="$(mktemp)"
+    cat > "$tmp_formula" << FORMULA
+class Duduclaw < Formula
+  desc "Multi-Runtime AI Agent Platform — channels, memory, evolution, local LLM"
+  homepage "https://github.com/$GH_REPO"
+  version "$want"
+  license "Apache-2.0"
+
+  # Prebuilt release tarballs (binary + Python SDK) — no source build.
+  # Regenerated by scripts/release.sh homebrew; do not edit by hand.
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/$GH_REPO/releases/download/v#{version}/duduclaw-darwin-arm64.tar.gz"
+      sha256 "${shas[0]}"
+    else
+      url "https://github.com/$GH_REPO/releases/download/v#{version}/duduclaw-darwin-x64.tar.gz"
+      sha256 "${shas[1]}"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/$GH_REPO/releases/download/v#{version}/duduclaw-linux-arm64.tar.gz"
+      sha256 "${shas[2]}"
+    else
+      url "https://github.com/$GH_REPO/releases/download/v#{version}/duduclaw-linux-x64.tar.gz"
+      sha256 "${shas[3]}"
+    end
+  end
+
+  depends_on "python@3.12" => :recommended
+
+  conflicts_with "duduclaw-pro", because: "both install a \`duduclaw\` gateway on port 18789"
+
+  def install
+    bin.install "duduclaw"
+    # Python SDK — evolution vetter & SDK chat fallback
+    (libexec/"python").install "python/duduclaw" if (buildpath/"python/duduclaw").exist?
+  end
+
+  def caveats
+    <<~EOS
+      DuDuClaw v#{version}
+
+      Quick start:
+        duduclaw onboard
+        duduclaw run
+
+      Dashboard: http://localhost:18789
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/duduclaw version")
+  end
+end
+FORMULA
+
+    if command -v ruby >/dev/null 2>&1; then
+        ruby -c "$tmp_formula" >/dev/null || {
+            echo "Error: generated formula fails ruby syntax check. Aborting (tap untouched)."
+            rm -f "$tmp_formula"
+            return 1
+        }
+    fi
+
+    if [[ -n "$(git -C "$tap_dir" status --porcelain -- "$TAP_FORMULA")" ]]; then
+        if cmp -s "$tmp_formula" "$tap_dir/$TAP_FORMULA"; then
+            # Our own dry-run leftover — restore HEAD so the pull below is clean.
+            git -C "$tap_dir" checkout -- "$TAP_FORMULA"
+        else
+            echo "Error: $tap_dir/$TAP_FORMULA has uncommitted HAND edits — resolve them first."
+            rm -f "$tmp_formula"
+            return 1
+        fi
+    fi
+    git -C "$tap_dir" pull --ff-only --quiet
+
+    mv "$tmp_formula" "$tap_dir/$TAP_FORMULA"
+    if git -C "$tap_dir" diff --quiet -- "$TAP_FORMULA"; then
+        echo "  Tap already at $want — nothing to do."
+        return 0
+    fi
+
+    echo ""
+    git -C "$tap_dir" --no-pager diff --stat -- "$TAP_FORMULA"
+    if $DRY_RUN; then
+        echo "[DRY RUN] Formula regenerated at $tap_dir/$TAP_FORMULA (left uncommitted)."
+        echo "[DRY RUN] Would commit + push 'duduclaw $want' to $TAP_REPO."
+        return 0
+    fi
+
+    # 4. Commit + push.
+    git -C "$tap_dir" add "$TAP_FORMULA"
+    git -C "$tap_dir" commit --quiet -m "duduclaw $want — prebuilt binary formula (release.sh sync)"
+    git -C "$tap_dir" push --quiet origin HEAD:main
+    echo "  Pushed. Users get $want via: brew update && brew upgrade duduclaw"
+
+    # 5. Confirm the published formula actually reads the new version.
+    local pub
+    pub="$(published_tap_version)"
+    if [[ "$pub" == "$want" ]]; then
+        echo "  Verified: published tap formula reads $want."
+    else
+        echo "  WARNING: published formula reads '${pub:-unreachable}' (raw CDN may lag a minute)."
+        echo "           Re-check with: $0 verify $want"
+    fi
+}
+
 # --- Arg parsing / sub-commands ---
 if [[ $# -lt 1 ]]; then
     echo "Usage:"
     echo "  $0 <patch|minor|major> [--title \"<theme>\"] [--dry-run]"
     echo "                                       bump + sync every platform manifest"
     echo "  $0 audit                             show each platform's version + drift"
-    echo "  $0 verify [version]                  confirm PyPI/npm published <version>"
+    echo "  $0 verify [version]                  confirm PyPI/npm/brew published <version>"
+    echo "  $0 homebrew [version] [--dry-run]    sync the Homebrew tap formula (post-CI)"
     exit 1
 fi
 
@@ -211,11 +407,25 @@ case "$1" in
             echo ""
             echo "DRIFT DETECTED: a manifest is behind the Cargo version. The next"
             echo "'$0 <patch|minor|major>' run re-syncs every manifest to the new version."
+            echo "(Homebrew tap drift is fixed separately: '$0 homebrew <version>' —"
+            echo " it needs the GitHub release assets, not a bump.)"
         }
         exit 0
         ;;
     verify)
         run_verify "${2:-$CURRENT_VERSION}"
+        exit $?
+        ;;
+    homebrew)
+        shift
+        HB_VER="$CURRENT_VERSION"
+        for a in "$@"; do
+            case "$a" in
+                --dry-run) DRY_RUN=true; echo "[DRY RUN] Tap will not be pushed" ;;
+                *) HB_VER="${a#v}" ;;
+            esac
+        done
+        run_homebrew "$HB_VER"
         exit $?
         ;;
 esac
@@ -484,9 +694,12 @@ echo "  2. Amend the commit if needed:  git commit --amend"
 echo "  3. Push to remote:              git push && git push --tags"
 echo "     -> the tag push triggers .github/workflows/release.yml, which builds"
 echo "        binaries and AUTO-PUBLISHES GitHub Release + npm + PyPI (all 3)."
-echo "  4. After CI finishes, CONFIRM every registry actually got it:"
+echo "  4. After CI finishes, sync the Homebrew tap (formula points at the new"
+echo "     release tarballs, so this MUST run after the release assets exist):"
+echo "       ./scripts/release.sh homebrew $NEW_VERSION"
+echo "  5. CONFIRM every registry actually got it:"
 echo "       ./scripts/release.sh verify $NEW_VERSION"
-echo "     (this catches a PyPI/npm 'skip-existing' silent miss)"
+echo "     (this catches a PyPI/npm 'skip-existing' silent miss + brew tap drift)"
 echo "     The cloud console's enterprise version dropdown picks the new"
 echo "     version up automatically once the GitHub Release exists AND the"
 echo "     duduclaw-pro:v$NEW_VERSION image is in the registry (built above)."
