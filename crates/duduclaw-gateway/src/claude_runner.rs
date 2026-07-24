@@ -1110,13 +1110,11 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
 /// tools the CLI backends do.
 fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
     let mut envs = vec![(duduclaw_core::ENV_AGENT_ID.to_string(), agent_id.to_string())];
-    for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.trim().is_empty() {
-                envs.push((var.to_string(), v));
-            }
-        }
-    }
+    // Shared forward set (home/port/instance + MCP auth) — see
+    // `duduclaw_core::mcp_forward_env_vars`. The spawned mcp-server inherits
+    // this process env too, but the explicit pairs keep the tool loop working
+    // even if a future spawn path sanitizes the child env.
+    envs.extend(duduclaw_core::mcp_forward_env_vars());
     envs
 }
 

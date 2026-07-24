@@ -162,6 +162,35 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!("edition_profile={}", boot_edition.as_str());
     }
 
+    // Provision the internal MCP API key as early as possible (before any
+    // child spawn) and record it via `set_internal_mcp_api_key`, from where
+    // `mcp_forward_env_vars()` folds it into every MCP env assembly point
+    // (per-runtime MCP config writers, `.mcp.json` template, tool-loop
+    // client). Without this, the M6 fail-closed `mcp-server` auth (v1.31)
+    // kills the tool surface of every runtime whose CLI spawns MCP children
+    // with a sanitized env (the Grok "查 odoo 不行" incident). An
+    // operator-provided env key always wins; provisioning failure is
+    // warn-not-fatal (status quo: no key).
+    if std::env::var(duduclaw_core::ENV_MCP_API_KEY)
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true)
+    {
+        match crate::mcp_internal_key::ensure_internal_mcp_key(&home_dir) {
+            Ok(key) => {
+                duduclaw_core::set_internal_mcp_api_key(key);
+                info!("internal MCP API key active for this gateway (spawned MCP children authenticate)");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "internal MCP key provisioning failed — CLI-spawned duduclaw \
+                     mcp-server children will fail auth unless DUDUCLAW_MCP_API_KEY \
+                     is provided in the environment"
+                );
+            }
+        }
+    }
+
     // Install operator-configured extra allowed Origins for dashboard WS/CORS.
     // Empty by default => built-in loopback origins only (no behaviour change).
     let extra_origins = init_allowed_origins(config.allowed_origins.clone());
