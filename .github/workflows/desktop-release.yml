@@ -94,7 +94,7 @@ jobs:
           args: --target ${{ matrix.target }}
           tagName: ${{ github.ref_name }}
           releaseName: "DuDuClaw Desktop ${{ github.ref_name }}"
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           # tauri-action emits latest.json (updater manifest) when the updater
           # is configured — published alongside the installers (§D4.4).
@@ -134,3 +134,29 @@ jobs:
           }
           Get-ChildItem -Recurse -Filter *.msi src-tauri/target |
             ForEach-Object { ./scripts/desktop/sign-windows.ps1 -Artifact $_.FullName }
+
+  # The updater endpoint is the FIXED tag `desktop-updater` (§D4.4). It cannot
+  # be `releases/latest/...` — core releases (v*) ship far more often than
+  # desktop ones, so "latest" almost always points at a release with no
+  # latest.json and the updater check would 404 forever. After all platform
+  # builds land, republish the merged latest.json under the fixed tag.
+  updater-manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Republish latest.json under the desktop-updater tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+            --pattern latest.json --output latest.json
+          if ! gh release view desktop-updater --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            # prerelease so it never becomes the repo's "latest" release (the
+            # install scripts resolve core binaries through /releases/latest).
+            gh release create desktop-updater --repo "${{ github.repository }}" \
+              --prerelease --title "Desktop updater manifest" \
+              --notes "Moving pointer for the desktop auto-updater. latest.json here always describes the newest desktop release; installers live on the desktop-v* releases."
+          fi
+          gh release upload desktop-updater latest.json --repo "${{ github.repository }}" --clobber

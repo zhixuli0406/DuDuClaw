@@ -74,6 +74,12 @@ platform_manifests() {
     # causing a 404 → source-build fallback (MSVC + ~1.5h compile) on Windows.
     if [[ -f scripts/install.sh ]]; then echo "installer_sh|scripts/install.sh"; fi
     if [[ -f scripts/install.ps1 ]]; then echo "installer_ps1|scripts/install.ps1"; fi
+    # Desktop shell (Tauri). Version must equal the core version or the updater
+    # ships a shell/core mismatch (§D4.4). Enumerated here so the desktop app
+    # can never silently freeze behind the core again (it sat at 1.33.0 for 11
+    # releases because this file was bumped by hand and the desktop-v* tag was
+    # a separate manual step nobody ran).
+    if [[ -f src-tauri/tauri.conf.json ]]; then echo "tauri|src-tauri/tauri.conf.json"; fi
 }
 
 # --- Read the current version out of a manifest, by kind. (Never fails: empty on miss.) ---
@@ -88,7 +94,7 @@ extract_version() {
             { grep -m1 -E "^[[:space:]]*__version__ = \"$SEMVER\"" "$file" \
                 | sed -E "s/^[[:space:]]*__version__ = \"($SEMVER)\".*/\1/"; } 2>/dev/null || true
             ;;
-        npm)
+        npm|tauri)
             { grep -m1 -E "\"version\"[[:space:]]*:" "$file" \
                 | sed -E "s/.*\"version\"[[:space:]]*:[[:space:]]*\"($SEMVER)\".*/\1/"; } 2>/dev/null || true
             ;;
@@ -507,6 +513,9 @@ while IFS='|' read -r kind file; do
             sed -i '' -E "s/(\"version\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
             sed -i '' -E "s/(\"@duduclaw\/[a-z0-9-]+\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
             ;;
+        tauri)
+            sed -i '' -E "s/(\"version\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
+            ;;
         badge)
             sed -i '' -E "s|(badge/version-)$SEMVER(-blue)|\1$NEW_VERSION\2|" "$file"
             ;;
@@ -660,6 +669,12 @@ STAGE_FILES+=("CHANGELOG.md")
 git add -- "${STAGE_FILES[@]}"
 git commit -m "chore: bump v$NEW_VERSION"
 git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
+# Desktop tag rides the same bump commit: pushing it triggers
+# .github/workflows/desktop-release.yml (Tauri build, sign/notarize, publish —
+# no draft). Kept as a separate tag so a desktop-only rebuild stays possible.
+if [[ -f src-tauri/tauri.conf.json ]]; then
+    git tag -a "desktop-v$NEW_VERSION" -m "Desktop release v$NEW_VERSION"
+fi
 
 # --- Enterprise pro-image (commercial checkout only) ---
 # The duduclaw-pro image is versioned by THIS release train (same gateway,
@@ -692,8 +707,9 @@ echo "Next steps:"
 echo "  1. Review CHANGELOG.md release notes (curated [Unreleased] was renamed)"
 echo "  2. Amend the commit if needed:  git commit --amend"
 echo "  3. Push to remote:              git push && git push --tags"
-echo "     -> the tag push triggers .github/workflows/release.yml, which builds"
-echo "        binaries and AUTO-PUBLISHES GitHub Release + npm + PyPI (all 3)."
+echo "     -> v$NEW_VERSION triggers release.yml (binaries + GitHub Release + npm + PyPI)"
+echo "     -> desktop-v$NEW_VERSION triggers desktop-release.yml (Tauri installers,"
+echo "        signed + notarized, published directly — no draft)"
 echo "  4. After CI finishes, sync the Homebrew tap (formula points at the new"
 echo "     release tarballs, so this MUST run after the release assets exist):"
 echo "       ./scripts/release.sh homebrew $NEW_VERSION"
