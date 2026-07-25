@@ -50,14 +50,24 @@ release blocker (§D4.3).
 
 ## 5. Cut a release
 
+The normal path is the core release ritual — `scripts/release.sh <bump>` bumps
+`src-tauri/tauri.conf.json` with every other manifest and tags BOTH `v<X.Y.Z>`
+and `desktop-v<X.Y.Z>` on the bump commit; `git push --tags` then triggers this
+pipeline alongside the core one. (Desktop sat frozen at 1.33.0 for 11 releases
+while these were separate manual steps — don't go back to hand-tagging.)
+
+For a desktop-only rebuild of an existing version:
+
 ```bash
-# bump src-tauri/tauri.conf.json "version" to match the core version, then:
-git tag desktop-v1.30.1
-git push origin desktop-v1.30.1
+git tag desktop-v1.44.0 <bump-commit>
+git push origin desktop-v1.44.0
 ```
 
-The workflow builds the 4-target matrix, signs/notarizes, and publishes a
-**draft** release with installers + `latest.json`. Review, then publish.
+The workflow builds the 4-target matrix, signs/notarizes, and **publishes the
+release directly** (no draft) with installers + `latest.json`. A final job
+copies `latest.json` to the fixed-tag `desktop-updater` release — that fixed
+URL is the updater endpoint, because `releases/latest/...` would point at the
+much more frequent core releases and 404.
 
 ## 6. Certificate hygiene
 

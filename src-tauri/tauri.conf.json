@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DuDuClaw",
-  "version": "1.33.0",
+  "version": "1.44.0",
   "identifier": "ai.duduclaw.desktop",
   "build": {
     "beforeDevCommand": "cd web && npm run dev",
@@ -62,16 +62,16 @@
     "linux": {
       "deb": { "depends": ["libwebkit2gtk-4.1-0"] }
     },
-    "createUpdaterArtifacts": false
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "updater": {
-      "active": false,
+      "active": true,
       "endpoints": [
-        "https://github.com/zhixuli0406/DuDuClaw/releases/latest/download/latest.json"
+        "https://github.com/zhixuli0406/DuDuClaw/releases/download/desktop-updater/latest.json"
       ],
       "dialog": true,
-      "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ2RTBGMDdBQ0U5Mjg2QjMKUldTemhwTE9ldkRnUnJxOFlmcEtSanhucXFWdUlhL0lNcENWUyt0WmpiYnhjTXc1ZU5JOThjQ2EK"
     }
   }
 }
