@@ -46,6 +46,85 @@ const BLOCKED_MODELS: &[&str] = &[
     "mail.channel",
 ];
 
+/// Non-sensitive `res.partner` columns exposed by the safe customer-search
+/// tool. Deliberately excludes bank (`res.partner.bank`), tax
+/// (`vat`/`property_*`), and credit fields — only enough to identify a partner
+/// and reach them. Any change here is a data-exposure decision.
+pub const PARTNER_SEARCH_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "email",
+    "phone",
+    "mobile",
+    "city",
+    "country_id",
+    "is_company",
+    "parent_id",
+    "ref",
+];
+
+/// System models that stay **read-only** even after an operator opts them out
+/// of the block list via `unblock_models`. Schema introspection needs to *read*
+/// `ir.model` / `ir.model.fields`; attachments may be *read* for context — but a
+/// generic `write`/`unlink`/`create` against these is refused unconditionally
+/// (fail closed). Unblocking never grants mutation of Odoo's own metadata tables.
+const READ_ONLY_WHEN_UNBLOCKED: &[&str] = &[
+    "ir.model",
+    "ir.model.fields",
+    "ir.attachment",
+];
+
+/// Coarse access class used by the block-list gate. `Read` covers
+/// `search` / `read` / `fields_get` and friends; `Mutate` covers everything
+/// that can change Odoo state (`create` / `write` / `unlink` / workflow buttons)
+/// and any method we cannot positively classify as read-only (fail closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessKind {
+    Read,
+    Mutate,
+}
+
+/// Why a generic-tool call against a default-blocked model was refused.
+/// Lets the MCP layer render a message that points the operator at the right
+/// knob without leaking internal paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockDenial {
+    /// Model is in the built-in security block list and the agent has not
+    /// listed it under `unblock_models`. Resolvable by an admin.
+    SecurityDefault,
+    /// Model was unblocked but is a system metadata table — mutating verbs are
+    /// never allowed regardless of `unblock_models` (fail closed).
+    SystemReadOnly,
+}
+
+/// Decide whether a generic `odoo_search` / `odoo_execute` call against `model`
+/// clears the built-in block list, honouring the agent's `unblock_models`
+/// opt-out. Pure + fail-closed so it is unit-testable in isolation.
+///
+/// - Not default-blocked ⇒ `Ok(())` (the per-agent `allowed_models` whitelist,
+///   checked separately upstream, is the remaining gate).
+/// - Default-blocked & not in `unblock_models` ⇒ `Err(SecurityDefault)`.
+/// - Default-blocked & unblocked:
+///     - system metadata model + `Mutate` ⇒ `Err(SystemReadOnly)`.
+///     - otherwise ⇒ `Ok(())`.
+pub fn check_blocklist(
+    model: &str,
+    kind: AccessKind,
+    unblock_models: &[String],
+) -> Result<(), BlockDenial> {
+    if !BLOCKED_MODELS.contains(&model) {
+        return Ok(());
+    }
+    let unblocked = unblock_models.iter().any(|m| m == model);
+    if !unblocked {
+        return Err(BlockDenial::SecurityDefault);
+    }
+    if READ_ONLY_WHEN_UNBLOCKED.contains(&model) && kind == AccessKind::Mutate {
+        return Err(BlockDenial::SystemReadOnly);
+    }
+    Ok(())
+}
+
 /// Merge a multi-company scope into an ORM `kwargs` value's `context` map
 /// (M18 / RFC-21 §2).
 ///
@@ -112,6 +191,54 @@ pub struct OdooConnector {
     /// (`allowed_company_ids` + `company_id`). Empty ⇒ inherit the Odoo
     /// user's default companies (no scoping).
     company_ids: Vec<i64>,
+}
+
+/// Metadata for one Odoo field (from `ir.model.fields`). Metadata only — no
+/// row data is ever carried here.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchemaField {
+    pub name: String,
+    /// Odoo field type (`char`, `many2one`, `date`, …).
+    pub ttype: String,
+    /// Human label.
+    pub label: String,
+    pub required: bool,
+    /// Target model for relational fields (`many2one`/`one2many`/`many2many`).
+    pub relation: Option<String>,
+}
+
+/// Metadata for one Odoo model (from `ir.model`) plus its fields.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchemaModel {
+    /// Technical name (`res.partner`, `x_custom_model`).
+    pub model: String,
+    /// Human label.
+    pub name: String,
+    /// Whether this is a Studio/custom model (`x_`-prefixed).
+    pub custom: bool,
+    pub field_count: usize,
+    pub fields: Vec<SchemaField>,
+}
+
+/// Result of a schema introspection sweep — metadata only.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchemaReport {
+    pub models: Vec<SchemaModel>,
+    /// Models discovered before the `max_models` cap was applied.
+    pub total_models: usize,
+    /// True when the model list was truncated by `max_models`.
+    pub truncated: bool,
+}
+
+/// Whether an `ir.model` model name is pure system noise we skip during
+/// introspection (transient/wizard tables and framework internals). Custom
+/// models (`x_`) are always kept. Pure function for unit tests.
+pub fn is_introspection_noise(model: &str) -> bool {
+    if model.starts_with("x_") {
+        return false;
+    }
+    const NOISE_PREFIXES: &[&str] = &["ir.", "base.", "bus.", "base_import.", "web_editor.", "report."];
+    NOISE_PREFIXES.iter().any(|p| model.starts_with(p))
 }
 
 /// Connection status for monitoring.
@@ -290,9 +417,174 @@ impl OdooConnector {
         interpret_count_result(&result)
     }
 
-    /// Check if a model is in the blocked list.
+    /// Check if a model is in the built-in security block list (static — no
+    /// per-agent `unblock_models` override). Retained for callers that only
+    /// need the default decision; the override-aware gate is
+    /// [`check_blocklist`].
     pub fn is_model_blocked(model: &str) -> bool {
         BLOCKED_MODELS.contains(&model)
+    }
+
+    /// Introspect the Odoo schema — models plus their field metadata.
+    ///
+    /// Privileged management operation: reads `ir.model` / `ir.model.fields`
+    /// directly. The generic-tool block list is an MCP-layer concern and does
+    /// not apply to this admin sweep. Returns **metadata only** — never a
+    /// business row. Framework/transient noise is filtered out, the model count
+    /// is capped at `max_models`, and fields-per-model is capped so a large
+    /// database can't produce an unbounded payload.
+    pub async fn introspect_schema(&self, max_models: usize) -> Result<SchemaReport, String> {
+        const MAX_FIELDS_PER_MODEL: usize = 80;
+
+        // 1. Enumerate non-transient models.
+        let model_domain = vec![json!(["transient", "=", false])];
+        let raw_models = self
+            .search_read("ir.model", model_domain, &["model", "name", "transient"], 2000)
+            .await?;
+        let arr = raw_models.as_array().cloned().unwrap_or_default();
+
+        // 2. Drop framework noise; keep custom + business models.
+        let mut kept: Vec<(String, String)> = Vec::new();
+        for m in &arr {
+            let model = m.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            if model.is_empty() || is_introspection_noise(model) {
+                continue;
+            }
+            let name = m
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(model)
+                .to_string();
+            kept.push((model.to_string(), name));
+        }
+        kept.sort_by(|a, b| a.0.cmp(&b.0));
+        let total_models = kept.len();
+        let truncated = total_models > max_models;
+        kept.truncate(max_models);
+
+        if kept.is_empty() {
+            return Ok(SchemaReport { models: Vec::new(), total_models, truncated });
+        }
+
+        // 3. One batched field query for all kept models.
+        let model_names: Vec<&str> = kept.iter().map(|(m, _)| m.as_str()).collect();
+        let field_domain = vec![json!(["model", "in", model_names])];
+        let field_cap = kept
+            .len()
+            .saturating_mul(MAX_FIELDS_PER_MODEL)
+            .min(20_000);
+        let raw_fields = self
+            .search_read(
+                "ir.model.fields",
+                field_domain,
+                &["model", "name", "ttype", "field_description", "required", "relation"],
+                field_cap,
+            )
+            .await?;
+
+        // 4. Group fields by model (respecting the per-model cap).
+        let mut by_model: std::collections::HashMap<String, Vec<SchemaField>> =
+            std::collections::HashMap::new();
+        let empty = Vec::new();
+        for f in raw_fields.as_array().unwrap_or(&empty) {
+            let model = f.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if model.is_empty() {
+                continue;
+            }
+            let entry = by_model.entry(model).or_default();
+            if entry.len() >= MAX_FIELDS_PER_MODEL {
+                continue;
+            }
+            let relation = f
+                .get("relation")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            entry.push(SchemaField {
+                name: f.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                ttype: f.get("ttype").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                label: f
+                    .get("field_description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                required: f.get("required").and_then(|v| v.as_bool()).unwrap_or(false),
+                relation,
+            });
+        }
+
+        // 5. Assemble.
+        let models: Vec<SchemaModel> = kept
+            .into_iter()
+            .map(|(model, name)| {
+                let fields = by_model.remove(&model).unwrap_or_default();
+                let custom = model.starts_with("x_");
+                SchemaModel {
+                    field_count: fields.len(),
+                    custom,
+                    model,
+                    name,
+                    fields,
+                }
+            })
+            .collect();
+
+        Ok(SchemaReport { models, total_models, truncated })
+    }
+
+    /// Field metadata for a single known model via `fields_get`. Read-only,
+    /// metadata only. Caps the number of returned fields.
+    pub async fn schema_fields(&self, model: &str, max_fields: usize) -> Result<Vec<SchemaField>, String> {
+        let raw = self
+            .execute_kw(
+                model,
+                "fields_get",
+                vec![json!([])],
+                json!({"attributes": ["string", "type", "required", "relation"]}),
+            )
+            .await?;
+        let obj = raw
+            .as_object()
+            .ok_or_else(|| format!("Unexpected fields_get response for '{model}'"))?;
+        let mut out: Vec<SchemaField> = Vec::new();
+        for (fname, meta) in obj {
+            if out.len() >= max_fields {
+                break;
+            }
+            out.push(SchemaField {
+                name: fname.clone(),
+                ttype: meta.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                label: meta.get("string").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                required: meta.get("required").and_then(|v| v.as_bool()).unwrap_or(false),
+                relation: meta
+                    .get("relation")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Safe customer search over `res.partner`. Field set is fixed to
+    /// non-sensitive columns (no bank/tax data) and the query matches
+    /// name/email/ref. Privileged (bypasses the generic block list) because the
+    /// field projection is hard-coded — callers still enforce `OdooRead` scope
+    /// and per-agent `read` permission upstream.
+    pub async fn partner_search(&self, query: &str, limit: usize) -> Result<Value, String> {
+        let mut domain: Vec<Value> = Vec::new();
+        let q = query.trim();
+        if !q.is_empty() {
+            // OR over name / email / ref.
+            domain.push(json!("|"));
+            domain.push(json!("|"));
+            domain.push(json!(["name", "ilike", q]));
+            domain.push(json!(["email", "ilike", q]));
+            domain.push(json!(["ref", "ilike", q]));
+        }
+        self.search_read("res.partner", domain, PARTNER_SEARCH_FIELDS, limit)
+            .await
     }
 
     /// Get connection status for monitoring.
@@ -386,5 +678,100 @@ mod tests {
         assert!(interpret_count_result(&Value::Null).is_err());
         assert!(interpret_count_result(&json!(false)).is_err());
         assert!(interpret_count_result(&json!("3")).is_err());
+    }
+
+    // ── A: configurable block list (unblock_models) ───────────────────────
+
+    #[test]
+    fn check_blocklist_allows_non_blocked_model() {
+        // A model not in the default block list always clears this gate.
+        assert!(check_blocklist("sale.order", AccessKind::Read, &[]).is_ok());
+        assert!(check_blocklist("crm.lead", AccessKind::Mutate, &[]).is_ok());
+    }
+
+    #[test]
+    fn check_blocklist_denies_blocked_model_without_unblock() {
+        // res.partner is default-blocked; no opt-out ⇒ security default denial.
+        assert_eq!(
+            check_blocklist("res.partner", AccessKind::Read, &[]),
+            Err(BlockDenial::SecurityDefault)
+        );
+    }
+
+    #[test]
+    fn check_blocklist_allows_unblocked_business_model() {
+        // Opting res.partner out lets both read and mutate through — it's a
+        // business (not system) table.
+        let unblock = vec!["res.partner".to_string()];
+        assert!(check_blocklist("res.partner", AccessKind::Read, &unblock).is_ok());
+        assert!(check_blocklist("res.partner", AccessKind::Mutate, &unblock).is_ok());
+    }
+
+    #[test]
+    fn check_blocklist_system_model_read_only_even_when_unblocked() {
+        // ir.model / ir.model.fields may be READ once unblocked (schema
+        // introspection), but a mutating verb is refused fail-closed.
+        let unblock = vec!["ir.model".to_string(), "ir.model.fields".to_string()];
+        assert!(check_blocklist("ir.model", AccessKind::Read, &unblock).is_ok());
+        assert_eq!(
+            check_blocklist("ir.model", AccessKind::Mutate, &unblock),
+            Err(BlockDenial::SystemReadOnly)
+        );
+        assert!(check_blocklist("ir.model.fields", AccessKind::Read, &unblock).is_ok());
+        assert_eq!(
+            check_blocklist("ir.model.fields", AccessKind::Mutate, &unblock),
+            Err(BlockDenial::SystemReadOnly)
+        );
+    }
+
+    #[test]
+    fn check_blocklist_attachment_read_only_when_unblocked() {
+        let unblock = vec!["ir.attachment".to_string()];
+        assert!(check_blocklist("ir.attachment", AccessKind::Read, &unblock).is_ok());
+        assert_eq!(
+            check_blocklist("ir.attachment", AccessKind::Mutate, &unblock),
+            Err(BlockDenial::SystemReadOnly)
+        );
+    }
+
+    // ── B: introspection noise filter ─────────────────────────────────────
+
+    #[test]
+    fn introspection_keeps_business_and_custom_models() {
+        assert!(!is_introspection_noise("res.partner"));
+        assert!(!is_introspection_noise("sale.order"));
+        assert!(!is_introspection_noise("account.move"));
+        // Custom (Studio) models are always kept even if oddly prefixed.
+        assert!(!is_introspection_noise("x_custom_model"));
+        assert!(!is_introspection_noise("x_bus_route"));
+    }
+
+    #[test]
+    fn introspection_drops_framework_noise() {
+        assert!(is_introspection_noise("ir.model"));
+        assert!(is_introspection_noise("ir.ui.view"));
+        assert!(is_introspection_noise("base.language.install"));
+        assert!(is_introspection_noise("bus.bus"));
+        assert!(is_introspection_noise("report.layout"));
+    }
+
+    // ── C: partner search field whitelist ─────────────────────────────────
+
+    #[test]
+    fn partner_search_fields_exclude_sensitive_columns() {
+        // The whitelist must never leak bank / tax / credit columns.
+        for banned in ["vat", "bank_ids", "credit", "debit", "property_account_receivable_id"] {
+            assert!(
+                !PARTNER_SEARCH_FIELDS.contains(&banned),
+                "partner search must not expose '{banned}'"
+            );
+        }
+        // And it must carry the identifying columns callers rely on.
+        for needed in ["id", "name", "email", "ref"] {
+            assert!(
+                PARTNER_SEARCH_FIELDS.contains(&needed),
+                "partner search must expose '{needed}'"
+            );
+        }
     }
 }

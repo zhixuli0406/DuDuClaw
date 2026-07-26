@@ -133,6 +133,16 @@ export interface ChannelStatus {
   error?: string;
 }
 
+export interface CliCredentialInfo {
+  runtime: 'codex' | 'gemini' | 'grok';
+  /** Display path of the credential store, e.g. "~/.grok/auth.json". */
+  store: string;
+  installed: boolean;
+  present: boolean;
+  /** Epoch seconds of the credential file's last write, when present. */
+  modified_at: number | null;
+}
+
 export interface AccountInfo {
   id: string;
   auth_method: 'apikey' | 'oauth';
@@ -358,7 +368,21 @@ export interface ReliabilitySummary {
 
 // ── Task Board types ────────────────────────────────────────
 
-export type TaskStatus = 'todo' | 'in_progress' | 'done' | 'blocked' | 'needs_human';
+// Iterative Kanban (v1.45): `review` (goal-mode acceptance pending) and
+// `revising` (judge-rejected, awaiting the next round) are now first-class
+// board columns. `pending` / `cancelled` are transient/terminal states the
+// backend may also return; the board simply doesn't give them a column.
+export type TaskStatus =
+  | 'todo'
+  | 'in_progress'
+  | 'review'
+  | 'revising'
+  | 'done'
+  | 'blocked'
+  | 'needs_human'
+  | 'failed'
+  | 'pending'
+  | 'cancelled';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'urgent';
 
 export interface TaskInfo {
@@ -378,6 +402,47 @@ export interface TaskInfo {
   parent_task_id?: string;
   tags: string[];
   message_id?: string;
+  // ── Iterative Kanban (v1.45) ──────────────────────────────
+  /** Judge-rejection round counter (0 = first attempt). */
+  revision_round?: number;
+  /** Set once `revision_round` reaches the soft cap — diminishing returns. */
+  diminishing?: boolean;
+  /** Cumulative agent processing seconds (the "agent clock"). */
+  agent_seconds?: number;
+  /** Lease deadline (RFC3339); a past value with an in_progress task = stale. */
+  lease_expires_at?: string;
+}
+
+/** One judge-review round of a goal-mode task (Iterative Kanban timeline). */
+export interface TaskIteration {
+  round: number;
+  dispatched_at: string;
+  submitted_at?: string | null;
+  judged_at?: string | null;
+  verdict?: 'accepted' | 'rejected' | 'escalated' | null;
+  judge_feedback?: string | null;
+  feedback_class?: string | null;
+}
+
+/** Per-agent flow metrics (Iterative Kanban analytics). */
+export interface AgentFlowMetrics {
+  agent_id: string;
+  goal_tasks: number;
+  finished: number;
+  first_pass_yield: number;
+  avg_rounds: number;
+  avg_agent_seconds: number;
+  avg_cycle_seconds: number;
+  review_queue_depth: number;
+}
+
+/** Board-level + per-agent flow metrics returned by tasks.flow_metrics. */
+export interface FlowMetrics {
+  agents: AgentFlowMetrics[];
+  review_queue_depth: number;
+  review_wip_limit: number;
+  accepts_last_7d: number;
+  avg_daily_accepts_7d: number;
 }
 
 // RFC-24 Decision Continuity
@@ -870,6 +935,25 @@ export interface OdooStatus {
   error?: string;
 }
 
+/** One model row from `odoo.discover_schema` (metadata only). */
+export interface OdooSchemaModel {
+  model: string;
+  name: string;
+  custom: boolean;
+  field_count: number;
+}
+
+/** Result of an `odoo.discover_schema` scan. */
+export interface OdooDiscoverSchemaResult {
+  success: boolean;
+  message?: string;
+  models?: OdooSchemaModel[];
+  total_models?: number;
+  truncated?: boolean;
+  wiki_written?: boolean;
+  wiki_note?: string;
+}
+
 export interface OdooConfig {
   url: string;
   db: string;
@@ -880,6 +964,7 @@ export interface OdooConfig {
   poll_interval_seconds: number;
   poll_models: string[];
   webhook_enabled: boolean;
+  unblock_models?: string[];
   features_crm: boolean;
   features_sale: boolean;
   features_inventory: boolean;
@@ -901,6 +986,7 @@ export interface OdooConfigUpdate {
   poll_models: string[];
   webhook_enabled: boolean;
   webhook_secret?: string;
+  unblock_models?: string[];
   features_crm: boolean;
   features_sale: boolean;
   features_inventory: boolean;
@@ -2044,6 +2130,8 @@ export interface OdooAgentConfig {
   db?: string;
   username?: string;
   allowed_models: string[];
+  /** Models opted out of the built-in security block list. */
+  unblock_models?: string[];
   allowed_actions: string[];
   company_ids: number[];
   api_key_set: boolean;
@@ -2064,6 +2152,7 @@ export interface OdooAgentConfigSet {
   password?: string;
   profile?: string;
   allowed_models?: string[];
+  unblock_models?: string[];
   allowed_actions?: string[];
   company_ids?: number[];
 }
@@ -2832,7 +2921,11 @@ export const api = {
       client.call('auth.cli_login.finalize', { session_id: sessionId }) as Promise<{
         registered: boolean;
         account_id?: string;
+        /** 'cli_store' = credentials persisted to the CLI's own store — a
+         *  success for non-Claude CLIs (no [[accounts]] entry needed). */
         reason?: string;
+        /** Present when reason === 'cli_store': the credential file path. */
+        store?: string;
       }>,
   },
 
@@ -2841,6 +2934,12 @@ export const api = {
       client.call('accounts.list') as Promise<{ accounts: AccountInfo[] }>,
     budgetSummary: () =>
       client.call('accounts.budget_summary') as Promise<BudgetSummary>,
+    /** CLI-store credentials (grok/codex/gemini) — subscription logins that
+     *  live in the CLI's own credential file, not in rotator accounts. */
+    cliCredentials: () =>
+      client.call('accounts.cli_credentials') as Promise<{
+        credentials: CliCredentialInfo[];
+      }>,
     rotate: () =>
       client.call('accounts.rotate') as Promise<{ success: boolean }>,
     health: () =>
@@ -3336,6 +3435,13 @@ export const api = {
         success: boolean;
         message: string;
       }>,
+    /** Introspect models/fields, write a schema summary to the wiki, and
+     *  return a lightweight model list. Metadata only — no business rows. */
+    discoverSchema: (maxModels?: number) =>
+      client.call(
+        'odoo.discover_schema',
+        maxModels ? { max_models: maxModels } : {},
+      ) as Promise<OdooDiscoverSchemaResult>,
   },
   identity: {
     configGet: () =>
@@ -3373,6 +3479,7 @@ export const api = {
       client.call('mcp.oauth.status', { provider_id: providerId }) as Promise<{
         authenticated: boolean;
         expires_at: string | null;
+        scopes?: string[];
       }>,
     oauthRevoke: (providerId: string) =>
       client.call('mcp.oauth.revoke', { provider_id: providerId }) as Promise<{ success: boolean }>,
@@ -3438,6 +3545,14 @@ export const api = {
     // L2: list a task's comments (oldest first).
     comments: (taskId: string) =>
       client.call('tasks.comments', { task_id: taskId }) as Promise<{ comments: TaskComment[] }>,
+    // Iterative Kanban: a task's revision timeline (dispatched → submitted →
+    // verdict per round).
+    iterations: (taskId: string) =>
+      client.call('tasks.iterations', { task_id: taskId }) as Promise<{ iterations: TaskIteration[] }>,
+    // Iterative Kanban: per-agent + board flow metrics. Non-admins pass an
+    // agent_id and see only that agent's slice.
+    flowMetrics: (agentId?: string) =>
+      client.call('tasks.flow_metrics', agentId ? { agent_id: agentId } : {}) as Promise<FlowMetrics>,
   },
   // U4 co-edited plans — a shared, ordered step list per AI employee that both
   // the user (here) and the agent (plan_get / plan_update_step MCP) edit.

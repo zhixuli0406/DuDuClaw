@@ -56,10 +56,21 @@ pub fn builtin_providers(redirect_uri: &str) -> Vec<McpOAuthConfig> {
             client_secret: String::new(),
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
             token_url: "https://oauth2.googleapis.com/token".into(),
+            // Native Gmail + Calendar tool surface. `gmail.compose` is required
+            // to create drafts; `calendar.events` to create/list events. `drive`
+            // was dropped (no Drive tools ship) to keep the authorization
+            // surface minimal. Tokens authorized with the old scope set will
+            // 403 on the new write APIs → the tools guide the user to reconnect.
             scopes: vec![
-                "https://www.googleapis.com/auth/drive".into(),
                 "https://www.googleapis.com/auth/gmail.readonly".into(),
-                "https://www.googleapis.com/auth/calendar".into(),
+                "https://www.googleapis.com/auth/gmail.compose".into(),
+                "https://www.googleapis.com/auth/calendar.events".into(),
+                // v1.45: Sheets read/append native tools. Tokens authorized
+                // before this scope was added will 403 on the Sheets APIs → the
+                // tools guide the user to reconnect (google_status flags it as a
+                // missing scope).
+                "https://www.googleapis.com/auth/spreadsheets".into(),
+                "https://www.googleapis.com/auth/userinfo.email".into(),
             ],
             redirect_uri: redirect_uri.to_string(),
         },
@@ -69,7 +80,24 @@ pub fn builtin_providers(redirect_uri: &str) -> Vec<McpOAuthConfig> {
             client_secret: String::new(),
             auth_url: "https://github.com/login/oauth/authorize".into(),
             token_url: "https://github.com/login/oauth/access_token".into(),
-            scopes: vec!["repo".into(), "read:org".into()],
+            // `repo` covers issue/PR read + issue comment on both public and
+            // private repositories. Classic OAuth App tokens have no expiry
+            // unless the app opts into token expiration (then a refresh_token is
+            // issued) — `exchange_code` parses both shapes.
+            scopes: vec!["repo".into()],
+            redirect_uri: redirect_uri.to_string(),
+        },
+        McpOAuthConfig {
+            provider_id: "notion".into(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            auth_url: "https://api.notion.com/v1/oauth/authorize".into(),
+            token_url: "https://api.notion.com/v1/oauth/token".into(),
+            // Notion OAuth capabilities are configured on the integration in the
+            // Notion dashboard, not via the `scope` query param, so the scope
+            // list stays empty. The access token is long-lived and carries NO
+            // refresh_token — `expires_at = None` is the normal, healthy state.
+            scopes: vec![],
             redirect_uri: redirect_uri.to_string(),
         },
         McpOAuthConfig {
@@ -111,7 +139,7 @@ pub fn generate_pkce() -> (String, String) {
 /// Build the full authorization URL with PKCE and state parameters.
 pub fn build_auth_url(config: &McpOAuthConfig, state: &str, code_challenge: &str) -> String {
     let scopes = config.scopes.join(" ");
-    format!(
+    let mut url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
         config.auth_url,
         urlencoded(&config.client_id),
@@ -119,7 +147,21 @@ pub fn build_auth_url(config: &McpOAuthConfig, state: &str, code_challenge: &str
         urlencoded(&scopes),
         urlencoded(state),
         urlencoded(code_challenge),
-    )
+    );
+    // Google only returns a refresh_token when `access_type=offline` is set, and
+    // only re-issues one when the user is forced through consent. Without this,
+    // the access token expires in ~1h with no way to refresh — breaking the
+    // native Gmail/Calendar tools. Other providers ignore these extra params.
+    if config.auth_url.contains("accounts.google.com") {
+        url.push_str("&access_type=offline&prompt=consent");
+    }
+    // Notion requires `owner=user` to run the user-authorization flow (without
+    // it the authorize endpoint errors). Notion ignores the PKCE challenge and
+    // scope params, which are harmless extras here.
+    if config.auth_url.contains("api.notion.com") {
+        url.push_str("&owner=user");
+    }
+    url
 }
 
 /// Minimal percent-encoding for URL query values.
@@ -141,6 +183,78 @@ fn urlencoded(s: &str) -> String {
 
 // ── Token exchange ──────────────────────────────────────────
 
+/// How a provider's token endpoint expects the authorization-code exchange to
+/// be assembled. Different providers diverge from the "plain form POST" default:
+///
+/// - **Notion** requires HTTP Basic auth (`client_id:client_secret`) plus a
+///   JSON body `{grant_type, code, redirect_uri}` — client credentials must NOT
+///   appear in the body, and it does not use PKCE.
+/// - **GitHub / Google / Slack** take a form-encoded body with the credentials
+///   inline; GitHub additionally needs `Accept: application/json` (which the
+///   others tolerate) or it replies form-encoded.
+#[derive(Debug, PartialEq)]
+pub enum ExchangeBody {
+    /// Form-encoded key/value pairs (default path).
+    Form(Vec<(String, String)>),
+    /// JSON object body (Notion).
+    Json(serde_json::Value),
+}
+
+/// A provider-specific, side-effect-free plan for the token-exchange request.
+/// Unit-tested per provider so the wire assembly can't silently regress.
+#[derive(Debug, PartialEq)]
+pub struct ExchangeRequest {
+    pub url: String,
+    /// Send `Authorization: Basic base64(client_id:client_secret)` (Notion).
+    pub basic_auth: bool,
+    /// Send `Accept: application/json` (GitHub, and harmless elsewhere).
+    pub accept_json: bool,
+    pub body: ExchangeBody,
+}
+
+fn is_notion_provider(config: &McpOAuthConfig) -> bool {
+    config.provider_id == "notion" || config.token_url.contains("api.notion.com")
+}
+
+/// Build the token-exchange request plan for a provider. Pure function — no I/O.
+pub fn build_exchange_request(
+    config: &McpOAuthConfig,
+    code: &str,
+    code_verifier: &str,
+) -> ExchangeRequest {
+    if is_notion_provider(config) {
+        // Notion: Basic auth for the client credentials, JSON body without them,
+        // and no PKCE verifier.
+        return ExchangeRequest {
+            url: config.token_url.clone(),
+            basic_auth: true,
+            accept_json: true,
+            body: ExchangeBody::Json(serde_json::json!({
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": config.redirect_uri,
+            })),
+        };
+    }
+
+    // Default (GitHub, Google, Slack, generic custom providers): form POST with
+    // the credentials inline. `Accept: application/json` forces GitHub to reply
+    // JSON instead of its default form-encoded body; other providers ignore it.
+    ExchangeRequest {
+        url: config.token_url.clone(),
+        basic_auth: false,
+        accept_json: true,
+        body: ExchangeBody::Form(vec![
+            ("grant_type".into(), "authorization_code".into()),
+            ("code".into(), code.into()),
+            ("redirect_uri".into(), config.redirect_uri.clone()),
+            ("client_id".into(), config.client_id.clone()),
+            ("client_secret".into(), config.client_secret.clone()),
+            ("code_verifier".into(), code_verifier.into()),
+        ]),
+    }
+}
+
 /// Exchange an authorization code for tokens.
 pub async fn exchange_code(
     config: &McpOAuthConfig,
@@ -148,19 +262,21 @@ pub async fn exchange_code(
     code_verifier: &str,
 ) -> Result<McpOAuthToken, String> {
     let client = reqwest::Client::new();
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("redirect_uri", &config.redirect_uri),
-        ("client_id", &config.client_id),
-        ("client_secret", &config.client_secret),
-        ("code_verifier", code_verifier),
-    ];
+    let plan = build_exchange_request(config, code, code_verifier);
 
-    let resp = client
-        .post(&config.token_url)
-        .header("Accept", "application/json")
-        .form(&params)
+    let mut req = client.post(&plan.url);
+    if plan.accept_json {
+        req = req.header("Accept", "application/json");
+    }
+    if plan.basic_auth {
+        req = req.basic_auth(&config.client_id, Some(&config.client_secret));
+    }
+    req = match &plan.body {
+        ExchangeBody::Form(params) => req.form(params),
+        ExchangeBody::Json(v) => req.json(v),
+    };
+
+    let resp = req
         .send()
         .await
         .map_err(|e| format!("Token request failed: {e}"))?;
@@ -391,6 +507,107 @@ pub fn cleanup_pending(pending: &mut HashMap<String, PendingOAuth>) {
     pending.retain(|_, p| p.created_at.elapsed().as_secs() < PENDING_TTL_SECS);
 }
 
+// ── Client credential persistence ───────────────────────────
+//
+// The OAuth *token* (access + refresh) is persisted, but the client
+// credentials used to obtain it were previously discarded after the flow (they
+// only lived in the in-memory `PendingOAuth`). A refresh_token grant needs the
+// same `client_id`/`client_secret`, so we persist a per-provider client config
+// here — `client_secret` encrypted at rest with the same keyfile as the token
+// file. Stored in `mcp-oauth-configs.json`.
+
+const CLIENT_CONFIG_FILE: &str = "mcp-oauth-configs.json";
+
+/// Persisted client credentials + endpoints for a provider. Enables in-place
+/// token refresh without re-prompting the user for their client secret.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOAuthClientConfig {
+    pub provider_id: String,
+    pub client_id: String,
+    /// Encrypted at rest (`enc:v1:` prefix). Decrypted on load.
+    pub client_secret: String,
+    pub auth_url: String,
+    pub token_url: String,
+    pub scopes: Vec<String>,
+    pub redirect_uri: String,
+}
+
+/// Load all stored client configs, decrypting `client_secret`.
+pub fn load_client_configs(home_dir: &Path) -> Vec<McpOAuthClientConfig> {
+    let path = home_dir.join(CLIENT_CONFIG_FILE);
+    let mut configs: Vec<McpOAuthClientConfig> = match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    for c in &mut configs {
+        c.client_secret = decrypt_field(&c.client_secret, home_dir);
+    }
+    configs
+}
+
+/// Save client configs with atomic write, encrypting `client_secret`.
+fn save_client_configs(home_dir: &Path, configs: &[McpOAuthClientConfig]) -> Result<(), String> {
+    let path = home_dir.join(CLIENT_CONFIG_FILE);
+    let on_disk: Vec<McpOAuthClientConfig> = configs
+        .iter()
+        .map(|c| McpOAuthClientConfig {
+            provider_id: c.provider_id.clone(),
+            client_id: c.client_id.clone(),
+            client_secret: encrypt_field(&c.client_secret, home_dir),
+            auth_url: c.auth_url.clone(),
+            token_url: c.token_url.clone(),
+            scopes: c.scopes.clone(),
+            redirect_uri: c.redirect_uri.clone(),
+        })
+        .collect();
+
+    let json = serde_json::to_string_pretty(&on_disk)
+        .map_err(|e| format!("Failed to serialize client configs: {e}"))?;
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json)
+        .map_err(|e| format!("Failed to write temp client-config file: {e}"))?;
+    std::fs::rename(&tmp_path, &path)
+        .map_err(|e| format!("Failed to rename client-config file: {e}"))?;
+    Ok(())
+}
+
+/// Get the stored client config for a provider (secret decrypted).
+pub fn get_client_config(home_dir: &Path, provider_id: &str) -> Option<McpOAuthClientConfig> {
+    load_client_configs(home_dir)
+        .into_iter()
+        .find(|c| c.provider_id == provider_id)
+}
+
+/// Upsert a client config: replace existing for the same provider, or append.
+pub fn upsert_client_config(
+    home_dir: &Path,
+    config: McpOAuthClientConfig,
+) -> Result<(), String> {
+    let mut configs = load_client_configs(home_dir);
+    configs.retain(|c| c.provider_id != config.provider_id);
+    configs.push(config);
+    save_client_configs(home_dir, &configs)
+}
+
+/// Whether a provider has persisted client credentials (used for the dashboard
+/// `configured` flag, since the built-in templates carry empty credentials).
+pub fn has_client_config(home_dir: &Path, provider_id: &str) -> bool {
+    get_client_config(home_dir, provider_id)
+        .map(|c| !c.client_id.is_empty())
+        .unwrap_or(false)
+}
+
+/// Remove a provider's stored client config (called on revoke).
+pub fn remove_client_config(home_dir: &Path, provider_id: &str) -> Result<(), String> {
+    let mut configs = load_client_configs(home_dir);
+    let before = configs.len();
+    configs.retain(|c| c.provider_id != provider_id);
+    if configs.len() == before {
+        return Ok(());
+    }
+    save_client_configs(home_dir, &configs)
+}
+
 #[cfg(test)]
 mod xc1_token_encryption_tests {
     use super::*;
@@ -436,5 +653,155 @@ mod xc1_token_encryption_tests {
         let loaded = load_tokens(&home);
         assert_eq!(loaded[0].access_token, "ya29.legacy");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn client_config_round_trips_and_encrypts_secret() {
+        let home = tmp_home();
+        let cfg = McpOAuthClientConfig {
+            provider_id: "google".into(),
+            client_id: "1234.apps.googleusercontent.com".into(),
+            client_secret: "GOCSPX-super-secret".into(),
+            auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".into()],
+            redirect_uri: "http://localhost:3000/api/mcp/oauth/callback".into(),
+        };
+        upsert_client_config(&home, cfg.clone()).expect("save");
+
+        // Secret must be encrypted at rest; client_id stays readable.
+        let raw = std::fs::read_to_string(home.join(CLIENT_CONFIG_FILE)).unwrap();
+        assert!(!raw.contains("GOCSPX-super-secret"), "secret leaked: {raw}");
+        assert!(raw.contains("1234.apps.googleusercontent.com"));
+
+        let loaded = get_client_config(&home, "google").expect("present");
+        assert_eq!(loaded.client_secret, "GOCSPX-super-secret");
+        assert_eq!(loaded.client_id, cfg.client_id);
+        assert!(has_client_config(&home, "google"));
+        assert!(!has_client_config(&home, "github"));
+
+        remove_client_config(&home, "google").expect("remove");
+        assert!(get_client_config(&home, "google").is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn google_auth_url_requests_offline_access() {
+        let cfg = McpOAuthConfig {
+            provider_id: "google".into(),
+            client_id: "cid".into(),
+            client_secret: String::new(),
+            auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            scopes: vec!["s1".into()],
+            redirect_uri: "http://localhost:3000/api/mcp/oauth/callback".into(),
+        };
+        let url = build_auth_url(&cfg, "state123", "challenge");
+        assert!(url.contains("access_type=offline"), "url: {url}");
+        assert!(url.contains("prompt=consent"), "url: {url}");
+
+        // Non-Google providers must NOT get the extra params.
+        let gh = McpOAuthConfig {
+            auth_url: "https://github.com/login/oauth/authorize".into(),
+            ..cfg
+        };
+        let gh_url = build_auth_url(&gh, "s", "c");
+        assert!(!gh_url.contains("access_type=offline"));
+    }
+
+    fn cfg(provider: &str, auth_url: &str, token_url: &str) -> McpOAuthConfig {
+        McpOAuthConfig {
+            provider_id: provider.into(),
+            client_id: "cid".into(),
+            client_secret: "csecret".into(),
+            auth_url: auth_url.into(),
+            token_url: token_url.into(),
+            scopes: vec![],
+            redirect_uri: "http://localhost:3000/api/mcp/oauth/callback".into(),
+        }
+    }
+
+    #[test]
+    fn notion_auth_url_requests_owner_user() {
+        let c = cfg(
+            "notion",
+            "https://api.notion.com/v1/oauth/authorize",
+            "https://api.notion.com/v1/oauth/token",
+        );
+        let url = build_auth_url(&c, "st", "ch");
+        assert!(url.contains("&owner=user"), "url: {url}");
+        // Google-only extras must not leak onto Notion.
+        assert!(!url.contains("access_type=offline"));
+    }
+
+    #[test]
+    fn notion_exchange_uses_basic_auth_and_json_body() {
+        let c = cfg(
+            "notion",
+            "https://api.notion.com/v1/oauth/authorize",
+            "https://api.notion.com/v1/oauth/token",
+        );
+        let req = build_exchange_request(&c, "auth_code_123", "verifier_ignored");
+        assert!(req.basic_auth, "Notion must use HTTP Basic auth");
+        assert!(req.accept_json);
+        match req.body {
+            ExchangeBody::Json(v) => {
+                assert_eq!(v["grant_type"], "authorization_code");
+                assert_eq!(v["code"], "auth_code_123");
+                assert_eq!(v["redirect_uri"], c.redirect_uri);
+                // Credentials must NOT appear in the JSON body (they go in the
+                // Basic auth header) and PKCE is not used by Notion.
+                assert!(v.get("client_id").is_none());
+                assert!(v.get("client_secret").is_none());
+                assert!(v.get("code_verifier").is_none());
+            }
+            other => panic!("expected JSON body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notion_detected_by_token_url_even_with_custom_provider_id() {
+        let c = cfg(
+            "my-notion",
+            "https://api.notion.com/v1/oauth/authorize",
+            "https://api.notion.com/v1/oauth/token",
+        );
+        let req = build_exchange_request(&c, "x", "y");
+        assert!(req.basic_auth, "token_url host should trigger Notion path");
+    }
+
+    #[test]
+    fn github_exchange_is_form_post_with_accept_json() {
+        let c = cfg(
+            "github",
+            "https://github.com/login/oauth/authorize",
+            "https://github.com/login/oauth/access_token",
+        );
+        let req = build_exchange_request(&c, "gh_code", "verifier");
+        assert!(!req.basic_auth);
+        assert!(req.accept_json, "GitHub needs Accept: application/json to get JSON");
+        match req.body {
+            ExchangeBody::Form(params) => {
+                let get = |k: &str| params.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.as_str());
+                assert_eq!(get("grant_type"), Some("authorization_code"));
+                assert_eq!(get("code"), Some("gh_code"));
+                assert_eq!(get("client_id"), Some("cid"));
+                assert_eq!(get("client_secret"), Some("csecret"));
+                assert_eq!(get("code_verifier"), Some("verifier"));
+            }
+            other => panic!("expected Form body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn google_exchange_is_form_post() {
+        let c = cfg(
+            "google",
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://oauth2.googleapis.com/token",
+        );
+        let req = build_exchange_request(&c, "g_code", "verifier");
+        assert!(!req.basic_auth);
+        assert!(matches!(req.body, ExchangeBody::Form(_)));
     }
 }

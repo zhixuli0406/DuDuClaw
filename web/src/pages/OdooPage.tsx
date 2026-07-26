@@ -1,7 +1,13 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type OdooStatus, type OdooAgentConfig, type OdooAgentConfigSet } from '@/lib/api';
+import {
+  api,
+  type OdooStatus,
+  type OdooAgentConfig,
+  type OdooAgentConfigSet,
+  type OdooDiscoverSchemaResult,
+} from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
   CheckCircle,
@@ -10,6 +16,8 @@ import {
   RefreshCw,
   Save,
   AlertTriangle,
+  Database,
+  Search,
 } from 'lucide-react';
 import {
   Button,
@@ -52,6 +60,7 @@ export function OdooPage() {
   const [pollModels, setPollModels] = useState('crm.lead,sale.order');
   const [webhookEnabled, setWebhookEnabled] = useState(false);
   const [webhookSecret, setWebhookSecret] = useState('');
+  const [globalUnblockModels, setGlobalUnblockModels] = useState('');
 
   // Feature toggles
   const [features, setFeatures] = useState<Record<FeatureKey, boolean>>({
@@ -73,6 +82,13 @@ export function OdooPage() {
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Schema discovery ("解析資料庫")
+  const [discovering, setDiscovering] = useState(false);
+  const [schema, setSchema] = useState<OdooDiscoverSchemaResult | null>(null);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+  const [schemaFilter, setSchemaFilter] = useState('');
+  const [pickedModels, setPickedModels] = useState<Set<string>>(new Set());
+
   const loadConfig = useCallback(async () => {
     setLoading(true);
     try {
@@ -91,6 +107,7 @@ export function OdooPage() {
         setPollInterval(String(configRes.poll_interval_seconds ?? 60));
         setPollModels((configRes.poll_models ?? []).join(','));
         setWebhookEnabled(configRes.webhook_enabled ?? false);
+        setGlobalUnblockModels((configRes.unblock_models ?? []).join(', '));
         setFeatures({
           crm: configRes.features_crm ?? true,
           sale: configRes.features_sale ?? true,
@@ -136,6 +153,10 @@ export function OdooPage() {
         poll_models: pollModels.split(',').map((s) => s.trim()).filter(Boolean),
         webhook_enabled: webhookEnabled,
         webhook_secret: webhookSecret || undefined,
+        unblock_models: globalUnblockModels
+          .split(/[,\s]+/)
+          .map((s) => s.trim())
+          .filter(Boolean),
         features_crm: features.crm,
         features_sale: features.sale,
         features_inventory: features.inventory,
@@ -187,6 +208,43 @@ export function OdooPage() {
       setTesting(false);
     }
   };
+
+  const handleDiscover = async () => {
+    setDiscovering(true);
+    setSchemaError(null);
+    try {
+      const res = await api.odoo.discoverSchema();
+      if (!res.success) {
+        setSchema(null);
+        setSchemaError(res.message || t('odoo.schema.failed'));
+        return;
+      }
+      setSchema(res);
+      setPickedModels(new Set());
+      setSchemaFilter('');
+    } catch (e) {
+      const detail = typeof e === 'string' ? e : e instanceof Error ? e.message : '';
+      setSchema(null);
+      setSchemaError(detail ? `${t('odoo.schema.failed')}: ${detail}` : t('odoo.schema.failed'));
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
+  const toggleModel = (model: string) => {
+    setPickedModels((prev) => {
+      const next = new Set(prev);
+      if (next.has(model)) next.delete(model);
+      else next.add(model);
+      return next;
+    });
+  };
+
+  const filteredModels = (schema?.models ?? []).filter((m) => {
+    const q = schemaFilter.trim().toLowerCase();
+    if (!q) return true;
+    return m.model.toLowerCase().includes(q) || m.name.toLowerCase().includes(q);
+  });
 
   const protocolOptions: SelectOption[] = [
     { value: 'jsonrpc', label: 'JSON-RPC' },
@@ -288,6 +346,17 @@ export function OdooPage() {
             {testing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
             {t('odoo.testConnection')}
           </Button>
+          {/* Schema discovery — introspect models/fields + write to the wiki. */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleDiscover}
+            disabled={discovering || !url.trim() || !db.trim() || saving}
+            title={t('odoo.schema.hint')}
+          >
+            {discovering ? <Loader2 className="animate-spin" /> : <Database />}
+            {t('odoo.schema.discover')}
+          </Button>
           {testResult && (
             <span
               className={cn(
@@ -299,7 +368,81 @@ export function OdooPage() {
               {testResult.message}
             </span>
           )}
+          {schemaError && (
+            <span className="inline-flex items-center gap-1.5 text-sm font-medium text-destructive">
+              <AlertTriangle className="size-4" />
+              {schemaError}
+            </span>
+          )}
         </div>
+
+        {/* Schema discovery results — searchable, checkable model list. */}
+        {schema && (
+          <div className="space-y-3 rounded-lg border border-surface-border p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-sm font-medium">
+                {t('odoo.schema.found')
+                  .replace('{count}', String(schema.total_models ?? 0))
+                  .replace('{shown}', String(schema.models?.length ?? 0))}
+                {schema.truncated ? ` ${t('odoo.schema.truncated')}` : ''}
+              </p>
+              {schema.wiki_written ? (
+                <span className="inline-flex items-center gap-1.5 text-xs text-success">
+                  <CheckCircle className="size-3.5" />
+                  {t('odoo.schema.wikiWritten')}
+                </span>
+              ) : (
+                schema.wiki_note && (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <AlertTriangle className="size-3.5" />
+                    {t('odoo.schema.wikiSkipped')}
+                  </span>
+                )
+              )}
+            </div>
+
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                className="pl-8"
+                placeholder={t('odoo.schema.filter')}
+                value={schemaFilter}
+                onChange={(e) => setSchemaFilter(e.target.value)}
+              />
+            </div>
+
+            <div className="max-h-72 overflow-y-auto rounded-md border border-surface-border">
+              {filteredModels.length === 0 ? (
+                <p className="p-3 text-center text-sm text-muted-foreground">{t('common.noData')}</p>
+              ) : (
+                <ul className="divide-y divide-surface-border">
+                  {filteredModels.map((m) => (
+                    <li key={m.model}>
+                      <label className="flex cursor-pointer items-center gap-3 px-3 py-2 text-sm hover:bg-surface-hover">
+                        <Checkbox
+                          checked={pickedModels.has(m.model)}
+                          onCheckedChange={() => toggleModel(m.model)}
+                          aria-label={m.model}
+                        />
+                        <span className="font-mono text-xs">{m.model}</span>
+                        {m.custom && (
+                          <Badge className="border-brand/30 bg-brand/10 text-brand">
+                            {t('odoo.schema.custom')}
+                          </Badge>
+                        )}
+                        <span className="truncate text-muted-foreground">{m.name}</span>
+                        <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                          {t('odoo.schema.fieldCount').replace('{n}', String(m.field_count))}
+                        </span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">{t('odoo.schema.pickHint')}</p>
+          </div>
+        )}
       </SettingsSection>
 
       {/* Feature modules */}
@@ -356,8 +499,22 @@ export function OdooPage() {
         </SettingsCard>
       </SettingsSection>
 
+      {/* Global model access (security unblock list) */}
+      <SettingsSection title={t('odoo.access')}>
+        <SettingsCard>
+          <RowText
+            label={t('odoo.unblockModels')}
+            description={t('odoo.unblockModelsHint')}
+            value={globalUnblockModels}
+            onChange={setGlobalUnblockModels}
+            placeholder="res.partner, x_custom_model"
+            tier="text"
+          />
+        </SettingsCard>
+      </SettingsSection>
+
       {/* Per-agent credential override */}
-      <AgentOdooOverride />
+      <AgentOdooOverride pickedModels={Array.from(pickedModels)} />
     </div>
   );
 }
@@ -369,7 +526,7 @@ export function OdooPage() {
  * blank keeps the stored secret, the "clear" toggle wipes it. A separate test
  * button verifies the staffer's effective connection.
  */
-function AgentOdooOverride() {
+function AgentOdooOverride({ pickedModels = [] }: { pickedModels?: string[] }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
 
@@ -393,6 +550,7 @@ function AgentOdooOverride() {
   const [clearApiKey, setClearApiKey] = useState(false);
   const [clearPassword, setClearPassword] = useState(false);
   const [allowedModels, setAllowedModels] = useState('');
+  const [unblockModels, setUnblockModels] = useState('');
   const [allowedActions, setAllowedActions] = useState('');
   const [companyIds, setCompanyIds] = useState('');
 
@@ -422,6 +580,7 @@ function AgentOdooOverride() {
     setClearApiKey(false);
     setClearPassword(false);
     setAllowedModels((c?.allowed_models ?? []).join(', '));
+    setUnblockModels((c?.unblock_models ?? []).join(', '));
     setAllowedActions((c?.allowed_actions ?? []).join(', '));
     setCompanyIds((c?.company_ids ?? []).join(', '));
   }, []);
@@ -461,6 +620,7 @@ function AgentOdooOverride() {
         db: db.trim() || undefined,
         user: username.trim() || undefined,
         allowed_models: parseList(allowedModels),
+        unblock_models: parseList(unblockModels),
         allowed_actions: parseList(allowedActions),
         company_ids: parseList(companyIds)
           .map((n) => Number(n))
@@ -597,6 +757,30 @@ function AgentOdooOverride() {
                   value={allowedModels}
                   onChange={setAllowedModels}
                   placeholder="crm.lead, sale.order"
+                  tier="text"
+                />
+                {pickedModels.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-2 px-1 pb-1">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        const current = parseList(allowedModels);
+                        const merged = Array.from(new Set([...current, ...pickedModels]));
+                        setAllowedModels(merged.join(', '));
+                      }}
+                    >
+                      <Database className="size-4" />
+                      {t('odoo.schema.addPicked').replace('{n}', String(pickedModels.length))}
+                    </Button>
+                  </div>
+                )}
+                <RowText
+                  label={t('agents.odoo.unblockModels')}
+                  description={t('agents.odoo.unblockModels.hint')}
+                  value={unblockModels}
+                  onChange={setUnblockModels}
+                  placeholder="res.partner"
                   tier="text"
                 />
                 <RowText

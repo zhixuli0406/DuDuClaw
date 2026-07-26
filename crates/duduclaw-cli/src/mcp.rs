@@ -850,6 +850,169 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "record_id", description: "Record ID", required: true },
         ],
     },
+    ToolDef {
+        name: "odoo_partner_search",
+        description: "Search customers/contacts in Odoo (res.partner). Read-only, returns only non-sensitive fields (name, email, phone, city, company flag, ref) — no bank or tax data. Use this to find a partner_id before creating a quotation.",
+        params: &[
+            ParamDef { name: "query", description: "Name / email / customer ref to match (fuzzy)", required: false },
+            ParamDef { name: "limit", description: "Max results (default 10, max 40)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "odoo_schema_fields",
+        description: "Inspect the field structure of one Odoo model (fields_get). Returns field metadata only (name, type, label, required, relation) — no records. Use it to learn what columns a custom model has before querying it.",
+        params: &[
+            ParamDef { name: "model", description: "Odoo model name (e.g. x_custom_model, res.partner)", required: true },
+        ],
+    },
+    // ── Google Workspace native tools (Gmail + Calendar) ─────────
+    // Consume the user's connected Google account (OAuth vault). Connect via
+    // the dashboard Integrations → Google page first.
+    ToolDef {
+        name: "google_status",
+        description: "Check the Google Workspace connection: connected/not, granted scopes, token validity/expiry. Reads local state only — no Google API call. Call this first if a Gmail/Calendar tool reports an auth error.",
+        params: &[],
+    },
+    ToolDef {
+        name: "gmail_search",
+        description: "Search the connected Gmail mailbox (read-only). Uses Gmail search syntax, e.g. 'from:alice is:unread' or 'subject:invoice newer_than:7d'. Returns sender/subject/date/snippet for each match.",
+        params: &[
+            ParamDef { name: "query", description: "Gmail search query (Gmail search operators supported)", required: true },
+            ParamDef { name: "max_results", description: "Max messages to return (1-25, default 10)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "gmail_read",
+        description: "Read one Gmail message in full (read-only): headers, plain-text body (long bodies truncated), and an attachment list (filename + size only — attachments are not downloaded).",
+        params: &[
+            ParamDef { name: "message_id", description: "Gmail message ID (from gmail_search results)", required: true },
+        ],
+    },
+    ToolDef {
+        name: "gmail_create_draft",
+        description: "Create a Gmail DRAFT for human review. This only saves a draft and NEVER sends the email — sending stays a manual human action. Operators may additionally gate this via agent.toml [capabilities] approval_required_tools.",
+        params: &[
+            ParamDef { name: "to", description: "Recipient email address", required: true },
+            ParamDef { name: "subject", description: "Email subject", required: true },
+            ParamDef { name: "body", description: "Plain-text email body", required: true },
+            ParamDef { name: "cc", description: "CC email address (optional)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "calendar_list_events",
+        description: "List events on the connected primary Google Calendar (read-only). Defaults to the next 7 days when no time range is given. Returns summary/start/end/location plus any Google Meet link.",
+        params: &[
+            ParamDef { name: "time_min", description: "Range start, RFC-3339 (default: now)", required: false },
+            ParamDef { name: "time_max", description: "Range end, RFC-3339 (default: now + 7 days)", required: false },
+            ParamDef { name: "max_results", description: "Max events to return (1-50, default 20)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "calendar_create_event",
+        description: "Create a REAL event on the connected primary Google Calendar (externally visible; attendees are notified). Set with_meet=true to attach a Google Meet video link. Operators may gate this via agent.toml [capabilities] approval_required_tools.",
+        params: &[
+            ParamDef { name: "summary", description: "Event title", required: true },
+            ParamDef { name: "start", description: "Start time, RFC-3339 (e.g. 2026-07-26T14:00:00+08:00)", required: true },
+            ParamDef { name: "end", description: "End time, RFC-3339", required: true },
+            ParamDef { name: "description", description: "Event description (optional)", required: false },
+            ParamDef { name: "attendees", description: "Comma-separated attendee emails (optional)", required: false },
+            ParamDef { name: "with_meet", description: "Attach a Google Meet link (true/false, default false)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "sheets_read",
+        description: "Read a range of cells from a connected Google Sheet (read-only). Accepts a spreadsheet ID or a full spreadsheet URL. Returns up to 200 rows of formatted cell values.",
+        params: &[
+            ParamDef { name: "spreadsheet_id", description: "Spreadsheet ID or full Google Sheets URL", required: true },
+            ParamDef { name: "range", description: "A1 range, optionally sheet-qualified (e.g. 'Sheet1!A1:C10' or 'A:D')", required: true },
+        ],
+    },
+    ToolDef {
+        name: "sheets_append",
+        description: "Append one row of values to a connected Google Sheet (write). Values are entered as if typed by a user (USER_ENTERED), so numbers/dates/formulas are parsed. Operators may gate this via agent.toml [capabilities] approval_required_tools.",
+        params: &[
+            ParamDef { name: "spreadsheet_id", description: "Spreadsheet ID or full Google Sheets URL", required: true },
+            ParamDef { name: "range", description: "A1 range identifying the table to append to (e.g. 'Sheet1!A1')", required: true },
+            ParamDef { name: "values", description: "Row cells: JSON array of strings, or a comma-separated list", required: true },
+        ],
+    },
+    // ── Notion native tools ──────────────────────────────────────
+    // Consume the user's connected Notion workspace (OAuth vault). Connect via
+    // the dashboard Integrations → Notion page first. Notion content is an
+    // external knowledge source — surfaced for query/citation only; it is NOT
+    // auto-written into the shared wiki.
+    ToolDef {
+        name: "notion_status",
+        description: "Check the Notion connection: connected/not. Reads local state only — no Notion API call. Call this first if a Notion tool reports an auth error.",
+        params: &[],
+    },
+    ToolDef {
+        name: "notion_search",
+        description: "Search pages and databases shared with your Notion integration (read-only). Returns id/title/type/last-edited/url for each match. Notion content is an external reference source, not the shared wiki.",
+        params: &[
+            ParamDef { name: "query", description: "Search text (matches page/database titles)", required: true },
+            ParamDef { name: "max_results", description: "Max results to return (1-25, default 10)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "notion_page_read",
+        description: "Read one Notion page in full (read-only): title, url, last-edited, and the page body flattened to plain text (common block types; up to ~200 blocks). Use notion_search to find a page_id first.",
+        params: &[
+            ParamDef { name: "page_id", description: "Notion page ID (from notion_search results)", required: true },
+        ],
+    },
+    ToolDef {
+        name: "notion_page_append",
+        description: "Append text as new paragraph blocks to an existing Notion page (write). Each non-empty line becomes its own paragraph. Never deletes or overwrites existing content. Operators may gate this via agent.toml [capabilities] approval_required_tools.",
+        params: &[
+            ParamDef { name: "page_id", description: "Notion page ID to append to", required: true },
+            ParamDef { name: "text", description: "Text to append (one paragraph block per non-empty line)", required: true },
+        ],
+    },
+    // ── GitHub native tools ──────────────────────────────────────
+    // Consume the user's connected GitHub account (OAuth vault). Connect via
+    // the dashboard Integrations → GitHub page first.
+    ToolDef {
+        name: "github_status",
+        description: "Check the GitHub connection: connected/not, granted scopes. Reads local state only — no GitHub API call. Call this first if a GitHub tool reports an auth error.",
+        params: &[],
+    },
+    ToolDef {
+        name: "github_search_issues",
+        description: "Search GitHub issues and pull requests (read-only). Uses GitHub search syntax, e.g. 'repo:owner/name is:open label:bug' or 'author:alice is:pr'. Returns repo/number/title/state/is_pr/updated/url.",
+        params: &[
+            ParamDef { name: "query", description: "GitHub issues search query", required: true },
+            ParamDef { name: "max_results", description: "Max results to return (1-25, default 10)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "github_issue_read",
+        description: "Read one GitHub issue in full (read-only): title, state, author, body (truncated if long), and the most recent 10 comments.",
+        params: &[
+            ParamDef { name: "owner", description: "Repository owner (user or org)", required: true },
+            ParamDef { name: "repo", description: "Repository name", required: true },
+            ParamDef { name: "number", description: "Issue number", required: true },
+        ],
+    },
+    ToolDef {
+        name: "github_pr_read",
+        description: "Read one GitHub pull request (read-only): metadata (base/head/state/merged/mergeable) plus the changed-file list (filename/status/additions/deletions, up to 50 files). Diff contents are not fetched.",
+        params: &[
+            ParamDef { name: "owner", description: "Repository owner (user or org)", required: true },
+            ParamDef { name: "repo", description: "Repository name", required: true },
+            ParamDef { name: "number", description: "Pull request number", required: true },
+        ],
+    },
+    ToolDef {
+        name: "github_issue_comment",
+        description: "Post a comment on a GitHub issue or PR (write). This is a PUBLICLY VISIBLE external statement — treat it as an outbound communication. Operators should gate this via agent.toml [capabilities] approval_required_tools.",
+        params: &[
+            ParamDef { name: "owner", description: "Repository owner (user or org)", required: true },
+            ParamDef { name: "repo", description: "Repository name", required: true },
+            ParamDef { name: "number", description: "Issue or PR number", required: true },
+            ParamDef { name: "body", description: "Comment body (Markdown supported)", required: true },
+        ],
+    },
     // ── Cost telemetry tools ─────────────────────────────────────
     ToolDef {
         name: "cost_summary",
@@ -1501,6 +1664,7 @@ pub(crate) const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 #[cfg(test)]
 mod user_code_profile_registration_tests {
     use super::TOOLS;
+
 
     #[test]
     fn user_code_profile_tool_registered() {
@@ -4077,12 +4241,34 @@ async fn handle_agent_update(params: &Value, home_dir: &Path) -> Value {
         }),
     };
 
+    // WP: capture the pre-update display_name / trigger so a rename can
+    // sync SOUL.md / IDENTITY.md self-introduction text and the default
+    // `@trigger` afterward. Root cause: the agent's system-prompt self-name
+    // comes 100% from literal text burned into SOUL.md at creation time —
+    // agent.toml's display_name never reached the prompt on its own, so a
+    // rename left the agent introducing itself with its old name forever.
+    let old_display_name = config.agent.display_name.clone();
+    let old_trigger = config.agent.trigger.clone();
+
     let mut changes = Vec::new();
 
     // -- Agent identity fields --
     if let Some(v) = params.get("display_name").and_then(|v| v.as_str()) {
         config.agent.display_name = v.to_string();
         changes.push(format!("display_name = \"{v}\""));
+
+        // Auto-sync the default `@{old_name}` mention trigger to the new
+        // name, unless the caller also set `trigger` explicitly in this same
+        // request (that wins, and is applied below) or the existing trigger
+        // was already customized away from the default pattern.
+        if params.get("trigger").and_then(|t| t.as_str()).is_none() {
+            if let Some(new_trigger) =
+                duduclaw_core::synced_trigger(&old_trigger, &old_display_name, v)
+            {
+                changes.push(format!("trigger synced -> \"{new_trigger}\""));
+                config.agent.trigger = new_trigger;
+            }
+        }
     }
     if let Some(v) = params.get("role").and_then(|v| v.as_str()) {
         use std::str::FromStr;
@@ -4208,6 +4394,41 @@ async fn handle_agent_update(params: &Value, home_dir: &Path) -> Value {
             "isError": true
         });
     }
+
+    // WP: sync SOUL.md / IDENTITY.md self-introduction text to the new
+    // display_name (see comment above the capture site). Best-effort: a
+    // missing file is skipped, an IO error is logged but does not fail the
+    // already-committed agent.toml write.
+    let mut soul_sync_changes: Vec<String> = Vec::new();
+    if old_display_name != config.agent.display_name && !old_display_name.is_empty() {
+        let new_display_name = &config.agent.display_name;
+        for fname in ["SOUL.md", "IDENTITY.md"] {
+            let path = agent_dir.join(fname);
+            let content = match tokio::fs::read_to_string(&path).await {
+                Ok(c) => c,
+                Err(_) => continue, // file doesn't exist — nothing to sync
+            };
+            let (new_content, changed) =
+                duduclaw_core::rename_in_markdown(&content, &old_display_name, new_display_name);
+            if !changed {
+                continue;
+            }
+            let tmp_path = path.with_extension("md.tmp");
+            if let Err(e) = tokio::fs::write(&tmp_path, &new_content).await {
+                tracing::warn!(agent_id, file = fname, error = %e, "Failed to write identity-rename tmp file");
+                continue;
+            }
+            if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                tracing::warn!(agent_id, file = fname, error = %e, "Failed to commit identity-rename");
+                continue;
+            }
+            soul_sync_changes.push(format!(
+                "{fname} self-name synced \"{old_display_name}\" -> \"{new_display_name}\""
+            ));
+        }
+    }
+    changes.extend(soul_sync_changes);
 
     serde_json::json!({
         "content": [{"type": "text", "text": format!(
@@ -5634,6 +5855,9 @@ async fn handle_odoo_tool(
     // tool_calls.jsonl so the audit trail attributes Odoo activity to a
     // specific agent rather than to the global admin user.
     let _audit_profile = odoo.pool_key(caller_agent).await.1;
+    // A: effective block-list opt-out for this agent (per-agent override, else
+    // global). Empty ⇒ the built-in security block list is fully in force.
+    let unblock_models = odoo.unblock_models(caller_agent).await;
 
     let result: std::result::Result<String, String> = match tool {
         "odoo_crm_leads" => {
@@ -5778,7 +6002,9 @@ async fn handle_odoo_tool(
         "odoo_search" => {
             let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
             if model.is_empty() { return mcp_error("model is required"); }
-            if OdooConnector::is_model_blocked(model) { return mcp_error(&format!("Model '{model}' is blocked for security reasons")); }
+            if let Err(denial) = duduclaw_odoo::check_blocklist(model, duduclaw_odoo::AccessKind::Read, &unblock_models) {
+                return mcp_error(&blocklist_denial_message(model, denial));
+            }
             let domain_str = params.get("domain").and_then(|v| v.as_str()).unwrap_or("[]");
             let domain: Vec<Value> = serde_json::from_str(domain_str).unwrap_or_default();
             let fields_str = params.get("fields").and_then(|v| v.as_str()).unwrap_or("id,name");
@@ -5794,7 +6020,17 @@ async fn handle_odoo_tool(
             let method = params.get("method").and_then(|v| v.as_str()).unwrap_or("");
             let ids_str = params.get("ids").and_then(|v| v.as_str()).unwrap_or("[]");
             if model.is_empty() || method.is_empty() { return mcp_error("model and method are required"); }
-            if OdooConnector::is_model_blocked(model) { return mcp_error(&format!("Model '{model}' is blocked")); }
+            // A: block-list gate honours per-agent unblock_models. Classify the
+            // method into read vs mutate so a system table (ir.model/…) stays
+            // read-only even when unblocked (fail closed on unknown methods).
+            let access_kind = if odoo_method_to_verb(method) == "read" {
+                duduclaw_odoo::AccessKind::Read
+            } else {
+                duduclaw_odoo::AccessKind::Mutate
+            };
+            if let Err(denial) = duduclaw_odoo::check_blocklist(model, access_kind, &unblock_models) {
+                return mcp_error(&blocklist_denial_message(model, denial));
+            }
 
             // Whitelist safe Odoo methods — block dangerous ones like unlink, write on sensitive models (MCP-H6)
             const BLOCKED_METHODS: &[&str] = &[
@@ -5819,6 +6055,34 @@ async fn handle_odoo_tool(
             match conn.execute_kw("ir.actions.report", "render_qweb_pdf", vec![serde_json::json!(report_name), serde_json::json!([record_id])], serde_json::json!({})).await {
                 Ok(_) => Ok(format!("Report '{report_name}' generated for record {record_id}. Download from Odoo.")),
                 Err(e) => Err(format!("Report generation failed: {e}")),
+            }
+        }
+        "odoo_partner_search" => {
+            // Safe customer lookup — read-only over res.partner with a fixed
+            // non-sensitive field projection (no bank/tax data). Bypasses the
+            // generic block list because the field set is hard-coded; still
+            // gated by OdooRead scope + per-agent read permission upstream.
+            let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(10)
+                .clamp(1, 40);
+            match conn.partner_search(query, limit).await {
+                Ok(data) => Ok(serde_json::to_string_pretty(&data).unwrap_or_default()),
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_schema_fields" => {
+            // Field metadata for one known model (fields_get). Metadata only —
+            // no business rows — so it is safe on any model; per-agent
+            // allowed_models still applies via classify_odoo_call.
+            let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            if model.is_empty() { return mcp_error("model is required"); }
+            match conn.schema_fields(model, 200).await {
+                Ok(fields) => Ok(serde_json::to_string_pretty(&fields).unwrap_or_default()),
+                Err(e) => Err(e),
             }
         }
         _ => Err(format!("Unknown Odoo tool: {tool}")),
@@ -5863,6 +6127,11 @@ fn classify_odoo_call(tool: &str, params: &Value) -> Option<(&'static str, Strin
         "odoo_inventory_products" => Some(("search", "product.product".into())),
         "odoo_inventory_check" => Some(("search", "stock.quant".into())),
         "odoo_invoice_list" | "odoo_payment_status" => Some(("search", "account.move".into())),
+        "odoo_partner_search" => Some(("read", "res.partner".into())),
+        "odoo_schema_fields" => {
+            let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            if model.is_empty() { None } else { Some(("read", model.to_string())) }
+        }
         "odoo_search" => {
             let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
             if model.is_empty() { None } else { Some(("search", model.to_string())) }
@@ -5885,6 +6154,23 @@ fn classify_odoo_call(tool: &str, params: &Value) -> Option<(&'static str, Strin
             if name.is_empty() { None } else { Some(("execute", name.to_string())) }
         }
         _ => None,
+    }
+}
+
+/// Render a user-facing message for a block-list denial. Points the operator at
+/// the right knob (unblock_models) without leaking internal paths, and keeps the
+/// system-metadata read-only case distinct from the ordinary security default.
+fn blocklist_denial_message(model: &str, denial: duduclaw_odoo::BlockDenial) -> String {
+    match denial {
+        duduclaw_odoo::BlockDenial::SecurityDefault => format!(
+            "Model '{model}' is blocked by a security default. An admin can unlock it by adding \
+             it to unblock_models in the agent's Odoo settings (agent.toml [odoo] or the \
+             dashboard Odoo page)."
+        ),
+        duduclaw_odoo::BlockDenial::SystemReadOnly => format!(
+            "Model '{model}' is a system metadata table — readable when unblocked, but writing \
+             or deleting on it is never allowed."
+        ),
     }
 }
 
@@ -7856,7 +8142,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
 
         let response = match method {
             "initialize" => handle_initialize(&id, &request),
-            "tools/list" => handle_tools_list(&id, principal.is_external),
+            "tools/list" => handle_tools_list(&id, principal.is_external, home_dir),
             "tools/call" => {
                 // W20-P1 Phase 2A + P2-4: delegate to McpDispatcher, which now
                 // enforces the full pipeline — including RFC-23 egress ("secret
@@ -7917,12 +8203,35 @@ fn handle_initialize(id: &Value, _request: &Value) -> Value {
     )
 }
 
-fn handle_tools_list(id: &Value, is_external: bool) -> Value {
+/// Tools hidden while the Google Workspace integration gate is off
+/// (`config.toml [integrations] google_workspace`, default false).
+const GOOGLE_WORKSPACE_TOOLS: &[&str] = &[
+    "google_status",
+    "gmail_search",
+    "gmail_read",
+    "gmail_create_draft",
+    "calendar_list_events",
+    "calendar_create_event",
+    "sheets_read",
+    "sheets_append",
+];
+
+/// Test helper: tools/list now needs a home_dir (Google Workspace gate). An
+/// empty tempdir has no config.toml, so the gate reads closed (the fail-closed
+/// default) and google tools stay out of the listing.
+#[cfg(test)]
+fn tmp_home_for_tools_list() -> tempfile::TempDir {
+    tempfile::tempdir().expect("tempdir")
+}
+
+fn handle_tools_list(id: &Value, is_external: bool, home_dir: &Path) -> Value {
+    let google_enabled = duduclaw_gateway::google_workspace::integration_enabled(home_dir);
     let tools: Vec<Value> = TOOLS
         .iter()
         .filter(|t| {
             !is_external || EXTERNAL_TOOLS_WHITELIST.contains(&t.name)
         })
+        .filter(|t| google_enabled || !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
         .map(build_tool_schema)
         .collect();
     jsonrpc_response(id, serde_json::json!({ "tools": tools }))
@@ -8057,6 +8366,14 @@ pub(crate) async fn handle_tools_call(
             | "cancel_reminder"
             | "decision_resolve"
             | "jitrl_feedback"
+            // Google Workspace write tools (draft creation, calendar event,
+            // spreadsheet row append).
+            | "gmail_create_draft"
+            | "calendar_create_event"
+            | "sheets_append"
+            // Notion / GitHub write tools (page append, public issue comment).
+            | "notion_page_append"
+            | "github_issue_comment"
     );
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
@@ -8277,6 +8594,36 @@ pub(crate) async fn handle_tools_call(
         "os_frontmost" => handle_os_frontmost().await,
         "os_spotlight_search" => handle_os_spotlight_search(&arguments).await,
         "os_calendar_today" => handle_os_calendar_today().await,
+        // Google Workspace native tools (Gmail + Calendar). Scope gates
+        // (google:read / google:write) are enforced upstream in mcp_dispatch;
+        // these handlers consume the OAuth vault token directly.
+        // Whole group sits behind the integration gate (hidden from tools/list
+        // too) until DuDu Studio's OAuth app clears Google verification.
+        name if GOOGLE_WORKSPACE_TOOLS.contains(&name)
+            && !duduclaw_gateway::google_workspace::integration_enabled(home_dir) =>
+        {
+            serde_json::json!({
+                "content": [{"type": "text", "text": "Google Workspace 整合尚未在此版本開放，將於後續版本提供。（操作者可在 config.toml [integrations] 設 google_workspace = true 搶先啟用）"}],
+                "isError": true
+            })
+        }
+        "google_status" => handle_google_status(home_dir).await,
+        "gmail_search" => handle_gmail_search(&arguments, home_dir).await,
+        "gmail_read" => handle_gmail_read(&arguments, home_dir).await,
+        "gmail_create_draft" => handle_gmail_create_draft(&arguments, home_dir).await,
+        "calendar_list_events" => handle_calendar_list_events(&arguments, home_dir).await,
+        "calendar_create_event" => handle_calendar_create_event(&arguments, home_dir).await,
+        "sheets_read" => handle_sheets_read(&arguments, home_dir).await,
+        "sheets_append" => handle_sheets_append(&arguments, home_dir).await,
+        "notion_status" => handle_notion_status(home_dir).await,
+        "notion_search" => handle_notion_search(&arguments, home_dir).await,
+        "notion_page_read" => handle_notion_page_read(&arguments, home_dir).await,
+        "notion_page_append" => handle_notion_page_append(&arguments, home_dir).await,
+        "github_status" => handle_github_status(home_dir).await,
+        "github_search_issues" => handle_github_search_issues(&arguments, home_dir).await,
+        "github_issue_read" => handle_github_issue_read(&arguments, home_dir).await,
+        "github_pr_read" => handle_github_pr_read(&arguments, home_dir).await,
+        "github_issue_comment" => handle_github_issue_comment(&arguments, home_dir).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => {
             handle_odoo_tool(t, &arguments, home_dir, odoo, default_agent).await
@@ -11210,6 +11557,609 @@ async fn handle_computer_use_tool(tool_name: &str, args: &Value) -> Value {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Google Workspace native tool handlers (Gmail + Calendar).
+//
+// These consume the OAuth vault token via the gateway `google_workspace`
+// module. The google:read / google:write scope gates are enforced upstream in
+// mcp_dispatch; auth/API failures degrade to clear tool_error text that guides
+// the user back to the dashboard Integrations → Google page.
+// ─────────────────────────────────────────────────────────────────
+
+/// Read a u32 argument that may arrive as a JSON number or string.
+fn arg_u32(args: &Value, key: &str, default: u32) -> u32 {
+    args.get(key)
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .or_else(|| {
+            args.get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.trim().parse::<u32>().ok())
+        })
+        .unwrap_or(default)
+}
+
+async fn handle_google_status(home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace::{GOOGLE_PROVIDER, REQUIRED_SCOPES};
+    use duduclaw_gateway::mcp_oauth;
+
+    let token = mcp_oauth::load_tokens(home_dir)
+        .into_iter()
+        .find(|t| t.provider_id == GOOGLE_PROVIDER);
+    let configured = mcp_oauth::has_client_config(home_dir, GOOGLE_PROVIDER);
+
+    let mut out = String::new();
+    match token {
+        None => {
+            out.push_str("Google Workspace: NOT connected.\n");
+            if configured {
+                out.push_str(
+                    "Client credentials are set. Open the dashboard Integrations → Google page and click \"Connect Google\" to authorize.",
+                );
+            } else {
+                out.push_str(
+                    "No OAuth client is configured. Open the dashboard Integrations → Google page to set up your Google OAuth client, then connect.",
+                );
+            }
+        }
+        Some(t) => {
+            let now = chrono::Utc::now();
+            let (state, expiry) = match t.expires_at {
+                Some(exp) if now >= exp => ("EXPIRED".to_string(), exp.to_rfc3339()),
+                Some(exp) => ("valid".to_string(), exp.to_rfc3339()),
+                None => ("valid (no expiry)".to_string(), "n/a".to_string()),
+            };
+            let has_refresh = t
+                .refresh_token
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let auto_refresh = if has_refresh && configured {
+                "available"
+            } else {
+                "unavailable — reconnect to enable automatic refresh"
+            };
+            out.push_str(&format!(
+                "Google Workspace: connected.\nToken: {state} (expires: {expiry})\nAuto-refresh: {auto_refresh}\nGranted scopes:\n"
+            ));
+            for s in &t.scopes {
+                out.push_str(&format!("  - {s}\n"));
+            }
+            let missing: Vec<&str> = REQUIRED_SCOPES
+                .iter()
+                .copied()
+                .filter(|req| !t.scopes.iter().any(|s| s == req))
+                .collect();
+            if !missing.is_empty() {
+                out.push_str(
+                    "\nMissing scopes needed for full Gmail/Calendar functionality (reconnect from the dashboard to grant):\n",
+                );
+                for m in missing {
+                    out.push_str(&format!("  - {m}\n"));
+                }
+            }
+        }
+    }
+    tool_text(out.trim_end())
+}
+
+async fn handle_gmail_search(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let query = match args.get("query").and_then(|v| v.as_str()) {
+        Some(q) if !q.trim().is_empty() => q,
+        _ => return tool_error("Missing required parameter: query"),
+    };
+    let max = arg_u32(args, "max_results", 10);
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::gmail_search(&token, query, max).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_gmail_read(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let message_id = match args.get("message_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.trim().is_empty() => id,
+        _ => return tool_error("Missing required parameter: message_id"),
+    };
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::gmail_read(&token, message_id).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_gmail_create_draft(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let to = match args.get("to").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => return tool_error("Missing required parameter: to"),
+    };
+    let subject = match args.get("subject").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return tool_error("Missing required parameter: subject"),
+    };
+    let body = match args.get("body").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return tool_error("Missing required parameter: body"),
+    };
+    let cc = args
+        .get("cc")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::gmail_create_draft(&token, to, subject, body, cc).await {
+        Ok(r) => tool_text(&format!(
+            "Draft created — NOT sent. Review and send it manually in Gmail.\nDraft ID: {}\nTo: {}\nSubject: {}",
+            r.draft_id, r.to, r.subject
+        )),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_calendar_list_events(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let time_min = args
+        .get("time_min")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let time_max = args
+        .get("time_max")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    // Validate provided timestamps before hitting the API.
+    for (label, val) in [("time_min", time_min), ("time_max", time_max)] {
+        if let Some(v) = val {
+            if !gw::is_rfc3339(v) {
+                return tool_error(&format!(
+                    "Invalid {label}: '{v}' is not a valid RFC-3339 timestamp (e.g. 2026-07-26T14:00:00+08:00)"
+                ));
+            }
+        }
+    }
+    let max = arg_u32(args, "max_results", 20);
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::calendar_list_events(&token, time_min, time_max, max).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_calendar_create_event(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let summary = match args.get("summary").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return tool_error("Missing required parameter: summary"),
+    };
+    let start = match args.get("start").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => return tool_error("Missing required parameter: start"),
+    };
+    let end = match args.get("end").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => return tool_error("Missing required parameter: end"),
+    };
+    if !gw::is_rfc3339(start) {
+        return tool_error(&format!(
+            "Invalid start: '{start}' is not RFC-3339 (e.g. 2026-07-26T14:00:00+08:00)"
+        ));
+    }
+    if !gw::is_rfc3339(end) {
+        return tool_error(&format!(
+            "Invalid end: '{end}' is not RFC-3339 (e.g. 2026-07-26T15:00:00+08:00)"
+        ));
+    }
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let attendees: Option<Vec<String>> = args.get("attendees").and_then(|v| v.as_str()).map(|s| {
+        s.split(',')
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .collect()
+    });
+    let with_meet = args
+        .get("with_meet")
+        .and_then(|v| v.as_bool())
+        .or_else(|| {
+            args.get("with_meet")
+                .and_then(|v| v.as_str())
+                .map(|s| s.eq_ignore_ascii_case("true"))
+        })
+        .unwrap_or(false);
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::calendar_create_event(
+        &token,
+        summary,
+        start,
+        end,
+        description,
+        attendees.as_deref(),
+        with_meet,
+    )
+    .await
+    {
+        Ok(r) => {
+            let meet = r
+                .meet_link
+                .as_deref()
+                .map(|l| format!("\nGoogle Meet: {l}"))
+                .unwrap_or_default();
+            tool_text(&format!(
+                "Calendar event created (externally visible; attendees notified).\nEvent ID: {}\nSummary: {}\nStart: {}\nEnd: {}\nLink: {}{}",
+                r.id, r.summary, r.start, r.end, r.html_link, meet
+            ))
+        }
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Google Sheets tool handlers. Consume the OAuth vault token via the gateway
+// `google_workspace` module (shared `google` provider — same connect flow as
+// Gmail/Calendar; requires the spreadsheets scope, so a token authorized before
+// Sheets shipped will 403 and guide the user to reconnect).
+// ─────────────────────────────────────────────────────────────────
+
+/// Read a u64 argument that may arrive as a JSON number or string.
+fn arg_u64(args: &Value, key: &str) -> Option<u64> {
+    args.get(key).and_then(|v| v.as_u64()).or_else(|| {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    })
+}
+
+async fn handle_sheets_read(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let spreadsheet = match args.get("spreadsheet_id").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => return tool_error("Missing required parameter: spreadsheet_id"),
+    };
+    let range = match args.get("range").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => return tool_error("Missing required parameter: range"),
+    };
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::sheets_read(&token, spreadsheet, range).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_sheets_append(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let spreadsheet = match args.get("spreadsheet_id").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => return tool_error("Missing required parameter: spreadsheet_id"),
+    };
+    let range = match args.get("range").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => return tool_error("Missing required parameter: range"),
+    };
+    // Accept values as a JSON array of strings, or a comma-separated string.
+    let values: Vec<String> = match args.get("values") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            })
+            .collect(),
+        Some(Value::String(s)) => s.split(',').map(|c| c.trim().to_string()).collect(),
+        _ => return tool_error("Missing required parameter: values (JSON array of strings or comma-separated list)"),
+    };
+    if values.is_empty() {
+        return tool_error("Parameter 'values' must contain at least one cell");
+    }
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::sheets_append(&token, spreadsheet, range, values).await {
+        Ok(r) => tool_text(&format!(
+            "Appended 1 row to the sheet.\nUpdated range: {}\nUpdated rows: {}\nUpdated cells: {}",
+            r.updated_range, r.updated_rows, r.updated_cells
+        )),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Notion tool handlers. Consume the OAuth vault token via the gateway
+// `notion_workspace` module. Notion content is an external knowledge source —
+// surfaced for query/citation only, never auto-written into the shared wiki.
+// ─────────────────────────────────────────────────────────────────
+
+async fn handle_notion_status(home_dir: &Path) -> Value {
+    use duduclaw_gateway::mcp_oauth;
+    use duduclaw_gateway::notion_workspace::NOTION_PROVIDER;
+
+    let token = mcp_oauth::load_tokens(home_dir)
+        .into_iter()
+        .find(|t| t.provider_id == NOTION_PROVIDER);
+    let configured = mcp_oauth::has_client_config(home_dir, NOTION_PROVIDER);
+
+    let mut out = String::new();
+    match token {
+        None => {
+            out.push_str("Notion: NOT connected.\n");
+            if configured {
+                out.push_str(
+                    "Integration credentials are set. Open the dashboard Integrations → Notion page and click \"Connect Notion\" to authorize.",
+                );
+            } else {
+                out.push_str(
+                    "No Notion integration is configured. Open the dashboard Integrations → Notion page to set up your Notion OAuth integration, then connect.",
+                );
+            }
+        }
+        Some(_t) => {
+            out.push_str(
+                "Notion: connected.\nToken: valid (Notion access tokens are long-lived and do not expire).\nRemember: a page/database must be shared with your integration before these tools can see it.",
+            );
+        }
+    }
+    tool_text(out.trim_end())
+}
+
+async fn handle_notion_search(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::notion_workspace as nw;
+
+    let query = match args.get("query").and_then(|v| v.as_str()) {
+        Some(q) => q,
+        None => return tool_error("Missing required parameter: query"),
+    };
+    let max = arg_u32(args, "max_results", 10);
+
+    let token = match nw::get_valid_notion_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match nw::notion_search(&token, query, max).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_notion_page_read(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::notion_workspace as nw;
+
+    let page_id = match args.get("page_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => return tool_error("Missing required parameter: page_id"),
+    };
+
+    let token = match nw::get_valid_notion_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match nw::notion_page_read(&token, page_id).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_notion_page_append(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::notion_workspace as nw;
+
+    let page_id = match args.get("page_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => return tool_error("Missing required parameter: page_id"),
+    };
+    let text = match args.get("text").and_then(|v| v.as_str()) {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => return tool_error("Missing required parameter: text"),
+    };
+
+    let token = match nw::get_valid_notion_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match nw::notion_page_append(&token, page_id, text).await {
+        Ok(r) => tool_text(&format!(
+            "Appended {} paragraph block(s) to Notion page {}.",
+            r.appended_blocks, r.page_id
+        )),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// GitHub tool handlers. Consume the OAuth vault token via the gateway
+// `github_workspace` module. github_issue_comment posts a publicly visible
+// comment — operators should gate it via approval_required_tools.
+// ─────────────────────────────────────────────────────────────────
+
+async fn handle_github_status(home_dir: &Path) -> Value {
+    use duduclaw_gateway::github_workspace::GITHUB_PROVIDER;
+    use duduclaw_gateway::mcp_oauth;
+
+    let token = mcp_oauth::load_tokens(home_dir)
+        .into_iter()
+        .find(|t| t.provider_id == GITHUB_PROVIDER);
+    let configured = mcp_oauth::has_client_config(home_dir, GITHUB_PROVIDER);
+
+    let mut out = String::new();
+    match token {
+        None => {
+            out.push_str("GitHub: NOT connected.\n");
+            if configured {
+                out.push_str(
+                    "OAuth App credentials are set. Open the dashboard Integrations → GitHub page and click \"Connect GitHub\" to authorize.",
+                );
+            } else {
+                out.push_str(
+                    "No GitHub OAuth App is configured. Open the dashboard Integrations → GitHub page to set up your GitHub OAuth App, then connect.",
+                );
+            }
+        }
+        Some(t) => {
+            let expiry = match t.expires_at {
+                Some(exp) if chrono::Utc::now() >= exp => {
+                    format!("EXPIRED ({})", exp.to_rfc3339())
+                }
+                Some(exp) => format!("valid (expires {})", exp.to_rfc3339()),
+                None => "valid (no expiry — classic OAuth App token)".to_string(),
+            };
+            out.push_str(&format!(
+                "GitHub: connected.\nToken: {expiry}\nGranted scopes:\n"
+            ));
+            if t.scopes.is_empty() {
+                out.push_str("  (none recorded)\n");
+            } else {
+                for s in &t.scopes {
+                    out.push_str(&format!("  - {s}\n"));
+                }
+            }
+            if !t.scopes.iter().any(|s| s == "repo") {
+                out.push_str(
+                    "\nNote: the 'repo' scope is not granted — private repositories will 404. Reconnect from the dashboard to grant it.\n",
+                );
+            }
+        }
+    }
+    tool_text(out.trim_end())
+}
+
+async fn handle_github_search_issues(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::github_workspace as gh;
+
+    let query = match args.get("query").and_then(|v| v.as_str()) {
+        Some(q) if !q.trim().is_empty() => q,
+        _ => return tool_error("Missing required parameter: query"),
+    };
+    let max = arg_u32(args, "max_results", 10);
+
+    let token = match gh::get_valid_github_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gh::github_search_issues(&token, query, max).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+/// Extract (owner, repo, number) from tool args (owner/repo strings + numeric).
+/// Returns a static error string on missing/invalid input. Uses the fully
+/// qualified `std::result::Result` because this module aliases `Result<T>` to a
+/// single-parameter `DuDuClawError` result.
+fn github_target(
+    args: &Value,
+) -> std::result::Result<(String, String, u64), &'static str> {
+    let owner = args
+        .get("owner")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("Missing required parameter: owner")?;
+    let repo = args
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("Missing required parameter: repo")?;
+    let number = arg_u64(args, "number").ok_or("Missing/invalid required parameter: number")?;
+    Ok((owner.to_string(), repo.to_string(), number))
+}
+
+async fn handle_github_issue_read(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::github_workspace as gh;
+
+    let (owner, repo, number) = match github_target(args) {
+        Ok(t) => t,
+        Err(e) => return tool_error(e),
+    };
+    let token = match gh::get_valid_github_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gh::github_issue_read(&token, &owner, &repo, number).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_github_pr_read(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::github_workspace as gh;
+
+    let (owner, repo, number) = match github_target(args) {
+        Ok(t) => t,
+        Err(e) => return tool_error(e),
+    };
+    let token = match gh::get_valid_github_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gh::github_pr_read(&token, &owner, &repo, number).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_github_issue_comment(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::github_workspace as gh;
+
+    let (owner, repo, number) = match github_target(args) {
+        Ok(t) => t,
+        Err(e) => return tool_error(e),
+    };
+    let body = match args.get("body").and_then(|v| v.as_str()) {
+        Some(b) if !b.trim().is_empty() => b,
+        _ => return tool_error("Missing required parameter: body"),
+    };
+    let token = match gh::get_valid_github_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gh::github_issue_comment(&token, &owner, &repo, number, body).await {
+        Ok(r) => tool_text(&format!(
+            "Comment posted (publicly visible) on {owner}/{repo}#{number}.\nComment ID: {}\nLink: {}",
+            r.id, r.url
+        )),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
 fn tool_text(text: &str) -> Value {
     serde_json::json!({
         "content": [{ "type": "text", "text": text }]
@@ -11398,6 +12348,10 @@ fn task_row_to_json(row: &duduclaw_gateway::task_store::TaskRow) -> Value {
         "acceptance_criteria": row.acceptance_criteria,
         "result_summary": row.result_summary,
         "judge_feedback": row.judge_feedback,
+        // Iterative Kanban (v1.45): revision-round cache + agent clock.
+        "revision_round": row.revision_round,
+        "diminishing": row.diminishing,
+        "agent_seconds": row.agent_seconds,
     })
 }
 
@@ -15476,7 +16430,7 @@ mod wiki_namespace_tests {
         let id = json!(1);
 
         // External principal → should see exactly 7 whitelisted tools
-        let response = super::handle_tools_list(&id, true);
+        let response = super::handle_tools_list(&id, true, tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"].as_array().expect("tools must be array");
         assert_eq!(
             tools.len(),
@@ -15509,7 +16463,7 @@ mod wiki_namespace_tests {
         let id = json!(1);
 
         // Internal principal → should see all tools (more than 7)
-        let response = super::handle_tools_list(&id, false);
+        let response = super::handle_tools_list(&id, false, tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"].as_array().expect("tools must be array");
         assert!(
             tools.len() > 7,
@@ -15886,7 +16840,7 @@ mod wiki_namespace_tests {
         use serde_json::json;
         let id = json!(1);
 
-        let response = super::handle_tools_list(&id, /* is_external= */ false);
+        let response = super::handle_tools_list(&id, /* is_external= */ false, tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -15910,7 +16864,7 @@ mod wiki_namespace_tests {
         use serde_json::json;
         let id = json!(1);
 
-        let response = super::handle_tools_list(&id, /* is_external= */ true);
+        let response = super::handle_tools_list(&id, /* is_external= */ true, tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -15938,7 +16892,7 @@ mod wiki_namespace_tests {
     fn rollout_to_skill_pipeline_tools_visible_to_internal_principal() {
         use serde_json::json;
 
-        let response = super::handle_tools_list(&json!(1), /* is_external= */ false);
+        let response = super::handle_tools_list(&json!(1), /* is_external= */ false, tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -15969,7 +16923,7 @@ mod wiki_namespace_tests {
     fn rollout_to_skill_pipeline_tools_hidden_from_external_principal() {
         use serde_json::json;
 
-        let response = super::handle_tools_list(&json!(1), /* is_external= */ true);
+        let response = super::handle_tools_list(&json!(1), /* is_external= */ true, tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -15999,7 +16953,7 @@ mod wiki_namespace_tests {
     fn pipeline_tool_descriptions_are_non_empty() {
         use serde_json::json;
 
-        let response = super::handle_tools_list(&json!(1), /* is_external= */ false);
+        let response = super::handle_tools_list(&json!(1), /* is_external= */ false, tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -16029,7 +16983,7 @@ mod wiki_namespace_tests {
         use serde_json::json;
         let id = json!(1);
 
-        let response = super::handle_tools_list(&id, /* is_external= */ false);
+        let response = super::handle_tools_list(&id, /* is_external= */ false, tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -16066,7 +17020,7 @@ mod wiki_namespace_tests {
     #[test]
     fn g5_skill_tools_visible_internal_hidden_external() {
         use serde_json::json;
-        let internal = super::handle_tools_list(&json!(1), /* is_external= */ false);
+        let internal = super::handle_tools_list(&json!(1), /* is_external= */ false, tmp_home_for_tools_list().path());
         let internal_names: Vec<&str> = internal["result"]["tools"]
             .as_array()
             .unwrap()
@@ -16085,7 +17039,7 @@ mod wiki_namespace_tests {
             .unwrap();
         assert!(search["inputSchema"]["properties"].get("hub").is_some());
 
-        let external = super::handle_tools_list(&json!(1), /* is_external= */ true);
+        let external = super::handle_tools_list(&json!(1), /* is_external= */ true, tmp_home_for_tools_list().path());
         let external_names: Vec<&str> = external["result"]["tools"]
             .as_array()
             .unwrap()

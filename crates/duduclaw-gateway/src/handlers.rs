@@ -28,7 +28,9 @@ use crate::partner_store::{
     PartnerCustomerInput, PartnerCustomerPatch, PartnerProfileInput, PartnerStore,
 };
 use crate::protocol::WsFrame;
-use crate::task_store::{ActivityRow, CommentRow, PlanRow, PlanStepRow, TaskRow, TaskStore};
+use crate::task_store::{
+    ActivityRow, CommentRow, PlanRow, PlanStepRow, TaskIterationRow, TaskRow, TaskStore,
+};
 
 /// Copy an industry pack's knowledge extras (FAQ.json + flat wiki/) into a
 /// freshly-created agent directory. Editable core files (SOUL.md /
@@ -1672,6 +1674,98 @@ fn scp_apply_namespace(
     Ok(format!("namespace '{namespace}' = {mode}"))
 }
 
+/// Look up the declared mode for a single namespace in a parsed `.scope.toml`
+/// table. Returns `None` when the namespace has no explicit policy (defaults to
+/// `agent_writable`).
+fn scp_namespace_mode(table: &toml::Table, namespace: &str) -> Option<String> {
+    table
+        .get("namespaces")?
+        .as_table()?
+        .get(namespace)?
+        .as_table()?
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Render the compact, auto-injectable Odoo schema summary (wiki `context`
+/// layer). Lists custom (`x_`) models in full and caps the business-model roll
+/// so the auto-injected prompt stays small.
+fn render_odoo_schema_summary(report: &duduclaw_odoo::SchemaReport) -> String {
+    const MAX_BUSINESS_ROWS: usize = 60;
+    let custom: Vec<&duduclaw_odoo::SchemaModel> =
+        report.models.iter().filter(|m| m.custom).collect();
+    let business: Vec<&duduclaw_odoo::SchemaModel> =
+        report.models.iter().filter(|m| !m.custom).collect();
+
+    let mut s = String::new();
+    s.push_str("---\ntitle: Odoo 資料表結構摘要\nlayer: context\ntags: [odoo, schema]\n---\n\n");
+    s.push_str("# Odoo 資料表結構摘要\n\n");
+    s.push_str(&format!(
+        "掃描到 {} 個資料表（顯示 {} 個{}）。完整欄位表見 wiki 頁 `odoo/schema-fields`，或用 `odoo_schema_fields` 工具查單一資料表。\n\n",
+        report.total_models,
+        report.models.len(),
+        if report.truncated { "，已截斷" } else { "" },
+    ));
+
+    if !custom.is_empty() {
+        s.push_str("## 自訂資料表 (x_)\n\n");
+        for m in &custom {
+            s.push_str(&format!(
+                "- `{}` — {} ({} 欄)\n",
+                m.model, m.name, m.field_count
+            ));
+        }
+        s.push('\n');
+    }
+
+    s.push_str("## 內建資料表\n\n");
+    for m in business.iter().take(MAX_BUSINESS_ROWS) {
+        s.push_str(&format!(
+            "- `{}` — {} ({} 欄)\n",
+            m.model, m.name, m.field_count
+        ));
+    }
+    if business.len() > MAX_BUSINESS_ROWS {
+        s.push_str(&format!(
+            "- …其餘 {} 個內建資料表見 `odoo/schema-fields`\n",
+            business.len() - MAX_BUSINESS_ROWS
+        ));
+    }
+    s
+}
+
+/// Render the full per-model field tables (wiki `deep` layer, search-only).
+/// Pre-truncated so it comfortably fits under `WikiStore`'s page-size cap.
+fn render_odoo_schema_details(report: &duduclaw_odoo::SchemaReport) -> String {
+    const MAX_BYTES: usize = 200_000;
+    let mut s = String::new();
+    s.push_str("---\ntitle: Odoo 資料表欄位明細\nlayer: deep\ntags: [odoo, schema, fields]\n---\n\n");
+    s.push_str("# Odoo 資料表欄位明細\n\n");
+    for m in &report.models {
+        let custom_tag = if m.custom { " (自訂)" } else { "" };
+        s.push_str(&format!("## `{}` — {}{}\n\n", m.model, m.name, custom_tag));
+        for f in &m.fields {
+            let req = if f.required { " [required]" } else { "" };
+            let rel = f
+                .relation
+                .as_deref()
+                .map(|r| format!(" → {r}"))
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "- `{}`: {}{}{} — {}\n",
+                f.name, f.ttype, rel, req, f.label
+            ));
+        }
+        s.push('\n');
+        if s.len() > MAX_BYTES {
+            s.push_str("\n_…輸出過長已截斷，請用 `odoo_schema_fields` 查詢個別資料表。_\n");
+            break;
+        }
+    }
+    s
+}
+
 // ── P2 ODO helpers (per-agent [odoo] override) ────────────────────────────────
 
 /// Validate a per-agent Odoo `allowed_actions` entry. Accepts a bare verb
@@ -1750,6 +1844,23 @@ fn apply_odoo_to_table(
         }
         section.insert("allowed_models".into(), toml::Value::Array(out.clone()));
         changes.push(format!("odoo.allowed_models = [{} entries]", out.len()));
+    }
+
+    // unblock_models[] (opt-out of the built-in security block list)
+    if let Some(arr) = odoo_in.get("unblock_models").and_then(|v| v.as_array()) {
+        let mut out: Vec<toml::Value> = Vec::new();
+        for item in arr {
+            let m = item.as_str().unwrap_or("").trim();
+            if m.is_empty() {
+                continue;
+            }
+            if !MethodHandler::is_valid_odoo_model(m) {
+                return Err(format!("Invalid odoo unblock_models entry '{m}'"));
+            }
+            out.push(toml::Value::String(m.into()));
+        }
+        section.insert("unblock_models".into(), toml::Value::Array(out.clone()));
+        changes.push(format!("odoo.unblock_models = [{} entries]", out.len()));
     }
 
     // allowed_actions[] (bare verb or verb:model)
@@ -4181,6 +4292,13 @@ impl MethodHandler {
                 require_manager!();
                 self.handle_budget_summary().await
             }
+            // CLI-store credentials (grok/codex/gemini) — presence-only view
+            // of each CLI's own credential file, so subscription logins that
+            // never become rotator accounts still show on the accounts page.
+            "accounts.cli_credentials" => {
+                require_manager!();
+                self.handle_accounts_cli_credentials().await
+            }
             "accounts.rotate" => {
                 require_admin!();
                 self.handle_accounts_rotate(params).await
@@ -4481,6 +4599,11 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_odoo_test(params).await
             }
+            // Schema introspection — enumerate models/fields + write to wiki.
+            "odoo.discover_schema" => {
+                require_admin!();
+                self.handle_odoo_discover_schema(params).await
+            }
             // RFC-21 §2: per-agent Odoo credential isolation.
             "odoo.agent_config_get" => {
                 require_admin!();
@@ -4631,6 +4754,16 @@ impl MethodHandler {
             // read/post; unknown task fails closed for non-admins.
             "tasks.comment" => self.handle_tasks_comment(params, ctx).await,
             "tasks.comments" => self.handle_tasks_comments(params, ctx).await,
+            // Iterative Kanban: per-task revision timeline + per-agent flow
+            // metrics. Both are read-only board analytics (Viewer). The
+            // per-task call gates on the task's owning agent inside the handler
+            // (like tasks.comments); the aggregate forces non-admins to scope to
+            // a bound agent (check_agent_filter) and filters the result to it.
+            "tasks.iterations" => self.handle_tasks_iterations(params, ctx).await,
+            "tasks.flow_metrics" => {
+                check_agent_filter!(AccessLevel::Viewer);
+                self.handle_tasks_flow_metrics(params).await
+            }
 
             // ── Co-edited plans (U4, Cocoa arXiv:2412.10999) ──
             // Same gate pattern as tasks.*: listing takes the optional
@@ -6467,6 +6600,33 @@ impl MethodHandler {
                 .map(|c| c.contains_key("os_native"))
                 .unwrap_or(false);
 
+        // WP: capture the pre-update display_name + agent dir when this call
+        // is renaming the agent, so we can keep SOUL.md / IDENTITY.md self-
+        // introduction text and the default `@trigger` in sync afterward.
+        // Root cause: the agent's system-prompt self-name comes 100% from
+        // literal text burned into SOUL.md at creation time — agent.toml's
+        // display_name never reached the prompt on its own, so a rename left
+        // the agent introducing itself with its old name forever. Read
+        // BEFORE the mutation closure runs (which re-parses agent.toml fresh
+        // from disk), so this is the authoritative "before" value.
+        let new_display_name = params
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let (old_display_name, agent_dir_for_rename) = if new_display_name.is_some() {
+            let reg = self.registry.read().await;
+            match reg.get(&agent_id) {
+                Some(a) => (
+                    Some(a.config.agent.display_name.clone()),
+                    Some(a.dir.clone()),
+                ),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        let old_display_name_for_closure = old_display_name.clone();
+
         let params_clone = params.clone();
         let mut changes: Vec<String> = Vec::new();
         let home_for_update = self.home_dir.clone();
@@ -6477,6 +6637,29 @@ impl MethodHandler {
                 if let Some(v) = params_clone.get("display_name").and_then(|v| v.as_str()) {
                     agent_section.insert("display_name".into(), toml::Value::String(v.into()));
                     changes.push(format!("display_name = \"{v}\""));
+
+                    // Auto-sync the default `@{old_name}` mention trigger to
+                    // the new name, unless the caller also set `trigger`
+                    // explicitly in this same request (that wins) or the
+                    // existing trigger was already customized away from the
+                    // default pattern.
+                    if params_clone.get("trigger").and_then(|t| t.as_str()).is_none() {
+                        if let Some(old_name) = old_display_name_for_closure.as_deref() {
+                            let current_trigger = agent_section
+                                .get("trigger")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("");
+                            if let Some(new_trigger) =
+                                duduclaw_core::synced_trigger(current_trigger, old_name, v)
+                            {
+                                agent_section.insert(
+                                    "trigger".into(),
+                                    toml::Value::String(new_trigger.clone()),
+                                );
+                                changes.push(format!("trigger synced -> \"{new_trigger}\""));
+                            }
+                        }
+                    }
                 }
                 if let Some(v) = params_clone.get("role").and_then(|v| v.as_str()) {
                     match v {
@@ -7189,6 +7372,51 @@ impl MethodHandler {
 
         match result {
             Ok(hot_reloaded) => {
+                // WP: sync SOUL.md / IDENTITY.md self-introduction text to
+                // the new display_name (see comment above the capture site).
+                // Best-effort: a missing file is skipped, an IO error is
+                // logged but does not fail the already-committed agent.toml
+                // write.
+                let mut soul_sync_changes: Vec<String> = Vec::new();
+                if let (Some(new_name), Some(old_name), Some(dir)) =
+                    (&new_display_name, &old_display_name, &agent_dir_for_rename)
+                {
+                    if old_name != new_name && !old_name.is_empty() {
+                        for fname in ["SOUL.md", "IDENTITY.md"] {
+                            let path = dir.join(fname);
+                            let content = match tokio::fs::read_to_string(&path).await {
+                                Ok(c) => c,
+                                Err(_) => continue, // file doesn't exist — nothing to sync
+                            };
+                            let (new_content, changed) =
+                                duduclaw_core::rename_in_markdown(&content, old_name, new_name);
+                            if !changed {
+                                continue;
+                            }
+                            let tmp_path = path.with_extension("md.tmp");
+                            if let Err(e) = tokio::fs::write(&tmp_path, &new_content).await {
+                                warn!(agent_id = agent_id.as_str(), file = fname, error = %e, "Failed to write identity-rename tmp file");
+                                continue;
+                            }
+                            if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
+                                let _ = tokio::fs::remove_file(&tmp_path).await;
+                                warn!(agent_id = agent_id.as_str(), file = fname, error = %e, "Failed to commit identity-rename");
+                                continue;
+                            }
+                            soul_sync_changes.push(format!(
+                                "{fname} self-name synced \"{old_name}\" -> \"{new_name}\""
+                            ));
+                        }
+                    }
+                }
+                if !soul_sync_changes.is_empty() {
+                    info!(
+                        agent_id = agent_id.as_str(),
+                        changes = ?soul_sync_changes,
+                        "Synced agent identity files after display_name change"
+                    );
+                }
+
                 // Hot-restart channel bots whose tokens just changed. Without
                 // this, the running bot loop keeps the previous captured token
                 // until gateway restart, so user-visible behavior diverges
@@ -7225,6 +7453,7 @@ impl MethodHandler {
                         "hot_reloaded": hot_reloaded,
                         "channels_restarted": restarted,
                         "os_watch_hot_reloaded": os_watch_hot_reloaded,
+                        "identity_files_synced": soul_sync_changes,
                         "message": if hot_reloaded {
                             "Agent updated successfully"
                         } else {
@@ -10031,6 +10260,24 @@ impl MethodHandler {
             })
             .collect();
         WsFrame::ok_response("", json!({ "accounts": accounts_json }))
+    }
+
+    /// `accounts.cli_credentials` — see the dispatch comment. Presence + mtime
+    /// only; never reads credential content.
+    async fn handle_accounts_cli_credentials(&self) -> WsFrame {
+        let credentials: Vec<Value> = crate::cli_auth::cli_credential_statuses()
+            .into_iter()
+            .map(|c| {
+                json!({
+                    "runtime": c.runtime.as_str(),
+                    "store": c.store,
+                    "installed": c.installed,
+                    "present": c.present,
+                    "modified_at": c.modified_epoch,
+                })
+            })
+            .collect();
+        WsFrame::ok_response("", json!({ "credentials": credentials }))
     }
 
     async fn handle_budget_summary(&self) -> WsFrame {
@@ -14623,8 +14870,24 @@ impl MethodHandler {
             );
         }
         let Some(token) = session.captured_token() else {
-            // Success without a scrapeable token (e.g. localhost-callback CLIs that
-            // persist to their own store). Nothing to register here.
+            // Only `claude setup-token` ever PRINTS a token — every other CLI
+            // (grok/codex/gemini) persists credentials to its own store, which
+            // is exactly what the success_file watcher confirmed. For those,
+            // "no scrapeable token" IS the expected success path: the runtime
+            // reads the CLI store directly, no [[accounts]] entry is needed.
+            // Report it as `cli_store` so the dashboard renders success, not a
+            // warning. A tokenless CLAUDE login stays an anomaly (the scrape
+            // failed) and keeps the old reason.
+            if session.runtime != duduclaw_core::types::RuntimeType::Claude {
+                let store = crate::cli_auth::spec_for(session.runtime)
+                    .and_then(|s| s.success_file)
+                    .map(|f| format!("~/{f}"))
+                    .unwrap_or_else(|| "CLI 憑證儲存".to_string());
+                return WsFrame::ok_response(
+                    "",
+                    json!({"registered": false, "reason": "cli_store", "store": store}),
+                );
+            }
             return WsFrame::ok_response(
                 "",
                 json!({"registered": false, "reason": "no token captured"}),
@@ -16375,9 +16638,9 @@ impl MethodHandler {
             }
         }
 
-        // ── G.3 [general] default_agent / inference_mode ──
+        // ── G.3 [general] default_agent / inference_mode / default_language ──
         {
-            let has_gen = ["default_agent", "inference_mode"]
+            let has_gen = ["default_agent", "inference_mode", "default_language"]
                 .iter()
                 .any(|k| params.get(*k).is_some());
             if has_gen {
@@ -16406,6 +16669,26 @@ impl MethodHandler {
                                 "Invalid inference_mode. Valid: local, claude, hybrid",
                             );
                         }
+                    }
+                }
+                // WP: global default reply language. Empty string clears it
+                // (agent reverts to "follow the user's input language" — the
+                // pre-existing behaviour). Not an enum: any BCP-47-ish tag is
+                // accepted so operators aren't blocked on a code the
+                // dashboard dropdown hasn't been updated to offer yet; the
+                // prompt-injection side (`prompt_identity::language_instruction`)
+                // degrades gracefully to the raw code for unrecognized values.
+                if let Some(v) = params.get("default_language").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if v.is_empty() {
+                        general.remove("default_language");
+                        changes.push("general.default_language cleared".into());
+                    } else {
+                        general.insert(
+                            "default_language".into(),
+                            toml::Value::String(v.into()),
+                        );
+                        changes.push(format!("general.default_language = \"{v}\""));
                     }
                 }
             }
@@ -16698,7 +16981,7 @@ impl MethodHandler {
         if changes.is_empty() {
             return WsFrame::error_response(
                 "",
-                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple), dispatch(policy), memory(graph_embed_seed), topology_evolution(enabled)",
+                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple), dispatch(policy), memory(graph_embed_seed), topology_evolution(enabled)",
             );
         }
 
@@ -17394,6 +17677,7 @@ impl MethodHandler {
                 "poll_interval_seconds": cfg.poll_interval_seconds,
                 "poll_models": cfg.poll_models,
                 "webhook_enabled": cfg.webhook_enabled,
+                "unblock_models": cfg.unblock_models,
                 "features_crm": cfg.features_crm,
                 "features_sale": cfg.features_sale,
                 "features_inventory": cfg.features_inventory,
@@ -17404,15 +17688,20 @@ impl MethodHandler {
         )
     }
 
-    /// Validate an Odoo model name (e.g. `crm.lead`, `sale.order`).
-    /// Rejects blocked models (security-sensitive Odoo internals).
+    /// Validate an Odoo model name (e.g. `crm.lead`, `sale.order`) for a
+    /// per-agent `allowed_models` entry. Syntax-only: `allowed_models` is a
+    /// *restriction* filter (a model listed here is still subject to the
+    /// built-in block list + `unblock_models` at call time — listing it never
+    /// grants access past a security default), so blocked model names such as
+    /// `res.partner` are accepted here. This lets an operator scope an agent to
+    /// `res.partner` for the field-whitelisted `odoo_partner_search`, or pair it
+    /// with `unblock_models` for generic access, without the form rejecting it.
     fn is_valid_odoo_model(name: &str) -> bool {
         !name.is_empty()
             && name.len() < 100
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
-            && !duduclaw_odoo::OdooConnector::is_model_blocked(name)
     }
 
     /// Validate that a URL is safe for Odoo connections.
@@ -17659,6 +17948,29 @@ impl MethodHandler {
             odoo.insert("poll_models".into(), toml::Value::Array(arr));
         }
 
+        // Global unblock list: models the operator explicitly releases from the
+        // built-in security block list (per-agent [odoo].unblock_models still
+        // overrides). Absent param preserves the stored list so older dashboard
+        // builds can't silently wipe it.
+        if let Some(models) = params.get("unblock_models").and_then(|v| v.as_array()) {
+            let arr: Vec<toml::Value> = models
+                .iter()
+                .take(50)
+                .filter_map(|v| {
+                    v.as_str()
+                        .filter(|s| Self::is_valid_odoo_model(s))
+                        .map(|s| toml::Value::String(s.into()))
+                })
+                .collect();
+            odoo.insert("unblock_models".into(), toml::Value::Array(arr));
+        } else if let Some(existing) = table
+            .get("odoo")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("unblock_models"))
+        {
+            odoo.insert("unblock_models".into(), existing.clone());
+        }
+
         // Webhook config
         odoo.insert(
             "webhook_enabled".into(),
@@ -17832,6 +18144,147 @@ impl MethodHandler {
                 )
             }
         }
+    }
+
+    /// `odoo.discover_schema` — connect with the stored config, introspect the
+    /// model/field schema, write a summary to the shared wiki, and return a
+    /// lightweight model list to the dashboard. Metadata only — no business
+    /// rows are read or returned. Honours the `.scope.toml` policy for the
+    /// `odoo` namespace: a locked namespace skips the wiki write (fail-safe)
+    /// but still returns the discovered models.
+    async fn handle_odoo_discover_schema(&self, params: Value) -> WsFrame {
+        let max_models = params
+            .get("max_models")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).clamp(10, 1000))
+            .unwrap_or(300);
+
+        // Build connector from the stored global config (same path as status).
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        let odoo_cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
+        if !odoo_cfg.is_configured() {
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "success": false,
+                    "message": "Odoo not configured — fill URL and database, then save first",
+                }),
+            );
+        }
+        let credential = match self.resolve_odoo_credential(&table) {
+            Some(c) if !c.is_empty() => c,
+            _ => {
+                return WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": false,
+                        "message": "No API key or password configured",
+                    }),
+                );
+            }
+        };
+
+        let conn = match duduclaw_odoo::OdooConnector::connect(&odoo_cfg, &credential).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Odoo discover_schema connect failed: {e}");
+                return WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": false,
+                        "message": format!("Connection failed: {}", Self::scrub_odoo_error(&e)),
+                    }),
+                );
+            }
+        };
+
+        let report = match conn.introspect_schema(max_models).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Odoo introspect_schema failed: {e}");
+                return WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": false,
+                        "message": format!("Schema scan failed: {}", Self::scrub_odoo_error(&e)),
+                    }),
+                );
+            }
+        };
+
+        // Lightweight model list for the UI (no field payload — that lives in
+        // the wiki / odoo_schema_fields).
+        let models: Vec<Value> = report
+            .models
+            .iter()
+            .map(|m| {
+                json!({
+                    "model": m.model,
+                    "name": m.name,
+                    "custom": m.custom,
+                    "field_count": m.field_count,
+                })
+            })
+            .collect();
+
+        // Write schema to the shared wiki, honouring the .scope.toml policy.
+        let (wiki_written, wiki_note) = self.write_odoo_schema_wiki(&report).await;
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "models": models,
+                "total_models": report.total_models,
+                "truncated": report.truncated,
+                "wiki_written": wiki_written,
+                "wiki_note": wiki_note,
+            }),
+        )
+    }
+
+    /// Persist an introspected schema to the shared wiki as two pages:
+    /// `odoo/schema` (context layer — compact summary, auto-injectable) and
+    /// `odoo/schema-fields` (deep layer — full field tables for search).
+    /// Returns `(written, note)`. Skips the write (fail-safe) when the `odoo`
+    /// namespace is locked by `.scope.toml`.
+    async fn write_odoo_schema_wiki(
+        &self,
+        report: &duduclaw_odoo::SchemaReport,
+    ) -> (bool, String) {
+        // .scope.toml policy for the `odoo` namespace.
+        let scope_path = self
+            .home_dir
+            .join("shared")
+            .join("wiki")
+            .join(".scope.toml");
+        let scope_table = self.read_config_table(&scope_path).await;
+        if let Some(mode) = scp_namespace_mode(&scope_table, "odoo") {
+            if mode != "agent_writable" {
+                return (
+                    false,
+                    format!("wiki 'odoo' namespace is '{mode}' — schema not written"),
+                );
+            }
+        }
+
+        let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
+        if let Err(e) = store.ensure_scaffold() {
+            return (false, format!("wiki scaffold failed: {e}"));
+        }
+
+        let summary = render_odoo_schema_summary(report);
+        let details = render_odoo_schema_details(report);
+
+        if let Err(e) = store.write_page("odoo/schema.md", &summary) {
+            return (false, format!("wiki write failed: {e}"));
+        }
+        if let Err(e) = store.write_page("odoo/schema-fields.md", &details) {
+            // Summary landed; report the partial state honestly.
+            return (true, format!("summary written; field detail failed: {e}"));
+        }
+        (true, "schema written to wiki (odoo/schema, odoo/schema-fields)".into())
     }
 
     /// Build a transient `OdooConfig` + credential from RPC params for the
@@ -18087,6 +18540,7 @@ impl MethodHandler {
                 "db": get_str("db"),
                 "username": get_str("username"),
                 "allowed_models": get_arr("allowed_models"),
+                "unblock_models": get_arr("unblock_models"),
                 "allowed_actions": get_arr("allowed_actions"),
                 "company_ids": company_ids,
                 "api_key_set": api_key_set,
@@ -18125,6 +18579,7 @@ impl MethodHandler {
             "password",
             "profile",
             "allowed_models",
+            "unblock_models",
             "allowed_actions",
             "company_ids",
         ] {
@@ -20599,7 +21054,11 @@ impl MethodHandler {
         use crate::mcp_oauth;
 
         let redirect_uri = format!("http://localhost:3000/api/mcp/oauth/callback");
-        let providers = mcp_oauth::builtin_providers(&redirect_uri);
+        let google_enabled = crate::google_workspace::integration_enabled(&self.home_dir);
+        let providers: Vec<_> = mcp_oauth::builtin_providers(&redirect_uri)
+            .into_iter()
+            .filter(|p| google_enabled || p.provider_id != crate::google_workspace::GOOGLE_PROVIDER)
+            .collect();
 
         let results: Vec<Value> = providers
             .iter()
@@ -20619,11 +21078,16 @@ impl MethodHandler {
                     }
                     None => "none",
                 };
+                // `configured` reflects persisted client credentials — the
+                // built-in templates always carry empty client_id, so checking
+                // the stored config is what tells us the user has set up creds.
+                let configured =
+                    !p.client_id.is_empty() || mcp_oauth::has_client_config(&self.home_dir, &p.provider_id);
                 json!({
                     "provider_id": p.provider_id,
                     "auth_url": p.auth_url,
                     "scopes": p.scopes,
-                    "configured": !p.client_id.is_empty(),
+                    "configured": configured,
                     "status": status,
                     "expires_at": token.and_then(|t| t.expires_at),
                 })
@@ -20684,7 +21148,24 @@ impl MethodHandler {
                 redirect_uri: redirect_uri.clone(),
             });
 
-        // Override client_id/secret if provided in params
+        // Prefill from previously-stored client credentials so re-authorizing
+        // (e.g. to grant new scopes) doesn't require re-entering the secret.
+        if let Some(stored) = mcp_oauth::get_client_config(&self.home_dir, &provider_id) {
+            if config.client_id.is_empty() {
+                config.client_id = stored.client_id;
+            }
+            if config.client_secret.is_empty() {
+                config.client_secret = stored.client_secret;
+            }
+            if config.auth_url.is_empty() {
+                config.auth_url = stored.auth_url;
+            }
+            if config.token_url.is_empty() {
+                config.token_url = stored.token_url;
+            }
+        }
+
+        // Override client_id/secret if provided in params (form input wins).
         if !client_id.is_empty() {
             config.client_id = client_id;
         }
@@ -20703,6 +21184,23 @@ impl MethodHandler {
                 "",
                 "auth_url and token_url are required for custom providers",
             );
+        }
+
+        // Persist client credentials so the token can be refreshed later without
+        // re-prompting the user (secret encrypted at rest). See mcp_oauth.
+        if let Err(e) = mcp_oauth::upsert_client_config(
+            &self.home_dir,
+            mcp_oauth::McpOAuthClientConfig {
+                provider_id: provider_id.clone(),
+                client_id: config.client_id.clone(),
+                client_secret: config.client_secret.clone(),
+                auth_url: config.auth_url.clone(),
+                token_url: config.token_url.clone(),
+                scopes: config.scopes.clone(),
+                redirect_uri: config.redirect_uri.clone(),
+            },
+        ) {
+            warn!(provider = %provider_id, error = %e, "Failed to persist OAuth client config");
         }
 
         // Generate PKCE
@@ -21309,6 +21807,79 @@ impl MethodHandler {
             }
             Err(e) => WsFrame::error_response("", &format!("list comments: {e}")),
         }
+    }
+
+    /// Iterative Kanban: the revision timeline (dispatched → submitted → verdict
+    /// per round) for one task. Viewer-gated on the task's owning agent.
+    async fn handle_tasks_iterations(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        if task_id.is_empty() {
+            return WsFrame::error_response("", "task_id is required");
+        }
+        if let Err(f) = self
+            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+            .await
+        {
+            return f;
+        }
+        match store.list_iterations(task_id).await {
+            Ok(rows) => {
+                let iterations: Vec<Value> = rows.iter().map(task_iteration_to_json).collect();
+                WsFrame::ok_response("", json!({ "iterations": iterations }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("list iterations: {e}")),
+        }
+    }
+
+    /// Iterative Kanban: per-agent + board flow metrics (first-pass yield, avg
+    /// rounds, dual-clock means, review queue depth, WIP limit + 7-day accept
+    /// throughput for the Little's-Law wait estimate). Non-admins pass an
+    /// `agent_id` (check_agent_filter) and see only that agent's slice; admins
+    /// see all agents.
+    async fn handle_tasks_flow_metrics(&self, params: Value) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let now = Utc::now().to_rfc3339();
+        let metrics = match store.flow_metrics(&now).await {
+            Ok(m) => m,
+            Err(e) => return WsFrame::error_response("", &format!("flow metrics: {e}")),
+        };
+        let review_wip_limit = crate::goal_loop::review_wip_limit(&self.home_dir);
+        // Scope the per-agent slice when the caller filtered to one agent.
+        let filter_agent = params.get("agent_id").and_then(|v| v.as_str());
+        let agents: Vec<Value> = metrics
+            .agents
+            .iter()
+            .filter(|a| filter_agent.map(|f| f == a.agent_id).unwrap_or(true))
+            .map(|a| {
+                json!({
+                    "agent_id": a.agent_id,
+                    "goal_tasks": a.goal_tasks,
+                    "finished": a.finished,
+                    "first_pass_yield": a.first_pass_yield,
+                    "avg_rounds": a.avg_rounds,
+                    "avg_agent_seconds": a.avg_agent_seconds,
+                    "avg_cycle_seconds": a.avg_cycle_seconds,
+                    "review_queue_depth": a.review_queue_depth,
+                })
+            })
+            .collect();
+        WsFrame::ok_response(
+            "",
+            json!({
+                "agents": agents,
+                "review_queue_depth": metrics.review_queue_depth,
+                "review_wip_limit": review_wip_limit,
+                "accepts_last_7d": metrics.accepts_last_7d,
+                "avg_daily_accepts_7d": metrics.avg_daily_accepts_7d,
+            }),
+        )
     }
 
     // ── Co-edited plan handlers (U4) ────────────────────────
@@ -24133,6 +24704,23 @@ fn task_row_to_json(r: &TaskRow) -> Value {
         "parent_task_id": r.parent_task_id,
         "tags": r.tags.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
         "message_id": r.message_id,
+        // Iterative Kanban (v1.45): revision-round cache + agent clock + lease.
+        "revision_round": r.revision_round,
+        "diminishing": r.diminishing,
+        "agent_seconds": r.agent_seconds,
+        "lease_expires_at": r.lease_expires_at,
+    })
+}
+
+fn task_iteration_to_json(r: &TaskIterationRow) -> Value {
+    json!({
+        "round": r.round,
+        "dispatched_at": r.dispatched_at,
+        "submitted_at": r.submitted_at,
+        "judged_at": r.judged_at,
+        "verdict": r.verdict,
+        "judge_feedback": r.judge_feedback,
+        "feedback_class": r.feedback_class,
     })
 }
 
