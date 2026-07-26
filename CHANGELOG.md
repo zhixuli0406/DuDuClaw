@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.45.0] - 2026-07-26 — 客戶實測修復與一鍵串接
+
 ### Added
 - **Notion／GitHub／Google Sheets 一鍵串接**：整合頁新增 Notion 與 GitHub 分頁（與
   Google 相同的三態連接流程，抽成共用元件），Sheets 併入既有 Google 授權（scope
