@@ -58,6 +58,12 @@ pub struct AgentOdooConfig {
     /// Multi-company scope. When non-empty, queries are narrowed to these
     /// `res.company` ids. Empty ⇒ inherit Odoo user's default companies.
     pub company_ids: Vec<i32>,
+    /// Opt-out list for the built-in security block list. Default-blocked
+    /// models named here (e.g. `res.partner`) become reachable via the generic
+    /// `odoo_search` / `odoo_execute` tools — still subject to `allowed_models`
+    /// / `allowed_actions` and, for system metadata tables, read-only
+    /// enforcement. Empty ⇒ the default block list is fully in force.
+    pub unblock_models: Vec<String>,
 }
 
 impl AgentOdooConfig {
@@ -78,6 +84,7 @@ impl AgentOdooConfig {
             && self.allowed_models.is_empty()
             && self.allowed_actions.is_empty()
             && self.company_ids.is_empty()
+            && self.unblock_models.is_empty()
     }
 
     /// Parse from a `agent.toml` table — looks for the `[odoo]` section.

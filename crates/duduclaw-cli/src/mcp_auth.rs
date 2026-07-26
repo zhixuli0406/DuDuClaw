@@ -32,6 +32,27 @@ pub enum Scope {
     /// `action_confirm`) and the generic `odoo_execute` / `odoo_report`
     /// surfaces, which can fire side-effects beyond simple writes.
     OdooExecute,
+    /// Google Workspace: gates the read-class native tools (`google_status`,
+    /// `gmail_search`, `gmail_read`, `calendar_list_events`). Distinct scope so
+    /// operators can grant Gmail/Calendar read without full `Admin`.
+    GoogleRead,
+    /// Google Workspace: gates the write-class native tools
+    /// (`gmail_create_draft` — draft only, never sends; `calendar_create_event`
+    /// — creates a real, externally-visible event; `sheets_append`).
+    GoogleWrite,
+    /// Notion: gates the read-class native tools (`notion_status`,
+    /// `notion_search`, `notion_page_read`). Notion content is an external
+    /// knowledge source surfaced for query/citation only.
+    NotionRead,
+    /// Notion: gates the write-class native tool (`notion_page_append` — appends
+    /// paragraph blocks to an existing page; never deletes/overwrites).
+    NotionWrite,
+    /// GitHub: gates the read-class native tools (`github_status`,
+    /// `github_search_issues`, `github_issue_read`, `github_pr_read`).
+    GithubRead,
+    /// GitHub: gates the write-class native tool (`github_issue_comment` — posts
+    /// a publicly visible comment).
+    GithubWrite,
     /// RFC-26: gates the Live Run Forking tools (`fork_run`, `inspect_branches`,
     /// `diff_branches`, `merge_or_select`, `terminate_branch`, `fork_cost`).
     /// Distinct from `Admin` so operators can grant an agent the ability to fork
@@ -57,6 +78,12 @@ impl std::fmt::Display for Scope {
             Scope::OdooRead => "odoo:read",
             Scope::OdooWrite => "odoo:write",
             Scope::OdooExecute => "odoo:execute",
+            Scope::GoogleRead => "google:read",
+            Scope::GoogleWrite => "google:write",
+            Scope::NotionRead => "notion:read",
+            Scope::NotionWrite => "notion:write",
+            Scope::GithubRead => "github:read",
+            Scope::GithubWrite => "github:write",
             Scope::ForkExecute => "fork:execute",
             Scope::OsNative => "os:native",
             Scope::Admin => "admin",
@@ -377,6 +404,24 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
             "odoo:execute" => {
                 result.insert(Scope::OdooExecute);
             }
+            "google:read" => {
+                result.insert(Scope::GoogleRead);
+            }
+            "google:write" => {
+                result.insert(Scope::GoogleWrite);
+            }
+            "notion:read" => {
+                result.insert(Scope::NotionRead);
+            }
+            "notion:write" => {
+                result.insert(Scope::NotionWrite);
+            }
+            "github:read" => {
+                result.insert(Scope::GithubRead);
+            }
+            "github:write" => {
+                result.insert(Scope::GithubWrite);
+            }
             "fork:execute" => {
                 result.insert(Scope::ForkExecute);
             }
@@ -471,6 +516,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "odoo_inventory_check"
         | "odoo_invoice_list"
         | "odoo_payment_status"
+        | "odoo_partner_search"
+        | "odoo_schema_fields"
         | "odoo_search" => Some(Scope::OdooRead),
         // Connect is read-class — it acquires/refreshes the connection but
         // doesn't mutate Odoo state. Without it, no read can happen either.
@@ -483,6 +530,27 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // Execute class: workflow buttons + generic execute_kw + report
         // generation. These can fire arbitrary Odoo-side actions.
         "odoo_sale_confirm" | "odoo_execute" | "odoo_report" => Some(Scope::OdooExecute),
+        // Google Workspace native tools. Read class: connection diagnostics,
+        // mail search/read, calendar listing, spreadsheet read — no external
+        // side-effects.
+        "google_status" | "gmail_search" | "gmail_read" | "calendar_list_events"
+        | "sheets_read" => Some(Scope::GoogleRead),
+        // Write class: draft creation (never sends) + real calendar-event
+        // creation + spreadsheet row append. Defence-in-depth beyond any
+        // per-agent approval_required_tools gate the operator adds.
+        "gmail_create_draft" | "calendar_create_event" | "sheets_append" => {
+            Some(Scope::GoogleWrite)
+        }
+        // Notion native tools. Read class: connection diagnostics, search, and
+        // page read. Write class: append paragraph blocks to an existing page.
+        "notion_status" | "notion_search" | "notion_page_read" => Some(Scope::NotionRead),
+        "notion_page_append" => Some(Scope::NotionWrite),
+        // GitHub native tools. Read class: diagnostics, issue/PR search and
+        // read. Write class: post a publicly visible issue/PR comment.
+        "github_status" | "github_search_issues" | "github_issue_read" | "github_pr_read" => {
+            Some(Scope::GithubRead)
+        }
+        "github_issue_comment" => Some(Scope::GithubWrite),
         // W19-P1 M4: Audit Trail 查詢 API — admin-only，與 WebSocket 路徑
         // `require_admin!()` 保持對等訪問控制。
         "audit_trail_query" => Some(Scope::Admin),
@@ -801,6 +869,19 @@ is_external = {is_external}
     }
 
     #[test]
+    fn test_new_odoo_read_tools_require_odoo_read() {
+        // The safe customer search + schema introspection tools must sit in the
+        // read scope class — never fall through to Admin or (worse) None.
+        for tool in ["odoo_partner_search", "odoo_schema_fields"] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::OdooRead),
+                "tool {tool} must require odoo:read"
+            );
+        }
+    }
+
+    #[test]
     fn test_explicitly_enumerated_admin_tools_2026_07() {
         // Scope-table consistency (2026-07): these previously relied on the
         // Admin fall-through; now enumerated explicitly with the same
@@ -842,6 +923,99 @@ is_external = {is_external}
         );
         // A read-only key must NOT satisfy the write tool.
         assert_ne!(tool_requires_scope("memory_alias_add"), Some(Scope::MemoryRead));
+    }
+
+    #[test]
+    fn test_google_scopes_parse_and_display() {
+        let scopes = parse_scopes("google:read,google:write").expect("should parse");
+        assert!(scopes.contains(&Scope::GoogleRead));
+        assert!(scopes.contains(&Scope::GoogleWrite));
+        assert_eq!(Scope::GoogleRead.to_string(), "google:read");
+        assert_eq!(Scope::GoogleWrite.to_string(), "google:write");
+    }
+
+    #[test]
+    fn test_google_tools_scope_split() {
+        // Read class.
+        for tool in ["google_status", "gmail_search", "gmail_read", "calendar_list_events"] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::GoogleRead),
+                "tool {tool} must require google:read"
+            );
+        }
+        // Write class — a read-only key must NOT satisfy it.
+        for tool in ["gmail_create_draft", "calendar_create_event"] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::GoogleWrite),
+                "tool {tool} must require google:write"
+            );
+            assert_ne!(tool_requires_scope(tool), Some(Scope::GoogleRead));
+        }
+    }
+
+    #[test]
+    fn test_notion_scopes_parse_and_display() {
+        let scopes = parse_scopes("notion:read,notion:write").expect("should parse");
+        assert!(scopes.contains(&Scope::NotionRead));
+        assert!(scopes.contains(&Scope::NotionWrite));
+        assert_eq!(Scope::NotionRead.to_string(), "notion:read");
+        assert_eq!(Scope::NotionWrite.to_string(), "notion:write");
+    }
+
+    #[test]
+    fn test_github_scopes_parse_and_display() {
+        let scopes = parse_scopes("github:read,github:write").expect("should parse");
+        assert!(scopes.contains(&Scope::GithubRead));
+        assert!(scopes.contains(&Scope::GithubWrite));
+        assert_eq!(Scope::GithubRead.to_string(), "github:read");
+        assert_eq!(Scope::GithubWrite.to_string(), "github:write");
+    }
+
+    #[test]
+    fn test_notion_tools_scope_split() {
+        for tool in ["notion_status", "notion_search", "notion_page_read"] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::NotionRead),
+                "tool {tool} must require notion:read"
+            );
+        }
+        assert_eq!(
+            tool_requires_scope("notion_page_append"),
+            Some(Scope::NotionWrite)
+        );
+        // A read-only key must NOT satisfy the write tool.
+        assert_ne!(tool_requires_scope("notion_page_append"), Some(Scope::NotionRead));
+    }
+
+    #[test]
+    fn test_github_tools_scope_split() {
+        for tool in [
+            "github_status",
+            "github_search_issues",
+            "github_issue_read",
+            "github_pr_read",
+        ] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::GithubRead),
+                "tool {tool} must require github:read"
+            );
+        }
+        assert_eq!(
+            tool_requires_scope("github_issue_comment"),
+            Some(Scope::GithubWrite)
+        );
+        assert_ne!(tool_requires_scope("github_issue_comment"), Some(Scope::GithubRead));
+    }
+
+    #[test]
+    fn test_sheets_tools_join_google_scope_split() {
+        assert_eq!(tool_requires_scope("sheets_read"), Some(Scope::GoogleRead));
+        assert_eq!(tool_requires_scope("sheets_append"), Some(Scope::GoogleWrite));
+        assert_ne!(tool_requires_scope("sheets_append"), Some(Scope::GoogleRead));
     }
 
     #[test]

@@ -8,6 +8,9 @@ pub mod rpc;
 
 pub use agent_config::{AgentOdooConfig, OdooConfigResolver};
 pub use config::OdooConfig;
-pub use connector::{OdooConnector, OdooStatus};
+pub use connector::{
+    check_blocklist, is_introspection_noise, AccessKind, BlockDenial, OdooConnector, OdooStatus,
+    SchemaField, SchemaModel, SchemaReport, PARTNER_SEARCH_FIELDS,
+};
 pub use edition::{Edition, EditionGate};
 pub use events::{OdooEvent, PollTracker};

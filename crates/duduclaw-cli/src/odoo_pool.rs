@@ -111,6 +111,18 @@ impl OdooConnectorPool {
         self.resolver.read().await.for_agent(agent_id).cloned()
     }
 
+    /// Effective `unblock_models` opt-out for `agent_id`. When the agent has an
+    /// `agent.toml [odoo]` override block, that block's `unblock_models` is
+    /// authoritative (even if empty — a deliberate "none"); otherwise the
+    /// global `config.toml [odoo].unblock_models` baseline applies.
+    pub async fn unblock_models(&self, agent_id: &str) -> Vec<String> {
+        let resolver = self.resolver.read().await;
+        match resolver.for_agent(agent_id) {
+            Some(cfg) => cfg.unblock_models.clone(),
+            None => resolver.global().unblock_models.clone(),
+        }
+    }
+
     /// Decrypted credentials for the given agent. Falls back to the global
     /// `[odoo]` block when no per-agent override sets the relevant fields.
     /// `decrypt` is invoked lazily so a miss in either pool slot never

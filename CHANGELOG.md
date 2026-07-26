@@ -2,6 +2,116 @@
 
 ## [Unreleased]
 
+### Added
+- **Notion／GitHub／Google Sheets 一鍵串接**：整合頁新增 Notion 與 GitHub 分頁（與
+  Google 相同的三態連接流程，抽成共用元件），Sheets 併入既有 Google 授權（scope
+  增補，舊授權會引導重新授權）。新工具 13 個：Notion `notion_search`／
+  `notion_page_read`／`notion_page_append`／`notion_status`；GitHub
+  `github_search_issues`／`github_issue_read`／`github_pr_read`（僅檔案清單不拉
+  diff）／`github_issue_comment`（對外可見，建議搭配審批）／`github_status`；
+  Sheets `sheets_read`／`sheets_append`（支援直接貼試算表網址）。新增
+  `NotionRead/Write`、`GithubRead/Write` 權限範疇，未列舉工具照舊 fail-closed。
+  OAuth 交換層修正兩個 provider 相容陷阱：Notion token 端點要求 HTTP Basic 認證
+  ＋JSON body（並於授權 URL 補 `owner=user`）、GitHub 需 `Accept: application/json`
+  才回 JSON——交換請求組裝已純函式化並以單元測試鎖住。附 `docs/guides/notion.md`
+  與 `docs/guides/github.md`。
+- **Google Workspace 一鍵串接（Gmail／日曆／Meet）**（本版預設隱藏：整組工具與 dashboard 分頁
+  待原廠 OAuth App 通過 Google 驗證後開放；操作者可設 `config.toml [integrations]
+  google_workspace = true` 搶先啟用）：整合頁新增 Google 分頁——填入
+  自家 Google OAuth 用戶端後一鍵授權，AI 員工即獲得六個原生工具：`gmail_search`／
+  `gmail_read`（唯讀搜尋與讀信，附件只列清單不下載）、`gmail_create_draft`（**只建
+  草稿不寄送**——寄出由使用者在 Gmail 按下，安全預設）、`calendar_list_events`／
+  `calendar_create_event`（可同時產生 Google Meet 會議連結，即 Meet 支援）、
+  `google_status`（連線診斷）。全部原生實作、不依賴第三方套件；token 以 AES 加密
+  落地並自動 refresh；新增 `GoogleRead`／`GoogleWrite` 權限範疇（未列舉工具照舊
+  fail-closed）；寫入類工具建議搭配 `approval_required_tools` 審批。附
+  `docs/guides/google-workspace.md` 申請與連接指南。順帶修復既有 OAuth 缺陷：
+  用戶端憑證過去從未持久化（授權完即丟，token 過期後 refresh 必然失敗、
+  「已設定」狀態恆為否），現存於加密設定檔並於重授權時預填；Google 授權 URL 補
+  `access_type=offline`（否則 Google 不核發 refresh token）。`config.toml [general] default_language`（全新安裝預設
+  `zh-TW`）＋ dashboard 一般設定下拉（跟隨輸入／繁體中文／English／日本語）。語言
+  指令改由系統層在 system prompt 動態注入，SOUL.md 模板內約 20 處重複的語言段落
+  同步移除（行業慣用語彙保留）——新 AI 員工不必再各自指定語言。
+- **任務類路徑補 Telegram typing indicator**：過去只有一般聊天有輸入中指示，任務
+  的「接收」與「執行」拆成兩個非同步階段，執行端（bus 委派／SQLite 佇列／goal
+  loop／cron／提醒 Agent 回呼）在長時間 CLI 執行期間完全沒有 typing。四條路徑現在
+  於執行前解出目的地（委派走新增的非消費性 `peek_callback`；goal loop 由 task 來源
+  反查）建立 RAII typing guard，查不到目的地時靜默降級、絕不影響任務執行。
+- **Odoo 客製資料庫探索與安全解鎖**：客戶的 Odoo 幾乎都是客製的，過去 agent 一查
+  客戶主檔（`res.partner`）或自訂模型就被硬編碼黑名單擋下、且沒有任何 schema 探索
+  能力。本次補上四塊：**(A) 黑名單可配置化**——保留現有安全預設不變，新增
+  `agent.toml [odoo] unblock_models`（全域 `config.toml [odoo]` 亦可）opt-out；被擋
+  時錯誤訊息分流「安全預設封鎖，可由管理員解鎖」vs「白名單未涵蓋」，`ir.model` /
+  `ir.model.fields` / `ir.attachment` 這類系統表即使 unblock 也只允許讀取（寫入／刪除
+  一律 fail-closed）。**(B) Schema introspection**——`OdooConnector::introspect_schema()`
+  特權唯讀掃描 `ir.model`／`ir.model.fields`（只回中繼資料、絕不回資料列），過濾
+  transient／框架雜訊、上限保護；dashboard `odoo.discover_schema` RPC 回傳模型清單並
+  把結構摘要寫進共享知識庫（`odoo/schema` context 層可自動注入、`odoo/schema-fields`
+  deep 層供搜尋，遵守 `.scope.toml` 政策）；新增 agent MCP 工具 `odoo_schema_fields`
+  查單一模型欄位。**(C) 安全客戶搜尋**——新增 MCP 工具 `odoo_partner_search`，對
+  `res.partner` 唯讀查詢且欄位白名單固定（僅 name/email/phone/city/ref 等，不含銀行
+  ／稅務欄位），繞過黑名單但仍受 `OdooRead` scope 與 per-agent read 權限管制，補上
+  「沒有客戶搜尋工具」缺口。**(D) Dashboard UI**——Odoo 頁測試按鈕旁新增「解析
+  資料庫」按鈕，掃描結果可搜尋過濾、x_ 自訂模型醒目標示、勾選一鍵加進 AI 員工的
+  allowed_models；三語系（zh-TW／en／ja-JP）齊備。
+- **迭代式看板（Iterative Kanban）**：把 Task Board 從「一次性 Q&A」重塑為「人機迭代
+  循環」導向。新增 `revising` 狀態——判官否決 goal-mode 任務後不再默默回 `pending`，
+  而是進入可見的「修訂中」欄並帶「第 N 輪」徽章；看板欄位 5→7
+  （待辦／進行中／驗收中／修訂中／需人工／已完成／受阻，`failed` 併入受阻欄以徽章
+  區分，`review` 首次在看板可見——先前 review 任務在板上隱形是缺口）。新增
+  `task_iterations` 明細表（每輪 dispatched→submitted→verdict＋否決理由，先例
+  vibe-kanban `coding_agent_turn`／Linear `AgentSession`）與 `tasks.iterations` RPC；
+  詳情頁新增修訂時間軸與**雙時鐘**（Agent 處理時間 vs 完整人機週期）。軟上限徽章
+  「報酬遞減」（達 `soft_cap` 時亮琥珀色但不擋，證據：外部回饋下 2 輪拿走 76-95%
+  增益 arXiv:2604.10508、Self-Refine 官方上限 4 arXiv:2303.17651）、租約逾期
+  「stale」徽章。新增 `tasks.flow_metrics` RPC（per agent：一輪過件率 first-pass
+  yield／平均輪次／agent 秒數 vs 週期秒數／驗收佇列深度）與 `review` 欄 WIP 上限
+  （`config.toml [task_board] review_wip_limit`，預設 10；超標亮警示＋以 Little's Law
+  推算等待時間＝佇列深÷近 7 日日均驗收數）。三語系（zh-TW／en／ja-JP）齊備。
+- **帳號頁新增「CLI 訂閱憑證」區塊**：Grok／Codex／Gemini 的訂閱登入存在 CLI 自家
+  憑證檔（`~/.grok/auth.json` 等）、不是 rotator 帳號條目，過去登入成功後在
+  「帳號與預算」頁完全看不到。新增 `accounts.cli_credentials` RPC（只讀存在性
+  與 mtime，絕不讀憑證內容）＋帳號頁卡片區：顯示已登入／未登入、憑證更新時間、
+  「登入／重新登入」按鈕直接開一鍵登入 modal；未安裝的 CLI 不顯示。Claude 刻意
+  排除（其登入本來就以 rotator 帳號卡呈現）。
+
+### Changed
+- **goal loop `iteration_cap` 預設 8→5（硬上限）**：迭代式看板調研顯示 critique-revise
+  型迴圈（判官否決→重試）的增益上限低——外部回饋下 2 輪拿走 76-95%
+  （arXiv:2604.10508），第 3 輪起趨近零、純自審多輪甚至負報酬（arXiv:2310.01798），
+  故 Complex goal 的硬上限由 8 下修為 5。Simple goal 維持 3（`iteration_cap_simple`
+  不變）。新增 `soft_cap`（預設 3）只標記「報酬遞減」不擋。覆寫方式：
+  `config.toml [goal_loop] iteration_cap = <n>` / `soft_cap = <n>`。oscillation（連續
+  兩輪同構否決）與 hard cap → `needs_human` 的既有行為與優先序不變。
+
+### Fixed
+- **AI 員工改名後仍自稱舊名字（「改資訊沒有改到靈魂」）**：改名 RPC 過去只寫
+  `agent.toml` 的 `display_name`，但 system prompt 的自稱完全來自建立時燒進
+  SOUL.md 的名字，兩邊脫鉤。雙重修復：① prompt 組裝層（cron／通路回覆／minimal
+  三個入口）最前面注入 `agent.toml` 的權威名字宣告，SOUL 內文過期也壓得住；
+  ② 改名時（dashboard `agents.update` 與 MCP `agent_update` 兩路）自動把
+  SOUL.md／IDENTITY.md 內的舊名精確替換為新名（原子寫回），預設 `@舊名` trigger
+  一併連動。
+- **回覆有時不會發到 Telegram（已讀不回）**：一組疊加的靜默失敗——
+  ① `forward_to_channel` 的 Telegram 分支獨家把發送失敗吞成成功（其他通道都回
+  `Err` 觸發 5 次重試），現已比照其他通道回 `Err`；② goal loop 進度推播「先標記
+  已送再發送」且不看結果，`done`（最終答案）一次網路抖動即永久遺失，通知結果現在
+  三態化（送達／無目標／發送失敗），失敗於下一輪 tick 重試（上限 3），needs_human
+  ／kickoff 通知同步修正；③ 委派子任務失敗過去只寫 DB 不通知任何人，現在轉發
+  分類式保底訊息（不洩 stderr／內部路徑），JSONL 與 SQLite 兩條佇列一致；
+  ④ Telegram 發送層對 429／5xx 加退避重試（尊重 `retry_after`）、HTML→純文字
+  fallback 結果不再被丟棄、語音發送失敗補送文字版、進度訊息刪除移到空回覆判斷
+  之後；⑤ 五個刻意靜默分支（封鎖／熔斷／L3 靜音）補記 `channel_failures.jsonl`
+  （`silent_by_design` 標記），dashboard doctor 查得到「為什麼這個人已讀不回」。
+- **Grok／Codex／Gemini 一鍵登入成功卻顯示「未自動加入帳號（no token captured）」警告**：
+  只有 `claude setup-token` 會把 token 印在畫面上供擷取；其他 CLI 登入成功時是把憑證
+  寫進自家儲存（`~/.grok/auth.json` 等，這正是 cli_auth 判定成功的檔案監看訊號），
+  runtime 直接讀該儲存、本來就不需要帳號條目——「無 token 可擷取」是這些 CLI 的
+  唯一正常成功路徑，卻被當成異常回報。`auth.cli_login.finalize` 現在對非 Claude
+  runtime 回傳 `reason="cli_store"` + 憑證檔路徑，CliLoginModal 據此顯示
+  「登入成功，憑證已存入 ~/.grok/auth.json，此 CLI 的 AI 員工可直接使用」；
+  Claude 登入抓不到 token 仍維持原警告（那才是真正的擷取異常）。
+
 ## [1.44.0] - 2026-07-24 — MCP 工具面認證斷鏈根治、dashboard 健康診斷活體探測、Homebrew 通路復活
 
 ### Added

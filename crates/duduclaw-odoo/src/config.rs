@@ -32,6 +32,11 @@ pub struct OdooConfig {
     pub features_accounting: bool,
     pub features_project: bool,
     pub features_hr: bool,
+    /// Global opt-out list for the built-in security block list. Applies to
+    /// every agent that has no per-agent `[odoo].unblock_models` of its own.
+    /// Empty ⇒ the default block list is fully in force.
+    #[serde(default)]
+    pub unblock_models: Vec<String>,
 }
 
 impl Default for OdooConfig {
@@ -59,6 +64,7 @@ impl Default for OdooConfig {
             features_accounting: true,
             features_project: false,
             features_hr: false,
+            unblock_models: Vec::new(),
         }
     }
 }
