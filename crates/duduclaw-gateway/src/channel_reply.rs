@@ -725,8 +725,26 @@ const GATED_CHANNELS: &[&str] = &[
     "feishu", "googlechat", "teams", "webchat", "wecom", "dingtalk",
 ];
 
+/// Record a `channel_failures.jsonl` line for a reply that is intentionally
+/// dropped by design (pairing/access/failsafe/circuit-breaker gates). The
+/// gate's safety semantics are unchanged — it still never replies to the
+/// user — this only makes "why did this person get silence" answerable from
+/// the dashboard/doctor tooling instead of requiring a live debug session.
+/// Best-effort: a write failure is logged, never propagated.
+pub(crate) fn record_silent_reply(home_dir: &std::path::Path, session_id: &str, user_id: &str, reason: &str) {
+    let rec = serde_json::json!({
+        "event": "channel_reply_silent",
+        "session_id": session_id,
+        "user_id": user_id,
+        "reason": reason,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Err(e) = crate::trajectory_guard::append_anomaly(home_dir, &rec) {
+        warn!(error = %e, "silent-reply audit: 寫入 channel_failures.jsonl 失敗");
+    }
+}
+
 /// Central per-user access gate (allowlist / blocklist / pairing).
-///
 /// Called once at the top of the reply pipeline so every channel is covered
 /// by one enforcement point. `pub(crate)` so the per-channel chat-command
 /// intercepts (telegram/discord/line/slack), which run BEFORE this pipeline,
@@ -787,6 +805,7 @@ pub(crate) async fn check_user_access_gate(
         if !code.is_empty() {
             // Blocked users may not pair.
             if blocked.iter().any(|b| b == user_id || b == session_id) {
+                record_silent_reply(&ctx.home_dir, session_id, user_id, "silent_by_design: pair_blocked");
                 return Some(String::new());
             }
             let ok = ctx.access_control.verify_pairing_code(user_id, code).await
@@ -805,7 +824,10 @@ pub(crate) async fn check_user_access_gate(
         .await
     {
         crate::access_control::AccessDecision::Allowed => None,
-        crate::access_control::AccessDecision::Blocked => Some(String::new()),
+        crate::access_control::AccessDecision::Blocked => {
+            record_silent_reply(&ctx.home_dir, session_id, user_id, "silent_by_design: access_blocked");
+            Some(String::new())
+        }
         crate::access_control::AccessDecision::RequirePairing => {
             Some("🔒 尚未配對。請向管理員索取配對碼，並輸入：/pair <配對碼>".to_string())
         }
@@ -1032,6 +1054,11 @@ async fn build_reply_with_session_inner(
     // below and the sensitivity-aware wiki injection inside build_system_prompt.
     let is_private = duduclaw_core::is_private_session(session_id, user_id);
 
+    // WP: global default reply language (config.toml [general]
+    // default_language), read once per turn — same cost/consistency
+    // tradeoff as `get_default_agent` above. See `crate::prompt_identity`.
+    let default_language = crate::prompt_identity::read_default_language(&ctx.home_dir).await;
+
     // Build progressive system prompt
     let system_prompt = {
         let cache = ctx.skill_cache.lock().await;
@@ -1044,7 +1071,7 @@ async fn build_reply_with_session_inner(
         if compressed.is_empty() {
             build_system_prompt(
                 agent, None, None, None, skill_token_budget, team_ref, "", citation_ctx,
-                &sender_block, is_private,
+                &sender_block, is_private, default_language.as_deref(),
             )
         } else {
             build_system_prompt(
@@ -1058,6 +1085,7 @@ async fn build_reply_with_session_inner(
                 citation_ctx,
                 &sender_block,
                 is_private,
+                default_language.as_deref(),
             )
         }
     };
@@ -1138,6 +1166,7 @@ async fn build_reply_with_session_inner(
             }
             FailsafeLevel::L3Muted => {
                 // Muted: silent drop, no reply
+                record_silent_reply(&ctx.home_dir, session_id, user_id, "silent_by_design: l3_muted");
                 return String::new();
             }
             FailsafeLevel::L2Restricted => {
@@ -1165,6 +1194,7 @@ async fn build_reply_with_session_inner(
             }
             duduclaw_security::circuit_breaker::BreakerDecision::Deny(_) => {
                 debug!(session_id, "Circuit breaker denied — message dropped");
+                record_silent_reply(&ctx.home_dir, session_id, user_id, "silent_by_design: breaker_deny");
                 return String::new(); // silent drop
             }
             duduclaw_security::circuit_breaker::BreakerDecision::Trip(reason) => {
@@ -1172,6 +1202,10 @@ async fn build_reply_with_session_inner(
                 // Audit log
                 duduclaw_security::audit::log_circuit_breaker_trip(
                     &ctx.home_dir, &agent_id, session_id, &reason.to_string(),
+                );
+                record_silent_reply(
+                    &ctx.home_dir, session_id, user_id,
+                    &format!("silent_by_design: breaker_trip ({reason})"),
                 );
                 // Escalate failsafe
                 if let Some(ref failsafe) = ctx.failsafe {
@@ -7427,6 +7461,10 @@ fn build_system_prompt(
     // `false` (a group/shared session) withholds them. Fail-closed by the
     // caller — see `duduclaw_core::is_private_session`.
     allow_personal: bool,
+    // `config.toml [general] default_language`, when set — see
+    // `crate::prompt_identity` for the rationale. `None` preserves the
+    // pre-existing "follow the user's input language" behaviour.
+    default_language: Option<&str>,
 ) -> String {
     // #11 (2026-05-12) — Minimal mode: short-circuit to the lean assembler.
     // Agents opt in via `agent.toml [prompt] mode = "minimal"`. See
@@ -7437,6 +7475,7 @@ fn build_system_prompt(
                 a,
                 sender_block,
                 pinned_instructions,
+                default_language,
             );
         }
     }
@@ -7447,6 +7486,27 @@ fn build_system_prompt(
     // 50KB threshold so it stays silent on normal traffic but lights up
     // exactly the requests that risk hitting the 200K cliff.
     let mut audit: Vec<crate::prompt_audit::PromptSection> = Vec::new();
+
+    // Authoritative identity + global default language, ahead of SOUL so it
+    // wins over any stale name/language text SOUL.md still contains (see
+    // `crate::prompt_identity` doc comment for the root-cause writeup).
+    // `agent = None` (no agent resolved) still allows a language-only
+    // directive through — the identity half naturally no-ops on an empty name.
+    let display_name = agent
+        .map(|a| {
+            if a.config.agent.display_name.trim().is_empty() {
+                a.config.agent.name.as_str()
+            } else {
+                a.config.agent.display_name.as_str()
+            }
+        })
+        .unwrap_or("");
+    if let Some(s) =
+        crate::prompt_identity::identity_and_language_section(display_name, default_language)
+    {
+        audit.push(crate::prompt_audit::PromptSection::new("identity_directive", &s));
+        parts.push(s);
+    }
 
     if let Some(a) = agent {
         if let Some(soul) = &a.soul {

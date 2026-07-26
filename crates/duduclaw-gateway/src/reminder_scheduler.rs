@@ -355,6 +355,27 @@ async fn decrypt_channel_token(
     plain.to_string()
 }
 
+/// Best-effort typing indicator for a reminder's delivery channel.
+/// Telegram-only for now (see `channel_typing::typing_guard_for`);
+/// returns `None` for every other channel or an unconfigured/undecryptable
+/// token without affecting reminder delivery.
+async fn build_reminder_typing_guard(
+    home_dir: &Path,
+    http: &reqwest::Client,
+    reminder: &Reminder,
+) -> Option<crate::channel_typing::TypingGuard> {
+    if reminder.channel != "telegram" {
+        return None;
+    }
+    let config = read_config(home_dir).await?;
+    let token = decrypt_channel_token(
+        &config, "telegram_bot_token_enc", "telegram_bot_token", home_dir,
+    ).await;
+    crate::channel_typing::typing_guard_for(
+        http.clone(), "telegram", &reminder.chat_id, None, &token,
+    )
+}
+
 // ── JSONL persistence (lockfile-protected) ───────────────────
 
 /// Lockfile path for serializing all writes to `reminders.jsonl`.
@@ -813,15 +834,23 @@ async fn deliver_reminder(
                 reminder.id, prompt
             );
 
-            call_claude_for_agent_with_type(
+            // Best-effort typing indicator on the reminder's own delivery
+            // channel for the duration of the CLI call — AgentCallback
+            // reminders can take a while to generate and previously gave
+            // no sign of life until the final message landed. Cosmetic
+            // only: any resolution failure yields `None` and the CLI call
+            // proceeds unaffected.
+            let typing_guard = build_reminder_typing_guard(home_dir, http, reminder).await;
+            let result = call_claude_for_agent_with_type(
                 home_dir,
                 registry,
                 &reminder.agent_id,
                 &full_prompt,
                 crate::cost_telemetry::RequestType::Cron,
             )
-            .await
-            .map_err(|e| format!("Agent callback failed: {e}"))?
+            .await;
+            drop(typing_guard);
+            result.map_err(|e| format!("Agent callback failed: {e}"))?
         }
     };
 

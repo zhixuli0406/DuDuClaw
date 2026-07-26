@@ -160,13 +160,21 @@ enum KickoffGate {
 pub struct GoalLoopConfig {
     /// Hard cap on total dispatches per task **for Complex goals** (independent
     /// of the judge's `max_retries`; both apply, stricter wins). Exceed ⇒
-    /// `needs_human`.
+    /// `needs_human`. Iterative Kanban lowered this 8→5: under critique-revise
+    /// feedback two rounds capture 76-95% of the gain (arXiv:2604.10508) and
+    /// rounds past ~4 trend to zero (Self-Refine 2303.17651), so 5 is the
+    /// evidence-backed hard ceiling. Override in `config.toml [goal_loop]`.
     pub iteration_cap: u32,
     /// D4 item 3: iteration cap for **Simple goals** (MaAS dynamic depth — a
     /// simple goal that has not converged in a few tries is unlikely to, so it
     /// escalates sooner and cheaper). The per-task effective cap is chosen by
     /// [`crate::dispatch_engine::classify_goal_difficulty`].
     pub iteration_cap_simple: u32,
+    /// Iterative Kanban soft cap: once a task's `revision_round` reaches this,
+    /// it is flagged `diminishing` (amber "報酬遞減" badge) but NOT blocked —
+    /// only `iteration_cap` blocks. Default 3 (2604.10508: gains flatten after
+    /// round 2-3). Passed to `reject_review` via the dispatch engine.
+    pub soft_cap: i64,
     /// Wall-clock budget measured from the task's `created_at`, in hours.
     /// Exceed ⇒ `needs_human`.
     pub wall_clock_hours: i64,
@@ -182,8 +190,9 @@ pub struct GoalLoopConfig {
 impl Default for GoalLoopConfig {
     fn default() -> Self {
         Self {
-            iteration_cap: 8,
+            iteration_cap: 5,
             iteration_cap_simple: 3,
+            soft_cap: 3,
             wall_clock_hours: 24,
             max_concurrent: 3,
             tick_secs: 30,
@@ -212,6 +221,30 @@ impl GoalLoopConfig {
             None => Self::default(),
         }
     }
+}
+
+/// Iterative Kanban default `review` WIP limit. The board flags the review
+/// column amber and shows a Little's-Law wait estimate once the queue depth
+/// exceeds this. Override in `config.toml [task_board] review_wip_limit`.
+pub const DEFAULT_REVIEW_WIP_LIMIT: i64 = 10;
+
+/// Read `[task_board] review_wip_limit` from `<home>/config.toml`. Absent /
+/// malformed / non-positive ⇒ [`DEFAULT_REVIEW_WIP_LIMIT`] (a WIP limit ≤ 0 is
+/// meaningless, so it falls back rather than disabling the guard silently).
+pub fn review_wip_limit(home_dir: &Path) -> i64 {
+    let path = home_dir.join("config.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return DEFAULT_REVIEW_WIP_LIMIT;
+    };
+    let Ok(table) = content.parse::<toml::Table>() else {
+        return DEFAULT_REVIEW_WIP_LIMIT;
+    };
+    table
+        .get("task_board")
+        .and_then(|s| s.get("review_wip_limit"))
+        .and_then(|v| v.as_integer())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_REVIEW_WIP_LIMIT)
 }
 
 /// Per-task driver bookkeeping (in memory; the durable state is the task row).
@@ -273,8 +306,32 @@ pub struct GoalLoopDriver {
     /// to the source conversation, so the same phase is not pushed twice. Pruned
     /// when a task reaches a terminal state (entry removed on `done`).
     progress_seen: Mutex<HashMap<String, String>>,
+    /// Retry counter for a progress push that failed transiently
+    /// ([`crate::goal_notify::NotifyOutcome::SendFailed`]), keyed by
+    /// `"<task_id>::<phase_key>"`. A phase is only marked `progress_seen`
+    /// once delivered OR once this counter exhausts [`PROGRESS_PUSH_MAX_RETRIES`]
+    /// — a transient network blip no longer looks identical to "delivered".
+    progress_retry: Mutex<HashMap<String, u32>>,
+    /// Retry counter for a `needs_human` approval push that failed
+    /// transiently, keyed by task id. Mirrors `progress_retry`'s semantics.
+    needs_human_retry: Mutex<HashMap<String, u32>>,
+    /// Task ids whose kickoff approval push has been delivered (or
+    /// permanently given up on) — separate from `kickoff` (which tracks the
+    /// durable `ApprovalBroker` row so a second tick never re-requests it).
+    /// A task can be `kickoff`-tracked but NOT yet `kickoff_notified` when its
+    /// initial notification send failed; the next `Pending` poll retries it.
+    kickoff_notified: Mutex<HashSet<String>>,
+    /// Retry counter for a kickoff notification that failed transiently,
+    /// keyed by task id.
+    kickoff_retry: Mutex<HashMap<String, u32>>,
     running: Arc<AtomicBool>,
 }
+
+/// Retry cap for a transient ([`crate::goal_notify::NotifyOutcome::SendFailed`])
+/// channel push before the driver gives up and marks the phase "handled" so
+/// it does not retry forever. Applies uniformly to the progress board,
+/// needs_human approval, and kickoff approval pushes.
+const NOTIFY_PUSH_MAX_RETRIES: u32 = 3;
 
 impl GoalLoopDriver {
     pub fn new(store: Arc<TaskStore>, queue: Arc<MessageQueue>, config: GoalLoopConfig) -> Self {
@@ -290,6 +347,10 @@ impl GoalLoopDriver {
             notified_needs_human: Mutex::new(HashSet::new()),
             operator_skipped: Mutex::new(HashSet::new()),
             progress_seen: Mutex::new(HashMap::new()),
+            progress_retry: Mutex::new(HashMap::new()),
+            needs_human_retry: Mutex::new(HashMap::new()),
+            kickoff_notified: Mutex::new(HashSet::new()),
+            kickoff_retry: Mutex::new(HashMap::new()),
             running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -366,11 +427,12 @@ impl GoalLoopDriver {
         self.reconcile_needs_human().await;
 
         // Candidates: goal_mode tasks awaiting a run, assigned to a concrete
-        // agent. `todo` = freshly created; `pending` = returned from a judge
-        // rejection (or a durable claim awaiting pickup). Reuses the existing
-        // status query so no new store method is needed.
+        // agent. `todo` = freshly created; `pending` = a durable claim awaiting
+        // pickup; `revising` = returned from a judge rejection (Iterative Kanban)
+        // for the next round. Reuses the existing status query so no new store
+        // method is needed.
         let mut candidates: Vec<TaskRow> = Vec::new();
-        for status in ["todo", "pending"] {
+        for status in ["todo", "pending", "revising"] {
             for t in self.store.tasks_in_status(status).await? {
                 if t.goal_mode && !t.assigned_to.trim().is_empty() {
                     candidates.push(t);
@@ -387,6 +449,17 @@ impl GoalLoopDriver {
         {
             let mut kickoff = self.kickoff.lock().await;
             kickoff.retain(|id, _| candidate_ids.contains(id));
+        }
+        // Same pruning for the kickoff notification delivery/retry state —
+        // a task that left the candidate set (dispatched or aborted) has no
+        // further use for either.
+        {
+            let mut kn = self.kickoff_notified.lock().await;
+            kn.retain(|id| candidate_ids.contains(id));
+        }
+        {
+            let mut kr = self.kickoff_retry.lock().await;
+            kr.retain(|id, _| candidate_ids.contains(id));
         }
 
         let mut inflight = self.inflight.lock().await;
@@ -423,20 +496,33 @@ impl GoalLoopDriver {
                     }
                 }
                 // Judge-accepted / human-marked done — push the ✅ result and
-                // drop all tracking (terminal).
+                // drop all tracking (terminal) ONLY once the push is actually
+                // delivered (or permanently given up on). A transient send
+                // failure used to be indistinguishable from success here —
+                // tracking was dropped immediately regardless, so the final
+                // answer was lost for good the moment one HTTP call blipped.
+                // Leaving the task tracked lets the next tick's "done" branch
+                // retry the push.
                 "done" => {
-                    if let Some(t) = &task_opt {
-                        self.push_progress(t, "done", crate::goal_notify::GoalProgress::Done)
-                            .await;
+                    let handled = match &task_opt {
+                        Some(t) => {
+                            self.push_progress(t, "done", crate::goal_notify::GoalProgress::Done)
+                                .await
+                        }
+                        None => true,
+                    };
+                    if handled {
+                        inflight.remove(&id);
+                        self.progress_seen.lock().await.remove(&id);
+                        self.clear_progress_retries(&id).await;
                     }
-                    inflight.remove(&id);
-                    self.progress_seen.lock().await.remove(&id);
                 }
                 // Other terminal / escalated states (cancelled / failed /
                 // needs_human) — no longer the driver's dispatch concern.
                 // needs_human progress is pushed by reconcile_needs_human.
                 _ => {
                     inflight.remove(&id);
+                    self.clear_progress_retries(&id).await;
                 }
             }
         }
@@ -697,6 +783,18 @@ impl GoalLoopDriver {
             // ── Dispatch: enqueue a work message on the existing wake-up rail ──
             let next_iter = current_iter + 1;
             self.enqueue_work(task, next_iter).await?;
+            // Iterative Kanban: open this round in the iteration timeline. Round
+            // is the judge-rejection counter + 1 (revision_round is bumped by
+            // reject_review), idempotent per round so a stall re-dispatch of the
+            // same round adds no duplicate. Best-effort telemetry — a failure
+            // here must not break dispatch.
+            if let Err(e) = self
+                .store
+                .record_iteration_dispatch(&task.id, task.revision_round + 1, &now.to_rfc3339())
+                .await
+            {
+                debug!(task = %task.id, error = %e, "goal loop: iteration dispatch record failed (non-fatal)");
+            }
             if is_new {
                 active += 1;
             }
@@ -822,6 +920,7 @@ impl GoalLoopDriver {
         let live: HashSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
         let mut notified = self.notified_needs_human.lock().await;
         notified.retain(|id| live.contains(id));
+        self.needs_human_retry.lock().await.retain(|id, _| live.contains(id));
 
         for task in &tasks {
             if !task.goal_mode || notified.contains(&task.id) {
@@ -852,26 +951,72 @@ impl GoalLoopDriver {
                     }
                     Err(e) => warn!(task = %task.id, error = %e, "goal loop: observer auto-close failed"),
                 }
+                // Observer resolves the task out of needs_human synchronously
+                // above (or logs+leaves it for a later retry on store error);
+                // either way there is no channel-push retry state to track.
+                notified.insert(task.id.clone());
             } else {
                 // Operator/Collaborator/Consultant/Approver: push retry/done/abort
                 // buttons to the agent control channel, and mirror a plain
-                // heads-up to the goal's source conversation.
-                let sent = crate::goal_notify::notify_goal_needs_human(&self.home_dir, task).await;
-                self.push_progress(task, "needs_human", crate::goal_notify::GoalProgress::NeedsHuman)
-                    .await;
-                self.post_activity(
-                    "goal_loop.needs_human_notified",
-                    &task.assigned_to,
-                    Some(&task.id),
-                    &format!(
-                        "已推播需人工審批 — {}(推播{})",
-                        task.title,
-                        if sent { "成功" } else { "略過" }
-                    ),
-                )
-                .await;
+                // heads-up to the goal's source conversation. A transient
+                // SendFailed is retried (bounded) on a later tick instead of
+                // being marked `notified` immediately — previously ANY
+                // outcome (including a network blip) inserted into `notified`
+                // unconditionally, so a failed push was never retried and the
+                // human never learned the task was stuck.
+                use crate::goal_notify::NotifyOutcome;
+                let outcome = crate::goal_notify::notify_goal_needs_human(&self.home_dir, task).await;
+                match outcome {
+                    NotifyOutcome::Sent | NotifyOutcome::NoTarget => {
+                        self.push_progress(
+                            task, "needs_human", crate::goal_notify::GoalProgress::NeedsHuman,
+                        )
+                        .await;
+                        self.needs_human_retry.lock().await.remove(&task.id);
+                        let sent = outcome == NotifyOutcome::Sent;
+                        self.post_activity(
+                            "goal_loop.needs_human_notified",
+                            &task.assigned_to,
+                            Some(&task.id),
+                            &format!(
+                                "已推播需人工審批 — {}(推播{})",
+                                task.title,
+                                if sent { "成功" } else { "無通知目標(設定缺漏)" }
+                            ),
+                        )
+                        .await;
+                        notified.insert(task.id.clone());
+                    }
+                    NotifyOutcome::SendFailed => {
+                        let mut retries = self.needs_human_retry.lock().await;
+                        let count = retries.entry(task.id.clone()).or_insert(0);
+                        *count += 1;
+                        if *count >= NOTIFY_PUSH_MAX_RETRIES {
+                            warn!(task = %task.id, attempts = *count,
+                                  "goal loop: needs_human push failed after max retries, giving up");
+                            retries.remove(&task.id);
+                            drop(retries);
+                            self.push_progress(
+                                task, "needs_human", crate::goal_notify::GoalProgress::NeedsHuman,
+                            )
+                            .await;
+                            self.post_activity(
+                                "goal_loop.needs_human_notified",
+                                &task.assigned_to,
+                                Some(&task.id),
+                                &format!("需人工審批推播多次失敗，放棄重試 — {}", task.title),
+                            )
+                            .await;
+                            notified.insert(task.id.clone());
+                        } else {
+                            warn!(task = %task.id, attempt = *count,
+                                  "goal loop: needs_human push failed, will retry next tick");
+                            // Not inserted into `notified` — reconcile_needs_human
+                            // retries this task again next tick.
+                        }
+                    }
+                }
             }
-            notified.insert(task.id.clone());
         }
     }
 
@@ -904,13 +1049,11 @@ impl GoalLoopDriver {
                     .await?;
                 kickoff.insert(task.id.clone(), id.clone());
                 drop(kickoff);
-                crate::goal_notify::notify_goal_kickoff(
-                    &self.home_dir,
-                    &task.assigned_to,
-                    id.as_str(),
-                    &summary,
-                )
-                .await;
+                // The ApprovalBroker row above is already durably created —
+                // a failed notification here must NOT be re-requested (that
+                // would spam duplicate approvals); only the notification
+                // itself is retried, via the Pending arm below on later ticks.
+                self.notify_kickoff_with_retry(task, id.as_str(), &summary).await;
                 self.post_activity(
                     "goal_loop.kickoff_requested",
                     &task.assigned_to,
@@ -937,7 +1080,20 @@ impl GoalLoopDriver {
                     .await;
                     Ok(KickoffGate::Proceed)
                 }
-                ApprovalStatus::Pending => Ok(KickoffGate::Waiting),
+                ApprovalStatus::Pending => {
+                    drop(kickoff);
+                    // Retry a previously-failed notification (bounded) — the
+                    // approval already exists, so this only re-sends the push.
+                    if !self.kickoff_notified.lock().await.contains(&task.id) {
+                        let summary = format!(
+                            "目標:{} — 最多 {} 輪自主嘗試",
+                            task.title,
+                            self.iteration_cap_for(task)
+                        );
+                        self.notify_kickoff_with_retry(task, id.as_str(), &summary).await;
+                    }
+                    Ok(KickoffGate::Waiting)
+                }
                 // Denied / Expired (TTL = deny, fail-closed) ⇒ abort the goal.
                 other => {
                     kickoff.remove(&task.id);
@@ -958,6 +1114,45 @@ impl GoalLoopDriver {
                     Ok(KickoffGate::Aborted)
                 }
             },
+        }
+    }
+
+    /// Push the kickoff approval, retrying a transient send failure (bounded)
+    /// via [`kickoff_gate`]'s `Pending` poll branch on later ticks. The
+    /// underlying `ApprovalBroker` row is already durably created by the
+    /// caller — this only manages the notification's own delivery state.
+    /// `NoTarget` / exhausted retries are treated as "handled" so the loop
+    /// does not attempt the push forever.
+    async fn notify_kickoff_with_retry(&self, task: &TaskRow, approval_id: &str, summary: &str) {
+        use crate::goal_notify::NotifyOutcome;
+        let outcome =
+            crate::goal_notify::notify_goal_kickoff(&self.home_dir, &task.assigned_to, approval_id, summary)
+                .await;
+        match outcome {
+            NotifyOutcome::Sent => {
+                self.kickoff_notified.lock().await.insert(task.id.clone());
+                self.kickoff_retry.lock().await.remove(&task.id);
+            }
+            NotifyOutcome::NoTarget => {
+                warn!(task = %task.id, "goal loop: kickoff push has no notify target");
+                self.kickoff_notified.lock().await.insert(task.id.clone());
+                self.kickoff_retry.lock().await.remove(&task.id);
+            }
+            NotifyOutcome::SendFailed => {
+                let mut retries = self.kickoff_retry.lock().await;
+                let count = retries.entry(task.id.clone()).or_insert(0);
+                *count += 1;
+                if *count >= NOTIFY_PUSH_MAX_RETRIES {
+                    warn!(task = %task.id, attempts = *count,
+                          "goal loop: kickoff push failed after max retries, giving up");
+                    retries.remove(&task.id);
+                    drop(retries);
+                    self.kickoff_notified.lock().await.insert(task.id.clone());
+                } else {
+                    warn!(task = %task.id, attempt = *count,
+                          "goal loop: kickoff push failed, will retry next tick");
+                }
+            }
         }
     }
 
@@ -1118,22 +1313,63 @@ impl GoalLoopDriver {
     }
 
     /// P5: push one progress line to the goal's source conversation, deduped by
-    /// `phase_key` so the same phase never double-posts. Best-effort — a failed
-    /// push is silent (the Activity Feed already recorded the transition).
+    /// `phase_key` so the same phase never double-posts. Best-effort — a
+    /// transient send failure is retried (bounded) on later ticks rather than
+    /// being silently treated as delivered.
+    ///
+    /// Returns `true` once the phase is "handled" (delivered, no destination
+    /// configured, or retries exhausted) — callers that gate cleanup on
+    /// delivery (the `done` phase) should only release tracking when this is
+    /// `true`. Returns `false` while a transient failure is still being
+    /// retried, so the caller keeps the task tracked for the next tick.
     async fn push_progress(
         &self,
         task: &TaskRow,
         phase_key: &str,
         progress: crate::goal_notify::GoalProgress,
-    ) {
+    ) -> bool {
         {
-            let mut seen = self.progress_seen.lock().await;
+            let seen = self.progress_seen.lock().await;
             if seen.get(&task.id).map(|s| s == phase_key).unwrap_or(false) {
-                return;
+                return true; // already delivered (or given up) for this phase
             }
-            seen.insert(task.id.clone(), phase_key.to_string());
         }
-        crate::goal_notify::notify_goal_progress(&self.home_dir, task, progress).await;
+        let retry_key = format!("{}::{phase_key}", task.id);
+        let outcome = crate::goal_notify::notify_goal_progress(&self.home_dir, task, progress).await;
+        if outcome.is_final() {
+            self.progress_seen.lock().await.insert(task.id.clone(), phase_key.to_string());
+            self.progress_retry.lock().await.remove(&retry_key);
+            if outcome == crate::goal_notify::NotifyOutcome::NoTarget {
+                debug!(task = %task.id, phase = %phase_key, "goal loop: progress push has no notify target");
+            }
+            return true;
+        }
+        // SendFailed — bounded retry.
+        let mut retries = self.progress_retry.lock().await;
+        let count = retries.entry(retry_key.clone()).or_insert(0);
+        *count += 1;
+        if *count >= NOTIFY_PUSH_MAX_RETRIES {
+            warn!(task = %task.id, phase = %phase_key, attempts = *count,
+                  "goal loop: progress push failed after max retries, giving up");
+            retries.remove(&retry_key);
+            drop(retries);
+            self.progress_seen.lock().await.insert(task.id.clone(), phase_key.to_string());
+            true
+        } else {
+            warn!(task = %task.id, phase = %phase_key, attempt = *count,
+                  "goal loop: progress push failed, will retry next tick");
+            false
+        }
+    }
+
+    /// Drop any in-flight progress-push retry counters for `task_id` — called
+    /// when a task leaves the driver's dispatch concern entirely (terminal
+    /// cleanup), so a stale counter never lingers keyed to a task that no
+    /// longer exists in any live state.
+    async fn clear_progress_retries(&self, task_id: &str) {
+        let prefix = format!("{task_id}::");
+        let mut retries = self.progress_retry.lock().await;
+        retries.retain(|k, _| !k.starts_with(&prefix));
     }
 
     /// Best-effort append to the dashboard Activity Feed. A failure here must not
@@ -1175,6 +1411,7 @@ mod tests {
             // Kept equal to `iteration_cap` so the short test goal texts (which
             // classify as Simple) exercise the same effective cap as before D4.
             iteration_cap_simple: 2,
+            soft_cap: 3,
             wall_clock_hours: 24,
             max_concurrent: 3,
             tick_secs: 30,
@@ -1208,17 +1445,19 @@ mod tests {
     fn config_defaults_and_partial_section() {
         // Absent section ⇒ defaults.
         let d = GoalLoopConfig::default();
-        assert_eq!(d.iteration_cap, 8);
+        assert_eq!(d.iteration_cap, 5);
         assert_eq!(d.iteration_cap_simple, 3);
+        assert_eq!(d.soft_cap, 3);
         assert_eq!(d.max_concurrent, 3);
 
         // Partial section ⇒ only the given field overrides; the rest default.
-        let toml = "[goal_loop]\niteration_cap = 5\n";
+        let toml = "[goal_loop]\niteration_cap = 7\n";
         let table: toml::Table = toml.parse().unwrap();
         let cfg: GoalLoopConfig =
             table.get("goal_loop").unwrap().clone().try_into().unwrap();
-        assert_eq!(cfg.iteration_cap, 5);
+        assert_eq!(cfg.iteration_cap, 7);
         assert_eq!(cfg.iteration_cap_simple, 3, "unspecified field keeps its default");
+        assert_eq!(cfg.soft_cap, 3, "unspecified field keeps its default");
         assert_eq!(cfg.max_concurrent, 3, "unspecified field keeps its default");
         assert_eq!(cfg.wall_clock_hours, 24);
     }
@@ -1365,7 +1604,7 @@ mod tests {
     /// Drive one full rejection round for a task already tracked in-flight and
     /// awaiting pickup: (1) agent moves it to `review` and a tick observes that
     /// (flips `awaiting_pickup=false`, does not re-dispatch); (2) the judge
-    /// rejects with `feedback` (→ `pending`, `judge_feedback` set); (3) the next
+    /// rejects with `feedback` (→ `revising`, `judge_feedback` set); (3) the next
     /// tick is the rejection re-dispatch the caller runs. This helper performs
     /// steps 1–2 and returns; the caller ticks for step 3.
     async fn agent_round_then_reject(
@@ -1381,8 +1620,9 @@ mod tests {
             .unwrap();
         // Tick while in review so the driver marks it no-longer-awaiting-pickup.
         d.tick_once().await.unwrap();
-        // Judge rejects → pending + judge_feedback.
-        store.reject_review(id, feedback).await.unwrap();
+        // Judge rejects → revising + judge_feedback (soft_cap 3 — a high value so
+        // the diminishing flag never interferes with these oscillation tests).
+        store.reject_review(id, feedback, 99).await.unwrap();
     }
 
     #[tokio::test]
@@ -1455,11 +1695,68 @@ mod tests {
 
         let got = store.get_task("g1").await.unwrap().unwrap();
         assert_ne!(got.status, "needs_human", "differing feedback must keep retrying");
-        assert_eq!(got.status, "pending");
+        assert_eq!(got.status, "revising");
         let (acts, _) = store.list_activity(None, None, 100, 0).await.unwrap();
         assert!(
             !acts.iter().any(|a| a.event_type == "goal_loop.oscillation"),
             "no oscillation should be recorded for differing feedback"
+        );
+    }
+
+    // ── Iterative Kanban: revising re-dispatch + cap ordering ──
+
+    #[tokio::test]
+    async fn revising_task_is_re_dispatched_and_opens_new_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+
+        // A task the judge already rejected once → revising, round 1.
+        let mut t = goal_task("g1", "alice");
+        t.status = "revising".into();
+        t.revision_round = 1;
+        t.judge_feedback = Some("add the missing section".into());
+        store.insert_task(&t).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+
+        // Re-dispatched with feedback, and iteration round 2 opened (round =
+        // revision_round + 1).
+        let pending = queue.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].payload.contains("add the missing section"));
+        let iters = store.list_iterations("g1").await.unwrap();
+        assert_eq!(iters.len(), 1);
+        assert_eq!(iters[0].round, 2, "revising re-dispatch opens round revision_round+1");
+    }
+
+    /// Oscillation must win over the iteration cap when BOTH would fire on the
+    /// same tick: identical feedback for two rounds escalates as oscillation
+    /// (its guard runs before the cap check), locking the existing precedence.
+    #[tokio::test]
+    async fn oscillation_takes_precedence_over_iteration_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+
+        // Cap = 2 (small_cfg). max_retries high so only the driver escalates.
+        let mut t = goal_task("g1", "alice");
+        t.max_retries = 100;
+        store.insert_task(&t).await.unwrap();
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+
+        d.tick_once().await.unwrap(); // iter 1
+        agent_round_then_reject(&d, &store, "g1", "same").await;
+        d.tick_once().await.unwrap(); // iter 2 (== cap), first rejection recorded
+        // Second identical rejection: iter would be at cap AND feedback repeats.
+        agent_round_then_reject(&d, &store, "g1", "same").await;
+        d.tick_once().await.unwrap();
+
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, "needs_human");
+        assert_eq!(
+            got.judge_feedback.as_deref(),
+            Some("goal-loop no-progress oscillation"),
+            "oscillation reason wins over the iteration-cap reason"
         );
     }
 

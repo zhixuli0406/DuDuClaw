@@ -80,6 +80,35 @@ async fn channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> Option
         .filter(|t| !t.is_empty())
 }
 
+/// Outcome of a best-effort channel push. Distinguishes "nothing to push to"
+/// (a static config gap — no source-channel stamp, no `[proactive]` fallback,
+/// or no bot token; retrying will never help) from "there WAS a destination
+/// but the send itself failed" (a transient condition worth retrying on the
+/// driver's next tick). Callers previously collapsed both into a single
+/// `bool`, which meant a `false` from a network blip was treated exactly like
+/// a permanent "no destination" — the caller marked the phase as delivered
+/// and never tried again, silently losing the notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyOutcome {
+    /// The message was delivered.
+    Sent,
+    /// No notify destination (or no bot token) configured — a config gap,
+    /// not a transient failure. Retrying will not help until the operator
+    /// fixes the configuration.
+    NoTarget,
+    /// A destination existed but the HTTP send failed. Worth retrying.
+    SendFailed,
+}
+
+impl NotifyOutcome {
+    /// True for outcomes the caller should treat as "handled" — the phase
+    /// should be marked delivered/seen and not retried. Only [`Self::SendFailed`]
+    /// is worth another attempt.
+    pub fn is_final(self) -> bool {
+        !matches!(self, NotifyOutcome::SendFailed)
+    }
+}
+
 /// P5 outer progress board: a phase transition of a goal task, pushed as a
 /// short (1–3 line) zh-TW note to the conversation that launched the goal.
 ///
@@ -172,22 +201,31 @@ fn progress_body(task: &TaskRow, progress: &GoalProgress) -> String {
 /// (`source_channel`/`source_chat_id`), falling back to the agent's
 /// `[proactive]` destination; when neither exists the push is silent (the driver
 /// still records the transition on the Activity Feed). Best-effort — a missing
-/// token / send failure is logged, never panics. Returns whether a message was
-/// delivered.
-pub async fn notify_goal_progress(home_dir: &Path, task: &TaskRow, progress: GoalProgress) -> bool {
+/// token / send failure is logged, never panics. Returns a [`NotifyOutcome`]
+/// so the caller can distinguish "nothing to push to" from "send failed,
+/// worth retrying".
+pub async fn notify_goal_progress(
+    home_dir: &Path,
+    task: &TaskRow,
+    progress: GoalProgress,
+) -> NotifyOutcome {
     let Some((channel, chat_id)) =
         task_source_target(task).or_else(|| agent_notify_target(home_dir, &task.assigned_to))
     else {
         // No source and no [proactive] destination — Activity-only, silent.
-        return false;
+        return NotifyOutcome::NoTarget;
     };
     let Some(token) = channel_token(home_dir, &task.assigned_to, &channel).await else {
         info!(task = %task.id, %channel, "goal-progress: no bot token; skipping push");
-        return false;
+        return NotifyOutcome::NoTarget;
     };
     let text = progress_body(task, &progress);
     let http = reqwest::Client::new();
-    send_plain_text(&http, &channel, &token, &chat_id, &text).await
+    if send_plain_text(&http, &channel, &token, &chat_id, &text).await {
+        NotifyOutcome::Sent
+    } else {
+        NotifyOutcome::SendFailed
+    }
 }
 
 /// Render the zh-TW needs_human approval body for a goal task.
@@ -215,32 +253,37 @@ fn needs_human_body(task: &TaskRow) -> String {
 /// Push the needs_human approval (with buttons where supported, else plain text
 /// with a dashboard hint) to the agent's default channel. Best-effort.
 ///
-/// Returns `true` when a message was delivered (so the driver can mark it
-/// notified), `false` when there was nothing to push to / the send failed.
-pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> bool {
+/// Returns a [`NotifyOutcome`] so the driver can distinguish a permanent "no
+/// destination" config gap (mark notified, no point retrying) from a
+/// transient send failure (worth retrying next tick).
+pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyOutcome {
     let Some((channel, chat_id)) = agent_notify_target(home_dir, &task.assigned_to) else {
         info!(task = %task.id, agent = %task.assigned_to,
               "goal-notify: agent has no [proactive] notify destination; skipping push");
-        return false;
+        return NotifyOutcome::NoTarget;
     };
     let Some(token) = channel_token(home_dir, &task.assigned_to, &channel).await else {
         info!(task = %task.id, %channel, "goal-notify: no bot token; skipping push");
-        return false;
+        return NotifyOutcome::NoTarget;
     };
     let http = reqwest::Client::new();
     let body = needs_human_body(task);
     if channel_supports_buttons(&channel) {
         let markup = goal_button_markup(&channel, &task.id);
         match send_with_markup(&http, &channel, &token, &chat_id, &body, markup).await {
-            Ok(()) => true,
+            Ok(()) => NotifyOutcome::Sent,
             Err(e) => {
                 warn!(task = %task.id, %channel, error = %e, "goal-notify: button push failed");
-                false
+                NotifyOutcome::SendFailed
             }
         }
     } else {
         let text = format!("{body}\n\n請至儀表板任務看板處理此「需人工」任務。");
-        send_plain_text(&http, &channel, &token, &chat_id, &text).await
+        if send_plain_text(&http, &channel, &token, &chat_id, &text).await {
+            NotifyOutcome::Sent
+        } else {
+            NotifyOutcome::SendFailed
+        }
     }
 }
 
@@ -274,20 +317,24 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
 }
 
 /// Push a kickoff approve/deny gate to the agent's default channel. `summary`
-/// is the human-readable "goal + iteration cap" line. Best-effort; returns
-/// whether a message was delivered.
+/// is the human-readable "goal + iteration cap" line. Best-effort; returns a
+/// [`NotifyOutcome`] distinguishing a config gap from a retryable send
+/// failure. Note: the underlying `ApprovalBroker` row is created by the
+/// caller BEFORE this push, so a `SendFailed` here means the approval already
+/// exists durably — the caller retries only the notification, never
+/// re-requests the approval.
 pub async fn notify_goal_kickoff(
     home_dir: &Path,
     agent_id: &str,
     approval_id: &str,
     summary: &str,
-) -> bool {
+) -> NotifyOutcome {
     let Some((channel, chat_id)) = agent_notify_target(home_dir, agent_id) else {
         info!(agent = %agent_id, "goal-notify: no notify destination for kickoff; skipping");
-        return false;
+        return NotifyOutcome::NoTarget;
     };
     let Some(token) = channel_token(home_dir, agent_id, &channel).await else {
-        return false;
+        return NotifyOutcome::NoTarget;
     };
     let body = format!(
         "🚀 自主目標啟動前需要您的核准\n{summary}\n\n請選擇：開始 / 拒絕。"
@@ -296,15 +343,19 @@ pub async fn notify_goal_kickoff(
     if channel_supports_buttons(&channel) {
         let markup = kickoff_button_markup(&channel, approval_id);
         match send_with_markup(&http, &channel, &token, &chat_id, &body, markup).await {
-            Ok(()) => true,
+            Ok(()) => NotifyOutcome::Sent,
             Err(e) => {
                 warn!(agent = %agent_id, %channel, error = %e, "goal-notify: kickoff push failed");
-                false
+                NotifyOutcome::SendFailed
             }
         }
     } else {
         let text = format!("{body}\n\n（此通道無按鈕，請至儀表板核准。）");
-        send_plain_text(&http, &channel, &token, &chat_id, &text).await
+        if send_plain_text(&http, &channel, &token, &chat_id, &text).await {
+            NotifyOutcome::Sent
+        } else {
+            NotifyOutcome::SendFailed
+        }
     }
 }
 
@@ -583,6 +634,16 @@ async fn append_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_outcome_is_final_only_for_sent_and_no_target() {
+        // Sent and NoTarget are both "handled" — the caller marks the phase
+        // delivered/seen and moves on. Only SendFailed (a transient send
+        // failure with a real destination) should trigger a retry.
+        assert!(NotifyOutcome::Sent.is_final());
+        assert!(NotifyOutcome::NoTarget.is_final());
+        assert!(!NotifyOutcome::SendFailed.is_final());
+    }
 
     fn mk_task(id: &str) -> TaskRow {
         TaskRow::new(
