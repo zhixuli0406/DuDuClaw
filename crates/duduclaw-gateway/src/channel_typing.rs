@@ -147,6 +147,39 @@ pub fn slack_status(
     })
 }
 
+/// Build a typing/loading indicator guard for an already-resolved
+/// `(channel_type, chat_id, thread_id, token)` tuple, if that channel type
+/// has typing support wired up here. Used by task-dispatch paths (bus
+/// delegation, SQLite queue, cron, reminders) which resolve their own
+/// channel token via each subsystem's existing cascade and then just need
+/// "start typing, stop on drop" — they should never need to know the
+/// per-platform API shape.
+///
+/// Returns `None` for unsupported channel types, an empty token, or a
+/// chat id that fails to parse for the target platform's expected id type
+/// (e.g. Telegram wants a numeric chat id). Always best-effort: callers
+/// must not let a `None` here affect task execution.
+pub fn typing_guard_for(
+    client: reqwest::Client,
+    channel_type: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    token: &str,
+) -> Option<TypingGuard> {
+    if token.is_empty() {
+        return None;
+    }
+    match channel_type {
+        "telegram" => {
+            let cid = chat_id.parse::<i64>().ok()?;
+            let tid = thread_id.and_then(|t| t.parse::<i64>().ok());
+            let api_base = format!("https://api.telegram.org/bot{token}");
+            Some(telegram_typing(client, api_base, cid, tid))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +201,23 @@ mod tests {
         assert!(at_drop >= 2, "expected ≥2 refreshes, got {at_drop}");
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(count.load(Ordering::SeqCst), at_drop, "loop kept running after drop");
+    }
+
+    #[tokio::test]
+    async fn typing_guard_for_rejects_bad_input() {
+        let client = reqwest::Client::new();
+        // Empty token — never start a guard even for a supported channel.
+        assert!(typing_guard_for(client.clone(), "telegram", "12345", None, "").is_none());
+        // Unsupported channel type.
+        assert!(typing_guard_for(client.clone(), "discord", "12345", None, "tok").is_none());
+        // Non-numeric Telegram chat id.
+        assert!(typing_guard_for(client.clone(), "telegram", "not-a-number", None, "tok").is_none());
+    }
+
+    #[tokio::test]
+    async fn typing_guard_for_accepts_valid_telegram() {
+        let client = reqwest::Client::new();
+        let guard = typing_guard_for(client, "telegram", "-1001234567890", Some("7"), "tok");
+        assert!(guard.is_some());
     }
 }

@@ -1675,8 +1675,14 @@ mod tests {
         assert_eq!(records[0].compression_stages, "");
     }
 
+    // The two wp5 cache-break tests snapshot the same process-global metrics
+    // counter; running them concurrently lets one increment land between the
+    // other's before/after reads (flaky under parallel test load).
+    static WP5_METRICS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn wp5_cache_break_suspect_counter_fires_on_craters_after_healthy() {
+        let _serialize = WP5_METRICS_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let telemetry = CostTelemetry::new(&dir.path().join("wp5c.db")).unwrap();
         let before = crate::metrics::global_metrics()
@@ -1718,6 +1724,7 @@ mod tests {
 
     #[tokio::test]
     async fn wp5_cache_break_suspect_does_not_fire_when_not_compressed() {
+        let _serialize = WP5_METRICS_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let telemetry = CostTelemetry::new(&dir.path().join("wp5d.db")).unwrap();
         let before = crate::metrics::global_metrics()

@@ -217,6 +217,14 @@ async fn poll_and_dispatch_sqlite(
         // get no channel context, their `send_to_agent` callbacks never
         // register, and sub-agent replies are silently dropped at the
         // `forward_delegation_response` no-callback branch.
+        // Best-effort typing indicator for the duration of the CLI run —
+        // covers plain `send_to_agent` delegation callbacks AND goal-loop
+        // work items (which have no callback of their own; see the
+        // fallback in `build_typing_guard_for_sqlite_message`).
+        let typing_guard = build_typing_guard_for_sqlite_message(
+            home_dir, &msg.id, msg.origin_agent.as_deref(), &msg.target, &msg.payload,
+        ).await;
+
         let dispatch_fut =
             dispatch_to_agent(home_dir, registry, &msg.target, &msg.payload, &delegation);
         // v1.10: scope wiki RL trust feedback context so the sub-agent's
@@ -233,6 +241,7 @@ async fn poll_and_dispatch_sqlite(
             }
             _ => dispatch_fut.await,
         };
+        drop(typing_guard);
 
         match result {
             Ok(response) => {
@@ -265,11 +274,39 @@ async fn poll_and_dispatch_sqlite(
                     error = %e,
                     "SQLite queue: message dispatch failed"
                 );
+                // Best-effort user-facing fallback: previously a terminal dispatch
+                // failure was only logged, so a delegation callback (if any) sat
+                // unconsumed forever and the requester never learned their
+                // sub-task died (silent drop). Classify the error the same way
+                // `channel_reply` does for the main-line CLI failure path and
+                // forward a short, non-leaking zh-TW notice — never the raw `e`
+                // (which may contain stderr text or internal paths).
+                let label = short_failure_label(crate::channel_reply::classify_cli_failure(&e));
+                let fallback_text = format!("⚠️ 子任務處理失敗：{label}。請稍後再試或改寫指令。");
+                forward_delegation_response(home_dir, &msg.id, &fallback_text, &msg.target).await;
             }
         }
     }
 
     Ok(())
+}
+
+/// Short zh-TW category label for a classified dispatch failure, used only in
+/// the user-facing fallback notice — never the raw error string (which may
+/// carry stderr text or internal paths).
+fn short_failure_label(reason: crate::channel_reply::FailureReason) -> &'static str {
+    use crate::channel_reply::FailureReason;
+    match reason {
+        FailureReason::BinaryMissing => "找不到執行環境",
+        FailureReason::AuthFailed => "帳號未登入或認證失效",
+        FailureReason::RateLimited => "API 使用量已達上限",
+        FailureReason::Billing => "帳號額度已用完",
+        FailureReason::Timeout => "處理超時",
+        FailureReason::SpawnError => "子程序啟動失敗",
+        FailureReason::EmptyResponse => "未產生回應內容",
+        FailureReason::NoAccounts => "沒有可用帳號",
+        FailureReason::Unknown => "未知錯誤",
+    }
 }
 
 /// Reset stale acked messages back to pending, or fail them if retries exhausted.
@@ -553,16 +590,31 @@ async fn poll_and_dispatch(
                 sender: msg.sender_agent.clone().unwrap_or_default(),
                 hop_depth: msg.hop_depth,
             };
+            // Best-effort typing indicator for the duration of the CLI run —
+            // only fires when a `send_to_agent` delegation callback exists
+            // (i.e. this bus message came from a user-facing channel turn).
+            let typing_guard = build_typing_guard_for_message(
+                &home, &msg.message_id, msg.origin_agent.as_deref(),
+            ).await;
+
             let dispatch_fut = dispatch_to_agent(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
                 .scope(session_id_for_scope, dispatch_fut);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
                 .scope(turn_id_for_scope, dispatch_fut);
             let result = dispatch_fut.await;
+            drop(typing_guard);
 
             let mut response_text = match &result {
                 Ok(text) => text.clone(),
-                Err(e) => format!("Error: {e}"),
+                Err(e) => {
+                    // Same non-leaking fallback as the SQLite queue path: the raw
+                    // error may carry stderr text or internal paths, so forward a
+                    // classified zh-TW notice instead.
+                    let label =
+                        short_failure_label(crate::channel_reply::classify_cli_failure(e));
+                    format!("⚠️ 子任務處理失敗：{label}。請稍後再試或改寫指令。")
+                }
             };
 
             // ── L2+L4: Post-Action Hallucination Audit ──────────
@@ -2460,19 +2512,25 @@ async fn forward_to_channel(
                 let resp = http.post(&url).json(&payload).send().await
                     .map_err(|e| format!("telegram send chunk {}/{}: {e}", i + 1, total))?;
                 if !resp.status().is_success() {
-                    // Retry without parse_mode in case Markdown causes issues on this chunk
+                    // Retry without parse_mode in case Markdown causes issues on this chunk.
+                    // A failure here (network error or non-2xx) MUST propagate as Err —
+                    // this used to only `warn!` and fall through to `Ok(())`, which
+                    // silently swallowed the delivery failure and starved the
+                    // `forward_delegation_response` 5-attempt retry (every other
+                    // channel in this match already returns Err on the equivalent
+                    // path). Multi-chunk replies may re-send earlier chunks on the
+                    // outer retry — same accepted tradeoff as LINE/Discord/Slack above.
                     let fallback_payload = serde_json::json!({
                         "chat_id": channel_id,
                         "text": body,
                     });
-                    match http.post(&url).json(&fallback_payload).send().await {
-                        Ok(r) if !r.status().is_success() => {
-                            warn!(status = %r.status(), chunk = i + 1, total = total, "Telegram fallback retry also failed");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, chunk = i + 1, total = total, "Telegram fallback retry network error");
-                        }
-                        _ => {}
+                    let fallback_resp = http.post(&url).json(&fallback_payload).send().await
+                        .map_err(|e| format!("telegram fallback send chunk {}/{}: {e}", i + 1, total))?;
+                    if !fallback_resp.status().is_success() {
+                        return Err(format!(
+                            "Telegram API returned {} on chunk {}/{} (markdown and plain-text attempts both failed)",
+                            fallback_resp.status(), i + 1, total
+                        ));
                     }
                 }
                 if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
@@ -2775,6 +2833,177 @@ fn get_config_token(config: &toml::Value, enc_key: &str, plain_key: &str, home_d
     }
     // Fallback to plaintext
     channels.and_then(|c| c.get(plain_key)).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+// ── Typing indicator for dispatched tasks ────────────────────
+//
+// Task-dispatch paths (bus delegation here, SQLite queue, cron,
+// reminders) previously showed no typing indicator while the CLI ran —
+// only the interactive `telegram.rs` reply path did, via
+// `channel_typing::telegram_typing`. This section recovers enough
+// routing info from each dispatch path to start the same indicator for
+// the (often multi-minute) task-dispatch CLI run.
+//
+// Every function here is best-effort: any lookup/decrypt/parse failure
+// returns `None` silently (debug-logged) and must never affect dispatch
+// outcomes — typing is cosmetic.
+
+/// Non-destructive lookup of a `send_to_agent` delegation callback's
+/// channel routing. Unlike `forward_delegation_response`'s
+/// `DELETE RETURNING`, this leaves the row untouched — the callback is
+/// still needed later, once the response is ready, to actually forward it.
+async fn peek_callback(
+    home_dir: &Path,
+    message_id: &str,
+) -> Option<(String, String, String, Option<String>)> {
+    let db_path = home_dir.join("message_queue.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let msg_id = message_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&db_path).ok()?;
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+        conn.query_row(
+            "SELECT agent_id, channel_type, channel_id, thread_id \
+             FROM delegation_callbacks WHERE message_id = ?1",
+            rusqlite::params![msg_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Parse the `[goal-loop task_id=<id> iter=<n>]` marker that
+/// `goal_loop.rs::enqueue_work` stamps at the front of its payload.
+/// Returns `None` for any message that isn't a goal-loop dispatch.
+fn extract_goal_loop_task_id(payload: &str) -> Option<&str> {
+    const MARKER: &str = "[goal-loop task_id=";
+    let start = payload.find(MARKER)? + MARKER.len();
+    let rest = &payload[start..];
+    let end = rest.find(' ')?;
+    let id = &rest[..end];
+    if id.is_empty() { None } else { Some(id) }
+}
+
+/// Read a task's originating channel (`source_channel`/`source_chat_id`,
+/// stamped at `/goal` kickoff — see `task_store.rs`'s P5 fields) directly
+/// from `tasks.db`. Read-only, best-effort — a bare query rather than a
+/// full `TaskStore::open` so this never pays schema-migration cost on the
+/// hot dispatch path.
+async fn lookup_task_source_channel(home_dir: &Path, task_id: &str) -> Option<(String, String)> {
+    let db_path = home_dir.join("tasks.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let id = task_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&db_path).ok()?;
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+        conn.query_row(
+            "SELECT source_channel, source_chat_id FROM tasks WHERE id = ?1",
+            rusqlite::params![id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+    .and_then(|(ch, chat)| match (ch, chat) {
+        (Some(c), Some(i)) if !c.is_empty() && !i.is_empty() => Some((c, i)),
+        _ => None,
+    })
+}
+
+/// Read + parse `config.toml`. Shared by the typing-guard resolvers below.
+async fn read_config_toml(home_dir: &Path) -> Option<toml::Value> {
+    let config_str = tokio::fs::read_to_string(home_dir.join("config.toml")).await.ok()?;
+    config_str.parse().ok()
+}
+
+/// Best-effort typing indicator for a dispatched bus/SQLite message.
+///
+/// Looks up the `delegation_callbacks` row registered by `send_to_agent`
+/// (if any) and, for Telegram destinations, starts a `sendChatAction`
+/// loop that stops when the returned guard is dropped.
+///
+/// Returns `None` for every unsupported/unresolvable case (no callback —
+/// the normal case for cron/reminder-originated internal delegations,
+/// non-Telegram channel, missing/undecryptable token, non-numeric chat
+/// id).
+async fn build_typing_guard_for_message(
+    home_dir: &Path,
+    message_id: &str,
+    origin_agent: Option<&str>,
+) -> Option<crate::channel_typing::TypingGuard> {
+    let (callback_agent, channel_type, channel_id, thread_id) =
+        peek_callback(home_dir, message_id).await?;
+    if channel_type != "telegram" {
+        return None;
+    }
+    let config = read_config_toml(home_dir).await?;
+    let token = resolve_forward_token(
+        home_dir, &callback_agent, origin_agent, "telegram",
+        &config, "telegram_bot_token_enc", "telegram_bot_token",
+    );
+    let guard = crate::channel_typing::typing_guard_for(
+        forward_http().clone(), "telegram", &channel_id, thread_id.as_deref(), &token,
+    );
+    if guard.is_none() {
+        tracing::debug!(
+            message_id, channel_id, has_token = !token.is_empty(),
+            "typing guard: could not start telegram indicator for dispatched message"
+        );
+    }
+    guard
+}
+
+/// Same idea as `build_typing_guard_for_message`, plus a goal-loop
+/// fallback for the SQLite queue.
+///
+/// Goal-loop work items (`goal_loop.rs::enqueue_work`) carry no
+/// `reply_channel`/`origin_agent` and register no delegation callback (they
+/// aren't sent via the `send_to_agent` MCP tool), so step 1 above always
+/// misses for them. Recover the routing instead from the originating
+/// task's `source_channel`/`source_chat_id` via the `[goal-loop
+/// task_id=...]` marker `enqueue_work` stamps into the payload. There is
+/// no callback agent to cascade the token from in this case, so the
+/// assigned agent (`assigned_agent`, about to run the task) is used as the
+/// `reports_to` cascade root instead.
+async fn build_typing_guard_for_sqlite_message(
+    home_dir: &Path,
+    message_id: &str,
+    origin_agent: Option<&str>,
+    assigned_agent: &str,
+    payload: &str,
+) -> Option<crate::channel_typing::TypingGuard> {
+    if let Some(guard) = build_typing_guard_for_message(home_dir, message_id, origin_agent).await {
+        return Some(guard);
+    }
+    let task_id = extract_goal_loop_task_id(payload)?;
+    let (source_channel, source_chat_id) = lookup_task_source_channel(home_dir, task_id).await?;
+    if source_channel != "telegram" {
+        return None;
+    }
+    let config = read_config_toml(home_dir).await?;
+    let token = resolve_forward_token(
+        home_dir, assigned_agent, None, "telegram",
+        &config, "telegram_bot_token_enc", "telegram_bot_token",
+    );
+    crate::channel_typing::typing_guard_for(
+        forward_http().clone(), "telegram", &source_chat_id, None, &token,
+    )
 }
 
 #[cfg(test)]
@@ -3468,6 +3697,91 @@ bot_token = "{token}"
              '2026-04-21T12:35:48', ?5, ?2)",
             rusqlite::params![id, sender, target, response, reply_channel],
         ).unwrap();
+    }
+
+    #[tokio::test]
+    async fn peek_callback_reads_without_consuming() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let mid = "peek-test-1";
+        setup_done_message(home, mid, "duduclaw-tl", "duduclaw-marketing", "the report", None);
+
+        let conn = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
+        conn.execute(
+            "INSERT INTO delegation_callbacks (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at) \
+             VALUES (?1, 'duduclaw-marketing', 'telegram', '12345', '7', 0, '2026-04-21T12:35:48')",
+            rusqlite::params![mid],
+        ).unwrap();
+        drop(conn);
+
+        let peeked = peek_callback(home, mid).await.expect("callback row present");
+        assert_eq!(peeked, (
+            "duduclaw-marketing".to_string(),
+            "telegram".to_string(),
+            "12345".to_string(),
+            Some("7".to_string()),
+        ));
+
+        // Unlike `forward_delegation_response`'s DELETE RETURNING, the row
+        // must still be there — `forward_delegation_response` still needs
+        // to consume it later once the response is ready.
+        let count: i64 = rusqlite::Connection::open(home.join("message_queue.db")).unwrap()
+            .query_row("SELECT COUNT(*) FROM delegation_callbacks WHERE message_id=?1",
+                rusqlite::params![mid], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "peek_callback must not consume the row");
+
+        // A message with no registered callback yields None (expected for
+        // cron/reminder/internal delegations).
+        assert!(peek_callback(home, "no-such-message").await.is_none());
+    }
+
+    #[test]
+    fn extract_goal_loop_task_id_parses_marker() {
+        let payload = "[goal-loop task_id=abc-123 iter=2] 你有一個自主目標任務要推進:\n...";
+        assert_eq!(extract_goal_loop_task_id(payload), Some("abc-123"));
+
+        // Non-goal-loop payloads (plain send_to_agent messages) yield None.
+        assert_eq!(extract_goal_loop_task_id("just a normal delegation payload"), None);
+    }
+
+    #[tokio::test]
+    async fn lookup_task_source_channel_reads_tasks_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        let store = crate::task_store::TaskStore::open(home).expect("open task store");
+        let mut row = crate::task_store::TaskRow::new(
+            "goal-task-1".to_string(),
+            "title".to_string(),
+            "description".to_string(),
+            "medium".to_string(),
+            "duduclaw-marketing".to_string(),
+            "goal-loop".to_string(),
+        );
+        row.source_channel = Some("telegram".to_string());
+        row.source_chat_id = Some("67890".to_string());
+        store.insert_task(&row).await.expect("insert task");
+
+        let found = lookup_task_source_channel(home, "goal-task-1").await;
+        assert_eq!(found, Some(("telegram".to_string(), "67890".to_string())));
+
+        // A task with no source_channel/source_chat_id (not created from a
+        // `/goal` channel command) yields None.
+        let mut row2 = crate::task_store::TaskRow::new(
+            "plain-task-1".to_string(),
+            "title".to_string(),
+            "description".to_string(),
+            "medium".to_string(),
+            "duduclaw-marketing".to_string(),
+            "system".to_string(),
+        );
+        row2.source_channel = None;
+        row2.source_chat_id = None;
+        store.insert_task(&row2).await.expect("insert task");
+        assert!(lookup_task_source_channel(home, "plain-task-1").await.is_none());
+
+        // Unknown task id yields None.
+        assert!(lookup_task_source_channel(home, "no-such-task").await.is_none());
     }
 
     #[tokio::test]

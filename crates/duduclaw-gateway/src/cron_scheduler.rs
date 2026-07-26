@@ -357,6 +357,13 @@ async fn execute_cron_task(
     // sub-agent replies.
     let reply_channel_override = cron_reply_channel_string(task);
 
+    // Best-effort typing indicator on the notify target for the duration
+    // of the CLI call — cron tasks can run for minutes with no visible
+    // sign of life otherwise. Cosmetic only: any resolution failure
+    // (no notify target, non-Telegram channel, missing token) yields
+    // `None` and does not affect dispatch.
+    let typing_guard = build_cron_typing_guard(home_dir, task).await;
+
     let dispatch_fut = crate::claude_runner::DELEGATION_ENV
         .scope(delegation_env, async {
             call_claude_for_agent_with_type(
@@ -372,6 +379,7 @@ async fn execute_cron_task(
         Some(rc) => crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut).await,
         None => dispatch_fut.await,
     };
+    drop(typing_guard);
 
     match result {
         Ok(response) => {
@@ -588,6 +596,24 @@ async fn resolve_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", &field_base)
         .await
         .unwrap_or_default()
+}
+
+/// Best-effort typing indicator for a cron task's notify target.
+/// Telegram-only for now (see `channel_typing::typing_guard_for`); returns
+/// `None` for every other case (no notify target configured, non-Telegram
+/// channel, empty resolved token) without affecting task execution.
+async fn build_cron_typing_guard(
+    home_dir: &Path,
+    task: &CronTaskRow,
+) -> Option<crate::channel_typing::TypingGuard> {
+    if task.notify_channel.as_deref() != Some("telegram") {
+        return None;
+    }
+    let chat_id = task.notify_chat_id.as_deref()?;
+    let token = resolve_channel_token(home_dir, &task.agent_id, "telegram").await;
+    crate::channel_typing::typing_guard_for(
+        reqwest::Client::new(), "telegram", chat_id, task.notify_thread_id.as_deref(), &token,
+    )
 }
 
 /// Build the `DUDUCLAW_REPLY_CHANNEL` string from a cron task's notify_*

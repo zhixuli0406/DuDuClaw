@@ -31,6 +31,19 @@ struct TgResponse<T> {
     ok: bool,
     result: Option<T>,
     description: Option<String>,
+    /// Telegram's numeric API error code (mirrors the HTTP status: 429 for
+    /// rate limit, 5xx for server errors, 400/403/etc for client errors).
+    /// Absent on success.
+    #[serde(default)]
+    error_code: Option<i64>,
+    /// Present on a 429 response — how long to wait before retrying.
+    #[serde(default)]
+    parameters: Option<TgResponseParameters>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TgResponseParameters {
+    retry_after: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -683,17 +696,29 @@ async fn poll_loop(
                 };
                 drop(typing_guard);
 
-                // Remove the interim progress/task-board message — the final
-                // reply supersedes it.
+                // Guard: don't send empty replies (Telegram rejects empty text).
+                // Checked BEFORE deleting the interim progress message: this
+                // used to delete first and check emptiness after, which is
+                // fine functionally (both paths still delete) but reads as
+                // "decide what to do, THEN delete", not "delete only once we
+                // know what we're doing" — reordered so the emptiness
+                // decision comes first. Either way the progress message is
+                // removed so it never lingers as a stale "分析中…" bubble,
+                // even on the silent-by-design (blocked/muted) empty-reply path.
+                if reply.trim().is_empty() {
+                    warn!(chat_id, "Telegram: reply is empty — skipping send");
+                    if let Some(mid) = progress_msg_cleanup.lock().await.take() {
+                        let del_body = json!({ "chat_id": chat_id, "message_id": mid });
+                        let _ = client.post(format!("{api_base}/deleteMessage")).json(&del_body).send().await;
+                    }
+                    continue;
+                }
+
+                // Non-empty reply — remove the interim progress/task-board
+                // message now; the final reply below supersedes it.
                 if let Some(mid) = progress_msg_cleanup.lock().await.take() {
                     let del_body = json!({ "chat_id": chat_id, "message_id": mid });
                     let _ = client.post(format!("{api_base}/deleteMessage")).json(&del_body).send().await;
-                }
-
-                // Guard: don't send empty replies (Telegram rejects empty text)
-                if reply.trim().is_empty() {
-                    warn!(chat_id, "Telegram: reply is empty — skipping send");
-                    continue;
                 }
 
                 // Check voice mode
@@ -704,19 +729,28 @@ async fn poll_loop(
                     let tts_provider = crate::tts::EdgeTtsProvider::new();
                     match tts_provider.synthesize(&reply, "").await {
                         Ok(audio_bytes) => {
-                            send_voice(&client, &api_base, chat_id, audio_bytes).await;
-                            if reply.len() > 200 {
-                                send_reply(&client, &api_base, chat_id, &format!("📝 {}", truncate_bytes(&reply, 200)), thread_id, msg_id, None).await;
+                            let voice_sent = send_voice(&client, &api_base, chat_id, audio_bytes).await;
+                            if voice_sent {
+                                if reply.len() > 200 {
+                                    send_reply(&client, &api_base, chat_id, &format!("📝 {}", truncate_bytes(&reply, 200)), thread_id, msg_id, None).await;
+                                }
+                            } else {
+                                // sendAudio failed — a short reply (≤200 chars) had NO
+                                // text companion at all, so a failed voice upload used
+                                // to leave the user with nothing. Send the full text
+                                // reply as a fallback so the turn is never silently lost.
+                                warn!(chat_id, "Telegram: sendAudio failed — falling back to text reply");
+                                send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons()), &ctx.home_dir).await;
                             }
                         }
                         Err(e) => {
                             warn!("TTS synthesis failed, falling back to text: {e}");
-                            send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons())).await;
+                            send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons()), &ctx.home_dir).await;
                         }
                     }
                 } else {
                     // Send with inline keyboard buttons
-                    send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons())).await;
+                    send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons()), &ctx.home_dir).await;
                 }
             }
         }
@@ -956,7 +990,7 @@ async fn handle_command(
                 }
             };
             drop(typing_guard);
-            send_reply_markdown(client, api_base, chat_id, &reply, thread_id, None, Some(channel_format::telegram_conversation_buttons())).await;
+            send_reply_markdown(client, api_base, chat_id, &reply, thread_id, None, Some(channel_format::telegram_conversation_buttons()), &ctx.home_dir).await;
         }
         "/status" => {
             let agent_info = {
@@ -1332,7 +1366,11 @@ async fn transcribe_voice(
     Ok(text)
 }
 
-async fn send_voice(client: &reqwest::Client, api_base: &str, chat_id: i64, audio_data: Vec<u8>) {
+/// Send a voice reply. Returns `true` on success so the caller can fall back
+/// to a text send when the voice upload fails — previously this returned
+/// `()` and a failed `sendAudio` call for a short reply (≤200 chars, no text
+/// companion message) left the user with nothing at all.
+async fn send_voice(client: &reqwest::Client, api_base: &str, chat_id: i64, audio_data: Vec<u8>) -> bool {
     let part = match reqwest::multipart::Part::bytes(audio_data)
         .file_name("reply.mp3")
         .mime_str("audio/mpeg")
@@ -1340,7 +1378,7 @@ async fn send_voice(client: &reqwest::Client, api_base: &str, chat_id: i64, audi
         Ok(p) => p,
         Err(e) => {
             error!("Failed to create voice part: {e}");
-            return;
+            return false;
         }
     };
 
@@ -1349,14 +1387,22 @@ async fn send_voice(client: &reqwest::Client, api_base: &str, chat_id: i64, audi
         .part("audio", part);
 
     match client.post(format!("{api_base}/sendAudio")).multipart(form).send().await {
-        Ok(resp) => {
-            if let Ok(data) = resp.json::<TgResponse<serde_json::Value>>().await
-                && !data.ok
-            {
-                error!("Telegram sendAudio failed: {}", data.description.unwrap_or_default());
+        Ok(resp) => match resp.json::<TgResponse<serde_json::Value>>().await {
+            Ok(data) => {
+                if !data.ok {
+                    error!("Telegram sendAudio failed: {}", data.description.unwrap_or_default());
+                }
+                data.ok
             }
+            Err(e) => {
+                error!("Telegram sendAudio parse error: {e}");
+                false
+            }
+        },
+        Err(e) => {
+            error!("Telegram sendAudio error: {e}");
+            false
         }
-        Err(e) => error!("Telegram sendAudio error: {e}"),
     }
 }
 
@@ -1399,7 +1445,11 @@ const TG_MARKDOWN_CHUNK: usize = 3400;
 
 /// Send an AI reply: markdown → Telegram HTML (tables → <pre>, code fences
 /// → <pre><code>, headings → bold). Each chunk falls back to plain text if
-/// Telegram rejects the HTML entities.
+/// Telegram rejects the HTML entities. `home_dir` is used only to record a
+/// `channel_failures.jsonl` line when BOTH the HTML and plain-text attempts
+/// for a chunk fail — previously that second failure was silently dropped
+/// (the caller had no idea the message never arrived).
+#[allow(clippy::too_many_arguments)]
 async fn send_reply_markdown(
     client: &reqwest::Client,
     api_base: &str,
@@ -1408,6 +1458,7 @@ async fn send_reply_markdown(
     message_thread_id: Option<i64>,
     reply_to_message_id: Option<i64>,
     reply_markup: Option<serde_json::Value>,
+    home_dir: &Path,
 ) {
     let chunks = channel_format::split_text(markdown, TG_MARKDOWN_CHUNK);
     let last = chunks.len().saturating_sub(1);
@@ -1422,7 +1473,10 @@ async fn send_reply_markdown(
 
         // Oversized after rendering (pathological escaping) → plain chunk.
         if html.chars().count() > channel_format::limits::TELEGRAM_MESSAGE {
-            send_message_once(client, api_base, chat_id, chunk, None, message_thread_id, reply_params, markup).await;
+            let ok = send_message_once(client, api_base, chat_id, chunk, None, message_thread_id, reply_params, markup).await;
+            if !ok {
+                record_send_failure(home_dir, chat_id, i, chunks.len(), "oversized_plain_chunk");
+            }
             continue;
         }
 
@@ -1435,12 +1489,66 @@ async fn send_reply_markdown(
             // HTML parse rejected — resend the raw chunk as plain text so
             // the reply is never silently dropped.
             warn!("Telegram: HTML parse failed — falling back to plain text");
-            send_message_once(client, api_base, chat_id, chunk, None, message_thread_id, None, markup).await;
+            let plain_ok = send_message_once(client, api_base, chat_id, chunk, None, message_thread_id, None, markup).await;
+            if !plain_ok {
+                // Both attempts failed — this chunk (and everything after
+                // it, since the loop keeps going for the remaining chunks)
+                // never reached the user. Previously this branch discarded
+                // the second `send_message_once` result entirely.
+                warn!(chat_id, chunk = i + 1, total = chunks.len(), "Telegram send failed (both HTML and plain)");
+                record_send_failure(home_dir, chat_id, i, chunks.len(), "html_and_plain_both_failed");
+            }
         }
     }
 }
 
-/// POST a single sendMessage. Returns `true` on success (`ok: true`).
+/// Record a `channel_failures.jsonl` line for a Telegram send that failed
+/// after exhausting its fallback attempts. Best-effort — a write failure is
+/// only logged, never propagated (this is telemetry, not control flow).
+fn record_send_failure(home_dir: &Path, chat_id: i64, chunk_index: usize, total_chunks: usize, reason: &str) {
+    let rec = serde_json::json!({
+        "event": "telegram_send_failed",
+        "channel": "telegram",
+        "chat_id": chat_id,
+        "chunk": chunk_index + 1,
+        "total_chunks": total_chunks,
+        "reason": reason,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Err(e) = crate::trajectory_guard::append_anomaly(home_dir, &rec) {
+        warn!(error = %e, "telegram: 寫入 channel_failures.jsonl 失敗");
+    }
+}
+
+/// Max attempts (initial + retries) for a rate-limited / 5xx `sendMessage`.
+const TG_SEND_MAX_ATTEMPTS: u32 = 3;
+
+/// Whether a Telegram API error code is worth retrying: 429 (rate limit) and
+/// any 5xx (transient server-side failure). 4xx other than 429 (bad request,
+/// forbidden, chat not found, etc.) means retrying the identical request
+/// would just reproduce the identical failure. Pure — unit-tested.
+fn tg_is_retryable_code(code: u16) -> bool {
+    code == 429 || (500..600).contains(&code)
+}
+
+/// Backoff duration before the next retry attempt. Honors Telegram's own
+/// `retry_after` (from the 429 response body) when present and positive;
+/// otherwise a short fixed schedule (1s after the first failure, 3s after
+/// the second). Pure — unit-tested.
+fn tg_backoff_for(attempt: u32, retry_after_secs: Option<i64>) -> std::time::Duration {
+    retry_after_secs
+        .filter(|secs| *secs > 0)
+        .map(|secs| std::time::Duration::from_secs(secs as u64))
+        .unwrap_or_else(|| std::time::Duration::from_secs(if attempt <= 1 { 1 } else { 3 }))
+}
+
+/// POST a single sendMessage, retrying up to twice on 429 (honoring
+/// `retry_after` when Telegram sends one) or 5xx server errors — both are
+/// transient and previously fell straight through to "failed", forcing the
+/// caller's own (heavier) HTML→plain fallback to absorb what a short backoff
+/// would have fixed. 4xx client errors (bad chat_id, blocked bot, malformed
+/// entities, etc.) are never retried — retrying an identical bad request
+/// just wastes the attempt budget. Returns `true` on success (`ok: true`).
 #[allow(clippy::too_many_arguments)]
 async fn send_message_once(
     client: &reqwest::Client,
@@ -1460,26 +1568,80 @@ async fn send_message_once(
         reply_parameters,
         reply_markup,
     };
-    match client.post(format!("{api_base}/sendMessage")).json(&body).send().await {
-        Ok(resp) => match resp.json::<TgResponse<serde_json::Value>>().await {
-            Ok(data) => {
-                if !data.ok {
-                    error!(
-                        "Telegram send failed: {}",
-                        data.description.unwrap_or_default()
-                    );
-                }
-                data.ok
+    for attempt in 1..=TG_SEND_MAX_ATTEMPTS {
+        let resp = match client.post(format!("{api_base}/sendMessage")).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Telegram send error: {e}");
+                return false;
             }
+        };
+        let status = resp.status();
+        let data = match resp.json::<TgResponse<serde_json::Value>>().await {
+            Ok(d) => d,
             Err(e) => {
                 error!("Telegram send parse error: {e}");
-                false
+                return false;
             }
-        },
-        Err(e) => {
-            error!("Telegram send error: {e}");
-            false
+        };
+        if data.ok {
+            return true;
         }
+        error!(
+            "Telegram send failed ({}): {}",
+            status,
+            data.description.as_deref().unwrap_or("(no description)")
+        );
+        // Prefer Telegram's own `error_code` from the JSON body (the documented
+        // API contract) and fall back to the transport-level HTTP status —
+        // both normally agree, but the body is the source of truth.
+        let code = data.error_code.map(|c| c as u16).unwrap_or_else(|| status.as_u16());
+        if !tg_is_retryable_code(code) || attempt >= TG_SEND_MAX_ATTEMPTS {
+            return false;
+        }
+        let backoff = tg_backoff_for(attempt, data.parameters.as_ref().and_then(|p| p.retry_after));
+        warn!(chat_id, attempt, status = %status, ?backoff, "Telegram send transient failure — retrying after backoff");
+        tokio::time::sleep(backoff).await;
+    }
+    false
+}
+
+#[cfg(test)]
+mod send_retry_tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_and_server_errors_are_retryable() {
+        assert!(tg_is_retryable_code(429));
+        assert!(tg_is_retryable_code(500));
+        assert!(tg_is_retryable_code(502));
+        assert!(tg_is_retryable_code(599));
+    }
+
+    #[test]
+    fn client_errors_other_than_429_are_not_retryable() {
+        // Retrying an identical bad request (bad chat_id, blocked bot,
+        // malformed entities, ...) just reproduces the identical failure.
+        assert!(!tg_is_retryable_code(400));
+        assert!(!tg_is_retryable_code(403));
+        assert!(!tg_is_retryable_code(404));
+        assert!(!tg_is_retryable_code(200)); // never reached in practice, but not retryable
+    }
+
+    #[test]
+    fn backoff_honors_telegrams_retry_after_when_positive() {
+        assert_eq!(tg_backoff_for(1, Some(7)), std::time::Duration::from_secs(7));
+        assert_eq!(tg_backoff_for(2, Some(30)), std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn backoff_falls_back_to_fixed_schedule_without_retry_after() {
+        assert_eq!(tg_backoff_for(1, None), std::time::Duration::from_secs(1));
+        assert_eq!(tg_backoff_for(2, None), std::time::Duration::from_secs(3));
+        // A zero or negative retry_after (malformed/absent) is ignored, not
+        // treated as "retry immediately".
+        assert_eq!(tg_backoff_for(1, Some(0)), std::time::Duration::from_secs(1));
+        assert_eq!(tg_backoff_for(1, Some(-5)), std::time::Duration::from_secs(1));
     }
 }
 
