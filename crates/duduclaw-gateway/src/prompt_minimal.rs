@@ -41,10 +41,18 @@ pub fn build_minimal_system_prompt(
     agent: &LoadedAgent,
     sender_block: &str,
     pinned_instructions: &str,
+    default_language: Option<&str>,
 ) -> String {
     let contract_prompt = duduclaw_agent::contract::contract_to_prompt(&agent.contract);
+    let display_name = if agent.config.agent.display_name.trim().is_empty() {
+        &agent.config.agent.name
+    } else {
+        &agent.config.agent.display_name
+    };
     build_minimal_inner(MinimalInput {
         agent_name: &agent.config.agent.name,
+        display_name,
+        default_language,
         soul: agent.soul.as_deref(),
         identity: agent.identity.as_deref(),
         contract: &contract_prompt,
@@ -58,6 +66,8 @@ pub fn build_minimal_system_prompt(
 /// without touching `LoadedAgent` or filesystem.
 pub(crate) struct MinimalInput<'a> {
     pub agent_name: &'a str,
+    pub display_name: &'a str,
+    pub default_language: Option<&'a str>,
     pub soul: Option<&'a str>,
     pub identity: Option<&'a str>,
     pub contract: &'a str,
@@ -69,6 +79,16 @@ pub(crate) struct MinimalInput<'a> {
 pub(crate) fn build_minimal_inner(input: MinimalInput<'_>) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut audit: Vec<crate::prompt_audit::PromptSection> = Vec::new();
+
+    // 0. Authoritative identity + global default language, ahead of SOUL so
+    //    it wins over any stale name/language text SOUL.md still contains.
+    if let Some(s) = crate::prompt_identity::identity_and_language_section(
+        input.display_name,
+        input.default_language,
+    ) {
+        audit.push(crate::prompt_audit::PromptSection::new("identity_directive", &s));
+        parts.push(s);
+    }
 
     // 1. SOUL core (truncated to minimal_core_kb)
     if let Some(soul) = input.soul {
@@ -195,6 +215,8 @@ mod tests {
     ) -> MinimalInput<'a> {
         MinimalInput {
             agent_name: "test",
+            display_name: "test",
+            default_language: None,
             soul,
             identity,
             contract: "",
@@ -313,12 +335,37 @@ mod tests {
         let prompt = build_minimal_inner(input(Some("soul"), Some(&big_id), "", "", 5));
         // Identity section length is bounded.
         // The whole prompt minus the SOUL/MCP-index parts should be < 2.5KB.
+        // Budget: identity_directive preamble (~190B incl. separator) + soul
+        // "soul" + sep + identity 2K (IDENTITY_MAX_BYTES) + sep.
         let mcp_pos = prompt.find("Available MCP Tools").unwrap();
         let identity_slice = &prompt[..mcp_pos];
         assert!(
-            identity_slice.len() < 2 * 1024 + 200, // soul "soul" + sep + identity 2K + sep
+            identity_slice.len() < 2 * 1024 + 500,
             "identity section ({} bytes) must respect IDENTITY_MAX_BYTES",
             identity_slice.len()
+        );
+    }
+
+    #[test]
+    fn minimal_prompt_includes_identity_directive_before_soul() {
+        let prompt = build_minimal_inner(MinimalInput {
+            agent_name: "test",
+            display_name: "Alice",
+            default_language: Some("zh-TW"),
+            soul: Some("Be friendly."),
+            identity: None,
+            contract: "",
+            sender_block: "",
+            pinned_instructions: "",
+            minimal_core_kb: 5,
+        });
+        assert!(prompt.contains("Your name is \"Alice\""));
+        assert!(prompt.contains("Traditional Chinese"));
+        let name_pos = prompt.find("Your name is").unwrap();
+        let soul_pos = prompt.find("Be friendly.").unwrap();
+        assert!(
+            name_pos < soul_pos,
+            "identity directive must precede SOUL content"
         );
     }
 }

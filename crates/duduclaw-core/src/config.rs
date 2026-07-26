@@ -12,11 +12,21 @@ use std::path::Path;
 
 /// Write a minimal but valid `config.toml` into `home`.
 ///
-/// Only the two sections the operator cares about on first boot are written —
-/// `[general]` log level and `[gateway]` bind/port. Everything else the gateway
-/// reads with `unwrap_or_default`, so this is sufficient to start. The write is
-/// atomic (temp file + rename) so a crash mid-write never leaves a half-written
-/// config that would fail to parse on the next boot.
+/// Only the sections the operator cares about on first boot are written —
+/// `[general]` log level + default reply language, and `[gateway]` bind/port.
+/// Everything else the gateway reads with `unwrap_or_default`, so this is
+/// sufficient to start. The write is atomic (temp file + rename) so a crash
+/// mid-write never leaves a half-written config that would fail to parse on
+/// the next boot.
+///
+/// `default_language` is pinned to `zh-TW` — DuDuClaw's primary market is
+/// Taiwan — so a brand-new install replies in Traditional Chinese by default
+/// (see `duduclaw-gateway::prompt_identity::read_default_language`) without
+/// the operator having to touch the dashboard settings page first. This only
+/// affects fresh installs: an existing `config.toml` a user already authored
+/// is never touched (see the no-op-safe note below), so upgraders keep
+/// whatever they had (including no `default_language` at all, which falls
+/// back to "follow the user's input language").
 ///
 /// This is a no-op-safe primitive: callers should check for an existing config
 /// first; this function always overwrites, so don't call it when a config the
@@ -30,6 +40,7 @@ pub fn write_minimal_config(home: &Path, bind: &str, port: u16) -> Result<()> {
          \n\
          [general]\n\
          log_level = \"info\"\n\
+         default_language = \"zh-TW\"\n\
          \n\
          [gateway]\n\
          bind = \"{bind}\"\n\
@@ -64,13 +75,11 @@ mod tests {
         let gateway = table.get("gateway").and_then(|v| v.as_table()).expect("[gateway]");
         assert_eq!(gateway.get("bind").and_then(|v| v.as_str()), Some("0.0.0.0"));
         assert_eq!(gateway.get("port").and_then(|v| v.as_integer()), Some(12345));
+        let general = table.get("general").and_then(|v| v.as_table()).expect("[general]");
+        assert_eq!(general.get("log_level").and_then(|v| v.as_str()), Some("info"));
         assert_eq!(
-            table
-                .get("general")
-                .and_then(|v| v.as_table())
-                .and_then(|g| g.get("log_level"))
-                .and_then(|v| v.as_str()),
-            Some("info")
+            general.get("default_language").and_then(|v| v.as_str()),
+            Some("zh-TW")
         );
 
         // No leftover temp file.

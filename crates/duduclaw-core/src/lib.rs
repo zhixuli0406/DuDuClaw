@@ -1,4 +1,5 @@
 pub mod agent_guard;
+pub mod agent_rename;
 pub mod config;
 pub mod cron_tz;
 pub mod department;
@@ -14,6 +15,7 @@ pub mod traits;
 pub mod types;
 
 pub use agent_guard::{check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES};
+pub use agent_rename::{rename_in_markdown, synced_trigger};
 pub use config::write_minimal_config;
 pub use cron_tz::{parse_timezone, should_fire_in_tz};
 pub use department::{
