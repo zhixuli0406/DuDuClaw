@@ -56,6 +56,9 @@ use crate::task_store::TaskStore;
 pub const DEFAULT_LEASE_SECS: i64 = 300;
 /// Default dispatcher tick.
 pub const DEFAULT_TICK_SECS: u64 = 30;
+/// Iterative Kanban soft cap (rounds before the `diminishing` flag is raised on
+/// a rejected goal task). Default mirrors `GoalLoopConfig::soft_cap`.
+pub const DEFAULT_SOFT_CAP: i64 = 3;
 
 /// Whether the background dispatch engine (zombie reclaim + goal-mode review)
 /// runs. **Default OFF** (conservative rollout default, not a safety block).
@@ -687,6 +690,9 @@ pub struct DispatchEngine {
     /// judge evidence block. `None` ⇒ the block is never built (same
     /// behavior as a missing audit file).
     home_dir: Option<std::path::PathBuf>,
+    /// Iterative Kanban soft cap passed to `reject_review` (drives the
+    /// `diminishing` flag; does NOT block the loop).
+    soft_cap: i64,
 }
 
 impl DispatchEngine {
@@ -698,11 +704,19 @@ impl DispatchEngine {
             tick_secs: DEFAULT_TICK_SECS,
             running: Arc::new(AtomicBool::new(false)),
             home_dir: None,
+            soft_cap: DEFAULT_SOFT_CAP,
         }
     }
 
     pub fn with_lease_secs(mut self, secs: i64) -> Self {
         self.lease_secs = secs;
+        self
+    }
+
+    /// Set the Iterative Kanban soft cap (rounds → `diminishing` flag). Wired
+    /// from `GoalLoopConfig::soft_cap` at startup.
+    pub fn with_soft_cap(mut self, soft_cap: i64) -> Self {
+        self.soft_cap = soft_cap;
         self
     }
 
@@ -831,7 +845,10 @@ impl DispatchEngine {
                     info!(task = %task.id, "goal-mode 驗收通過 → done");
                 }
                 Ok(v) => {
-                    let status = self.store.reject_review(&task.id, &v.feedback).await?;
+                    let status = self
+                        .store
+                        .reject_review(&task.id, &v.feedback, self.soft_cap)
+                        .await?;
                     // WP3 (PORTICO): a rejection re-opens the loop for a retry,
                     // but the review phase closed — revoke so the retry must
                     // re-request any scoped tool it still needs.
@@ -1177,11 +1194,13 @@ mod tests {
         });
         let engine = DispatchEngine::new(store.clone(), Some(judge));
 
-        // First reject: retry 0 < 1 ⇒ back to pending with feedback.
+        // First reject: retry 0 < 1 ⇒ back to `revising` (Iterative Kanban) with
+        // feedback and the round counter bumped.
         engine.tick_once().await.unwrap();
         let t = store.get_task("g2").await.unwrap().unwrap();
-        assert_eq!(t.status, "pending");
+        assert_eq!(t.status, "revising");
         assert_eq!(t.retry_count, 1);
+        assert_eq!(t.revision_round, 1);
         assert_eq!(t.judge_feedback.as_deref(), Some("nope"));
 
         // Worker re-completes → review; second reject at cap ⇒ needs_human.

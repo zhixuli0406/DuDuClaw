@@ -117,9 +117,11 @@
   --status-task-icon-todo: oklch(55% 0.15 75);
   --status-task-icon-in_progress: oklch(55% 0.16 255);
   --status-task-icon-in_review: oklch(53% 0.19 300);
+  --status-task-icon-revising: oklch(58% 0.15 85);
   --status-task-icon-done: oklch(53% 0.15 150);
   --status-task-icon-blocked: oklch(55% 0.2 25);
   --status-task-icon-needs_human: oklch(56% 0.19 40);
+  --status-task-icon-failed: oklch(50% 0.13 25);
   --status-task-icon-cancelled: oklch(55% 0.015 255);
 
   /* 10 warm agent gradient pairs (amber/coral/sage/sky/violet families) — the
@@ -190,9 +192,11 @@
   --status-task-icon-todo: oklch(80% 0.15 80);
   --status-task-icon-in_progress: oklch(75% 0.15 255);
   --status-task-icon-in_review: oklch(76% 0.16 300);
+  --status-task-icon-revising: oklch(80% 0.14 85);
   --status-task-icon-done: oklch(76% 0.15 152);
   --status-task-icon-blocked: oklch(72% 0.19 25);
   --status-task-icon-needs_human: oklch(76% 0.17 45);
+  --status-task-icon-failed: oklch(68% 0.15 25);
   --status-task-icon-cancelled: oklch(66% 0.015 255);
 
   /* Character system — bubble body goes dark; ink stays dark (agent tints are

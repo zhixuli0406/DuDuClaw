@@ -266,6 +266,51 @@ pub fn resolve_program(runtime: RuntimeType) -> Option<String> {
     }
 }
 
+/// Snapshot of one CLI's OWN credential store, for the dashboard accounts
+/// page. Non-Claude CLIs never register a rotator `[[accounts]]` entry —
+/// their login persists to `~/.grok/auth.json` etc. and the runtime reads
+/// that store directly — so without this surface a successful Grok login is
+/// invisible in the 帳號 UI (the "grok cli oAuth 不會出現在帳號輪替卡片"
+/// report). Presence + mtime only; credential CONTENT is never read.
+#[derive(Debug, Clone)]
+pub struct CliCredentialStatus {
+    pub runtime: RuntimeType,
+    /// Display path of the credential store (`~/<success_file>`).
+    pub store: String,
+    /// CLI binary resolvable on this machine.
+    pub installed: bool,
+    /// Credential file exists (logged in at least once).
+    pub present: bool,
+    /// Credential file mtime (epoch seconds) when present.
+    pub modified_epoch: Option<u64>,
+}
+
+/// Status of every non-Claude CLI credential store. Claude is excluded on
+/// purpose: its login already surfaces as a rotator account (keychain /
+/// setup-token). Runtimes without a `success_file` (antigravity) are skipped.
+pub fn cli_credential_statuses() -> Vec<CliCredentialStatus> {
+    [RuntimeType::Codex, RuntimeType::Gemini, RuntimeType::Grok]
+        .into_iter()
+        .filter_map(|rt| {
+            let rel = spec_for(rt)?.success_file?;
+            let path = home_join(rel);
+            let present = path.as_deref().map(|p| p.exists()).unwrap_or(false);
+            let modified_epoch = path
+                .as_deref()
+                .and_then(file_mtime)
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            Some(CliCredentialStatus {
+                runtime: rt,
+                store: format!("~/{rel}"),
+                installed: resolve_program(rt).is_some(),
+                present,
+                modified_epoch,
+            })
+        })
+        .collect()
+}
+
 /// Login session status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthStatus {
@@ -716,6 +761,25 @@ mod tests {
             scan_outcome("Signed in as x@example.com, but then device code expired", &spec),
             Some(AuthStatus::Failed)
         );
+    }
+
+    /// The accounts-page credential surface covers exactly the non-Claude
+    /// store-persisting runtimes, with display paths and consistent flags
+    /// (mtime only when the file is present).
+    #[test]
+    fn cli_credential_statuses_cover_store_persisting_runtimes() {
+        let statuses = cli_credential_statuses();
+        let runtimes: Vec<RuntimeType> = statuses.iter().map(|s| s.runtime).collect();
+        assert_eq!(
+            runtimes,
+            vec![RuntimeType::Codex, RuntimeType::Gemini, RuntimeType::Grok]
+        );
+        for s in &statuses {
+            assert!(s.store.starts_with("~/."), "display path: {}", s.store);
+            if !s.present {
+                assert!(s.modified_epoch.is_none(), "mtime without file: {:?}", s);
+            }
+        }
     }
 
     #[test]

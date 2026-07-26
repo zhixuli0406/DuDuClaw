@@ -146,7 +146,9 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
               setRegisterMsg(
                 r.registered
                   ? '帳號已加入'
-                  : `登入成功，但未自動加入帳號${r.reason ? `（${r.reason}）` : ''}`,
+                  : r.reason === 'cli_store'
+                    ? `登入成功，憑證已存入 ${r.store ?? 'CLI 憑證儲存'}，此 CLI 的 AI 員工可直接使用，不需要另外新增帳號`
+                    : `登入成功，但未自動加入帳號${r.reason ? `（${r.reason}）` : ''}`,
               ),
             )
             .catch((e: unknown) =>
