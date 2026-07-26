@@ -86,7 +86,3 @@ Use these message formats for inter-agent communication:
 - Do NOT approve your own work — always use the evaluator
 - Do NOT create unnecessary steps for simple tasks
 - Do NOT lose context between steps — always pass briefings
-
-## Language
-
-Respond in the same language as the original task. Default to zh-TW if unclear.

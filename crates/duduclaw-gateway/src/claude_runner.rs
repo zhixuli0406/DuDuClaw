@@ -45,6 +45,10 @@ pub fn set_shared_task_store(store: Arc<crate::task_store::TaskStore>) {
 fn build_system_prompt(
     agent: &duduclaw_agent::LoadedAgent,
     citation_ctx: Option<(&str, &str, Option<&str>)>,
+    // `config.toml [general] default_language`, when set — see
+    // `crate::prompt_identity` for the rationale. `None` preserves the
+    // pre-existing "follow the user's input language" behaviour.
+    default_language: Option<&str>,
 ) -> String {
     // #11 (2026-05-12) — Minimal mode shortcut. Same opt-in flag as the
     // channel_reply path so an agent's mode choice is global. Cron path
@@ -56,6 +60,7 @@ fn build_system_prompt(
             agent,
             sender_block,
             pinned,
+            default_language,
         );
     }
 
@@ -64,6 +69,21 @@ fn build_system_prompt(
     // log. Cheap (one usize per push) and gives operators per-section
     // visibility when the 200K cliff fires.
     let mut audit: Vec<crate::prompt_audit::PromptSection> = Vec::new();
+
+    // Authoritative identity + global default language, ahead of SOUL so it
+    // wins over any stale name/language text SOUL.md still contains (see
+    // `crate::prompt_identity` doc comment for the root-cause writeup).
+    let display_name = if agent.config.agent.display_name.trim().is_empty() {
+        &agent.config.agent.name
+    } else {
+        &agent.config.agent.display_name
+    };
+    if let Some(s) =
+        crate::prompt_identity::identity_and_language_section(display_name, default_language)
+    {
+        audit.push(crate::prompt_audit::PromptSection::new("identity_directive", &s));
+        parts.push(s);
+    }
 
     if let Some(soul) = &agent.soul {
         let s = format!("# Soul\n{}", soul.trim_end());
@@ -442,7 +462,8 @@ async fn call_claude_for_agent_impl(
     let citation_ref = turn_owned.as_deref().map(|tid| {
         (agent_id, tid, session_owned.as_deref())
     });
-    let system_prompt = build_system_prompt(agent, citation_ref);
+    let default_language = crate::prompt_identity::read_default_language(home_dir).await;
+    let system_prompt = build_system_prompt(agent, citation_ref, default_language.as_deref());
     let agent_name = agent.config.agent.name.clone();
     let claude_model = agent.config.model.preferred.clone();
     // OTel: record the resolved model on the `invoke_agent` span.

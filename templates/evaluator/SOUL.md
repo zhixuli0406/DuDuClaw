@@ -71,7 +71,3 @@ You must NEVER:
 - Skip verification steps because the task "seems simple"
 
 If you catch yourself being lenient, that is a signal to be MORE strict, not less.
-
-## Language
-
-Respond in the same language as the verification request. Default to zh-TW if unclear.

@@ -21,6 +21,7 @@ export function GeneralTab() {
   const startTour = useTourStore((s) => s.start);
   const [logLevel, setLogLevel] = useState('info');
   const [rotationStrategy, setRotationStrategy] = useState('priority');
+  const [defaultLanguage, setDefaultLanguage] = useState('');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -36,6 +37,8 @@ export function GeneralTab() {
         if (logMatch) setLogLevel(logMatch[1]);
         const rotMatch = raw.match(/strategy\s*=\s*"(\w+)"/);
         if (rotMatch) setRotationStrategy(rotMatch[1]);
+        const langMatch = raw.match(/default_language\s*=\s*"([^"]*)"/);
+        if (langMatch) setDefaultLanguage(langMatch[1]);
       }
     }).catch((e) => {
       console.warn("[api]", e);
@@ -47,7 +50,11 @@ export function GeneralTab() {
     setSaving(true);
     setSaved(false);
     try {
-      await api.system.updateConfig({ log_level: logLevel, rotation_strategy: rotationStrategy });
+      await api.system.updateConfig({
+        log_level: logLevel,
+        rotation_strategy: rotationStrategy,
+        default_language: defaultLanguage,
+      });
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -67,6 +74,15 @@ export function GeneralTab() {
     value: s,
     label: intl.formatMessage({ id: `settings.rotation.${s}` }),
     raw: s,
+  }));
+  // Empty string = "follow the user's input language" (pre-existing
+  // behaviour, unchanged). Non-empty pins a global default reply language.
+  const languageOptions: SelectOption[] = ['', 'zh-TW', 'en', 'ja-JP'].map((code) => ({
+    value: code,
+    label: intl.formatMessage({
+      id: code === '' ? 'settings.general.defaultLanguage.followInput' : `settings.general.defaultLanguage.${code}`,
+    }),
+    raw: code,
   }));
 
   return (
@@ -94,6 +110,14 @@ export function GeneralTab() {
             value={logLevel}
             onChange={setLogLevel}
             options={logLevelOptions}
+          />
+          {/* Editable: default reply language */}
+          <RowSelect
+            label={intl.formatMessage({ id: 'settings.general.defaultLanguage' })}
+            description={intl.formatMessage({ id: 'settings.general.defaultLanguage.help' })}
+            value={defaultLanguage}
+            onChange={setDefaultLanguage}
+            options={languageOptions}
           />
           {/* Replay the guided tour */}
           <SettingsRow label={intl.formatMessage({ id: 'settings.general.replayTour' })}>
