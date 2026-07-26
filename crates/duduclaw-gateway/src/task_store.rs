@@ -19,7 +19,7 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      created_at, updated_at, completed_at, blocked_reason, parent_task_id, tags, message_id, \
      claimed_by, claimed_at, lease_expires_at, depends_on, retry_count, max_retries, \
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
-     source_channel, source_chat_id";
+     source_channel, source_chat_id, revision_round, diminishing, agent_seconds";
 
 // ── Task row ────────────────────────────────────────────────
 
@@ -98,6 +98,25 @@ pub struct TaskRow {
     /// launching session). NULL when no source conversation is known.
     #[serde(default)]
     pub source_chat_id: Option<String>,
+
+    // ── Iterative Kanban (v1.45) ────────────────────────────
+    /// Judge-rejection round counter for a goal-mode task (distinct from
+    /// `retry_count`, which conflates zombie-reclaim requeues with rejections).
+    /// 0 for a first attempt; incremented on every judge rejection. The
+    /// authoritative per-round detail lives in `task_iterations`; this is a
+    /// board-display cache. Old rows migrate to 0.
+    #[serde(default)]
+    pub revision_round: i64,
+    /// Soft-cap flag: set once `revision_round` reaches the goal loop's
+    /// `soft_cap` (default 3). Does NOT block the loop — it flags diminishing
+    /// returns for the dashboard (amber badge). Cleared only by a fresh task.
+    #[serde(default)]
+    pub diminishing: bool,
+    /// Cumulative agent processing seconds across all rounds
+    /// (Σ submitted_at − dispatched_at). The "agent clock" half of the dual
+    /// clock; the "wall clock" half is `completed_at − created_at`.
+    #[serde(default)]
+    pub agent_seconds: i64,
 }
 
 fn empty_deps() -> String {
@@ -147,8 +166,72 @@ impl TaskRow {
             lease_renewed_at: None,
             source_channel: None,
             source_chat_id: None,
+            revision_round: 0,
+            diminishing: false,
+            agent_seconds: 0,
         }
     }
+}
+
+// ── Iterative Kanban: iteration detail row (v1.45) ──────────
+
+/// One judge-review round of a goal-mode task (先例: vibe-kanban
+/// `coding_agent_turn` / Linear `AgentSession`). The `task_iterations` table is
+/// the source of truth for the revision timeline; `tasks.revision_round` /
+/// `diminishing` / `agent_seconds` are display caches derived from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskIterationRow {
+    pub id: i64,
+    pub task_id: String,
+    /// 1-based attempt number.
+    pub round: i64,
+    /// When this round's work was dispatched.
+    pub dispatched_at: String,
+    /// When the worker submitted (NULL ⇒ round in progress).
+    pub submitted_at: Option<String>,
+    /// When the judge ruled (NULL ⇒ not yet judged).
+    pub judged_at: Option<String>,
+    /// `accepted` | `rejected` | `escalated` | NULL.
+    pub verdict: Option<String>,
+    /// The judge's rejection reason for this round.
+    pub judge_feedback: Option<String>,
+    /// P3 (reserved): ODC injection-source label for the defect.
+    pub feedback_class: Option<String>,
+}
+
+/// Per-agent slice of [`FlowMetrics`] (Iterative Kanban analytics, P2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentFlow {
+    pub agent_id: String,
+    /// Goal tasks currently finished (`done`) or in `review`.
+    pub goal_tasks: i64,
+    pub finished: i64,
+    /// Fraction of finished goal tasks accepted on the first round (0..1).
+    pub first_pass_yield: f64,
+    pub avg_rounds: f64,
+    pub avg_agent_seconds: f64,
+    pub avg_cycle_seconds: f64,
+    pub review_queue_depth: i64,
+}
+
+/// Board-level + per-agent flow metrics returned by [`TaskStore::flow_metrics`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowMetrics {
+    pub agents: Vec<AgentFlow>,
+    pub review_queue_depth: i64,
+    pub accepts_last_7d: i64,
+    pub avg_daily_accepts_7d: f64,
+}
+
+/// Mutable accumulator used while folding tasks into per-agent [`AgentFlow`].
+#[derive(Default)]
+struct AgentFlowAccum {
+    finished: i64,
+    first_pass: i64,
+    sum_rounds: i64,
+    sum_agent_secs: i64,
+    sum_cycle_secs: i64,
+    review_queue_depth: i64,
 }
 
 // ── G1 dispatch value types ─────────────────────────────────
@@ -429,7 +512,31 @@ impl TaskStore {
         Self::add_dispatch_columns(conn)?;
         // ── U4 co-edited plans: idempotent table creation ──
         Self::init_plan_schema(conn)?;
+        // ── Iterative Kanban: iteration detail table (v1.45) ──
+        Self::init_iteration_schema(conn)?;
         Ok(())
+    }
+
+    /// Iterative Kanban: idempotent iteration-detail schema. New table only
+    /// (`CREATE TABLE IF NOT EXISTS`), so re-running on every open is a no-op.
+    fn init_iteration_schema(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_iterations (
+                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_id        TEXT NOT NULL,
+                 round          INTEGER NOT NULL,
+                 dispatched_at  TEXT NOT NULL,
+                 submitted_at   TEXT,
+                 judged_at      TEXT,
+                 verdict        TEXT,
+                 judge_feedback TEXT,
+                 feedback_class TEXT
+             );
+
+             CREATE INDEX IF NOT EXISTS idx_task_iterations_task
+                 ON task_iterations(task_id, round);",
+        )
+        .map_err(|e| format!("init iteration schema: {e}"))
     }
 
     /// U4: idempotent plan schema. New tables only (`CREATE TABLE IF NOT
@@ -500,6 +607,10 @@ impl TaskStore {
             // P5 goal-loop source write-back (v1.37).
             ("source_channel", "source_channel TEXT"),
             ("source_chat_id", "source_chat_id TEXT"),
+            // Iterative Kanban (v1.45): revision-round cache columns.
+            ("revision_round", "revision_round INTEGER NOT NULL DEFAULT 0"),
+            ("diminishing", "diminishing INTEGER NOT NULL DEFAULT 0"),
+            ("agent_seconds", "agent_seconds INTEGER NOT NULL DEFAULT 0"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -572,9 +683,11 @@ impl TaskStore {
                  parent_task_id, tags, message_id,
                  claimed_by, claimed_at, lease_expires_at, depends_on, retry_count,
                  max_retries, goal_mode, acceptance_criteria, result_summary, judge_feedback,
-                 goal_id, lease_renewed_at, source_channel, source_chat_id)
+                 goal_id, lease_renewed_at, source_channel, source_chat_id,
+                 revision_round, diminishing, agent_seconds)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+                     ?29, ?30, ?31)",
             params![
                 row.id,
                 row.title,
@@ -604,6 +717,9 @@ impl TaskStore {
                 row.lease_renewed_at,
                 row.source_channel,
                 row.source_chat_id,
+                row.revision_round,
+                row.diminishing as i64,
+                row.agent_seconds,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -802,7 +918,11 @@ impl TaskStore {
         let Some((status, claimed_by, depends_on)) = row else {
             return Ok(ClaimOutcome::NotClaimable);
         };
-        if status != "pending" || claimed_by.is_some() {
+        // `revising` (Iterative Kanban) is claimable exactly like `pending`: a
+        // judge rejection parks the task there with claim/lease cleared, and the
+        // goal loop re-dispatches it for the next round. Same fail-closed
+        // dependency gate applies.
+        if !matches!(status.as_str(), "pending" | "revising") || claimed_by.is_some() {
             return Ok(ClaimOutcome::NotClaimable);
         }
 
@@ -836,7 +956,7 @@ impl TaskStore {
                     SET claimed_by = ?2, claimed_at = ?3, lease_expires_at = ?4,
                         lease_renewed_at = ?3,
                         status = 'in_progress', assigned_to = ?2, updated_at = ?3
-                  WHERE id = ?1 AND status = 'pending' AND claimed_by IS NULL",
+                  WHERE id = ?1 AND status IN ('pending', 'revising') AND claimed_by IS NULL",
                 params![id, agent_id, now, lease_expires_at],
             )
             .map_err(|e| format!("atomic claim: {e}"))?;
@@ -1066,15 +1186,24 @@ impl TaskStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| format!("complete: begin: {e}"))?;
-            let row: Option<(bool, Option<String>)> = tx
+            let row: Option<(bool, Option<String>, i64, Option<String>, String)> = tx
                 .query_row(
-                    "SELECT goal_mode, claimed_by FROM tasks WHERE id = ?1",
+                    "SELECT goal_mode, claimed_by, revision_round, claimed_at, created_at
+                       FROM tasks WHERE id = ?1",
                     params![id],
-                    |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?)),
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)? != 0,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|e| format!("complete: load: {e}"))?;
-            let Some((goal_mode, claimed_by)) = row else {
+            let Some((goal_mode, claimed_by, revision_round, claimed_at, created_at)) = row else {
                 return Ok(None);
             };
             if let Some(holder) = claimed_by.as_deref() {
@@ -1089,14 +1218,36 @@ impl TaskStore {
             // reclaimed and reassigned) could clobber the authoritative result
             // by calling complete on an already-`done`/`cancelled` task.
             if goal_mode {
-                tx.execute(
-                    "UPDATE tasks
+                let affected = tx
+                    .execute(
+                        "UPDATE tasks
                         SET status = 'review', result_summary = ?2,
                             lease_expires_at = NULL, updated_at = ?3
                       WHERE id = ?1 AND status NOT IN ('done', 'cancelled')",
-                    params![id, summary, now],
-                )
-                .map_err(|e| format!("complete (review): {e}"))?;
+                        params![id, summary, now],
+                    )
+                    .map_err(|e| format!("complete (review): {e}"))?;
+                // Iterative Kanban: stamp this round's submission and add the
+                // per-round agent seconds (submitted − dispatched) to the task's
+                // cumulative agent clock. Only when the completion actually took
+                // effect (a terminal-state clobber attempt records nothing).
+                if affected == 1 {
+                    let fallback_dispatch = claimed_at.as_deref().unwrap_or(&created_at);
+                    let secs = iter_submit_conn(
+                        &tx,
+                        id,
+                        &now,
+                        revision_round + 1,
+                        fallback_dispatch,
+                    )?;
+                    if secs > 0 {
+                        tx.execute(
+                            "UPDATE tasks SET agent_seconds = agent_seconds + ?2 WHERE id = ?1",
+                            params![id, secs],
+                        )
+                        .map_err(|e| format!("complete (agent_seconds): {e}"))?;
+                    }
+                }
             } else {
                 tx.execute(
                     "UPDATE tasks
@@ -1124,14 +1275,28 @@ impl TaskStore {
                 params![id, now, feedback],
             )
             .map_err(|e| format!("accept review: {e}"))?;
+        if n == 1 {
+            // Iterative Kanban: seal the current round's verdict.
+            iter_verdict_conn(&conn, id, "accepted", feedback, &now)?;
+        }
         Ok(n == 1)
     }
 
-    /// Goal-mode acceptance rejected: send the task back to `pending` for
-    /// another attempt (retry budget permitting), attaching judge feedback.
-    /// When retries are exhausted, escalate to `needs_human` (fail-safe — never
-    /// loops indefinitely). Returns the terminal status applied.
-    pub async fn reject_review(&self, id: &str, feedback: &str) -> Result<String, String> {
+    /// Goal-mode acceptance rejected. Iterative Kanban: send the task to the new
+    /// `revising` state (not `pending`) for another round — claim/lease cleared,
+    /// `revision_round` incremented, `diminishing` flag raised once the round
+    /// count reaches `soft_cap` (the loop is NOT blocked, only flagged). When the
+    /// judge retry budget (`max_retries`) is exhausted, escalate to `needs_human`
+    /// instead (fail-safe — never loops indefinitely). Returns the status applied.
+    ///
+    /// `soft_cap` is the goal loop's soft cap (default 3); the diminishing flag
+    /// only affects dashboard presentation, never dispatch.
+    pub async fn reject_review(
+        &self,
+        id: &str,
+        feedback: &str,
+        soft_cap: i64,
+    ) -> Result<String, String> {
         let row = match self.get_task(id).await? {
             Some(r) => r,
             None => return Err(format!("task not found: {id}")),
@@ -1140,24 +1305,35 @@ impl TaskStore {
         let conn = self.conn.lock().await;
         if row.retry_count < row.max_retries {
             let new_retry = row.retry_count + 1;
-            conn.execute(
-                "UPDATE tasks
-                    SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
-                        lease_expires_at = NULL, retry_count = ?2, judge_feedback = ?3,
-                        result_summary = NULL, updated_at = ?4
+            let new_round = row.revision_round + 1;
+            let diminishing = new_round >= soft_cap.max(1);
+            let n = conn
+                .execute(
+                    "UPDATE tasks
+                    SET status = 'revising', claimed_by = NULL, claimed_at = NULL,
+                        lease_expires_at = NULL, retry_count = ?2, revision_round = ?3,
+                        diminishing = ?4, judge_feedback = ?5, result_summary = NULL,
+                        updated_at = ?6
                   WHERE id = ?1 AND status = 'review'",
-                params![id, new_retry, feedback, now],
-            )
-            .map_err(|e| format!("reject review (requeue): {e}"))?;
-            Ok("pending".to_string())
+                    params![id, new_retry, new_round, diminishing as i64, feedback, now],
+                )
+                .map_err(|e| format!("reject review (revising): {e}"))?;
+            if n == 1 {
+                iter_verdict_conn(&conn, id, "rejected", feedback, &now)?;
+            }
+            Ok("revising".to_string())
         } else {
-            conn.execute(
-                "UPDATE tasks
+            let n = conn
+                .execute(
+                    "UPDATE tasks
                     SET status = 'needs_human', judge_feedback = ?2, updated_at = ?3
                   WHERE id = ?1 AND status = 'review'",
-                params![id, feedback, now],
-            )
-            .map_err(|e| format!("reject review (escalate): {e}"))?;
+                    params![id, feedback, now],
+                )
+                .map_err(|e| format!("reject review (escalate): {e}"))?;
+            if n == 1 {
+                iter_verdict_conn(&conn, id, "escalated", feedback, &now)?;
+            }
             Ok("needs_human".to_string())
         }
     }
@@ -1246,6 +1422,131 @@ impl TaskStore {
             )
             .map_err(|e| format!("cancel task: {e}"))?;
         Ok(n == 1)
+    }
+
+    // ── Iterative Kanban: iteration detail (v1.45) ──────────
+
+    /// Open a work round for a goal-mode task (called by the goal loop driver on
+    /// dispatch). Idempotent per `(task_id, round)`: a stall re-dispatch of the
+    /// same round is a no-op, so a round row is created exactly once.
+    pub async fn record_iteration_dispatch(
+        &self,
+        task_id: &str,
+        round: i64,
+        now: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        iter_dispatch_conn(&conn, task_id, round, now)
+    }
+
+    /// All iteration rows for a task, oldest round first (the revision timeline).
+    pub async fn list_iterations(&self, task_id: &str) -> Result<Vec<TaskIterationRow>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, task_id, round, dispatched_at, submitted_at, judged_at,
+                        verdict, judge_feedback, feedback_class
+                   FROM task_iterations WHERE task_id = ?1 ORDER BY round ASC, id ASC",
+            )
+            .map_err(|e| format!("prepare iterations: {e}"))?;
+        let rows = stmt
+            .query_map(params![task_id], row_to_iteration)
+            .map_err(|e| format!("query iterations: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect iterations: {e}"))?;
+        Ok(rows)
+    }
+
+    /// Per-agent + board-level flow metrics for the Iterative Kanban analytics
+    /// (P2). Computed over goal-mode tasks:
+    /// - `first_pass_yield`: fraction of finished (`done`) goal tasks accepted on
+    ///   round 1 (`revision_round == 0`);
+    /// - `avg_rounds`: mean `revision_round + 1` over finished goal tasks;
+    /// - `avg_agent_seconds` / `avg_cycle_seconds`: the dual clock means;
+    /// - `review_queue_depth`: goal tasks currently in `review`.
+    ///
+    /// Board level also returns the `review` WIP total and the 7-day acceptance
+    /// throughput (for the Little's-Law wait estimate). `accepts_last_7d` counts
+    /// goal tasks whose `completed_at` is within the last 7 days.
+    pub async fn flow_metrics(&self, now: &str) -> Result<FlowMetrics, String> {
+        let tasks = self.list_tasks(None, None, None).await?;
+        let cutoff = DateTime::parse_from_rfc3339(now)
+            .map(|n| n.with_timezone(&Utc) - chrono::Duration::days(7));
+
+        use std::collections::BTreeMap;
+        let mut per: BTreeMap<String, AgentFlowAccum> = BTreeMap::new();
+        let mut review_depth = 0i64;
+        let mut accepts_7d = 0i64;
+
+        for t in &tasks {
+            if !t.goal_mode {
+                continue;
+            }
+            let e = per.entry(t.assigned_to.clone()).or_default();
+            if t.status == "review" {
+                review_depth += 1;
+                e.review_queue_depth += 1;
+            }
+            if t.status == "done" {
+                e.finished += 1;
+                e.sum_rounds += t.revision_round + 1;
+                e.sum_agent_secs += t.agent_seconds;
+                if t.revision_round == 0 {
+                    e.first_pass += 1;
+                }
+                if let (Some(done), Ok(cut)) = (t.completed_at.as_deref(), &cutoff) {
+                    if let Ok(d) = DateTime::parse_from_rfc3339(done) {
+                        let cycle = (d.with_timezone(&Utc)
+                            - DateTime::parse_from_rfc3339(&t.created_at)
+                                .map(|c| c.with_timezone(&Utc))
+                                .unwrap_or_else(|_| d.with_timezone(&Utc)))
+                        .num_seconds()
+                        .max(0);
+                        e.sum_cycle_secs += cycle;
+                        if d.with_timezone(&Utc) >= *cut {
+                            accepts_7d += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let agents = per
+            .into_iter()
+            .map(|(agent_id, a)| AgentFlow {
+                agent_id,
+                goal_tasks: a.finished + a.review_queue_depth,
+                finished: a.finished,
+                first_pass_yield: if a.finished > 0 {
+                    a.first_pass as f64 / a.finished as f64
+                } else {
+                    0.0
+                },
+                avg_rounds: if a.finished > 0 {
+                    a.sum_rounds as f64 / a.finished as f64
+                } else {
+                    0.0
+                },
+                avg_agent_seconds: if a.finished > 0 {
+                    a.sum_agent_secs as f64 / a.finished as f64
+                } else {
+                    0.0
+                },
+                avg_cycle_seconds: if a.finished > 0 {
+                    a.sum_cycle_secs as f64 / a.finished as f64
+                } else {
+                    0.0
+                },
+                review_queue_depth: a.review_queue_depth,
+            })
+            .collect();
+
+        Ok(FlowMetrics {
+            agents,
+            review_queue_depth: review_depth,
+            accepts_last_7d: accepts_7d,
+            avg_daily_accepts_7d: accepts_7d as f64 / 7.0,
+        })
     }
 
     // ── G8 goal chain ───────────────────────────────────────
@@ -1969,7 +2270,139 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         lease_renewed_at: row.get(25)?,
         source_channel: row.get(26)?,
         source_chat_id: row.get(27)?,
+        revision_round: row.get(28)?,
+        diminishing: row.get::<_, i64>(29)? != 0,
+        agent_seconds: row.get(30)?,
     })
+}
+
+fn row_to_iteration(row: &rusqlite::Row) -> rusqlite::Result<TaskIterationRow> {
+    Ok(TaskIterationRow {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        round: row.get(2)?,
+        dispatched_at: row.get(3)?,
+        submitted_at: row.get(4)?,
+        judged_at: row.get(5)?,
+        verdict: row.get(6)?,
+        judge_feedback: row.get(7)?,
+        feedback_class: row.get(8)?,
+    })
+}
+
+// ── Iterative Kanban: iteration sync helpers (usable in a tx) ──
+
+/// Whole seconds between two RFC3339 stamps, floored at 0 (a bad stamp ⇒ 0 so
+/// telemetry never goes negative or panics).
+fn round_seconds(dispatched_at: &str, submitted_at: &str) -> i64 {
+    match (
+        DateTime::parse_from_rfc3339(dispatched_at),
+        DateTime::parse_from_rfc3339(submitted_at),
+    ) {
+        (Ok(d), Ok(s)) => (s.with_timezone(&Utc) - d.with_timezone(&Utc))
+            .num_seconds()
+            .max(0),
+        _ => 0,
+    }
+}
+
+/// Open round `round` for `task_id` if it does not already exist. Idempotent per
+/// `(task_id, round)` — a stall re-dispatch of the same round writes nothing.
+fn iter_dispatch_conn(
+    conn: &Connection,
+    task_id: &str,
+    round: i64,
+    now: &str,
+) -> Result<(), String> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM task_iterations WHERE task_id = ?1 AND round = ?2",
+            params![task_id, round],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("iter dispatch lookup: {e}"))?;
+    if exists.is_some() {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO task_iterations (task_id, round, dispatched_at) VALUES (?1, ?2, ?3)",
+        params![task_id, round, now],
+    )
+    .map_err(|e| format!("iter dispatch insert: {e}"))?;
+    Ok(())
+}
+
+/// Stamp the worker submission on the latest open round (max round with a NULL
+/// `submitted_at`) and return that round's agent seconds. When no open round
+/// exists (e.g. a direct claim→complete path that skipped the driver dispatch),
+/// one is created retroactively anchored at `fallback_dispatch` (claim time) so
+/// the agent clock is still captured. Returns 0 seconds when the elapsed time is
+/// non-positive / unparseable.
+fn iter_submit_conn(
+    conn: &Connection,
+    task_id: &str,
+    now: &str,
+    fallback_round: i64,
+    fallback_dispatch: &str,
+) -> Result<i64, String> {
+    let open: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, dispatched_at FROM task_iterations
+              WHERE task_id = ?1 AND submitted_at IS NULL
+              ORDER BY round DESC LIMIT 1",
+            params![task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("iter submit lookup: {e}"))?;
+    let (row_id, dispatched_at) = match open {
+        Some((id, d)) => (id, d),
+        None => {
+            conn.execute(
+                "INSERT INTO task_iterations (task_id, round, dispatched_at) VALUES (?1, ?2, ?3)",
+                params![task_id, fallback_round, fallback_dispatch],
+            )
+            .map_err(|e| format!("iter submit backfill: {e}"))?;
+            (conn.last_insert_rowid(), fallback_dispatch.to_string())
+        }
+    };
+    conn.execute(
+        "UPDATE task_iterations SET submitted_at = ?2 WHERE id = ?1",
+        params![row_id, now],
+    )
+    .map_err(|e| format!("iter submit update: {e}"))?;
+    Ok(round_seconds(&dispatched_at, now))
+}
+
+/// Seal the judge verdict on the latest un-judged round (max round with a NULL
+/// `judged_at`). No open round ⇒ no-op (best-effort telemetry).
+fn iter_verdict_conn(
+    conn: &Connection,
+    task_id: &str,
+    verdict: &str,
+    feedback: &str,
+    now: &str,
+) -> Result<(), String> {
+    let row_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM task_iterations
+              WHERE task_id = ?1 AND judged_at IS NULL
+              ORDER BY round DESC LIMIT 1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("iter verdict lookup: {e}"))?;
+    if let Some(id) = row_id {
+        conn.execute(
+            "UPDATE task_iterations
+                SET judged_at = ?2, verdict = ?3, judge_feedback = ?4 WHERE id = ?1",
+            params![id, now, verdict, feedback],
+        )
+        .map_err(|e| format!("iter verdict update: {e}"))?;
+    }
+    Ok(())
 }
 
 // ── Connection-level read helpers ───────────────────────────
@@ -2591,16 +3024,18 @@ mod tests {
         assert_eq!(updated.status, "review");
         assert_eq!(updated.result_summary.as_deref(), Some("did the thing"));
 
-        // Reject → requeues to pending (retry 0 < 1) with feedback.
-        let status = store.reject_review("goal", "criteria not met").await.unwrap();
-        assert_eq!(status, "pending");
+        // Reject → routes to `revising` (Iterative Kanban, retry 0 < 1) with
+        // feedback and the round counter bumped.
+        let status = store.reject_review("goal", "criteria not met", 3).await.unwrap();
+        assert_eq!(status, "revising");
         let t = store.get_task("goal").await.unwrap().unwrap();
         assert_eq!(t.retry_count, 1);
+        assert_eq!(t.revision_round, 1);
         assert_eq!(t.judge_feedback.as_deref(), Some("criteria not met"));
 
         // Complete again → review → reject at cap ⇒ needs_human (fail-safe).
         store.complete_task("goal", "attempt 2", "w").await.unwrap();
-        let status2 = store.reject_review("goal", "still failing").await.unwrap();
+        let status2 = store.reject_review("goal", "still failing", 3).await.unwrap();
         assert_eq!(status2, "needs_human");
         assert_eq!(store.get_task("goal").await.unwrap().unwrap().status, "needs_human");
     }
@@ -3187,5 +3622,214 @@ mod tests {
         }
         let s2 = TaskStore::open(dir.path()).expect("reopen");
         assert_eq!(s2.get_task("m1").await.unwrap().unwrap().status, "pending");
+    }
+
+    // ── Iterative Kanban (v1.45) ────────────────────────────
+
+    /// A goal-mode task in `review`, ready for a judge verdict.
+    fn goal_review_task(id: &str) -> TaskRow {
+        let mut t = TaskRow::new(
+            id.into(),
+            format!("goal {id}"),
+            "do the work".into(),
+            "medium".into(),
+            "alice".into(),
+            "system".into(),
+        );
+        t.status = "review".into();
+        t.goal_mode = true;
+        t.max_retries = 5;
+        t.acceptance_criteria = Some("must be correct".into());
+        t.result_summary = Some("attempt".into());
+        t
+    }
+
+    #[tokio::test]
+    async fn reject_review_routes_to_revising_and_bumps_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        store.insert_task(&goal_review_task("g1")).await.unwrap();
+        // Round 1 was dispatched (driver) before the judge ruled.
+        store.record_iteration_dispatch("g1", 1, "2026-07-25T10:00:00Z").await.unwrap();
+
+        let status = store.reject_review("g1", "missing summary", 3).await.unwrap();
+        assert_eq!(status, "revising");
+        let t = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(t.status, "revising");
+        assert_eq!(t.revision_round, 1);
+        assert!(!t.diminishing, "one round is below soft cap 3");
+        assert_eq!(t.retry_count, 1);
+        assert_eq!(t.judge_feedback.as_deref(), Some("missing summary"));
+        // Claim/lease/result cleared so the loop can re-dispatch it.
+        assert!(t.claimed_by.is_none());
+        assert!(t.result_summary.is_none());
+        // A rejection verdict is sealed in the iteration timeline.
+        let iters = store.list_iterations("g1").await.unwrap();
+        assert_eq!(iters.len(), 1);
+        assert_eq!(iters[0].verdict.as_deref(), Some("rejected"));
+        assert_eq!(iters[0].judge_feedback.as_deref(), Some("missing summary"));
+    }
+
+    #[tokio::test]
+    async fn revising_task_is_claimable_for_next_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        store.insert_task(&goal_review_task("g1")).await.unwrap();
+        store.reject_review("g1", "again", 3).await.unwrap();
+
+        // atomic_claim accepts `revising` exactly like `pending`: round+1 work
+        // moves it back to in_progress under the claimer.
+        let out = store
+            .atomic_claim("g1", "alice", "2026-07-25T10:00:00Z", "2026-07-25T10:05:00Z")
+            .await
+            .unwrap();
+        assert!(out.is_claimed());
+        let t = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(t.status, "in_progress");
+        assert_eq!(t.claimed_by.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn soft_cap_raises_diminishing_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.revision_round = 2; // next reject → round 3 == soft cap
+        store.insert_task(&t).await.unwrap();
+
+        store.reject_review("g1", "still wrong", 3).await.unwrap();
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.revision_round, 3);
+        assert!(got.diminishing, "reaching soft cap 3 raises the diminishing flag");
+        assert_eq!(got.status, "revising", "soft cap flags but never blocks");
+    }
+
+    #[tokio::test]
+    async fn reject_review_escalates_when_retry_budget_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.max_retries = 1;
+        t.retry_count = 1; // budget already spent
+        store.insert_task(&t).await.unwrap();
+        store.record_iteration_dispatch("g1", 1, "2026-07-25T10:00:00Z").await.unwrap();
+
+        let status = store.reject_review("g1", "give up", 3).await.unwrap();
+        assert_eq!(status, "needs_human");
+        assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "needs_human");
+        let iters = store.list_iterations("g1").await.unwrap();
+        assert_eq!(iters[0].verdict.as_deref(), Some("escalated"));
+    }
+
+    #[tokio::test]
+    async fn full_round_records_dispatch_submit_verdict_and_agent_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.status = "pending".into();
+        t.result_summary = None;
+        store.insert_task(&t).await.unwrap();
+
+        // Round 1: dispatch (driver, in the past), claim, complete → review.
+        // A past dispatch stamp makes the agent-seconds delta clearly positive
+        // against the real `Utc::now()` complete_task uses.
+        store
+            .record_iteration_dispatch("g1", 1, "2020-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        store
+            .atomic_claim("g1", "alice", "2026-07-25T10:00:05Z", "2026-07-25T10:05:00Z")
+            .await
+            .unwrap();
+        store.complete_task("g1", "done round 1", "alice").await.unwrap();
+
+        let iters = store.list_iterations("g1").await.unwrap();
+        assert_eq!(iters.len(), 1);
+        assert_eq!(iters[0].round, 1);
+        assert!(iters[0].submitted_at.is_some(), "submit stamped on complete");
+        // agent_seconds accumulated on the task (submit − dispatch).
+        let after = store.get_task("g1").await.unwrap().unwrap();
+        assert!(after.agent_seconds > 0, "agent clock accumulated");
+        assert_eq!(after.status, "review");
+
+        // Reject → verdict sealed on round 1, task revising.
+        store.reject_review("g1", "fix it", 3).await.unwrap();
+        let iters = store.list_iterations("g1").await.unwrap();
+        assert_eq!(iters[0].verdict.as_deref(), Some("rejected"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_iteration_is_idempotent_per_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        store.insert_task(&pending_task("g1")).await.unwrap();
+        // A stall re-dispatch of the same round must not open a duplicate row.
+        store.record_iteration_dispatch("g1", 1, "2026-07-25T10:00:00Z").await.unwrap();
+        store.record_iteration_dispatch("g1", 1, "2026-07-25T10:01:00Z").await.unwrap();
+        assert_eq!(store.list_iterations("g1").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn accept_review_seals_accepted_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        store.insert_task(&goal_review_task("g1")).await.unwrap();
+        store.record_iteration_dispatch("g1", 1, "2026-07-25T10:00:00Z").await.unwrap();
+
+        assert!(store.accept_review("g1", "looks good").await.unwrap());
+        assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "done");
+        let iters = store.list_iterations("g1").await.unwrap();
+        assert_eq!(iters[0].verdict.as_deref(), Some("accepted"));
+    }
+
+    #[tokio::test]
+    async fn iteration_migration_idempotent_and_old_rows_default_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate a pre-Iterative-Kanban db: insert a task, close, reopen twice.
+        {
+            let s = TaskStore::open(dir.path()).unwrap();
+            s.insert_task(&pending_task("old1")).await.unwrap();
+        }
+        let s2 = TaskStore::open(dir.path()).unwrap();
+        // Reopening runs the ALTERs again — must not error, and the old row's new
+        // columns default to zero.
+        let t = s2.get_task("old1").await.unwrap().unwrap();
+        assert_eq!(t.revision_round, 0);
+        assert!(!t.diminishing);
+        assert_eq!(t.agent_seconds, 0);
+        // task_iterations table exists and is queryable (empty for the old task).
+        assert!(s2.list_iterations("old1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn flow_metrics_computes_first_pass_yield_and_review_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+
+        // done, first pass (revision_round 0).
+        let mut d1 = goal_review_task("d1");
+        d1.status = "done".into();
+        d1.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        d1.revision_round = 0;
+        d1.agent_seconds = 10;
+        store.insert_task(&d1).await.unwrap();
+        // done, second round (revision_round 1 → not first pass).
+        let mut d2 = goal_review_task("d2");
+        d2.status = "done".into();
+        d2.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        d2.revision_round = 1;
+        d2.agent_seconds = 30;
+        store.insert_task(&d2).await.unwrap();
+        // one still in review (queue depth).
+        store.insert_task(&goal_review_task("r1")).await.unwrap();
+
+        let m = store.flow_metrics(&chrono::Utc::now().to_rfc3339()).await.unwrap();
+        assert_eq!(m.review_queue_depth, 1);
+        assert_eq!(m.accepts_last_7d, 2);
+        let alice = m.agents.iter().find(|a| a.agent_id == "alice").unwrap();
+        assert_eq!(alice.finished, 2);
+        assert!((alice.first_pass_yield - 0.5).abs() < 1e-9, "1 of 2 first-pass");
+        assert!((alice.avg_rounds - 1.5).abs() < 1e-9, "rounds 1 and 2 → avg 1.5");
+        assert_eq!(alice.review_queue_depth, 1);
     }
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type AccountInfo, type BudgetSummary } from '@/lib/api';
+import { api, type AccountInfo, type BudgetSummary, type CliCredentialInfo } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import {
@@ -94,6 +94,13 @@ const CLI_OPTIONS: ReadonlyArray<[LoginRuntime, string]> = [
   ['grok', 'Grok（SuperGrok 訂閱）'],
 ];
 
+/** Card titles for the CLI-store credential section. */
+const CLI_CRED_LABELS: Record<string, string> = {
+  codex: 'Codex CLI',
+  gemini: 'Gemini CLI',
+  grok: 'Grok CLI（SuperGrok 訂閱）',
+};
+
 /**
  * AccountsPage — multi-account rotation surface (MDS, the accounts tab of
  * `/manage/billing` + legacy `/accounts`). Budget KPIs, a usage bar, and a grid
@@ -106,6 +113,7 @@ export function AccountsPage() {
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [loginRuntime, setLoginRuntime] = useState<LoginRuntime | null>(null);
+  const [cliCreds, setCliCreds] = useState<CliCredentialInfo[]>([]);
 
   const fetchBudget = useCallback(async () => {
     setLoading(true);
@@ -116,6 +124,14 @@ export function AccountsPage() {
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     } finally {
       setLoading(false);
+    }
+    // CLI-store credentials (grok/codex/gemini) live outside the rotator —
+    // fetched separately, and a failure here never blocks the budget view.
+    try {
+      const r = await api.accounts.cliCredentials();
+      setCliCreds(r.credentials.filter((c) => c.installed || c.present));
+    } catch {
+      setCliCreds([]);
     }
   }, [intl]);
 
@@ -248,6 +264,66 @@ export function AccountsPage() {
       ) : !loading ? (
         <Empty icon={Wallet} title={intl.formatMessage({ id: 'common.noData' })} variant="dashed" />
       ) : null}
+
+      {/* CLI subscription credentials — grok/codex/gemini keep their login in
+          the CLI's own store (never a rotator account), surfaced here so a
+          successful one-click login is visible on this page. */}
+      {cliCreds.length > 0 && (
+        <div className="space-y-3">
+          <div>
+            <h3 className="text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: 'accounts.cliCreds.title' })}
+            </h3>
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'accounts.cliCreds.desc' })}
+            </p>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {cliCreds.map((c) => (
+              <Card key={c.runtime}>
+                <CardContent className="pt-5">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-surface-muted">
+                        <KeyRound className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                      <div>
+                        <p className="font-medium text-foreground">{CLI_CRED_LABELS[c.runtime] ?? c.runtime}</p>
+                        <p className="font-mono text-xs text-muted-foreground">{c.store}</p>
+                      </div>
+                    </div>
+                    {c.present ? (
+                      <Badge variant="secondary" className="bg-success/15 text-success">
+                        {intl.formatMessage({ id: 'accounts.cliCreds.loggedIn' })}
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline">
+                        {intl.formatMessage({ id: 'accounts.cliCreds.notLoggedIn' })}
+                      </Badge>
+                    )}
+                  </div>
+                  <div className="mt-3 flex items-center justify-between">
+                    <p className="text-xs text-muted-foreground">
+                      {c.present && c.modified_at
+                        ? intl.formatMessage(
+                            { id: 'accounts.cliCreds.updatedAt' },
+                            { date: new Date(c.modified_at * 1000).toLocaleString() },
+                          )
+                        : ' '}
+                    </p>
+                    <Button variant="outline" size="sm" onClick={() => setLoginRuntime(c.runtime)}>
+                      <LogIn />
+                      {intl.formatMessage({
+                        id: c.present ? 'accounts.cliCreds.relogin' : 'accounts.cliCreds.login',
+                      })}
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Add Account Dialog */}
       <AddAccountDialog open={showAddDialog} onClose={() => setShowAddDialog(false)} onCreated={fetchBudget} />

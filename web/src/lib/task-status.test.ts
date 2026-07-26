@@ -1,5 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import type { TaskStatus } from '@/lib/api';
 import type { TaskStatusKey } from '@/components/ui';
 import {
   BACKEND_STATUSES,
@@ -50,8 +49,8 @@ describe('task-status mapping layer', () => {
   });
 
   it('toBackendStatus is exhaustive over TaskStatus (compile-time subset guarantee)', () => {
-    // Sanity: the backend union has exactly these members.
-    const sample: TaskStatus[] = ['todo', 'in_progress', 'done', 'blocked'];
+    // Sanity: the four writable statuses round-trip through toBackendStatus.
+    const sample: TaskStatusKey[] = ['todo', 'in_progress', 'done', 'blocked'];
     expect(sample.every((s) => toBackendStatus(s) === s)).toBe(true);
   });
 });

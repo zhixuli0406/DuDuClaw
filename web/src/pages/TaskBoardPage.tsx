@@ -38,7 +38,7 @@ import {
 import { CreateTaskModal, TaskDoneBurst, celebrateTaskDone } from '@/components/task';
 import { toStatusKey, toBackendStatus } from '@/lib/task-status';
 import { timeAgo } from '@/lib/format';
-import type { TaskInfo, TaskStatus, TaskPriority, TaskCreateParams } from '@/lib/api';
+import { api, type TaskInfo, type TaskStatus, type TaskPriority, type TaskCreateParams, type FlowMetrics } from '@/lib/api';
 import {
   Plus,
   Trash2,
@@ -101,14 +101,42 @@ function writeCollapsed(s: ReadonlySet<string>) {
   }
 }
 
-const COLUMNS: ReadonlyArray<{ status: TaskStatus }> = [
-  { status: 'todo' },
-  { status: 'in_progress' },
+// Iterative Kanban: 7 columns. `review` (goal-mode acceptance pending) and
+// `revising` (judge-rejected, looping for the next round) are goal-loop-owned —
+// the human never drags a card into them, so they are read-only drop targets.
+// `failed` folds into the `blocked` column (differentiated by a badge);
+// transient `pending` folds into `todo`.
+const COLUMNS: ReadonlyArray<{ status: TaskStatus; writable: boolean }> = [
+  { status: 'todo', writable: true },
+  { status: 'in_progress', writable: true },
+  { status: 'review', writable: false },
+  { status: 'revising', writable: false },
   // P2a: autonomous goal tasks parked for a human decision (retry/done/abort).
-  { status: 'needs_human' },
-  { status: 'done' },
-  { status: 'blocked' },
+  { status: 'needs_human', writable: false },
+  { status: 'done', writable: true },
+  { status: 'blocked', writable: true },
 ];
+
+/** Which board column a task's status belongs to (folds failed→blocked,
+ *  pending→todo). Pure — shared by the board filter and list grouping. */
+function inColumn(taskStatus: TaskStatus, column: TaskStatus): boolean {
+  if (column === 'blocked') return taskStatus === 'blocked' || taskStatus === 'failed';
+  if (column === 'todo') return taskStatus === 'todo' || taskStatus === 'pending';
+  return taskStatus === column;
+}
+
+/** 1-based round number shown on revising/review cards. */
+function roundNumber(task: TaskInfo): number {
+  return (task.revision_round ?? 0) + 1;
+}
+
+/** A leased in_progress task whose lease deadline has passed is a stale/zombie
+ *  candidate — the dispatcher will reclaim it. Pure. */
+function isStale(task: TaskInfo, now: number): boolean {
+  if (task.status !== 'in_progress' || !task.lease_expires_at) return false;
+  const t = Date.parse(task.lease_expires_at);
+  return Number.isFinite(t) && t < now;
+}
 
 const PRIORITY_RANK: Record<TaskPriority, number> = { urgent: 0, high: 1, medium: 2, low: 3 };
 
@@ -173,6 +201,27 @@ function TaskCard({
         <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{task.description}</p>
       )}
 
+      {/* Iterative Kanban badges: revision round · diminishing returns · stale lease. */}
+      {(task.status === 'revising' || task.status === 'review' || task.diminishing || isStale(task, Date.now())) && (
+        <div className="mt-2 flex flex-wrap items-center gap-1">
+          {(task.status === 'revising' || task.status === 'review') && (
+            <Badge variant="secondary" className="tabular-nums">
+              {intl.formatMessage({ id: 'tasks.badge.round' }, { n: roundNumber(task) })}
+            </Badge>
+          )}
+          {task.diminishing && (
+            <Badge className="border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-300">
+              {intl.formatMessage({ id: 'tasks.badge.diminishing' })}
+            </Badge>
+          )}
+          {isStale(task, Date.now()) && (
+            <Badge className="border-rose-500/30 bg-rose-500/15 text-rose-700 dark:text-rose-300">
+              {intl.formatMessage({ id: 'tasks.badge.stale' })}
+            </Badge>
+          )}
+        </div>
+      )}
+
       <div className="mt-3 flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
           <PriorityIcon priority={task.priority} size="sm" />
@@ -185,6 +234,12 @@ function TaskCard({
 
       {task.status === 'blocked' && task.blocked_reason && (
         <div className="mt-2 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">{task.blocked_reason}</div>
+      )}
+      {task.status === 'failed' && (
+        <div className="mt-2 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">
+          <span className="font-medium">{intl.formatMessage({ id: 'tasks.badge.failed' })}</span>
+          {task.judge_feedback || task.blocked_reason ? `：${task.judge_feedback || task.blocked_reason}` : ''}
+        </div>
       )}
       {task.status === 'needs_human' && (
         <div className="mt-2 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">
@@ -199,16 +254,21 @@ function TaskCard({
 // ── Kanban column ───────────────────────────────────────────
 function KanbanColumn({
   status,
+  writable,
   tasks,
   agents,
+  wip,
   onDrop,
   onOpen,
   onRemove,
   onAdd,
 }: {
   status: TaskStatus;
+  writable: boolean;
   tasks: ReadonlyArray<TaskInfo>;
   agents: ReadonlyArray<{ name: string; display_name: string }>;
+  /** Review-column WIP gauge (limit + Little's-Law wait estimate). */
+  wip?: { limit: number; wait: string | null };
   onDrop: (taskId: string, status: TaskStatus) => void;
   onOpen: (id: string) => void;
   onRemove: (task: TaskInfo) => void;
@@ -216,6 +276,7 @@ function KanbanColumn({
 }) {
   const intl = useIntl();
   const [isDragOver, setIsDragOver] = useState(false);
+  const overWip = wip != null && tasks.length > wip.limit;
 
   return (
     <div className="flex w-70 shrink-0 flex-col">
@@ -224,29 +285,52 @@ function KanbanColumn({
         <h3 className="text-sm font-medium text-foreground">
           {intl.formatMessage({ id: `tasks.column.${status}` })}
         </h3>
-        <span className="font-mono text-xs tabular-nums text-muted-foreground">{tasks.length}</span>
-        <button
-          type="button"
-          onClick={onAdd}
-          className="ml-auto rounded p-0.5 text-muted-foreground hover:bg-surface-hover hover:text-foreground"
-          title={intl.formatMessage({ id: 'tasks.create' })}
-          aria-label={`${intl.formatMessage({ id: 'tasks.create' })} · ${intl.formatMessage({ id: `tasks.column.${status}` })}`}
-        >
-          <Plus className="size-4" />
-        </button>
+        {wip ? (
+          <span
+            className={cn(
+              'font-mono text-xs tabular-nums',
+              overWip ? 'font-semibold text-amber-600 dark:text-amber-400' : 'text-muted-foreground',
+            )}
+            title={
+              overWip
+                ? intl.formatMessage(
+                    { id: 'tasks.wip.over' },
+                    { count: tasks.length, limit: wip.limit, wait: wip.wait ?? '—' },
+                  )
+                : intl.formatMessage({ id: 'tasks.wip.within' }, { count: tasks.length, limit: wip.limit })
+            }
+          >
+            {tasks.length} / {wip.limit}
+          </span>
+        ) : (
+          <span className="font-mono text-xs tabular-nums text-muted-foreground">{tasks.length}</span>
+        )}
+        {writable && (
+          <button
+            type="button"
+            onClick={onAdd}
+            className="ml-auto rounded p-0.5 text-muted-foreground hover:bg-surface-hover hover:text-foreground"
+            title={intl.formatMessage({ id: 'tasks.create' })}
+            aria-label={`${intl.formatMessage({ id: 'tasks.create' })} · ${intl.formatMessage({ id: `tasks.column.${status}` })}`}
+          >
+            <Plus className="size-4" />
+          </button>
+        )}
       </div>
       <div
         className={cn(
           'flex min-h-[200px] flex-col gap-2 rounded-xl bg-muted/40 p-2 transition-shadow',
-          isDragOver && 'ring-2 ring-brand/25',
+          isDragOver && writable && 'ring-2 ring-brand/25',
         )}
         onDragOver={(e) => {
+          if (!writable) return; // read-only goal-loop column — no manual drops
           e.preventDefault();
           e.dataTransfer.dropEffect = 'move';
           setIsDragOver(true);
         }}
         onDragLeave={() => setIsDragOver(false)}
         onDrop={(e) => {
+          if (!writable) return;
           e.preventDefault();
           setIsDragOver(false);
           const taskId = e.dataTransfer.getData('text/plain');
@@ -264,7 +348,7 @@ function KanbanColumn({
         ))}
         {tasks.length === 0 && (
           <p className="px-2 py-6 text-center text-xs text-muted-foreground/70">
-            {intl.formatMessage({ id: 'tasks.dropHint' })}
+            {intl.formatMessage({ id: writable ? 'tasks.dropHint' : 'tasks.column.empty' })}
           </p>
         )}
       </div>
@@ -272,10 +356,12 @@ function KanbanColumn({
   );
 }
 
-/** One horizontal board (five status columns), shared by the flat + swimlane views. */
+/** One horizontal board (seven status columns), shared by the flat + swimlane
+ *  views. `reviewWip` gauges the review column (WIP limit + wait estimate). */
 function KanbanBoard({
   rows,
   agents,
+  reviewWip,
   onDrop,
   onOpen,
   onRemove,
@@ -283,6 +369,7 @@ function KanbanBoard({
 }: {
   rows: ReadonlyArray<TaskInfo>;
   agents: ReadonlyArray<{ name: string; display_name: string }>;
+  reviewWip?: { limit: number; wait: string | null };
   onDrop: (taskId: string, status: TaskStatus) => void;
   onOpen: (id: string) => void;
   onRemove: (task: TaskInfo) => void;
@@ -290,12 +377,14 @@ function KanbanBoard({
 }) {
   return (
     <div className="flex gap-4 overflow-x-auto p-2">
-      {COLUMNS.map(({ status }) => (
+      {COLUMNS.map(({ status, writable }) => (
         <KanbanColumn
           key={status}
           status={status}
-          tasks={rows.filter((t) => t.status === status)}
+          writable={writable}
+          tasks={rows.filter((t) => inColumn(t.status, status))}
           agents={agents}
+          wip={status === 'review' ? reviewWip : undefined}
           onDrop={onDrop}
           onOpen={onOpen}
           onRemove={onRemove}
@@ -605,10 +694,17 @@ export function TaskBoardPage() {
   const [removeTarget, setRemoveTarget] = useState<TaskInfo | null>(null);
   const [confirmBatch, setConfirmBatch] = useState(false);
   const [burst, setBurst] = useState<{ agentId: string } | null>(null);
+  const [flow, setFlow] = useState<FlowMetrics | null>(null);
 
   useEffect(() => {
     fetchTasks();
     fetchAgents();
+    // Iterative Kanban: fetch flow metrics for the review-column WIP gauge.
+    // Best-effort — the board renders fine without it (no gauge, plain count).
+    api.tasks
+      .flowMetrics()
+      .then(setFlow)
+      .catch(() => setFlow(null));
   }, [fetchTasks, fetchAgents]);
 
   // Open the create modal when routed here with `?new=1` (Sidebar / MobileBottomNav).
@@ -758,7 +854,7 @@ export function TaskBoardPage() {
       key: status,
       agentId: undefined as string | undefined,
       label: intl.formatMessage({ id: `tasks.column.${status}` }),
-      rows: orderRows(filteredTasks.filter((t) => t.status === status), order),
+      rows: orderRows(filteredTasks.filter((t) => inColumn(t.status, status)), order),
     })).filter((g) => g.rows.length > 0);
   }, [group, agentBuckets, filteredTasks, intl, order]);
 
@@ -789,6 +885,22 @@ export function TaskBoardPage() {
       writeCollapsed(next);
       return next;
     });
+
+  // Iterative Kanban review-column WIP gauge (flat board only — a board-wide
+  // policy limit against per-lane counts would mislead in swimlanes). Wait
+  // estimate is Little's Law: queue depth ÷ 7-day daily acceptance throughput.
+  const reviewWip = useMemo(() => {
+    if (!flow) return undefined;
+    const rate = flow.avg_daily_accepts_7d;
+    const wait =
+      rate > 0
+        ? intl.formatMessage(
+            { id: 'tasks.wip.waitDays' },
+            { days: (flow.review_queue_depth / rate).toFixed(1) },
+          )
+        : null;
+    return { limit: flow.review_wip_limit, wait };
+  }, [flow, intl]);
 
   const openCreate = () => setShowCreate(true);
 
@@ -896,6 +1008,7 @@ export function TaskBoardPage() {
             <KanbanBoard
               rows={filteredTasks}
               agents={agents}
+              reviewWip={reviewWip}
               onDrop={handleDrop}
               onOpen={openTask}
               onRemove={setRemoveTarget}

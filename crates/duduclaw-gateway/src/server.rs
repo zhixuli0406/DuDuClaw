@@ -1156,7 +1156,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 crate::dispatch_engine::DispatchEngine::new(ts.clone(), Some(judge))
                     // WP4 GroundEval: fold `tool_calls.jsonl` evidence into
                     // the goal-mode acceptance judge prompt.
-                    .with_home_dir(home_dir.clone()),
+                    .with_home_dir(home_dir.clone())
+                    // Iterative Kanban: share the goal loop's soft cap so a
+                    // rejection past it flags `diminishing` on the board.
+                    .with_soft_cap(
+                        crate::goal_loop::GoalLoopConfig::from_home(&home_dir).soft_cap,
+                    ),
             );
             bg_handles.push(tokio::spawn(async move { engine.run().await }));
             info!("Dispatch engine started (durable SQLite派工：殭屍回收 + goal-mode 驗收)");

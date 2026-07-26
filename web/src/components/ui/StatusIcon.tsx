@@ -5,10 +5,12 @@ import {
   Circle,
   CircleDot,
   Eye,
+  RotateCcw,
   CheckCircle2,
   Ban,
   XCircle,
   AlertTriangle,
+  CircleSlash,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -30,9 +32,11 @@ export type TaskStatusKey =
   | 'todo'
   | 'in_progress'
   | 'in_review'
+  | 'revising'
   | 'done'
   | 'blocked'
   | 'needs_human'
+  | 'failed'
   | 'cancelled';
 
 export const TASK_STATUS_ORDER: readonly TaskStatusKey[] = [
@@ -50,9 +54,12 @@ const ICONS: Record<TaskStatusKey, LucideIcon> = {
   todo: Circle,
   in_progress: CircleDot,
   in_review: Eye,
+  // Iterative Kanban: judge-rejected, looping back for another round.
+  revising: RotateCcw,
   done: CheckCircle2,
   blocked: Ban,
   needs_human: AlertTriangle,
+  failed: CircleSlash,
   cancelled: XCircle,
 };
 
@@ -61,9 +68,11 @@ const DEFAULT_LABELS: Record<TaskStatusKey, string> = {
   todo: 'To do',
   in_progress: 'In progress',
   in_review: 'In review',
+  revising: 'Revising',
   done: 'Done',
   blocked: 'Blocked',
   needs_human: 'Needs human',
+  failed: 'Failed',
   cancelled: 'Cancelled',
 };
 

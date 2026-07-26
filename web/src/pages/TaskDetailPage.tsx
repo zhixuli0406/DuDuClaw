@@ -33,7 +33,7 @@ import {
 } from '@/components/task';
 import { toStatusKey } from '@/lib/task-status';
 import { timeAgo } from '@/lib/format';
-import type { TaskInfo, TaskStatus, TaskPriority } from '@/lib/api';
+import { api, type TaskInfo, type TaskStatus, type TaskPriority, type TaskIteration } from '@/lib/api';
 import {
   ArrowLeft,
   Link2,
@@ -53,6 +53,32 @@ function taskSource(task: TaskInfo): TaskSource {
   if (task.parent_task_id) return 'delegated';
   return 'manual';
 }
+
+/** Compact H/M/S duration from whole seconds (e.g. 3725 → "1h 2m"). */
+function formatDuration(totalSeconds: number): string {
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return '0s';
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = Math.floor(totalSeconds % 60);
+  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  return `${s}s`;
+}
+
+/** Seconds between two RFC3339 stamps (0 if unparseable / negative). */
+function secondsBetween(from?: string | null, to?: string | null): number {
+  if (!from || !to) return 0;
+  const a = Date.parse(from);
+  const b = Date.parse(to);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  return Math.max(0, Math.round((b - a) / 1000));
+}
+
+const VERDICT_TONE: Record<string, string> = {
+  accepted: 'text-success',
+  rejected: 'text-amber-600 dark:text-amber-400',
+  escalated: 'text-destructive',
+};
 
 /** `/tasks/:id` — the Multica IssueDetail flagship (spec §5.3 式1). */
 export function TaskDetailPage() {
@@ -80,6 +106,7 @@ export function TaskDetailPage() {
   const [addSub, setAddSub] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [burst, setBurst] = useState<{ agentId: string } | null>(null);
+  const [iterations, setIterations] = useState<TaskIteration[]>([]);
 
   useEffect(() => {
     fetchTasks();
@@ -90,6 +117,24 @@ export function TaskDetailPage() {
   useEffect(() => {
     if (id) fetchComments(id);
   }, [id, fetchComments]);
+
+  // Iterative Kanban: the revision timeline. Best-effort — a task with no goal
+  // rounds simply returns an empty list and the section is hidden.
+  useEffect(() => {
+    if (!id) return;
+    let alive = true;
+    api.tasks
+      .iterations(id)
+      .then((r) => {
+        if (alive) setIterations(r?.iterations ?? []);
+      })
+      .catch(() => {
+        if (alive) setIterations([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [id]);
 
   const task = useMemo(() => tasks.find((t) => t.id === id), [tasks, id]);
   const parent = useMemo(
@@ -340,6 +385,94 @@ export function TaskDetailPage() {
             </p>
           )}
         </div>
+
+        {/* Iterative Kanban: dual clock + revision timeline (goal-mode only). */}
+        {(iterations.length > 0 || (task.agent_seconds ?? 0) > 0) && (
+          <div>
+            <h2 className="mb-2 px-1.5 text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'tasks.iterations.title' })}
+            </h2>
+
+            {/* Dual clock: agent processing time vs full human+machine cycle. */}
+            <div className="mb-3 grid grid-cols-2 gap-2 px-1.5">
+              <div className="rounded-lg border border-surface-border bg-surface px-3 py-2">
+                <p className="text-xs text-muted-foreground">
+                  {intl.formatMessage({ id: 'tasks.clock.agent' })}
+                </p>
+                <p className="font-mono text-sm font-semibold tabular-nums text-foreground">
+                  {formatDuration(task.agent_seconds ?? 0)}
+                </p>
+              </div>
+              <div className="rounded-lg border border-surface-border bg-surface px-3 py-2">
+                <p className="text-xs text-muted-foreground">
+                  {intl.formatMessage({ id: 'tasks.clock.cycle' })}
+                </p>
+                <p className="font-mono text-sm font-semibold tabular-nums text-foreground">
+                  {formatDuration(secondsBetween(task.created_at, task.completed_at || task.updated_at))}
+                </p>
+              </div>
+            </div>
+
+            {/* Round-by-round timeline. */}
+            {iterations.length > 0 && (
+              <ol className="space-y-2 px-1.5">
+                {iterations.map((it) => {
+                  const agentSecs = secondsBetween(it.dispatched_at, it.submitted_at);
+                  return (
+                    <li
+                      key={it.round}
+                      className="rounded-lg border border-surface-border bg-surface p-3 text-sm"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium text-foreground">
+                          {intl.formatMessage({ id: 'tasks.badge.round' }, { n: it.round })}
+                        </span>
+                        {it.verdict && (
+                          <Badge
+                            variant="secondary"
+                            className={VERDICT_TONE[it.verdict] ?? 'text-muted-foreground'}
+                          >
+                            {intl.formatMessage({ id: `tasks.verdict.${it.verdict}` })}
+                          </Badge>
+                        )}
+                        {it.submitted_at && (
+                          <span className="ml-auto font-mono text-xs tabular-nums text-muted-foreground">
+                            {formatDuration(agentSecs)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted-foreground">
+                        <span>
+                          {intl.formatMessage({ id: 'tasks.iterations.dispatched' })}{' '}
+                          <span className="font-mono tabular-nums">{timeAgo(it.dispatched_at)}</span>
+                        </span>
+                        <span>
+                          {intl.formatMessage({ id: 'tasks.iterations.submitted' })}{' '}
+                          <span className="font-mono tabular-nums">
+                            {it.submitted_at
+                              ? timeAgo(it.submitted_at)
+                              : intl.formatMessage({ id: 'tasks.iterations.pending' })}
+                          </span>
+                        </span>
+                        {it.judged_at && (
+                          <span>
+                            {intl.formatMessage({ id: 'tasks.iterations.judged' })}{' '}
+                            <span className="font-mono tabular-nums">{timeAgo(it.judged_at)}</span>
+                          </span>
+                        )}
+                      </div>
+                      {it.verdict === 'rejected' && it.judge_feedback && (
+                        <p className="mt-2 rounded-md bg-amber-500/10 px-2 py-1 text-xs text-amber-700 dark:text-amber-300">
+                          {it.judge_feedback}
+                        </p>
+                      )}
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+          </div>
+        )}
 
         {/* Updated timestamp byline */}
         <p className="px-1.5 text-xs text-muted-foreground">
