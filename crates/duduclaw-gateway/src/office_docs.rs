@@ -217,6 +217,20 @@ async fn deliver_one(
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let mime = media::mime_from_extension(ext);
 
+    // Archive a copy under the agent's attachments/ BEFORE sending, so the
+    // deliverable stays browsable/downloadable in the dashboard Files page
+    // even after channel delivery (and even when the send below fails).
+    // Files already inside attachments/ are listed as-is — no duplicate copy.
+    // `path` is canonicalized by validate_deliver_path, so the guard base must
+    // be canonicalized too (macOS: /var vs /private/var).
+    let attach_base = std::fs::canonicalize(agent_dir.join("attachments"))
+        .unwrap_or_else(|_| agent_dir.join("attachments"));
+    if !path.starts_with(&attach_base) {
+        if let Err(e) = media::save_attachment_in_base(agent_dir, &data, filename).await {
+            warn!(path = %path.display(), error = %e, "📎DELIVER: archive copy failed — delivery continues");
+        }
+    }
+
     sender
         .send_document(&data, filename, mime)
         .await
@@ -383,6 +397,43 @@ mod tests {
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         );
         assert_eq!(sent[0].2, "real xlsx bytes".len());
+
+        // The deliverable is archived under the agent's attachments/ so the
+        // dashboard Files page can list it after delivery.
+        let archived: Vec<_> = std::fs::read_dir(agent_dir.join("attachments"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(archived.len(), 1, "expected one archived copy: {archived:?}");
+        assert!(archived[0].ends_with("summary.xlsx"), "{archived:?}");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn deliver_from_attachments_does_not_duplicate_archive() {
+        let home = std::env::temp_dir().join(format!("dd-proc-dup-{}", uuid::Uuid::new_v4()));
+        let agent_dir = home.join("agents").join("a");
+        let attach_dir = agent_dir.join("attachments");
+        std::fs::create_dir_all(&attach_dir).unwrap();
+        let file = attach_dir.join("already.docx");
+        std::fs::write(&file, b"docx").unwrap();
+
+        let docs = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender {
+            docs: docs.clone(),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            fail_docs: false,
+        };
+
+        let reply = format!("done\n📎DELIVER:{}", file.to_str().unwrap());
+        let _ = process_deliverables(&reply, &agent_dir, &home, &sender).await;
+
+        assert_eq!(docs.lock().unwrap().len(), 1);
+        // Still exactly one file — no timestamped duplicate alongside it.
+        let count = std::fs::read_dir(&attach_dir).unwrap().count();
+        assert_eq!(count, 1);
 
         let _ = std::fs::remove_dir_all(&home);
     }
