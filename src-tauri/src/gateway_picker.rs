@@ -399,6 +399,39 @@ pub fn gateway_start_local(
     manager.start(&app)
 }
 
+/// The bundled picker URL captured at startup. Once the main window navigates to
+/// a chosen gateway's own dashboard, its live URL is that remote origin — so we
+/// stash the original bundled URL here to navigate *back* to the picker for the
+/// "切換 Gateway" entry. `None` if it couldn't be read at startup.
+pub struct PickerHome(pub std::sync::Mutex<Option<url::Url>>);
+
+/// Navigate the main window back to the bundled Gateway picker, tagged with
+/// `switch=1` so the page shows the picker instead of silently auto-connecting
+/// the remembered gateway (design §2.5). Invoked by the tray "切換 Gateway" item
+/// and the [`gateway_open_picker`] command.
+pub fn open_picker(app: &AppHandle) -> Result<(), String> {
+    let mut url = app
+        .try_state::<PickerHome>()
+        .and_then(|s| s.0.lock().ok().and_then(|g| g.clone()))
+        .ok_or_else(|| "picker home URL unknown".to_string())?;
+    // Mark the switch intent (robust across hash/path routing — the page just
+    // looks for the marker anywhere in `location.href`).
+    url.set_query(Some("switch=1"));
+    let win = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window not found".to_string())?;
+    win.navigate(url).map_err(|e| format!("navigate: {e}"))?;
+    let _ = win.show();
+    let _ = win.set_focus();
+    Ok(())
+}
+
+/// Reopen the Gateway picker to switch gateways (tray / user-menu entry).
+#[tauri::command]
+pub fn gateway_open_picker(app: AppHandle) -> Result<(), String> {
+    open_picker(&app)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

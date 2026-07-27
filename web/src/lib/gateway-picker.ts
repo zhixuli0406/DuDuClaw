@@ -78,3 +78,62 @@ export const gatewayLocalStatus = () => invoke<LocalStatus>('gateway_local_statu
 
 /** (Re)start the local sidecar — used when the user explicitly picks "本機". */
 export const gatewayStartLocal = () => invoke<number>('gateway_start_local');
+
+// ── Auto-selection policy (design §2.5) ──────────────────────────────────────
+
+/**
+ * What the picker should do after probing the remembered gateway + scanning the
+ * LAN. `auto` carries the target; `list` reveals the manual picker; `local`
+ * starts and connects to the bundled sidecar.
+ */
+export type PickerAction =
+  | { kind: 'auto'; target: GatewayRecord; from: 'remembered' | 'discovered' }
+  | { kind: 'list' }
+  | { kind: 'local' };
+
+/** Inputs to {@link decideAction} — kept as a plain record so it stays pure. */
+export interface DecideInput {
+  /** The last-connected gateway, if any. */
+  remembered: GatewayRecord | null;
+  /** Whether {@link DecideInput.remembered}'s `/healthz` responded ok. */
+  rememberedHealthy: boolean;
+  /** Gateways found on the LAN this scan. */
+  discovered: GatewayRecord[];
+}
+
+/**
+ * Pure auto-selection policy (design §2.5 "自動選擇策略"):
+ *
+ *  1. remembered gateway is healthy → auto-connect it (picker never shown)
+ *  2. remembered gateway is unreachable → fall to the picker (user decides)
+ *  3. no remembered, exactly 1 discovered → auto-connect it (toast)
+ *  4. no remembered, ≥2 discovered → show the picker list
+ *  5. no remembered, 0 discovered → start + connect the local sidecar
+ *
+ * Deterministic and side-effect-free so it can be unit-tested; the page performs
+ * the actual health probe / scan and feeds the results in here.
+ */
+export function decideAction(input: DecideInput): PickerAction {
+  const { remembered, rememberedHealthy, discovered } = input;
+  if (remembered) {
+    return rememberedHealthy
+      ? { kind: 'auto', target: remembered, from: 'remembered' }
+      : { kind: 'list' };
+  }
+  if (discovered.length === 1) {
+    return { kind: 'auto', target: discovered[0], from: 'discovered' };
+  }
+  if (discovered.length >= 2) return { kind: 'list' };
+  return { kind: 'local' };
+}
+
+/**
+ * True when the desktop shell was navigated back to the picker to *switch*
+ * gateways (tray "切換 Gateway" appends `switch=1`). In that case the page must
+ * show the picker instead of silently auto-connecting the remembered gateway.
+ * Robust across hash/path routing — just looks for the marker anywhere in the
+ * current URL.
+ */
+export function isSwitchIntent(): boolean {
+  return typeof window !== 'undefined' && window.location.href.includes('switch=1');
+}

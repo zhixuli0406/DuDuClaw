@@ -133,6 +133,10 @@ impl SidecarManager {
             // launchd-era typo; the CLI entry point is `duduclaw run`.
             .args(["run", "--yes"])
             .env("DUDUCLAW_PORT", port.to_string())
+            // Employee desktop sidecars must NEVER become a LAN-discoverable
+            // gateway (design §2.5 "防 gateway 蔓延"). Force mDNS off regardless
+            // of config.toml — this env wins over `[server] mdns_advertise`.
+            .env("DUDUCLAW_MDNS_ADVERTISE", "0")
             .env("PATH", lifecycle::augmented_path());
 
         let (mut rx, child) = sidecar

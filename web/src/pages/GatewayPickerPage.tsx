@@ -3,8 +3,11 @@ import { useIntl } from 'react-intl';
 import { Navigate } from 'react-router';
 import { Server, Wifi, RefreshCw, Plug, ArrowRight, AlertCircle, HardDrive } from 'lucide-react';
 import { Button, Card, CardContent, Input, Badge, Spinner } from '@/components/mds';
+import { toast } from '@/lib/toast';
 import {
   isTauri,
+  isSwitchIntent,
+  decideAction,
   gatewayDiscover,
   gatewayHealth,
   gatewaySelect,
@@ -16,21 +19,31 @@ import {
 } from '@/lib/gateway-picker';
 
 /**
- * Gateway picker (WP-GW) — the desktop shell's pre-login landing page. Lets the
- * user connect to the local sidecar, a mDNS-discovered LAN gateway, or a
- * manually-entered host, and auto-connects to the last choice after a 3s
- * countdown (cancelled by any interaction).
+ * Gateway picker (WP-GW) — the desktop shell's pre-login landing page.
+ *
+ * Behaviour is **auto-select first** (design §2.5): on launch it resolves a
+ * gateway without asking — a healthy remembered gateway connects straight away,
+ * a single LAN gateway auto-connects with a toast, and nothing found falls back
+ * to the local sidecar. The manual picker (local / LAN list / manual entry) is
+ * only shown when the policy can't decide, or when the user reopens it via the
+ * tray "切換 Gateway" item (which appends `switch=1`).
  *
  * Desktop-only: outside Tauri it redirects to `/` so a plain browser never sees
  * it. Calm Glass surfaces (web/DESIGN.md); zh-TW / en / ja-JP via react-intl.
  */
-const COUNTDOWN_SECONDS = 3;
+
+/** `resolving` = auto-select in progress (splash); `picker` = show the picker. */
+type Phase = 'resolving' | 'picker';
 
 export function GatewayPickerPage() {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) =>
     intl.formatMessage({ id }, values);
 
+  // Reopening via the tray forces the picker; a fresh launch auto-resolves.
+  const [phase, setPhase] = useState<Phase>(() =>
+    isTauri() && !isSwitchIntent() ? 'resolving' : 'picker'
+  );
   const [local, setLocal] = useState<LocalStatus | null>(null);
   const [discovered, setDiscovered] = useState<GatewayRecord[]>([]);
   const [scanning, setScanning] = useState(false);
@@ -38,20 +51,8 @@ export function GatewayPickerPage() {
   const [manualBusy, setManualBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [connectingUrl, setConnectingUrl] = useState<string | null>(null);
-  const [countdown, setCountdown] = useState<number | null>(null);
-  const [lastGateway, setLastGateway] = useState<GatewayRecord | null>(null);
 
-  const countdownTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-  const interacted = useRef(false);
-
-  const stopCountdown = useCallback(() => {
-    interacted.current = true;
-    if (countdownTimer.current) {
-      clearInterval(countdownTimer.current);
-      countdownTimer.current = null;
-    }
-    setCountdown(null);
-  }, []);
+  const resolved = useRef(false);
 
   // ── Local sidecar status polling ──
   useEffect(() => {
@@ -73,15 +74,20 @@ export function GatewayPickerPage() {
   // ── LAN discovery ──
   const scan = useCallback(() => {
     setScanning(true);
-    gatewayDiscover()
-      .then((list) => setDiscovered(list))
-      .catch((e) => setError(String(e?.message ?? e)))
+    return gatewayDiscover()
+      .then((list) => {
+        setDiscovered(list);
+        return list;
+      })
+      .catch((e) => {
+        setError(String(e?.message ?? e));
+        return [] as GatewayRecord[];
+      })
       .finally(() => setScanning(false));
   }, []);
 
   const connect = useCallback(
-    async (record: GatewayRecord) => {
-      stopCountdown();
+    async (record: GatewayRecord): Promise<boolean> => {
       setError(null);
       setConnectingUrl(record.url);
       try {
@@ -90,7 +96,7 @@ export function GatewayPickerPage() {
         if (!health.ok) {
           setError(t('gateway.error.unreachable', { detail: health.error ?? '' }));
           setConnectingUrl(null);
-          return;
+          return false;
         }
         const merged: GatewayRecord = {
           ...record,
@@ -98,49 +104,17 @@ export function GatewayPickerPage() {
           name: record.name || health.name || record.host,
         };
         await gatewaySelect(merged); // navigates the window on success
+        return true;
       } catch (e) {
         setError(String((e as Error)?.message ?? e));
         setConnectingUrl(null);
+        return false;
       }
     },
-    [stopCountdown, t]
+    [t]
   );
 
-  // ── Initial load: discovery + last-selection countdown ──
-  useEffect(() => {
-    if (!isTauri()) return;
-    scan();
-    gatewayLast()
-      .then((state) => {
-        const last = state.last_gateway ?? null;
-        if (!last) return;
-        setLastGateway(last);
-        if (interacted.current) return;
-        // Start the auto-connect countdown.
-        setCountdown(COUNTDOWN_SECONDS);
-        countdownTimer.current = setInterval(() => {
-          setCountdown((c) => {
-            if (c === null) return null;
-            if (c <= 1) {
-              if (countdownTimer.current) clearInterval(countdownTimer.current);
-              countdownTimer.current = null;
-              // Fire the auto-connect (guarded against prior interaction).
-              if (!interacted.current) void connect(last);
-              return null;
-            }
-            return c - 1;
-          });
-        }, 1000);
-      })
-      .catch(() => {});
-    return () => {
-      if (countdownTimer.current) clearInterval(countdownTimer.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const connectLocal = useCallback(async () => {
-    stopCountdown();
+  const connectLocal = useCallback(async (): Promise<boolean> => {
     setError(null);
     try {
       // Ensure the sidecar is up (a prior remote pick may have stopped it),
@@ -159,14 +133,74 @@ export function GatewayPickerPage() {
         tls: false,
         url: status.url,
       };
-      await connect(record);
+      return await connect(record);
     } catch (e) {
       setError(String((e as Error)?.message ?? e));
+      return false;
     }
-  }, [connect, stopCountdown, t]);
+  }, [connect, t]);
+
+  // ── Auto-select on launch (design §2.5) ──
+  useEffect(() => {
+    if (!isTauri() || isSwitchIntent() || resolved.current) return;
+    resolved.current = true;
+    let cancelled = false;
+
+    const fallToPicker = () => {
+      if (cancelled) return;
+      setPhase('picker');
+      void scan();
+    };
+
+    (async () => {
+      try {
+        const state = await gatewayLast();
+        const remembered = state.last_gateway ?? null;
+
+        // Probe the remembered gateway; only scan the LAN when we still need to
+        // decide (no remembered, or it's unreachable).
+        let rememberedHealthy = false;
+        if (remembered) {
+          rememberedHealthy = await gatewayHealth(remembered.url)
+            .then((h) => h.ok)
+            .catch(() => false);
+        }
+        const discoveredNow =
+          remembered && rememberedHealthy ? [] : await scan();
+        if (cancelled) return;
+
+        const action = decideAction({
+          remembered,
+          rememberedHealthy,
+          discovered: discoveredNow,
+        });
+        if (action.kind === 'list') {
+          setPhase('picker');
+          return;
+        }
+        if (action.kind === 'local') {
+          const ok = await connectLocal();
+          if (!ok) fallToPicker();
+          return;
+        }
+        // action.kind === 'auto'
+        if (action.from === 'discovered') {
+          toast.info(t('gateway.autoConnecting', { name: action.target.name }));
+        }
+        const ok = await connect(action.target);
+        if (!ok) fallToPicker();
+      } catch {
+        fallToPicker();
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const connectManual = useCallback(async () => {
-    stopCountdown();
     setError(null);
     const raw = manual.trim();
     if (!raw) return;
@@ -198,20 +232,36 @@ export function GatewayPickerPage() {
     } finally {
       setManualBusy(false);
     }
-  }, [manual, stopCountdown, t]);
+  }, [manual, t]);
 
   // Non-desktop: never render the picker.
   if (!isTauri()) return <Navigate to="/" replace />;
 
   const localRunning = local?.status === 'running';
 
+  // Auto-select splash: shown while the launch policy resolves a gateway. No
+  // buttons — the page connects on its own, revealing the picker only on
+  // fallback.
+  if (phase === 'resolving') {
+    return (
+      <div className="min-h-screen w-full bg-app-shell text-foreground">
+        <div className="mx-auto flex min-h-screen max-w-2xl flex-col items-center justify-center gap-4 px-6">
+          <div className="flex items-center gap-2 text-brand">
+            <span className="text-xl" aria-hidden>
+              🐾
+            </span>
+            <span className="text-sm font-medium">{t('app.name')}</span>
+          </div>
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Spinner /> {t('gateway.resolving')}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div
-      className="min-h-screen w-full bg-app-shell text-foreground"
-      onPointerDown={() => {
-        if (countdown !== null) stopCountdown();
-      }}
-    >
+    <div className="min-h-screen w-full bg-app-shell text-foreground">
       <div className="mx-auto flex min-h-screen max-w-2xl flex-col justify-center gap-6 px-6 py-12">
         {/* Header */}
         <header className="space-y-1.5">
@@ -224,25 +274,6 @@ export function GatewayPickerPage() {
           <h1 className="text-2xl font-semibold tracking-tight">{t('gateway.title')}</h1>
           <p className="text-sm text-muted-foreground">{t('gateway.subtitle')}</p>
         </header>
-
-        {/* Auto-connect countdown */}
-        {countdown !== null && lastGateway && (
-          <Card className="border-brand/30 bg-brand/5">
-            <CardContent className="flex items-center justify-between gap-3 py-3">
-              <div className="min-w-0">
-                <div className="text-sm font-medium">
-                  {t('gateway.countdown.title', { seconds: countdown })}
-                </div>
-                <div className="truncate text-xs text-muted-foreground">
-                  {lastGateway.name} · {lastGateway.host}:{lastGateway.port}
-                </div>
-              </div>
-              <Button variant="outline" size="sm" onClick={stopCountdown}>
-                {t('gateway.countdown.cancel')}
-              </Button>
-            </CardContent>
-          </Card>
-        )}
 
         {/* Error banner */}
         {error && (

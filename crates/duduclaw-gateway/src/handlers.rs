@@ -87,6 +87,14 @@ pub(crate) fn is_valid_agent_id(id: &str) -> bool {
         && !id.contains("..")
 }
 
+/// Validate a `[gateway] bind` value: fail-closed to a literal IP address only.
+/// The dashboard offers `127.0.0.1` / `0.0.0.0` and custom IPs — a hostname,
+/// blank, or any injection string (`0.0.0.0; rm -rf`, `evil.com`) must be
+/// rejected so the listen address can never be steered to an unexpected target.
+pub(crate) fn is_valid_bind_addr(v: &str) -> bool {
+    v.parse::<std::net::IpAddr>().is_ok()
+}
+
 /// Validate a skill file stem is safe to join into a path (no separators, no
 /// leading dot, no traversal). Skill names may keep mixed case and `_`/`.`
 /// (e.g. GitHub-sourced skills), unlike the stricter agent-id charset.
@@ -16590,8 +16598,13 @@ impl MethodHandler {
                     .unwrap();
                 if let Some(v) = params.get("bind").and_then(|v| v.as_str()) {
                     let v = v.trim();
-                    if v.is_empty() || v.len() > 64 {
-                        return WsFrame::error_response("", "gateway.bind must be 1-64 chars");
+                    // Fail-closed: only a literal IP is accepted (127.0.0.1 /
+                    // 0.0.0.0 / custom). Rejects hostnames + injection strings.
+                    if !is_valid_bind_addr(v) {
+                        return WsFrame::error_response(
+                            "",
+                            "gateway.bind must be a valid IP address (e.g. 127.0.0.1 or 0.0.0.0)",
+                        );
                     }
                     gateway.insert("bind".into(), toml::Value::String(v.into()));
                     changes.push(format!("gateway.bind = \"{v}\" (restart required)"));
@@ -16685,9 +16698,9 @@ impl MethodHandler {
             }
         }
 
-        // ── G.3 [general] default_agent / inference_mode / default_language ──
+        // ── G.3 [general] name / default_agent / inference_mode / default_language ──
         {
-            let has_gen = ["default_agent", "inference_mode", "default_language"]
+            let has_gen = ["name", "default_agent", "inference_mode", "default_language"]
                 .iter()
                 .any(|k| params.get(*k).is_some());
             if has_gen {
@@ -16696,6 +16709,21 @@ impl MethodHandler {
                     .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                     .as_table_mut()
                     .unwrap();
+                // Gateway display name = the mDNS instance name shown in the
+                // desktop picker. Empty clears it (falls back to hostname).
+                if let Some(v) = params.get("name").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if v.len() > 64 {
+                        return WsFrame::error_response("", "general.name must be ≤ 64 chars");
+                    }
+                    if v.is_empty() {
+                        general.remove("name");
+                        changes.push("general.name cleared".into());
+                    } else {
+                        general.insert("name".into(), toml::Value::String(v.into()));
+                        changes.push(format!("general.name = \"{v}\""));
+                    }
+                }
                 if let Some(v) = params.get("default_agent").and_then(|v| v.as_str()) {
                     let v = v.trim();
                     if !v.is_empty() && !is_valid_agent_id(v) {
@@ -16739,6 +16767,18 @@ impl MethodHandler {
                     }
                 }
             }
+        }
+
+        // ── G.3b [server] mdns_advertise (LAN discovery broadcast, restart required) ──
+        // Read once at gateway start (server.rs) — persist + flag, never hot-apply.
+        if let Some(v) = params.get("mdns_advertise").and_then(|v| v.as_bool()) {
+            let server = table
+                .entry("server")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            server.insert("mdns_advertise".into(), toml::Value::Boolean(v));
+            changes.push(format!("server.mdns_advertise = {v} (restart required)"));
         }
 
         // ── G.4 [logging] format (pretty/json) ──
@@ -24972,6 +25012,39 @@ fn update_frontmatter_field(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod bind_addr_validation_tests {
+    use super::is_valid_bind_addr;
+
+    #[test]
+    fn accepts_literal_ips() {
+        for ok in ["127.0.0.1", "0.0.0.0", "192.168.1.5", "::1", "::", "10.0.0.1"] {
+            assert!(is_valid_bind_addr(ok), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_hostnames_and_injection_fail_closed() {
+        // Anything that isn't a literal IP is rejected: hostnames, blanks,
+        // command/argument injection, IP-with-port, CIDR, whitespace.
+        for bad in [
+            "",
+            "  ",
+            "localhost",
+            "evil.com",
+            "gateway.company.com",
+            "0.0.0.0; rm -rf /",
+            "0.0.0.0 --disable-auth",
+            "127.0.0.1:18789",
+            "0.0.0.0/0",
+            "999.999.999.999",
+            "0x7f000001",
+        ] {
+            assert!(!is_valid_bind_addr(bad), "should reject {bad:?}");
+        }
+    }
 }
 
 #[cfg(test)]

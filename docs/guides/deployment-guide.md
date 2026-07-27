@@ -376,9 +376,11 @@ LAN automatically via mDNS, so employees never type an IP.
 
 ### Server side — advertise on the LAN
 
-The gateway advertises itself over mDNS/DNS-SD as `_duduclaw._tcp.local.`. It is
-**on by default**; no action is needed for basic discovery. To reach the gateway
-from other machines, bind to a LAN interface (not loopback):
+The gateway advertises itself over mDNS/DNS-SD as `_duduclaw._tcp.local.`.
+Advertising is **off by default** (opt-in) — only a gateway you deliberately
+mark as an "office gateway" appears on the LAN, so employee desktops and stray
+instances never turn into discoverable gateways. On the shared server, opt in and
+bind to a LAN interface (not loopback):
 
 ```toml
 # ~/.duduclaw/config.toml on the gateway server
@@ -390,13 +392,20 @@ port = 18789
 name = "Office Gateway"  # shown as the instance name in the desktop picker
 
 [server]
-mdns_advertise = true    # default true; set false to stop LAN broadcasting
+mdns_advertise = true    # default FALSE; set true to broadcast on the LAN
 tls = false              # set true when the gateway is fronted by HTTPS (below)
 ```
 
-- `mdns_advertise = false` disables the broadcast entirely (e.g. security policy
-  forbids service discovery on the corporate LAN). Employees can still connect by
-  typing `host:port` manually in the picker.
+You can flip these in the dashboard under **Settings → System → Server** (admin
+only) instead of editing the file — the display name, bind interface, and mDNS
+switch are all editable there (bind/broadcast changes note that a gateway restart
+is required).
+
+- With `mdns_advertise = false` (the default), the gateway never broadcasts;
+  employees connect by typing `host:port` manually in the picker.
+- Env override: `DUDUCLAW_MDNS_ADVERTISE=0|1` takes precedence over config. The
+  desktop app's own bundled sidecar sets `=0`, so a laptop running the desktop
+  app is never advertised on the network regardless of its `config.toml`.
 - The advertisement carries the gateway **version**, the **display name**, and a
   **`tls` flag** in its TXT record; no credentials or secrets are broadcast.
 - Advertising is best-effort: if mDNS registration fails (locked-down network,
@@ -416,7 +425,18 @@ WebSocket Origin allowlist) or the dashboard WS upgrade will be rejected.
 
 ### Employee side — the desktop Gateway picker
 
-On launch the desktop app opens the picker with three ways to connect:
+On launch the desktop app **auto-selects** a gateway and connects without asking,
+falling back to a picker only when it can't decide:
+
+1. If it **remembers** a gateway and that gateway's `/healthz` responds → connect
+   to it straight away (no picker, no countdown).
+2. Otherwise it scans the LAN: exactly **one** gateway found → connect to it and
+   show a brief toast; **several** found → show the picker list; **none** found →
+   start and connect to the local bundled gateway.
+3. If the remembered gateway is unreachable, it falls to the picker so the
+   employee can choose.
+
+The picker itself offers three ways to connect:
 
 1. **本機 / Local** — the app's own bundled gateway (for solo use).
 2. **區網偵測 / On your network** — gateways discovered via mDNS, with a rescan
@@ -425,10 +445,10 @@ On launch the desktop app opens the picker with three ways to connect:
    The address is validated against `/healthz` before connecting; a bad address
    shows an error and does **not** navigate.
 
-The picker remembers the last gateway and **auto-connects after a 3-second
-countdown**; any interaction cancels it and keeps the picker open. Choosing a
-remote gateway releases the local sidecar (no competing local instance is left
-running). Only `http`/`https` addresses are accepted (fail-closed).
+To switch gateways later, use **切換 Gateway / Switch Gateway** in the app's tray
+menu — it reopens the picker. Choosing a remote gateway releases the local
+sidecar (no competing local instance is left running). Only `http`/`https`
+addresses are accepted (fail-closed).
 
 > Discovery only advertises a *display name* — it is not an authentication
 > boundary. Login and authorization are always enforced by the target gateway,
