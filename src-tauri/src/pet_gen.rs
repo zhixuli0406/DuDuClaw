@@ -14,7 +14,8 @@
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, WebviewWindow};
 
 use duduclaw_pets::{
     BackgroundRemover, OnnxRemover, PassthroughRemover, PetMode, PetPack, BIREFNET_LITE, SILUETA,
@@ -25,6 +26,14 @@ use crate::mascot_window;
 /// Event broadcast to all windows when the active pet changes (the overlay
 /// listens and re-fetches). Kept as a string constant so JS and Rust agree.
 pub const PET_CHANGED_EVENT: &str = "pet://changed";
+
+/// Event the main window listens for to navigate to the pet studio (fired by the
+/// pet's right-click "open studio" item).
+pub const PET_OPEN_STUDIO_EVENT: &str = "pet://open-studio";
+
+/// Base (standard) desktop-pet window side in logical px — matches the initial
+/// `inner_size` in `mascot_window.rs`. Small = 50%, large = 150%.
+const PET_BASE_PX: f64 = 180.0;
 
 /// A pet as shown in the studio list.
 #[derive(Debug, Serialize)]
@@ -47,6 +56,33 @@ pub struct PetRuntimePayload {
     pub image_data_url: Option<String>,
     /// Behavior weights (state → frequency) the runtime uses for idle variants.
     pub behaviors: Vec<PetBehavior>,
+    /// Sprite grid metadata (sprite mode only) — lets the runtime play frames.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprite_sheet: Option<SpriteSheet>,
+}
+
+/// Spritesheet playback metadata for sprite-mode pets.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpriteSheet {
+    /// Frame cell width in px.
+    pub frame_width: u32,
+    /// Frame cell height in px.
+    pub frame_height: u32,
+    /// Frames per animation row.
+    pub cols: u32,
+    /// Per-state animation rows.
+    pub animations: Vec<SpriteAnimation>,
+}
+
+/// One playable animation row (sprite mode).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpriteAnimation {
+    pub state: String,
+    pub row: u32,
+    pub frames: u32,
+    pub fps: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,13 +174,16 @@ pub fn pet_list() -> Vec<PetSummary> {
 ///
 /// `photo_base64` may be a bare base64 string or a `data:` URL (the prefix is
 /// stripped). `external_cutout = true` skips segmentation (the PNG is already
-/// transparent). Returns the new pet's summary. Does NOT auto-activate — the UI
-/// activates explicitly after the user confirms the preview.
+/// transparent). `pixelate = true` (the default the studio sends) runs the local
+/// pixel-art pipeline and bakes an animated Codex Pets spritesheet; `false`
+/// keeps the single-image procedural pet. Returns the new pet's summary. Does
+/// NOT auto-activate — the UI activates explicitly after the user confirms.
 #[tauri::command]
 pub fn pet_generate(
     name: String,
     photo_base64: String,
     external_cutout: bool,
+    pixelate: bool,
 ) -> Result<GeneratedPet, String> {
     let raw = strip_data_url(&photo_base64);
     let bytes = base64::engine::general_purpose::STANDARD
@@ -152,9 +191,13 @@ pub fn pet_generate(
         .map_err(|e| format!("invalid image data: {e}"))?;
     let remover = pick_remover(external_cutout);
     let label = remover.label().to_string();
-    let pack = duduclaw_pets::generate_procedural_pet(&name, &bytes, remover.as_ref())
-        .map_err(|e| e.to_string())?;
-    tracing::info!(slug = %pack.slug, remover = %label, "generated pet pack");
+    let pack = if pixelate {
+        duduclaw_pets::generate_pixel_sprite_pet(&name, &bytes, remover.as_ref())
+    } else {
+        duduclaw_pets::generate_procedural_pet(&name, &bytes, remover.as_ref())
+    }
+    .map_err(|e| e.to_string())?;
+    tracing::info!(slug = %pack.slug, remover = %label, pixelate, "generated pet pack");
     let image_data_url = pack.image_path().and_then(|p| encode_image_data_url(&p));
     Ok(GeneratedPet {
         slug: pack.slug,
@@ -195,6 +238,8 @@ pub fn pet_activate(app: AppHandle, slug: Option<String>) -> Result<(), String> 
         if let Some(win) = tauri::Manager::get_webview_window(&app, mascot_window::MASCOT_LABEL) {
             let _ = win.show();
         }
+        // Honor the saved size preference each time the pet is put on the desk.
+        apply_saved_scale(&app);
     } else {
         // Deactivate = take the pet off the desk: hide the pet window, or the
         // pet keeps floating with no way to dismiss it.
@@ -238,12 +283,35 @@ pub fn pet_load_active() -> Option<PetRuntimePayload> {
             condition: b.condition.clone(),
         })
         .collect();
+    // Sprite-mode pets carry grid metadata so the runtime can play frames.
+    let sprite_sheet = if pack.manifest.mode == PetMode::Sprite {
+        let animations = pack
+            .manifest
+            .animations
+            .iter()
+            .map(|(state, a)| SpriteAnimation {
+                state: state.clone(),
+                row: a.row,
+                frames: a.frames,
+                fps: a.fps,
+            })
+            .collect();
+        Some(SpriteSheet {
+            frame_width: duduclaw_pets::sprite_bake::FRAME_W,
+            frame_height: duduclaw_pets::sprite_bake::FRAME_H,
+            cols: duduclaw_pets::sprite_bake::COLS,
+            animations,
+        })
+    } else {
+        None
+    };
     Some(PetRuntimePayload {
         slug: pack.slug,
         display_name: pack.manifest.display_name,
         mode: mode_str(pack.manifest.mode),
         image_data_url,
         behaviors,
+        sprite_sheet,
     })
 }
 
@@ -285,4 +353,184 @@ pub async fn pet_model_download(variant: String) -> Result<String, String> {
     })
     .await
     .map_err(|e| format!("download task failed: {e}"))?
+}
+
+// ── Desktop-pet size (scale) persistence ─────────────────────────────────────
+
+/// Persisted desktop-pet preferences (currently just the window scale).
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct DesktopSettings {
+    /// `"small"` | `"standard"` | `"large"`. Absent ⇒ standard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scale: Option<String>,
+}
+
+fn desktop_settings_path() -> std::path::PathBuf {
+    duduclaw_pets::pets_dir().join("desktop.json")
+}
+
+/// The saved scale keyword, defaulting to `"standard"`.
+fn load_scale() -> String {
+    std::fs::read(desktop_settings_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<DesktopSettings>(&b).ok())
+        .and_then(|s| s.scale)
+        .unwrap_or_else(|| "standard".to_string())
+}
+
+fn save_scale(scale: &str) {
+    let _ = std::fs::create_dir_all(duduclaw_pets::pets_dir());
+    let json = serde_json::to_vec_pretty(&DesktopSettings {
+        scale: Some(scale.to_string()),
+    })
+    .unwrap_or_default();
+    let _ = std::fs::write(desktop_settings_path(), json);
+}
+
+/// Logical window side (px) for a scale keyword.
+fn scale_to_px(scale: &str) -> f64 {
+    match scale {
+        "small" => PET_BASE_PX * 0.5,
+        "large" => PET_BASE_PX * 1.5,
+        _ => PET_BASE_PX,
+    }
+}
+
+/// Resize the pet window to `scale` (does not persist).
+fn resize_pet_window(app: &AppHandle, scale: &str) {
+    if let Some(win) = app.get_webview_window(mascot_window::MASCOT_LABEL) {
+        let px = scale_to_px(scale);
+        let _ = win.set_size(LogicalSize::new(px, px));
+    }
+}
+
+/// Apply the saved scale to the pet window (called when it is shown).
+pub fn apply_saved_scale(app: &AppHandle) {
+    resize_pet_window(app, &load_scale());
+}
+
+/// Set the desktop-pet window scale (`"small"` | `"standard"` | `"large"`),
+/// persist it, and resize the live window immediately.
+#[tauri::command]
+pub fn pet_set_scale(app: AppHandle, scale: String) -> Result<(), String> {
+    if !matches!(scale.as_str(), "small" | "standard" | "large") {
+        return Err(format!("unknown scale: {scale}"));
+    }
+    save_scale(&scale);
+    resize_pet_window(&app, &scale);
+    Ok(())
+}
+
+/// The current desktop-pet scale keyword.
+#[tauri::command]
+pub fn pet_get_scale() -> String {
+    load_scale()
+}
+
+/// Show the main window and ask it to navigate to the pet studio.
+#[tauri::command]
+pub fn pet_open_studio(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+    let _ = app.emit(PET_OPEN_STUDIO_EVENT, ());
+}
+
+// ── Right-click context menu ─────────────────────────────────────────────────
+
+/// Pop up the desktop-pet's native right-click menu at the cursor.
+///
+/// Items: 收回桌面 · 切換寵物 (submenu of packs) · 大小 (小/標準/大) ·
+/// 打開桌寵工作室. Menu clicks are routed by [`handle_pet_menu_event`] via the
+/// app-level `on_menu_event` handler in `main.rs`.
+#[tauri::command]
+pub fn pet_context_menu(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    let map_err = |e: tauri::Error| e.to_string();
+
+    let hide =
+        MenuItem::with_id(&app, "pet_hide", "收回桌面", true, None::<&str>).map_err(map_err)?;
+
+    // Switch-pet submenu: every pack, the active one dotted.
+    let active = duduclaw_pets::get_active_slug();
+    let switch = Submenu::with_id(&app, "pet_switch_menu", "切換寵物", true).map_err(map_err)?;
+    let packs = duduclaw_pets::list_packs();
+    if packs.is_empty() {
+        let none = MenuItem::with_id(&app, "pet_switch_none", "（尚無寵物）", false, None::<&str>)
+            .map_err(map_err)?;
+        switch.append(&none).map_err(map_err)?;
+    } else {
+        for p in &packs {
+            let is_active = active.as_deref() == Some(p.slug.as_str());
+            let label = if is_active {
+                format!("● {}", p.manifest.display_name)
+            } else {
+                format!("　{}", p.manifest.display_name)
+            };
+            let item = MenuItem::with_id(
+                &app,
+                format!("pet_switch:{}", p.slug),
+                label,
+                !is_active,
+                None::<&str>,
+            )
+            .map_err(map_err)?;
+            switch.append(&item).map_err(map_err)?;
+        }
+    }
+
+    // Size submenu, current scale dotted.
+    let current = load_scale();
+    let size = Submenu::with_id(&app, "pet_size_menu", "大小", true).map_err(map_err)?;
+    for (key, label) in [
+        ("small", "小 (50%)"),
+        ("standard", "標準"),
+        ("large", "大 (150%)"),
+    ] {
+        let dotted = if current == key {
+            format!("● {label}")
+        } else {
+            format!("　{label}")
+        };
+        let item = MenuItem::with_id(&app, format!("pet_size:{key}"), dotted, true, None::<&str>)
+            .map_err(map_err)?;
+        size.append(&item).map_err(map_err)?;
+    }
+
+    let sep = PredefinedMenuItem::separator(&app).map_err(map_err)?;
+    let studio = MenuItem::with_id(&app, "pet_studio", "打開桌寵工作室", true, None::<&str>)
+        .map_err(map_err)?;
+
+    let menu = Menu::with_items(&app, &[&hide, &switch, &size, &sep, &studio]).map_err(map_err)?;
+    window.popup_menu(&menu).map_err(map_err)?;
+    Ok(())
+}
+
+/// Route a menu-item click to a pet action. Returns `true` if `id` was a pet
+/// menu id (so `main.rs` can stop routing). Non-pet ids (tray) return `false`.
+pub fn handle_pet_menu_event(app: &AppHandle, id: &str) -> bool {
+    match id {
+        "pet_hide" => {
+            if let Some(win) = app.get_webview_window(mascot_window::MASCOT_LABEL) {
+                let _ = win.hide();
+            }
+            true
+        }
+        "pet_studio" => {
+            pet_open_studio(app.clone());
+            true
+        }
+        _ if id.starts_with("pet_size:") => {
+            let scale = &id["pet_size:".len()..];
+            let _ = pet_set_scale(app.clone(), scale.to_string());
+            true
+        }
+        _ if id.starts_with("pet_switch:") => {
+            let slug = id["pet_switch:".len()..].to_string();
+            let _ = pet_activate(app.clone(), Some(slug));
+            true
+        }
+        _ => false,
+    }
 }

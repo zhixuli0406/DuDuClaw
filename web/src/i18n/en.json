@@ -2483,6 +2483,8 @@
   "pet.studio.namePlaceholder": "Pet name",
   "pet.studio.externalLabel": "Already background-removed",
   "pet.studio.externalHint": "Skip removal — my image is already a transparent PNG.",
+  "pet.studio.pixelLabel": "Pixel-art style",
+  "pet.studio.pixelHint": "Turn the cutout into a retro pixel sprite with baked animations (Codex Pets style).",
   "pet.studio.generate": "Generate",
   "pet.studio.activate": "Put on desktop",
   "pet.studio.removerUsed": "Background removed with {remover}",

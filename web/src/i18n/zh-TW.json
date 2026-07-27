@@ -2483,6 +2483,8 @@
   "pet.studio.namePlaceholder": "寵物名稱",
   "pet.studio.externalLabel": "已經去背",
   "pet.studio.externalHint": "略過去背——我的圖片已是透明背景 PNG。",
+  "pet.studio.pixelLabel": "像素風",
+  "pet.studio.pixelHint": "把去背後的圖轉成復古像素精靈，並烘焙好動作（Codex Pets 風格）。",
   "pet.studio.generate": "生成",
   "pet.studio.activate": "放上桌面",
   "pet.studio.removerUsed": "已用 {remover} 去背",

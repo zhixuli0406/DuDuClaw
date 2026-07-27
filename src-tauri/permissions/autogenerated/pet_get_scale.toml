@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pet-get-scale"
+description = "Enables the pet_get_scale command without any pre-configured scope."
+commands.allow = ["pet_get_scale"]
+
+[[permission]]
+identifier = "deny-pet-get-scale"
+description = "Denies the pet_get_scale command without any pre-configured scope."
+commands.deny = ["pet_get_scale"]

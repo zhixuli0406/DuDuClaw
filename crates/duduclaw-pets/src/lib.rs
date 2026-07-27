@@ -13,8 +13,10 @@
 pub mod error;
 pub mod manifest;
 pub mod pack;
+pub mod pixelate;
 pub mod segmentation;
 pub mod slug;
+pub mod sprite_bake;
 
 pub use error::{PetError, Result};
 pub use manifest::{
@@ -22,12 +24,14 @@ pub use manifest::{
 };
 pub use pack::{
     delete_pack, get_active_slug, list_packs, load_active, load_pack, pack_dir, pets_dir,
-    save_procedural_pack, set_active_slug, slug_exists, write_manifest, PetPack,
+    save_procedural_pack, save_sprite_pack, set_active_slug, slug_exists, write_manifest, PetPack,
 };
+pub use pixelate::{pixelate_rgba, quantize_pixel_art, DEFAULT_PALETTE_SIZE, DEFAULT_PIXEL_WIDTH};
 pub use segmentation::{
     models_dir, sha256_hex, BackgroundRemover, ModelSpec, ModelVariant, PassthroughRemover,
     BIREFNET_LITE, SILUETA,
 };
+pub use sprite_bake::{bake_spritesheet, spritesheet_animations, ROWS as SPRITE_ROWS};
 
 #[cfg(feature = "onnx")]
 pub use segmentation::{download_model, OnnxRemover};
@@ -65,6 +69,45 @@ pub fn generate_procedural_pet(
     let cutout = remover.remove_background(photo_bytes)?;
     let unique = allocate_slug(display_name);
     pack::save_procedural_pack(&unique, display_name.trim(), &cutout, photo_bytes)
+}
+
+/// End-to-end pixel-art path: remove the background, quantise the cutout to a
+/// retro pixel sprite, bake an 8×9 Codex Pets spritesheet from deterministic
+/// action transforms, and persist a `sprite`-mode pack. Zero external API.
+///
+/// The original photo is retained verbatim for regeneration. Returns the pack.
+pub fn generate_pixel_sprite_pet(
+    display_name: &str,
+    photo_bytes: &[u8],
+    remover: &dyn BackgroundRemover,
+) -> Result<PetPack> {
+    if slug::sanitize_slug(display_name) == "pet" && display_name.trim().is_empty() {
+        return Err(PetError::InvalidName(display_name.to_string()));
+    }
+    // 1. Background removal → RGBA cutout.
+    let cutout_png = remover.remove_background(photo_bytes)?;
+    let cutout = image::load_from_memory(&cutout_png)
+        .map_err(|e| PetError::Image(format!("decode cutout failed: {e}")))?
+        .to_rgba8();
+    // 2. Pixel-art quantise (canonical low-res sprite).
+    let pixel = pixelate::quantize_pixel_art(
+        &cutout,
+        pixelate::DEFAULT_PIXEL_WIDTH,
+        pixelate::DEFAULT_PALETTE_SIZE,
+    );
+    // 3. Bake the action spritesheet.
+    let sheet = sprite_bake::bake_spritesheet(&pixel);
+    let sheet_png = segmentation::encode_png_rgba(&sheet)?;
+    let animations = sprite_bake::spritesheet_animations();
+    // 4. Persist a sprite-mode pack.
+    let unique = allocate_slug(display_name);
+    pack::save_sprite_pack(
+        &unique,
+        display_name.trim(),
+        &sheet_png,
+        photo_bytes,
+        animations,
+    )
 }
 
 /// Shared test helpers. `DUDUCLAW_HOME` is process-global, so **every** test that
@@ -118,6 +161,31 @@ mod tests {
             // Re-generating with the same name allocates a distinct slug.
             let pack2 = generate_procedural_pet("嘟嘟", &photo, &PassthroughRemover).unwrap();
             assert_eq!(pack2.slug, "嘟嘟-2");
+        });
+    }
+
+    #[test]
+    fn generate_pixel_sprite_end_to_end() {
+        with_temp_home(|| {
+            let photo = tiny_png();
+            let pack = generate_pixel_sprite_pet("像素嘟", &photo, &PassthroughRemover).unwrap();
+            assert_eq!(pack.manifest.mode, PetMode::Sprite);
+            // Sprite pack writes the baked grid + retains the source photo.
+            assert!(pack.dir.join("spritesheet.png").is_file());
+            assert!(pack.dir.join("source.png").is_file());
+            assert_eq!(
+                pack.manifest.spritesheet_path.as_deref(),
+                Some("spritesheet.png")
+            );
+            // All 9 animation rows made it into the manifest.
+            assert_eq!(pack.manifest.animations.len(), SPRITE_ROWS.len());
+            assert!(pack.manifest.animations.contains_key("idle"));
+
+            // pet.json round-trips: reload sees sprite mode + the spritesheet.
+            let loaded = load_pack(&pack.slug).unwrap();
+            assert_eq!(loaded.manifest.mode, PetMode::Sprite);
+            assert!(loaded.image_path().unwrap().ends_with("spritesheet.png"));
+            assert_eq!(loaded.manifest.animations.len(), SPRITE_ROWS.len());
         });
     }
 
