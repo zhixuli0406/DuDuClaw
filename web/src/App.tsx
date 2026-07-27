@@ -23,6 +23,7 @@ const RoutinesPage = lazyPage(() => import('./pages/RoutinesPage'), 'RoutinesPag
 const TimelinePage = lazyPage(() => import('./pages/TimelinePage'), 'TimelinePage');
 const RunsPage = lazyPage(() => import('./pages/RunsPage'), 'RunsPage');
 const CanvasPage = lazyPage(() => import('./pages/CanvasPage'), 'CanvasPage');
+const FilesPage = lazyPage(() => import('./pages/FilesPage'), 'FilesPage');
 const AgentDetailPage = lazyPage(() => import('./pages/AgentDetailPage'), 'AgentDetailPage');
 const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'SkillMarketPage');
 const WidgetsPage = lazyPage(() => import('./pages/WidgetsPage'), 'WidgetsPage');
@@ -73,6 +74,7 @@ const SkillNewPage = lazyPage(() => import('./pages/SkillNewPage'), 'SkillNewPag
 const SkillCustomDetailPage = lazyPage(() => import('./pages/SkillCustomDetailPage'), 'SkillCustomDetailPage');
 const GrowthPage = lazyPage(() => import('./pages/GrowthPage'), 'GrowthPage');
 const MascotOverlayPage = lazyPage(() => import('./pages/MascotOverlayPage'), 'MascotOverlayPage');
+const PetStudioPage = lazyPage(() => import('./pages/PetStudioPage'), 'PetStudioPage');
 const AboutPage = lazyPage(() => import('./pages/AboutPage'), 'AboutPage');
 const DistributorsPage = lazyPage(() => import('./pages/DistributorsPage'), 'DistributorsPage');
 const OSPage = lazyPage(() => import('./pages/OSPage'), 'OSPage');
@@ -140,6 +142,7 @@ export function App() {
                   per agent), so it is open to every authenticated user. */}
               <Route path="runs" element={<RunsPage />} />
               <Route path="canvas" element={<CanvasPage />} />
+              <Route path="files" element={<FilesPage />} />
 
               {/* ── 員工 / 公司 ── */}
               <Route path="agents" element={<AgentsPage />} />
@@ -156,6 +159,8 @@ export function App() {
               <Route path="agents/:id/:tab" element={<AgentDetailPage />} />
               <Route path="memory" element={<MemoryPage />} />
               <Route path="growth" element={<GrowthPage />} />
+              {/* 桌寵工作室 — photo → interactive desktop pet (WP-P2/P3). */}
+              <Route path="pet-studio" element={<PetStudioPage />} />
               <Route path="skills" element={<SkillMarketPage />} />
               <Route path="skills/new" element={<SkillNewPage />} />
               <Route path="skills/custom/:id" element={<SkillCustomDetailPage />} />
