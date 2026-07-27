@@ -3769,5 +3769,7 @@
   "gateway.manual.hint": "支援 http/https；連線前會先驗證。公司伺服器建議使用 HTTPS。",
   "gateway.resolving": "正在為你連線 Gateway…",
   "gateway.autoConnecting": "已偵測到 {name}，正在自動連線…",
-  "gateway.error.unreachable": "無法連線到該 Gateway：{detail}"
+  "gateway.error.unreachable": "無法連線到該 Gateway：{detail}",
+  "pet.studio.dismiss": "收回桌面",
+  "pet.studio.dismissed": "寵物已收回"
 }

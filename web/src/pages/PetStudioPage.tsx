@@ -125,6 +125,16 @@ export function PetStudioPage() {
     [refresh, t]
   );
 
+  const onDeactivate = useCallback(async () => {
+    try {
+      await petActivate(null);
+      toast.success(t('pet.studio.dismissed'));
+      refresh();
+    } catch (e) {
+      toast.error(formatError(e));
+    }
+  }, [refresh, t]);
+
   const onDelete = useCallback(
     async (slug: string) => {
       try {
@@ -334,7 +344,14 @@ export function PetStudioPage() {
                     <span className="flex-1 truncate text-sm" title={p.displayName}>
                       {p.displayName}
                     </span>
-                    {p.active && <Badge variant="secondary">{t('pet.studio.activeBadge')}</Badge>}
+                    {p.active && (
+                      <>
+                        <Badge variant="secondary">{t('pet.studio.activeBadge')}</Badge>
+                        <Button variant="ghost" size="sm" onClick={() => void onDeactivate()}>
+                          {t('pet.studio.dismiss')}
+                        </Button>
+                      </>
+                    )}
                     {!p.active && (
                       <Button variant="ghost" size="sm" onClick={() => void onActivate(p.slug)}>
                         {t('pet.studio.use')}

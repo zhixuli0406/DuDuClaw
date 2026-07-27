@@ -33,10 +33,38 @@ impl BackgroundRemover for PassthroughRemover {
     fn remove_background(&self, image_bytes: &[u8]) -> Result<Vec<u8>> {
         let img = image::load_from_memory(image_bytes)
             .map_err(|e| PetError::Image(format!("decode failed: {e}")))?;
+        let img = apply_exif_orientation(img, image_bytes);
         encode_png_rgba(&img.to_rgba8())
     }
     fn label(&self) -> &'static str {
         "passthrough"
+    }
+}
+
+/// Apply the EXIF `Orientation` tag (phone photos): the `image` decoder keeps
+/// raw sensor orientation, so portrait shots arrive rotated. No/invalid EXIF →
+/// the image is returned untouched.
+pub(crate) fn apply_exif_orientation(
+    img: image::DynamicImage,
+    raw_bytes: &[u8],
+) -> image::DynamicImage {
+    let orientation = exif::Reader::new()
+        .read_from_container(&mut std::io::Cursor::new(raw_bytes))
+        .ok()
+        .and_then(|meta| {
+            meta.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0))
+        })
+        .unwrap_or(1);
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img,
     }
 }
 
@@ -191,9 +219,11 @@ mod onnx_impl {
             use image::imageops::FilterType;
             use ndarray::Array4;
 
-            let orig = image::load_from_memory(image_bytes)
-                .map_err(|e| PetError::Image(format!("decode failed: {e}")))?
-                .to_rgb8();
+            let decoded = image::load_from_memory(image_bytes)
+                .map_err(|e| PetError::Image(format!("decode failed: {e}")))?;
+            // Phone photos carry EXIF orientation the decoder does not apply —
+            // without this the whole pipeline runs on a rotated image.
+            let orig = apply_exif_orientation(decoded, image_bytes).to_rgb8();
             let (ow, oh) = (orig.width(), orig.height());
             let side = self.input_size;
 
@@ -227,17 +257,35 @@ mod onnx_impl {
                 .run(ort::inputs![input_tensor])
                 .map_err(|e| PetError::Inference(format!("run: {e}")))?;
 
-            // The BiRefNet-lite / silueta ONNX exports emit a single output: the
-            // foreground map.
-            let out = outputs
-                .values()
-                .next()
-                .ok_or_else(|| PetError::Inference("no output tensor".into()))?;
-            let (out_shape, out_data) = out
-                .try_extract_tensor::<f32>()
-                .map_err(|e| PetError::Inference(format!("extract: {e}")))?;
-            let shape: Vec<usize> = out_shape.iter().map(|d| *d as usize).collect();
-            let flat: Vec<f32> = out_data.to_vec();
+            // BiRefNet exports can emit SEVERAL maps (coarse decoder stages +
+            // the final refined matte). Grabbing the first map yields a blurry
+            // vignette instead of a segmentation — pick the output with the
+            // largest spatial area; on ties prefer the LAST (refinement order).
+            let mut best: Option<(String, Vec<usize>, Vec<f32>)> = None;
+            for (name, value) in outputs.iter() {
+                let Ok((s, d)) = value.try_extract_tensor::<f32>() else {
+                    continue;
+                };
+                let dims: Vec<usize> = s.iter().map(|d| *d as usize).collect();
+                let area = if dims.len() >= 2 {
+                    dims[dims.len() - 2] * dims[dims.len() - 1]
+                } else {
+                    0
+                };
+                let better = match &best {
+                    None => true,
+                    Some((_, bdims, _)) => {
+                        let barea = bdims[bdims.len() - 2] * bdims[bdims.len() - 1];
+                        area >= barea
+                    }
+                };
+                if better {
+                    best = Some((name.to_string(), dims, d.to_vec()));
+                }
+            }
+            let (out_name, shape, flat) =
+                best.ok_or_else(|| PetError::Inference("no f32 output tensor".into()))?;
+            tracing::debug!(output = %out_name, ?shape, "segmentation output selected");
 
             // The trailing two dims are the mask HxW.
             let (mh, mw) = match shape.len() {
@@ -254,18 +302,28 @@ mod onnx_impl {
             // Take the last mh*mw values (final map when multiple are concatenated).
             let mask = &flat[flat.len() - want..];
 
-            // Min-max normalize to [0,1] (robust across sigmoid/logit outputs).
+            // Map scores to [0,1] probabilities. Logit-range outputs go through
+            // a sigmoid (min-max normalisation instead turns mid-tones into a
+            // translucent veil over the whole photo); already-probabilistic
+            // outputs are clamped as-is.
             let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
             for &v in mask {
                 lo = lo.min(v);
                 hi = hi.max(v);
             }
-            let range = (hi - lo).max(1e-6);
+            let is_logits = lo < -0.05 || hi > 1.05;
+            let to_prob = |v: f32| -> f32 {
+                if is_logits {
+                    1.0 / (1.0 + (-v).exp())
+                } else {
+                    v.clamp(0.0, 1.0)
+                }
+            };
 
             // Rasterize the mask to a grayscale image, then resize to the original.
             let mut mask_img = image::GrayImage::new(mw as u32, mh as u32);
             for (i, &v) in mask.iter().enumerate() {
-                let a = (((v - lo) / range) * 255.0).clamp(0.0, 255.0) as u8;
+                let a = (to_prob(v) * 255.0).clamp(0.0, 255.0) as u8;
                 let (x, y) = ((i % mw) as u32, (i / mw) as u32);
                 mask_img.put_pixel(x, y, image::Luma([a]));
             }

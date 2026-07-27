@@ -3769,5 +3769,7 @@
   "gateway.manual.hint": "http/https 対応。接続前にアドレスを検証します。会社サーバーには HTTPS を推奨します。",
   "gateway.resolving": "Gateway に接続しています…",
   "gateway.autoConnecting": "{name} を検出しました。接続中…",
-  "gateway.error.unreachable": "その Gateway に接続できませんでした: {detail}"
+  "gateway.error.unreachable": "その Gateway に接続できませんでした: {detail}",
+  "pet.studio.dismiss": "デスクから戻す",
+  "pet.studio.dismissed": "ペットを戻しました"
 }
