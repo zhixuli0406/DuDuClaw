@@ -15,6 +15,7 @@
     "windows": [
       {
         "title": "DuDuClaw",
+        "url": "gateway-picker",
         "width": 1280,
         "height": 840,
         "minWidth": 960,

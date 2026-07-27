@@ -219,8 +219,11 @@ impl SidecarManager {
         self.set_status(SidecarStatus::Stopped);
     }
 
-    /// Block (briefly) until the gateway answers on its port, so we only reveal
-    /// the window once the UI can actually load (§D0).
+    /// Block (briefly) until the gateway answers on its port. Retained as a
+    /// readiness primitive; since WP-GW the window boots on the bundled Gateway
+    /// picker (which polls `gateway_local_status` instead of blocking on this),
+    /// so it currently has no caller.
+    #[allow(dead_code)]
     pub fn wait_until_ready(&self, timeout: Duration) -> bool {
         let port = self.port();
         let deadline = std::time::Instant::now() + timeout;

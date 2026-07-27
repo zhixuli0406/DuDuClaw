@@ -367,11 +367,82 @@ docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 
 ---
 
+## 10. Enterprise LAN Deployment (employee desktops → company gateway)
+
+A common enterprise setup: run one gateway on a shared server and have each
+employee's **desktop app** connect to it over the office network. The desktop
+app ships a **Gateway picker** (shown before login) that finds gateways on the
+LAN automatically via mDNS, so employees never type an IP.
+
+### Server side — advertise on the LAN
+
+The gateway advertises itself over mDNS/DNS-SD as `_duduclaw._tcp.local.`. It is
+**on by default**; no action is needed for basic discovery. To reach the gateway
+from other machines, bind to a LAN interface (not loopback):
+
+```toml
+# ~/.duduclaw/config.toml on the gateway server
+[gateway]
+bind = "0.0.0.0"        # reachable on the LAN (default 127.0.0.1 = local only)
+port = 18789
+
+[general]
+name = "Office Gateway"  # shown as the instance name in the desktop picker
+
+[server]
+mdns_advertise = true    # default true; set false to stop LAN broadcasting
+tls = false              # set true when the gateway is fronted by HTTPS (below)
+```
+
+- `mdns_advertise = false` disables the broadcast entirely (e.g. security policy
+  forbids service discovery on the corporate LAN). Employees can still connect by
+  typing `host:port` manually in the picker.
+- The advertisement carries the gateway **version**, the **display name**, and a
+  **`tls` flag** in its TXT record; no credentials or secrets are broadcast.
+- Advertising is best-effort: if mDNS registration fails (locked-down network,
+  no multicast), the gateway logs a warning and serves normally.
+- On graceful shutdown the gateway withdraws the advertisement (mDNS goodbye), so
+  employees stop seeing a gateway that has gone away.
+
+### HTTPS recommendation
+
+mDNS discovery yields a plain `http://<ip>:<port>` endpoint, which is fine on a
+**trusted internal network**. For anything crossing untrusted segments — or as a
+default hardening step — front the gateway with a reverse proxy that terminates
+TLS (see §5 Caddy/Nginx) and set `[server] tls = true` so the picker shows the
+endpoint as HTTPS. Employees can also type the HTTPS proxy hostname manually.
+Remember to add the proxy hostname to `[gateway] allowed_origins` (see §5's
+WebSocket Origin allowlist) or the dashboard WS upgrade will be rejected.
+
+### Employee side — the desktop Gateway picker
+
+On launch the desktop app opens the picker with three ways to connect:
+
+1. **本機 / Local** — the app's own bundled gateway (for solo use).
+2. **區網偵測 / On your network** — gateways discovered via mDNS, with a rescan
+   button. Each row shows name, `host:port`, and version.
+3. **手動輸入 / Manual** — type `192.168.1.10:18789` or `https://gw.company.com`.
+   The address is validated against `/healthz` before connecting; a bad address
+   shows an error and does **not** navigate.
+
+The picker remembers the last gateway and **auto-connects after a 3-second
+countdown**; any interaction cancels it and keeps the picker open. Choosing a
+remote gateway releases the local sidecar (no competing local instance is left
+running). Only `http`/`https` addresses are accepted (fail-closed).
+
+> Discovery only advertises a *display name* — it is not an authentication
+> boundary. Login and authorization are always enforced by the target gateway,
+> so a spoofed advertisement can at most show a misleading name, never bypass
+> auth.
+
+---
+
 ## Quick Reference
 
 | Method | URL | Use Case |
 |--------|-----|----------|
 | Local only | `http://localhost:18789` | Development |
+| Enterprise LAN | mDNS auto-discovery (desktop picker) | Employees → company gateway |
 | Tailscale | `https://xxx.ts.net` | Home server, LINE webhook |
 | ngrok | `https://xxx.ngrok-free.app` | Quick demo |
 | Cloudflare | `https://duduclaw.yourdomain.com` | Production |

@@ -31,6 +31,11 @@ tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# Gateway picker (WP-GW): mDNS LAN discovery + /healthz probing + URL scheme
+# validation. rustls-tls keeps HTTPS gateway probing off system OpenSSL.
+mdns-sd = "0.20"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Photo → desktop-pet pack format + local background removal (WP-P2/P3). The
 # `onnx` feature pulls the ort/onnxruntime path (BiRefNet/silueta); prebuilt
 # onnxruntime binaries resolve on the desktop's native target (aarch64/x86_64

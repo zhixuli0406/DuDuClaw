@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+- **桌面版 Gateway 選擇器 + 區網 mDNS 偵測（WP-GW）**：企業把 gateway 架在公司伺服器，
+  員工桌面 app 啟動即進入「選擇 Gateway」頁（登入前、bundled UI），可選本機、
+  區網自動偵測到的 gateway，或手動輸入公司位址。Gateway 端以 mDNS/DNS-SD 廣播
+  `_duduclaw._tcp.local.`（TXT 帶 version／name／tls），`config.toml [server]
+  mdns_advertise` 預設開、可關（企業防掃描），graceful shutdown 反註冊，廣播失敗
+  只 warn 不擋啟動；新增 `/healthz` JSON 探針（version／name）。桌面端四個 Tauri
+  command：`gateway_discover`（browse 3 秒去重）／`gateway_health`（healthz 2s
+  timeout）／`gateway_select`（scheme 白名單 http/https fail-closed → 存
+  `~/.duduclaw/desktop.json` last+recent≤5 → navigate 主視窗；選遠端釋放本機
+  sidecar）／`gateway_last`。桌面主視窗改為 debug/release 一律先開 bundled
+  `/gateway-picker`（根治舊 debug build 停在 `tauri://localhost` 的 port 錯位），
+  由 picker 觸發 navigate；記住上次選擇並 3 秒倒數自動連（任意互動取消）。三語
+  i18n、Calm Glass。附 `docs/guides/deployment-guide.md` §10 企業區網部署（含
+  `mdns_advertise` 開關與 HTTPS 建議）。
+
 ## [1.45.0] - 2026-07-26 — 客戶實測修復與一鍵串接
 
 ### Added
