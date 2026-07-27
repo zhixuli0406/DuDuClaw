@@ -137,6 +137,10 @@ fn select_pages(
     } else {
         load_personal_namespaces(store.wiki_dir())
     };
+    // WP2.3: namespaces declaring `visible_to_departments = [...]` in
+    // `.scope.toml` are injected only for agents in one of those departments.
+    // Empty/absent policy → no extra restriction (fail-safe).
+    let dept_vis = duduclaw_core::DepartmentVisibilityPolicy::load_for_wiki_dir(store.wiki_dir());
     let mut stripped_personal = 0usize;
     let mut candidates: Vec<RankedPage> = Vec::new();
     for layer in [WikiLayer::Identity, WikiLayer::Core] {
@@ -150,10 +154,12 @@ fn select_pages(
                         stripped_personal += 1;
                         continue; // P3-2: context-collapse — withhold in group
                     }
-                    // WP7: never inject another department's page (or any
-                    // department page for a no-department viewer). Company
-                    // pages always pass.
-                    if !duduclaw_core::department_page_visible(&path, viewer_department) {
+                    // WP7 + WP2.3: never inject another department's page (the
+                    // built-in `departments/<dept>/` isolation) nor a page in a
+                    // namespace whose `visible_to_departments` excludes the
+                    // viewer. Company pages with no declaration always pass; a
+                    // no-department viewer sees neither restricted kind.
+                    if !dept_vis.page_visible(&path, viewer_department) {
                         continue;
                     }
                     candidates.push(RankedPage {
@@ -473,6 +479,50 @@ mode = "agent_writable"
         )
         .unwrap();
         assert!(load_personal_namespaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn scope_toml_department_visibility_filters_injection() {
+        // WP2.3: the injection path loads visible_to_departments from the same
+        // .scope.toml as knowledge_owner / sensitivity, and page_visible
+        // combines the built-in departments/ isolation with the namespace
+        // filter. This proves select_pages' filter reads the file it should.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".scope.toml"),
+            r#"
+[namespaces."hr"]
+mode = "operator_only"
+visible_to_departments = ["hr", "legal"]
+
+[namespaces."sop"]
+mode = "agent_writable"
+"#,
+        )
+        .unwrap();
+        let vis = duduclaw_core::DepartmentVisibilityPolicy::load_for_wiki_dir(dir.path());
+        // hr/* only injected for hr/legal agents; sales + no-dept are excluded.
+        assert!(vis.page_visible("hr/salary.md", Some("hr")));
+        assert!(vis.page_visible("hr/salary.md", Some("legal")));
+        assert!(!vis.page_visible("hr/salary.md", Some("sales")));
+        assert!(!vis.page_visible("hr/salary.md", None));
+        // Undeclared company page stays visible to everyone.
+        assert!(vis.page_visible("sop/deploy.md", None));
+        // Built-in department isolation still applies independently.
+        assert!(!vis.page_visible("departments/art/x.md", Some("hr")));
+    }
+
+    #[test]
+    fn scope_toml_visibility_absent_or_malformed_is_failsafe() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent → empty policy, nothing restricted.
+        let vis = duduclaw_core::DepartmentVisibilityPolicy::load_for_wiki_dir(dir.path());
+        assert!(vis.is_empty());
+        assert!(vis.page_visible("hr/x.md", None));
+        // Malformed → fail-safe empty (never blocks injection).
+        std::fs::write(dir.path().join(".scope.toml"), "not [ valid toml").unwrap();
+        let vis = duduclaw_core::DepartmentVisibilityPolicy::load_for_wiki_dir(dir.path());
+        assert!(vis.is_empty());
     }
 
     #[test]

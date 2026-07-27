@@ -88,3 +88,9 @@ computer_use = false
 browser_via_bash = false
 allowed_tools = []
 denied_tools = []
+
+# WP2.6 §4 — curated skills a QA/evaluator agent typically wants.
+[skills]
+recommended = [
+    "anthropic-skills:webapp-testing",  # drive real app QA flows
+]

@@ -87,3 +87,11 @@ computer_use = false
 browser_via_bash = false
 allowed_tools = []
 denied_tools = []
+
+# WP2.6 §4 — curated skills a manufacturing/operations agent typically wants.
+[skills]
+recommended = [
+    "anthropic-skills:xlsx",  # BOM / production-schedule spreadsheets
+    "anthropic-skills:pdf",   # spec sheets, work orders
+    "anthropic-skills:docx",  # SOP documents
+]

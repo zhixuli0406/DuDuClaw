@@ -88,3 +88,10 @@ computer_use = false
 browser_via_bash = false
 allowed_tools = []
 denied_tools = []
+
+# WP2.6 §4 — curated skills an orchestrator/team-lead agent typically wants.
+[skills]
+recommended = [
+    "anthropic-skills:skill-creator",  # author new team skills
+    "clawhub:pro-code-reviewer",       # review delegated engineering work
+]

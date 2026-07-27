@@ -19,7 +19,9 @@ pub use agent_rename::{rename_in_markdown, synced_trigger};
 pub use config::write_minimal_config;
 pub use cron_tz::{parse_timezone, should_fire_in_tz};
 pub use department::{
-    department_of_page, department_page_visible, is_valid_department, DEPARTMENTS_NAMESPACE,
+    department_of_page, department_page_visible, is_valid_department,
+    namespace_department_visible, top_level_namespace as wiki_top_level_namespace,
+    DepartmentVisibilityPolicy, DEPARTMENTS_NAMESPACE,
 };
 pub use dispatch_guard::{
     check_and_record as dispatch_guard_check, DispatchGuardConfig, DispatchGuardDecision,

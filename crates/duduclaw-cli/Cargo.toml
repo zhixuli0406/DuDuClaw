@@ -70,6 +70,9 @@ axum = { workspace = true }
 futures-util = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 async-trait = { workspace = true }
+# WP2.1/WP2.2: expert-pack install/pack (zip read + write). deflate only —
+# matches the gateway's updater dependency; no zip-bomb-prone extra codecs.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -243,6 +243,37 @@ Both `shared_wiki_write` and `shared_wiki_delete` honour the policy. Unlisted na
 
 Use `wiki_namespace_status` MCP tool to inspect the active policy before writing.
 
+### Department read-visibility (`visible_to_departments`)
+
+The write `mode` above governs *who may write* a namespace. To govern *who may read* it at the **department** level, add a `visible_to_departments` array to the same `[namespaces."x"]` table. Only agents whose `[agent] department` is on the list see that namespace — both in **prompt injection** (auto-injected L0/L1 pages) and via **`shared_wiki_search` / `shared_wiki_read` / `shared_wiki_ls`**.
+
+```toml
+# HR pages are readable only by the hr and legal departments
+[namespaces."hr"]
+mode                   = "operator_only"   # writes: operator only
+visible_to_departments = ["hr", "legal"]   # reads: hr + legal departments only
+```
+
+This is orthogonal to the write `mode` — a namespace may declare either, both, or neither. An agent's department comes from `[agent] department` in its `agent.toml` (empty/absent = no department).
+
+**Fail-closed** for any declared namespace: an agent whose department is not on the list — including an agent with **no department** — is denied. Exact department match only (no prefix/substring). An empty list denies everyone.
+
+**Fail-safe** when undeclared: a namespace without `visible_to_departments` stays readable by all agents, exactly as before. Absent / malformed `.scope.toml` ⇒ no filter.
+
+This layers on top of the built-in `departments/<dept>/` isolation (see Department knowledge layering below): `departments/art/*` is always visible only to the `art` department regardless of `.scope.toml`, while `visible_to_departments` lets an operator restrict *any* namespace (`hr/`, `finance/`, …) to chosen departments. `wiki_namespace_status` surfaces the active `visible_to_departments` declarations.
+
+### Department knowledge & skill layering
+
+Knowledge and skills layer **company → department → personal**:
+
+- **Wiki:** pages under `shared/wiki/departments/<dept>/` are visible only to agents whose `[agent] department` matches `<dept>`; the company layer (every other namespace) is open to all. Read isolation is always enforced.
+- **Skills:** three layers merge per agent with **per-agent > department > global** precedence (nearest wins on a name collision):
+  - global — `~/.duduclaw/skills/` (all agents)
+  - department — `~/.duduclaw/shared/skills/departments/<dept>/` (only agents in `<dept>`)
+  - per-agent — `<agent>/SKILLS/`
+
+Install a skill into the department layer via the `skill_hub_install` MCP tool with `scope = "department:<name>"` (or `"global"` / an agent id). An agent with no department only ever sees the global + per-agent layers.
+
 ---
 
 ## Cloud Ingest Integration

@@ -76,6 +76,19 @@ pub struct GatedManifest {
     /// Debug-rendered `RiskLevel` (`"Low"`, `"Medium"`, …) — for summaries.
     pub risk_level: String,
     pub findings: usize,
+    /// Trust floor of the originating hub (WP2.6 §3 layer-4). Non-`Official`
+    /// sources should be sandbox-TTL trialled before graduation.
+    pub trust_floor: duduclaw_agent::trust_tier::TrustTier,
+    /// Normalized source verdict that passed layer-1 (`clean`/`unknown`/`None`).
+    pub source_verdict: Option<String>,
+}
+
+impl GatedManifest {
+    /// WP2.6 §3 layer-4: everything that is not first-party `Official` must go
+    /// through the sandbox-TTL trial before it can graduate to a shared scope.
+    pub fn requires_sandbox_trial(&self) -> bool {
+        self.trust_floor != duduclaw_agent::trust_tier::TrustTier::Official
+    }
 }
 
 /// Phase 1: fetch `skill_name` from `hub_id` and run it through the
@@ -111,9 +124,25 @@ pub async fn fetch_and_gate(
         return Err(format!("skill '{skill_name}' not found on hub '{hub_id}'"));
     };
 
-    // ── The gate (fail-closed: absent/blank/High-risk ⇒ Err) ─
-    let scan = gate_hub_content(hub_id, skill_name, manifest.content.as_deref())?;
+    // ── Layer 1 (WP2.6 §3): source-side verdict is the first filter ─
+    // A source that flags its own skill as suspicious/malicious is a DENY here
+    // — it does NOT replace our own scan, it precedes it (fail-closed).
+    if duduclaw_agent::skill_hub::verdict_is_blocking(manifest.source_verdict.as_deref()) {
+        return Err(format!(
+            "source '{hub_id}' reports skill '{skill_name}' as {} — install DENIED \
+             (fail-closed: layer-1 source verdict)",
+            manifest.source_verdict.as_deref().unwrap_or("unsafe")
+        ));
+    }
+
+    // ── Content hash (TOCTOU / integrity): DENY on a claimed-hash mismatch ─
     let content = manifest.content.as_deref().unwrap_or_default().to_string();
+    duduclaw_agent::skill_hub::verify_content_hash(&content, manifest.expected_hash.as_deref())?;
+
+    // ── Layers 2+3: SKILL.md as DATA through the 6-category scanner ─
+    // (secrets / prompt-injection / exfiltration / code-exec / size / contract);
+    // fail-closed on absent/blank/High-risk.
+    let scan = gate_hub_content(hub_id, skill_name, manifest.content.as_deref())?;
 
     Ok(GatedManifest {
         hub: hub_id.to_string(),
@@ -121,6 +150,8 @@ pub async fn fetch_and_gate(
         content,
         risk_level: format!("{:?}", scan.risk_level),
         findings: scan.findings.len(),
+        trust_floor: manifest.trust_floor,
+        source_verdict: manifest.source_verdict.clone(),
     })
 }
 
@@ -267,6 +298,25 @@ mod tests {
             "---\nname: notes\ndescription: takes notes\n---\n# Notes\n\nWrite things down.";
         let scan = gate_hub_content("clawhub", "notes", Some(clean)).unwrap();
         assert!(scan.passed);
+    }
+
+    // ── Layer-4: non-official sources require sandbox trial ──
+
+    #[test]
+    fn non_official_requires_sandbox_trial() {
+        use duduclaw_agent::trust_tier::TrustTier;
+        let mut g = GatedManifest {
+            hub: "clawhub".into(),
+            skill_name: "s".into(),
+            content: "x".into(),
+            risk_level: "Low".into(),
+            findings: 0,
+            trust_floor: TrustTier::Active,
+            source_verdict: Some("clean".into()),
+        };
+        assert!(g.requires_sandbox_trial(), "community source ⇒ sandbox trial");
+        g.trust_floor = TrustTier::Official;
+        assert!(!g.requires_sandbox_trial(), "official first-party ⇒ trusted");
     }
 
     // ── Fail-closed #3: unknown hub id denies ────────────────

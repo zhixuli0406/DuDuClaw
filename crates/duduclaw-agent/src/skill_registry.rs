@@ -35,6 +35,24 @@ pub struct SkillIndexEntry {
     /// Derived maintenance-trust tier (official / active / orphan).
     #[serde(default)]
     pub trust_tier: crate::trust_tier::TrustTier,
+    /// Install-popularity signal for WP2.6 ranking. Where a hub reports it, this
+    /// is the **rolling 60-day install count** (ClawHub `metrics.rolling60DayInstalls`,
+    /// skills.sh cross-ecosystem `installs`); 0 when the hub exposes no such
+    /// signal (GitHub search). Feeds `log(1+installs)` in the rank formula.
+    #[serde(default)]
+    pub install_count: u64,
+    /// Canonical upstream URL used for **cross-source dedup** — two hubs that
+    /// surface the same underlying skill (e.g. a GitHub repo also mirrored on a
+    /// marketplace) collapse to one hit keyed by this URL. `None` ⇒ dedup falls
+    /// back to the skill name.
+    #[serde(default)]
+    pub source_url: Option<String>,
+    /// Source-side security verdict (WP2.6 §3 layer-1), normalized: `"clean"`,
+    /// `"suspicious"`, `"malicious"`, `"unknown"`, or `None` when the source
+    /// publishes no verdict. Advisory for ranking; the install gate treats a
+    /// non-clean verdict as a fail-closed DENY signal.
+    #[serde(default)]
+    pub source_verdict: Option<String>,
 }
 
 /// The full skill index with metadata.
@@ -311,6 +329,12 @@ async fn search_github_repos(
                 owner_type,
                 stars,
                 trust_tier,
+                // GitHub search exposes no install metric; repo URL is the
+                // canonical upstream for cross-source dedup. Discovery-only
+                // source: no security verdict.
+                install_count: 0,
+                source_url: Some(html_url.to_string()),
+                source_verdict: None,
             })
         })
         .collect();

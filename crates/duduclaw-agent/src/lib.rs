@@ -10,8 +10,10 @@ pub mod prompt_snapshot;
 pub mod registry;
 pub mod resolver;
 pub mod runner;
+pub mod skill_ext_gap;
 pub mod skill_hub;
 pub mod skill_loader;
+pub mod skill_recommend;
 pub mod skill_registry;
 pub mod trust_tier;
 

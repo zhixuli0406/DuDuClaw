@@ -38,6 +38,7 @@ pub mod license;               // M1: license activate/status/refresh/export/imp
 mod migrate;
 mod export_to;                 // G9: export agents as an agentcompanies/v1 package
 mod migrate_from;              // Painless migration from OpenClaw / Hermes / paperclip
+pub mod expert;                // WP2.1/WP2.2: expert-pack install/pack/list/remove/export
 pub mod odoo_pool;             // RFC-21 §2: per-agent Odoo connector pool
 mod ptc;
 mod service;
@@ -672,6 +673,14 @@ enum Commands {
     ///     duduclaw license deactivate
     #[command(subcommand)]
     License(license::LicenseCommands),
+
+    /// Manage expert packs: portable bundles of a team (agents + hierarchy),
+    /// skills, wiki SOPs, prompts and channel hints. Install native
+    /// `expert.toml` packs or import Claude Code plugins / Agent Skills.
+    Expert {
+        #[command(subcommand)]
+        command: expert::ExpertCommands,
+    },
 
     /// Generate a per-agent usage report (default: last 7 days, Markdown).
     ///
@@ -1429,6 +1438,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Hook(HookCommands::AgentFileGuard) => cmd_hook_agent_file_guard().await,
         Commands::License(license_cmd) => license::run(license_cmd).await,
+        Commands::Expert { command } => expert::run(command).await,
         Commands::WeeklyReport {
             days,
             agent,
@@ -4239,6 +4249,22 @@ fn is_valid_agent_id(id: &str) -> bool {
         && !id.starts_with('-')
         && !id.ends_with('-')
         && !id.contains("..")
+}
+
+/// Normalise an arbitrary source name into a filesystem-safe agent id
+/// (lowercase alphanumeric + hyphen, collapsed dashes, ≤64 chars). Mirrors the
+/// `migrate_from` helper; shared by the expert-pack importers.
+pub(crate) fn sanitize_agent_id(raw: &str) -> String {
+    let lowered = raw.trim().to_lowercase();
+    let mut s: String = lowered
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    while s.contains("--") {
+        s = s.replace("--", "-");
+    }
+    let s = s.trim_matches('-').to_string();
+    duduclaw_core::truncate_chars(&s, 64)
 }
 
 /// `duduclaw agent pause/resume <agent>` - Modify agent.toml status.

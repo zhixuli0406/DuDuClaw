@@ -43,13 +43,25 @@ pub const HUB_GITHUB: &str = "github";
 pub const HUB_CLAWHUB: &str = "clawhub";
 pub const HUB_LOBEHUB: &str = "lobehub";
 pub const HUB_SKILLS_SH: &str = "skills-sh";
+/// anthropics/skills — the official first-party seed repo (WP2.6 P0).
+pub const HUB_ANTHROPIC: &str = "anthropic-skills";
 
 /// All hub ids this build knows how to construct.
-pub const KNOWN_HUB_IDS: &[&str] = &[HUB_GITHUB, HUB_CLAWHUB, HUB_LOBEHUB, HUB_SKILLS_SH];
+pub const KNOWN_HUB_IDS: &[&str] =
+    &[HUB_GITHUB, HUB_CLAWHUB, HUB_LOBEHUB, HUB_SKILLS_SH, HUB_ANTHROPIC];
 
-/// Hubs enabled by default: only first-hand-verified, no-auth sources.
-/// `skills-sh` is deliberately excluded (auth-gated API — see module doc).
-pub const DEFAULT_HUB_IDS: &[&str] = &[HUB_GITHUB, HUB_CLAWHUB, HUB_LOBEHUB];
+/// Hubs enabled by default (WP2.6 P0 set): the official anthropics/skills seed
+/// repo plus the three verified, no-auth marketplaces. `skills-sh` is now a
+/// public read endpoint (verified 2026-07-27) and included as a discovery /
+/// ranking-signal source; it is discovery-only for install (fail-closed at the
+/// gate) since it exposes no skill content.
+pub const DEFAULT_HUB_IDS: &[&str] =
+    &[HUB_ANTHROPIC, HUB_GITHUB, HUB_CLAWHUB, HUB_LOBEHUB, HUB_SKILLS_SH];
+
+/// Per-source search deadline (WP2.6 §1). A hub that does not answer within
+/// this window is reported `[unreachable: <hub>: timeout]` and skipped — one
+/// slow source never stalls the aggregate.
+pub const PER_SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Boxed future so [`SkillHub`] stays dyn-compatible.
 pub type HubFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -70,6 +82,85 @@ pub struct HubManifest {
     pub content: Option<String>,
     /// Human-facing URL for the skill.
     pub url: String,
+    /// SHA-256 (lowercase hex) of `content` when present — the hash of exactly
+    /// the bytes the install gate will write. Recorded for provenance and
+    /// checked against `expected_hash` when the source supplies one.
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    /// Hash the source *claims* for this content (e.g. a pinned commit blob, a
+    /// marketplace `contentHash`). When present, the gate DENIES on mismatch
+    /// (fail-closed, TOCTOU defence). `None` ⇒ no cross-check available.
+    #[serde(default)]
+    pub expected_hash: Option<String>,
+    /// Source-side security verdict (WP2.6 §3 layer-1): `"clean"` /
+    /// `"suspicious"` / `"malicious"` / `"unknown"`, or `None`.
+    #[serde(default)]
+    pub source_verdict: Option<String>,
+    /// Trust floor of the originating hub — non-official sources are forced
+    /// through sandbox-TTL trial before graduation (§3 layer-4).
+    #[serde(default)]
+    pub trust_floor: crate::trust_tier::TrustTier,
+}
+
+impl HubManifest {
+    /// Compute + attach the SHA-256 of the current `content` (no-op when the
+    /// hub served no content). Idempotent.
+    pub fn with_computed_hash(mut self) -> Self {
+        self.content_hash = self.content.as_deref().map(sha256_hex);
+        self
+    }
+}
+
+/// Lowercase-hex SHA-256 of a string — the WP2.6 content-hash primitive.
+/// Uses `ring` (already a crate dependency) so no new hashing crate is pulled in.
+pub fn sha256_hex(s: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Verify installed content against a source-claimed hash (fail-closed).
+/// `Ok(())` when no `expected` is supplied (nothing to check) or it matches;
+/// `Err` on mismatch — the caller must DENY the install.
+pub fn verify_content_hash(content: &str, expected: Option<&str>) -> Result<(), String> {
+    let Some(expected) = expected.map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty())
+    else {
+        return Ok(());
+    };
+    let actual = sha256_hex(content);
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "content hash mismatch — install DENIED (fail-closed): expected {expected}, got {actual}"
+        ))
+    }
+}
+
+/// Normalize a source's raw verdict string into the WP2.6 vocabulary. Unknown
+/// / absent verdicts map to `None` (advisory), while anything indicating
+/// suspicion or a block maps to a non-clean tag the gate treats as DENY.
+pub fn normalize_verdict(raw: Option<&str>) -> Option<String> {
+    let v = raw?.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return None;
+    }
+    let tag = if v.contains("malicious") || v.contains("block") || v.contains("banned") {
+        "malicious"
+    } else if v.contains("suspicious") || v.contains("flag") || v.contains("warn") {
+        "suspicious"
+    } else if v.contains("clean") || v.contains("verified") || v.contains("installable") || v == "ok"
+    {
+        "clean"
+    } else {
+        "unknown"
+    };
+    Some(tag.to_string())
+}
+
+/// True when a source verdict must block an install (fail-closed): anything
+/// that is not explicitly `clean`/`unknown`/absent.
+pub fn verdict_is_blocking(verdict: Option<&str>) -> bool {
+    matches!(verdict, Some("malicious") | Some("suspicious"))
 }
 
 // ── Trait ───────────────────────────────────────────────────
@@ -105,6 +196,13 @@ pub trait SkillHub: Send + Sync {
         home_dir: &'a Path,
         name: &'a str,
     ) -> HubFuture<'a, Result<Option<HubManifest>, String>>;
+
+    /// Trust floor for skills from this source (WP2.6 §1). Official first-party
+    /// sources (anthropics/skills) return `Official`; community marketplaces
+    /// default to `Active` and let per-entry classification demote to `Orphan`.
+    fn trust_floor(&self) -> crate::trust_tier::TrustTier {
+        crate::trust_tier::TrustTier::Active
+    }
 }
 
 // ── Shared cache helpers ────────────────────────────────────
@@ -276,6 +374,10 @@ impl SkillHub for GitHubHub {
                     // GitHub search results are repo links — no inline SKILL.md.
                     content: None,
                     url: s.url.clone(),
+                    content_hash: None,
+                    expected_hash: None,
+                    source_verdict: None,
+                    trust_floor: crate::trust_tier::TrustTier::Active,
                 }))
         })
     }
@@ -284,26 +386,30 @@ impl SkillHub for GitHubHub {
 // ── ClawHub ─────────────────────────────────────────────────
 
 /// ClawHub (`https://clawhub.ai`) — OpenClaw's skill marketplace.
-/// Verified 2026-07-11: `GET /api/v1/skills?limit=N` and
-/// `GET /api/v1/skills/<slug>` respond 200 JSON without authentication; the
-/// detail response carries the full SKILL.md in `skill.description`.
+/// Verified 2026-07-27: `GET /api/v1/search?q=&nonSuspiciousOnly=true` responds
+/// 200 JSON unauthenticated (`{"results":[...]}`) carrying the WP2.6 ranking
+/// signals — `metrics.rolling60DayInstalls`, `official`, and the `trust`
+/// verdict; `GET /api/v1/skills/<slug>` serves the full SKILL.md in
+/// `skill.description` for install.
 #[derive(Debug, Default)]
 pub struct ClawHubHub;
 
 const CLAWHUB_BASE: &str = "https://clawhub.ai";
-const CLAWHUB_LIST_LIMIT: usize = 100;
 
-/// Map a ClawHub `/api/v1/skills` response body to index entries. Pure —
-/// unit-tested against a captured live payload.
-pub fn parse_clawhub_items(body: &serde_json::Value) -> Vec<SkillIndexEntry> {
-    let items = body["items"].as_array().cloned().unwrap_or_default();
-    items
+/// Map a ClawHub `/api/v1/search` response body to index entries. Pure —
+/// unit-tested against a captured live payload (2026-07-27).
+pub fn parse_clawhub_search(body: &serde_json::Value) -> Vec<SkillIndexEntry> {
+    let results = body["results"].as_array().cloned().unwrap_or_default();
+    results
         .iter()
         .filter_map(|item| {
             let slug = item["slug"].as_str()?;
             let display = item["displayName"].as_str().unwrap_or(slug);
             let summary = item["summary"].as_str().unwrap_or("");
-            let topics: Vec<String> = item["topics"]
+            let owner = item["ownerHandle"].as_str().unwrap_or("");
+            let official = item["official"].as_bool().unwrap_or(false);
+            let native_skill = &item["native"]["skill"];
+            let topics: Vec<String> = native_skill["topics"]
                 .as_array()
                 .map(|a| {
                     a.iter()
@@ -311,47 +417,99 @@ pub fn parse_clawhub_items(body: &serde_json::Value) -> Vec<SkillIndexEntry> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let stars = item["stats"]["stars"].as_u64().unwrap_or(0);
-            let updated_ms = item["updatedAt"].as_i64().unwrap_or(0);
+            let stars = native_skill["stats"]["stars"].as_u64().unwrap_or(0);
+            // 60-day install signal for ranking (the exact metric the formula wants).
+            let install_count = item["metrics"]["rolling60DayInstalls"].as_u64().unwrap_or(0);
+            let updated_ms = item["metrics"]["updatedAt"]
+                .as_i64()
+                .or_else(|| native_skill["updatedAt"].as_i64())
+                .unwrap_or(0);
             let pushed_at = chrono::DateTime::<Utc>::from_timestamp_millis(updated_ms)
                 .map(|dt| dt.to_rfc3339());
+            // Canonical human URL: `/owner/skills/slug`.
+            let canonical = item["canonicalUrl"].as_str().unwrap_or("");
+            let url = if canonical.is_empty() {
+                format!("{CLAWHUB_BASE}/skills/{slug}")
+            } else {
+                format!("{CLAWHUB_BASE}{canonical}")
+            };
+            // Source-side verdict (layer-1): fold clawHubVerdict + installability
+            // + isSuspicious into one normalized tag.
+            let raw_verdict = item["trust"]["clawHubVerdict"]
+                .as_str()
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    if native_skill["isSuspicious"].as_bool() == Some(true) {
+                        Some("suspicious".to_string())
+                    } else {
+                        item["trust"]["installability"].as_str().map(|s| s.to_string())
+                    }
+                });
+            let source_verdict = normalize_verdict(raw_verdict.as_deref());
+            let trust_tier = if official {
+                crate::trust_tier::TrustTier::Official
+            } else {
+                crate::trust_tier::classify_trust_tier(
+                    pushed_at.as_deref(),
+                    None,
+                    stars,
+                    Utc::now(),
+                )
+            };
             let mut description = summary.to_string();
             if description.is_empty() {
                 description = display.to_string();
             }
+            // Upstream origin for cross-source dedup, when ClawHub knows it.
+            let source_url = item["install"]["sourceUrl"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| Some(url.clone()));
             Some(SkillIndexEntry {
                 name: slug.to_string(),
                 description,
                 tags: topics,
-                author: String::new(),
-                url: format!("{CLAWHUB_BASE}/skills/{slug}"),
+                author: owner.to_string(),
+                url,
                 compatible: vec!["openclaw".to_string()],
                 pushed_at,
                 owner_type: None,
                 stars,
-                trust_tier: crate::trust_tier::TrustTier::Active,
+                trust_tier,
+                install_count,
+                source_url,
+                source_verdict,
             })
         })
         .collect()
 }
 
-async fn clawhub_fetch_list() -> Result<Vec<SkillIndexEntry>, String> {
+/// Live query against ClawHub search. `nonSuspiciousOnly=true` = the source's
+/// own first-pass filter (layer-1); we still rescan every install locally.
+async fn clawhub_search(query: &str, limit: usize) -> Result<Vec<SkillIndexEntry>, String> {
     let http = http_client()?;
-    let url = format!("{CLAWHUB_BASE}/api/v1/skills");
+    let url = format!("{CLAWHUB_BASE}/api/v1/search");
     let resp = http
         .get(&url)
-        .query(&[("limit", CLAWHUB_LIST_LIMIT.to_string())])
+        .query(&[
+            ("q", query),
+            ("nonSuspiciousOnly", "true"),
+            ("limit", &limit.to_string()),
+        ])
         .send()
         .await
-        .map_err(|e| format!("clawhub request: {e}"))?;
+        .map_err(|e| format!("clawhub search request: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("clawhub API returned {}", resp.status()));
+        return Err(format!("clawhub search API returned {}", resp.status()));
     }
     let body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("clawhub JSON: {e}"))?;
-    Ok(parse_clawhub_items(&body))
+        .map_err(|e| format!("clawhub search JSON: {e}"))?;
+    let mut out = parse_clawhub_search(&body);
+    out.truncate(limit);
+    Ok(out)
 }
 
 impl SkillHub for ClawHubHub {
@@ -363,27 +521,24 @@ impl SkillHub for ClawHubHub {
         true
     }
 
+    // ClawHub `/search` is inherently query-live (anonymous budget 1200/min),
+    // so — unlike the index-cached hubs — it is called directly per query.
     fn search<'a>(
         &'a self,
-        home_dir: &'a Path,
+        _home_dir: &'a Path,
         query: &'a str,
         limit: usize,
     ) -> HubFuture<'a, Result<Vec<SkillIndexEntry>, String>> {
-        Box::pin(async move {
-            let index = cached_index(home_dir, HUB_CLAWHUB, clawhub_fetch_list).await?;
-            Ok(index.search(query, limit).into_iter().cloned().collect())
-        })
+        Box::pin(async move { clawhub_search(query, limit).await })
     }
 
     fn list<'a>(
         &'a self,
-        home_dir: &'a Path,
+        _home_dir: &'a Path,
         limit: usize,
     ) -> HubFuture<'a, Result<Vec<SkillIndexEntry>, String>> {
-        Box::pin(async move {
-            let index = cached_index(home_dir, HUB_CLAWHUB, clawhub_fetch_list).await?;
-            Ok(index.skills.into_iter().take(limit).collect())
-        })
+        // No query ⇒ ask for the popular/featured set via an empty-query search.
+        Box::pin(async move { clawhub_search("", limit).await })
     }
 
     fn fetch_manifest<'a>(
@@ -437,12 +592,29 @@ impl SkillHub for ClawHubHub {
                 .as_str()
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.to_string());
-            Ok(Some(HubManifest {
-                hub: HUB_CLAWHUB.to_string(),
-                name: slug.to_string(),
-                content,
-                url: format!("{CLAWHUB_BASE}/skills/{slug}"),
-            }))
+            // Detail-level verdict (layer-1): isSuspicious flag or a moderation
+            // status, whichever the endpoint exposes.
+            let raw_verdict = if body["skill"]["isSuspicious"].as_bool() == Some(true) {
+                Some("suspicious".to_string())
+            } else {
+                body["moderation"]["status"]
+                    .as_str()
+                    .or_else(|| body["moderation"]["verdict"].as_str())
+                    .map(|s| s.to_string())
+            };
+            Ok(Some(
+                HubManifest {
+                    hub: HUB_CLAWHUB.to_string(),
+                    name: slug.to_string(),
+                    content,
+                    url: format!("{CLAWHUB_BASE}/skills/{slug}"),
+                    content_hash: None,
+                    expected_hash: None,
+                    source_verdict: normalize_verdict(raw_verdict.as_deref()),
+                    trust_floor: crate::trust_tier::TrustTier::Active,
+                }
+                .with_computed_hash(),
+            ))
         })
     }
 }
@@ -498,6 +670,9 @@ pub fn parse_lobehub_index(body: &serde_json::Value) -> Vec<SkillIndexEntry> {
                 owner_type: None,
                 stars: 0,
                 trust_tier: crate::trust_tier::TrustTier::Active,
+                install_count: 0,
+                source_url: p["homepage"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()),
+                source_verdict: None,
             })
         })
         .collect()
@@ -661,32 +836,106 @@ impl SkillHub for LobeHubHub {
                 .text()
                 .await
                 .map_err(|e| format!("lobehub manifest body: {e}"))?;
-            Ok(Some(HubManifest {
-                hub: HUB_LOBEHUB.to_string(),
-                name: name.to_string(),
-                content: Some(text),
-                url: manifest_url,
-            }))
+            Ok(Some(
+                HubManifest {
+                    hub: HUB_LOBEHUB.to_string(),
+                    name: name.to_string(),
+                    content: Some(text),
+                    url: manifest_url,
+                    content_hash: None,
+                    expected_hash: None,
+                    source_verdict: None,
+                    trust_floor: crate::trust_tier::TrustTier::Active,
+                }
+                .with_computed_hash(),
+            ))
         })
     }
 }
 
-// ── skills.sh (UNVERIFIED stub) ─────────────────────────────
+// ── skills.sh ───────────────────────────────────────────────
 
-/// skills.sh (Vercel's Agent Skills Directory) — **UNVERIFIED stub**.
+/// skills.sh — cross-ecosystem Agent Skills directory.
+/// Verified 2026-07-27: `GET https://www.skills.sh/api/search?q=` responds
+/// 200 JSON unauthenticated (`{"skills":[{id, skillId, name, installs, source}]}`).
+/// This is an **uncommitted** third-party interface, so parsing is fail-closed:
+/// a missing/renamed `skills` array disables the source and is reported
+/// upstream rather than silently returning nothing.
 ///
-/// First-hand check 2026-07-11: `GET https://skills.sh/api/v1/skills` and
-/// `/api/v1/skills/search` both return 401 `authentication_required` without
-/// a Vercel OIDC bearer token, which DuDuClaw cannot mint. Per the G5 rule
-/// ("any hub whose API you cannot verify first-hand gets a stub provider
-/// marked UNVERIFIED and is excluded from defaults") every method returns an
-/// honest error; nothing is fabricated.
+/// Discovery-only: skills.sh exposes no skill *content*, so `fetch_manifest`
+/// returns `None` and the install gate denies (fail-closed) — the directory is
+/// a ranking + discovery signal, not an install source.
 #[derive(Debug, Default)]
 pub struct SkillsShHub;
 
-const SKILLS_SH_UNAVAILABLE: &str = "skills.sh API requires a Vercel OIDC bearer token \
-     (verified 2026-07-11: unauthenticated requests return 401 authentication_required) — \
-     hub is an UNVERIFIED stub and is excluded from defaults";
+const SKILLS_SH_BASE: &str = "https://www.skills.sh";
+
+/// Map a skills.sh `/api/search` body to entries. Pure — unit-tested.
+/// Returns `Err` when the committed `skills` array is absent (interface drift):
+/// the caller then reports `[unreachable]` and drops the source, never guesses.
+pub fn parse_skills_sh(body: &serde_json::Value) -> Result<Vec<SkillIndexEntry>, String> {
+    let Some(arr) = body["skills"].as_array() else {
+        return Err(
+            "skills.sh response has no `skills` array — interface drift, source disabled \
+             (fail-closed, not fabricated)"
+                .to_string(),
+        );
+    };
+    Ok(arr
+        .iter()
+        .filter_map(|s| {
+            let name = s["name"].as_str().or_else(|| s["skillId"].as_str())?;
+            let source = s["source"].as_str().unwrap_or("");
+            let installs = s["installs"].as_u64().unwrap_or(0);
+            let author = source.split('/').next().unwrap_or("").to_string();
+            // `source` is an `owner/repo` GitHub slug; `id` adds the skill path.
+            let source_url = if source.is_empty() {
+                None
+            } else {
+                Some(format!("https://github.com/{source}"))
+            };
+            let url = source_url
+                .clone()
+                .unwrap_or_else(|| format!("{SKILLS_SH_BASE}/skills"));
+            Some(SkillIndexEntry {
+                name: name.to_string(),
+                description: String::new(),
+                tags: vec![],
+                author,
+                url,
+                compatible: vec!["claude-code".to_string()],
+                pushed_at: None,
+                owner_type: None,
+                stars: 0,
+                trust_tier: crate::trust_tier::TrustTier::Active,
+                install_count: installs,
+                source_url,
+                source_verdict: None,
+            })
+        })
+        .collect())
+}
+
+async fn skills_sh_search(query: &str, limit: usize) -> Result<Vec<SkillIndexEntry>, String> {
+    let http = http_client()?;
+    let url = format!("{SKILLS_SH_BASE}/api/search");
+    let resp = http
+        .get(&url)
+        .query(&[("q", query)])
+        .send()
+        .await
+        .map_err(|e| format!("skills.sh request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("skills.sh API returned {}", resp.status()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("skills.sh JSON: {e}"))?;
+    let mut out = parse_skills_sh(&body)?;
+    out.truncate(limit);
+    Ok(out)
+}
 
 impl SkillHub for SkillsShHub {
     fn id(&self) -> &str {
@@ -694,24 +943,24 @@ impl SkillHub for SkillsShHub {
     }
 
     fn verified(&self) -> bool {
-        false
+        true
     }
 
     fn search<'a>(
         &'a self,
         _home_dir: &'a Path,
-        _query: &'a str,
-        _limit: usize,
+        query: &'a str,
+        limit: usize,
     ) -> HubFuture<'a, Result<Vec<SkillIndexEntry>, String>> {
-        Box::pin(async move { Err(SKILLS_SH_UNAVAILABLE.to_string()) })
+        Box::pin(async move { skills_sh_search(query, limit).await })
     }
 
     fn list<'a>(
         &'a self,
         _home_dir: &'a Path,
-        _limit: usize,
+        limit: usize,
     ) -> HubFuture<'a, Result<Vec<SkillIndexEntry>, String>> {
-        Box::pin(async move { Err(SKILLS_SH_UNAVAILABLE.to_string()) })
+        Box::pin(async move { skills_sh_search("", limit).await })
     }
 
     fn fetch_manifest<'a>(
@@ -719,7 +968,167 @@ impl SkillHub for SkillsShHub {
         _home_dir: &'a Path,
         _name: &'a str,
     ) -> HubFuture<'a, Result<Option<HubManifest>, String>> {
-        Box::pin(async move { Err(SKILLS_SH_UNAVAILABLE.to_string()) })
+        // Discovery-only: no content interface ⇒ the gate denies (fail-closed).
+        Box::pin(async move { Ok(None) })
+    }
+}
+
+// ── anthropics/skills (official seed repo) ──────────────────
+
+/// The official first-party skills repo `anthropics/skills` (WP2.6 P0).
+/// Skills live at `skills/<name>/SKILL.md`; each is fetched raw from a **pinned
+/// commit SHA** (TOCTOU defence — the tree we index and the blob we install are
+/// the same immutable commit). Trust floor is `Official`.
+#[derive(Debug, Default)]
+pub struct AnthropicSkillsHub;
+
+const ANTHROPIC_OWNER_REPO: &str = "anthropics/skills";
+/// Pinned commit SHA (captured 2026-07-27). Indexing + install both resolve
+/// against this immutable ref; bump deliberately, never float to a branch.
+const ANTHROPIC_PIN_SHA: &str = "b29e7cf65e5cb78a5ac33d582270551bc74a14eb";
+
+/// Parse a GitHub git-trees (recursive) body into official skill entries.
+/// A skill is any blob at `skills/<name>/SKILL.md`; `name` is the middle
+/// segment. Pure — unit-tested against a captured tree.
+pub fn parse_anthropic_tree(body: &serde_json::Value) -> Vec<SkillIndexEntry> {
+    let tree = body["tree"].as_array().cloned().unwrap_or_default();
+    tree.iter()
+        .filter_map(|node| {
+            if node["type"].as_str() != Some("blob") {
+                return None;
+            }
+            let path = node["path"].as_str()?;
+            // Exactly `skills/<name>/SKILL.md` (two-segment prefix, no deeper).
+            let rest = path.strip_prefix("skills/")?;
+            let name = rest.strip_suffix("/SKILL.md")?;
+            if name.is_empty() || name.contains('/') {
+                return None;
+            }
+            Some(SkillIndexEntry {
+                name: name.to_string(),
+                description: format!("Official anthropics/skills skill: {name}"),
+                tags: vec!["official".to_string(), "anthropic".to_string()],
+                author: "anthropics".to_string(),
+                url: format!("https://github.com/{ANTHROPIC_OWNER_REPO}/tree/{ANTHROPIC_PIN_SHA}/skills/{name}"),
+                compatible: vec!["claude-code".to_string()],
+                pushed_at: Some(Utc::now().to_rfc3339()),
+                owner_type: Some("Organization".to_string()),
+                stars: 0,
+                trust_tier: crate::trust_tier::TrustTier::Official,
+                install_count: 0,
+                source_url: Some(format!(
+                    "https://github.com/{ANTHROPIC_OWNER_REPO}/tree/main/skills/{name}"
+                )),
+                source_verdict: Some("clean".to_string()),
+            })
+        })
+        .collect()
+}
+
+async fn anthropic_fetch_tree() -> Result<Vec<SkillIndexEntry>, String> {
+    let http = http_client()?;
+    let url = format!(
+        "https://api.github.com/repos/{ANTHROPIC_OWNER_REPO}/git/trees/{ANTHROPIC_PIN_SHA}?recursive=1"
+    );
+    let resp = http
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("anthropic-skills tree request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("anthropic-skills tree API returned {}", resp.status()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("anthropic-skills tree JSON: {e}"))?;
+    Ok(parse_anthropic_tree(&body))
+}
+
+impl SkillHub for AnthropicSkillsHub {
+    fn id(&self) -> &str {
+        HUB_ANTHROPIC
+    }
+
+    fn verified(&self) -> bool {
+        true
+    }
+
+    fn trust_floor(&self) -> crate::trust_tier::TrustTier {
+        crate::trust_tier::TrustTier::Official
+    }
+
+    fn search<'a>(
+        &'a self,
+        home_dir: &'a Path,
+        query: &'a str,
+        limit: usize,
+    ) -> HubFuture<'a, Result<Vec<SkillIndexEntry>, String>> {
+        Box::pin(async move {
+            let index = cached_index(home_dir, HUB_ANTHROPIC, anthropic_fetch_tree).await?;
+            Ok(index.search(query, limit).into_iter().cloned().collect())
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        home_dir: &'a Path,
+        limit: usize,
+    ) -> HubFuture<'a, Result<Vec<SkillIndexEntry>, String>> {
+        Box::pin(async move {
+            let index = cached_index(home_dir, HUB_ANTHROPIC, anthropic_fetch_tree).await?;
+            Ok(index.skills.into_iter().take(limit).collect())
+        })
+    }
+
+    fn fetch_manifest<'a>(
+        &'a self,
+        _home_dir: &'a Path,
+        name: &'a str,
+    ) -> HubFuture<'a, Result<Option<HubManifest>, String>> {
+        Box::pin(async move {
+            // `name` must be a safe single path segment (the MCP handler
+            // validates; re-check here as this string lands in a URL path).
+            if name.is_empty() || name.contains('/') || name.contains("..") {
+                return Err(format!("invalid anthropic-skills skill name '{name}'"));
+            }
+            let http = http_client()?;
+            // Raw fetch pinned to the same immutable commit as the index.
+            let url = format!(
+                "https://raw.githubusercontent.com/{ANTHROPIC_OWNER_REPO}/{ANTHROPIC_PIN_SHA}/skills/{name}/SKILL.md"
+            );
+            let resp = http
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("anthropic-skills raw request: {e}"))?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if !resp.status().is_success() {
+                return Err(format!("anthropic-skills raw returned {}", resp.status()));
+            }
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| format!("anthropic-skills raw body: {e}"))?;
+            Ok(Some(
+                HubManifest {
+                    hub: HUB_ANTHROPIC.to_string(),
+                    name: name.to_string(),
+                    content: Some(text),
+                    url: format!(
+                        "https://github.com/{ANTHROPIC_OWNER_REPO}/blob/{ANTHROPIC_PIN_SHA}/skills/{name}/SKILL.md"
+                    ),
+                    content_hash: None,
+                    expected_hash: None,
+                    source_verdict: Some("clean".to_string()),
+                    trust_floor: crate::trust_tier::TrustTier::Official,
+                }
+                .with_computed_hash(),
+            ))
+        })
     }
 }
 
@@ -729,7 +1138,10 @@ impl SkillHub for SkillsShHub {
 #[derive(Debug, Clone)]
 pub struct HubHit {
     pub hub: String,
+    /// Raw relevance (term match) score.
     pub score: usize,
+    /// Composite WP2.6 rank (`relevance × trust × installs × freshness`).
+    pub rank: f64,
     pub entry: SkillIndexEntry,
 }
 
@@ -754,8 +1166,59 @@ fn make_hub(id: &str) -> Option<Box<dyn SkillHub>> {
         HUB_CLAWHUB => Some(Box::new(ClawHubHub)),
         HUB_LOBEHUB => Some(Box::new(LobeHubHub)),
         HUB_SKILLS_SH => Some(Box::new(SkillsShHub)),
+        HUB_ANTHROPIC => Some(Box::new(AnthropicSkillsHub)),
         _ => None,
     }
+}
+
+// ── Ranking (WP2.6 §1) ──────────────────────────────────────
+
+/// Number of top slots reserved for `Official`-tier hits (`官方 tier 保底前三`).
+pub const OFFICIAL_FLOOR_SLOTS: usize = 3;
+
+/// Freshness multiplier from an entry's last-activity timestamp: `1.0` while
+/// fresh (≤ [`crate::trust_tier::FRESH_MONTHS`]), decaying linearly to a `0.5`
+/// floor by 24 months; unknown dates are a neutral `0.8` (never a hard demote).
+pub fn freshness_factor(pushed_at: Option<&str>, now: chrono::DateTime<Utc>) -> f64 {
+    const FLOOR: f64 = 0.5;
+    const DECAY_END_MONTHS: f64 = 24.0;
+    let Some(months) = pushed_at
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| (now - d.with_timezone(&Utc)).num_seconds() as f64 / 86_400.0 / 30.44)
+    else {
+        return 0.8;
+    };
+    if months <= crate::trust_tier::FRESH_MONTHS {
+        1.0
+    } else if months >= DECAY_END_MONTHS {
+        FLOOR
+    } else {
+        let span = DECAY_END_MONTHS - crate::trust_tier::FRESH_MONTHS;
+        1.0 - (1.0 - FLOOR) * ((months - crate::trust_tier::FRESH_MONTHS) / span)
+    }
+}
+
+/// The WP2.6 rank score:
+/// `relevance × trust_coeff × (1 + ln(1 + installs)) × freshness`.
+///
+/// The install term is `1 + ln(1+installs)` rather than the bare
+/// `log(1+installs)` from the design sketch so that a zero-install skill keeps
+/// its full relevance × trust × freshness score instead of collapsing to 0.
+pub fn rank_score(entry: &SkillIndexEntry, relevance: usize, now: chrono::DateTime<Utc>) -> f64 {
+    let trust = entry.trust_tier.rank_coefficient();
+    let install = 1.0 + (1.0 + entry.install_count as f64).ln();
+    let fresh = freshness_factor(entry.pushed_at.as_deref(), now);
+    relevance as f64 * trust * install * fresh
+}
+
+/// Dedup key for cross-source merge: the canonical upstream URL when present
+/// (so the same skill mirrored on two hubs collapses to one), else the name.
+fn dedup_key(entry: &SkillIndexEntry) -> String {
+    entry
+        .source_url
+        .as_deref()
+        .map(|u| u.trim_end_matches('/').to_ascii_lowercase())
+        .unwrap_or_else(|| entry.name.to_ascii_lowercase())
 }
 
 impl HubRegistry {
@@ -833,10 +1296,18 @@ impl HubRegistry {
     }
 
     /// Search one hub (`only = Some(id)`) or aggregate across all configured
-    /// hubs (`only = None`). Every hit is (re-)scored with the same
-    /// `score_match` weighting the GitHub index uses; cross-hub duplicates
-    /// (same skill name) keep the higher score, hub declaration order breaks
-    /// ties (earlier hub wins).
+    /// hubs (`only = None`).
+    ///
+    /// WP2.6 semantics:
+    /// - **Per-source 3s deadline** ([`PER_SOURCE_TIMEOUT`]): a slow hub is
+    ///   reported `[unreachable: <hub>: timeout]` and skipped, never blocking.
+    /// - **Fail-honest**: every failing/timed-out hub lands in `errors`.
+    /// - **Cross-source dedup** by canonical `source_url` (else name): the
+    ///   surviving entry keeps the higher relevance, the **max** install count,
+    ///   and the stronger trust tier / verdict across the duplicates.
+    /// - **Rank** = `relevance × trust × (1+ln(1+installs)) × freshness`.
+    /// - **Official floor**: `Official`-tier hits are guaranteed the top
+    ///   [`OFFICIAL_FLOOR_SLOTS`] slots when any exist.
     pub async fn search(
         &self,
         home_dir: &Path,
@@ -846,7 +1317,10 @@ impl HubRegistry {
     ) -> AggregatedSearch {
         let lower = query.to_lowercase();
         let terms: Vec<&str> = lower.split_whitespace().collect();
+        let now = Utc::now();
         let mut out = AggregatedSearch::default();
+        // key → index into out.hits, for O(1) cross-source dedup.
+        let mut by_key: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         for hub in &self.hubs {
             if let Some(want) = only {
@@ -854,44 +1328,127 @@ impl HubRegistry {
                     continue;
                 }
             }
-            match hub.search(home_dir, query, limit).await {
-                Ok(entries) => {
-                    for entry in entries {
-                        let score = score_match(&entry, &terms);
-                        if score == 0 {
-                            continue;
-                        }
-                        // Cross-hub dedupe by exact name: keep the better hit.
-                        if let Some(existing) =
-                            out.hits.iter_mut().find(|h| h.entry.name == entry.name)
-                        {
-                            if score > existing.score {
-                                *existing = HubHit {
-                                    hub: hub.id().to_string(),
-                                    score,
-                                    entry,
-                                };
-                            }
-                            continue;
-                        }
-                        out.hits.push(HubHit {
-                            hub: hub.id().to_string(),
-                            score,
-                            entry,
-                        });
+            let fetched =
+                match tokio::time::timeout(PER_SOURCE_TIMEOUT, hub.search(home_dir, query, limit))
+                    .await
+                {
+                    Ok(Ok(entries)) => entries,
+                    Ok(Err(e)) => {
+                        out.errors.push((hub.id().to_string(), e));
+                        continue;
                     }
+                    Err(_) => {
+                        out.errors.push((
+                            hub.id().to_string(),
+                            format!("timeout after {}s", PER_SOURCE_TIMEOUT.as_secs()),
+                        ));
+                        continue;
+                    }
+                };
+
+            for entry in fetched {
+                let score = score_match(&entry, &terms);
+                if score == 0 {
+                    continue;
                 }
-                Err(e) => out.errors.push((hub.id().to_string(), e)),
+                let key = dedup_key(&entry);
+                if let Some(&idx) = by_key.get(&key) {
+                    merge_duplicate(&mut out.hits[idx], hub.id(), score, entry, now);
+                    continue;
+                }
+                let rank = rank_score(&entry, score, now);
+                by_key.insert(key, out.hits.len());
+                out.hits.push(HubHit {
+                    hub: hub.id().to_string(),
+                    score,
+                    rank,
+                    entry,
+                });
             }
         }
 
+        // Primary order: composite rank desc, name tie-break.
         out.hits.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
+            b.rank
+                .partial_cmp(&a.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.entry.name.cmp(&b.entry.name))
         });
+        promote_official_floor(&mut out.hits);
         out.hits.truncate(limit);
         out
+    }
+}
+
+/// Merge a duplicate hit into the one already kept for its dedup key: adopt the
+/// higher-relevance presentation, take the **max** install count, and keep the
+/// stronger trust tier + any non-clean verdict (so a suspicious mirror can't be
+/// laundered by a clean one).
+fn merge_duplicate(
+    kept: &mut HubHit,
+    hub_id: &str,
+    score: usize,
+    entry: SkillIndexEntry,
+    now: chrono::DateTime<Utc>,
+) {
+    let max_installs = kept.entry.install_count.max(entry.install_count);
+    let stronger_tier = min_tier(kept.entry.trust_tier, entry.trust_tier);
+    // Blocking verdict on either side wins (fail-closed toward suspicion).
+    let verdict = pick_worse_verdict(
+        kept.entry.source_verdict.as_deref(),
+        entry.source_verdict.as_deref(),
+    );
+    if score > kept.score {
+        *kept = HubHit {
+            hub: hub_id.to_string(),
+            score,
+            rank: 0.0,
+            entry,
+        };
+    }
+    kept.entry.install_count = max_installs;
+    kept.entry.trust_tier = stronger_tier;
+    kept.entry.source_verdict = verdict;
+    kept.rank = rank_score(&kept.entry, kept.score, now);
+}
+
+/// The stronger of two trust tiers (Official > Active > Orphan).
+fn min_tier(
+    a: crate::trust_tier::TrustTier,
+    b: crate::trust_tier::TrustTier,
+) -> crate::trust_tier::TrustTier {
+    use crate::trust_tier::TrustTier::*;
+    match (a, b) {
+        (Official, _) | (_, Official) => Official,
+        (Active, _) | (_, Active) => Active,
+        _ => Orphan,
+    }
+}
+
+/// Prefer a blocking verdict over a clean/absent one (fail-closed).
+fn pick_worse_verdict(a: Option<&str>, b: Option<&str>) -> Option<String> {
+    for v in [a, b] {
+        if verdict_is_blocking(v) {
+            return v.map(|s| s.to_string());
+        }
+    }
+    a.or(b).map(|s| s.to_string())
+}
+
+/// Guarantee `Official`-tier hits occupy the first [`OFFICIAL_FLOOR_SLOTS`]
+/// slots (`官方 tier 保底前三`), preserving relative order otherwise. A stable
+/// partial promotion: pull the highest-ranked officials to the front until the
+/// floor is filled or officials run out.
+pub fn promote_official_floor(hits: &mut [HubHit]) {
+    let mut insert_at = 0usize;
+    for i in 0..hits.len() {
+        if insert_at >= OFFICIAL_FLOOR_SLOTS {
+            break;
+        }
+        if hits[i].entry.trust_tier == crate::trust_tier::TrustTier::Official {
+            hits[insert_at..=i].rotate_right(1);
+            insert_at += 1;
+        }
     }
 }
 
@@ -913,6 +1470,9 @@ mod tests {
             owner_type: None,
             stars: 0,
             trust_tier: crate::trust_tier::TrustTier::Active,
+            install_count: 0,
+            source_url: None,
+            source_verdict: None,
         }
     }
 
@@ -965,6 +1525,10 @@ mod tests {
                         name: e.name.clone(),
                         content: Some(format!("# {}", e.name)),
                         url: e.url.clone(),
+                        content_hash: None,
+                        expected_hash: None,
+                        source_verdict: None,
+                        trust_floor: crate::trust_tier::TrustTier::Active,
                     }))
             })
         }
@@ -1052,16 +1616,12 @@ mod tests {
     }
 
     #[test]
-    fn defaults_exclude_unverified_skills_sh() {
+    fn defaults_are_the_wp26_p0_set() {
         let reg = HubRegistry::default_hubs();
         let ids = reg.ids();
-        assert!(ids.contains(&HUB_GITHUB));
-        assert!(ids.contains(&HUB_CLAWHUB));
-        assert!(ids.contains(&HUB_LOBEHUB));
-        assert!(
-            !ids.contains(&HUB_SKILLS_SH),
-            "unverified hub must not be a default"
-        );
+        for id in [HUB_ANTHROPIC, HUB_GITHUB, HUB_CLAWHUB, HUB_LOBEHUB, HUB_SKILLS_SH] {
+            assert!(ids.contains(&id), "default set must include {id}");
+        }
     }
 
     #[test]
@@ -1090,42 +1650,249 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn skills_sh_stub_is_honest_about_unavailability() {
-        let hub = SkillsShHub;
-        assert!(!hub.verified());
-        let err = hub
-            .search(Path::new("/nonexistent"), "x", 5)
-            .await
-            .unwrap_err();
-        assert!(
-            err.contains("401"),
-            "error must cite the first-hand verification: {err}"
-        );
+    #[test]
+    fn clawhub_search_mapping_from_captured_live_payload() {
+        // Shape captured live 2026-07-27 from GET clawhub.ai/api/v1/search.
+        let body: serde_json::Value = serde_json::json!({
+            "results": [{
+                "slug": "code",
+                "displayName": "Code",
+                "summary": "Coding workflow with planning and testing.",
+                "official": false,
+                "ownerHandle": "ivangdavila",
+                "canonicalUrl": "/ivangdavila/skills/code",
+                "downloads": 29082,
+                "metrics": {"bookmarks": 0, "rolling60DayInstalls": 39, "updatedAt": 1778487899210u64},
+                "install": {"kind": "clawhub", "reference": "ivangdavila/code", "sourceUrl": null},
+                "trust": {"clawHubVerdict": null, "installability": "installable"},
+                "native": {"skill": {
+                    "topics": ["Software Development", "Coding"],
+                    "isSuspicious": false,
+                    "stats": {"stars": 52, "installs": 907}
+                }}
+            }]
+        });
+        let entries = parse_clawhub_search(&body);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.name, "code");
+        assert_eq!(e.author, "ivangdavila");
+        assert_eq!(e.tags, vec!["software development", "coding"]);
+        assert_eq!(e.stars, 52);
+        assert_eq!(e.install_count, 39, "60-day install signal");
+        assert_eq!(e.url, "https://clawhub.ai/ivangdavila/skills/code");
+        assert_eq!(e.source_verdict.as_deref(), Some("clean"), "installable → clean");
+        assert!(e.pushed_at.is_some());
     }
 
     #[test]
-    fn clawhub_mapping_from_captured_live_payload() {
-        // Shape captured live 2026-07-11 from GET clawhub.ai/api/v1/skills.
-        let body: serde_json::Value = serde_json::json!({
-            "items": [{
-                "slug": "pro-code-reviewer",
-                "displayName": "Code Reviewer",
-                "summary": "Review code changes against platform-specific rules",
-                "topics": ["Code Review"],
-                "stats": {"comments":0,"downloads":520,"installs":16,"stars":3,"versions":5},
-                "createdAt": 1778223456288u64,
-                "updatedAt": 1783775545882u64
+    fn clawhub_search_flags_suspicious() {
+        let body = serde_json::json!({
+            "results": [{
+                "slug": "sketchy", "displayName": "Sketchy", "summary": "x",
+                "ownerHandle": "who", "canonicalUrl": "/who/skills/sketchy",
+                "metrics": {"rolling60DayInstalls": 1},
+                "trust": {"clawHubVerdict": "suspicious"},
+                "native": {"skill": {"isSuspicious": true, "stats": {"stars": 0}}}
             }]
         });
-        let entries = parse_clawhub_items(&body);
+        let e = &parse_clawhub_search(&body)[0];
+        assert_eq!(e.source_verdict.as_deref(), Some("suspicious"));
+    }
+
+    #[test]
+    fn skills_sh_mapping_and_fail_closed() {
+        // Shape captured live 2026-07-27 from GET www.skills.sh/api/search.
+        let body = serde_json::json!({
+            "query": "code", "searchType": "fuzzy",
+            "skills": [
+                {"id": "mattpocock/skills/code-review", "skillId": "code-review",
+                 "name": "code-review", "installs": 186935, "source": "mattpocock/skills"}
+            ]
+        });
+        let entries = parse_skills_sh(&body).unwrap();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
-        assert_eq!(e.name, "pro-code-reviewer");
-        assert_eq!(e.tags, vec!["code review"]);
-        assert_eq!(e.stars, 3);
-        assert!(e.url.starts_with("https://clawhub.ai/skills/"));
-        assert!(e.pushed_at.is_some());
+        assert_eq!(e.name, "code-review");
+        assert_eq!(e.install_count, 186935);
+        assert_eq!(e.author, "mattpocock");
+        assert_eq!(e.source_url.as_deref(), Some("https://github.com/mattpocock/skills"));
+
+        // Interface drift ⇒ Err (disabled + reported), never a fabricated empty.
+        let drift = serde_json::json!({"unexpected": []});
+        assert!(parse_skills_sh(&drift).is_err());
+    }
+
+    #[test]
+    fn anthropic_tree_maps_official_skills_only() {
+        let body = serde_json::json!({
+            "tree": [
+                {"path": "skills/pdf/SKILL.md", "type": "blob", "sha": "d3e0"},
+                {"path": "skills/xlsx/SKILL.md", "type": "blob", "sha": "9da5"},
+                {"path": "template/SKILL.md", "type": "blob", "sha": "50a4"},      // not under skills/
+                {"path": "skills/pdf/reference/deep/SKILL.md", "type": "blob", "sha": "x"}, // nested
+                {"path": "skills/pdf", "type": "tree", "sha": "y"}                   // dir, not blob
+            ]
+        });
+        let entries = parse_anthropic_tree(&body);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["pdf", "xlsx"], "only skills/<name>/SKILL.md blobs");
+        assert!(entries.iter().all(|e| e.trust_tier == crate::trust_tier::TrustTier::Official));
+        assert!(entries.iter().all(|e| e.source_verdict.as_deref() == Some("clean")));
+    }
+
+    #[test]
+    fn content_hash_roundtrip_and_verify() {
+        let content = "---\nname: x\n---\n# X";
+        let h = sha256_hex(content);
+        assert_eq!(h.len(), 64);
+        assert!(verify_content_hash(content, None).is_ok(), "no expected ⇒ ok");
+        assert!(verify_content_hash(content, Some(&h)).is_ok());
+        assert!(verify_content_hash(content, Some(&h.to_uppercase())).is_ok(), "case-insensitive");
+        assert!(verify_content_hash(content, Some("deadbeef")).is_err(), "mismatch ⇒ DENY");
+    }
+
+    #[test]
+    fn verdict_normalization_and_blocking() {
+        assert_eq!(normalize_verdict(Some("installable")).as_deref(), Some("clean"));
+        assert_eq!(normalize_verdict(Some("SUSPICIOUS")).as_deref(), Some("suspicious"));
+        assert_eq!(normalize_verdict(Some("malicious")).as_deref(), Some("malicious"));
+        assert_eq!(normalize_verdict(Some("weird-status")).as_deref(), Some("unknown"));
+        assert_eq!(normalize_verdict(None), None);
+        assert!(verdict_is_blocking(Some("suspicious")));
+        assert!(verdict_is_blocking(Some("malicious")));
+        assert!(!verdict_is_blocking(Some("clean")));
+        assert!(!verdict_is_blocking(None));
+    }
+
+    #[test]
+    fn rank_rewards_installs_trust_and_freshness() {
+        let now = Utc::now();
+        let mut base = entry("s", "browser helper", &[]);
+        let low = rank_score(&base, 5, now);
+        base.install_count = 10_000;
+        let high_installs = rank_score(&base, 5, now);
+        assert!(high_installs > low, "more installs ⇒ higher rank");
+
+        // Official tier beats active at equal relevance/installs.
+        let mut official = entry("o", "x", &[]);
+        official.trust_tier = crate::trust_tier::TrustTier::Official;
+        let mut orphan = entry("p", "x", &[]);
+        orphan.trust_tier = crate::trust_tier::TrustTier::Orphan;
+        assert!(rank_score(&official, 5, now) > rank_score(&orphan, 5, now));
+
+        // Zero installs must not zero the score (design-sketch fix).
+        assert!(rank_score(&entry("z", "browser", &[]), 5, now) > 0.0);
+    }
+
+    #[test]
+    fn freshness_decays_with_age() {
+        let now = Utc::now();
+        let fresh = (now - chrono::Duration::days(30)).to_rfc3339();
+        let stale = (now - chrono::Duration::days(800)).to_rfc3339();
+        assert_eq!(freshness_factor(Some(&fresh), now), 1.0);
+        assert_eq!(freshness_factor(Some(&stale), now), 0.5, "floors at 0.5");
+        assert_eq!(freshness_factor(None, now), 0.8, "unknown is neutral");
+        assert!(freshness_factor(Some("garbage"), now) == 0.8);
+    }
+
+    #[test]
+    fn official_floor_promotes_to_top_three() {
+        let mk = |name: &str, tier| {
+            let mut e = entry(name, "x", &[]);
+            e.trust_tier = tier;
+            HubHit { hub: "h".into(), score: 1, rank: 1.0, entry: e }
+        };
+        use crate::trust_tier::TrustTier::*;
+        // An official buried at the bottom must surface into the top 3.
+        let mut hits = vec![
+            mk("a", Active),
+            mk("b", Active),
+            mk("c", Active),
+            mk("d", Active),
+            mk("off", Official),
+        ];
+        promote_official_floor(&mut hits);
+        let top3: Vec<&str> = hits[..3].iter().map(|h| h.entry.name.as_str()).collect();
+        assert!(top3.contains(&"off"), "official must be in top 3: {top3:?}");
+    }
+
+    #[tokio::test]
+    async fn source_url_dedup_takes_max_installs_and_worse_verdict() {
+        // Two hubs surface the same upstream repo — must collapse to one hit.
+        let mut a = entry("dup", "browser tool", &[]);
+        a.source_url = Some("https://github.com/owner/repo".into());
+        a.install_count = 5;
+        a.source_verdict = Some("clean".into());
+        let mut b = entry("dup", "browser tool", &[]);
+        b.source_url = Some("https://github.com/owner/repo/".into()); // trailing slash
+        b.install_count = 999;
+        b.source_verdict = Some("suspicious".into());
+
+        let hub_a = MockHub { id: "a", entries: vec![a], fail: false };
+        let hub_b = MockHub { id: "b", entries: vec![b], fail: false };
+        let reg = HubRegistry::with_hubs(vec![Box::new(hub_a), Box::new(hub_b)]);
+        let res = reg.search(Path::new("/nonexistent"), "browser", 10, None).await;
+        assert_eq!(res.hits.len(), 1, "same source_url ⇒ one hit");
+        assert_eq!(res.hits[0].entry.install_count, 999, "max installs kept");
+        assert_eq!(
+            res.hits[0].entry.source_verdict.as_deref(),
+            Some("suspicious"),
+            "worse verdict wins (fail-closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_hub_times_out_and_is_reported() {
+        struct SlowHub;
+        impl SkillHub for SlowHub {
+            fn id(&self) -> &str { "slow" }
+            fn verified(&self) -> bool { true }
+            fn search<'a>(
+                &'a self, _h: &'a Path, _q: &'a str, _l: usize,
+            ) -> HubFuture<'a, Result<Vec<SkillIndexEntry>, String>> {
+                Box::pin(async move {
+                    tokio::time::sleep(PER_SOURCE_TIMEOUT + std::time::Duration::from_secs(2)).await;
+                    Ok(vec![])
+                })
+            }
+            fn list<'a>(
+                &'a self, _h: &'a Path, _l: usize,
+            ) -> HubFuture<'a, Result<Vec<SkillIndexEntry>, String>> {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn fetch_manifest<'a>(
+                &'a self, _h: &'a Path, _n: &'a str,
+            ) -> HubFuture<'a, Result<Option<HubManifest>, String>> {
+                Box::pin(async move { Ok(None) })
+            }
+        }
+        let fast = MockHub { id: "fast", entries: vec![entry("s1", "browser", &[])], fail: false };
+        let reg = HubRegistry::with_hubs(vec![Box::new(fast), Box::new(SlowHub)]);
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(6), reg.search(Path::new("/x"), "browser", 10, None))
+                .await
+                .expect("aggregate must not hang past the per-source deadline");
+        assert_eq!(res.hits.len(), 1, "fast hub still returns");
+        assert!(res.errors.iter().any(|(h, e)| h == "slow" && e.contains("timeout")));
+    }
+
+    /// Real-network smoke: one live ClawHub search. Skips (not fails) when the
+    /// network is unavailable — CI stays green offline.
+    #[tokio::test]
+    async fn smoke_clawhub_search_live() {
+        match clawhub_search("code", 5).await {
+            Ok(hits) => {
+                // Live endpoint reachable — sanity-check the mapping holds.
+                if let Some(h) = hits.first() {
+                    assert!(!h.name.is_empty());
+                    assert!(h.url.starts_with("https://clawhub.ai/"));
+                }
+            }
+            Err(e) => {
+                eprintln!("[smoke skipped] clawhub unreachable: {e}");
+            }
+        }
     }
 
     #[test]

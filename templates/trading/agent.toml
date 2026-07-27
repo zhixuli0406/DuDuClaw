@@ -87,3 +87,10 @@ computer_use = false
 browser_via_bash = false
 allowed_tools = []
 denied_tools = []
+
+# WP2.6 §4 — curated skills a trading/quote-desk agent typically wants.
+[skills]
+recommended = [
+    "anthropic-skills:xlsx",  # price lists, P&L spreadsheets
+    "anthropic-skills:pdf",   # quotes, contracts
+]
