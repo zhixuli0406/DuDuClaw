@@ -19,6 +19,7 @@ import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { ToolCatalogPicker } from '@/components/shared/ToolCatalogPicker';
+import { CapabilityToggles } from '@/components/shared/CapabilityToggles';
 import {
   MoneyField,
   DurationField,
@@ -39,7 +40,9 @@ import {
   Wallet,
   Repeat,
   Settings2,
+  ChevronRight,
 } from 'lucide-react';
+import { cn } from '@/lib/utils';
 import {
   Button,
   Empty,
@@ -260,6 +263,10 @@ export function EditAgentPage() {
   // agents.inspect the first time the 工具與權限 tab opens, so existing values are
   // visible and editable rather than reset to defaults.
   const [capsLoaded, setCapsLoaded] = useState(false);
+  // Raw allowed/denied/policy editors collapse by default — the plain-language
+  // CapabilityToggles are the primary surface; auto-opened by the prefill when
+  // the agent already has an allowlist or Progent policy.
+  const [showAdvancedTools, setShowAdvancedTools] = useState(false);
 
   // OW — v1.39 OS-native [os_watch] form. Prefilled from agents.inspect
   // (`os_watch`) alongside caps; only written when the operator edits it, so an
@@ -415,6 +422,11 @@ export function EditAgentPage() {
           ...c,
           computer_use_config: { ...prev.computer_use_config, ...(c.computer_use_config ?? {}) },
         }));
+        // Auto-expand the advanced editors when the agent already carries
+        // engineer-level config an operator would otherwise not see.
+        if ((c.allowed_tools?.length ?? 0) > 0 || (c.policy?.length ?? 0) > 0) {
+          setShowAdvancedTools(true);
+        }
       }
       // OW — prefill [os_watch] from the raw table (null when unset).
       const ow = detail.os_watch;
@@ -978,28 +990,52 @@ export function EditAgentPage() {
             </SettingsCard>
           </SettingsSection>
 
+          {/* Plain-language feature switches — the primary capability surface
+              for non-engineering operators. Compiles to denied_tools; the raw
+              lists stay editable in the collapsed advanced section below. */}
+          <SettingsSection title={t('agents.cap.toggles.title')} description={t('agents.cap.toggles.desc')}>
+            <CapabilityToggles
+              deniedTools={caps.denied_tools}
+              allowedTools={caps.allowed_tools}
+              onDeniedChange={(v) => updateCap('denied_tools', v)}
+              onClearAllowlist={() => updateCap('allowed_tools', [])}
+            />
+          </SettingsSection>
+
           <SettingsSection title={t('agents.edit.capabilities')} description={t('agents.cap.desc')}>
-            <FieldBlock label={t('agents.cap.allowedTools')} description={t('agents.cap.allowedTools.hint')}>
-              <div className="space-y-2">
-                <ChipEditor values={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} placeholder="Read" addLabel={t('common.add')} />
-                <ToolCatalogPicker triggerLabel={t('agents.cap.toolPicker.add')} selected={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} />
-              </div>
-            </FieldBlock>
-            <FieldBlock label={t('agents.cap.deniedTools')} description={t('agents.cap.deniedTools.hint')}>
-              <div className="space-y-2">
-                <ChipEditor values={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} placeholder="Bash" addLabel={t('common.add')} />
-                <ToolCatalogPicker triggerLabel={t('agents.cap.toolPicker.add')} selected={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} />
-              </div>
-            </FieldBlock>
-            <FieldBlock label={t('agents.cap.wikiVisibleTo')} description={t('agents.cap.wikiVisibleTo.hint')}>
-              <ChipEditor values={caps.wiki_visible_to} onChange={(v) => updateCap('wiki_visible_to', v)} placeholder="coder" addLabel={t('common.add')} />
-            </FieldBlock>
-            <SettingsCard>
-              <RowSwitch label={t('agents.cap.nativeSandbox')} description={t('agents.cap.nativeSandbox.help')} checked={caps.native_sandbox} onChange={(v) => updateCap('native_sandbox', v)} />
-            </SettingsCard>
-            <FieldBlock label={t('agents.cap.policy')} description={t('agents.cap.policy.help')}>
-              <ToolPolicyEditor value={caps.policy} onChange={(v) => updateCap('policy', v)} />
-            </FieldBlock>
+            <button
+              type="button"
+              onClick={() => setShowAdvancedTools((v) => !v)}
+              className="inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <ChevronRight className={cn('size-3.5 transition-transform', showAdvancedTools && 'rotate-90')} />
+              {showAdvancedTools ? t('agents.cap.toggles.hideAdvanced') : t('agents.cap.toggles.showAdvanced')}
+            </button>
+            {showAdvancedTools && (
+              <>
+                <FieldBlock label={t('agents.cap.allowedTools')} description={t('agents.cap.allowedTools.hint')}>
+                  <div className="space-y-2">
+                    <ChipEditor values={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} placeholder="Read" addLabel={t('common.add')} />
+                    <ToolCatalogPicker triggerLabel={t('agents.cap.toolPicker.add')} selected={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} />
+                  </div>
+                </FieldBlock>
+                <FieldBlock label={t('agents.cap.deniedTools')} description={t('agents.cap.deniedTools.hint')}>
+                  <div className="space-y-2">
+                    <ChipEditor values={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} placeholder="Bash" addLabel={t('common.add')} />
+                    <ToolCatalogPicker triggerLabel={t('agents.cap.toolPicker.add')} selected={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} />
+                  </div>
+                </FieldBlock>
+                <FieldBlock label={t('agents.cap.wikiVisibleTo')} description={t('agents.cap.wikiVisibleTo.hint')}>
+                  <ChipEditor values={caps.wiki_visible_to} onChange={(v) => updateCap('wiki_visible_to', v)} placeholder="coder" addLabel={t('common.add')} />
+                </FieldBlock>
+                <SettingsCard>
+                  <RowSwitch label={t('agents.cap.nativeSandbox')} description={t('agents.cap.nativeSandbox.help')} checked={caps.native_sandbox} onChange={(v) => updateCap('native_sandbox', v)} />
+                </SettingsCard>
+                <FieldBlock label={t('agents.cap.policy')} description={t('agents.cap.policy.help')}>
+                  <ToolPolicyEditor value={caps.policy} onChange={(v) => updateCap('policy', v)} />
+                </FieldBlock>
+              </>
+            )}
           </SettingsSection>
 
           <SettingsSection title={t('agents.contract.title')} description={t('agents.contract.desc')}>
