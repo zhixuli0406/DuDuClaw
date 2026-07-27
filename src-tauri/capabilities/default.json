@@ -2,7 +2,10 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capabilities for the DuDuClaw desktop shell (TODO §D).",
-  "windows": ["main", "mascot"],
+  "windows": [
+    "main",
+    "mascot"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-show",
@@ -13,12 +16,34 @@
     "shell:allow-execute",
     {
       "identifier": "shell:allow-spawn",
-      "allow": [{ "name": "binaries/duduclaw", "sidecar": true, "args": true }]
+      "allow": [
+        {
+          "name": "binaries/duduclaw",
+          "sidecar": true,
+          "args": true
+        }
+      ]
     },
     "updater:default",
     "notification:default",
     "autostart:allow-enable",
     "autostart:allow-disable",
-    "autostart:allow-is-enabled"
+    "autostart:allow-is-enabled",
+    "allow-open-main-window",
+    "allow-pet-list",
+    "allow-pet-generate",
+    "allow-pet-active-get",
+    "allow-pet-activate",
+    "allow-pet-remove",
+    "allow-pet-load-active",
+    "allow-pet-model-status",
+    "allow-pet-model-download",
+    "allow-gateway-discover",
+    "allow-gateway-health",
+    "allow-gateway-select",
+    "allow-gateway-last",
+    "allow-gateway-local-status",
+    "allow-gateway-start-local",
+    "allow-gateway-open-picker"
   ]
 }
