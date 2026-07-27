@@ -74,6 +74,7 @@ const SkillNewPage = lazyPage(() => import('./pages/SkillNewPage'), 'SkillNewPag
 const SkillCustomDetailPage = lazyPage(() => import('./pages/SkillCustomDetailPage'), 'SkillCustomDetailPage');
 const GrowthPage = lazyPage(() => import('./pages/GrowthPage'), 'GrowthPage');
 const MascotOverlayPage = lazyPage(() => import('./pages/MascotOverlayPage'), 'MascotOverlayPage');
+const GatewayPickerPage = lazyPage(() => import('./pages/GatewayPickerPage'), 'GatewayPickerPage');
 const PetStudioPage = lazyPage(() => import('./pages/PetStudioPage'), 'PetStudioPage');
 const AboutPage = lazyPage(() => import('./pages/AboutPage'), 'AboutPage');
 const DistributorsPage = lazyPage(() => import('./pages/DistributorsPage'), 'DistributorsPage');
@@ -114,6 +115,9 @@ export function App() {
           <Route path="wizard" element={<OnboardWizardPage />} />
           {/* Tauri desktop-pet mini route (§7.4) — no app shell. */}
           <Route path="mascot-overlay" element={<MascotOverlayPage />} />
+          {/* WP-GW desktop Gateway picker — pre-login, no app shell; redirects
+              to `/` outside Tauri. The desktop main window boots here. */}
+          <Route path="gateway-picker" element={<GatewayPickerPage />} />
           <Route element={<AuthGuard />}>
             <Route element={<MainLayout />}>
               {/* First-run onboarding — mounted OUTSIDE FirstRunGate so the

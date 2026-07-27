@@ -7,13 +7,13 @@
 //! the embedded dashboard in a native window with a tray. NOT compiled in this
 //! environment (no Tauri toolchain) — see Phase D verification notes.
 
+mod gateway_picker;
 mod lifecycle;
 mod mascot_window;
 mod pet_gen;
 mod sidecar;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -63,6 +63,12 @@ fn main() {
             pet_gen::pet_load_active,
             pet_gen::pet_model_status,
             pet_gen::pet_model_download,
+            gateway_picker::gateway_discover,
+            gateway_picker::gateway_health,
+            gateway_picker::gateway_select,
+            gateway_picker::gateway_last,
+            gateway_picker::gateway_local_status,
+            gateway_picker::gateway_start_local,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -74,50 +80,25 @@ fn main() {
                 tracing::warn!("desktop-pet window init failed: {e}");
             }
 
-            // Start (or attach to) the gateway, then point the window at it.
-            let port = manager
-                .start(&handle)
-                .unwrap_or_else(|e| {
-                    tracing::error!("gateway start failed: {e}");
-                    lifecycle::configured_port()
-                });
+            // WP-GW: the main window boots on the bundled Gateway picker
+            // (`/gateway-picker`, set via tauri.conf window url) in BOTH debug
+            // and release — no more `#[cfg]` divergence where debug stalled on
+            // `tauri://localhost` with a port-less `location.host`. The picker
+            // itself triggers navigation via `gateway_select`. Reveal the window
+            // right away; the picker does not wait for the sidecar.
+            if let Some(win) = handle.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
 
-            // Wait briefly for readiness, then navigate + reveal the window so
-            // there is no white flash before the dashboard can load (§D0).
+            // Preheat the local sidecar in the background so the "本機" card is
+            // ready quickly, WITHOUT blocking the picker (design §3). If the user
+            // ends up choosing a remote gateway, `gateway_select` releases it.
             let mgr = manager.clone();
             let handle2 = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let ready = tauri::async_runtime::spawn_blocking(move || {
-                    mgr.wait_until_ready(Duration::from_secs(20))
-                })
-                .await
-                .unwrap_or(false);
-                if !ready {
-                    tracing::warn!("gateway did not become ready in time");
-                }
-                if let Some(win) = handle2.get_webview_window("main") {
-                    // Debug (`cargo tauri dev`): the window already loaded the
-                    // Vite dev server (devUrl :5173), which serves the live web
-                    // app with HMR and proxies /ws + /api to the gateway. Stay on
-                    // it so web edits hot-reload — do NOT navigate to the gateway's
-                    // embedded (compile-time) dist, which would mask local changes.
-                    #[cfg(debug_assertions)]
-                    {
-                        tracing::info!(
-                            "dev: webview stays on Vite devUrl; gateway/backend on port {port}"
-                        );
-                    }
-                    // Release: the bundled webview must be pointed at the gateway's
-                    // embedded dashboard served over loopback.
-                    #[cfg(not(debug_assertions))]
-                    {
-                        let url = format!("http://{}:{}/", lifecycle::DEFAULT_HOST, port);
-                        if let Ok(parsed) = url.parse() {
-                            let _ = win.navigate(parsed);
-                        }
-                    }
-                    let _ = win.show();
-                    let _ = win.set_focus();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = mgr.start(&handle2) {
+                    tracing::error!("local sidecar preheat failed: {e}");
                 }
             });
 

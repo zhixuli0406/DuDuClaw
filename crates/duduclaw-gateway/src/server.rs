@@ -1502,6 +1502,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
+        // `/healthz` — JSON liveness probe used by the desktop Gateway picker
+        // (WP-GW) to validate a manually-entered / discovered gateway and show
+        // its version + name before navigating. No auth (mirrors `/health`).
+        .route("/healthz", get(healthz_handler))
         .route("/metrics", get(crate::metrics::metrics_handler))
         .route("/api/runtime/status", get(crate::runtime_status::handler))
         // Dashboard file panel (WP1.4): list + download an AI staff member's
@@ -1620,6 +1624,45 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .await
         .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
 
+    // LAN discovery: advertise this gateway over mDNS so desktop apps on the
+    // same network can find it (WP-GW). Strictly best-effort — a failure only
+    // warns and never blocks serving. Held for the lifetime of the process and
+    // torn down (unregistered) inside the graceful-shutdown future below.
+    let mdns_advertiser = {
+        let host_os = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .filter(|h| !h.trim().is_empty())
+            .unwrap_or_else(|| "duduclaw".to_string());
+        let cfg_text = std::fs::read_to_string(home_dir.join("config.toml")).unwrap_or_default();
+        let mdns_cfg = crate::mdns::MdnsConfig::from_toml_str(&cfg_text, &host_os);
+        if mdns_cfg.advertise {
+            match crate::mdns::MdnsAdvertiser::start(
+                &mdns_cfg,
+                &host_os,
+                config.port,
+                env!("CARGO_PKG_VERSION"),
+            ) {
+                Ok(adv) => {
+                    info!(
+                        service = %adv.fullname(),
+                        name = %mdns_cfg.name,
+                        "mDNS advertising enabled ({})",
+                        crate::mdns::SERVICE_TYPE
+                    );
+                    Some(adv)
+                }
+                Err(e) => {
+                    warn!("mDNS advertising disabled (register failed): {e}");
+                    None
+                }
+            }
+        } else {
+            info!("mDNS advertising disabled by config ([server] mdns_advertise = false)");
+            None
+        }
+    };
+
     // Serve with graceful shutdown on Ctrl+C.
     //
     // **Round 2 review fix (HIGH-4)**: the worker supervisor's
@@ -1637,6 +1680,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     .with_graceful_shutdown(async move {
         let _ = tokio::signal::ctrl_c().await;
         info!("Shutdown signal received, flushing state...");
+        // Withdraw the LAN advertisement first so peers stop offering a
+        // gateway that is going away (sends the mDNS goodbye packet).
+        if let Some(adv) = mdns_advertiser {
+            info!("Withdrawing mDNS advertisement...");
+            adv.stop();
+        }
         pe_for_shutdown.flush_all().await;
         pe_for_shutdown
             .persist_metacognition(&meta_path_for_shutdown)
@@ -3650,6 +3699,24 @@ fn has_users(user_db: &UserDb) -> bool {
 /// Simple health-check endpoint.
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+/// JSON liveness probe for the desktop Gateway picker (WP-GW). Returns the
+/// gateway version + display name so the picker can show them next to a
+/// discovered / manually-entered endpoint. Unauthenticated, like `/health`.
+async fn healthz_handler() -> Json<serde_json::Value> {
+    let name = std::fs::read_to_string(
+        duduclaw_core::platform::duduclaw_home().join("config.toml"),
+    )
+    .ok()
+    .map(|text| crate::mdns::MdnsConfig::from_toml_str(&text, "DuDuClaw").name)
+    .unwrap_or_else(|| "DuDuClaw".to_string());
+    Json(serde_json::json!({
+        "ok": true,
+        "service": "duduclaw-gateway",
+        "version": env!("CARGO_PKG_VERSION"),
+        "name": name,
+    }))
 }
 
 // ── Reliability Dashboard HTTP endpoint (W20-P0) ─────────────

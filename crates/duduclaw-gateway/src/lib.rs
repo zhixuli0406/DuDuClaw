@@ -152,6 +152,7 @@ pub mod governance;
 pub mod workforce_private;
 pub mod skill_approval;
 pub mod skill_lifecycle;
+pub mod mdns;
 pub mod server;
 pub mod session;
 pub mod session_portability;
