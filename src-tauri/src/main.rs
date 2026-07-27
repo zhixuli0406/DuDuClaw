@@ -9,6 +9,7 @@
 
 mod lifecycle;
 mod mascot_window;
+mod pet_gen;
 mod sidecar;
 
 use std::sync::Arc;
@@ -52,7 +53,17 @@ fn main() {
             None,
         ))
         .manage(manager.clone())
-        .invoke_handler(tauri::generate_handler![open_main_window])
+        .invoke_handler(tauri::generate_handler![
+            open_main_window,
+            pet_gen::pet_list,
+            pet_gen::pet_generate,
+            pet_gen::pet_active_get,
+            pet_gen::pet_activate,
+            pet_gen::pet_remove,
+            pet_gen::pet_load_active,
+            pet_gen::pet_model_status,
+            pet_gen::pet_model_download,
+        ])
         .setup(move |app| {
             let handle = app.handle().clone();
 

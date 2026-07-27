@@ -3,6 +3,8 @@ import { useIntl } from 'react-intl';
 import { DuDu } from '@/components/mascot';
 import type { DuduFace } from '@/components/mascot/faces';
 import { useApprovalsStore } from '@/stores/approvals-store';
+import { PetRuntime } from '@/components/pet/PetRuntime';
+import { isTauri, onPetChanged, petLoadActive, type PetRuntimePayload } from '@/lib/pet';
 
 /**
  * `/mascot-overlay` — the Tauri desktop-pet mini route (§7.4). Rendered inside a
@@ -45,6 +47,34 @@ export function MascotOverlayPage() {
   const [awake, setAwake] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Custom pet pack (WP-P3): if the owner generated one from a photo it replaces
+  // the built-in DuDu SVG with the procedural PetRuntime. Falls back to DuDu when
+  // none is active or we're not in the desktop shell.
+  const [pet, setPet] = useState<PetRuntimePayload | null>(null);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let alive = true;
+    const load = () => {
+      void petLoadActive()
+        .then((p) => {
+          if (alive) setPet(p);
+        })
+        .catch(() => {
+          if (alive) setPet(null);
+        });
+    };
+    load();
+    let unlisten = () => {};
+    void onPetChanged(load).then((fn) => {
+      if (alive) unlisten = fn;
+      else fn();
+    });
+    return () => {
+      alive = false;
+      unlisten();
+    };
+  }, []);
+
   const wake = useCallback(() => {
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
@@ -76,6 +106,12 @@ export function MascotOverlayPage() {
   }, [wake, dozeSoon]);
 
   const hasPending = pending > 0;
+
+  // A custom photo pet takes over the whole overlay with its own runtime.
+  if (pet) {
+    return <PetRuntime pet={pet} pendingCount={pending} onActivate={openMainWindow} />;
+  }
+
   const face: DuduFace = awake ? (hasPending ? 'curious' : 'idle') : 'sleep';
   // Hop only when something is waiting and the pet is dozing (don't fidget while
   // the owner is actively hovering). The `dudu-hop` class is inert under

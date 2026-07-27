@@ -29,6 +29,7 @@ members = [
     "crates/duduclaw-llm",
     "crates/duduclaw-sandbox",
     "crates/duduclaw-os",
+    "crates/duduclaw-pets",
 ]
 
 [workspace.package]
@@ -119,3 +120,4 @@ duduclaw-license = { path = "crates/duduclaw-license" }
 duduclaw-llm = { path = "crates/duduclaw-llm" }
 duduclaw-sandbox = { path = "crates/duduclaw-sandbox" }
 duduclaw-os = { path = "crates/duduclaw-os" }
+duduclaw-pets = { path = "crates/duduclaw-pets", default-features = false }
