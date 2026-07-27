@@ -1504,6 +1504,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/health", get(health_handler))
         .route("/metrics", get(crate::metrics::metrics_handler))
         .route("/api/runtime/status", get(crate::runtime_status::handler))
+        // Dashboard file panel (WP1.4): list + download an AI staff member's
+        // attachment files. Bearer-JWT gated; download also accepts the JWT as
+        // a `token` query param so browser preview/download links work.
+        .route("/api/files", get(handle_files_list))
+        .route("/api/files/download", get(handle_files_download))
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
         .route(
             "/api/reliability/summary",
@@ -2491,6 +2496,184 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+// ── Dashboard file panel (WP1.4) ─────────────────────────────────
+//
+// Two Bearer-JWT-gated endpoints let the dashboard list and download the
+// documents an AI staff member produced/received under its attachments dir:
+//   GET /api/files?agent=<id>                     → JSON [{name,size,mtime}]
+//   GET /api/files/download?agent=<id>&name=<f>   → streamed file
+// When `agent` is omitted both fall back to the shared `<home>/attachments/`.
+// Path safety lives in `crate::files_api` (allowlist + canonicalize
+// containment, fail-closed); see its unit tests.
+
+/// Authenticate a file request and authorize it for the requested `agent`,
+/// mirroring the per-agent fail-closed gate the dashboard RPC layer applies.
+///
+/// The JWT is taken from the `Authorization` header OR the `token_query`
+/// (browser preview/download links can't set a header). Then:
+///   - `Some(agent)` → the user must be able to access that agent
+///     (`can_access_agent`; admins pass all).
+///   - `None` (shared `<home>/attachments/` bucket) → admin only — the shared
+///     bucket belongs to no single agent, so non-admins (who are scoped to
+///     their bound agents) are denied.
+///
+/// Returns an `into_response()`-ready 401/403 on failure.
+fn authorize_file_access(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    token_query: Option<&str>,
+    agent: Option<&str>,
+) -> Result<(), axum::response::Response> {
+    let unauthorized = || {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid or expired token" })),
+        )
+            .into_response()
+    };
+    let token = extract_bearer_token(headers)
+        .or(token_query)
+        .ok_or_else(unauthorized)?;
+    let ctx = authenticate_jwt(state, token).map_err(|_| unauthorized())?;
+
+    let allowed = match agent {
+        Some(a) => ctx.can_access_agent(a),
+        None => ctx.is_admin(),
+    };
+    if !allowed {
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "access denied" })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct FilesListQuery {
+    agent: Option<String>,
+}
+
+/// GET /api/files — list attachment files for an agent (or the shared dir).
+async fn handle_files_list(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<FilesListQuery>,
+) -> axum::response::Response {
+    let agent = q.agent.as_deref().filter(|s| !s.is_empty());
+    if let Err(resp) = authorize_file_access(&state, &headers, None, agent) {
+        return resp;
+    }
+    let dir = match crate::files_api::attachments_dir(&state.home_dir, agent) {
+        Some(d) => d,
+        None => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid agent id" })),
+            )
+                .into_response();
+        }
+    };
+    let files = crate::files_api::list_files(&dir);
+    Json(serde_json::json!({ "files": files })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct FilesDownloadQuery {
+    agent: Option<String>,
+    name: String,
+    /// Optional JWT for browser preview/download links that cannot set an
+    /// `Authorization` header (`window.open` / `<a href>`).
+    token: Option<String>,
+}
+
+/// GET /api/files/download — stream a single attachment file.
+async fn handle_files_download(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<FilesDownloadQuery>,
+) -> axum::response::Response {
+    let agent = q.agent.as_deref().filter(|s| !s.is_empty());
+    // Auth (header or `token` query) + per-agent authorization, fail-closed.
+    if let Err(resp) = authorize_file_access(&state, &headers, q.token.as_deref(), agent) {
+        return resp;
+    }
+
+    let dir = match crate::files_api::attachments_dir(&state.home_dir, agent) {
+        Some(d) => d,
+        None => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid agent id" })),
+            )
+                .into_response();
+        }
+    };
+
+    let path = match crate::files_api::resolve_download(&dir, &q.name) {
+        Ok(p) => p,
+        Err(crate::files_api::ResolveError::BadRequest) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid file name" })),
+            )
+                .into_response();
+        }
+        Err(crate::files_api::ResolveError::Denied) => {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "access denied" })),
+            )
+                .into_response();
+        }
+        Err(crate::files_api::ResolveError::NotFound) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "file not found" })),
+            )
+                .into_response();
+        }
+    };
+
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "file not found" })),
+            )
+                .into_response();
+        }
+    };
+
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+    let ct = crate::files_api::content_type_for(&q.name);
+    let disposition = if crate::files_api::is_inline_previewable(&q.name) {
+        "inline"
+    } else {
+        "attachment"
+    };
+    // RFC 5987 filename* keeps CJK filenames intact across the header.
+    let cd = format!(
+        "{disposition}; filename*=UTF-8''{}",
+        crate::files_api::encode_filename_star(&q.name)
+    );
+
+    let mut resp = axum::response::Response::new(body);
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(ct),
+    );
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_str(&cd)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
+    );
+    resp
 }
 
 // ── Voice endpoints (openhuman-parity B: STT + TTS) ──────────────

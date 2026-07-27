@@ -57,6 +57,7 @@ pub mod mcp_internal_key;
 pub mod decision_capture;
 pub mod cron_scheduler;
 pub mod cron_store;
+pub mod cron_templates;
 pub mod license_runtime;
 pub mod task_store;
 pub mod partner_store;
@@ -115,6 +116,7 @@ pub mod mcp_oauth;
 pub mod mcp_scan;
 pub mod media;
 pub mod model_capabilities;
+pub mod office_docs;
 pub mod tts;
 pub mod stt;
 pub mod lifecycle_flush;
@@ -135,6 +137,7 @@ pub mod prompt_identity;
 pub mod prompt_minimal;
 pub mod protocol;
 pub mod pty_runtime;
+pub mod files_api;
 pub mod runtime_models;
 pub mod runtime_status;
 pub mod worker_supervisor;
@@ -230,5 +233,8 @@ pub mod dispatch_policy;
 // ── D5: semi-automatic topology evolution (edge optimization, human-gated) ──
 pub mod topology_evolution;
 pub mod goal_plan;
+// ── WP2.4: structured outcome acceptance — deterministic (zero-LLM) validation
+//         of a goal's ```json / files:<glob> contract before the MAV judge ──
+pub mod outcome_spec;
 // ── P2a: goal-loop channel push + decision (needs_human exit + autonomy kickoff) ──
 pub mod goal_notify;

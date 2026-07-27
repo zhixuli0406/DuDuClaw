@@ -257,21 +257,22 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     };
 
     let msg_type = message.get("message_type").and_then(|v| v.as_str()).unwrap_or("");
-    if msg_type != "text" {
+    // WP1.3: also accept file / image messages (downloaded below).
+    if !matches!(msg_type, "text" | "file" | "image") {
         return;
     }
 
-    // Parse content JSON: {"text":"hello"}
+    // Parse content JSON. text: {"text":"hi"}; file: {"file_key","file_name"};
+    // image: {"image_key"}.
     let content_str = message.get("content").and_then(|v| v.as_str()).unwrap_or("{}");
-    let raw_text = serde_json::from_str::<serde_json::Value>(content_str)
-        .ok()
-        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
-        .unwrap_or_default();
+    let content_val =
+        serde_json::from_str::<serde_json::Value>(content_str).unwrap_or_default();
+    let raw_text = content_val
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
     let text = strip_feishu_mentions(&raw_text);
-
-    if text.is_empty() {
-        return;
-    }
 
     let chat_id = message.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
     let msg_id = message.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -282,7 +283,50 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    info!("📩 Feishu [{sender}]: {}", truncate_bytes(&text, 80));
+    // WP1.3: download a file/image resource via the message resource API
+    // (Bearer tenant token) into the resolved agent's dir.
+    let mut attachment_lines: Vec<String> = Vec::new();
+    if matches!(msg_type, "file" | "image") && !msg_id.is_empty() {
+        let (key_field, res_type, default_name) = if msg_type == "image" {
+            ("image_key", "image", "image.png")
+        } else {
+            ("file_key", "file", "file")
+        };
+        if let Some(file_key) = content_val.get(key_field).and_then(|v| v.as_str()) {
+            let filename = content_val
+                .get("file_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(default_name);
+            match download_feishu_resource(state, msg_id, file_key, res_type).await {
+                Ok(bytes) => {
+                    let attach_base = crate::channel_reply::resolve_attachment_base(
+                        state.ctx.as_ref(), None,
+                    ).await;
+                    match crate::media::save_attachment_in_base(&attach_base, &bytes, filename).await {
+                        Ok(path) => attachment_lines.push(crate::media::format_attachment_ref(
+                            &crate::media::MediaType::File, filename, &path,
+                        )),
+                        Err(e) => warn!("Feishu: failed to save attachment {filename}: {e}"),
+                    }
+                }
+                Err(e) => warn!("Feishu: failed to download resource {file_key}: {e}"),
+            }
+        }
+    }
+
+    let input_text = if attachment_lines.is_empty() {
+        text.clone()
+    } else if text.is_empty() {
+        attachment_lines.join("\n")
+    } else {
+        format!("{text}\n\n{}", attachment_lines.join("\n"))
+    };
+
+    if input_text.trim().is_empty() {
+        return;
+    }
+
+    info!("📩 Feishu [{sender}]: {}", truncate_bytes(&input_text, 80));
 
     // Chat commands
     if crate::chat_commands::is_command(&text) {
@@ -339,7 +383,27 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     });
 
     let session_id = format!("feishu:{chat_id}");
-    let reply = build_reply_with_session(&text, &state.ctx, &session_id, sender, Some(on_progress)).await;
+    let reply = build_reply_with_session(&input_text, &state.ctx, &session_id, sender, Some(on_progress)).await;
+
+    // WP1.3: 📎DELIVER: outbound — upload generated files via the Feishu file
+    // API, strip the marker. Uses the tenant token for the sender.
+    let reply = match state.get_token().await {
+        Ok(token) => {
+            let doc_sender = crate::channel_sender::FeishuSender {
+                access_token: token,
+                chat_id: chat_id.to_string(),
+                http: state.http.clone(),
+            };
+            crate::channel_reply::deliver_documents_for_reply(
+                state.ctx.as_ref(), None, reply, &doc_sender,
+            ).await
+        }
+        Err(e) => {
+            // Token unavailable — strip markers so the raw marker never leaks.
+            warn!(chat_id, "Feishu: token unavailable for DELIVER: {e}");
+            crate::office_docs::parse_deliverables(&reply).0
+        }
+    };
 
     // Guard: don't send empty replies
     if reply.trim().is_empty() {
@@ -377,6 +441,29 @@ enum FeishuTarget<'a> {
     Reply(&'a str),
     /// Direct send to a chat id.
     Chat(&'a str),
+}
+
+/// WP1.3: download a file/image resource attached to an inbound message via the
+/// Feishu message resource API (`type` = `file` | `image`). `file_key` is DATA
+/// from the event — it is percent-safe (Feishu keys are `[A-Za-z0-9_-]`) and
+/// the URL is SSRF-validated by `download_url`.
+async fn download_feishu_resource(
+    state: &FeishuState,
+    message_id: &str,
+    file_key: &str,
+    res_type: &str,
+) -> Result<Vec<u8>, String> {
+    let token = state.get_token().await?;
+    let url = format!(
+        "{FEISHU_API}/im/v1/messages/{message_id}/resources/{file_key}?type={res_type}"
+    );
+    crate::media::download_url(
+        &state.http,
+        &url,
+        Some(("Authorization", &format!("Bearer {token}"))),
+        crate::media::MAX_FILE_SIZE as usize,
+    )
+    .await
 }
 
 /// Send a raw Feishu message payload (`msg_type` + pre-serialised

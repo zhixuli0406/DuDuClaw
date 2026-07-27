@@ -362,7 +362,14 @@ async fn handle_event(
     let raw_text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let text = strip_bot_mention(raw_text);
     let text = text.as_str();
-    if text.is_empty() {
+    // WP1.3: a message may carry only file attachments (no text) — still
+    // process it. Genuinely empty messages (no text, no files) are ignored.
+    let has_files = event
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if text.is_empty() && !has_files {
         return;
     }
 
@@ -514,12 +521,60 @@ async fn handle_event(
         });
     });
 
-    let reply = if let Some(agent) = agent_name {
-        build_reply_for_agent(text, ctx, agent, &session_id, user, Some(on_progress)).await
+    // WP1.3: download Slack file attachments (url_private + Bearer bot token)
+    // to the resolved agent's dir, then append markdown refs to the prompt.
+    let mut attachment_lines: Vec<String> = Vec::new();
+    if let Some(files) = event.get("files").and_then(|v| v.as_array()) {
+        let attach_base =
+            crate::channel_reply::resolve_attachment_base(ctx.as_ref(), agent_name).await;
+        for f in files {
+            let url = f
+                .get("url_private_download")
+                .or_else(|| f.get("url_private"))
+                .and_then(|v| v.as_str());
+            let Some(url) = url else { continue };
+            let mime = f.get("mimetype").and_then(|v| v.as_str()).unwrap_or("application/octet-stream");
+            let filename = f.get("name").and_then(|v| v.as_str()).unwrap_or("file");
+            let mt = crate::media::media_type_from_mime(mime);
+            match crate::media::download_url(
+                http, url, Some(("Authorization", &format!("Bearer {bot_token}"))),
+                crate::media::MAX_FILE_SIZE as usize,
+            )
+            .await
+            {
+                Ok(bytes) => match crate::media::save_attachment_in_base(&attach_base, &bytes, filename).await {
+                    Ok(path) => attachment_lines.push(crate::media::format_attachment_ref(&mt, filename, &path)),
+                    Err(e) => warn!("Slack: failed to save attachment {filename}: {e}"),
+                },
+                Err(e) => warn!("Slack: failed to download attachment {filename}: {e}"),
+            }
+        }
+    }
+    let input_text = if attachment_lines.is_empty() {
+        text.to_string()
+    } else if text.is_empty() {
+        attachment_lines.join("\n")
     } else {
-        build_reply_with_session(text, ctx, &session_id, user, Some(on_progress)).await
+        format!("{text}\n\n{}", attachment_lines.join("\n"))
+    };
+
+    let reply = if let Some(agent) = agent_name {
+        build_reply_for_agent(&input_text, ctx, agent, &session_id, user, Some(on_progress)).await
+    } else {
+        build_reply_with_session(&input_text, ctx, &session_id, user, Some(on_progress)).await
     };
     drop(status_guard);
+
+    // WP1.3: 📎DELIVER: outbound — upload generated files via Slack, strip marker.
+    let reply = {
+        let sender = crate::channel_sender::SlackSender {
+            bot_token: bot_token.to_string(),
+            channel_id: channel.to_string(),
+            user_id: user.to_string(),
+            http: http.clone(),
+        };
+        crate::channel_reply::deliver_documents_for_reply(ctx.as_ref(), agent_name, reply, &sender).await
+    };
 
     // Remove the interim progress message — the final reply supersedes it.
     if let Some(pts) = progress_msg_cleanup.lock().await.take() {

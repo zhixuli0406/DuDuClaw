@@ -1194,25 +1194,42 @@ async fn handle_message_create(
 
     let content = data["content"].as_str().unwrap_or("");
 
-    // Extract image attachment URLs from the message
-    let attachment_lines: Vec<String> = data["attachments"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|att| {
-                    let url = att["url"].as_str()?;
-                    let content_type = att["content_type"].as_str().unwrap_or("");
-                    let filename = att["filename"].as_str().unwrap_or("file");
-                    // Only forward image attachments (Claude supports vision)
-                    if content_type.starts_with("image/") {
-                        Some(format!("[Attached image: {filename}]({url})"))
-                    } else {
-                        Some(format!("[Attached file: {filename}]({url})"))
+    // WP1.3: download attachments to disk (agent-Readable absolute paths) so
+    // office documents can be parsed by skills, not just linked. Files land in
+    // the shared `{home}/attachments/` (the DELIVER validator trusts this root
+    // too); download failures degrade to a plain URL reference.
+    let mut attachment_lines: Vec<String> = Vec::new();
+    if let Some(arr) = data["attachments"].as_array() {
+        let attach_base =
+            crate::channel_reply::resolve_attachment_base(ctx.as_ref(), agent_name).await;
+        for att in arr {
+            let Some(url) = att["url"].as_str() else { continue };
+            let content_type = att["content_type"].as_str().unwrap_or("application/octet-stream");
+            let filename = att["filename"].as_str().unwrap_or("file");
+            let mt = crate::media::media_type_from_mime(content_type);
+            match crate::media::download_url(
+                &ctx.http, url, None, crate::media::MAX_FILE_SIZE as usize,
+            )
+            .await
+            {
+                Ok(bytes) => {
+                    match crate::media::save_attachment_in_base(&attach_base, &bytes, filename).await {
+                        Ok(path) => {
+                            attachment_lines.push(crate::media::format_attachment_ref(&mt, filename, &path));
+                        }
+                        Err(e) => {
+                            warn!("Discord: failed to save attachment {filename}: {e}");
+                            attachment_lines.push(format!("[Attached file: {filename}]({url})"));
+                        }
                     }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                }
+                Err(e) => {
+                    warn!("Discord: failed to download attachment {filename}: {e}");
+                    attachment_lines.push(format!("[Attached file: {filename}]({url})"));
+                }
+            }
+        }
+    }
 
     if content.is_empty() && attachment_lines.is_empty() {
         return;
@@ -1545,6 +1562,20 @@ async fn handle_message_create(
 
     // Stop typing (explicit drop; also runs automatically on panic via Drop)
     drop(typing_guard);
+
+    // WP1.3: 📎DELIVER: outbound — upload any generated files to Discord and
+    // strip the marker. Byte-identical no-op when no marker is present.
+    let reply = {
+        let sender = crate::channel_sender::DiscordSender {
+            bot_token: token.to_string(),
+            channel_id: reply_channel_id.clone(),
+            user_id: user_id.to_string(),
+            http: http.clone(),
+        };
+        crate::channel_reply::deliver_documents_for_reply(
+            ctx.as_ref(), effective_agent.as_deref(), reply, &sender,
+        ).await
+    };
 
     // ── Guard: don't send empty replies (Discord rejects empty content) ──
     if reply.trim().is_empty() {
