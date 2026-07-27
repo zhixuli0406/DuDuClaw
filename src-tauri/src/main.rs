@@ -69,6 +69,7 @@ fn main() {
             gateway_picker::gateway_last,
             gateway_picker::gateway_local_status,
             gateway_picker::gateway_start_local,
+            gateway_picker::gateway_open_picker,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -86,10 +87,18 @@ fn main() {
             // `tauri://localhost` with a port-less `location.host`. The picker
             // itself triggers navigation via `gateway_select`. Reveal the window
             // right away; the picker does not wait for the sidecar.
-            if let Some(win) = handle.get_webview_window("main") {
+            let picker_home = if let Some(win) = handle.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.set_focus();
-            }
+                win.url().ok()
+            } else {
+                None
+            };
+            // Stash the bundled picker URL so the tray "切換 Gateway" item can
+            // navigate back to it even after the window loads a remote gateway.
+            app.manage(gateway_picker::PickerHome(std::sync::Mutex::new(
+                picker_home,
+            )));
 
             // Preheat the local sidecar in the background so the "本機" card is
             // ready quickly, WITHOUT blocking the picker (design §3). If the user
@@ -135,12 +144,16 @@ fn show_main_window(app: &AppHandle) {
 
 fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "開啟 DuDuClaw", true, None::<&str>)?;
+    let switch_gw = MenuItem::with_id(app, "switch_gateway", "切換 Gateway", true, None::<&str>)?;
     let mascot = MenuItem::with_id(app, "toggle_mascot", "顯示/隱藏桌寵", true, None::<&str>)?;
     let restart = MenuItem::with_id(app, "restart", "重啟背景服務", true, None::<&str>)?;
     let status = MenuItem::with_id(app, "status", tray_status_label(manager), false, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "結束", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &mascot, &status, &restart, &sep, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&open, &switch_gw, &mascot, &status, &restart, &sep, &quit],
+    )?;
 
     let manager_for_menu = manager.clone();
     TrayIconBuilder::with_id("main-tray")
@@ -149,6 +162,11 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
+            "switch_gateway" => {
+                if let Err(e) = gateway_picker::open_picker(app) {
+                    tracing::warn!("open gateway picker failed: {e}");
+                }
+            }
             "toggle_mascot" => {
                 if let Err(e) = mascot_window::toggle_mascot_window(app) {
                     tracing::warn!("toggle desktop pet failed: {e}");

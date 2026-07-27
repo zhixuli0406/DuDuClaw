@@ -5,11 +5,15 @@
 //! module advertises the gateway as `_duduclaw._tcp.local.` so the desktop
 //! shell's `gateway_discover` command can browse and list reachable gateways.
 //!
-//! Design (`commercial/docs/design-gateway-picker.md` §2):
+//! Design (`commercial/docs/design-gateway-picker.md` §2 / §2.5):
 //! - service type `_duduclaw._tcp.local.`, instance = the gateway's display name
 //! - TXT records: `version`, `name`, `tls=0/1`
-//! - `config.toml [server] mdns_advertise` (default **true**, operators can
-//!   disable to avoid LAN scanning); `[server] tls` marks an HTTPS front
+//! - `config.toml [server] mdns_advertise` (default **false** since §2.5 — an
+//!   opt-in "office gateway" broadcasts, everyone else stays quiet to prevent
+//!   gateway sprawl on the LAN); `[server] tls` marks an HTTPS front
+//! - env override `DUDUCLAW_MDNS_ADVERTISE` (`0`/`1`) takes precedence over
+//!   config — desktop-app sidecars inject `=0` so an employee laptop never
+//!   turns into a discoverable gateway
 //! - register on startup, unregister on graceful shutdown
 //! - advertising is strictly best-effort: any failure is logged as a warning
 //!   and never blocks the gateway from serving.
@@ -19,10 +23,26 @@ use mdns_sd::{ServiceDaemon, ServiceInfo};
 /// The DNS-SD service type all DuDuClaw gateways advertise under.
 pub const SERVICE_TYPE: &str = "_duduclaw._tcp.local.";
 
+/// Env var overriding `[server] mdns_advertise`. Takes precedence over config so
+/// desktop-app sidecars can inject `DUDUCLAW_MDNS_ADVERTISE=0` and never appear
+/// on the LAN, regardless of what the user's `config.toml` says.
+pub const MDNS_ADVERTISE_ENV: &str = "DUDUCLAW_MDNS_ADVERTISE";
+
+/// Resolve the effective advertise decision: an env override (if it parses to a
+/// bool) wins; otherwise the config value stands. Unset / garbage env falls
+/// through to config — the env can only *decide*, never accidentally flip on a
+/// malformed value.
+pub fn resolve_advertise(config_advertise: bool, env_val: Option<&str>) -> bool {
+    match env_val.and_then(parse_bool) {
+        Some(v) => v,
+        None => config_advertise,
+    }
+}
+
 /// Resolved advertising settings, parsed from `config.toml` (fail-safe).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MdnsConfig {
-    /// Whether to advertise at all (`[server] mdns_advertise`, default true).
+    /// Whether to advertise at all (`[server] mdns_advertise`, default false).
     pub advertise: bool,
     /// Human-facing instance name (`[general] name`, default = hostname).
     pub name: String,
@@ -40,8 +60,9 @@ impl MdnsConfig {
     ///
     /// A minimal section-aware line scanner — deliberately dependency-free so
     /// the parse stays trivially testable and mirrors `lifecycle`-style config
-    /// readers elsewhere. `[server] mdns_advertise` defaults to **true** (opt
-    /// out, not opt in).
+    /// readers elsewhere. `[server] mdns_advertise` defaults to **false** (opt
+    /// in, not opt out — only a deliberately-configured office gateway
+    /// broadcasts; see design §2.5 "防 gateway 蔓延").
     pub fn from_toml_str(text: &str, default_name: &str) -> Self {
         let mut advertise: Option<bool> = None;
         let mut tls: Option<bool> = None;
@@ -80,7 +101,7 @@ impl MdnsConfig {
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| default_name.to_string());
         MdnsConfig {
-            advertise: advertise.unwrap_or(true),
+            advertise: advertise.unwrap_or(false),
             name: if name.trim().is_empty() {
                 "DuDuClaw".to_string()
             } else {
@@ -241,17 +262,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_defaults_to_advertise_true_with_hostname() {
-        // Empty config → advertise on, name = provided hostname default, tls off.
+    fn config_defaults_to_advertise_false_with_hostname() {
+        // Empty config → advertise OFF by default (§2.5 opt-in), name = provided
+        // hostname default, tls off.
         let cfg = MdnsConfig::from_toml_str("", "office-server");
         assert_eq!(
             cfg,
             MdnsConfig {
-                advertise: true,
+                advertise: false,
                 name: "office-server".to_string(),
                 tls: false,
             }
         );
+    }
+
+    #[test]
+    fn config_opt_in_true_enables_advertising() {
+        let cfg = MdnsConfig::from_toml_str("[server]\nmdns_advertise = true\n", "h");
+        assert!(cfg.advertise);
     }
 
     #[test]
@@ -289,9 +317,24 @@ mdns_advertise = 1  # inline comment
     fn config_bool_variants_and_bad_values_fail_safe() {
         assert!(MdnsConfig::from_toml_str("[server]\nmdns_advertise = yes\n", "h").advertise);
         assert!(!MdnsConfig::from_toml_str("[server]\nmdns_advertise = off\n", "h").advertise);
-        // Garbage value → default true (fail-safe: keep advertising unless told
-        // otherwise explicitly).
-        assert!(MdnsConfig::from_toml_str("[server]\nmdns_advertise = maybe\n", "h").advertise);
+        // Garbage value → default false (fail-safe: stay quiet unless explicitly
+        // told to broadcast).
+        assert!(!MdnsConfig::from_toml_str("[server]\nmdns_advertise = maybe\n", "h").advertise);
+    }
+
+    #[test]
+    fn env_override_takes_precedence_over_config() {
+        // Env forces OFF even when config opted in.
+        assert!(!resolve_advertise(true, Some("0")));
+        assert!(!resolve_advertise(true, Some("false")));
+        // Env forces ON even when config (default) is off.
+        assert!(resolve_advertise(false, Some("1")));
+        assert!(resolve_advertise(true, Some("on")));
+        // Unset or garbage env → config value stands (env can't flip on a typo).
+        assert!(!resolve_advertise(false, None));
+        assert!(resolve_advertise(true, None));
+        assert!(resolve_advertise(true, Some("maybe")));
+        assert!(!resolve_advertise(false, Some("garbage")));
     }
 
     #[test]

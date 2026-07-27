@@ -1636,7 +1636,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             .unwrap_or_else(|| "duduclaw".to_string());
         let cfg_text = std::fs::read_to_string(home_dir.join("config.toml")).unwrap_or_default();
         let mdns_cfg = crate::mdns::MdnsConfig::from_toml_str(&cfg_text, &host_os);
-        if mdns_cfg.advertise {
+        // Env override (`DUDUCLAW_MDNS_ADVERTISE`) wins over config — desktop-app
+        // sidecars inject `=0` so an employee laptop never advertises (§2.5).
+        let env_override = std::env::var(crate::mdns::MDNS_ADVERTISE_ENV).ok();
+        let advertise = crate::mdns::resolve_advertise(mdns_cfg.advertise, env_override.as_deref());
+        if advertise {
             match crate::mdns::MdnsAdvertiser::start(
                 &mdns_cfg,
                 &host_os,
@@ -1658,7 +1662,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 }
             }
         } else {
-            info!("mDNS advertising disabled by config ([server] mdns_advertise = false)");
+            info!(
+                "mDNS advertising disabled ([server] mdns_advertise defaults off; \
+                 set = true to broadcast, or DUDUCLAW_MDNS_ADVERTISE env to override)"
+            );
             None
         }
     };

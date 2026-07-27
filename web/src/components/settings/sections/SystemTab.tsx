@@ -14,18 +14,35 @@ import {
   SettingsSaveState,
 } from '@/components/mds';
 import { AdvancedSection, DangerZone, type SelectOption } from '@/components/settings/controls';
-import { RowSelect } from '@/pages/agent-form/form-rows';
+import { RowSelect, RowSwitch } from '@/pages/agent-form/form-rows';
 
 // Secret-manager backends the gateway's system.update_config accepts.
 const SM_BACKENDS = ['local', 'vault', 'env', 'onepassword', 'infisical'];
+
+// [gateway] bind presets shown in the dropdown; anything else is "custom".
+type BindMode = 'loopback' | 'lan' | 'custom';
+const bindToMode = (v: string): BindMode =>
+  v === '0.0.0.0' ? 'lan' : v === '' || v === '127.0.0.1' ? 'loopback' : 'custom';
+
+// Client-side fail-closed IP check (the gateway re-validates authoritatively).
+// Accepts IPv4 dotted-quad and loose IPv6; rejects hostnames / injection.
+const isValidIp = (raw: string): boolean => {
+  const s = raw.trim();
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) return s.split('.').every((n) => Number(n) <= 255);
+  return s.includes(':') && /^[0-9a-fA-F:]+$/.test(s);
+};
 
 // ── G — System tab (gateway / rotation / general / logging / secret_manager) ──
 
 export function SystemTab() {
   const intl = useIntl();
   const { agents, fetchAgents } = useAgentsStore();
+  // [server] — display name + LAN advertising (restart required).
+  const [name, setName] = useState('');
+  const [mdnsAdvertise, setMdnsAdvertise] = useState(false);
   // [gateway] — bind/port require restart; auth_token is write-only.
   const [bind, setBind] = useState('');
+  const [bindMode, setBindMode] = useState<BindMode>('loopback');
   const [port, setPort] = useState('');
   const [authToken, setAuthToken] = useState('');
   // [rotation]
@@ -59,7 +76,17 @@ export function SystemTab() {
       const raw = (res as Record<string, unknown>)?.config;
       if (typeof raw !== 'string') return;
       const m = (re: RegExp) => raw.match(re)?.[1];
-      setBind(m(/\bbind\s*=\s*"([^"]*)"/) ?? '');
+      // Scope name/mdns to their own sections so a `name`/`mdns_advertise`
+      // elsewhere in config.toml can't be misread.
+      const section = (h: string) =>
+        raw.match(new RegExp(`\\[${h}\\]([\\s\\S]*?)(?:\\n\\s*\\[|$)`))?.[1] ?? '';
+      const general = section('general');
+      const server = section('server');
+      setName(general.match(/\bname\s*=\s*"([^"]*)"/)?.[1] ?? '');
+      setMdnsAdvertise(/\bmdns_advertise\s*=\s*true\b/.test(server));
+      const bindVal = m(/\bbind\s*=\s*"([^"]*)"/) ?? '';
+      setBind(bindVal);
+      setBindMode(bindToMode(bindVal));
       setPort(m(/\bport\s*=\s*(\d+)/) ?? '');
       setHealthInterval(m(/health_check_interval_seconds\s*=\s*(\d+)/) ?? '');
       setCooldown(m(/cooldown_after_rate_limit_seconds\s*=\s*(\d+)/) ?? '');
@@ -96,10 +123,18 @@ export function SystemTab() {
   };
 
   const handleSave = async () => {
+    // Fail-closed on a custom bind IP before touching the network — instant
+    // feedback; the gateway re-validates server-side regardless.
+    if (bindMode === 'custom' && bind.trim() !== '' && !isValidIp(bind)) {
+      toast.error(intl.formatMessage({ id: 'settings.system.bind.invalid' }));
+      return;
+    }
     setSaving(true);
     setSaved(false);
     try {
       const payload: Record<string, unknown> = {};
+      payload.name = name.trim();
+      payload.mdns_advertise = mdnsAdvertise;
       if (bind.trim() !== '') payload.bind = bind.trim();
       if (port.trim() !== '') payload.port = Number(port);
       if (authToken.trim() !== '') payload.auth_token = authToken.trim();
@@ -141,9 +176,60 @@ export function SystemTab() {
   const smOptions: SelectOption[] = SM_BACKENDS.map((v) => ({
     value: v, label: intl.formatMessage({ id: `settings.smBackend.${v}` }), raw: v,
   }));
+  const bindModeOptions: SelectOption[] = (['loopback', 'lan', 'custom'] as BindMode[]).map((v) => ({
+    value: v, label: intl.formatMessage({ id: `settings.system.bind.${v}` }), raw: v,
+  }));
+
+  const onBindModeChange = (m: string) => {
+    setBindMode(m as BindMode);
+    if (m === 'loopback') setBind('127.0.0.1');
+    else if (m === 'lan') setBind('0.0.0.0');
+    else setBind(''); // custom: user types the IP below
+  };
 
   return (
     <div className="space-y-8">
+      {/* Server — display name + LAN binding/broadcast (mostly restart-required) */}
+      <SettingsSection
+        title={intl.formatMessage({ id: 'settings.system.server' })}
+        description={intl.formatMessage({ id: 'settings.system.server.desc' })}
+      >
+        <SettingsCard>
+          <SettingsRow
+            label={intl.formatMessage({ id: 'settings.system.name' })}
+            description={intl.formatMessage({ id: 'settings.system.name.help' })}
+            tier="text"
+          >
+            <Input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Office Gateway" maxLength={64} />
+          </SettingsRow>
+        </SettingsCard>
+        <DangerZone
+          title={intl.formatMessage({ id: 'settings.system.dangerTitle' })}
+          description={intl.formatMessage({ id: 'settings.system.serverRestart' })}
+        >
+          <SettingsCard>
+            <RowSelect
+              label={intl.formatMessage({ id: 'settings.system.bind' })}
+              description={intl.formatMessage({ id: 'settings.system.bind.help' })}
+              value={bindMode}
+              onChange={onBindModeChange}
+              options={bindModeOptions}
+            />
+            {bindMode === 'custom' && (
+              <SettingsRow label={intl.formatMessage({ id: 'settings.system.bind.custom' })} tier="text">
+                <Input type="text" value={bind} onChange={(e) => setBind(e.target.value)} placeholder="192.168.1.10" />
+              </SettingsRow>
+            )}
+            <RowSwitch
+              label={intl.formatMessage({ id: 'settings.system.mdns' })}
+              description={intl.formatMessage({ id: 'settings.system.mdns.help' })}
+              checked={mdnsAdvertise}
+              onChange={setMdnsAdvertise}
+            />
+          </SettingsCard>
+        </DangerZone>
+      </SettingsSection>
+
       {/* Gateway network binding — restart-required, can lock you out */}
       <SettingsSection title={intl.formatMessage({ id: 'settings.system.gateway' })}>
         <DangerZone
@@ -151,9 +237,6 @@ export function SystemTab() {
           description={intl.formatMessage({ id: 'settings.system.dangerDesc' })}
         >
           <SettingsCard>
-            <SettingsRow label={intl.formatMessage({ id: 'settings.system.bind' })} description={intl.formatMessage({ id: 'settings.system.bind.help' })} tier="text">
-              <Input type="text" value={bind} onChange={(e) => setBind(e.target.value)} placeholder="0.0.0.0" />
-            </SettingsRow>
             <SettingsRow label={intl.formatMessage({ id: 'settings.system.port' })} description={intl.formatMessage({ id: 'settings.system.port.help' })} tier="select">
               <Input type="number" min={1} max={65535} value={port} onChange={(e) => setPort(e.target.value)} placeholder="3100" />
             </SettingsRow>

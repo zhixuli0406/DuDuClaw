@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Changed
+- **Gateway 選擇器 v2：自動選擇＋防 mDNS 蔓延（WP-GW §2.5）**：桌面 app 啟動改為
+  **自動選擇**——記住的 gateway `/healthz` 通就直接連（不再顯示清單或倒數）；沒記住者
+  掃描區網，恰 1 個自動連並 toast、多個顯示清單、0 個自動啟動本機；記住的 gateway 連不上
+  才落到 picker。tray 選單新增「切換 Gateway」隨時重開 picker（帶 `switch=1` 標記略過
+  自動連）。防蔓延三道閘：`[server] mdns_advertise` **預設值改為 false**（明確開啟制，
+  只有刻意設定的辦公室 gateway 會出現在偵測清單）；新增 env override
+  `DUDUCLAW_MDNS_ADVERTISE`（`0`/`1`，優先於 config）；桌面 app spawn 的本機 sidecar
+  一律注入 `DUDUCLAW_MDNS_ADVERTISE=0`（員工桌面永不變成區網 gateway）。廣播開關納入
+  dashboard **設定 → 系統 → 伺服器**（admin-only，含顯示名／bind／mDNS 開關，bind 與
+  廣播變更標示需重啟）。`docs/guides/deployment-guide.md` §10 同步更新。
+
 ### Added
 - **桌面版 Gateway 選擇器 + 區網 mDNS 偵測（WP-GW）**：企業把 gateway 架在公司伺服器，
   員工桌面 app 啟動即進入「選擇 Gateway」頁（登入前、bundled UI），可選本機、
