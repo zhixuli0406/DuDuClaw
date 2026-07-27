@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pet-active-get"
+description = "Enables the pet_active_get command without any pre-configured scope."
+commands.allow = ["pet_active_get"]
+
+[[permission]]
+identifier = "deny-pet-active-get"
+description = "Denies the pet_active_get command without any pre-configured scope."
+commands.deny = ["pet_active_get"]

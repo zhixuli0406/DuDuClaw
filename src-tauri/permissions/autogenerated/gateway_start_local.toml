@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-start-local"
+description = "Enables the gateway_start_local command without any pre-configured scope."
+commands.allow = ["gateway_start_local"]
+
+[[permission]]
+identifier = "deny-gateway-start-local"
+description = "Denies the gateway_start_local command without any pre-configured scope."
+commands.deny = ["gateway_start_local"]

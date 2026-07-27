@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-last"
+description = "Enables the gateway_last command without any pre-configured scope."
+commands.allow = ["gateway_last"]
+
+[[permission]]
+identifier = "deny-gateway-last"
+description = "Denies the gateway_last command without any pre-configured scope."
+commands.deny = ["gateway_last"]

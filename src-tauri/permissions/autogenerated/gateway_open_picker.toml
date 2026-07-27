@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-open-picker"
+description = "Enables the gateway_open_picker command without any pre-configured scope."
+commands.allow = ["gateway_open_picker"]
+
+[[permission]]
+identifier = "deny-gateway-open-picker"
+description = "Denies the gateway_open_picker command without any pre-configured scope."
+commands.deny = ["gateway_open_picker"]

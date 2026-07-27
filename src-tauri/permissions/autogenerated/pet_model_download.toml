@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pet-model-download"
+description = "Enables the pet_model_download command without any pre-configured scope."
+commands.allow = ["pet_model_download"]
+
+[[permission]]
+identifier = "deny-pet-model-download"
+description = "Denies the pet_model_download command without any pre-configured scope."
+commands.deny = ["pet_model_download"]
