@@ -18,6 +18,7 @@ import {
 import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { ChipEditor } from '@/components/shared/ChipEditor';
+import { ToolCatalogPicker } from '@/components/shared/ToolCatalogPicker';
 import {
   MoneyField,
   DurationField,
@@ -979,10 +980,16 @@ export function EditAgentPage() {
 
           <SettingsSection title={t('agents.edit.capabilities')} description={t('agents.cap.desc')}>
             <FieldBlock label={t('agents.cap.allowedTools')} description={t('agents.cap.allowedTools.hint')}>
-              <ChipEditor values={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} placeholder="Read" addLabel={t('common.add')} />
+              <div className="space-y-2">
+                <ChipEditor values={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} placeholder="Read" addLabel={t('common.add')} />
+                <ToolCatalogPicker triggerLabel={t('agents.cap.toolPicker.add')} selected={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} />
+              </div>
             </FieldBlock>
             <FieldBlock label={t('agents.cap.deniedTools')} description={t('agents.cap.deniedTools.hint')}>
-              <ChipEditor values={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} placeholder="Bash" addLabel={t('common.add')} />
+              <div className="space-y-2">
+                <ChipEditor values={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} placeholder="Bash" addLabel={t('common.add')} />
+                <ToolCatalogPicker triggerLabel={t('agents.cap.toolPicker.add')} selected={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} />
+              </div>
             </FieldBlock>
             <FieldBlock label={t('agents.cap.wikiVisibleTo')} description={t('agents.cap.wikiVisibleTo.hint')}>
               <ChipEditor values={caps.wiki_visible_to} onChange={(v) => updateCap('wiki_visible_to', v)} placeholder="coder" addLabel={t('common.add')} />

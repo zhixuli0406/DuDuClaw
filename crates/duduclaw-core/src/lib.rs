@@ -11,6 +11,7 @@ pub mod match_utils;
 pub mod platform;
 pub mod sensitivity;
 pub mod text_utils;
+pub mod tool_catalog;
 pub mod traits;
 pub mod types;
 
@@ -33,6 +34,7 @@ pub use match_utils::{is_valid_egress_host, origin_host_matches, word_contains_c
 pub use platform::{duduclaw_home, duduclaw_instance, expand_tilde, home_dir, mcp_server_key};
 pub use sensitivity::{is_private_session, perception_source_sensitivity, Sensitivity};
 pub use text_utils::{truncate_bytes, truncate_chars};
+pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
 pub use traits::{Channel, ContainerRuntime, MemoryEngine};
 pub use types::*;
 

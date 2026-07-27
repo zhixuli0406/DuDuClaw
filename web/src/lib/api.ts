@@ -1905,6 +1905,25 @@ export interface ToolCatalogEntry {
   description: string;
 }
 
+/** One entry in the built-in tool catalog (`tools.builtin_catalog`) — a
+ *  concrete tool an agent can be granted/denied via `[capabilities]
+ *  allowed_tools` / `denied_tools`. Sourced from `duduclaw_core::tool_catalog`,
+ *  the single source of truth that mirrors `mcp_auth::tool_requires_scope`. */
+export interface BuiltinToolEntry {
+  /** Bare tool name, e.g. `office_script` or `Bash`. */
+  name: string;
+  /** The exact string to add to the allow/deny list. MCP tools are
+   *  `mcp__duduclaw__<name>`; native Claude tools use the bare name. */
+  qualified: string;
+  description: string;
+  /** MCP scope Display form (e.g. `skill:execute`), or `''` for native tools. */
+  scope: string;
+  /** UI grouping category (`channel` / `memory` / `wiki` / `office` / ...). */
+  category: string;
+  /** `mcp` for DuDuClaw MCP tools, `claude` for native Claude Code tools. */
+  kind: string;
+}
+
 // ── SKS: global [skill_synthesis] auto-run (W19-P1) ─────────────
 
 /** Skill-synthesis auto-run scheduler config from `skill_synthesis.get`. */
@@ -3259,6 +3278,10 @@ export const api = {
   tools: {
     catalog: () =>
       client.call('tools.catalog') as Promise<{ tools: ToolCatalogEntry[] }>,
+    /** Built-in tool catalog for the capability editor picker. Readable by any
+     *  authenticated user (same tier as `agents.list`). */
+    builtinCatalog: () =>
+      client.call('tools.builtin_catalog') as Promise<{ tools: BuiltinToolEntry[] }>,
   },
   skillMarket: {
     search: (query: string) =>
