@@ -8,8 +8,8 @@
 
 use async_trait::async_trait;
 use duduclaw_core::truncate_bytes;
-use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -154,9 +154,14 @@ impl AgentRuntime for OpenAiCompatRuntime {
     async fn is_available(&self) -> bool {
         // Check if any OpenAI-compatible provider API key is configured
         const PROVIDER_KEYS: &[&str] = &[
-            "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "MINIMAX_API_KEY",
-            "GROQ_API_KEY", "TOGETHER_API_KEY", "MISTRAL_API_KEY",
-            "OPENROUTER_API_KEY", "XAI_API_KEY",
+            "OPENAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "MINIMAX_API_KEY",
+            "GROQ_API_KEY",
+            "TOGETHER_API_KEY",
+            "MISTRAL_API_KEY",
+            "OPENROUTER_API_KEY",
+            "XAI_API_KEY",
         ];
         PROVIDER_KEYS.iter().any(|k| std::env::var(k).is_ok())
     }
@@ -635,14 +640,17 @@ async fn resolve_provider_config(
                             .filter(|s| !s.is_empty())
                             .and_then(|enc_val| {
                                 let key = crate::config_crypto::load_keyfile_public(home_dir)?;
-                                let engine = duduclaw_security::crypto::CryptoEngine::new(&key).ok()?;
+                                let engine =
+                                    duduclaw_security::crypto::CryptoEngine::new(&key).ok()?;
                                 engine.decrypt_string(enc_val).ok()
                             });
 
                         // Fall back to plaintext api_key with a warning
                         let api_key_opt = api_key_opt.or_else(|| {
                             let plain = acc.get("api_key").and_then(|k| k.as_str())?;
-                            if plain.is_empty() { return None; }
+                            if plain.is_empty() {
+                                return None;
+                            }
                             tracing::warn!(
                                 provider,
                                 "OpenAI-compat account uses plaintext api_key; \
@@ -655,7 +663,8 @@ async fn resolve_provider_config(
                             let url = base_url
                                 .map(|u| u.to_string())
                                 .or_else(|| {
-                                    PROVIDERS.iter()
+                                    PROVIDERS
+                                        .iter()
                                         .find(|p| p.name == provider)
                                         .map(|p| p.base_url.to_string())
                                 })
@@ -693,8 +702,14 @@ impl OpenAiCompatRuntime {
         .await?;
         let client = http_client();
         let messages = vec![
-            ChatMessage { role: "system".to_string(), content: context.system_prompt.clone() },
-            ChatMessage { role: "user".to_string(), content: prompt.to_string() },
+            ChatMessage {
+                role: "system".to_string(),
+                content: context.system_prompt.clone(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            },
         ];
         let body = ChatCompletionRequest {
             model: context.model.clone(),
@@ -703,17 +718,22 @@ impl OpenAiCompatRuntime {
             stream: true,
         };
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-        let response = client.post(&url)
+        let response = client
+            .post(&url)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .json(&body)
-            .send().await
+            .send()
+            .await
             .map_err(|e| format!("SSE request failed: {e}"))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("SSE error ({status}): {}", body.chars().take(300).collect::<String>()));
+            return Err(format!(
+                "SSE error ({status}): {}",
+                body.chars().take(300).collect::<String>()
+            ));
         }
 
         // Stream SSE chunks instead of buffering the entire response
@@ -725,7 +745,9 @@ impl OpenAiCompatRuntime {
         let mut done = false;
 
         while let Some(chunk) = stream.next().await {
-            if done { break; }
+            if done {
+                break;
+            }
             let chunk = chunk.map_err(|e| format!("SSE stream error: {e}"))?;
             buf.extend_from_slice(&chunk);
 
@@ -745,12 +767,21 @@ impl OpenAiCompatRuntime {
                         break;
                     }
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if let Some(delta) = chunk.pointer("/choices/0/delta/content").and_then(|v| v.as_str()) {
+                        if let Some(delta) = chunk
+                            .pointer("/choices/0/delta/content")
+                            .and_then(|v| v.as_str())
+                        {
                             content.push_str(delta);
                         }
                         if let Some(usage) = chunk.get("usage") {
-                            input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(input_tokens);
-                            output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(output_tokens);
+                            input_tokens = usage
+                                .get("prompt_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(input_tokens);
+                            output_tokens = usage
+                                .get("completion_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(output_tokens);
                         }
                     }
                 }
@@ -764,12 +795,21 @@ impl OpenAiCompatRuntime {
             if let Some(json_str) = line.strip_prefix("data: ") {
                 if json_str != "[DONE]" {
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if let Some(delta) = chunk.pointer("/choices/0/delta/content").and_then(|v| v.as_str()) {
+                        if let Some(delta) = chunk
+                            .pointer("/choices/0/delta/content")
+                            .and_then(|v| v.as_str())
+                        {
                             content.push_str(delta);
                         }
                         if let Some(usage) = chunk.get("usage") {
-                            input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(input_tokens);
-                            output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(output_tokens);
+                            input_tokens = usage
+                                .get("prompt_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(input_tokens);
+                            output_tokens = usage
+                                .get("completion_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(output_tokens);
                         }
                     }
                 }
@@ -808,7 +848,16 @@ mod tests {
     fn test_parse_completion_response() {
         let json = r#"{"choices":[{"message":{"role":"assistant","content":"Hello!"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
         let resp: ChatCompletionResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.as_ref().unwrap().content.as_deref().unwrap(), "Hello!");
+        assert_eq!(
+            resp.choices[0]
+                .message
+                .as_ref()
+                .unwrap()
+                .content
+                .as_deref()
+                .unwrap(),
+            "Hello!"
+        );
         assert_eq!(resp.usage.unwrap().prompt_tokens, 10);
     }
 
@@ -830,7 +879,7 @@ mod tests {
     // ── MCP tool-loop wiring (API-mode tool surface) ────────────────────────
 
     use duduclaw_llm::{
-        DEFAULT_MAX_TOOL_ITERS, StopReason, ToolDef, ToolExecutor, ToolOutcome, run_tool_loop,
+        run_tool_loop, StopReason, ToolDef, ToolExecutor, ToolOutcome, DEFAULT_MAX_TOOL_ITERS,
     };
     use std::sync::Mutex;
 
@@ -1002,6 +1051,55 @@ mod tests {
         let out = crate::claude_runner::filter_tool_defs(defs(), Some(&both));
         let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["memory_search"]);
+    }
+
+    /// Entries written by the dashboard tool picker are Claude-CLI-qualified
+    /// (`mcp__duduclaw__<name>`); the API-path registry advertises bare names.
+    /// Both directions must match after namespace-prefix normalization.
+    #[test]
+    fn capability_filter_matches_mcp_qualified_entries() {
+        use duduclaw_core::types::CapabilitiesConfig;
+        let defs = || {
+            vec![
+                ToolDef {
+                    name: "office_script".into(),
+                    description: "".into(),
+                    input_schema: serde_json::json!({}),
+                },
+                ToolDef {
+                    name: "memory_search".into(),
+                    description: "".into(),
+                    input_schema: serde_json::json!({}),
+                },
+            ]
+        };
+
+        // Qualified deny drops the bare-named tool.
+        let denied = CapabilitiesConfig {
+            denied_tools: vec!["mcp__duduclaw__office_script".into()],
+            ..Default::default()
+        };
+        let out = crate::claude_runner::filter_tool_defs(defs(), Some(&denied));
+        let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["memory_search"]);
+
+        // Qualified allowlist keeps the bare-named tool (previously dropped
+        // every MCP tool for API-mode agents).
+        let allowed = CapabilitiesConfig {
+            allowed_tools: vec!["mcp__duduclaw__office_script".into()],
+            ..Default::default()
+        };
+        let out = crate::claude_runner::filter_tool_defs(defs(), Some(&allowed));
+        let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["office_script"]);
+
+        // Degenerate prefix `mcp__` with no tool segment must not match everything.
+        let weird = CapabilitiesConfig {
+            denied_tools: vec!["mcp__duduclaw__".into()],
+            ..Default::default()
+        };
+        let out = crate::claude_runner::filter_tool_defs(defs(), Some(&weird));
+        assert_eq!(out.len(), 2, "empty tool segment must deny nothing");
     }
 
     // ── UsageTap + run_tool_loop (mock provider/executor, no HTTP) ──────────

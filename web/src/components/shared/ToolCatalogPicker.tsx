@@ -13,7 +13,7 @@ import { inputClass } from './controlClass';
 let cache: BuiltinToolEntry[] | null = null;
 let inflight: Promise<BuiltinToolEntry[]> | null = null;
 
-function fetchCatalog(): Promise<BuiltinToolEntry[]> {
+export function fetchCatalog(): Promise<BuiltinToolEntry[]> {
   if (cache) return Promise.resolve(cache);
   if (inflight) return inflight;
   inflight = api.tools

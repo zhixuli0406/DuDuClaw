@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+- **功能開關（Feature switches）— 面向一般使用者的 capabilities 設定**：AI 員工編輯頁
+  「工具與權限」新增白話「功能開關」區塊——14 組日常語言功能組（辦公文件／訊息與語音／
+  記憶／知識庫／排程／團隊協作／技能管理／Google／Notion／GitHub／Odoo ERP／電腦整合／
+  檔案與程式／系統管理），每組一個 Switch＋風險徽章，成員清單由 `tools.builtin_catalog`
+  單一事實來源提供（新工具自動歸組，未知分類落入系統管理組）。語意為 deny-compile：
+  預設全開（空白名單＝全部可用，`office_script` 因此為預設工具）；關閉某組即把該組
+  qualified 工具名寫入 `denied_tools`，重新開啟則移除；部分停用顯示「部分自訂」徽章。
+  原始 allowed/denied 清單、wiki 可見範圍、Progent policy 編輯器摺疊進「進階工具設定」
+  （agent 已有白名單或 policy 時自動展開）；白名單模式下功能開關停用並顯示說明橫幅＋
+  一鍵清除白名單。三語 i18n。
+
+### Fixed
+- **API 模式 agent 的 qualified 工具名比對失效**：dashboard 工具選單寫入的
+  `mcp__duduclaw__<name>` 格式在 `filter_tool_defs`（openai-compat／Direct API 工具迴圈
+  的能力過濾器）中比對不到 registry 廣播的裸名——qualified 白名單會把 API 模式 agent 的
+  MCP 工具全數濾掉、qualified 黑名單則靜默不生效。`tool_base_name` 現會剝除
+  `mcp__<server>__` 前綴後再比對（deny 方向跨 server 過寬屬 fail-safe，已註記）。
+
 ### Changed
 - **Gateway 選擇器 v2：自動選擇＋防 mDNS 蔓延（WP-GW §2.5）**：桌面 app 啟動改為
   **自動選擇**——記住的 gateway `/healthz` 通就直接連（不再顯示清單或倒數）；沒記住者

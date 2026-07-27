@@ -81,7 +81,10 @@ fn build_system_prompt(
     if let Some(s) =
         crate::prompt_identity::identity_and_language_section(display_name, default_language)
     {
-        audit.push(crate::prompt_audit::PromptSection::new("identity_directive", &s));
+        audit.push(crate::prompt_audit::PromptSection::new(
+            "identity_directive",
+            &s,
+        ));
         parts.push(s);
     }
 
@@ -282,8 +285,7 @@ async fn build_pending_tasks_section(home_dir: &Path, agent_id: &str) -> Option<
                     let why = leaf.description.trim();
                     if !why.is_empty() {
                         if let Some(last) = parts.last_mut() {
-                            *last =
-                                format!("{last} ({})", duduclaw_core::truncate_chars(why, 80));
+                            *last = format!("{last} ({})", duduclaw_core::truncate_chars(why, 80));
                         }
                     }
                 }
@@ -317,7 +319,14 @@ async fn build_pending_tasks_section(home_dir: &Path, agent_id: &str) -> Option<
                 .and_then(|gid| goal_chains.get(gid))
                 .map(|chain| format!("\n   Goal: {chain}"))
                 .unwrap_or_default();
-            format!("{}. [{}] {}{}{}", i + 1, t.priority, t.title, extra, goal_line)
+            format!(
+                "{}. [{}] {}{}{}",
+                i + 1,
+                t.priority,
+                t.title,
+                extra,
+                goal_line
+            )
         })
         .collect();
     let more = if total > 5 {
@@ -366,9 +375,13 @@ pub async fn call_claude_for_agent(
     prompt: &str,
 ) -> Result<String, String> {
     call_claude_for_agent_with_type(
-        home_dir, registry, agent_id, prompt,
+        home_dir,
+        registry,
+        agent_id,
+        prompt,
         crate::cost_telemetry::RequestType::Chat,
-    ).await
+    )
+    .await
 }
 
 /// Like [`call_claude_for_agent`] but allows specifying the request type for telemetry.
@@ -400,8 +413,15 @@ pub async fn call_claude_for_agent_preloaded(
     request_type: crate::cost_telemetry::RequestType,
 ) -> Result<String, String> {
     let agent_id = agent.config.agent.name.clone();
-    call_claude_for_agent_impl(home_dir, registry, &agent_id, prompt, request_type, Some(agent))
-        .await
+    call_claude_for_agent_impl(
+        home_dir,
+        registry,
+        &agent_id,
+        prompt,
+        request_type,
+        Some(agent),
+    )
+    .await
 }
 
 // OTel GenAI semconv (Development): root `invoke_agent` span for one
@@ -459,16 +479,15 @@ async fn call_claude_for_agent_impl(
         .try_with(|sid| sid.clone())
         .ok()
         .flatten();
-    let citation_ref = turn_owned.as_deref().map(|tid| {
-        (agent_id, tid, session_owned.as_deref())
-    });
+    let citation_ref = turn_owned
+        .as_deref()
+        .map(|tid| (agent_id, tid, session_owned.as_deref()));
     let default_language = crate::prompt_identity::read_default_language(home_dir).await;
     let system_prompt = build_system_prompt(agent, citation_ref, default_language.as_deref());
     let agent_name = agent.config.agent.name.clone();
     let claude_model = agent.config.model.preferred.clone();
     // OTel: record the resolved model on the `invoke_agent` span.
-    tracing::Span::current()
-        .record(crate::otel::attrs::REQUEST_MODEL, claude_model.as_str());
+    tracing::Span::current().record(crate::otel::attrs::REQUEST_MODEL, claude_model.as_str());
     let fallback_model = agent.config.model.fallback.clone();
     let local_config = agent.config.model.local.clone();
     let api_mode = agent.config.model.api_mode.clone();
@@ -549,8 +568,7 @@ async fn call_claude_for_agent_impl(
         );
         if routed != claude_model {
             // Routing changed the model — re-record it on the OTel span.
-            tracing::Span::current()
-                .record(crate::otel::attrs::REQUEST_MODEL, routed.as_str());
+            tracing::Span::current().record(crate::otel::attrs::REQUEST_MODEL, routed.as_str());
         }
         routed
     } else {
@@ -632,7 +650,9 @@ async fn call_claude_for_agent_impl(
 
     if agent_dir.exists() {
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
-        if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await {
+        if let Err(e) =
+            crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await
+        {
             warn!(
                 agent = %agent_name,
                 error = %e,
@@ -672,10 +692,8 @@ async fn call_claude_for_agent_impl(
             // configured provider. Non-Claude providers are short-circuited to
             // `runtime_dispatch` above (the `non_claude_provider` guard), so this
             // resolves to Claude in practice today — but the coupling is gone.
-            let cli_kind = crate::pty_runtime::cli_kind_for_provider(
-                delegation_settings.provider,
-            )
-            .unwrap_or(duduclaw_cli_runtime::CliKind::Claude);
+            let cli_kind = crate::pty_runtime::cli_kind_for_provider(delegation_settings.provider)
+                .unwrap_or(duduclaw_cli_runtime::CliKind::Claude);
             // Gap A fix: route each rotator-selected account's credential env
             // into the PTY pool (per-account `account_id` + `env`), mirroring the
             // channel-reply path. Previously this dispatcher short-circuit called
@@ -719,11 +737,8 @@ async fn call_claude_for_agent_impl(
                     // No rotator accounts / rotator unavailable → ambient-env
                     // fallback (the user's default `claude auth login` session),
                     // matching the pre-fix behaviour.
-                    let acquire = crate::pty_runtime::AcquireOptions::new(
-                        agent_id,
-                        cli_kind,
-                        cli_bare_mode,
-                    );
+                    let acquire =
+                        crate::pty_runtime::AcquireOptions::new(agent_id, cli_kind, cli_bare_mode);
                     return crate::pty_runtime::acquire_and_invoke_with(
                         crate::pty_runtime::InvokeOptions::new(
                             acquire,
@@ -754,37 +769,66 @@ async fn call_claude_for_agent_impl(
             // Force local inference regardless of per-agent prefer_local
             let model_id = local_config.as_ref().map(|c| c.model.as_str());
             return call_local_inference(
-                home_dir, prompt, &system_prompt_inlined, model_id,
-                Some(agent_id), Some(&capabilities),
+                home_dir,
+                prompt,
+                &system_prompt_inlined,
+                model_id,
+                Some(agent_id),
+                Some(&capabilities),
             )
-                .await
-                .map_err(|e| format!(
+            .await
+            .map_err(|e| {
+                format!(
                     "Agent '{agent_name}' is in local-only mode but inference failed: {e}. \
                      Fix local model setup or switch to 'hybrid' mode in config.toml."
-                ));
+                )
+            });
         }
         "claude" => {
             // Skip local entirely, go straight to Claude API
             info!(agent = %agent_name, model = %claude_model, "Claude-only mode");
             let wd = effective_work_dir(&agent_dir);
             let primary_result = call_with_rotation(
-                home_dir, agent_id, prompt, &claude_model, &system_prompt_inlined,
-                request_type, Some(&capabilities), wd.as_deref(), cli_bare_mode,
-            ).await;
+                home_dir,
+                agent_id,
+                prompt,
+                &claude_model,
+                &system_prompt_inlined,
+                request_type,
+                Some(&capabilities),
+                wd.as_deref(),
+                cli_bare_mode,
+            )
+            .await;
             return match primary_result {
                 Ok(text) => Ok(text),
-                Err(ref e) if is_llm_fallback_error(e) && should_attempt_model_fallback(&claude_model, &fallback_model) => {
+                Err(ref e)
+                    if is_llm_fallback_error(e)
+                        && should_attempt_model_fallback(&claude_model, &fallback_model) =>
+                {
                     warn!(
                         primary = %claude_model,
                         fallback = %fallback_model,
                         error = %e,
                         "LLM timeout/overloaded — attempting model fallback (claude mode)"
                     );
-                    emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, e).await;
+                    emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, e)
+                        .await;
                     call_with_rotation(
-                        home_dir, agent_id, prompt, &fallback_model, &system_prompt_inlined,
-                        request_type, Some(&capabilities), wd.as_deref(), cli_bare_mode,
-                    ).await.map_err(|fe| format_fallback_error_message(&claude_model, e, &fallback_model, &fe))
+                        home_dir,
+                        agent_id,
+                        prompt,
+                        &fallback_model,
+                        &system_prompt_inlined,
+                        request_type,
+                        Some(&capabilities),
+                        wd.as_deref(),
+                        cli_bare_mode,
+                    )
+                    .await
+                    .map_err(|fe| {
+                        format_fallback_error_message(&claude_model, e, &fallback_model, &fe)
+                    })
                 }
                 Err(e) => Err(e),
             };
@@ -821,14 +865,24 @@ async fn call_claude_for_agent_impl(
     if let Some(ref local) = local_config {
         let should_try_local = adaptive_prefer || local.use_router || local.prefer_local;
         if should_try_local {
-            let reason = if adaptive_prefer { "adaptive-override" }
-                else if local.use_router { "router-driven" }
-                else { "prefer-local" };
+            let reason = if adaptive_prefer {
+                "adaptive-override"
+            } else if local.use_router {
+                "router-driven"
+            } else {
+                "prefer-local"
+            };
             info!(agent = %agent_name, local_model = %local.model, reason, "Trying local offload");
             match call_local_inference(
-                home_dir, prompt, &system_prompt_inlined, Some(&local.model),
-                Some(agent_id), Some(&capabilities),
-            ).await {
+                home_dir,
+                prompt,
+                &system_prompt_inlined,
+                Some(&local.model),
+                Some(agent_id),
+                Some(&capabilities),
+            )
+            .await
+            {
                 Ok(response) => {
                     info!(agent = %agent_name, "Query served by local model (cost saved)");
                     return Ok(response);
@@ -852,9 +906,18 @@ async fn call_claude_for_agent_impl(
     if api_mode != "direct" {
         info!(agent = %agent_name, model = %claude_model, "Calling Claude CLI (SDK primary)");
         match call_with_rotation(
-            home_dir, agent_id, prompt, &claude_model, &system_prompt_inlined, request_type,
-            Some(&capabilities), wd.as_deref(), cli_bare_mode,
-        ).await {
+            home_dir,
+            agent_id,
+            prompt,
+            &claude_model,
+            &system_prompt_inlined,
+            request_type,
+            Some(&capabilities),
+            wd.as_deref(),
+            cli_bare_mode,
+        )
+        .await
+        {
             Ok(text) => return Ok(text),
             Err(e) => {
                 let is_rate = is_rate_limit_error(&e);
@@ -874,11 +937,23 @@ async fn call_claude_for_agent_impl(
                         error = %e,
                         "LLM timeout/overloaded — attempting model fallback via CLI (hybrid mode)"
                     );
-                    emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, &e).await;
+                    emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, &e)
+                        .await;
                     return call_with_rotation(
-                        home_dir, agent_id, prompt, &fallback_model, &system_prompt_inlined,
-                        request_type, Some(&capabilities), wd.as_deref(), cli_bare_mode,
-                    ).await.map_err(|fe| format_fallback_error_message(&claude_model, &e, &fallback_model, &fe));
+                        home_dir,
+                        agent_id,
+                        prompt,
+                        &fallback_model,
+                        &system_prompt_inlined,
+                        request_type,
+                        Some(&capabilities),
+                        wd.as_deref(),
+                        cli_bare_mode,
+                    )
+                    .await
+                    .map_err(|fe| {
+                        format_fallback_error_message(&claude_model, &e, &fallback_model, &fe)
+                    });
                 } else if api_mode == "auto" && is_rate {
                     // No model fallback available: all OAuth accounts rate-limited
                     // and the two models are the same (or fallback is unset).
@@ -909,8 +984,15 @@ async fn call_claude_for_agent_impl(
             "Trying Direct API cross-provider fallback chain"
         );
         return try_direct_api_chain(
-            home_dir, agent_id, prompt, &claude_model, &model_fallbacks,
-            &system_prompt, tasks_suffix.as_deref(), request_type, Some(&capabilities),
+            home_dir,
+            agent_id,
+            prompt,
+            &claude_model,
+            &model_fallbacks,
+            &system_prompt,
+            tasks_suffix.as_deref(),
+            request_type,
+            Some(&capabilities),
         )
         .await;
     }
@@ -921,11 +1003,23 @@ async fn call_claude_for_agent_impl(
     let direct_rotator = get_rotator(home_dir).await.ok();
     info!(agent = %agent_name, model = %claude_model, "Trying Direct API (API Key fallback)");
     match try_direct_api(
-        home_dir, agent_id, prompt, &claude_model, &system_prompt,
-        tasks_suffix.as_deref(), request_type, direct_rotator.as_deref(), Some(&capabilities),
-    ).await {
+        home_dir,
+        agent_id,
+        prompt,
+        &claude_model,
+        &system_prompt,
+        tasks_suffix.as_deref(),
+        request_type,
+        direct_rotator.as_deref(),
+        Some(&capabilities),
+    )
+    .await
+    {
         Ok(text) => Ok(text),
-        Err(ref e) if is_llm_fallback_error(e) && should_attempt_model_fallback(&claude_model, &fallback_model) => {
+        Err(ref e)
+            if is_llm_fallback_error(e)
+                && should_attempt_model_fallback(&claude_model, &fallback_model) =>
+        {
             warn!(
                 primary = %claude_model,
                 fallback = %fallback_model,
@@ -934,9 +1028,17 @@ async fn call_claude_for_agent_impl(
             );
             emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, e).await;
             try_direct_api(
-                home_dir, agent_id, prompt, &fallback_model, &system_prompt,
-                tasks_suffix.as_deref(), request_type, direct_rotator.as_deref(), Some(&capabilities),
-            ).await
+                home_dir,
+                agent_id,
+                prompt,
+                &fallback_model,
+                &system_prompt,
+                tasks_suffix.as_deref(),
+                request_type,
+                direct_rotator.as_deref(),
+                Some(&capabilities),
+            )
+            .await
             .map_err(|fe| format_fallback_error_message(&claude_model, e, &fallback_model, &fe))
         }
         Err(e) => Err(e),
@@ -1118,7 +1220,10 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
         &self,
         req: &duduclaw_llm::ChatRequest,
     ) -> Result<
-        futures_util::stream::BoxStream<'static, Result<duduclaw_llm::StreamEvent, duduclaw_llm::LlmError>>,
+        futures_util::stream::BoxStream<
+            'static,
+            Result<duduclaw_llm::StreamEvent, duduclaw_llm::LlmError>,
+        >,
         duduclaw_llm::LlmError,
     > {
         self.inner.stream(req).await
@@ -1130,7 +1235,10 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
 /// the multi-instance overrides) so the API-path tool loop reaches the same MCP
 /// tools the CLI backends do.
 fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
-    let mut envs = vec![(duduclaw_core::ENV_AGENT_ID.to_string(), agent_id.to_string())];
+    let mut envs = vec![(
+        duduclaw_core::ENV_AGENT_ID.to_string(),
+        agent_id.to_string(),
+    )];
     // Shared forward set (home/port/instance + MCP auth) — see
     // `duduclaw_core::mcp_forward_env_vars`. The spawned mcp-server inherits
     // this process env too, but the explicit pairs keep the tool loop working
@@ -1140,10 +1248,29 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
 }
 
 /// Base tool name — the part before an optional `(` qualifier (e.g.
-/// `Bash(git:*)` → `Bash`), trimmed. Token-anchored (never substring), per the
-/// 2026-06 review conventions.
+/// `Bash(git:*)` → `Bash`), trimmed, with an `mcp__<server>__` namespace prefix
+/// stripped (`mcp__duduclaw__office_script` → `office_script`). Token-anchored
+/// (never substring), per the 2026-06 review conventions.
+///
+/// The prefix strip is what lets the Claude-CLI-qualified entries the dashboard
+/// tool picker writes into `[capabilities] allowed_tools` / `denied_tools`
+/// match the BARE tool names the API-path `ToolRegistry` advertises — without
+/// it, an allowlist of qualified names would drop every MCP tool for API-mode
+/// agents, and a qualified deny would silently not deny. Stripping ignores the
+/// server segment, so a deny of `mcp__other__foo` also drops a tool named
+/// `foo` from any server — over-matching on deny is fail-safe, and allowlist
+/// collisions across servers are an accepted trade-off (documented here).
 fn tool_base_name(entry: &str) -> &str {
-    entry.split('(').next().unwrap_or(entry).trim()
+    let e = entry.split('(').next().unwrap_or(entry).trim();
+    if let Some(rest) = e.strip_prefix("mcp__") {
+        if let Some(idx) = rest.find("__") {
+            let bare = &rest[idx + 2..];
+            if !bare.is_empty() {
+                return bare;
+            }
+        }
+    }
+    e
 }
 
 /// Filter MCP tool defs by the agent's capabilities (G2, fail-closed): a tool
@@ -1162,11 +1289,16 @@ pub(crate) fn filter_tool_defs(
     defs.into_iter()
         .filter(|d| {
             let name = tool_base_name(&d.name);
-            if denied.iter().any(|x| tool_base_name(x).eq_ignore_ascii_case(name)) {
+            if denied
+                .iter()
+                .any(|x| tool_base_name(x).eq_ignore_ascii_case(name))
+            {
                 return false;
             }
             if !allowed.is_empty()
-                && !allowed.iter().any(|x| tool_base_name(x).eq_ignore_ascii_case(name))
+                && !allowed
+                    .iter()
+                    .any(|x| tool_base_name(x).eq_ignore_ascii_case(name))
             {
                 return false;
             }
@@ -1241,7 +1373,9 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
             }
             // A single external server failing must not sink the whole reply —
             // skip it; the internal server + other externals still serve.
-            Err(e) => warn!(server = %ext.name, error = %e, "external MCP connect failed — skipping"),
+            Err(e) => {
+                warn!(server = %ext.name, error = %e, "external MCP connect failed — skipping")
+            }
         }
     }
 
@@ -1252,7 +1386,9 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
             // Degrade to internal-only rather than losing all tools.
             warn!(error = %e, "combined MCP registry build failed — retrying internal-only");
             let internal = connect_internal().await.ok()?;
-            duduclaw_llm::ToolRegistry::from_clients(vec![internal]).await.ok()
+            duduclaw_llm::ToolRegistry::from_clients(vec![internal])
+                .await
+                .ok()
         }
     }
 }
@@ -1341,7 +1477,12 @@ async fn run_llm_provider(
     // candidate — nothing to retry with on the same provider.
     let key_source = match resolve_provider_key(provider_id, rotator).await {
         Ok(k) => k,
-        Err(e) => return Err(ChainError { message: e, failover: false }),
+        Err(e) => {
+            return Err(ChainError {
+                message: e,
+                failover: false,
+            })
+        }
     };
     let (account_id, key) = match key_source {
         KeySource::Rotator { account_id, key } => (Some(account_id), key),
@@ -1350,13 +1491,23 @@ async fn run_llm_provider(
 
     let base_provider = match build_llm_provider_with_key(provider_id, &key) {
         Ok(p) => p,
-        Err(e) => return Err(ChainError { message: e, failover: false }),
+        Err(e) => {
+            return Err(ChainError {
+                message: e,
+                failover: false,
+            })
+        }
     };
 
-    let supports_caching = crate::cost_telemetry::model_registry()
-        .supports(model, duduclaw_llm::Feature::Caching);
-    let mut req =
-        build_llm_chat_request(model, supports_caching, system_prompt, dynamic_system_suffix, prompt);
+    let supports_caching =
+        crate::cost_telemetry::model_registry().supports(model, duduclaw_llm::Feature::Caching);
+    let mut req = build_llm_chat_request(
+        model,
+        supports_caching,
+        system_prompt,
+        dynamic_system_suffix,
+        prompt,
+    );
 
     let cost_acc = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let provider = RecordingProvider {
@@ -1383,19 +1534,20 @@ async fn run_llm_provider(
             // direct-API tool loop too (complete mediation, I3). Empty policy →
             // kernel abstains (passthrough).
             let empty_policy: Vec<duduclaw_core::types::ToolPolicy> = Vec::new();
-            let policy = capabilities.map(|c| c.policy.as_slice()).unwrap_or(&empty_policy);
+            let policy = capabilities
+                .map(|c| c.policy.as_slice())
+                .unwrap_or(&empty_policy);
             let guarded = duduclaw_llm::PolicyExecutor::new(reg, policy, agent_id);
             // S2 argument-level provenance (PACT): policy comes from
             // `config.toml [provenance]` — absent/off ⇒ ProvenanceConfig::default()
             // and the loop below is byte-identical to the plain `run_tool_loop`.
             // The user prompt is the channel input for this turn ⇒ seeded Tainted.
             let (prov_policy, prov_sensitive) = {
-                let table = std::fs::read_to_string(
-                    duduclaw_core::duduclaw_home().join("config.toml"),
-                )
-                .ok()
-                .and_then(|s| s.parse::<toml::Table>().ok())
-                .unwrap_or_default();
+                let table =
+                    std::fs::read_to_string(duduclaw_core::duduclaw_home().join("config.toml"))
+                        .ok()
+                        .and_then(|s| s.parse::<toml::Table>().ok())
+                        .unwrap_or_default();
                 crate::channel_reply::parse_provenance_settings(&table)
             };
             let prov_cfg = crate::channel_reply::build_channel_provenance_config(
@@ -1429,7 +1581,10 @@ async fn run_llm_provider(
         Ok(resp) => {
             {
                 let span = tracing::Span::current();
-                span.record(crate::otel::attrs::USAGE_INPUT_TOKENS, resp.usage.input_tokens);
+                span.record(
+                    crate::otel::attrs::USAGE_INPUT_TOKENS,
+                    resp.usage.input_tokens,
+                );
                 span.record(
                     crate::otel::attrs::USAGE_OUTPUT_TOKENS,
                     resp.usage.output_tokens + resp.usage.reasoning_tokens,
@@ -1473,8 +1628,15 @@ async fn try_llm_provider_api(
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
     run_llm_provider(
-        agent_id, prompt, model, system_prompt, dynamic_system_suffix, request_type,
-        provider_id, rotator, capabilities,
+        agent_id,
+        prompt,
+        model,
+        system_prompt,
+        dynamic_system_suffix,
+        request_type,
+        provider_id,
+        rotator,
+        capabilities,
     )
     .await
     .map_err(|ce| ce.message)
@@ -1516,23 +1678,39 @@ async fn try_direct_api(
 ) -> Result<String, String> {
     if let DirectApiRoute::LlmProvider(provider_id) = direct_api_route(model) {
         return try_llm_provider_api(
-            agent_id, prompt, model, system_prompt, dynamic_system_suffix,
-            request_type, &provider_id, rotator, capabilities,
+            agent_id,
+            prompt,
+            model,
+            system_prompt,
+            dynamic_system_suffix,
+            request_type,
+            &provider_id,
+            rotator,
+            capabilities,
         )
         .await;
     }
 
     let api_key = get_api_key(home_dir).await;
     if api_key.is_empty() {
-        return Err("No API key available for Direct API (OAuth accounts require CLI path)".to_string());
+        return Err(
+            "No API key available for Direct API (OAuth accounts require CLI path)".to_string(),
+        );
     }
 
     // TODO: pass conversation_history from the caller to enable multi-turn
     // for the Direct API fallback path (currently stateless).
     let scope = format!("{agent_id}:{model}");
     let response = crate::direct_api::call_direct_api_attributed(
-        Some(&scope), &api_key, model, system_prompt, dynamic_system_suffix, prompt, &[],
-    ).await?;
+        Some(&scope),
+        &api_key,
+        model,
+        system_prompt,
+        dynamic_system_suffix,
+        prompt,
+        &[],
+    )
+    .await?;
 
     // Record telemetry
     if let Some(ref usage) = response.usage {
@@ -1717,8 +1895,15 @@ async fn try_direct_api_chain(
         // Fail-safe: nothing resolvable — fall back to the single-shot legacy
         // attempt on the preferred model so its own "no key" error surfaces.
         return try_direct_api(
-            home_dir, agent_id, prompt, preferred_model, system_prompt,
-            dynamic_system_suffix, request_type, rotator.as_deref(), capabilities,
+            home_dir,
+            agent_id,
+            prompt,
+            preferred_model,
+            system_prompt,
+            dynamic_system_suffix,
+            request_type,
+            rotator.as_deref(),
+            capabilities,
         )
         .await;
     }
@@ -1728,21 +1913,38 @@ async fn try_direct_api_chain(
         let (provider, bare) = provider_and_bare(&model);
         if provider == "anthropic" {
             match try_direct_api(
-                home_dir, agent_id, prompt, &bare, system_prompt,
-                dynamic_system_suffix, request_type, rotator_ref, capabilities,
+                home_dir,
+                agent_id,
+                prompt,
+                &bare,
+                system_prompt,
+                dynamic_system_suffix,
+                request_type,
+                rotator_ref,
+                capabilities,
             )
             .await
             {
                 Ok(t) => Ok(t),
                 Err(e) => {
                     let failover = is_chain_failover(&e);
-                    Err(ChainError { message: e, failover })
+                    Err(ChainError {
+                        message: e,
+                        failover,
+                    })
                 }
             }
         } else {
             run_llm_provider(
-                agent_id, prompt, &bare, system_prompt, dynamic_system_suffix,
-                request_type, &provider, rotator_ref, capabilities,
+                agent_id,
+                prompt,
+                &bare,
+                system_prompt,
+                dynamic_system_suffix,
+                request_type,
+                &provider,
+                rotator_ref,
+                capabilities,
             )
             .await
         }
@@ -1751,7 +1953,9 @@ async fn try_direct_api_chain(
 }
 
 /// Cached inference_mode — avoids reading config.toml on every call (P1-3).
-static INFERENCE_MODE_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<(std::time::Instant, String)>>> = std::sync::OnceLock::new();
+static INFERENCE_MODE_CACHE: std::sync::OnceLock<
+    tokio::sync::RwLock<Option<(std::time::Instant, String)>>,
+> = std::sync::OnceLock::new();
 
 pub(crate) async fn get_inference_mode(home_dir: &Path) -> String {
     let cache = INFERENCE_MODE_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
@@ -1767,9 +1971,12 @@ pub(crate) async fn get_inference_mode(home_dir: &Path) -> String {
     }
 
     let config_path = home_dir.join("config.toml");
-    let content = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
+    let content = tokio::fs::read_to_string(&config_path)
+        .await
+        .unwrap_or_default();
     let table: toml::Table = content.parse().unwrap_or_default();
-    let mode = table.get("general")
+    let mode = table
+        .get("general")
         .and_then(|g| g.get("inference_mode"))
         .and_then(|v| v.as_str())
         .unwrap_or("hybrid")
@@ -1780,17 +1987,27 @@ pub(crate) async fn get_inference_mode(home_dir: &Path) -> String {
 }
 
 /// Cached AccountRotator — avoids rebuilding on every call (BE-H4).
-static ROTATOR_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<(std::time::Instant, std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>)>>> = std::sync::OnceLock::new();
+static ROTATOR_CACHE: std::sync::OnceLock<
+    tokio::sync::RwLock<
+        Option<(
+            std::time::Instant,
+            std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>,
+        )>,
+    >,
+> = std::sync::OnceLock::new();
 
 /// Mutex protecting rotator rebuild — prevents concurrent `claude auth status` subprocesses.
 static ROTATOR_INIT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 /// Cached InferenceEngine — singleton for local LLM inference.
-static INFERENCE_ENGINE: std::sync::OnceLock<tokio::sync::RwLock<Option<std::sync::Arc<duduclaw_inference::InferenceEngine>>>> = std::sync::OnceLock::new();
+static INFERENCE_ENGINE: std::sync::OnceLock<
+    tokio::sync::RwLock<Option<std::sync::Arc<duduclaw_inference::InferenceEngine>>>,
+> = std::sync::OnceLock::new();
 
 /// Mutex protecting the one-time initialization of the inference engine.
 /// Prevents concurrent tasks from each loading a full GGUF model (OOM risk).
-static INFERENCE_INIT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+static INFERENCE_INIT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
 
 /// Process-lifetime negative cache — set to `true` once
 /// `InferenceEngine::init` fails in a way that won't recover this run
@@ -1808,7 +2025,9 @@ static INFERENCE_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Get or create the inference engine singleton.
-async fn get_inference_engine(home_dir: &std::path::Path) -> Option<std::sync::Arc<duduclaw_inference::InferenceEngine>> {
+async fn get_inference_engine(
+    home_dir: &std::path::Path,
+) -> Option<std::sync::Arc<duduclaw_inference::InferenceEngine>> {
     // Negative-cache fast path: a previous init attempt already failed
     // in a way that won't recover without a gateway restart. Skip silently.
     if INFERENCE_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1882,7 +2101,15 @@ pub async fn try_local_inference(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
-    call_local_inference(home_dir, prompt, system_prompt, model_id, agent_id, capabilities).await
+    call_local_inference(
+        home_dir,
+        prompt,
+        system_prompt,
+        model_id,
+        agent_id,
+        capabilities,
+    )
+    .await
 }
 
 async fn call_local_inference(
@@ -1911,7 +2138,12 @@ async fn call_local_inference(
                 == duduclaw_inference::router::RoutingTier::CloudApi;
         if !router_escalates {
             if let Some(text) = crate::local_llm::try_local_tool_loop(
-                &engine, prompt, system_prompt, model_id, aid, capabilities,
+                &engine,
+                prompt,
+                system_prompt,
+                model_id,
+                aid,
+                capabilities,
             )
             .await
             {
@@ -1970,7 +2202,9 @@ async fn call_local_inference(
 
 /// Get or create a cached AccountRotator (refreshes every 5 minutes).
 /// Public accessor for the cached rotator — used by handlers.rs too.
-pub async fn get_rotator_cached(home_dir: &Path) -> Result<std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>, String> {
+pub async fn get_rotator_cached(
+    home_dir: &Path,
+) -> Result<std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>, String> {
     get_rotator(home_dir).await
 }
 
@@ -1984,7 +2218,9 @@ pub async fn invalidate_rotator_cache() {
     }
 }
 
-async fn get_rotator(home_dir: &Path) -> Result<std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>, String> {
+async fn get_rotator(
+    home_dir: &Path,
+) -> Result<std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>, String> {
     let cache = ROTATOR_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
     let ttl = std::time::Duration::from_secs(300); // 5 min cache
 
@@ -2103,7 +2339,9 @@ async fn call_with_rotation(
         }
         info!(agent_id, "No rotator accounts — using ambient env fallback");
         let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let resp = call_claude_with_env(prompt, model, system_prompt, &empty, capabilities, work_dir).await?;
+        let resp =
+            call_claude_with_env(prompt, model, system_prompt, &empty, capabilities, work_dir)
+                .await?;
 
         if let Some(ref usage) = resp.usage {
             if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
@@ -2126,10 +2364,7 @@ async fn call_with_rotation(
         // OAuth accounts can't supply that, so skip them with a hint
         // rather than waste a subprocess on a guaranteed "Not logged in"
         // failure. Falls through to the next account.
-        if bare_mode
-            && selected.auth_method
-                == duduclaw_agent::account_rotator::AuthMethod::OAuth
-        {
+        if bare_mode && selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
             warn!(
                 account = %selected.id,
                 "skipping OAuth account — agent requested cli_bare_mode \
@@ -2142,7 +2377,14 @@ async fn call_with_rotation(
 
         let bare_scope = BARE_MODE.scope(
             bare_mode,
-            call_claude_with_env(prompt, model, system_prompt, &selected.env_vars, capabilities, work_dir),
+            call_claude_with_env(
+                prompt,
+                model,
+                system_prompt,
+                &selected.env_vars,
+                capabilities,
+                work_dir,
+            ),
         );
         match bare_scope.await {
             Ok(response) => {
@@ -2155,7 +2397,8 @@ async fn call_with_rotation(
                         // unknown models) — same unit as monthly_budget_cents.
                         crate::cost_telemetry::cost_for(model, usage)
                     }
-                } else if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
+                } else if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth
+                {
                     0
                 } else {
                     ((prompt.len() + response.text.len()) / 1000).max(1) as u64
@@ -2240,7 +2483,9 @@ async fn call_claude_streaming(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn().map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("claude CLI spawn error: {e}"))?;
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
@@ -2260,15 +2505,13 @@ async fn call_claude_streaming(
     let mut last_tool_reported: Option<String> = None;
 
     // Keepalive timer (90s) — only meaningful when on_progress is Some
-    let mut keepalive = tokio::time::interval(
-        std::time::Duration::from_secs(crate::channel_reply::KEEPALIVE_INTERVAL_SECS),
-    );
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(
+        crate::channel_reply::KEEPALIVE_INTERVAL_SECS,
+    ));
     keepalive.reset();
 
     // Hard max timeout — absolute safety net
-    let hard_deadline = tokio::time::sleep(
-        std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS),
-    );
+    let hard_deadline = tokio::time::sleep(std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS));
     tokio::pin!(hard_deadline);
 
     loop {
@@ -2420,7 +2663,10 @@ async fn call_claude_streaming(
         span.record(crate::otel::attrs::USAGE_OUTPUT_TOKENS, usage.output_tokens);
     }
 
-    Ok(ClaudeResponse { text: result_text, usage: token_usage })
+    Ok(ClaudeResponse {
+        text: result_text,
+        usage: token_usage,
+    })
 }
 
 // ── Delegation context (task-local) ──────────────────────────
@@ -2501,13 +2747,17 @@ fn prepare_claude_cmd(
     }
 
     cmd.args([
-        "-p", prompt,
-        "--model", model,
-        "--output-format", "stream-json",
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--output-format",
+        "stream-json",
         "--verbose",
         // Subprocess has no TTY — auto-accept tool permissions.
         // Security is enforced by DuDuClaw's CONTRACT.toml + container sandbox.
-        "--permission-mode", "auto",
+        "--permission-mode",
+        "auto",
         // Auto-approve all DuDuClaw MCP tools + a curated set of native Claude
         // Code tools. When `--allowedTools` is specified, Claude Code treats
         // it as the **only** auto-approved list — anything else would need
@@ -2520,7 +2770,8 @@ fn prepare_claude_cmd(
         // interactive Claude Code. The allowlist is applied below so a
         // per-agent `allowed_tools` override (HS12) can narrow it.
         // Allow enough agentic turns for complex tasks (read → think → write).
-        "--max-turns", "50",
+        "--max-turns",
+        "50",
     ]);
 
     // Apply tool restrictions based on agent capabilities (deny-by-default)
@@ -2567,12 +2818,13 @@ fn prepare_claude_cmd(
     }
 
     // CACHE_SPLIT_MARKER is a Direct-API-only layering hint — strip it here.
-    let system_prompt_cli: std::borrow::Cow<'_, str> =
-        if system_prompt.contains(crate::direct_api::CACHE_SPLIT_MARKER) {
-            std::borrow::Cow::Owned(system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, ""))
-        } else {
-            std::borrow::Cow::Borrowed(system_prompt)
-        };
+    let system_prompt_cli: std::borrow::Cow<'_, str> = if system_prompt
+        .contains(crate::direct_api::CACHE_SPLIT_MARKER)
+    {
+        std::borrow::Cow::Owned(system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, ""))
+    } else {
+        std::borrow::Cow::Borrowed(system_prompt)
+    };
     let system_prompt = system_prompt_cli.as_ref();
     let prompt_guard = if !system_prompt.is_empty() {
         match tempfile::NamedTempFile::new() {
@@ -2629,9 +2881,7 @@ fn prepare_claude_cmd(
     // attach turn_id / session_id to sub-agent dispatch BusMessages.
     // Same pattern as REPLY_CHANNEL — task_local set in channel_reply path,
     // read here, propagated to subprocess via env var.
-    if let Ok(Some(turn_id)) =
-        duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(|t| t.clone())
-    {
+    if let Ok(Some(turn_id)) = duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(|t| t.clone()) {
         cmd.env(duduclaw_core::ENV_TRUST_TURN_ID, &turn_id);
     }
     if let Ok(Some(session_id)) =
@@ -2653,7 +2903,14 @@ async fn call_claude_with_env(
     work_dir: Option<&Path>,
 ) -> Result<ClaudeResponse, String> {
     let claude = duduclaw_core::which_claude().ok_or("Claude CLI not found")?;
-    let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt, capabilities, work_dir);
+    let (mut cmd, _prompt_guard) = prepare_claude_cmd(
+        &claude,
+        prompt,
+        model,
+        system_prompt,
+        capabilities,
+        work_dir,
+    );
 
     for (key, value) in env_vars {
         if value.is_empty() {
@@ -2686,13 +2943,19 @@ mod direct_api_routing_tests {
     #[test]
     fn route_decision_table() {
         // Anthropic models (registry-known) → legacy path.
-        assert_eq!(direct_api_route("claude-sonnet-5"), DirectApiRoute::LegacyAnthropic);
+        assert_eq!(
+            direct_api_route("claude-sonnet-5"),
+            DirectApiRoute::LegacyAnthropic
+        );
         assert_eq!(
             direct_api_route("anthropic/claude-haiku-4-5"),
             DirectApiRoute::LegacyAnthropic
         );
         // Registry-unknown claude id → legacy path (behavior-compatible).
-        assert_eq!(direct_api_route("claude-sonnet-4-6"), DirectApiRoute::LegacyAnthropic);
+        assert_eq!(
+            direct_api_route("claude-sonnet-4-6"),
+            DirectApiRoute::LegacyAnthropic
+        );
         // Known non-Anthropic models → their duduclaw-llm provider.
         assert_eq!(
             direct_api_route("gpt-5.4"),
@@ -2711,14 +2974,20 @@ mod direct_api_routing_tests {
             DirectApiRoute::LlmProvider("deepseek".to_string())
         );
         // Unknown model → legacy path (fail-safe, unchanged failure mode).
-        assert_eq!(direct_api_route("unknown-model"), DirectApiRoute::LegacyAnthropic);
+        assert_eq!(
+            direct_api_route("unknown-model"),
+            DirectApiRoute::LegacyAnthropic
+        );
     }
 
     /// The two marker constants MUST stay byte-identical — prompt assemblers
     /// write the gateway constant, the llm path splits on the crate constant.
     #[test]
     fn cache_split_markers_stay_in_sync() {
-        assert_eq!(duduclaw_llm::CACHE_SPLIT_MARKER, crate::direct_api::CACHE_SPLIT_MARKER);
+        assert_eq!(
+            duduclaw_llm::CACHE_SPLIT_MARKER,
+            crate::direct_api::CACHE_SPLIT_MARKER
+        );
     }
 
     // ── HIGH-A: `moa:` ids must never reach a CLI spawn / the rotator ────
@@ -2787,7 +3056,10 @@ mod direct_api_routing_tests {
         // Single user message carrying the prompt; no tools.
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, Role::User);
-        assert_eq!(req.messages[0].parts, vec![ContentPart::Text("hello".to_string())]);
+        assert_eq!(
+            req.messages[0].parts,
+            vec![ContentPart::Text("hello".to_string())]
+        );
         assert!(req.tools.is_empty());
     }
 
@@ -2888,7 +3160,9 @@ mod chain_tests {
     #[test]
     fn order_candidates_all_keyless_is_empty() {
         let out =
-            order_direct_api_candidates("gpt-5.4", &["gemini/gemini-3.1-pro".to_string()], |_| false);
+            order_direct_api_candidates("gpt-5.4", &["gemini/gemini-3.1-pro".to_string()], |_| {
+                false
+            });
         assert!(out.is_empty());
     }
 
@@ -2908,17 +3182,25 @@ mod chain_tests {
     #[test]
     fn chain_failover_classification_typed() {
         use duduclaw_llm::LlmError as E;
-        assert!(llm_err_is_chain_failover(&E::RateLimited { retry_after: None }));
+        assert!(llm_err_is_chain_failover(&E::RateLimited {
+            retry_after: None
+        }));
         assert!(llm_err_is_chain_failover(&E::Billing));
         assert!(llm_err_is_chain_failover(&E::Timeout));
         assert!(llm_err_is_chain_failover(&E::Network("reset".into())));
-        assert!(llm_err_is_chain_failover(&E::Http { status: 503, body_snippet: "x".into() }));
+        assert!(llm_err_is_chain_failover(&E::Http {
+            status: 503,
+            body_snippet: "x".into()
+        }));
         // Terminal.
         assert!(!llm_err_is_chain_failover(&E::Auth));
         assert!(!llm_err_is_chain_failover(&E::InvalidRequest("bad".into())));
         assert!(!llm_err_is_chain_failover(&E::ContentFilter));
         assert!(!llm_err_is_chain_failover(&E::ContextWindowExceeded));
-        assert!(!llm_err_is_chain_failover(&E::Http { status: 400, body_snippet: "x".into() }));
+        assert!(!llm_err_is_chain_failover(&E::Http {
+            status: 400,
+            body_snippet: "x".into()
+        }));
     }
 
     // ── G1: chain driver (failover advances / terminal short-circuits) ──
@@ -2933,7 +3215,10 @@ mod chain_tests {
             async move {
                 calls.lock().unwrap().push(m.clone());
                 if m == "a" {
-                    Err(ChainError { message: "rate limit".into(), failover: true })
+                    Err(ChainError {
+                        message: "rate limit".into(),
+                        failover: true,
+                    })
                 } else {
                     Ok("answer from b".to_string())
                 }
@@ -2941,7 +3226,10 @@ mod chain_tests {
         })
         .await;
         assert_eq!(result.unwrap(), "answer from b");
-        assert_eq!(*calls.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -2953,7 +3241,10 @@ mod chain_tests {
             let calls = seen.clone();
             async move {
                 calls.lock().unwrap().push(m.clone());
-                Err(ChainError { message: format!("auth error on {m}"), failover: false })
+                Err(ChainError {
+                    message: format!("auth error on {m}"),
+                    failover: false,
+                })
             }
         })
         .await;
@@ -2966,7 +3257,10 @@ mod chain_tests {
     async fn chain_exhaustion_returns_last_failover() {
         let candidates = vec!["a".to_string(), "b".to_string()];
         let result = drive_direct_api_chain(&candidates, |m| async move {
-            Err::<String, _>(ChainError { message: format!("timeout {m}"), failover: true })
+            Err::<String, _>(ChainError {
+                message: format!("timeout {m}"),
+                failover: true,
+            })
         })
         .await;
         let err = result.unwrap_err();
@@ -3013,7 +3307,9 @@ mod chain_tests {
             ..Default::default()
         };
         let out = filter_tool_defs(defs.clone(), Some(&caps2));
-        assert!(out.iter().all(|d| d.name != "tasks_list" && d.name != "computer"));
+        assert!(out
+            .iter()
+            .all(|d| d.name != "tasks_list" && d.name != "computer"));
 
         // Allowlist mode: only listed tools survive (fail-closed).
         let caps3 = CapabilitiesConfig {
@@ -3039,18 +3335,28 @@ mod chain_tests {
     fn key_source_prefers_rotator_then_env() {
         // Rotator account with a real key → Rotator.
         assert_eq!(
-            choose_key_source(Some(("acct-1".into(), Some("sk-1".into()))), Some("env-key".into())),
-            Some(KeySource::Rotator { account_id: "acct-1".into(), key: "sk-1".into() })
+            choose_key_source(
+                Some(("acct-1".into(), Some("sk-1".into()))),
+                Some("env-key".into())
+            ),
+            Some(KeySource::Rotator {
+                account_id: "acct-1".into(),
+                key: "sk-1".into()
+            })
         );
         // Rotator OAuth account (no raw key) → env fallback.
         assert_eq!(
             choose_key_source(Some(("oauth-1".into(), None)), Some("env-key".into())),
-            Some(KeySource::Env { key: "env-key".into() })
+            Some(KeySource::Env {
+                key: "env-key".into()
+            })
         );
         // No rotator pick + env present → Env.
         assert_eq!(
             choose_key_source(None, Some("env-key".into())),
-            Some(KeySource::Env { key: "env-key".into() })
+            Some(KeySource::Env {
+                key: "env-key".into()
+            })
         );
         // Nothing usable → None.
         assert_eq!(choose_key_source(None, None), None);
