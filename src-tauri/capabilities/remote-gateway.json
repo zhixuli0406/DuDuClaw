@@ -2,7 +2,10 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "remote-gateway",
   "description": "The main/mascot webviews navigate to the dashboard served by the selected gateway (a remote origin from Tauri's point of view — loopback sidecar or an enterprise LAN gateway chosen via the picker). Without remote coverage every app command invoke is denied by the ACL (e.g. pet_generate). Scope: no shell permissions here — remote pages get core plumbing + app commands only.",
-  "windows": ["main", "mascot"],
+  "windows": [
+    "main",
+    "mascot"
+  ],
   "remote": {
     "urls": [
       "http://localhost:*",
@@ -18,6 +21,22 @@
     "core:window:allow-set-focus",
     "core:window:allow-unminimize",
     "core:window:allow-start-dragging",
-    "notification:default"
+    "notification:default",
+    "allow-open-main-window",
+    "allow-pet-list",
+    "allow-pet-generate",
+    "allow-pet-active-get",
+    "allow-pet-activate",
+    "allow-pet-remove",
+    "allow-pet-load-active",
+    "allow-pet-model-status",
+    "allow-pet-model-download",
+    "allow-gateway-discover",
+    "allow-gateway-health",
+    "allow-gateway-select",
+    "allow-gateway-last",
+    "allow-gateway-local-status",
+    "allow-gateway-start-local",
+    "allow-gateway-open-picker"
   ]
 }
