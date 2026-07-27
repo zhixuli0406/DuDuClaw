@@ -118,6 +118,7 @@ function RoutineFormDialog({
   const [saving, setSaving] = useState(false);
   // Office scheduling templates (create mode only) — prefill name/cron/prompt.
   const [templates, setTemplates] = useState<CronTemplate[]>([]);
+  const [templateId, setTemplateId] = useState('');
 
   useEffect(() => {
     if (isEdit) return;
@@ -130,6 +131,7 @@ function RoutineFormDialog({
   const applyTemplate = (id: string) => {
     const t = templates.find((x) => x.id === id);
     if (!t) return;
+    setTemplateId(id);
     setName(t.name);
     setSchedule(t.cron);
     setBody(t.prompt);
@@ -182,7 +184,7 @@ function RoutineFormDialog({
               <label className="text-xs font-medium text-muted-foreground">
                 {intl.formatMessage({ id: 'routines.template.label' })}
               </label>
-              <Select value="" onValueChange={(v) => applyTemplate(String(v))}>
+              <Select value={templateId} onValueChange={(v) => applyTemplate(String(v))}>
                 <SelectTrigger className="w-full">
                   <SelectValue
                     placeholder={intl.formatMessage({ id: 'routines.template.placeholder' })}
