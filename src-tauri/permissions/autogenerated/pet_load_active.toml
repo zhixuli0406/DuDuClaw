@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pet-load-active"
+description = "Enables the pet_load_active command without any pre-configured scope."
+commands.allow = ["pet_load_active"]
+
+[[permission]]
+identifier = "deny-pet-load-active"
+description = "Denies the pet_load_active command without any pre-configured scope."
+commands.deny = ["pet_load_active"]

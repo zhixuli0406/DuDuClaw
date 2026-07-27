@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pet-list"
+description = "Enables the pet_list command without any pre-configured scope."
+commands.allow = ["pet_list"]
+
+[[permission]]
+identifier = "deny-pet-list"
+description = "Denies the pet_list command without any pre-configured scope."
+commands.deny = ["pet_list"]

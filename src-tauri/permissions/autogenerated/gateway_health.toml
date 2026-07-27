@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-health"
+description = "Enables the gateway_health command without any pre-configured scope."
+commands.allow = ["gateway_health"]
+
+[[permission]]
+identifier = "deny-gateway-health"
+description = "Denies the gateway_health command without any pre-configured scope."
+commands.deny = ["gateway_health"]
