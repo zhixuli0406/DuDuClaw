@@ -30,6 +30,12 @@ tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
+# Photo → desktop-pet pack format + local background removal (WP-P2/P3). The
+# `onnx` feature pulls the ort/onnxruntime path (BiRefNet/silueta); prebuilt
+# onnxruntime binaries resolve on the desktop's native target (aarch64/x86_64
+# with a supported prebuilt) — same setup as duduclaw-inference's `onnx` feature.
+duduclaw-pets = { path = "../crates/duduclaw-pets", features = ["onnx"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Transitive pin (not used directly): time 0.3.52 changed the public

@@ -1,0 +1,37 @@
+[package]
+name = "duduclaw-pets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Photo → interactive desktop-pet pack format + local background removal (WP-P2/P3)"
+
+[dependencies]
+duduclaw-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+sha2 = "0.10"
+# Pure-Rust image decode/encode + resize. Kept in the default feature set: the
+# passthrough (external-cutout) path and RGBA compositing need it even without ONNX.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+# ONNX-based local background removal (BiRefNet-general-lite / silueta). OFF by
+# default so the workspace builds/tests without the onnxruntime toolchain; the
+# desktop shell turns it on. Mirrors duduclaw-inference's ort pin exactly.
+ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
+# Must match ort's ndarray major (ort 2.0.0-rc.12 uses 0.17) or Tensor::from_array
+# sees a foreign ArrayBase type and the OwnedTensorArrayData bound fails.
+ndarray = { version = "0.17", optional = true }
+# Model download for the ONNX path.
+reqwest = { version = "0.12", features = ["blocking"], optional = true }
+
+[features]
+default = []
+# Local ONNX background removal + model download. Enabled by the desktop app.
+onnx = ["dep:ort", "dep:ndarray", "dep:reqwest"]
+
+[dev-dependencies]
+tempfile = "3"

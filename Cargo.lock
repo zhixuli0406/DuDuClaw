@@ -2092,6 +2092,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid 1.23.1",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -2429,6 +2430,24 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "duduclaw-pets"
+version = "1.45.0"
+dependencies = [
+ "chrono",
+ "duduclaw-core",
+ "image",
+ "ndarray 0.17.2",
+ "ort",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
