@@ -17,16 +17,22 @@ pub fn build_mascot_window(app: &AppHandle) -> tauri::Result<()> {
     if app.get_webview_window(MASCOT_LABEL).is_some() {
         return Ok(());
     }
-    WebviewWindowBuilder::new(app, MASCOT_LABEL, WebviewUrl::App("mascot-overlay".into()))
-        .title("DuDu")
-        .inner_size(180.0, 180.0)
-        .transparent(true)
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .visible(false)
-        .build()?;
+    let builder =
+        WebviewWindowBuilder::new(app, MASCOT_LABEL, WebviewUrl::App("mascot-overlay".into()))
+            .title("DuDu")
+            .inner_size(180.0, 180.0)
+            .transparent(true)
+            .decorations(false)
+            // CRITICAL: on macOS a transparent, decorationless window STILL draws
+            // a rectangular drop-shadow that outlines the window bounds — that is
+            // the "矩形框" users see around the pet. Disabling the shadow (plus the
+            // fully-transparent web surface) leaves only the pet's own pixels.
+            .shadow(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .resizable(false)
+            .visible(false);
+    builder.build()?;
     Ok(())
 }
 

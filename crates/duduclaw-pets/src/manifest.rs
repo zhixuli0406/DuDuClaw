@@ -141,6 +141,32 @@ impl PetManifest {
         }
     }
 
+    /// Build a fresh sprite pet manifest (baked pixel-art spritesheet path).
+    ///
+    /// `spritesheet_file` / `source_file` are pack-relative filenames;
+    /// `animations` is the per-state grid table (see `sprite_bake`).
+    pub fn new_sprite(
+        id: impl Into<String>,
+        display_name: impl Into<String>,
+        spritesheet_file: impl Into<String>,
+        source_file: impl Into<String>,
+        animations: BTreeMap<String, AnimationSpec>,
+    ) -> Self {
+        PetManifest {
+            schema_version: SCHEMA_VERSION,
+            id: id.into(),
+            display_name: display_name.into(),
+            description: String::new(),
+            spritesheet_path: Some(spritesheet_file.into()),
+            mode: PetMode::Sprite,
+            sprite: None,
+            source: Some(source_file.into()),
+            animations,
+            behaviors: default_procedural_behaviors(),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        }
+    }
+
     /// Parse a manifest from JSON bytes.
     pub fn from_json(bytes: &[u8]) -> crate::Result<Self> {
         serde_json::from_slice(bytes).map_err(|e| crate::PetError::Manifest(e.to_string()))

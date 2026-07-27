@@ -33,8 +33,7 @@ fn open_main_window(app: AppHandle) {
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -63,6 +62,10 @@ fn main() {
             pet_gen::pet_load_active,
             pet_gen::pet_model_status,
             pet_gen::pet_model_download,
+            pet_gen::pet_context_menu,
+            pet_gen::pet_set_scale,
+            pet_gen::pet_get_scale,
+            pet_gen::pet_open_studio,
             gateway_picker::gateway_discover,
             gateway_picker::gateway_health,
             gateway_picker::gateway_select,
@@ -114,6 +117,12 @@ fn main() {
             build_tray(app.handle(), &manager)?;
             Ok(())
         })
+        // Route right-click desktop-pet menu clicks. The tray uses its own
+        // `on_menu_event`; this app-level handler only acts on `pet_*` ids
+        // (returns false otherwise) so the two never conflict.
+        .on_menu_event(|app, event| {
+            pet_gen::handle_pet_menu_event(app, event.id().as_ref());
+        })
         .on_window_event(|window, event| {
             // Close-to-tray: hide instead of quitting (§D2.4). Real quit goes
             // through the tray menu / RunEvent::ExitRequested.
@@ -147,7 +156,13 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
     let switch_gw = MenuItem::with_id(app, "switch_gateway", "切換 Gateway", true, None::<&str>)?;
     let mascot = MenuItem::with_id(app, "toggle_mascot", "顯示/隱藏桌寵", true, None::<&str>)?;
     let restart = MenuItem::with_id(app, "restart", "重啟背景服務", true, None::<&str>)?;
-    let status = MenuItem::with_id(app, "status", tray_status_label(manager), false, None::<&str>)?;
+    let status = MenuItem::with_id(
+        app,
+        "status",
+        tray_status_label(manager),
+        false,
+        None::<&str>,
+    )?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "結束", true, None::<&str>)?;
     let menu = Menu::with_items(

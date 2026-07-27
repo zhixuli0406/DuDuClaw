@@ -2483,6 +2483,8 @@
   "pet.studio.namePlaceholder": "ペットの名前",
   "pet.studio.externalLabel": "背景除去済み",
   "pet.studio.externalHint": "除去をスキップ——画像はすでに透過 PNG です。",
+  "pet.studio.pixelLabel": "ピクセルアート",
+  "pet.studio.pixelHint": "切り抜きをレトロなピクセルスプライトに変換し、動きを焼き込みます（Codex Pets 風）。",
   "pet.studio.generate": "生成",
   "pet.studio.activate": "デスクトップに置く",
   "pet.studio.removerUsed": "{remover} で背景を除去しました",

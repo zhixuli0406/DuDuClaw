@@ -1,5 +1,6 @@
 import { useEffect, lazy, Suspense } from 'react';
-import { Routes, Route, Navigate } from 'react-router';
+import { Routes, Route, Navigate, useNavigate } from 'react-router';
+import { onPetOpenStudio } from './lib/pet';
 import { MainLayout } from './components/layout/MainLayout';
 import { ManageShell } from './components/layout/ManageShell';
 import { AuthGuard, RoleGuard } from './components/AuthGuard';
@@ -94,6 +95,22 @@ export function App() {
   const disconnect = useConnectionStore((s) => s.disconnect);
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const initialized = useAuthStore((s) => s.initialized);
+  const navigate = useNavigate();
+
+  // The desktop pet's right-click "open studio" item fires a Tauri event on the
+  // main window; navigate there when it arrives (no-op outside Tauri).
+  useEffect(() => {
+    let unlisten = () => {};
+    let alive = true;
+    void onPetOpenStudio(() => navigate('/pet-studio')).then((fn) => {
+      if (alive) unlisten = fn;
+      else fn();
+    });
+    return () => {
+      alive = false;
+      unlisten();
+    };
+  }, [navigate]);
 
   // Connect WS after auth is resolved; disconnect on logout.
   // Skip during initialization to avoid premature disconnect.

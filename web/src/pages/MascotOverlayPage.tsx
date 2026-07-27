@@ -4,7 +4,13 @@ import { DuDu } from '@/components/mascot';
 import type { DuduFace } from '@/components/mascot/faces';
 import { useApprovalsStore } from '@/stores/approvals-store';
 import { PetRuntime } from '@/components/pet/PetRuntime';
-import { isTauri, onPetChanged, petLoadActive, type PetRuntimePayload } from '@/lib/pet';
+import {
+  isTauri,
+  onPetChanged,
+  openPetContextMenu,
+  petLoadActive,
+  type PetRuntimePayload,
+} from '@/lib/pet';
 
 /**
  * `/mascot-overlay` — the Tauri desktop-pet mini route (§7.4). Rendered inside a
@@ -46,6 +52,15 @@ export function MascotOverlayPage() {
   const pending = useApprovalsStore((s) => s.pendingCount);
   const [awake, setAwake] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Make the overlay window fully transparent (see index.css rule): the default
+  // opaque `--app-bg` body would otherwise render a solid rectangle behind the
+  // pet. Scoped to this route only; removed on unmount so the main window (which
+  // never mounts this page) is never affected.
+  useEffect(() => {
+    document.body.classList.add('mascot-overlay-body');
+    return () => document.body.classList.remove('mascot-overlay-body');
+  }, []);
 
   // Custom pet pack (WP-P3): if the owner generated one from a photo it replaces
   // the built-in DuDu SVG with the procedural PetRuntime. Falls back to DuDu when
@@ -126,6 +141,10 @@ export function MascotOverlayPage() {
       onMouseEnter={wake}
       onMouseLeave={dozeSoon}
       onClick={openMainWindow}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        void openPetContextMenu();
+      }}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') openMainWindow();
       }}

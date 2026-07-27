@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pet-open-studio"
+description = "Enables the pet_open_studio command without any pre-configured scope."
+commands.allow = ["pet_open_studio"]
+
+[[permission]]
+identifier = "deny-pet-open-studio"
+description = "Denies the pet_open_studio command without any pre-configured scope."
+commands.deny = ["pet_open_studio"]

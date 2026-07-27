@@ -84,6 +84,40 @@ pub fn save_procedural_pack(
     })
 }
 
+/// Persist a freshly baked sprite pack (pixel-art spritesheet) to disk.
+///
+/// `unique_slug` must already be sanitized + collision-resolved. `spritesheet_png`
+/// is the baked RGBA grid (see `sprite_bake`); `source` is the original photo
+/// bytes (stored verbatim). `animations` is the per-state grid table.
+pub fn save_sprite_pack(
+    unique_slug: &str,
+    display_name: &str,
+    spritesheet_png: &[u8],
+    source: &[u8],
+    animations: std::collections::BTreeMap<String, crate::manifest::AnimationSpec>,
+) -> Result<PetPack> {
+    let dir = pack_dir(unique_slug);
+    std::fs::create_dir_all(&dir)?;
+
+    std::fs::write(dir.join("spritesheet.png"), spritesheet_png)?;
+    std::fs::write(dir.join("source.png"), source)?;
+
+    let manifest = PetManifest::new_sprite(
+        unique_slug,
+        display_name,
+        "spritesheet.png",
+        "source.png",
+        animations,
+    );
+    write_manifest(&dir, &manifest)?;
+
+    Ok(PetPack {
+        slug: unique_slug.to_string(),
+        manifest,
+        dir,
+    })
+}
+
 /// Write `pet.json` into a pack directory (pretty JSON).
 pub fn write_manifest(dir: &Path, manifest: &PetManifest) -> Result<()> {
     std::fs::write(dir.join("pet.json"), manifest.to_json()?)?;

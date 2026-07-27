@@ -217,6 +217,17 @@ body {
   font-feature-settings: "tnum" 1; /* tabular numerals for dashboard data */
 }
 
+/* Desktop-pet overlay window (§7.4): the mascot lives in its own transparent
+   Tauri window. The default opaque `--app-bg` on <body> would paint the whole
+   180×180 window as a solid rectangle around the pet. When MascotOverlayPage
+   mounts it stamps `.mascot-overlay-body` on <body>; force every ancestor of
+   the pet fully transparent so only the pet's own pixels are visible. */
+html:has(body.mascot-overlay-body),
+body.mascot-overlay-body,
+body.mascot-overlay-body #root {
+  background: transparent !important;
+}
+
 h1, h2, h3 {
   letter-spacing: -0.02em;
 }
@@ -292,6 +303,13 @@ h1, h2, h3 {
   25% { transform: translateY(-8%); }
   40% { transform: translateY(0); }
 }
+/* Desktop-pet notify placard — a gentle "look at me" wave. Reduced-motion holds
+   the sign still (only the enabled rule below animates). */
+@keyframes dudu-placard {
+  0%, 100% { transform: rotate(-4deg); }
+  50% { transform: rotate(4deg); }
+}
+.dudu-placard { transform-origin: 50% 90%; }
 
 /* ─────────── Character system motion (§3.2, T2.2) ───────────
    Eyes blink out of phase (per-character animation-delay set inline from the
@@ -319,6 +337,7 @@ h1, h2, h3 {
      also JS-gates on reduced-motion (renders a toast instead of particles). */
   .confetti-piece { animation: confetti-fall 1.6s cubic-bezier(0.4, 0.2, 0.6, 1) forwards; }
   .dudu-hop { animation: dudu-hop 1.8s ease-in-out infinite; }
+  .dudu-placard { animation: dudu-placard 1.6s ease-in-out infinite; }
 
   .character-eyes {
     transform-box: fill-box;

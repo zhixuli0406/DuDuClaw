@@ -65,6 +65,8 @@ export function PetStudioPage() {
   const [photoDataUrl, setPhotoDataUrl] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [external, setExternal] = useState(false);
+  // Pixel-art is the default look users expect (petdex / Codex Pets style).
+  const [pixelate, setPixelate] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [preview, setPreview] = useState<GeneratedPet | null>(null);
   const [downloading, setDownloading] = useState<'birefnet' | 'silueta' | null>(null);
@@ -99,7 +101,7 @@ export function PetStudioPage() {
     if (!photoDataUrl) return;
     setGenerating(true);
     try {
-      const result = await petGenerate(name.trim() || 'DuDu', photoDataUrl, external);
+      const result = await petGenerate(name.trim() || 'DuDu', photoDataUrl, external, pixelate);
       setPreview(result);
       refresh();
       if (result.removerLabel === 'passthrough' && !external) {
@@ -110,7 +112,7 @@ export function PetStudioPage() {
     } finally {
       setGenerating(false);
     }
-  }, [photoDataUrl, name, external, refresh, t]);
+  }, [photoDataUrl, name, external, pixelate, refresh, t]);
 
   const onActivate = useCallback(
     async (slug: string) => {
@@ -287,6 +289,15 @@ export function PetStudioPage() {
                 placeholder={t('pet.studio.namePlaceholder')}
                 maxLength={48}
               />
+              <label className="flex items-center justify-between gap-3 text-sm">
+                <span className="flex flex-col">
+                  <span>{t('pet.studio.pixelLabel')}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {t('pet.studio.pixelHint')}
+                  </span>
+                </span>
+                <Switch checked={pixelate} onCheckedChange={setPixelate} />
+              </label>
               <label className="flex items-center justify-between gap-3 text-sm">
                 <span className="flex flex-col">
                   <span>{t('pet.studio.externalLabel')}</span>

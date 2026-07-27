@@ -26,6 +26,22 @@ export interface PetBehavior {
   condition: string | null;
 }
 
+/** One playable animation row of a baked spritesheet. */
+export interface SpriteAnimation {
+  state: string;
+  row: number;
+  frames: number;
+  fps: number;
+}
+
+/** Spritesheet grid metadata (sprite-mode pets). */
+export interface SpriteSheet {
+  frameWidth: number;
+  frameHeight: number;
+  cols: number;
+  animations: SpriteAnimation[];
+}
+
 /** Everything the overlay runtime needs to render + animate a pet. */
 export interface PetRuntimePayload {
   slug: string;
@@ -33,7 +49,12 @@ export interface PetRuntimePayload {
   mode: PetMode;
   imageDataUrl: string | null;
   behaviors: PetBehavior[];
+  /** Present for sprite-mode (pixel-art) pets; drives frame playback. */
+  spriteSheet?: SpriteSheet | null;
 }
+
+/** Desktop-pet window size keyword. */
+export type PetScale = 'small' | 'standard' | 'large';
 
 /** Result of generating a pet: summary + cutout preview + which remover ran. */
 export interface GeneratedPet {
@@ -90,8 +111,12 @@ export const petList = () => invoke<PetSummary[]>('pet_list');
  * Generate a pet from a base64 (or data-URL) photo. `externalCutout` skips
  * background removal when the caller already supplies a transparent PNG.
  */
-export const petGenerate = (name: string, photoBase64: string, externalCutout = false) =>
-  invoke<GeneratedPet>('pet_generate', { name, photoBase64, externalCutout });
+export const petGenerate = (
+  name: string,
+  photoBase64: string,
+  externalCutout = false,
+  pixelate = true
+) => invoke<GeneratedPet>('pet_generate', { name, photoBase64, externalCutout, pixelate });
 
 /** The currently active pet, if any. */
 export const petActiveGet = () => invoke<PetSummary | null>('pet_active_get');
@@ -112,14 +137,68 @@ export const petModelStatus = () => invoke<ModelStatus>('pet_model_status');
 export const petModelDownload = (variant: 'birefnet' | 'silueta') =>
   invoke<string>('pet_model_download', { variant });
 
+/** Pop up the pet's native right-click menu (no-op outside Tauri). */
+export const petContextMenu = () => invoke<void>('pet_context_menu');
+
+/** Set the desktop-pet window scale; persists + resizes immediately. */
+export const petSetScale = (scale: PetScale) => invoke<void>('pet_set_scale', { scale });
+
+/** The current desktop-pet window scale keyword. */
+export const petGetScale = () => invoke<PetScale>('pet_get_scale');
+
+/** Show the main window and navigate it to the pet studio. */
+export const petOpenStudio = () => invoke<void>('pet_open_studio');
+
 /** Event name broadcast when the active pet changes (matches the Rust const). */
 export const PET_CHANGED_EVENT = 'pet://changed';
+
+/** Event fired when the pet's menu asks to open the studio (main-window listens). */
+export const PET_OPEN_STUDIO_EVENT = 'pet://open-studio';
 
 /** Subscribe to active-pet changes. Returns an unlisten fn (no-op outside Tauri). */
 export async function onPetChanged(handler: () => void): Promise<() => void> {
   const listen = tauri()?.event?.listen;
   if (typeof listen !== 'function') return () => {};
   return listen(PET_CHANGED_EVENT, () => handler());
+}
+
+/** Subscribe to "open pet studio" requests from the pet menu (main window). */
+export async function onPetOpenStudio(handler: () => void): Promise<() => void> {
+  const listen = tauri()?.event?.listen;
+  if (typeof listen !== 'function') return () => {};
+  return listen(PET_OPEN_STUDIO_EVENT, () => handler());
+}
+
+/** Tauri app-event a host can emit to drive the pet's working/notify state. */
+export const PET_AGENT_SIGNAL_EVENT = 'pet://agent-signal';
+
+/** A pet reaction signal: busy ('working'), attention ('notify'), or clear. */
+export interface PetAgentSignalPayload {
+  state: 'working' | 'notify' | 'idle';
+}
+
+/**
+ * Subscribe to agent-status signals pushed as a Tauri app event (no-op outside
+ * Tauri). The overlay window has no authenticated gateway WS of its own, so a
+ * live "agent is working" / "new message" feed must be forwarded here by a host
+ * that does (e.g. the gateway or the main window emitting `pet://agent-signal`).
+ * The interface is ready; wiring a real emitter is a follow-up.
+ */
+export async function onPetAgentSignal(
+  handler: (p: PetAgentSignalPayload) => void
+): Promise<() => void> {
+  const listen = tauri()?.event?.listen;
+  if (typeof listen !== 'function') return () => {};
+  return listen(PET_AGENT_SIGNAL_EVENT, (e) => handler(e.payload as PetAgentSignalPayload));
+}
+
+/** Try to pop the native pet context menu; swallow errors (best-effort UX). */
+export async function openPetContextMenu(): Promise<void> {
+  try {
+    await petContextMenu();
+  } catch {
+    /* not in Tauri, or menu already open — ignore */
+  }
 }
 
 /**
