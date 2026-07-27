@@ -4049,6 +4049,14 @@ impl MethodHandler {
             "ping" => WsFrame::ok_response("", json!({ "pong": true })),
             "hello-ok" => self.handle_hello_ok(params),
             "tools.catalog" => self.handle_tools_catalog(params),
+            "tools.builtin_catalog" => {
+                // Non-sensitive static catalog for the capability editor picker;
+                // any authenticated user (same tier as `agents.list`) may read it.
+                if let Err(e) = acl::require_role(ctx, UserRole::Employee) {
+                    return WsFrame::error_response("", &e);
+                }
+                self.handle_tools_builtin_catalog()
+            }
 
             // ── Agent methods (filtered by binding) ──────────
             "agents.list" => self.handle_agents_list_filtered(ctx, params).await,
@@ -5357,6 +5365,23 @@ impl MethodHandler {
                 ]
             }),
         )
+    }
+
+    /// `tools.builtin_catalog` — catalog of built-in agent tools (DuDuClaw MCP
+    /// tools qualified as `mcp__duduclaw__<name>`, plus native Claude Code
+    /// tools) that populates the capability editor's "add from built-in tools"
+    /// picker for `allowed_tools` / `denied_tools`. Sourced from
+    /// `duduclaw_core::tool_catalog` — the single source of truth whose scope
+    /// column is drift-tested against `mcp_auth::tool_requires_scope`. Distinct
+    /// from `tools.catalog`, which enumerates dashboard RPC methods.
+    fn handle_tools_builtin_catalog(&self) -> WsFrame {
+        let tools = duduclaw_core::tool_catalog::builtin_tool_catalog();
+        match serde_json::to_value(&tools) {
+            Ok(v) => WsFrame::ok_response("", json!({ "tools": v })),
+            Err(e) => {
+                WsFrame::error_response("", &format!("tool catalog serialize failed: {e}"))
+            }
+        }
     }
 
     // ── Agents ───────────────────────────────────────────────

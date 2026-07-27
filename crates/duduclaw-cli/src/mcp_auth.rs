@@ -858,6 +858,31 @@ is_external = {is_external}
         assert_eq!(tool_requires_scope("totally_unknown"), Some(Scope::Admin));
     }
 
+    // ── Drift guard: dashboard tool catalog ↔ security gate ──────────────────
+    // The dashboard "add from built-in tools" picker is fed by
+    // `duduclaw_core::tool_catalog::builtin_tool_catalog()`, which lives in
+    // `duduclaw-core` because the gateway cannot depend on this crate (cli →
+    // gateway → core; a gateway → cli dep would be a cycle). This test is the
+    // mechanical guard that keeps the catalog's advertised scope byte-identical
+    // to what `tool_requires_scope` actually enforces. If someone changes a
+    // tool's scope in the gate but not the catalog (or vice versa), this fails.
+    #[test]
+    fn test_catalog_scopes_match_tool_requires_scope() {
+        for entry in duduclaw_core::tool_catalog::builtin_tool_catalog() {
+            if entry.kind != "mcp" {
+                continue; // native Claude tools have no MCP scope
+            }
+            let enforced = tool_requires_scope(entry.name)
+                .expect("enumerated MCP tool must resolve to a scope")
+                .to_string();
+            assert_eq!(
+                enforced, entry.scope,
+                "catalog scope for `{}` ({}) drifted from tool_requires_scope ({})",
+                entry.name, entry.scope, enforced
+            );
+        }
+    }
+
     #[test]
     fn test_dangerous_tools_require_admin() {
         // C2 regression: these previously returned None (no scope), letting a
