@@ -376,7 +376,27 @@ fn strip_mention_tags(text: &str) -> String {
 async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
     let raw_text = activity.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let text = strip_mention_tags(raw_text);
-    if text.is_empty() {
+    // WP1.3: collect Teams file attachments (file.download.info carries a
+    // pre-authenticated `downloadUrl`, fetchable without a bearer token).
+    let file_attachments: Vec<(String, String)> = activity
+        .get("attachments")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    let ctype = a.get("contentType").and_then(|v| v.as_str()).unwrap_or("");
+                    if ctype == "application/vnd.microsoft.teams.file.download.info" {
+                        let url = a.pointer("/content/downloadUrl").and_then(|v| v.as_str())?;
+                        let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("file");
+                        Some((name.to_string(), url.to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if text.is_empty() && file_attachments.is_empty() {
         return;
     }
 
@@ -515,8 +535,51 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         }
     }
 
-    let reply = build_reply_with_session(&text, &state.ctx, &session_id, &sender_id, Some(on_progress)).await;
+    // WP1.3: download inbound file attachments to the resolved agent's dir.
+    let mut attachment_lines: Vec<String> = Vec::new();
+    if !file_attachments.is_empty() {
+        let attach_base =
+            crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), None).await;
+        for (name, url) in &file_attachments {
+            match crate::media::download_url(
+                &state.ctx.http, url, None, crate::media::MAX_FILE_SIZE as usize,
+            )
+            .await
+            {
+                Ok(bytes) => match crate::media::save_attachment_in_base(&attach_base, &bytes, name).await {
+                    Ok(path) => attachment_lines.push(crate::media::format_attachment_ref(
+                        &crate::media::MediaType::File, name, &path,
+                    )),
+                    Err(e) => warn!("Teams: failed to save attachment {name}: {e}"),
+                },
+                Err(e) => warn!("Teams: failed to download attachment {name}: {e}"),
+            }
+        }
+    }
+    let input_text = if attachment_lines.is_empty() {
+        text.clone()
+    } else if text.is_empty() {
+        attachment_lines.join("\n")
+    } else {
+        format!("{text}\n\n{}", attachment_lines.join("\n"))
+    };
+
+    let reply = build_reply_with_session(&input_text, &state.ctx, &session_id, &sender_id, Some(on_progress)).await;
     drop(typing_guard);
+
+    // WP1.3: 📎DELIVER: — Teams file upload is not wired, so the sender's
+    // default `send_document` degrades to a text notice (→ dashboard Files
+    // panel) via the persisted conversation reference; the marker is stripped.
+    let reply = {
+        let doc_sender = crate::channel_sender::create_teams_sender(
+            state.ctx.home_dir.clone(),
+            target.conversation_id.clone(),
+            sender_id.clone(),
+        );
+        crate::channel_reply::deliver_documents_for_reply(
+            state.ctx.as_ref(), None, reply, doc_sender.as_ref(),
+        ).await
+    };
 
     // Remove the interim progress activity — the final reply supersedes it.
     if let Some(aid) = progress_cleanup.lock().await.take() {

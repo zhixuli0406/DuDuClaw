@@ -513,7 +513,11 @@ async fn poll_loop(
                 };
 
                 // ── Attachment handling: photo/document/video/sticker ──
-                let home_for_attach = ctx.home_dir.clone();
+                // WP1.3: land inbound files under the resolved agent's dir
+                // (`~/.duduclaw/agents/<id>/attachments/`); falls back to the
+                // shared home dir when no agent resolves.
+                let home_for_attach =
+                    crate::channel_reply::resolve_attachment_base(ctx.as_ref(), agent_name.as_deref()).await;
                 if let Some(photos) = &msg.photo {
                     // Telegram sends multiple sizes; take the largest (last element)
                     if let Some(largest) = photos.last() {
@@ -679,6 +683,10 @@ async fn poll_loop(
                 );
 
                 let user_id = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
+                // WP1.3: track which agent produced the reply so DELIVER path
+                // validation uses the right sandbox root (None → resolver falls
+                // back to default/main agent).
+                let mut effective_agent: Option<String> = agent_name.clone();
                 let reply = if let Some(ref agent) = agent_name {
                     // Per-agent bot: unchanged deterministic routing to its owner.
                     build_reply_for_agent(&input_text, &ctx, agent, &session_id, &user_id, Some(on_progress)).await
@@ -686,7 +694,9 @@ async fn poll_loop(
                     // Global/shared bot: route by the user→agent binding (WP9).
                     match resolve_shared_route(&ctx, &user_id).await {
                         SharedRoute::Bound(bound_agent) => {
-                            build_reply_for_agent(&input_text, &ctx, &bound_agent, &session_id, &user_id, Some(on_progress)).await
+                            let r = build_reply_for_agent(&input_text, &ctx, &bound_agent, &session_id, &user_id, Some(on_progress)).await;
+                            effective_agent = Some(bound_agent);
+                            r
                         }
                         SharedRoute::Unbound => {
                             build_reply_with_session(&input_text, &ctx, &session_id, &user_id, Some(on_progress)).await
@@ -695,6 +705,21 @@ async fn poll_loop(
                     }
                 };
                 drop(typing_guard);
+
+                // WP1.3: 📎DELIVER: outbound — send any generated files back to
+                // Telegram (sendDocument) and strip the marker from the text.
+                // Byte-identical no-op when the reply carries no marker.
+                let reply = {
+                    let token = api_base.rsplitn(2, "/bot").next().unwrap_or_default().to_string();
+                    let sender = crate::channel_sender::TelegramSender {
+                        bot_token: token,
+                        chat_id: chat_id.to_string(),
+                        http: client.clone(),
+                    };
+                    crate::channel_reply::deliver_documents_for_reply(
+                        ctx.as_ref(), effective_agent.as_deref(), reply, &sender,
+                    ).await
+                };
 
                 // Guard: don't send empty replies (Telegram rejects empty text).
                 // Checked BEFORE deleting the interim progress message: this

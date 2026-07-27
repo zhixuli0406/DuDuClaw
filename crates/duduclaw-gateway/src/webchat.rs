@@ -630,7 +630,11 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // disk, exactly as channel attachments are handled.
                                 let mut full_content = content.clone();
                                 if !attachments.is_empty() {
-                                    let refs = save_webchat_attachments(&state.ctx.home_dir, &attachments).await;
+                                    // WP1.3: land inbound files under the resolved agent's dir.
+                                    let attach_base = crate::channel_reply::resolve_attachment_base(
+                                        state.ctx.as_ref(), Some(effective_agent_id),
+                                    ).await;
+                                    let refs = save_webchat_attachments(&attach_base, &attachments).await;
                                     if !refs.is_empty() {
                                         if !full_content.trim().is_empty() {
                                             full_content.push_str("\n\n");
@@ -731,6 +735,54 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             };
                                             if let Ok(json) = serde_json::to_string(&msg) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                        }
+                                    }
+                                };
+
+                                // WP1.3: 📎DELIVER: handling. WebChat has no
+                                // in-band binary frame (the browser client
+                                // surfaces generated files via the dashboard
+                                // Files panel), so strip the marker and degrade
+                                // to a text note naming each sandbox-validated
+                                // file — never leak the raw marker, never echo
+                                // an out-of-sandbox path.
+                                let reply = {
+                                    let (cleaned, paths) =
+                                        crate::office_docs::parse_deliverables(&reply);
+                                    if paths.is_empty() {
+                                        reply
+                                    } else {
+                                        let agent_dir = state
+                                            .ctx
+                                            .home_dir
+                                            .join("agents")
+                                            .join(effective_agent_id);
+                                        let names: Vec<String> = paths
+                                            .iter()
+                                            .filter_map(|p| {
+                                                crate::office_docs::validate_deliver_path(
+                                                    p, &agent_dir, &state.ctx.home_dir,
+                                                )
+                                                .ok()
+                                                .and_then(|cp| {
+                                                    cp.file_name()
+                                                        .and_then(|n| n.to_str())
+                                                        .map(|s| s.to_string())
+                                                })
+                                            })
+                                            .collect();
+                                        if names.is_empty() {
+                                            cleaned
+                                        } else {
+                                            let note = format!(
+                                                "📎 已生成檔案：{}（可至 Dashboard 檔案面板下載）",
+                                                names.join("、")
+                                            );
+                                            if cleaned.is_empty() {
+                                                note
+                                            } else {
+                                                format!("{cleaned}\n\n{note}")
                                             }
                                         }
                                     }
@@ -889,11 +941,13 @@ fn compose_session_id(base: &str, agent: Option<&str>, conv_nonce: Option<&str>)
     composed
 }
 
-/// Decode, size-check, and persist WebChat attachments to `<home>/attachments/`,
-/// returning markdown file-reference lines to append to the prompt. Invalid or
-/// oversized attachments are logged and skipped (never abort the whole message).
+/// Decode, size-check, and persist WebChat attachments to
+/// `<base_dir>/attachments/`, returning markdown file-reference lines to append
+/// to the prompt. Invalid or oversized attachments are logged and skipped
+/// (never abort the whole message). `base_dir` is the per-agent dir (WP1.3),
+/// falling back to the shared home dir.
 async fn save_webchat_attachments(
-    home_dir: &std::path::Path,
+    base_dir: &std::path::Path,
     attachments: &[ChatAttachment],
 ) -> Vec<String> {
     use base64::Engine;
@@ -920,7 +974,7 @@ async fn save_webchat_attachments(
         } else {
             att.filename.clone()
         };
-        match crate::media::save_attachment_to_disk(home_dir, &data, &filename).await {
+        match crate::media::save_attachment_in_base(base_dir, &data, &filename).await {
             Ok(path) => {
                 let mime = att
                     .mime

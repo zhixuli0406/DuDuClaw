@@ -184,6 +184,27 @@ pub trait ChannelSender: Send + Sync {
     /// Send a photo (PNG bytes) with an optional caption.
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError>;
 
+    /// Send an arbitrary document (WP1.3 — the `📎DELIVER:` outbound path).
+    ///
+    /// `data` is the raw file bytes, `filename` the name to present, `mime` the
+    /// content type. The default implementation degrades to a text notice so a
+    /// channel with no native file API (LINE, Teams, Google Chat, …) still tells
+    /// the user the deliverable exists; channels with real upload APIs override
+    /// this. `_mime` is unused by the fallback but part of the contract for
+    /// overrides.
+    async fn send_document(
+        &self,
+        data: &[u8],
+        filename: &str,
+        _mime: &str,
+    ) -> Result<(), ChannelSendError> {
+        let kb = data.len() / 1024;
+        self.send_text(&format!(
+            "📎 已生成檔案「{filename}」（約 {kb} KB）。此通道不支援直接傳送檔案，請至 Dashboard 檔案面板下載。"
+        ))
+        .await
+    }
+
     /// Request confirmation from the user and wait for their reply.
     ///
     /// Returns `true` if the user confirmed, `false` otherwise.
@@ -349,6 +370,26 @@ impl ChannelSender for TelegramSender {
             .send()
             .await
             .map_err(|e| ChannelSendError(format!("Telegram sendPhoto: {e}")))?;
+        Ok(())
+    }
+
+    async fn send_document(
+        &self, data: &[u8], filename: &str, mime: &str,
+    ) -> Result<(), ChannelSendError> {
+        let url = format!("https://api.telegram.org/bot{}/sendDocument", self.bot_token);
+        let part = reqwest::multipart::Part::bytes(data.to_vec())
+            .file_name(filename.to_string())
+            .mime_str(mime)
+            .map_err(|e| ChannelSendError(e.to_string()))?;
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", self.chat_id.clone())
+            .part("document", part);
+        self.http
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ChannelSendError(format!("Telegram sendDocument: {e}")))?;
         Ok(())
     }
 
@@ -532,6 +573,31 @@ impl ChannelSender for DiscordSender {
         Ok(())
     }
 
+    async fn send_document(
+        &self, data: &[u8], filename: &str, mime: &str,
+    ) -> Result<(), ChannelSendError> {
+        let url = format!("https://discord.com/api/v10/channels/{}/messages", self.channel_id);
+        let file_part = reqwest::multipart::Part::bytes(data.to_vec())
+            .file_name(filename.to_string())
+            .mime_str(mime)
+            .map_err(|e| ChannelSendError(e.to_string()))?;
+        let payload = serde_json::json!({"content": ""}).to_string();
+        let payload_part = reqwest::multipart::Part::text(payload)
+            .mime_str("application/json")
+            .map_err(|e| ChannelSendError(e.to_string()))?;
+        let form = reqwest::multipart::Form::new()
+            .part("payload_json", payload_part)
+            .part("files[0]", file_part);
+        self.http
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ChannelSendError(format!("Discord sendDocument: {e}")))?;
+        Ok(())
+    }
+
     async fn request_confirmation(
         &self, prompt: &str, screenshot: Option<&[u8]>, _timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
@@ -628,6 +694,52 @@ impl ChannelSender for SlackSender {
             .await
             .map_err(|e| ChannelSendError(format!("Slack completeUpload: {e}")))?;
 
+        Ok(())
+    }
+
+    async fn send_document(
+        &self, data: &[u8], filename: &str, _mime: &str,
+    ) -> Result<(), ChannelSendError> {
+        // Slack files.uploadV2: getUploadURLExternal → PUT bytes → completeUploadExternal.
+        let get_url_resp = self.http
+            .post("https://slack.com/api/files.getUploadURLExternal")
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .json(&serde_json::json!({ "filename": filename, "length": data.len() }))
+            .send()
+            .await
+            .map_err(|e| ChannelSendError(format!("Slack getUploadURL: {e}")))?;
+        let resp_json: serde_json::Value = get_url_resp
+            .json()
+            .await
+            .map_err(|e| ChannelSendError(format!("Slack getUploadURL parse: {e}")))?;
+        let upload_url = resp_json["upload_url"]
+            .as_str()
+            .ok_or_else(|| ChannelSendError("Slack: no upload_url in response".into()))?;
+        let file_id = resp_json["file_id"]
+            .as_str()
+            .ok_or_else(|| ChannelSendError("Slack: no file_id in response".into()))?;
+        // SEC: validate upload URL domain to prevent SSRF.
+        if !upload_url.starts_with("https://files.slack.com/") {
+            return Err(ChannelSendError(format!(
+                "Slack upload URL domain mismatch (possible SSRF): {upload_url}"
+            )));
+        }
+        self.http
+            .put(upload_url)
+            .body(data.to_vec())
+            .send()
+            .await
+            .map_err(|e| ChannelSendError(format!("Slack file upload: {e}")))?;
+        self.http
+            .post("https://slack.com/api/files.completeUploadExternal")
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .json(&serde_json::json!({
+                "files": [{"id": file_id, "title": filename}],
+                "channel_id": self.channel_id,
+            }))
+            .send()
+            .await
+            .map_err(|e| ChannelSendError(format!("Slack completeUpload: {e}")))?;
         Ok(())
     }
 
@@ -734,6 +846,56 @@ impl ChannelSender for WhatsAppSender {
         Ok(())
     }
 
+    async fn send_document(
+        &self, data: &[u8], filename: &str, mime: &str,
+    ) -> Result<(), ChannelSendError> {
+        // Step 1: upload media (type = actual document MIME).
+        let upload_url = format!(
+            "https://graph.facebook.com/v20.0/{}/media",
+            self.phone_number_id
+        );
+        let file_part = reqwest::multipart::Part::bytes(data.to_vec())
+            .file_name(filename.to_string())
+            .mime_str(mime)
+            .map_err(|e| ChannelSendError(e.to_string()))?;
+        let form = reqwest::multipart::Form::new()
+            .text("messaging_product", "whatsapp")
+            .text("type", mime.to_string())
+            .part("file", file_part);
+        let upload_resp = self.http
+            .post(&upload_url)
+            .bearer_auth(&self.access_token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ChannelSendError(format!("WhatsApp media upload: {e}")))?;
+        let resp_json: serde_json::Value = upload_resp
+            .json()
+            .await
+            .map_err(|e| ChannelSendError(format!("WhatsApp upload parse: {e}")))?;
+        let media_id = resp_json["id"]
+            .as_str()
+            .ok_or_else(|| ChannelSendError("WhatsApp: no media id".into()))?;
+        // Step 2: send document message.
+        let msg_url = format!(
+            "https://graph.facebook.com/v20.0/{}/messages",
+            self.phone_number_id
+        );
+        self.http
+            .post(&msg_url)
+            .bearer_auth(&self.access_token)
+            .json(&serde_json::json!({
+                "messaging_product": "whatsapp",
+                "to": self.to,
+                "type": "document",
+                "document": { "id": media_id, "filename": filename }
+            }))
+            .send()
+            .await
+            .map_err(|e| ChannelSendError(format!("WhatsApp sendDocument: {e}")))?;
+        Ok(())
+    }
+
     async fn request_confirmation(
         &self, prompt: &str, screenshot: Option<&[u8]>, _timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
@@ -820,6 +982,57 @@ impl ChannelSender for FeishuSender {
             self.send_text(caption).await?;
         }
 
+        Ok(())
+    }
+
+    async fn send_document(
+        &self, data: &[u8], filename: &str, _mime: &str,
+    ) -> Result<(), ChannelSendError> {
+        // Step 1: upload file (Feishu file_type — map the well-known ones, else
+        // "stream" for a generic binary). Office docs use their native types.
+        let file_type = match filename.rsplit('.').next().map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("pdf") => "pdf",
+            Some("doc") | Some("docx") => "doc",
+            Some("xls") | Some("xlsx") => "xls",
+            Some("ppt") | Some("pptx") => "ppt",
+            Some("mp4") => "mp4",
+            _ => "stream",
+        };
+        let file_part = reqwest::multipart::Part::bytes(data.to_vec())
+            .file_name(filename.to_string())
+            .mime_str(_mime)
+            .map_err(|e| ChannelSendError(e.to_string()))?;
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", file_type)
+            .text("file_name", filename.to_string())
+            .part("file", file_part);
+        let upload_resp = self.http
+            .post("https://open.feishu.cn/open-apis/im/v1/files")
+            .bearer_auth(&self.access_token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ChannelSendError(format!("Feishu file upload: {e}")))?;
+        let resp_json: serde_json::Value = upload_resp
+            .json()
+            .await
+            .map_err(|e| ChannelSendError(format!("Feishu upload parse: {e}")))?;
+        let file_key = resp_json["data"]["file_key"]
+            .as_str()
+            .ok_or_else(|| ChannelSendError("Feishu: no file_key".into()))?;
+        // Step 2: send file message.
+        self.http
+            .post("https://open.feishu.cn/open-apis/im/v1/messages")
+            .bearer_auth(&self.access_token)
+            .query(&[("receive_id_type", "chat_id")])
+            .json(&serde_json::json!({
+                "receive_id": self.chat_id,
+                "msg_type": "file",
+                "content": serde_json::json!({"file_key": file_key}).to_string(),
+            }))
+            .send()
+            .await
+            .map_err(|e| ChannelSendError(format!("Feishu sendFile: {e}")))?;
         Ok(())
     }
 
@@ -1101,6 +1314,23 @@ impl ChannelSender for WebChatSender {
         Ok(())
     }
 
+    async fn send_document(
+        &self, data: &[u8], filename: &str, mime: &str,
+    ) -> Result<(), ChannelSendError> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        let msg = serde_json::json!({
+            "type": "document",
+            "session_id": self.session_id,
+            "filename": filename,
+            "mime": mime,
+            "data_base64": b64,
+        });
+        if let Some(ref tx) = self.event_tx {
+            tx.send(msg.to_string()).ok();
+        }
+        Ok(())
+    }
+
     async fn request_confirmation(
         &self, prompt: &str, screenshot: Option<&[u8]>, _timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
@@ -1152,6 +1382,43 @@ mod tests {
         // NullSender denies confirmations by default (security: no channel = no approval)
         assert!(!sender.request_confirmation("ok?", None, 60).await.unwrap());
         assert_eq!(sender.channel_type(), "null");
+    }
+
+    /// A channel with no `send_document` override falls back to a text notice
+    /// (not a silent drop). Uses a sender that records send_text calls.
+    struct TextOnlySender {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ChannelSender for TextOnlySender {
+        async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
+            self.seen.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+        async fn send_photo(&self, _png: &[u8], _cap: &str) -> Result<(), ChannelSendError> {
+            Ok(())
+        }
+        async fn request_confirmation(
+            &self, _p: &str, _s: Option<&[u8]>, _t: u64,
+        ) -> Result<bool, ChannelSendError> {
+            Ok(false)
+        }
+        fn channel_type(&self) -> &'static str { "textonly" }
+    }
+
+    #[tokio::test]
+    async fn send_document_default_falls_back_to_text() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender = TextOnlySender { seen: seen.clone() };
+        sender
+            .send_document(&vec![0u8; 2048], "report.docx", "application/octet-stream")
+            .await
+            .unwrap();
+        let msgs = seen.lock().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].contains("report.docx"), "{}", msgs[0]);
+        assert!(msgs[0].contains("2 KB"), "{}", msgs[0]);
     }
 
     #[test]

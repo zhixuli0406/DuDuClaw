@@ -371,7 +371,11 @@ async fn line_webhook_handler(
                             let ext = crate::media::extension_from_mime(&mime);
                             format!("{type_label}.{ext}")
                         };
-                        match crate::media::save_attachment_to_disk(&state.ctx.home_dir, &data, &fname).await {
+                        // WP1.3: land under the resolved agent's dir.
+                        let attach_base = crate::channel_reply::resolve_attachment_base(
+                            state.ctx.as_ref(), None,
+                        ).await;
+                        match crate::media::save_attachment_in_base(&attach_base, &data, &fname).await {
                             Ok(path) => {
                                 attachment_lines.push(crate::media::format_attachment_ref(&mt, &fname, &path));
                             }
@@ -519,6 +523,20 @@ async fn line_webhook_handler(
 
             let reply = build_reply_with_session(&input_text, &state.ctx, &session_id, sender, on_progress).await;
             drop(loading_guard);
+
+            // WP1.3: 📎DELIVER: — LINE has no bot-push file API, so the sender's
+            // default `send_document` degrades to a text notice (→ dashboard
+            // Files panel) and the marker is stripped from the reply.
+            let reply = {
+                let doc_sender = crate::channel_sender::LineSender {
+                    access_token: token.clone(),
+                    user_id: sender.to_string(),
+                    http: state.http.clone(),
+                };
+                crate::channel_reply::deliver_documents_for_reply(
+                    state.ctx.as_ref(), None, reply, &doc_sender,
+                ).await
+            };
 
             // Guard: don't send empty replies
             if reply.trim().is_empty() {

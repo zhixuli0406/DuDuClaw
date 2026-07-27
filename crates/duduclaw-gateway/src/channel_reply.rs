@@ -7537,7 +7537,19 @@ fn build_system_prompt(
         let mut skills_total_bytes: usize = 0;
         if let (Some(skills), Some(msg)) = (compressed_skills, user_message) {
             if !skills.is_empty() {
-                let active = active_skills.cloned().unwrap_or_default();
+                let mut active = active_skills.cloned().unwrap_or_default();
+
+                // WP1.2 deterministic boost: when the message carries an office
+                // document attachment (docx/xlsx/pptx/pdf/csv…), force the
+                // matching skill into the active set so `select_layers` promotes
+                // its full content to Layer 2. Zero cost when no doc is attached
+                // (empty result → `active` unchanged). Only boosts skills the
+                // agent actually has loaded.
+                for skill_name in crate::office_docs::skills_for_attachment_refs(msg) {
+                    if skills.iter().any(|s| s.name == skill_name) {
+                        active.insert(skill_name.to_string());
+                    }
+                }
 
                 // Layer 0: all skill names
                 let index: Vec<&str> = skills.iter().map(|s| s.tag.as_str()).collect();
@@ -7756,6 +7768,71 @@ async fn get_default_agent(home_dir: &Path) -> Option<String> {
     let general = table.get("general")?.as_table()?;
     let name = general.get("default_agent")?.as_str()?;
     if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// WP1.3: resolve the agent directory that a channel turn's `📎DELIVER:` paths
+/// must live under (the trusted sandbox root for path validation).
+///
+/// `explicit_agent` is the per-bot / user-bound agent when the channel knows
+/// it; otherwise the configured `[general] default_agent` is used, falling back
+/// to the registry's main agent. Returns `None` only when no agent can be
+/// resolved at all (then delivery is skipped, fail-closed).
+pub async fn resolve_agent_dir_for_delivery(
+    ctx: &ReplyContext,
+    explicit_agent: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let id = match explicit_agent {
+        Some(a) if !a.is_empty() => a.to_string(),
+        _ => match get_default_agent(&ctx.home_dir).await {
+            Some(d) => d,
+            None => {
+                let reg = ctx.registry.read().await;
+                reg.main_agent()?.config.agent.name.clone()
+            }
+        },
+    };
+    Some(ctx.home_dir.join("agents").join(&id))
+}
+
+/// WP1.3: resolve the base directory an inbound attachment should be saved
+/// under. Prefers the (per-agent) directory from
+/// [`resolve_agent_dir_for_delivery`] so files land in
+/// `~/.duduclaw/agents/<id>/attachments/`; falls back to the shared home dir
+/// only when no agent can be resolved. `save_attachment_in_base` appends the
+/// `attachments/` segment.
+pub async fn resolve_attachment_base(
+    ctx: &ReplyContext,
+    explicit_agent: Option<&str>,
+) -> std::path::PathBuf {
+    resolve_agent_dir_for_delivery(ctx, explicit_agent)
+        .await
+        .unwrap_or_else(|| ctx.home_dir.clone())
+}
+
+/// WP1.3: post-process a finished reply for `📎DELIVER:` markers — send any
+/// referenced files through `sender` and return the user-visible text (marker
+/// lines stripped). No marker → the reply is returned untouched with zero I/O.
+/// When the sandbox root can't be resolved, markers are stripped without
+/// sending (fail-closed — never leak the raw marker, never send unvalidated).
+pub async fn deliver_documents_for_reply(
+    ctx: &ReplyContext,
+    explicit_agent: Option<&str>,
+    reply: String,
+    sender: &dyn crate::channel_sender::ChannelSender,
+) -> String {
+    if !reply.contains(crate::office_docs::DELIVER_MARKER) {
+        return reply;
+    }
+    match resolve_agent_dir_for_delivery(ctx, explicit_agent).await {
+        Some(agent_dir) => {
+            crate::office_docs::process_deliverables(&reply, &agent_dir, &ctx.home_dir, sender)
+                .await
+        }
+        None => {
+            let (cleaned, _) = crate::office_docs::parse_deliverables(&reply);
+            cleaned
+        }
+    }
 }
 
 /// Return the name of the agent that binds `global_token`, if any.

@@ -242,6 +242,10 @@ async fn receive_webhook(
                     let sender = &msg.from;
                     let base_text = msg.text.as_ref().map(|t| t.body.clone()).unwrap_or_default();
                     let mut attachment_lines: Vec<String> = Vec::new();
+                    // WP1.3: land inbound files under the resolved agent's dir.
+                    let attach_base = crate::channel_reply::resolve_attachment_base(
+                        state.ctx.as_ref(), None,
+                    ).await;
 
                     // ── Download and save media attachments ──
                     let media_info: Option<(&str, &str, &str)> = match msg.msg_type.as_str() {
@@ -264,7 +268,7 @@ async fn receive_webhook(
                                 let mt = crate::media::media_type_from_mime(mime);
                                 let ext = crate::media::extension_from_mime(mime);
                                 let fname = format!("{type_label}.{ext}");
-                                match crate::media::save_attachment_to_disk(&state.ctx.home_dir, &data, &fname).await {
+                                match crate::media::save_attachment_in_base(&attach_base, &data, &fname).await {
                                     Ok(path) => {
                                         attachment_lines.push(crate::media::format_attachment_ref(&mt, &fname, &path));
                                     }
@@ -283,7 +287,7 @@ async fn receive_webhook(
                         match download_media(&state.http, &state.access_token, &doc.id).await {
                             Ok(data) => {
                                 let mt = crate::media::media_type_from_mime(mime);
-                                match crate::media::save_attachment_to_disk(&state.ctx.home_dir, &data, fname).await {
+                                match crate::media::save_attachment_in_base(&attach_base, &data, fname).await {
                                     Ok(path) => {
                                         attachment_lines.push(crate::media::format_attachment_ref(&mt, fname, &path));
                                     }
@@ -373,6 +377,20 @@ async fn receive_webhook(
                     let reply = build_reply_with_session(
                         &input_text, &state.ctx, &session_id, sender, Some(on_progress),
                     ).await;
+
+                    // WP1.3: 📎DELIVER: outbound — upload generated files via
+                    // the WhatsApp media API, strip the marker.
+                    let reply = {
+                        let doc_sender = crate::channel_sender::WhatsAppSender {
+                            access_token: state.access_token.clone(),
+                            phone_number_id: phone_id.clone(),
+                            to: sender.clone(),
+                            http: state.http.clone(),
+                        };
+                        crate::channel_reply::deliver_documents_for_reply(
+                            state.ctx.as_ref(), None, reply, &doc_sender,
+                        ).await
+                    };
 
                     // Guard: don't send empty replies
                     if reply.trim().is_empty() {

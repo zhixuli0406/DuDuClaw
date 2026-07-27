@@ -348,6 +348,20 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
 
     let reply = build_reply_with_session(&text, &state.ctx, &session_id, &sender_id, Some(on_progress)).await;
 
+    // WP1.3: 📎DELIVER: — Google Chat attachment upload is not wired, so the
+    // sender's default `send_document` degrades to a text notice (→ dashboard
+    // Files panel); the marker is stripped from the reply.
+    let reply = {
+        let doc_sender = crate::channel_sender::create_googlechat_sender(
+            state.ctx.home_dir.clone(),
+            space.clone(),
+            sender_id.clone(),
+        );
+        crate::channel_reply::deliver_documents_for_reply(
+            state.ctx.as_ref(), None, reply, doc_sender.as_ref(),
+        ).await
+    };
+
     if reply.trim().is_empty() {
         warn!("Google Chat: reply is empty — cleaning up placeholder");
         if let Some(name) = placeholder.as_deref() {
