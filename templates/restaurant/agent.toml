@@ -88,3 +88,14 @@ browser_via_bash = false
 allowed_tools = []
 denied_tools = []
 wiki_visible_to = ["*"]  # Which agents can read this agent's wiki. ["*"] = all, [] = private
+
+# WP2.6 §4 — curated skills a restaurant/hospitality agent typically wants.
+# Zero-cost static shortlist surfaced by the recommendation system; entries are
+# "hub:slug" (qualified) or a bare slug. Install via skill_hub_install.
+[skills]
+recommended = [
+    "anthropic-skills:internal-comms",   # menus, staff notices, customer replies
+    "anthropic-skills:brand-guidelines", # on-brand promo copy
+    "anthropic-skills:xlsx",             # inventory / rota spreadsheets
+    "anthropic-skills:pdf",              # menu / invoice PDFs
+]

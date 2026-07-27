@@ -132,6 +132,14 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "enabled", description: "Set to true to resume, false to pause (default: false)", required: false },
         ],
     },
+    ToolDef {
+        name: "run_cron_task",
+        description: "Run a scheduled cron task once RIGHT NOW (test execution) by ID or name. Goes through the exact same execution path as a scheduled fire — including any trigger gate — and records the run in the task's history. Blocks until the run completes, then returns the recorded outcome. Works regardless of the task's enabled state.",
+        params: &[
+            ParamDef { name: "id", description: "Task ID to run", required: false },
+            ParamDef { name: "name", description: "Task name to run (used if id is omitted)", required: false },
+        ],
+    },
     // ── Reminder tools ────────────────────────────────────────────
     ToolDef {
         name: "create_reminder",
@@ -420,16 +428,28 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "skill_search",
         description: "Search skill hubs for available skills to install. By default aggregates \
-                       across all configured hubs (github / clawhub / lobehub) with the same \
-                       weighted scoring; pass hub to search a single hub.",
+                       across all configured hubs (anthropic-skills / github / clawhub / lobehub / \
+                       skills-sh) ranked by relevance × trust × install-count × freshness, with \
+                       official first-party skills floored into the top results; pass hub to \
+                       search a single hub.",
         params: &[
             ParamDef { name: "query", description: "Search query (name, tag, or description)", required: true },
-            ParamDef { name: "hub", description: "Restrict to one hub id: github, clawhub, or lobehub (default: aggregate all configured hubs)", required: false },
+            ParamDef { name: "hub", description: "Restrict to one hub id: anthropic-skills, github, clawhub, lobehub, or skills-sh (default: aggregate all configured hubs)", required: false },
         ],
     },
     ToolDef {
         name: "skill_list",
         description: "List all skills installed for a specific agent",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "skill_gaps",
+        description: "WP2.6: report an agent's capability gaps inferred from attachment file types \
+                       it received but has no matching skill for (e.g. a .psd with no design skill), \
+                       plus the template's curated recommended skills. A discovery aid for what to \
+                       install next.",
         params: &[
             ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
         ],
@@ -479,7 +499,7 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "hub", description: "Hub id (exact): clawhub or lobehub. github is discovery-only and will be denied by the gate.", required: true },
             ParamDef { name: "skill_name", description: "Skill slug/identifier on that hub", required: true },
             ParamDef { name: "owner", description: "Publisher handle — required when the hub reports the slug as ambiguous (clawhub 409)", required: false },
-            ParamDef { name: "scope", description: "Install target: 'global' (default) or an agent id", required: false },
+            ParamDef { name: "scope", description: "Install target: 'global' (default, all agents), 'department:<name>' (only agents in that department), or an agent id (that agent only)", required: false },
         ],
     },
     ToolDef {
@@ -2959,6 +2979,30 @@ async fn handle_pause_cron_task(params: &Value, home_dir: &Path) -> Value {
 }
 
 // ── Reminder handlers ─────���──────────────────────────────────
+
+/// Run a scheduled cron task once, immediately ("test execution"), by ID or
+/// name. Delegates to the gateway's standalone runner which drives the SAME
+/// dispatch path a scheduled fire uses (trigger gate + execute + run history),
+/// blocking until the run completes and returning the recorded outcome.
+async fn handle_run_cron_task(params: &Value, home_dir: &Path) -> Value {
+    let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+    let key = if !id.is_empty() {
+        id
+    } else if !name.is_empty() {
+        name
+    } else {
+        return tool_error("Either 'id' or 'name' is required");
+    };
+
+    match duduclaw_gateway::cron_scheduler::run_cron_task_now_standalone(home_dir, key).await {
+        Ok(summary) => serde_json::json!({
+            "content": [{"type": "text", "text": summary}]
+        }),
+        Err(e) => tool_error(&format!("run cron task: {e}")),
+    }
+}
 
 /// Create a one-shot reminder.
 async fn handle_create_reminder(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
@@ -6378,12 +6422,98 @@ async fn handle_skill_search(params: &Value, home_dir: &Path) -> Value {
             } else {
                 format!(" [{}]", s.tags.join(", "))
             };
-            lines.push(format!("- **{}** ({}): {}{}", s.name, h.hub, s.description, tags));
+            // WP2.6: surface trust tier, 60-day installs, and any non-clean
+            // source verdict so the caller can judge before installing.
+            let mut meta = format!("trust={}", s.trust_tier.as_str());
+            if s.install_count > 0 {
+                meta.push_str(&format!(", installs={}", s.install_count));
+            }
+            if let Some(v) = &s.source_verdict {
+                if v != "clean" {
+                    meta.push_str(&format!(", verdict={v}"));
+                }
+            }
+            lines.push(format!(
+                "- **{}** ({}, {}): {}{}",
+                s.name, h.hub, meta, s.description, tags
+            ));
         }
     }
     // Honest degradation: name every hub that failed.
     for (hub, err) in &result.errors {
         lines.push(format!("[unreachable: {hub}: {err}]"));
+    }
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": lines.join("\n")}]
+    })
+}
+
+/// WP2.6 §4+§5: report an agent's capability gaps (attachment file types it
+/// received but has no matching skill for) plus the template's curated
+/// recommended-skills shortlist. Read-only discovery aid.
+async fn handle_skill_gaps(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    let agent_name = if agent_id.is_empty() {
+        if default_agent.is_empty() {
+            resolve_main_agent_name(home_dir).await
+        } else {
+            default_agent.to_string()
+        }
+    } else {
+        agent_id.to_string()
+    };
+
+    // Installed skill names (global + agent-local), lowercased, as the
+    // "already covered" term set for gap analysis.
+    let mut installed_terms: Vec<String> = Vec::new();
+    for dir in [
+        home_dir.join("skills"),
+        home_dir.join("agents").join(&agent_name).join("SKILLS"),
+    ] {
+        for sk in duduclaw_agent::registry::AgentRegistry::load_skills(&dir).await {
+            installed_terms.push(sk.name.to_lowercase());
+        }
+    }
+
+    // Extension-based gaps recorded at the attachment chokepoint (§5).
+    let records = duduclaw_agent::skill_ext_gap::read_all(home_dir);
+    let gaps = duduclaw_agent::skill_ext_gap::aggregate_gaps_for_agent(
+        &records,
+        &agent_name,
+        &installed_terms,
+    );
+
+    // Curated per-template recommendations from the agent's own agent.toml (§4).
+    let agent_dir = home_dir.join("agents").join(&agent_name);
+    let recommended = duduclaw_agent::skill_recommend::read_recommended(&agent_dir);
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("Skill recommendations for agent '{agent_name}':\n"));
+
+    lines.push("**Curated (from template)**:".to_string());
+    if recommended.is_empty() {
+        lines.push("- (none configured — add [skills] recommended to agent.toml)".to_string());
+    } else {
+        for r in &recommended {
+            lines.push(format!("- {}", r.as_ref_str()));
+        }
+    }
+
+    lines.push("\n**Inferred from received file types**:".to_string());
+    if gaps.is_empty() {
+        lines.push("- (no capability gaps recorded)".to_string());
+    } else {
+        for g in &gaps {
+            lines.push(format!(
+                "- **{}** — seen {}× as [{}] (e.g. {}); try `skill_search {}`",
+                g.capability,
+                g.count,
+                g.exts.join(", "),
+                g.sample_filename,
+                g.capability
+            ));
+        }
     }
 
     serde_json::json!({
@@ -7065,8 +7195,22 @@ async fn handle_skill_hub_install(
             return mcp_error("invalid owner (alphanumeric, hyphens, underscores only)");
         }
     }
-    if scope != "global" && !is_safe_path_component(scope) {
-        return mcp_error("invalid scope (use 'global' or a valid agent id)");
+    // WP2.3: `department:<dept>` installs the skill into the shared department
+    // layer (`~/.duduclaw/shared/skills/departments/<dept>/`) so only agents in
+    // that department load it. The department name is DATA — validated against
+    // the `is_valid_department` allowlist here and again at the loader sink.
+    if scope != "global" {
+        if let Some(dept) = scope.strip_prefix("department:") {
+            if !duduclaw_core::is_valid_department(dept) {
+                return mcp_error(
+                    "invalid department scope (1..=64 bytes, no path separators / whitespace / control chars)",
+                );
+            }
+        } else if !is_safe_path_component(scope) {
+            return mcp_error(
+                "invalid scope (use 'global', 'department:<name>', or a valid agent id)",
+            );
+        }
     }
 
     use duduclaw_gateway::skill_lifecycle::hub_install;
@@ -8327,6 +8471,7 @@ pub(crate) async fn handle_tools_call(
             | "update_cron_task"
             | "delete_cron_task"
             | "pause_cron_task"
+            | "run_cron_task"
             | "tasks_create"
             | "tasks_update"
             | "tasks_claim"
@@ -8409,6 +8554,7 @@ pub(crate) async fn handle_tools_call(
         "update_cron_task" => handle_update_cron_task(&arguments, home_dir).await,
         "delete_cron_task" => handle_delete_cron_task(&arguments, home_dir).await,
         "pause_cron_task" => handle_pause_cron_task(&arguments, home_dir).await,
+        "run_cron_task" => handle_run_cron_task(&arguments, home_dir).await,
         "create_reminder" => handle_create_reminder(&arguments, home_dir, default_agent).await,
         "list_reminders" => handle_list_reminders(&arguments, home_dir, default_agent).await,
         "cancel_reminder" => handle_cancel_reminder(&arguments, home_dir, default_agent).await,
@@ -8424,6 +8570,7 @@ pub(crate) async fn handle_tools_call(
         "agent_remove" => handle_agent_remove(&arguments, home_dir).await,
         "agent_update_soul" => handle_agent_update_soul(&arguments, home_dir).await,
         "skill_search" => handle_skill_search(&arguments, home_dir).await,
+        "skill_gaps" => handle_skill_gaps(&arguments, home_dir, default_agent).await,
         "skill_list" => handle_skill_list(&arguments, home_dir).await,
         "skill_security_scan" => handle_skill_security_scan(&arguments, home_dir).await,
         "skill_graduate" => handle_skill_graduate(&arguments, home_dir).await,
@@ -8718,6 +8865,11 @@ fn build_params_summary(tool_name: &str, args: &Value) -> String {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
             let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
             format!("id={id} name={name} enabled={enabled}")
+        }
+        "run_cron_task" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("id={id} name={name}")
         }
         _ => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -10307,19 +10459,29 @@ fn resolve_agent_department(home_dir: &Path, agent_id: &str) -> Option<String> {
 /// read its own department's pages plus the open company layer.
 struct DeptVisibility {
     caller_department: Option<String>,
+    /// WP2.3 — the `.scope.toml` `visible_to_departments` read filter. Combined
+    /// (AND) with the built-in `departments/<dept>/` isolation in [`Self::allows`]
+    /// so a namespace declared `visible_to_departments = [...]` is invisible to
+    /// agents outside those departments (fail-closed). Empty policy = no extra
+    /// restriction (behaviour identical to pre-WP2.3).
+    vis_policy: duduclaw_core::DepartmentVisibilityPolicy,
 }
 
 impl DeptVisibility {
     fn for_agent(home_dir: &Path, caller_agent: &str) -> Self {
         Self {
             caller_department: resolve_agent_department(home_dir, caller_agent),
+            vis_policy: duduclaw_core::DepartmentVisibilityPolicy::load_for_home(home_dir),
         }
     }
 
     /// Whether the caller may see/touch `page_path` (department dimension only;
     /// `.scope.toml` write policy is checked separately on write/delete).
+    /// Combines the built-in `departments/<dept>/` isolation with the
+    /// `visible_to_departments` namespace read filter — both must permit.
     fn allows(&self, page_path: &str) -> bool {
-        duduclaw_core::department_page_visible(page_path, self.caller_department.as_deref())
+        self.vis_policy
+            .page_visible(page_path, self.caller_department.as_deref())
     }
 }
 
@@ -10383,7 +10545,8 @@ async fn handle_shared_wiki_read(args: &Value, home_dir: &Path, caller_agent: &s
     // callers — always on, independent of the `.scope.toml` write policy.
     if !DeptVisibility::for_agent(home_dir, caller_agent).allows(page_path) {
         return tool_error(&format!(
-            "Shared wiki read denied: '{page_path}' belongs to another department."
+            "Shared wiki read denied: '{page_path}' is restricted to another department \
+             (department page or a namespace with visible_to_departments)."
         ));
     }
 
@@ -10859,6 +11022,17 @@ async fn handle_wiki_namespace_status(home_dir: &Path, caller_agent: &str) -> Va
     let departments_explicit =
         policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE);
 
+    // WP2.3: namespaces declaring `visible_to_departments = [...]` (read-side
+    // visibility, orthogonal to the write mode above). Surface them so the
+    // dashboard/agent can see which namespaces are department-restricted.
+    let vis_policy = duduclaw_core::DepartmentVisibilityPolicy::load_for_home(home_dir);
+    let visible_to_departments: serde_json::Value = vis_policy
+        .snapshot()
+        .iter()
+        .map(|(ns, depts)| (ns.clone(), serde_json::json!(depts)))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+
     let payload = serde_json::json!({
         "policy_file": policy.loaded_from()
             .map(|p| p.display().to_string())
@@ -10882,6 +11056,10 @@ async fn handle_wiki_namespace_status(home_dir: &Path, caller_agent: &str) -> Va
             // writes to `departments/<own-dept>/…`.
             "write_policy_from_scope_toml": departments_explicit,
         },
+        // WP2.3 read-visibility filter: namespace → departments allowed to see
+        // it (prompt injection + shared_wiki_search/read). Fail-closed for any
+        // declared namespace; unlisted namespaces stay visible to all.
+        "visible_to_departments": visible_to_departments,
     });
 
     let pretty = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
@@ -14997,6 +15175,142 @@ mod wiki_schema_tests {
             !text.contains("departments/sales/quota.md"),
             "other dept page must not appear in lint report: {text}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // WP2.3 — namespace read-visibility via `visible_to_departments`
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp23_visible_to_departments_filters_read_and_ls() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml_dept(&agents_dir, "hilda", "hr");
+        write_agent_toml_dept(&agents_dir, "monet", "art");
+
+        // Operator restricts the `hr` namespace to hr + legal departments.
+        // agent_writable keeps writes open so we can seed the page via MCP.
+        write_scope_policy(
+            tmp.path(),
+            r#"
+                [namespaces."hr"]
+                mode = "agent_writable"
+                visible_to_departments = ["hr", "legal"]
+            "#,
+        );
+
+        // hr agent writes an hr-namespace page (write policy is agent_writable).
+        let w = handle_shared_wiki_write(
+            &serde_json::json!({ "page_path": "hr/salary.md", "content": clean_karpathy_page("Salary bands") }),
+            tmp.path(),
+            "hilda",
+        )
+        .await;
+        assert!(
+            w["content"][0]["text"].as_str().unwrap_or("").contains("Written shared wiki page"),
+            "hr agent should be able to write its restricted namespace: {w}"
+        );
+
+        // hr agent (in-department) can read it.
+        let r_ok = handle_shared_wiki_read(
+            &serde_json::json!({ "page_path": "hr/salary.md" }),
+            tmp.path(),
+            "hilda",
+        )
+        .await;
+        assert!(!r_ok["isError"].as_bool().unwrap_or(false), "in-department read must succeed: {r_ok}");
+
+        // art agent (not hr/legal) is denied the read — fail-closed.
+        let r_deny = handle_shared_wiki_read(
+            &serde_json::json!({ "page_path": "hr/salary.md" }),
+            tmp.path(),
+            "monet",
+        )
+        .await;
+        assert!(r_deny["isError"].as_bool().unwrap_or(false), "out-of-department read must be denied: {r_deny}");
+
+        // ls hides the restricted page from the art agent but shows it to hr.
+        let ls_art = handle_shared_wiki_ls(tmp.path(), "monet").await;
+        assert!(
+            !ls_art["content"][0]["text"].as_str().unwrap_or("").contains("hr/salary.md"),
+            "restricted page must not appear in an out-of-department listing"
+        );
+        let ls_hr = handle_shared_wiki_ls(tmp.path(), "hilda").await;
+        assert!(
+            ls_hr["content"][0]["text"].as_str().unwrap_or("").contains("hr/salary.md"),
+            "restricted page must appear for an in-department agent"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp23_no_department_agent_denied_restricted_namespace() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        // Agent with NO department field.
+        write_agent_toml(&agents_dir, "agnes");
+        write_agent_toml_dept(&agents_dir, "hilda", "hr");
+
+        write_scope_policy(
+            tmp.path(),
+            r#"
+                [namespaces."hr"]
+                mode = "agent_writable"
+                visible_to_departments = ["hr"]
+            "#,
+        );
+
+        let _ = handle_shared_wiki_write(
+            &serde_json::json!({ "page_path": "hr/salary.md", "content": clean_karpathy_page("Salary") }),
+            tmp.path(),
+            "hilda",
+        )
+        .await;
+
+        // No-department agent is fail-closed out of the declared namespace.
+        let r = handle_shared_wiki_read(
+            &serde_json::json!({ "page_path": "hr/salary.md" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(r["isError"].as_bool().unwrap_or(false), "no-department read of a restricted namespace must be denied: {r}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp23_undeclared_namespace_visible_to_all() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml_dept(&agents_dir, "hilda", "hr");
+        write_agent_toml_dept(&agents_dir, "monet", "art");
+
+        // `hr` is declared, but `sop` is not — sop stays open to everyone.
+        write_scope_policy(
+            tmp.path(),
+            r#"
+                [namespaces."hr"]
+                mode = "agent_writable"
+                visible_to_departments = ["hr"]
+            "#,
+        );
+
+        let _ = handle_shared_wiki_write(
+            &serde_json::json!({ "page_path": "sop/hours.md", "content": clean_karpathy_page("Hours") }),
+            tmp.path(),
+            "hilda",
+        )
+        .await;
+
+        // art agent reads the undeclared company page fine (no regression).
+        let r = handle_shared_wiki_read(
+            &serde_json::json!({ "page_path": "sop/hours.md" }),
+            tmp.path(),
+            "monet",
+        )
+        .await;
+        assert!(!r["isError"].as_bool().unwrap_or(false), "undeclared namespace must stay visible to all: {r}");
     }
 
     #[tokio::test(flavor = "current_thread")]

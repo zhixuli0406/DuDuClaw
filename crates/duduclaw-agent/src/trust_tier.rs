@@ -45,6 +45,19 @@ impl TrustTier {
             TrustTier::Orphan => "orphan",
         }
     }
+
+    /// Ranking multiplier for the WP2.6 federated-search formula
+    /// (`relevance × trust_coeff × install_factor × freshness`). Official
+    /// sources are boosted, orphaned ones demoted; the neutral default is 1.0.
+    /// These are deliberately gentle (0.6..1.3) so trust nudges ordering
+    /// without letting a stale-but-popular skill dominate an official one.
+    pub fn rank_coefficient(&self) -> f64 {
+        match self {
+            TrustTier::Official => 1.3,
+            TrustTier::Active => 1.0,
+            TrustTier::Orphan => 0.6,
+        }
+    }
 }
 
 /// Whole-months elapsed between `pushed` and `now` (approx: 30.44-day months).
