@@ -63,6 +63,14 @@ pub enum Scope {
     /// granting `Admin`; enforcement additionally requires the per-agent
     /// `[capabilities] os_native` flag at the dispatch gate (defence-in-depth).
     OsNative,
+    /// Gates the `office_script` MCP tool — server-side execution of a bundled
+    /// office skill's vetted `scripts/*.py` (docx/xlsx/pptx/pdf) so API-mode
+    /// agents that have no Bash tool can still produce document files.
+    /// Deliberately narrower than `Admin` (which the code-execution
+    /// `execute_program` requires): constrained to the four built-in skills and
+    /// the caller's own agent directory, so operators can grant document
+    /// production without granting superuser.
+    SkillExecute,
     Admin,
 }
 
@@ -86,6 +94,7 @@ impl std::fmt::Display for Scope {
             Scope::GithubWrite => "github:write",
             Scope::ForkExecute => "fork:execute",
             Scope::OsNative => "os:native",
+            Scope::SkillExecute => "skill:execute",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -428,6 +437,9 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
             "os:native" => {
                 result.insert(Scope::OsNative);
             }
+            "skill:execute" => {
+                result.insert(Scope::SkillExecute);
+            }
             "admin" => {
                 result.insert(Scope::Admin);
             }
@@ -580,6 +592,11 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // as the P1 tools, gated by [capabilities] os_native at the dispatch
         // gate; no ActionGuard (they have no host side-effect).
         "os_frontmost" | "os_spotlight_search" | "os_calendar_today" => Some(Scope::OsNative),
+        // Server-side office-document script execution (docx/xlsx/pptx/pdf).
+        // Its own least-privilege scope instead of the Admin `execute_program`
+        // uses: the tool is constrained to the four bundled skills' vetted
+        // scripts and the caller's agent directory.
+        "office_script" => Some(Scope::SkillExecute),
         // ── High-impact tools — explicitly Admin (C2 fix) ────────────────
         // Arbitrary code execution, agent lifecycle/identity mutation, prompt
         // rewrite, cross-agent dispatch, scheduling, and evolution control.
