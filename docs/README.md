@@ -96,6 +96,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |
 | [guides/mcp-bridge.md](guides/mcp-bridge.md) | Mounting external MCP servers (`[[mcp.external]]`) + `secret://` credentials + per-SaaS recipes (Gmail/Plane/Chatwoot/Invoice Ninja/WooCommerce) | Current |
+| [guides/professional-software.md](guides/professional-software.md) | 專業軟體整合（Photoshop / AutoCAD 社群 MCP）：支援矩陣、per-agent `.mcp.json` 安裝、capability 治理、ezdxf 降級、RCE 風險聲明 | Current |
 | [guides/google-workspace.md](guides/google-workspace.md) | Native Google Workspace integration (Gmail + Calendar + Sheets, eight MCP tools, OAuth setup, draft-only safety) | Current |
 | [guides/notion.md](guides/notion.md) | Native Notion integration (search / page read / page append, four MCP tools, OAuth setup, external-knowledge-source boundary) | Current |
 | [guides/github.md](guides/github.md) | Native GitHub integration (issue/PR search + read + comment, five MCP tools, OAuth App setup, public-comment safety) | Current |

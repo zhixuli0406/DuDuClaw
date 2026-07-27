@@ -34,6 +34,8 @@ import {
   ScrollText,
   Presentation,
   MonitorCog,
+  FolderOpen,
+  PawPrint,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -133,6 +135,8 @@ export const navGroups: NavGroup[] = [
       { to: '/runs', icon: ScrollText, label: 'nav.runs', desc: 'nav.runs.desc', ownScope: true },
       // G15 Live Canvas — agent-pushed HTML workspace, sandbox-rendered.
       { to: '/canvas', icon: Presentation, label: 'nav.canvas', desc: 'nav.canvas.desc', ownScope: true },
+      // WP1.4 file panel — attachments an AI staff member received/produced.
+      { to: '/files', icon: FolderOpen, label: 'nav.files', desc: 'nav.files.desc', ownScope: true },
       { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', minRole: 'manager' },
       // G11 Work Timeline — company-level Gantt of every AI staff member's runs.
       { to: '/timeline', icon: ChartGantt, label: 'nav.timeline', desc: 'nav.timeline.desc', minRole: 'manager' },
@@ -159,6 +163,9 @@ export const navGroups: NavGroup[] = [
       { to: '/widgets', icon: LayoutGrid, label: 'nav.widgets', desc: 'nav.widgets.desc' },
       { to: '/knowledge', icon: BookOpen, label: 'nav.knowledge', desc: 'nav.knowledge.desc' },
       { to: '/growth', icon: Trophy, label: 'nav.growth', desc: 'nav.growth.desc', ownScope: true },
+      // 桌寵工作室 — photo → interactive desktop pet (desktop app only; the page
+      // itself shows a "desktop-only" state in a plain browser).
+      { to: '/pet-studio', icon: PawPrint, label: 'nav.petStudio', desc: 'nav.petStudio.desc' },
     ],
   },
   {
