@@ -1291,6 +1291,16 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "timeout_seconds", description: "Execution timeout in seconds (default: 30, max: 300)", required: false },
         ],
     },
+    // ── Office document script execution ─────────────────────────
+    ToolDef {
+        name: "office_script",
+        description: "Run a bundled office-document skill's Python script server-side (docx/xlsx/pptx/pdf) to READ or CREATE a document file. Use this INSTEAD OF Bash when you have no shell/Bash tool (API-mode agents): it runs `scripts/<script>.py` from the skill via `uv run` (PEP 723 deps auto-resolved) inside YOUR agent directory. Produce the file, then end your reply with a line `📎DELIVER:<absolute path>` so the gateway hands the file to the user. Input and output (--out) paths must stay inside your agent directory or its attachments/.",
+        params: &[
+            ParamDef { name: "skill", description: "Skill to run: one of docx, xlsx, pptx, pdf", required: true },
+            ParamDef { name: "script", description: "Script name without any path: create, extract, or to_pdf (the .py suffix is optional)", required: true },
+            ParamDef { name: "args", description: "JSON array of string arguments passed to the script, e.g. [\"outline.md\", \"--out\", \"/abs/agent-dir/attachments/deck.pptx\"]. Any path argument must resolve inside your agent directory.", required: false },
+        ],
+    },
     // ── Skill Bank tools ─────────────────────────────────────────
     ToolDef {
         name: "skill_bank_search",
@@ -8488,6 +8498,7 @@ pub(crate) async fn handle_tools_call(
             | "terminate_branch"
             // ── 2026-07 additions (verified mutating, previously untracked) ──
             | "execute_program"
+            | "office_script"
             | "computer_click"
             | "computer_type"
             | "computer_key"
@@ -8651,6 +8662,8 @@ pub(crate) async fn handle_tools_call(
         "skill_extract" => handle_skill_extract(&arguments, home_dir, default_agent).await,
         // Program execution
         "execute_program" => handle_execute_program(&arguments).await,
+        // Office document script execution (agent_id from caller context)
+        "office_script" => handle_office_script(&arguments, home_dir, default_agent).await,
         // Skill Bank tools
         "skill_bank_search" => handle_skill_bank_search(&arguments).await,
         "skill_bank_feedback" => handle_skill_bank_feedback(&arguments).await,
@@ -11544,6 +11557,166 @@ async fn handle_execute_program(args: &Value) -> Value {
             }
         }
         Err(e) => tool_error(&format!("Failed to execute {language}: {e}")),
+    }
+}
+
+// ── office_script handler ───────────────────────────────────────
+//
+// Server-side execution of a bundled office skill's vetted `scripts/*.py`
+// (docx/xlsx/pptx/pdf) so API-mode agents that have no Bash tool can still
+// produce document files. Fail-closed on every input:
+//   - `skill` must be one of the four bundled office skills.
+//   - `script` must be a bare stem (alnum / `_` / `-`) resolving to an existing
+//     `<agent>/SKILLS/<skill>/scripts/<script>.py`.
+//   - every path-shaped argument must resolve inside the caller's agent dir or
+//     the shared `{home}/attachments` root — the same sandbox the outbound
+//     `📎DELIVER:` validator trusts.
+// The agent id comes from the caller context (`default_agent`), never from
+// arguments, so an agent can only ever run scripts in its own directory.
+
+/// The four bundled office skills whose scripts `office_script` may run.
+const OFFICE_SCRIPT_SKILLS: &[&str] = &["docx", "xlsx", "pptx", "pdf"];
+
+/// Whether a single script argument is allowed. A bare flag/value with no path
+/// separator (`--format`, `json`) always passes; a path-shaped argument must
+/// normalise to inside `agent_root` or `attach_root`. Validation is lexical (no
+/// `canonicalize`) because an `--out` file does not exist yet.
+fn office_arg_within_sandbox(arg: &str, agent_root: &Path, attach_root: &Path) -> bool {
+    if !(arg.contains('/') || arg.contains('\\')) {
+        return true;
+    }
+    let p = Path::new(arg);
+    let abs = if p.is_absolute() { p.to_path_buf() } else { agent_root.join(p) };
+    let norm = duduclaw_core::agent_guard::lexical_normalize(&abs);
+    norm.starts_with(agent_root) || norm.starts_with(attach_root)
+}
+
+async fn handle_office_script(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    // 1. skill allowlist (fail-closed).
+    let skill = args.get("skill").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if !OFFICE_SCRIPT_SKILLS.contains(&skill) {
+        return tool_error(&format!(
+            "Invalid skill '{skill}'. Must be one of: docx, xlsx, pptx, pdf"
+        ));
+    }
+
+    // 2. script stem validation — a bare name, no path components.
+    let raw_script = args.get("script").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let stem = raw_script.strip_suffix(".py").unwrap_or(raw_script);
+    if stem.is_empty()
+        || !stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return tool_error(
+            "Invalid script name. Use a bare stem like 'create', 'extract', or 'to_pdf' \
+             (alphanumeric, '_' or '-'; no path separators).",
+        );
+    }
+
+    // 3. resolve the script inside the CALLER's own agent dir (never from args).
+    let agent_dir = home_dir.join("agents").join(default_agent);
+    let script_path = agent_dir
+        .join("SKILLS")
+        .join(skill)
+        .join("scripts")
+        .join(format!("{stem}.py"));
+    if !script_path.is_file() {
+        return tool_error(&format!(
+            "Script not found: SKILLS/{skill}/scripts/{stem}.py (agent '{default_agent}'). \
+             Available office scripts: create, extract, to_pdf."
+        ));
+    }
+
+    // 4. validate every path-shaped argument stays inside the sandbox.
+    let attach_root = home_dir.join("attachments");
+    let script_args: Vec<String> = match args.get("args") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) => {
+            let mut out = Vec::with_capacity(a.len());
+            for v in a {
+                let Some(s) = v.as_str() else {
+                    return tool_error("Every element of 'args' must be a string.");
+                };
+                if !office_arg_within_sandbox(s, &agent_dir, &attach_root) {
+                    return tool_error(&format!(
+                        "Argument path escapes the agent sandbox: {s}. Inputs and --out must \
+                         live under your agent directory or its attachments/."
+                    ));
+                }
+                out.push(s.to_string());
+            }
+            out
+        }
+        Some(_) => return tool_error("'args' must be a JSON array of strings."),
+    };
+
+    // 5. run the script (cwd = agent dir so relative paths stay in the sandbox).
+    run_office_script(&script_path, &script_args, &agent_dir).await
+}
+
+/// Spawn `uv run <script> <args...>` (PEP 723 deps auto-resolved), falling back
+/// to the system python3 when `uv` is not installed. `kill_on_drop` guarantees a
+/// timed-out child is reaped. Returns the script's stdout on success, or a
+/// diagnostic error with stdout+stderr on non-zero exit.
+async fn run_office_script(script_path: &Path, script_args: &[String], cwd: &Path) -> Value {
+    use tokio::process::Command;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+    const MAX_OUT: usize = 32_768;
+
+    let build = |program: &str, prefix: &[&str]| {
+        let mut cmd = Command::new(program);
+        cmd.current_dir(cwd).kill_on_drop(true);
+        for a in prefix {
+            cmd.arg(a);
+        }
+        cmd.arg(script_path)
+            .args(script_args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd
+    };
+
+    let py = duduclaw_core::platform::python3_command();
+    let (used, child) = match build("uv", &["run"]).spawn() {
+        Ok(c) => ("uv run", c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match build(py, &[]).spawn() {
+            Ok(c) => (py, c),
+            Err(e2) => {
+                return tool_error(&format!(
+                    "Neither 'uv' nor '{py}' could be spawned to run the office script: {e2}. \
+                     Install uv (https://docs.astral.sh/uv/) or the script's Python deps."
+                ));
+            }
+        },
+        Err(e) => return tool_error(&format!("Failed to spawn 'uv run': {e}")),
+    };
+
+    let output = match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return tool_error(&format!("office script execution error ({used}): {e}")),
+        // Timeout drops `child`; kill_on_drop reaps the subprocess.
+        Err(_) => {
+            return tool_error(&format!(
+                "office script timed out after {}s ({used})",
+                TIMEOUT.as_secs()
+            ));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() {
+        let body = duduclaw_core::truncate_bytes(stdout.trim(), MAX_OUT);
+        tool_text(&format!(
+            "office_script ok ({used}, exit 0).\n{body}\n\nIf a file was produced, end your \
+             reply with a line `📎DELIVER:<absolute path>` so it reaches the user."
+        ))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        tool_error(&format!(
+            "office_script failed ({used}, exit {code}).\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            duduclaw_core::truncate_bytes(&stdout, MAX_OUT),
+            duduclaw_core::truncate_bytes(&stderr, MAX_OUT),
+        ))
     }
 }
 
@@ -18537,5 +18710,193 @@ mod wp5_install_approval_tests {
             }
             InstallApprovalOutcome::Proceed => panic!("TTL expiry must deny (fail-closed)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod office_script_tests {
+    use super::*;
+
+    struct TempHome(std::path::PathBuf);
+    impl TempHome {
+        fn new() -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("duduclaw-office-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Materialise `<home>/agents/<agent>/SKILLS/<skill>/scripts/<name>.py`.
+    fn install_script(home: &std::path::Path, agent: &str, skill: &str, name: &str, body: &str) {
+        let dir = home
+            .join("agents")
+            .join(agent)
+            .join("SKILLS")
+            .join(skill)
+            .join("scripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.py")), body).unwrap();
+    }
+
+    fn text_of(v: &Value) -> String {
+        v.get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+    fn is_err(v: &Value) -> bool {
+        v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false)
+    }
+
+    // ── Path sandbox validation ─────────────────────────────────────────
+    #[test]
+    fn arg_sandbox_allows_bare_flags_and_values() {
+        let root = std::path::Path::new("/home/agent");
+        let attach = std::path::Path::new("/home/attachments");
+        assert!(office_arg_within_sandbox("--format", root, attach));
+        assert!(office_arg_within_sandbox("json", root, attach));
+        assert!(office_arg_within_sandbox("outline.md", root, attach)); // relative, no sep
+    }
+
+    #[test]
+    fn arg_sandbox_allows_paths_inside_agent_and_attachments() {
+        let root = std::path::Path::new("/home/agent");
+        let attach = std::path::Path::new("/home/attachments");
+        assert!(office_arg_within_sandbox("/home/agent/attachments/out.pptx", root, attach));
+        assert!(office_arg_within_sandbox("attachments/out.pptx", root, attach)); // relative → joins root
+        assert!(office_arg_within_sandbox("/home/attachments/in.pptx", root, attach));
+    }
+
+    #[test]
+    fn arg_sandbox_rejects_escapes_and_absolute_outside() {
+        let root = std::path::Path::new("/home/agent");
+        let attach = std::path::Path::new("/home/attachments");
+        assert!(!office_arg_within_sandbox("/etc/passwd", root, attach));
+        assert!(!office_arg_within_sandbox("../victim/secret.docx", root, attach));
+        assert!(!office_arg_within_sandbox("/home/agent/../victim/x", root, attach));
+    }
+
+    // ── Handler fail-closed input validation ────────────────────────────
+    #[tokio::test]
+    async fn rejects_unknown_skill() {
+        let home = TempHome::new();
+        let out = handle_office_script(
+            &serde_json::json!({ "skill": "keynote", "script": "create" }),
+            home.path(),
+            "bot",
+        )
+        .await;
+        assert!(is_err(&out));
+        assert!(text_of(&out).contains("Invalid skill"));
+    }
+
+    #[tokio::test]
+    async fn rejects_script_with_path_separator() {
+        let home = TempHome::new();
+        let out = handle_office_script(
+            &serde_json::json!({ "skill": "pptx", "script": "../../evil" }),
+            home.path(),
+            "bot",
+        )
+        .await;
+        assert!(is_err(&out));
+        assert!(text_of(&out).contains("Invalid script name"));
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_script_file() {
+        let home = TempHome::new();
+        // Skill valid, stem valid, but no such script installed.
+        let out = handle_office_script(
+            &serde_json::json!({ "skill": "pptx", "script": "create" }),
+            home.path(),
+            "bot",
+        )
+        .await;
+        assert!(is_err(&out));
+        assert!(text_of(&out).contains("Script not found"));
+    }
+
+    #[tokio::test]
+    async fn rejects_arg_escaping_sandbox() {
+        let home = TempHome::new();
+        install_script(home.path(), "bot", "pptx", "create", "print('x')\n");
+        let out = handle_office_script(
+            &serde_json::json!({
+                "skill": "pptx",
+                "script": "create",
+                "args": ["/etc/passwd"]
+            }),
+            home.path(),
+            "bot",
+        )
+        .await;
+        assert!(is_err(&out));
+        assert!(text_of(&out).contains("escapes the agent sandbox"));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_string_arg() {
+        let home = TempHome::new();
+        install_script(home.path(), "bot", "pptx", "create", "print('x')\n");
+        let out = handle_office_script(
+            &serde_json::json!({ "skill": "pptx", "script": "create", "args": [42] }),
+            home.path(),
+            "bot",
+        )
+        .await;
+        assert!(is_err(&out));
+        assert!(text_of(&out).contains("must be a string"));
+    }
+
+    // ── Live execution (skips when no Python runner is on PATH) ──────────
+    #[tokio::test]
+    async fn runs_a_real_script_and_returns_stdout() {
+        // Only meaningful when `uv` or python3 exists — skip otherwise so CI
+        // on a runner without a Python toolchain does not fail.
+        let py = duduclaw_core::platform::python3_command();
+        let has_uv = std::process::Command::new("uv")
+            .arg("--version")
+            .output()
+            .is_ok();
+        let has_py = std::process::Command::new(py)
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !has_uv && !has_py {
+            eprintln!("skipping: neither uv nor {py} available");
+            return;
+        }
+
+        let home = TempHome::new();
+        // A dependency-free script so `python3` fallback also works (uv would
+        // resolve PEP 723 deps, but we assert only on stdout here). The `.stem`
+        // is `extract` to exercise a real allowlisted name.
+        install_script(
+            home.path(),
+            "bot",
+            "pptx",
+            "extract",
+            "print('OFFICE_SCRIPT_OK')\n",
+        );
+        let out = handle_office_script(
+            &serde_json::json!({ "skill": "pptx", "script": "extract" }),
+            home.path(),
+            "bot",
+        )
+        .await;
+        assert!(!is_err(&out), "expected success, got: {}", text_of(&out));
+        assert!(text_of(&out).contains("OFFICE_SCRIPT_OK"));
     }
 }

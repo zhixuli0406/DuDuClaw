@@ -25,7 +25,24 @@ inline metadata 宣告（讀取用 `pypdf`、建立用 `reportlab`）；`uv` 不
 
 ## 腳本
 
-腳本位於本技能的 `scripts/` 目錄。
+腳本位於本技能的 `scripts/` 目錄。**兩種執行路徑，依你有沒有 Bash 工具擇一：**
+
+- **有 Bash / shell 工具** → 直接跑 `uv run scripts/<script>.py ...`（見下方各節）。
+- **沒有 Bash / shell 工具（API 模式後端，如 Grok / DeepSeek / MiniMax）** → **不要**只回文字，
+  改用 `office_script` MCP 工具在伺服器端跑同一支腳本：
+  - `skill`：`pdf`
+  - `script`：`create` / `extract`（不含路徑，`.py` 可省略）
+  - `args`：字串陣列，等同 `uv run` 後面那串參數；任何路徑須落在你的 agent 目錄或其 `attachments/`。
+
+  例（把整理好的文字產成 PDF）：
+
+  ```json
+  {"skill": "pdf", "script": "create",
+   "args": ["report.md", "--out", "/你的agent目錄/attachments/report.pdf"]}
+  ```
+
+  工具以 `uv run`（uv 不存在時退回 `python3`）在你的 agent 目錄內執行並回傳腳本 stdout；
+  產出檔案後**務必**依下方 📎DELIVER 協定交付。
 
 ### 1. 讀取抽取 — `extract.py`
 
@@ -59,3 +76,6 @@ uv run scripts/create.py notes.txt --out /abs/out.pdf
 
 路徑須為絕對路徑且位於你的 agent 工作目錄（或其 `attachments/`）下；標記行不顯示給
 使用者，請另用文字說明。
+
+**API 模式同樣適用**：用 `office_script` 產出 `.pdf` 後，一樣在最後一行輸出
+`📎DELIVER:<絕對路徑>`——只回文字不算完成。
