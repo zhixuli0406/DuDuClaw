@@ -3769,5 +3769,7 @@
   "gateway.manual.hint": "http/https supported; the address is verified before connecting. HTTPS is recommended for company servers.",
   "gateway.resolving": "Connecting to your gateway…",
   "gateway.autoConnecting": "Found {name}, connecting…",
-  "gateway.error.unreachable": "Could not reach that gateway: {detail}"
+  "gateway.error.unreachable": "Could not reach that gateway: {detail}",
+  "pet.studio.dismiss": "Take off desk",
+  "pet.studio.dismissed": "Pet dismissed"
 }

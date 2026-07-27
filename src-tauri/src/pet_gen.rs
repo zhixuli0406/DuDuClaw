@@ -195,15 +195,30 @@ pub fn pet_activate(app: AppHandle, slug: Option<String>) -> Result<(), String> 
         if let Some(win) = tauri::Manager::get_webview_window(&app, mascot_window::MASCOT_LABEL) {
             let _ = win.show();
         }
+    } else {
+        // Deactivate = take the pet off the desk: hide the pet window, or the
+        // pet keeps floating with no way to dismiss it.
+        if let Some(win) = tauri::Manager::get_webview_window(&app, mascot_window::MASCOT_LABEL) {
+            let _ = win.hide();
+        }
     }
     let _ = app.emit(PET_CHANGED_EVENT, slug);
     Ok(())
 }
 
-/// Delete a pet pack.
+/// Delete a pet pack. Removing the currently active pet also hides the pet
+/// window (same rationale as deactivating).
 #[tauri::command]
 pub fn pet_remove(app: AppHandle, slug: String) -> Result<(), String> {
+    let was_active = duduclaw_pets::load_active()
+        .map(|p| p.manifest.id == slug)
+        .unwrap_or(false);
     duduclaw_pets::delete_pack(&slug).map_err(|e| e.to_string())?;
+    if was_active {
+        if let Some(win) = tauri::Manager::get_webview_window(&app, mascot_window::MASCOT_LABEL) {
+            let _ = win.hide();
+        }
+    }
     let _ = app.emit(PET_CHANGED_EVENT, Option::<String>::None);
     Ok(())
 }

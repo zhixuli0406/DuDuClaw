@@ -17,6 +17,8 @@ sha2 = "0.10"
 # Pure-Rust image decode/encode + resize. Kept in the default feature set: the
 # passthrough (external-cutout) path and RGBA compositing need it even without ONNX.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# EXIF Orientation for phone photos — the `image` decoder does not apply it.
+kamadak-exif = "0.6"
 
 # ONNX-based local background removal (BiRefNet-general-lite / silueta). OFF by
 # default so the workspace builds/tests without the onnxruntime toolchain; the
