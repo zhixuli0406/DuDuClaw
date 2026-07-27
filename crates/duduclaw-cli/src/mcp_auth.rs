@@ -605,6 +605,7 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "delete_cron_task"
         | "update_cron_task"
         | "pause_cron_task"
+        | "run_cron_task"
         | "channel_config"
         | "model_download"
         | "model_load"
@@ -855,6 +856,7 @@ is_external = {is_external}
             "evolution_toggle",
             "schedule_task",
             "delete_cron_task",
+            "run_cron_task",
             "shared_wiki_write",
             "shared_wiki_delete",
         ] {

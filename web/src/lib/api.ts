@@ -3200,6 +3200,24 @@ export const api = {
       client.call('cron.resume', { id }),
     remove: (id: string) =>
       client.call('cron.remove', { id }),
+    /** Trigger a single immediate ("test") execution of a routine. */
+    runNow: (id: string) =>
+      client.call('cron.run_now', { id }) as Promise<{
+        success: boolean;
+        id: string;
+        name: string;
+      }>,
+    /** Built-in office scheduling templates for prefilling the create dialog. */
+    templates: () =>
+      client.call('cron.templates') as Promise<{
+        templates: Array<{
+          id: string;
+          name: string;
+          cron: string;
+          description: string;
+          prompt: string;
+        }>;
+      }>,
   },
   heartbeat: {
     status: () =>
