@@ -4473,6 +4473,14 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_cron_remove(params).await
             }
+            "cron.run_now" => {
+                require_admin!();
+                self.handle_cron_run_now(params).await
+            }
+            "cron.templates" => {
+                require_admin!();
+                self.handle_cron_templates().await
+            }
 
             // ── System (admin only for config changes) ───────
             "system.status" => self.handle_system_status().await,
@@ -5300,6 +5308,8 @@ impl MethodHandler {
                     { "name": "cron.add", "description": "Add a cron job" },
                     { "name": "cron.pause", "description": "Pause a cron job" },
                     { "name": "cron.remove", "description": "Remove a cron job" },
+                    { "name": "cron.run_now", "description": "Run a cron job once now (test execution)" },
+                    { "name": "cron.templates", "description": "List built-in office scheduling templates" },
                     { "name": "system.status", "description": "System status" },
                     { "name": "system.doctor", "description": "Health checks" },
                     { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
@@ -13736,6 +13746,43 @@ impl MethodHandler {
             Ok(false) => WsFrame::error_response("", "Cron task not found"),
             Err(e) => WsFrame::error_response("", &format!("delete: {e}")),
         }
+    }
+
+    /// Trigger a single immediate ("test") execution of a cron task. Routes
+    /// through the live [`CronScheduler::run_now`] so the run takes the exact
+    /// same path as a scheduled fire (trigger gate + execute + run history).
+    /// Returns immediately; the outcome lands in the task's run history, which
+    /// the dashboard picks up on its next `cron.list` refresh.
+    async fn handle_cron_run_now(&self, params: Value) -> WsFrame {
+        let id = match params.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'id' parameter"),
+        };
+        let scheduler = match self.cron_scheduler.read().await.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                return WsFrame::error_response(
+                    "",
+                    "Cron scheduler not initialized yet — retry in a moment",
+                )
+            }
+        };
+        match scheduler.run_now(&id).await {
+            Ok(name) => {
+                info!(id = %id, name = %name, "Cron task manual run-now triggered");
+                WsFrame::ok_response("", json!({ "success": true, "id": id, "name": name }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("run cron task: {e}")),
+        }
+    }
+
+    /// Return the built-in "office scheduling" templates so the dashboard can
+    /// prefill the routine create dialog. Pure constants — no store access.
+    async fn handle_cron_templates(&self) -> WsFrame {
+        WsFrame::ok_response(
+            "",
+            json!({ "templates": crate::cron_templates::templates_json() }),
+        )
     }
 
     // ── Partner Portal ───────────────────────────────────────

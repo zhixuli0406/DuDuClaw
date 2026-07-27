@@ -14,6 +14,7 @@
 |------|------|
 | `/goal <目標描述>` | 建立一個自主目標任務，指派給當前對話的 AI 員工。沒有另外指定驗收標準時，以目標描述本身當作驗收基準。 |
 | `/goal <目標> \|\| <驗收標準>` | 用 `\|\|` 分隔：前半是目標，後半是驗收標準（判官核可的依據）。 |
+| `/goal <目標> \|\| <驗收標準> \|\| outcome:<spec>` | 再加一段結構化產出驗收（見下方「結構化產出驗收」）。交付前先跑零成本的 deterministic 校驗，未達標直接退回修正，不燒判官。 |
 | `/goal status` | 列出當前 AI 員工進行中的目標任務（短碼 / 狀態 / 第幾輪）。 |
 | `/goal` | 顯示用法說明。 |
 
@@ -21,6 +22,7 @@
 
 ```
 /goal 整理這批客戶資料成月報並寄出 || 報表含每月營收圖表，寄到 boss@example.com
+/goal 產出 Q3 月報 || 含每月營收圖表 || outcome:files:report.docx
 ```
 
 建立後會回覆確認訊息，包含任務短碼、上限輪數，以及「完成或卡住會在這裡通知你」。任務進度與需人工的通知會**推回你發起的這個對話**（來源頻道），而不只是 AI 員工的 `[proactive]` 通知頻道。
@@ -137,6 +139,36 @@ max_hop_depth = 5       # 委派鏈跨行程 re-spawn 的深度上限。預設 5
 名冊 = `<home>/agents/` 下的員工目錄。名冊為空時，`round_robin` / `llm_select` 都退回原指派（不孤兒化）。改派會寫回任務的 `assigned_to`，讓 heartbeat 拉取與活動記錄一致。
 
 ---
+
+## 結構化產出驗收（outcome schema，WP2.4）
+
+`/goal … || outcome:<spec>` 讓你在自由文字的驗收標準之外，再加一層**機器可校驗**的產出契約。當 AI 員工回報完成、任務進入 `review` 時，這層契約會在**驗收判官（LLM）之前**先跑一次 **deterministic、零 LLM 成本**的校驗：
+
+- **校驗不通過** → 任務直接退回 `revising`，回饋訊息帶具體缺陷（缺哪個欄位、少哪個檔），**完全不呼叫判官**。這是擋判官假陽性的防線：結構上明顯不合格的產出，不會被過度寬鬆的判官放行，也不浪費一次判官 LLM call。
+- **校驗通過** → 才進判官，且判官 prompt 會附上「結構化產出驗收已通過 deterministic 校驗」的註記，讓判官專注在品質面向。
+
+三種 spec 型別：
+
+| spec | 意義 |
+|------|------|
+| `outcome:text` | 預設。無結構化契約，行為與未加 outcome 時完全一致（不持久化、判官前不跑任何校驗）。 |
+| `outcome:json:<JSON Schema>` | JSON Schema 子集（`object` / `array` / `string` / `number` / `integer` / `boolean`，支援 `properties` / `required` / `items`）。校驗 AI 員工最終回覆中的 ` ```json ` 區塊（找不到 fenced 區塊則退而解析整段回覆）。缺欄位 / 型別不符都會列成具體缺陷。 |
+| `outcome:files:<glob,glob>` | 斷言 AI 員工工作目錄下有符合每個 glob 的產出檔（支援 `*`／`?`）。例：`outcome:files:report.docx, out/*.pdf`。 |
+
+**範例**
+
+```
+/goal 匯出這季營收數字 || outcome:json:{"type":"object","required":["revenue","month"],"properties":{"revenue":{"type":"number"},"month":{"type":"string"}}}
+/goal 產出季報並存檔 || 需含營收圖表 || outcome:files:report.docx,charts/*.png
+```
+
+**界線與 fail-closed 行為：**
+
+- **路徑穿越拒絕**：`files:` 的 glob 若是絕對路徑、家目錄（`~`）、或含 `..` 上層目錄，一律在 `/goal` 建立時就拒絕（fail-closed，任務不建立），校驗時再擋一次。工作目錄基準是 `<home>/agents/<agent>/`。
+- **畸形 spec 拒絕**：`json:` 不是合法 JSON 物件、`files:` 空清單、未知型別前綴 → `/goal` 直接回錯誤、不建立任務（不會靜默降級成 text）。
+- **持久化**：spec 以單一 `outcome:<base64url>` 標籤存在任務既有的 `tags` 欄位（base64url 不含逗號，不與標籤分隔衝突），**不改資料庫 schema**。`text` 不持久化。
+- **與 planner 的關係**：設了 outcome spec 時會略過 `planner_enabled` 的子任務拆分——結構化契約針對單一最終交付物，不套用到每個被拆出的子任務。
+- **判官仍是後盾**：標籤若毀損無法解碼，deterministic 校驗跳過、直接交給判官（判官照樣把關），不會因為觀測性缺口而卡住任務。
 
 ## 動態判官深度（MaAS）
 

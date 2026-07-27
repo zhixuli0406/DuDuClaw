@@ -634,7 +634,8 @@ fn format_tool_activity(records: &[ToolActivityRecord]) -> Option<String> {
     if records.is_empty() {
         return None;
     }
-    let mut counts: std::collections::BTreeMap<&str, (u32, u32)> = std::collections::BTreeMap::new();
+    let mut counts: std::collections::BTreeMap<&str, (u32, u32)> =
+        std::collections::BTreeMap::new();
     for r in records {
         let entry = counts.entry(r.tool_name.as_str()).or_insert((0, 0));
         if r.success {
@@ -820,6 +821,50 @@ impl DispatchEngine {
             let result = task.result_summary.clone().unwrap_or_default();
             let mut task_desc = format!("{}\n{}", task.title, task.description);
 
+            // ── WP2.4: deterministic outcome acceptance (BEFORE the judge) ──
+            // A goal that declares a structured outcome contract (`json:` /
+            // `files:`, persisted as an `outcome:<b64>` tag) is validated at
+            // ZERO LLM cost here. A deterministic failure sends the task straight
+            // back to `revising` with concrete defects and NEVER invokes the
+            // judge — the guard against judge false-positives. A pass reaches the
+            // judge with an explicit "deterministic 校驗已通過" note. Gated on a
+            // wired `home_dir` (needed to resolve the agent working dir for
+            // `files:` assertions); a corrupt tag yields `None` and falls through
+            // to the judge unchanged (the judge remains a backstop).
+            let mut deterministic_note: Option<String> = None;
+            if let Some(home) = &self.home_dir {
+                if let Some(spec) = crate::outcome_spec::OutcomeSpec::from_tags(&task.tags) {
+                    let worker = task
+                        .claimed_by
+                        .clone()
+                        .unwrap_or_else(|| task.assigned_to.clone());
+                    let work_dir = crate::outcome_spec::agent_work_dir(home, &worker);
+                    let check = spec.validate(&result, &work_dir);
+                    if !check.passed {
+                        let feedback = format!(
+                            "結構化產出驗收未通過（deterministic 零成本校驗，未進判官）：{}",
+                            check.defects.join("；")
+                        );
+                        let status = self
+                            .store
+                            .reject_review(&task.id, &feedback, self.soft_cap)
+                            .await?;
+                        // Phase closed (a rejection re-opens the loop) → revoke
+                        // scoped grants, mirroring the judge-rejection path.
+                        self.revoke_task_grants(&task.id).await;
+                        info!(
+                            task = %task.id, %status, defects = check.defects.len(),
+                            "WP2.4 outcome 校驗未通過 → 跳過判官，直接退回 revising"
+                        );
+                        continue;
+                    }
+                    deterministic_note = Some(
+                        "結構化產出驗收（outcome schema）已通過 deterministic 零成本校驗。"
+                            .to_string(),
+                    );
+                }
+            }
+
             // WP4 GroundEval: fold tool-call evidence for this task's
             // claim→review window into the prompt (best-effort, never
             // fails the review — see `read_tool_activity_block`).
@@ -835,6 +880,14 @@ impl DispatchEngine {
                 if let Some(block) = read_tool_activity_block(home, &agent_id, &since, &now) {
                     task_desc = format!("{task_desc}\n\n{block}");
                 }
+            }
+
+            // WP2.4: tell the judge the deterministic contract already passed, so
+            // it focuses on the qualitative aspects rather than re-deriving what
+            // the zero-cost check already verified.
+            if let Some(note) = &deterministic_note {
+                task_desc =
+                    format!("{task_desc}\n\n<deterministic_check>{note}</deterministic_check>");
             }
 
             match judge.judge(&criteria, &task_desc, &result).await {
@@ -1031,13 +1084,31 @@ mod tests {
     #[test]
     fn difficulty_classifies_simple_and_complex() {
         // Short, single-step, tool-light ⇒ Simple.
-        assert_eq!(classify_goal_difficulty("寄一封提醒信給 Bob"), Difficulty::Simple);
-        assert_eq!(classify_goal_difficulty("rename the file to report.md"), Difficulty::Simple);
+        assert_eq!(
+            classify_goal_difficulty("寄一封提醒信給 Bob"),
+            Difficulty::Simple
+        );
+        assert_eq!(
+            classify_goal_difficulty("rename the file to report.md"),
+            Difficulty::Simple
+        );
         // Keyword-flagged ⇒ Complex (zh + en).
-        assert_eq!(classify_goal_difficulty("研究三家競品的定價"), Difficulty::Complex);
-        assert_eq!(classify_goal_difficulty("比較 A 與 B 兩個方案"), Difficulty::Complex);
-        assert_eq!(classify_goal_difficulty("migrate the database to postgres"), Difficulty::Complex);
-        assert_eq!(classify_goal_difficulty("deploy the new service"), Difficulty::Complex);
+        assert_eq!(
+            classify_goal_difficulty("研究三家競品的定價"),
+            Difficulty::Complex
+        );
+        assert_eq!(
+            classify_goal_difficulty("比較 A 與 B 兩個方案"),
+            Difficulty::Complex
+        );
+        assert_eq!(
+            classify_goal_difficulty("migrate the database to postgres"),
+            Difficulty::Complex
+        );
+        assert_eq!(
+            classify_goal_difficulty("deploy the new service"),
+            Difficulty::Complex
+        );
         assert_eq!(
             classify_goal_difficulty("Research and compare vendors"),
             Difficulty::Complex
@@ -1063,7 +1134,10 @@ mod tests {
         let p = build_acceptance_prompt_for("crit", "task", "result", Difficulty::Simple);
         assert!(p.contains("\"correctness\""));
         assert!(p.contains("\"safety\""));
-        assert!(!p.contains("completeness"), "Simple panel must not mention completeness");
+        assert!(
+            !p.contains("completeness"),
+            "Simple panel must not mention completeness"
+        );
         assert!(p.contains("two independent aspects"));
     }
 
@@ -1098,8 +1172,14 @@ mod tests {
         let reply = r#"{"correctness": {"pass": true, "reason": "ok"},
                         "safety": {"pass": true, "reason": "clean"}}"#;
         let judge = LlmAcceptanceJudge::new(StubCaller(reply.into()));
-        let v = judge.judge("寄一封信", "寄一封提醒信給 Bob", "已寄出").await.unwrap();
-        assert!(v.passed, "simple goal accepted on two aspects (no completeness required)");
+        let v = judge
+            .judge("寄一封信", "寄一封提醒信給 Bob", "已寄出")
+            .await
+            .unwrap();
+        assert!(
+            v.passed,
+            "simple goal accepted on two aspects (no completeness required)"
+        );
     }
 
     #[tokio::test]
@@ -1113,7 +1193,10 @@ mod tests {
             .judge("完整比較報告", "研究並比較三家競品的定價方案", "報告已產出")
             .await
             .unwrap();
-        assert!(!v.passed, "complex goal needs completeness — missing aspect fails closed");
+        assert!(
+            !v.passed,
+            "complex goal needs completeness — missing aspect fails closed"
+        );
         assert!(v.feedback.contains("completeness"));
     }
 
@@ -1157,7 +1240,8 @@ mod tests {
         store
             .atomic_claim(id, "w", "2026-07-11T10:00:00Z", "2026-07-11T10:05:00Z")
             .await
-            .unwrap().is_claimed();
+            .unwrap()
+            .is_claimed();
         store.complete_task(id, "my result", "w").await.unwrap();
         assert_eq!(store.get_task(id).await.unwrap().unwrap().status, "review");
     }
@@ -1207,7 +1291,8 @@ mod tests {
         store
             .atomic_claim("g2", "w", "2026-07-11T11:00:00Z", "2026-07-11T11:05:00Z")
             .await
-            .unwrap().is_claimed();
+            .unwrap()
+            .is_claimed();
         store.complete_task("g2", "attempt 2", "w").await.unwrap();
         engine.tick_once().await.unwrap();
         assert_eq!(
@@ -1252,6 +1337,151 @@ mod tests {
         );
     }
 
+    // ── WP2.4 deterministic outcome acceptance (before the judge) ──
+
+    /// Judge that counts how many times it is asked to rule — lets a test prove
+    /// the deterministic outcome gate short-circuits the (expensive) LLM judge.
+    struct CountingJudge {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        verdict: AcceptanceVerdict,
+    }
+
+    #[async_trait]
+    impl AcceptanceJudge for CountingJudge {
+        async fn judge(
+            &self,
+            _criteria: &str,
+            _task: &str,
+            _result: &str,
+        ) -> Result<AcceptanceVerdict, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.verdict.clone())
+        }
+    }
+
+    /// Seed a `review` goal task carrying `tags` and a worker `result_summary`.
+    async fn seed_review_with(store: &TaskStore, id: &str, tags: &str, result: &str) {
+        let mut g = pending_goal(id);
+        g.tags = tags.to_string();
+        store.insert_task(&g).await.unwrap();
+        store
+            .atomic_claim(id, "w", "2026-07-11T10:00:00Z", "2026-07-11T10:05:00Z")
+            .await
+            .unwrap()
+            .is_claimed();
+        store.complete_task(id, result, "w").await.unwrap();
+        assert_eq!(store.get_task(id).await.unwrap().unwrap().status, "review");
+    }
+
+    #[tokio::test]
+    async fn outcome_check_failure_skips_judge_and_revises() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        // A files: contract for a file the worker never produced.
+        let tag = crate::outcome_spec::OutcomeSpec::parse("files:report.docx")
+            .unwrap()
+            .to_tag()
+            .unwrap();
+        seed_review_with(&store, "og1", &tag, "我覺得應該算完成了").await;
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let judge = Arc::new(CountingJudge {
+            calls: calls.clone(),
+            verdict: AcceptanceVerdict {
+                passed: true,
+                feedback: "would have passed".into(),
+            },
+        });
+        let engine =
+            DispatchEngine::new(store.clone(), Some(judge)).with_home_dir(dir.path().to_path_buf());
+        engine.tick_once().await.unwrap();
+
+        // Deterministic failure → back to revising, judge NEVER consulted.
+        let t = store.get_task("og1").await.unwrap().unwrap();
+        assert_eq!(t.status, "revising");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "judge must not be called");
+        assert!(t
+            .judge_feedback
+            .as_deref()
+            .unwrap_or("")
+            .contains("report.docx"));
+    }
+
+    #[tokio::test]
+    async fn outcome_check_json_missing_field_skips_judge() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        let tag = crate::outcome_spec::OutcomeSpec::parse(
+            r#"json:{"type":"object","required":["total"]}"#,
+        )
+        .unwrap()
+        .to_tag()
+        .unwrap();
+        // Reply parses as JSON but is missing the required `total` field.
+        seed_review_with(
+            &store,
+            "og2",
+            &tag,
+            r#"結果：```json
+{"subtotal": 100}
+```"#,
+        )
+        .await;
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let judge = Arc::new(CountingJudge {
+            calls: calls.clone(),
+            verdict: AcceptanceVerdict {
+                passed: true,
+                feedback: "x".into(),
+            },
+        });
+        let engine =
+            DispatchEngine::new(store.clone(), Some(judge)).with_home_dir(dir.path().to_path_buf());
+        engine.tick_once().await.unwrap();
+
+        assert_eq!(
+            store.get_task("og2").await.unwrap().unwrap().status,
+            "revising"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn outcome_check_pass_reaches_judge_and_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        // The worker actually produced the declared file.
+        let work_dir = dir.path().join("agents").join("w");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(work_dir.join("report.docx"), b"content").unwrap();
+        let tag = crate::outcome_spec::OutcomeSpec::parse("files:report.docx")
+            .unwrap()
+            .to_tag()
+            .unwrap();
+        seed_review_with(&store, "og3", &tag, "報表已產出 report.docx").await;
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let judge = Arc::new(CountingJudge {
+            calls: calls.clone(),
+            verdict: AcceptanceVerdict {
+                passed: true,
+                feedback: "ok".into(),
+            },
+        });
+        let engine =
+            DispatchEngine::new(store.clone(), Some(judge)).with_home_dir(dir.path().to_path_buf());
+        engine.tick_once().await.unwrap();
+
+        // Deterministic gate passed → judge consulted once → accepted.
+        assert_eq!(store.get_task("og3").await.unwrap().unwrap().status, "done");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "judge runs exactly once after a passing gate"
+        );
+    }
+
     // ── WP4 GroundEval: `<tool_activity>` judge evidence ────────
 
     #[test]
@@ -1269,12 +1499,8 @@ mod tests {
             "not json\n",
             "{\"agent_id\":\"w\"}\n", // missing timestamp/tool_name
         );
-        let records = filter_tool_activity(
-            jsonl,
-            "w",
-            "2026-07-11T10:00:00Z",
-            "2026-07-11T10:05:00Z",
-        );
+        let records =
+            filter_tool_activity(jsonl, "w", "2026-07-11T10:00:00Z", "2026-07-11T10:05:00Z");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].tool_name, "memory_search");
         assert!(records[0].success);
@@ -1287,7 +1513,8 @@ mod tests {
             "{\"timestamp\":\"2026-07-11T10:00:00Z\",\"agent_id\":\"w\",\"tool_name\":\"Read\",\"success\":true}\n",
             "{\"timestamp\":\"2026-07-11T10:05:00Z\",\"agent_id\":\"w\",\"tool_name\":\"Read\",\"success\":true}\n",
         );
-        let records = filter_tool_activity(jsonl, "w", "2026-07-11T10:00:00Z", "2026-07-11T10:05:00Z");
+        let records =
+            filter_tool_activity(jsonl, "w", "2026-07-11T10:00:00Z", "2026-07-11T10:05:00Z");
         assert_eq!(records.len(), 2, "both boundary timestamps are in-window");
     }
 
@@ -1305,9 +1532,18 @@ mod tests {
     #[test]
     fn format_tool_activity_aggregates_ok_err_per_tool() {
         let records = vec![
-            ToolActivityRecord { tool_name: "memory_search".into(), success: true },
-            ToolActivityRecord { tool_name: "memory_search".into(), success: false },
-            ToolActivityRecord { tool_name: "Bash".into(), success: true },
+            ToolActivityRecord {
+                tool_name: "memory_search".into(),
+                success: true,
+            },
+            ToolActivityRecord {
+                tool_name: "memory_search".into(),
+                success: false,
+            },
+            ToolActivityRecord {
+                tool_name: "Bash".into(),
+                success: true,
+            },
         ];
         let block = format_tool_activity(&records).unwrap();
         assert!(block.starts_with("<tool_activity>\n"));
@@ -1400,16 +1636,25 @@ mod tests {
         .unwrap();
 
         let judge = Arc::new(CapturingJudge {
-            outcome: Ok(AcceptanceVerdict { passed: true, feedback: "ok".into() }),
+            outcome: Ok(AcceptanceVerdict {
+                passed: true,
+                feedback: "ok".into(),
+            }),
             captured_task: std::sync::Mutex::new(None),
         });
-        let engine = DispatchEngine::new(store.clone(), Some(judge.clone() as Arc<dyn AcceptanceJudge>))
-            .with_home_dir(dir.path().to_path_buf());
+        let engine = DispatchEngine::new(
+            store.clone(),
+            Some(judge.clone() as Arc<dyn AcceptanceJudge>),
+        )
+        .with_home_dir(dir.path().to_path_buf());
         engine.tick_once().await.unwrap();
 
         let captured = judge.captured_task.lock().unwrap().clone().unwrap();
         assert!(captured.contains("<tool_activity>"), "{captured}");
-        assert!(captured.contains("memory_search: 1 ok, 1 err"), "{captured}");
+        assert!(
+            captured.contains("memory_search: 1 ok, 1 err"),
+            "{captured}"
+        );
         assert!(!captured.contains("Bash"), "{captured}");
     }
 
@@ -1425,11 +1670,17 @@ mod tests {
         .unwrap();
 
         let judge = Arc::new(CapturingJudge {
-            outcome: Ok(AcceptanceVerdict { passed: true, feedback: "ok".into() }),
+            outcome: Ok(AcceptanceVerdict {
+                passed: true,
+                feedback: "ok".into(),
+            }),
             captured_task: std::sync::Mutex::new(None),
         });
         // No `.with_home_dir(...)` — behavior must match pre-WP4 (no block).
-        let engine = DispatchEngine::new(store.clone(), Some(judge.clone() as Arc<dyn AcceptanceJudge>));
+        let engine = DispatchEngine::new(
+            store.clone(),
+            Some(judge.clone() as Arc<dyn AcceptanceJudge>),
+        );
         engine.tick_once().await.unwrap();
 
         let captured = judge.captured_task.lock().unwrap().clone().unwrap();
@@ -1445,8 +1696,7 @@ mod tests {
         seed_review(&store, "g7").await; // claimed_by = "w"
 
         // Mint a grant bound to this task for agent "w".
-        let grants =
-            crate::capability_grants::CapabilityGrantStore::open(dir.path()).unwrap();
+        let grants = crate::capability_grants::CapabilityGrantStore::open(dir.path()).unwrap();
         grants
             .grant("w", Some("g7"), "send_message", "capability_request", 3600)
             .await
@@ -1454,10 +1704,13 @@ mod tests {
         assert!(grants.has_active_grant("w", "send_message").await);
 
         let judge = Arc::new(StubJudge {
-            outcome: Ok(AcceptanceVerdict { passed: true, feedback: "ok".into() }),
+            outcome: Ok(AcceptanceVerdict {
+                passed: true,
+                feedback: "ok".into(),
+            }),
         });
-        let engine = DispatchEngine::new(store.clone(), Some(judge))
-            .with_home_dir(dir.path().to_path_buf());
+        let engine =
+            DispatchEngine::new(store.clone(), Some(judge)).with_home_dir(dir.path().to_path_buf());
         engine.tick_once().await.unwrap();
 
         assert_eq!(store.get_task("g7").await.unwrap().unwrap().status, "done");
@@ -1488,7 +1741,8 @@ mod tests {
         store
             .atomic_claim("z", "w", "2026-07-01T08:00:00Z", "2026-07-01T08:05:00Z")
             .await
-            .unwrap().is_claimed();
+            .unwrap()
+            .is_claimed();
 
         let engine = DispatchEngine::new(store.clone(), None);
         engine.tick_once().await.unwrap();
@@ -1524,9 +1778,9 @@ mod tests {
         assert!(store
             .atomic_claim("long", "w", &now.to_rfc3339(), &lease)
             .await
-            .unwrap().is_claimed());
-        let guard =
-            LeaseRenewalGuard::spawn(store.clone(), "long".into(), "w".into(), lease_secs);
+            .unwrap()
+            .is_claimed());
+        let guard = LeaseRenewalGuard::spawn(store.clone(), "long".into(), "w".into(), lease_secs);
 
         let engine = DispatchEngine::new(store.clone(), None).with_lease_secs(lease_secs);
         // Hold the task for >2 full lease windows, reclaiming on every pass.
@@ -1563,13 +1817,17 @@ mod tests {
         assert!(store
             .atomic_claim("gone", "w", "2026-07-01T10:00:00Z", "2026-07-01T10:05:00Z")
             .await
-            .unwrap().is_claimed());
+            .unwrap()
+            .is_claimed());
 
         // At expiry (10:05) and inside the grace window (< 10:10): NOT yet
         // reclaimed — conservative reclaim waits one further full window.
         let out = store.reclaim_zombies("2026-07-01T10:06:00Z").await.unwrap();
         assert!(out.is_empty(), "still inside the grace window");
-        assert_eq!(store.get_task("gone").await.unwrap().unwrap().status, "in_progress");
+        assert_eq!(
+            store.get_task("gone").await.unwrap().unwrap().status,
+            "in_progress"
+        );
 
         // After expiry + one full lease window with zero renewals: reclaimed.
         let out2 = store.reclaim_zombies("2026-07-01T10:10:00Z").await.unwrap();

@@ -69,11 +69,15 @@ pub enum GoalCommand {
     Usage,
     /// `/goal status` → list this agent's in-progress goal tasks.
     Status,
-    /// `/goal <description>` (optionally `<description> || <acceptance criteria>`).
-    /// When no `||` is given the description doubles as the acceptance criteria.
+    /// `/goal <description>` (optionally `<description> || <acceptance criteria>
+    /// || outcome:<spec>`). When no `||` is given the description doubles as the
+    /// acceptance criteria. `outcome` is the raw `outcome:` payload (WP2.4) — the
+    /// text after `outcome:`, validated into an `OutcomeSpec` at creation time;
+    /// `None` when the third segment is absent.
     Create {
         description: String,
         acceptance_criteria: Option<String>,
+        outcome: Option<String>,
     },
 }
 
@@ -81,8 +85,12 @@ pub enum GoalCommand {
 ///
 /// - empty / whitespace → [`GoalCommand::Usage`]
 /// - `status` (case-insensitive) → [`GoalCommand::Status`]
-/// - `<desc> || <criteria>` → split on the first `||`; an empty right side is
-///   treated as "no explicit criteria"
+/// - `<desc> || <criteria>` → split on `||`; an empty right side is treated as
+///   "no explicit criteria"
+/// - `<desc> || <criteria> || outcome:<spec>` (or `<desc> || outcome:<spec>`) →
+///   WP2.4 structured outcome. The `outcome:` segment is captured raw (the whole
+///   remainder from `outcome:` onward, so any `||` inside a JSON schema survives)
+///   and validated later in [`handle_goal_create`].
 /// - anything else → the whole tail is the goal description
 fn parse_goal_args(args: Option<&str>) -> GoalCommand {
     let raw = args.map(str::trim).unwrap_or("");
@@ -92,7 +100,9 @@ fn parse_goal_args(args: Option<&str>) -> GoalCommand {
     if raw.eq_ignore_ascii_case("status") {
         return GoalCommand::Status;
     }
-    match raw.split_once("||") {
+    // Split off an optional trailing `|| outcome:<spec>` section first (WP2.4).
+    let (head, outcome) = split_outcome_section(raw);
+    match head.as_str().split_once("||") {
         Some((desc, crit)) => {
             let desc = desc.trim();
             if desc.is_empty() {
@@ -102,13 +112,40 @@ fn parse_goal_args(args: Option<&str>) -> GoalCommand {
             GoalCommand::Create {
                 description: desc.to_string(),
                 acceptance_criteria: (!crit.is_empty()).then(|| crit.to_string()),
+                outcome,
             }
         }
         None => GoalCommand::Create {
-            description: raw.to_string(),
+            description: head.trim().to_string(),
             acceptance_criteria: None,
+            outcome,
         },
     }
+}
+
+/// Split a `/goal` tail into `(head, outcome_spec)` where `head` is everything
+/// before the `|| outcome:` segment and `outcome_spec` is the raw payload after
+/// `outcome:`. The whole remainder (including any `||` inside a JSON schema) is
+/// kept so `outcome:{"a":"1||2"}` is not truncated. Returns `(raw, None)` when no
+/// top-level `outcome:` segment is present. `split`/`join` on `||` are exact
+/// inverses, so the reconstructed head equals the original substring.
+fn split_outcome_section(raw: &str) -> (String, Option<String>) {
+    let parts: Vec<&str> = raw.split("||").collect();
+    // Segment 0 is always the description; scan later segments for `outcome:`.
+    for i in 1..parts.len() {
+        if let Some(spec) = parts[i].trim_start().strip_prefix("outcome:") {
+            let head = parts[..i].join("||");
+            // The outcome payload is this segment's remainder plus any following
+            // `||`-joined segments (JSON schemas may contain `||` inside strings).
+            let mut spec = spec.to_string();
+            if i + 1 < parts.len() {
+                spec.push_str("||");
+                spec.push_str(&parts[i + 1..].join("||"));
+            }
+            return (head, Some(spec.trim().to_string()));
+        }
+    }
+    (raw.to_string(), None)
 }
 
 impl ChatCommand {
@@ -128,9 +165,7 @@ impl ChatCommand {
 /// Check if a message starts with a `/` command or `!` safety word.
 pub fn is_command(text: &str) -> bool {
     let trimmed = text.trim();
-    (trimmed.starts_with('/')
-        && trimmed.len() > 1
-        && trimmed.as_bytes()[1].is_ascii_alphabetic())
+    (trimmed.starts_with('/') && trimmed.len() > 1 && trimmed.as_bytes()[1].is_ascii_alphabetic())
         || is_likely_safety_word(trimmed)
 }
 
@@ -217,13 +252,12 @@ pub fn parse_command(
         "resume" => Some(ChatCommand::ComputerResume),
         "stop" => Some(ChatCommand::ComputerStop),
         "replay" => {
-            let n = args
-                .and_then(|a| a.parse::<u32>().ok())
-                .unwrap_or(5);
+            let n = args.and_then(|a| a.parse::<u32>().ok()).unwrap_or(5);
             Some(ChatCommand::Replay(n))
         }
         "handoff" => Some(ChatCommand::Handoff(
-            args.filter(|a| !a.is_empty()).map(|a| a.to_ascii_lowercase()),
+            args.filter(|a| !a.is_empty())
+                .map(|a| a.to_ascii_lowercase()),
         )),
         "undo" => {
             // Same laxity as /replay: non-numeric arg falls back to default.
@@ -277,24 +311,14 @@ pub async fn handle_command(
             // Handled by the caller — needs access to the orchestrator
             "📸 截圖指令已接收（需要 active computer use session）".to_string()
         }
-        ChatCommand::ComputerOn => {
-            "🖥️ Computer Use 已啟用（本次 session）".to_string()
-        }
-        ChatCommand::ComputerOff => {
-            "🖥️ Computer Use 已關閉".to_string()
-        }
+        ChatCommand::ComputerOn => "🖥️ Computer Use 已啟用（本次 session）".to_string(),
+        ChatCommand::ComputerOff => "🖥️ Computer Use 已關閉".to_string(),
         ChatCommand::ComputerPause => {
             "⏸ Computer Use session 已暫停。發送 /resume 繼續".to_string()
         }
-        ChatCommand::ComputerResume => {
-            "▶️ Computer Use session 已恢復".to_string()
-        }
-        ChatCommand::ComputerStop => {
-            "🛑 Computer Use session 已終止".to_string()
-        }
-        ChatCommand::Replay(n) => {
-            handle_replay(ctx, agent_id, *n).await
-        }
+        ChatCommand::ComputerResume => "▶️ Computer Use session 已恢復".to_string(),
+        ChatCommand::ComputerStop => "🛑 Computer Use session 已終止".to_string(),
+        ChatCommand::Replay(n) => handle_replay(ctx, agent_id, *n).await,
         ChatCommand::Handoff(target) => {
             handle_handoff(ctx, session_id, agent_id, target.as_deref()).await
         }
@@ -331,7 +355,11 @@ async fn handle_status(ctx: &ReplyContext, session_id: &str, agent_id: &str) -> 
     drop(reg);
 
     // Session info
-    let session_info = match ctx.session_manager.get_or_create(session_id, agent_id).await {
+    let session_info = match ctx
+        .session_manager
+        .get_or_create(session_id, agent_id)
+        .await
+    {
         Ok(session) => format!(
             "Session: #{}\nTokens: {}\nLast active: {}",
             session.lineage, session.total_tokens, session.last_active
@@ -422,7 +450,11 @@ async fn handle_pair(ctx: &ReplyContext, session_id: &str, code: &str) -> String
     // channel_reply checks BOTH user id and session id, so either form of
     // approval unlocks the conversation. Codes come from the operator via
     // the `pairing_generate` MCP tool.
-    if ctx.access_control.verify_pairing_code(session_id, code).await {
+    if ctx
+        .access_control
+        .verify_pairing_code(session_id, code)
+        .await
+    {
         "✅ 配對成功，現在可以開始對話了。".to_string()
     } else {
         "❌ 配對碼錯誤或已過期，請向管理員索取新的配對碼。".to_string()
@@ -509,7 +541,9 @@ async fn handle_handoff(
         .any(|key| status.get(key).map(|s| s.connected).unwrap_or(false))
     };
     if !connected {
-        return format!("❌ {target} 頻道尚未設定或目前未連線，無法轉移。請先在儀表板完成該頻道設定。");
+        return format!(
+            "❌ {target} 頻道尚未設定或目前未連線，無法轉移。請先在儀表板完成該頻道設定。"
+        );
     }
 
     let candidates = match ctx
@@ -641,8 +675,12 @@ fn goal_usage_text() -> String {
     "🎯 *自主目標 /goal*\n\
      `/goal <目標描述>` — 交付一個目標，AI 員工會自主規劃、執行、自我驗收，完成或卡住時通知你\n\
      `/goal <目標> || <驗收標準>` — 用 `||` 另外指定驗收標準（沒給就用目標本身當驗收基準）\n\
+     `/goal <目標> || <驗收標準> || outcome:<spec>` — 再加結構化產出驗收（交付前零成本自動校驗）\n\
+     • `outcome:text`（預設，行為不變）\n\
+     • `outcome:json:<JSON Schema>` — 校驗最終回覆裡的 ```json 區塊（object/array/string/number/boolean）\n\
+     • `outcome:files:<glob,glob>` — 斷言工作目錄下有對應產出檔（例 `outcome:files:report.docx`）\n\
      `/goal status` — 查看進行中的目標任務\n\n\
-     範例：`/goal 整理這批客戶資料成月報並寄出 || 報表含每月營收圖表，寄到 boss@example.com`"
+     範例：`/goal 整理這批客戶資料成月報並寄出 || 報表含每月營收圖表 || outcome:files:report.docx`"
         .to_string()
 }
 
@@ -658,6 +696,7 @@ async fn handle_goal(
         GoalCommand::Create {
             description,
             acceptance_criteria,
+            outcome,
         } => {
             handle_goal_create(
                 ctx,
@@ -665,6 +704,7 @@ async fn handle_goal(
                 agent_id,
                 description,
                 acceptance_criteria.as_deref(),
+                outcome.as_deref(),
             )
             .await
         }
@@ -679,6 +719,7 @@ async fn handle_goal_create(
     agent_id: &str,
     description: &str,
     acceptance_criteria: Option<&str>,
+    outcome: Option<&str>,
 ) -> String {
     let store = match crate::task_store::TaskStore::open(&ctx.home_dir) {
         Ok(s) => s,
@@ -693,12 +734,23 @@ async fn handle_goal_create(
         .map(str::to_string)
         .unwrap_or_else(|| description.to_string());
 
+    // ── WP2.4: parse + validate the structured outcome spec up front ──
+    // A malformed spec is rejected fail-closed (the task is NOT created) so the
+    // user fixes it rather than getting a silently text-only acceptance.
+    let outcome_tag = match outcome.map(crate::outcome_spec::OutcomeSpec::parse) {
+        Some(Ok(spec)) => spec.to_tag(), // None for `text` (nothing to persist)
+        Some(Err(e)) => return format!("⚠️ outcome 產出驗收格式錯誤：{e}"),
+        None => None,
+    };
+
     // ── D4 item 1: optional LLMCompiler-style decomposition ──
     // Off by default; only attempted when `[goal_loop] planner_enabled = true`.
     // A valid multi-task DAG is inserted as-is; anything else (declined split,
     // parse failure, cycle, trivial plan) falls through to the single-task path
     // below so behavior is byte-identical when the planner is off or unhelpful.
-    if crate::goal_plan::planner_enabled(&ctx.home_dir) {
+    // Skipped entirely when an outcome spec is set: the structured contract
+    // applies to one final deliverable, not to each decomposed subtask.
+    if outcome_tag.is_none() && crate::goal_plan::planner_enabled(&ctx.home_dir) {
         if let Some(reply) = try_decompose_goal(
             &store,
             &ctx.home_dir,
@@ -729,6 +781,12 @@ async fn handle_goal_create(
     task.status = "todo".to_string();
     task.goal_mode = true;
     task.acceptance_criteria = Some(criteria);
+    // WP2.4: ride the structured outcome spec on the existing comma-separated
+    // tags field (base64url, comma-free) — no schema change. `text` specs and
+    // the no-spec case leave tags untouched (behaviour unchanged).
+    if let Some(tag) = &outcome_tag {
+        task.tags = tag.clone();
+    }
     if !channel.is_empty() {
         task.source_channel = Some(channel);
     }
@@ -748,6 +806,11 @@ async fn handle_goal_create(
          輸入 `/goal status` 可隨時查看進度。",
         duduclaw_core::truncate_chars(description, 200),
     );
+    if outcome_tag.is_some() {
+        msg.push_str(
+            "\n📐 已設定結構化產出驗收：交付前會先做零成本自動校驗，未達標會直接退回修正（不浪費驗收判官）。",
+        );
+    }
     if !enabled {
         msg.push_str(
             "\n\n⚠️ 目前尚未啟用自主派工引擎，任務已建立但不會自動開始執行。\
@@ -774,11 +837,10 @@ async fn try_decompose_goal(
 ) -> Option<String> {
     use crate::goal_plan::{plan_is_dag, plan_to_tasks, GoalDecomposer};
 
-    let decomposer = crate::goal_plan::LlmGoalDecomposer::new(
-        crate::goal_plan::UtilityDecomposeCaller {
+    let decomposer =
+        crate::goal_plan::LlmGoalDecomposer::new(crate::goal_plan::UtilityDecomposeCaller {
             home_dir: home_dir.to_path_buf(),
-        },
-    );
+        });
     let plan = match decomposer.decompose(description, criteria).await {
         Ok(p) => p,
         Err(e) => {
@@ -904,7 +966,9 @@ async fn handle_safety_stop(ctx: &ReplyContext, session_id: &str, _agent_id: &st
 async fn handle_safety_stop_all(ctx: &ReplyContext) -> String {
     if let Some(ref failsafe) = ctx.failsafe {
         // Halt all active scopes + a global scope marker
-        failsafe.force_halt("__global__", "safety word: !STOP ALL").await;
+        failsafe
+            .force_halt("__global__", "safety word: !STOP ALL")
+            .await;
         for (scope, _) in failsafe.active_states().await {
             failsafe.force_halt(&scope, "safety word: !STOP ALL").await;
         }
@@ -967,9 +1031,7 @@ async fn handle_safety_status(ctx: &ReplyContext, session_id: &str) -> String {
 async fn handle_replay(ctx: &ReplyContext, agent_id: &str, limit: u32) -> String {
     let audit = crate::screenshot_audit::BrowserAuditLog::new(&ctx.home_dir, 7);
     match audit.entries_for_agent(agent_id, limit as usize) {
-        Ok(entries) if entries.is_empty() => {
-            "📭 沒有找到截圖記錄".to_string()
-        }
+        Ok(entries) if entries.is_empty() => "📭 沒有找到截圖記錄".to_string(),
         Ok(entries) => {
             let mut lines = vec![format!("📸 最近 {} 筆操作記錄：", entries.len())];
             for entry in &entries {
@@ -979,7 +1041,8 @@ async fn handle_replay(ctx: &ReplyContext, agent_id: &str, limit: u32) -> String
                     .as_ref()
                     .map(|p| format!(" [截圖: {}]", p.display()))
                     .unwrap_or_default();
-                lines.push(format!("• {ts} [{tier}] {action}{ss}",
+                lines.push(format!(
+                    "• {ts} [{tier}] {action}{ss}",
                     tier = entry.tier,
                     action = entry.action,
                 ));
@@ -1041,7 +1104,10 @@ mod tests {
 
     #[test]
     fn test_parse_model_no_arg() {
-        assert_eq!(parse_command("/model", None), Some(ChatCommand::Model(None)));
+        assert_eq!(
+            parse_command("/model", None),
+            Some(ChatCommand::Model(None))
+        );
     }
 
     #[test]
@@ -1063,15 +1129,36 @@ mod tests {
 
     #[test]
     fn test_parse_computer_commands() {
-        assert_eq!(parse_command("/screenshot", None), Some(ChatCommand::Screenshot));
+        assert_eq!(
+            parse_command("/screenshot", None),
+            Some(ChatCommand::Screenshot)
+        );
         assert_eq!(parse_command("/ss", None), Some(ChatCommand::Screenshot));
-        assert_eq!(parse_command("/computer on", None), Some(ChatCommand::ComputerOn));
-        assert_eq!(parse_command("/computer off", None), Some(ChatCommand::ComputerOff));
-        assert_eq!(parse_command("/pause", None), Some(ChatCommand::ComputerPause));
-        assert_eq!(parse_command("/resume", None), Some(ChatCommand::ComputerResume));
-        assert_eq!(parse_command("/stop", None), Some(ChatCommand::ComputerStop));
+        assert_eq!(
+            parse_command("/computer on", None),
+            Some(ChatCommand::ComputerOn)
+        );
+        assert_eq!(
+            parse_command("/computer off", None),
+            Some(ChatCommand::ComputerOff)
+        );
+        assert_eq!(
+            parse_command("/pause", None),
+            Some(ChatCommand::ComputerPause)
+        );
+        assert_eq!(
+            parse_command("/resume", None),
+            Some(ChatCommand::ComputerResume)
+        );
+        assert_eq!(
+            parse_command("/stop", None),
+            Some(ChatCommand::ComputerStop)
+        );
         assert_eq!(parse_command("/replay", None), Some(ChatCommand::Replay(5)));
-        assert_eq!(parse_command("/replay 10", None), Some(ChatCommand::Replay(10)));
+        assert_eq!(
+            parse_command("/replay 10", None),
+            Some(ChatCommand::Replay(10))
+        );
     }
 
     #[test]
@@ -1085,14 +1172,20 @@ mod tests {
             parse_command("/handoff Slack", None),
             Some(ChatCommand::Handoff(Some("slack".to_string())))
         );
-        assert_eq!(parse_command("/handoff", None), Some(ChatCommand::Handoff(None)));
+        assert_eq!(
+            parse_command("/handoff", None),
+            Some(ChatCommand::Handoff(None))
+        );
 
         // /undo — default 1, explicit N passes through (validated in handler)
         assert_eq!(parse_command("/undo", None), Some(ChatCommand::Undo(1)));
         assert_eq!(parse_command("/undo 3", None), Some(ChatCommand::Undo(3)));
         assert_eq!(parse_command("/undo abc", None), Some(ChatCommand::Undo(1)));
 
-        assert_eq!(parse_command("/rollback", None), Some(ChatCommand::Rollback));
+        assert_eq!(
+            parse_command("/rollback", None),
+            Some(ChatCommand::Rollback)
+        );
 
         // Non-admin commands, same gating as peers (/new, /compact).
         assert!(!ChatCommand::Handoff(Some("telegram".into())).requires_admin());
@@ -1108,6 +1201,7 @@ mod tests {
             Some(ChatCommand::Goal(GoalCommand::Create {
                 description: "整理客戶資料成報表".to_string(),
                 acceptance_criteria: None,
+                outcome: None,
             }))
         );
 
@@ -1117,6 +1211,7 @@ mod tests {
             Some(ChatCommand::Goal(GoalCommand::Create {
                 description: "做月報".to_string(),
                 acceptance_criteria: Some("含營收圖表並寄出".to_string()),
+                outcome: None,
             }))
         );
 
@@ -1126,6 +1221,43 @@ mod tests {
             Some(ChatCommand::Goal(GoalCommand::Create {
                 description: "做月報".to_string(),
                 acceptance_criteria: None,
+                outcome: None,
+            }))
+        );
+
+        // WP2.4 three-part: description || criteria || outcome:<spec>.
+        assert_eq!(
+            parse_command(
+                "/goal 做月報 || 含營收圖表 || outcome:files:report.docx",
+                None
+            ),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: Some("含營收圖表".to_string()),
+                outcome: Some("files:report.docx".to_string()),
+            }))
+        );
+
+        // Outcome may follow the description directly (criteria omitted).
+        assert_eq!(
+            parse_command("/goal 做月報 || outcome:text", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: None,
+                outcome: Some("text".to_string()),
+            }))
+        );
+
+        // A `||` inside a JSON schema string survives (payload kept whole).
+        assert_eq!(
+            parse_command(
+                r#"/goal 產出設定 || outcome:json:{"type":"object","required":["a||b"]}"#,
+                None
+            ),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "產出設定".to_string(),
+                acceptance_criteria: None,
+                outcome: Some(r#"json:{"type":"object","required":["a||b"]}"#.to_string()),
             }))
         );
 
@@ -1174,9 +1306,18 @@ mod tests {
     #[test]
     fn test_parse_safety_words() {
         assert_eq!(parse_command("!STOP", None), Some(ChatCommand::SafetyStop));
-        assert_eq!(parse_command("!STOP ALL", None), Some(ChatCommand::SafetyStopAll));
-        assert_eq!(parse_command("!RESUME", None), Some(ChatCommand::SafetyResume));
-        assert_eq!(parse_command("!STATUS", None), Some(ChatCommand::SafetyStatus));
+        assert_eq!(
+            parse_command("!STOP ALL", None),
+            Some(ChatCommand::SafetyStopAll)
+        );
+        assert_eq!(
+            parse_command("!RESUME", None),
+            Some(ChatCommand::SafetyResume)
+        );
+        assert_eq!(
+            parse_command("!STATUS", None),
+            Some(ChatCommand::SafetyStatus)
+        );
         assert_eq!(parse_command("!停止", None), Some(ChatCommand::SafetyStop));
     }
 }

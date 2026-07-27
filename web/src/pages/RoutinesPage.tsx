@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { Clock, Play, Pause, Trash2, Plus, Pencil, MoreHorizontal } from 'lucide-react';
+import { Clock, Play, Pause, Trash2, Plus, Pencil, MoreHorizontal, FlaskConical } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -48,6 +48,14 @@ interface Routine {
   enabled: boolean;
   last_run_at?: string | null;
   last_status?: string | null;
+}
+
+interface CronTemplate {
+  id: string;
+  name: string;
+  cron: string;
+  description: string;
+  prompt: string;
 }
 
 /** Column template shared by the routines ListGrid header + rows (spec §4). */
@@ -108,6 +116,24 @@ function RoutineFormDialog({
   const [agent, setAgent] = useState(task?.agent_id ?? '');
   const [body, setBody] = useState(task?.task ?? '');
   const [saving, setSaving] = useState(false);
+  // Office scheduling templates (create mode only) — prefill name/cron/prompt.
+  const [templates, setTemplates] = useState<CronTemplate[]>([]);
+
+  useEffect(() => {
+    if (isEdit) return;
+    api.cron
+      .templates()
+      .then((res) => setTemplates(res?.templates ?? []))
+      .catch((e) => console.warn('[api]', e));
+  }, [isEdit]);
+
+  const applyTemplate = (id: string) => {
+    const t = templates.find((x) => x.id === id);
+    if (!t) return;
+    setName(t.name);
+    setSchedule(t.cron);
+    setBody(t.prompt);
+  };
 
   const canSave = !!schedule.trim() && (isEdit || !!name.trim());
 
@@ -151,6 +177,28 @@ function RoutineFormDialog({
         </DialogHeader>
 
         <div className="space-y-4">
+          {!isEdit && templates.length > 0 && (
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                {intl.formatMessage({ id: 'routines.template.label' })}
+              </label>
+              <Select value="" onValueChange={(v) => applyTemplate(String(v))}>
+                <SelectTrigger className="w-full">
+                  <SelectValue
+                    placeholder={intl.formatMessage({ id: 'routines.template.placeholder' })}
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {templates.map((t) => (
+                    <SelectItem key={t.id} value={t.id}>
+                      {t.name} · {t.description}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
           <div className="space-y-1.5">
             <label htmlFor="routine-name" className="text-xs font-medium text-muted-foreground">
               {intl.formatMessage({ id: 'settings.cron.name' })}
@@ -207,12 +255,14 @@ function RoutineRow({
   onToggle,
   onEdit,
   onRemove,
+  onRunNow,
 }: {
   routine: Routine;
   busy: boolean;
   onToggle: () => void;
   onEdit: () => void;
   onRemove: () => void;
+  onRunNow: () => void;
 }) {
   const intl = useIntl();
   return (
@@ -264,6 +314,10 @@ function RoutineRow({
             <MoreHorizontal />
           </DropdownMenuTrigger>
           <DropdownMenuContent>
+            <DropdownMenuItem onClick={onRunNow} disabled={busy}>
+              <FlaskConical />
+              {intl.formatMessage({ id: 'routines.runNow' })}
+            </DropdownMenuItem>
             <DropdownMenuItem onClick={onEdit} disabled={busy}>
               <Pencil />
               {intl.formatMessage({ id: 'routines.edit' })}
@@ -411,6 +465,7 @@ export function RoutinesPage() {
                   }
                   onEdit={() => setDialog(r)}
                   onRemove={() => act(r.id, () => api.cron.remove(r.id), 'routines.removedToast')}
+                  onRunNow={() => act(r.id, () => api.cron.runNow(r.id), 'routines.runNowToast')}
                 />
               ))}
             </ListGridContainer>

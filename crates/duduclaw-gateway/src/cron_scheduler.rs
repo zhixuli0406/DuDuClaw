@@ -21,6 +21,48 @@ use duduclaw_agent::registry::AgentRegistry;
 /// [`crate::cron_store::CronTaskRow`] in new code.
 pub type CronTask = CronTaskRow;
 
+/// Abstraction over the single "call the agent and get its reply" step of a
+/// cron task's execution. Extracting this seam lets the whole dispatch path
+/// ([`dispatch_cron_task`] → [`execute_cron_task`] → run recording) be
+/// unit-tested with a mock in place of the real Claude CLI call, so a test
+/// can prove that a **run-now** goes through the exact same code as a
+/// scheduled fire. Production always uses [`RealAgentInvoker`].
+#[async_trait::async_trait]
+pub trait AgentInvoker: Send + Sync {
+    async fn invoke(
+        &self,
+        home_dir: &Path,
+        registry: &Arc<RwLock<AgentRegistry>>,
+        agent_id: &str,
+        prompt: &str,
+    ) -> Result<String, String>;
+}
+
+/// Production [`AgentInvoker`]: routes through the normal per-agent Claude
+/// dispatch (`call_claude_for_agent_with_type`) tagged as a `Cron` request.
+/// Zero-sized, so it is cheap to construct per spawned task.
+pub struct RealAgentInvoker;
+
+#[async_trait::async_trait]
+impl AgentInvoker for RealAgentInvoker {
+    async fn invoke(
+        &self,
+        home_dir: &Path,
+        registry: &Arc<RwLock<AgentRegistry>>,
+        agent_id: &str,
+        prompt: &str,
+    ) -> Result<String, String> {
+        call_claude_for_agent_with_type(
+            home_dir,
+            registry,
+            agent_id,
+            prompt,
+            crate::cost_telemetry::RequestType::Cron,
+        )
+        .await
+    }
+}
+
 /// Maximum concurrent cron task executions.
 const MAX_CONCURRENT_CRON: usize = 4;
 
@@ -73,6 +115,38 @@ impl CronScheduler {
     /// call from any thread; returns instantly and never blocks.
     pub fn reload_now(&self) {
         self.reload_notify.notify_one();
+    }
+
+    /// Trigger a **single immediate execution** of the task with `task_id`
+    /// ("run now" / "test execution"). The run goes through the exact same
+    /// [`dispatch_cron_task`] path a scheduled fire uses — same trigger gate,
+    /// same delegation env, same channel delivery, same run recording — so
+    /// the outcome lands in the store's run history just like any other fire.
+    ///
+    /// Works regardless of the task's `enabled` state (so a routine can be
+    /// tested before being switched on) and respects the same concurrency
+    /// semaphore as scheduled fires. The execution is spawned in the
+    /// background and this returns immediately with the task's display name;
+    /// the caller (dashboard RPC) polls the run history to see the result.
+    /// Returns an error only when the id is unknown or the store is
+    /// unreadable.
+    pub async fn run_now(&self, task_id: &str) -> Result<String, String> {
+        let row = self
+            .store
+            .get(task_id)
+            .await?
+            .ok_or_else(|| format!("找不到排程任務：{task_id}"))?;
+        let name = row.name.clone();
+        let home = self.home_dir.clone();
+        let registry = self.registry.clone();
+        let store = self.store.clone();
+        let sem = self.semaphore.clone();
+        tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            info!(id = %row.id, name = %row.name, "cron task run-now triggered (manual test execution)");
+            dispatch_cron_task(&home, &store, &registry, &row, &RealAgentInvoker).await;
+        });
+        Ok(name)
     }
 
     /// Reload tasks from the store into memory, preserving `last_run` for
@@ -192,7 +266,7 @@ impl CronScheduler {
                 let sem = self.semaphore.clone();
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await;
-                    dispatch_cron_task(&home, &store, &registry, &task).await;
+                    dispatch_cron_task(&home, &store, &registry, &task, &RealAgentInvoker).await;
                 });
             }
         }
@@ -215,6 +289,7 @@ async fn dispatch_cron_task(
     store: &Arc<CronStore>,
     registry: &Arc<RwLock<AgentRegistry>>,
     task: &CronTaskRow,
+    invoker: &dyn AgentInvoker,
 ) {
     use crate::condition_eval::{evaluate_condition, evaluate_on_exit, TriggerKind};
 
@@ -241,7 +316,7 @@ async fn dispatch_cron_task(
 
     match TriggerKind::from_db(&task.trigger_kind) {
         TriggerKind::Time => {
-            execute_cron_task(home_dir, store, registry, task, None).await;
+            execute_cron_task(home_dir, store, registry, task, None, invoker).await;
         }
         TriggerKind::Condition => {
             let script = match task.condition_script.as_deref() {
@@ -273,8 +348,15 @@ async fn dispatch_cron_task(
 
             if outcome.fire {
                 info!(id = %task.id, name = %task.name, "condition trigger 觸發，執行任務");
-                execute_cron_task(home_dir, store, registry, task, outcome.message.as_deref())
-                    .await;
+                execute_cron_task(
+                    home_dir,
+                    store,
+                    registry,
+                    task,
+                    outcome.message.as_deref(),
+                    invoker,
+                )
+                .await;
             } else {
                 info!(id = %task.id, name = %task.name, "condition trigger 評估未觸發（跳過）");
             }
@@ -294,7 +376,7 @@ async fn dispatch_cron_task(
 
             if evaluate_on_exit(watch).await {
                 info!(id = %task.id, name = %task.name, "on_exit trigger 觸發（監看指令退出 0），執行任務");
-                execute_cron_task(home_dir, store, registry, task, None).await;
+                execute_cron_task(home_dir, store, registry, task, None, invoker).await;
             } else {
                 info!(id = %task.id, name = %task.name, "on_exit trigger 未觸發（跳過）");
             }
@@ -314,6 +396,7 @@ async fn execute_cron_task(
     registry: &Arc<RwLock<AgentRegistry>>,
     task: &CronTaskRow,
     trigger_message: Option<&str>,
+    invoker: &dyn AgentInvoker,
 ) {
     let prompt = match trigger_message {
         Some(m) if !m.trim().is_empty() => {
@@ -366,14 +449,9 @@ async fn execute_cron_task(
 
     let dispatch_fut = crate::claude_runner::DELEGATION_ENV
         .scope(delegation_env, async {
-            call_claude_for_agent_with_type(
-                home_dir,
-                registry,
-                &task.agent_id,
-                &prompt,
-                crate::cost_telemetry::RequestType::Cron,
-            )
-            .await
+            invoker
+                .invoke(home_dir, registry, &task.agent_id, &prompt)
+                .await
         });
     let result = match reply_channel_override {
         Some(rc) => crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut).await,
@@ -696,9 +774,219 @@ pub fn start_cron_scheduler(
     (handle, scheduler)
 }
 
+/// Standalone one-shot execution of a cron task by id **or** name, for
+/// callers that do not hold a live [`CronScheduler`] handle — chiefly the
+/// out-of-process MCP subprocess (`duduclaw mcp-server`), which shares the
+/// same `<home>/cron_tasks.db` but has no in-memory scheduler.
+///
+/// Builds its own [`CronStore`] and a freshly-scanned [`AgentRegistry`] from
+/// `home_dir`, then runs the **same** [`dispatch_cron_task`] path a
+/// scheduled fire uses (trigger gate + execute + run recording). Unlike
+/// [`CronScheduler::run_now`] this **blocks until the task completes** so the
+/// MCP tool can report the outcome inline; the run is bounded by the shared
+/// cross-process `dispatch_guard` breaker exactly like a scheduled fire.
+///
+/// Returns a short human-readable summary of the recorded run on success.
+pub async fn run_cron_task_now_standalone(
+    home_dir: &Path,
+    id_or_name: &str,
+) -> Result<String, String> {
+    run_cron_task_now_with(home_dir, id_or_name, &RealAgentInvoker).await
+}
+
+/// Injectable core of [`run_cron_task_now_standalone`] — parameterised over
+/// the [`AgentInvoker`] so tests can substitute a mock for the real CLI.
+async fn run_cron_task_now_with(
+    home_dir: &Path,
+    id_or_name: &str,
+    invoker: &dyn AgentInvoker,
+) -> Result<String, String> {
+    let store = Arc::new(CronStore::open(home_dir)?);
+
+    // Resolve by id first, then by name (mirrors the MCP lookup convention).
+    let row = match store.get(id_or_name).await? {
+        Some(r) => r,
+        None => store
+            .get_by_name(id_or_name)
+            .await?
+            .ok_or_else(|| format!("找不到排程任務：{id_or_name}"))?,
+    };
+
+    // Scan the agents directory so the invoker can resolve the target agent's
+    // config exactly as the gateway would. Best-effort: a scan error still
+    // lets the dispatch attempt proceed (and fail with a clear per-agent
+    // error) rather than silently swallowing the run request.
+    let mut registry = AgentRegistry::new(home_dir.join("agents"));
+    if let Err(e) = registry.scan().await {
+        warn!("run_cron_task_now_standalone: agent registry scan failed: {e}");
+    }
+    let registry = Arc::new(RwLock::new(registry));
+
+    dispatch_cron_task(home_dir, &store, &registry, &row, invoker).await;
+
+    // Re-read the row to report the recorded outcome (dispatch_cron_task may
+    // have skipped execution at a fail-closed trigger gate, in which case the
+    // run counters are unchanged — surface that honestly).
+    let updated = store.get(&row.id).await?.unwrap_or(row);
+    let status = updated.last_status.as_deref().unwrap_or("未執行");
+    Ok(format!(
+        "已觸發排程「{name}」（id: {id}）。狀態：{status}｜累計執行 {runs} 次（失敗 {fails} 次）",
+        name = updated.name,
+        id = updated.id,
+        runs = updated.run_count,
+        fails = updated.failure_count,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// Records every `(agent_id, prompt)` it is asked to invoke and returns a
+    /// canned reply — a stand-in for the real Claude CLI call so the dispatch
+    /// path can be exercised deterministically in a test.
+    struct RecordingInvoker {
+        calls: Arc<StdMutex<Vec<(String, String)>>>,
+        reply: String,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentInvoker for RecordingInvoker {
+        async fn invoke(
+            &self,
+            _home_dir: &Path,
+            _registry: &Arc<RwLock<AgentRegistry>>,
+            agent_id: &str,
+            prompt: &str,
+        ) -> Result<String, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((agent_id.to_string(), prompt.to_string()));
+            if self.fail {
+                Err("mock failure".to_string())
+            } else {
+                Ok(self.reply.clone())
+            }
+        }
+    }
+
+    /// run-now goes through the SAME `dispatch_cron_task` path a scheduled
+    /// fire uses: the mock invoker receives the canonical
+    /// `[Scheduled Task: <name>] <task>` prompt and the run is recorded in
+    /// the store (run_count bumped, last_status = success) — proving the
+    /// manual trigger reuses the scheduled execution path end-to-end.
+    #[tokio::test]
+    async fn run_now_dispatch_uses_same_path_and_records_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CronStore::open(dir.path()).unwrap());
+        let row = CronTaskRow::new(
+            "rn1".into(),
+            "Daily Digest".into(),
+            "agnes".into(),
+            "0 9 * * *".into(),
+            "彙整今日郵件".into(),
+        );
+        store.insert(&row).await.unwrap();
+
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let invoker = RecordingInvoker {
+            calls: calls.clone(),
+            reply: "done".into(),
+            fail: false,
+        };
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(dir.path().join("agents"))));
+
+        dispatch_cron_task(dir.path(), &store, &registry, &row, &invoker).await;
+
+        // The invoker saw exactly one call with the scheduled-fire prompt shape.
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "invoker should be called exactly once");
+        assert_eq!(recorded[0].0, "agnes");
+        assert_eq!(recorded[0].1, "[Scheduled Task: Daily Digest] 彙整今日郵件");
+
+        // The run was recorded like any scheduled fire.
+        let got = store.get("rn1").await.unwrap().unwrap();
+        assert_eq!(got.run_count, 1);
+        assert_eq!(got.failure_count, 0);
+        assert_eq!(got.last_status.as_deref(), Some("success"));
+    }
+
+    /// A failing invoke is recorded as a failed run through the same path.
+    #[tokio::test]
+    async fn run_now_dispatch_records_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CronStore::open(dir.path()).unwrap());
+        let row = CronTaskRow::new(
+            "rn2".into(),
+            "Boom".into(),
+            "agnes".into(),
+            "0 9 * * *".into(),
+            "do stuff".into(),
+        );
+        store.insert(&row).await.unwrap();
+
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let invoker = RecordingInvoker {
+            calls: calls.clone(),
+            reply: String::new(),
+            fail: true,
+        };
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(dir.path().join("agents"))));
+
+        dispatch_cron_task(dir.path(), &store, &registry, &row, &invoker).await;
+
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let got = store.get("rn2").await.unwrap().unwrap();
+        assert_eq!(got.run_count, 1);
+        assert_eq!(got.failure_count, 1);
+        assert_eq!(got.last_status.as_deref(), Some("failure"));
+    }
+
+    /// The standalone (MCP-facing) entry point resolves by name, runs the same
+    /// dispatch path (mock invoker), and reports the recorded outcome. Uses
+    /// the injectable core so the real CLI is never spawned in a test.
+    #[tokio::test]
+    async fn standalone_run_now_resolves_and_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CronStore::open(dir.path()).unwrap();
+        let row = CronTaskRow::new(
+            "sr1".into(),
+            "Weekly".into(),
+            "agnes".into(),
+            "0 17 * * 5".into(),
+            "週報".into(),
+        );
+        store.insert(&row).await.unwrap();
+        drop(store);
+
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let invoker = RecordingInvoker {
+            calls: calls.clone(),
+            reply: "ok".into(),
+            fail: false,
+        };
+
+        // Unknown id → clear error, no dispatch.
+        let err = run_cron_task_now_with(dir.path(), "nope", &invoker)
+            .await
+            .unwrap_err();
+        assert!(err.contains("找不到"), "unexpected error: {err}");
+        assert!(calls.lock().unwrap().is_empty());
+
+        // Resolve by name → runs the dispatch path and reports a success summary.
+        let summary = run_cron_task_now_with(dir.path(), "Weekly", &invoker)
+            .await
+            .unwrap();
+        assert!(summary.contains("Weekly"), "summary: {summary}");
+        assert!(summary.contains("success"), "summary: {summary}");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let store = CronStore::open(dir.path()).unwrap();
+        let got = store.get("sr1").await.unwrap().unwrap();
+        assert_eq!(got.run_count, 1, "standalone run should record exactly one run");
+    }
 
     fn task_with_notify(channel: Option<&str>, chat: Option<&str>, thread: Option<&str>) -> CronTaskRow {
         let mut row = CronTaskRow::new(
