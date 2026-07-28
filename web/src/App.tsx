@@ -27,6 +27,7 @@ const CanvasPage = lazyPage(() => import('./pages/CanvasPage'), 'CanvasPage');
 const FilesPage = lazyPage(() => import('./pages/FilesPage'), 'FilesPage');
 const AgentDetailPage = lazyPage(() => import('./pages/AgentDetailPage'), 'AgentDetailPage');
 const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'SkillMarketPage');
+const ExpertsPage = lazyPage(() => import('./pages/ExpertsPage'), 'ExpertsPage');
 const WidgetsPage = lazyPage(() => import('./pages/WidgetsPage'), 'WidgetsPage');
 const WidgetComposerPage = lazyPage(() => import('./pages/WidgetComposerPage'), 'WidgetComposerPage');
 const KnowledgeShell = lazyPage(() => import('./pages/KnowledgeShell'), 'KnowledgeShell');
@@ -206,6 +207,9 @@ export function App() {
                   are `require_admin!`-gated server-side; this mirrors that. */}
               <Route element={<RoleGuard minRole="admin" />}>
                 <Route path="os" element={<OSPage />} />
+                {/* 專家包 — expert-pack management; experts.* RPCs are
+                    require_admin!-gated server-side, this mirrors that. */}
+                <Route path="experts" element={<ExpertsPage />} />
               </Route>
 
               {/* ── Zone D 管理 — single entry, ManageShell subnav tree ──

@@ -124,6 +124,8 @@ export interface ProactiveSettings {
   max_messages_per_hour: number;
   notify_channel: string;
   notify_chat_id: string;
+  /** Optional thread/topic ID within the chat (Discord thread / TG topic). */
+  notify_thread_id?: string;
 }
 
 export interface ChannelStatus {
@@ -1319,6 +1321,26 @@ export interface RuntimeDetect {
   claude_subscription: string | null;
 }
 
+// ── Expert packs (專家包) ─────────────────────────
+
+/** One installed expert pack row from `experts.list` (admin-only). */
+export interface ExpertPack {
+  slug: string;
+  /** Source format label (internal; UI shows a friendly badge instead). */
+  kind: string;
+  display_name: string;
+  version: string;
+  description: string;
+  /** AI staffer ids created by this pack. */
+  agents: string[];
+  skills_count: number;
+  wiki_count: number;
+  installed_at: string;
+  /** null ⇒ the pack ships no managed hooks. */
+  hooks_status: 'disabled' | 'pending_approval' | 'enabled' | null;
+  hooks_files: number;
+}
+
 // ── EVO: per-agent advanced [evolution] ─────────────────────────
 
 export interface EvolutionExternalFactors {
@@ -1582,6 +1604,8 @@ export interface AgentCapabilities {
   policy?: ToolPolicyRule[];
   /** v1.39 — opt-in OS-native features (filesystem watchers via [os_watch]). */
   os_native?: boolean;
+  /** WP3.3 — opt-in recording-to-skill capture (browser/desktop recording). */
+  recording?: boolean;
 }
 
 /** v1.39 — top-level `[os_watch]` table (gated by `capabilities.os_native`).
@@ -2893,6 +2917,32 @@ export const api = {
     detect: () =>
       client.call('runtime.detect') as Promise<RuntimeDetect>,
   },
+  // Expert packs (專家包) — all admin-only, fail-closed server-side.
+  experts: {
+    list: () =>
+      client.call('experts.list') as Promise<{ packs: ExpertPack[] }>,
+    /** Install from a server-local path (use `POST /api/experts/upload` to
+     *  stage a .zip first — see ExpertsPage). Long-running: security scans run
+     *  inside the install pipeline. */
+    install: (path: string) =>
+      client.call('experts.install', { path }, false, 320000) as Promise<{
+        success: boolean;
+        output: string;
+      }>,
+    remove: (slug: string) =>
+      client.call('experts.remove', { slug }) as Promise<{
+        success: boolean;
+        items: Array<{ status: string; kind: string; name: string; detail: string }>;
+      }>,
+    /** Apply the approval-center decision for a pack's hooks (approve → enable;
+     *  deny/expire → stay disabled). */
+    hooksApply: (slug: string) =>
+      client.call('experts.hooks_apply', { slug }) as Promise<{
+        status: 'enabled' | 'disabled' | 'pending_approval' | 'denied' | 'expired';
+        files?: number;
+        approval_id?: string;
+      }>,
+  },
   channels: {
     status: () =>
       client.call('channels.status') as Promise<{ channels: ChannelStatus[] }>,
@@ -3170,6 +3220,8 @@ export const api = {
         voice?: Partial<VoiceSettings> | null;
         // Structured [gateway] allowed_origins for the remote-access allowlist UI.
         allowed_origins?: string[];
+        // Structured [skills] gap_digest_enabled for the daily skill-gap digest toggle.
+        gap_digest_enabled?: boolean;
       }>,
     updateConfig: (fields: Record<string, unknown>) =>
       client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean; hot_reloaded?: string[] }>,

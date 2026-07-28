@@ -36,6 +36,7 @@ import {
   MonitorCog,
   FolderOpen,
   PawPrint,
+  Package,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -159,6 +160,8 @@ export const navGroups: NavGroup[] = [
       { to: '/world', icon: Globe2, label: 'nav.world', desc: 'nav.world.desc', ownScope: true },
       { to: '/memory', icon: Brain, label: 'nav.memory', desc: 'nav.memory.desc', ownScope: true },
       { to: '/skills', icon: Puzzle, label: 'nav.skills', desc: 'nav.skills.desc' },
+      // 專家包 — install/manage bundled AI teams; experts.* RPCs are admin-only.
+      { to: '/experts', icon: Package, label: 'nav.experts', desc: 'nav.experts.desc', minRole: 'admin' },
       // Widget 工坊 — custom dashboard cards (AI-built / HTML / shared).
       { to: '/widgets', icon: LayoutGrid, label: 'nav.widgets', desc: 'nav.widgets.desc' },
       { to: '/knowledge', icon: BookOpen, label: 'nav.knowledge', desc: 'nav.knowledge.desc' },

@@ -421,6 +421,13 @@ fn apply_capabilities_to_table(
         section.insert("os_native".into(), toml::Value::Boolean(v));
         changes.push(format!("capabilities.os_native = {v}"));
     }
+    // ── recording (bool) — opt-in recording-to-skill capture (WP3.3). Gates
+    // the browser/desktop record + skill_from_recording MCP tools at the
+    // dispatch gate (fail-closed, default false).
+    if let Some(v) = cap.get("recording").and_then(|v| v.as_bool()) {
+        section.insert("recording".into(), toml::Value::Boolean(v));
+        changes.push(format!("capabilities.recording = {v}"));
+    }
 
     // ── Array fields (tool names must be non-empty strings) ──
     for (param_key, toml_key) in &[
@@ -4464,6 +4471,24 @@ impl MethodHandler {
             }
             "skills.install_request" => self.handle_skills_install_request(params, ctx).await,
 
+            // ── Expert packs (專家包, admin only) ────────────────
+            "experts.list" => {
+                require_admin!();
+                self.handle_experts_list().await
+            }
+            "experts.install" => {
+                require_admin!();
+                self.handle_experts_install(params).await
+            }
+            "experts.remove" => {
+                require_admin!();
+                self.handle_experts_remove(params).await
+            }
+            "experts.hooks_apply" => {
+                require_admin!();
+                self.handle_experts_hooks_apply(params).await
+            }
+
             // ── Cron (admin only) ────────────────────────────
             "cron.list" => {
                 require_admin!();
@@ -5346,6 +5371,10 @@ impl MethodHandler {
                     { "name": "mcp.import.fetch", "description": "Fetch + security-scan MCP server defs from a GitHub/URL manifest" },
                     { "name": "mcp.import.install", "description": "Install a scanned MCP server def (fail-closed re-scan)" },
                     { "name": "skills.install_request", "description": "File a Skill install request for approval (non-admin)" },
+                    { "name": "experts.list", "description": "List installed expert packs (admin)" },
+                    { "name": "experts.install", "description": "Install an expert pack from a server-local dir/zip (admin)" },
+                    { "name": "experts.remove", "description": "Remove an installed expert pack (admin)" },
+                    { "name": "experts.hooks_apply", "description": "Apply the approval decision for a pack's hooks (admin)" },
                     { "name": "mcp.install_request", "description": "File an MCP install request for approval (non-admin)" },
                     { "name": "install_requests.list", "description": "List install requests actionable by the caller (manager+)" },
                     { "name": "install_requests.mine", "description": "The caller's own install requests + status" },
@@ -6905,6 +6934,12 @@ impl MethodHandler {
                     if let Some(v) = p.get("notify_chat_id").and_then(|v| v.as_str()) {
                         pt.insert("notify_chat_id".into(), toml::Value::String(v.into()));
                         changes.push(format!("proactive.notify_chat_id = \"{v}\""));
+                    }
+                    // Optional thread/topic id (Discord thread, Telegram topic).
+                    // Empty string clears it (readers treat empty as unset).
+                    if let Some(v) = p.get("notify_thread_id").and_then(|v| v.as_str()) {
+                        pt.insert("notify_thread_id".into(), toml::Value::String(v.into()));
+                        changes.push(format!("proactive.notify_thread_id = \"{v}\""));
                     }
                 }
             }
@@ -9381,6 +9416,7 @@ impl MethodHandler {
                             "max_messages_per_hour": cfg.proactive.max_messages_per_hour,
                             "notify_channel": cfg.proactive.notify_channel,
                             "notify_chat_id": cfg.proactive.notify_chat_id,
+                            "notify_thread_id": cfg.proactive.notify_thread_id,
                         },
                         "permissions": {
                             "can_create_agents": cfg.permissions.can_create_agents,
@@ -15139,6 +15175,129 @@ impl MethodHandler {
         )
     }
 
+    // ── Expert packs (專家包) — dashboard admin surface ─────────────────────
+    //
+    // Shared on-disk contracts + remove/hooks semantics live in
+    // `crate::expert_admin` (also consumed by the `duduclaw expert` CLI).
+    // Install reuses the FULL CLI pipeline (format detection, safe_zip
+    // zip-slip fence + 50 MB cap, prompt-injection / skill-security scanning,
+    // hook quarantine) by spawning `duduclaw expert install <path>` — the
+    // installer is entangled with cli-only agent scaffolding, so a subprocess
+    // is the zero-drift reuse path (same pattern as doctor_probes → mcp-server).
+
+    async fn handle_experts_list(&self) -> WsFrame {
+        let packs: Vec<Value> = crate::expert_admin::list_records(&self.home_dir)
+            .into_iter()
+            .map(|r| {
+                let hooks = crate::expert_admin::read_hooks_state(&self.home_dir, &r.slug);
+                json!({
+                    "slug": r.slug,
+                    "kind": r.kind.label(),
+                    "display_name": if r.display_name.is_empty() { r.slug.clone() } else { r.display_name.clone() },
+                    "version": r.version,
+                    "description": r.description,
+                    "agents": r.agents,
+                    "skills_count": r.global_skills.len(),
+                    "wiki_count": r.wiki_files.len(),
+                    "installed_at": r.installed_at,
+                    // null ⇒ the pack ships no managed hooks.
+                    "hooks_status": hooks.as_ref().map(|h| h.status.as_str()),
+                    "hooks_files": hooks.map(|h| h.files.len()).unwrap_or(0),
+                })
+            })
+            .collect();
+        WsFrame::ok_response("", json!({ "packs": packs }))
+    }
+
+    async fn handle_experts_install(&self, params: Value) -> WsFrame {
+        let Some(path) = params.get("path").and_then(|v| v.as_str()) else {
+            return WsFrame::error_response("", "path parameter is required");
+        };
+        let src = std::path::Path::new(path);
+        if !src.exists() {
+            return WsFrame::error_response("", "安裝來源不存在（請重新上傳）");
+        }
+        let is_zip = src.is_file()
+            && src
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("zip"))
+                .unwrap_or(false);
+        if !src.is_dir() && !is_zip {
+            return WsFrame::error_response("", "安裝來源必須是資料夾或 .zip 檔");
+        }
+
+        // Reuse the full CLI install pipeline via our own binary. Hooks are
+        // NEVER auto-trusted from the dashboard — they land disabled with an
+        // approval request (fail-closed), decided in the approval center.
+        let bin = duduclaw_core::resolve_duduclaw_bin();
+        let fut = tokio::process::Command::new(&bin)
+            .arg("expert")
+            .arg("install")
+            .arg(src)
+            .env("DUDUCLAW_HOME", &self.home_dir)
+            .kill_on_drop(true)
+            .output();
+        let output = match tokio::time::timeout(std::time::Duration::from_secs(300), fut).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return WsFrame::error_response("", &format!("安裝程序啟動失敗: {e}"));
+            }
+            Err(_) => {
+                return WsFrame::error_response("", "安裝逾時（300 秒），已中止");
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Strip ANSI-free console tail for surfacing (CJK-safe truncation).
+        let tail = |s: &str| duduclaw_core::truncate_chars(s.trim(), 1200).to_string();
+        if !output.status.success() {
+            let detail = if stderr.trim().is_empty() { &stdout } else { &stderr };
+            return WsFrame::error_response("", &format!("安裝失敗：{}", tail(detail)));
+        }
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "output": tail(&stdout) }),
+        )
+    }
+
+    async fn handle_experts_remove(&self, params: Value) -> WsFrame {
+        let Some(slug) = params.get("slug").and_then(|v| v.as_str()) else {
+            return WsFrame::error_response("", "slug parameter is required");
+        };
+        match crate::expert_admin::remove_pack(&self.home_dir, slug).await {
+            Ok(items) => WsFrame::ok_response(
+                "",
+                json!({
+                    "success": true,
+                    "items": serde_json::to_value(&items).unwrap_or(Value::Null),
+                }),
+            ),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_experts_hooks_apply(&self, params: Value) -> WsFrame {
+        let Some(slug) = params.get("slug").and_then(|v| v.as_str()) else {
+            return WsFrame::error_response("", "slug parameter is required");
+        };
+        use crate::expert_admin::HooksApplyOutcome as O;
+        match crate::expert_admin::apply_hooks_decision(&self.home_dir, slug).await {
+            Ok(O::Enabled { files }) => {
+                WsFrame::ok_response("", json!({ "status": "enabled", "files": files }))
+            }
+            Ok(O::Disabled) => WsFrame::ok_response("", json!({ "status": "disabled" })),
+            Ok(O::StillPending { approval_id }) => WsFrame::ok_response(
+                "",
+                json!({ "status": "pending_approval", "approval_id": approval_id }),
+            ),
+            Ok(O::DeniedOrExpired { status }) => {
+                WsFrame::ok_response("", json!({ "status": status }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
     async fn handle_system_config(&self) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
 
@@ -15172,6 +15331,19 @@ impl MethodHandler {
                 .unwrap_or_default()
         };
 
+        // Structured [skills] gap_digest_enabled so the dashboard Settings
+        // toggle shows the saved value (absent / malformed ⇒ false, matching
+        // the fail-closed default in skill_gap_digest.rs).
+        let gap_digest_enabled: bool = {
+            let table = self.read_config_table(&config_path).await;
+            table
+                .get("skills")
+                .and_then(|s| s.as_table())
+                .and_then(|s| s.get("gap_digest_enabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+
         match tokio::fs::read_to_string(&config_path).await {
             Ok(content) => {
                 // Mask sensitive fields
@@ -15182,7 +15354,7 @@ impl MethodHandler {
                             toml::to_string_pretty(&table).unwrap_or_else(|_| content.clone());
                         WsFrame::ok_response(
                             "",
-                            json!({ "config": masked, "voice": voice, "allowed_origins": allowed_origins }),
+                            json!({ "config": masked, "voice": voice, "allowed_origins": allowed_origins, "gap_digest_enabled": gap_digest_enabled }),
                         )
                     }
                     Err(_) => {
@@ -16861,6 +17033,22 @@ impl MethodHandler {
                 .unwrap();
             server.insert("mdns_advertise".into(), toml::Value::Boolean(v));
             changes.push(format!("server.mdns_advertise = {v} (restart required)"));
+        }
+
+        // ── G.3c [skills] gap_digest_enabled (daily skill-gap digest, hot-applied) ──
+        // Re-read from config.toml on every digest tick (skill_gap_digest.rs),
+        // so persisting is enough — no restart, no hot-reload plumbing.
+        if let Some(v) = params.get("gap_digest_enabled").and_then(|v| v.as_bool()) {
+            let skills = table
+                .entry("skills")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(skills) = skills {
+                skills.insert("gap_digest_enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("skills.gap_digest_enabled = {v}"));
+            } else {
+                return WsFrame::error_response("", "Invalid [skills] section in config.toml");
+            }
         }
 
         // ── G.4 [logging] format (pretty/json) ──
@@ -26838,6 +27026,42 @@ policies:
         assert!(cfg.os_native);
     }
 
+    // ── WP3.3: recording capability (dashboard toggle) ───────────────────────
+
+    #[test]
+    fn cap_recording_round_trips_into_capabilities_config() {
+        let mut table = toml::Table::new();
+        let changes = apply_capabilities_to_table(
+            &mut table,
+            &json!({ "capabilities": { "recording": true } }),
+        )
+        .expect("apply");
+        let cap = table.get("capabilities").unwrap().as_table().unwrap();
+        assert_eq!(cap.get("recording").unwrap().as_bool(), Some(true));
+        assert!(changes.iter().any(|c| c.contains("recording = true")));
+        // Must deserialize back into a real CapabilitiesConfig.
+        let cfg: duduclaw_core::types::CapabilitiesConfig = cap
+            .clone()
+            .try_into()
+            .expect("deserializes into CapabilitiesConfig");
+        assert!(cfg.recording);
+
+        // Explicit false is also written (operator turning it off).
+        let mut t2 = toml::Table::new();
+        let changes2 = apply_capabilities_to_table(
+            &mut t2,
+            &json!({ "capabilities": { "recording": false } }),
+        )
+        .expect("apply");
+        assert!(changes2.iter().any(|c| c.contains("recording = false")));
+
+        // Serialization of CapabilitiesConfig carries `recording` so
+        // agents.inspect exposes it to the dashboard.
+        let json = serde_json::to_value(duduclaw_core::types::CapabilitiesConfig::default())
+            .expect("serialize");
+        assert_eq!(json.get("recording"), Some(&serde_json::Value::Bool(false)));
+    }
+
     #[test]
     fn os_watch_apply_writes_all_fields() {
         let mut table = toml::Table::new();
@@ -28463,6 +28687,48 @@ mod d6_curation_tests {
         );
     }
 
+    /// [skills] gap_digest_enabled round-trip: system.update_config persists
+    /// the flag, skill_gap_digest's parser reads it back, and system.config
+    /// exposes the structured value for the dashboard toggle.
+    #[tokio::test]
+    async fn system_update_config_gap_digest_enabled_round_trip() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Default (no config) ⇒ false in system.config.
+        let frame = handler.handle_system_config().await;
+        // No config.toml yet — handler errors on read; write first, then read.
+        let _ = frame;
+
+        let frame = handler
+            .handle_system_update_config(json!({ "gap_digest_enabled": true }))
+            .await;
+        assert!(frame_ok(&frame), "gap_digest_enabled=true must persist: {frame:?}");
+
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let cfg: toml::Table = raw.parse().unwrap();
+        assert_eq!(cfg["skills"]["gap_digest_enabled"].as_bool(), Some(true));
+        // The digest consumer parses the same shape.
+        assert!(crate::skill_gap_digest::gap_digest_enabled_from_str(&raw));
+
+        // system.config surfaces the structured flag for the dashboard.
+        let frame = handler.handle_system_config().await;
+        assert!(frame_ok(&frame));
+        let data = frame_data(&frame);
+        assert_eq!(
+            data.get("gap_digest_enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        // Turning it back off round-trips too.
+        let frame = handler
+            .handle_system_update_config(json!({ "gap_digest_enabled": false }))
+            .await;
+        assert!(frame_ok(&frame));
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(!crate::skill_gap_digest::gap_digest_enabled_from_str(&raw));
+    }
+
     #[tokio::test]
     async fn system_update_config_rejects_bad_dispatch_policy_and_cap() {
         let home = tempfile::tempdir().unwrap();
@@ -28496,6 +28762,178 @@ mod d6_curation_tests {
         assert!(
             !home.path().join("config.toml").exists(),
             "no partial write on validation failure"
+        );
+    }
+
+    // ── Expert packs dashboard RPCs ──────────────────────────────────────────
+
+    /// All four experts.* RPCs are admin-only fail-closed: a manager-role
+    /// caller is denied before any handler logic runs.
+    #[tokio::test]
+    async fn experts_rpcs_deny_non_admin() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext {
+            user_id: "m1".to_string(),
+            email: "m1@test.local".to_string(),
+            role: UserRole::Manager,
+            agent_access: std::collections::HashMap::new(),
+        };
+        for method in [
+            "experts.list",
+            "experts.install",
+            "experts.remove",
+            "experts.hooks_apply",
+        ] {
+            let frame = handler
+                .handle(method, json!({ "slug": "x", "path": "/tmp/x" }), &ctx)
+                .await;
+            assert!(!frame_ok(&frame), "{method} must deny non-admin: {frame:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn experts_list_and_remove_round_trip() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        // Empty on a fresh home.
+        let frame = handler.handle("experts.list", json!({}), &ctx).await;
+        assert!(frame_ok(&frame));
+        assert_eq!(
+            frame_data(&frame)["packs"].as_array().map(|a| a.len()),
+            Some(0)
+        );
+
+        // Seed one installed pack + pending hooks state via the shared impl.
+        let rec = crate::expert_admin::InstallRecord {
+            slug: "sales".into(),
+            kind: crate::expert_admin::PackKind::Native,
+            display_name: "銷售團隊".into(),
+            version: "1.2.0".into(),
+            description: "demo".into(),
+            agents: vec!["sales-lead".into()],
+            global_skills: vec![],
+            wiki_files: vec![],
+            installed_at: crate::expert_admin::now_iso(),
+        };
+        crate::expert_admin::write_record(home.path(), &rec).unwrap();
+        crate::expert_admin::write_hooks_state(
+            home.path(),
+            "sales",
+            &crate::expert_admin::HooksState {
+                status: crate::expert_admin::HooksStatus::PendingApproval,
+                approval_id: Some("ap-1".into()),
+                files: vec!["pre.sh".into()],
+                updated_at: crate::expert_admin::now_iso(),
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.path().join("agents/sales-lead")).unwrap();
+
+        let frame = handler.handle("experts.list", json!({}), &ctx).await;
+        assert!(frame_ok(&frame));
+        let packs = frame_data(&frame)["packs"].as_array().unwrap().clone();
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0]["slug"].as_str(), Some("sales"));
+        assert_eq!(packs[0]["display_name"].as_str(), Some("銷售團隊"));
+        assert_eq!(packs[0]["hooks_status"].as_str(), Some("pending_approval"));
+        assert_eq!(packs[0]["agents"].as_array().map(|a| a.len()), Some(1));
+
+        // Remove deletes the recorded agent dir and the pack record.
+        let frame = handler
+            .handle("experts.remove", json!({ "slug": "sales" }), &ctx)
+            .await;
+        assert!(frame_ok(&frame), "remove: {frame:?}");
+        assert!(!home.path().join("agents/sales-lead").exists());
+        let frame = handler.handle("experts.list", json!({}), &ctx).await;
+        assert_eq!(
+            frame_data(&frame)["packs"].as_array().map(|a| a.len()),
+            Some(0)
+        );
+
+        // Unknown slug errors (not silent success).
+        let frame = handler
+            .handle("experts.remove", json!({ "slug": "ghost" }), &ctx)
+            .await;
+        assert!(!frame_ok(&frame));
+    }
+
+    #[tokio::test]
+    async fn experts_install_rejects_missing_and_non_zip_sources() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        // Missing path param.
+        let frame = handler.handle("experts.install", json!({}), &ctx).await;
+        assert!(!frame_ok(&frame));
+        // Nonexistent source.
+        let frame = handler
+            .handle(
+                "experts.install",
+                json!({ "path": home.path().join("nope.zip").to_string_lossy() }),
+                &ctx,
+            )
+            .await;
+        assert!(!frame_ok(&frame));
+        // Existing file that is not a .zip (and not a dir) is rejected before
+        // any subprocess spawns.
+        let txt = home.path().join("notes.txt");
+        std::fs::write(&txt, "hi").unwrap();
+        let frame = handler
+            .handle(
+                "experts.install",
+                json!({ "path": txt.to_string_lossy() }),
+                &ctx,
+            )
+            .await;
+        assert!(!frame_ok(&frame));
+    }
+
+    #[tokio::test]
+    async fn experts_hooks_apply_reports_pending_and_errors_on_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        // No managed hooks ⇒ error.
+        let frame = handler
+            .handle("experts.hooks_apply", json!({ "slug": "ghost" }), &ctx)
+            .await;
+        assert!(!frame_ok(&frame));
+
+        // Undecided approval ⇒ status stays pending_approval.
+        let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+        let id = broker
+            .request(
+                "p",
+                crate::expert_admin::HOOKS_ACTION_KIND,
+                "enable",
+                json!({}),
+                3600,
+            )
+            .await
+            .unwrap();
+        crate::expert_admin::write_hooks_state(
+            home.path(),
+            "p",
+            &crate::expert_admin::HooksState {
+                status: crate::expert_admin::HooksStatus::PendingApproval,
+                approval_id: Some(id.to_string()),
+                files: vec!["pre.sh".into()],
+                updated_at: crate::expert_admin::now_iso(),
+            },
+        )
+        .unwrap();
+        let frame = handler
+            .handle("experts.hooks_apply", json!({ "slug": "p" }), &ctx)
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        assert_eq!(
+            frame_data(&frame)["status"].as_str(),
+            Some("pending_approval")
         );
     }
 
@@ -29654,6 +30092,45 @@ skill_security_scan = true
         unsafe {
             std::env::remove_var("DUDUCLAW_EDITION");
         }
+    }
+
+    /// `agents.update` persists the `[proactive]` notify target
+    /// (channel / chat / thread), the goal-loop + gap-digest push destination.
+    #[tokio::test]
+    async fn agents_update_writes_proactive_notify_target() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "alpha", false);
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_agents_update(json!({
+                "agent_id": "alpha",
+                "proactive": {
+                    "notify_channel": "telegram",
+                    "notify_chat_id": "123456",
+                    "notify_thread_id": "42",
+                },
+            }))
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+
+        let raw =
+            std::fs::read_to_string(home.path().join("agents").join("alpha").join("agent.toml"))
+                .unwrap();
+        let table: toml::Table = raw.parse().unwrap();
+        let p = table["proactive"].as_table().unwrap();
+        assert_eq!(p["notify_channel"].as_str(), Some("telegram"));
+        assert_eq!(p["notify_chat_id"].as_str(), Some("123456"));
+        assert_eq!(p["notify_thread_id"].as_str(), Some("42"));
+
+        // The goal-loop notifier resolves the same shape.
+        assert_eq!(
+            crate::goal_notify::agent_notify_target(home.path(), "alpha"),
+            Some(("telegram".to_string(), "123456".to_string()))
+        );
+        // And it deserializes into the typed config (agents.inspect prefill).
+        let cfg: duduclaw_core::types::ProactiveConfig = p.clone().try_into().unwrap();
+        assert_eq!(cfg.notify_thread_id, "42");
     }
 
     #[tokio::test]

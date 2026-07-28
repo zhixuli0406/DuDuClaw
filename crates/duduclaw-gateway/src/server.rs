@@ -1527,6 +1527,16 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "/api/stt",
             post(handle_stt).layer(DefaultBodyLimit::max(STT_MAX_UPLOAD_BYTES + 512 * 1024)),
         )
+        // Expert-pack upload (dashboard 專家包 install flow). Bearer-JWT +
+        // admin-role gated; 50 MiB cap (matches the safe_zip extraction cap).
+        // Stages the zip under <home>/tmp/expert-uploads/ and returns the
+        // server-local path for a follow-up `experts.install` RPC.
+        .route(
+            "/api/experts/upload",
+            post(handle_expert_upload).layer(DefaultBodyLimit::max(
+                crate::expert_admin::MAX_EXPERT_UPLOAD_BYTES + 512 * 1024,
+            )),
+        )
         .route("/api/tts", post(handle_tts))
         .route(
             "/api/voice/config",
@@ -2937,6 +2947,147 @@ fn require_bearer(
         )
             .into_response()
     })
+}
+
+/// POST /api/experts/upload — stage an expert-pack `.zip` for installation.
+///
+/// Multipart body with a `file` (or `pack`) part, ≤50 MiB. Admin-only
+/// (Bearer JWT + role check — fail-closed). The upload is staged under
+/// `<home>/tmp/expert-uploads/<uuid>-<sanitized-name>.zip` (client filename
+/// contributes only a sanitized basename — no traversal) and the resulting
+/// server-local path is returned for a follow-up `experts.install` RPC, which
+/// runs the full install pipeline (zip-slip fenced extraction + security
+/// scanning) on it.
+async fn handle_expert_upload(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    mut multipart: Multipart,
+) -> axum::response::Response {
+    // Bearer + admin — a valid non-admin token is rejected (fail-closed).
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "missing Authorization header" })),
+            )
+                .into_response();
+        }
+    };
+    let ctx = match authenticate_jwt(&state, token) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "invalid or expired token" })),
+            )
+                .into_response();
+        }
+    };
+    if !ctx.is_admin() {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "只有管理員可以上傳專家包" })),
+        )
+            .into_response();
+    }
+
+    let mut data: Option<Vec<u8>> = None;
+    let mut client_name = "pack.zip".to_string();
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("malformed multipart: {e}") })),
+                )
+                    .into_response();
+            }
+        };
+        match field.name().unwrap_or("") {
+            "file" | "pack" => {
+                if let Some(fname) = field.file_name() {
+                    if !fname.is_empty() {
+                        client_name = fname.to_string();
+                    }
+                }
+                match field.bytes().await {
+                    Ok(bytes) => {
+                        if bytes.len() > crate::expert_admin::MAX_EXPERT_UPLOAD_BYTES {
+                            return (
+                                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                                Json(serde_json::json!({
+                                    "error": "檔案超過 50 MB 上限"
+                                })),
+                            )
+                                .into_response();
+                        }
+                        data = Some(bytes.to_vec());
+                    }
+                    Err(e) => {
+                        // axum surfaces the DefaultBodyLimit breach here too.
+                        return (
+                            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                            Json(serde_json::json!({
+                                "error": format!("讀取上傳內容失敗（檔案過大或連線中斷）: {e}")
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(data) = data else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing 'file' field" })),
+        )
+            .into_response();
+    };
+    // Light sanity: a zip starts with the "PK" local-file signature. The real
+    // fence (zip-slip, per-entry caps) runs inside the install pipeline.
+    if data.len() < 4 || &data[..2] != b"PK" {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不是有效的 .zip 檔" })),
+        )
+            .into_response();
+    }
+
+    let dest = crate::expert_admin::staged_upload_path(&state.home_dir, &client_name);
+    let dir = crate::expert_admin::upload_dir(&state.home_dir);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("建立暫存目錄失敗: {e}") })),
+        )
+            .into_response();
+    }
+    // Opportunistic cleanup: drop staged uploads older than 24 h.
+    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if let Ok(meta) = entry.metadata().await
+                && let Ok(modified) = meta.modified()
+                && modified.elapsed().map(|d| d.as_secs() > 86_400).unwrap_or(false)
+            {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+    if let Err(e) = tokio::fs::write(&dest, &data).await {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("寫入上傳檔失敗: {e}") })),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({ "path": dest.to_string_lossy() })).into_response()
 }
 
 /// POST /api/stt — transcribe an uploaded audio clip to text.

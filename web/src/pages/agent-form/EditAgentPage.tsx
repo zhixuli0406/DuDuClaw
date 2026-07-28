@@ -378,8 +378,16 @@ export function EditAgentPage() {
       // ODO — reset write-only Odoo override form.
       setOdoo(DEFAULT_ODOO);
       setOdooDirty(false);
-      // Advanced — seed account_pool from inspect; rest are write-only defaults.
-      setAdv({ ...DEFAULT_ADVANCED, account_pool: agent.model?.account_pool ?? [] });
+      // Advanced — seed account_pool + the [proactive] notify target from
+      // inspect (lazy prefill, keeps advDirty false); rest are write-only
+      // defaults.
+      setAdv({
+        ...DEFAULT_ADVANCED,
+        account_pool: agent.model?.account_pool ?? [],
+        proactive_notify_channel: agent.proactive?.notify_channel ?? '',
+        proactive_notify_chat_id: agent.proactive?.notify_chat_id ?? '',
+        proactive_notify_thread_id: agent.proactive?.notify_thread_id ?? '',
+      });
       setAdvDirty(false);
     }
   }, [agent]);
@@ -585,6 +593,7 @@ export function EditAgentPage() {
           native_sandbox: caps.native_sandbox,
           policy: caps.policy,
           os_native: caps.os_native,
+          recording: caps.recording,
           computer_use_config: { ...caps.computer_use_config },
         };
       }
@@ -682,6 +691,11 @@ export function EditAgentPage() {
           token_budget_per_check: adv.proactive_token_budget_per_check,
           max_turns: adv.proactive_max_turns,
           ...(adv.proactive_timezone.trim() !== '' ? { timezone: adv.proactive_timezone.trim() } : {}),
+          // Notify target (prefilled from inspect, so writing it back is safe;
+          // empty strings clear the target — readers treat empty as unset).
+          notify_channel: adv.proactive_notify_channel,
+          notify_chat_id: adv.proactive_notify_chat_id.trim(),
+          notify_thread_id: adv.proactive_notify_thread_id.trim(),
         };
         // UI.3 — stagnation detection.
         submitForm.stagnation_enabled = adv.stagnation_enabled;
@@ -861,6 +875,15 @@ export function EditAgentPage() {
     { value: 'container', label: intl.formatMessage({ id: 'agents.cap.mode.container' }), raw: 'container' },
     { value: 'native', label: intl.formatMessage({ id: 'agents.cap.mode.native' }), raw: 'native' },
     { value: 'auto', label: intl.formatMessage({ id: 'agents.cap.mode.auto' }), raw: 'auto' },
+  ];
+  // Notify-target channels — the four 1:1-DM-capable channels the gateway's
+  // push senders support (goal-loop buttons + skill digest).
+  const notifyChannelOptions: SelectOption[] = [
+    { value: '', label: intl.formatMessage({ id: 'agents.adv.notifyChannel.none' }), raw: '' },
+    { value: 'telegram', label: 'Telegram', raw: 'telegram' },
+    { value: 'discord', label: 'Discord', raw: 'discord' },
+    { value: 'slack', label: 'Slack', raw: 'slack' },
+    { value: 'line', label: 'LINE', raw: 'line' },
   ];
   const stagnationActionOptions: SelectOption[] = [
     { value: 'log_only', label: intl.formatMessage({ id: 'agents.adv.stagnation.logOnly' }), raw: 'log_only' },
@@ -1095,6 +1118,7 @@ export function EditAgentPage() {
               <RowSwitch label={t('agents.cap.computerUse')} description={t('agents.cap.computerUse.help')} checked={caps.computer_use} onChange={guardDanger(t('agents.cap.computerUse'), (v) => updateCap('computer_use', v))} />
               <RowSelect label={t('agents.cap.computerUseMode')} description={t('agents.cap.computerUseMode.help')} value={caps.computer_use_mode} onChange={(v) => updateCap('computer_use_mode', v as ComputerUseMode)} options={computerUseModeOptions} />
               <RowSwitch label={t('agents.cap.browserViaBash')} description={t('agents.cap.browserViaBash.help')} checked={caps.browser_via_bash} onChange={guardDanger(t('agents.cap.browserViaBash'), (v) => updateCap('browser_via_bash', v))} />
+              <RowSwitch label={t('agents.cap.recording')} description={t('agents.cap.recording.help')} checked={caps.recording} onChange={guardDanger(t('agents.cap.recording'), (v) => updateCap('recording', v))} />
             </SettingsCard>
             {caps.computer_use_mode === 'native' && (
               <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.nativeWarning')}</p>
@@ -1325,6 +1349,16 @@ export function EditAgentPage() {
               <RowNumber label={t('agents.adv.proactiveMaxTurns')} value={adv.proactive_max_turns} min={1} max={100} onChange={(v) => updateAdv('proactive_max_turns', v)} />
               <RowText label={t('agents.adv.proactiveTimezone')} description="Asia/Taipei" tier="select-wide" value={adv.proactive_timezone} placeholder="Asia/Taipei" onChange={(v) => updateAdv('proactive_timezone', v)} />
               <RowNumber label={t('agents.edit.maxSilenceHours')} value={form.max_silence_hours ?? 12} min={1} step={0.5} onChange={(v) => updateField('max_silence_hours', v)} />
+            </SettingsCard>
+          </SettingsSection>
+
+          {/* [proactive] notify target — where goal-loop progress + daily skill
+              suggestions get pushed. Prefilled from agents.inspect. */}
+          <SettingsSection title={t('agents.adv.notifyTarget')} description={t('agents.adv.notifyTarget.desc')}>
+            <SettingsCard>
+              <RowSelect label={t('agents.adv.notifyChannel')} description={t('agents.adv.notifyChannel.help')} value={adv.proactive_notify_channel} onChange={(v) => updateAdv('proactive_notify_channel', v)} options={notifyChannelOptions} />
+              <RowText label={t('agents.adv.notifyChatId')} description={t('agents.adv.notifyChatId.help')} value={adv.proactive_notify_chat_id} placeholder="123456789" onChange={(v) => updateAdv('proactive_notify_chat_id', v)} />
+              <RowText label={t('agents.adv.notifyThreadId')} description={t('agents.adv.notifyThreadId.help')} value={adv.proactive_notify_thread_id} placeholder="" onChange={(v) => updateAdv('proactive_notify_thread_id', v)} />
             </SettingsCard>
           </SettingsSection>
 

@@ -18,21 +18,25 @@
 //! hooks dir and the state records the grant — DuDuClaw never wires pack
 //! hooks into any runtime config implicitly.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use console::style;
-use serde::{Deserialize, Serialize};
 
 use duduclaw_core::error::Result;
-use duduclaw_gateway::approval::{ApprovalBroker, ApprovalId, ApprovalStatus};
+use duduclaw_gateway::approval::ApprovalBroker;
+use duduclaw_gateway::expert_admin::{self, HooksApplyOutcome};
 
 use super::install::InstallCtx;
-use super::{Report, cfg_err, copy_dir, io_err, now_iso};
+use super::{Report, cfg_err, copy_dir, now_iso};
 
-/// `action_kind` stored in `approvals.db` for hook-enable requests. Unknown
-/// kinds render verbatim in the dashboard approval center
-/// (`governance::ApprovalKind::Other`), so no UI change is needed.
-pub const HOOKS_ACTION_KIND: &str = "expert_hooks_enable";
+// The state machine (status enum, `hooks-state.json` shape/paths, quarantine
+// promote, apply-decision semantics) is SHARED with the dashboard
+// `experts.hooks_apply` RPC and lives in `duduclaw_gateway::expert_admin` —
+// re-exported here under the historical CLI names.
+pub use duduclaw_gateway::expert_admin::{
+    HOOKS_ACTION_KIND, HooksState, HooksStatus, hooks_disabled_dir as disabled_dir,
+    hooks_enabled_dir as enabled_dir, read_hooks_state as read_state,
+};
 
 /// Max chars of each hook file excerpt included in the approval summary.
 const HOOK_EXCERPT_CHARS: usize = 200;
@@ -40,71 +44,9 @@ const HOOK_EXCERPT_CHARS: usize = 200;
 /// TTL for a hooks approval request (24 h). Expiry = DENY (fail-closed).
 const HOOKS_APPROVAL_TTL_SECS: i64 = 86_400;
 
-// ─────────────────────────── State machine ───────────────────────────
-
-/// Persisted hook-enablement status for one installed pack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HooksStatus {
-    /// Imported but not granted (default; also the post-deny/expiry state).
-    Disabled,
-    /// An ApprovalBroker request is filed and undecided.
-    PendingApproval,
-    /// Explicitly granted (`--trust-hooks` or an approved request).
-    Enabled,
-}
-
-/// `<home>/experts/<slug>/hooks-state.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HooksState {
-    pub status: HooksStatus,
-    /// The ApprovalBroker request id (kept after a terminal decision for
-    /// audit cross-reference into `approvals.db`).
-    #[serde(default)]
-    pub approval_id: Option<String>,
-    /// Relative file paths inside the hooks dir.
-    #[serde(default)]
-    pub files: Vec<String>,
-    #[serde(default)]
-    pub updated_at: String,
-}
-
-fn state_path(home: &Path, slug: &str) -> PathBuf {
-    super::experts_dir(home).join(slug).join("hooks-state.json")
-}
-
-/// The quarantine location every import lands in.
-pub fn disabled_dir(home: &Path, slug: &str) -> PathBuf {
-    super::experts_dir(home).join(slug).join("hooks-disabled")
-}
-
-/// The active location hooks are promoted to on grant.
-pub fn enabled_dir(home: &Path, slug: &str) -> PathBuf {
-    super::experts_dir(home).join(slug).join("hooks")
-}
-
-/// Read the persisted state (`None` when absent / unparseable — treated as
-/// "no managed hooks", never as a grant).
-pub fn read_state(home: &Path, slug: &str) -> Option<HooksState> {
-    let content = std::fs::read_to_string(state_path(home, slug)).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
-/// Persist the state atomically (temp + rename).
+/// Persist the state atomically (temp + rename) — shared impl, CLI error type.
 fn write_state(home: &Path, slug: &str, state: &HooksState) -> Result<()> {
-    let dir = super::experts_dir(home).join(slug);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| io_err(format!("建立 {} 失敗: {e}", dir.display())))?;
-    let path = state_path(home, slug);
-    let tmp = dir.join("hooks-state.json.tmp");
-    let content = serde_json::to_string_pretty(state)
-        .map_err(|e| cfg_err(format!("序列化 hooks-state.json 失敗: {e}")))?;
-    std::fs::write(&tmp, content).map_err(|e| io_err(format!("寫入暫存檔失敗: {e}")))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        io_err(format!("覆寫 hooks-state.json 失敗: {e}"))
-    })?;
-    Ok(())
+    expert_admin::write_hooks_state(home, slug, state).map_err(cfg_err)
 }
 
 // ─────────────────────────── Summary ───────────────────────────
@@ -153,11 +95,10 @@ fn build_summary(slug: &str, hooks_dir: &Path, files: &[String]) -> String {
     out
 }
 
-/// Copy the quarantined hooks into the active dir (grant application).
+/// Copy the quarantined hooks into the active dir (grant application) —
+/// shared impl, CLI error type.
 fn promote_enabled(home: &Path, slug: &str) -> Result<()> {
-    let src = disabled_dir(home, slug);
-    let dest = enabled_dir(home, slug);
-    copy_dir(&src, &dest).map_err(|e| io_err(format!("啟用 hooks 複製失敗: {e}")))
+    expert_admin::promote_hooks_enabled(home, slug).map_err(cfg_err)
 }
 
 // ─────────────────────────── Import (install path) ───────────────────────────
@@ -299,23 +240,35 @@ pub(super) async fn import_hooks(
 
 /// Show the hooks state and apply a decided approval: approved → enable,
 /// denied / expired → keep disabled (logged). Never enables without a grant.
+/// Thin console renderer over the shared
+/// [`expert_admin::apply_hooks_decision`] (also behind `experts.hooks_apply`).
 pub async fn cmd_hooks(home: &Path, slug: &str) -> Result<()> {
-    let Some(state) = read_state(home, slug) else {
-        return Err(cfg_err(format!(
-            "專家包 '{slug}' 沒有受管理的 hooks（或尚未安裝）"
-        )));
-    };
+    // Distinguish "already enabled/disabled" from "just applied" for the
+    // console wording, mirroring the pre-refactor UX.
+    let was_pending = matches!(
+        read_state(home, slug).map(|s| s.status),
+        Some(HooksStatus::PendingApproval)
+    );
 
-    match state.status {
-        HooksStatus::Enabled => {
-            println!(
-                "\n  {} '{slug}' 的 hooks 已啟用（{} 個檔案）。\n",
-                style("✓").green(),
-                state.files.len()
-            );
+    match expert_admin::apply_hooks_decision(home, slug)
+        .await
+        .map_err(cfg_err)?
+    {
+        HooksApplyOutcome::Enabled { files } => {
+            if was_pending {
+                println!(
+                    "\n  {} 審批已核准，'{slug}' 的 hooks 已啟用（{files} 個檔案）。\n",
+                    style("✓").green()
+                );
+            } else {
+                println!(
+                    "\n  {} '{slug}' 的 hooks 已啟用（{files} 個檔案）。\n",
+                    style("✓").green()
+                );
+            }
             Ok(())
         }
-        HooksStatus::Disabled => {
+        HooksApplyOutcome::Disabled => {
             println!(
                 "\n  {} '{slug}' 的 hooks 目前停用。若要啟用：重新安裝時帶 `--trust-hooks`，\n\
                  \x20   或請管理者在 dashboard 審批中心建立新的核准後再執行本指令。\n",
@@ -323,80 +276,25 @@ pub async fn cmd_hooks(home: &Path, slug: &str) -> Result<()> {
             );
             Ok(())
         }
-        HooksStatus::PendingApproval => {
-            let Some(id_str) = state.approval_id.clone() else {
-                // Inconsistent state (pending without an id) ⇒ fail closed.
-                let _ = write_state(
-                    home,
-                    slug,
-                    &HooksState {
-                        status: HooksStatus::Disabled,
-                        updated_at: now_iso(),
-                        ..state
-                    },
-                );
-                return Err(cfg_err(
-                    "hooks 狀態缺少審批編號，已改回停用（fail-closed）".into(),
-                ));
+        HooksApplyOutcome::DeniedOrExpired { status } => {
+            let verdict = if status == "denied" {
+                "已被拒絕"
+            } else {
+                "已逾期（視同拒絕）"
             };
-            let broker = ApprovalBroker::open(home).map_err(cfg_err)?;
-            let id = ApprovalId::from(id_str.clone());
-            let status = broker.poll(&id).await.map_err(cfg_err)?;
-            match status {
-                ApprovalStatus::Approved => {
-                    promote_enabled(home, slug)?;
-                    let file_count = state.files.len();
-                    write_state(
-                        home,
-                        slug,
-                        &HooksState {
-                            status: HooksStatus::Enabled,
-                            updated_at: now_iso(),
-                            ..state
-                        },
-                    )?;
-                    println!(
-                        "\n  {} 審批已核准，'{slug}' 的 hooks 已啟用（{file_count} 個檔案）。\n",
-                        style("✓").green()
-                    );
-                    Ok(())
-                }
-                ApprovalStatus::Denied | ApprovalStatus::Expired => {
-                    write_state(
-                        home,
-                        slug,
-                        &HooksState {
-                            status: HooksStatus::Disabled,
-                            updated_at: now_iso(),
-                            ..state
-                        },
-                    )?;
-                    let verdict = if status == ApprovalStatus::Denied {
-                        "已被拒絕"
-                    } else {
-                        "已逾期（視同拒絕）"
-                    };
-                    tracing::warn!(
-                        slug,
-                        approval_id = %id_str,
-                        status = status.as_str(),
-                        "expert pack hooks approval not granted — hooks stay disabled"
-                    );
-                    println!(
-                        "\n  {} 審批{verdict}，'{slug}' 的 hooks 維持停用（fail-closed）。\n",
-                        style("✗").red()
-                    );
-                    Ok(())
-                }
-                ApprovalStatus::Pending => {
-                    println!(
-                        "\n  {} 審批仍在等待決定（編號 {id_str}）。請在 dashboard 審批中心\n\
-                         \x20   核准或拒絕後，再執行 `duduclaw expert hooks {slug}`。\n",
-                        style("…").yellow()
-                    );
-                    Ok(())
-                }
-            }
+            println!(
+                "\n  {} 審批{verdict}，'{slug}' 的 hooks 維持停用（fail-closed）。\n",
+                style("✗").red()
+            );
+            Ok(())
+        }
+        HooksApplyOutcome::StillPending { approval_id } => {
+            println!(
+                "\n  {} 審批仍在等待決定（編號 {approval_id}）。請在 dashboard 審批中心\n\
+                 \x20   核准或拒絕後，再執行 `duduclaw expert hooks {slug}`。\n",
+                style("…").yellow()
+            );
+            Ok(())
         }
     }
 }

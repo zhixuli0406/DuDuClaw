@@ -189,6 +189,7 @@ async fn install_native(
         kind: PackKind::Native,
         display_name: e.display(super::UI_LOCALE).to_string(),
         version: e.version.clone(),
+        description: e.description.clone(),
         agents: Vec::new(),
         global_skills: Vec::new(),
         wiki_files: Vec::new(),

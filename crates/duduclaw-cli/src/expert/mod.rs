@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use console::style;
-use serde::{Deserialize, Serialize};
 
 use duduclaw_core::error::{DuDuClawError, Result};
 
@@ -145,98 +144,21 @@ pub async fn run(cmd: ExpertCommands) -> Result<()> {
 }
 
 // ─────────────────────────── Install record ───────────────────────────
+//
+// The on-disk contract (`~/.duduclaw/experts/<slug>/install.json`, the hooks
+// state machine, and the remove semantics) is SHARED with the dashboard admin
+// RPCs and lives in `duduclaw_gateway::expert_admin` (cli → gateway is the
+// legal dependency direction). Re-exported here so the CLI and the dashboard
+// can never drift.
 
-/// What kind of source produced an installed pack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PackKind {
-    Native,
-    ClaudePlugin,
-    Skill,
-}
+pub use duduclaw_gateway::expert_admin::{
+    InstallRecord, PackKind, experts_dir, list_records, read_record,
+};
 
-impl PackKind {
-    fn label(self) -> &'static str {
-        match self {
-            PackKind::Native => "expert.toml",
-            PackKind::ClaudePlugin => "claude-plugin",
-            PackKind::Skill => "agent-skill",
-        }
-    }
-}
-
-/// On-disk record of an install, written to
-/// `~/.duduclaw/experts/<slug>/install.json`. Drives `list` and `remove`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstallRecord {
-    pub slug: String,
-    pub kind: PackKind,
-    #[serde(default)]
-    pub display_name: String,
-    #[serde(default)]
-    pub version: String,
-    /// Agent ids created by this install (removed on uninstall).
-    #[serde(default)]
-    pub agents: Vec<String>,
-    /// Global skill dir names created by this install (removed on uninstall;
-    /// skills that pre-existed are NOT recorded here so they survive removal).
-    #[serde(default)]
-    pub global_skills: Vec<String>,
-    /// Wiki file paths (relative to `<home>/shared/wiki`) written by this
-    /// install (removed on uninstall).
-    #[serde(default)]
-    pub wiki_files: Vec<String>,
-    #[serde(default)]
-    pub installed_at: String,
-}
-
-/// `~/.duduclaw/experts`
-pub fn experts_dir(home: &Path) -> PathBuf {
-    home.join("experts")
-}
-
-fn record_path(home: &Path, slug: &str) -> PathBuf {
-    experts_dir(home).join(slug).join("install.json")
-}
-
-/// Persist an install record (atomic temp + rename).
+/// Persist an install record (atomic temp + rename). Thin wrapper mapping the
+/// shared impl's `String` error into the CLI error type.
 pub fn write_record(home: &Path, rec: &InstallRecord) -> Result<()> {
-    let dir = experts_dir(home).join(&rec.slug);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| io_err(format!("建立 {} 失敗: {e}", dir.display())))?;
-    let path = dir.join("install.json");
-    let tmp = dir.join("install.json.tmp");
-    let content = serde_json::to_string_pretty(rec)
-        .map_err(|e| cfg_err(format!("序列化 install.json 失敗: {e}")))?;
-    std::fs::write(&tmp, content).map_err(|e| io_err(format!("寫入暫存檔失敗: {e}")))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        io_err(format!("覆寫 install.json 失敗: {e}"))
-    })?;
-    Ok(())
-}
-
-/// Read all install records under `~/.duduclaw/experts/*/install.json`.
-pub fn list_records(home: &Path) -> Vec<InstallRecord> {
-    let mut out = Vec::new();
-    let dir = experts_dir(home);
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for entry in rd.flatten() {
-            let rec = entry.path().join("install.json");
-            if let Ok(content) = std::fs::read_to_string(&rec)
-                && let Ok(r) = serde_json::from_str::<InstallRecord>(&content)
-            {
-                out.push(r);
-            }
-        }
-    }
-    out.sort_by(|a, b| a.slug.cmp(&b.slug));
-    out
-}
-
-fn read_record(home: &Path, slug: &str) -> Option<InstallRecord> {
-    let content = std::fs::read_to_string(record_path(home, slug)).ok()?;
-    serde_json::from_str(&content).ok()
+    duduclaw_gateway::expert_admin::write_record(home, rec).map_err(cfg_err)
 }
 
 // ─────────────────────────── Report ───────────────────────────
@@ -431,28 +353,8 @@ fn set_capabilities(table: &mut toml::value::Table, allowed: &[String], denied: 
     }
 }
 
-/// Recursively copy `src` → `dest`, skipping symlinks.
-fn copy_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        if ft.is_symlink() {
-            continue;
-        }
-        let target = dest.join(entry.file_name());
-        if ft.is_dir() {
-            copy_dir(&entry.path(), &target)?;
-        } else if ft.is_file() {
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
-
-fn now_iso() -> String {
-    chrono::Utc::now().to_rfc3339()
-}
+// Recursive symlink-skipping dir copy + ISO timestamp — shared impls.
+pub(crate) use duduclaw_gateway::expert_admin::{copy_dir, now_iso};
 
 // ─────────────────────────── per-agent .mcp.json merge ───────────────────────────
 
@@ -614,87 +516,21 @@ fn cmd_list(home: &Path, json: bool) -> Result<()> {
 }
 
 async fn cmd_remove(home: &Path, slug: &str) -> Result<()> {
-    let Some(rec) = read_record(home, slug) else {
-        return Err(cfg_err(format!(
-            "找不到已安裝的專家包 '{slug}'（用 `duduclaw expert list` 查看）"
-        )));
-    };
+    // Shared impl (also behind the dashboard `experts.remove` RPC): removes
+    // recorded agents / pack-owned skills / wiki pages (fenced under
+    // shared/wiki), then the record dir itself.
+    let items = duduclaw_gateway::expert_admin::remove_pack(home, slug)
+        .await
+        .map_err(cfg_err)?;
 
     let mut report = Report::default();
-
-    // Agents.
-    for agent in &rec.agents {
-        if !crate::is_valid_agent_id(agent) {
-            report.skipped("agent", agent, "非法 agent id，未刪除");
-            continue;
-        }
-        let dir = home.join("agents").join(agent);
-        if dir.exists() {
-            match tokio::fs::remove_dir_all(&dir).await {
-                Ok(()) => report.imported("removed-agent", agent),
-                Err(e) => report.skipped("agent", agent, format!("刪除失敗: {e}")),
-            }
-        } else {
-            report.ignored("agent", agent, "目錄不存在");
+    for it in &items {
+        match it.status {
+            "removed" => report.imported(&format!("removed-{}", it.kind), &it.name),
+            "missing" => report.ignored(it.kind, &it.name, it.detail.clone()),
+            _ => report.skipped(it.kind, &it.name, it.detail.clone()),
         }
     }
-
-    // Pack-owned global skills.
-    for skill in &rec.global_skills {
-        if !duduclaw_agent::skill_loader::is_safe_skill_name(skill) {
-            report.skipped("skill", skill, "非安全名稱，未刪除");
-            continue;
-        }
-        let dir = home.join("skills").join(skill);
-        if dir.exists() {
-            match tokio::fs::remove_dir_all(&dir).await {
-                Ok(()) => report.imported("removed-skill", skill),
-                Err(e) => report.skipped("skill", skill, format!("刪除失敗: {e}")),
-            }
-        } else {
-            report.ignored("skill", skill, "不存在");
-        }
-    }
-
-    // Wiki files (fenced under shared/wiki).
-    let wiki_root = home.join("shared").join("wiki");
-    let wiki_canon = wiki_root.canonicalize().ok();
-    for rel in &rec.wiki_files {
-        let path = wiki_root.join(rel);
-        let safe = wiki_canon
-            .as_ref()
-            .zip(path.parent().and_then(|p| p.canonicalize().ok()))
-            .map(|(root, parent)| parent.starts_with(root))
-            .unwrap_or(false);
-        if !safe {
-            report.skipped("wiki", rel, "路徑逃逸 wiki 圍欄，未刪除");
-            continue;
-        }
-        if path.exists() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    report.imported("removed-wiki", rel);
-                    // Prune now-empty parent dirs up to the wiki fence
-                    // (`remove_dir` refuses non-empty dirs, so shared
-                    // namespaces that still hold other packs' pages survive).
-                    let mut parent = path.parent().map(|p| p.to_path_buf());
-                    while let Some(dir) = parent {
-                        if dir == wiki_root || std::fs::remove_dir(&dir).is_err() {
-                            break;
-                        }
-                        parent = dir.parent().map(|p| p.to_path_buf());
-                    }
-                }
-                Err(e) => report.skipped("wiki", rel, format!("刪除失敗: {e}")),
-            }
-        } else {
-            report.ignored("wiki", rel, "不存在");
-        }
-    }
-
-    // The record dir itself.
-    let rec_dir = experts_dir(home).join(slug);
-    let _ = std::fs::remove_dir_all(&rec_dir);
 
     report.render_console(false);
     println!(
