@@ -62,6 +62,65 @@ pub fn read_frontmost_poll_secs(agent_dir: &Path) -> Option<u64> {
     if secs <= 0 { None } else { Some(secs as u64) }
 }
 
+/// `<home>/os/<agent>/` — durable per-agent OS observation logs.
+pub fn frontmost_log_dir(home_dir: &Path, agent_id: &str) -> PathBuf {
+    home_dir.join("os").join(agent_id)
+}
+
+/// Today's frontmost log filename (local days — the summary is user-facing).
+pub fn frontmost_log_name(date: chrono::NaiveDate) -> String {
+    format!("frontmost-{}.jsonl", date.format("%Y-%m-%d"))
+}
+
+/// Append one app-switch line `{"ts","app"}` to today's daily log.
+///
+/// Data minimization: the **window title is never written** — only the app
+/// name + timestamp, the minimum the proactive-care summary needs. On the
+/// first write of a new day, older day-files (keeping today + yesterday) are
+/// pruned. Errors are swallowed after a warn — losing a log line must never
+/// affect the poll loop.
+pub fn append_frontmost_log(home_dir: &Path, agent_id: &str, app: &str) {
+    let dir = frontmost_log_dir(home_dir, agent_id);
+    let today = chrono::Local::now().date_naive();
+    let path = dir.join(frontmost_log_name(today));
+    if !path.exists() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(agent = %agent_id, error = %e, "frontmost log dir create failed");
+            return;
+        }
+        // New day — prune everything except today and yesterday.
+        let keep: HashSet<String> = [
+            frontmost_log_name(today),
+            frontmost_log_name(today.pred_opt().unwrap_or(today)),
+        ]
+        .into_iter()
+        .collect();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("frontmost-") && !keep.contains(&name) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    let line = serde_json::json!({
+        "ts": chrono::Local::now().to_rfc3339(),
+        "app": duduclaw_core::truncate_chars(app, 80),
+    });
+    let res = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{line}")
+        });
+    if let Err(e) = res {
+        warn!(agent = %agent_id, error = %e, "frontmost log append failed");
+    }
+}
+
 /// One polling cycle's outcome, kept in the loop's local state.
 struct PollState {
     /// Last successfully observed (app, window_title); `None` before the
@@ -80,6 +139,7 @@ fn spawn_agent_poll(
     agent_id: String,
     poll_secs: u64,
     tx: broadcast::Sender<AutopilotEvent>,
+    home_dir: Option<PathBuf>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut state = PollState {
@@ -115,6 +175,17 @@ fn spawn_agent_poll(
                             window_title: info.window_title.clone(),
                             prev_app,
                         });
+                        // Durable daily app-switch log — the data source the
+                        // proactive-care check summarises (survives restarts,
+                        // unlike the footprint distiller's in-memory state).
+                        if let Some(home) = home_dir.clone() {
+                            let aid = agent_id.clone();
+                            let app = info.app.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                append_frontmost_log(&home, &aid, &app);
+                            })
+                            .await;
+                        }
                         state.last = Some((info.app, info.window_title));
                     }
                 }
@@ -189,7 +260,9 @@ impl OsFrontmostRegistry {
             return false;
         };
         info!(agent = %agent_id, poll_secs = secs, "starting frontmost polling");
-        let poll = spawn_agent_poll(agent_id.to_string(), secs, tx);
+        // `<home>/agents/<id>` → `<home>` (for the daily app-switch log).
+        let home_dir = agent_dir.parent().and_then(|p| p.parent()).map(Path::to_path_buf);
+        let poll = spawn_agent_poll(agent_id.to_string(), secs, tx, home_dir);
         self.tasks.lock().await.insert(
             agent_id.to_string(),
             FrontmostEntry {
@@ -390,5 +463,31 @@ mod tests {
         .unwrap();
         assert!(!reg.start_agent("a1", agent_dir.path(), tx).await);
         assert!(reg.is_empty().await);
+    }
+
+    #[test]
+    fn frontmost_log_appends_and_prunes_old_days() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = frontmost_log_dir(home.path(), "a1");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A stale day-file from last week must be pruned on the first write
+        // of a day (today's file does not exist yet).
+        let stale = dir.join("frontmost-2020-01-01.jsonl");
+        std::fs::write(&stale, "{}\n").unwrap();
+
+        append_frontmost_log(home.path(), "a1", "Safari");
+        append_frontmost_log(home.path(), "a1", "Xcode");
+
+        assert!(!stale.exists(), "stale day-file pruned");
+        let today = chrono::Local::now().date_naive();
+        let content =
+            std::fs::read_to_string(dir.join(frontmost_log_name(today))).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["app"], "Safari");
+        assert!(first["ts"].as_str().unwrap().len() > 10);
+        // Data minimization: no window-title key exists in the schema.
+        assert!(first.get("window_title").is_none());
     }
 }

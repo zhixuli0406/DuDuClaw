@@ -3,6 +3,21 @@
 ## [Unreleased]
 
 ### Fixed
+- **OS 員工主動關懷從未作動（四層斷點全修）**：實測回報 os_native agent 開一天多
+  零輸出。①主動關懷檢查要求手寫 PROACTIVE.md、缺檔靜默跳過（連 log 都沒有）——
+  os_native agent 現在缺檔自動改用內建「OS 關懷」檢查（預設回 PROACTIVE_OK、
+  寧靜默勿打擾）；②OS 感知資料與關懷檢查完全沒接線——前景 app 輪詢現在落地
+  當日 JSONL（`os/<agent>/frontmost-<日期>.jsonl`，僅 app 名＋時間、絕不含視窗
+  標題；跨重啟保留今昨兩日），檢查時聚合成使用時長摘要以 `<os_observations>`
+  DATA 區塊注入；③通知目標未設 → 訊息直接丟棄——現在 fallback 到該 agent 最近
+  的可推播頻道對話（sessions.db，webchat 除外）；④**bus_queue 的
+  `proactive_notification` 從來沒有消費者**（dispatcher 只認 agent_message）——
+  就算前三關全過，訊息也永遠死在佇列（Odoo webhook 主動通知同樣斷頭）。
+  dispatcher 現在消費並經 forward_to_channel（token cascade＋分段）真正送出。
+  quiet hours（預設 23–8）照舊生效。
+- **設定列窄容器跑版**：`SettingsRow` 控制欄固定寬＋label 欄可壓到 0，在雙欄卡片
+  等窄容器中 CJK label 被壓成一字一行（本地推理頁實測回報）。改 flex-wrap＋
+  label flex-basis 下限：空間不足時控制欄自動換行成整行，不再擠壓 label。
 - **內建專家包裝完的櫃檯主管載入失敗**：expert.toml roster 的 `role = "front_desk"`
   被原樣寫進 agent.toml，但 `AgentRole` 沒有這個變體——gateway 啟動掃描直接跳過
   該 agent（`unknown variant front_desk`）。三層修法：①核心 `AgentRole` 接受

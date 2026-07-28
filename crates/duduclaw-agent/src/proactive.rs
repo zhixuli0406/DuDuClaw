@@ -170,6 +170,158 @@ pub fn parse_proactive_result(result: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+// ── OS-native proactive care (default check + observations) ─────
+//
+// P4 field report: os_native agents collected frontmost/footprint data for a
+// day and NEVER acted on it — the proactive check required a hand-written
+// PROACTIVE.md (silently skipping without one) and had no OS context in its
+// prompt. These helpers close that loop: a built-in care check used when
+// PROACTIVE.md is absent, a durable daily app-usage summary read from the
+// gateway's `<home>/os/<agent>/frontmost-<date>.jsonl` log, and a notify-target
+// fallback onto the agent's most recent channel conversation.
+
+/// Built-in OS-care check used when the agent has `os_native = true` but no
+/// hand-written PROACTIVE.md. Kept deliberately conservative: the default
+/// outcome is PROACTIVE_OK.
+pub const DEFAULT_OS_CARE_CHECKS: &str = r#"## OS 主動關懷（內建預設檢查）
+
+你是使用者的貼身 AI 員工。<os_observations> 區塊（若存在）是使用者今天在這台電腦上的前景應用使用摘要（僅 app 名稱與時間統計，已脫敏、不含視窗內容）。
+
+根據摘要判斷是否值得「主動」傳一則簡短且有價值的訊息給使用者，例如：
+- 同類工作連續專注超過 2 小時 → 提醒起身休息、喝水
+- 深夜（23:00 後）仍在長時間工作 → 一句簡短關心
+- 會議/通訊軟體佔比很高 → 問要不要幫忙整理待辦或紀錄
+- 今天的活動模式和平常明顯不同 → 簡單問候確認
+
+規則：
+- 沒有明確值得說的事 → 回 PROACTIVE_OK（這是預設答案，寧靜默勿打擾）
+- 要發就發一則 ≤3 句、具體、口語的訊息；不說教、不重複昨天說過的話
+- 絕不揣測視窗內容或使用者情緒，只根據 app 使用時間陳述"#;
+
+/// One parsed line of the daily frontmost log.
+#[derive(Debug, serde::Deserialize)]
+struct FrontmostLine {
+    ts: String,
+    app: String,
+}
+
+/// Idle gap cap: a gap longer than this between two app switches is not
+/// attributed to the earlier app (the user probably walked away).
+const FRONTMOST_GAP_CAP_SECS: i64 = 30 * 60;
+
+/// Summarise today's frontmost app usage from the gateway's daily log.
+/// Returns `None` when there is no log / no usable events. App names are
+/// passed through the perception sanitizer before entering any prompt.
+pub fn frontmost_daily_summary(home_dir: &Path, agent_id: &str) -> Option<String> {
+    let today = chrono::Local::now().date_naive();
+    let path = home_dir
+        .join("os")
+        .join(agent_id)
+        .join(format!("frontmost-{}.jsonl", today.format("%Y-%m-%d")));
+    let content = std::fs::read_to_string(&path).ok()?;
+
+    let mut events: Vec<(chrono::DateTime<chrono::Local>, String)> = content
+        .lines()
+        .filter_map(|l| serde_json::from_str::<FrontmostLine>(l).ok())
+        .filter_map(|l| {
+            chrono::DateTime::parse_from_rfc3339(&l.ts)
+                .ok()
+                .map(|ts| (ts.with_timezone(&chrono::Local), l.app))
+        })
+        .collect();
+    if events.is_empty() {
+        return None;
+    }
+    events.sort_by_key(|(ts, _)| *ts);
+
+    let mut per_app: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for pair in events.windows(2) {
+        let gap = (pair[1].0 - pair[0].0).num_seconds().max(0);
+        *per_app.entry(pair[0].1.clone()).or_default() += gap.min(FRONTMOST_GAP_CAP_SECS);
+    }
+    // The still-open last segment, capped the same way.
+    if let Some((last_ts, last_app)) = events.last() {
+        let gap = (chrono::Local::now() - *last_ts).num_seconds().max(0);
+        *per_app.entry(last_app.clone()).or_default() += gap.min(FRONTMOST_GAP_CAP_SECS);
+    }
+
+    let mut ranked: Vec<(String, i64)> = per_app
+        .into_iter()
+        .filter(|(_, secs)| *secs >= 60)
+        .collect();
+    if ranked.is_empty() {
+        return None;
+    }
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.truncate(6);
+
+    let fmt_dur = |secs: i64| {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if h > 0 { format!("{h} 小時 {m} 分") } else { format!("{m} 分") }
+    };
+    let apps: Vec<String> = ranked
+        .iter()
+        .map(|(app, secs)| {
+            let clean =
+                duduclaw_security::perception::sanitize_perception_text(app, 80).text;
+            format!("{clean} {}", fmt_dur(*secs))
+        })
+        .collect();
+    let first = events.first().map(|(ts, _)| ts.format("%H:%M").to_string())?;
+    let last = events.last().map(|(ts, _)| ts.format("%H:%M").to_string())?;
+    Some(format!(
+        "日期 {}；最早活動 {first}、最近活動 {last}；前景應用使用（切換 {} 次）：{}",
+        today.format("%Y-%m-%d"),
+        events.len(),
+        apps.join("、")
+    ))
+}
+
+/// Channel prefixes a proactive notification can actually be pushed to
+/// (webchat is pull-only, so it is deliberately absent).
+const PUSHABLE_CHANNELS: [&str; 8] = [
+    "discord",
+    "telegram",
+    "line",
+    "slack",
+    "whatsapp",
+    "feishu",
+    "googlechat",
+    "teams",
+];
+
+/// Fallback notify target: the agent's most recent *pushable* channel
+/// conversation from `<home>/sessions.db` (`<channel>:<chat…>` session ids).
+/// Returns `(channel, chat_id)` — e.g. `("discord", "thread:123…")`.
+pub fn resolve_notify_fallback(home_dir: &Path, agent_id: &str) -> Option<(String, String)> {
+    let db_path = home_dir.join("sessions.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM sessions WHERE agent_id = ?1 AND archived_at IS NULL \
+             ORDER BY last_active DESC LIMIT 20",
+        )
+        .ok()?;
+    let ids: Vec<String> = stmt
+        .query_map(rusqlite::params![agent_id], |row| row.get::<_, String>(0))
+        .ok()?
+        .flatten()
+        .collect();
+    for id in ids {
+        if let Some((channel, chat)) = id.split_once(':') {
+            if PUSHABLE_CHANNELS.contains(&channel) && !chat.is_empty() {
+                return Some((channel.to_string(), chat.to_string()));
+            }
+        }
+    }
+    None
+}
+
 // ── Rule Evaluation Engine (Phase E2) ───────────────────────────
 
 /// Runtime state for tracking per-rule cooldowns.
@@ -496,5 +648,79 @@ mod tests {
         assert!(prompt.contains("my-agent"));
         assert!(prompt.contains("Check inventory"));
         assert!(prompt.contains("PROACTIVE_OK"));
+    }
+
+    // ── OS-native proactive care helpers ──
+
+    #[test]
+    fn frontmost_summary_aggregates_today_and_ranks_apps() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("os").join("a1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = chrono::Local::now();
+        let file = dir.join(format!(
+            "frontmost-{}.jsonl",
+            now.date_naive().format("%Y-%m-%d")
+        ));
+        // Xcode 20min → Safari 5min → Xcode (open segment, capped by now).
+        let mk = |mins_ago: i64, app: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "ts": (now - chrono::Duration::minutes(mins_ago)).to_rfc3339(),
+                    "app": app,
+                })
+            )
+        };
+        std::fs::write(
+            &file,
+            format!("{}{}{}", mk(30, "Xcode"), mk(10, "Safari"), mk(5, "Xcode")),
+        )
+        .unwrap();
+
+        let summary = frontmost_daily_summary(home.path(), "a1").expect("summary");
+        assert!(summary.contains("Xcode"), "{summary}");
+        assert!(summary.contains("Safari"), "{summary}");
+        assert!(summary.contains("切換 3 次"), "{summary}");
+        // Ranking: Xcode (20m + ~5m open segment) before Safari (5m).
+        let xi = summary.find("Xcode").unwrap();
+        let si = summary.find("Safari").unwrap();
+        assert!(xi < si, "dominant app first: {summary}");
+    }
+
+    #[test]
+    fn frontmost_summary_absent_or_empty_is_none() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(frontmost_daily_summary(home.path(), "a1").is_none());
+    }
+
+    #[test]
+    fn notify_fallback_picks_latest_pushable_channel() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(home.path().join("sessions.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, \
+             last_active TEXT NOT NULL, archived_at TEXT);",
+        )
+        .unwrap();
+        let mut insert = |id: &str, agent: &str, at: &str, archived: Option<&str>| {
+            conn.execute(
+                "INSERT INTO sessions (id, agent_id, last_active, archived_at) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![id, agent, at, archived],
+            )
+            .unwrap();
+        };
+        // Newest is webchat (pull-only → skipped), then an archived discord
+        // (skipped), then the live discord thread that must win.
+        insert("webchat:x#conv:1", "a1", "2026-07-28T10:00:00Z", None);
+        insert("discord:thread:999", "a1", "2026-07-28T09:00:00Z", Some("2026-07-28T09:30:00Z"));
+        insert("discord:thread:123", "a1", "2026-07-28T08:00:00Z", None);
+        insert("telegram:555", "other-agent", "2026-07-28T11:00:00Z", None);
+
+        let (ch, chat) = resolve_notify_fallback(home.path(), "a1").expect("fallback target");
+        assert_eq!(ch, "discord");
+        assert_eq!(chat, "thread:123");
+
+        assert!(resolve_notify_fallback(home.path(), "no-such-agent").is_none());
     }
 }

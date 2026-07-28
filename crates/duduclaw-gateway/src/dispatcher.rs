@@ -457,8 +457,16 @@ async fn poll_and_dispatch(
 
     let mut to_dispatch: Vec<BusMessage> = Vec::new();
     let mut remaining_lines: Vec<String> = Vec::new();
+    let mut proactive_sends: Vec<ProactiveSend> = Vec::new();
 
     for line in &lines {
+        // Proactive-care / webhook notifications: consume-and-deliver. These
+        // used to fall into the "unknown type" arm below and sit in the queue
+        // as dead letters FOREVER — the whole proactive feature ended here.
+        if let Some(send) = parse_proactive_line(line) {
+            proactive_sends.push(send);
+            continue;
+        }
         match serde_json::from_str::<BusMessage>(line) {
             Ok(msg) if msg.msg_type == "agent_message" => {
                 if !duduclaw_core::is_valid_agent_id(&msg.agent_id) {
@@ -523,7 +531,7 @@ async fn poll_and_dispatch(
         }
     }
 
-    if to_dispatch.is_empty() {
+    if to_dispatch.is_empty() && proactive_sends.is_empty() {
         return Ok(());
     }
 
@@ -552,6 +560,36 @@ async fn poll_and_dispatch(
     tokio::fs::rename(&tmp_path, &queue_path)
         .await
         .map_err(|e| format!("Failed to rename temp bus_queue: {e}"))?;
+
+    // ── Deliver proactive notifications (already removed from the queue) ──
+    for send in proactive_sends {
+        match forward_to_channel(
+            home_dir,
+            &send.channel,
+            &send.channel_id,
+            send.thread_id.as_deref(),
+            &send.message,
+            &send.agent_id,
+            &send.agent_id,
+            None,
+        )
+        .await
+        {
+            Ok(()) => info!(
+                agent = %send.agent_id,
+                channel = %send.channel,
+                chat_id = %send.channel_id,
+                "Proactive notification delivered"
+            ),
+            Err(e) => warn!(
+                agent = %send.agent_id,
+                channel = %send.channel,
+                chat_id = %send.channel_id,
+                error = %e,
+                "Proactive notification delivery failed (dropped — not requeued)"
+            ),
+        }
+    }
 
     // Process each message concurrently (up to 4 at a time)
     let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
@@ -1910,6 +1948,54 @@ fn parse_reply_channel(rc: &str) -> Result<(String, String, Option<String>), Str
         (cid, tid)
     };
     Ok((ch_type, ch_id, thread_id))
+}
+
+/// One ready-to-deliver proactive notification consumed from the bus queue
+/// (written by the heartbeat proactive check or the Odoo webhook poller).
+#[derive(Debug, PartialEq)]
+struct ProactiveSend {
+    agent_id: String,
+    channel: String,
+    /// The concrete channel/chat id `forward_to_channel` posts to.
+    channel_id: String,
+    thread_id: Option<String>,
+    message: String,
+}
+
+/// Parse one bus-queue line as a `proactive_notification`, `None` for every
+/// other line type or a malformed entry (which stays in the queue as before).
+/// The `chat_id` may carry the session-id `thread:<id>` form (the fallback
+/// target resolver) — that collapses to `channel_id = <id>`, matching
+/// [`parse_reply_channel`]'s convention.
+fn parse_proactive_line(line: &str) -> Option<ProactiveSend> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("proactive_notification") {
+        return None;
+    }
+    let agent_id = v.get("agent_id")?.as_str()?.trim().to_string();
+    let channel = v.get("channel")?.as_str()?.trim().to_string();
+    let chat_id = v.get("chat_id")?.as_str()?.trim().to_string();
+    let message = v.get("message")?.as_str()?.trim().to_string();
+    if agent_id.is_empty() || channel.is_empty() || chat_id.is_empty() || message.is_empty() {
+        return None;
+    }
+    let explicit_thread = v
+        .get("thread_id")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let (channel_id, thread_id) = match chat_id.strip_prefix("thread:") {
+        Some(id) => (id.to_string(), None),
+        None => (chat_id, explicit_thread),
+    };
+    Some(ProactiveSend {
+        agent_id,
+        channel,
+        channel_id,
+        thread_id,
+        message,
+    })
 }
 
 /// Check if a delegation callback exists for this message and forward
@@ -3899,5 +3985,41 @@ bot_token = "{token}"
         setup_done_message(tmp.path(), "m1", "a", "b", "ok", None);
         let err = reforward_message(tmp.path(), "m1", true).await.unwrap_err();
         assert!(err.contains("Cannot determine where to forward"), "got: {err}");
+    }
+
+    // ── WP-OS: proactive_notification consumption ──
+
+    #[test]
+    fn parse_proactive_line_valid_and_thread_forms() {
+        let line = r#"{"type":"proactive_notification","agent_id":"ceo-assistant","channel":"discord","chat_id":"thread:12345","message":"該休息了"}"#;
+        let send = parse_proactive_line(line).expect("valid line parses");
+        assert_eq!(send.agent_id, "ceo-assistant");
+        assert_eq!(send.channel, "discord");
+        // `thread:<id>` collapses to the concrete channel id (a Discord
+        // thread IS the channel to post to).
+        assert_eq!(send.channel_id, "12345");
+        assert_eq!(send.thread_id, None);
+        assert_eq!(send.message, "該休息了");
+
+        let line = r#"{"type":"proactive_notification","agent_id":"a","channel":"telegram","chat_id":"-100","thread_id":"77","message":"m"}"#;
+        let send = parse_proactive_line(line).unwrap();
+        assert_eq!(send.channel_id, "-100");
+        assert_eq!(send.thread_id, Some("77".to_string()));
+    }
+
+    #[test]
+    fn parse_proactive_line_rejects_other_types_and_malformed() {
+        assert!(parse_proactive_line(r#"{"type":"agent_message","agent_id":"a"}"#).is_none());
+        assert!(parse_proactive_line("not json").is_none());
+        // Missing message → not deliverable → leave in queue path untouched.
+        assert!(parse_proactive_line(
+            r#"{"type":"proactive_notification","agent_id":"a","channel":"discord","chat_id":"1"}"#
+        )
+        .is_none());
+        // Empty fields are as bad as missing ones.
+        assert!(parse_proactive_line(
+            r#"{"type":"proactive_notification","agent_id":"","channel":"discord","chat_id":"1","message":"m"}"#
+        )
+        .is_none());
     }
 }
