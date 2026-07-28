@@ -14,6 +14,10 @@ import { AlertTriangle, ExternalLink } from 'lucide-react';
 export function SkillSynthesisTab() {
   const intl = useIntl();
   const [config, setConfig] = useState<SkillSynthesisConfig | null>(null);
+  // Daily skill-gap digest ([skills] gap_digest_enabled) — persisted via
+  // system.update_config, read back structured from system.config.
+  const [gapDigest, setGapDigest] = useState(false);
+  const [gapDigestDirty, setGapDigestDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -24,6 +28,12 @@ export function SkillSynthesisTab() {
       setConfig(await api.skillSynthesis.get());
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    }
+    try {
+      const sys = await api.system.config();
+      setGapDigest(sys.gap_digest_enabled ?? false);
+    } catch {
+      // Non-fatal: the toggle just starts from its default (off).
     }
   }, [intl]);
 
@@ -40,6 +50,10 @@ export function SkillSynthesisTab() {
         lookback_days: config.lookback_days,
         target_agent: config.target_agent.trim(),
       });
+      if (gapDigestDirty) {
+        await api.system.updateConfig({ gap_digest_enabled: gapDigest });
+        setGapDigestDirty(false);
+      }
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -72,6 +86,12 @@ export function SkillSynthesisTab() {
             description={intl.formatMessage({ id: 'skillSynthesis.dryRun.hint' })}
             checked={config.dry_run}
             onChange={(v) => setConfig({ ...config, dry_run: v })}
+          />
+          <RowSwitch
+            label={intl.formatMessage({ id: 'skillSynthesis.gapDigest' })}
+            description={intl.formatMessage({ id: 'skillSynthesis.gapDigest.hint' })}
+            checked={gapDigest}
+            onChange={(v) => { setGapDigest(v); setGapDigestDirty(true); }}
           />
         </SettingsCard>
       </SettingsSection>

@@ -113,6 +113,7 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
   native_sandbox: false,
   policy: [],
   os_native: false,
+  recording: false,
   computer_use_config: {
     allowed_apps: [],
     blocked_actions: [],
@@ -171,6 +172,11 @@ export const DEFAULT_ADVANCED: {
   proactive_token_budget_per_check: number;
   proactive_timezone: string;
   proactive_max_turns: number;
+  /** [proactive] notify target — goal-loop + skill-digest push destination.
+   *  Prefilled from agents.inspect (unlike the write-only extras above). */
+  proactive_notify_channel: string;
+  proactive_notify_chat_id: string;
+  proactive_notify_thread_id: string;
   stagnation_enabled: boolean;
   stagnation_window_seconds: number;
   stagnation_trigger_threshold: number;
@@ -186,6 +192,9 @@ export const DEFAULT_ADVANCED: {
   proactive_token_budget_per_check: 0,
   proactive_timezone: '',
   proactive_max_turns: 1,
+  proactive_notify_channel: '',
+  proactive_notify_chat_id: '',
+  proactive_notify_thread_id: '',
   stagnation_enabled: false,
   stagnation_window_seconds: 3600,
   stagnation_trigger_threshold: 3,

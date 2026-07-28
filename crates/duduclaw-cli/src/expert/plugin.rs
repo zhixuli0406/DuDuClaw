@@ -71,9 +71,10 @@ pub(super) async fn install(
         display_name: if description.is_empty() {
             name.clone()
         } else {
-            description
+            description.clone()
         },
         version,
+        description,
         agents: Vec::new(),
         global_skills: Vec::new(),
         wiki_files: Vec::new(),

@@ -33,6 +33,7 @@ export function ProactiveTab() {
     max_messages_per_hour: 3,
     notify_channel: '',
     notify_chat_id: '',
+    notify_thread_id: '',
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -58,6 +59,7 @@ export function ProactiveTab() {
         max_messages_per_hour: detail?.proactive?.max_messages_per_hour ?? 3,
         notify_channel: detail?.proactive?.notify_channel ?? '',
         notify_chat_id: detail?.proactive?.notify_chat_id ?? '',
+        notify_thread_id: detail?.proactive?.notify_thread_id ?? '',
       });
     }).catch((e) => {
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
@@ -162,6 +164,12 @@ export function ProactiveTab() {
             value={config.notify_chat_id}
             onChange={(v) => setConfig({ ...config, notify_chat_id: v })}
             placeholder="e.g., 123456789"
+          />
+          <RowText
+            label={intl.formatMessage({ id: 'agents.adv.notifyThreadId' })}
+            description={intl.formatMessage({ id: 'agents.adv.notifyThreadId.help' })}
+            value={config.notify_thread_id}
+            onChange={(v) => setConfig({ ...config, notify_thread_id: v })}
           />
         </SettingsCard>
       </AdvancedSection>

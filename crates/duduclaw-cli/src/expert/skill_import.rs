@@ -71,6 +71,7 @@ pub(super) async fn install(
             duduclaw_core::truncate_chars(&meta.description, 60)
         },
         version: meta.version.clone(),
+        description: meta.description.clone(),
         agents: Vec::new(),
         global_skills: Vec::new(),
         wiki_files: Vec::new(),

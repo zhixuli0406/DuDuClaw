@@ -13,6 +13,18 @@
   ＋新 MCP scope `recording`（dispatch gate 雙重把關、fail-closed）。錄製檔落
   `~/.duduclaw/recordings/<id>/`（權限 700，30 分鐘自動停止上限）。
   詳見 `docs/guides/recording-to-skill.md`。
+- **config/CLI-only 功能搬上 dashboard（四項）**：①AI 員工編輯頁 danger zone 新增
+  「錄製功能」開關（`[capabilities] recording`，開啟才允許錄製工具，fail-closed 不變）；
+  ②設定頁技能分區新增「每日技能推薦摘要」開關（`[skills] gap_digest_enabled`，寫入即
+  生效免重啟）；③**專家包管理頁**（`/experts`，admin-only）——已安裝清單（hooks 狀態
+  badge）、上傳 .zip 安裝（`POST /api/experts/upload`：JWT＋admin、50MB 上限、PK magic
+  ＋檔名淨化＋路徑圍欄；安裝走子行程重用 CLI 完整管線含 zip-slip 防護與安全掃描；
+  dashboard 安裝 hooks 一律進審批、永不 auto-trust）、移除（wiki 圍欄＋空目錄修剪）、
+  hooks 審批核准後一鍵套用；共用契約下沉 gateway `expert_admin.rs`，CLI re-export
+  同一實作零漂移；④AI 員工「主動通知目標」（`[proactive] notify_channel/chat_id/
+  thread_id`，goal loop 與缺口推薦的推送目的地）進編輯頁＋設定頁。新增 14 測試
+  （非 admin 全拒／上傳 traversal 全困／hooks fail-closed／remove 圍欄），gateway 2861
+  全綠。仍留 CLI：expert pack/export/convert-teams、eval/test 等開發者工具。
 - **專家包 hooks 審批全迴路＋團隊劇本批次遷移**：專家包含 hooks 時 install 隔離至
   `hooks-disabled/` 並經 ApprovalBroker 建立 `expert_hooks_enable` 審批（TTL 24h、
   fail-closed：拒絕／逾期／無授權一律停用），`duduclaw expert hooks <slug>` 套用決定，

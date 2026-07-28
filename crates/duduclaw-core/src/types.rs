@@ -2110,6 +2110,9 @@ pub struct ProactiveConfig {
     pub notify_channel: String,
     /// Chat/group ID to send notifications to.
     pub notify_chat_id: String,
+    /// Optional thread/topic ID within the chat (e.g. a Discord thread or a
+    /// Telegram forum topic). Empty = post to the chat root.
+    pub notify_thread_id: String,
     /// IANA timezone for quiet hours (e.g., "Asia/Taipei").
     /// NOTE: only affects `quiet_hours_*` evaluation. The `check_interval`
     /// cron expression is always evaluated in UTC (same as `[heartbeat] cron`).
@@ -2131,6 +2134,7 @@ impl Default for ProactiveConfig {
             token_budget_per_check: 2000,
             notify_channel: String::new(),
             notify_chat_id: String::new(),
+            notify_thread_id: String::new(),
             timezone: "Asia/Taipei".into(),
             max_turns: 8,
         }
