@@ -94,6 +94,8 @@ pub fn is_safe_slug(slug: &str) -> bool {
 ///   3. `../../templates-premium` relative to the exe (dev: target/<profile>)
 ///   4. `commercial/templates-premium/` under the CWD (dev checkout)
 ///   5. `templates-premium/` under the CWD
+///   6. `<duduclaw home>/templates-premium` (runtime-state deployment —
+///      `DUDUCLAW_HOME` or `~/.duduclaw`; npm-wrapper installs land here)
 ///
 /// Returns `None` when no premium tree is installed (e.g. the public OSS
 /// binary that never shipped the closed templates).
@@ -133,6 +135,24 @@ pub fn find_premium_templates_dir() -> Option<PathBuf> {
     let cwd = PathBuf::from("templates-premium");
     if cwd.is_dir() {
         return Some(cwd);
+    }
+
+    // 6. `<duduclaw home>/templates-premium` — the deployment location for
+    // premium content seeded next to the runtime state (license seeding /
+    // operator copy). Without this probe, a gateway launched from the npm
+    // wrapper (exe deep inside node_modules, cwd = $HOME) never finds the
+    // premium tree even though the machine has it — the dashboard built-in
+    // expert catalog then reads as "not shipped" on a fully licensed install.
+    let home = std::env::var("DUDUCLAW_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".duduclaw")));
+    if let Some(home) = home {
+        let candidate = home.join("templates-premium");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
     }
 
     None
