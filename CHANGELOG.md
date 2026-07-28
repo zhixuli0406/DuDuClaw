@@ -13,6 +13,15 @@
   ＋新 MCP scope `recording`（dispatch gate 雙重把關、fail-closed）。錄製檔落
   `~/.duduclaw/recordings/<id>/`（權限 700，30 分鐘自動停止上限）。
   詳見 `docs/guides/recording-to-skill.md`。
+- **內建專家包目錄＋LLM 引導自製**：專家包頁新增「內建專家包」目錄——22 產業團隊包
+  一鍵安裝（與首登精靈同一 premium 資料源；`experts.catalog`／`experts.install_builtin`，
+  gateway 以冪等 convert-teams 快取＋既有安裝管線子行程執行，premium 未部署顯示
+  fail-safe 空狀態）。「自製專家包」四步引導：產業／描述／團隊規模／通路 → LLM 生成
+  完整草稿（模型只輸出 STRICT JSON、expert.toml 後端確定性渲染，消除 TOML 語法失敗
+  模式）→ 預覽＋回饋重生成（上限 5 輪）→ 安裝（LLM 產物視同外來內容過完整安全掃描；
+  no-hooks 三層防線：schema 無欄位＋prompt 禁止＋遞迴後驗，安裝邊界再驗）。draft
+  24h 過期清理、全 RPC admin-only、路徑／slug 全圍欄（含 agent.partial 白名單防
+  `[agent]` 劫持）。gateway 2882 測試綠。
 - **config/CLI-only 功能搬上 dashboard（四項）**：①AI 員工編輯頁 danger zone 新增
   「錄製功能」開關（`[capabilities] recording`，開啟才允許錄製工具，fail-closed 不變）；
   ②設定頁技能分區新增「每日技能推薦摘要」開關（`[skills] gap_digest_enabled`，寫入即

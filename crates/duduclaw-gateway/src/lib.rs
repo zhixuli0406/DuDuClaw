@@ -73,6 +73,7 @@ pub mod cep_matcher;
 pub mod rule_induction;
 pub mod approval;
 pub mod expert_admin;
+pub mod expert_generate;
 pub mod capability;
 pub mod capability_grants;
 pub mod growth;

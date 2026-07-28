@@ -4488,6 +4488,26 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_experts_hooks_apply(params).await
             }
+            "experts.catalog" => {
+                require_admin!();
+                self.handle_experts_catalog().await
+            }
+            "experts.install_builtin" => {
+                require_admin!();
+                self.handle_experts_install_builtin(params).await
+            }
+            "experts.generate" => {
+                require_admin!();
+                self.handle_experts_generate(params).await
+            }
+            "experts.generate_revise" => {
+                require_admin!();
+                self.handle_experts_generate_revise(params).await
+            }
+            "experts.install_draft" => {
+                require_admin!();
+                self.handle_experts_install_draft(params).await
+            }
 
             // ── Cron (admin only) ────────────────────────────
             "cron.list" => {
@@ -5375,6 +5395,11 @@ impl MethodHandler {
                     { "name": "experts.install", "description": "Install an expert pack from a server-local dir/zip (admin)" },
                     { "name": "experts.remove", "description": "Remove an installed expert pack (admin)" },
                     { "name": "experts.hooks_apply", "description": "Apply the approval decision for a pack's hooks (admin)" },
+                    { "name": "experts.catalog", "description": "List built-in industry expert packs available for one-click install (admin)" },
+                    { "name": "experts.install_builtin", "description": "Convert + install a built-in industry expert pack (admin)" },
+                    { "name": "experts.generate", "description": "LLM-generate a custom expert-pack draft from a guided form (admin)" },
+                    { "name": "experts.generate_revise", "description": "Regenerate an expert-pack draft with feedback (admin, max 5 rounds)" },
+                    { "name": "experts.install_draft", "description": "Install a generated expert-pack draft via the full security pipeline (admin)" },
                     { "name": "mcp.install_request", "description": "File an MCP install request for approval (non-admin)" },
                     { "name": "install_requests.list", "description": "List install requests actionable by the caller (manager+)" },
                     { "name": "install_requests.mine", "description": "The caller's own install requests + status" },
@@ -15230,35 +15255,46 @@ impl MethodHandler {
         // Reuse the full CLI install pipeline via our own binary. Hooks are
         // NEVER auto-trusted from the dashboard — they land disabled with an
         // approval request (fail-closed), decided in the approval center.
+        match self
+            .spawn_expert_cli(&["install".into(), src.as_os_str().to_os_string()], 300)
+            .await
+        {
+            Ok(output) => WsFrame::ok_response("", json!({ "success": true, "output": output })),
+            Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
+        }
+    }
+
+    /// Spawn our own binary's `duduclaw expert <args…>` sub-command against
+    /// the gateway home — the zero-drift reuse path for the CLI install /
+    /// convert pipelines (same pattern as `doctor_probes` → `mcp-server`).
+    /// Returns the CJK-safe-truncated stdout tail on success.
+    async fn spawn_expert_cli(
+        &self,
+        args: &[std::ffi::OsString],
+        timeout_secs: u64,
+    ) -> Result<String, String> {
         let bin = duduclaw_core::resolve_duduclaw_bin();
         let fut = tokio::process::Command::new(&bin)
             .arg("expert")
-            .arg("install")
-            .arg(src)
+            .args(args)
             .env("DUDUCLAW_HOME", &self.home_dir)
             .kill_on_drop(true)
             .output();
-        let output = match tokio::time::timeout(std::time::Duration::from_secs(300), fut).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                return WsFrame::error_response("", &format!("安裝程序啟動失敗: {e}"));
-            }
-            Err(_) => {
-                return WsFrame::error_response("", "安裝逾時（300 秒），已中止");
-            }
-        };
+        let output =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
+                Ok(Ok(o)) => o,
+                Ok(Err(e)) => return Err(format!("子程序啟動失敗: {e}")),
+                Err(_) => return Err(format!("子程序逾時（{timeout_secs} 秒），已中止")),
+            };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Strip ANSI-free console tail for surfacing (CJK-safe truncation).
-        let tail = |s: &str| duduclaw_core::truncate_chars(s.trim(), 1200).to_string();
+        let tail = |s: &str| duduclaw_core::truncate_chars(s.trim(), 1200);
         if !output.status.success() {
             let detail = if stderr.trim().is_empty() { &stdout } else { &stderr };
-            return WsFrame::error_response("", &format!("安裝失敗：{}", tail(detail)));
+            return Err(tail(detail));
         }
-        WsFrame::ok_response(
-            "",
-            json!({ "success": true, "output": tail(&stdout) }),
-        )
+        Ok(tail(&stdout))
     }
 
     async fn handle_experts_remove(&self, params: Value) -> WsFrame {
@@ -15295,6 +15331,330 @@ impl MethodHandler {
                 WsFrame::ok_response("", json!({ "status": status }))
             }
             Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    // ── Built-in expert-pack catalog (22 industry teams → one-click install) ──
+
+    /// `experts.catalog` — built-in industry packs available for one-click
+    /// install. Fail-safe: absent premium tree ⇒ `deployed: false`, never an
+    /// error. Locked license ⇒ list withheld with the upsell flag (same
+    /// convention as `templates.industries`).
+    async fn handle_experts_catalog(&self) -> WsFrame {
+        let unlocked = self.premium_templates_unlocked().await;
+        let dir = crate::premium_templates::find_premium_templates_dir();
+        let records = crate::expert_admin::list_records(&self.home_dir);
+        let catalog = crate::expert_generate::builtin_catalog(dir.as_deref(), &records);
+        let deployed = catalog["deployed"].as_bool().unwrap_or(false);
+        WsFrame::ok_response(
+            "",
+            json!({
+                "deployed": deployed,
+                "unlocked": unlocked,
+                "present_but_locked": deployed && !unlocked,
+                "packs": if unlocked { catalog["packs"].clone() } else { json!([]) },
+            }),
+        )
+    }
+
+    /// `experts.install_builtin` — convert (cached, idempotent) + install one
+    /// built-in industry pack. Both steps reuse the CLI pipelines via
+    /// subprocess: `expert convert-teams` then `expert install` (full
+    /// security scanning, hooks fail-closed).
+    async fn handle_experts_install_builtin(&self, params: Value) -> WsFrame {
+        use crate::expert_generate as eg;
+        let industry = params
+            .get("industry")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Slug fence FIRST — traversal is rejected before license checks or
+        // any subprocess (deterministic fail-closed ordering).
+        let cache_pack = match eg::builtin_pack_cache_dir(&self.home_dir, industry) {
+            Ok(d) => d,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let premium_dir = match self.premium_dir_unlocked().await {
+            Ok(d) => d,
+            Err(frame) => return frame,
+        };
+        if let Err(e) = crate::premium_templates::load_team_manifest(&premium_dir, industry) {
+            warn!(industry, error = %e, "install_builtin: unknown/invalid team manifest");
+            return WsFrame::error_response("", "找不到此產業的內建專家包");
+        }
+
+        // Ensure the converted cache. `convert-teams` has no per-industry
+        // filter, so the whole tree is converted once (idempotent,
+        // byte-deterministic) and reused afterwards.
+        if !cache_pack.join("expert.toml").is_file() {
+            let out_dir = eg::builtin_cache_dir(&self.home_dir);
+            if let Err(e) = tokio::fs::create_dir_all(&out_dir).await {
+                return WsFrame::error_response("", &format!("建立快取目錄失敗: {e}"));
+            }
+            let convert = self
+                .spawn_expert_cli(
+                    &[
+                        "convert-teams".into(),
+                        premium_dir.join("teams").into_os_string(),
+                        "--out".into(),
+                        out_dir.into_os_string(),
+                    ],
+                    120,
+                )
+                .await;
+            if let Err(e) = convert {
+                // The batch errs when ANY team fails; THIS industry may still
+                // have converted fine — proceed only when its pack exists.
+                if !cache_pack.join("expert.toml").is_file() {
+                    return WsFrame::error_response("", &format!("內建包轉換失敗：{e}"));
+                }
+                warn!(industry, error = %e, "convert-teams reported failures; target pack present — proceeding");
+            }
+        }
+
+        match self
+            .spawn_expert_cli(&["install".into(), cache_pack.into_os_string()], 300)
+            .await
+        {
+            Ok(output) => WsFrame::ok_response(
+                "",
+                json!({
+                    "success": true,
+                    "slug": eg::builtin_pack_slug(industry),
+                    "output": output,
+                }),
+            ),
+            Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
+        }
+    }
+
+    // ── LLM-guided expert-pack authoring ──────────────────────────────────
+
+    /// One LLM round for pack generation: rotated Claude CLI (zero-tool
+    /// caps) → Direct API fallback — the same call chain as
+    /// `widgets.custom.generate`.
+    async fn run_expert_generation_llm(&self, system: &str, user: &str) -> Result<String, String> {
+        let caps = crate::night_llm::night_capabilities();
+        let model = crate::expert_generate::GENERATE_MODEL;
+        let cli_err = match crate::channel_reply::call_claude_cli_rotated(
+            user,
+            model,
+            system,
+            &self.home_dir,
+            None,
+            None,
+            Some(&caps),
+            None,
+            &[],
+        )
+        .await
+        {
+            Ok(text) if !text.trim().is_empty() => return Ok(text),
+            Ok(_) => "empty CLI response".to_string(),
+            Err(e) => duduclaw_core::truncate_chars(&e, 200),
+        };
+
+        let api_key = crate::claude_runner::get_api_key_from_home(&self.home_dir).await;
+        if api_key.is_empty() {
+            return Err(format!("（{cli_err}），且未設定 API key 可作備援"));
+        }
+        match crate::direct_api::call_direct_api(&api_key, model, system, user, &[]).await {
+            Ok(resp) if !resp.text.trim().is_empty() => Ok(resp.text),
+            Ok(_) => Err("模型回傳空內容".into()),
+            Err(e) => Err(duduclaw_core::truncate_chars(&e, 200)),
+        }
+    }
+
+    /// Full generation round for a draft: LLM → parse → materialize →
+    /// validate, with ONE auto-retry that feeds the validation errors back to
+    /// the model. Returns the accepted design JSON (stored as the prior for
+    /// revise rounds). Honest failure: the final validation errors are
+    /// surfaced, never a half-valid draft.
+    async fn generate_expert_draft(
+        &self,
+        draft_id: &str,
+        req: &crate::expert_generate::GenerateRequest,
+        prior_json: Option<&str>,
+        feedback: Option<&str>,
+    ) -> Result<String, String> {
+        use crate::expert_generate as eg;
+        let pack_dir = eg::draft_pack_dir(&self.home_dir, draft_id)?;
+        let example = eg::example_pack_snippet(&self.home_dir);
+        let mut last_errors: Vec<String> = Vec::new();
+
+        for _attempt in 0..2 {
+            let errs = (!last_errors.is_empty()).then_some(last_errors.as_slice());
+            let (system, user) =
+                eg::build_pack_generation_prompt(req, &example, prior_json, feedback, errs);
+            let raw = self.run_expert_generation_llm(&system, &user).await?;
+            let gp = match eg::parse_generated_pack(&raw) {
+                Ok(g) => g,
+                Err(e) => {
+                    last_errors = vec![e];
+                    continue;
+                }
+            };
+            if let Err(e) = eg::materialize_draft(&pack_dir, &gp) {
+                last_errors = vec![e];
+                continue;
+            }
+            let problems = eg::validate_draft_pack(&pack_dir);
+            if problems.is_empty() {
+                // Store the normalized design (round-trips through the
+                // schema) rather than the raw response with its prose risk.
+                return Ok(serde_json::to_string(&gp).unwrap_or(raw));
+            }
+            last_errors = problems;
+        }
+        Err(format!(
+            "草稿未通過驗證（已自動重試 1 次）：{}",
+            duduclaw_core::truncate_chars(&last_errors.join("；"), 600)
+        ))
+    }
+
+    /// `experts.generate` — guided-form → LLM draft under
+    /// `<home>/tmp/expert-drafts/<id>/pack/`. Nothing is installed here; the
+    /// draft previews client-side and `experts.install_draft` runs the full
+    /// security pipeline when the admin accepts.
+    async fn handle_experts_generate(&self, params: Value) -> WsFrame {
+        use crate::expert_generate as eg;
+        // Opportunistic 24 h sweep (same convention as expert-uploads).
+        eg::cleanup_expired_drafts(&self.home_dir);
+
+        let req: eg::GenerateRequest = match serde_json::from_value(params) {
+            Ok(r) => r,
+            Err(_) => {
+                return WsFrame::error_response("", "請描述這個專家包要解決什麼問題");
+            }
+        };
+        if let Err(e) = eg::validate_generate_request(&req) {
+            return WsFrame::error_response("", &e);
+        }
+
+        let draft_id = uuid::Uuid::new_v4().to_string();
+        match self.generate_expert_draft(&draft_id, &req, None, None).await {
+            Ok(accepted) => {
+                let now = crate::expert_admin::now_iso();
+                let state = eg::DraftState {
+                    draft_id: draft_id.clone(),
+                    request: req,
+                    rounds: 1,
+                    created_at: now.clone(),
+                    updated_at: now,
+                    last_generation: accepted,
+                };
+                if let Err(e) = eg::write_draft_state(&self.home_dir, &state) {
+                    return WsFrame::error_response("", &e);
+                }
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "draft_id": state.draft_id,
+                        "rounds": state.rounds,
+                        "rounds_left": state.rounds_left(),
+                        "preview": eg::draft_preview_json(&self.home_dir, &state),
+                    }),
+                )
+            }
+            Err(e) => WsFrame::error_response("", &format!("專家包生成失敗：{e}")),
+        }
+    }
+
+    /// `experts.generate_revise` — regenerate a draft with the admin's
+    /// feedback (prior design replayed as DATA). Capped at
+    /// [`crate::expert_generate::MAX_GENERATE_ROUNDS`] total rounds.
+    async fn handle_experts_generate_revise(&self, params: Value) -> WsFrame {
+        use crate::expert_generate as eg;
+        let draft_id = params
+            .get("draft_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let feedback = params
+            .get("feedback")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if feedback.is_empty() {
+            return WsFrame::error_response("", "請說明想修改哪裡");
+        }
+        if feedback.chars().count() > eg::MAX_DESCRIPTION_CHARS {
+            return WsFrame::error_response(
+                "",
+                &format!("回饋最長 {} 字", eg::MAX_DESCRIPTION_CHARS),
+            );
+        }
+        let mut state = match eg::read_draft_state(&self.home_dir, draft_id) {
+            Ok(s) => s,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        if !state.can_revise() {
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "已達重新生成上限（{} 輪）。請直接安裝或重新開始。",
+                    eg::MAX_GENERATE_ROUNDS
+                ),
+            );
+        }
+
+        let prior = state.last_generation.clone();
+        let req = state.request.clone();
+        match self
+            .generate_expert_draft(&state.draft_id, &req, Some(&prior), Some(feedback))
+            .await
+        {
+            Ok(accepted) => {
+                state.rounds += 1;
+                state.updated_at = crate::expert_admin::now_iso();
+                state.last_generation = accepted;
+                if let Err(e) = eg::write_draft_state(&self.home_dir, &state) {
+                    return WsFrame::error_response("", &e);
+                }
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "draft_id": state.draft_id,
+                        "rounds": state.rounds,
+                        "rounds_left": state.rounds_left(),
+                        "preview": eg::draft_preview_json(&self.home_dir, &state),
+                    }),
+                )
+            }
+            Err(e) => WsFrame::error_response("", &format!("重新生成失敗：{e}")),
+        }
+    }
+
+    /// `experts.install_draft` — install a generated draft through the FULL
+    /// CLI security pipeline (LLM output is external content; scanning is
+    /// never skipped). The draft dir is cleaned up on success.
+    async fn handle_experts_install_draft(&self, params: Value) -> WsFrame {
+        use crate::expert_generate as eg;
+        let draft_id = params
+            .get("draft_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let pack_dir = match eg::draft_pack_dir(&self.home_dir, draft_id) {
+            Ok(d) => d,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        if !pack_dir.join("expert.toml").is_file() {
+            return WsFrame::error_response("", "找不到這份草稿（可能已過期清除，請重新生成）");
+        }
+        // Defense in depth: the no-hooks rule is re-checked at the install
+        // boundary, not just at generation time.
+        if let Err(e) = eg::ensure_no_hooks(&pack_dir) {
+            return WsFrame::error_response("", &e);
+        }
+        match self
+            .spawn_expert_cli(&["install".into(), pack_dir.into_os_string()], 300)
+            .await
+        {
+            Ok(output) => {
+                if let Ok(dir) = eg::draft_dir(&self.home_dir, draft_id) {
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                }
+                WsFrame::ok_response("", json!({ "success": true, "output": output }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
         }
     }
 
@@ -28784,12 +29144,171 @@ mod d6_curation_tests {
             "experts.install",
             "experts.remove",
             "experts.hooks_apply",
+            "experts.catalog",
+            "experts.install_builtin",
+            "experts.generate",
+            "experts.generate_revise",
+            "experts.install_draft",
         ] {
             let frame = handler
-                .handle(method, json!({ "slug": "x", "path": "/tmp/x" }), &ctx)
+                .handle(
+                    method,
+                    json!({
+                        "slug": "x", "path": "/tmp/x", "industry": "x",
+                        "description": "d", "draft_id": "x", "feedback": "f"
+                    }),
+                    &ctx,
+                )
                 .await;
             assert!(!frame_ok(&frame), "{method} must deny non-admin: {frame:?}");
         }
+    }
+
+    /// `experts.catalog` is fail-safe: a fresh home with no premium tree
+    /// returns an ok frame with an empty pack list, never an error.
+    #[tokio::test]
+    async fn experts_catalog_fail_safe_without_premium() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        let frame = handler.handle("experts.catalog", json!({}), &ctx).await;
+        assert!(frame_ok(&frame), "catalog must not error: {frame:?}");
+        let data = frame_data(&frame);
+        assert!(data["packs"].is_array());
+        assert!(data["deployed"].is_boolean());
+        assert!(data["unlocked"].is_boolean());
+    }
+
+    /// `experts.install_builtin` rejects unsafe industry slugs BEFORE license
+    /// checks or any subprocess spawn (path-traversal fence).
+    #[tokio::test]
+    async fn experts_install_builtin_rejects_bad_slugs() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        for bad in ["../etc", "a/b", "..", "", "UPPER"] {
+            let frame = handler
+                .handle("experts.install_builtin", json!({ "industry": bad }), &ctx)
+                .await;
+            assert!(!frame_ok(&frame), "{bad:?} must be rejected: {frame:?}");
+        }
+        // Nothing was written into the cache by the rejected calls.
+        assert!(!crate::expert_generate::builtin_cache_dir(home.path()).exists());
+    }
+
+    /// `experts.generate` validates inputs before any LLM call.
+    #[tokio::test]
+    async fn experts_generate_rejects_invalid_inputs() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        // Missing / empty description.
+        for params in [json!({}), json!({ "description": "   " })] {
+            let frame = handler.handle("experts.generate", params, &ctx).await;
+            assert!(!frame_ok(&frame), "empty description must be rejected");
+        }
+        // Out-of-range team size and unknown channel.
+        let frame = handler
+            .handle(
+                "experts.generate",
+                json!({ "description": "d", "team_size": 99 }),
+                &ctx,
+            )
+            .await;
+        assert!(!frame_ok(&frame));
+        let frame = handler
+            .handle(
+                "experts.generate",
+                json!({ "description": "d", "channels": ["myspace"] }),
+                &ctx,
+            )
+            .await;
+        assert!(!frame_ok(&frame));
+    }
+
+    /// `experts.generate_revise` fences draft ids, requires feedback, and
+    /// enforces the round cap — all before any LLM call.
+    #[tokio::test]
+    async fn experts_generate_revise_guards() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        // Traversal / unknown draft ids.
+        for id in ["../evil", "ghost"] {
+            let frame = handler
+                .handle(
+                    "experts.generate_revise",
+                    json!({ "draft_id": id, "feedback": "改" }),
+                    &ctx,
+                )
+                .await;
+            assert!(!frame_ok(&frame), "{id:?} must be rejected");
+        }
+        // Empty feedback.
+        let frame = handler
+            .handle(
+                "experts.generate_revise",
+                json!({ "draft_id": "abc", "feedback": "  " }),
+                &ctx,
+            )
+            .await;
+        assert!(!frame_ok(&frame));
+
+        // Round cap: a draft at MAX_GENERATE_ROUNDS refuses further revision.
+        let state = crate::expert_generate::DraftState {
+            draft_id: "abc-cap".into(),
+            request: crate::expert_generate::GenerateRequest {
+                industry_hint: String::new(),
+                description: "d".into(),
+                team_size: 2,
+                channels: vec![],
+            },
+            rounds: crate::expert_generate::MAX_GENERATE_ROUNDS,
+            created_at: crate::expert_admin::now_iso(),
+            updated_at: crate::expert_admin::now_iso(),
+            last_generation: "{}".into(),
+        };
+        crate::expert_generate::write_draft_state(home.path(), &state).unwrap();
+        let frame = handler
+            .handle(
+                "experts.generate_revise",
+                json!({ "draft_id": "abc-cap", "feedback": "改" }),
+                &ctx,
+            )
+            .await;
+        assert!(!frame_ok(&frame), "round cap must reject: {frame:?}");
+        let err = format!("{frame:?}");
+        assert!(err.contains("上限"), "cap message surfaced: {err}");
+    }
+
+    /// `experts.install_draft` fences draft ids and refuses missing drafts.
+    #[tokio::test]
+    async fn experts_install_draft_guards() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        for id in ["../evil", "ghost", ""] {
+            let frame = handler
+                .handle("experts.install_draft", json!({ "draft_id": id }), &ctx)
+                .await;
+            assert!(!frame_ok(&frame), "{id:?} must be rejected");
+        }
+        // A draft that smuggled hooks in is refused at the install boundary.
+        let pack = crate::expert_generate::draft_pack_dir(home.path(), "abc-hooked").unwrap();
+        std::fs::create_dir_all(pack.join("hooks")).unwrap();
+        std::fs::write(pack.join("expert.toml"), "[expert]\nname = \"x\"\n").unwrap();
+        std::fs::write(pack.join("hooks/pre.sh"), "echo hi").unwrap();
+        let frame = handler
+            .handle(
+                "experts.install_draft",
+                json!({ "draft_id": "abc-hooked" }),
+                &ctx,
+            )
+            .await;
+        assert!(!frame_ok(&frame), "hooks-carrying draft must be refused");
+        assert!(format!("{frame:?}").contains("hooks"));
     }
 
     #[tokio::test]
