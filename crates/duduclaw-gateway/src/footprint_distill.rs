@@ -41,8 +41,8 @@
 //!
 //! The ticker starting at gateway boot (rather than a cron-style fixed
 //! midnight trigger) is deliberately what "UTC 日界或 gateway 啟動補跑" means
-//! here: there is no persisted backlog to catch up on partial days from a
-//! *previous* run (state is pure in-memory, see below) — the loop simply
+//! here: startup restores the snapshot (see below) — a yesterday-dated
+//! restored bucket distills on the ticker's first pass — and the loop then
 //! keeps checking date rollover regardless of what time of day the gateway
 //! happened to start, so a long-running process naturally distills every UTC
 //! midnight it lives through.
@@ -60,11 +60,14 @@
 //!   opted in is never even added to the in-memory tracking map, not merely
 //!   skipped at write time — data minimization starts at collection, not just
 //!   at persistence.
-//! - Aggregation state is pure in-memory (`std::sync::Mutex` over a `HashMap`,
-//!   never held across an `.await`) — a gateway restart loses the current UTC
-//!   day's partial stats (same tradeoff as the P3-3 CEP pending window / P3-4
-//!   kickoff debounce state: documented, not silent, and low-stakes here since
-//!   at most one day of aggregation is ever at risk).
+//! - Aggregation state lives in memory (`std::sync::Mutex` over a `HashMap`,
+//!   never held across an `.await`) with a crash/restart snapshot: every
+//!   distill tick persists each bucket to
+//!   `<home>/os/<agent>/footprint-aggregate.json` (atomic tmp+rename) and
+//!   startup restores it — a restart loses at most one
+//!   [`DISTILL_CHECK_INTERVAL`] of accumulation, not the whole day (the
+//!   pre-2026-07-29 memory-only design meant a frequently-restarted gateway
+//!   never distilled anything).
 //! - Every piece of perceived text (app name, directory path) is passed
 //!   through `sanitize_perception_text` before it is ever used as an
 //!   aggregation key or written to memory — the same P2-5 perception boundary
@@ -238,7 +241,7 @@ fn format_duration_secs(total_secs: u64) -> String {
 /// on distillation — [`FootprintTracker::distill_and_reset`] swaps in a fresh
 /// instance rather than clearing this one, so a concurrent `note_event` can
 /// never observe a half-cleared struct.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct AgentDayStats {
     /// The UTC calendar day this bucket is accumulating for.
     date: NaiveDate,
@@ -608,6 +611,57 @@ impl FootprintTracker {
         }
     }
 
+    /// `<home>/os/<agent>/footprint-aggregate.json` — the crash/restart
+    /// snapshot of one agent's in-progress day bucket.
+    fn snapshot_path(&self, agent_id: &str) -> PathBuf {
+        self.home_dir.join("os").join(agent_id).join("footprint-aggregate.json")
+    }
+
+    /// Persist every tracked agent's in-progress bucket (atomic tmp+rename).
+    ///
+    /// The aggregation used to be memory-only, so ANY gateway restart threw
+    /// away the whole day's accumulation — a frequently-restarted gateway
+    /// never distilled anything (the "one day of use, zero footprint memory"
+    /// field report). Snapshots bound the loss to one check interval.
+    pub fn save_snapshots(&self) {
+        let snapshot: Vec<(String, AgentDayStats)> = {
+            let map = self.state.lock().unwrap();
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        for (agent_id, stats) in snapshot {
+            let path = self.snapshot_path(&agent_id);
+            let Some(dir) = path.parent() else { continue };
+            let Ok(json) = serde_json::to_vec(&stats) else { continue };
+            let write = std::fs::create_dir_all(dir).and_then(|_| {
+                let tmp = path.with_extension("json.tmp");
+                std::fs::write(&tmp, &json)?;
+                std::fs::rename(&tmp, &path)
+            });
+            if let Err(e) = write {
+                warn!(agent = %agent_id, error = %e, "P4-4 footprint snapshot write failed");
+            }
+        }
+    }
+
+    /// Reload persisted buckets for currently-enabled agents (startup).
+    /// A yesterday-dated bucket is loaded as-is — the distill loop's next tick
+    /// rolls it over and distills it, so a restart shortly after midnight
+    /// still gets yesterday's memories. Unreadable/invalid files are ignored.
+    pub fn load_snapshots(&self) {
+        let agents: Vec<String> =
+            self.enabled_agents.lock().unwrap().iter().cloned().collect();
+        for agent_id in agents {
+            let path = self.snapshot_path(&agent_id);
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(stats) = serde_json::from_slice::<AgentDayStats>(&bytes) else {
+                warn!(agent = %agent_id, "P4-4 footprint snapshot unreadable — starting fresh");
+                continue;
+            };
+            info!(agent = %agent_id, date = %stats.date, "P4-4 footprint snapshot restored");
+            self.state.lock().unwrap().insert(agent_id, stats);
+        }
+    }
+
     /// Spawn the background task that feeds `rx` into this tracker. Lagged
     /// events are tolerated (footprint is a soft daily-usage estimate, missing
     /// a few switches only under-counts a day's tally).
@@ -652,6 +706,9 @@ impl FootprintTracker {
                 for agent_id in agents {
                     self.distill_and_reset(&agent_id, now).await;
                 }
+                // Crash/restart durability: bound data loss to one interval.
+                let this = self.clone();
+                let _ = tokio::task::spawn_blocking(move || this.save_snapshots()).await;
             }
         })
     }
@@ -706,6 +763,10 @@ pub async fn init_footprint_distill(
     } else {
         info!(agents = ?enabled, "starting P4-4 digital-footprint distillation");
     }
+
+    // Restore any persisted in-progress buckets BEFORE events start flowing
+    // (a yesterday-dated bucket distills on the ticker's first pass).
+    tracker.load_snapshots();
 
     let ingest = tracker.clone().spawn_ingest(tx.subscribe());
     let ticker = tracker.spawn_distill_loop();
@@ -1279,5 +1340,55 @@ mod tests {
             home.path().join("memory.db").exists(),
             "a day with at least one observed switch must distill (elapsed time counts)"
         );
+    }
+
+    // ── snapshot persistence (restart durability) ──
+
+    #[test]
+    fn snapshots_round_trip_across_tracker_instances() {
+        let home = tempfile::tempdir().unwrap();
+        let t1 = FootprintTracker::new(home.path().to_path_buf(), enabled_set("a1"));
+        let now = utc(2026, 7, 29, 3, 0);
+        t1.note_event(
+            &AutopilotEvent::OsFrontmostEvent {
+                agent_id: "a1".into(),
+                app: "Xcode".into(),
+                window_title: "t".into(),
+                prev_app: String::new(),
+            },
+            now,
+        );
+        t1.note_event(
+            &AutopilotEvent::OsFrontmostEvent {
+                agent_id: "a1".into(),
+                app: "Safari".into(),
+                window_title: "t".into(),
+                prev_app: "Xcode".into(),
+            },
+            utc(2026, 7, 29, 3, 10),
+        );
+        t1.save_snapshots();
+        assert!(
+            home.path().join("os/a1/footprint-aggregate.json").is_file(),
+            "snapshot written"
+        );
+
+        // A fresh tracker (= restarted gateway) restores the bucket.
+        let t2 = FootprintTracker::new(home.path().to_path_buf(), enabled_set("a1"));
+        t2.load_snapshots();
+        let restored = t2.state.lock().unwrap().get("a1").cloned().expect("bucket restored");
+        assert_eq!(restored.date, now.date_naive());
+        assert_eq!(restored.app_seconds.get("Xcode"), Some(&600), "10 min of Xcode kept");
+        assert_eq!(
+            restored.current_app.as_ref().map(|(a, _)| a.as_str()),
+            Some("Safari"),
+            "open segment kept"
+        );
+
+        // Corrupt file → ignored, fresh start (never a panic).
+        std::fs::write(home.path().join("os/a1/footprint-aggregate.json"), b"not json").unwrap();
+        let t3 = FootprintTracker::new(home.path().to_path_buf(), enabled_set("a1"));
+        t3.load_snapshots();
+        assert!(t3.state.lock().unwrap().get("a1").is_none());
     }
 }
