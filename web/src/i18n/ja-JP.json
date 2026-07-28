@@ -3424,6 +3424,7 @@
   "files.error": "ファイル一覧の読み込みに失敗しました",
   "files.download": "ダウンロード",
   "files.preview": "プレビュー",
+  "files.previewPdf": "プレビュー（PDF変換）",
   "files.count": "{count} 件のファイル",
   "nav.canvas": "キャンバス",
   "nav.canvas.desc": "AI 社員が送信するライブビジュアルワークスペース",

@@ -3424,6 +3424,7 @@
   "files.error": "檔案列表載入失敗",
   "files.download": "下載",
   "files.preview": "預覽",
+  "files.previewPdf": "預覽（轉為 PDF）",
   "files.count": "{count} 個檔案",
   "nav.canvas": "畫布",
   "nav.canvas.desc": "AI 員工推送的即時視覺工作區",

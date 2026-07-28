@@ -190,6 +190,51 @@ pub fn is_inline_previewable(name: &str) -> bool {
     )
 }
 
+/// Whether the file type can be converted to PDF for in-browser preview via
+/// LibreOffice headless (`GET /api/files/preview`). Complements
+/// [`is_inline_previewable`] — those types the browser renders natively and
+/// need no conversion.
+pub fn is_office_convertible(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "docx" | "doc" | "odt" | "xlsx" | "xls" | "ods" | "csv" | "pptx" | "ppt" | "odp"
+    )
+}
+
+/// Locate the LibreOffice `soffice` binary. PATH lookup first, then the
+/// standard install locations (launchd-launched gateways often run without a
+/// user PATH). `None` = LibreOffice not installed → preview degrades to an
+/// explicit error, never a broken byte stream.
+pub fn find_soffice() -> Option<PathBuf> {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for name in ["soffice", "soffice.exe"] {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    const CANDIDATES: &[&str] = &[
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/usr/local/bin/soffice",
+        "/opt/homebrew/bin/soffice",
+        "/usr/bin/soffice",
+        "/usr/bin/libreoffice",
+        "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+    ];
+    CANDIDATES.iter().map(Path::new).find(|p| p.is_file()).map(Path::to_path_buf)
+}
+
+/// Cache directory for converted preview PDFs. Scoped per agent (or the
+/// shared bucket) so identically-named files from different agents can't
+/// collide: `<home>/cache/preview/<agent | _shared>/`.
+pub fn preview_cache_dir(home: &Path, agent: Option<&str>) -> PathBuf {
+    home.join("cache").join("preview").join(agent.unwrap_or("_shared"))
+}
+
 /// Percent-encode `name` for an RFC 5987 `filename*=UTF-8''…` parameter so a
 /// CJK / non-ASCII filename survives the `Content-Disposition` header intact.
 pub fn encode_filename_star(name: &str) -> String {
