@@ -140,6 +140,12 @@ export const petModelDownload = (variant: 'birefnet' | 'silueta') =>
 /** Pop up the pet's native right-click menu (no-op outside Tauri). */
 export const petContextMenu = () => invoke<void>('pet_context_menu');
 
+/**
+ * Nudge the pet window horizontally by `dx` logical px (autonomous walk).
+ * Resolves `true` when the move hit a screen edge (the walk should turn around).
+ */
+export const petMoveBy = (dx: number) => invoke<boolean>('pet_move_by', { dx });
+
 /** Set the desktop-pet window scale; persists + resizes immediately. */
 export const petSetScale = (scale: PetScale) => invoke<void>('pet_set_scale', { scale });
 

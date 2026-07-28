@@ -53,9 +53,12 @@ pub const SHEET_W: u32 = COLS * FRAME_W;
 pub const SHEET_H: u32 = FRAME_H * ROWS.len() as u32;
 
 // Fitting: the base sprite is scaled to sit inside the cell, feet near the
-// bottom so poses share a consistent ground line.
-const FIT_H: u32 = 168;
-const FIT_MAX_W: u32 = 160;
+// bottom so poses share a consistent ground line. FIT_H leaves ~40px of cell
+// headroom above the sprite — the jump arc and run bounce need it; at 168 the
+// apex frames clipped the head, which flattened the poses into "every frame
+// looks the same".
+const FIT_H: u32 = 148;
+const FIT_MAX_W: u32 = 150;
 const BASELINE_MARGIN: i32 = 18; // px above the cell bottom the feet rest at.
 
 /// A per-frame geometric transform of the fitted base sprite.
@@ -95,57 +98,64 @@ fn transform_for(row: usize, frame: u32) -> Transform {
     match row {
         // idle — breathing.
         0 => {
-            t.scale_y = 1.0 + 0.04 * wave;
-            t.scale_x = 1.0 - 0.02 * wave;
-            t.dy = -2.0 * wave;
+            t.scale_y = 1.0 + 0.05 * wave;
+            t.scale_x = 1.0 - 0.025 * wave;
+            t.dy = -3.0 * wave;
         }
-        // running-right — forward lean + bounce.
+        // running-right — forward lean + bounce + gait sway.
         1 => {
-            t.dy = -8.0 * bounce;
-            t.shear = 5.0 + 3.0 * wave;
-            t.scale_y = 1.0 + 0.03 * bounce;
+            t.dy = -14.0 * bounce;
+            t.dx = 5.0 * wave;
+            t.shear = 11.0 + 5.0 * wave;
+            t.scale_y = 1.0 + 0.05 * bounce;
+            t.scale_x = 1.0 - 0.03 * bounce;
         }
         // running-left — mirror of running-right.
         2 => {
-            t.dy = -8.0 * bounce;
-            t.shear = -(5.0 + 3.0 * wave);
-            t.scale_y = 1.0 + 0.03 * bounce;
+            t.dy = -14.0 * bounce;
+            t.dx = -5.0 * wave;
+            t.shear = -(11.0 + 5.0 * wave);
+            t.scale_y = 1.0 + 0.05 * bounce;
+            t.scale_x = 1.0 - 0.03 * bounce;
             t.flip_h = true;
         }
-        // waving — side-to-side tilt.
+        // waving — big side-to-side rock.
         3 => {
-            t.shear = 7.0 * wave;
-            t.dy = -1.5 * bounce;
-            t.scale_x = 1.0 + 0.02 * wave;
+            t.shear = 15.0 * wave;
+            t.dy = -3.0 * bounce;
+            t.scale_x = 1.0 + 0.03 * wave;
         }
-        // jumping — rise + stretch at apex.
+        // jumping — full arc: crouch, launch, stretch at the apex.
         4 => {
-            t.dy = -22.0 * bounce;
-            t.scale_y = 1.0 + 0.06 * bounce;
-            t.scale_x = 1.0 - 0.05 * bounce;
+            t.dy = -26.0 * bounce + 4.0 * (1.0 - bounce);
+            t.scale_y = 1.0 + 0.10 * bounce - 0.06 * (1.0 - bounce);
+            t.scale_x = 1.0 - 0.08 * bounce + 0.05 * (1.0 - bounce);
         }
-        // failed — slump down.
+        // failed — deep slump: shorter, wider, tipped forward.
         5 => {
-            t.dy = 8.0;
-            t.scale_y = 0.9;
-            t.shear = 3.0 + 1.0 * wave;
+            t.dy = 10.0 + 2.0 * bounce;
+            t.scale_y = 0.80 - 0.02 * bounce;
+            t.scale_x = 1.08;
+            t.shear = 7.0 + 2.0 * wave;
         }
-        // waiting — slow shallow breath (half period so it feels calmer).
+        // waiting — SIT: settle into a low crouch and breathe there.
         6 => {
             let calm = (phase * std::f32::consts::PI).sin();
-            t.scale_y = 1.0 + 0.025 * calm;
-            t.dy = -1.0 * calm;
+            t.scale_y = 0.72 + 0.03 * calm;
+            t.scale_x = 1.14 - 0.03 * calm;
+            t.dy = 2.0;
         }
         // running — upright bounce, no lean.
         7 => {
-            t.dy = -7.0 * bounce;
-            t.scale_y = 1.0 + 0.03 * bounce;
-            t.scale_x = 1.0 - 0.02 * bounce;
+            t.dy = -12.0 * bounce;
+            t.scale_y = 1.0 + 0.06 * bounce;
+            t.scale_x = 1.0 - 0.04 * bounce;
         }
-        // review — small forward nod.
+        // review — pronounced forward nod.
         8 => {
-            t.dy = 2.0 * wave;
-            t.shear = 2.0 * wave;
+            t.dy = 4.0 * bounce;
+            t.shear = 6.0 * wave;
+            t.scale_y = 1.0 - 0.03 * bounce;
         }
         _ => {}
     }

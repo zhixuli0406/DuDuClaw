@@ -97,8 +97,14 @@ export function PetStudioPage() {
     }
   }, []);
 
+  // Re-entry guard: `generating` disables the button only after a re-render,
+  // so a rapid double-click could still fire two Rust generations. The ref
+  // closes that window synchronously (same pattern for activate/delete below).
+  const busyRef = useRef(false);
+
   const onGenerate = useCallback(async () => {
-    if (!photoDataUrl) return;
+    if (!photoDataUrl || busyRef.current) return;
+    busyRef.current = true;
     setGenerating(true);
     try {
       const result = await petGenerate(name.trim() || 'DuDu', photoDataUrl, external, pixelate);
@@ -110,18 +116,23 @@ export function PetStudioPage() {
     } catch (e) {
       toast.error(formatError(e));
     } finally {
+      busyRef.current = false;
       setGenerating(false);
     }
   }, [photoDataUrl, name, external, pixelate, refresh, t]);
 
   const onActivate = useCallback(
     async (slug: string) => {
+      if (busyRef.current) return;
+      busyRef.current = true;
       try {
         await petActivate(slug);
         toast.success(t('pet.studio.activated'));
         refresh();
       } catch (e) {
         toast.error(formatError(e));
+      } finally {
+        busyRef.current = false;
       }
     },
     [refresh, t]
@@ -139,11 +150,15 @@ export function PetStudioPage() {
 
   const onDelete = useCallback(
     async (slug: string) => {
+      if (busyRef.current) return;
+      busyRef.current = true;
       try {
         await petRemove(slug);
         refresh();
       } catch (e) {
         toast.error(formatError(e));
+      } finally {
+        busyRef.current = false;
       }
     },
     [refresh]

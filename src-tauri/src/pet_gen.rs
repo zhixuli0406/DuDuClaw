@@ -427,6 +427,32 @@ pub fn pet_get_scale() -> String {
     load_scale()
 }
 
+/// Nudge the pet window horizontally by `dx` logical px (the autonomous walk).
+/// Clamped to the current monitor's bounds so the pet never wanders off-screen.
+/// Returns `true` when the move was clamped (hit a screen edge) — the runtime
+/// uses that to turn the walk around.
+#[tauri::command]
+pub fn pet_move_by(app: AppHandle, dx: f64) -> Result<bool, String> {
+    let Some(win) = app.get_webview_window(mascot_window::MASCOT_LABEL) else {
+        return Ok(true); // no window — treat as blocked so the walk stops
+    };
+    let pos = win.outer_position().map_err(|e| e.to_string())?;
+    let size = win.outer_size().map_err(|e| e.to_string())?;
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let desired = pos.x + (dx * scale).round() as i32;
+    let clamped = match win.current_monitor().ok().flatten() {
+        Some(mon) => {
+            let min_x = mon.position().x;
+            let max_x = mon.position().x + mon.size().width as i32 - size.width as i32;
+            desired.clamp(min_x, max_x.max(min_x))
+        }
+        None => desired,
+    };
+    win.set_position(tauri::PhysicalPosition::new(clamped, pos.y))
+        .map_err(|e| e.to_string())?;
+    Ok(clamped != desired)
+}
+
 /// Show the main window and ask it to navigate to the pet studio.
 #[tauri::command]
 pub fn pet_open_studio(app: AppHandle) {
