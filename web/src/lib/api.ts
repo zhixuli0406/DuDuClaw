@@ -1343,7 +1343,14 @@ export interface ExpertPack {
 
 /** One built-in industry pack row from `experts.catalog` (admin-only). */
 export interface ExpertCatalogEntry {
-  industry: string;
+  /** WP-ORG — `team` = industry team pack; `expert` = standalone expert pack. */
+  kind?: 'team' | 'expert';
+  /** Present on team entries only. */
+  industry?: string;
+  /** Catalog section slug (health/professional/retail/lifestyle/education/other). */
+  category?: string;
+  /** Distinct functional departments the roster lands in (zh-TW data strings). */
+  departments?: string[];
   label: string;
   slug: string;
   description: string;
@@ -2961,8 +2968,13 @@ export const api = {
     /** Install from a server-local path (use `POST /api/experts/upload` to
      *  stage a .zip first — see ExpertsPage). Long-running: security scans run
      *  inside the install pipeline. */
-    install: (path: string) =>
-      client.call('experts.install', { path }, false, 320000) as Promise<{
+    install: (path: string, attachUnder?: string) =>
+      client.call(
+        'experts.install',
+        { path, ...(attachUnder ? { attach_under: attachUnder } : {}) },
+        false,
+        320000,
+      ) as Promise<{
         success: boolean;
         output: string;
       }>,
@@ -2990,8 +3002,13 @@ export const api = {
       }>,
     /** Convert (cached) + install one built-in industry pack. Long-running:
      *  the full install security pipeline runs inside. */
-    installBuiltin: (industry: string) =>
-      client.call('experts.install_builtin', { industry }, false, 320000) as Promise<{
+    installBuiltin: (target: { industry?: string; slug?: string }, attachUnder?: string) =>
+      client.call(
+        'experts.install_builtin',
+        { ...target, ...(attachUnder ? { attach_under: attachUnder } : {}) },
+        false,
+        320000,
+      ) as Promise<{
         success: boolean;
         slug: string;
         output: string;
@@ -3012,8 +3029,13 @@ export const api = {
         320000,
       ) as Promise<ExpertDraftResult>,
     /** Install a generated draft via the full security-scanned pipeline. */
-    installDraft: (draftId: string) =>
-      client.call('experts.install_draft', { draft_id: draftId }, false, 320000) as Promise<{
+    installDraft: (draftId: string, attachUnder?: string) =>
+      client.call(
+        'experts.install_draft',
+        { draft_id: draftId, ...(attachUnder ? { attach_under: attachUnder } : {}) },
+        false,
+        320000,
+      ) as Promise<{
         success: boolean;
         output: string;
       }>,

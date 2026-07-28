@@ -235,7 +235,7 @@ async fn import_agents(
             name: final_id.clone(),
             display_name: display,
             role: "worker".to_string(),
-            reports_to: String::new(),
+            reports_to: ctx.attach_under.clone().unwrap_or_default(),
             icon: "🐾".to_string(),
             trigger: format!("@{final_id}"),
             provider: duduclaw_core::types::RuntimeType::Claude,

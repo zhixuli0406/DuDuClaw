@@ -100,7 +100,7 @@ async fn native_install_list_remove_roundtrip() {
     build_native_pack(pack.path());
 
     // ── install ──
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
         .await
         .expect("install should succeed");
 
@@ -154,7 +154,7 @@ async fn native_install_list_remove_roundtrip() {
     );
 
     // Re-install must be refused (idempotency guard).
-    let dup = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false).await;
+    let dup = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None).await;
     assert!(dup.is_err(), "duplicate install should be refused");
 
     // ── export (reverse .mcp.json flow: aggregate, strip duduclaw) ──
@@ -201,7 +201,7 @@ async fn dry_run_writes_nothing() {
     let pack = TempTree::new("pack");
     build_native_pack(pack.path());
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), true, false, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), true, false, false, None)
         .await
         .expect("dry-run should succeed");
 
@@ -228,7 +228,7 @@ async fn claude_plugin_import_maps_agents() {
     // A hook must be imported DISABLED, never wired.
     write(&pack.path().join("hooks/pre.sh"), "#!/bin/sh\necho hi\n");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
         .await
         .expect("plugin import should succeed");
 
@@ -263,7 +263,7 @@ async fn single_skill_import() {
         &pack.path().join("SKILL.md"),
         "---\nname: translate\ndescription: Translate between languages\n---\n\nTranslate the input faithfully.\n",
     );
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
         .await
         .expect("skill import should succeed");
     assert!(home.path().join("skills/translate/SKILL.md").is_file());
@@ -275,7 +275,7 @@ async fn unrecognised_format_is_rejected() {
     let home = TempTree::new("home");
     let pack = TempTree::new("junk");
     write(&pack.path().join("random.txt"), "nothing recognisable");
-    let res = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false).await;
+    let res = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None).await;
     assert!(res.is_err(), "unrecognised layout must be rejected");
     assert!(!home.path().join("agents").exists());
 }
@@ -290,7 +290,7 @@ async fn injection_laden_persona_is_blocked() {
     );
     // The scan blocks the only asset → nothing installed, and no record is
     // written (fail-closed).
-    let _ = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false).await;
+    let _ = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None).await;
     assert!(!home.path().join("skills/evil").exists());
 }
 
@@ -319,7 +319,7 @@ async fn hooks_without_trust_are_pending_and_fail_closed() {
     let pack = TempTree::new("hookpack");
     build_hook_pack(pack.path(), "hooky");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
         .await
         .expect("install should succeed");
 
@@ -356,7 +356,7 @@ async fn trust_hooks_flag_enables_immediately() {
     let pack = TempTree::new("hookpack");
     build_hook_pack(pack.path(), "trusty");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, true)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, true, None)
         .await
         .expect("install should succeed");
 
@@ -378,7 +378,7 @@ async fn approved_hooks_enable_via_hooks_cmd() {
     let pack = TempTree::new("hookpack");
     build_hook_pack(pack.path(), "approved");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
         .await
         .unwrap();
     let state = hooks::read_state(home.path(), "approved").unwrap();
@@ -404,7 +404,7 @@ async fn denied_hooks_stay_disabled_via_hooks_cmd() {
     let pack = TempTree::new("hookpack");
     build_hook_pack(pack.path(), "denied");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
         .await
         .unwrap();
     let state = hooks::read_state(home.path(), "denied").unwrap();
@@ -442,5 +442,121 @@ fn demo_pack_validates_when_present() {
     assert!(
         problems.is_empty(),
         "demo pack should validate: {problems:?}"
+    );
+}
+
+/// WP-ORG: manifest `department` lands in `[agent] department` + materialises
+/// the department wiki space; `--attach-under` re-parents pack roots onto an
+/// existing supervisor and rejects unknown targets before installing.
+#[tokio::test]
+async fn org_placement_department_and_attach_under() {
+    let home = TempTree::new("home-org");
+    let pack = TempTree::new("pack-org");
+    write(
+        &pack.path().join("expert.toml"),
+        r#"
+[expert]
+name = "org-demo"
+description = "組織對位示範"
+version = "1.0.0"
+category = "professional"
+
+[[expert.agents]]
+name = "lead"
+role = "front_desk"
+rank = "manager"
+
+[[expert.agents]]
+name = "clerk"
+role = "worker"
+reports_to = "lead"
+department = "財務"
+rank = "staff"
+"#,
+    );
+    write(&pack.path().join("agents/lead/soul.md"), "# 主管\n\n對外窗口。\n");
+    write(&pack.path().join("agents/clerk/soul.md"), "# 帳務\n\n請款行政。\n");
+
+    // Unknown attach target ⇒ fail-closed, nothing installed.
+    let bad = cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        Some("no-such-boss".into()),
+    )
+    .await;
+    assert!(bad.is_err(), "unknown --attach-under must abort");
+    assert!(!home.path().join("agents/lead").exists(), "must not half-install");
+
+    // Existing supervisor ⇒ root re-parents under it.
+    let boss_dir = home.path().join("agents/boss");
+    write(&boss_dir.join("agent.toml"), "[agent]\nname = \"boss\"\nrole = \"main\"\n");
+    cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        Some("boss".into()),
+    )
+    .await
+    .expect("install with attach_under should succeed");
+
+    let lead_toml =
+        std::fs::read_to_string(home.path().join("agents/lead/agent.toml")).unwrap();
+    assert!(
+        lead_toml.contains("reports_to = \"boss\""),
+        "pack root attaches under the chosen supervisor: {lead_toml}"
+    );
+    let clerk_toml =
+        std::fs::read_to_string(home.path().join("agents/clerk/agent.toml")).unwrap();
+    assert!(
+        clerk_toml.contains("reports_to = \"lead\""),
+        "in-pack hierarchy untouched"
+    );
+    assert!(
+        clerk_toml.contains("department = \"財務\""),
+        "manifest department written to agent.toml: {clerk_toml}"
+    );
+    assert!(
+        home.path().join("shared/wiki/departments/財務").is_dir(),
+        "department wiki space materialised"
+    );
+    assert!(
+        !lead_toml.contains("department ="),
+        "no-department agent stays department-less"
+    );
+}
+
+/// WP-ORG: bad `department` / `rank` values are validation problems.
+#[test]
+fn manifest_validate_rejects_bad_org_fields() {
+    let dir = TempTree::new("pack-orgval");
+    write(
+        &dir.path().join("expert.toml"),
+        r#"
+[expert]
+name = "bad-org"
+description = "x"
+version = "1"
+
+[[expert.agents]]
+name = "a"
+department = "fin/ance"
+rank = "boss"
+"#,
+    );
+    write(&dir.path().join("agents/a/soul.md"), "# a\n");
+    let m = super::manifest::read(dir.path()).unwrap();
+    let problems = super::manifest::validate(&m, dir.path());
+    assert!(
+        problems.iter().any(|p| p.message.contains("非合法部門名")),
+        "{problems:?}"
+    );
+    assert!(
+        problems.iter().any(|p| p.message.contains("rank")),
+        "{problems:?}"
     );
 }

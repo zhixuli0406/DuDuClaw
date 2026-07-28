@@ -61,6 +61,11 @@ pub enum ExpertCommands {
         /// disabled and an ApprovalBroker request is filed (fail-closed).
         #[arg(long)]
         trust_hooks: bool,
+        /// Attach the pack's root agents (empty `reports_to`) under an
+        /// existing agent — e.g. your CEO / front-desk supervisor. The target
+        /// must already exist; a typo aborts before anything installs.
+        #[arg(long)]
+        attach_under: Option<String>,
     },
 
     /// Validate and package a pack directory into a distributable `.zip`.
@@ -129,7 +134,8 @@ pub async fn run(cmd: ExpertCommands) -> Result<()> {
             dry_run,
             rename,
             trust_hooks,
-        } => install::cmd_install(&home, &source, dry_run, rename, trust_hooks).await,
+            attach_under,
+        } => install::cmd_install(&home, &source, dry_run, rename, trust_hooks, attach_under).await,
         ExpertCommands::Pack { dir, out } => cmd_pack(&dir, out.as_deref()),
         ExpertCommands::List { json } => cmd_list(&home, json),
         ExpertCommands::Remove { slug } => cmd_remove(&home, &slug).await,

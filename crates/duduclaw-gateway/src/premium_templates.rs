@@ -245,6 +245,10 @@ pub struct WorkerSpec {
     /// worker's CONTRACT.toml `must_not` and SOUL.md overlay section.
     #[serde(default)]
     pub overlay: Vec<String>,
+    /// Optional team.toml override for the functional department; empty ⇒
+    /// the shared-kit default (`duduclaw_core::org::department_for_kit`).
+    #[serde(default)]
+    pub department: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -558,13 +562,20 @@ fn assemble_worker(
     let soul_md = append_overlay_to_soul(&soul_src, &spec.overlay);
     let contract_toml = append_overlay_to_contract(&contract_src, &spec.overlay)?;
     let trigger = if spec.trigger.is_empty() { spec.name.clone() } else { spec.trigger.clone() };
+    // WP-ORG: workers land in their functional department (team.toml override
+    // wins over the shared-kit default; neither ⇒ department-less as before).
+    let department = if spec.department.trim().is_empty() {
+        duduclaw_core::org::department_for_kit(&spec.kit)
+    } else {
+        Some(spec.department.trim())
+    };
     let agent_toml = patch_agent_toml(
         &agent_src,
         &spec.name,
         &spec.display_name,
         &trigger,
         Some(manifest.front_desk.name.as_str()),
-        None,
+        department,
         false,
     )?;
     let (display_name, trigger) = agent_identity_fields(&agent_toml);

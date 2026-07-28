@@ -24,6 +24,10 @@ pub(super) struct InstallCtx {
     /// Explicit operator grant for pack hooks (`--trust-hooks`). Without it
     /// hooks land disabled behind an ApprovalBroker request (fail-closed).
     pub trust_hooks: bool,
+    /// Existing agent id to attach the pack's root agents under
+    /// (`--attach-under`). Validated to exist BEFORE anything installs
+    /// (fail-closed); pack roots then scaffold with `reports_to` set to it.
+    pub attach_under: Option<String>,
 }
 
 /// Entry for `duduclaw expert install`.
@@ -33,6 +37,7 @@ pub async fn cmd_install(
     dry_run: bool,
     rename: bool,
     trust_hooks: bool,
+    attach_under: Option<String>,
 ) -> Result<()> {
     // ── 1. Resolve the source to an on-disk directory (download / unzip). ──
     // A throwaway staging dir under the system temp; cleaned at the end.
@@ -58,11 +63,31 @@ pub async fn cmd_install(
         return Err(cfg_err("未識別格式，拒絕安裝".into()));
     };
 
+    // ── attach-under: validate the target exists BEFORE anything installs
+    //    (fail-closed — a typo'd supervisor must not half-install a pack). ──
+    let attach_under = match attach_under.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(id) => {
+            if !crate::is_valid_agent_id(id) {
+                drop(cleanup);
+                return Err(cfg_err(format!("--attach-under '{id}' 非合法 agent id")));
+            }
+            if !home.join("agents").join(id).join("agent.toml").is_file() {
+                drop(cleanup);
+                return Err(cfg_err(format!(
+                    "--attach-under 目標 '{id}' 不存在（先建立主管或改用既有 agent）"
+                )));
+            }
+            Some(id.to_string())
+        }
+    };
+
     let ctx = InstallCtx {
         home: home.to_path_buf(),
         dry_run,
         rename,
         trust_hooks,
+        attach_under,
     };
     let mut report = Report::default();
 
@@ -254,7 +279,9 @@ async fn install_native(
             continue;
         };
         let parent_final = if agent.reports_to.trim().is_empty() {
-            String::new()
+            // Pack root — attach under the operator-chosen supervisor (already
+            // validated to exist), or stay a root as before.
+            ctx.attach_under.clone().unwrap_or_default()
         } else {
             id_map
                 .get(agent.reports_to.trim())
@@ -347,6 +374,9 @@ async fn install_one_agent(
 
     if ctx.dry_run {
         report.imported("agent", &final_id);
+        if !agent.department.trim().is_empty() {
+            report.imported("agent-department", &format!("{final_id} → {}", agent.department.trim()));
+        }
         // Report referenced skills in plan mode too.
         plan_agent_skills(pack_dir, agent, report);
         return Ok(Some(final_id));
@@ -366,6 +396,37 @@ async fn install_one_agent(
     crate::scaffold_agent_dir(&ctx.home, &scaffold).await?;
     report.imported("agent", &final_id);
     record.agents.push(final_id.clone());
+
+    // ── Org placement: `[agent] department` + its shared-wiki space. ──
+    // Invalid names warn-and-skip (the rest of the agent still installs);
+    // `expert pack` already rejects them at authoring time.
+    let department = agent.department.trim();
+    if !department.is_empty() {
+        if duduclaw_core::is_valid_department(department) {
+            let dept = department.to_string();
+            super::patch_agent_toml(&ctx.home, &final_id, |t| {
+                if let Some(a) = t.get_mut("agent").and_then(|v| v.as_table_mut()) {
+                    a.insert("department".into(), toml::Value::String(dept.clone()));
+                }
+            })?;
+            let wiki_dir = ctx
+                .home
+                .join("shared")
+                .join("wiki")
+                .join(duduclaw_core::DEPARTMENTS_NAMESPACE)
+                .join(department);
+            if let Err(e) = std::fs::create_dir_all(&wiki_dir) {
+                report.warning("agent-department", &final_id, format!("部門 wiki 目錄建立失敗: {e}"));
+            }
+            report.imported("agent-department", &format!("{final_id} → {department}"));
+        } else {
+            report.warning(
+                "agent-department",
+                &final_id,
+                format!("department '{}' 非合法部門名，略過", department.escape_debug()),
+            );
+        }
+    }
 
     // Merge agent.partial.toml onto the scaffolded agent.toml.
     let partial_path = pack_dir

@@ -34,6 +34,10 @@ import {
   Building2,
 } from 'lucide-react';
 import { GenerateExpertDialog } from '@/components/experts/GenerateExpertDialog';
+import { AttachUnderSelect } from '@/components/experts/AttachUnderSelect';
+
+/** WP-ORG — catalog section order (mirrors `duduclaw_core::org::CATALOG_CATEGORIES`). */
+const CATEGORY_ORDER = ['health', 'professional', 'retail', 'lifestyle', 'education', 'other'] as const;
 
 /**
  * ExpertsPage — 專家包 management (admin-only, mirrors the `experts.*` RPCs).
@@ -64,6 +68,9 @@ export function ExpertsPage() {
   } | null>(null);
   const [installingBuiltin, setInstallingBuiltin] = useState<string | null>(null);
   const [generateOpen, setGenerateOpen] = useState(false);
+  // WP-ORG — pending catalog install: pick the org placement, then confirm.
+  const [installTarget, setInstallTarget] = useState<ExpertCatalogEntry | null>(null);
+  const [attachUnder, setAttachUnder] = useState('');
 
   const load = useCallback(async () => {
     try {
@@ -89,11 +96,17 @@ export function ExpertsPage() {
 
   useEffect(() => { load(); }, [load]);
 
-  const handleInstallBuiltin = async (entry: ExpertCatalogEntry) => {
-    setInstallingBuiltin(entry.industry);
+  const handleInstallBuiltin = async () => {
+    if (!installTarget) return;
+    const entry = installTarget;
+    setInstallingBuiltin(entry.slug);
     try {
-      await api.experts.installBuiltin(entry.industry);
+      await api.experts.installBuiltin(
+        entry.kind === 'expert' ? { slug: entry.slug } : { industry: entry.industry },
+        attachUnder || undefined,
+      );
       toast.success(t('experts.install.success'));
+      setInstallTarget(null);
       await load();
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: formatError(e) }));
@@ -251,53 +264,78 @@ export function ExpertsPage() {
           </p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {catalog.packs.map((entry) => (
-            <Card key={entry.industry} className="gap-3">
-              <CardContent className="space-y-3">
-                <div className="min-w-0">
-                  <h3 className="truncate text-sm font-medium">{entry.label}</h3>
-                  {entry.description && (
-                    <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
-                      {entry.description}
-                    </p>
-                  )}
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-                    <Users className="size-3.5" />
-                    {intl.formatMessage({ id: 'experts.card.agents' }, { count: entry.agents_count })}
-                  </span>
-                  {entry.installed ? (
-                    <Badge variant="secondary">
-                      <Check />
-                      {t('experts.builtin.installed')}
-                    </Badge>
-                  ) : (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={installingBuiltin !== null}
-                      onClick={() => handleInstallBuiltin(entry)}
-                    >
-                      {installingBuiltin === entry.industry ? (
-                        <>
-                          <Spinner className="size-3.5" />
-                          {t('experts.installing')}
-                        </>
-                      ) : (
-                        <>
-                          <Download />
-                          {t('experts.builtin.install')}
-                        </>
+        CATEGORY_ORDER.map((category) => {
+          const entries = catalog.packs.filter(
+            (p) => (CATEGORY_ORDER.includes((p.category ?? '') as (typeof CATEGORY_ORDER)[number]) ? p.category : 'other') === category,
+          );
+          if (entries.length === 0) return null;
+          return (
+            <div key={category} className="space-y-2">
+              <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                {t(`experts.category.${category}`)}
+              </h3>
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {entries.map((entry) => (
+                  <Card key={entry.slug} className="gap-3">
+                    <CardContent className="space-y-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <h3 className="truncate text-sm font-medium">{entry.label}</h3>
+                          {entry.kind === 'expert' && (
+                            <Badge variant="ghost">{t('experts.kind.expert')}</Badge>
+                          )}
+                        </div>
+                        {entry.description && (
+                          <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+                            {entry.description}
+                          </p>
+                        )}
+                      </div>
+                      {(entry.departments?.length ?? 0) > 0 && (
+                        <div className="flex flex-wrap items-center gap-1">
+                          {entry.departments!.map((d) => (
+                            <Badge key={d} variant="ghost">{d}</Badge>
+                          ))}
+                        </div>
                       )}
-                    </Button>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
+                      <div className="flex items-center justify-between">
+                        <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                          <Users className="size-3.5" />
+                          {intl.formatMessage({ id: 'experts.card.agents' }, { count: entry.agents_count })}
+                        </span>
+                        {entry.installed ? (
+                          <Badge variant="secondary">
+                            <Check />
+                            {t('experts.builtin.installed')}
+                          </Badge>
+                        ) : (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={installingBuiltin !== null}
+                            onClick={() => { setAttachUnder(''); setInstallTarget(entry); }}
+                          >
+                            {installingBuiltin === entry.slug ? (
+                              <>
+                                <Spinner className="size-3.5" />
+                                {t('experts.installing')}
+                              </>
+                            ) : (
+                              <>
+                                <Download />
+                                {t('experts.builtin.install')}
+                              </>
+                            )}
+                          </Button>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            </div>
+          );
+        })
       )}
     </section>
   );
@@ -408,6 +446,49 @@ export function ExpertsPage() {
         onOpenChange={setGenerateOpen}
         onInstalled={() => { load(); }}
       />
+
+      <Dialog
+        open={installTarget !== null}
+        onOpenChange={(open) => { if (!open && installingBuiltin === null) setInstallTarget(null); }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {intl.formatMessage({ id: 'experts.attach.title' }, { name: installTarget?.label ?? '' })}
+            </DialogTitle>
+            <DialogDescription>
+              {intl.formatMessage(
+                { id: 'experts.attach.desc' },
+                { count: installTarget?.agents_count ?? 0 },
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <AttachUnderSelect
+            value={attachUnder}
+            onChange={setAttachUnder}
+            disabled={installingBuiltin !== null}
+          />
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setInstallTarget(null)}
+              disabled={installingBuiltin !== null}
+            >
+              {t('common.cancel')}
+            </Button>
+            <Button
+              variant="brand"
+              size="sm"
+              onClick={handleInstallBuiltin}
+              disabled={installingBuiltin !== null}
+            >
+              {installingBuiltin !== null && <Spinner className="size-3.5" />}
+              {t('experts.builtin.install')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={removeTarget !== null} onOpenChange={(open) => { if (!open) setRemoveTarget(null); }}>
         <DialogContent>

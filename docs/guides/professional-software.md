@@ -61,7 +61,7 @@ AutoCAD（`command` 要改成本機 venv 的絕對路徑）：
 
 見下節。這是必要步驟，不是選配。
 
-> 前述兩個專業軟體都有對應的付費專家包（`marketing-designer` 行銷設計師、`cad-drafter` CAD 製圖員），把 soul、`.mcp.json` 樣板、capability 設定與安全 SOP 打包好，一次安裝完成。
+> 前述兩個專業軟體都有對應的付費專家包（`marketing-designer` 行銷設計師、`cad-drafter` CAD 製圖員），把 soul、`.mcp.json` 樣板、capability 設定與安全 SOP 打包好，一次安裝完成。這些單一專家包也會出現在 dashboard 專家包頁的內建目錄（依職能部門標示），安裝時可用「匯報對象」選單（或 CLI `duduclaw expert install <pack> --attach-under <agent-id>`）把專家掛到既有主管之下，直接併入組織圖與部門。
 
 ## Capability 治理
 

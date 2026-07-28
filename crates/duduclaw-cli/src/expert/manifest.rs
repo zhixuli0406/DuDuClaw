@@ -50,6 +50,11 @@ pub struct ExpertSection {
     pub license: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Catalog category slug (`health` / `professional` / `retail` /
+    /// `lifestyle` / `education` / `other`) — dashboard section grouping.
+    /// Empty ⇒ the catalog derives one (or files under `other`).
+    #[serde(default)]
+    pub category: String,
     /// `[expert.prompts]` — recommended prompt strings to surface in the UI.
     #[serde(default)]
     pub prompts: Prompts,
@@ -92,6 +97,16 @@ pub struct ExpertAgent {
     /// In-pack supervisor by `name`. Empty = team root.
     #[serde(default)]
     pub reports_to: String,
+    /// Functional department this member joins on install (written to
+    /// `[agent] department`, org-chart / departments-page visible). Empty ⇒
+    /// no department, the pre-WP-ORG behaviour.
+    #[serde(default)]
+    pub department: String,
+    /// Display rank (`executive` / `manager` / `staff`). Informational for
+    /// the catalog UI; empty ⇒ derived from `role` via
+    /// `duduclaw_core::org::rank_for_role`.
+    #[serde(default)]
+    pub rank: String,
     /// Trigger keyword (defaults to `@<display_name>` when blank).
     #[serde(default)]
     pub trigger: String,
@@ -225,6 +240,27 @@ pub fn validate(manifest: &ExpertManifest, dir: &Path) -> Vec<Problem> {
                 &mut problems,
                 &field,
                 format!("'{}' 非合法 agent id", a.name.escape_debug()),
+            );
+        }
+        // Org placement: department must be a safe path segment, rank must be
+        // a known value (both optional).
+        if !a.department.trim().is_empty()
+            && !duduclaw_core::is_valid_department(a.department.trim())
+        {
+            push(
+                &mut problems,
+                &field,
+                format!("department '{}' 非合法部門名", a.department.escape_debug()),
+            );
+        }
+        if !a.rank.trim().is_empty() && duduclaw_core::org::OrgRank::parse(&a.rank).is_none() {
+            push(
+                &mut problems,
+                &field,
+                format!(
+                    "rank '{}' 非法（executive / manager / staff）",
+                    a.rank.escape_debug()
+                ),
             );
         }
         // reports_to must reference an in-pack agent (or be empty = root).
