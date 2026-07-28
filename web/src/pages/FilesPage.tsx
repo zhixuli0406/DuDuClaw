@@ -59,9 +59,14 @@ function formatSize(bytes: number): string {
   return `${value >= 100 ? Math.round(value) : value.toFixed(1)} ${units[i]}`;
 }
 
-/** Only PDFs and images preview natively; everything else force-downloads. */
+/** PDFs and images preview natively (streamed inline as-is). */
 function isPreviewable(name: string): boolean {
   return /\.(pdf|png|jpe?g|gif|webp)$/i.test(name);
+}
+
+/** Office types preview via the gateway's LibreOffice→PDF conversion. */
+function isOfficePreviewable(name: string): boolean {
+  return /\.(docx?|xlsx?|pptx?|odt|ods|odp|csv)$/i.test(name);
 }
 
 export function FilesPage() {
@@ -137,6 +142,16 @@ export function FilesPage() {
   const downloadUrl = useCallback(
     (name: string): string => {
       const url = buildUrl('/api/files/download', name);
+      return jwt ? `${url}&token=${encodeURIComponent(jwt)}` : url;
+    },
+    [buildUrl, jwt],
+  );
+
+  /** Preview URL — office types go through the LibreOffice→PDF endpoint;
+   *  natively-previewable types stream inline from the same endpoint. */
+  const previewUrl = useCallback(
+    (name: string): string => {
+      const url = buildUrl('/api/files/preview', name);
       return jwt ? `${url}&token=${encodeURIComponent(jwt)}` : url;
     },
     [buildUrl, jwt],
@@ -245,12 +260,16 @@ export function FilesPage() {
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center justify-end gap-1">
-                        {isPreviewable(f.name) && (
+                        {(isPreviewable(f.name) || isOfficePreviewable(f.name)) && (
                           <Tooltip>
                             <TooltipTrigger
                               render={
                                 <a
-                                  href={downloadUrl(f.name)}
+                                  href={
+                                    isPreviewable(f.name)
+                                      ? downloadUrl(f.name)
+                                      : previewUrl(f.name)
+                                  }
                                   target="_blank"
                                   rel="noreferrer"
                                   aria-label={intl.formatMessage({ id: 'files.preview' })}
@@ -264,7 +283,11 @@ export function FilesPage() {
                               }
                             />
                             <TooltipContent>
-                              {intl.formatMessage({ id: 'files.preview' })}
+                              {intl.formatMessage({
+                                id: isPreviewable(f.name)
+                                  ? 'files.preview'
+                                  : 'files.previewPdf',
+                              })}
                             </TooltipContent>
                           </Tooltip>
                         )}

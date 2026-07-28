@@ -3424,6 +3424,7 @@
   "files.error": "Failed to load files",
   "files.download": "Download",
   "files.preview": "Preview",
+  "files.previewPdf": "Preview (as PDF)",
   "files.count": "{count} files",
   "nav.canvas": "Canvas",
   "nav.canvas.desc": "Live visual workspace pushed by your AI staff",
