@@ -151,6 +151,7 @@ pub mod delegation_scope;
 pub mod governance;
 pub mod workforce_private;
 pub mod skill_approval;
+pub mod skill_gap_digest;
 pub mod skill_lifecycle;
 pub mod mdns;
 pub mod server;

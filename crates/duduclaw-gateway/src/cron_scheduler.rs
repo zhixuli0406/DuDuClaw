@@ -228,6 +228,18 @@ impl CronScheduler {
 
             self.reload().await;
 
+            // ── WP2.6 P1: scheduler-level daily skill-gap digest ──
+            // Rides the existing 30s tick (no new scheduler, mirroring the
+            // heartbeat task-board pull precedent). Internally gated: default
+            // OFF via `config.toml [skills] gap_digest_enabled`, and a
+            // persisted daily cursor makes at most one attempt per 24h.
+            {
+                let home = self.home_dir.clone();
+                tokio::spawn(async move {
+                    crate::skill_gap_digest::maybe_send_daily_digest(&home).await;
+                });
+            }
+
             let now = Utc::now();
             let mut to_spawn = Vec::new();
             {

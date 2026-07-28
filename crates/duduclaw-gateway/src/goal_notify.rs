@@ -66,7 +66,10 @@ pub(crate) fn agent_notify_target(home_dir: &Path, agent_id: &str) -> Option<(St
 /// Resolve the bot token for `channel`: the agent's own (walking `reports_to`)
 /// first, then the global `config.toml [channels]` token — matching the
 /// cron/delegation forwarding cascade.
-async fn channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> Option<String> {
+///
+/// `pub(crate)`: also reused by `skill_gap_digest` (WP2.6 P1), which pushes to
+/// the same `[proactive]` destination with the same token cascade.
+pub(crate) async fn channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> Option<String> {
     if let Some(tok) =
         crate::config_crypto::resolve_agent_channel_token_via_reports_to(home_dir, agent_id, channel)
     {
@@ -482,7 +485,10 @@ async fn send_with_markup(
 
 /// Send plain text to a channel via the shared sender factory. Returns whether
 /// delivery succeeded. Best-effort (logs, never panics).
-async fn send_plain_text(
+///
+/// `pub(crate)`: also reused by `skill_gap_digest` (WP2.6 P1) for its daily
+/// recommendation push.
+pub(crate) async fn send_plain_text(
     http: &reqwest::Client,
     channel: &str,
     token: &str,
