@@ -7533,6 +7533,22 @@ fn build_system_prompt(
             parts.push(contract_prompt);
         }
 
+        // WP1.3 hardening (2026-07-28): the 📎DELIVER protocol used to live
+        // only in the office SKILL.md files, so a model that skipped skill
+        // content wrote its .docx to ~/Desktop and never emitted the marker —
+        // the gateway then had nothing to send or archive. The rule is now
+        // always-on, static text (prompt-cache friendly), runtime-agnostic.
+        let deliver_rules = "## 檔案交付規則（強制）\n\
+            如果本次回覆產出任何檔案（docx/xlsx/pptx/pdf 等）：\n\
+            1. 檔案必須儲存在你的工作目錄（目前所在目錄）內，禁止寫到 ~/Desktop、/tmp 或其他外部路徑。\n\
+            2. 回覆最後把每個產出檔各自獨立一行標出：📎DELIVER:<絕對路徑>\n\
+            3. 沒有 📎DELIVER 標記，使用者就收不到檔案——只在文字裡描述檔案位置不算交付。";
+        audit.push(crate::prompt_audit::PromptSection::new(
+            "deliver_rules",
+            deliver_rules,
+        ));
+        parts.push(deliver_rules.to_string());
+
         // Progressive skill injection (when available)
         let mut skills_total_bytes: usize = 0;
         if let (Some(skills), Some(msg)) = (compressed_skills, user_message) {
@@ -7821,6 +7837,20 @@ pub async fn deliver_documents_for_reply(
     sender: &dyn crate::channel_sender::ChannelSender,
 ) -> String {
     if !reply.contains(crate::office_docs::DELIVER_MARKER) {
+        // Marker-less reply that TALKS about a produced document (live
+        // 2026-07-28 incident: real .docx written, marker forgotten, user got
+        // prose only) — run the deterministic sweep so recently-produced
+        // office files in the agent workdir still reach the user + archive.
+        if crate::office_docs::reply_mentions_document(&reply) {
+            if let Some(agent_dir) = resolve_agent_dir_for_delivery(ctx, explicit_agent).await {
+                crate::office_docs::sweep_undeclared_deliverables(
+                    &agent_dir,
+                    &ctx.home_dir,
+                    sender,
+                )
+                .await;
+            }
+        }
         return reply;
     }
     match resolve_agent_dir_for_delivery(ctx, explicit_agent).await {
