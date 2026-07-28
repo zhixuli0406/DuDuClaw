@@ -237,6 +237,162 @@ async fn deliver_one(
         .map_err(|e| e.to_string())
 }
 
+// ── WP1.3 hardening: undeclared-deliverable sweep ───────────────
+//
+// Live incident (2026-07-28): the agent produced a real .docx but wrote it to
+// ~/Desktop and never emitted `📎DELIVER:` — the user got prose claiming the
+// file exists, the gateway had nothing to send or archive. The always-on
+// prompt rule (channel_reply) attacks the cause; this sweep is the
+// deterministic net for the "wrote it in the workdir but forgot the marker"
+// half: after a marker-less reply that *talks about* a produced document,
+// recently-modified office files inside the agent directory are delivered and
+// archived exactly as if they had been declared.
+
+/// Extensions the sweep treats as user deliverables. Deliberately excludes
+/// `.md`/`.txt`/`.json` — agents constantly write those as internal state.
+const SWEEP_EXTS: &[&str] = &["docx", "xlsx", "pptx", "pdf", "csv", "odt", "ods", "odp"];
+/// Max age of a file's mtime for the sweep to attribute it to the reply that
+/// just finished (long CLI runs take minutes).
+const SWEEP_WINDOW_SECS: u64 = 15 * 60;
+/// Directory recursion cap — deliverables land at or near the workdir root.
+const SWEEP_MAX_DEPTH: usize = 3;
+/// At most this many files are auto-delivered per reply.
+const SWEEP_MAX_FILES: usize = 3;
+
+/// Heuristic gate: does the reply text talk about a produced document? Keeps
+/// the sweep from firing on unrelated replies (and narrows the window in
+/// which a concurrent conversation on the same agent could pick up the other
+/// conversation's file). This is a delivery heuristic, not a security
+/// decision — the fence stays `validate_deliver_path`.
+pub fn reply_mentions_document(reply: &str) -> bool {
+    let lower = reply.to_lowercase();
+    const KEYWORDS: &[&str] = &[
+        ".docx", ".xlsx", ".pptx", ".pdf", ".csv", "word", "excel", "powerpoint", "檔案", "文件",
+        "簡報", "報表", "試算表",
+    ];
+    KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
+/// Mirror of `media::save_attachment_in_base`'s filename sanitizer, used to
+/// match a workdir file against its archived `<ts>_<safe_name>` copies.
+fn sanitize_name(filename: &str) -> String {
+    filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// True when `attachments/` already holds a copy of `filename` with `size`
+/// bytes (archive names are `<ts>_<sanitized>`), meaning a previous turn
+/// already delivered this exact file — the sweep must not re-send it.
+fn already_archived(agent_dir: &Path, filename: &str, size: u64) -> bool {
+    let safe = sanitize_name(filename);
+    let Ok(entries) = std::fs::read_dir(agent_dir.join("attachments")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let suffix_match = name
+            .split_once('_')
+            .is_some_and(|(_, rest)| rest == safe);
+        if suffix_match && entry.metadata().is_ok_and(|m| m.len() == size) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Collect sweep candidates: office-typed files under `agent_dir` (depth ≤
+/// [`SWEEP_MAX_DEPTH`]) modified within [`SWEEP_WINDOW_SECS`], excluding
+/// `attachments/` (already archived) and hidden/internal directories. Newest
+/// first, capped at [`SWEEP_MAX_FILES`].
+fn sweep_candidates(agent_dir: &Path) -> Vec<PathBuf> {
+    const SKIP_DIRS: &[&str] = &[
+        "attachments",
+        "sessions",
+        "logs",
+        "memory",
+        "wiki",
+        "node_modules",
+        "target",
+    ];
+    let now = std::time::SystemTime::now();
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(agent_dir.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_dir() {
+                if depth + 1 <= SWEEP_MAX_DEPTH
+                    && !name.starts_with('.')
+                    && !SKIP_DIRS.contains(&name)
+                {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            let ext_ok = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| SWEEP_EXTS.contains(&e.to_ascii_lowercase().as_str()));
+            if !ext_ok {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(modified) = meta.modified() else { continue };
+            let recent = now
+                .duration_since(modified)
+                .map(|age| age.as_secs() <= SWEEP_WINDOW_SECS)
+                .unwrap_or(true); // mtime in the future (clock skew) still counts
+            if !recent || already_archived(agent_dir, name, meta.len()) {
+                continue;
+            }
+            found.push((modified, path));
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().take(SWEEP_MAX_FILES).map(|(_, p)| p).collect()
+}
+
+/// Deliver + archive recently-produced office files the agent forgot to
+/// declare with `📎DELIVER:`. Returns how many files were sent. Failures are
+/// logged and skipped — the sweep is a net, never a new failure mode for the
+/// reply itself.
+pub async fn sweep_undeclared_deliverables(
+    agent_dir: &Path,
+    home_dir: &Path,
+    sender: &dyn ChannelSender,
+) -> usize {
+    let candidates = sweep_candidates(agent_dir);
+    let mut sent = 0usize;
+    for path in candidates {
+        let raw = path.to_string_lossy();
+        match deliver_one(&raw, agent_dir, home_dir, sender).await {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "deliver sweep: sent undeclared produced file");
+                sent += 1;
+            }
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "deliver sweep: send failed — skipped");
+            }
+        }
+    }
+    sent
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -475,6 +631,85 @@ mod tests {
         let reply = "一般回覆，沒有附件。\n第二行。";
         let out = process_deliverables(reply, &agent_dir, &home, &sender).await;
         assert_eq!(out, reply);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── undeclared-deliverable sweep ────────────────────────────────
+
+    #[test]
+    fn reply_mentions_document_gate() {
+        assert!(reply_mentions_document("Word 檔已產出：report.docx"));
+        assert!(reply_mentions_document("已完成簡報初稿"));
+        assert!(reply_mentions_document("The Excel summary is ready"));
+        assert!(!reply_mentions_document("今天天氣不錯，行程已確認"));
+    }
+
+    #[test]
+    fn sweep_candidates_picks_recent_office_files_only() {
+        let home = std::env::temp_dir().join(format!("dd-sweep-{}", uuid::Uuid::new_v4()));
+        let agent_dir = home.join("agents").join("a");
+        std::fs::create_dir_all(agent_dir.join("attachments")).unwrap();
+        std::fs::create_dir_all(agent_dir.join("out")).unwrap();
+
+        // Fresh deliverable in the workdir root + one in a subdir.
+        std::fs::write(agent_dir.join("報告.docx"), b"d1").unwrap();
+        std::fs::write(agent_dir.join("out").join("data.xlsx"), b"d2").unwrap();
+        // Internal-state file types are never swept.
+        std::fs::write(agent_dir.join("SOUL.md"), b"soul").unwrap();
+        std::fs::write(agent_dir.join("state.json"), b"{}").unwrap();
+        // Files already under attachments/ are archives, not candidates.
+        std::fs::write(agent_dir.join("attachments").join("old.docx"), b"a").unwrap();
+
+        let got = sweep_candidates(&agent_dir);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(got.len(), 2, "got: {names:?}");
+        assert!(names.contains(&"報告.docx".to_string()));
+        assert!(names.contains(&"data.xlsx".to_string()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn sweep_skips_already_archived_copy() {
+        let home = std::env::temp_dir().join(format!("dd-sweep-dup-{}", uuid::Uuid::new_v4()));
+        let agent_dir = home.join("agents").join("a");
+        std::fs::create_dir_all(agent_dir.join("attachments")).unwrap();
+        // Workdir file whose archived copy (same sanitized name + size)
+        // already exists — a previous turn delivered it.
+        std::fs::write(agent_dir.join("report.docx"), b"same-bytes").unwrap();
+        std::fs::write(
+            agent_dir.join("attachments").join("1785000000000_report.docx"),
+            b"same-bytes",
+        )
+        .unwrap();
+        assert!(sweep_candidates(&agent_dir).is_empty());
+
+        // Changed content (different size) → delivered again.
+        std::fs::write(agent_dir.join("report.docx"), b"same-bytes-v2!").unwrap();
+        assert_eq!(sweep_candidates(&agent_dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn sweep_delivers_and_archives_undeclared_file() {
+        let home = std::env::temp_dir().join(format!("dd-sweep-send-{}", uuid::Uuid::new_v4()));
+        let agent_dir = home.join("agents").join("a");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("總覽.docx"), b"docx-bytes").unwrap();
+        let docs = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender {
+            docs: docs.clone(),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            fail_docs: false,
+        };
+        let sent = sweep_undeclared_deliverables(&agent_dir, &home, &sender).await;
+        assert_eq!(sent, 1);
+        assert_eq!(docs.lock().unwrap().len(), 1);
+        // Archived copy exists → an immediate second sweep is a no-op.
+        let sent2 = sweep_undeclared_deliverables(&agent_dir, &home, &sender).await;
+        assert_eq!(sent2, 0, "dedup against the archive must hold");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
