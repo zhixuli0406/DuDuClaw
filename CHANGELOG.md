@@ -31,6 +31,18 @@
   檔根本沒有預覽鍵。與 download 相同的 JWT 驗證＋路徑圍欄。
 
 ### Fixed
+- **Grok CLI runtime「只旁白不執行」三層根因（客戶實測 2026-07-28）**：grok-4.5 agent
+  回「正在查詢…」但從不真的呼叫工具。①grok 對專案層 `.grok/config.toml` 的 MCP 註冊
+  設有互動式資料夾信任閘，headless `-p` 永遠無法核准 → duduclaw MCP server 從未啟動；
+  spawn env 加 `GROK_FOLDER_TRUST=0`（活體驗證 `grok inspect` trusted no→yes）。
+  ②duduclaw `mcp-server` 在 log 目錄不可寫的環境會因 rolling appender 初始化 panic
+  整個死掉（宿主看到 handshake Broken pipe、整個工具面消失）；改用 fallible builder，
+  寫不了檔就降級純 stderr logging，絕不為診斷便利犧牲工具面。③`grok -p` 無法顯示
+  工具核准提示 → spawn 加 `--permission-mode bypassPermissions`＋能力對映
+  `--sandbox`；built-in workspace/read-only profile 會連 MCP 子行程一起關進沙箱、
+  弄死 SQLite 狀態（活體實錘「Failed to open memory DB」），故改寫入自訂 profile
+  `duduclaw-ww`/`duduclaw-ro`（extends 內建＋放行 duduclaw home）。活體驗證：
+  `grok -p` 實際呼叫 `list_agents` 回傳三 agent 名單。
 - **產檔交付雙保險（活體事故 2026-07-28）**：agent 真做出 .docx 卻寫到 ~/Desktop 且
   沒帶 `📎DELIVER:` 標記——使用者只收到文字、檔案頁無歸檔。①提示詞硬化：交付規則
   從 office SKILL.md 升級為 channel system prompt **常駐區塊**（靜態文字、prompt-cache

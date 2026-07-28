@@ -46,6 +46,13 @@ use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 
 /// Hard backstop on the whole subprocess.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// Custom sandbox profile names written by [`GrokRuntime::ensure_sandbox_profiles`]
+/// into `<agent_dir>/.grok/sandbox.toml` and referenced by the spawn's
+/// `--sandbox` flag. Both extend a built-in profile with the duduclaw home
+/// writable (the built-ins kill the MCP sidecar's SQLite state).
+const SANDBOX_PROFILE_WW: &str = "duduclaw-ww";
+const SANDBOX_PROFILE_RO: &str = "duduclaw-ro";
 /// Availability-probe timeout — a bare `grok` starts the interactive TUI, so the
 /// probe must never be able to hang the registry.
 const PROBE_TIMEOUT_SECS: u64 = 5;
@@ -286,6 +293,16 @@ impl AgentRuntime for GrokRuntime {
                     "failed to write grok MCP config — continuing without it"
                 );
             }
+            // Custom sandbox profiles (duduclaw state dir writable) — see the
+            // --sandbox mapping below for why the built-ins are unusable.
+            if let Err(e) = Self::ensure_sandbox_profiles(dir, &context.home_dir).await {
+                warn!(
+                    runtime = "grok",
+                    agent = %context.agent_id,
+                    error = %e,
+                    "failed to write grok sandbox profiles — sandboxed spawns may lose MCP tools"
+                );
+            }
         }
 
         let payload = build_prompt(context, prompt);
@@ -326,6 +343,34 @@ impl AgentRuntime for GrokRuntime {
             }
         }
 
+        // Headless tool execution (2026-07-28 root cause of "narrates but never
+        // executes"): `grok -p` cannot show approval prompts, so every tool
+        // call that needs confirmation is dead on arrival — the model then
+        // narrates ("正在查詢…") and exits without calling anything. Mirror the
+        // codex runtime-parity model: the capability-derived OS sandbox
+        // profile is the hard wall, approvals are off for the unattended run.
+        //
+        // CRITICAL: the BUILT-IN `workspace`/`read-only` profiles also wrap
+        // the MCP children grok spawns, and they deny writes to `~/.duduclaw`
+        // — live-verified to kill the duduclaw mcp-server at boot ("Failed to
+        // open memory DB") and hang the session. The custom profiles written
+        // by `ensure_sandbox_profiles` extend the built-ins with the duduclaw
+        // state dir writable (its own MCP scope gates + [capabilities] policy
+        // remain the access control there). Live-verified working end-to-end.
+        match sandbox_level_for(caps) {
+            duduclaw_core::types::SandboxLevel::ReadOnly => {
+                args.push("--sandbox".to_string());
+                args.push(SANDBOX_PROFILE_RO.to_string());
+            }
+            duduclaw_core::types::SandboxLevel::WorkspaceWrite => {
+                args.push("--sandbox".to_string());
+                args.push(SANDBOX_PROFILE_WW.to_string());
+            }
+            duduclaw_core::types::SandboxLevel::FullAccess => {}
+        }
+        args.push("--permission-mode".to_string());
+        args.push("bypassPermissions".to_string());
+
         // Prompt LAST as the value of `-p, --single` (verified value-consuming).
         args.push("-p".to_string());
         args.push(payload.clone());
@@ -337,7 +382,16 @@ impl AgentRuntime for GrokRuntime {
         // the PTY retry so both spawns look at the same credential root.
         let user_home = resolve_user_home(&context.home_dir, std::env::var("HOME").ok().as_deref());
         let grok_home_override = std::env::var("GROK_HOME").ok();
-        let home_env = build_home_env(&user_home, grok_home_override.as_deref());
+        let mut home_env = build_home_env(&user_home, grok_home_override.as_deref());
+        // Folder-trust gate (2026-07-28, verified `grok inspect`: "Project
+        // trusted: no"): the per-agent `.grok/config.toml` this runtime writes
+        // only ACTIVATES once the folder is trusted — untrusted, the duduclaw
+        // MCP server is discovered but never started, so headless runs had no
+        // tools at all. The agent dir and its config are duduclaw-managed
+        // (written by us two lines up), so disable the gate for this spawn
+        // only via the documented `GROK_FOLDER_TRUST=0` env. Shared with the
+        // PTY retry through `home_env` so both spawns behave identically.
+        home_env.push(("GROK_FOLDER_TRUST".to_string(), "0".to_string()));
 
         // Auth: forward `XAI_API_KEY` when set (verified var — NOT GROK_API_KEY).
         // Interactive `grok login` sessions are honoured by the CLI itself.
@@ -682,6 +736,72 @@ impl GrokRuntime {
         Some(toml::Value::Table(table))
     }
 
+    /// Ensure `<agent_dir>/.grok/sandbox.toml` defines the two custom sandbox
+    /// profiles the spawn's `--sandbox` mapping references. Both extend a
+    /// built-in profile and additionally grant `read_write` on the duduclaw
+    /// home so the MCP sidecar's SQLite/JSONL state stays writable (the
+    /// built-in profiles kill it — live-verified "Failed to open memory DB").
+    /// Merge-preserving and idempotent, same contract as `write_mcp_config`.
+    pub async fn ensure_sandbox_profiles(
+        agent_dir: &std::path::Path,
+        home_dir: &std::path::Path,
+    ) -> Result<bool, String> {
+        let path = agent_dir.join(".grok").join("sandbox.toml");
+        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        let mut root: toml::Value = if existing.trim().is_empty() {
+            toml::Value::Table(toml::map::Map::new())
+        } else {
+            toml::from_str(&existing).map_err(|e| format!("malformed grok sandbox.toml: {e}"))?
+        };
+        let root_tbl = root
+            .as_table_mut()
+            .ok_or_else(|| "grok sandbox.toml root is not a table".to_string())?;
+        let profiles = root_tbl
+            .entry("profiles".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if !profiles.is_table() {
+            *profiles = toml::Value::Table(toml::map::Map::new());
+        }
+        let map = profiles
+            .as_table_mut()
+            .expect("profiles normalized to table above");
+
+        let home = home_dir.to_string_lossy().to_string();
+        let mk = |base: &str| {
+            let mut t = toml::map::Map::new();
+            t.insert("extends".to_string(), toml::Value::String(base.to_string()));
+            t.insert(
+                "read_write".to_string(),
+                toml::Value::Array(vec![toml::Value::String(home.clone())]),
+            );
+            toml::Value::Table(t)
+        };
+        let mut changed = false;
+        for (name, base) in [
+            (SANDBOX_PROFILE_WW, "workspace"),
+            (SANDBOX_PROFILE_RO, "read-only"),
+        ] {
+            let def = mk(base);
+            if map.get(name) != Some(&def) {
+                map.insert(name.to_string(), def);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(false);
+        }
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let rendered = toml::to_string_pretty(&root).map_err(|e| e.to_string())?;
+        tokio::fs::write(&path, rendered)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
     /// Ensure the duduclaw MCP server is registered in the agent's
     /// `.grok/config.toml`. Called before every spawn; idempotent.
     pub async fn ensure_duduclaw_mcp_config(
@@ -716,6 +836,32 @@ mod tests {
             conversation_history: vec![],
             capabilities: None,
         }
+    }
+
+    #[tokio::test]
+    async fn sandbox_profiles_write_and_are_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let home = tmp.path().join("home");
+
+        let first = GrokRuntime::ensure_sandbox_profiles(&agent_dir, &home)
+            .await
+            .unwrap();
+        assert!(first, "first call must write");
+        let raw = std::fs::read_to_string(agent_dir.join(".grok").join("sandbox.toml")).unwrap();
+        let parsed: toml::Value = toml::from_str(&raw).unwrap();
+        for (name, base) in [("duduclaw-ww", "workspace"), ("duduclaw-ro", "read-only")] {
+            let p = &parsed["profiles"][name];
+            assert_eq!(p["extends"].as_str(), Some(base));
+            let rw = p["read_write"].as_array().unwrap();
+            assert_eq!(rw[0].as_str().unwrap(), home.to_string_lossy());
+        }
+
+        let second = GrokRuntime::ensure_sandbox_profiles(&agent_dir, &home)
+            .await
+            .unwrap();
+        assert!(!second, "second call must be a no-op");
     }
 
     #[test]
