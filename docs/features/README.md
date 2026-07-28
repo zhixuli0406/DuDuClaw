@@ -1,6 +1,6 @@
 # DuDuClaw Feature Highlights
 
-> DuDuClaw v1.21.1 | Last updated: 2026-06-21
+> DuDuClaw v1.46.0 | Last updated: 2026-07-29
 
 This directory contains detailed introductions to DuDuClaw's standout features. Each article explains the design rationale, system behavior, and operational flow — aimed at developers who want to understand *how things work* without diving into source code.
 
@@ -40,6 +40,12 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 28 | [Live Run Forking](28-live-forking.md) | Parallel branches + AI judge (duduclaw-fork, RFC-26) |
 | 29 | [Evolution Events](29-evolution-events.md) | Black-box recorder with batch+retry delivery |
 | 30 | [Custom Dashboard Widgets](30-custom-widgets.md) | AI-guided or raw-HTML dashboard cards in a sandbox |
+| 31 | [Office Document Suite](31-office-document-suite.md) | Real docx/xlsx/pptx/pdf output with the DELIVER protocol, archive and preview |
+| 32 | [Expert Packs](32-expert-packs.md) | Installable AI teams: built-in catalog, LLM-guided authoring, department × rank org placement |
+| 33 | [OS-Native Perception & Proactive Care](33-os-native-perception.md) | File watch + frontmost sensing → footprint memory, care checks, one-click automations |
+| 34 | [Autonomous Goal Loop](34-goal-loop.md) | /goal → loop to completion with an MAV acceptance judge; stuck escalates to a human |
+| 35 | [Photo → Desktop Pet](35-photo-desktop-pet.md) | Local photo-to-pixel-pet pipeline with a Codex-Pets spritesheet and wander engine |
+| 36 | [Recording → Skill](36-recording-to-skill.md) | Browser/desktop recordings distilled into approval-gated SKILL.md drafts |
 
 ---
 

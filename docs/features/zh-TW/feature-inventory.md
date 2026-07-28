@@ -1,10 +1,32 @@
 # DuDuClaw 完整功能清單
 
-> v1.24.0 核心 + 2026-07 新增 | 最後更新：2026-07-09
+> v1.24.0 核心 + 2026-07 新增 | 最後更新：2026-07-29（v1.46.0）
 >
 > 說明:以下各章為 v1.24.0 基準。緊接其後的**「2026-07 新增」**區塊涵蓋此後落地的功能(權威清單見 `CHANGELOG.md` `[Unreleased]`)。本檔已與英文版同步至 2026-07。
 
 ---
+
+## 2026-07 中後期新增(v1.33 – v1.46)
+
+| 功能 | 說明 |
+|------|------|
+| 統一 LLM provider 層(`duduclaw-llm`) | 一套正規化的 request/stream 形狀,涵蓋四種原生協議(Anthropic / OpenAI Responses / Gemini / OpenAI-compat,8 個 preset);`ModelRegistry` 定價 + `FallbackRouter` 冷卻;stdio MCP client + provider 無關的 tool loop,讓 API 模式 agent 取得完整工具面 |
+| Agent 行為評測(`duduclaw eval`) | 每 agent 的 golden-task 回歸:確定性 tool-call/regex/grounded 斷言 + 可選 LLM 判官;live 與 replay 兩種模式,exit code 可作 CI 閘 |
+| HITL ApprovalBroker | 橫跨 MCP 工具 / autopilot / bus 任務的單一中斷/審批原語;SQLite 落地,TTL 過期 = DENY(fail-closed) |
+| OpenTelemetry GenAI 追蹤 | opt-in 的 `gen_ai.*` span,可經 OTLP 匯出至 Langfuse/Grafana/Jaeger/Datadog;關閉時零開銷 |
+| 通道 UX 層 | 各平台 markdown 渲染、輸入中指示,以及跨 8 個外部通道就地編輯的即時 todo 看板進度 |
+| 自主目標迴圈 | `/goal` → 迴圈跑到完成,配三面向 MAV 驗收判官;卡住時經通道按鈕升級給人([34-goal-loop.md](34-goal-loop.md)) |
+| 迭代式看板輪次 | Task board `revising` 狀態機,含逐輪明細歷史 |
+| 可信記憶與判官強化(v1.41) | 寫入時 origin 綁定 + 抗 Sybil 再確認、GovMem 晉升閘、Janus 規則觀察期、PORTICO 任務範圍能力授權、trace-grounded 評測斷言 |
+| OS 原生感知與主動關懷 | 檔案監看 + 前景感知 → footprint temporal memory(重啟可續的快照)、內建主動關懷檢查、LLM 評分主動閘、一鍵 OS 自動化範本([33-os-native-perception.md](33-os-native-perception.md)) |
+| Office 文件套件 | 真正的 docx/xlsx/pptx/pdf 產出、📎DELIVER 協議 + 未宣告產出 sweep、gateway 歸檔、含 LibreOffice 預覽的 Files 頁([31-office-document-suite.md](31-office-document-suite.md)) |
+| 專家包生態系 | 可安裝的 AI 團隊:經安全掃描的安裝管線、含分類/部門分組的內建產業目錄、LLM 引導的包自製、部門 × 職級組織定位與 `--attach-under`([32-expert-packs.md](32-expert-packs.md)) |
+| 錄製 → skill | 瀏覽器(Playwright trace+HAR,憑證就地遮罩)與桌面錄製器,蒸餾成須核准的 SKILL.md 草稿([36-recording-to-skill.md](36-recording-to-skill.md)) |
+| 照片 → 桌面寵物 | 本地照片 → 去背 → 像素量化 → Codex-Pets 8×9 spritesheet;自主遊蕩引擎移動真正的置頂視窗([35-photo-desktop-pet.md](35-photo-desktop-pet.md)) |
+| 能力功能開關 | 16 組白話功能群組疊在原始 allow/deny 工具清單之上,背後是完整性防護的工具目錄 |
+| Google Workspace / Notion / GitHub 原生工具 | Gmail/Calendar/Drive/Sheets、Notion、GitHub 的第一方 MCP 工具(v1.45;設定前預設隱藏) |
+| 桌面殼層(Tauri 2) | 原生視窗包裝 gateway + 儀表板、tray、gateway 選擇器、透明桌面寵物 overlay 視窗 |
+| 互動節奏防護 | 對話歷史框架 + 常駐節奏規則,打招呼永不重新觸發先前的重工具任務 |
 
 ## 2026-07 新增(v1.24.0 之後)
 

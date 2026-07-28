@@ -1,6 +1,6 @@
 # DuDuClaw Complete Feature Inventory
 
-> v1.24.0 core + 2026-07 additions | Last updated: 2026-07-09
+> v1.24.0 core + 2026-07 additions | Last updated: 2026-07-29 (v1.46.0)
 >
 > Note: the sections below describe the v1.24.0 baseline. The **2026-07
 > additions** block immediately after captures features shipped since (see
@@ -8,6 +8,28 @@
 > `zh-TW/` mirrors are synced with the 2026-07 additions.
 
 ---
+
+## 2026-07 mid/late additions (v1.33 – v1.46)
+
+| Feature | Description |
+|---------|-------------|
+| Unified LLM provider layer (`duduclaw-llm`) | One normalized request/stream shape over four native protocols (Anthropic / OpenAI Responses / Gemini / OpenAI-compat, 8 presets); `ModelRegistry` pricing + `FallbackRouter` cooldowns; stdio MCP client + provider-agnostic tool loop so API-mode agents get the full tool surface |
+| Agent behavioral evals (`duduclaw eval`) | Golden-task regression per agent: deterministic tool-call/regex/grounded assertions + optional LLM judge; live and replay modes, CI-gating exit code |
+| HITL ApprovalBroker | One interrupt/approval primitive across MCP tools / autopilot / bus tasks; SQLite-backed, TTL expiry = DENY (fail-closed) |
+| OpenTelemetry GenAI tracing | Opt-in `gen_ai.*` spans, OTLP-exportable to Langfuse/Grafana/Jaeger/Datadog; zero overhead when off |
+| Channel UX layer | Per-platform markdown rendering, typing indicators, live todo-board progress edited in place across 8 external channels |
+| Autonomous Goal Loop | `/goal` → loop-to-completion with a three-aspect MAV acceptance judge; stuck escalates to a human with channel buttons ([34-goal-loop.md](34-goal-loop.md)) |
+| Iterative kanban rounds | Task board `revising` state machine with per-round detail history |
+| Trusted memory & judge hardening (v1.41) | Write-time origin binding with Sybil-resistant reaffirmation, GovMem promotion gate, Janus rule probation, PORTICO task-scoped capability grants, trace-grounded eval assertions |
+| OS-native perception & proactive care | File watch + frontmost sensing → footprint temporal memory (restart-durable snapshots), built-in proactive care checks, LLM-scored proactive gate, one-click OS automation templates ([33-os-native-perception.md](33-os-native-perception.md)) |
+| Office document suite | Real docx/xlsx/pptx/pdf output, 📎DELIVER protocol + undeclared-output sweep, gateway archive, files page with LibreOffice preview ([31-office-document-suite.md](31-office-document-suite.md)) |
+| Expert packs ecosystem | Installable AI teams: security-scanned install pipeline, built-in industry catalog with category/department grouping, LLM-guided pack authoring, department × rank org placement with `--attach-under` ([32-expert-packs.md](32-expert-packs.md)) |
+| Recording → skill | Browser (Playwright trace+HAR, secrets redacted in place) and desktop recorders distilled into approval-gated SKILL.md drafts ([36-recording-to-skill.md](36-recording-to-skill.md)) |
+| Photo → desktop pet | Local photo → background removal → pixel quantization → Codex-Pets 8×9 spritesheet; autonomous wander engine moving a real always-on-top window ([35-photo-desktop-pet.md](35-photo-desktop-pet.md)) |
+| Capability feature toggles | 16 plain-language feature groups over the raw allow/deny tool lists, backed by a completeness-guarded tool catalog |
+| Google Workspace / Notion / GitHub native tools | First-party MCP tools for Gmail/Calendar/Drive/Sheets, Notion, GitHub (v1.45; hidden by default until configured) |
+| Desktop shell (Tauri 2) | Native window wrapping gateway + dashboard, tray, gateway picker, transparent desktop-pet overlay window |
+| Interaction pacing guard | Conversation-history framing + always-on pacing rule so greetings never re-trigger prior tool-heavy tasks |
 
 ## 2026-07 additions (post-v1.24.0)
 
