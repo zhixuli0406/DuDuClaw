@@ -29,6 +29,8 @@ pub mod mcp_memory_handlers;
 pub mod mcp_memory_quota;
 pub mod mcp_namespace;
 pub mod mcp_rate_limit;
+pub mod mcp_recording;         // WP3.3 R1/R3: browser + desktop recording capture
+pub(crate) mod mcp_recording_distill; // WP3.3 R2: HAR redaction/parsing + skill_from_recording
 pub mod mcp_redact;
 pub mod mcp_redaction;         // RFC-23 redaction pipeline integration
 pub mod redaction_verify;      // WP2: `duduclaw redaction verify` evidence report
@@ -463,6 +465,21 @@ enum Commands {
 
     /// Start DuDuClaw MCP server (for Claude Code integration)
     McpServer,
+
+    /// (internal) Desktop recording worker loop — spawned detached by the
+    /// `desktop_record_start` MCP tool (WP3.3 R3). Hidden from help.
+    #[command(hide = true)]
+    DesktopRecordWorker {
+        /// Recording directory (~/.duduclaw/recordings/<id>).
+        #[arg(long)]
+        dir: PathBuf,
+        /// Capture interval in milliseconds (default 1000 = 1 fps).
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Hard auto-stop cap in seconds.
+        #[arg(long, default_value_t = 1800)]
+        max_seconds: u64,
+    },
 
     /// MCP refresh-token management (v1.16.0).
     ///
@@ -1412,6 +1429,11 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Security => cmd_security_posture().await,
         Commands::Import { file, force } => cmd_import_data(file, force).await,
         Commands::McpServer => cmd_mcp_server().await,
+        Commands::DesktopRecordWorker { dir, interval_ms, max_seconds } => {
+            let code =
+                mcp_recording::run_desktop_record_worker(dir, interval_ms, max_seconds).await;
+            std::process::exit(code);
+        }
         Commands::Mcp(mcp_cmd) => cmd_mcp(mcp_cmd, &duduclaw_home()).await,
         Commands::Wizard => wizard::cmd_wizard(&duduclaw_home()).await,
         Commands::Test { name, bank } => cmd_test_agent(&name, bank.as_deref()).await,
