@@ -100,7 +100,7 @@ async fn native_install_list_remove_roundtrip() {
     build_native_pack(pack.path());
 
     // ── install ──
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
         .await
         .expect("install should succeed");
 
@@ -154,7 +154,7 @@ async fn native_install_list_remove_roundtrip() {
     );
 
     // Re-install must be refused (idempotency guard).
-    let dup = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false).await;
+    let dup = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false).await;
     assert!(dup.is_err(), "duplicate install should be refused");
 
     // ── export (reverse .mcp.json flow: aggregate, strip duduclaw) ──
@@ -189,6 +189,9 @@ async fn native_install_list_remove_roundtrip() {
     assert!(!agents.join("front").exists());
     assert!(!agents.join("nurse").exists());
     assert!(!home.path().join("shared/wiki/policies/clinic.md").exists());
+    // Emptied wiki namespace dirs are pruned (fence itself survives).
+    assert!(!home.path().join("shared/wiki/policies").exists());
+    assert!(home.path().join("shared/wiki").exists());
     assert!(list_records(home.path()).is_empty());
 }
 
@@ -198,7 +201,7 @@ async fn dry_run_writes_nothing() {
     let pack = TempTree::new("pack");
     build_native_pack(pack.path());
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), true, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), true, false, false)
         .await
         .expect("dry-run should succeed");
 
@@ -225,7 +228,7 @@ async fn claude_plugin_import_maps_agents() {
     // A hook must be imported DISABLED, never wired.
     write(&pack.path().join("hooks/pre.sh"), "#!/bin/sh\necho hi\n");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
         .await
         .expect("plugin import should succeed");
 
@@ -260,7 +263,7 @@ async fn single_skill_import() {
         &pack.path().join("SKILL.md"),
         "---\nname: translate\ndescription: Translate between languages\n---\n\nTranslate the input faithfully.\n",
     );
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false)
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
         .await
         .expect("skill import should succeed");
     assert!(home.path().join("skills/translate/SKILL.md").is_file());
@@ -272,7 +275,7 @@ async fn unrecognised_format_is_rejected() {
     let home = TempTree::new("home");
     let pack = TempTree::new("junk");
     write(&pack.path().join("random.txt"), "nothing recognisable");
-    let res = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false).await;
+    let res = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false).await;
     assert!(res.is_err(), "unrecognised layout must be rejected");
     assert!(!home.path().join("agents").exists());
 }
@@ -287,8 +290,141 @@ async fn injection_laden_persona_is_blocked() {
     );
     // The scan blocks the only asset → nothing installed, and no record is
     // written (fail-closed).
-    let _ = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false).await;
+    let _ = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false).await;
     assert!(!home.path().join("skills/evil").exists());
+}
+
+// ─────────────────── hooks ApprovalBroker lifecycle ───────────────────
+
+/// Build a minimal Claude-plugin pack carrying one hook.
+fn build_hook_pack(dir: &Path, slug: &str) {
+    write(
+        &dir.join(".claude-plugin/plugin.json"),
+        &format!(r#"{{ "name": "{slug}", "description": "hook pack", "version": "1.0.0" }}"#),
+    );
+    write(
+        &dir.join("agents/helper.md"),
+        "---\nname: helper\n---\n\nYou help with tasks politely.\n",
+    );
+    write(
+        &dir.join("hooks/pre-tool.sh"),
+        "#!/bin/sh\necho auditing tool call\n",
+    );
+}
+
+#[tokio::test]
+async fn hooks_without_trust_are_pending_and_fail_closed() {
+    use super::hooks::{self, HOOKS_ACTION_KIND, HooksStatus};
+    let home = TempTree::new("home");
+    let pack = TempTree::new("hookpack");
+    build_hook_pack(pack.path(), "hooky");
+
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
+        .await
+        .expect("install should succeed");
+
+    // Quarantined, NOT enabled (fail-closed).
+    assert!(hooks::disabled_dir(home.path(), "hooky")
+        .join("pre-tool.sh")
+        .is_file());
+    assert!(!hooks::enabled_dir(home.path(), "hooky").exists());
+
+    // State machine: pending_approval with a filed approval id.
+    let state = hooks::read_state(home.path(), "hooky").expect("state written");
+    assert_eq!(state.status, HooksStatus::PendingApproval);
+    let approval_id = state.approval_id.clone().expect("approval filed");
+    assert_eq!(state.files, vec!["pre-tool.sh".to_string()]);
+
+    // The approval record is broker-visible with the right kind/payload and a
+    // summary carrying file name + command excerpt (dashboard-compatible).
+    let broker = duduclaw_gateway::approval::ApprovalBroker::open(home.path()).unwrap();
+    let pending = broker.list_pending(None).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    let rec = &pending[0];
+    assert_eq!(rec.id.as_str(), approval_id);
+    assert_eq!(rec.action_kind, HOOKS_ACTION_KIND);
+    assert_eq!(rec.payload["slug"], "hooky");
+    assert_eq!(rec.payload["files"][0], "pre-tool.sh");
+    assert!(rec.summary.contains("pre-tool.sh"));
+    assert!(rec.summary.contains("echo auditing tool call"));
+}
+
+#[tokio::test]
+async fn trust_hooks_flag_enables_immediately() {
+    use super::hooks::{self, HooksStatus};
+    let home = TempTree::new("home");
+    let pack = TempTree::new("hookpack");
+    build_hook_pack(pack.path(), "trusty");
+
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, true)
+        .await
+        .expect("install should succeed");
+
+    let state = hooks::read_state(home.path(), "trusty").expect("state written");
+    assert_eq!(state.status, HooksStatus::Enabled);
+    assert!(state.approval_id.is_none(), "explicit grant, no approval filed");
+    assert!(hooks::enabled_dir(home.path(), "trusty")
+        .join("pre-tool.sh")
+        .is_file());
+    // No pending approval left behind.
+    let broker = duduclaw_gateway::approval::ApprovalBroker::open(home.path()).unwrap();
+    assert!(broker.list_pending(None).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn approved_hooks_enable_via_hooks_cmd() {
+    use super::hooks::{self, HooksStatus};
+    let home = TempTree::new("home");
+    let pack = TempTree::new("hookpack");
+    build_hook_pack(pack.path(), "approved");
+
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
+        .await
+        .unwrap();
+    let state = hooks::read_state(home.path(), "approved").unwrap();
+    let id = duduclaw_gateway::approval::ApprovalId::from(state.approval_id.clone().unwrap());
+
+    // Human approves (dashboard approvals.decide equivalent).
+    let broker = duduclaw_gateway::approval::ApprovalBroker::open(home.path()).unwrap();
+    broker.decide(&id, true, "dashboard:test").await.unwrap();
+
+    hooks::cmd_hooks(home.path(), "approved").await.unwrap();
+
+    let state = hooks::read_state(home.path(), "approved").unwrap();
+    assert_eq!(state.status, HooksStatus::Enabled);
+    assert!(hooks::enabled_dir(home.path(), "approved")
+        .join("pre-tool.sh")
+        .is_file());
+}
+
+#[tokio::test]
+async fn denied_hooks_stay_disabled_via_hooks_cmd() {
+    use super::hooks::{self, HooksStatus};
+    let home = TempTree::new("home");
+    let pack = TempTree::new("hookpack");
+    build_hook_pack(pack.path(), "denied");
+
+    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false)
+        .await
+        .unwrap();
+    let state = hooks::read_state(home.path(), "denied").unwrap();
+    let id = duduclaw_gateway::approval::ApprovalId::from(state.approval_id.clone().unwrap());
+
+    let broker = duduclaw_gateway::approval::ApprovalBroker::open(home.path()).unwrap();
+    broker.decide(&id, false, "dashboard:test").await.unwrap();
+
+    hooks::cmd_hooks(home.path(), "denied").await.unwrap();
+
+    let state = hooks::read_state(home.path(), "denied").unwrap();
+    assert_eq!(state.status, HooksStatus::Disabled, "deny keeps hooks disabled");
+    assert!(
+        !hooks::enabled_dir(home.path(), "denied").exists(),
+        "denied hooks never reach the enabled dir (fail-closed)"
+    );
+    // Quarantine copy is retained for audit / later re-grant.
+    assert!(hooks::disabled_dir(home.path(), "denied")
+        .join("pre-tool.sh")
+        .is_file());
 }
 
 /// The committed demo pack (L3, gitignored) validates cleanly when present.
