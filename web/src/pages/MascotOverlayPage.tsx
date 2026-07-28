@@ -3,7 +3,7 @@ import { useIntl } from 'react-intl';
 import { DuDu } from '@/components/mascot';
 import type { DuduFace } from '@/components/mascot/faces';
 import { useApprovalsStore } from '@/stores/approvals-store';
-import { PetRuntime } from '@/components/pet/PetRuntime';
+import { PetRuntime, useDisplayMax } from '@/components/pet/PetRuntime';
 import {
   isTauri,
   onPetChanged,
@@ -50,6 +50,9 @@ function openMainWindow(): void {
 export function MascotOverlayPage() {
   const intl = useIntl();
   const pending = useApprovalsStore((s) => s.pendingCount);
+  // Track the live window size so the 小/標準/大 menu (which resizes the native
+  // window) scales the built-in DuDu too, not just the invisible frame.
+  const displayMax = useDisplayMax();
   const [awake, setAwake] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -156,7 +159,7 @@ export function MascotOverlayPage() {
       })}
     >
       <div className={hop ? 'dudu-hop relative' : 'relative'}>
-        <DuDu face={face} size="lg" />
+        <DuDu face={face} size={displayMax} />
         {hasPending && (
           <span
             className="absolute -right-1 -top-1 grid min-h-[22px] min-w-[22px] place-items-center rounded-full bg-[var(--status-agent-paused)] px-1.5 text-[11px] font-bold text-white shadow-[var(--shadow-pop)] ring-2 ring-background"
