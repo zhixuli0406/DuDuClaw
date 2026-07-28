@@ -3826,6 +3826,17 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut last_pong = std::time::Instant::now();
 
+    // RPC responses funnel: requests are handled in spawned tasks (see the
+    // Request arm below) and their responses come back through this channel.
+    // Handling them inline used to stall the whole select loop — a long RPC
+    // (experts.generate/install run minutes) stopped the heartbeat arm, the
+    // 60s pong check then killed the connection MID-REQUEST (dashboard saw
+    // "Connection closed") and every other RPC on the socket was head-of-line
+    // blocked. The Option<bool> is the response-gated os_events_subscribed
+    // update (see the os.events.subscribe authorization note below).
+    let (rpc_tx, mut rpc_rx) =
+        tokio::sync::mpsc::channel::<(WsFrame, Option<bool>)>(64);
+
     loop {
         tokio::select! {
             // ── Heartbeat ping ─────────────────────────────
@@ -3862,40 +3873,49 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                         match frame {
                             WsFrame::Request { id, method, params } => {
-                                // Track log subscription state
+                                // Track log subscription state (method-name
+                                // based, so it stays synchronous here).
                                 if method == "logs.subscribe" {
                                     logs_subscribed = true;
                                 } else if method == "logs.unsubscribe" {
                                     logs_subscribed = false;
                                 }
 
-                                let mut response = state.handler.handle(&method, params, &user_ctx).await;
+                                // Handle the request in a spawned task — never
+                                // inline. See the `rpc_tx` comment above: a
+                                // minutes-long RPC awaited here starves the
+                                // heartbeat and head-of-line-blocks the socket.
+                                let task_state = state.clone();
+                                let task_ctx = user_ctx.clone();
+                                let task_tx = rpc_tx.clone();
+                                tokio::spawn(async move {
+                                    let mut response = task_state
+                                        .handler
+                                        .handle(&method, params, &task_ctx)
+                                        .await;
 
-                                // P4-3+ OS live event tail: unlike `logs.subscribe` above (which
-                                // flips its flag on the method NAME alone, before authorization
-                                // runs), gate this flag on the ACTUAL response outcome. os_file/
-                                // os_frontmost events can carry filesystem paths and window
-                                // titles, so a denied (non-admin) `os.events.subscribe` must never
-                                // start the forwarding tail.
-                                match method.as_str() {
-                                    "os.events.subscribe" => {
-                                        if matches!(&response, WsFrame::Response { ok: true, .. }) {
-                                            os_events_subscribed = true;
-                                            os_window_start_ms = 0;
-                                            os_window_count = 0;
+                                    // P4-3+ OS live event tail: unlike `logs.subscribe` above
+                                    // (which flips its flag on the method NAME alone, before
+                                    // authorization runs), gate this flag on the ACTUAL response
+                                    // outcome. os_file/os_frontmost events can carry filesystem
+                                    // paths and window titles, so a denied (non-admin)
+                                    // `os.events.subscribe` must never start the forwarding
+                                    // tail. The flag itself lives in the select loop, so the
+                                    // decision travels back beside the response.
+                                    let os_update = match method.as_str() {
+                                        "os.events.subscribe" => {
+                                            matches!(&response, WsFrame::Response { ok: true, .. })
+                                                .then_some(true)
                                         }
-                                    }
-                                    "os.events.unsubscribe" => {
-                                        os_events_subscribed = false;
-                                    }
-                                    _ => {}
-                                }
+                                        "os.events.unsubscribe" => Some(false),
+                                        _ => None,
+                                    };
 
-                                if let WsFrame::Response { id: ref mut resp_id, .. } = response {
-                                    *resp_id = id;
-                                }
-                                let resp_text = serde_json::to_string(&response).unwrap_or_default();
-                                if sink.send(Message::Text(resp_text.into())).await.is_err() { break; }
+                                    if let WsFrame::Response { id: ref mut resp_id, .. } = response {
+                                        *resp_id = id;
+                                    }
+                                    let _ = task_tx.send((response, os_update)).await;
+                                });
                             }
                             other => { warn!("Received non-request frame: {:?}", other); }
                         }
@@ -3909,6 +3929,24 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                     _ => {}
                 }
+            }
+
+            // ── Completed RPC responses (handled in spawned tasks) ─
+            // `rpc_tx` is held by this scope, so recv() can only yield None
+            // after every in-flight task dropped its clone AND the local
+            // sender was dropped — which never happens while this loop runs.
+            Some((response, os_update)) = rpc_rx.recv() => {
+                match os_update {
+                    Some(true) => {
+                        os_events_subscribed = true;
+                        os_window_start_ms = 0;
+                        os_window_count = 0;
+                    }
+                    Some(false) => { os_events_subscribed = false; }
+                    None => {}
+                }
+                let resp_text = serde_json::to_string(&response).unwrap_or_default();
+                if sink.send(Message::Text(resp_text.into())).await.is_err() { break; }
             }
 
             // ── Outbound log broadcast (only when subscribed) ─
