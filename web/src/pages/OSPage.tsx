@@ -56,6 +56,7 @@ import {
   type BadgeProps,
 } from '@/components/mds';
 import { OsAgentCard } from '@/components/os/OsAgentCard';
+import { OsAutomationTemplates } from '@/components/os/OsAutomationTemplates';
 import { OsQuadrantChart } from '@/components/os/OsQuadrantChart';
 
 /**
@@ -442,6 +443,14 @@ export function OSPage() {
             </div>
           )}
         </section>
+
+        {/* One-click OS automation rule templates (WP-OS follow-up) */}
+        {!loading && status && status.agents.length > 0 && (
+          <OsAutomationTemplates
+            agents={status.agents}
+            displayNameOf={displayNameOf}
+          />
+        )}
 
         {/* Proactivity report */}
         <Panel

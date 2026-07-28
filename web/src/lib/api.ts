@@ -645,7 +645,10 @@ export type AutopilotTriggerEvent =
   | 'task_status_changed'
   | 'channel_message'
   | 'agent_idle'
-  | 'schedule';
+  | 'schedule'
+  // OS-native perception events (P2-4) — used by the OS-page rule templates.
+  | 'os_file'
+  | 'os_frontmost';
 
 export type AutopilotActionType = 'delegate' | 'notify' | 'run_skill';
 
