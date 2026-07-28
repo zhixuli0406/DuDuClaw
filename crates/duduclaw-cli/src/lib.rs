@@ -1165,13 +1165,34 @@ pub async fn entry_point() {
     use tracing_subscriber::util::SubscriberInitExt;
 
     // Persistent file log — ensures gateway events survive restarts for diagnostics.
+    //
+    // MUST NOT panic when the log dir is unwritable (2026-07-28 live incident):
+    // `rolling::daily` panics on "failed to create initial log file", and when
+    // an external CLI host (grok) spawned `duduclaw mcp-server` in an
+    // environment where `~/.duduclaw/logs/` was not writable, that panic
+    // killed the whole MCP server at startup — the host saw "handshake
+    // failed: Broken pipe" and the agent lost its entire tool surface over a
+    // diagnostics convenience. Use the fallible builder and degrade to
+    // stderr-only logging instead.
     let log_dir = duduclaw_home().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "gateway.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    // Keep the guard alive for the lifetime of the process by leaking it.
-    // Dropping it would flush and close the writer prematurely.
-    std::mem::forget(_guard);
+    let file_writer = match tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("gateway.log")
+        .build(&log_dir)
+    {
+        Ok(appender) => {
+            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+            // Keep the guard alive for the lifetime of the process by leaking
+            // it. Dropping it would flush and close the writer prematurely.
+            std::mem::forget(guard);
+            Some(non_blocking)
+        }
+        Err(e) => {
+            eprintln!("[duduclaw] file log disabled ({e}) — continuing with stderr logging only");
+            None
+        }
+    };
 
     // Three-tier resolution for the effective log level:
     //   1. `RUST_LOG` env var (highest precedence — operator override)
@@ -1225,10 +1246,17 @@ pub async fn entry_point() {
     // `env_filter` as everything else — set log level `info` (tier 1 or 2
     // above) when enabling telemetry. See docs/guides/observability.md.
     let _otel_guard = duduclaw_gateway::otel::init(&duduclaw_home());
+    // `Option<Layer>` composes as a pass-through, so the stack shape is
+    // identical when the file writer is unavailable.
+    let file_layer = file_writer.map(|w| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(w)
+    });
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(non_blocking))
+        .with(file_layer)
         .with(duduclaw_gateway::log::BroadcastLayer)
         .with(duduclaw_gateway::otel::subscriber_layer())
         .init();
