@@ -41,6 +41,12 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/28-live-forking.md](features/28-live-forking.md) | Live run forking — parallel branches + AI judge (duduclaw-fork) |
 | [features/29-evolution-events.md](features/29-evolution-events.md) | Evolution events — black-box recorder with batch+retry delivery |
 | [features/30-custom-widgets.md](features/30-custom-widgets.md) | Custom dashboard widgets — sandboxed HTML cards, AI-guided authoring, instance sharing |
+| [features/31-office-document-suite.md](features/31-office-document-suite.md) | Office document suite — real docx/xlsx/pptx/pdf output, DELIVER protocol, archive + preview |
+| [features/32-expert-packs.md](features/32-expert-packs.md) | Expert packs — installable AI teams, built-in catalog, LLM-guided authoring, org placement |
+| [features/33-os-native-perception.md](features/33-os-native-perception.md) | OS-native perception & proactive care — sensing, footprint memory, care checks, automations |
+| [features/34-goal-loop.md](features/34-goal-loop.md) | Autonomous goal loop — /goal to completion with an MAV acceptance judge |
+| [features/35-photo-desktop-pet.md](features/35-photo-desktop-pet.md) | Photo → desktop pet — local pixel-art pipeline + wander engine |
+| [features/36-recording-to-skill.md](features/36-recording-to-skill.md) | Recording → skill — approval-gated skill drafts from browser/desktop recordings |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios (zh-TW) — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix (zh-TW) — sales-facing coverage table |
 

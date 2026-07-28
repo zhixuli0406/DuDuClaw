@@ -1,10 +1,32 @@
 # DuDuClaw 全機能一覧
 
-> v1.24.0 コア + 2026-07 追加 | 最終更新：2026-07-09
+> v1.24.0 コア + 2026-07 追加 | 最終更新：2026-07-29 (v1.46.0)
 >
 > 注記:以下の各セクションは v1.24.0 のベースラインです。直後の**「2026-07 追加」**ブロックが、それ以降に実装された機能をまとめています(正式な一覧は `CHANGELOG.md` `[Unreleased]` を参照)。本ファイルは英語版と 2026-07 まで同期済みです。
 
 ---
+
+## 2026-07 中盤〜後半追加(v1.33 – v1.46)
+
+| 機能 | 説明 |
+|------|------|
+| 統一 LLM プロバイダーレイヤー(`duduclaw-llm`) | 4 つのネイティブプロトコル(Anthropic / OpenAI Responses / Gemini / OpenAI-compat、8 プリセット)を 1 つの正規化された request/stream 形状で扱う。`ModelRegistry` 価格表 + `FallbackRouter` クールダウン。stdio MCP クライアント + プロバイダー非依存のツールループにより API モードのエージェントも全ツールサーフェスを獲得 |
+| エージェント行動 eval(`duduclaw eval`) | エージェントごとのゴールデンタスク回帰:決定論的な tool-call/regex/grounded アサーション + 任意の LLM judge。live / replay の 2 モード、CI をゲートする exit code |
+| HITL ApprovalBroker | MCP ツール / autopilot / bus タスクを横断する単一の割り込み/承認プリミティブ。SQLite ベース、TTL 期限切れ = DENY(フェイルクローズ) |
+| OpenTelemetry GenAI トレーシング | opt-in の `gen_ai.*` span、OTLP で Langfuse/Grafana/Jaeger/Datadog へエクスポート可能。オフ時はオーバーヘッドゼロ |
+| チャネル UX レイヤー | プラットフォーム別 markdown レンダリング、typing インジケーター、8 つの外部チャネルでその場編集されるライブ todo ボード進捗 |
+| 自律ゴールループ | `/goal` → 3 観点 MAV 受け入れ判定付きで完了までループ。行き詰まりはチャネルボタン付きで人間へエスカレーション([34-goal-loop.md](34-goal-loop.md)) |
+| 反復カンバンラウンド | タスクボードの `revising` 状態機械 + ラウンドごとの詳細履歴 |
+| 信頼された記憶と判定の強化(v1.41) | Sybil 耐性のある再確認を備えた書き込み時 origin binding、GovMem 昇格ゲート、Janus ルール保護観察、PORTICO タスクスコープの capability grant、trace-grounded な eval アサーション |
+| OS ネイティブ知覚とプロアクティブケア | ファイル監視 + 前面アプリセンシング → フットプリント temporal memory(再起動耐性スナップショット)、組み込みプロアクティブケアチェック、LLM スコアリングのプロアクティブゲート、ワンクリック OS 自動化テンプレート([33-os-native-perception.md](33-os-native-perception.md)) |
+| オフィスドキュメントスイート | 本物の docx/xlsx/pptx/pdf 出力、📎DELIVER プロトコル + 未宣言出力スイープ、ゲートウェイアーカイブ、LibreOffice プレビュー付きファイルページ([31-office-document-suite.md](31-office-document-suite.md)) |
+| エキスパートパックエコシステム | インストール可能な AI チーム:セキュリティスキャン付きインストールパイプライン、カテゴリ/部門でグループ化された組み込み産業カタログ、LLM ガイド付きパックオーサリング、`--attach-under` 付きの部門 × ランク組織配置([32-expert-packs.md](32-expert-packs.md)) |
+| レコーディング → スキル | ブラウザ(Playwright trace+HAR、シークレットはその場で秘匿処理)とデスクトップのレコーダーを、承認ゲート付き SKILL.md ドラフトへ蒸留([36-recording-to-skill.md](36-recording-to-skill.md)) |
+| 写真 → デスクトップペット | ローカルで写真 → 背景除去 → ピクセル量子化 → Codex-Pets 8×9 スプライトシート。本物の常時最前面ウィンドウを動かす自律徘徊エンジン([35-photo-desktop-pet.md](35-photo-desktop-pet.md)) |
+| ケイパビリティ機能トグル | 生の allow/deny ツールリストの上に置かれた 16 の平易な機能グループ。完全性ガード付きツールカタログが裏付け |
+| Google Workspace / Notion / GitHub ネイティブツール | Gmail/Calendar/Drive/Sheets、Notion、GitHub のファーストパーティ MCP ツール(v1.45。設定されるまでデフォルト非表示) |
+| デスクトップシェル(Tauri 2) | ゲートウェイ + ダッシュボードを包むネイティブウィンドウ、トレイ、ゲートウェイピッカー、透明なデスクトップペットオーバーレイウィンドウ |
+| インタラクションペーシングガード | 会話履歴フレーミング + 常時有効なペーシングルールにより、挨拶が直前のツール多用タスクを再トリガーしないようにする |
 
 ## 2026-07 追加(v1.24.0 以降)
 

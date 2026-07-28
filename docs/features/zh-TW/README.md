@@ -1,6 +1,6 @@
 # DuDuClaw 特色功能介紹
 
-> DuDuClaw v1.21.1 | 最後更新：2026-06-21
+> DuDuClaw v1.46.0 | 最後更新：2026-07-29
 
 本目錄收錄 DuDuClaw 各項特色功能的詳細介紹。每篇文章以設計理念、系統行為與運作流程為主軸——面向想深入了解「系統如何運作」的開發者，無需閱讀原始碼。
 
@@ -40,6 +40,12 @@
 | 28 | [即時執行分支（Live Forking）](28-live-forking.md) | 並行分支 + AI 評審（duduclaw-fork, RFC-26） |
 | 29 | [演化事件](29-evolution-events.md) | 黑盒紀錄器，批次 + 重試遞送 |
 | 30 | [自訂儀表板小工具](30-custom-widgets.md) | AI 引導或原始 HTML 的儀表板卡片，沙箱內執行 |
+| 31 | [辦公文件套件](31-office-document-suite.md) | 真實 docx/xlsx/pptx/pdf 產出：DELIVER 交付協定、歸檔與預覽 |
+| 32 | [專家包](32-expert-packs.md) | 可安裝的 AI 團隊：內建目錄、LLM 引導自製、部門×階級組織對位 |
+| 33 | [OS 感知與主動關懷](33-os-native-perception.md) | 檔案監看＋前景感知 → 足跡記憶、關懷檢查、一鍵自動化 |
+| 34 | [自主目標迴圈](34-goal-loop.md) | /goal → 迴圈到完成，MAV 驗收判官；卡住升級真人 |
+| 35 | [照片 → 桌寵](35-photo-desktop-pet.md) | 本地照片轉像素桌寵：Codex Pets 動作表＋漫遊引擎 |
+| 36 | [錄製 → 技能](36-recording-to-skill.md) | 瀏覽器/桌面錄製蒸餾成審批制 SKILL.md 草稿 |
 
 ---
 
