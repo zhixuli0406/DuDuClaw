@@ -188,12 +188,16 @@ export function SettingsRow({
       data-slot="settings-row"
       data-tier={tier}
       className={cn(
-        'flex min-h-16 flex-col gap-2 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:gap-4',
+        // `sm:flex-wrap` + the label's flex-basis floor: in a narrow container
+        // (e.g. a two-column card grid) the control wraps onto its own full
+        // line instead of crushing the label into one-CJK-char-per-line
+        // vertical text (the 本地推理 RWD bug).
+        'flex min-h-16 flex-col gap-2 px-4 py-3.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-x-4 sm:gap-y-2',
         className
       )}
       {...props}
     >
-      <div className="min-w-0 space-y-0.5">
+      <div className="min-w-0 space-y-0.5 sm:flex-1 sm:basis-40">
         <div className="text-sm font-medium">{label}</div>
         {description && (
           <div className="text-xs text-muted-foreground">{description}</div>
@@ -201,7 +205,7 @@ export function SettingsRow({
       </div>
       <div
         data-slot="settings-row-control"
-        className={cn('shrink-0', rowTierClass[tier])}
+        className={cn('min-w-0 max-w-full shrink-0', rowTierClass[tier])}
       >
         {children}
       </div>
