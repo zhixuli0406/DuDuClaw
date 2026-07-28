@@ -18,8 +18,14 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Emitter, LogicalSize, Manager, WebviewWindow};
 
 use duduclaw_pets::{
-    BackgroundRemover, OnnxRemover, PassthroughRemover, PetMode, PetPack, BIREFNET_LITE, SILUETA,
+    BackgroundRemover, PassthroughRemover, PetMode, PetPack, BIREFNET_LITE, SILUETA,
 };
+// The `onnx` feature on duduclaw-pets is target-gated in Cargo.toml (ort-sys
+// only ships prebuilt onnxruntime for aarch64-macos and windows) — every use
+// of these symbols carries the same cfg. Other targets fall back to the
+// passthrough remover and refuse model downloads with an honest message.
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "windows"))]
+use duduclaw_pets::OnnxRemover;
 
 use crate::mascot_window;
 
@@ -144,19 +150,24 @@ fn pick_remover(external: bool) -> Box<dyn BackgroundRemover> {
     if external {
         return Box::new(PassthroughRemover);
     }
-    if BIREFNET_LITE.is_present() {
-        match OnnxRemover::load(&BIREFNET_LITE) {
-            Ok(r) => return Box::new(r),
-            Err(e) => tracing::warn!(error = %e, "BiRefNet load failed; trying silueta"),
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "windows"))]
+    {
+        if BIREFNET_LITE.is_present() {
+            match OnnxRemover::load(&BIREFNET_LITE) {
+                Ok(r) => return Box::new(r),
+                Err(e) => tracing::warn!(error = %e, "BiRefNet load failed; trying silueta"),
+            }
         }
-    }
-    if SILUETA.is_present() {
-        match OnnxRemover::load(&SILUETA) {
-            Ok(r) => return Box::new(r),
-            Err(e) => tracing::warn!(error = %e, "silueta load failed; using passthrough"),
+        if SILUETA.is_present() {
+            match OnnxRemover::load(&SILUETA) {
+                Ok(r) => return Box::new(r),
+                Err(e) => tracing::warn!(error = %e, "silueta load failed; using passthrough"),
+            }
         }
+        tracing::warn!("no segmentation model installed; storing photo without background removal");
     }
-    tracing::warn!("no segmentation model installed; storing photo without background removal");
+    #[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "windows")))]
+    tracing::warn!("onnxruntime unavailable on this target; storing photo without background removal");
     Box::new(PassthroughRemover)
 }
 
@@ -349,6 +360,7 @@ pub fn pet_model_status() -> ModelStatus {
 /// `"birefnet"` or `"silueta"`. Returns the downloaded file's SHA-256. Runs on a
 /// blocking thread (network + disk). NOT triggered at build time.
 #[tauri::command]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "windows"))]
 pub async fn pet_model_download(variant: String) -> Result<String, String> {
     let spec = match variant.as_str() {
         "birefnet" => &BIREFNET_LITE,
@@ -360,6 +372,16 @@ pub async fn pet_model_download(variant: String) -> Result<String, String> {
     })
     .await
     .map_err(|e| format!("download task failed: {e}"))?
+}
+
+/// Targets without prebuilt onnxruntime (x86_64 macOS / Linux) cannot run the
+/// local segmentation models — refuse the download honestly instead of
+/// fetching a model that could never load. Pet generation still works via the
+/// passthrough remover.
+#[tauri::command]
+#[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "windows")))]
+pub async fn pet_model_download(_variant: String) -> Result<String, String> {
+    Err("此平台沒有 onnxruntime 預編譯，無法使用本地去背模型；生成會改用原圖直出".to_string())
 }
 
 // ── Desktop-pet size (scale) persistence ─────────────────────────────────────
