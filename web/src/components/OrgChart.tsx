@@ -14,6 +14,8 @@ interface OrgNode {
   status: string;
   icon: string;
   model: string;
+  /** WP-ORG — functional department (`[agent] department`); '' = none. */
+  department: string;
   children?: OrgNode[];
 }
 
@@ -34,7 +36,7 @@ interface OrgChartProps {
 
 function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string, rootGlyph: string): OrgNode {
   if (agents.length === 0) {
-    return { name: '__root__', displayName: rootName, role: 'system', status: 'active', icon: rootGlyph, model: '', children: [] };
+    return { name: '__root__', displayName: rootName, role: 'system', status: 'active', icon: rootGlyph, model: '', department: '', children: [] };
   }
 
   // Find the root: prefer role=main, then first agent with no reports_to
@@ -44,7 +46,7 @@ function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string, rootGly
   const toNode = (agent: AgentDetail, visited = new Set<string>()): OrgNode => {
     // Prevent infinite recursion from circular reports_to
     if (visited.has(agent.name)) {
-      return { name: agent.name, displayName: agent.display_name, role: agent.role, status: agent.status, icon: glyphText(agent.icon), model: agent.model?.preferred ?? '', children: [] };
+      return { name: agent.name, displayName: agent.display_name, role: agent.role, status: agent.status, icon: glyphText(agent.icon), model: agent.model?.preferred ?? '', department: agent.department ?? '', children: [] };
     }
     const next = new Set(visited);
     next.add(agent.name);
@@ -55,6 +57,7 @@ function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string, rootGly
       status: agent.status,
       icon: glyphText(agent.icon),
       model: agent.model?.preferred ?? '',
+      department: agent.department ?? '',
       children: agents
         .filter((a) => a.reports_to === agent.name && a.name !== agent.name)
         .map((a) => toNode(a, new Set(next))),
@@ -102,6 +105,7 @@ function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string, rootGly
     status: 'active',
     icon: rootGlyph,
     model: '',
+    department: '',
     children: agents.map((a) => toNode(a)),
   };
 }
@@ -336,7 +340,11 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
       .attr('font-size', '11px')
       .text((d) => {
         const role = d.data.role.charAt(0).toUpperCase() + d.data.role.slice(1);
-        return `${role} · ${d.data.status}`;
+        // WP-ORG — surface the functional department when set (status is
+        // already carried by the top-right dot + card colors).
+        const dept = d.data.department;
+        const line = dept ? `${dept} · ${role}` : `${role} · ${d.data.status}`;
+        return line.length > 20 ? line.slice(0, 19) + '…' : line;
       });
 
     // Model badge

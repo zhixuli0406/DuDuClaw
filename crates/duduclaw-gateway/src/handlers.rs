@@ -15255,12 +15255,31 @@ impl MethodHandler {
         // Reuse the full CLI install pipeline via our own binary. Hooks are
         // NEVER auto-trusted from the dashboard — they land disabled with an
         // approval request (fail-closed), decided in the approval center.
-        match self
-            .spawn_expert_cli(&["install".into(), src.as_os_str().to_os_string()], 300)
-            .await
-        {
+        let mut args = vec!["install".into(), src.as_os_str().to_os_string()];
+        match Self::attach_under_args(&params) {
+            Ok(extra) => args.extend(extra),
+            Err(frame) => return frame,
+        }
+        match self.spawn_expert_cli(&args, 300).await {
             Ok(output) => WsFrame::ok_response("", json!({ "success": true, "output": output })),
             Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
+        }
+    }
+
+    /// WP-ORG: optional `attach_under` param → `--attach-under <id>` CLI args.
+    /// The id shape is fenced here (fail-closed error, never silently dropped)
+    /// so an arbitrary string can never become a stray flag; the CLI then
+    /// validates the target actually exists before installing.
+    fn attach_under_args(params: &Value) -> Result<Vec<std::ffi::OsString>, WsFrame> {
+        match params.get("attach_under").and_then(|v| v.as_str()).map(str::trim) {
+            None | Some("") => Ok(Vec::new()),
+            Some(id) if crate::premium_templates::is_safe_slug(id) => {
+                Ok(vec!["--attach-under".into(), id.into()])
+            }
+            Some(id) => Err(WsFrame::error_response(
+                "",
+                &format!("attach_under '{}' 非合法 agent id", id.escape_debug()),
+            )),
         }
     }
 
@@ -15363,10 +15382,42 @@ impl MethodHandler {
     /// security scanning, hooks fail-closed).
     async fn handle_experts_install_builtin(&self, params: Value) -> WsFrame {
         use crate::expert_generate as eg;
+        let attach_args = match Self::attach_under_args(&params) {
+            Ok(a) => a,
+            Err(frame) => return frame,
+        };
+
+        // WP-ORG: `slug` (no `industry`) selects a standalone pack shipped
+        // under `<premium>/experts/<slug>/` — installed straight from the
+        // premium tree, no conversion step.
         let industry = params
             .get("industry")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        if industry.is_empty() {
+            let slug = params.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            if !crate::premium_templates::is_safe_slug(slug) || slug.ends_with("-team") {
+                return WsFrame::error_response("", "找不到此內建專家包");
+            }
+            let premium_dir = match self.premium_dir_unlocked().await {
+                Ok(d) => d,
+                Err(frame) => return frame,
+            };
+            let pack_dir = premium_dir.join("experts").join(slug);
+            if !pack_dir.join("expert.toml").is_file() {
+                return WsFrame::error_response("", "找不到此內建專家包");
+            }
+            let mut args = vec!["install".into(), pack_dir.into_os_string()];
+            args.extend(attach_args);
+            return match self.spawn_expert_cli(&args, 300).await {
+                Ok(output) => WsFrame::ok_response(
+                    "",
+                    json!({ "success": true, "slug": slug, "output": output }),
+                ),
+                Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
+            };
+        }
+
         // Slug fence FIRST — traversal is rejected before license checks or
         // any subprocess (deterministic fail-closed ordering).
         let cache_pack = match eg::builtin_pack_cache_dir(&self.home_dir, industry) {
@@ -15411,10 +15462,9 @@ impl MethodHandler {
             }
         }
 
-        match self
-            .spawn_expert_cli(&["install".into(), cache_pack.into_os_string()], 300)
-            .await
-        {
+        let mut args = vec!["install".into(), cache_pack.into_os_string()];
+        args.extend(attach_args);
+        match self.spawn_expert_cli(&args, 300).await {
             Ok(output) => WsFrame::ok_response(
                 "",
                 json!({
@@ -15644,10 +15694,12 @@ impl MethodHandler {
         if let Err(e) = eg::ensure_no_hooks(&pack_dir) {
             return WsFrame::error_response("", &e);
         }
-        match self
-            .spawn_expert_cli(&["install".into(), pack_dir.into_os_string()], 300)
-            .await
-        {
+        let mut args = vec!["install".into(), pack_dir.into_os_string()];
+        match Self::attach_under_args(&params) {
+            Ok(extra) => args.extend(extra),
+            Err(frame) => return frame,
+        }
+        match self.spawn_expert_cli(&args, 300).await {
             Ok(output) => {
                 if let Ok(dir) = eg::draft_dir(&self.home_dir, draft_id) {
                     let _ = tokio::fs::remove_dir_all(&dir).await;

@@ -3,6 +3,22 @@
 ## [Unreleased]
 
 ### Added
+- **專家包部門×階級（WP-ORG 完整組織藍圖）**：專家包不再攤平混列——
+  ①目錄按 5 大類別分組（醫療健康／專業服務／零售與電商／生活服務／教育與托育；
+  對照表在 `duduclaw_core::org`），premium `experts/` 下的單一專家包（如 CAD 製圖員）
+  也一併上目錄（`kind: expert`，與團隊包同流程一鍵安裝）；②`expert.toml` 新增
+  `[expert] category` 與每位成員 `department`／`rank`（executive/manager/staff；
+  unknown-keys 前向相容，`expert pack` 驗證非法值）；③convert-teams 自動蓋章
+  （front_desk→manager、worker→staff＋共用 kit→部門對照：docs-admin→行政、
+  billing-admin→財務、care-followup→客服、dispatch-scheduler→營運、inventory→倉管、
+  marketing→行銷、sales-followup→業務）；④安裝時把 `department` 寫入
+  `[agent] department` 並確保 `shared/wiki/departments/<部門>/` 知識空間存在——
+  裝完的 AI 員工直接落入部門頁與組織圖；⑤新 `--attach-under <agent-id>`
+  （CLI flag＋`experts.install`/`install_builtin`/`install_draft` RPC 參數）：
+  包的根主管可掛接到既有主管（如 CEO 幕僚長）之下，目標不存在先擋下、絕不半裝
+  （fail-closed）；dashboard 安裝與自製生成流程都有「匯報對象」選單（候選＝main
+  或已有直屬部下者）；⑥組織圖節點顯示部門、首登團隊精靈建立的 worker 也自動落部門。
+  內建包轉換快取改版為 `cache/experts-builtin-v2`（舊快取自動失效重轉）。
 - **錄製 → 技能閉環（WP3.3）**：新增五個 MCP 工具——`browser_record_start` /
   `browser_record_stop`（真實 Playwright 瀏覽器帶 tracing + HAR + UI 動作記錄器，
   停止時 HAR 就地脫敏：Authorization/cookie/set-cookie/token 類 query 與 body 值

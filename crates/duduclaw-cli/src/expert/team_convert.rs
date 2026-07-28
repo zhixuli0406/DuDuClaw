@@ -95,6 +95,10 @@ struct Worker {
     summary: String,
     #[serde(default)]
     overlay: Vec<String>,
+    /// Optional team.toml override for the functional department; empty ⇒
+    /// the shared-kit default (`duduclaw_core::org::department_for_kit`).
+    #[serde(default)]
+    department: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,6 +341,10 @@ fn render_manifest(
             Value::String("taiwan".into()),
         ]),
     );
+    expert.insert(
+        "category".into(),
+        Value::String(duduclaw_core::org::industry_category(&team.industry).to_string()),
+    );
 
     let mut display = Table::new();
     display.insert("zh-TW".into(), Value::String(label.to_string()));
@@ -374,6 +382,7 @@ fn render_manifest(
     fd_t.insert("role".into(), Value::String("front_desk".into()));
     fd_t.insert("display_name".into(), Value::String(fd_display.clone()));
     fd_t.insert("trigger".into(), Value::String(format!("@{fd_display}")));
+    fd_t.insert("rank".into(), Value::String("manager".into()));
     if let Some(s) = skill_name {
         fd_t.insert("skills".into(), Value::Array(vec![Value::String(s.into())]));
     }
@@ -396,6 +405,15 @@ fn render_manifest(
             w.trigger.clone()
         };
         wt.insert("trigger".into(), Value::String(trigger));
+        wt.insert("rank".into(), Value::String("staff".into()));
+        let department = if w.department.trim().is_empty() {
+            duduclaw_core::org::department_for_kit(&w.kit).unwrap_or("")
+        } else {
+            w.department.trim()
+        };
+        if !department.is_empty() {
+            wt.insert("department".into(), Value::String(department.to_string()));
+        }
         agents.push(Value::Table(wt));
     }
     expert.insert("agents".into(), Value::Array(agents));

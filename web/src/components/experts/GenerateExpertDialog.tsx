@@ -22,6 +22,7 @@ import {
   Spinner,
 } from '@/components/mds';
 import { Sparkles, Users, Puzzle, BookOpen, RefreshCw } from 'lucide-react';
+import { AttachUnderSelect } from './AttachUnderSelect';
 
 /** Channels a generated pack may suggest (mirrors the gateway allowlist). */
 const CHANNEL_OPTIONS = [
@@ -71,6 +72,8 @@ export function GenerateExpertDialog({
   const [roundsLeft, setRoundsLeft] = useState(0);
   const [feedback, setFeedback] = useState('');
   const [revising, setRevising] = useState(false);
+  // WP-ORG — org placement for the installed pack root (empty = independent).
+  const [attachUnder, setAttachUnder] = useState('');
   /** Bumped on cancel so an in-flight generation's late result is ignored. */
   const generationToken = useRef(0);
 
@@ -80,9 +83,21 @@ export function GenerateExpertDialog({
     setPreview(null);
     setFeedback('');
     setRevising(false);
+    setAttachUnder('');
   };
 
-  const close = (next: boolean) => {
+  const close = (next: boolean, eventDetails?: { reason?: string }) => {
+    // Never lose the flow to an accidental dismissal: outside presses are
+    // disabled at the Dialog level (`disablePointerDismissal`), and Escape is
+    // ignored while a generation/installation is running or a draft preview
+    // is on screen. Closing then requires an explicit control (X / 取消).
+    if (
+      !next &&
+      eventDetails?.reason === 'escape-key' &&
+      step !== 'form'
+    ) {
+      return;
+    }
     if (!next) {
       generationToken.current += 1; // drop any in-flight result
       reset();
@@ -149,7 +164,7 @@ export function GenerateExpertDialog({
     if (!draftId) return;
     setStep('installing');
     try {
-      await api.experts.installDraft(draftId);
+      await api.experts.installDraft(draftId, attachUnder || undefined);
       toast.success(t('experts.install.success'));
       reset();
       onOpenChange(false);
@@ -166,7 +181,7 @@ export function GenerateExpertDialog({
   };
 
   return (
-    <Dialog open={open} onOpenChange={close}>
+    <Dialog open={open} onOpenChange={close} disablePointerDismissal>
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
@@ -323,6 +338,8 @@ export function GenerateExpertDialog({
                 ))}
               </div>
             )}
+
+            <AttachUnderSelect value={attachUnder} onChange={setAttachUnder} disabled={revising} />
 
             <div className="space-y-1.5">
               <label className="text-sm font-medium" htmlFor="expert-gen-feedback">

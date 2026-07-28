@@ -7,7 +7,7 @@
 //!    (`<premium_dir>/teams/<industry>-team/`) as one-click installable expert
 //!    packs. Conversion reuses the CLI `duduclaw expert convert-teams`
 //!    pipeline via subprocess (idempotent, byte-deterministic) into
-//!    `<home>/cache/experts-builtin/`, then the normal
+//!    `<home>/cache/experts-builtin-v2/`, then the normal
 //!    `duduclaw expert install` security pipeline.
 //!
 //! 2. **LLM-guided authoring** (`experts.generate` / `experts.generate_revise`
@@ -67,10 +67,14 @@ pub const KNOWN_CHANNELS: [&str; 9] = [
 
 // ─────────────────────────── Built-in catalog ───────────────────────────
 
-/// `<home>/cache/experts-builtin` — converted-pack cache written by the
-/// `expert convert-teams` subprocess.
+/// `<home>/cache/experts-builtin-v2` — converted-pack cache written by the
+/// `expert convert-teams` subprocess. The `-v2` suffix is the conversion
+/// schema version: WP-ORG added `department` / `rank` / `category` stamps, and
+/// the cache is only re-converted when the pack dir is absent — versioning the
+/// dir is what invalidates pre-WP-ORG conversions (the old `experts-builtin`
+/// dir is simply orphaned).
 pub fn builtin_cache_dir(home: &Path) -> PathBuf {
-    home.join("cache").join("experts-builtin")
+    home.join("cache").join("experts-builtin-v2")
 }
 
 /// The converted pack slug for an industry (`convert-teams` names each output
@@ -92,26 +96,51 @@ pub fn builtin_pack_cache_dir(home: &Path, industry: &str) -> Result<PathBuf, St
 /// Build the `experts.catalog` payload from a (possibly absent) premium tree
 /// and the current install records. Fail-safe: absent / unreadable premium
 /// dir ⇒ `deployed: false` with an empty list — never an error.
+///
+/// WP-ORG: every entry carries `kind` (`team` / `expert`), a `category`
+/// section slug, and the distinct `departments` its roster lands in, so the
+/// dashboard can group instead of flattening 22+ cards into one grid.
+/// Standalone packs (premium `experts/<slug>/`, non-`*-team`) list alongside
+/// the industry teams.
 pub fn builtin_catalog(premium_dir: Option<&Path>, installed: &[InstallRecord]) -> Value {
     let installed_slugs: BTreeSet<&str> = installed.iter().map(|r| r.slug.as_str()).collect();
     let Some(dir) = premium_dir else {
         return json!({ "deployed": false, "packs": [] });
     };
     let teams = pt::list_team_industries(dir);
-    if teams.is_empty() {
-        return json!({ "deployed": false, "packs": [] });
-    }
-    let packs: Vec<Value> = teams
+    let mut packs: Vec<Value> = teams
         .iter()
         .map(|t| {
-            // Description = front-desk summary from the manifest (best-effort;
-            // the listing already validated it once).
-            let description = pt::load_team_manifest(dir, &t.industry)
-                .map(|m| m.front_desk.summary)
+            // Description / departments from the manifest (best-effort; the
+            // listing already validated it once).
+            let manifest = pt::load_team_manifest(dir, &t.industry).ok();
+            let description = manifest
+                .as_ref()
+                .map(|m| m.front_desk.summary.clone())
+                .unwrap_or_default();
+            let departments: Vec<&str> = manifest
+                .as_ref()
+                .map(|m| {
+                    m.workers
+                        .iter()
+                        .filter_map(|w| {
+                            if w.department.trim().is_empty() {
+                                duduclaw_core::org::department_for_kit(&w.kit)
+                            } else {
+                                Some(w.department.trim())
+                            }
+                        })
+                        .collect::<BTreeSet<&str>>()
+                        .into_iter()
+                        .collect()
+                })
                 .unwrap_or_default();
             let slug = builtin_pack_slug(&t.industry);
             json!({
+                "kind": "team",
                 "industry": t.industry,
+                "category": duduclaw_core::org::industry_category(&t.industry),
+                "departments": departments,
                 "label": t.label,
                 "slug": slug,
                 "description": description,
@@ -121,7 +150,74 @@ pub fn builtin_catalog(premium_dir: Option<&Path>, installed: &[InstallRecord]) 
             })
         })
         .collect();
+    packs.extend(standalone_catalog_entries(dir, &installed_slugs));
+    if packs.is_empty() {
+        return json!({ "deployed": false, "packs": [] });
+    }
     json!({ "deployed": true, "packs": packs })
+}
+
+/// Standalone expert packs shipped under `<premium>/experts/<slug>/` —
+/// everything with an `expert.toml` whose slug is NOT `<industry>-team`
+/// (those are the committed convert-teams outputs, already listed as teams).
+/// Best-effort: an unparsable pack is skipped, never an error.
+fn standalone_catalog_entries(premium_dir: &Path, installed_slugs: &BTreeSet<&str>) -> Vec<Value> {
+    let experts_root = premium_dir.join("experts");
+    let Ok(entries) = std::fs::read_dir(&experts_root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut slugs: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|s| is_safe_slug(s) && !s.ends_with("-team"))
+        .collect();
+    slugs.sort();
+    for slug in slugs {
+        let pack_dir = experts_root.join(&slug);
+        let Ok(raw) = std::fs::read_to_string(pack_dir.join("expert.toml")) else {
+            continue;
+        };
+        let Ok(manifest) = toml::from_str::<DraftManifest>(&raw) else {
+            continue;
+        };
+        let e = manifest.expert;
+        if e.name != slug {
+            continue; // dir/manifest mismatch — not a distributable pack
+        }
+        let label = e
+            .display_name
+            .get("zh-TW")
+            .or_else(|| e.display_name.get("en"))
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| slug.clone());
+        let departments: Vec<&str> = e
+            .agents
+            .iter()
+            .map(|a| a.department.trim())
+            .filter(|d| !d.is_empty())
+            .collect::<BTreeSet<&str>>()
+            .into_iter()
+            .collect();
+        let category = if e.category.trim().is_empty() {
+            "other"
+        } else {
+            e.category.trim()
+        };
+        out.push(json!({
+            "kind": "expert",
+            "category": category,
+            "departments": departments,
+            "label": label,
+            "slug": slug,
+            "description": e.description,
+            "agents_count": e.agents.len(),
+            "installed": installed_slugs.contains(slug.as_str()),
+        }));
+    }
+    out
 }
 
 // ─────────────────────────── Draft store ───────────────────────────
@@ -298,6 +394,10 @@ pub struct GeneratedAgent {
     pub trigger: String,
     #[serde(default)]
     pub summary: String,
+    /// WP-ORG: functional department (zh-TW data string, e.g. "財務") — the
+    /// installer writes it to `[agent] department`. Optional.
+    #[serde(default)]
+    pub department: String,
     pub soul_md: String,
     #[serde(default)]
     pub agent_partial_toml: String,
@@ -440,6 +540,15 @@ pub fn materialize_draft(pack_dir: &Path, gp: &GeneratedPack) -> Result<(), Stri
         }
         if a.soul_md.trim().is_empty() {
             return Err(format!("agent '{}' 缺少 soul_md", a.name));
+        }
+        if !a.department.trim().is_empty()
+            && !duduclaw_core::is_valid_department(a.department.trim())
+        {
+            return Err(format!(
+                "agent '{}' 的 department '{}' 非合法部門名",
+                a.name,
+                a.department.escape_debug()
+            ));
         }
     }
     let skill_name = match &gp.skill {
@@ -586,6 +695,13 @@ fn render_manifest(gp: &GeneratedPack, skill_name: Option<&str>) -> String {
         if !a.trigger.trim().is_empty() {
             t.insert("trigger".into(), T::String(a.trigger.trim().to_string()));
         }
+        if !a.department.trim().is_empty() {
+            t.insert("department".into(), T::String(a.department.trim().to_string()));
+        }
+        t.insert(
+            "rank".into(),
+            T::String(if i == 0 { "manager" } else { "staff" }.to_string()),
+        );
         // The dispatch skill belongs to the team root (first roster entry).
         if i == 0
             && let Some(s) = skill_name
@@ -683,6 +799,10 @@ struct DraftExpert {
     #[serde(default)]
     version: String,
     #[serde(default)]
+    display_name: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
     agents: Vec<DraftAgent>,
 }
 
@@ -692,6 +812,8 @@ struct DraftAgent {
     name: String,
     #[serde(default)]
     reports_to: String,
+    #[serde(default)]
+    department: String,
 }
 
 /// Validate a materialized draft pack — a gateway-side mirror of the strict
@@ -987,7 +1109,8 @@ pub fn build_pack_generation_prompt(
   "agents": [
     { "name": "小寫英數連字號", "role": "front_desk 或 worker", "display_name": "zh-TW 稱呼",
       "reports_to": "front_desk 的 name（front_desk 自己留空字串）", "trigger": "觸發詞",
-      "summary": "一句話職責", "soul_md": "完整 SOUL 草稿（markdown）",
+      "summary": "一句話職責", "department": "worker 的職能部門 zh-TW 短名（如 財務、客服；front_desk 留空字串）",
+      "soul_md": "完整 SOUL 草稿（markdown）",
       "agent_partial_toml": "可留空字串；只允許 [model]/[budget]/[permissions]/[capabilities] 區段" }
   ],
   "skill": { "name": "小寫英數連字號，如 flowershop-dispatch", "description": "一句話", "skill_md": "分派劇本 markdown 本文（不用 frontmatter，系統會補）" },
@@ -1065,6 +1188,7 @@ mod tests {
                     reports_to: String::new(),
                     trigger: "@花店總機".into(),
                     summary: "對外唯一窗口".into(),
+                    department: String::new(),
                     soul_md: "# 花店總機\n\n## 紅線\n\n- 不碰金流\n".into(),
                     agent_partial_toml: "[model]\npreferred = \"claude-haiku-4-5\"\n\n[agent]\nname = \"HIJACK\"\n".into(),
                 },
@@ -1075,6 +1199,7 @@ mod tests {
                     reports_to: "flowershop-assistant".into(),
                     trigger: "flowershop-care".into(),
                     summary: "售後回訪".into(),
+                    department: "客服".into(),
                     soul_md: "# 售後關懷\n".into(),
                     agent_partial_toml: String::new(),
                 },
@@ -1396,6 +1521,58 @@ name = "foo-docs"
 
         let v = builtin_catalog(Some(tmp.path()), &[]);
         assert_eq!(v["packs"][0]["installed"], false);
+    }
+
+    /// WP-ORG: team entries carry kind/category/departments; standalone packs
+    /// under `experts/` list with their manifest org metadata; committed
+    /// `*-team` conversions are NOT double-listed.
+    #[test]
+    fn catalog_org_grouping_and_standalone_packs() {
+        let tmp = tempfile::tempdir().unwrap();
+        premium_fixture(tmp.path());
+
+        // Standalone pack + a committed team conversion (must be skipped).
+        let solo = tmp.path().join("experts/cad-helper");
+        std::fs::create_dir_all(&solo).unwrap();
+        std::fs::write(
+            solo.join("expert.toml"),
+            r#"[expert]
+name = "cad-helper"
+description = "畫圖助手"
+version = "1.0.0"
+category = "professional"
+
+[expert.display_name]
+"zh-TW" = "CAD 製圖員"
+
+[[expert.agents]]
+name = "drafter"
+role = "worker"
+department = "設計"
+"#,
+        )
+        .unwrap();
+        let converted = tmp.path().join("experts/foo-team");
+        std::fs::create_dir_all(&converted).unwrap();
+        std::fs::write(converted.join("expert.toml"), "[expert]\nname = \"foo-team\"\n").unwrap();
+
+        let v = builtin_catalog(Some(tmp.path()), &[]);
+        let packs = v["packs"].as_array().unwrap();
+        assert_eq!(packs.len(), 2, "team + standalone, no double-list: {packs:?}");
+
+        let team = &packs[0];
+        assert_eq!(team["kind"], "team");
+        assert_eq!(team["category"], "other", "fixture industry 'foo' is uncategorised");
+        assert_eq!(team["departments"], serde_json::json!(["行政"]), "docs-admin kit → 行政");
+
+        let solo = &packs[1];
+        assert_eq!(solo["kind"], "expert");
+        assert_eq!(solo["slug"], "cad-helper");
+        assert_eq!(solo["label"], "CAD 製圖員");
+        assert_eq!(solo["category"], "professional");
+        assert_eq!(solo["departments"], serde_json::json!(["設計"]));
+        assert_eq!(solo["agents_count"], 1);
+        assert_eq!(solo["installed"], false);
     }
 
     // ── prompt building ──

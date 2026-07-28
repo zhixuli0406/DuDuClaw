@@ -8,6 +8,7 @@ pub mod error;
 pub mod fs_lock;
 pub mod keychain;
 pub mod match_utils;
+pub mod org;
 pub mod platform;
 pub mod sensitivity;
 pub mod text_utils;
