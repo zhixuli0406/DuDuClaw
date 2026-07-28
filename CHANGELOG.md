@@ -30,6 +30,14 @@
   檔案頁 office 列現在顯示「預覽（轉為 PDF）」眼睛鍵——先前文案宣稱可預覽但 office
   檔根本沒有預覽鍵。與 download 相同的 JWT 驗證＋路徑圍欄。
 
+- **儲存時 model↔runtime provider 自動對齊**：agent 設定存檔（`agents.update`）時，
+  若 `[model] preferred` 與 `[runtime] provider` 為確信的家族不一致（例如 grok-4.5 配
+  claude——活體事故：走 Claude CLI 撞 model_not_found 整隻 agent 無法回應），gateway
+  直接把 provider 改寫為能服務該模型的 runtime：家族 CLI 已安裝→家族 CLI，未安裝→
+  `openai_compat`（API 模式可服務任意模型）；`openai_compat` 永遠視為相容故 API 模式
+  設定不受影響；未知模型家族不猜。回應帶 `runtime_provider_aligned`，dashboard 以
+  toast 告知「已自動將執行環境調整為 X」並同步表單，不會留下與畫面不同的靜默設定。
+
 ### Fixed
 - **Grok CLI runtime「只旁白不執行」三層根因（客戶實測 2026-07-28）**：grok-4.5 agent
   回「正在查詢…」但從不真的呼叫工具。①grok 對專案層 `.grok/config.toml` 的 MCP 註冊

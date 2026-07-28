@@ -1508,6 +1508,7 @@
   "agents.cap.toolPicker.search": "Search tools…",
   "agents.cap.toolPicker.empty": "No matching tools",
   "agents.cap.toolPicker.error": "Failed to load tool catalog",
+  "agents.edit.runtimeAligned": "Model and runtime did not match — runtime automatically adjusted to {provider}",
   "agents.cap.toggles.title": "Feature switches",
   "agents.cap.toggles.desc": "Decide what this AI employee can do with simple switches — no tool names needed. Everything on is the default.",
   "agents.cap.toggles.allowlistBanner": "Allowlist mode is active (only listed tools are permitted), so feature switches are disabled. Clear the allowlist to use switches instead.",

@@ -161,6 +161,38 @@ pub fn model_matches_provider(model: &str, provider: RuntimeType) -> bool {
     }
 }
 
+/// Best-effort model-family → runtime mapping for the dashboard save-time
+/// auto-align (`agents.update`): a confident family match returns that
+/// family's CLI runtime when its binary is installed, else `openai_compat`
+/// (API mode serves any model) so the aligned config is actually runnable.
+/// Claude always maps to Claude (its API path is the Anthropic-native client,
+/// not chat/completions). Unknown families return `None` — never guess.
+pub fn infer_provider_for_model(model: &str) -> Option<RuntimeType> {
+    let lower = model.trim().to_ascii_lowercase();
+    let m = lower.rsplit('/').next().unwrap_or(&lower);
+    if m.starts_with("claude") {
+        return Some(RuntimeType::Claude);
+    }
+    let (family, cli_present) = if m.starts_with("grok") {
+        (RuntimeType::Grok, duduclaw_core::which_grok().is_some())
+    } else if m.starts_with("gemini") {
+        (RuntimeType::Gemini, duduclaw_core::which_gemini().is_some())
+    } else if m.starts_with("gpt-")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("codex")
+    {
+        (RuntimeType::Codex, duduclaw_core::which_codex().is_some())
+    } else {
+        return None;
+    };
+    Some(if cli_present {
+        family
+    } else {
+        RuntimeType::OpenAiCompat
+    })
+}
+
 fn warn_mismatch_once(agent_dir: &Path, model: &str, provider: RuntimeType) {
     static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
@@ -738,6 +770,30 @@ mod tests {
         // Blank / whitespace value → None (fail-safe to preferred).
         write_agent_toml(agent.path(), "[model]\nstandard = \"  \"\n");
         assert_eq!(agent_standard_model(agent.path()), None);
+    }
+
+    #[test]
+    fn infer_provider_for_model_families() {
+        use RuntimeType::*;
+        assert_eq!(infer_provider_for_model("claude-sonnet-4-6"), Some(Claude));
+        // Family CLIs may or may not be installed on the test host — the
+        // inference must land on the family CLI or the openai_compat API
+        // fallback, never a different family and never Claude.
+        for (model, family) in [
+            ("grok-4.5", Grok),
+            ("gemini-3.1-pro", Gemini),
+            ("gpt-5.4", Codex),
+            ("xai/grok-4.5", Grok), // qualified provider/model form
+        ] {
+            let got = infer_provider_for_model(model).expect(model);
+            assert!(
+                got == family || got == OpenAiCompat,
+                "{model} inferred {got:?}"
+            );
+        }
+        // Unknown families: never guess.
+        assert_eq!(infer_provider_for_model("qwen3-8b"), None);
+        assert_eq!(infer_provider_for_model(""), None);
     }
 
     #[test]

@@ -2746,7 +2746,12 @@ export const api = {
         avatar: string | null;
       }>,
     update: (agentId: string, fields: AgentUpdateParams) =>
-      client.call('agents.update', { agent_id: agentId, ...fields }) as Promise<{ success: boolean }>,
+      client.call('agents.update', { agent_id: agentId, ...fields }) as Promise<{
+        success: boolean;
+        /** Save-time auto-align: provider the gateway rewrote `[runtime]` to
+         *  (model↔provider family mismatch), or null when untouched. */
+        runtime_provider_aligned?: string | null;
+      }>,
     /** WP4 — soft-delete: the AI staff member is hidden from every list but its
      *  data is retained on disk (not recoverable via the UI). */
     remove: (agentId: string) =>

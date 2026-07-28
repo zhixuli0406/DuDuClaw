@@ -6674,6 +6674,12 @@ impl MethodHandler {
         let mut changes: Vec<String> = Vec::new();
         let home_for_update = self.home_dir.clone();
 
+        // Save-time model↔provider auto-align result, surfaced back to the
+        // dashboard so it can toast the adjustment (set inside the closure).
+        let aligned_provider: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let aligned_for_closure = aligned_provider.clone();
+
         let result = self.update_agent_toml(&agent_id, move |table| {
             // ── Identity fields ([agent] section) ──
             if let Some(agent_section) = table.get_mut("agent").and_then(|v| v.as_table_mut()) {
@@ -7406,6 +7412,54 @@ impl MethodHandler {
                 }
             }
 
+            // ── Auto-align [runtime] provider to [model] preferred ──
+            // Live incident (2026-07-28): model grok-4.5 saved with the
+            // default provider "claude" routed into the Claude CLI and died
+            // with model_not_found — the warning log existed but nothing
+            // stopped the broken save. On the FINAL table state, a confident
+            // family mismatch rewrites the provider to the runtime that can
+            // actually serve the model (family CLI if installed, else
+            // openai_compat). `openai_compat` always passes the match check,
+            // so API-mode setups are never touched.
+            {
+                let preferred = table
+                    .get("model")
+                    .and_then(|m| m.get("preferred"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                if let Some(model) = preferred {
+                    let provider = table
+                        .get("runtime")
+                        .and_then(|r| r.get("provider"))
+                        .and_then(|v| v.as_str())
+                        .map(duduclaw_core::types::RuntimeType::parse)
+                        .unwrap_or_default();
+                    if !crate::runtime_config::model_matches_provider(&model, provider) {
+                        if let Some(aligned) =
+                            crate::runtime_config::infer_provider_for_model(&model)
+                        {
+                            let rt_section = table
+                                .entry("runtime")
+                                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                                .as_table_mut()
+                                .ok_or("Invalid [runtime] section")?;
+                            rt_section.insert(
+                                "provider".into(),
+                                toml::Value::String(aligned.as_str().into()),
+                            );
+                            changes.push(format!(
+                                "runtime.provider auto-aligned \"{}\" → \"{}\" (model \"{model}\")",
+                                provider.as_str(),
+                                aligned.as_str()
+                            ));
+                            if let Ok(mut slot) = aligned_for_closure.lock() {
+                                *slot = Some(aligned.as_str().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
             if changes.is_empty() {
                 return Err("No valid fields to update".into());
             }
@@ -7497,6 +7551,9 @@ impl MethodHandler {
                         "channels_restarted": restarted,
                         "os_watch_hot_reloaded": os_watch_hot_reloaded,
                         "identity_files_synced": soul_sync_changes,
+                        // Save-time model↔provider auto-align: the provider the
+                        // gateway rewrote [runtime] to, or null when untouched.
+                        "runtime_provider_aligned": aligned_provider.lock().ok().and_then(|s| s.clone()),
                         "message": if hot_reloaded {
                             "Agent updated successfully"
                         } else {
