@@ -21,7 +21,7 @@ use std::path::Path;
 
 use super::install::{InstallCtx, install_skill_global};
 use super::{
-    InstallRecord, PackKind, Report, ScanVerdict, cfg_err, copy_dir, io_err, map_model, now_iso,
+    InstallRecord, PackKind, Report, ScanVerdict, cfg_err, io_err, map_model, now_iso,
     scan_external, set_capabilities,
 };
 
@@ -102,8 +102,9 @@ pub(super) async fn install(
     // ── commands/*.md → single skill each ──
     import_commands(ctx, dir, report, &mut record);
 
-    // ── hooks/ → imported DISABLED ──
-    import_hooks_disabled(ctx, dir, &name, report);
+    // ── hooks/ → quarantined; enablement is ApprovalBroker-gated
+    //    (--trust-hooks, or approve + `expert hooks <slug>`) ──
+    super::hooks::import_hooks(ctx, dir, &name, report).await;
 
     // ── ignored capabilities ──
     for key in [
@@ -331,32 +332,6 @@ fn import_commands(ctx: &InstallCtx, dir: &Path, report: &mut Report, record: &m
         } else {
             report.skipped("command", &name, "寫入失敗");
         }
-    }
-}
-
-/// Copy `hooks/` into `<home>/experts/<slug>/hooks-disabled/` and report every
-/// hook file. Hooks are NEVER wired into any active config — enabling one is a
-/// deliberate operator action gated by the ApprovalBroker (follow-up WP).
-fn import_hooks_disabled(ctx: &InstallCtx, dir: &Path, slug: &str, report: &mut Report) {
-    let hooks_dir = dir.join("hooks");
-    if !hooks_dir.is_dir() {
-        return;
-    }
-    let dest = super::experts_dir(&ctx.home)
-        .join(slug)
-        .join("hooks-disabled");
-    let mut names = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&hooks_dir) {
-        for entry in rd.flatten() {
-            names.push(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-    names.sort();
-    for n in &names {
-        report.warning("hook", n, "已匯入但停用；啟用需經 ApprovalBroker 放行");
-    }
-    if !ctx.dry_run && !names.is_empty() {
-        let _ = copy_dir(&hooks_dir, &dest);
     }
 }
 

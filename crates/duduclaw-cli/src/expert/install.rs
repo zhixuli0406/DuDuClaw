@@ -21,10 +21,19 @@ pub(super) struct InstallCtx {
     pub home: PathBuf,
     pub dry_run: bool,
     pub rename: bool,
+    /// Explicit operator grant for pack hooks (`--trust-hooks`). Without it
+    /// hooks land disabled behind an ApprovalBroker request (fail-closed).
+    pub trust_hooks: bool,
 }
 
 /// Entry for `duduclaw expert install`.
-pub async fn cmd_install(home: &Path, source: &str, dry_run: bool, rename: bool) -> Result<()> {
+pub async fn cmd_install(
+    home: &Path,
+    source: &str,
+    dry_run: bool,
+    rename: bool,
+    trust_hooks: bool,
+) -> Result<()> {
     // ── 1. Resolve the source to an on-disk directory (download / unzip). ──
     // A throwaway staging dir under the system temp; cleaned at the end.
     let staging = std::env::temp_dir().join(format!("duduclaw-expert-{}", uuid::Uuid::new_v4()));
@@ -53,6 +62,7 @@ pub async fn cmd_install(home: &Path, source: &str, dry_run: bool, rename: bool)
         home: home.to_path_buf(),
         dry_run,
         rename,
+        trust_hooks,
     };
     let mut report = Report::default();
 
@@ -262,6 +272,9 @@ async fn install_native(
     if wiki_dir.is_dir() {
         install_wiki_tree(ctx, &wiki_dir, report, &mut record);
     }
+
+    // ── hooks/ → quarantined; enablement is ApprovalBroker-gated ──
+    super::hooks::import_hooks(ctx, dir, &e.name, report).await;
 
     Ok(record)
 }

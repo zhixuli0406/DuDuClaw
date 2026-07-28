@@ -25,11 +25,13 @@ use serde::{Deserialize, Serialize};
 use duduclaw_core::error::{DuDuClawError, Result};
 
 pub mod detect;
+pub mod hooks;
 mod install;
 pub mod manifest;
 mod plugin;
 mod safe_zip;
 mod skill_import;
+mod team_convert;
 pub mod topo;
 
 #[cfg(test)]
@@ -55,6 +57,11 @@ pub enum ExpertCommands {
         /// reporting a conflict.
         #[arg(long)]
         rename: bool,
+        /// Explicitly trust and enable the pack's hooks (the codex / claude
+        /// plugin `--trust` convention). Without this flag hooks are imported
+        /// disabled and an ApprovalBroker request is filed (fail-closed).
+        #[arg(long)]
+        trust_hooks: bool,
     },
 
     /// Validate and package a pack directory into a distributable `.zip`.
@@ -91,6 +98,27 @@ pub enum ExpertCommands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+
+    /// Show / apply the ApprovalBroker decision for a pack's imported hooks:
+    /// approved → enable, denied / expired → keep disabled (fail-closed).
+    Hooks {
+        /// Pack slug (see `expert list`).
+        slug: String,
+    },
+
+    /// Batch-convert legacy team playbooks (`teams/<industry>-team/`) into
+    /// native expert packs (`expert.toml` + agents + skills + wiki SOP).
+    /// Idempotent: output is deterministic from the sources; re-running
+    /// overwrites with identical content.
+    ConvertTeams {
+        /// Directory containing `<industry>-team/` playbooks (each with a
+        /// `team.toml`), e.g. `commercial/templates-premium/teams`.
+        teams_dir: PathBuf,
+        /// Output directory for generated packs
+        /// (default: `<teams_dir>/../experts`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 /// CLI entry point.
@@ -101,12 +129,17 @@ pub async fn run(cmd: ExpertCommands) -> Result<()> {
             source,
             dry_run,
             rename,
-        } => install::cmd_install(&home, &source, dry_run, rename).await,
+            trust_hooks,
+        } => install::cmd_install(&home, &source, dry_run, rename, trust_hooks).await,
         ExpertCommands::Pack { dir, out } => cmd_pack(&dir, out.as_deref()),
         ExpertCommands::List { json } => cmd_list(&home, json),
         ExpertCommands::Remove { slug } => cmd_remove(&home, &slug).await,
         ExpertCommands::Export { slug, format, out } => {
             install::cmd_export(&home, &slug, &format, out.as_deref()).await
+        }
+        ExpertCommands::Hooks { slug } => hooks::cmd_hooks(&home, &slug).await,
+        ExpertCommands::ConvertTeams { teams_dir, out } => {
+            team_convert::cmd_convert_teams(&teams_dir, out.as_deref())
         }
     }
 }
@@ -639,7 +672,19 @@ async fn cmd_remove(home: &Path, slug: &str) -> Result<()> {
         }
         if path.exists() {
             match std::fs::remove_file(&path) {
-                Ok(()) => report.imported("removed-wiki", rel),
+                Ok(()) => {
+                    report.imported("removed-wiki", rel);
+                    // Prune now-empty parent dirs up to the wiki fence
+                    // (`remove_dir` refuses non-empty dirs, so shared
+                    // namespaces that still hold other packs' pages survive).
+                    let mut parent = path.parent().map(|p| p.to_path_buf());
+                    while let Some(dir) = parent {
+                        if dir == wiki_root || std::fs::remove_dir(&dir).is_err() {
+                            break;
+                        }
+                        parent = dir.parent().map(|p| p.to_path_buf());
+                    }
+                }
                 Err(e) => report.skipped("wiki", rel, format!("刪除失敗: {e}")),
             }
         } else {
