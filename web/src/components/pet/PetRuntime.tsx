@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { PetRuntimePayload, SpriteAnimation } from '@/lib/pet';
-import { onPetAgentSignal, openPetContextMenu, startWindowDrag } from '@/lib/pet';
+import { isTauri, onPetAgentSignal, openPetContextMenu, petMoveBy, startWindowDrag } from '@/lib/pet';
 
 /**
  * PetRuntime — the desktop-pet animator (WP-P3 / WP-P5-lite).
@@ -68,7 +68,13 @@ export type PetState =
   | 'click'
   | 'working'
   | 'notify'
-  | 'sleep';
+  | 'sleep'
+  // Autonomous behaviors (the Codex-Pets wander engine picks these at random):
+  | 'walk-left'
+  | 'walk-right'
+  | 'rest'
+  | 'wave'
+  | 'jump';
 
 /** External agent signal → pet reaction (real agent events wire in here). */
 export interface PetAgentSignal {
@@ -81,18 +87,39 @@ function stateToRow(state: PetState): string {
   switch (state) {
     case 'working':
       return 'running';
+    case 'walk-left':
+      return 'running-left';
+    case 'walk-right':
+      return 'running-right';
     case 'notify':
     case 'click':
+    case 'wave':
       return 'waving';
     case 'drag':
     case 'fall':
+    case 'jump':
       return 'jumping';
     case 'sleep':
+    case 'rest':
       return 'waiting';
     default:
       return 'idle';
   }
 }
+
+// ── Autonomous behavior tuning (ms / px) ─────────────────────────────────────
+/** Pause between behavior picks while idle. */
+const WANDER_MIN_DELAY = 6_000;
+const WANDER_EXTRA_DELAY = 8_000;
+/** Walk stride per tick (logical px) and tick interval — ~55 px/s. */
+const WALK_STEP_PX = 3;
+const WALK_TICK_MS = 55;
+/** One walk lasts 2–6 s before settling back to idle. */
+const WALK_MIN_MS = 2_000;
+const WALK_EXTRA_MS = 4_000;
+/** Sitting rest lasts 4–9 s. */
+const REST_MIN_MS = 4_000;
+const REST_EXTRA_MS = 5_000;
 
 interface PetRuntimeProps {
   pet: PetRuntimePayload;
@@ -326,9 +353,97 @@ export function PetRuntime({ pet, pendingCount = 0, onActivate }: PetRuntimeProp
     }
   }, [hasPending, notifyDismissed]);
 
-  // Working bob (procedural mode only; sprite mode uses the running row).
+  // ── Autonomous wander engine (Codex-Pets style) ──────────────────────────
+  // While idle, periodically pick a weighted-random behavior: walk left/right
+  // (moving the REAL pet window across the desktop, turning at screen edges),
+  // sit down (rest), wave, or jump. Any interaction or agent signal changes
+  // `state`, and every behavior re-checks `stateRef` before acting — so a
+  // press/drag interrupts the wander instantly. Mounted once; gated on motion
+  // preference at pick time so it also honours live setting changes.
   useEffect(() => {
-    if (isSprite || state !== 'working') return;
+    let alive = true;
+    let pickTimer: number | null = null;
+    let walkTimer: number | null = null;
+    let revertTimer: number | null = null;
+
+    const schedule = () => {
+      if (!alive) return;
+      pickTimer = window.setTimeout(pick, WANDER_MIN_DELAY + Math.random() * WANDER_EXTRA_DELAY);
+    };
+
+    const backToIdle = (from: PetState[]) => {
+      if (alive && from.includes(stateRef.current)) setState('idle');
+      schedule();
+    };
+
+    const startWalk = () => {
+      let dir: 1 | -1 = Math.random() < 0.5 ? -1 : 1;
+      const walkStates: PetState[] = ['walk-left', 'walk-right'];
+      setState(dir < 0 ? 'walk-left' : 'walk-right');
+      const until = Date.now() + WALK_MIN_MS + Math.random() * WALK_EXTRA_MS;
+      walkTimer = window.setInterval(() => {
+        if (!alive || Date.now() > until || !walkStates.includes(stateRef.current)) {
+          if (walkTimer !== null) window.clearInterval(walkTimer);
+          walkTimer = null;
+          backToIdle(walkStates);
+          return;
+        }
+        petMoveBy(dir * WALK_STEP_PX)
+          .then((hitEdge) => {
+            if (!alive || !hitEdge) return;
+            dir = dir < 0 ? 1 : -1; // bounce off the screen edge
+            if (walkStates.includes(stateRef.current)) {
+              setState(dir < 0 ? 'walk-left' : 'walk-right');
+            }
+          })
+          .catch(() => {
+            // Not hosted in Tauri — stop moving, finish the walk quietly.
+            if (walkTimer !== null) window.clearInterval(walkTimer);
+            walkTimer = null;
+            backToIdle(walkStates);
+          });
+      }, WALK_TICK_MS);
+    };
+
+    const pick = () => {
+      if (!alive) return;
+      if (stateRef.current !== 'idle' || prefersReducedMotion()) {
+        schedule();
+        return;
+      }
+      const r = Math.random();
+      if (r < 0.4 && isTauri()) {
+        startWalk();
+      } else if (r < 0.62) {
+        setState('rest');
+        revertTimer = window.setTimeout(
+          () => backToIdle(['rest']),
+          REST_MIN_MS + Math.random() * REST_EXTRA_MS,
+        );
+      } else if (r < 0.78) {
+        setState('wave');
+        revertTimer = window.setTimeout(() => backToIdle(['wave']), 1_600);
+      } else if (r < 0.9) {
+        setState('jump');
+        revertTimer = window.setTimeout(() => backToIdle(['jump']), 1_400);
+      } else {
+        schedule(); // stay idle this round
+      }
+    };
+
+    schedule();
+    return () => {
+      alive = false;
+      if (pickTimer !== null) window.clearTimeout(pickTimer);
+      if (walkTimer !== null) window.clearInterval(walkTimer);
+      if (revertTimer !== null) window.clearTimeout(revertTimer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Working / walking bob (procedural mode only; sprite mode uses its rows).
+  useEffect(() => {
+    if (isSprite || !['working', 'walk-left', 'walk-right'].includes(state)) return;
     const el = spriteRef.current;
     if (!canAnimate(el)) return;
     const anim = el.animate(

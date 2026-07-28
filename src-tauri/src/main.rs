@@ -63,6 +63,7 @@ fn main() {
             pet_gen::pet_model_status,
             pet_gen::pet_model_download,
             pet_gen::pet_context_menu,
+            pet_gen::pet_move_by,
             pet_gen::pet_set_scale,
             pet_gen::pet_get_scale,
             pet_gen::pet_open_studio,
