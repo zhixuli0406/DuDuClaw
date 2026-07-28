@@ -23,7 +23,24 @@
   廣播的每個工具必須存在於型錄，未來新增工具漏補型錄會直接讓 build 變紅（與既有
   scope-drift 測試互補）。
 
+- **檔案頁 Office 預覽（LibreOffice→PDF）**：新增 `GET /api/files/preview`——
+  docx/xlsx/pptx/odt/ods/odp/csv 由 gateway 以 `soffice --headless` 轉 PDF 後 inline
+  串流（mtime 驗證快取於 `<home>/cache/preview/<agent>/`、隔離 LO profile 防 lock 打架、
+  60s timeout）；未裝 LibreOffice 回明確 503 zh-TW 訊息。pdf/圖片維持原生 inline。
+  檔案頁 office 列現在顯示「預覽（轉為 PDF）」眼睛鍵——先前文案宣稱可預覽但 office
+  檔根本沒有預覽鍵。與 download 相同的 JWT 驗證＋路徑圍欄。
+
 ### Fixed
+- **產檔交付雙保險（活體事故 2026-07-28）**：agent 真做出 .docx 卻寫到 ~/Desktop 且
+  沒帶 `📎DELIVER:` 標記——使用者只收到文字、檔案頁無歸檔。①提示詞硬化：交付規則
+  從 office SKILL.md 升級為 channel system prompt **常駐區塊**（靜態文字、prompt-cache
+  友善）：產檔必須存工作目錄、回覆末行逐檔標 `📎DELIVER:<絕對路徑>`；②確定性安全網：
+  無標記但回覆提及文件產出時，回覆後掃描 agent 目錄（深度≤3、15 分鐘窗、office 副檔名、
+  對 attachments 歸檔去重、上限 3 檔）自動送檔＋歸檔（`sweep_undeclared_deliverables`）。
+- **桌寵「調整大小」只放大隱形視窗**：`pet_set_scale` 縮放的是原生視窗，但
+  `PetRuntime` 的 canvas／原相 `<img>`／內建 DuDu 都寫死 170px——調大只撐大透明外框，
+  調小會被裁切。顯示尺寸改為跟隨視窗短邊（92%，含陰影與跳躍動畫餘裕）並監聽 resize，
+  小／標準／大現在真的縮放像素寵物本體。
 - **API 模式 agent 的 qualified 工具名比對失效**：dashboard 工具選單寫入的
   `mcp__duduclaw__<name>` 格式在 `filter_tool_defs`（openai-compat／Direct API 工具迴圈
   的能力過濾器）中比對不到 registry 廣播的裸名——qualified 白名單會把 API 模式 agent 的

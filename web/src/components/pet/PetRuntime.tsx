@@ -26,8 +26,40 @@ import { onPetAgentSignal, openPetContextMenu, startWindowDrag } from '@/lib/pet
 const DRAG_THRESHOLD = 4;
 /** Idle time (ms) with no interaction before the pet dozes off. */
 const SLEEP_AFTER_MS = 60_000;
-/** Longest edge (px) the pet is drawn at inside the overlay window. */
-const DISPLAY_MAX = 170;
+/**
+ * Fraction of the overlay window's short edge the pet is drawn at. The native
+ * host resizes the WINDOW for 小/標準/大 (`pet_set_scale`), so the pet must
+ * track the viewport — a fixed pixel size only grows the invisible frame.
+ * The margin absorbs the drop shadow and the hop/jump animation overshoot.
+ */
+const DISPLAY_FRACTION = 0.92;
+/** Lower bound (px) so the pet never collapses on a degenerate viewport. */
+const DISPLAY_MIN = 48;
+
+/** Longest edge (px) to draw the pet at, tracking live window resizes. */
+export function useDisplayMax(): number {
+  const [max, setMax] = useState(() =>
+    typeof window === 'undefined'
+      ? 170
+      : Math.max(
+          DISPLAY_MIN,
+          Math.round(Math.min(window.innerWidth, window.innerHeight) * DISPLAY_FRACTION),
+        ),
+  );
+  useEffect(() => {
+    const onResize = () => {
+      setMax(
+        Math.max(
+          DISPLAY_MIN,
+          Math.round(Math.min(window.innerWidth, window.innerHeight) * DISPLAY_FRACTION),
+        ),
+      );
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  return max;
+}
 
 export type PetState =
   | 'idle'
@@ -130,13 +162,14 @@ export function PetRuntime({ pet, pendingCount = 0, onActivate }: PetRuntimeProp
     };
   }, [isSprite, pet.imageDataUrl]);
 
-  // Display size — scale the frame to fit DISPLAY_MAX, preserving aspect.
+  // Display size — scale the frame to fit the live viewport, preserving aspect.
+  const displayMax = useDisplayMax();
   const display = useMemo(() => {
-    if (!sheet) return { w: DISPLAY_MAX, h: DISPLAY_MAX };
+    if (!sheet) return { w: displayMax, h: displayMax };
     const { frameWidth: fw, frameHeight: fh } = sheet;
-    const scale = DISPLAY_MAX / Math.max(fw, fh);
+    const scale = displayMax / Math.max(fw, fh);
     return { w: Math.round(fw * scale), h: Math.round(fh * scale) };
-  }, [sheet]);
+  }, [sheet, displayMax]);
 
   // Frame stepping loop: draw the current row's frames onto the canvas.
   useEffect(() => {
@@ -437,7 +470,8 @@ export function PetRuntime({ pet, pendingCount = 0, onActivate }: PetRuntimeProp
               src={pet.imageDataUrl}
               alt={label}
               draggable={false}
-              className="pointer-events-none block max-h-[170px] max-w-[170px] object-contain drop-shadow-[0_6px_10px_rgba(0,0,0,0.28)]"
+              style={{ maxWidth: displayMax, maxHeight: displayMax }}
+              className="pointer-events-none block object-contain drop-shadow-[0_6px_10px_rgba(0,0,0,0.28)]"
             />
           ) : (
             <div className="grid size-[120px] place-items-center rounded-full bg-muted text-4xl">
