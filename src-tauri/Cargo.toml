@@ -37,10 +37,14 @@ mdns-sd = "0.20"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Photo → desktop-pet pack format + local background removal (WP-P2/P3). The
-# `onnx` feature pulls the ort/onnxruntime path (BiRefNet/silueta); prebuilt
-# onnxruntime binaries resolve on the desktop's native target (aarch64/x86_64
-# with a supported prebuilt) — same setup as duduclaw-inference's `onnx` feature.
-duduclaw-pets = { path = "../crates/duduclaw-pets", features = ["onnx"] }
+# `onnx` pulls the ort/onnxruntime path (BiRefNet/silueta local background
+# removal). ort-sys 2.0.0-rc.12 ships prebuilt onnxruntime ONLY for
+# aarch64-macos and windows — the v1.46.0 desktop CI failed on
+# x86_64-apple-darwin and x86_64-linux with "ort does not provide prebuilt
+# binaries for the target". Target-gate the feature: those platforms build
+# without `onnx` and pet generation degrades to the passthrough remover
+# (photo kept as-is), everything else identical.
+duduclaw-pets = { path = "../crates/duduclaw-pets" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Transitive pin (not used directly): time 0.3.52 changed the public
@@ -48,6 +52,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # compile against cookie 0.18.1 pulled in by tauri/wry. Hold time at 0.3.51 until
 # tauri ships a cookie that targets the new API. Remove once that lands.
 time = "=0.3.51"
+
+# ONNX-backed background removal only where ort-sys has prebuilt onnxruntime
+# (see the duduclaw-pets comment above). Same path + extra feature is a legal
+# Cargo pattern: features unify on matching targets.
+[target.'cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "windows"))'.dependencies]
+duduclaw-pets = { path = "../crates/duduclaw-pets", features = ["onnx"] }
 
 [features]
 # Bundle artifacts use this; keep parity with Tauri's default template.
