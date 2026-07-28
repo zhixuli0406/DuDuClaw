@@ -39,6 +39,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 27 | [Cross-Platform PTY Pool + Worker](27-pty-pool-runtime.md) | Drive the interactive `claude` REPL (v1.15.0) |
 | 28 | [Live Run Forking](28-live-forking.md) | Parallel branches + AI judge (duduclaw-fork, RFC-26) |
 | 29 | [Evolution Events](29-evolution-events.md) | Black-box recorder with batch+retry delivery |
+| 30 | [Custom Dashboard Widgets](30-custom-widgets.md) | AI-guided or raw-HTML dashboard cards in a sandbox |
 
 ---
 

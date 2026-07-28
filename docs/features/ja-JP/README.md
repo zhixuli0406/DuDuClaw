@@ -39,6 +39,7 @@
 | 27 | [クロスプラットフォーム PTY プール + ワーカー](27-pty-pool-runtime.md) | 対話型 `claude` REPL を駆動（v1.15.0） |
 | 28 | [ライブ実行フォーク（Live Forking）](28-live-forking.md) | 並列ブランチ + AI ジャッジ（duduclaw-fork, RFC-26） |
 | 29 | [進化イベント](29-evolution-events.md) | バッチ + リトライ配信のブラックボックスレコーダー |
+| 30 | [カスタムダッシュボードウィジェット](30-custom-widgets.md) | AI ガイドまたは生 HTML のダッシュボードカード（サンドボックス実行） |
 
 ---
 

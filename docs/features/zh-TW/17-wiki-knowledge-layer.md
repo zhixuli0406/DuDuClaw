@@ -243,6 +243,37 @@ mode         = "operator_only"
 
 寫入前可使用 `wiki_namespace_status` MCP 工具來檢視當前生效的政策。
 
+### 部門級讀取可見範圍（`visible_to_departments`）
+
+上面的 `mode` 管的是「誰能寫入」一個命名空間。要管「誰能在**部門**層級讀取」，在同一個 `[namespaces."x"]` 表格底下加一個 `visible_to_departments` 陣列。只有 `[agent] department` 落在清單上的 Agent 才看得到那個命名空間——不論是**prompt 注入**（自動注入的 L0/L1 頁面），還是透過 **`shared_wiki_search` / `shared_wiki_read` / `shared_wiki_ls`**。
+
+```toml
+# HR 頁面只有 hr 與 legal 部門能讀
+[namespaces."hr"]
+mode                   = "operator_only"   # 寫入：僅限操作者
+visible_to_departments = ["hr", "legal"]   # 讀取：僅限 hr + legal 部門
+```
+
+這與寫入用的 `mode` 是正交的——一個命名空間可以同時宣告兩者、只宣告其中一個，或都不宣告。Agent 的部門來自其 `agent.toml` 裡的 `[agent] department`（空值/未設定 = 沒有部門）。
+
+對任何有宣告的命名空間都是 **fail-closed**：部門不在清單上的 Agent——包括**沒有部門**的 Agent——一律拒絕。只做精確的部門比對（不做前綴/子字串比對）。清單為空則拒絕所有人。
+
+若未宣告則是 **fail-safe**：沒有 `visible_to_departments` 的命名空間維持對所有 Agent 可讀，行為與過去相同。`.scope.toml` 缺失或格式錯誤 ⇒ 不過濾。
+
+這一層疊在內建的 `departments/<dept>/` 隔離之上（見下方「部門知識分層」）：`departments/art/*` 無論 `.scope.toml` 怎麼設，永遠只對 `art` 部門可見；而 `visible_to_departments` 讓操作者可以把*任何*命名空間（`hr/`、`finance/` 等）限制給指定部門。`wiki_namespace_status` 會列出目前生效的 `visible_to_departments` 宣告。
+
+### 部門知識與 Skill 分層
+
+知識與 Skill 採**公司 → 部門 → 個人**分層：
+
+- **Wiki：** `shared/wiki/departments/<dept>/` 底下的頁面只對 `[agent] department` 相符的 Agent 可見；公司層（其他所有命名空間）對所有人開放。讀取隔離永遠強制執行。
+- **Skill：** 三層依 **per-agent > 部門 > 全域**的優先序合併（名稱衝突時最近的層級勝出）：
+  - 全域 — `~/.duduclaw/skills/`（所有 Agent）
+  - 部門 — `~/.duduclaw/shared/skills/departments/<dept>/`（僅限 `<dept>` 部門的 Agent）
+  - per-agent — `<agent>/SKILLS/`
+
+透過 `skill_hub_install` MCP 工具、帶 `scope = "department:<name>"`（或 `"global"` / 指定 agent id）可以把 Skill 裝進部門層。沒有部門的 Agent 就只看得到全域層與 per-agent 層。
+
 ---
 
 ## Cloud Ingest 整合

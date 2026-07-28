@@ -1,6 +1,6 @@
-# 多帳號智慧輪替
+# 多帳號輪替與跨供應商容錯
 
-> API 認證資料的智慧排程——永遠不再碰到限速。
+> 跨 Claude、Codex、Gemini 的智慧認證資料排程——永遠不再碰到限速。
 
 ---
 
@@ -178,15 +178,72 @@ LeastCost 策略確保免費配額（來自訂閱）優先消耗。付費 API �
 
 ---
 
+## 跨供應商容錯
+
+搭配 DuDuClaw 的 Multi-Runtime 架構（Claude / Codex / Gemini / OpenAI-compat），帳號輪替延伸到跨供應商層級。**FailoverManager** 協調跨供應商的健康狀態：
+
+```
+主要供應商（Claude）被限速
+     |
+     v
+FailoverManager 檢查替代方案：
+  - Codex CLI 可用？→ 路由過去
+  - Gemini CLI 可用？→ 路由過去
+  - 本地推論可用？→ 路由過去
+     |
+     v
+不可重試的錯誤？（認證失敗、帳單停權）
+  → 標記供應商為不健康，較長冷卻時間
+可重試的錯誤？（逾時、暫時性伺服器錯誤）
+  → 短冷卻時間，很快重試
+```
+
+### 通道失敗追蹤
+
+當通道回覆失敗時（面向使用者的路徑），系統會記錄結構化的失敗資料：
+
+```
+失敗紀錄 → ~/.duduclaw/channel_failures.jsonl：
+  {
+    "ts": "2026-04-15T10:30:00Z",
+    "agent": "dudu",
+    "channel": "telegram",
+    "reason": "RateLimited",      // 或 Billing、Timeout、BinaryMissing 等
+    "account": "oauth-pro-1",
+    "message_zh": "API 用量已達上限..."
+  }
+```
+
+失敗類別會渲染成**分類專屬的 zh-TW 訊息**，取代舊版那句籠統的「請執行 `claude auth status`」提示。失敗日誌會餵進儀表板供觀察。
+
+### CLI 執行檔探測
+
+DuDuClaw 以系統服務方式執行（透過 `duduclaw service install`），這代表 `PATH` 可能不包含 AI CLI 執行檔的位置。`which_claude()` 函式會探測：
+
+- Homebrew（Intel + Apple Silicon 路徑）
+- Bun 全域安裝
+- Volta 工具鏈
+- npm 全域
+- `.claude/bin`
+- `.local/bin`
+- asdf shims
+- NVM 版本目錄
+
+這確保由 launchd/systemd 啟動的 gateway 能找到 CLI 執行檔，不依賴 `PATH` 繼承。
+
+---
+
 ## 與其他系統的互動
 
+- **Multi-Runtime**：帳號輪替橫跨 Claude、Codex、Gemini 與 OpenAI-compat 供應商運作。
 - **信心路由器**：路由到本地推論的查詢不消耗任何 API 帳號，延長配額使用期限。
 - **CostTelemetry**：提供支持預算執行和快取效率回饋的數據。
+- **FailoverManager**：協調跨供應商的健康追蹤與容錯決策。
 - **Direct API**：為簡單查詢提供高快取命中率的旁路。
-- **儀表板**：即時顯示帳號健康、使用量和剩餘預算。
+- **儀表板**：即時顯示帳號健康、使用量、剩餘預算與通道失敗日誌。
 
 ---
 
 ## 總結
 
-API 認證資料是有限的資源。多帳號輪替將它們視為一支受管理的車隊——自動選擇最佳可用選項、冷卻過載帳號、執行預算、並在雲端使用效率低時轉移到本地推論。
+API 認證資料是有限的資源——在多供應商世界裡，它們是一整支有限資源組成的*車隊*。多帳號輪替將它們視為一支受管理的車隊——自動跨供應商選擇最佳可用選項、冷卻過載帳號、執行預算、並在雲端使用效率低時轉移到本地推論。

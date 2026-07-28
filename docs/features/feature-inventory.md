@@ -18,6 +18,7 @@
 | Cross-session user profile | per-user preference traits (temporal supersession) → session-stable `## About This User` reply injection; `user_profile_record` / `user_profile_get` MCP tools |
 | GDPR export/erase | `duduclaw gdpr export\|erase <contact>` over memory (triples + mentions + key_facts, 4-table cascade, SHA-256 tombstone) **and** the session store (`<channel>:<chat_id>` prefix) |
 | Memory PPR bench | `duduclaw memory bench` — P50/P95 latency + partition recommendation (LightRAG measurement gate) |
+| Custom Dashboard Widgets | AI-guided or raw-HTML dashboard cards in a sandboxed runtime; Widget Studio share/import/export ([30-custom-widgets.md](30-custom-widgets.md)) |
 | Budget circuit breaker | hard per-agent rolling-window spend caps (`[budget] daily_cap_cents`) that block LLM calls at the choke-point; `budget_events.jsonl` |
 | Burn-rate cost anomaly | rolling mean+stddev outlier detection over per-day spend (`cost_anomaly.rs`) |
 | Audit export + SIEM sink | `duduclaw audit` — normalize + stream the JSONL audit trails to NDJSON / a webhook |
