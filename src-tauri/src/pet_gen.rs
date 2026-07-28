@@ -179,33 +179,40 @@ pub fn pet_list() -> Vec<PetSummary> {
 /// keeps the single-image procedural pet. Returns the new pet's summary. Does
 /// NOT auto-activate — the UI activates explicitly after the user confirms.
 #[tauri::command]
-pub fn pet_generate(
+pub async fn pet_generate(
     name: String,
     photo_base64: String,
     external_cutout: bool,
     pixelate: bool,
 ) -> Result<GeneratedPet, String> {
-    let raw = strip_data_url(&photo_base64);
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(raw.as_bytes())
-        .map_err(|e| format!("invalid image data: {e}"))?;
-    let remover = pick_remover(external_cutout);
-    let label = remover.label().to_string();
-    let pack = if pixelate {
-        duduclaw_pets::generate_pixel_sprite_pet(&name, &bytes, remover.as_ref())
-    } else {
-        duduclaw_pets::generate_procedural_pet(&name, &bytes, remover.as_ref())
-    }
-    .map_err(|e| e.to_string())?;
-    tracing::info!(slug = %pack.slug, remover = %label, pixelate, "generated pet pack");
-    let image_data_url = pack.image_path().and_then(|p| encode_image_data_url(&p));
-    Ok(GeneratedPet {
-        slug: pack.slug,
-        display_name: pack.manifest.display_name,
-        mode: mode_str(pack.manifest.mode),
-        image_data_url,
-        remover_label: label,
+    // Heavy CPU work (segmentation + pixelate + spritesheet bake takes
+    // seconds) — a sync command runs it on the MAIN thread and beachballs the
+    // whole app. async + spawn_blocking keeps the UI (and its spinner) alive.
+    tauri::async_runtime::spawn_blocking(move || {
+        let raw = strip_data_url(&photo_base64);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw.as_bytes())
+            .map_err(|e| format!("invalid image data: {e}"))?;
+        let remover = pick_remover(external_cutout);
+        let label = remover.label().to_string();
+        let pack = if pixelate {
+            duduclaw_pets::generate_pixel_sprite_pet(&name, &bytes, remover.as_ref())
+        } else {
+            duduclaw_pets::generate_procedural_pet(&name, &bytes, remover.as_ref())
+        }
+        .map_err(|e| e.to_string())?;
+        tracing::info!(slug = %pack.slug, remover = %label, pixelate, "generated pet pack");
+        let image_data_url = pack.image_path().and_then(|p| encode_image_data_url(&p));
+        Ok(GeneratedPet {
+            slug: pack.slug,
+            display_name: pack.manifest.display_name,
+            mode: mode_str(pack.manifest.mode),
+            image_data_url,
+            remover_label: label,
+        })
     })
+    .await
+    .map_err(|e| format!("generation task failed: {e}"))?
 }
 
 /// Strip a leading `data:*;base64,` prefix if present, returning the base64 body.
