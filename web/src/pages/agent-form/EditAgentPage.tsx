@@ -701,7 +701,22 @@ export function EditAgentPage() {
 
       // updateAgent re-fetches the roster internally. Autosave never navigates
       // away — the header SettingsSaveState indicator is the only feedback.
-        await updateAgent(agent.name, submitForm);
+        const res = await updateAgent(agent.name, submitForm);
+        // Save-time auto-align: the gateway rewrote [runtime] provider to
+        // match the model family — tell the operator instead of leaving a
+        // silently-different config than what the form showed.
+        if (res?.runtime_provider_aligned) {
+          setRuntime((prev) => ({
+            ...prev,
+            provider: res.runtime_provider_aligned as RuntimeProvider,
+          }));
+          toast.info(
+            intl.formatMessage(
+              { id: 'agents.edit.runtimeAligned' },
+              { provider: res.runtime_provider_aligned },
+            ),
+          );
+        }
       }
       // CON — a dirty contract writes through its own RPC (in addition to the
       // section update above; a contract-only edit runs only this branch).

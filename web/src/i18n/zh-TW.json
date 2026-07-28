@@ -1508,6 +1508,7 @@
   "agents.cap.toolPicker.search": "搜尋工具…",
   "agents.cap.toolPicker.empty": "沒有符合的工具",
   "agents.cap.toolPicker.error": "工具型錄載入失敗",
+  "agents.edit.runtimeAligned": "偵測到模型與執行環境不一致，已自動將執行環境調整為 {provider}",
   "agents.cap.toggles.title": "功能開關",
   "agents.cap.toggles.desc": "用開關決定這位 AI 員工可以使用哪些功能，不需要了解工具名稱。全部開啟是預設狀態。",
   "agents.cap.toggles.allowlistBanner": "目前使用白名單模式（僅允許清單內的工具），功能開關已停用。清除白名單即可改用功能開關。",

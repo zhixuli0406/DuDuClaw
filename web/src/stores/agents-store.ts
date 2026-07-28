@@ -19,7 +19,10 @@ interface AgentsStore {
   selectAgent: (id: string | null) => void;
   pauseAgent: (id: string) => Promise<void>;
   resumeAgent: (id: string) => Promise<void>;
-  updateAgent: (id: string, fields: AgentUpdateParams) => Promise<void>;
+  updateAgent: (
+    id: string,
+    fields: AgentUpdateParams,
+  ) => Promise<{ success: boolean; runtime_provider_aligned?: string | null } | undefined>;
   removeAgent: (id: string) => Promise<void>;
   /** WP4 — archive (recoverable). Rejected by the backend for the main agent. */
   archiveAgent: (id: string) => Promise<void>;
@@ -94,11 +97,13 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
     },
     updateAgent: async (id, fields) => {
       try {
-        await api.agents.update(id, fields);
+        const res = await api.agents.update(id, fields);
         // Re-fetch to get the authoritative state after update
         await get().fetchAgents();
+        return res;
       } catch {
         set({ error: 'agents.error.update' });
+        return undefined;
       }
     },
     removeAgent: async (id) => {

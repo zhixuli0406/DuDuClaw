@@ -1508,6 +1508,7 @@
   "agents.cap.toolPicker.search": "ツールを検索…",
   "agents.cap.toolPicker.empty": "一致するツールがありません",
   "agents.cap.toolPicker.error": "ツールカタログの読み込みに失敗しました",
+  "agents.edit.runtimeAligned": "モデルと実行環境の不一致を検出し、実行環境を {provider} に自動調整しました",
   "agents.cap.toggles.title": "機能スイッチ",
   "agents.cap.toggles.desc": "この AI 社員が使える機能をスイッチで設定できます。ツール名の知識は不要です。すべてオンが既定です。",
   "agents.cap.toggles.allowlistBanner": "許可リストモードが有効のため（リスト内のツールのみ許可）、機能スイッチは無効です。許可リストをクリアするとスイッチで設定できます。",
