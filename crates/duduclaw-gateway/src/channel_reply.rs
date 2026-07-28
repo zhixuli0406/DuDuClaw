@@ -249,7 +249,17 @@ pub(crate) fn format_history_as_prompt(history: &[ConversationTurn], current_mes
         buf.push_str(">\n");
     }
     buf.push_str("</conversation_history>\n\n");
+    // Joanna field report: a bare "hi" after a heavy task turn re-triggered
+    // the task's Drive searches for minutes — with no framing, an eager
+    // persona treats unfinished history as a standing work order. Make the
+    // contract explicit: history is context, the current message is the job.
+    buf.push_str(
+        "以上 <conversation_history> 只是過去的對話紀錄（上下文），其中的任務都已結束或暫停。\
+         只回應下方 <current_message>；除非使用者現在明確要求，否則不要自行重啟、繼續或補做歷史中的任務，\
+         也不要為了寒暄或簡短訊息呼叫工具。\n\n<current_message>\n",
+    );
     buf.push_str(current_message);
+    buf.push_str("\n</current_message>");
     buf
 }
 
@@ -3927,7 +3937,10 @@ mod multi_turn_tests {
         let result = format_history_as_prompt(&history, "world");
         assert!(result.contains("<conversation_history>"));
         assert!(result.contains("<user>hi</user>"));
-        assert!(result.ends_with("world"));
+        // History framing (2026-07-28): the current message is delimited and
+        // preceded by the "history is context, don't resume old tasks" rule.
+        assert!(result.contains("不要自行重啟"), "{result}");
+        assert!(result.ends_with("<current_message>\nworld\n</current_message>"), "{result}");
     }
 
     #[test]
@@ -7548,6 +7561,21 @@ fn build_system_prompt(
             deliver_rules,
         ));
         parts.push(deliver_rules.to_string());
+
+        // Interaction-pacing rule (2026-07-28 field report): after a heavy
+        // task turn, a bare greeting re-triggered minutes of Drive searches —
+        // the model treated unfinished history as a standing work order.
+        // Always-on static text (prompt-cache friendly, runtime-agnostic; the
+        // Direct API path gets real turn structure but the same bias).
+        let pacing_rules = "## 互動節奏（強制）\n\
+            只回應使用者這一次說的話。寒暄、道謝、簡短閒聊——直接簡短回覆，\
+            不呼叫任何工具。先前對話中的任務一律視為已結束或暫停：\
+            除非使用者現在明確要求繼續，否則不得自行重啟、續作或補做。";
+        audit.push(crate::prompt_audit::PromptSection::new(
+            "pacing_rules",
+            pacing_rules,
+        ));
+        parts.push(pacing_rules.to_string());
 
         // Progressive skill injection (when available)
         let mut skills_total_bytes: usize = 0;
