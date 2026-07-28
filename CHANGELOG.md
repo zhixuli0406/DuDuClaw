@@ -3,6 +3,32 @@
 ## [Unreleased]
 
 ### Added
+- **錄製 → 技能閉環（WP3.3）**：新增五個 MCP 工具——`browser_record_start` /
+  `browser_record_stop`（真實 Playwright 瀏覽器帶 tracing + HAR + UI 動作記錄器，
+  停止時 HAR 就地脫敏：Authorization/cookie/set-cookie/token 類 query 與 body 值
+  一律替換為 `<env:VAR>` 佔位符）、`desktop_record_start` / `desktop_record_stop`
+  （macOS 每秒截圖＋前景視窗標題，不記錄鍵入內容）、`skill_from_recording`
+  （把錄製蒸餾成 SKILL.md 草稿：安全掃描 fail-closed → 隔離草稿區＋管理員審批，
+  絕不直接進技能庫）。功能預設關：需 `agent.toml [capabilities] recording = true`
+  ＋新 MCP scope `recording`（dispatch gate 雙重把關、fail-closed）。錄製檔落
+  `~/.duduclaw/recordings/<id>/`（權限 700，30 分鐘自動停止上限）。
+  詳見 `docs/guides/recording-to-skill.md`。
+- **專家包 hooks 審批全迴路＋團隊劇本批次遷移**：專家包含 hooks 時 install 隔離至
+  `hooks-disabled/` 並經 ApprovalBroker 建立 `expert_hooks_enable` 審批（TTL 24h、
+  fail-closed：拒絕／逾期／無授權一律停用），`duduclaw expert hooks <slug>` 套用決定，
+  CLI `--trust-hooks` 顯式放行（比照 plugin `--trust` 慣例）；dashboard 審批中心
+  相容顯示免新 UI。新增 `duduclaw expert convert-teams`：22 個產業團隊劇本批次轉為
+  expert 包（front_desk/workers reports_to 佈線、產業 SOUL overlay、分派劇本→
+  Agent Skills 格式 skill、wiki SOP per-slug 命名空間），轉換冪等，3 包真 binary
+  全生命週期活測通過；順修 `expert remove` 空 wiki 目錄殘留。
+- **Skill 市集每日聚合推薦（WP2.6 P1）**：騎既有 CronScheduler tick 的 24h 摘要——
+  聚合過去一天的能力缺口（gap accumulator）取 top3、以聯邦市集搜尋掛推薦技能，
+  推送到 `[proactive]` 通路；無缺口完全靜默。預設關（`config.toml [skills]
+  gap_digest_enabled = true` 啟用）。
+- **Google Chat 入向附件**：webhook 訊息帶附件時以 service account 走 Chat media API
+  下載並歸檔到 agent attachments/（訊息附 `[📎 filename](path)` 參照，與其他通路一致）；
+  Drive 型附件因 `chat.bot` scope 不含 Drive 明確降級標註不硬做；任何附件失敗
+  皆不擋訊息。純附件無文字的訊息現在也會進 agent。
 - **功能開關（Feature switches）— 面向一般使用者的 capabilities 設定**：AI 員工編輯頁
   「工具與權限」新增白話「功能開關」區塊——14 組日常語言功能組（辦公文件／訊息與語音／
   記憶／知識庫／排程／團隊協作／技能管理／Google／Notion／GitHub／Odoo ERP／電腦整合／

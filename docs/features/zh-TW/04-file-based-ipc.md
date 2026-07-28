@@ -1,6 +1,6 @@
 # 檔案式 IPC 訊息匯流排
 
-> 透過 append-only JSONL 實現零依賴的跨 Agent 通訊。
+> 透過 append-only JSONL 實現結構化的跨 Agent 委派，搭配 TaskSpec 工作流。
 
 ---
 
@@ -137,15 +137,93 @@ HeartbeatScheduler（每 Agent）
 
 ---
 
+## DelegationEnvelope：結構化交接
+
+原始 JSONL 訊息對簡單任務夠用，但複雜的多 Agent 工作流需要結構。**DelegationEnvelope** 提供標準化的交接協定：
+
+```
+DelegationEnvelope：
+  context：          接收方需要的背景資訊
+  constraints：       邊界與要求
+  task_chain：        誰把什麼委派給誰的歷史紀錄
+  expected_output：   發送方期待收到什麼
+  delegation_depth：  目前的跳躍次數（上限 5）
+```
+
+信封跟著訊息一起在匯流排上傳遞。每個處理它的 Agent 都會往 `task_chain` 追加一筆紀錄，形成一條可追蹤的委派路徑：
+
+```
+Agent A → Agent B → Agent C
+  |          |          |
+  v          v          v
+depth=1    depth=2    depth=3
+```
+
+系統強制設定最大委派深度（5 跳）以防止無窮委派迴圈。信封格式向下相容——不理解信封的 Agent 仍可處理原始 payload。
+
+---
+
+## TaskSpec：多步驟工作流規劃
+
+對於橫跨多個步驟、彼此有依賴關係的任務，**TaskSpec** 系統提供結構化的工作流規劃：
+
+```
+TaskSpec：
+  steps：
+    - id: "step-1"
+      action: "research"
+      dependencies: []
+      status: completed
+
+    - id: "step-2"
+      action: "draft"
+      dependencies: ["step-1"]
+      status: in_progress
+
+    - id: "step-3"
+      action: "review"
+      dependencies: ["step-2"]
+      status: pending
+```
+
+工作流引擎處理：
+- **依賴感知排程**：步驟只在其依賴都完成時才執行
+- **自動重試**：失敗的步驟最多重試 3 次，帶退避
+- **自動重新規劃**：重試用盡後，系統可重新規劃（最多 2 次），調整後續步驟
+- **持久化**：TaskSpec 狀態存到 `tasks/` 目錄，程序重啟後仍保留
+
+```
+步驟失敗
+     |
+     v
+重試（最多 3 次）
+     |
+  +--+--+
+  |     |
+ 成功    仍然失敗
+  |     |
+  v     v
+繼續    重新規劃（最多 2 次）
+            |
+            v
+          生成調整後的步驟
+          並從那裡重試
+```
+
+---
+
 ## 與其他系統的互動
 
 - **HeartbeatScheduler**：驅動每個 Agent 的輪詢節奏。
 - **Agent Registry**：調度器知道存在哪些 Agent 及其併發限制。
 - **容器沙盒**：當任務需要隔離時，調度器在容器內而非直接在主機上啟動子程序。
+- **DelegationEnvelope**：為複雜的多 Agent 交接提供結構化背景資訊。
+- **TaskSpec**：讓多步驟工作流具備依賴感知，支援重試與重新規劃。
+- **Multi-Runtime**：調度器依每個 Agent 的 runtime 設定，啟動對應的 CLI 後端（Claude/Codex/Gemini）。
 - **審計日誌**：所有已調度任務記錄在 JSONL 審計紀錄中。
 
 ---
 
 ## 總結
 
-能用的最簡單方案通常是最好的方案。對 DuDuClaw 規模的跨 Agent 通訊而言，JSONL 檔案提供了訊息代理的一切——持久性、併發安全、可觀測性——卻沒有任何營運開銷。
+能用的最簡單方案通常是最好的方案。對 DuDuClaw 規模的跨 Agent 通訊而言，JSONL 檔案提供了訊息代理的一切——持久性、併發安全、可觀測性——卻沒有任何營運開銷。而當任務變複雜時，DelegationEnvelope 與 TaskSpec 又能在不犧牲底層傳輸簡潔性的前提下，補上必要的結構。

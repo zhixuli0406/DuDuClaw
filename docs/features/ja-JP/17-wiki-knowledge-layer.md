@@ -243,6 +243,37 @@ mode         = "operator_only"
 
 書き込み前に`wiki_namespace_status` MCPツールを使って、現在有効なポリシーを確認してください。
 
+### 部門別の読み取り可視性（`visible_to_departments`）
+
+上記の`mode`は「誰が書き込めるか」を制御します。「誰が**部門**レベルで読み取れるか」を制御するには、同じ`[namespaces."x"]`テーブルに`visible_to_departments`配列を追加します。`[agent] department`がリストに含まれるエージェントだけがそのネームスペースを見ることができます——**プロンプトインジェクション**（自動注入されるL0/L1ページ）でも、**`shared_wiki_search` / `shared_wiki_read` / `shared_wiki_ls`**経由でも同様です。
+
+```toml
+# HRページはhrとlegal部門のみ閲覧可能
+[namespaces."hr"]
+mode                   = "operator_only"   # 書き込み：オペレーターのみ
+visible_to_departments = ["hr", "legal"]   # 読み取り：hr + legal部門のみ
+```
+
+これは書き込み用の`mode`とは直交しています——ネームスペースはどちらか一方、両方、またはどちらも宣言しないことができます。エージェントの部門は、その`agent.toml`内の`[agent] department`から取得されます（空/未設定＝部門なし）。
+
+宣言されたネームスペースについては**フェイルクローズ**：部門がリストにないエージェント——**部門を持たない**エージェントを含む——は拒否されます。部門の一致は完全一致のみ（プレフィックス／部分文字列一致は不可）。空のリストは全員を拒否します。
+
+未宣言の場合は**フェイルセーフ**：`visible_to_departments`のないネームスペースは、これまでどおりすべてのエージェントから読み取り可能なままです。`.scope.toml`が存在しない、または不正な場合 ⇒ フィルタなし。
+
+これは組み込みの`departments/<dept>/`分離（下記の「部門別ナレッジレイヤリング」参照）の上に重なります：`departments/art/*`は`.scope.toml`の設定にかかわらず常に`art`部門のみに可視であり、`visible_to_departments`はオペレーターが*任意の*ネームスペース（`hr/`、`finance/`など）を選択した部門に制限できるようにします。`wiki_namespace_status`は現在有効な`visible_to_departments`の宣言を表示します。
+
+### 部門別ナレッジ＆スキルレイヤリング
+
+ナレッジとスキルは**会社 → 部門 → 個人**の順にレイヤリングされます：
+
+- **Wiki：** `shared/wiki/departments/<dept>/`配下のページは、`[agent] department`が`<dept>`に一致するエージェントのみに可視です。会社レイヤー（それ以外のすべてのネームスペース）は全員に開放されています。読み取りの分離は常に強制されます。
+- **スキル：** 3つのレイヤーが**per-agent > 部門 > グローバル**の優先順位でエージェントごとにマージされます（名前が衝突した場合は近いレイヤーが優先）：
+  - グローバル — `~/.duduclaw/skills/`（全エージェント）
+  - 部門 — `~/.duduclaw/shared/skills/departments/<dept>/`（`<dept>`のエージェントのみ）
+  - per-agent — `<agent>/SKILLS/`
+
+`skill_hub_install` MCPツールで`scope = "department:<name>"`（または`"global"` / エージェントID）を指定すると、スキルを部門レイヤーにインストールできます。部門を持たないエージェントは、グローバルレイヤーとper-agentレイヤーのみを見ることになります。
+
 ---
 
 ## Cloud Ingest連携

@@ -87,6 +87,11 @@ DuDuClaw 的信心路由器就是 LLM 查詢的差旅審核員——評估每個
 - llamafile 單檔案伺服器
 - vLLM、SGLang 等推論框架
 
+**MLX Bridge** — 給 Apple Silicon 使用者的 Python 子行程，呼叫 `mlx_lm`：
+- 不需 API 呼叫的本地反思
+- 支援 LoRA adapter，可微調 Agent 人格
+- 反思在本地跑，省下 API token
+
 ### InferenceManager 狀態機
 
 系統不會只選擇一個後端就固定不動。InferenceManager 維護一個帶自動容錯的優先鏈：
@@ -162,11 +167,30 @@ llamafile 正在執行嗎？
 
 ---
 
+## 透過 MCP 管理模型
+
+推論引擎完全可透過 MCP 工具管理：
+
+| 工具 | 用途 |
+|------|------|
+| `model_list` | 列出 `~/.duduclaw/models/` 底下的 GGUF 檔案 |
+| `model_load` / `model_unload` | 載入/卸載模型生命週期 |
+| `inference_status` | 目前載入的模型、硬體、記憶體用量、後端類型 |
+| `hardware_info` | GPU 自動偵測、VRAM、RAM、建議設定 |
+| `route_query` | 預覽路由決策而不實際生成 |
+| `inference_mode` | 目前模式（exo-cluster / llamafile / direct / cloud-only） |
+| `model_search` | 依 RAM 條件搜尋 HuggingFace + 精選模型庫 |
+| `model_download` | 下載到 `~/.duduclaw/models/`，支援斷點續傳與 mirror 容錯 |
+| `model_recommend` | 依硬體條件建議適合的模型 |
+
+---
+
 ## 與其他系統的互動
 
 - **帳號輪替**：本地推論處理的查詢不消耗任何 API 帳號，延長配額使用期限。
-- **CostTelemetry**：追蹤每個查詢由哪個層級處理，使營運人員能調整閾值以達最佳成本/品質平衡。
+- **CostTelemetry**：追蹤每個查詢由哪個層級處理，使營運人員能調整閾值以達最佳成本/品質平衡。快取效率低於 30% 時，自適應路由會自動偏向本地。
 - **演化引擎**：路由器的決策回饋到預測引擎的準確度指標。
+- **Multi-Runtime**：信心路由器位在 runtime 層*之下*——它決定模型，而 runtime 決定 CLI 後端。
 
 ---
 

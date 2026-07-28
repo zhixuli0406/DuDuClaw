@@ -39,6 +39,7 @@
 | 27 | [跨平台 PTY Pool + Worker](27-pty-pool-runtime.md) | 驅動互動式 `claude` REPL（v1.15.0） |
 | 28 | [即時執行分支（Live Forking）](28-live-forking.md) | 並行分支 + AI 評審（duduclaw-fork, RFC-26） |
 | 29 | [演化事件](29-evolution-events.md) | 黑盒紀錄器，批次 + 重試遞送 |
+| 30 | [自訂儀表板小工具](30-custom-widgets.md) | AI 引導或原始 HTML 的儀表板卡片，沙箱內執行 |
 
 ---
 
