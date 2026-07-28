@@ -361,10 +361,23 @@ async fn install_one_agent(
     } else {
         agent.display_name.clone()
     };
-    let role = if agent.role.trim().is_empty() {
-        "worker".to_string()
-    } else {
-        agent.role.clone()
+    // Normalize to the canonical role string — the roster may use pack-side
+    // names (`front_desk`) or free-form casing; writing an unparseable role
+    // into agent.toml would brick the agent at registry load. Unknown → worker
+    // (fail-safe, reported) rather than a verbatim passthrough.
+    let role = match agent.role.trim() {
+        "" => "worker".to_string(),
+        raw => match raw.parse::<duduclaw_core::types::AgentRole>() {
+            Ok(r) => r.as_str().to_string(),
+            Err(_) => {
+                report.warning(
+                    "agent-role",
+                    &base,
+                    format!("未知 role '{}'，改用 worker", raw.escape_debug()),
+                );
+                "worker".to_string()
+            }
+        },
     };
     let trigger = if agent.trigger.trim().is_empty() {
         format!("@{display}")

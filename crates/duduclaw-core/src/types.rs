@@ -35,8 +35,10 @@ pub enum AgentRole {
     /// cleanly fit `TeamLeader` or `ProductManager`.
     Planner,
     /// Team Leader — coordinates a sub-team, integrates reports, assigns
-    /// work. Typically has `reports_to = ""` or a parent org.
-    #[serde(alias = "tl", alias = "lead", alias = "teamlead")]
+    /// work. Typically has `reports_to = ""` or a parent org. `front_desk` is
+    /// the expert-pack roster name for the same thing (the team's 對外窗口 that
+    /// workers report to) — accepted here so installed packs load.
+    #[serde(alias = "tl", alias = "lead", alias = "teamlead", alias = "front_desk", alias = "front-desk")]
     TeamLeader,
     /// Product Manager — drives research and feature proposals for a
     /// specific project / domain.
@@ -91,7 +93,9 @@ impl std::str::FromStr for AgentRole {
             "developer" | "engineer" => Self::Developer,
             "qa" | "quality-assurance" | "quality" => Self::Qa,
             "planner" => Self::Planner,
-            "team-leader" | "teamleader" | "tl" | "lead" => Self::TeamLeader,
+            "team-leader" | "teamleader" | "tl" | "lead" | "front-desk" | "frontdesk" => {
+                Self::TeamLeader
+            }
             "product-manager" | "productmanager" | "pm" => Self::ProductManager,
             _ => {
                 return Err(format!(
@@ -2431,6 +2435,23 @@ pub struct DoctorCheck {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// `front_desk` (the expert-pack roster name) must load as TeamLeader —
+    /// both via serde (existing agent.toml on disk) and FromStr (CLI/MCP
+    /// inputs). Installed packs bricked at registry load without this.
+    #[test]
+    fn agent_role_front_desk_alias() {
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            role: AgentRole,
+        }
+        for raw in ["front_desk", "front-desk"] {
+            let p: Probe = toml::from_str(&format!("role = \"{raw}\"")).unwrap();
+            assert_eq!(p.role, AgentRole::TeamLeader, "serde alias {raw}");
+        }
+        assert_eq!(AgentRole::from_str("front_desk").unwrap(), AgentRole::TeamLeader);
+        assert_eq!(AgentRole::from_str("Front Desk").unwrap(), AgentRole::TeamLeader);
+    }
 
     // ── R4: Grok runtime type ──────────────────────────────────────
 

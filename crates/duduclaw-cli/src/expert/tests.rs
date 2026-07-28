@@ -510,6 +510,16 @@ rank = "staff"
         lead_toml.contains("reports_to = \"boss\""),
         "pack root attaches under the chosen supervisor: {lead_toml}"
     );
+    // The written file must round-trip through the REAL registry parser —
+    // the roster's `front_desk` role once landed verbatim in agent.toml and
+    // bricked the agent at gateway load (unknown AgentRole variant).
+    let parsed: duduclaw_core::types::AgentConfig =
+        toml::from_str(&lead_toml).expect("scaffolded agent.toml must parse as AgentConfig");
+    assert_eq!(
+        parsed.agent.role,
+        duduclaw_core::types::AgentRole::TeamLeader,
+        "front_desk normalizes to the canonical team-leader role"
+    );
     let clerk_toml =
         std::fs::read_to_string(home.path().join("agents/clerk/agent.toml")).unwrap();
     assert!(

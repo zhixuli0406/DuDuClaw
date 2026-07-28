@@ -48,13 +48,21 @@ impl OrgRank {
     }
 }
 
-/// Derive a display rank from a canonical role string (see
-/// `AgentRole::as_str` + the expert-pack `front_desk` convention). Unknown
-/// roles rank as staff — the safest floor for an attach-target allowlist.
+/// Derive a display rank from a role string (canonical kebab-case per
+/// `AgentRole::as_str`, plus the expert-pack `front_desk` roster name;
+/// separators are normalised so `team_leader` and `team-leader` agree).
+/// Unknown roles rank as staff — the safest floor for an attach-target
+/// allowlist.
 pub fn rank_for_role(role: &str) -> OrgRank {
-    match role.trim() {
+    let normalised: String = role
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c == '_' || c == ' ' { '-' } else { c })
+        .collect();
+    match normalised.as_str() {
         "ceo" => OrgRank::Executive,
-        "main" | "front_desk" | "team_leader" | "product_manager" => OrgRank::Manager,
+        "main" | "front-desk" | "team-leader" | "product-manager" => OrgRank::Manager,
         _ => OrgRank::Staff,
     }
 }
