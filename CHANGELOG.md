@@ -14,6 +14,15 @@
   （agent 已有白名單或 policy 時自動展開）；白名單模式下功能開關停用並顯示說明橫幅＋
   一鍵清除白名單。三語 i18n。
 
+- **工具型錄補完（65 工具）＋完整性守衛**：`builtin_tool_catalog` 補上先前缺漏的 65 個
+  MCP 工具（任務看板 tasks_*/goals/plan、上網查資料 web_search/web_fetch_cached/
+  web_extract、費用 cost_*、電腦操作 computer_*、技能生態 skill_search/skill_hub_install
+  等、reminder/cron、channel_status、模型管理、平台雜項），scope 一律如實標
+  `admin`（對齊 mcp_auth C2 fail-closed fall-through 實況）。功能開關新增「任務看板」
+  「上網查資料」兩組；cost/computer 歸入系統管理組。新增**完整性守衛測試**：tools/list
+  廣播的每個工具必須存在於型錄，未來新增工具漏補型錄會直接讓 build 變紅（與既有
+  scope-drift 測試互補）。
+
 ### Fixed
 - **API 模式 agent 的 qualified 工具名比對失效**：dashboard 工具選單寫入的
   `mcp__duduclaw__<name>` 格式在 `filter_tool_defs`（openai-compat／Direct API 工具迴圈

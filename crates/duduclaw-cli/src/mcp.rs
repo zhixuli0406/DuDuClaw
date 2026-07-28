@@ -16910,6 +16910,30 @@ mod wiki_namespace_tests {
         assert!(expected.exists(), "page must be in client's namespace: {:?}", expected);
     }
 
+    // ── Catalog completeness guard ──────────────────────────────────────
+    // Complements the scope-drift test in `mcp_auth`: every tool this server
+    // ADVERTISES (the static `TOOLS` table behind tools/list) must appear in
+    // `duduclaw_core::tool_catalog::builtin_tool_catalog`, so the dashboard's
+    // capability editor (feature switches + picker) can always see/deny it.
+    // Adding a tool without a catalog entry fails this test.
+    #[test]
+    fn tool_catalog_covers_all_advertised_tools() {
+        let catalog: std::collections::HashSet<String> =
+            duduclaw_core::tool_catalog::builtin_tool_catalog()
+                .iter()
+                .map(|e| e.name.to_string())
+                .collect();
+        for tool in super::TOOLS.iter() {
+            assert!(
+                catalog.contains(tool.name),
+                "advertised tool `{}` is missing from builtin_tool_catalog — add it \
+                 (with the gate-enforced scope from mcp_auth::tool_requires_scope) to \
+                 duduclaw-core/src/tool_catalog.rs",
+                tool.name
+            );
+        }
+    }
+
     // ── TC-INT-外部工具過濾: external tools/list returns exactly 7 tools ────────
     #[test]
     fn external_tools_list_returns_exactly_7_tools() {

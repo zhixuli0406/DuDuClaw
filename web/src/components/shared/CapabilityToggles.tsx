@@ -15,6 +15,8 @@ import {
   MonitorIcon,
   TerminalIcon,
   SettingsIcon,
+  KanbanIcon,
+  GlobeIcon,
   type LucideIcon,
 } from 'lucide-react';
 import { type BuiltinToolEntry } from '@/lib/api';
@@ -36,6 +38,8 @@ import { fetchCatalog } from './ToolCatalogPicker';
 /** UI feature groups: catalog categories folded into everyday-language units. */
 const GROUPS: ReadonlyArray<{ id: string; cats: readonly string[]; icon: LucideIcon; caution?: boolean }> = [
   { id: 'office', cats: ['office'], icon: FileTextIcon },
+  { id: 'tasks', cats: ['task'], icon: KanbanIcon },
+  { id: 'web', cats: ['web'], icon: GlobeIcon },
   { id: 'channel', cats: ['channel'], icon: MessageSquareIcon },
   { id: 'memory', cats: ['memory'], icon: BrainIcon },
   { id: 'knowledge', cats: ['wiki', 'identity'], icon: BookOpenIcon },
@@ -48,9 +52,10 @@ const GROUPS: ReadonlyArray<{ id: string; cats: readonly string[]; icon: LucideI
   { id: 'odoo', cats: ['odoo'], icon: BriefcaseIcon },
   { id: 'desktop', cats: ['os'], icon: MonitorIcon },
   { id: 'coding', cats: ['claude'], icon: TerminalIcon, caution: true },
-  // Catch-all: system/inference/security/fork plus any category the catalog
-  // grows later that this map doesn't know yet.
-  { id: 'system', cats: ['system', 'inference', 'security', 'fork'], icon: SettingsIcon, caution: true },
+  // Catch-all: system/inference/security/fork/cost/computer plus any category
+  // the catalog grows later that this map doesn't know yet. (computer_* tools
+  // are additionally gated by the computer_use danger-zone switch.)
+  { id: 'system', cats: ['system', 'inference', 'security', 'fork', 'cost', 'computer'], icon: SettingsIcon, caution: true },
 ];
 
 const KNOWN_CATS = new Set(GROUPS.flatMap((g) => g.cats));

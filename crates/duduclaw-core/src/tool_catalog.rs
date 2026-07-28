@@ -675,6 +675,359 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "wiki",
     ),
     ("wiki_trust_history", "Wiki trust history", "admin", "wiki"),
+    // ── 2026-07-28 coverage completion ───────────────────────────────────
+    // Every tool advertised by the MCP server's tools/list that was missing
+    // from the catalog. All of these fall through to `Scope::Admin` in
+    // `tool_requires_scope` (the C2 fail-closed default) — the catalog must
+    // mirror the gate as it IS, not as it might be; if a tool later gets a
+    // least-privilege scope in mcp_auth, update its entry here (the cli drift
+    // test will fail the build until both agree). `category` remains UI-only.
+    // ── Task board / goals / plans (task) ────────────────────────────────
+    (
+        "tasks_list",
+        "List tasks from the shared Kanban board",
+        "admin",
+        "task",
+    ),
+    (
+        "tasks_create",
+        "Create a Kanban board task",
+        "admin",
+        "task",
+    ),
+    ("tasks_update", "Update board task fields", "admin", "task"),
+    (
+        "tasks_claim",
+        "Atomically claim a pending board task",
+        "admin",
+        "task",
+    ),
+    ("tasks_complete", "Mark a board task done", "admin", "task"),
+    ("tasks_block", "Mark a board task blocked", "admin", "task"),
+    (
+        "tasks_renew",
+        "Renew a claimed task's lease",
+        "admin",
+        "task",
+    ),
+    (
+        "activity_list",
+        "List recent Activity Feed events",
+        "admin",
+        "task",
+    ),
+    (
+        "activity_post",
+        "Post progress to the Activity Feed",
+        "admin",
+        "task",
+    ),
+    (
+        "goals_create",
+        "Create a goal in the goal hierarchy",
+        "admin",
+        "task",
+    ),
+    ("goals_list", "List goals in the hierarchy", "admin", "task"),
+    (
+        "plan_get",
+        "Read the shared co-edited plan",
+        "admin",
+        "task",
+    ),
+    (
+        "plan_start",
+        "Clarify-first planning for an ambiguous task",
+        "admin",
+        "task",
+    ),
+    (
+        "plan_update_step",
+        "Update your steps in a shared plan",
+        "admin",
+        "task",
+    ),
+    // ── Web access (web) ─────────────────────────────────────────────────
+    ("web_search", "Search the web", "admin", "web"),
+    (
+        "web_fetch_cached",
+        "Fetch a URL (SSRF-guarded, cached, rate-limited)",
+        "admin",
+        "web",
+    ),
+    (
+        "web_extract",
+        "Fetch a URL and extract elements via CSS selector",
+        "admin",
+        "web",
+    ),
+    // ── Cost telemetry (cost) ────────────────────────────────────────────
+    (
+        "cost_summary",
+        "Token usage and cost summary",
+        "admin",
+        "cost",
+    ),
+    ("cost_agents", "Agents ranked by cost", "admin", "cost"),
+    ("cost_recent", "Recent API call records", "admin", "cost"),
+    ("cost_users", "End users ranked by cost", "admin", "cost"),
+    // ── Computer use actions (computer) ──────────────────────────────────
+    // Additionally gated by `[capabilities] computer_use` at dispatch.
+    (
+        "computer_session_start",
+        "Start a Computer Use session",
+        "admin",
+        "computer",
+    ),
+    (
+        "computer_session_stop",
+        "Stop a Computer Use session",
+        "admin",
+        "computer",
+    ),
+    (
+        "computer_screenshot",
+        "Capture a screenshot",
+        "admin",
+        "computer",
+    ),
+    (
+        "computer_click",
+        "Click at screen coordinates",
+        "admin",
+        "computer",
+    ),
+    (
+        "computer_type",
+        "Type text at the cursor",
+        "admin",
+        "computer",
+    ),
+    (
+        "computer_key",
+        "Press a key combination",
+        "admin",
+        "computer",
+    ),
+    (
+        "computer_scroll",
+        "Scroll at screen coordinates",
+        "admin",
+        "computer",
+    ),
+    // ── Agent roster / delegation status (agent) ─────────────────────────
+    (
+        "list_agents",
+        "List registered agents with hierarchy",
+        "admin",
+        "agent",
+    ),
+    (
+        "agent_status",
+        "Detailed status of one agent",
+        "admin",
+        "agent",
+    ),
+    (
+        "create_task",
+        "Submit a multi-step task to the dispatcher",
+        "admin",
+        "agent",
+    ),
+    (
+        "task_status",
+        "Status of a dispatched task",
+        "admin",
+        "agent",
+    ),
+    (
+        "check_responses",
+        "Check replies from agents you delegated to",
+        "admin",
+        "agent",
+    ),
+    // ── Scheduling / reminders (cron) ────────────────────────────────────
+    (
+        "list_cron_tasks",
+        "List scheduled cron tasks",
+        "admin",
+        "cron",
+    ),
+    (
+        "create_reminder",
+        "Create a one-shot reminder",
+        "admin",
+        "cron",
+    ),
+    (
+        "cancel_reminder",
+        "Cancel a pending reminder",
+        "admin",
+        "cron",
+    ),
+    ("list_reminders", "List reminders", "admin", "cron"),
+    // ── Channel status (channel) ─────────────────────────────────────────
+    (
+        "channel_status",
+        "Per-channel connection state overview",
+        "admin",
+        "channel",
+    ),
+    (
+        "channel_config_list",
+        "List channel settings for a scope",
+        "admin",
+        "channel",
+    ),
+    // ── Skill ecosystem (skill) ──────────────────────────────────────────
+    (
+        "skill_search",
+        "Search skill hubs for installable skills",
+        "admin",
+        "skill",
+    ),
+    (
+        "skill_list",
+        "List skills installed for an agent",
+        "admin",
+        "skill",
+    ),
+    (
+        "skill_hub_install",
+        "Install a skill from a configured hub",
+        "admin",
+        "skill",
+    ),
+    (
+        "skill_pin",
+        "Pin/unpin a skill for the curator",
+        "admin",
+        "skill",
+    ),
+    (
+        "skill_gaps",
+        "Report inferred capability gaps",
+        "admin",
+        "skill",
+    ),
+    (
+        "skill_bank_search",
+        "Search learned skills in the skill bank",
+        "admin",
+        "skill",
+    ),
+    (
+        "skill_bank_feedback",
+        "Record skill execution feedback",
+        "admin",
+        "skill",
+    ),
+    (
+        "skill_curator_status",
+        "Skill curator lifecycle state",
+        "admin",
+        "skill",
+    ),
+    (
+        "skill_synthesis_status",
+        "Skill auto-synthesis status",
+        "admin",
+        "skill",
+    ),
+    (
+        "shared_skill_list",
+        "List team-shared skills",
+        "admin",
+        "skill",
+    ),
+    // ── Local inference / models (inference) ─────────────────────────────
+    ("model_list", "List local GGUF models", "admin", "inference"),
+    (
+        "model_search",
+        "Search downloadable GGUF models",
+        "admin",
+        "inference",
+    ),
+    (
+        "model_recommend",
+        "Hardware-aware model recommendations",
+        "admin",
+        "inference",
+    ),
+    (
+        "route_query",
+        "Preview the confidence-router decision",
+        "admin",
+        "inference",
+    ),
+    (
+        "inference_status",
+        "Local inference engine status",
+        "admin",
+        "inference",
+    ),
+    (
+        "hardware_info",
+        "Detect hardware capabilities",
+        "admin",
+        "inference",
+    ),
+    (
+        "llamafile_list",
+        "List available llamafiles",
+        "admin",
+        "inference",
+    ),
+    // ── Platform / misc (system) ─────────────────────────────────────────
+    (
+        "autopilot_list",
+        "List automation rules (read-only)",
+        "admin",
+        "system",
+    ),
+    (
+        "pairing_manage",
+        "Manage channel pairing requests",
+        "admin",
+        "system",
+    ),
+    (
+        "capability_request",
+        "Request a task-scoped tool grant (HITL)",
+        "admin",
+        "system",
+    ),
+    (
+        "decision_list",
+        "List your open decisions",
+        "admin",
+        "system",
+    ),
+    (
+        "decision_resolve",
+        "Resolve an open decision",
+        "admin",
+        "system",
+    ),
+    (
+        "evolution_status",
+        "Evolution engine status",
+        "admin",
+        "system",
+    ),
+    (
+        "submit_feedback",
+        "Submit a user feedback signal",
+        "admin",
+        "system",
+    ),
+    ("log_mood", "Log user mood", "admin", "system"),
+    (
+        "session_restore_context",
+        "Search archived session messages",
+        "admin",
+        "system",
+    ),
 ];
 
 /// Native Claude Code tools: `(name, description)`. These are defined by Claude
