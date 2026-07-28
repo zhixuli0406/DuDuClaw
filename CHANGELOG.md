@@ -2,7 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+- **OS 自動化範本（一鍵套用）**：OS 頁新增「自動化範本」卡——①新檔案自動處理
+  （監看資料夾出現新檔 → AI 員工判斷性質、歸檔、回報；自動補 `[os_watch] paths`）
+  ②切到特定 App 提醒（前景切換符合關鍵字 → 推播提醒到你的頻道）。皆經既有
+  `autopilot.create` 完整驗證與熔斷保護，建立後可在 設定 → Autopilot 管理。
+- **footprint 蒸餾重啟持久化**：日聚合每 15 分鐘快照到
+  `os/<agent>/footprint-aggregate.json`（原子寫入），啟動時回載——重啟最多損失
+  一個檢查間隔，不再整天歸零（先前常重啟的 gateway 永遠蒸不出足跡記憶）；
+  跨午夜重啟的昨日 bucket 會在首個 tick 補蒸餾。
+
 ### Fixed
+- **收到寒暄卻重啟舊任務、狂呼叫 MCP 工具**（客戶實測：一句 hi 等三分鐘、
+  agent 自己去 Google Drive 搜前一輪任務的檔案）：對話歷史注入沒有任何框架
+  指令，熱心 persona 把歷史裡未完成的任務當成常設工單。修：
+  `<conversation_history>` 之後明示「歷史僅供參考、只回應 <current_message>、
+  舊任務非經要求不得重啟」，並在常駐系統規則加「互動節奏」段（寒暄直接回覆、
+  不呼叫工具）——CLI 與 Direct API 全路徑生效。
 - **OS 員工主動關懷從未作動（四層斷點全修）**：實測回報 os_native agent 開一天多
   零輸出。①主動關懷檢查要求手寫 PROACTIVE.md、缺檔靜默跳過（連 log 都沒有）——
   os_native agent 現在缺檔自動改用內建「OS 關懷」檢查（預設回 PROACTIVE_OK、
