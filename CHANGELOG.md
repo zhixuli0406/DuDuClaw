@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+- **內建專家包裝完的櫃檯主管載入失敗**：expert.toml roster 的 `role = "front_desk"`
+  被原樣寫進 agent.toml，但 `AgentRole` 沒有這個變體——gateway 啟動掃描直接跳過
+  該 agent（`unknown variant front_desk`）。三層修法：①核心 `AgentRole` 接受
+  `front_desk`／`front-desk` 別名（對應 TeamLeader）——**已裝壞的 agent 免手術、
+  升級後自動復活**；②安裝時 role 一律正規化為 canonical 字串，未知值退 worker
+  並回報，不再原樣直寫；③安裝測試新增「真 registry 解析器 round-trip」回歸
+  （`rank_for_role` 同步接受 kebab/underscore 兩形）。
+
 ### Added
 - **桌寵自主行為引擎（Codex Pets 式漫遊）**：桌寵不再只會原地待機——待機 6–14 秒
   後加權隨機挑行為：走路（真的移動桌寵視窗橫越桌面，約 55px/s，碰到螢幕邊緣自動
