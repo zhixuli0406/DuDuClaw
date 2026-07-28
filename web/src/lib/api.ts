@@ -1341,6 +1341,43 @@ export interface ExpertPack {
   hooks_files: number;
 }
 
+/** One built-in industry pack row from `experts.catalog` (admin-only). */
+export interface ExpertCatalogEntry {
+  industry: string;
+  label: string;
+  slug: string;
+  description: string;
+  agents_count: number;
+  installed: boolean;
+}
+
+/** Preview of an LLM-generated expert-pack draft (`experts.generate`). */
+export interface ExpertDraftPreview {
+  slug: string;
+  display_name: string;
+  description: string;
+  version: string;
+  prompts: string[];
+  channels: string[];
+  agents: Array<{
+    name: string;
+    role: string;
+    display_name: string;
+    reports_to: string;
+    soul_excerpt: string;
+  }>;
+  skills: string[];
+  wiki_titles: string[];
+}
+
+/** `experts.generate` / `experts.generate_revise` result envelope. */
+export interface ExpertDraftResult {
+  draft_id: string;
+  rounds: number;
+  rounds_left: number;
+  preview: ExpertDraftPreview;
+}
+
 // ── EVO: per-agent advanced [evolution] ─────────────────────────
 
 export interface EvolutionExternalFactors {
@@ -2941,6 +2978,44 @@ export const api = {
         status: 'enabled' | 'disabled' | 'pending_approval' | 'denied' | 'expired';
         files?: number;
         approval_id?: string;
+      }>,
+    /** Built-in industry packs available for one-click install. Fail-safe:
+     *  `deployed: false` when this install ships no premium templates. */
+    catalog: () =>
+      client.call('experts.catalog') as Promise<{
+        deployed: boolean;
+        unlocked: boolean;
+        present_but_locked: boolean;
+        packs: ExpertCatalogEntry[];
+      }>,
+    /** Convert (cached) + install one built-in industry pack. Long-running:
+     *  the full install security pipeline runs inside. */
+    installBuiltin: (industry: string) =>
+      client.call('experts.install_builtin', { industry }, false, 320000) as Promise<{
+        success: boolean;
+        slug: string;
+        output: string;
+      }>,
+    /** LLM-generate a custom expert-pack draft from the guided form. */
+    generate: (req: {
+      industry_hint?: string;
+      description: string;
+      team_size?: number;
+      channels?: string[];
+    }) => client.call('experts.generate', req, false, 320000) as Promise<ExpertDraftResult>,
+    /** Regenerate a draft with feedback (max 5 total rounds). */
+    generateRevise: (draftId: string, feedback: string) =>
+      client.call(
+        'experts.generate_revise',
+        { draft_id: draftId, feedback },
+        false,
+        320000,
+      ) as Promise<ExpertDraftResult>,
+    /** Install a generated draft via the full security-scanned pipeline. */
+    installDraft: (draftId: string) =>
+      client.call('experts.install_draft', { draft_id: draftId }, false, 320000) as Promise<{
+        success: boolean;
+        output: string;
       }>,
   },
   channels: {
