@@ -652,6 +652,15 @@ pub struct CapabilitiesConfig {
     /// a non-empty `[os_watch] paths` list in the agent's `agent.toml`.
     #[serde(default)]
     pub os_native: bool,
+
+    /// Opt-in recording-to-skill capture (WP3.3). Master switch: when `false`
+    /// (default), the `browser_record_start` / `browser_record_stop` /
+    /// `desktop_record_start` / `desktop_record_stop` / `skill_from_recording`
+    /// MCP tools are denied at the dispatch gate (fail-closed). Recordings
+    /// capture live browser traffic / desktop screenshots and are privacy-
+    /// sensitive, so this must be an explicit operator decision per agent.
+    #[serde(default)]
+    pub recording: bool,
 }
 
 /// Effect of a [`ToolPolicy`] rule.
@@ -790,6 +799,7 @@ impl Default for CapabilitiesConfig {
             policy: Vec::new(),
             native_sandbox: false,
             os_native: false,
+            recording: false,
         }
     }
 }

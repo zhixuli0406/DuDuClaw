@@ -71,6 +71,13 @@ pub enum Scope {
     /// the caller's own agent directory, so operators can grant document
     /// production without granting superuser.
     SkillExecute,
+    /// WP3.3 recording-to-skill: gates the `browser_record_start` /
+    /// `browser_record_stop` / `desktop_record_start` / `desktop_record_stop` /
+    /// `skill_from_recording` MCP tools. Distinct scope so operators can grant
+    /// recording without Admin; the dispatch gate ADDITIONALLY requires the
+    /// per-agent `[capabilities] recording = true` flag (defence-in-depth,
+    /// deny-by-default).
+    Recording,
     Admin,
 }
 
@@ -95,6 +102,7 @@ impl std::fmt::Display for Scope {
             Scope::ForkExecute => "fork:execute",
             Scope::OsNative => "os:native",
             Scope::SkillExecute => "skill:execute",
+            Scope::Recording => "recording",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -440,6 +448,9 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
             "skill:execute" => {
                 result.insert(Scope::SkillExecute);
             }
+            "recording" => {
+                result.insert(Scope::Recording);
+            }
             "admin" => {
                 result.insert(Scope::Admin);
             }
@@ -597,6 +608,14 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // uses: the tool is constrained to the four bundled skills' vetted
         // scripts and the caller's agent directory.
         "office_script" => Some(Scope::SkillExecute),
+        // WP3.3 recording-to-skill capture + distillation. Own scope so the
+        // capability can be granted without Admin; the dispatch gate ALSO
+        // requires `[capabilities] recording = true` (deny-by-default).
+        "browser_record_start"
+        | "browser_record_stop"
+        | "desktop_record_start"
+        | "desktop_record_stop"
+        | "skill_from_recording" => Some(Scope::Recording),
         // ── High-impact tools — explicitly Admin (C2 fix) ────────────────
         // Arbitrary code execution, agent lifecycle/identity mutation, prompt
         // rewrite, cross-agent dispatch, scheduling, and evolution control.
@@ -852,6 +871,28 @@ is_external = {is_external}
     }
 
     // ── Test 10: tool_requires_scope totally_unknown → None ──────────────────
+    #[test]
+    fn test_recording_scope_parses_and_maps() {
+        // WP3.3: the recording scope round-trips through parse/Display and
+        // every recording tool maps to it (never falls through to Admin).
+        let scopes = parse_scopes("recording").expect("should parse");
+        assert!(scopes.contains(&Scope::Recording));
+        assert_eq!(Scope::Recording.to_string(), "recording");
+        for tool in [
+            "browser_record_start",
+            "browser_record_stop",
+            "desktop_record_start",
+            "desktop_record_stop",
+            "skill_from_recording",
+        ] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::Recording),
+                "tool {tool} must require the recording scope"
+            );
+        }
+    }
+
     #[test]
     fn test_tool_requires_scope_unknown_tool() {
         // C2: fail-closed — unknown tools require Admin, not None.

@@ -1676,6 +1676,58 @@ const TOOLS: &[ToolDef] = &[
             Requires the agent's [capabilities] os_native = true.",
         params: &[],
     },
+    // ── Recording → skill (WP3.3; requires [capabilities] recording = true) ──
+    ToolDef {
+        name: "browser_record_start",
+        description: "Start a browser recording session: opens a real Playwright browser at `url` with \
+            tracing + HAR capture and an injected UI-action recorder, for a human to demonstrate an SOP. \
+            Returns a recording id. Artifacts land under ~/.duduclaw/recordings/<id>/ (mode 700). \
+            Requires the agent's [capabilities] recording = true.",
+        params: &[
+            ParamDef { name: "url", description: "http(s):// URL to open for the demonstration", required: true },
+            ParamDef { name: "name", description: "Human-readable recording name (becomes the default skill name)", required: false },
+            ParamDef { name: "headless", description: "Run headless (default false — recordings are human-driven)", required: false },
+            ParamDef { name: "max_seconds", description: "Auto-stop cap in seconds (default 1800, max 7200)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "browser_record_stop",
+        description: "Stop a browser recording: flushes trace.zip / session.har / actions.json, then redacts \
+            the HAR in place (Authorization / cookie / set-cookie / token-like query & body values → <env:VAR> \
+            placeholders). Requires the agent's [capabilities] recording = true.",
+        params: &[
+            ParamDef { name: "id", description: "Recording id returned by browser_record_start", required: true },
+        ],
+    },
+    ToolDef {
+        name: "desktop_record_start",
+        description: "Start a desktop recording (macOS): 1 fps screenshots + foreground app/window titles into \
+            ~/.duduclaw/recordings/<id>/desktop/. Typed content is NEVER captured. \
+            Requires the agent's [capabilities] recording = true.",
+        params: &[
+            ParamDef { name: "name", description: "Human-readable recording name", required: false },
+            ParamDef { name: "max_seconds", description: "Auto-stop cap in seconds (default 1800, max 7200)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "desktop_record_stop",
+        description: "Stop a desktop recording session and report captured frame/event counts. \
+            Requires the agent's [capabilities] recording = true.",
+        params: &[
+            ParamDef { name: "id", description: "Recording id returned by desktop_record_start", required: true },
+        ],
+    },
+    ToolDef {
+        name: "skill_from_recording",
+        description: "Distill a finished recording into a draft SKILL.md (browser-sop from redacted HAR API calls \
+            + UI actions; desktop-sop from window-flow events). The draft is security-scanned (fail-closed) and \
+            staged into the custom-skill approval pipeline — it is NEVER installed directly; a human approver \
+            must accept it in the dashboard first. Requires the agent's [capabilities] recording = true.",
+        params: &[
+            ParamDef { name: "id", description: "Recording id (must be stopped first)", required: true },
+            ParamDef { name: "name", description: "Skill name override (slugified; defaults to the recording name)", required: false },
+        ],
+    },
 ];
 
 // ── External tool whitelist (W19-P0 BUG-QA-001) ─────────────
@@ -8530,6 +8582,12 @@ pub(crate) async fn handle_tools_call(
             // Notion / GitHub write tools (page append, public issue comment).
             | "notion_page_append"
             | "github_issue_comment"
+            // Recording → skill (WP3.3): all five mutate recording/draft state.
+            | "browser_record_start"
+            | "browser_record_stop"
+            | "desktop_record_start"
+            | "desktop_record_stop"
+            | "skill_from_recording"
     );
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
@@ -8754,6 +8812,36 @@ pub(crate) async fn handle_tools_call(
         "os_frontmost" => handle_os_frontmost().await,
         "os_spotlight_search" => handle_os_spotlight_search(&arguments).await,
         "os_calendar_today" => handle_os_calendar_today().await,
+        // Recording → skill tools (WP3.3). The [capabilities] recording gate +
+        // Scope::Recording are enforced upstream in mcp_dispatch (fail-closed);
+        // these handlers are the mechanism. Recording ownership follows the
+        // CALLER (same rationale as os_watch_status): internal stdio callers
+        // may present an empty client_id → fall back to the default agent.
+        "browser_record_start" | "browser_record_stop" | "desktop_record_start"
+        | "desktop_record_stop" | "skill_from_recording" => {
+            let rec_agent = if caller_client_id.is_empty() {
+                default_agent
+            } else {
+                caller_client_id
+            };
+            match tool_name {
+                "browser_record_start" => {
+                    crate::mcp_recording::handle_browser_record_start(&arguments, home_dir, rec_agent).await
+                }
+                "browser_record_stop" => {
+                    crate::mcp_recording::handle_browser_record_stop(&arguments, home_dir).await
+                }
+                "desktop_record_start" => {
+                    crate::mcp_recording::handle_desktop_record_start(&arguments, home_dir, rec_agent).await
+                }
+                "desktop_record_stop" => {
+                    crate::mcp_recording::handle_desktop_record_stop(&arguments, home_dir).await
+                }
+                _ => {
+                    crate::mcp_recording_distill::handle_skill_from_recording(&arguments, home_dir, rec_agent).await
+                }
+            }
+        }
         // Google Workspace native tools (Gmail + Calendar). Scope gates
         // (google:read / google:write) are enforced upstream in mcp_dispatch;
         // these handlers consume the OAuth vault token directly.

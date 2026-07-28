@@ -540,6 +540,39 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "skill:execute",
         "office",
     ),
+    // ── Recording → skill capture (recording; WP3.3) ─────────────────────
+    // All five ALSO require `[capabilities] recording = true` at the dispatch
+    // gate (deny-by-default).
+    (
+        "browser_record_start",
+        "Start a browser recording session (Playwright trace + HAR)",
+        "recording",
+        "recording",
+    ),
+    (
+        "browser_record_stop",
+        "Stop a browser recording and persist redacted artifacts",
+        "recording",
+        "recording",
+    ),
+    (
+        "desktop_record_start",
+        "Start a desktop recording (screenshots + foreground window)",
+        "recording",
+        "recording",
+    ),
+    (
+        "desktop_record_stop",
+        "Stop a desktop recording session",
+        "recording",
+        "recording",
+    ),
+    (
+        "skill_from_recording",
+        "Distill a recording into a draft SKILL.md (approval-gated)",
+        "recording",
+        "recording",
+    ),
     // ── Admin-tier tools (admin) ─────────────────────────────────────────
     (
         "memory_invalidate_by_origin",

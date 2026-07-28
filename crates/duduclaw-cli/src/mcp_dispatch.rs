@@ -53,6 +53,18 @@ const OS_NATIVE_TOOLS: &[&str] = &[
     "os_calendar_today",
 ];
 
+/// The recording MCP tools gated by the `[capabilities] recording` master
+/// switch (WP3.3). Recording captures live browser traffic / desktop
+/// screenshots, so it is deny-by-default per agent — same enforcement shape
+/// as [`OS_NATIVE_TOOLS`].
+const RECORDING_TOOLS: &[&str] = &[
+    "browser_record_start",
+    "browser_record_stop",
+    "desktop_record_start",
+    "desktop_record_stop",
+    "skill_from_recording",
+];
+
 /// Neutralize `os_notify` `title`/`body` in place for the user's visual surface
 /// (P2-5). Each value is replaced by its perception-sanitized form (control
 /// chars stripped, angle brackets defanged, CJK-safe truncation) and any
@@ -95,6 +107,7 @@ fn neutralize_os_notify_args(args: &mut serde_json::Map<String, Value>) -> (Vec<
 struct AgentGateConfig {
     policy: Vec<ToolPolicy>,
     os_native: bool,
+    recording: bool,
 }
 
 /// Read `<home>/agents/<id>/agent.toml` once and extract the gate-relevant
@@ -117,13 +130,14 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
         Ok(cfg) => AgentGateConfig {
             policy: cfg.capabilities.policy,
             os_native: cfg.capabilities.os_native,
+            recording: cfg.capabilities.recording,
         },
         Err(e) => {
             warn!(
                 agent = %agent_id,
                 error = %e,
                 "malformed agent.toml [capabilities] — PolicyKernel abstains (empty policy) \
-                 and os_native defaults to false (fail-closed)"
+                 and os_native / recording default to false (fail-closed)"
             );
             AgentGateConfig::default()
         }
@@ -572,6 +586,26 @@ impl McpDispatcher {
                 &format!(
                     "工具「{tool_name}」需要 OS 原生整合能力，但此代理未啟用。請在 agent.toml \
                      設定 [capabilities] os_native = true 後再使用。"
+                ),
+            );
+        }
+
+        // ── 3.625 Recording capability gate (WP3.3, deny-by-default, I5) ─────
+        // The recording tools capture live browser traffic / desktop
+        // screenshots — privacy-sensitive, so they require the agent's explicit
+        // `[capabilities] recording = true`. Same fail-closed shape as the
+        // OS-native gate above: missing/malformed config resolved to
+        // `recording = false` in `load_agent_gate_config`. External clients are
+        // never granted these tools (not in the external whitelist), and would
+        // be denied here regardless because they carry the empty default gate.
+        if RECORDING_TOOLS.contains(&tool_name) && !agent_gate.recording {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            return jsonrpc_error(
+                id,
+                -32003,
+                &format!(
+                    "工具「{tool_name}」需要錄製能力，但此代理未啟用。請在 agent.toml 設定 \
+                     [capabilities] recording = true 後再使用。"
                 ),
             );
         }
@@ -1206,6 +1240,81 @@ effect = "forbid"
             let msg = result["error"]["message"].as_str().unwrap_or("");
             assert!(msg.contains("os_native"), "{tool}: denial must mention os_native, got: {msg}");
         }
+    }
+
+    // ── WP3.3: recording capability gate ───────────────────────────────────────
+
+    /// All five recording tools with the capability absent (no agent.toml) are
+    /// denied fail-closed, with guidance to enable `[capabilities] recording`.
+    #[tokio::test]
+    async fn recording_tools_denied_when_capability_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+
+        // Admin bypasses the scope check so the call reaches the recording gate.
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        for tool in super::RECORDING_TOOLS {
+            let params = make_params(tool, serde_json::json!({ "id": "rec-x" }));
+            let id = serde_json::json!(50);
+            let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+            assert_eq!(
+                result["error"]["code"], -32003,
+                "{tool} without the recording capability must be denied, got: {result}"
+            );
+            let msg = result["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                msg.contains("recording"),
+                "{tool}: denial must mention the recording capability, got: {msg}"
+            );
+        }
+    }
+
+    /// recording = false explicitly is also denied (never fall-open).
+    #[tokio::test]
+    async fn recording_tool_denied_when_capability_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nrecording = false\n");
+
+        let principal = make_principal(vec![Scope::Recording], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("browser_record_stop", serde_json::json!({ "id": "rec-x" }));
+        let id = serde_json::json!(51);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "browser_record_stop with recording=false must be denied, got: {result}"
+        );
+    }
+
+    /// recording = true lets a recording tool pass the gate. The handler is
+    /// then free to fail on its own terms (unknown id → tool-level isError),
+    /// but must NOT be blocked with the capability message.
+    #[tokio::test]
+    async fn recording_tool_passes_gate_when_capability_true() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nrecording = true\n");
+
+        let principal = make_principal(vec![Scope::Recording], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params(
+            "browser_record_stop",
+            serde_json::json!({ "id": "rec-00000000000000-000000" }),
+        );
+        let id = serde_json::json!(52);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        // Reaches the handler (unknown recording → tool-level error, not a
+        // JSON-RPC capability denial).
+        assert!(
+            result.get("error").is_none(),
+            "browser_record_stop with recording=true must pass the gate, got: {result}"
+        );
     }
 
     // ── Test: benign arguments pass the injection stage (P0-1) ─────────────────
