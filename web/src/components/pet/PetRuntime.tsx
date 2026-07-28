@@ -371,15 +371,24 @@ export function PetRuntime({ pet, pendingCount = 0, onActivate }: PetRuntimeProp
       pickTimer = window.setTimeout(pick, WANDER_MIN_DELAY + Math.random() * WANDER_EXTRA_DELAY);
     };
 
+    // Engine-side state changes update `stateRef` SYNCHRONOUSLY before the
+    // React render lands. The walk interval's first tick (55ms) can beat the
+    // render flush; reading a stale 'idle' there killed the interval and left
+    // the pet stuck in `walk-*` forever (the "pet never moves" field report).
+    const go = (s: PetState) => {
+      stateRef.current = s;
+      setState(s);
+    };
+
     const backToIdle = (from: PetState[]) => {
-      if (alive && from.includes(stateRef.current)) setState('idle');
+      if (alive && from.includes(stateRef.current)) go('idle');
       schedule();
     };
 
     const startWalk = () => {
       let dir: 1 | -1 = Math.random() < 0.5 ? -1 : 1;
       const walkStates: PetState[] = ['walk-left', 'walk-right'];
-      setState(dir < 0 ? 'walk-left' : 'walk-right');
+      go(dir < 0 ? 'walk-left' : 'walk-right');
       const until = Date.now() + WALK_MIN_MS + Math.random() * WALK_EXTRA_MS;
       walkTimer = window.setInterval(() => {
         if (!alive || Date.now() > until || !walkStates.includes(stateRef.current)) {
@@ -393,7 +402,7 @@ export function PetRuntime({ pet, pendingCount = 0, onActivate }: PetRuntimeProp
             if (!alive || !hitEdge) return;
             dir = dir < 0 ? 1 : -1; // bounce off the screen edge
             if (walkStates.includes(stateRef.current)) {
-              setState(dir < 0 ? 'walk-left' : 'walk-right');
+              go(dir < 0 ? 'walk-left' : 'walk-right');
             }
           })
           .catch(() => {
@@ -415,16 +424,16 @@ export function PetRuntime({ pet, pendingCount = 0, onActivate }: PetRuntimeProp
       if (r < 0.4 && isTauri()) {
         startWalk();
       } else if (r < 0.62) {
-        setState('rest');
+        go('rest');
         revertTimer = window.setTimeout(
           () => backToIdle(['rest']),
           REST_MIN_MS + Math.random() * REST_EXTRA_MS,
         );
       } else if (r < 0.78) {
-        setState('wave');
+        go('wave');
         revertTimer = window.setTimeout(() => backToIdle(['wave']), 1_600);
       } else if (r < 0.9) {
-        setState('jump');
+        go('jump');
         revertTimer = window.setTimeout(() => backToIdle(['jump']), 1_400);
       } else {
         schedule(); // stay idle this round
