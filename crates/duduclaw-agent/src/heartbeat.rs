@@ -857,10 +857,20 @@ async fn execute_proactive_check(
         return;
     }
 
-    // Load PROACTIVE.md
+    // Load PROACTIVE.md. os_native agents fall back to the built-in OS-care
+    // check — requiring a hand-written file made the whole feature silently
+    // dead for every dashboard-configured agent (the P4 field report).
+    let os_native = agent_config.capabilities.os_native;
     let proactive_md = match proactive::load_proactive_md(&agent_dir) {
         Some(md) => md,
-        None => return, // No PROACTIVE.md → nothing to do
+        None if os_native => proactive::DEFAULT_OS_CARE_CHECKS.to_string(),
+        None => {
+            debug!(
+                agent = agent_id,
+                "Proactive check skipped: no PROACTIVE.md (and os_native is off)"
+            );
+            return;
+        }
     };
 
     // ── U1 natural-timing gate (learned rhythm, sessions.db read-only) ──
@@ -918,7 +928,16 @@ async fn execute_proactive_check(
     // temp file (avoids /proc/PID/cmdline leak), attach the agent's
     // `.mcp.json` with `--strict-mcp-config`, and make max_turns config-
     // driven with a sensible default of 8.
-    let prompt = proactive::build_proactive_prompt(&proactive_md, agent_id);
+    let mut prompt = proactive::build_proactive_prompt(&proactive_md, agent_id);
+    // OS observations: today's frontmost app-usage digest (app names already
+    // pass the perception sanitizer inside the summariser). DATA, not orders.
+    if os_native {
+        if let Some(summary) = proactive::frontmost_daily_summary(home_dir, agent_id) {
+            prompt.push_str(&format!(
+                "\n<os_observations>\n{summary}\n</os_observations>\n"
+            ));
+        }
+    }
     let claude = duduclaw_core::which_claude();
 
     let result = match claude {
@@ -1009,14 +1028,40 @@ async fn execute_proactive_check(
 
             info!(agent = agent_id, msg_len = message.len(), "Proactive check: notification to send");
 
-            // Route notification to channel via bus_queue
+            // Route notification to channel via bus_queue. Explicit target
+            // wins; empty target falls back to the agent's most recent
+            // pushable channel conversation (sessions.db) — an unset field no
+            // longer silently discards the whole feature.
             let notify = &agent_config.proactive;
-            if !notify.notify_channel.is_empty() && !notify.notify_chat_id.is_empty() {
+            let target = if !notify.notify_channel.is_empty() && !notify.notify_chat_id.is_empty()
+            {
+                Some((notify.notify_channel.clone(), notify.notify_chat_id.clone()))
+            } else {
+                let home = home_dir.to_path_buf();
+                let aid = agent_id.to_string();
+                let fallback = tokio::task::spawn_blocking(move || {
+                    proactive::resolve_notify_fallback(&home, &aid)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some((ch, chat)) = &fallback {
+                    info!(
+                        agent = agent_id,
+                        channel = %ch,
+                        chat_id = %chat,
+                        "Proactive notify target unset — falling back to most recent conversation"
+                    );
+                }
+                fallback
+            };
+            if let Some((channel, chat_id)) = target {
                 let bus_entry = serde_json::json!({
                     "type": "proactive_notification",
                     "agent_id": agent_id,
-                    "channel": notify.notify_channel,
-                    "chat_id": notify.notify_chat_id,
+                    "channel": channel,
+                    "chat_id": chat_id,
+                    "thread_id": notify.notify_thread_id,
                     "message": message,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });
@@ -1025,7 +1070,7 @@ async fn execute_proactive_check(
                 // Use spawn_blocking + flock for safe concurrent JSONL append
                 let qp = queue_path.clone();
                 let aid = agent_id.to_string();
-                let ch = notify.notify_channel.clone();
+                let ch = channel.clone();
                 tokio::task::spawn_blocking(move || {
                     use std::io::Write;
                     let file = std::fs::OpenOptions::new()
@@ -1042,7 +1087,11 @@ async fn execute_proactive_check(
                     }
                 }).await.ok();
             } else {
-                warn!(agent = agent_id, "Proactive notification has no target channel configured");
+                warn!(
+                    agent = agent_id,
+                    "Proactive notification dropped: no notify target configured and no \
+                     recent channel conversation to fall back to"
+                );
             }
         }
     }
