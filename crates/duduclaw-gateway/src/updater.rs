@@ -81,6 +81,48 @@ pub fn auto_update_enabled(home_dir: &std::path::Path) -> bool {
     false
 }
 
+/// Extract the version from `duduclaw version` output (which may be preceded
+/// by log lines): the first whitespace token that is a plain MAJOR.MINOR.PATCH.
+fn parse_cli_version_output(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|t| {
+            t.trim_start_matches('v').split('.').count() == 3 && parse_version_tag(t).is_some()
+        })
+        .map(|t| t.trim_start_matches('v').to_string())
+}
+
+/// Version of the binary currently ON DISK at this process's executable path,
+/// best-effort (`None` on any failure). After `npm i -g duduclaw` or a manual
+/// binary swap replaces the file under a still-running gateway, the dashboard
+/// keeps reporting the old in-memory version with no hint that a restart is
+/// all that's missing (2026-07-29 field report: CLI said 1.46.2, dashboard
+/// said 1.46.0). Comparing this against [`current_version`] lets the update
+/// page say "new version installed — restart to apply".
+pub async fn on_disk_version() -> Option<String> {
+    let exe = duduclaw_core::platform::executable_path();
+    if exe.as_os_str().is_empty() {
+        return None;
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(VERIFY_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new(&exe)
+                .arg("version")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+        }),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_cli_version_output(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// Maximum download + decompressed binary size: 200 MB. [H5][R2:NC2]
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 /// Maximum release notes length: 8 KB. [M1]
@@ -209,6 +251,44 @@ fn is_newer(current: &str, latest: &str) -> bool {
         (major, minor, patch)
     };
     parse(latest) > parse(current)
+}
+
+/// Strict parse of a CLI version tag (`v1.46.2`, `1.46.2`, `v2.0.0-rc.1`).
+/// Returns `None` for anything that is not a plain version — notably the
+/// desktop installer tags (`desktop-v1.46.2`) and the fixed `desktop-updater`
+/// pointer — so callers can tell "older version" apart from "not a CLI
+/// version tag at all" (which `is_newer`'s tolerant parse silently maps to 0).
+fn parse_version_tag(tag: &str) -> Option<(u32, u32, u32)> {
+    let s = tag.strip_prefix('v').unwrap_or(tag);
+    if s.is_empty() {
+        return None;
+    }
+    let mut nums = [0u32; 3];
+    for (i, part) in s.split('.').enumerate() {
+        if i >= 3 {
+            break; // pre-release dots ("1.0.0-rc.1") beyond patch
+        }
+        let numeric = part.split('-').next()?;
+        nums[i] = numeric.parse().ok()?;
+    }
+    Some((nums[0], nums[1], nums[2]))
+}
+
+/// Map a GitHub "latest" tag to the CLI release tag it corresponds to.
+/// Plain version tags map to themselves; a desktop installer tag
+/// (`desktop-v1.46.2`, published minutes after `v1.46.2` and thus able to
+/// claim the repo's "Latest" marker) maps to its paired CLI tag. Anything
+/// else → `None`.
+///
+/// 2026-07-29 field report: `releases/latest` returned `desktop-v1.46.2`, the
+/// update page showed "vdesktop-v1.46.2", and the tolerant semver compare
+/// parsed it as (0,46,2) — wrongly reporting "already up to date" on v1.46.0.
+fn paired_cli_tag(tag: &str) -> Option<&str> {
+    if parse_version_tag(tag).is_some() {
+        return Some(tag);
+    }
+    tag.strip_prefix("desktop-")
+        .filter(|t| parse_version_tag(t).is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +424,10 @@ pub async fn check_update() -> Result<UpdateInfo, String> {
             }
         }
     };
+
+    // "Latest" may be claimed by a desktop installer release (desktop-v*) —
+    // resolve the paired CLI release before comparing versions.
+    let release = resolve_cli_release(&client, repo, release).await?;
 
     let latest = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
     let available = is_newer(current_version(), latest);
@@ -823,6 +907,67 @@ fn tag_from_latest_location(location: &str) -> Option<String> {
     Some(tag.to_string())
 }
 
+/// Synthesize a release record with deterministic asset URLs
+/// (`releases/download/<tag>/duduclaw-<suffix>`) for paths where the real
+/// release object is unavailable (rate-limited API). Release notes / publish
+/// date are unavailable here — empty, never fabricated.
+fn synthesize_release(repo: &str, tag: &str) -> GitHubRelease {
+    let asset_name = format!("duduclaw-{}", platform_asset_suffix());
+    let download_url = format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
+    GitHubRelease {
+        tag_name: tag.to_string(),
+        body: None,
+        published_at: None,
+        assets: vec![GitHubAsset {
+            name: asset_name,
+            browser_download_url: download_url,
+        }],
+    }
+}
+
+/// If the "latest" release carries a non-CLI tag (desktop installer), swap in
+/// the paired CLI release: prefer the real release object (correct notes,
+/// publish date, asset list); degrade to deterministic asset URLs when the
+/// API is unavailable (e.g. this check already came through the redirect
+/// fallback because of rate limiting).
+async fn resolve_cli_release(
+    client: &reqwest::Client,
+    repo: &str,
+    release: GitHubRelease,
+) -> Result<GitHubRelease, String> {
+    if parse_version_tag(&release.tag_name).is_some() {
+        return Ok(release);
+    }
+    let Some(cli_tag) = paired_cli_tag(&release.tag_name).map(str::to_string) else {
+        return Err(format!(
+            "最新 release tag「{}」不是 CLI 版本，無法判斷可更新版本",
+            release.tag_name
+        ));
+    };
+    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{cli_tag}");
+    let by_tag: Result<GitHubRelease, String> = async {
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch release by tag: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("GitHub API returned {}", resp.status()));
+        }
+        resp.json::<GitHubRelease>()
+            .await
+            .map_err(|e| format!("Failed to parse release JSON: {e}"))
+    }
+    .await;
+    match by_tag {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            warn!(tag = %cli_tag, error = %e, "release-by-tag lookup failed; using deterministic asset URLs");
+            Ok(synthesize_release(repo, &cli_tag))
+        }
+    }
+}
+
 /// Rate-limit-immune fallback: resolve the latest tag from the WEB
 /// `releases/latest` redirect (no API quota) and synthesize the release with
 /// deterministic asset URLs (`releases/download/<tag>/duduclaw-<suffix>`).
@@ -847,18 +992,7 @@ async fn check_latest_via_redirect(ua: &str, repo: &str) -> Result<GitHubRelease
         .ok_or_else(|| format!("releases/latest returned {} without a redirect", resp.status()))?;
     let tag = tag_from_latest_location(location)
         .ok_or_else(|| format!("unrecognized releases/latest redirect: {location}"))?;
-    let asset_name = format!("duduclaw-{}", platform_asset_suffix());
-    let download_url =
-        format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
-    Ok(GitHubRelease {
-        tag_name: tag,
-        body: None,
-        published_at: None,
-        assets: vec![GitHubAsset {
-            name: asset_name,
-            browser_download_url: download_url,
-        }],
-    })
+    Ok(synthesize_release(repo, &tag))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1128,6 +1262,55 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         assert_eq!(tag_from_latest_location("https://github.com/x/y/releases"), None);
         assert_eq!(tag_from_latest_location(".../releases/tag/"), None);
         assert_eq!(tag_from_latest_location(".../releases/tag/v1.0.0?x=../../evil"), None);
+    }
+
+    // ── desktop-v* claiming "Latest" (2026-07-29 field report) ──
+
+    #[test]
+    fn parse_version_tag_accepts_cli_tags() {
+        assert_eq!(parse_version_tag("v1.46.2"), Some((1, 46, 2)));
+        assert_eq!(parse_version_tag("1.46.2"), Some((1, 46, 2)));
+        assert_eq!(parse_version_tag("v2.0.0-rc.1"), Some((2, 0, 0)));
+        assert_eq!(parse_version_tag("1.0"), Some((1, 0, 0)));
+    }
+
+    #[test]
+    fn parse_version_tag_rejects_non_cli_tags() {
+        assert_eq!(parse_version_tag("desktop-v1.46.2"), None);
+        assert_eq!(parse_version_tag("desktop-updater"), None);
+        assert_eq!(parse_version_tag(""), None);
+        assert_eq!(parse_version_tag("v"), None);
+        assert_eq!(parse_version_tag("1.46a.2"), None);
+    }
+
+    #[test]
+    fn paired_cli_tag_resolves_desktop_tags() {
+        assert_eq!(paired_cli_tag("v1.46.2"), Some("v1.46.2"));
+        assert_eq!(paired_cli_tag("desktop-v1.46.2"), Some("v1.46.2"));
+        assert_eq!(paired_cli_tag("desktop-updater"), None);
+        assert_eq!(paired_cli_tag("nightly"), None);
+    }
+
+    #[test]
+    fn parse_cli_version_output_skips_log_lines() {
+        // Real-world shape: a log line precedes the version line.
+        let out = "[duduclaw] effective log level: config.toml [general] log_level=info\nduduclaw 1.46.2\n";
+        assert_eq!(parse_cli_version_output(out), Some("1.46.2".to_string()));
+        assert_eq!(parse_cli_version_output("duduclaw v1.46.2"), Some("1.46.2".to_string()));
+        assert_eq!(parse_cli_version_output("no version here"), None);
+        // Two-dot requirement rejects filenames like config.toml or bare "1.46".
+        assert_eq!(parse_cli_version_output("config.toml 1.46"), None);
+    }
+
+    #[test]
+    fn synthesize_release_builds_deterministic_urls() {
+        let r = synthesize_release("zhixuli0406/DuDuClaw", "v1.46.2");
+        assert_eq!(r.tag_name, "v1.46.2");
+        assert_eq!(r.assets.len(), 1);
+        assert!(r.assets[0]
+            .browser_download_url
+            .starts_with("https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.46.2/duduclaw-"));
+        assert!(is_valid_download_url(&r.assets[0].browser_download_url));
     }
 
     #[test]

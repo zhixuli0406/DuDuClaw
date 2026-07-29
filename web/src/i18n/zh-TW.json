@@ -689,6 +689,7 @@
   "settings.update.check": "檢查更新",
   "settings.update.checking": "檢查中...",
   "settings.update.upToDate": "目前已是最新版本。",
+  "settings.update.restartPending": "新版本 v{version} 已安裝完成，重新啟動 DuDuClaw（或桌面 App）後生效。",
   "settings.update.available": "有新版本可用！",
   "settings.update.current": "目前版本",
   "settings.update.latest": "最新版本",

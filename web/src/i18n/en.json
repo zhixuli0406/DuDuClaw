@@ -690,6 +690,7 @@
   "settings.update.check": "Check for Updates",
   "settings.update.checking": "Checking...",
   "settings.update.upToDate": "You are running the latest version.",
+  "settings.update.restartPending": "Version v{version} is already installed — restart DuDuClaw (or the desktop app) to apply it.",
   "settings.update.available": "A new version is available!",
   "settings.update.current": "Current Version",
   "settings.update.latest": "Latest Version",

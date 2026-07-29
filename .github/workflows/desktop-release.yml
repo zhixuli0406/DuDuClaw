@@ -160,3 +160,20 @@ jobs:
               --notes "Moving pointer for the desktop auto-updater. latest.json here always describes the newest desktop release; installers live on the desktop-v* releases."
           fi
           gh release upload desktop-updater latest.json --repo "${{ github.repository }}" --clobber
+
+      # A desktop-v* release publishes minutes AFTER its paired CLI v* release,
+      # so it steals the repo's "Latest" marker — /releases/latest then returns
+      # an installer-only release and every deployed gateway's update check
+      # mis-parses the tag (2026-07-29 field report: "vdesktop-v1.46.2" shown
+      # as latest and wrongly reported up-to-date). Hand "Latest" back to the
+      # CLI release; if it doesn't exist yet, just unmark this one.
+      - name: Restore the CLI release as the repo's "Latest"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CLI_TAG="${GITHUB_REF_NAME#desktop-}"
+          if gh release view "$CLI_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release edit "$CLI_TAG" --repo "${{ github.repository }}" --latest
+          else
+            gh release edit "$GITHUB_REF_NAME" --repo "${{ github.repository }}" --latest=false
+          fi

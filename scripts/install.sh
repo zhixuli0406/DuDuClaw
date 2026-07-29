@@ -133,6 +133,16 @@ resolve_version() {
     tag="$(wget -qO- "$api" 2>/dev/null | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v?([^"]+)".*/\1/')"
   fi
 
+  # "latest" can be claimed by a desktop installer release (desktop-v1.46.2)
+  # — map it to the paired CLI version, and reject any tag that still doesn't
+  # look like MAJOR.MINOR.PATCH so we never build a bogus download URL.
+  tag="${tag#desktop-}"
+  tag="${tag#v}"
+  case "$tag" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) tag="" ;;
+  esac
+
   if [ -n "$tag" ]; then
     DUDUCLAW_VERSION="$tag"
   else

@@ -30,6 +30,7 @@ export function UpdateTab() {
     install_method: string;
     brew_formula?: string;
     auto_update?: boolean;
+    restart_pending_version?: string | null;
   } | null>(null);
 
   // Load edition + auto_update state on mount
@@ -158,6 +159,20 @@ export function UpdateTab() {
 
       {updateInfo && !installed && (
         <div className="space-y-4">
+          {/* Binary already swapped on disk (npm/brew/manual) — the running
+              gateway is older than what's installed; a restart is all that's
+              missing. Shown regardless of `available`. */}
+          {updateInfo.restart_pending_version && (
+            <div className="flex items-center gap-2 rounded-lg bg-warning/10 p-4 ring-1 ring-inset ring-warning/20">
+              <RefreshCw className="h-5 w-5 shrink-0 text-warning" />
+              <span className="text-sm text-warning">
+                {intl.formatMessage(
+                  { id: 'settings.update.restartPending' },
+                  { version: updateInfo.restart_pending_version },
+                )}
+              </span>
+            </div>
+          )}
           {/* Version info */}
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="rounded-lg bg-muted/50 p-4">

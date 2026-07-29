@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+- **系統更新頁「已安裝待重啟」提示**：檢查更新時同步探測磁碟上 binary 的實際
+  版本，若與執行中程序不同（例如 `npm i -g duduclaw` 更新後 gateway 還沒重啟、
+  桌面 App 舊 sidecar 還在跑），頁面直接顯示「新版本 vX 已安裝完成，重新啟動
+  後生效」，不再讓 CLI 與 dashboard 各說各話。
+
+### Changed
+- **個人版再精簡**（客戶回饋第二輪）：側邊欄的「＋交辦任務」按鈕與搜尋框、
+  行動版底部導航的中央 ＋交辦 按鈕在個人版一併隱藏（任務看板仍可由
+  進階群組與 ⌘K 進入）。
+
+### Fixed
+- **系統更新誤判「已是最新版本」**（客戶實測：最新版本顯示 `vdesktop-v1.46.2`）：
+  桌面安裝包 release（`desktop-v*`）比 CLI release 晚幾分鐘發布，會搶走 GitHub
+  的 Latest 標記，`releases/latest` 便回傳安裝包 release——版本比較把
+  `desktop-v1.46.2` 解析成 (0,46,2) 而誤判不需更新。三層修復：
+  ① `check_update` 遇到非 CLI 版本 tag 時自動解析對應的 `v*` release
+  （API 失效時退回確定性資產網址）；② `desktop-release.yml` 發完桌面版後把
+  Latest 標記還給 CLI release；③ `install.sh` / `install.ps1` 解析 latest tag
+  時剝除 `desktop-` 前綴並拒絕非版本 tag。GitHub 上的 Latest 已手動指回
+  `v1.46.2`，既有部署的更新檢查立即恢復正確。
+
 ## [1.46.2] - 2026-07-29 — 更新檢查限網環境自救（api.github.com 不通 fallback）
 
 ## [1.46.1] - 2026-07-29 — prompt 洩漏修復＋跨通道對話清單

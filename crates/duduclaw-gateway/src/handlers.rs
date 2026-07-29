@@ -15810,6 +15810,12 @@ impl MethodHandler {
     }
 
     async fn handle_system_check_update(&self) -> WsFrame {
+        // Detect a binary already swapped on disk under this running process
+        // (npm/brew/manual update without a restart): the dashboard would
+        // otherwise keep showing the stale in-memory version with no hint.
+        let on_disk = crate::updater::on_disk_version().await;
+        let restart_pending_version =
+            on_disk.filter(|v| v != crate::updater::current_version());
         match crate::updater::check_update().await {
             Ok(info) => {
                 // [M2] Cache the download/checksum URLs server-side
@@ -15837,6 +15843,10 @@ impl MethodHandler {
                         "install_method": info.install_method,
                         "brew_formula": crate::updater::brew_formula_name(),
                         "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
+                        // Non-null when the on-disk binary is already a
+                        // different version than this running process —
+                        // "installed, restart to apply".
+                        "restart_pending_version": restart_pending_version,
                     }),
                 )
             }
