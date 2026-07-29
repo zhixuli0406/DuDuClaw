@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.46.1] - 2026-07-29 — prompt 洩漏修復＋跨通道對話清單
+
 ### Added
 - **對話頁跨通道 session 清單**（客戶回饋）：對話頁左欄現在列出所有通道的
   對話紀錄——Telegram、Discord、LINE、Slack 等外部通道的 session 與網頁對話
