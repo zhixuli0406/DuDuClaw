@@ -317,14 +317,36 @@ fn is_env_truthy(var: &str) -> bool {
 /// re-issues the original user request. Kept as a pure function for
 /// testability (the prompt format is part of the protocol contract).
 pub fn build_retry_reminder(original_prompt: &str) -> String {
+    // LEAK HAZARD (2026-07-29 WebChat field report): this reminder is TYPED
+    // into the live REPL, and the TUI re-renders typed input (input-box echo
+    // + submitted transcript). When the reminder contained the sentinel
+    // LITERAL, those re-renders alone produced a sentinel pair and the
+    // extractor's last-pair rule returned the echoed reminder — i.e. the
+    // entire prompt, history framing and all — as the "answer", which then
+    // reached the user verbatim. Describe the sentinel; never emit it.
     format!(
         "[DUDUCLAW PROTOCOL REMINDER]: Your previous response did NOT contain the required \
-         sentinel-wrapped answer. The sentinel string is \
-         {sentinel}. Wrap your final answer between two such sentinel lines exactly \
-         (no markdown wrapping, no characters between the equals signs). Now reply to:\n\n\
-         {original_prompt}",
-        sentinel = duduclaw_cli_runtime::INTERACTIVE_SENTINEL,
+         sentinel-wrapped answer. The sentinel is the exact marker line from your system \
+         instructions: five equals signs, then DUDUCLAW.MARK, then five equals signs, written \
+         as one unbroken token on its own line. Write one such line, then your full answer, \
+         then the same line again (no markdown wrapping). Now reply to:\n\n{original_prompt}"
     )
+}
+
+/// True when an extracted pool "answer" still contains our own prompt or
+/// protocol scaffolding — i.e. the extractor latched onto the REPL's echo of
+/// typed input instead of a model-authored payload. Such text is a protocol
+/// failure and must NEVER be returned as a user-visible reply (the caller
+/// treats it like an empty payload: mark unhealthy → fresh-spawn fallback).
+pub fn answer_leaks_prompt_scaffold(answer: &str) -> bool {
+    const MARKERS: [&str; 5] = [
+        "[DUDUCLAW PROTOCOL REMINDER]",
+        "<conversation_history>",
+        "</conversation_history>",
+        "<current_message>",
+        duduclaw_cli_runtime::INTERACTIVE_SENTINEL,
+    ];
+    MARKERS.iter().any(|m| answer.contains(m))
 }
 
 /// Returns true when `DUDUCLAW_DISABLE_PTY_POOL` is set to a truthy value
@@ -775,7 +797,10 @@ async fn acquire_and_invoke_inner(
                         "pty_runtime: empty payload — retrying with explicit reminder"
                     );
                     match session.invoke_with(&reminder, retry_timeout).await {
-                        Ok(retried) if !retried.trim().is_empty() => {
+                        Ok(retried)
+                            if !retried.trim().is_empty()
+                                && !answer_leaks_prompt_scaffold(&retried) =>
+                        {
                             metrics.pty_pool_invoke_complete(
                                 elapsed_ms,
                                 crate::metrics::PtyInvokeOutcome::Ok,
@@ -783,7 +808,8 @@ async fn acquire_and_invoke_inner(
                             return Ok(retried);
                         }
                         _ => {
-                            // Retry didn't help — fall through to the
+                            // Retry didn't help (empty again, error, or an
+                            // echo-leak) — fall through to the
                             // mark-unhealthy path below.
                         }
                     }
@@ -803,6 +829,20 @@ async fn acquire_and_invoke_inner(
                     crate::metrics::PtyInvokeOutcome::EmptyPayload,
                 );
                 Err("pty_runtime: empty payload (session marked unhealthy)".to_string())
+            } else if answer_leaks_prompt_scaffold(&answer) {
+                // The "answer" is our own echoed input — a protocol failure,
+                // never user-visible text. Same handling as empty payload.
+                warn!(
+                    agent_id = %agent_id,
+                    "pty_runtime: extracted payload contains prompt scaffolding (echo leak) — marking session unhealthy"
+                );
+                session.mark_unhealthy();
+                metrics.pty_pool_invoke_complete(
+                    elapsed_ms,
+                    crate::metrics::PtyInvokeOutcome::EmptyPayload,
+                );
+                Err("pty_runtime: echo leak instead of model answer (session marked unhealthy)"
+                    .to_string())
             } else {
                 metrics.pty_pool_invoke_complete(
                     elapsed_ms,
@@ -945,6 +985,7 @@ async fn invoke_via_managed_worker(
                         .invoke(make_params(&reminder, remaining.as_millis() as u64), remaining)
                         .await
                         && !retried.trim().is_empty()
+                        && !answer_leaks_prompt_scaffold(&retried)
                     {
                         metrics.pty_pool_invoke_complete(
                             elapsed_ms,
@@ -959,6 +1000,16 @@ async fn invoke_via_managed_worker(
                     crate::metrics::PtyInvokeOutcome::EmptyPayload,
                 );
                 Err("pty_runtime: empty payload from managed worker".to_string())
+            } else if answer_leaks_prompt_scaffold(&text) {
+                warn!(
+                    agent_id = %agent_id,
+                    "pty_runtime: managed worker payload contains prompt scaffolding (echo leak)"
+                );
+                metrics.pty_pool_invoke_complete(
+                    elapsed_ms,
+                    crate::metrics::PtyInvokeOutcome::EmptyPayload,
+                );
+                Err("pty_runtime: echo leak from managed worker".to_string())
             } else {
                 metrics.pty_pool_invoke_complete(
                     elapsed_ms,
@@ -1717,11 +1768,33 @@ mod tests {
         let prompt = "Please summarise the design doc.";
         let reminder = build_retry_reminder(prompt);
         assert!(reminder.contains("DUDUCLAW PROTOCOL REMINDER"));
+        // 2026-07-29 leak fix: the reminder is TYPED into the REPL and echoed
+        // by the TUI — containing the sentinel literal let the echo satisfy
+        // the extractor's positional pairing and leaked the whole prompt to
+        // the user. The reminder must DESCRIBE the sentinel, never emit it.
         assert!(
-            reminder.contains(duduclaw_cli_runtime::INTERACTIVE_SENTINEL),
-            "reminder must include the literal sentinel string"
+            !reminder.contains(duduclaw_cli_runtime::INTERACTIVE_SENTINEL),
+            "reminder must NOT include the literal sentinel string (echo-leak hazard)"
         );
+        assert!(reminder.contains("DUDUCLAW.MARK"), "still names the marker");
         assert!(reminder.ends_with(prompt));
+    }
+
+    #[test]
+    fn scaffold_leak_detector_flags_echoed_prompts_only() {
+        assert!(answer_leaks_prompt_scaffold(
+            "[DUDUCLAW PROTOCOL REMINDER]: Your previous response…"
+        ));
+        assert!(answer_leaks_prompt_scaffold(
+            "junk <conversation_history>\n<user>hi</user>"
+        ));
+        assert!(answer_leaks_prompt_scaffold("<current_message>\nhello\n</current_message>"));
+        assert!(answer_leaks_prompt_scaffold(duduclaw_cli_runtime::INTERACTIVE_SENTINEL));
+        // Normal replies — including ones that TALK about history — pass.
+        assert!(!answer_leaks_prompt_scaffold("好的，我已把退貨規則記到知識庫。"));
+        assert!(!answer_leaks_prompt_scaffold(
+            "Based on our conversation history, the answer is 42."
+        ));
     }
 
     #[test]
