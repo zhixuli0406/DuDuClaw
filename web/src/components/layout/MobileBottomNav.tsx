@@ -2,6 +2,7 @@ import { NavLink, useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
 import { Plus } from 'lucide-react';
 import { useApprovalsStore } from '@/stores/approvals-store';
+import { useSystemStore } from '@/stores/system-store';
 import { cn } from '@/lib/utils';
 import { mobileNavItems, type NavItem } from './nav-model';
 
@@ -46,6 +47,9 @@ export function MobileBottomNav() {
   const intl = useIntl();
   const navigate = useNavigate();
   const inboxCount = useApprovalsStore((s) => s.pendingCount);
+  // Personal IA (2026-07-29 client feedback round 2): the centre ＋交辦 quick
+  // action is task-board chrome — hidden on Personal like the sidebar button.
+  const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
 
   // Split the side items around the center ＋交辦 action. The center is a
   // fixed-width slot flanked by two equal-flex groups, so the raised ＋ button
@@ -68,19 +72,21 @@ export function MobileBottomNav() {
 
       {/* Center raised action: ＋交辦 — a fixed-width slot kept horizontally
           centred by the equal-flex groups on either side. */}
-      <div className="flex w-16 shrink-0 items-center justify-center">
-        <button
-          type="button"
-          // TODO(v2-V5): route to the task board's create intent until a global
-          // create-task modal exists.
-          onClick={() => navigate('/tasks?new=1')}
-          aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
-          title={intl.formatMessage({ id: 'sidebar.newTask' })}
-          className="-mt-6 grid size-14 place-items-center rounded-full bg-brand text-brand-foreground shadow-[var(--menu-shadow)] ring-4 ring-sidebar transition-transform active:translate-y-px active:scale-95"
-        >
-          <Plus className="size-6" />
-        </button>
-      </div>
+      {!isPersonal && (
+        <div className="flex w-16 shrink-0 items-center justify-center">
+          <button
+            type="button"
+            // TODO(v2-V5): route to the task board's create intent until a global
+            // create-task modal exists.
+            onClick={() => navigate('/tasks?new=1')}
+            aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
+            title={intl.formatMessage({ id: 'sidebar.newTask' })}
+            className="-mt-6 grid size-14 place-items-center rounded-full bg-brand text-brand-foreground shadow-[var(--menu-shadow)] ring-4 ring-sidebar transition-transform active:translate-y-px active:scale-95"
+          >
+            <Plus className="size-6" />
+          </button>
+        </div>
+      )}
 
       <div className="flex flex-1 items-stretch">
         {right.map((item) => (
