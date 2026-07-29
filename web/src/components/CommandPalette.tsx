@@ -18,9 +18,16 @@ import {
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
 import { fuzzyMatch, highlightSegments } from '@/lib/fuzzy';
-import { dailyItems, navGroups, manageNav, manageEntry, type NavItem } from '@/components/layout/nav-model';
+import {
+  manageNav,
+  manageEntry,
+  navGroupsForEdition,
+  primaryItemsForEdition,
+  type NavItem,
+} from '@/components/layout/nav-model';
 import { hasMinRole } from '@/lib/roles';
 import { isVisible } from '@/lib/nav-visibility';
+import { isTauri } from '@/lib/gateway-picker';
 import { useForksExist } from '@/hooks/useForksExist';
 import { CharacterAvatar } from '@/components/character';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
@@ -125,10 +132,12 @@ export function CommandPalette() {
     // destination (T1.5). `staffEntry` / `manageEntry` are already inside
     // `navGroups`, so they must NOT be appended again (duplicate route id).
     const navSources: Array<{ item: NavItem; groupLabel: string }> = [
-      ...dailyItems.map((item) => ({ item, groupLabel: 'navGroup.daily' })),
-      ...navGroups.flatMap((group) => group.items.map((item) => ({ item, groupLabel: group.label }))),
+      ...primaryItemsForEdition(isPersonal).map((item) => ({ item, groupLabel: 'navGroup.daily' })),
+      ...navGroupsForEdition(isPersonal).flatMap((group) =>
+        group.items.map((item) => ({ item, groupLabel: group.label })),
+      ),
     ];
-    const visibilityCtx = { hasOperatorAccess, forksExist };
+    const visibilityCtx = { hasOperatorAccess, forksExist, isDesktop: isTauri() };
     const navCommands: Command[] = navSources
       .filter(({ item }) => isVisible(item, user?.role, isPersonal, visibilityCtx))
       .map(({ item, groupLabel }) => ({

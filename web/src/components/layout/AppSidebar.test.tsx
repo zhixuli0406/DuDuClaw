@@ -6,6 +6,7 @@ import { renderWithProviders } from '@/test/render';
 import { SidebarProvider } from '@/components/mds';
 import { AppSidebar } from './AppSidebar';
 import { useAuthStore } from '@/stores/auth-store';
+import { useSystemStore } from '@/stores/system-store';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 
 function renderSidebar() {
@@ -24,6 +25,8 @@ beforeEach(() => {
     bindings: [],
   } as never);
   useCommandPaletteStore.setState({ open: false });
+  // Default to the non-personal layout; the personal-IA test opts in itself.
+  useSystemStore.setState({ status: null } as never);
 });
 
 describe('AppSidebar (Multica shell)', () => {
@@ -65,6 +68,35 @@ describe('AppSidebar (Multica shell)', () => {
     // A non-active item carries neither.
     const chat = screen.getByRole('link', { name: /Chat/i });
     expect(chat).not.toHaveAttribute('aria-current', 'page');
+  });
+
+  // Personal IA (2026-07-29 client feedback): flat 主區 (daily + Routines /
+  // World / Skills / Knowledge), no 工作/公司 groups, no staff zone; 設定 and
+  // 進階 close the rail collapsed. Roster/org/pet-studio hidden (pet studio is
+  // desktop-only and jsdom is not Tauri).
+  it('personal edition: minimal primary rail, collapsed 設定/進階, staff surfaces hidden', async () => {
+    const user = userEvent.setup();
+    useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+    renderSidebar();
+
+    // 主區 flat items are present.
+    expect(screen.getByRole('link', { name: /Routines/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Knowledge/i })).toBeInTheDocument();
+    // Enterprise group labels are gone; 進階 exists but starts collapsed.
+    expect(screen.queryByText(/^Work$/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Company$/)).not.toBeInTheDocument();
+    expect(screen.getByText(/^Advanced$/)).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Task Board/i })).not.toBeInTheDocument();
+    // 設定 collapsed by default too.
+    expect(screen.queryByRole('link', { name: /About/i })).not.toBeInTheDocument();
+    // Hidden on Personal: AI staff roster + pet studio (desktop-only).
+    expect(screen.queryByRole('link', { name: /^Agents$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Pet studio/i })).not.toBeInTheDocument();
+
+    // Expanding 進階 reveals the folded work surfaces.
+    await user.click(screen.getByText(/^Advanced$/));
+    expect(screen.getByRole('link', { name: /Task Board/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Memory/i })).toBeInTheDocument();
   });
 
   it('opens the command palette from the search trigger', async () => {

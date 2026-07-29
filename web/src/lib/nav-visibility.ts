@@ -27,6 +27,19 @@ import { hasMinRole } from '@/lib/roles';
 export interface Gated {
   readonly minRole?: UserRole;
   readonly enterprise?: boolean;
+  /**
+   * Hidden on the Personal edition (2026-07-29 client feedback): unlike
+   * `enterprise` (an enterprise-only *feature*), this marks a surface that
+   * exists in Personal but is deliberately kept out of its simplified IA
+   * (AI 員工 roster, 公司/org chart, 授權). The route stays URL-reachable.
+   */
+  readonly personalHidden?: boolean;
+  /**
+   * Only meaningful inside the desktop app (Tauri) — e.g. 桌寵工作室. Hidden
+   * in a plain browser, where the page could only show a "desktop-only" stub.
+   * Fail-closed: callers that can't supply `ctx.isDesktop` hide the surface.
+   */
+  readonly desktopOnly?: boolean;
   /** Data-scope hint (employee sees only own agents). Does not gate visibility. */
   readonly ownScope?: boolean;
   /** Sensitive surface — requires operator/owner access to be shown. */
@@ -47,6 +60,8 @@ export interface VisibilityContext {
   readonly hasOperatorAccess?: boolean;
   /** True once at least one fork record exists (progressive disclosure). */
   readonly forksExist?: boolean;
+  /** True when running inside the desktop app (Tauri). */
+  readonly isDesktop?: boolean;
 }
 
 export function isVisible(
@@ -57,6 +72,9 @@ export function isVisible(
 ): boolean {
   if (!hasMinRole(userRole, item.minRole)) return false;
   if (isPersonal && item.enterprise) return false;
+  if (isPersonal && item.personalHidden) return false;
+  // Desktop-only surfaces stay hidden unless we know we're in the app (fail-closed).
+  if (item.desktopOnly && !ctx?.isDesktop) return false;
   // Sensitive surfaces stay hidden unless operator access is proven (fail-closed).
   if (item.operatorOnly && !ctx?.hasOperatorAccess) return false;
   // Progressive disclosure: hidden until the backing data exists.

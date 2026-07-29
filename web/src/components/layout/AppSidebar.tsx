@@ -53,9 +53,12 @@ import {
 import {
   dailyItems,
   navGroups,
+  personalAdvancedGroup,
+  primaryItemsForEdition,
   staffEntry,
   type NavItem,
 } from './nav-model';
+import { isTauri } from '@/lib/gateway-picker';
 import { EditionBadge } from './EditionBadge';
 
 const GROUP_COLLAPSE_KEY = 'duduclaw:ui:nav-collapsed';
@@ -450,17 +453,26 @@ export function AppSidebar() {
   }, [connectionState, fetchInboxCount, fetchAgents]);
 
   const forksExist = useForksExist(hasMinRole(user?.role, 'manager'));
-  const ctx = { hasOperatorAccess, forksExist };
+  const ctx = { hasOperatorAccess, forksExist, isDesktop: isTauri() };
 
   const workItems = filterVisible(navGroups[0].items, user?.role, isPersonal, ctx);
   const companyItems = filterVisible(navGroups[1].items, user?.role, isPersonal, ctx);
   const settingsItems = filterVisible(navGroups[2].items, user?.role, isPersonal, ctx);
+  // Personal IA (2026-07-29): flat primary row + collapsed 設定 / 進階 groups.
+  const primaryItems = filterVisible(primaryItemsForEdition(isPersonal), user?.role, isPersonal, ctx);
+  const advancedItems = filterVisible(personalAdvancedGroup.items, user?.role, isPersonal, ctx);
 
   const badgeFor = (badge: NavItem['badge']): number => (badge === 'inbox' ? inboxCount : 0);
 
+  // Personal defaults 設定 and 進階 to collapsed; an explicit user toggle
+  // (stored, even as `false`) always wins over the default.
+  const personalDefaultCollapsed = new Set(['navGroup.settings', 'navGroup.advanced']);
+  const isSectionCollapsed = (label: string): boolean =>
+    collapsedSections[label] ?? (isPersonal && personalDefaultCollapsed.has(label));
+
   const toggleSection = (label: string) => {
     setCollapsedSections((prev) => {
-      const next = { ...prev, [label]: !prev[label] };
+      const next = { ...prev, [label]: !isSectionCollapsed(label) };
       try {
         localStorage.setItem(GROUP_COLLAPSE_KEY, JSON.stringify(next));
       } catch {
@@ -497,47 +509,72 @@ export function AppSidebar() {
       </SidebarHeader>
 
       <SidebarContent>
-        {/* Personal group — flat, no group label. */}
+        {/* Flat top rows — daily items (+ Personal 主區), no group label. */}
         <SidebarGroup>
           <SidebarMenu>
-            {dailyItems.map((item) => (
+            {(isPersonal ? primaryItems : dailyItems).map((item) => (
               <NavRow key={item.to} item={item} count={badgeFor(item.badge)} collapsed={collapsed} />
             ))}
           </SidebarMenu>
         </SidebarGroup>
 
-        <NavGroupSection
-          label={navGroups[0].label}
-          items={workItems}
-          badgeFor={badgeFor}
-          collapsed={collapsed}
-          sectionCollapsed={!!collapsedSections[navGroups[0].label]}
-          onToggle={() => toggleSection(navGroups[0].label)}
-        />
+        {isPersonal ? (
+          /* Personal IA (2026-07-29): no 工作/公司 groups, no staff zone —
+             設定 (collapsed) then 進階 (collapsed) close the rail. */
+          <>
+            <NavGroupSection
+              label={navGroups[2].label}
+              items={settingsItems}
+              badgeFor={badgeFor}
+              collapsed={collapsed}
+              sectionCollapsed={isSectionCollapsed(navGroups[2].label)}
+              onToggle={() => toggleSection(navGroups[2].label)}
+            />
+            <NavGroupSection
+              label={personalAdvancedGroup.label}
+              items={advancedItems}
+              badgeFor={badgeFor}
+              collapsed={collapsed}
+              sectionCollapsed={isSectionCollapsed(personalAdvancedGroup.label)}
+              onToggle={() => toggleSection(personalAdvancedGroup.label)}
+            />
+          </>
+        ) : (
+          <>
+            <NavGroupSection
+              label={navGroups[0].label}
+              items={workItems}
+              badgeFor={badgeFor}
+              collapsed={collapsed}
+              sectionCollapsed={isSectionCollapsed(navGroups[0].label)}
+              onToggle={() => toggleSection(navGroups[0].label)}
+            />
 
-        <StaffZone
-          collapsed={collapsed}
-          sectionCollapsed={!!collapsedSections['navGroup.staff']}
-          onToggle={() => toggleSection('navGroup.staff')}
-        />
+            <StaffZone
+              collapsed={collapsed}
+              sectionCollapsed={isSectionCollapsed('navGroup.staff')}
+              onToggle={() => toggleSection('navGroup.staff')}
+            />
 
-        <NavGroupSection
-          label={navGroups[1].label}
-          items={companyItems}
-          badgeFor={badgeFor}
-          collapsed={collapsed}
-          sectionCollapsed={!!collapsedSections[navGroups[1].label]}
-          onToggle={() => toggleSection(navGroups[1].label)}
-        />
+            <NavGroupSection
+              label={navGroups[1].label}
+              items={companyItems}
+              badgeFor={badgeFor}
+              collapsed={collapsed}
+              sectionCollapsed={isSectionCollapsed(navGroups[1].label)}
+              onToggle={() => toggleSection(navGroups[1].label)}
+            />
 
-        <NavGroupSection
-          label={navGroups[2].label}
-          items={settingsItems}
-          badgeFor={badgeFor}
-          collapsed={collapsed}
-          sectionCollapsed={!!collapsedSections[navGroups[2].label]}
-          onToggle={() => toggleSection(navGroups[2].label)}
-        />
+            <NavGroupSection
+              label={navGroups[2].label}
+              items={settingsItems}
+              badgeFor={badgeFor}
+              collapsed={collapsed}
+              sectionCollapsed={isSectionCollapsed(navGroups[2].label)}
+              onToggle={() => toggleSection(navGroups[2].label)}
+            />
+          </>
+        )}
       </SidebarContent>
 
       <SidebarFooter>
