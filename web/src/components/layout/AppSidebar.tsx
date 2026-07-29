@@ -488,24 +488,29 @@ export function AppSidebar() {
     <>
       <SidebarHeader>
         <CompanySwitcher collapsed={collapsed} />
-        {collapsed ? (
-          <Button
-            variant="brand"
-            size="icon"
-            className="mx-auto"
-            onClick={() => navigate('/tasks?new=1')}
-            title={intl.formatMessage({ id: 'sidebar.newTask' })}
-            aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
-          >
-            <Plus />
-          </Button>
-        ) : (
-          <Button variant="brand" className="w-full" onClick={() => navigate('/tasks?new=1')}>
-            <Plus />
-            {intl.formatMessage({ id: 'sidebar.newTask' })}
-          </Button>
-        )}
-        <SearchTrigger collapsed={collapsed} />
+        {/* Personal IA (2026-07-29 client feedback round 2): the task-board
+            quick-create button and the search trigger are work-management
+            chrome — hidden on Personal along with the board itself (still
+            reachable via 進階 → 任務看板 and the ⌘K shortcut). */}
+        {!isPersonal &&
+          (collapsed ? (
+            <Button
+              variant="brand"
+              size="icon"
+              className="mx-auto"
+              onClick={() => navigate('/tasks?new=1')}
+              title={intl.formatMessage({ id: 'sidebar.newTask' })}
+              aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
+            >
+              <Plus />
+            </Button>
+          ) : (
+            <Button variant="brand" className="w-full" onClick={() => navigate('/tasks?new=1')}>
+              <Plus />
+              {intl.formatMessage({ id: 'sidebar.newTask' })}
+            </Button>
+          ))}
+        {!isPersonal && <SearchTrigger collapsed={collapsed} />}
       </SidebarHeader>
 
       <SidebarContent>
