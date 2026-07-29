@@ -119,6 +119,12 @@ pub enum InstallMethod {
     /// the user runs `npm i -g duduclaw` again (harmless — next npm
     /// install just overwrites with the same or newer version).
     Npm,
+    /// Running as the desktop app's bundled sidecar (inside the signed
+    /// `.app` bundle / installer directory). Self-replacing that binary
+    /// would break the bundle's code signature — updates arrive through
+    /// the Tauri updater instead, so `apply_update` refuses (2026-07-29
+    /// field report: the generic path failed opaquely here).
+    Desktop,
     Standalone,
     Source,
     Unknown,
@@ -153,6 +159,18 @@ pub fn detect_install_method() -> InstallMethod {
     }
     let exe_str = exe.to_string_lossy();
 
+    // Desktop-app sidecar: macOS bundle path, or (Windows/Linux) the Tauri
+    // main executable sitting next to us. Checked FIRST — a sidecar under
+    // /Applications would otherwise fall through to Standalone and try to
+    // rewrite the signed bundle.
+    if exe_str.contains(".app/Contents/") {
+        return InstallMethod::Desktop;
+    }
+    if let Some(dir) = exe.parent() {
+        if dir.join("DuDuClaw.exe").exists() || dir.join("duduclaw-desktop-app").exists() {
+            return InstallMethod::Desktop;
+        }
+    }
     if exe_str.contains("/Cellar/duduclaw/")
         || exe_str.contains("/homebrew/")
         || exe_str.contains("/linuxbrew/")
@@ -295,20 +313,37 @@ pub async fn check_update() -> Result<UpdateInfo, String> {
 
     let repo = github_repo();
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch release info: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("GitHub API returned {}", resp.status()));
+    let api_result: Result<GitHubRelease, String> = async {
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch release info: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("GitHub API returned {}", resp.status()));
+        }
+        resp.json::<GitHubRelease>()
+            .await
+            .map_err(|e| format!("Failed to parse release JSON: {e}"))
     }
+    .await;
 
-    let release: GitHubRelease = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse release JSON: {e}"))?;
+    let release: GitHubRelease = match api_result {
+        Ok(r) => r,
+        Err(api_err) => {
+            // Fallback (2026-07-29 field report: 更新失敗 on an office NAT):
+            // the anonymous GitHub API allows only 60 req/hr per IP, so a
+            // shared egress trivially exhausts it. The releases/latest WEB
+            // endpoint is not rate-limited that way — its redirect Location
+            // carries the tag, and asset URLs are deterministic from it.
+            match check_latest_via_redirect(&ua, repo).await {
+                Ok(r) => r,
+                Err(fb_err) => {
+                    return Err(format!("{api_err}（fallback 亦失敗：{fb_err}）"));
+                }
+            }
+        }
+    };
 
     let latest = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
     let available = is_newer(current_version(), latest);
@@ -360,6 +395,15 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
         return Err("Another update is already in progress".into());
     }
     let _guard = UpdateGuard;
+
+    // Desktop sidecar: replacing the binary inside the signed app bundle
+    // breaks the code-signature seal — the Tauri updater owns this install.
+    if matches!(detect_install_method(), InstallMethod::Desktop) {
+        return Err(
+            "桌面版由 DuDuClaw App 自動更新（重新啟動 App 即會套用新版本），此處不執行覆寫"
+                .into(),
+        );
+    }
 
     // Homebrew check
     if detect_install_method() == InstallMethod::Homebrew {
@@ -768,6 +812,55 @@ struct GitHubRelease {
     assets: Vec<GitHubAsset>,
 }
 
+/// Extract the release tag from a `releases/latest` redirect Location
+/// (`…/releases/tag/v1.46.1` → `v1.46.1`). Pure for testability.
+fn tag_from_latest_location(location: &str) -> Option<String> {
+    let (_, tag) = location.rsplit_once("/releases/tag/")?;
+    let tag = tag.trim_end_matches('/');
+    if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | 'v')) {
+        return None;
+    }
+    Some(tag.to_string())
+}
+
+/// Rate-limit-immune fallback: resolve the latest tag from the WEB
+/// `releases/latest` redirect (no API quota) and synthesize the release with
+/// deterministic asset URLs (`releases/download/<tag>/duduclaw-<suffix>`).
+/// Release notes / publish date are unavailable on this path — empty, never
+/// fabricated.
+async fn check_latest_via_redirect(ua: &str, repo: &str) -> Result<GitHubRelease, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(ua)
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+    let resp = client
+        .get(format!("https://github.com/{repo}/releases/latest"))
+        .send()
+        .await
+        .map_err(|e| format!("releases/latest fetch failed: {e}"))?;
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| format!("releases/latest returned {} without a redirect", resp.status()))?;
+    let tag = tag_from_latest_location(location)
+        .ok_or_else(|| format!("unrecognized releases/latest redirect: {location}"))?;
+    let asset_name = format!("duduclaw-{}", platform_asset_suffix());
+    let download_url =
+        format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
+    Ok(GitHubRelease {
+        tag_name: tag,
+        body: None,
+        published_at: None,
+        assets: vec![GitHubAsset {
+            name: asset_name,
+            browser_download_url: download_url,
+        }],
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubAsset {
     name: String,
@@ -1017,5 +1110,31 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
             let _g = UpdateGuard;
         }
         assert!(!UPDATE_IN_PROGRESS.load(Ordering::SeqCst));
+    }
+
+    // ── releases/latest redirect fallback (rate-limit immunity) ──
+
+    #[test]
+    fn tag_from_latest_location_parses_and_fences() {
+        assert_eq!(
+            tag_from_latest_location("https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.46.1"),
+            Some("v1.46.1".to_string())
+        );
+        assert_eq!(
+            tag_from_latest_location("/zhixuli0406/DuDuClaw/releases/tag/v2.0.0-rc.1/"),
+            Some("v2.0.0-rc.1".to_string())
+        );
+        // No tag segment / empty / hostile characters → None.
+        assert_eq!(tag_from_latest_location("https://github.com/x/y/releases"), None);
+        assert_eq!(tag_from_latest_location(".../releases/tag/"), None);
+        assert_eq!(tag_from_latest_location(".../releases/tag/v1.0.0?x=../../evil"), None);
+    }
+
+    #[test]
+    fn desktop_bundle_paths_detected() {
+        // Pure-path check mirrors detect_install_method's first rule.
+        assert!("/Applications/DuDuClaw.app/Contents/MacOS/duduclaw".contains(".app/Contents/"));
+        assert!(!"/Users/x/.nvm/versions/node/v24/lib/node_modules/duduclaw/bin/duduclaw"
+            .contains(".app/Contents/"));
     }
 }

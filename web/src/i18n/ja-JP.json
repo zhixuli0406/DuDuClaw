@@ -698,6 +698,7 @@
   "settings.update.installing": "インストール中...",
   "settings.update.installed": "アップデートをインストールしました！再起動中...",
   "settings.update.brewHint": "Homebrew インストールを検出しました。次を実行してください:",
+  "settings.update.desktopManaged": "デスクトップ版をご利用中です。新バージョンは App が自動でダウンロードし、再起動時に適用されます。ここでの手動インストールは不要です。",
   "settings.update.noBinary": "このプラットフォーム向けのビルド済みバイナリはありません。ソースからビルドしてください。",
   "settings.update.failed": "アップデートに失敗しました",
   "settings.update.autoUpdate": "自動アップデート",

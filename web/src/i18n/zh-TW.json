@@ -698,6 +698,7 @@
   "settings.update.installing": "安裝中...",
   "settings.update.installed": "更新完成！正在重新啟動...",
   "settings.update.brewHint": "偵測到 Homebrew 安裝方式，請執行：",
+  "settings.update.desktopManaged": "你使用的是桌面版：新版本由 DuDuClaw App 自動下載，重新啟動 App 就會套用，這裡不需要手動安裝。",
   "settings.update.noBinary": "此平台無預編譯檔案，請從原始碼建置。",
   "settings.update.failed": "更新失敗",
   "settings.update.autoUpdate": "自動更新",
