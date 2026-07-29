@@ -55,8 +55,11 @@ export function UpdateTab() {
     try {
       const info = await api.system.checkUpdate();
       setUpdateInfo(info);
-    } catch {
-      setError(intl.formatMessage({ id: 'settings.update.failed' }));
+    } catch (err) {
+      // Surface the server's reason — a bare 「更新失敗」 hid the actual
+      // cause (e.g. GitHub API rate limit) from the 2026-07-29 field report.
+      const msg = err instanceof Error ? err.message : String(err ?? '');
+      setError(`${intl.formatMessage({ id: 'settings.update.failed' })}${msg ? `: ${msg}` : ''}`);
     } finally {
       setChecking(false);
     }
@@ -85,6 +88,7 @@ export function UpdateTab() {
   };
 
   const isHomebrew = updateInfo?.install_method === 'homebrew';
+  const isDesktop = updateInfo?.install_method === 'desktop';
   const noBinary = updateInfo?.available && !updateInfo.download_url;
   const isPro = edition !== 'community';
 
@@ -219,8 +223,17 @@ export function UpdateTab() {
                 </div>
               )}
 
+              {/* Desktop app: updates arrive via the app's own updater */}
+              {isDesktop && (
+                <div className="rounded-lg bg-muted/60 p-4 ring-1 ring-inset ring-surface-border">
+                  <p className="text-sm text-muted-foreground">
+                    {intl.formatMessage({ id: 'settings.update.desktopManaged' })}
+                  </p>
+                </div>
+              )}
+
               {/* No binary hint */}
-              {noBinary && !isHomebrew && (
+              {noBinary && !isHomebrew && !isDesktop && (
                 <div className="rounded-lg bg-warning/10 p-4 ring-1 ring-inset ring-warning/20">
                   <p className="text-sm text-warning">
                     {intl.formatMessage({ id: 'settings.update.noBinary' })}
@@ -229,7 +242,7 @@ export function UpdateTab() {
               )}
 
               {/* Install button */}
-              {!isHomebrew && !noBinary && (
+              {!isHomebrew && !isDesktop && !noBinary && (
                 <Button
                   variant="brand"
                   onClick={handleInstall}

@@ -699,6 +699,7 @@
   "settings.update.installing": "Installing...",
   "settings.update.installed": "Update installed! Restarting...",
   "settings.update.brewHint": "Homebrew installation detected. Please run:",
+  "settings.update.desktopManaged": "You are on the desktop app: updates download automatically and apply when you restart the app — no manual install needed here.",
   "settings.update.noBinary": "No pre-built binary available for this platform. Build from source.",
   "settings.update.failed": "Update failed",
   "settings.update.autoUpdate": "Auto Update",
