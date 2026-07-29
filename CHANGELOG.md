@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.46.2] - 2026-07-29 — 更新檢查限網環境自救（api.github.com 不通 fallback）
+
 ## [1.46.1] - 2026-07-29 — prompt 洩漏修復＋跨通道對話清單
 
 ### Added
