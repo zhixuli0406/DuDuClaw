@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### Added
+- **對話頁跨通道 session 清單**（客戶回饋）：對話頁左欄現在列出所有通道的
+  對話紀錄——Telegram、Discord、LINE、Slack 等外部通道的 session 與網頁對話
+  一起按 session 分開顯示，每列帶通道徽章與負責的 AI 員工；點選即載入該對話
+  並自動切換到對應員工接續。內部工作 session（cron／派工）不混入清單。
+  非 admin 使用者維持原本的單員工範圍（伺服器端 fail-closed）。
+- **session 標題自動跟隨討論內容**：新增背景 titler 任務（10 分鐘一輪，
+  沿用 summarizer 的 utility LLM 通道）——活躍 session 產生 ≤20 字簡短標題，
+  討論推進 6 輪以上自動重新命名；未命名前維持「第一則使用者訊息」fallback。
+  成本護欄：僅處理 48 小時內活躍的 session、每輪最多 5 個。
+
+### Changed
+- **個人版側邊欄重組**（客戶回饋）：主區精簡為 首頁／收件匣／對話／例行工作／
+  世界／Skill／知識庫；任務看板、共同計劃、執行紀錄、畫布、檔案、工作時間軸、
+  分析報表、OS、記憶、專家包、Widget 工坊、成長 全部收進底部新設的「進階」
+  群組（預設收起）；「設定」在個人版也預設收起。個人版隱藏：AI 員工名冊
+  （含側欄員工區）、公司組織圖、授權（頁面仍可由網址進入）。桌寵工作室改為
+  僅桌面版顯示（瀏覽器不再出現占位頁入口）。企業版佈局不變。
+
+### Fixed
+- **WebChat 回覆洩漏整段 prompt 內部結構**（客戶實測：回覆裡出現
+  `<conversation_history>`／協定 reminder／框架指令原文）。兩個根源都堵死：
+  ①PTY pool 的空回覆 retry reminder 含 sentinel 字面——reminder 是「打字」進
+  互動 REPL 的，TUI 會把輸入重繪多次（輸入框回顯＋送出後 transcript），兩次
+  回顯就湊成一對 sentinel，抽取器「取最後一對」規則把 reminder＋整段 prompt
+  當成答案回給使用者。reminder 改為描述 sentinel 而不輸出字面；所有 pool 回傳
+  路徑（含 managed worker）加 `answer_leaks_prompt_scaffold` 閘——含鷹架標記
+  的「答案」視同協定失敗（標記 unhealthy → fresh-spawn fallback），絕不出口。
+  ②grok 空 stdout 的 PTY 重試原樣回傳 `strip_ansi(stdout)`——TTY 下 CLI 會
+  渲染輸入，等於整段 prompt 跟著回覆一起出去。新增 `salvage_pty_stdout`：
+  切掉 prompt 尾端之前的所有輸出，殘留鷹架或空結果一律誠實回錯（fail-closed），
+  寧可走錯誤分類也不洩漏。
+- **知識庫空狀態文案洩漏內部術語**（「透過 MCP wiki_write 工具建立第一個頁面」
+  ——使用者不知道 MCP 是什麼）：個人＋共享知識庫空狀態改為可操作指引
+  （在對話裡吩咐 AI 員工「幫我把退貨規則記到知識庫」即建立第一頁；
+  專家包附帶現成 SOP 頁面），三語同步。
+
 ## [1.46.0] - 2026-07-29 — 專家包組織化＋OS 主動關懷＋桌寵漫遊
 
 ### Added

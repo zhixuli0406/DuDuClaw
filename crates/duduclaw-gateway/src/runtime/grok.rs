@@ -626,10 +626,48 @@ impl GrokRuntime {
         )
         .await
         .map_err(|e| format!("grok PTY retry invoke failed: {e}"))?;
-        Ok(duduclaw_cli_runtime::strip_ansi(&out.stdout)
-            .trim()
-            .to_string())
+        salvage_pty_stdout(&out.stdout, args)
     }
+}
+
+/// Clean a PTY one-shot's raw stdout into a user-safe answer.
+///
+/// Under a real TTY the CLI RENDERS its input — the prompt argument (history,
+/// framing, system text) appears in the output stream before the model's
+/// reply. Returning `strip_ansi(stdout)` verbatim therefore leaked the whole
+/// prompt to the user (2026-07-29 WebChat field report). Salvage: cut
+/// everything up to the LAST occurrence of the prompt's tail, then refuse
+/// (fail-closed) if prompt scaffolding still shows or nothing remains — an
+/// honest error beats a leaked prompt, and the caller's failure path already
+/// classifies errors for the user.
+fn salvage_pty_stdout(raw_stdout: &str, args: &[String]) -> Result<String, String> {
+    let stripped = duduclaw_cli_runtime::strip_ansi(raw_stdout);
+    // The prompt is the longest argument by construction (`-p <prompt>` with
+    // history + system text embedded); anything ≥200 chars can't be a flag.
+    let prompt_arg = args.iter().filter(|a| a.chars().count() >= 200).max_by_key(|a| a.len());
+    let mut answer: &str = &stripped;
+    if let Some(p) = prompt_arg {
+        // CJK-safe tail needle: last ~48 chars of the prompt as rendered.
+        let tail: String = {
+            let chars: Vec<char> = p.chars().collect();
+            let start = chars.len().saturating_sub(48);
+            chars[start..].iter().collect()
+        };
+        if let Some(pos) = stripped.rfind(tail.as_str()) {
+            answer = &stripped[pos + tail.len()..];
+        }
+    }
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Err("grok PTY retry: no model output after the rendered prompt".to_string());
+    }
+    if crate::pty_runtime::answer_leaks_prompt_scaffold(answer) {
+        return Err(
+            "grok PTY retry: output still contains prompt scaffolding (refusing to leak it)"
+                .to_string(),
+        );
+    }
+    Ok(answer.to_string())
 }
 
 // ── MCP config ──────────────────────────────────────────────────
@@ -1104,5 +1142,38 @@ mod tests {
             Some("agnes"),
             "duduclaw entry carries the agent identity env"
         );
+    }
+
+    // ── PTY stdout salvage (prompt-leak fix, 2026-07-29) ──
+
+    #[test]
+    fn salvage_cuts_rendered_prompt_and_keeps_answer() {
+        let prompt = format!("<conversation_history>{}</conversation_history>\n\n以上只是紀錄。\n<current_message>\nhi\n</current_message>", "x".repeat(300));
+        let args = vec!["-p".to_string(), prompt.clone(), "--model".to_string(), "grok-4.5".to_string()];
+        // A TTY renders the prompt, then the model's reply follows.
+        let raw = format!("banner\n{prompt}\n你好！我是 DuDu，需要幫忙嗎？\n");
+        let out = salvage_pty_stdout(&raw, &args).expect("salvaged");
+        assert_eq!(out, "你好！我是 DuDu，需要幫忙嗎？");
+    }
+
+    #[test]
+    fn salvage_refuses_when_only_prompt_echo_remains() {
+        let prompt = format!("<conversation_history>{}</conversation_history> tail-marker-abcdef", "y".repeat(300));
+        let args = vec!["-p".to_string(), prompt.clone()];
+        // Nothing after the rendered prompt → honest error, never a leak.
+        let raw = format!("ui chrome\n{prompt}\n   \n");
+        assert!(salvage_pty_stdout(&raw, &args).is_err());
+        // Prompt tail never rendered (weird TUI) but scaffolding present →
+        // fail-closed rather than returning the leak.
+        let raw2 = "<conversation_history>leaked</conversation_history>".to_string();
+        assert!(salvage_pty_stdout(&raw2, &args).is_err());
+    }
+
+    #[test]
+    fn salvage_passes_through_clean_short_output() {
+        // No ≥200-char prompt arg (unusual invocation) and clean output.
+        let args = vec!["-p".to_string(), "hi".to_string()];
+        let out = salvage_pty_stdout("just an answer\n", &args).unwrap();
+        assert_eq!(out, "just an answer");
     }
 }
