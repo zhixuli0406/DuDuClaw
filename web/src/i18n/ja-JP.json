@@ -689,6 +689,7 @@
   "settings.update.check": "アップデートを確認",
   "settings.update.checking": "確認中...",
   "settings.update.upToDate": "最新バージョンを使用しています。",
+  "settings.update.restartPending": "新しいバージョン v{version} はインストール済みです。DuDuClaw（またはデスクトップアプリ）を再起動すると適用されます。",
   "settings.update.available": "新しいバージョンが利用可能です！",
   "settings.update.current": "現在のバージョン",
   "settings.update.latest": "最新バージョン",

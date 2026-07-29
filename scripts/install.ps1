@@ -40,7 +40,13 @@ function Resolve-Version {
         $resp = Invoke-RestMethod -Uri $api -UseBasicParsing -Headers @{ "User-Agent" = "duduclaw-installer" } -ErrorAction Stop
         $tag = $resp.tag_name
         if ($tag) {
-            $script:DuDuClawVersion = $tag -replace '^v', ''
+            # "latest" can be claimed by a desktop installer release
+            # (desktop-v1.46.2) — map it to the paired CLI version, and reject
+            # any tag that still isn't MAJOR.MINOR.PATCH.
+            $tag = $tag -replace '^desktop-', '' -replace '^v', ''
+            if ($tag -match '^\d+\.\d+\.\d+') {
+                $script:DuDuClawVersion = $tag
+            }
         }
     } catch {
         # fall through to fallback below

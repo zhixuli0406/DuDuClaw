@@ -3336,6 +3336,8 @@ export const api = {
         download_url: string;
         install_method: string;
         auto_update: boolean;
+        /** Non-null when a newer binary is already on disk — restart to apply. */
+        restart_pending_version?: string | null;
       }>,
     applyUpdate: () =>
       client.call('system.apply_update', {}) as Promise<{
