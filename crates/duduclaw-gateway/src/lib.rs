@@ -147,6 +147,7 @@ pub mod ranked_wiki_injection;
 pub mod relevance_ranker;
 pub mod session_summarizer;
 pub mod session_summarizer_task;
+pub mod session_titler_task;
 pub mod channel_approval;
 pub mod credit;
 pub mod delegation_scope;

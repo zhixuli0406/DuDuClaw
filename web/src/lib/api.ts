@@ -2610,7 +2610,8 @@ export interface DistributorPatch {
 export interface ChatSessionSummary {
   session_id: string;
   agent_id: string;
-  /** First user message, CJK-safe 80-char truncation. May be empty. */
+  /** Auto-generated title following the discussion (background titler);
+   *  falls back to the first user message. CJK-safe 80-char cap. May be empty. */
   title: string;
   /** RFC3339 timestamp of the last activity. */
   last_active: string;

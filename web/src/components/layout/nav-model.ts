@@ -106,6 +106,9 @@ export const staffEntry: NavItem = {
   label: 'nav.agents',
   desc: 'nav.agents.desc',
   ownScope: true,
+  // Personal IA (2026-07-29): the roster page + LIVE staff zone are hidden —
+  // Personal talks to its AI through 對話, not an HR-style roster.
+  personalHidden: true,
 };
 
 /**
@@ -156,7 +159,7 @@ export const navGroups: NavGroup[] = [
     label: 'navGroup.company',
     items: [
       staffEntry,
-      { to: '/org', icon: Users2, label: 'nav.team', desc: 'nav.team.desc', minRole: 'manager' },
+      { to: '/org', icon: Users2, label: 'nav.team', desc: 'nav.team.desc', minRole: 'manager', personalHidden: true },
       { to: '/world', icon: Globe2, label: 'nav.world', desc: 'nav.world.desc', ownScope: true },
       { to: '/memory', icon: Brain, label: 'nav.memory', desc: 'nav.memory.desc', ownScope: true },
       { to: '/skills', icon: Puzzle, label: 'nav.skills', desc: 'nav.skills.desc' },
@@ -166,9 +169,9 @@ export const navGroups: NavGroup[] = [
       { to: '/widgets', icon: LayoutGrid, label: 'nav.widgets', desc: 'nav.widgets.desc' },
       { to: '/knowledge', icon: BookOpen, label: 'nav.knowledge', desc: 'nav.knowledge.desc' },
       { to: '/growth', icon: Trophy, label: 'nav.growth', desc: 'nav.growth.desc', ownScope: true },
-      // 桌寵工作室 — photo → interactive desktop pet (desktop app only; the page
-      // itself shows a "desktop-only" state in a plain browser).
-      { to: '/pet-studio', icon: PawPrint, label: 'nav.petStudio', desc: 'nav.petStudio.desc' },
+      // 桌寵工作室 — photo → interactive desktop pet. Desktop app only
+      // (2026-07-29): hidden in a plain browser instead of showing a stub page.
+      { to: '/pet-studio', icon: PawPrint, label: 'nav.petStudio', desc: 'nav.petStudio.desc', desktopOnly: true },
     ],
   },
   {
@@ -181,6 +184,76 @@ export const navGroups: NavGroup[] = [
     ],
   },
 ];
+
+// ── Personal edition IA (2026-07-29 client feedback) ────────────────────────
+//
+// Personal gets a deliberately minimal sidebar: the daily row plus a handful
+// of primary surfaces, with every power-user page folded into a collapsed
+// 「進階」 group at the bottom (below 設定, which also starts collapsed).
+// Hidden entirely on Personal: AI 員工 roster (+ LIVE staff zone), 公司 org
+// chart, 授權 (see `personalHidden` gates above / in `manageNav`). 桌寵工作室
+// is desktop-app-only everywhere (`desktopOnly`). Enterprise keeps the
+// original three-group layout untouched.
+//
+// Items are looked up by route so both layouts share the same NavItem objects
+// (labels, icons, and role gates can never drift between editions).
+
+const itemByPath = new Map<string, NavItem>(
+  [...dailyItems, staffEntry, ...navGroups.flatMap((g) => g.items)].map((i) => [i.to, i]),
+);
+
+function pickItems(paths: string[]): NavItem[] {
+  return paths.flatMap((p) => {
+    const item = itemByPath.get(p);
+    if (!item && import.meta.env.DEV) {
+      throw new Error(`personal nav references unknown route: ${p}`);
+    }
+    return item ? [item] : [];
+  });
+}
+
+/** Personal 主區 — rendered flat right after the daily row (no group label). */
+export const personalPrimaryItems: NavItem[] = pickItems([
+  '/routines',
+  '/world',
+  '/skills',
+  '/knowledge',
+  '/pet-studio',
+]);
+
+/** Personal 進階 — collapsed-by-default group at the very bottom. */
+export const personalAdvancedGroup: NavGroup = {
+  label: 'navGroup.advanced',
+  items: pickItems([
+    '/tasks',
+    '/plans',
+    '/runs',
+    '/canvas',
+    '/files',
+    '/timeline',
+    '/reports',
+    '/os',
+    '/memory',
+    '/experts',
+    '/widgets',
+    '/growth',
+    '/forks',
+  ]),
+};
+
+/**
+ * The collapsible group list for the current edition — used by the sidebar
+ * and the command palette so both agree on grouping. Personal: 設定 then 進階
+ * (primary items live in the flat row via `primaryItemsForEdition`).
+ */
+export function navGroupsForEdition(isPersonal: boolean): NavGroup[] {
+  return isPersonal ? [navGroups[2], personalAdvancedGroup] : navGroups;
+}
+
+/** The flat, label-less top rows for the current edition. */
+export function primaryItemsForEdition(isPersonal: boolean): NavItem[] {
+  return isPersonal ? [...dailyItems, ...personalPrimaryItems] : dailyItems;
+}
 
 /**
  * Zone D subnav tree, rendered by ManageShell (§6.1). Collapses the former
@@ -201,7 +274,9 @@ export const manageNav: NavItem[] = [
   // department dropdowns that draw from it — agent-create dialog, skill-install
   // scope) are hidden in the Personal edition.
   { to: '/manage/departments', icon: Network, label: 'manage.departments', desc: 'manage.departments.desc', minRole: 'admin', enterprise: true },
-  { to: '/manage/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager' },
+  // 授權 hidden on Personal (2026-07-29 client feedback). The page stays
+  // URL-reachable (`/manage/license`) and ⌘K still finds it on other editions.
+  { to: '/manage/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager', personalHidden: true },
   { to: '/manage/distributors', icon: Store, label: 'manage.distributors', desc: 'manage.distributors.desc', minRole: 'admin' },
   { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },
   { to: '/manage/logs', icon: FileText, label: 'manage.logs', desc: 'manage.logs.desc', minRole: 'manager' },

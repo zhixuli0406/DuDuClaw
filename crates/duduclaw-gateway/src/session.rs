@@ -46,9 +46,18 @@ pub struct SessionMessage {
     pub timestamp: String,
 }
 
+/// One row of `list_title_candidates` — a session the background auto-titler
+/// may need to (re)title.
+pub struct TitleCandidate {
+    pub session_id: String,
+    pub turn_count: u32,
+    pub titled_through_turn: u32,
+}
+
 /// A lightweight summary of a stored session, for the WebChat history picker
-/// (WP3). `title` is the session's first still-visible user message, CJK-safe
-/// truncated — enough to recognise the conversation without loading it.
+/// (WP3). `title` is the stored auto-title when present, otherwise the
+/// session's first still-visible user message, CJK-safe truncated — enough to
+/// recognise the conversation without loading it.
 pub struct SessionSummary {
     pub id: String,
     pub agent_id: String,
@@ -209,6 +218,18 @@ impl SessionManager {
         );
         let _ = conn.execute(
             "ALTER TABLE sessions ADD COLUMN checkpoint_message_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
+        // Session auto-titles (2026-07-29): a short LLM-generated title that
+        // follows the discussion, written by the background titler task
+        // (`session_titler_task`). NULL/empty `title` ⇒ listings fall back to
+        // the first user message. `titled_through_turn` records the turn count
+        // when the title was last generated so the titler can refresh it after
+        // the conversation moves on.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN titled_through_turn INTEGER NOT NULL DEFAULT 0",
             [],
         );
 
@@ -833,6 +854,105 @@ impl SessionManager {
         Ok(out)
     }
 
+    /// Fetch the LAST N turns of a session, in chronological order. Used by
+    /// the auto-titler so a refreshed title reflects where the discussion has
+    /// moved, not just how it started.
+    pub async fn read_last_n_turns_text(&self, session_id: &str, n: u32) -> Result<String> {
+        let conn = self.acquire().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT role, content FROM (
+                     SELECT id, role, content FROM session_messages
+                     WHERE session_id = ?1 AND hidden = 0 AND undone_at IS NULL
+                     ORDER BY id DESC
+                     LIMIT ?2
+                 ) ORDER BY id ASC",
+            )
+            .map_err(|e| DuDuClawError::Gateway(format!("read_last_n prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![session_id, n as i64], |row| {
+                let role: String = row.get(0)?;
+                let content: String = row.get(1)?;
+                Ok((role, content))
+            })
+            .map_err(|e| DuDuClawError::Gateway(format!("read_last_n query: {e}")))?;
+        let mut out = String::new();
+        for (role, content) in rows.flatten() {
+            out.push_str(&role);
+            out.push_str(": ");
+            out.push_str(&content);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// List recently-active, still-live sessions for the auto-title task.
+    ///
+    /// `active_within_secs` bounds the backlog: sessions idle longer are never
+    /// (re)titled, so a store full of historical sessions doesn't trigger an
+    /// LLM stampede right after an upgrade. Ordered newest-activity first so
+    /// the per-tick cap spends its budget on what the user is looking at.
+    pub async fn list_title_candidates(
+        &self,
+        active_within_secs: u64,
+    ) -> Result<Vec<TitleCandidate>> {
+        let cutoff = (chrono::Utc::now()
+            - chrono::Duration::seconds(active_within_secs.min(i64::MAX as u64) as i64))
+        .to_rfc3339();
+        let conn = self.acquire().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id,
+                        (SELECT COUNT(*) FROM session_messages m
+                           WHERE m.session_id = s.id AND m.hidden = 0 AND m.undone_at IS NULL),
+                        COALESCE(s.titled_through_turn, 0)
+                 FROM sessions s
+                 WHERE s.archived_at IS NULL AND s.last_active >= ?1
+                 ORDER BY s.last_active DESC",
+            )
+            .map_err(|e| DuDuClawError::Gateway(format!("list_title_candidates prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(TitleCandidate {
+                    session_id: row.get(0)?,
+                    turn_count: row.get::<_, i64>(1)?.max(0) as u32,
+                    titled_through_turn: row.get::<_, i64>(2)?.max(0) as u32,
+                })
+            })
+            .map_err(|e| DuDuClawError::Gateway(format!("list_title_candidates query: {e}")))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| DuDuClawError::Gateway(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Persist an auto-generated session title (CJK-safe cap) together with
+    /// the turn count it was generated at.
+    pub async fn set_title(&self, session_id: &str, title: &str, through_turn: u32) -> Result<()> {
+        let clean = duduclaw_core::truncate_chars(title.trim(), SESSION_TITLE_MAX_CHARS);
+        let conn = self.acquire().await;
+        conn.execute(
+            "UPDATE sessions SET title = ?1, titled_through_turn = ?2 WHERE id = ?3",
+            params![clean, through_turn as i64, session_id],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read back the stored auto-title (empty when never titled). Test/debug
+    /// aid for the titler task.
+    pub async fn get_title(&self, session_id: &str) -> Result<(String, u32)> {
+        let conn = self.acquire().await;
+        conn.query_row(
+            "SELECT COALESCE(title, ''), COALESCE(titled_through_turn, 0)
+             FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)?.max(0) as u32)),
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))
+    }
+
     /// Hide a message from the active context (Sculptor hide/restore).
     ///
     /// The message remains in the database and can be restored later.
@@ -916,9 +1036,10 @@ impl SessionManager {
     ///   the RPC layer — this method does not filter by user.
     /// - Archived (soft-deleted) sessions are excluded, matching the normal
     ///   listing semantics elsewhere in this module.
-    /// - `title` is the first still-visible user message, truncated to
+    /// - `title` prefers the stored auto-title (background titler task) and
+    ///   falls back to the first still-visible user message, truncated to
     ///   [`SESSION_TITLE_MAX_CHARS`] characters (CJK-safe via `truncate_chars`);
-    ///   empty when the session has no user turn yet.
+    ///   empty when the session has neither.
     /// - `limit` is clamped to [`SESSION_LIST_MAX_LIMIT`].
     pub async fn list_sessions(
         &self,
@@ -937,7 +1058,7 @@ impl SessionManager {
         // SQL so parameters bind positionally (no string interpolation of
         // values, no injection surface). Result shape and ordering are unchanged.
         let outer_head = "SELECT s.id, s.agent_id, s.last_active, s.total_tokens,
-                    COALESCE(s.lineage, 1),
+                    COALESCE(s.lineage, 1), s.title,
                     (SELECT COUNT(*) FROM session_messages m
                        WHERE m.session_id = s.id AND m.hidden = 0 AND m.undone_at IS NULL) AS turns,
                     (SELECT m2.content FROM session_messages m2
@@ -948,10 +1069,17 @@ impl SessionManager {
         let outer_tail = ") s ORDER BY s.last_active DESC";
 
         let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<SessionSummary> {
-            let first_user: Option<String> = row.get(6)?;
-            let title = first_user
+            // Prefer the auto-generated title (background titler); fall back to
+            // the first still-visible user message for untitled sessions.
+            let stored: Option<String> = row.get(5)?;
+            let first_user: Option<String> = row.get(7)?;
+            let picked = stored
                 .as_deref()
-                .map(|s| duduclaw_core::truncate_chars(s.trim(), SESSION_TITLE_MAX_CHARS))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| first_user.as_deref().map(str::trim));
+            let title = picked
+                .map(|s| duduclaw_core::truncate_chars(s, SESSION_TITLE_MAX_CHARS))
                 .unwrap_or_default();
             Ok(SessionSummary {
                 id: row.get(0)?,
@@ -959,7 +1087,7 @@ impl SessionManager {
                 last_active: row.get(2)?,
                 total_tokens: row.get(3)?,
                 lineage: row.get::<_, i64>(4)?.max(1) as u32,
-                turn_count: row.get::<_, i64>(5)?.max(0) as u32,
+                turn_count: row.get::<_, i64>(6)?.max(0) as u32,
                 title,
             })
         };
@@ -968,7 +1096,7 @@ impl SessionManager {
         match agent_id {
             Some(a) => {
                 let sql = format!(
-                    "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage \
+                    "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage, title \
                      FROM sessions \
                      WHERE archived_at IS NULL AND agent_id = ?1 \
                      ORDER BY last_active DESC LIMIT ?2{outer_tail}"
@@ -985,7 +1113,7 @@ impl SessionManager {
             }
             None => {
                 let sql = format!(
-                    "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage \
+                    "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage, title \
                      FROM sessions \
                      WHERE archived_at IS NULL \
                      ORDER BY last_active DESC LIMIT ?1{outer_tail}"

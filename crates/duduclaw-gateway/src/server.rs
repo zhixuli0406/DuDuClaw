@@ -1364,6 +1364,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     ));
     info!("Session summarizer task started (10-min cadence)");
 
+    // Session auto-titles (2026-07-29): every 10 min, give recently-active
+    // sessions a short LLM title that follows the discussion (re-titled after
+    // enough new turns). The WebChat conversation list prefers this over its
+    // first-user-message fallback. Cost-guarded: 48h activity window + 5
+    // titles/tick cap.
+    bg_handles.push(crate::session_titler_task::spawn_titler(
+        session_manager.clone(),
+        home_dir.clone(),
+        crate::session_titler_task::TitleParams::default(),
+    ));
+    info!("Session titler task started (10-min cadence)");
+
     // Phase 3 (2026-05-14): cross-platform PTY pool runtime.
     //
     // Initialises the global `duduclaw-cli-runtime` PtyPool used by agents

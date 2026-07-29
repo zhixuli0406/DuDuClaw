@@ -4,6 +4,9 @@ import { useSearchParams } from 'react-router';
 import { useChatStore, historyToMessages, type PendingAttachment } from '@/stores/chat-store';
 import { api, type ChatSessionSummary } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAuthStore } from '@/stores/auth-store';
+import { hasMinRole } from '@/lib/roles';
+import { sessionChannel, isConversationSession } from '@/lib/session-channel';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
 import { Plus, Paperclip, Eye, EyeOff, MessagesSquare, ArrowLeft, PanelLeftOpen } from 'lucide-react';
@@ -125,14 +128,24 @@ export function WebChatPage() {
   }, [mainAgentId, selectedAgentId, selectAgent]);
 
   // ── Session list (left column) ──────────────────────────────────────────────
+  //
+  // Admins see EVERY conversation session — including those held on Telegram /
+  // Discord / other channels — separated per session with a channel badge
+  // (2026-07-29 client feedback). Non-admins stay scoped to the selected
+  // employee (the RPC rejects unscoped listing for them, fail-closed).
+  // Internal work sessions (cron / delegation runs) are filtered out.
+  const role = useAuthStore((s) => s.user?.role);
+  const canListAll = hasMinRole(role, 'admin');
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [sessionsState, setSessionsState] = useState<'idle' | 'loading' | 'error' | 'ready'>('idle');
 
   const loadSessions = async () => {
     setSessionsState('loading');
     try {
-      const res = await api.chatSessions.list({ ...(historyAgentId ? { agent_id: historyAgentId } : {}), limit: 50 });
-      setSessions(res?.sessions ?? []);
+      const res = await api.chatSessions.list(
+        canListAll ? { limit: 100 } : { ...(historyAgentId ? { agent_id: historyAgentId } : {}), limit: 50 },
+      );
+      setSessions((res?.sessions ?? []).filter((s) => isConversationSession(s.session_id)));
       setSessionsState('ready');
     } catch {
       setSessionsState('error');
@@ -142,7 +155,7 @@ export function WebChatPage() {
   useEffect(() => {
     if (connectionState === 'connected') void loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [historyAgentId, connectionState]);
+  }, [historyAgentId, connectionState, canListAll]);
 
   // Refresh the list whenever a reply lands (`sessionsRevision` bumps once per
   // completed turn) so a just-created conversation appears — and stays
@@ -155,6 +168,11 @@ export function WebChatPage() {
   const handleResume = async (session: ChatSessionSummary) => {
     try {
       const hist = await api.chatSessions.history(session.session_id);
+      // Cross-channel sessions belong to whichever employee handles that
+      // channel — switch the partner first so the server's cross-agent resume
+      // guard accepts the follow-up turn (the main agent maps to the DuDu chip).
+      const owner = hist.agent_id || session.agent_id;
+      if (owner) selectAgent(owner === mainAgentId ? null : owner);
       resumeSession(session.session_id, historyToMessages(hist.messages ?? []));
       if (isMobile) setMobileShowList(false);
     } catch {
@@ -358,6 +376,8 @@ export function WebChatPage() {
           <ul className="space-y-0.5">
             {sessions.map((s) => {
               const active = s.session_id === sessionId;
+              const channel = sessionChannel(s.session_id);
+              const ownerName = agents.find((a) => a.name === s.agent_id)?.display_name ?? s.agent_id;
               return (
                 <li key={s.session_id}>
                   <button
@@ -372,10 +392,19 @@ export function WebChatPage() {
                       <p className="truncate text-sm text-foreground">
                         {s.title || intl.formatMessage({ id: 'webchat.history.untitled', defaultMessage: '(Untitled)' })}
                       </p>
-                      <p className="truncate text-xs text-muted-foreground">
-                        {intl.formatMessage({ id: 'webchat.history.turns', defaultMessage: '{count} turns' }, { count: s.turns })}
-                        {' · '}
-                        {timeAgo(s.last_active)}
+                      <p className="flex items-center gap-1.5 truncate text-xs text-muted-foreground">
+                        {channel && (
+                          <span className="shrink-0 rounded bg-muted px-1 py-px text-[10px] leading-4">
+                            {channel.label}
+                          </span>
+                        )}
+                        <span className="truncate">
+                          {ownerName}
+                          {' · '}
+                          {intl.formatMessage({ id: 'webchat.history.turns', defaultMessage: '{count} turns' }, { count: s.turns })}
+                          {' · '}
+                          {timeAgo(s.last_active)}
+                        </span>
                       </p>
                     </div>
                   </button>
