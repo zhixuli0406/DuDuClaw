@@ -207,6 +207,14 @@ export interface MemoryEntry {
   content: string;
   timestamp: string;
   tags: string[];
+  /** Cognitive layer: `episodic` | `semantic` | `procedural`. */
+  layer?: string;
+  /** What produced this memory (e.g. `footprint_distill`, `micro_reflection`). */
+  source_event?: string;
+  /** Importance score 0–10 (decay resistance). */
+  importance?: number;
+  /** How many times this entry has been retrieved. */
+  access_count?: number;
 }
 
 export interface KeyFactEntry {
@@ -3186,6 +3194,16 @@ export const api = {
         origin,
         ...(since ? { since } : {}),
       }) as Promise<{ expired: number }>,
+    /**
+     * Forget one entry. Soft delete — the backend archives the row before
+     * removing it from search / browse / prompt injection, so an operator can
+     * still recover it. `forgotten:false` = the id was already gone.
+     */
+    forget: (agentId: string, memoryId: string) =>
+      client.call('memory.forget', {
+        agent_id: agentId,
+        memory_id: memoryId,
+      }) as Promise<{ success: boolean; forgotten: boolean }>,
   },
   wiki: {
     pages: (agentId: string) =>
