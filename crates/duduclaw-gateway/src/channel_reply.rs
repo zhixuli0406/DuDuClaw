@@ -3406,16 +3406,16 @@ async fn build_reply_with_session_inner(
 
         // ── Conversation distill (async, non-blocking) ───────────
         // Auto-distilled facts go to the MEMORY system (temporal supersession),
-        // never to the curated wiki — see wiki_ingest.rs module docs.
-        {
+        // never to the curated wiki — see wiki_ingest.rs module docs. Gated on
+        // `cognitive_memory_db` like every other SqliteMemoryEngine path: an
+        // agent with `[evolution] cognitive_memory = false` must not have its
+        // conversations distilled (this call site previously bypassed the gate
+        // via ctx.memory_db_path + a home_dir fallback).
+        if let Some(memory_db_for_distill) = cognitive_memory_db.clone() {
             let user_text_for_distill = sanitized_text.clone();
             let reply_for_distill = reply.clone();
             let agent_id_for_distill = agent_id.clone();
             let home_for_distill = ctx.home_dir.clone();
-            let memory_db_for_distill = ctx
-                .memory_db_path
-                .clone()
-                .unwrap_or_else(|| ctx.home_dir.join("memory.db"));
             tokio::spawn(async move {
                 crate::wiki_ingest::run_ingest(
                     &user_text_for_distill,
