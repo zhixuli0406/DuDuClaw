@@ -11,6 +11,7 @@
 //! ## `agent.toml` schema
 //!
 //! ```toml
+//! # stdio server (spawned child process):
 //! [[mcp.external]]
 //! name = "chatwoot"
 //! command = "npx"
@@ -23,30 +24,120 @@
 //! env = { CHATWOOT_BASE_URL = "https://app.chatwoot.com", CHATWOOT_API_TOKEN = "secret://vault/chatwoot_token" }
 //! allowed_tools = ["chatwoot_list_conversations", "chatwoot_get_conversation"]  # allowlist (deny-by-default)
 //! denied_tools  = []                                                            # always removed
+//!
+//! # Google's official Workspace MCP servers via a built-in preset (endpoint
+//! # + `oauth://google` bearer are filled in automatically):
+//! [[mcp.external]]
+//! preset = "google:gmail"      # gmail|calendar|drive|docs|sheets|slides|chat
+//! allowed_tools = ["search_threads", "get_thread", "create_draft"]
+//!
+//! # remote Streamable-HTTP server, spelled out (equivalent to the preset):
+//! [[mcp.external]]
+//! name = "gmail"
+//! url = "https://gmailmcp.googleapis.com/mcp/v1"
+//! # bearer_token: literal, `env://VAR`, `secret://<backend>/<name>`, or
+//! # `oauth://google` (reuse the dashboard's connected Google account token,
+//! # auto-refreshed). Sent as `Authorization: Bearer <token>`.
+//! bearer_token = "oauth://google"
+//! # optional extra request headers (values support env:// and secret://):
+//! # headers = { X-Custom = "env://MY_HEADER_VALUE" }
+//! allowed_tools = ["search_threads", "get_thread", "create_draft"]
 //! ```
 //!
 //! ## Safety
 //!
-//! - A server with an unresolvable `env://` **or** `secret://` credential is
-//!   **skipped** (a server spawned without its token would misbehave) —
-//!   fail-safe, logged.
+//! - A server with an unresolvable `env://`, `secret://` or `oauth://`
+//!   credential is **skipped** (a server spawned/mounted without its token
+//!   would misbehave) — fail-safe, logged.
 //! - `allowed_tools` is deny-by-default: if set, only those tools are exposed.
 //! - The internal duduclaw server always wins name collisions (it is client 0).
+//! - Exactly one of `command` / `url` per entry; entries with both or neither
+//!   are skipped loudly.
 
 use std::path::Path;
 
 use duduclaw_llm::ToolFilter;
 
-/// One resolved external MCP server ready to spawn.
+/// Bearer scheme that resolves to the dashboard's connected Google account
+/// access token (auto-refreshed via the stored refresh token).
+const OAUTH_GOOGLE_REF: &str = "oauth://google";
+
+/// Google's official Workspace remote MCP endpoints, keyed by the short name
+/// used in `preset = "google:<name>"`.
+///
+/// Verified 2026-07-30 two ways: a live `initialize` + `tools/list` probe of
+/// every endpoint below, and Google's own
+/// <https://developers.google.com/workspace/guides/configure-mcp-servers>.
+/// Keeping the URLs here (instead of in each user's `agent.toml`) makes this
+/// the single place to fix if Google renames an endpoint at GA.
+///
+/// Deliberately absent: **Forms** and **Tasks** have no official MCP server
+/// (probed 404, and absent from Google's docs) — DuDuClaw serves those through
+/// its own native `forms_*` / `tasks_*` MCP tools instead. `people` is absent
+/// because it does not follow the `<svc>mcp.googleapis.com` pattern.
+const GOOGLE_MCP_PRESETS: &[(&str, &str)] = &[
+    ("gmail", "https://gmailmcp.googleapis.com/mcp/v1"),
+    ("calendar", "https://calendarmcp.googleapis.com/mcp/v1"),
+    ("drive", "https://drivemcp.googleapis.com/mcp/v1"),
+    ("docs", "https://docsmcp.googleapis.com/mcp/v1"),
+    ("sheets", "https://sheetsmcp.googleapis.com/mcp/v1"),
+    ("slides", "https://slidesmcp.googleapis.com/mcp/v1"),
+    ("chat", "https://chatmcp.googleapis.com/mcp/v1"),
+];
+
+/// Resolve `preset = "google:gmail"` to `(url, default_bearer)`. Unknown
+/// namespace or service ⇒ `None` (caller skips the entry loudly rather than
+/// mounting something unintended).
+fn resolve_preset(preset: &str) -> Option<(String, String)> {
+    let (ns, svc) = preset.split_once(':')?;
+    match ns.trim() {
+        "google" => GOOGLE_MCP_PRESETS
+            .iter()
+            .find(|(name, _)| *name == svc.trim())
+            .map(|(_, url)| (url.to_string(), OAUTH_GOOGLE_REF.to_string())),
+        _ => None,
+    }
+}
+
+/// Every preset name a config may reference, for docs/diagnostics.
+pub fn known_presets() -> Vec<String> {
+    GOOGLE_MCP_PRESETS
+        .iter()
+        .map(|(name, _)| format!("google:{name}"))
+        .collect()
+}
+
+/// One resolved external MCP server ready to spawn (stdio) or mount (http).
 #[derive(Debug, Clone)]
 pub struct ExternalMcpServer {
     pub name: String,
+    /// stdio transport: the command to spawn. Empty when `url` is set.
     pub command: String,
     pub args: Vec<String>,
     /// Fully-resolved child environment (`env://` refs already pulled).
     pub env: Vec<(String, String)>,
+    /// Streamable-HTTP transport: the remote endpoint. `None` for stdio.
+    pub url: Option<String>,
+    /// Raw bearer credential for HTTP (`env://` already resolved; `secret://`
+    /// and `oauth://google` still verbatim until the async resolve pass).
+    pub bearer_token: Option<String>,
+    /// Extra HTTP request headers (same staged resolution as `env`).
+    pub headers: Vec<(String, String)>,
     /// Per-server tool visibility filter.
     pub filter: ToolFilter,
+}
+
+impl ExternalMcpServer {
+    /// Final HTTP header set for a mounted remote server: caller headers plus
+    /// the bearer credential as `Authorization`. Call only after the async
+    /// resolve pass (all refs resolved).
+    pub fn http_headers(&self) -> Vec<(String, String)> {
+        let mut out = self.headers.clone();
+        if let Some(tok) = &self.bearer_token {
+            out.push(("authorization".to_string(), format!("Bearer {tok}")));
+        }
+        out
+    }
 }
 
 /// Resolve one env value: `env://VAR` → the gateway's env (None if unset),
@@ -79,11 +170,17 @@ pub async fn resolve_secret_refs(
 ) -> Vec<ExternalMcpServer> {
     use duduclaw_security::secret_manager::{resolve_secret_reference, SecretManagerConfig};
 
+    let needs_secret = |s: &ExternalMcpServer| {
+        s.env.iter().any(|(_, v)| v.starts_with("secret://"))
+            || s.headers.iter().any(|(_, v)| v.starts_with("secret://"))
+            || s.bearer_token.as_deref().is_some_and(|v| v.starts_with("secret://"))
+    };
+    let needs_oauth = |s: &ExternalMcpServer| {
+        s.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF)
+    };
+
     // Fast path: nothing to resolve ⇒ don't even read config.toml.
-    if !servers
-        .iter()
-        .any(|s| s.env.iter().any(|(_, v)| v.starts_with("secret://")))
-    {
+    if !servers.iter().any(|s| needs_secret(s) || needs_oauth(s)) {
         return servers;
     }
 
@@ -93,9 +190,27 @@ pub async fn resolve_secret_refs(
         Err(_) => SecretManagerConfig::default(),
     };
 
+    // Resolve the Google OAuth token at most once per pass (shared by all
+    // `oauth://google` mounts; the getter refreshes an expired token itself).
+    let google_token: Option<String> = if servers.iter().any(needs_oauth) {
+        match crate::google_workspace::get_valid_google_token(home_dir).await {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!(error = %e, "oauth://google bearer unresolved (Google account not connected?)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut out = Vec::with_capacity(servers.len());
     'server: for mut server in servers {
-        for (key, val) in server.env.iter_mut() {
+        for (key, val) in server
+            .env
+            .iter_mut()
+            .chain(server.headers.iter_mut())
+        {
             if val.starts_with("secret://") {
                 match resolve_secret_reference(val, &sm_cfg, home_dir).await {
                     Some(resolved) => *val = resolved,
@@ -103,6 +218,31 @@ pub async fn resolve_secret_refs(
                         tracing::warn!(
                             server = %server.name, key = %key,
                             "external MCP secret:// credential unresolved — skipping server"
+                        );
+                        continue 'server;
+                    }
+                }
+            }
+        }
+        if let Some(bearer) = server.bearer_token.as_mut() {
+            if bearer == OAUTH_GOOGLE_REF {
+                match &google_token {
+                    Some(t) => *bearer = t.clone(),
+                    None => {
+                        tracing::warn!(
+                            server = %server.name,
+                            "external MCP oauth://google bearer unresolved — skipping server"
+                        );
+                        continue 'server;
+                    }
+                }
+            } else if bearer.starts_with("secret://") {
+                match resolve_secret_reference(bearer, &sm_cfg, home_dir).await {
+                    Some(resolved) => *bearer = resolved,
+                    None => {
+                        tracing::warn!(
+                            server = %server.name,
+                            "external MCP secret:// bearer unresolved — skipping server"
                         );
                         continue 'server;
                     }
@@ -174,44 +314,124 @@ pub fn parse_external_servers(toml_value: &toml::Value) -> Vec<ExternalMcpServer
         if !enabled {
             continue;
         }
+        // A `preset` supplies the endpoint URL (and a default bearer) for a
+        // known vendor's official remote MCP server, so users don't paste (or
+        // mistype) endpoint URLs. An explicit `url` alongside it is ambiguous.
+        let preset = entry
+            .get("preset")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let mut preset_bearer: Option<String> = None;
+        let mut preset_url: Option<String> = None;
+        if let Some(p) = preset {
+            match resolve_preset(p) {
+                Some((url, bearer)) => {
+                    preset_url = Some(url);
+                    preset_bearer = Some(bearer);
+                }
+                None => {
+                    tracing::warn!(
+                        preset = %p,
+                        known = ?known_presets(),
+                        "external MCP preset unknown — skipping server"
+                    );
+                    continue;
+                }
+            }
+        }
+
         let name = entry
             .get("name")
             .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            // A preset entry needs no `name` — the preset itself labels it.
+            .or_else(|| preset.map(str::to_string))
+            .unwrap_or_default();
         let command = entry
             .get("command")
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        if command.trim().is_empty() {
-            tracing::warn!(server = %name, "external MCP server missing 'command' — skipping");
+        let explicit_url = entry
+            .get("url")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if preset_url.is_some() && explicit_url.is_some() {
+            tracing::warn!(
+                server = %name,
+                "external MCP server has BOTH 'preset' and 'url' — ambiguous, skipping"
+            );
             continue;
+        }
+        let url = preset_url.or(explicit_url);
+
+        // Exactly one transport per entry. Both or neither ⇒ skip loudly.
+        match (&url, command.trim().is_empty()) {
+            (None, true) => {
+                tracing::warn!(server = %name, "external MCP server needs 'command' (stdio) or 'url' (http) — skipping");
+                continue;
+            }
+            (Some(_), false) => {
+                tracing::warn!(server = %name, "external MCP server has BOTH 'command' and 'url' — ambiguous, skipping");
+                continue;
+            }
+            _ => {}
         }
         let args = str_array(entry.get("args"));
 
-        // Resolve env; a missing `env://` credential disables the whole server.
+        // Resolve env + headers; a missing `env://` credential disables the
+        // whole server. (`secret://` / `oauth://` resolve in the async pass.)
         let mut env = Vec::new();
+        let mut headers = Vec::new();
         let mut skip = false;
-        if let Some(tbl) = entry.get("env").and_then(|e| e.as_table()) {
-            for (k, raw) in tbl {
-                let Some(raw) = raw.as_str() else { continue };
-                match resolve_env_value(raw) {
-                    Some(v) => env.push((k.clone(), v)),
-                    None => {
-                        tracing::warn!(
-                            server = %name, key = %k,
-                            "external MCP env credential unresolved (env:// unset) — skipping server"
-                        );
-                        skip = true;
-                        break;
+        for (field, sink) in [("env", &mut env), ("headers", &mut headers)] {
+            if let Some(tbl) = entry.get(field).and_then(|e| e.as_table()) {
+                for (k, raw) in tbl {
+                    let Some(raw) = raw.as_str() else { continue };
+                    match resolve_env_value(raw) {
+                        Some(v) => sink.push((k.clone(), v)),
+                        None => {
+                            tracing::warn!(
+                                server = %name, key = %k,
+                                "external MCP {field} credential unresolved (env:// unset) — skipping server"
+                            );
+                            skip = true;
+                            break;
+                        }
                     }
                 }
+            }
+            if skip {
+                break;
             }
         }
         if skip {
             continue;
         }
+
+        // Bearer credential: env:// resolves now; secret:// and oauth://google
+        // stay verbatim for the async pass; anything else is a literal. An
+        // explicit `bearer_token` overrides the preset's default.
+        let bearer_token = match entry.get("bearer_token").and_then(|x| x.as_str()) {
+            None => preset_bearer,
+            Some(raw) if raw.starts_with("secret://") || raw == OAUTH_GOOGLE_REF => {
+                Some(raw.to_string())
+            }
+            Some(raw) => match resolve_env_value(raw) {
+                Some(v) => Some(v),
+                None => {
+                    tracing::warn!(
+                        server = %name,
+                        "external MCP bearer_token unresolved (env:// unset) — skipping server"
+                    );
+                    continue;
+                }
+            },
+        };
 
         // Tool filter lists are security-relevant: a present-but-wrong-type
         // value (e.g. `allowed_tools = "x"` instead of `["x"]`) must NOT silently
@@ -232,6 +452,9 @@ pub fn parse_external_servers(toml_value: &toml::Value) -> Vec<ExternalMcpServer
             command,
             args,
             env,
+            url,
+            bearer_token,
+            headers,
             filter,
         });
     }
@@ -375,6 +598,156 @@ env = { TOKEN = "secret://vault/tok" }
         let servers = parse(s);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].env[0].1, "secret://vault/tok");
+    }
+
+    // ── presets (vendor official remote MCP servers) ──
+
+    #[test]
+    fn google_presets_expand_to_verified_endpoints() {
+        let s = r#"
+[[mcp.external]]
+preset = "google:gmail"
+allowed_tools = ["search_threads"]
+[[mcp.external]]
+preset = "google:sheets"
+"#;
+        let servers = parse(s);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "google:gmail", "preset labels the entry");
+        assert_eq!(servers[0].url.as_deref(), Some("https://gmailmcp.googleapis.com/mcp/v1"));
+        // Bearer defaults to the connected Google account (resolved async).
+        assert_eq!(servers[0].bearer_token.as_deref(), Some("oauth://google"));
+        assert!(servers[0].filter.permits("search_threads"));
+        assert_eq!(servers[1].url.as_deref(), Some("https://sheetsmcp.googleapis.com/mcp/v1"));
+    }
+
+    #[test]
+    fn all_known_presets_resolve() {
+        for p in known_presets() {
+            let (url, bearer) = resolve_preset(&p).unwrap_or_else(|| panic!("{p} unresolved"));
+            assert!(url.starts_with("https://") && url.ends_with("/mcp/v1"), "{p}: {url}");
+            assert_eq!(bearer, "oauth://google");
+        }
+        // Forms/Tasks have no official Google MCP server — native tools serve
+        // them instead, so they must NOT silently resolve to a bogus endpoint.
+        assert!(resolve_preset("google:forms").is_none());
+        assert!(resolve_preset("google:tasks").is_none());
+        assert!(resolve_preset("google:nope").is_none());
+        assert!(resolve_preset("notavendor:gmail").is_none());
+        assert!(resolve_preset("malformed").is_none());
+    }
+
+    #[test]
+    fn unknown_preset_skips_server() {
+        assert!(parse("[[mcp.external]]\npreset = \"google:forms\"\n").is_empty());
+    }
+
+    #[test]
+    fn preset_plus_url_is_ambiguous_and_skipped() {
+        let s = r#"
+[[mcp.external]]
+preset = "google:gmail"
+url = "https://evil.example.com/mcp"
+"#;
+        assert!(parse(s).is_empty());
+    }
+
+    #[test]
+    fn explicit_bearer_overrides_preset_default() {
+        let s = r#"
+[[mcp.external]]
+preset = "google:drive"
+bearer_token = "literal-override"
+"#;
+        let servers = parse(s);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].bearer_token.as_deref(), Some("literal-override"));
+    }
+
+    // ── remote (Streamable HTTP) mounts ──
+
+    #[test]
+    fn parses_http_server_with_bearer_and_headers() {
+        let s = r#"
+[[mcp.external]]
+name = "gmail"
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+bearer_token = "literal-token"
+headers = { X-Extra = "plain" }
+allowed_tools = ["search_threads"]
+"#;
+        let servers = parse(s);
+        assert_eq!(servers.len(), 1);
+        let sv = &servers[0];
+        assert_eq!(sv.url.as_deref(), Some("https://gmailmcp.googleapis.com/mcp/v1"));
+        assert!(sv.command.is_empty());
+        assert_eq!(sv.bearer_token.as_deref(), Some("literal-token"));
+        assert_eq!(sv.headers, vec![("X-Extra".into(), "plain".into())]);
+        let hdrs = sv.http_headers();
+        assert!(hdrs.contains(&("authorization".into(), "Bearer literal-token".into())));
+        assert!(sv.filter.permits("search_threads"));
+        assert!(!sv.filter.permits("create_label"));
+    }
+
+    #[test]
+    fn both_command_and_url_is_ambiguous_and_skipped() {
+        let s = r#"
+[[mcp.external]]
+name = "ambiguous"
+command = "npx"
+url = "https://example.com/mcp"
+"#;
+        assert!(parse(s).is_empty());
+    }
+
+    #[test]
+    fn neither_command_nor_url_skipped() {
+        assert!(parse("[[mcp.external]]\nname = \"none\"\n").is_empty());
+    }
+
+    #[test]
+    fn bearer_env_ref_missing_skips_server() {
+        let s = r#"
+[[mcp.external]]
+name = "needsbearer"
+url = "https://example.com/mcp"
+bearer_token = "env://DUDUCLAW_TEST_DEFINITELY_UNSET_VAR_XYZ"
+"#;
+        assert!(parse(s).is_empty());
+    }
+
+    #[test]
+    fn bearer_secret_and_oauth_refs_pass_through_parse() {
+        let s = r#"
+[[mcp.external]]
+name = "a"
+url = "https://example.com/mcp"
+bearer_token = "secret://vault/tok"
+[[mcp.external]]
+name = "b"
+url = "https://example.com/mcp"
+bearer_token = "oauth://google"
+"#;
+        let servers = parse(s);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].bearer_token.as_deref(), Some("secret://vault/tok"));
+        assert_eq!(servers[1].bearer_token.as_deref(), Some("oauth://google"));
+    }
+
+    #[tokio::test]
+    async fn unresolvable_oauth_google_drops_server() {
+        // No connected Google account under a nonexistent home ⇒ the
+        // oauth://google mount is dropped fail-safe.
+        let s = r#"
+[[mcp.external]]
+name = "gmail"
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+bearer_token = "oauth://google"
+"#;
+        let servers = parse(s);
+        assert_eq!(servers.len(), 1);
+        let out = resolve_secret_refs(servers, Path::new("/nonexistent-home")).await;
+        assert!(out.is_empty(), "unresolvable oauth://google ⇒ server dropped");
     }
 
     #[tokio::test]

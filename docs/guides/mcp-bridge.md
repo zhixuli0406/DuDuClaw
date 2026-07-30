@@ -33,14 +33,57 @@ allowed_tools = ["chatwoot_list_conversations", "chatwoot_get_conversation"]  # 
 denied_tools  = ["chatwoot_delete_conversation"]                             # always removed
 ```
 
+Remote servers that speak **MCP Streamable HTTP** (no local process) are
+mounted with `url` instead of `command`. For vendors DuDuClaw already knows,
+use a **`preset`** — the endpoint and the credential source are filled in for
+you (endpoint URLs live in DuDuClaw, so a vendor rename is a one-line fix, not
+a config migration):
+
+```toml
+[[mcp.external]]
+preset = "google:gmail"    # gmail|calendar|drive|docs|sheets|slides|chat
+allowed_tools = ["search_threads", "get_thread", "create_draft"]
+```
+
+`preset = "google:<svc>"` expands to the official Google Workspace MCP endpoint
+plus `bearer_token = "oauth://google"` (the dashboard's connected Google
+account, auto-refreshed).
+
+> **For Google Workspace, prefer the native tools.** All eight services
+> (Gmail / Calendar / Sheets / Drive / Docs / Slides / Forms / Tasks) ship as
+> native MCP tools on GA APIs — see
+> [google-workspace.md](google-workspace.md). The official MCP servers are
+> Developer-Preview-only and their terms forbid exposing Pre-GA APIs to users
+> outside your own domain, so they are an advanced self-hosted opt-in, not a
+> shippable path ([google-mcp.md](google-mcp.md) explains the trade-off).
+
+Spelled out by hand it looks like this — also how you mount anything without a
+preset (e.g. a self-hosted DocuSeal instance's built-in `/mcp` endpoint):
+
+```toml
+[[mcp.external]]
+name = "gmail"
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+# bearer_token: literal, env://VAR, secret://<backend>/<name>, or
+# oauth://google (reuses the dashboard's connected Google account token,
+# auto-refreshed). Sent as `Authorization: Bearer <token>`.
+bearer_token = "oauth://google"
+# headers = { X-Custom = "env://MY_HEADER" }   # optional extra headers
+allowed_tools = ["search_threads", "get_thread", "create_draft"]
+```
+
 Field reference:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `name` | recommended | Label for logs |
-| `command` | **yes** | Executable to spawn (`npx`, `node`, `python`, an absolute path…) |
-| `args` | no | Argument vector |
-| `env` | no | Child environment. `env://VAR` pulls from the gateway's env; `secret://<backend>/<name>` pulls from the secret manager (see below); a missing/unresolvable `env://`/`secret://` credential **disables the whole server** (fail-safe — a server without its token would misbehave) |
+| `name` | recommended | Label for logs (a `preset` labels itself) |
+| `preset` | no | Built-in vendor shorthand (`google:gmail`, `google:calendar`, `google:drive`, `google:docs`, `google:sheets`, `google:slides`, `google:chat`) supplying `url` + a default `bearer_token`. Unknown preset ⇒ server skipped; `preset` + `url` together ⇒ ambiguous, skipped |
+| `command` | one of command/url/preset | stdio transport: executable to spawn (`npx`, `node`, `python`, an absolute path…) |
+| `url` | one of command/url/preset | Streamable-HTTP transport: the remote MCP endpoint (`https://` only; entries with both or neither `command`/`url` are skipped) |
+| `args` | no | Argument vector (stdio only) |
+| `env` | no | Child environment (stdio only). `env://VAR` pulls from the gateway's env; `secret://<backend>/<name>` pulls from the secret manager (see below); a missing/unresolvable `env://`/`secret://` credential **disables the whole server** (fail-safe — a server without its token would misbehave) |
+| `bearer_token` | no | HTTP auth: literal, `env://VAR`, `secret://…`, or `oauth://google`; sent as `Authorization: Bearer …`. Unresolvable ⇒ server skipped |
+| `headers` | no | Extra HTTP request headers; values support `env://` and `secret://` |
 | `enabled` | no (default true) | Set false to keep the config but not mount |
 | `allowed_tools` | no | If set, ONLY these tools are exposed (deny-by-default) |
 | `denied_tools` | no | Always removed, even if allow-listed |

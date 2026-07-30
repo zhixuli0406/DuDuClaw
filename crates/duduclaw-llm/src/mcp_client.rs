@@ -21,10 +21,20 @@
 //!
 //! ## Transport shape
 //!
-//! Requests/responses are one JSON object per line. Reads skip any line that
-//! is not the awaited response (notifications, stray log lines that happen to
-//! be valid JSON without a matching id). Every request is bounded by a
-//! timeout; the child is killed on drop (fail-closed — no orphaned server).
+//! Two transports behind one [`McpClient`]:
+//!   * **stdio** ([`McpClient::connect`]): requests/responses are one JSON
+//!     object per line. Reads skip any line that is not the awaited response
+//!     (notifications, stray log lines that happen to be valid JSON without a
+//!     matching id). The child is killed on drop (fail-closed — no orphaned
+//!     server).
+//!   * **Streamable HTTP** ([`McpClient::connect_http`]): every frame is
+//!     POSTed to a single remote endpoint; the response arrives as a plain
+//!     JSON body or as `text/event-stream` (the response frame inside SSE
+//!     `data:` events). A server-issued `Mcp-Session-Id` is echoed on later
+//!     requests; stateless servers (e.g. the Google Workspace remote MCP
+//!     servers) simply never issue one. Auth is caller-supplied headers.
+//!
+//! Every request on either transport is bounded by a timeout.
 //!
 //! The wire-framing helpers ([`build_initialize_request`],
 //! [`build_tools_list_request`], [`build_tools_call_request`],
@@ -257,21 +267,43 @@ fn concat_content_blocks(blocks: &[Value]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Stdio client
+// Client — stdio child process OR remote Streamable HTTP
 // ---------------------------------------------------------------------------
 
-/// A live MCP client bound to a spawned child process.
+/// The wire the client speaks over.
+enum McpTransport {
+    /// Line-delimited JSON-RPC over a spawned child's stdin/stdout.
+    Stdio {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    },
+    /// MCP Streamable HTTP: every JSON-RPC frame is POSTed to one endpoint;
+    /// the response is either a plain JSON body or a `text/event-stream`
+    /// carrying the response frame as SSE `data:` events. Covers both
+    /// stateless servers (e.g. Google Workspace MCP) and session-ful ones
+    /// (the `Mcp-Session-Id` response header is echoed on later requests).
+    Http {
+        http: reqwest::Client,
+        url: String,
+        /// Extra request headers (e.g. `Authorization: Bearer …`).
+        headers: Vec<(String, String)>,
+        /// Session id issued by the server at `initialize`, if any.
+        session_id: Option<String>,
+    },
+}
+
+/// A live MCP client bound to a spawned child process or a remote
+/// Streamable HTTP endpoint.
 ///
 /// Request/response is serialized: each method awaits its own reply before the
 /// next is issued (the tool loop dispatches sequentially), so a simple
 /// read-until-matching-id loop suffices without a background reader task.
 pub struct McpClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    transport: McpTransport,
     next_id: AtomicI64,
     timeout: Duration,
-    /// Server name for diagnostics (the spawned command).
+    /// Server name for diagnostics (the spawned command or the URL).
     label: String,
 }
 
@@ -305,9 +337,11 @@ impl McpClient {
             .ok_or_else(|| McpError::Spawn("child stdout unavailable".into()))?;
 
         let mut client = Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
+            transport: McpTransport::Stdio {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+            },
             next_id: AtomicI64::new(1),
             timeout,
             label: command.to_string(),
@@ -315,21 +349,75 @@ impl McpClient {
 
         if let Err(e) = client.handshake().await {
             // Best-effort teardown before surfacing the failure.
-            let _ = client.child.start_kill();
+            if let McpTransport::Stdio { child, .. } = &mut client.transport {
+                let _ = child.start_kill();
+            }
             return Err(e);
         }
+        Ok(client)
+    }
+
+    /// Connect to a remote MCP server over Streamable HTTP and perform the
+    /// `initialize` handshake. `headers` are sent on every request (put the
+    /// `Authorization` bearer here). Redirects are refused — a redirect on a
+    /// credential-bearing endpoint is treated as misconfiguration, not
+    /// something to follow silently.
+    pub async fn connect_http(
+        url: &str,
+        headers: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<Self, McpError> {
+        if !url.starts_with("https://") && !url.starts_with("http://127.0.0.1") && !url.starts_with("http://localhost") {
+            return Err(McpError::Spawn(format!(
+                "MCP HTTP endpoint must be https:// (or localhost for dev): {url}"
+            )));
+        }
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| McpError::Spawn(e.to_string()))?;
+
+        let mut client = Self {
+            transport: McpTransport::Http {
+                http,
+                url: url.to_string(),
+                headers: headers.to_vec(),
+                session_id: None,
+            },
+            next_id: AtomicI64::new(1),
+            timeout,
+            label: url.to_string(),
+        };
+        client.handshake().await?;
         Ok(client)
     }
 
     async fn handshake(&mut self) -> Result<(), McpError> {
         let id = self.alloc_id();
         let frame = build_initialize_request(id);
-        let resp = self.request(frame, id).await?;
+        let is_http = matches!(self.transport, McpTransport::Http { .. });
+        let resp = if is_http {
+            // `initialize` is the one HTTP request that captures the
+            // server-issued `Mcp-Session-Id` (if any) for later echo.
+            self.http_request(frame, id, true).await?
+        } else {
+            self.request(frame, id).await?
+        };
         if let Some(e) = rpc_error_of(&resp) {
             return Err(e);
         }
         // Announce readiness; notifications get no reply.
-        self.send_line(&build_initialized_notification()).await?;
+        let note = build_initialized_notification();
+        if is_http {
+            // Best-effort: stateless HTTP servers may reject or ignore
+            // notifications entirely — never fail the mount over it.
+            if let Err(e) = self.http_notify(&note).await {
+                warn!(server = %self.label, error = %e, "MCP initialized notification not accepted (continuing)");
+            }
+        } else {
+            self.send_line(&note).await?;
+        }
         Ok(())
     }
 
@@ -358,32 +446,40 @@ impl McpClient {
         &self.label
     }
 
-    /// Write one JSON frame followed by a newline.
+    /// Write one JSON frame followed by a newline (stdio transport only).
     async fn send_line(&mut self, frame: &Value) -> Result<(), McpError> {
+        let McpTransport::Stdio { stdin, .. } = &mut self.transport else {
+            return Err(McpError::Io("send_line on non-stdio transport".into()));
+        };
         let mut line = serde_json::to_string(frame).map_err(|e| McpError::Parse(e.to_string()))?;
         line.push('\n');
-        self.stdin
+        stdin
             .write_all(line.as_bytes())
             .await
             .map_err(|e| McpError::Io(e.to_string()))?;
-        self.stdin
+        stdin
             .flush()
             .await
             .map_err(|e| McpError::Io(e.to_string()))?;
         Ok(())
     }
 
-    /// Send a request and read frames until the one whose `id` matches, all
-    /// under a single timeout. Non-matching frames (notifications, other ids,
-    /// non-JSON log lines) are skipped.
+    /// Send a request and await the frame whose `id` matches, all under a
+    /// single timeout. Stdio: read frames, skipping non-matching lines. HTTP:
+    /// one POST whose response body carries the frame (JSON or SSE).
     async fn request(&mut self, frame: Value, expect_id: i64) -> Result<Value, McpError> {
+        if matches!(self.transport, McpTransport::Http { .. }) {
+            return self.http_request(frame, expect_id, false).await;
+        }
         let timeout = self.timeout;
         let fut = async {
             self.send_line(&frame).await?;
+            let McpTransport::Stdio { stdout, .. } = &mut self.transport else {
+                return Err(McpError::Io("stdio transport vanished".into()));
+            };
             loop {
                 let mut line = String::new();
-                let n = self
-                    .stdout
+                let n = stdout
                     .read_line(&mut line)
                     .await
                     .map_err(|e| McpError::Io(e.to_string()))?;
@@ -411,13 +507,147 @@ impl McpClient {
             Err(_) => Err(McpError::Timeout),
         }
     }
+
+    /// POST one JSON-RPC request frame to the Streamable HTTP endpoint and
+    /// extract the response frame with the matching `id` from either a plain
+    /// JSON body or a `text/event-stream` body. `capture_session` stores a
+    /// server-issued `Mcp-Session-Id` for echo on subsequent requests.
+    async fn http_request(
+        &mut self,
+        frame: Value,
+        expect_id: i64,
+        capture_session: bool,
+    ) -> Result<Value, McpError> {
+        let resp = self.http_post(&frame).await?;
+        let status = resp.status();
+
+        if capture_session {
+            let sid = resp
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            if let (Some(sid), McpTransport::Http { session_id, .. }) =
+                (sid, &mut self.transport)
+            {
+                *session_id = Some(sid);
+            }
+        }
+
+        // Refuse absurdly large bodies before buffering (protocol frames are
+        // small; tool results are capped separately by the tool loop).
+        if resp.content_length().unwrap_or(0) > MAX_HTTP_BODY_BYTES {
+            return Err(McpError::Io("MCP HTTP response too large".into()));
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| McpError::Io(e.to_string()))?;
+
+        if !status.is_success() {
+            let snippet: String = body.chars().take(300).collect();
+            return Err(McpError::Io(format!("HTTP {status}: {snippet}")));
+        }
+        if body.len() as u64 > MAX_HTTP_BODY_BYTES {
+            return Err(McpError::Io("MCP HTTP response too large".into()));
+        }
+
+        if content_type.starts_with("text/event-stream") {
+            return sse_extract_response(&body, expect_id)
+                .ok_or_else(|| McpError::Parse("no matching response frame in SSE body".into()));
+        }
+        let value: Value =
+            serde_json::from_str(&body).map_err(|e| McpError::Parse(e.to_string()))?;
+        if value.get("id").and_then(Value::as_i64) != Some(expect_id) {
+            return Err(McpError::Parse(format!(
+                "HTTP response id mismatch (expected {expect_id})"
+            )));
+        }
+        Ok(value)
+    }
+
+    /// POST a notification frame (no reply expected). Any 2xx is success.
+    async fn http_notify(&mut self, frame: &Value) -> Result<(), McpError> {
+        let resp = self.http_post(frame).await?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(McpError::Io(format!("HTTP {status}")))
+        }
+    }
+
+    /// Shared POST builder for the HTTP transport: standard MCP headers +
+    /// caller headers + session echo.
+    async fn http_post(&self, frame: &Value) -> Result<reqwest::Response, McpError> {
+        let McpTransport::Http {
+            http,
+            url,
+            headers,
+            session_id,
+        } = &self.transport
+        else {
+            return Err(McpError::Io("http_post on non-http transport".into()));
+        };
+        let mut req = http
+            .post(url.as_str())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if let Some(sid) = session_id {
+            req = req.header("mcp-session-id", sid.as_str());
+        }
+        req.json(frame)
+            .send()
+            .await
+            .map_err(|e| McpError::Io(e.to_string()))
+    }
+}
+
+/// Upper bound for a buffered MCP HTTP response body (16 MB).
+const MAX_HTTP_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Extract the JSON-RPC response frame with `expect_id` from an SSE body:
+/// events are blank-line-separated; each event's `data:` lines join to one
+/// JSON document. Pure for offline testing.
+fn sse_extract_response(body: &str, expect_id: i64) -> Option<Value> {
+    for event in body.split("\n\n") {
+        let data: String = event
+            .lines()
+            .filter_map(|l| {
+                let l = l.strip_prefix("data:")?;
+                Some(l.strip_prefix(' ').unwrap_or(l))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&data) {
+            if v.get("id").and_then(Value::as_i64) == Some(expect_id) {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        // Fail-closed: never leave the server running. `kill_on_drop(true)`
+        // Fail-closed: never leave a stdio server running. `kill_on_drop(true)`
         // covers the tokio Child too, but start_kill is explicit + immediate.
-        let _ = self.child.start_kill();
+        if let McpTransport::Stdio { child, .. } = &mut self.transport {
+            let _ = child.start_kill();
+        }
     }
 }
 
@@ -761,5 +991,144 @@ mod tests {
         assert!(routes.contains_key("crm_list"));
         assert!(!routes.contains_key("crm_delete"), "filtered external tool absent");
         assert_eq!(defs.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod http_transport_tests {
+    use super::*;
+
+    #[test]
+    fn sse_extract_matching_frame() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
+        let v = sse_extract_response(body, 7).expect("frame found");
+        assert_eq!(v["result"]["ok"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn sse_extract_skips_other_events_and_multiline_data() {
+        // A notification (no id), then the awaited response split over two
+        // data: lines within one event.
+        let body = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\n",
+            "data: \"id\":3,\"result\":{}}\n\n",
+        );
+        assert!(sse_extract_response(body, 3).is_some());
+        assert!(sse_extract_response(body, 4).is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_http_rejects_plain_http_non_localhost() {
+        let err = McpClient::connect_http(
+            "http://example.com/mcp",
+            &[],
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("plain-http non-localhost must be rejected");
+        assert!(matches!(err, McpError::Spawn(_)));
+    }
+
+    /// Minimal stateless Streamable-HTTP MCP server on a local TCP socket:
+    /// answers initialize / tools/list / tools/call with canned JSON bodies.
+    /// Exercises the full connect_http → list_tools → call_tool path.
+    #[tokio::test]
+    async fn http_client_end_to_end_against_local_mock() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    // Read until headers end, then honor content-length.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    let body_start;
+                    loop {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            body_start = pos + 4;
+                            break;
+                        }
+                    }
+                    let headers = String::from_utf8_lossy(&buf[..body_start]).to_string();
+                    let content_length: usize = headers
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < body_start + content_length {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let body = String::from_utf8_lossy(&buf[body_start..]).to_string();
+                    let frame: Value = serde_json::from_str(body.trim()).unwrap_or(Value::Null);
+                    let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+                    let id = frame.get("id").and_then(Value::as_i64);
+
+                    let (status, payload) = match (method, id) {
+                        ("initialize", Some(id)) => (
+                            "200 OK",
+                            Some(json!({"jsonrpc":"2.0","id":id,"result":{
+                                "protocolVersion":"2025-06-18",
+                                "serverInfo":{"name":"MockStateless"},
+                                "capabilities":{"tools":{}}}})),
+                        ),
+                        ("notifications/initialized", None) => ("202 Accepted", None),
+                        ("tools/list", Some(id)) => (
+                            "200 OK",
+                            Some(json!({"jsonrpc":"2.0","id":id,"result":{"tools":[
+                                {"name":"echo","description":"echo back","inputSchema":{"type":"object"}}
+                            ]}})),
+                        ),
+                        ("tools/call", Some(id)) => (
+                            "200 OK",
+                            Some(json!({"jsonrpc":"2.0","id":id,"result":{
+                                "content":[{"type":"text","text":"echoed!"}],
+                                "isError":false}})),
+                        ),
+                        _ => ("400 Bad Request", None),
+                    };
+                    let body = payload.map(|p| p.to_string()).unwrap_or_default();
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{}/mcp", addr.port());
+        let mut client = McpClient::connect_http(
+            &url,
+            &[("authorization".into(), "Bearer test-token".into())],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("handshake against mock");
+
+        let tools = client.list_tools().await.expect("tools/list");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+
+        let result = client
+            .call_tool("echo", json!({"msg": "hi"}))
+            .await
+            .expect("tools/call");
+        assert_eq!(result.content, "echoed!");
+        assert!(!result.is_error);
     }
 }
