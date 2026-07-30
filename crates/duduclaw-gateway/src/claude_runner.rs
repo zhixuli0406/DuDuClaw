@@ -1358,14 +1358,29 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
     let mut clients = vec![internal];
     let mut filters = vec![duduclaw_llm::ToolFilter::default()];
     for ext in externals {
-        match duduclaw_llm::McpClient::connect(
-            &ext.command,
-            &ext.args,
-            &ext.env,
-            duduclaw_llm::DEFAULT_MCP_TIMEOUT,
-        )
-        .await
-        {
+        // Transport per entry: `url` ⇒ remote Streamable HTTP (Google
+        // Workspace official MCP, DocuSeal self-hosted /mcp, …); otherwise
+        // spawn the stdio child as before.
+        let connected = match &ext.url {
+            Some(url) => {
+                duduclaw_llm::McpClient::connect_http(
+                    url,
+                    &ext.http_headers(),
+                    duduclaw_llm::DEFAULT_MCP_TIMEOUT,
+                )
+                .await
+            }
+            None => {
+                duduclaw_llm::McpClient::connect(
+                    &ext.command,
+                    &ext.args,
+                    &ext.env,
+                    duduclaw_llm::DEFAULT_MCP_TIMEOUT,
+                )
+                .await
+            }
+        };
+        match connected {
             Ok(c) => {
                 info!(server = %ext.name, "external MCP server mounted");
                 clients.push(c);
