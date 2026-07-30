@@ -14,7 +14,6 @@ import {
   Brain,
   Puzzle,
   LayoutGrid,
-  BookOpen,
   Trophy,
   Radio,
   Plug,
@@ -155,7 +154,8 @@ export const navGroups: NavGroup[] = [
     ],
   },
   {
-    // 公司 — staff, team, world, memory, skills, widgets, knowledge, growth.
+    // 公司 — staff, team, world, memory (incl. the knowledge base), skills,
+    // widgets, growth.
     label: 'navGroup.company',
     items: [
       staffEntry,
@@ -167,7 +167,6 @@ export const navGroups: NavGroup[] = [
       { to: '/experts', icon: Package, label: 'nav.experts', desc: 'nav.experts.desc', minRole: 'admin' },
       // Widget 工坊 — custom dashboard cards (AI-built / HTML / shared).
       { to: '/widgets', icon: LayoutGrid, label: 'nav.widgets', desc: 'nav.widgets.desc' },
-      { to: '/knowledge', icon: BookOpen, label: 'nav.knowledge', desc: 'nav.knowledge.desc' },
       { to: '/growth', icon: Trophy, label: 'nav.growth', desc: 'nav.growth.desc', ownScope: true },
       // 桌寵工作室 — photo → interactive desktop pet. Desktop app only
       // (2026-07-29): hidden in a plain browser instead of showing a stub page.
@@ -212,12 +211,17 @@ function pickItems(paths: string[]): NavItem[] {
   });
 }
 
-/** Personal 主區 — rendered flat right after the daily row (no group label). */
+/**
+ * Personal 主區 — rendered flat right after the daily row (no group label).
+ *
+ * 2026-07-30: the knowledge base merged into 記憶, so `/memory` takes the slot
+ * `/knowledge` used to hold here (and leaves 進階).
+ */
 export const personalPrimaryItems: NavItem[] = pickItems([
   '/routines',
   '/world',
   '/skills',
-  '/knowledge',
+  '/memory',
   '/pet-studio',
 ]);
 
@@ -233,7 +237,6 @@ export const personalAdvancedGroup: NavGroup = {
     '/timeline',
     '/reports',
     '/os',
-    '/memory',
     '/experts',
     '/widgets',
     '/growth',

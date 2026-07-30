@@ -27,7 +27,6 @@ const STEPS: ReadonlyArray<TourStep> = [
   { route: '/agents', target: '[data-tour="nav:/agents"]', titleKey: 'tour.step.agents.title', bodyKey: 'tour.step.agents.body' },
   { route: '/memory', target: '[data-tour="nav:/memory"]', titleKey: 'tour.step.memory.title', bodyKey: 'tour.step.memory.body' },
   { route: '/skills', target: '[data-tour="nav:/skills"]', titleKey: 'tour.step.skills.title', bodyKey: 'tour.step.skills.body' },
-  { route: '/knowledge', target: '[data-tour="nav:/knowledge"]', titleKey: 'tour.step.knowledge.title', bodyKey: 'tour.step.knowledge.body' },
   { route: '/growth', target: '[data-tour="nav:/growth"]', titleKey: 'tour.step.growth.title', bodyKey: 'tour.step.growth.body' },
   { route: '/manage', target: '[data-tour="nav:/manage"]', titleKey: 'tour.step.manage.title', bodyKey: 'tour.step.manage.body', minRole: 'manager' },
 ] as const;

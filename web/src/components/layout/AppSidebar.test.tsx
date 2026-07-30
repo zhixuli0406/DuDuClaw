@@ -71,9 +71,10 @@ describe('AppSidebar (Multica shell)', () => {
   });
 
   // Personal IA (2026-07-29 client feedback): flat 主區 (daily + Routines /
-  // World / Skills / Knowledge), no 工作/公司 groups, no staff zone; 設定 and
+  // World / Skills / Memory), no 工作/公司 groups, no staff zone; 設定 and
   // 進階 close the rail collapsed. Roster/org/pet-studio hidden (pet studio is
-  // desktop-only and jsdom is not Tauri).
+  // desktop-only and jsdom is not Tauri). 2026-07-30: the knowledge base
+  // merged into 記憶, so Memory took Knowledge's primary-rail slot.
   it('personal edition: minimal primary rail, collapsed 設定/進階, staff surfaces hidden', async () => {
     const user = userEvent.setup();
     useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
@@ -81,7 +82,7 @@ describe('AppSidebar (Multica shell)', () => {
 
     // 主區 flat items are present.
     expect(screen.getByRole('link', { name: /Routines/i })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /Knowledge/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Memory/i })).toBeInTheDocument();
     // Enterprise group labels are gone; 進階 exists but starts collapsed.
     expect(screen.queryByText(/^Work$/)).not.toBeInTheDocument();
     expect(screen.queryByText(/^Company$/)).not.toBeInTheDocument();
@@ -96,7 +97,7 @@ describe('AppSidebar (Multica shell)', () => {
     // Expanding 進階 reveals the folded work surfaces.
     await user.click(screen.getByText(/^Advanced$/));
     expect(screen.getByRole('link', { name: /Task Board/i })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /Memory/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Reports/i })).toBeInTheDocument();
   });
 
   it('opens the command palette from the search trigger', async () => {

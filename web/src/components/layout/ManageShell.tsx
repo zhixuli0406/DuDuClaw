@@ -56,7 +56,7 @@ const MANAGE_GROUPS: ReadonlyArray<{ labelId: string; paths: readonly string[] }
  * its own and relies on the ambient `p-4 md:p-6` the app shell already applies
  * around the route outlet. This shell therefore deliberately does NOT escape
  * that ambient padding (unlike full-bleed shells such as `EditAgentPage` /
- * `KnowledgeShell`) — doing so would strip the child pages' only source of
+ * `MemoryPage`) — doing so would strip the child pages' only source of
  * breathing room. The rail + content row simply sits inside it, same as the
  * pre-WP4.1 shell did.
  */

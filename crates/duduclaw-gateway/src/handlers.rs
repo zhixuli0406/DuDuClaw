@@ -2869,6 +2869,28 @@ fn redaction_table_to_response(table: &toml::Table) -> Value {
     })
 }
 
+/// Serialize one memory entry for the dashboard (`memory.browse` /
+/// `memory.search`). Shared so both surfaces stay field-identical.
+///
+/// The cognitive fields (`layer` / `source_event` / `importance` /
+/// `access_count`) are what the memory page's topic grouping runs on: the
+/// dashboard classifies an entry deterministically from its origin before it
+/// falls back to content keywords, so a `footprint_distill` entry never lands
+/// in the same bucket as a user-stated preference.
+fn memory_entry_row(e: &duduclaw_core::types::MemoryEntry) -> Value {
+    json!({
+        "id": e.id,
+        "agent_id": e.agent_id,
+        "content": e.content,
+        "timestamp": e.timestamp.to_rfc3339(),
+        "tags": e.tags,
+        "layer": e.layer.as_str(),
+        "source_event": e.source_event,
+        "importance": e.importance,
+        "access_count": e.access_count,
+    })
+}
+
 /// D3 wiring — fold `config.toml [memory]` graph-seed knobs into
 /// [`RetrievalWeights`]. Pure so it is unit-testable. Starts from engine
 /// defaults; overrides only `graph_embed_seed` (bool) and
@@ -4406,6 +4428,15 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Owner);
                 self.handle_memory_invalidate_origin(params).await
             }
+            // Destructive but recoverable: forget one entry (archived, not
+            // dropped). Owner access mirrors `memory.invalidate_origin`; the
+            // role bar is Employee-and-up because forgetting a single wrong
+            // memory is routine hygiene for whoever owns the AI staff member,
+            // not an admin-only rollback.
+            "memory.forget" => {
+                let _ = check_agent!(AccessLevel::Owner);
+                self.handle_memory_forget(params).await
+            }
 
             // ── Wiki (agent-scoped — HS4 fix, mirrors memory.*) ───────
             // Each arm reads `agent_id` from params; an Employee bound only to
@@ -5351,6 +5382,7 @@ impl MethodHandler {
                     { "name": "memory.get_at", "description": "Point-in-time fact lookup (D6 alias of memory.at)" },
                     { "name": "memory.graph", "description": "SPO knowledge-graph export for the D6 curation viewer" },
                     { "name": "memory.invalidate_origin", "description": "Destructive: expire all facts from one source (D6 rollback)" },
+                    { "name": "memory.forget", "description": "Forget one memory entry (archived, recoverable)" },
                     { "name": "cost.summary", "description": "Cost / cache-efficiency window summary + price-cliff status" },
                     { "name": "cost.agents", "description": "Per-agent cost + cache health" },
                     { "name": "cost.recent", "description": "Recent per-request cost records" },
@@ -10655,18 +10687,7 @@ impl MethodHandler {
 
         match engine.search(agent_id, query, limit).await {
             Ok(entries) => {
-                let results: Vec<Value> = entries
-                    .iter()
-                    .map(|e| {
-                        json!({
-                            "id": e.id,
-                            "agent_id": e.agent_id,
-                            "content": e.content,
-                            "timestamp": e.timestamp.to_rfc3339(),
-                            "tags": e.tags,
-                        })
-                    })
-                    .collect();
+                let results: Vec<Value> = entries.iter().map(memory_entry_row).collect();
                 WsFrame::ok_response("", json!({ "entries": results }))
             }
             Err(e) => WsFrame::error_response("", &format!("Memory search failed: {e}")),
@@ -10702,21 +10723,51 @@ impl MethodHandler {
 
         match engine.list_recent(agent_id, limit).await {
             Ok(entries) => {
-                let rows: Vec<Value> = entries
-                    .iter()
-                    .map(|e| {
-                        json!({
-                            "id": e.id,
-                            "agent_id": e.agent_id,
-                            "content": e.content,
-                            "timestamp": e.timestamp.to_rfc3339(),
-                            "tags": e.tags,
-                        })
-                    })
-                    .collect();
+                let rows: Vec<Value> = entries.iter().map(memory_entry_row).collect();
                 WsFrame::ok_response("", json!({ "entries": rows }))
             }
             Err(e) => WsFrame::error_response("", &format!("Memory browse failed: {e}")),
+        }
+    }
+
+    /// Forget one memory entry (2026-07-30 client feedback: per-row delete in
+    /// the memory list). Soft delete — the engine archives the row before
+    /// removing it from every retrieval surface.
+    async fn handle_memory_forget(&self, params: Value) -> WsFrame {
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let memory_id = params
+            .get("memory_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+        if memory_id.is_empty() {
+            return WsFrame::error_response("", "Missing 'memory_id' parameter");
+        }
+
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "success": false, "forgotten": false }));
+        }
+
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
+        };
+
+        match engine.forget(agent_id, memory_id).await {
+            Ok(forgotten) => {
+                WsFrame::ok_response("", json!({ "success": true, "forgotten": forgotten }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Memory forget failed: {e}")),
         }
     }
 

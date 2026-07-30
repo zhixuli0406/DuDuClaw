@@ -1391,6 +1391,115 @@ impl SqliteMemoryEngine {
         Ok(n > 0)
     }
 
+    /// Forget a single memory entry — the user-facing "delete" (2026-07-30
+    /// client feedback: the memory list needs a per-row delete affordance).
+    ///
+    /// This is a **soft** delete: the row is copied into `memories_archive`
+    /// (the same table [`crate::decay::run_decay`] uses), removed from the FTS
+    /// index, then deleted from `memories`. The entry stops being retrievable
+    /// — it can no longer be searched, injected into a prompt, or seed the SPO
+    /// graph — but an operator can still recover it from the archive. Archive
+    /// rows are pruned by the existing decay `delete_after_days` sweep.
+    ///
+    /// Ownership is enforced: an entry belonging to another agent is a no-op.
+    /// Returns `Ok(true)` when a row was forgotten, `Ok(false)` when the id
+    /// does not exist for this agent (idempotent — a double-delete is not an
+    /// error, matching [`Self::remove_tag`]'s contract).
+    pub async fn forget(&self, agent_id: &str, memory_id: &str) -> Result<bool> {
+        let bumped = {
+            let conn = self.conn.lock().await;
+
+            // The archive table is created lazily by `run_decay`; a database
+            // that has never decayed does not have it yet. Create it with the
+            // identical schema so both writers agree.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS memories_archive (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    layer TEXT NOT NULL DEFAULT 'episodic',
+                    importance REAL NOT NULL DEFAULT 5.0,
+                    access_count INTEGER NOT NULL DEFAULT 0,
+                    last_accessed TEXT,
+                    source_event TEXT DEFAULT '',
+                    archived_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )",
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+            // Ownership check up front so a cross-agent id never reaches the
+            // archive INSERT (which would leak another agent's content into
+            // this agent's archive).
+            let owned: bool = conn
+                .query_row(
+                    "SELECT 1 FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
+                    params![memory_id, agent_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?
+                .unwrap_or(false);
+            if !owned {
+                return Ok(false);
+            }
+
+            // Archive + FTS cleanup + delete atomically: a partial apply would
+            // leave an orphan FTS row that still surfaces in search results.
+            conn.execute_batch("BEGIN IMMEDIATE")
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+            let apply = || -> std::result::Result<bool, String> {
+                conn.execute(
+                    "INSERT OR IGNORE INTO memories_archive
+                         (id, agent_id, content, timestamp, tags, layer,
+                          importance, access_count, last_accessed, source_event)
+                     SELECT id, agent_id, content, timestamp, tags, layer,
+                            importance, access_count, last_accessed, source_event
+                     FROM memories WHERE id = ?1 AND agent_id = ?2",
+                    params![memory_id, agent_id],
+                )
+                .map_err(|e| format!("archive INSERT failed: {e}"))?;
+
+                conn.execute(
+                    "DELETE FROM memories_fts WHERE memory_id = ?1",
+                    params![memory_id],
+                )
+                .map_err(|e| format!("FTS cleanup failed: {e}"))?;
+
+                let n = conn
+                    .execute(
+                        "DELETE FROM memories WHERE id = ?1 AND agent_id = ?2",
+                        params![memory_id, agent_id],
+                    )
+                    .map_err(|e| format!("memories DELETE failed: {e}"))?;
+                Ok(n > 0)
+            };
+
+            let outcome = apply();
+            match outcome {
+                Ok(removed) => {
+                    conn.execute_batch("COMMIT")
+                        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                    removed
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(DuDuClawError::Memory(e));
+                }
+            }
+        };
+
+        // Forgetting a row can drop an SPO triple, so any cached graph built
+        // from the old snapshot is stale. Bumped outside the conn lock —
+        // `bump_graph_generation` takes its own lock.
+        if bumped {
+            self.bump_graph_generation(agent_id);
+        }
+        Ok(bumped)
+    }
+
     /// Store a memory with temporal / knowledge-graph metadata and automatic
     /// conflict resolution (F1, v1.19.0).
     ///
@@ -3344,6 +3453,61 @@ mod tests {
         assert!((ebbinghaus_retrievability(0.0, 0, 5.0, &w) - 1.0).abs() < 1e-9);
         let r = ebbinghaus_retrievability(10_000.0, 0, 0.0, &w);
         assert!((0.0..=1.0).contains(&r));
+    }
+
+    /// `forget` must remove the entry from every retrieval surface (browse,
+    /// search) while keeping a recoverable copy in `memories_archive`.
+    #[tokio::test]
+    async fn forget_removes_entry_from_retrieval_but_archives_it() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "forget-agent";
+
+        let doomed = make_entry(agent, "vault password is hunter2", vec![]);
+        let doomed_id = doomed.id.clone();
+        let kept = make_entry(agent, "vault backup runs nightly", vec![]);
+        engine.store(agent, doomed).await.unwrap();
+        engine.store(agent, kept).await.unwrap();
+        assert_eq!(engine.list_recent(agent, 10).await.unwrap().len(), 2);
+
+        assert!(engine.forget(agent, &doomed_id).await.unwrap());
+
+        // Gone from browse and from FTS search.
+        let remaining = engine.list_recent(agent, 10).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].content.contains("nightly"));
+        let hits = engine.search(agent, "password", 10).await.unwrap();
+        assert!(
+            !hits.iter().any(|h| h.id == doomed_id),
+            "forgotten entry must not surface in search"
+        );
+
+        // Still recoverable from the archive.
+        let conn = engine.conn_for_maintenance().await;
+        let archived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories_archive WHERE id = ?1",
+                params![doomed_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived, 1, "forget must archive, not hard-delete");
+    }
+
+    /// Ownership is enforced and repeated deletes are a no-op, not an error.
+    #[tokio::test]
+    async fn forget_is_agent_scoped_and_idempotent() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let entry = make_entry("owner-agent", "owned fact", vec![]);
+        let id = entry.id.clone();
+        engine.store("owner-agent", entry).await.unwrap();
+
+        // Another agent cannot forget it, and the row survives.
+        assert!(!engine.forget("other-agent", &id).await.unwrap());
+        assert_eq!(engine.list_recent("owner-agent", 10).await.unwrap().len(), 1);
+
+        assert!(engine.forget("owner-agent", &id).await.unwrap());
+        // Second delete: no-op, still Ok.
+        assert!(!engine.forget("owner-agent", &id).await.unwrap());
     }
 
     #[tokio::test]

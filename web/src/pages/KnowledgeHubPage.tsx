@@ -61,7 +61,7 @@ function namespaceOf(path: string): string {
  * §5.3). A Segmented view switcher (browse / search / graph / health) + an agent
  * picker; browse lists pages as a flat ListGrid and opens a max-w-4xl prose
  * reading view with a BreadcrumbHeader. Search / graph / health / lint behaviour
- * is unchanged. Renders header-less when `embedded` (KnowledgeShell owns the
+ * is unchanged. Renders header-less when `embedded` (MemoryPage's 知識庫 tab owns the
  * page header); standalone (legacy /wiki route) carries its own header.
  */
 export function KnowledgeHubPage({ embedded = false }: { embedded?: boolean }) {

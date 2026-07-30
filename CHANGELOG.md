@@ -2,6 +2,87 @@
 
 ## [Unreleased]
 
+### Added
+- **記憶與知識庫合併成單一「記憶與知識」頁**（2026-07-30 客戶回饋）：
+  原本分開的「記憶」與「知識庫」兩個側邊欄入口整併成一頁，分頁列為
+  記憶／個人知識庫／共享知識庫／關鍵洞察／自主進化。個人版只有一個
+  知識庫，共享分頁整個隱藏、標籤簡化為「知識庫」。舊 `/knowledge`
+  路由 302 到 `/memory?tab=wiki`，書籤與導覽導引不會斷。
+- **記憶改為主題分頁瀏覽（Perplexity 式）**：左側分類導航（工作與專案／
+  人物與聯絡／客戶與業務／偏好與習慣／規則與決策／工具與系統／時間與
+  地點／費用與帳務／使用足跡／學習訊號／其他）＋右側分類卡片，點分類
+  展開完整清單。分類器 `lib/memory-category.ts` 是零 LLM 成本的確定性
+  兩段式判定（來源 `source_event`/`tags` 優先，其次雙語關鍵字計分），
+  ASCII 詞需詞界、CJK 直接子字串比對，不做位元組切片。
+- **單筆記憶刪除**：記憶列滑鼠移過去出現垃圾桶（鍵盤 focus 同樣顯示），
+  兩段式確認後刪除。新增 `memory.forget` RPC 與
+  `SqliteMemoryEngine::forget()`——**軟刪除**：先寫入 `memories_archive`
+  再清 FTS 索引與主表，單一交易，管理者仍可回復；跨 agent id 一律 no-op，
+  重複刪除不算錯誤。刪除會 bump graph generation，避免 SPO 圖快取殘留。
+- **`docs/guides/memory-and-knowledge.md`**：記憶與知識庫的完整使用說明
+  （兩者差異對照、知識庫寫入方式與四個預設目錄、L0–L3 層級如何決定
+  「多常被想起」、自動帶入 vs 主動搜尋的分界、記憶自動記什麼／不記什麼、
+  刪除方式、FAQ）。
+
+- **MCP Bridge 遠端掛載（Streamable HTTP）**：`[[mcp.external]]` 新增 `url`
+  模式——`McpClient` 多了 HTTP transport（單端點 POST、JSON/SSE 回應、
+  `Mcp-Session-Id` 回聲、僅 https），可直接掛遠端 MCP server；`bearer_token`
+  支援 literal / `env://` / `secret://` / **`oauth://google`**（重用 dashboard
+  已連接的 Google 帳號 token，自動 refresh），`headers` 自訂請求標頭。
+  憑證解析不到即整台跳過（fail-safe）。
+- **Google Workspace 八服務全原生覆蓋（11 個新工具）**：Gmail／Calendar／
+  Sheets 之外補齊 **Drive／Docs／Slides／Forms／Tasks**，全部走 GA REST API
+  ——`drive_search`／`drive_read`（Docs/Slides 匯出純文字、Sheets 匯出 CSV
+  第一張表、二進位檔回中繼資料不回位元組）、`docs_read`／`docs_append`
+  （**僅追加**，無任何工具能改寫或刪除既有內容）、`slides_read`（唯讀）、
+  `forms_get`／`forms_list_responses`（唯讀，答案按 question_id 對應）、
+  `gtasks_lists`／`gtasks_list`／`gtasks_create`／`gtasks_complete`。
+  合計 19 個原生工具，兩個 scope（`google:read`／`google:write`）。
+  **不需要 Google Developer Preview 資格**，任何客戶都能用。
+  指南 `docs/guides/google-workspace.md`。
+  - Google Tasks 工具刻意用 `gtasks_` 前綴，與 DuDuClaw 自家任務看板的
+    `tasks_*` 工具區分（agent 不會混淆兩套任務系統）。
+  - Slides 不提供寫入工具：既有 office 文件套件已能產出真正的 `.pptx`，
+    比驅動 Slides `batchUpdate` element API 更安全也更好。
+- **MCP Bridge 遠端掛載新增 `preset`（進階選項）**：`preset = "google:<svc>"`
+  一行掛 Google 官方 remote MCP（Gmail 13／Calendar 9／Drive 8／Docs 2／
+  Sheets 7／Slides 2／Chat；端點與工具清單皆對正式端點實測），bearer 自動用
+  `oauth://google`。**非出貨路徑**——官方 server 仍是 Developer Preview，
+  且 Program Terms 禁止讓自家網域以外的終端使用者使用 Pre-GA API；產品面
+  一律走上述原生工具。詳見 `docs/guides/google-mcp.md`。
+- **DocuSeal 簽署工作流**：新開源 crate `duduclaw-docuseal-mcp`——MCP stdio
+  wrapper 包 DocuSeal REST API（cloud + self-hosted，`X-Auth-Token`），10 個
+  工具涵蓋「建板模 → 寄送簽署 → 查狀態 → 取簽署檔」＋官方內建 MCP（僅
+  self-hosted）沒有的歸檔/重寄/prefill 更新。指南 `docs/guides/docuseal.md`
+  （含 webhook 驗簽格式）。
+
+### Changed
+- **`memory.browse` / `memory.search` 回傳擴充**：多帶 `layer`、`source_event`、
+  `importance`、`access_count` 四個欄位，供儀表板做來源優先的主題分類。
+  既有欄位不變，舊消費端不受影響。
+- **側邊欄調整**：企業版「公司」群組移除獨立的「知識庫」項目；個人版主區
+  的知識庫入口換成「記憶與知識」（`/memory` 從「進階」升上主區）。
+  導覽導引的知識庫步驟移除（該頁已併入記憶頁）。
+- **Google 整合 scopes 擴充（最小權限）**：新增 `drive.readonly`、
+  `documents`、`presentations.readonly`、`forms.body.readonly`、
+  `forms.responses.readonly`、`tasks`。Drive 只要唯讀（沒有任何工具建立
+  Drive 檔案，故不要 `drive`／`drive.file`）、Slides 只要唯讀；Docs 需要完整
+  `documents` 是因為 `docs_append` 會寫入。**v1.47 之前連好的 Google 帳號需
+  重新連接一次**——舊 token 缺 scope 會回 403 並附重授權引導（不會靜默失敗）。
+- **記憶頁空狀態文案**：不再誤導「啟用認知記憶後才會儲存」（認知記憶預設
+  即開啟）——改為說明「實質對話會自動萃取重點儲存於此；閒聊不記錄」，僅在
+  agent 明確停用認知記憶時才顯示停用變體＋前往設定連結（三語系）。
+
+### Removed
+- `KnowledgeShell` 頁面元件（`/knowledge` 的個人／共享分頁殼）——功能由
+  `MemoryPage` 的知識庫分頁取代，路由改為重導，元件與其測試一併刪除。
+
+### Fixed
+- **認知記憶開關對 conversation distill 失效**：對話自動萃取的呼叫點繞過了
+  `[evolution] cognitive_memory` 閘（直接用 `ctx.memory_db_path` 還帶
+  home_dir 兜底）——關掉認知記憶的 agent 對話仍會被萃取寫入 memory.db。
+  現與其他記憶路徑共用同一 gate，關閉即全停。
+
 ## [1.46.3] - 2026-07-29 — 更新誤判修復＋個人版再精簡
 
 ### Added

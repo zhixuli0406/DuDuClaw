@@ -30,7 +30,6 @@ const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'Skill
 const ExpertsPage = lazyPage(() => import('./pages/ExpertsPage'), 'ExpertsPage');
 const WidgetsPage = lazyPage(() => import('./pages/WidgetsPage'), 'WidgetsPage');
 const WidgetComposerPage = lazyPage(() => import('./pages/WidgetComposerPage'), 'WidgetComposerPage');
-const KnowledgeShell = lazyPage(() => import('./pages/KnowledgeShell'), 'KnowledgeShell');
 const IntegrationsPage = lazyPage(() => import('./pages/IntegrationsPage'), 'IntegrationsPage');
 const BillingShell = lazyPage(() => import('./pages/BillingShell'), 'BillingShell');
 const GovernanceShell = lazyPage(() => import('./pages/GovernanceShell'), 'GovernanceShell');
@@ -190,7 +189,10 @@ export function App() {
               <Route path="widgets" element={<WidgetsPage />} />
               <Route path="widgets/new" element={<WidgetComposerPage />} />
               <Route path="widgets/:id/edit" element={<WidgetComposerPage />} />
-              <Route path="knowledge" element={<KnowledgeShell />} />
+              {/* 2026-07-30: the knowledge base merged into 記憶. Old links
+                  (bookmarks, the guided tour, docs) land on the knowledge tab
+                  instead of a dead route. */}
+              <Route path="knowledge" element={<Navigate to="/memory?tab=wiki" replace />} />
               {/* 關於 — open to every authenticated user (all instances). */}
               <Route path="about" element={<AboutPage />} />
 

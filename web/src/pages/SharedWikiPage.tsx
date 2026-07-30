@@ -75,7 +75,7 @@ function namespaceOf(path: string): string {
  * lists pages as a flat ListGrid and opens a max-w-4xl reading view. Namespace
  * policy modes render as tone-coded badges (read_only=warning / operator_only=
  * destructive / agent_writable=secondary). Data flow is unchanged. Renders
- * header-less when `embedded` (KnowledgeShell owns the header).
+ * header-less when `embedded` (MemoryPage's 共享知識庫 tab owns the header).
  */
 export function SharedWikiPage({ embedded = false }: { embedded?: boolean }) {
   const intl = useIntl();
