@@ -956,6 +956,93 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "values", description: "Row cells: JSON array of strings, or a comma-separated list", required: true },
         ],
     },
+    // Forms + Tasks have no official Google remote MCP server, so they are
+    // served natively here (Drive/Docs/Slides DO have official servers — mount
+    // those with agent.toml `[[mcp.external]] preset = "google:<svc>"`).
+    ToolDef {
+        name: "forms_get",
+        description: "Read a Google Form's structure (read-only): title, description, and every question with its question_id, type and choice options. Call this before forms_list_responses — response answers are keyed by question_id.",
+        params: &[
+            ParamDef { name: "form_id", description: "Form ID or full Google Forms URL (editor or viewform link)", required: true },
+        ],
+    },
+    ToolDef {
+        name: "forms_list_responses",
+        description: "List a Google Form's submitted responses (read-only, newest page first, up to 50). Each response has responseId, submitted time, respondent email (when the form collects it) and answers keyed by question_id — map ids to titles with forms_get.",
+        params: &[
+            ParamDef { name: "form_id", description: "Form ID or full Google Forms URL", required: true },
+        ],
+    },
+    ToolDef {
+        name: "gtasks_lists",
+        description: "List the connected Google Tasks account's task lists (read-only). Returns each list's id + title; pass an id as task_list_id to the other gtasks_* tools ('@default' targets the user's default list).",
+        params: &[],
+    },
+    ToolDef {
+        name: "gtasks_list",
+        description: "List tasks in one Google Tasks list (read-only). Pending tasks only by default; set show_completed=true to include finished ones. Returns id/title/notes/status/due for each.",
+        params: &[
+            ParamDef { name: "task_list_id", description: "Task list ID from gtasks_lists, or '@default'", required: false },
+            ParamDef { name: "show_completed", description: "Include completed tasks (true/false, default false)", required: false },
+            ParamDef { name: "max_results", description: "Max tasks to return (1-100, default 50)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "gtasks_create",
+        description: "Create a task in a Google Tasks list (write — appears in the user's real Google Tasks). Operators may gate this via agent.toml [capabilities] approval_required_tools.",
+        params: &[
+            ParamDef { name: "title", description: "Task title", required: true },
+            ParamDef { name: "task_list_id", description: "Task list ID from gtasks_lists, or '@default'", required: false },
+            ParamDef { name: "notes", description: "Task notes/details (optional)", required: false },
+            ParamDef { name: "due", description: "Due date, RFC-3339 (e.g. 2026-08-01T00:00:00Z). Google Tasks keeps the date part only.", required: false },
+        ],
+    },
+    ToolDef {
+        name: "gtasks_complete",
+        description: "Mark a Google Tasks task as completed (write). Get task ids from gtasks_list.",
+        params: &[
+            ParamDef { name: "task_id", description: "Task ID from gtasks_list", required: true },
+            ParamDef { name: "task_list_id", description: "Task list ID from gtasks_lists, or '@default'", required: false },
+        ],
+    },
+    ToolDef {
+        name: "drive_search",
+        description: "Search the connected Google Drive (read-only). Matches file NAMES and FULL TEXT, skips trashed files, newest first. Returns id/name/mimeType/modified/link for each hit — feed an id to drive_read, docs_read, sheets_read or slides_read.",
+        params: &[
+            ParamDef { name: "query", description: "Free-text search term (matched against file names and contents)", required: true },
+            ParamDef { name: "mime_type", description: "Optional exact MIME filter, e.g. application/vnd.google-apps.document (Docs), application/vnd.google-apps.spreadsheet (Sheets), application/vnd.google-apps.presentation (Slides), application/pdf", required: false },
+            ParamDef { name: "max_results", description: "Max files to return (1-50, default 20)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "drive_read",
+        description: "Read a Drive file as text (read-only). Google Docs/Slides export as plain text and Sheets as CSV (FIRST SHEET only — use sheets_read for a specific tab/range); text-like files are read verbatim. Binary types (images, PDF, zip) return metadata plus a note, never binary content.",
+        params: &[
+            ParamDef { name: "file_id", description: "Drive file ID or any Google share URL", required: true },
+        ],
+    },
+    ToolDef {
+        name: "docs_read",
+        description: "Read a Google Doc's text (read-only): title plus body text in document order, including table cell text. Long documents are truncated.",
+        params: &[
+            ParamDef { name: "document_id", description: "Document ID or full Google Docs URL", required: true },
+        ],
+    },
+    ToolDef {
+        name: "docs_append",
+        description: "Append text to the END of a Google Doc (write). Append-only by design — no tool rewrites or deletes existing content. Newlines start new paragraphs. Operators may gate this via agent.toml [capabilities] approval_required_tools.",
+        params: &[
+            ParamDef { name: "document_id", description: "Document ID or full Google Docs URL", required: true },
+            ParamDef { name: "text", description: "Text to append (newlines create paragraphs)", required: true },
+        ],
+    },
+    ToolDef {
+        name: "slides_read",
+        description: "Read a Google Slides presentation's text slide by slide (read-only): title plus each slide's shape, grouped-shape and table text. There is no Slides write tool — generate real .pptx files with the office document tools instead.",
+        params: &[
+            ParamDef { name: "presentation_id", description: "Presentation ID or full Google Slides URL", required: true },
+        ],
+    },
     // ── Notion native tools ──────────────────────────────────────
     // Consume the user's connected Notion workspace (OAuth vault). Connect via
     // the dashboard Integrations → Notion page first. Notion content is an
@@ -8420,6 +8507,17 @@ const GOOGLE_WORKSPACE_TOOLS: &[&str] = &[
     "calendar_create_event",
     "sheets_read",
     "sheets_append",
+    "forms_get",
+    "forms_list_responses",
+    "gtasks_lists",
+    "gtasks_list",
+    "gtasks_create",
+    "gtasks_complete",
+    "drive_search",
+    "drive_read",
+    "docs_read",
+    "docs_append",
+    "slides_read",
 ];
 
 /// Test helper: tools/list now needs a home_dir (Google Workspace gate). An
@@ -8575,10 +8673,14 @@ pub(crate) async fn handle_tools_call(
             | "decision_resolve"
             | "jitrl_feedback"
             // Google Workspace write tools (draft creation, calendar event,
-            // spreadsheet row append).
+            // spreadsheet row append, Google Tasks create/complete). The
+            // Forms tools are read-only and stay out of this list.
             | "gmail_create_draft"
             | "calendar_create_event"
             | "sheets_append"
+            | "gtasks_create"
+            | "gtasks_complete"
+            | "docs_append"
             // Notion / GitHub write tools (page append, public issue comment).
             | "notion_page_append"
             | "github_issue_comment"
@@ -8863,6 +8965,17 @@ pub(crate) async fn handle_tools_call(
         "calendar_create_event" => handle_calendar_create_event(&arguments, home_dir).await,
         "sheets_read" => handle_sheets_read(&arguments, home_dir).await,
         "sheets_append" => handle_sheets_append(&arguments, home_dir).await,
+        "forms_get" => handle_forms_get(&arguments, home_dir).await,
+        "forms_list_responses" => handle_forms_list_responses(&arguments, home_dir).await,
+        "gtasks_lists" => handle_gtasks_lists(home_dir).await,
+        "gtasks_list" => handle_gtasks_list(&arguments, home_dir).await,
+        "gtasks_create" => handle_gtasks_create(&arguments, home_dir).await,
+        "gtasks_complete" => handle_gtasks_complete(&arguments, home_dir).await,
+        "drive_search" => handle_drive_search(&arguments, home_dir).await,
+        "drive_read" => handle_drive_read(&arguments, home_dir).await,
+        "docs_read" => handle_docs_read(&arguments, home_dir).await,
+        "docs_append" => handle_docs_append(&arguments, home_dir).await,
+        "slides_read" => handle_slides_read(&arguments, home_dir).await,
         "notion_status" => handle_notion_status(home_dir).await,
         "notion_search" => handle_notion_search(&arguments, home_dir).await,
         "notion_page_read" => handle_notion_page_read(&arguments, home_dir).await,
@@ -12338,6 +12451,263 @@ async fn handle_sheets_append(args: &Value, home_dir: &Path) -> Value {
             "Appended 1 row to the sheet.\nUpdated range: {}\nUpdated rows: {}\nUpdated cells: {}",
             r.updated_range, r.updated_rows, r.updated_cells
         )),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Google Forms + Tasks handlers. Neither service has an official Google
+// remote MCP server (probed 404 on 2026-07-30, absent from Google's docs), so
+// DuDuClaw serves them natively off the same connected Google account.
+// ─────────────────────────────────────────────────────────────────
+
+/// Default Google Tasks list alias — the API accepts `@default` in place of an
+/// id, so an agent can create/list tasks without first calling `tasks_lists`.
+const TASKS_DEFAULT_LIST: &str = "@default";
+
+fn task_list_arg(args: &Value) -> &str {
+    args.get("task_list_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(TASKS_DEFAULT_LIST)
+}
+
+async fn handle_forms_get(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let form_id = match args.get("form_id").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return tool_error("Missing required parameter: form_id"),
+    };
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::forms_get(&token, form_id).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_forms_list_responses(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let form_id = match args.get("form_id").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return tool_error("Missing required parameter: form_id"),
+    };
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::forms_list_responses(&token, form_id).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_gtasks_lists(home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::tasks_list_tasklists(&token).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_gtasks_list(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let list_id = task_list_arg(args);
+    let show_completed = args
+        .get("show_completed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let max = arg_u32(args, "max_results", 50);
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::tasks_list(&token, list_id, show_completed, max).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_gtasks_create(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let title = match args.get("title").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return tool_error("Missing required parameter: title"),
+    };
+    let list_id = task_list_arg(args);
+    let notes = args
+        .get("notes")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let due = args
+        .get("due")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // Validate the timestamp locally so a bad format fails fast with guidance
+    // rather than as an opaque Google 400.
+    if let Some(d) = due {
+        if !gw::is_rfc3339(d) {
+            return tool_error(&format!(
+                "Invalid due: '{d}' is not a valid RFC-3339 timestamp (e.g. 2026-08-01T00:00:00Z)"
+            ));
+        }
+    }
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::tasks_create(&token, list_id, title, notes, due).await {
+        Ok(t) => tool_text(&format!(
+            "Task created in the user's Google Tasks.\nTask ID: {}\nTitle: {}\nStatus: {}\nDue: {}",
+            t.id,
+            t.title,
+            t.status,
+            if t.due.is_empty() { "(none)" } else { &t.due }
+        )),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_gtasks_complete(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let task_id = match args.get("task_id").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => return tool_error("Missing required parameter: task_id"),
+    };
+    let list_id = task_list_arg(args);
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::tasks_complete(&token, list_id, task_id).await {
+        Ok(t) => tool_text(&format!(
+            "Task marked completed.\nTask ID: {}\nTitle: {}\nStatus: {}",
+            t.id, t.title, t.status
+        )),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Google Drive / Docs / Slides handlers. Google's official MCP servers for
+// these three are Developer-Preview-only and their terms forbid exposing
+// Pre-GA APIs outside your own domain, so DuDuClaw uses the GA REST APIs
+// natively (2026-07-30 decision) — no preview enrollment for any customer.
+// ─────────────────────────────────────────────────────────────────
+
+async fn handle_drive_search(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let query = match args.get("query").and_then(|v| v.as_str()) {
+        Some(q) if !q.trim().is_empty() => q,
+        _ => return tool_error("Missing required parameter: query"),
+    };
+    let mime_type = args
+        .get("mime_type")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let max = arg_u32(args, "max_results", 20);
+
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::drive_search(&token, query, mime_type, max).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_drive_read(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let file_id = match args.get("file_id").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return tool_error("Missing required parameter: file_id"),
+    };
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::drive_read(&token, file_id).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_docs_read(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let document_id = match args.get("document_id").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return tool_error("Missing required parameter: document_id"),
+    };
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::docs_read(&token, document_id).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_docs_append(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let document_id = match args.get("document_id").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return tool_error("Missing required parameter: document_id"),
+    };
+    let text = match args.get("text").and_then(|v| v.as_str()) {
+        Some(v) if !v.is_empty() => v,
+        _ => return tool_error("Missing required parameter: text"),
+    };
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::docs_append(&token, document_id, text).await {
+        Ok(r) => tool_text(&format!(
+            "Appended to the Google Doc.\nDocument ID: {}\nCharacters appended: {}",
+            r.document_id, r.appended_chars
+        )),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+async fn handle_slides_read(args: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::google_workspace as gw;
+
+    let presentation_id = match args.get("presentation_id").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return tool_error("Missing required parameter: presentation_id"),
+    };
+    let token = match gw::get_valid_google_token(home_dir).await {
+        Ok(t) => t,
+        Err(e) => return tool_error(&e.to_string()),
+    };
+    match gw::slides_read(&token, presentation_id).await {
+        Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
         Err(e) => tool_error(&e.to_string()),
     }
 }

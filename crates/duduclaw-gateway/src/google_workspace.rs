@@ -49,21 +49,67 @@ pub fn integration_enabled(home_dir: &Path) -> bool {
 const GMAIL_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const CALENDAR_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const SHEETS_BASE: &str = "https://sheets.googleapis.com/v4/spreadsheets";
+/// Google Forms API v1. Forms has **no** official remote MCP server (probed
+/// 404 on 2026-07-30 and absent from Google's MCP docs), so it is served here
+/// as native tools.
+const FORMS_BASE: &str = "https://forms.googleapis.com/v1/forms";
+/// Google Tasks API v1 — likewise no official MCP server.
+const TASKS_BASE: &str = "https://tasks.googleapis.com/tasks/v1";
+/// Drive / Docs / Slides v3/v1. Google *does* ship official MCP servers for
+/// these three, but they are Developer-Preview-only and their terms forbid
+/// exposing Pre-GA APIs to users outside your own domain — unusable in a
+/// shipped product. These GA REST APIs carry no such restriction, so the
+/// native tools below are the supported path (2026-07-30 decision).
+const DRIVE_BASE: &str = "https://www.googleapis.com/drive/v3/files";
+const DOCS_BASE: &str = "https://docs.googleapis.com/v1/documents";
+const SLIDES_BASE: &str = "https://slides.googleapis.com/v1/presentations";
 const HTTP_TIMEOUT_SECS: u64 = 30;
 
 /// Max rows returned by `sheets_read` before truncation.
 const SHEETS_MAX_ROWS: usize = 200;
+
+/// Max form responses returned by `forms_list_responses` before truncation.
+const FORMS_MAX_RESPONSES: usize = 50;
+
+/// Max tasks returned by `tasks_list` before truncation.
+const TASKS_MAX_ITEMS: u32 = 100;
+
+/// Max files returned by `drive_search` before truncation.
+const DRIVE_MAX_FILES: u32 = 50;
+
+/// Max characters of extracted document / file text returned to an agent.
+/// Google's own export cap is 10 MB; this is the prompt-budget cap.
+const DOC_TEXT_MAX_CHARS: usize = 20_000;
 
 /// Maximum characters of a mail body returned by `gmail_read` before truncation.
 const BODY_MAX_CHARS: usize = 8000;
 
 /// Scopes this integration needs. Used for `google_status` diagnostics and the
 /// 403 re-auth guidance message.
+///
+/// Covers both the native tools here **and** the token reused by the official
+/// Google Workspace remote MCP mounts (`preset = "google:<svc>"`, bearer
+/// `oauth://google`) — Drive/Docs/Sheets/Slides scopes per Google's
+/// configure-mcp-servers page, Forms/Tasks per their REST references. A token
+/// granted before a scope was added here yields 403 with re-auth guidance
+/// ([`scope_guidance`]) rather than a silent failure.
 pub const REQUIRED_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/spreadsheets",
+    // Drive: read-only (search + export/download). No `drive.file` — no tool
+    // here creates Drive files.
+    "https://www.googleapis.com/auth/drive.readonly",
+    // Docs: full `documents` because `docs_append` writes; Slides stays
+    // read-only (no Slides write tool ships).
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/presentations.readonly",
+    // Forms (read-only: structure + responses) — native tools below.
+    "https://www.googleapis.com/auth/forms.body.readonly",
+    "https://www.googleapis.com/auth/forms.responses.readonly",
+    // Tasks (read/write) — native tools below.
+    "https://www.googleapis.com/auth/tasks",
     "https://www.googleapis.com/auth/userinfo.email",
 ];
 
@@ -239,6 +285,148 @@ pub struct SheetsAppendResult {
     pub updated_cells: u64,
 }
 
+// ── Forms result shapes ─────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct FormQuestion {
+    pub question_id: String,
+    pub title: String,
+    /// `text` / `choice` / `scale` / `date` / `time` / `file_upload` / `rating`
+    /// / `row` / `other`, derived from which `questionItem.question.*` variant
+    /// the API returned.
+    pub kind: String,
+    /// Choice options, when the question is a choice question.
+    pub options: Vec<String>,
+    pub required: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FormResult {
+    pub form_id: String,
+    pub title: String,
+    pub description: String,
+    pub question_count: usize,
+    pub questions: Vec<FormQuestion>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FormResponseEntry {
+    pub response_id: String,
+    pub submitted_at: String,
+    pub respondent_email: String,
+    /// question_id → the answer text(s) joined with `, `.
+    pub answers: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FormResponsesResult {
+    pub form_id: String,
+    pub count: usize,
+    pub truncated: bool,
+    pub responses: Vec<FormResponseEntry>,
+}
+
+// ── Tasks result shapes ─────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct TaskListEntry {
+    pub id: String,
+    pub title: String,
+    pub updated: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskListsResult {
+    pub count: usize,
+    pub lists: Vec<TaskListEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskEntry {
+    pub id: String,
+    pub title: String,
+    pub notes: String,
+    /// `needsAction` or `completed` (the API's own enum values).
+    pub status: String,
+    pub due: String,
+    pub completed: String,
+    /// Parent task id when this is a subtask.
+    pub parent: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TasksResult {
+    pub task_list_id: String,
+    pub count: usize,
+    pub truncated: bool,
+    pub tasks: Vec<TaskEntry>,
+}
+
+// ── Drive / Docs / Slides result shapes ─────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct DriveFileMeta {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub modified_time: String,
+    /// Byte size as reported by Drive; empty for Google-native docs (they have
+    /// no blob size).
+    pub size: String,
+    pub web_view_link: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DriveSearchResult {
+    pub count: usize,
+    pub truncated: bool,
+    pub files: Vec<DriveFileMeta>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DriveReadResult {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    /// The MIME type the file was exported as (Google-native docs), or `None`
+    /// when the bytes were downloaded verbatim.
+    pub exported_as: Option<String>,
+    pub content: String,
+    pub truncated: bool,
+    /// Set when the file could not be rendered as text (binary type).
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocsReadResult {
+    pub document_id: String,
+    pub title: String,
+    pub text: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocsAppendResult {
+    pub document_id: String,
+    pub appended_chars: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SlideText {
+    /// 1-based slide position as presented.
+    pub index: usize,
+    pub object_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SlidesReadResult {
+    pub presentation_id: String,
+    pub title: String,
+    pub slide_count: usize,
+    pub slides: Vec<SlideText>,
+}
+
 // ── Token acquisition ───────────────────────────────────────────────────────
 
 /// Return a valid Google access token, refreshing in place if expired.
@@ -346,6 +534,60 @@ async fn google_request(
         }
 
         // Retry once on transient failures.
+        if (code == 429 || (500..=599).contains(&code)) && attempt < 2 {
+            continue;
+        }
+
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(match code {
+            401 => GoogleApiError::Unauthorized,
+            403 => GoogleApiError::Forbidden(scope_guidance(&body_text)),
+            429 => GoogleApiError::RateLimited,
+            _ => GoogleApiError::Api {
+                status: code,
+                message: duduclaw_core::truncate_chars(&extract_api_message(&body_text), 240),
+            },
+        });
+    }
+}
+
+/// Like [`google_request`] but returns the response body verbatim as text.
+/// Needed by Drive export / `alt=media`, whose bodies are plain text or CSV,
+/// not JSON. Same retry + status classification.
+async fn google_request_text(
+    token: &str,
+    method: reqwest::Method,
+    url: &str,
+    query: &[(&str, String)],
+) -> Result<String, GoogleApiError> {
+    let client = http_client()?;
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut req = client.request(method.clone(), url).bearer_auth(token);
+        if !query.is_empty() {
+            req = req.query(query);
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt < 2 {
+                    continue;
+                }
+                return Err(GoogleApiError::Http(format!("request failed: {e}")));
+            }
+        };
+
+        let code = resp.status().as_u16();
+        if resp.status().is_success() {
+            return resp
+                .text()
+                .await
+                .map_err(|e| GoogleApiError::Http(format!("failed reading body: {e}")));
+        }
+
         if (code == 429 || (500..=599).contains(&code)) && attempt < 2 {
             continue;
         }
@@ -722,10 +964,740 @@ pub async fn sheets_append(
     })
 }
 
+// ── Forms (no official MCP server — native tools) ───────────────────────────
+
+/// Read a form's structure: title, description, and the question list with the
+/// `question_id`s needed to interpret [`forms_list_responses`] answers.
+/// Read-only (`forms.body.readonly`).
+pub async fn forms_get(token: &str, form_id: &str) -> Result<FormResult, GoogleApiError> {
+    let id = extract_form_id(form_id);
+    let url = format!("{FORMS_BASE}/{}", encode_path_component(&id));
+    let resp = google_request(token, reqwest::Method::GET, &url, &[], None).await?;
+
+    let info = resp.get("info").cloned().unwrap_or(Value::Null);
+    let questions: Vec<FormQuestion> = resp
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| items.iter().filter_map(parse_form_item).collect())
+        .unwrap_or_default();
+
+    Ok(FormResult {
+        form_id: resp
+            .get("formId")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string(),
+        title: info
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        description: info
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        question_count: questions.len(),
+        questions,
+    })
+}
+
+/// List a form's submitted responses (read-only, `forms.responses.readonly`).
+/// Capped at [`FORMS_MAX_RESPONSES`]; answers are keyed by `question_id` —
+/// pair with [`forms_get`] to map ids to question titles.
+pub async fn forms_list_responses(
+    token: &str,
+    form_id: &str,
+) -> Result<FormResponsesResult, GoogleApiError> {
+    let id = extract_form_id(form_id);
+    let url = format!("{FORMS_BASE}/{}/responses", encode_path_component(&id));
+    let resp = google_request(
+        token,
+        reqwest::Method::GET,
+        &url,
+        &[("pageSize", FORMS_MAX_RESPONSES.to_string())],
+        None,
+    )
+    .await?;
+
+    let all: Vec<&Value> = resp
+        .get("responses")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    // A nextPageToken means Google has more than one page for us.
+    let truncated = resp.get("nextPageToken").and_then(|v| v.as_str()).is_some();
+    let responses: Vec<FormResponseEntry> = all
+        .into_iter()
+        .take(FORMS_MAX_RESPONSES)
+        .map(parse_form_response)
+        .collect();
+
+    Ok(FormResponsesResult {
+        form_id: id,
+        count: responses.len(),
+        truncated,
+        responses,
+    })
+}
+
+// ── Tasks (no official MCP server — native tools) ───────────────────────────
+
+/// List the user's task lists (each id is the `task_list_id` other task tools
+/// take).
+pub async fn tasks_list_tasklists(token: &str) -> Result<TaskListsResult, GoogleApiError> {
+    let url = format!("{TASKS_BASE}/users/@me/lists");
+    let resp = google_request(
+        token,
+        reqwest::Method::GET,
+        &url,
+        &[("maxResults", "100".to_string())],
+        None,
+    )
+    .await?;
+
+    let lists: Vec<TaskListEntry> = resp
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|l| TaskListEntry {
+                    id: str_field(l, "id"),
+                    title: str_field(l, "title"),
+                    updated: str_field(l, "updated"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(TaskListsResult {
+        count: lists.len(),
+        lists,
+    })
+}
+
+/// List tasks in one task list. `show_completed` includes finished tasks
+/// (Google also requires `showHidden` for tasks hidden by a list clear).
+pub async fn tasks_list(
+    token: &str,
+    task_list_id: &str,
+    show_completed: bool,
+    max_results: u32,
+) -> Result<TasksResult, GoogleApiError> {
+    let n = clamp(max_results, 1, TASKS_MAX_ITEMS);
+    let url = format!(
+        "{TASKS_BASE}/lists/{}/tasks",
+        encode_path_component(task_list_id)
+    );
+    let mut query = vec![
+        ("maxResults", n.to_string()),
+        ("showCompleted", show_completed.to_string()),
+    ];
+    if show_completed {
+        // Completed-and-hidden tasks stay invisible without this.
+        query.push(("showHidden", "true".to_string()));
+    }
+    let resp = google_request(token, reqwest::Method::GET, &url, &query, None).await?;
+
+    let tasks: Vec<TaskEntry> = resp
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(parse_task).collect())
+        .unwrap_or_default();
+    let truncated = resp.get("nextPageToken").and_then(|v| v.as_str()).is_some();
+
+    Ok(TasksResult {
+        task_list_id: task_list_id.to_string(),
+        count: tasks.len(),
+        truncated,
+        tasks,
+    })
+}
+
+/// Create a task in one task list (write). `due` is an RFC-3339 timestamp —
+/// Google Tasks stores only the date part.
+pub async fn tasks_create(
+    token: &str,
+    task_list_id: &str,
+    title: &str,
+    notes: Option<&str>,
+    due: Option<&str>,
+) -> Result<TaskEntry, GoogleApiError> {
+    let url = format!(
+        "{TASKS_BASE}/lists/{}/tasks",
+        encode_path_component(task_list_id)
+    );
+    let mut body = serde_json::Map::new();
+    body.insert("title".into(), json!(title));
+    if let Some(n) = notes.filter(|s| !s.trim().is_empty()) {
+        body.insert("notes".into(), json!(n));
+    }
+    if let Some(d) = due.filter(|s| !s.trim().is_empty()) {
+        body.insert("due".into(), json!(d));
+    }
+    let resp = google_request(
+        token,
+        reqwest::Method::POST,
+        &url,
+        &[],
+        Some(&Value::Object(body)),
+    )
+    .await?;
+    Ok(parse_task(&resp))
+}
+
+/// Mark a task completed (write) — `status: "completed"` via PATCH.
+pub async fn tasks_complete(
+    token: &str,
+    task_list_id: &str,
+    task_id: &str,
+) -> Result<TaskEntry, GoogleApiError> {
+    let url = format!(
+        "{TASKS_BASE}/lists/{}/tasks/{}",
+        encode_path_component(task_list_id),
+        encode_path_component(task_id)
+    );
+    let body = json!({ "status": "completed" });
+    let resp = google_request(token, reqwest::Method::PATCH, &url, &[], Some(&body)).await?;
+    Ok(parse_task(&resp))
+}
+
+// ── Drive / Docs / Slides (GA REST — no preview gate) ───────────────────────
+
+/// Search the user's Drive by free text. Matches file names **and** full text,
+/// excludes trashed files, newest first. Read-only (`drive.readonly`).
+pub async fn drive_search(
+    token: &str,
+    query: &str,
+    mime_type: Option<&str>,
+    max_results: u32,
+) -> Result<DriveSearchResult, GoogleApiError> {
+    let n = clamp(max_results, 1, DRIVE_MAX_FILES);
+    let mut q = format!(
+        "trashed = false and (name contains '{}' or fullText contains '{}')",
+        escape_drive_query_value(query),
+        escape_drive_query_value(query)
+    );
+    if let Some(m) = mime_type.filter(|s| !s.trim().is_empty()) {
+        q.push_str(&format!(
+            " and mimeType = '{}'",
+            escape_drive_query_value(m)
+        ));
+    }
+
+    let resp = google_request(
+        token,
+        reqwest::Method::GET,
+        DRIVE_BASE,
+        &[
+            ("q", q),
+            ("pageSize", n.to_string()),
+            ("orderBy", "modifiedTime desc".to_string()),
+            (
+                "fields",
+                "nextPageToken,files(id,name,mimeType,modifiedTime,size,webViewLink)".to_string(),
+            ),
+            // Shared-drive items are invisible without both flags.
+            ("includeItemsFromAllDrives", "true".to_string()),
+            ("supportsAllDrives", "true".to_string()),
+        ],
+        None,
+    )
+    .await?;
+
+    let files: Vec<DriveFileMeta> = resp
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|f| DriveFileMeta {
+                    id: str_field(f, "id"),
+                    name: str_field(f, "name"),
+                    mime_type: str_field(f, "mimeType"),
+                    modified_time: str_field(f, "modifiedTime"),
+                    size: str_field(f, "size"),
+                    web_view_link: str_field(f, "webViewLink"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(DriveSearchResult {
+        count: files.len(),
+        truncated: resp.get("nextPageToken").and_then(|v| v.as_str()).is_some(),
+        files,
+    })
+}
+
+/// Read a Drive file as text. Google-native documents are **exported**
+/// (Docs → `text/plain`, Sheets → `text/csv` first sheet only, Slides →
+/// `text/plain`); text-ish blobs are downloaded verbatim; anything else
+/// returns metadata plus a note instead of binary garbage.
+pub async fn drive_read(token: &str, file_id: &str) -> Result<DriveReadResult, GoogleApiError> {
+    let id = extract_drive_file_id(file_id);
+    // Metadata first: the MIME type decides export vs download.
+    let meta = google_request(
+        token,
+        reqwest::Method::GET,
+        &format!("{DRIVE_BASE}/{}", encode_path_component(&id)),
+        &[
+            ("fields", "id,name,mimeType".to_string()),
+            ("supportsAllDrives", "true".to_string()),
+        ],
+        None,
+    )
+    .await?;
+    let name = str_field(&meta, "name");
+    let mime = str_field(&meta, "mimeType");
+
+    // Google-native → export; text-ish blob → download; else refuse politely.
+    let (url, query, exported_as) = match export_mime_for(&mime) {
+        Some(export_mime) => (
+            format!("{DRIVE_BASE}/{}/export", encode_path_component(&id)),
+            vec![("mimeType", export_mime.to_string())],
+            Some(export_mime.to_string()),
+        ),
+        None if is_text_like_mime(&mime) => (
+            format!("{DRIVE_BASE}/{}", encode_path_component(&id)),
+            vec![
+                ("alt", "media".to_string()),
+                ("supportsAllDrives", "true".to_string()),
+            ],
+            None,
+        ),
+        None => {
+            return Ok(DriveReadResult {
+                id,
+                name,
+                mime_type: mime.clone(),
+                exported_as: None,
+                content: String::new(),
+                truncated: false,
+                note: Some(format!(
+                    "This file type ({mime}) is not text — DuDuClaw does not download binary \
+                     content. Open it via web_view_link, or ask for a Google Docs/Sheets/Slides \
+                     file instead."
+                )),
+            });
+        }
+    };
+
+    let raw = google_request_text(token, reqwest::Method::GET, &url, &query).await?;
+    let (content, truncated) = truncate_text(&raw, DOC_TEXT_MAX_CHARS);
+    let note = (exported_as.as_deref() == Some("text/csv"))
+        .then(|| "Sheets export covers the FIRST sheet only — use sheets_read for a specific range or tab.".to_string());
+
+    Ok(DriveReadResult {
+        id,
+        name,
+        mime_type: mime,
+        exported_as,
+        content,
+        truncated,
+        note,
+    })
+}
+
+/// Read a Google Doc's text (paragraphs plus table cell text, in document
+/// order). Read path of the `documents` scope.
+pub async fn docs_read(token: &str, document_id: &str) -> Result<DocsReadResult, GoogleApiError> {
+    let id = extract_drive_file_id(document_id);
+    let resp = google_request(
+        token,
+        reqwest::Method::GET,
+        &format!("{DOCS_BASE}/{}", encode_path_component(&id)),
+        &[],
+        None,
+    )
+    .await?;
+
+    let mut text = String::new();
+    collect_doc_text(
+        resp.get("body").and_then(|b| b.get("content")).unwrap_or(&Value::Null),
+        &mut text,
+    );
+    let (text, truncated) = truncate_text(&text, DOC_TEXT_MAX_CHARS);
+
+    Ok(DocsReadResult {
+        document_id: str_field(&resp, "documentId"),
+        title: str_field(&resp, "title"),
+        text,
+        truncated,
+    })
+}
+
+/// Append text to the end of a Google Doc's body (write). Deliberately
+/// append-only: no tool rewrites or deletes existing document content, so a
+/// mistaken call can never destroy the user's text.
+pub async fn docs_append(
+    token: &str,
+    document_id: &str,
+    text: &str,
+) -> Result<DocsAppendResult, GoogleApiError> {
+    let id = extract_drive_file_id(document_id);
+    let body = json!({
+        "requests": [{
+            "insertText": {
+                "text": text,
+                // Empty EndOfSegmentLocation = end of the document body.
+                "endOfSegmentLocation": {}
+            }
+        }]
+    });
+    google_request(
+        token,
+        reqwest::Method::POST,
+        &format!("{DOCS_BASE}/{}:batchUpdate", encode_path_component(&id)),
+        &[],
+        Some(&body),
+    )
+    .await?;
+
+    Ok(DocsAppendResult {
+        document_id: id,
+        appended_chars: text.chars().count(),
+    })
+}
+
+/// Read a Google Slides presentation's text, slide by slide (read-only).
+pub async fn slides_read(
+    token: &str,
+    presentation_id: &str,
+) -> Result<SlidesReadResult, GoogleApiError> {
+    let id = extract_drive_file_id(presentation_id);
+    let resp = google_request(
+        token,
+        reqwest::Method::GET,
+        &format!("{SLIDES_BASE}/{}", encode_path_component(&id)),
+        &[],
+        None,
+    )
+    .await?;
+
+    let slides: Vec<SlideText> = resp
+        .get("slides")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let mut text = String::new();
+                    collect_slide_text(s.get("pageElements").unwrap_or(&Value::Null), &mut text);
+                    SlideText {
+                        index: i + 1,
+                        object_id: str_field(s, "objectId"),
+                        text: truncate_text(&text, DOC_TEXT_MAX_CHARS).0,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(SlidesReadResult {
+        presentation_id: str_field(&resp, "presentationId"),
+        title: str_field(&resp, "title"),
+        slide_count: slides.len(),
+        slides,
+    })
+}
+
 // ── Pure helpers (unit-tested) ──────────────────────────────────────────────
 
 fn clamp(n: u32, lo: u32, hi: u32) -> u32 {
     n.max(lo).min(hi)
+}
+
+/// Truncate to a character budget, reporting whether anything was dropped.
+/// Character-based (never byte slicing) so CJK text can't be cut mid-codepoint.
+fn truncate_text(s: &str, max_chars: usize) -> (String, bool) {
+    if s.chars().count() <= max_chars {
+        return (s.to_string(), false);
+    }
+    (s.chars().take(max_chars).collect(), true)
+}
+
+/// Escape a value interpolated into a Drive `q` search string. Drive's query
+/// grammar delimits string literals with `'`, escaping `\` and `'` with a
+/// backslash — without this a name containing a quote would break out of the
+/// literal and change the query's meaning.
+fn escape_drive_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            // Control characters have no place in a query literal.
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Export MIME type for a Google-native document, or `None` for blobs.
+/// Mapping per Google's export-formats reference: Docs/Slides → `text/plain`,
+/// Sheets → `text/csv` (first sheet only).
+fn export_mime_for(mime: &str) -> Option<&'static str> {
+    match mime {
+        "application/vnd.google-apps.document" => Some("text/plain"),
+        "application/vnd.google-apps.spreadsheet" => Some("text/csv"),
+        "application/vnd.google-apps.presentation" => Some("text/plain"),
+        _ => None,
+    }
+}
+
+/// Whether a blob MIME type is safe to render as text in a tool result.
+fn is_text_like_mime(mime: &str) -> bool {
+    let base = mime.split(';').next().unwrap_or(mime).trim();
+    base.starts_with("text/")
+        || matches!(
+            base,
+            "application/json"
+                | "application/xml"
+                | "application/x-yaml"
+                | "application/yaml"
+                | "application/x-ndjson"
+                | "application/toml"
+        )
+}
+
+/// Extract a Drive/Docs/Slides file id from a share URL, or pass a bare id
+/// through. Handles `/d/<ID>/edit`, `/d/e/<ID>/…` and `?id=<ID>` shapes.
+pub fn extract_drive_file_id(input: &str) -> String {
+    let s = input.trim();
+    if let Some(after) = s.split("/d/").nth(1) {
+        let after = after.strip_prefix("e/").unwrap_or(after);
+        let id: String = after
+            .chars()
+            .take_while(|c| *c != '/' && *c != '#' && *c != '?')
+            .collect();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    // Legacy `open?id=<ID>` / `uc?id=<ID>` links.
+    if let Some(after) = s.split("id=").nth(1) {
+        let id: String = after
+            .chars()
+            .take_while(|c| *c != '&' && *c != '#')
+            .collect();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    s.to_string()
+}
+
+/// Walk a Docs `body.content[]` array, appending paragraph text in order.
+/// Recurses into table cells so tabular content is not silently dropped.
+fn collect_doc_text(content: &Value, out: &mut String) {
+    let Some(arr) = content.as_array() else { return };
+    for el in arr {
+        if let Some(paragraph) = el.get("paragraph") {
+            if let Some(elements) = paragraph.get("elements").and_then(|v| v.as_array()) {
+                for e in elements {
+                    if let Some(t) = e
+                        .get("textRun")
+                        .and_then(|t| t.get("content"))
+                        .and_then(|v| v.as_str())
+                    {
+                        out.push_str(t);
+                    }
+                }
+            }
+        } else if let Some(table) = el.get("table") {
+            for row in table
+                .get("tableRows")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                for cell in row
+                    .get("tableCells")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    collect_doc_text(cell.get("content").unwrap_or(&Value::Null), out);
+                }
+            }
+        }
+        // sectionBreak / tableOfContents carry no author text of their own.
+    }
+}
+
+/// Walk a Slides `pageElements[]` array, appending shape/table text. Recurses
+/// into groups (`elementGroup.children`) so grouped shapes are included.
+fn collect_slide_text(page_elements: &Value, out: &mut String) {
+    let Some(arr) = page_elements.as_array() else { return };
+    for el in arr {
+        if let Some(text) = el.get("shape").and_then(|s| s.get("text")) {
+            append_slide_text_elements(text, out);
+        }
+        if let Some(table) = el.get("table") {
+            for row in table
+                .get("tableRows")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                for cell in row
+                    .get("tableCells")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(text) = cell.get("text") {
+                        append_slide_text_elements(text, out);
+                    }
+                }
+            }
+        }
+        if let Some(children) = el.get("elementGroup").and_then(|g| g.get("children")) {
+            collect_slide_text(children, out);
+        }
+    }
+}
+
+/// Append a Slides `text.textElements[]` run sequence. `paragraphMarker`
+/// entries carry no `textRun` and are skipped.
+fn append_slide_text_elements(text: &Value, out: &mut String) {
+    let Some(elements) = text.get("textElements").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for e in elements {
+        if let Some(t) = e
+            .get("textRun")
+            .and_then(|r| r.get("content"))
+            .and_then(|v| v.as_str())
+        {
+            out.push_str(t);
+        }
+    }
+}
+
+/// Read a string field, defaulting to empty.
+fn str_field(v: &Value, key: &str) -> String {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+/// Extract a form id from a full Google Forms URL, or pass a bare id through.
+/// Handles both the editor (`/forms/d/<ID>/edit`) and the viewer
+/// (`/forms/d/e/<LONG_ID>/viewform`) shapes.
+pub fn extract_form_id(input: &str) -> String {
+    let s = input.trim();
+    if let Some(after) = s.split("/d/").nth(1) {
+        // The viewer form embeds the published id under an extra `e/` segment.
+        let after = after.strip_prefix("e/").unwrap_or(after);
+        let id: String = after
+            .chars()
+            .take_while(|c| *c != '/' && *c != '#' && *c != '?')
+            .collect();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    s.to_string()
+}
+
+/// Map one `items[]` entry from `forms.get` to a [`FormQuestion`]. Non-question
+/// items (page breaks, images, text blocks) return `None`.
+fn parse_form_item(item: &Value) -> Option<FormQuestion> {
+    let question = item.get("questionItem")?.get("question")?;
+    let (kind, options) = if let Some(choice) = question.get("choiceQuestion") {
+        let opts = choice
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|o| {
+                        // An "Other" option has no `value`, only `isOther`.
+                        o.get("value")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "(other)".to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ("choice", opts)
+    } else if question.get("textQuestion").is_some() {
+        ("text", Vec::new())
+    } else if question.get("scaleQuestion").is_some() {
+        ("scale", Vec::new())
+    } else if question.get("dateQuestion").is_some() {
+        ("date", Vec::new())
+    } else if question.get("timeQuestion").is_some() {
+        ("time", Vec::new())
+    } else if question.get("fileUploadQuestion").is_some() {
+        ("file_upload", Vec::new())
+    } else if question.get("ratingQuestion").is_some() {
+        ("rating", Vec::new())
+    } else if question.get("rowQuestion").is_some() {
+        ("row", Vec::new())
+    } else {
+        ("other", Vec::new())
+    };
+
+    Some(FormQuestion {
+        question_id: str_field(question, "questionId"),
+        title: str_field(item, "title"),
+        kind: kind.to_string(),
+        options,
+        required: question
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+/// Flatten one `responses[]` entry: `answers` is a map of question_id →
+/// `textAnswers.answers[].value`, joined for multi-select questions.
+fn parse_form_response(resp: &Value) -> FormResponseEntry {
+    let mut answers = std::collections::BTreeMap::new();
+    if let Some(map) = resp.get("answers").and_then(|v| v.as_object()) {
+        for (qid, ans) in map {
+            let joined = ans
+                .get("textAnswers")
+                .and_then(|t| t.get("answers"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.get("value").and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            answers.insert(qid.clone(), joined);
+        }
+    }
+    FormResponseEntry {
+        response_id: str_field(resp, "responseId"),
+        // `lastSubmittedTime` is the edit-aware timestamp; fall back to create.
+        submitted_at: {
+            let last = str_field(resp, "lastSubmittedTime");
+            if last.is_empty() {
+                str_field(resp, "createTime")
+            } else {
+                last
+            }
+        },
+        respondent_email: str_field(resp, "respondentEmail"),
+        answers,
+    }
+}
+
+/// Map one Tasks API task object to a [`TaskEntry`].
+fn parse_task(t: &Value) -> TaskEntry {
+    TaskEntry {
+        id: str_field(t, "id"),
+        title: str_field(t, "title"),
+        notes: str_field(t, "notes"),
+        status: str_field(t, "status"),
+        due: str_field(t, "due"),
+        completed: str_field(t, "completed"),
+        parent: str_field(t, "parent"),
+    }
 }
 
 /// Extract a spreadsheet id from a full Google Sheets URL, or pass a bare id
@@ -1243,6 +2215,264 @@ mod tests {
     #[test]
     fn required_scopes_include_sheets() {
         assert!(REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/spreadsheets"));
+    }
+
+    #[test]
+    fn required_scopes_cover_all_eight_services() {
+        // All eight Workspace services are served by NATIVE tools off this one
+        // connection (no Developer-Preview MCP mounts required), so every
+        // service must have its scope granted here. Scope strings verified
+        // against each API's REST reference.
+        for s in [
+            // Gmail, Calendar, Sheets
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/calendar.events",
+            "https://www.googleapis.com/auth/spreadsheets",
+            // Drive, Docs, Slides
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/documents",
+            "https://www.googleapis.com/auth/presentations.readonly",
+            // Forms, Tasks
+            "https://www.googleapis.com/auth/forms.body.readonly",
+            "https://www.googleapis.com/auth/forms.responses.readonly",
+            "https://www.googleapis.com/auth/tasks",
+        ] {
+            assert!(REQUIRED_SCOPES.contains(&s), "missing scope: {s}");
+        }
+    }
+
+    // ── Forms helpers ──
+
+    #[test]
+    fn extract_form_id_handles_urls_and_bare_ids() {
+        assert_eq!(
+            extract_form_id("https://docs.google.com/forms/d/1AbC_dEf/edit#responses"),
+            "1AbC_dEf"
+        );
+        // The viewer URL nests the published id under an extra `e/` segment.
+        assert_eq!(
+            extract_form_id("https://docs.google.com/forms/d/e/1FAIpQLSxyz/viewform?usp=sf_link"),
+            "1FAIpQLSxyz"
+        );
+        assert_eq!(extract_form_id("  1BareId  "), "1BareId");
+    }
+
+    #[test]
+    fn parse_form_item_classifies_question_kinds() {
+        let choice = json!({
+            "itemId": "i1", "title": "方案",
+            "questionItem": { "question": {
+                "questionId": "q1", "required": true,
+                "choiceQuestion": { "type": "RADIO", "options": [
+                    {"value": "A"}, {"value": "B"}, {"isOther": true}
+                ]}
+            }}
+        });
+        let q = parse_form_item(&choice).expect("choice question");
+        assert_eq!(q.question_id, "q1");
+        assert_eq!(q.title, "方案");
+        assert_eq!(q.kind, "choice");
+        assert_eq!(q.options, vec!["A", "B", "(other)"]);
+        assert!(q.required);
+
+        let text = json!({
+            "itemId": "i2", "title": "備註",
+            "questionItem": { "question": { "questionId": "q2", "textQuestion": {"paragraph": true} } }
+        });
+        assert_eq!(parse_form_item(&text).unwrap().kind, "text");
+
+        let scale = json!({
+            "questionItem": { "question": { "questionId": "q3", "scaleQuestion": {"low": 1, "high": 5} } }
+        });
+        assert_eq!(parse_form_item(&scale).unwrap().kind, "scale");
+
+        // Non-question items (page break, image, text block) are skipped.
+        assert!(parse_form_item(&json!({"itemId": "i9", "pageBreakItem": {}})).is_none());
+    }
+
+    #[test]
+    fn parse_form_response_flattens_answers() {
+        let r = json!({
+            "responseId": "r1",
+            "createTime": "2026-07-01T00:00:00Z",
+            "lastSubmittedTime": "2026-07-02T00:00:00Z",
+            "respondentEmail": "a@b.c",
+            "answers": {
+                "q1": { "textAnswers": { "answers": [{"value": "A"}, {"value": "B"}] } },
+                "q2": { "textAnswers": { "answers": [{"value": "只有一個"}] } }
+            }
+        });
+        let e = parse_form_response(&r);
+        assert_eq!(e.response_id, "r1");
+        // lastSubmittedTime wins over createTime (edit-aware).
+        assert_eq!(e.submitted_at, "2026-07-02T00:00:00Z");
+        assert_eq!(e.answers.get("q1").unwrap(), "A, B");
+        assert_eq!(e.answers.get("q2").unwrap(), "只有一個");
+
+        // Missing lastSubmittedTime falls back to createTime.
+        let r2 = json!({"responseId": "r2", "createTime": "2026-07-01T00:00:00Z"});
+        assert_eq!(parse_form_response(&r2).submitted_at, "2026-07-01T00:00:00Z");
+    }
+
+    // ── Tasks helpers ──
+
+    #[test]
+    fn parse_task_maps_api_fields() {
+        let t = json!({
+            "id": "t1", "title": "回覆客戶", "notes": "先看報價",
+            "status": "needsAction", "due": "2026-08-01T00:00:00.000Z",
+            "parent": "t0"
+        });
+        let e = parse_task(&t);
+        assert_eq!(e.id, "t1");
+        assert_eq!(e.title, "回覆客戶");
+        assert_eq!(e.status, "needsAction");
+        assert_eq!(e.due, "2026-08-01T00:00:00.000Z");
+        assert_eq!(e.parent, "t0");
+        // Absent fields render as empty strings, never null/panic.
+        assert_eq!(e.completed, "");
+    }
+
+    #[test]
+    fn tasks_max_items_clamped() {
+        assert_eq!(clamp(999, 1, TASKS_MAX_ITEMS), TASKS_MAX_ITEMS);
+        assert_eq!(clamp(0, 1, TASKS_MAX_ITEMS), 1);
+    }
+
+    // ── Drive / Docs / Slides helpers ──
+
+    #[test]
+    fn drive_query_escaping_prevents_literal_breakout() {
+        // A quote in the search term must stay inside the string literal —
+        // otherwise the user's text could alter the query's meaning.
+        assert_eq!(escape_drive_query_value("O'Brien"), "O\\'Brien");
+        assert_eq!(escape_drive_query_value(r"back\slash"), r"back\\slash");
+        // Control characters are neutralized.
+        assert_eq!(escape_drive_query_value("a\nb"), "a b");
+        // CJK passes through untouched.
+        assert_eq!(escape_drive_query_value("報價單"), "報價單");
+    }
+
+    #[test]
+    fn export_mime_mapping_matches_google_reference() {
+        assert_eq!(
+            export_mime_for("application/vnd.google-apps.document"),
+            Some("text/plain")
+        );
+        assert_eq!(
+            export_mime_for("application/vnd.google-apps.spreadsheet"),
+            Some("text/csv")
+        );
+        assert_eq!(
+            export_mime_for("application/vnd.google-apps.presentation"),
+            Some("text/plain")
+        );
+        // Blobs are not exportable — they take the download path.
+        assert_eq!(export_mime_for("application/pdf"), None);
+        assert_eq!(export_mime_for("text/plain"), None);
+    }
+
+    #[test]
+    fn text_like_mime_detection() {
+        assert!(is_text_like_mime("text/plain"));
+        assert!(is_text_like_mime("text/csv; charset=utf-8"));
+        assert!(is_text_like_mime("application/json"));
+        assert!(!is_text_like_mime("application/pdf"));
+        assert!(!is_text_like_mime("image/png"));
+        assert!(!is_text_like_mime("application/vnd.google-apps.document"));
+    }
+
+    #[test]
+    fn extract_drive_file_id_handles_all_link_shapes() {
+        assert_eq!(
+            extract_drive_file_id("https://docs.google.com/document/d/1DocId/edit#heading=h.x"),
+            "1DocId"
+        );
+        assert_eq!(
+            extract_drive_file_id("https://docs.google.com/presentation/d/1DeckId/edit?usp=sharing"),
+            "1DeckId"
+        );
+        assert_eq!(
+            extract_drive_file_id("https://drive.google.com/file/d/1FileId/view"),
+            "1FileId"
+        );
+        // Legacy id= query links.
+        assert_eq!(
+            extract_drive_file_id("https://drive.google.com/open?id=1LegacyId&authuser=0"),
+            "1LegacyId"
+        );
+        assert_eq!(extract_drive_file_id("  1BareId "), "1BareId");
+    }
+
+    #[test]
+    fn doc_text_extraction_includes_tables_in_order() {
+        let content = json!([
+            { "paragraph": { "elements": [
+                { "textRun": { "content": "第一段\n" } },
+                { "textRun": { "content": "續行\n" } }
+            ]}},
+            { "table": { "tableRows": [
+                { "tableCells": [
+                    { "content": [ { "paragraph": { "elements": [ { "textRun": { "content": "格A\n" } } ] } } ] },
+                    { "content": [ { "paragraph": { "elements": [ { "textRun": { "content": "格B\n" } } ] } } ] }
+                ]}
+            ]}},
+            { "sectionBreak": {} },
+            { "paragraph": { "elements": [ { "textRun": { "content": "結尾\n" } } ] } }
+        ]);
+        let mut out = String::new();
+        collect_doc_text(&content, &mut out);
+        assert_eq!(out, "第一段\n續行\n格A\n格B\n結尾\n");
+    }
+
+    #[test]
+    fn slide_text_extraction_covers_shapes_groups_and_tables() {
+        let page_elements = json!([
+            { "shape": { "text": { "textElements": [
+                { "paragraphMarker": {} },
+                { "textRun": { "content": "標題\n" } }
+            ]}}},
+            { "elementGroup": { "children": [
+                { "shape": { "text": { "textElements": [ { "textRun": { "content": "群組內文\n" } } ] } } }
+            ]}},
+            { "table": { "tableRows": [
+                { "tableCells": [
+                    { "text": { "textElements": [ { "textRun": { "content": "表格\n" } } ] } }
+                ]}
+            ]}},
+            // An image has no text and must not break extraction.
+            { "image": { "contentUrl": "https://example.com/x.png" } }
+        ]);
+        let mut out = String::new();
+        collect_slide_text(&page_elements, &mut out);
+        assert_eq!(out, "標題\n群組內文\n表格\n");
+    }
+
+    #[test]
+    fn truncate_text_is_cjk_safe_and_flags_truncation() {
+        let (s, t) = truncate_text("短", 10);
+        assert_eq!(s, "短");
+        assert!(!t);
+        let long = "字".repeat(30);
+        let (s, t) = truncate_text(&long, 10);
+        assert_eq!(s.chars().count(), 10);
+        assert!(t);
+        // Boundary: exactly the budget is not truncation.
+        let (_, t) = truncate_text(&"a".repeat(10), 10);
+        assert!(!t);
+    }
+
+    #[test]
+    fn required_scopes_least_privilege_for_drive_and_slides() {
+        // Drive stays read-only (no tool creates Drive files) and Slides
+        // read-only (no Slides write tool); Docs needs full `documents`
+        // because docs_append writes.
+        assert!(REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/drive.readonly"));
+        assert!(!REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/drive.file"));
+        assert!(!REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/drive"));
+        assert!(REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/presentations.readonly"));
+        assert!(!REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/presentations"));
+        assert!(REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/documents"));
     }
 
     #[test]

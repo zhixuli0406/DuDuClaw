@@ -402,6 +402,60 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "google:read",
         "google",
     ),
+    // Forms + Google Tasks reads. Google ships no MCP server for either
+    // service, so DuDuClaw serves them natively. `gtasks_*` is Google Tasks —
+    // distinct from the internal task board's `tasks_*` tools.
+    (
+        "forms_get",
+        "Read a Google Form's questions",
+        "google:read",
+        "google",
+    ),
+    (
+        "forms_list_responses",
+        "List a Google Form's responses",
+        "google:read",
+        "google",
+    ),
+    (
+        "gtasks_lists",
+        "List Google Tasks task lists",
+        "google:read",
+        "google",
+    ),
+    (
+        "gtasks_list",
+        "List tasks in a Google Tasks list",
+        "google:read",
+        "google",
+    ),
+    // Drive / Docs / Slides reads. Google's official MCP servers for these are
+    // Developer-Preview-only (terms forbid Pre-GA use outside your domain), so
+    // DuDuClaw ships native GA-API tools instead.
+    (
+        "drive_search",
+        "Search Google Drive by name/content",
+        "google:read",
+        "google",
+    ),
+    (
+        "drive_read",
+        "Read a Drive file as text",
+        "google:read",
+        "google",
+    ),
+    (
+        "docs_read",
+        "Read a Google Doc's text",
+        "google:read",
+        "google",
+    ),
+    (
+        "slides_read",
+        "Read a Google Slides deck's text",
+        "google:read",
+        "google",
+    ),
     // ── Google Workspace: write (google:write) ───────────────────────────
     (
         "gmail_create_draft",
@@ -418,6 +472,24 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     (
         "sheets_append",
         "Append a spreadsheet row",
+        "google:write",
+        "google",
+    ),
+    (
+        "gtasks_create",
+        "Create a Google Tasks task",
+        "google:write",
+        "google",
+    ),
+    (
+        "gtasks_complete",
+        "Mark a Google Tasks task complete",
+        "google:write",
+        "google",
+    ),
+    (
+        "docs_append",
+        "Append text to a Google Doc",
         "google:write",
         "google",
     ),

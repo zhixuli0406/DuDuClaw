@@ -556,14 +556,20 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // Google Workspace native tools. Read class: connection diagnostics,
         // mail search/read, calendar listing, spreadsheet read — no external
         // side-effects.
+        // Forms (structure + responses) and Google Tasks listing are read-only
+        // too. `gtasks_*` is Google Tasks — distinct from DuDuClaw's own
+        // `tasks_*` task-board tools.
         "google_status" | "gmail_search" | "gmail_read" | "calendar_list_events"
-        | "sheets_read" => Some(Scope::GoogleRead),
-        // Write class: draft creation (never sends) + real calendar-event
-        // creation + spreadsheet row append. Defence-in-depth beyond any
-        // per-agent approval_required_tools gate the operator adds.
-        "gmail_create_draft" | "calendar_create_event" | "sheets_append" => {
-            Some(Scope::GoogleWrite)
+        | "sheets_read" | "forms_get" | "forms_list_responses" | "gtasks_lists"
+        | "gtasks_list" | "drive_search" | "drive_read" | "docs_read" | "slides_read" => {
+            Some(Scope::GoogleRead)
         }
+        // Write class: draft creation (never sends) + real calendar-event
+        // creation + spreadsheet row append + Google Tasks create/complete.
+        // Defence-in-depth beyond any per-agent approval_required_tools gate
+        // the operator adds.
+        "gmail_create_draft" | "calendar_create_event" | "sheets_append" | "gtasks_create"
+        | "gtasks_complete" | "docs_append" => Some(Scope::GoogleWrite),
         // Notion native tools. Read class: connection diagnostics, search, and
         // page read. Write class: append paragraph blocks to an existing page.
         "notion_status" | "notion_search" | "notion_page_read" => Some(Scope::NotionRead),
