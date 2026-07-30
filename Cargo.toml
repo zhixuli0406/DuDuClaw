@@ -30,6 +30,7 @@ members = [
     "crates/duduclaw-sandbox",
     "crates/duduclaw-os",
     "crates/duduclaw-pets",
+    "crates/duduclaw-docuseal-mcp",
 ]
 
 [workspace.package]

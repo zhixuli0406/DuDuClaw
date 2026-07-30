@@ -1,0 +1,23 @@
+[package]
+name = "duduclaw-docuseal-mcp"
+version.workspace = true
+edition.workspace = true
+
+# MCP stdio server wrapping the DocuSeal REST API (cloud + self-hosted).
+#
+# DocuSeal's own built-in MCP endpoint (Settings → MCP Server) is self-hosted
+# only and exposes 5 tools; this wrapper covers the cloud API (X-Auth-Token)
+# and the workflow gaps: submission archive, submitter re-send / prefill
+# update, signed-document URLs, one-off status polling. Mount it from
+# `agent.toml [[mcp.external]]` or any MCP-capable client.
+
+[dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[[bin]]
+name = "duduclaw-docuseal-mcp"
+path = "src/main.rs"
