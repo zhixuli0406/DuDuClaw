@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Dashboard 更新後 gateway 卡成殭屍行程**（2026-08-03 客戶實測）：套用更新後的
+  優雅關機會等**所有連線**結束才重啟，但 dashboard WebSocket／SSE 是永不主動關閉
+  的長連線，於是行程停在「port 已關、PID 還活著、永遠等不到 re-exec」。修法：
+  flush 完成後啟動 10 秒 drain watchdog，逾時強制收尾讓重啟繼續；prediction flush
+  （20s）／metacognition 持久化（10s）／worker supervisor 關閉（15s）各自加上時限，
+  任何一步卡住都不再擋整條關機鏈。活體驗證：掛一條永不完成的請求送 SIGINT，修前
+  永久卡死、修後 10 秒退出；無卡死連線時 1 秒正常退出、watchdog 不觸發。同修
+  一般 Ctrl+C 與 auto-update 重啟路徑（同一條關機鏈）。**已知成本**：只要還有
+  dashboard 分頁／WebSocket／SSE 連線開著，關機與自動更新重啟就會固定等滿 10 秒
+  drain 上限才收尾——這是刻意的取捨，換掉原本「永遠等不到」的卡死。後續優化：
+  關機時先廣播主動 close 給長連線，讓它們自己收線、不必等滿逾時。
+- **桌面版重開後「偵測到 gateway」但實際連不上**：sidecar spawn 後立即自稱
+  Running（不等 port 可連）、重開時會 attach 到前一個實例垂死中的 gateway、狀態
+  卡死後「連線」按鈕永遠無法自救。修法：新增 Starting 狀態（port 實測可連才轉
+  Running）、`start()` 對 Running 做活性複驗並重新規劃、殺孤兒行程後等它真的退出、
+  世代計數防止被淘汰子行程的事件亂入；另修 `stop()` 後自動重啟被永久停用的潛伏 bug。
+
 ## [1.49.0] - 2026-08-03 — 對話截斷與續聊修復＋chat 內切換模型
 
 ### Fixed

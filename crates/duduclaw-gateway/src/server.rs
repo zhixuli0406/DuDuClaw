@@ -1703,7 +1703,25 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let pe_for_shutdown = prediction_engine.clone();
     let meta_path_for_shutdown = metacognition_path.clone();
     let supervisor_for_shutdown = worker_supervisor;
-    axum::serve(
+    // Hard deadline for the post-flush connection drain. axum's graceful
+    // shutdown waits for EVERY in-flight connection — and dashboard
+    // WebSocket / SSE / WebChat connections are long-lived and never close
+    // on their own, so an unbounded drain wedges the process forever:
+    // listener closed (requests time out) but the PID stays alive and the
+    // self-update re-exec below is never reached (2026-08-03 field report:
+    // dashboard update → gateway stuck, PID alive, port dead).
+    const DRAIN_TIMEOUT_SECS: u64 = 10;
+    /// Bound one shutdown step; a wedged step must not block the restart.
+    async fn bounded_step<F: std::future::Future>(name: &str, secs: u64, fut: F) {
+        if tokio::time::timeout(std::time::Duration::from_secs(secs), fut)
+            .await
+            .is_err()
+        {
+            warn!("{name} did not finish within {secs}s — continuing shutdown");
+        }
+    }
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
@@ -1716,19 +1734,55 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             info!("Withdrawing mDNS advertisement...");
             adv.stop();
         }
-        pe_for_shutdown.flush_all().await;
-        pe_for_shutdown
-            .persist_metacognition(&meta_path_for_shutdown)
-            .await;
+        bounded_step("prediction engine flush", 20, pe_for_shutdown.flush_all()).await;
+        bounded_step(
+            "metacognition persist",
+            10,
+            pe_for_shutdown.persist_metacognition(&meta_path_for_shutdown),
+        )
+        .await;
         info!("Prediction engine state flushed");
         if let Some(supervisor) = supervisor_for_shutdown {
             info!("Shutting down worker supervisor...");
-            supervisor.shutdown().await;
+            // Internal chain is SIGTERM → 3s grace → SIGKILL; the outer bound
+            // only catches a wedged supervisor task.
+            bounded_step("worker supervisor shutdown", 15, supervisor.shutdown()).await;
             info!("Worker supervisor shut down");
         }
-    })
-    .await
-    .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
+        // WP10 (2026-08-04 field incident): tear down the IN-PROCESS PTY pool
+        // too. The supervisor chain above only covers the out-of-process
+        // worker; when `[runtime] worker_managed` is off (or the worker never
+        // came up) the pool's interactive `claude` REPL children were orphaned
+        // at exit and outlived the restart — so a wedged install stayed wedged
+        // and leaked one detached Node process per pooled session.
+        bounded_step("pty pool shutdown", 10, crate::pty_runtime::shutdown_pool()).await;
+        // Flush chain done — axum starts draining connections. Arm the
+        // drain watchdog below.
+        let _ = drain_started_tx.send(());
+    });
+    tokio::select! {
+        r = serve => {
+            r.map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
+        }
+        // Only ever fires after the flush chain completed AND the drain has
+        // been running for DRAIN_TIMEOUT_SECS (long-lived WS/SSE clients
+        // never hang up, so waiting longer is pointless). Dropping the serve
+        // future closes the remaining connections abruptly — by design.
+        _ = async {
+            // A dropped sender (shutdown task panicked/cancelled) is NOT the
+            // drain starting — park forever rather than arming the watchdog and
+            // tearing down live connections while nothing is shutting down.
+            if drain_started_rx.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(DRAIN_TIMEOUT_SECS)).await;
+        } => {
+            warn!(
+                "Connection drain exceeded {DRAIN_TIMEOUT_SECS}s (long-lived WebSocket/SSE \
+                 clients) — forcing shutdown so restart/re-exec can proceed"
+            );
+        }
+    }
 
     // Self-update installed a new binary during this run: re-exec into it
     // now that the graceful shutdown sequence (prediction flush → worker
