@@ -4449,6 +4449,27 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_wiki_read(params).await
             }
+            // WP5c curation station — the auto-filing audit surface.
+            // Listing is read-only (Viewer); the three state-changing actions
+            // need Owner access to the agent, mirroring `memory.forget`:
+            // promoting / removing / sharing an AI staff member's knowledge is
+            // routine hygiene for whoever owns them, not an admin-only lever.
+            "wiki.auto_pages" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_wiki_auto_pages(params).await
+            }
+            "wiki.promote" => {
+                let _ = check_agent!(AccessLevel::Owner);
+                self.handle_wiki_promote(params).await
+            }
+            "wiki.archive" => {
+                let _ = check_agent!(AccessLevel::Owner);
+                self.handle_wiki_archive(params).await
+            }
+            "wiki.share" => {
+                let _ = check_agent!(AccessLevel::Owner);
+                self.handle_wiki_share(params).await
+            }
             "wiki.search" => {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_wiki_search(params).await
@@ -4587,6 +4608,15 @@ impl MethodHandler {
             "models.list" => self.handle_models_list().await,
             "models.refresh" => self.handle_models_refresh().await,
             "runtime.detect" => self.handle_runtime_detect().await,
+            // ── WP2 / D16: onboarding one-click CLI install ──────────────
+            // Admin-only. The only accepted parameter is a provider NAME,
+            // matched against a hard-coded whitelist in `runtime_install.rs`;
+            // the command that runs is a compile-time constant. See that
+            // module's header for the full security model.
+            "runtime.install" => {
+                require_admin!();
+                self.handle_runtime_install(params, ctx).await
+            }
             "system.config" => {
                 require_admin!();
                 self.handle_system_config().await
@@ -5405,6 +5435,10 @@ impl MethodHandler {
                     { "name": "cost.recent", "description": "Recent per-request cost records" },
                     { "name": "wiki.pages", "description": "List wiki pages for an agent" },
                     { "name": "wiki.read", "description": "Read a wiki page" },
+                    { "name": "wiki.auto_pages", "description": "List auto-filed knowledge pages with their source chain (WP5c)" },
+                    { "name": "wiki.promote", "description": "Confirm an auto-filed page as curated knowledge (WP5c)" },
+                    { "name": "wiki.archive", "description": "Remove an auto-filed page and expire its memory pointer (WP5c)" },
+                    { "name": "wiki.share", "description": "Copy an auto-filed page into the shared knowledge base (WP5c)" },
                     { "name": "wiki.search", "description": "Search wiki pages" },
                     { "name": "wiki.lint", "description": "Wiki health check" },
                     { "name": "wiki.stats", "description": "Wiki statistics" },
@@ -5426,6 +5460,7 @@ impl MethodHandler {
                     { "name": "models.list", "description": "List available cloud and local models" },
                     { "name": "models.refresh", "description": "Re-probe installed CLIs/APIs for live model lists" },
                     { "name": "runtime.detect", "description": "Detect installed AI runtimes (claude/codex/gemini/antigravity) + Claude OAuth" },
+                    { "name": "runtime.install", "description": "Install a missing AI runtime CLI from a hard-coded whitelist (admin)" },
                     { "name": "system.config", "description": "View system config" },
                     { "name": "system.update_config", "description": "Update system config (log_level, rotation, allowed_origins)" },
                     { "name": "accounts.add", "description": "Add a new account" },
@@ -6997,7 +7032,11 @@ impl MethodHandler {
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                 .as_table_mut();
             if let Some(evo) = evo {
-                for key in &["skill_auto_activate", "skill_security_scan", "gvu_enabled", "cognitive_memory"] {
+                // D7 (2026-08-04): `cognitive_memory` is deliberately NOT in
+                // this list any more — the layer is always on, so a stale
+                // client that still posts the key is ignored rather than
+                // writing a dead flag back into agent.toml.
+                for key in &["skill_auto_activate", "skill_security_scan", "gvu_enabled"] {
                     if let Some(v) = params_clone.get(*key).and_then(|v| v.as_bool()) {
                         evo.insert((*key).into(), toml::Value::Boolean(v));
                         changes.push(format!("evolution.{key} = {v}"));
@@ -9446,7 +9485,7 @@ impl MethodHandler {
                         },
                         "evolution": {
                             "gvu_enabled": cfg.evolution.gvu_enabled,
-                            "cognitive_memory": cfg.evolution.cognitive_memory,
+                            "cognitive_memory": cfg.evolution.cognitive_memory_enabled(),
                             "skill_auto_activate": cfg.evolution.skill_auto_activate,
                             "skill_security_scan": cfg.evolution.skill_security_scan,
                             "max_silence_hours": cfg.evolution.max_silence_hours,
@@ -11228,6 +11267,184 @@ impl MethodHandler {
         }
     }
 
+    // ── WP5c: auto-filed knowledge pages (curation station audit tab) ──────
+    //
+    // `wiki.pages` cannot serve this tab: it returns neither `author` nor
+    // `sources`, so the client would need an N+1 `wiki.read` per page just to
+    // tell an auto page from a human one. One RPC, one pass.
+
+    /// Resolve `<home>/agents/<id>/wiki`, validating the agent id first.
+    fn agent_wiki_dir(&self, agent_id: &str) -> Option<PathBuf> {
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return None;
+        }
+        Some(self.home_dir.join("agents").join(agent_id).join("wiki"))
+    }
+
+    async fn handle_wiki_auto_pages(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(wiki_dir) = self.agent_wiki_dir(agent_id) else {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        };
+        if !wiki_dir.exists() {
+            return WsFrame::ok_response("", json!({ "pages": [], "exists": false }));
+        }
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+        match crate::auto_wiki_page::list_auto_pages(&store) {
+            Ok(rows) => WsFrame::ok_response("", json!({ "pages": rows, "exists": true })),
+            Err(e) => WsFrame::error_response("", &format!("Failed to list auto pages: {e}")),
+        }
+    }
+
+    /// Promote one auto page to curated knowledge (§6.2). Human-only, one-way.
+    async fn handle_wiki_promote(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(wiki_dir) = self.agent_wiki_dir(agent_id) else {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        };
+        if page_path.is_empty() {
+            return WsFrame::error_response("", "Missing 'page_path' parameter");
+        }
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+        match crate::auto_wiki_page::promote_page(&store, page_path) {
+            Ok(()) => WsFrame::ok_response("", json!({ "promoted": true, "path": page_path })),
+            Err(e) => WsFrame::error_response("", &format!("Promote failed: {e}")),
+        }
+    }
+
+    /// Remove one auto page: archive the file (restorable from `_archive/`)
+    /// AND expire its memory pointer.
+    ///
+    /// The pointer is expired by **exact subject** rather than by origin.
+    /// `memory.invalidate_origin(agent, "channel")` would expire every
+    /// conversationally-learned memory the agent has — correct as a "clear all
+    /// auto-collected knowledge" button (which the UI still offers, with an
+    /// explicit warning), catastrophic as "remove this one page".
+    async fn handle_wiki_archive(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(wiki_dir) = self.agent_wiki_dir(agent_id) else {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        };
+        if page_path.is_empty() {
+            return WsFrame::error_response("", "Missing 'page_path' parameter");
+        }
+        if !crate::auto_wiki_page::is_auto_path(page_path) {
+            return WsFrame::error_response("", "Only auto-filed pages can be removed here");
+        }
+
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+        let archived = match store.archive_page(page_path) {
+            Ok(b) => b,
+            Err(e) => return WsFrame::error_response("", &format!("Archive failed: {e}")),
+        };
+
+        // Expire the pointer so retrieval stops surfacing a page that is gone.
+        let mut expired = 0usize;
+        let db_path = self.agent_memory_db_path(agent_id);
+        if db_path.exists() {
+            let subject = crate::auto_wiki_page::pointer_subject(page_path);
+            match SqliteMemoryEngine::new(&db_path) {
+                Ok(engine) => match engine
+                    .expire_by_subject(agent_id, &subject, "auto_page_removed")
+                    .await
+                {
+                    Ok(n) => expired = n,
+                    Err(e) => warn!(agent = agent_id, "auto page pointer expiry failed: {e}"),
+                },
+                Err(e) => warn!(agent = agent_id, "auto page pointer expiry: open db failed: {e}"),
+            }
+        }
+
+        WsFrame::ok_response(
+            "",
+            json!({ "archived": archived, "pointers_expired": expired, "path": page_path }),
+        )
+    }
+
+    /// P2 = C: copy one auto page into the shared wiki so other AI staff can
+    /// use it. Explicitly a human action from the dashboard — the automatic
+    /// path only ever writes the agent's own `auto/` namespace.
+    async fn handle_wiki_share(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(wiki_dir) = self.agent_wiki_dir(agent_id) else {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        };
+        if page_path.is_empty() {
+            return WsFrame::error_response("", "Missing 'page_path' parameter");
+        }
+        // Same gate as promote/archive: this button lives on the auto-filing
+        // audit tab and its whole contract is "an auto page, its provenance
+        // intact". Without the check it would become a general
+        // copy-any-page-to-shared primitive with none of the shared-wiki
+        // safeguards (`.scope.toml`, department visibility, secret scanning)
+        // that the real `shared_wiki_write` / `wiki_share` paths apply.
+        if !crate::auto_wiki_page::is_auto_path(page_path) {
+            return WsFrame::error_response("", "Only auto-filed pages can be shared here");
+        }
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+        let page = match store.read_page(page_path) {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to read page: {e}")),
+        };
+        if page.author.as_deref() != Some(crate::auto_wiki_page::AUTO_PAGE_AUTHOR) {
+            return WsFrame::error_response("", "Only auto-filed pages can be shared here");
+        }
+
+        // `sources/` is the shared wiki's provenance namespace and derives
+        // `SourceType::RawDialogue`, so a shared auto page keeps the same low
+        // ranking weight it had locally.
+        let stem = std::path::Path::new(page_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("page");
+        let shared_path = format!("sources/{agent_id}--{stem}.md");
+        let now = Utc::now();
+        let shared = duduclaw_memory::WikiPage {
+            path: shared_path.clone(),
+            title: page.title.clone(),
+            created: now,
+            updated: now,
+            tags: {
+                let mut t = page.tags.clone();
+                if !t.iter().any(|x| x == "shared") {
+                    t.push("shared".to_string());
+                }
+                t.push(format!("from-{agent_id}"));
+                t
+            },
+            related: Vec::new(),
+            sources: page.sources.clone(),
+            author: Some(agent_id.to_string()),
+            layer: duduclaw_memory::WikiLayer::Context,
+            trust: page.trust,
+            source_type: duduclaw_memory::SourceType::RawDialogue,
+            last_verified: None,
+            citation_count: 0,
+            error_signal_count: 0,
+            success_signal_count: 0,
+            do_not_inject: false,
+            body: format!(
+                "{}\n\n---\n*由「{agent_id}」的知識庫分享（`{page_path}`）*\n",
+                page.body
+            ),
+        };
+        let shared_store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
+        if let Err(e) = shared_store.ensure_scaffold() {
+            return WsFrame::error_response("", &format!("Shared wiki unavailable: {e}"));
+        }
+        match shared_store.write_page_with_author(
+            &shared_path,
+            &duduclaw_memory::serialize_page(&shared),
+            agent_id,
+        ) {
+            Ok(()) => WsFrame::ok_response("", json!({ "shared": true, "path": shared_path })),
+            Err(e) => WsFrame::error_response("", &format!("Share failed: {e}")),
+        }
+    }
+
     async fn handle_wiki_read(&self, params: Value) -> WsFrame {
         let agent_id = params
             .get("agent_id")
@@ -11750,12 +11967,16 @@ impl MethodHandler {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str());
         let reg = self.registry.read().await;
 
-        // Collect global skill names for scope tagging
-        let global_names: std::collections::HashSet<&str> = reg
-            .global_skills()
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
+        // WP6: re-read the GLOBAL layer from disk rather than trusting
+        // `reg.global_skills()`. A skill graduated by the synthesis pipeline
+        // lands in `<home>/skills/` without a `registry.scan()`, so the cached
+        // list would both hide it and mislabel its `scope` badge as "agent".
+        let global_skills = duduclaw_agent::registry::AgentRegistry::load_skills(
+            &self.home_dir.join("skills"),
+        )
+        .await;
+        let global_names: std::collections::HashSet<&str> =
+            global_skills.iter().map(|s| s.name.as_str()).collect();
 
         // Scan verdicts recorded at install-approval time (Bug#9) — attach as
         // `security_status` so the "My Skills" security column shows the real
@@ -11767,10 +11988,50 @@ impl MethodHandler {
             Some(id) => {
                 match reg.get(id) {
                     Some(agent) => {
+                        // WP6: re-read from disk instead of trusting the
+                        // in-memory `agent.skills` snapshot. `registry.scan()`
+                        // only runs on dashboard-side installs, so a skill
+                        // written out-of-band — the MCP `skill_from_recording` /
+                        // `skill_graduate` tools, or the in-gateway synthesis
+                        // pipeline — stayed invisible here until a gateway
+                        // restart. That was a *read* failure, not just a
+                        // staleness one: no amount of refetching would have
+                        // surfaced it.
+                        //
+                        // All THREE layers are re-read and recomposed through
+                        // the same `compose_skill_layers` the scan uses (WP7:
+                        // global < department < per-agent, nearest wins).
+                        // Listing only the agent's own `SKILLS/` would fix the
+                        // freshness bug by deleting global and department
+                        // skills from the view — a worse lie than the stale one.
+                        let local_skills = duduclaw_agent::registry::AgentRegistry::load_skills(
+                            &agent.dir.join("SKILLS"),
+                        )
+                        .await;
+                        let dept = agent.config.agent.department.trim();
+                        let dept_skills = if !dept.is_empty()
+                            && duduclaw_core::is_valid_department(dept)
+                        {
+                            duduclaw_agent::registry::AgentRegistry::load_skills(
+                                &duduclaw_agent::skill_loader::department_skills_dir(
+                                    &self.home_dir,
+                                    dept,
+                                ),
+                            )
+                            .await
+                        } else {
+                            Vec::new()
+                        };
+                        let disk_skills =
+                            duduclaw_agent::registry::AgentRegistry::compose_skill_layers(
+                                &global_skills,
+                                dept_skills,
+                                local_skills,
+                            );
                         // Include `content` so the dashboard "My Skills" tab can render a
                         // preview — the SkillInfo frontend contract requires it, and omitting
                         // it made `skill.content.slice(...)` throw whenever an agent had skills.
-                        let skills: Vec<Value> = agent.skills.iter().map(|s| {
+                        let skills: Vec<Value> = disk_skills.iter().map(|s| {
                             let scope = if global_names.contains(s.name.as_str()) { "global" } else { "agent" };
                             let mut obj = json!({ "name": s.name, "size": s.content.len(), "scope": scope, "content": s.content });
                             if let Some(v) = verdict_of(&s.name) {
@@ -11784,9 +12045,8 @@ impl MethodHandler {
                 }
             }
             None => {
-                // Global skills
-                let global: Vec<Value> = reg
-                    .global_skills()
+                // Global skills — the freshly-read layer, same reason as above.
+                let global: Vec<Value> = global_skills
                     .iter()
                     .map(|s| {
                         let mut obj = json!({ "name": s.name, "size": s.content.len() });
@@ -13493,6 +13753,25 @@ impl MethodHandler {
         }
     }
 
+    /// WP6 — announce a cron mutation made through the dashboard.
+    ///
+    /// Deliberately routed through [`crate::dashboard_feedback::emit`] (the
+    /// `events.db` path the MCP `schedule_task` / `*_cron_task` tools use)
+    /// rather than [`Self::broadcast_event`]: one emitter, one whitelist, and
+    /// one place to change if the transport ever moves. The acting browser tab
+    /// already refetches locally — this is what makes a *second* tab, or the
+    /// operator's phone, agree with it. Called only on success paths; a failed
+    /// mutation announces nothing, so no client refetches to discover that
+    /// nothing changed.
+    async fn emit_cron_changed(&self, payload: Value) {
+        crate::dashboard_feedback::emit(
+            &self.home_dir,
+            crate::dashboard_feedback::EV_CRON_CHANGED,
+            payload,
+        )
+        .await;
+    }
+
     async fn handle_cron_add(&self, params: Value) -> WsFrame {
         let name = match params.get("name").and_then(|v| v.as_str()) {
             Some(n) if !n.is_empty() => n.to_string(),
@@ -13651,6 +13930,14 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("insert: {e}"));
         }
         self.notify_cron_reload().await;
+        self.emit_cron_changed(json!({
+            "action": "created",
+            "id": row.id,
+            "name": name,
+            "cron": cron_expr,
+            "agent_id": agent_id,
+        }))
+        .await;
         info!(name = %name, cron = %cron_expr, agent_id = %agent_id, "Cron task added");
         WsFrame::ok_response(
             "",
@@ -13846,6 +14133,8 @@ impl MethodHandler {
         }
 
         self.notify_cron_reload().await;
+        self.emit_cron_changed(json!({ "action": "updated", "id": id }))
+            .await;
         info!(id = %id, "Cron task updated");
         WsFrame::ok_response("", json!({ "success": true, "id": id }))
     }
@@ -13868,9 +14157,18 @@ impl MethodHandler {
         match result {
             Ok(true) => {
                 self.notify_cron_reload().await;
+                self.emit_cron_changed(json!({
+                    "action": "toggled",
+                    "id": params.get("id").and_then(|v| v.as_str()),
+                    "name": params.get("name").and_then(|v| v.as_str()),
+                    "enabled": enabled,
+                }))
+                .await;
                 info!(enabled, "Cron task enable state changed");
                 WsFrame::ok_response("", json!({ "success": true, "enabled": enabled }))
             }
+            // `Ok(false)` = no row matched. Nothing changed, so nothing is
+            // announced — same fail-quiet rule as the MCP side.
             Ok(false) => WsFrame::error_response("", "Cron task not found"),
             Err(e) => WsFrame::error_response("", &format!("set_enabled: {e}")),
         }
@@ -13893,6 +14191,12 @@ impl MethodHandler {
         match result {
             Ok(true) => {
                 self.notify_cron_reload().await;
+                self.emit_cron_changed(json!({
+                    "action": "removed",
+                    "id": params.get("id").and_then(|v| v.as_str()),
+                    "name": params.get("name").and_then(|v| v.as_str()),
+                }))
+                .await;
                 info!("Cron task removed");
                 WsFrame::ok_response("", json!({ "success": true }))
             }
@@ -13922,6 +14226,11 @@ impl MethodHandler {
         };
         match scheduler.run_now(&id).await {
             Ok(name) => {
+                // The run itself is async; what changed synchronously is the
+                // task's run history, which `cron.list` carries — so a refetch
+                // is exactly the right reaction here too.
+                self.emit_cron_changed(json!({ "action": "ran", "id": id, "name": name }))
+                    .await;
                 info!(id = %id, name = %name, "Cron task manual run-now triggered");
                 WsFrame::ok_response("", json!({ "success": true, "id": id, "name": name }))
             }
@@ -16947,7 +17256,7 @@ impl MethodHandler {
                 json!({
                     "agent_id": cfg.agent.name,
                     "gvu_enabled": cfg.evolution.gvu_enabled,
-                    "cognitive_memory": cfg.evolution.cognitive_memory,
+                    "cognitive_memory": cfg.evolution.cognitive_memory_enabled(),
                     "skill_auto_activate": cfg.evolution.skill_auto_activate,
                     "skill_security_scan": cfg.evolution.skill_security_scan,
                     "max_silence_hours": cfg.evolution.max_silence_hours,
@@ -17111,6 +17420,46 @@ impl MethodHandler {
                 "claude_subscription": claude_subscription,
             }),
         )
+    }
+
+    /// **WP2 / D16** — install a missing AI CLI on the user's behalf so the
+    /// onboarding wizard never has to say "go open a terminal".
+    ///
+    /// Pure dispatch: all policy (the provider→command whitelist, platform
+    /// support, prerequisite checks, concurrency guard, timeout, audit trail)
+    /// lives in [`crate::runtime_install`]. The only accepted parameter is
+    /// `provider`; an unrecognised value is an error, never a default.
+    ///
+    /// Progress streams as `runtime.install.output` / `runtime.install.status`
+    /// events — the same shape the one-click login uses for
+    /// `auth.cli_login.*`, so the dashboard reuses its transcript component.
+    ///
+    /// The caller's identity is threaded into the audit trail: running an
+    /// installer mutates the host, so `security_audit.jsonl` must record which
+    /// admin did it rather than a generic `"system"` actor.
+    async fn handle_runtime_install(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let provider = params
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let Some(spec) = crate::runtime_install::spec_for(provider) else {
+            // Fail closed: unknown / malformed provider resolves to nothing.
+            return WsFrame::error_response(
+                "",
+                "unsupported provider (claude|codex|gemini|antigravity|grok)",
+            );
+        };
+        let event_tx = self.event_tx.read().await.clone();
+        let actor =
+            crate::runtime_install::Actor::new(ctx.user_id.as_str(), ctx.email.as_str());
+        let outcome = crate::runtime_install::start_install(
+            spec,
+            self.home_dir.clone(),
+            actor,
+            event_tx,
+        )
+        .await;
+        WsFrame::ok_response("", outcome.to_payload(spec))
     }
 
     /// List all available models (cloud + local GGUF files).
@@ -19646,7 +19995,7 @@ impl MethodHandler {
                     // persist when in fact only the UI was misreading.
                     "evolution": {
                         "gvu_enabled": cfg.evolution.gvu_enabled,
-                        "cognitive_memory": cfg.evolution.cognitive_memory,
+                        "cognitive_memory": cfg.evolution.cognitive_memory_enabled(),
                         "skill_auto_activate": cfg.evolution.skill_auto_activate,
                         "skill_security_scan": cfg.evolution.skill_security_scan,
                         "max_silence_hours": cfg.evolution.max_silence_hours,
@@ -29127,6 +29476,161 @@ mod skills_install_scan_tests {
         );
     }
 
+    /// WP6/B2 — re-reading skills from disk must not quietly drop the WP7
+    /// layering. A globally-installed skill has to keep showing up in an
+    /// agent's `skills.list` **and** keep its `global` scope badge; listing
+    /// only the agent's own `SKILLS/` would have "fixed" staleness by hiding
+    /// every company-wide skill.
+    #[tokio::test]
+    async fn skills_list_keeps_global_layer_and_scope_badge() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = home.path();
+
+        // A global (company-wide) skill, written straight to disk the way the
+        // synthesis pipeline's graduation step does.
+        let global_dir = root.join("skills");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::write(
+            global_dir.join("company-tone.md"),
+            "---\nname: company-tone\n---\n\n用公司語氣回覆。\n",
+        )
+        .unwrap();
+
+        // One agent with a skill of its own.
+        let agent_dir = root.join("agents").join("agnes");
+        std::fs::create_dir_all(agent_dir.join("SKILLS")).unwrap();
+        // Reuse a real shipped template rather than a hand-rolled stub:
+        // `AgentConfig` requires [model]/[container]/[heartbeat]/[budget]/
+        // [permissions]/[evolution], and a stub that silently fails to parse
+        // makes this test pass for the wrong reason (empty skill list).
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            include_str!("../../../templates/evaluator/agent.toml")
+                .replace("name = \"evaluator\"", "name = \"agnes\""),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("SKILLS").join("invoice-ocr.md"),
+            "---\nname: invoice-ocr\n---\n\n讀發票。\n",
+        )
+        .unwrap();
+
+        let handler = MethodHandler::new(root.to_path_buf()).await;
+        {
+            let mut reg = handler.registry.write().await;
+            reg.scan().await.expect("scan");
+        }
+
+        let frame = handler.handle_skills_list(json!({ "agent_id": "agnes" })).await;
+        let payload = match &frame {
+            WsFrame::Response {
+                payload: Some(p), ..
+            } => p.clone(),
+            _ => panic!("skills.list failed: {}", frame_error_text(&frame)),
+        };
+        let skills = payload["skills"].as_array().expect("skills array");
+
+        let global = skills
+            .iter()
+            .find(|s| s["name"] == "company-tone")
+            .expect("a global skill must still appear in the agent's list");
+        assert_eq!(
+            global["scope"], "global",
+            "the global layer must keep its scope badge"
+        );
+
+        let local = skills
+            .iter()
+            .find(|s| s["name"] == "invoice-ocr")
+            .expect("the agent's own skill must appear");
+        assert_eq!(local["scope"], "agent");
+    }
+
+    /// WP6 — a routine created from the dashboard must announce itself on the
+    /// same `events.db` feedback path the MCP `schedule_task` tool uses, so a
+    /// second browser tab (or the operator's phone) refreshes instead of
+    /// silently disagreeing with the tab that made the change.
+    #[tokio::test]
+    async fn dashboard_cron_add_emits_dashboard_feedback_event() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        // `MethodHandler::new` leaves the cron store unset (the gateway wires it
+        // during startup) — seed it so this exercises the real insert path.
+        handler
+            .set_cron_store(Arc::new(
+                CronStore::open(home.path()).expect("open cron store"),
+            ))
+            .await;
+
+        let frame = handler
+            .handle_cron_add(json!({
+                "name": "每日晨報",
+                "cron": "0 9 * * *",
+                "task": "整理今天的行程",
+                "agent_id": "agnes",
+            }))
+            .await;
+        assert!(
+            matches!(frame, WsFrame::Response { ok: true, .. }),
+            "cron.add should succeed: {}",
+            frame_error_text(&frame)
+        );
+
+        let bus = crate::events_store::EventBusStore::open(home.path()).expect("events.db");
+        let rows = bus.fetch_since(0, 50).await.expect("fetch_since");
+        let row = rows
+            .iter()
+            .find(|r| r.event == crate::dashboard_feedback::EV_CRON_CHANGED)
+            .expect("dashboard cron.add must raise cron.changed");
+        let payload: Value = serde_json::from_str(&row.payload).expect("payload json");
+        assert_eq!(payload["action"], "created");
+        assert_eq!(payload["name"], "每日晨報");
+        assert_eq!(payload["cron"], "0 9 * * *");
+        assert_eq!(payload["agent_id"], "agnes");
+
+        // ...and it is a row the bridge will actually push to the socket.
+        assert!(
+            crate::dashboard_feedback::dashboard_push_frame(&row.event, &row.payload).is_some(),
+            "the emitted row must be pushable to the dashboard"
+        );
+    }
+
+    /// A rejected `cron.add` persists nothing, so it must announce nothing —
+    /// otherwise every connected tab refetches to discover the absence of what
+    /// the event implied.
+    #[tokio::test]
+    async fn rejected_dashboard_cron_add_emits_no_dashboard_feedback_event() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        // Store present on purpose: the silence must come from the rejection,
+        // not from an uninitialized store short-circuiting the handler.
+        handler
+            .set_cron_store(Arc::new(
+                CronStore::open(home.path()).expect("open cron store"),
+            ))
+            .await;
+
+        let frame = handler
+            .handle_cron_add(json!({
+                "name": "壞排程",
+                "cron": "not a cron",
+                "task": "x",
+            }))
+            .await;
+        assert!(
+            matches!(frame, WsFrame::Response { ok: false, .. }),
+            "an invalid cron expression must be rejected"
+        );
+
+        let bus = crate::events_store::EventBusStore::open(home.path()).expect("events.db");
+        let rows = bus.fetch_since(0, 50).await.expect("fetch_since");
+        assert!(
+            rows.iter()
+                .all(|r| r.event != crate::dashboard_feedback::EV_CRON_CHANGED),
+            "a failed cron.add must stay silent"
+        );
+    }
+
     #[tokio::test]
     async fn malicious_content_install_is_rejected_by_server_side_scan() {
         let home = tempfile::tempdir().expect("tempdir");
@@ -31144,5 +31648,164 @@ skill_security_scan = true
             .handle("os.events.unsubscribe", json!({}), &ctx)
             .await;
         assert!(!frame_ok(&frame2), "manager must be denied, got {frame2:?}");
+    }
+}
+
+#[cfg(test)]
+mod wp5c_auto_page_rpc_tests {
+    //! WP5c curation-station RPCs. The three state-changing actions
+    //! (`wiki.promote` / `wiki.archive` / `wiki.share`) all live on the
+    //! auto-filing audit tab and must agree on one gate: **an auto-filed page,
+    //! and only an auto-filed page**. A gap in any one of them turns that tab
+    //! into a general write primitive over the agent's whole wiki.
+    use super::*;
+
+    fn frame_ok(frame: &WsFrame) -> bool {
+        matches!(frame, WsFrame::Response { ok: true, .. })
+    }
+
+    fn frame_error_text(frame: &WsFrame) -> String {
+        match frame {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Seed an agent wiki with one auto-filed page and one hand-curated page.
+    fn seed_wiki(home: &std::path::Path) -> duduclaw_memory::WikiStore {
+        let wiki_dir = home.join("agents").join("agnes").join("wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+
+        crate::auto_wiki_page::write_auto_page(
+            &store,
+            home,
+            "agnes",
+            &crate::auto_wiki_page::AutoPageRequest {
+                doc_type: crate::knowledge_route::DocType::Charter,
+                title: "公司章程".into(),
+                slug: "company-charter".into(),
+                summary: "公司的組織章程。".into(),
+                original: "第一條　本公司依法設立。".into(),
+                source_label: "Telegram 對話".into(),
+                source_id: "conversation:telegram:1".into(),
+            },
+        )
+        .expect("seed auto page");
+
+        store
+            .write_page(
+                "concepts/return-policy.md",
+                "---\ntitle: \"退貨政策\"\nauthor: \"operator\"\nlayer: core\ntrust: 0.900\n---\n\n七天內未拆封可退。",
+            )
+            .unwrap();
+        store
+    }
+
+    /// The happy path: an auto page is listed, and sharing it copies it into
+    /// the shared wiki under a source-attributed name.
+    #[tokio::test]
+    async fn share_copies_an_auto_page_into_the_shared_wiki() {
+        let home = tempfile::tempdir().unwrap();
+        seed_wiki(home.path());
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_wiki_auto_pages(json!({ "agent_id": "agnes" }))
+            .await;
+        assert!(frame_ok(&frame), "{}", frame_error_text(&frame));
+
+        let frame = handler
+            .handle_wiki_share(json!({
+                "agent_id": "agnes",
+                "page_path": "auto/charter/company-charter.md",
+            }))
+            .await;
+        assert!(frame_ok(&frame), "{}", frame_error_text(&frame));
+        assert!(
+            home.path()
+                .join("shared/wiki/sources/agnes--company-charter.md")
+                .exists(),
+            "shared copy must exist"
+        );
+    }
+
+    /// M1: a hand-curated page must NOT be shareable through this RPC. It is
+    /// outside `auto/`, so the audit tab's provenance guarantees do not hold
+    /// for it and the shared-wiki safeguards (`.scope.toml`, department
+    /// visibility, secret scan) are not applied on this path.
+    #[tokio::test]
+    async fn share_refuses_a_hand_curated_page() {
+        let home = tempfile::tempdir().unwrap();
+        seed_wiki(home.path());
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_wiki_share(json!({
+                "agent_id": "agnes",
+                "page_path": "concepts/return-policy.md",
+            }))
+            .await;
+        assert!(!frame_ok(&frame), "curated page must be refused");
+        assert!(
+            frame_error_text(&frame).contains("auto-filed"),
+            "got: {}",
+            frame_error_text(&frame)
+        );
+        assert!(
+            !home.path().join("shared/wiki/sources").exists(),
+            "nothing may be written to the shared wiki"
+        );
+    }
+
+    /// A page that merely SITS under `auto/` but was written by a human is
+    /// also refused — the path check and the author check must both hold, or a
+    /// user who files something by hand into `auto/` loses the protection.
+    #[tokio::test]
+    async fn share_refuses_a_human_authored_page_inside_auto() {
+        let home = tempfile::tempdir().unwrap();
+        let store = seed_wiki(home.path());
+        store
+            .write_page(
+                "auto/charter/handmade.md",
+                "---\ntitle: \"手寫\"\nauthor: \"operator\"\nlayer: core\ntrust: 0.900\n---\n\nbody",
+            )
+            .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_wiki_share(json!({
+                "agent_id": "agnes",
+                "page_path": "auto/charter/handmade.md",
+            }))
+            .await;
+        assert!(!frame_ok(&frame), "human-authored page must be refused");
+    }
+
+    /// `wiki.archive` and `wiki.promote` enforce the same gate — asserted here
+    /// so the three actions can never drift apart silently.
+    #[tokio::test]
+    async fn archive_and_promote_share_the_same_gate() {
+        let home = tempfile::tempdir().unwrap();
+        seed_wiki(home.path());
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        for method in ["archive", "promote"] {
+            let params = json!({
+                "agent_id": "agnes",
+                "page_path": "concepts/return-policy.md",
+            });
+            let frame = match method {
+                "archive" => handler.handle_wiki_archive(params).await,
+                _ => handler.handle_wiki_promote(params).await,
+            };
+            assert!(!frame_ok(&frame), "{method} must refuse a curated page");
+        }
+
+        // The curated page is untouched.
+        let wiki = home.path().join("agents/agnes/wiki/concepts/return-policy.md");
+        let raw = std::fs::read_to_string(&wiki).unwrap();
+        assert!(raw.contains("七天內未拆封可退"));
+        assert!(raw.contains("author: \"operator\""));
     }
 }

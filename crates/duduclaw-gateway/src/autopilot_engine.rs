@@ -1691,9 +1691,18 @@ fn should_rebroadcast(row: &crate::events_store::EventRow) -> bool {
 ///   total table size.
 /// - Background prune (every `EVENTS_PRUNE_INTERVAL`) deletes rows older
 ///   than `EVENTS_RETENTION_DAYS` so the table stays bounded.
+/// `dashboard_tx` (WP6) is the dashboard WebSocket event channel. This task is
+/// already the only thing tailing `events.db`, so the channel-action → dashboard
+/// live feedback bridge rides along here rather than opening a second reader:
+/// whitelisted rows (`cron.changed` / `memory.changed` / `skill.changed` — see
+/// [`crate::dashboard_feedback`]) are serialized and pushed to every connected
+/// dashboard. Those event names are deliberately absent from [`row_to_event`],
+/// so they refresh views without triggering a single autopilot rule. `None`
+/// disables the bridge (tests, and any future caller without a socket).
 pub fn spawn_events_db_poll(
     store: Arc<crate::events_store::EventBusStore>,
     tx: broadcast::Sender<AutopilotEvent>,
+    dashboard_tx: Option<broadcast::Sender<String>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Seed to current MAX(id) — skip historical events on restart.
@@ -1708,6 +1717,20 @@ pub fn spawn_events_db_poll(
                 Ok(rows) if !rows.is_empty() => {
                     let batch_size = rows.len();
                     for row in &rows {
+                        // WP6: dashboard live feedback. Independent of
+                        // `should_rebroadcast` (which only guards the autopilot
+                        // bus against double-dispatching already-broadcast OS
+                        // events) — a feedback row is never an autopilot event.
+                        if let Some(ref dtx) = dashboard_tx {
+                            if let Some(frame) =
+                                crate::dashboard_feedback::dashboard_push_frame(
+                                    &row.event,
+                                    &row.payload,
+                                )
+                            {
+                                let _ = dtx.send(frame);
+                            }
+                        }
                         if !should_rebroadcast(row) {
                             continue;
                         }

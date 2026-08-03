@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Clock, Play, Pause, Trash2, Plus, Pencil, MoreHorizontal, FlaskConical } from 'lucide-react';
 import { api } from '@/lib/api';
+import { client } from '@/lib/ws-client';
+import { debounceTrailing } from '@/lib/debounce';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { toast, formatError } from '@/lib/toast';
@@ -372,6 +374,24 @@ export function RoutinesPage() {
     if (connectionState !== 'authenticated') return;
     setLoading(true);
     load();
+  }, [connectionState, load]);
+
+  // WP6 — a routine created from a channel ("每天九點幫我看信") used to land in
+  // `cron_tasks.db` and stay invisible here until a manual reload, which reads
+  // as "the bot ignored me". The gateway now pushes `cron.changed` for every
+  // cron mutation (dashboard RPC, MCP `schedule_task`, agent self-scheduling);
+  // refetch on it. Refetch rather than patch: the list is small and cannot
+  // drift from the server's view this way.
+  // A bulk edit raises one event per row, so the refetch is debounced (M4) —
+  // the last event in a burst is the one whose state is worth reading.
+  useEffect(() => {
+    if (connectionState !== 'authenticated') return;
+    const refresh = debounceTrailing(() => void load());
+    const unsubscribe = client.subscribe('cron.changed', refresh);
+    return () => {
+      refresh.cancel();
+      unsubscribe();
+    };
   }, [connectionState, load]);
 
   const act = useCallback(

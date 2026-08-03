@@ -4,6 +4,9 @@ import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
 import { api, type SkillIndexEntry, type SharedSkillInfo, type SkillInfo, type SkillLeaderboardEntry } from '@/lib/api';
+import { client } from '@/lib/ws-client';
+import { debounceTrailing } from '@/lib/debounce';
+import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
@@ -665,6 +668,7 @@ const MY_SKILLS_COLUMNS = 'minmax(0,1fr) auto 2.5rem';
 
 function MySkillsTab({ filter }: { filter: string }) {
   const intl = useIntl();
+  const connectionState = useConnectionStore((s) => s.state);
   const { agents, fetchAgents } = useAgentsStore();
   const [selectedAgent, setSelectedAgent] = useState<string>('');
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -678,10 +682,12 @@ function MySkillsTab({ filter }: { filter: string }) {
     if (agents.length > 0 && !selectedAgent) setSelectedAgent(agents[0].name);
   }, [agents, selectedAgent]);
 
-  useEffect(() => {
-    if (!selectedAgent) return;
-    setLoading(true);
-    (async () => {
+  /** Refetch the selected agent's skills. `showSpinner` is false for the WP6
+   *  live refresh so a newly synthesised skill doesn't flash the list away. */
+  const loadSkills = useCallback(
+    async (showSpinner: boolean) => {
+      if (!selectedAgent) return;
+      if (showSpinner) setLoading(true);
       try {
         const result = await api.skills.list(selectedAgent);
         setSkills(result?.skills ?? []);
@@ -690,10 +696,41 @@ function MySkillsTab({ filter }: { filter: string }) {
         toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
         setSkills([]);
       } finally {
-        setLoading(false);
+        if (showSpinner) setLoading(false);
       }
-    })();
-  }, [selectedAgent, intl]);
+    },
+    [selectedAgent, intl],
+  );
+
+  // M3: keyed on `connectionState` (same shape as RoutinesPage) so a reconnect
+  // re-reads once — pushes raised while the socket was down are gone.
+  useEffect(() => {
+    if (!selectedAgent) return;
+    if (connectionState !== 'authenticated') return;
+    void loadSkills(true);
+  }, [selectedAgent, loadSkills, connectionState]);
+
+  // WP6 — auto-synthesised skills are the least visible thing the platform
+  // produces: nobody asked for them, so nobody thinks to reload this page. The
+  // gateway pushes `skill.changed` from the synthesis pipeline and from the
+  // MCP skill tools (graduate / synthesis run / skill-from-recording);
+  // refetch when it concerns the agent on screen.
+  // M4: a synthesis run graduates several skills back-to-back; debounce so the
+  // burst costs one refetch.
+  useEffect(() => {
+    if (!selectedAgent) return;
+    if (connectionState !== 'authenticated') return;
+    const refresh = debounceTrailing(() => void loadSkills(false));
+    const unsubscribe = client.subscribe('skill.changed', (payload) => {
+      const p = (payload ?? {}) as { agent_id?: string | null };
+      if (p.agent_id && p.agent_id !== selectedAgent) return;
+      refresh();
+    });
+    return () => {
+      refresh.cancel();
+      unsubscribe();
+    };
+  }, [selectedAgent, loadSkills, connectionState]);
 
   const handleShare = useCallback(
     async (skillName: string) => {
