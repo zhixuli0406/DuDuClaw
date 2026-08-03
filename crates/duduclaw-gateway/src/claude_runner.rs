@@ -703,9 +703,22 @@ async fn call_claude_for_agent_impl(
             // worker's HS14 per-account scoping. Use the same `rotate_cli_spawn`
             // primitive the channel path uses so failover + per-account cooldown
             // apply here too.
+            // WP10 M1: feed the demotion breaker from this path too. The
+            // breaker is read upstream at `runtime_mode_for_agent` (line above),
+            // so a demoted agent never enters this block and falls through to
+            // the fresh-spawn path below — consistent with channel reply. But
+            // without recording here, dispatcher-only agents would never
+            // ACCUMULATE toward demotion and would keep paying the stall tax.
+            let record_pty_outcome = |r: &Result<String, String>| match r {
+                Ok(_) => crate::pty_runtime::record_pty_success(agent_id),
+                Err(e) if crate::pty_runtime::is_pty_transport_error(e) => {
+                    crate::pty_runtime::record_pty_transport_failure(agent_id);
+                }
+                Err(_) => {}
+            };
             match get_rotator(home_dir).await {
                 Ok(rotator) if rotator.count().await > 0 => {
-                    return crate::channel_reply::rotate_cli_spawn(
+                    let out = crate::channel_reply::rotate_cli_spawn(
                         &rotator,
                         move |env_vars, _retry_hint| {
                             let account_id =
@@ -732,6 +745,8 @@ async fn call_claude_for_agent_impl(
                         prompt.len(),
                     )
                     .await;
+                    record_pty_outcome(&out);
+                    return out;
                 }
                 _ => {
                     // No rotator accounts / rotator unavailable → ambient-env
@@ -739,7 +754,7 @@ async fn call_claude_for_agent_impl(
                     // matching the pre-fix behaviour.
                     let acquire =
                         crate::pty_runtime::AcquireOptions::new(agent_id, cli_kind, cli_bare_mode);
-                    return crate::pty_runtime::acquire_and_invoke_with(
+                    let out = crate::pty_runtime::acquire_and_invoke_with(
                         crate::pty_runtime::InvokeOptions::new(
                             acquire,
                             prompt,
@@ -748,6 +763,8 @@ async fn call_claude_for_agent_impl(
                         ),
                     )
                     .await;
+                    record_pty_outcome(&out);
+                    return out;
                 }
             }
         }

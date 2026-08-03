@@ -831,6 +831,7 @@ pub async fn build_reply_for_agent(
 ) -> String {
     let raw =
         build_reply_with_session_inner(text, ctx, Some(agent_name), session_id, user_id, on_progress).await;
+    let raw = crate::cli_noise::strip_cli_noise(&raw).text;
     let restored = restore_for_channel(raw, ctx, agent_name, session_id).await;
     enforce_contract(restored, &ctx.home_dir, agent_name).await
 }
@@ -849,6 +850,11 @@ pub async fn build_reply_with_session(
 ) -> String {
     let raw =
         build_reply_with_session_inner(text, ctx, None, session_id, user_id, on_progress).await;
+    // WP11-A: last-line-of-defence filter for AI-runtime internal messages
+    // (CLI TUI chrome, `CLAUDE_CODE_*` operator hints, paste/mode markers).
+    // Placed here so every channel that funnels through `build_reply_*` is
+    // covered, not just the one that reported the leak. See `cli_noise`.
+    let raw = crate::cli_noise::strip_cli_noise(&raw).text;
     let agent_id = resolve_agent_for_restore(ctx, session_id).await;
     let restored = restore_for_channel(raw, ctx, &agent_id, session_id).await;
     enforce_contract(restored, &ctx.home_dir, &agent_id).await
@@ -1122,20 +1128,18 @@ async fn build_reply_with_session_inner(
         .map(|a| a.config.evolution.external_factors.clone())
         .unwrap_or_default();
 
-    // Cognitive memory layer toggle (agent.toml [evolution] cognitive_memory).
-    // When disabled, every SqliteMemoryEngine path below is skipped: key-fact
-    // recall into the system prompt, key-fact extraction/storage, and the
-    // Reflexion → semantic-memory consolidation. Gating once here (rather than
-    // at each call site) keeps a single source of truth. Falls back to the
-    // EvolutionConfig default (true) when no agent resolved.
-    let cognitive_memory_db = if agent
-        .map(|a| a.config.evolution.cognitive_memory)
-        .unwrap_or(true)
-    {
-        ctx.memory_db_path.clone()
-    } else {
-        None
-    };
+    // Cognitive memory layer. D7 (2026-08-04): this is no longer a toggle —
+    // the layer is permanently resident, so every SqliteMemoryEngine path below
+    // (key-fact recall into the system prompt, key-fact extraction/storage,
+    // Reflexion → semantic-memory consolidation, conversation distillation) is
+    // driven purely by whether a memory database path is configured.
+    // `cognitive_memory_enabled()` is still consulted so a pre-D7 config that
+    // says `false` logs its one-time deprecation warning instead of silently
+    // changing behaviour.
+    if let Some(a) = agent {
+        let _ = a.config.evolution.cognitive_memory_enabled();
+    }
+    let cognitive_memory_db = ctx.memory_db_path.clone();
 
     // Refresh compressed skill cache from agent's loaded skills
     {
@@ -1720,8 +1724,8 @@ async fn build_reply_with_session_inner(
 
         // RFC-24 (F1 injection): surface this agent's still-open decisions so a
         // later "用方案 C" resolves from durable state, not conversation memory.
-        // Tail placement (near pinned, U-shaped peak attention). Own flag,
-        // independent of the cognitive_memory toggle. !Send → spawn_blocking.
+        // Tail placement (near pinned, U-shaped peak attention). Own opt-in
+        // flag (`[memory] decision_continuity`). !Send → spawn_blocking.
         if agent_dir
             .as_deref()
             .map(crate::runtime_config::decision_continuity_enabled)
@@ -2436,7 +2440,7 @@ async fn build_reply_with_session_inner(
         // history. Opt-in per agent (`[memory] decision_continuity`); detection
         // is deterministic and best-effort — any failure here is logged and
         // never affects reply delivery. Uses ctx.memory_db_path directly (its
-        // own flag, independent of the cognitive_memory toggle).
+        // own opt-in flag).
         if agent_dir
             .as_deref()
             .map(crate::runtime_config::decision_continuity_enabled)
@@ -3252,8 +3256,26 @@ async fn build_reply_with_session_inner(
                                         origin: Some("agent_derived".to_string()),
                                         ..Default::default()
                                     };
-                                    if let Err(e) = engine.store_temporal(&agent_id_for_pred, entry, ep_meta).await {
-                                        warn!(agent = %agent_id_for_pred, "Failed to store episodic memory: {e}");
+                                    match engine.store_temporal(&agent_id_for_pred, entry, ep_meta).await {
+                                        Err(e) => {
+                                            warn!(agent = %agent_id_for_pred, "Failed to store episodic memory: {e}");
+                                        }
+                                        // WP6: this is the "對話餵資料 → 記憶"
+                                        // path. Tell the dashboard so
+                                        // MemoryBrowser refetches instead of
+                                        // showing a stale list until reload.
+                                        Ok(memory_id) => {
+                                            crate::dashboard_feedback::emit(
+                                                &home_for_pred,
+                                                crate::dashboard_feedback::EV_MEMORY_CHANGED,
+                                                serde_json::json!({
+                                                    "action": "stored",
+                                                    "agent_id": &agent_id_for_pred,
+                                                    "memory_id": memory_id,
+                                                }),
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -3534,24 +3556,38 @@ async fn build_reply_with_session_inner(
         }
 
         // ── Conversation distill (async, non-blocking) ───────────
-        // Auto-distilled facts go to the MEMORY system (temporal supersession),
-        // never to the curated wiki — see wiki_ingest.rs module docs. Gated on
-        // `cognitive_memory_db` like every other SqliteMemoryEngine path: an
-        // agent with `[evolution] cognitive_memory = false` must not have its
-        // conversations distilled (this call site previously bypassed the gate
-        // via ctx.memory_db_path + a home_dir fallback).
+        // WP5c: the pipeline routes into TWO sinks — durable reference
+        // documents (charter / SOP / spec / policy) become an auto-filed page
+        // under the agent's own `wiki/auto/` namespace plus one memory
+        // pointer; everything else keeps going to the memory system with
+        // temporal supersession. Human-curated wiki namespaces are never
+        // written by this path. See wiki_ingest.rs module docs for the full
+        // contract and the four isolation locks.
+        //
+        // Runs whenever a memory database is configured (D7: the cognitive
+        // memory layer is always resident).
+        //
+        // `user_id` is threaded in for D9 (WP5d): the pipeline's first stage
+        // routes self-stated preferences / forms of address / reply-style
+        // requests into the per-user profile (`subject = user:<id>`) instead of
+        // a generic semantic entry. `session_id` supplies the WP5c source
+        // chain shown in the curation station ("Telegram 對話 · 8/4 10:12").
         if let Some(memory_db_for_distill) = cognitive_memory_db.clone() {
             let user_text_for_distill = sanitized_text.clone();
             let reply_for_distill = reply.clone();
             let agent_id_for_distill = agent_id.clone();
+            let user_id_for_distill = user_id.to_string();
             let home_for_distill = ctx.home_dir.clone();
+            let session_for_distill = session_id.to_string();
             tokio::spawn(async move {
                 crate::wiki_ingest::run_ingest(
                     &user_text_for_distill,
                     &reply_for_distill,
                     &agent_id_for_distill,
+                    &user_id_for_distill,
                     &home_for_distill,
                     &memory_db_for_distill,
+                    &session_for_distill,
                 ).await;
             });
         }
@@ -3738,6 +3774,15 @@ pub(crate) enum FailureReason {
     EmptyResponse,
     /// No rotator accounts configured.
     NoAccounts,
+    /// WP10 M4 — accounts ARE configured, but every one is in a billing-class
+    /// (24 h) cooldown. Recovery is hours away, so say so.
+    AccountsCoolingDownLong,
+    /// WP10 M4 — accounts are cooling down after a rate limit or a transient
+    /// error. Recovery is minutes away.
+    AccountsCoolingDownShort,
+    /// WP10 M4 — nothing is selectable but the reason is not attributable to a
+    /// cooldown. Wording must cover both horizons rather than guess.
+    AccountsCoolingDownUnknown,
     /// Fallback — unrecognized error string.
     Unknown,
 }
@@ -3790,6 +3835,18 @@ pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
     }
     if lower.contains("empty response") {
         return FailureReason::EmptyResponse;
+    }
+    // WP10 M4: tiered "nothing selectable" markers emitted by
+    // `rotate_cli_spawn`. Checked before the generic no-accounts test because
+    // they are strictly more specific.
+    if lower.contains("no accounts available: billing cooldown") {
+        return FailureReason::AccountsCoolingDownLong;
+    }
+    if lower.contains("no accounts available: short cooldown") {
+        return FailureReason::AccountsCoolingDownShort;
+    }
+    if lower.contains("no accounts available: reason unknown") {
+        return FailureReason::AccountsCoolingDownUnknown;
     }
     if lower.contains("no accounts") || lower.contains("no account configured") {
         return FailureReason::NoAccounts;
@@ -3877,7 +3934,24 @@ pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -
         ),
         FailureReason::NoAccounts => format!(
             "{agent_name} 目前沒有可用的 Claude 帳號。\n\
-             請先到儀表板設定 OAuth 或 API Key。"
+             請到儀表板加入 OAuth 或 API Key。"
+        ),
+        // WP10 M4 — the recovery horizon differs by an order of magnitude
+        // between billing exhaustion and a rate-limit cooldown, so the message
+        // says which one the user is actually waiting on.
+        FailureReason::AccountsCoolingDownLong => format!(
+            "{agent_name} 目前無法回應：帳號額度已用盡，正在冷卻中。\n\
+             最長可能需要 24 小時才會自動恢復。\n\
+             若不想等，可於 Anthropic Console 儲值，或在儀表板加入其他帳號。"
+        ),
+        FailureReason::AccountsCoolingDownShort => format!(
+            "{agent_name} 目前忙線中，帳號正在短暫冷卻。\n\
+             通常幾分鐘內會自動恢復，請稍後再送一次。"
+        ),
+        FailureReason::AccountsCoolingDownUnknown => format!(
+            "{agent_name} 目前沒有可用的帳號，系統正在等待恢復。\n\
+             若是短暫忙線，幾分鐘內會自動恢復；若是額度用盡，最長可能需要 24 小時。\n\
+             可到儀表板查看帳號狀態，或加入其他帳號以立即恢復服務。"
         ),
         FailureReason::Unknown => format!(
             "{agent_name} 暫時無法回應。\n\
@@ -3908,6 +3982,9 @@ fn classify_cli_error_hint(err: &str) -> &'static str {
         FailureReason::EmptyResponse => "空回應",
         FailureReason::BinaryMissing => "CLI 未安裝",
         FailureReason::NoAccounts => "無可用帳號",
+        FailureReason::AccountsCoolingDownLong => "額度用盡冷卻中",
+        FailureReason::AccountsCoolingDownShort => "短暫冷卻中",
+        FailureReason::AccountsCoolingDownUnknown => "帳號冷卻中",
         FailureReason::SpawnError => "程序啟動失敗",
         _ => "連線異常",
     }
@@ -4477,6 +4554,173 @@ mod rotation_tests {
         let broke = &statuses[0];
         assert!(!broke.is_healthy, "billing-exhausted account should be marked unhealthy");
         assert!(!broke.is_available, "should be unavailable during 24h cooldown");
+    }
+
+    /// WP10 (2026-08-04 field incident) — the exhaustion chain.
+    ///
+    /// A single OAuth account shared with the operator's own Claude Code
+    /// session made the interactive REPL stall. The stall was booked against
+    /// the ACCOUNT (`on_error`), so three stalls took the only account out of
+    /// rotation and every later message died with "All accounts exhausted".
+    /// A wedged PTY transport says nothing about the account's health —
+    /// the same account answers fine over fresh-spawn `claude -p`.
+    #[tokio::test]
+    async fn pty_stall_is_not_charged_to_account_health() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("oauth-default", 1)).await;
+
+        for _ in 0..5 {
+            let result = rotate_cli_spawn(
+                &rotator,
+                |_env_vars, _retry_hint| async move {
+                    Err::<String, _>(
+                        "interactive REPL stalled: no substantive progress for 120s \
+                         (mid_task=false)"
+                            .to_string(),
+                    )
+                },
+                100,
+            )
+            .await;
+            assert!(result.is_err());
+        }
+
+        let statuses = rotator.status().await;
+        let acc = &statuses[0];
+        assert!(
+            acc.is_healthy,
+            "5 PTY stalls must NOT mark the sole OAuth account unhealthy"
+        );
+        assert!(
+            acc.is_available,
+            "the account must stay selectable so the fresh-spawn fallback can use it"
+        );
+    }
+
+    /// Genuine account-level failures must still cool the account down —
+    /// the WP10 carve-out is narrow, not a blanket amnesty.
+    #[tokio::test]
+    async fn non_transport_errors_still_mark_account_unhealthy() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("flaky", 1)).await;
+
+        for _ in 0..3 {
+            let _ = rotate_cli_spawn(
+                &rotator,
+                |_env_vars, _retry_hint| async move {
+                    Err::<String, _>("claude CLI spawn error: exit 1".to_string())
+                },
+                100,
+            )
+            .await;
+        }
+
+        let statuses = rotator.status().await;
+        assert!(
+            !statuses[0].is_healthy,
+            "repeated genuine CLI failures must still take the account out of rotation"
+        );
+    }
+
+    /// WP10 — "no account currently available" must not masquerade as an
+    /// empty last error. Before the fix this produced
+    /// `All accounts exhausted. Last error: ` (empty tail), which classified
+    /// as `Unknown` and told the user to go read debug.log.
+    #[tokio::test]
+    async fn no_available_account_reports_a_classifiable_reason() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        let mut acc = fake_oauth_account("cooling", 1);
+        acc.is_healthy = false;
+        rotator.push_account_for_test(acc).await;
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars, _retry_hint| async move { Ok::<String, String>("unreachable".into()) },
+            100,
+        )
+        .await;
+
+        let err = result.expect_err("no selectable account ⇒ error");
+        // Unhealthy with NO cooldown attached ⇒ not attributable ⇒ hedge.
+        assert_eq!(
+            classify_cli_failure(&err),
+            FailureReason::AccountsCoolingDownUnknown,
+            "expected a cooling-down classification, got err: {err}"
+        );
+        // And the zh-TW surface must explain the wait, not only "go set up an
+        // account" — the user HAS an account.
+        let msg = format_fallback_message("小助手", FailureReason::AccountsCoolingDownUnknown);
+        assert!(msg.contains("冷卻") || msg.contains("恢復"), "message should explain the wait: {msg}");
+    }
+
+    /// WP10 M4 — a billing-exhausted account is a 24 h wait; saying "a few
+    /// minutes" would be a lie the user notices.
+    #[tokio::test]
+    async fn billing_cooldown_reports_the_long_horizon() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("broke", 1)).await;
+        rotator.on_billing_exhausted("broke").await; // 24 h
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars, _retry_hint| async move { Ok::<String, String>("unreachable".into()) },
+            100,
+        )
+        .await;
+
+        let err = result.expect_err("billing-cooled account ⇒ error");
+        assert_eq!(classify_cli_failure(&err), FailureReason::AccountsCoolingDownLong);
+        let msg = format_fallback_message("小助手", FailureReason::AccountsCoolingDownLong);
+        assert!(msg.contains("24"), "long horizon must be stated: {msg}");
+        assert!(!msg.contains("幾分鐘"), "must not promise minutes: {msg}");
+    }
+
+    /// A rate-limit cooldown is minutes, and must NOT borrow the 24 h wording.
+    #[tokio::test]
+    async fn rate_limit_cooldown_reports_the_short_horizon() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("busy", 1)).await;
+        rotator.on_rate_limited("busy").await; // 120 s
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars, _retry_hint| async move { Ok::<String, String>("unreachable".into()) },
+            100,
+        )
+        .await;
+
+        let err = result.expect_err("rate-limited account ⇒ error");
+        assert_eq!(classify_cli_failure(&err), FailureReason::AccountsCoolingDownShort);
+        let msg = format_fallback_message("小助手", FailureReason::AccountsCoolingDownShort);
+        assert!(msg.contains("幾分鐘"), "short horizon must be stated: {msg}");
+        assert!(!msg.contains("24"), "must not threaten 24h for a 2min wait: {msg}");
+    }
+
+    /// M2 regression: `SessionError::ChildExited` renders as "child process
+    /// exited during invoke (...)", which the generic classifier reads as a
+    /// spawn failure. It must NOT reach `on_error` and burn account health.
+    #[tokio::test]
+    async fn child_exited_is_transport_not_account_failure() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("solo", 1)).await;
+
+        for _ in 0..5 {
+            let _ = rotate_cli_spawn(
+                &rotator,
+                |_env_vars, _retry_hint| async move {
+                    Err::<String, _>(
+                        duduclaw_cli_runtime::SessionError::ChildExited { code: Some(1) }
+                            .to_string(),
+                    )
+                },
+                100,
+            )
+            .await;
+        }
+
+        let status = &rotator.status().await[0];
+        assert!(status.is_healthy, "a dead REPL child must not cool the account");
+        assert!(status.is_available);
     }
 
     /// T4.7 smoke replacement: single good OAuth account — no regression.
@@ -5681,6 +5925,31 @@ where
 
     for attempt in 0..max_attempts {
         let Some(selected) = rotator.select().await else {
+            // WP10: distinguish "accounts ARE configured but none is currently
+            // available" (all cooling down / marked unhealthy) from "the last
+            // attempt failed with <error>". Previously both collapsed into
+            // `All accounts exhausted. Last error: ` with an EMPTY tail, which
+            // classified as Unknown and told the user to check debug.log.
+            //
+            // The genuinely-empty rotator (`account_count == 0`) keeps the
+            // legacy aggregator string — it has its own callers and message.
+            //
+            // WP10 M4: tier the marker by the actual cooldown horizon so the
+            // zh-TW message can say "a few minutes" vs "up to 24 hours"
+            // instead of one hedged sentence. Unknown ⇒ conservative wording
+            // covering both (the caller must not guess).
+            if account_count > 0 && last_error.is_empty() {
+                use duduclaw_agent::account_rotator::UnavailableReason;
+                let tier = match rotator.unavailable_reason().await {
+                    UnavailableReason::LongCooldown => "billing cooldown",
+                    UnavailableReason::ShortCooldown => "short cooldown",
+                    UnavailableReason::Unknown => "reason unknown",
+                };
+                return Err(format!(
+                    "no accounts available: {tier} — all {account_count} configured \
+                     account(s) are cooling down or marked unhealthy"
+                ));
+            }
             break;
         };
         info!(account = %selected.id, attempt, "Channel CLI attempt");
@@ -5705,6 +5974,21 @@ where
                 } else if crate::claude_runner::is_rate_limit_error(&e) {
                     warn!(account = %selected.id, error = %e, "Account rate-limited — cooldown");
                     rotator.on_rate_limited(&selected.id).await;
+                } else if crate::pty_runtime::is_pty_transport_error(&e) {
+                    // WP10 (2026-08-04 field incident): a wedged interactive
+                    // REPL is a *transport* failure, not an account failure —
+                    // the same OAuth account answers fine over fresh-spawn
+                    // `claude -p`. Booking it against account health is what
+                    // turned one 120 s stall into "All accounts exhausted" on
+                    // single-account installs, killing every later message.
+                    // Do NOT call `on_error` here; the PTY-pool wrapper
+                    // handles it via the demotion breaker + fresh-spawn
+                    // fallback.
+                    warn!(
+                        account = %selected.id,
+                        error = %e,
+                        "PTY transport failure — NOT counted against account health"
+                    );
                 } else {
                     warn!(account = %selected.id, error = %e, "Account CLI attempt failed");
                     rotator.on_error(&selected.id).await;
@@ -7077,9 +7361,22 @@ pub(crate) async fn call_claude_cli_pty_rotated(
     )
     .await
     {
-        Ok(reply) => Ok(reply),
+        Ok(reply) => {
+            // WP10: a clean pool invoke clears the agent's failure streak so a
+            // transient wedge never accumulates toward demotion.
+            crate::pty_runtime::record_pty_success(&agent_id_from_work_dir(work_dir));
+            Ok(reply)
+        }
         Err(e) if crate::pty_runtime::pty_pool_error_should_fallback(&e) => {
             let (reason, mid_task) = crate::pty_runtime::classify_fallback_reason(&e);
+            // WP10: count transport-level wedges toward the demotion breaker.
+            // Two in a row route this agent to fresh-spawn `claude -p` for the
+            // cooldown window, so we stop paying the 120 s stall tax on every
+            // message (the incident: 4 stalls in 90 minutes, each one a
+            // two-minute dead wait before the fallback even started).
+            if crate::pty_runtime::is_pty_transport_error(&e) {
+                crate::pty_runtime::record_pty_transport_failure(&agent_id_from_work_dir(work_dir));
+            }
             if mid_task {
                 // Stall / hard-cap AFTER substantive progress: the interactive
                 // turn may have partially executed (tool calls, writes). We still

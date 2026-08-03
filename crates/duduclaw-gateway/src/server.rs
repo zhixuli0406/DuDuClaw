@@ -998,9 +998,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             match crate::events_store::EventBusStore::open(&home_dir) {
                 Ok(bus) => {
                     let bus = Arc::new(bus);
+                    // WP6: the same tail also bridges channel-action feedback
+                    // (`cron.changed` / `memory.changed` / `skill.changed`) to
+                    // the dashboard WebSocket, so a routine created from
+                    // Telegram appears on RoutinesPage without a reload.
                     bg_handles.push(crate::autopilot_engine::spawn_events_db_poll(
                         bus.clone(),
                         ap_tx.clone(),
+                        Some(event_tx.clone()),
                     ));
                     info!("Event bus (events.db) poll task started");
                     Some(bus)
@@ -1384,6 +1389,37 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // channel_reply can short-circuit cheaply; agents that don't opt in
     // never trigger a spawn. See
     // `commercial/docs/TODO-cli-pty-pool-worker.md` for the full design.
+    // WP10 one-time migration (2026-08-04): undo the PTY-pool settings the
+    // dashboard's agent edit page wrote WITHOUT user consent between v1.44 and
+    // v1.49. Must run BEFORE `pty_runtime::init` so the first reply of this
+    // boot already sees the corrected routing. Never blocks boot — the pass
+    // swallows its own failures and reports them.
+    {
+        let report = crate::pty_default_migration::run(&home_dir);
+        if !report.reset.is_empty() || !report.failed.is_empty() {
+            info!(
+                reset = report.reset.len(),
+                failed = report.failed.len(),
+                "WP10 PTY-default migration applied"
+            );
+            // The migration changes the user's config without being asked. A
+            // silent rewrite is what caused this incident in the first place,
+            // so surface it in the dashboard rather than only in the log.
+            // Best-effort: `emit` never fails the caller, and the event waits
+            // in `events.db` for the 2 s tail if no browser is connected yet.
+            crate::dashboard_feedback::emit(
+                &home_dir,
+                crate::dashboard_feedback::EV_RUNTIME_MIGRATED,
+                serde_json::json!({
+                    "migration": "wp10-pty-default-reset",
+                    "reset_agents": report.reset,
+                    "failed_agents": report.failed,
+                }),
+            )
+            .await;
+        }
+    }
+
     crate::pty_runtime::init(home_dir.clone());
     info!("PTY runtime initialised (Phase 3 adapter — opt-in via agent.toml)");
 
