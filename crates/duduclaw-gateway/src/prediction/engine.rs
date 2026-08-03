@@ -755,7 +755,9 @@ impl PredictionEngine {
         };
 
         if should_save {
-            self.save_model(&key.0, &key.1).await;
+            // Hot path: fire-and-forget is fine here — shutdown's `flush_all`
+            // rewrites every model anyway and *does* wait for the write.
+            let _ = self.save_model(&key.0, &key.1).await;
         }
     }
 
@@ -773,7 +775,16 @@ impl PredictionEngine {
     }
 
     /// Persist a single model to SQLite.
-    async fn save_model(&self, user_id: &str, agent_id: &str) {
+    ///
+    /// Returns the blocking-write `JoinHandle` so shutdown callers can wait for
+    /// the write to land; hot-path callers may drop it to keep the write
+    /// detached.
+    #[must_use = "shutdown paths must await the write; hot paths should `let _ =` it explicitly"]
+    async fn save_model(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let model = {
             let models = self.models.lock().await;
             models.get(&(user_id.to_string(), agent_id.to_string())).cloned()
@@ -783,7 +794,7 @@ impl PredictionEngine {
             let db_path = self.db_path.clone();
             let uid = user_id.to_string();
             let aid = agent_id.to_string();
-            tokio::task::spawn_blocking(move || {
+            Some(tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = Connection::open(&db_path) {
                     let json = serde_json::to_string(&model).unwrap_or_default();
                     let _ = conn.execute(
@@ -792,7 +803,9 @@ impl PredictionEngine {
                         params![uid, aid, json, model.total_conversations, model.last_updated.to_rfc3339()],
                     );
                 }
-            });
+            }))
+        } else {
+            None
         }
     }
 
@@ -803,13 +816,32 @@ impl PredictionEngine {
     }
 
     /// Flush all dirty models to disk (call on shutdown).
+    ///
+    /// Awaits every spawned write before returning: the shutdown path may
+    /// `exec()` into a new binary (self-restart) the moment this resolves, and a
+    /// detached `spawn_blocking` write that had not reached SQLite yet would
+    /// simply vanish with the old image — silently losing user-model state.
     pub async fn flush_all(&self) {
         let models = self.models.lock().await;
         let keys: Vec<(String, String)> = models.keys().cloned().collect();
         drop(models);
 
+        let mut handles = Vec::with_capacity(keys.len());
         for (user_id, agent_id) in keys {
-            self.save_model(&user_id, &agent_id).await;
+            if let Some(handle) = self.save_model(&user_id, &agent_id).await {
+                handles.push(handle);
+            }
+        }
+        for handle in handles {
+            // Per-write bound so one wedged SQLite lock cannot eat the caller's
+            // whole shutdown budget (the shutdown chain also wraps this call in
+            // an outer 20s `bounded_step`).
+            if tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+                .await
+                .is_err()
+            {
+                warn!("user model write did not finish within 3s — continuing shutdown");
+            }
         }
         info!("Flushed all user models to disk");
     }
@@ -901,5 +933,42 @@ impl PredictionEngine {
         } else {
             0.0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `flush_all` must not return until every spawned SQLite write
+    /// has actually landed. The shutdown chain may `exec()` into a new binary
+    /// immediately afterwards, so a still-pending detached write is lost state.
+    #[tokio::test]
+    async fn flush_all_awaits_pending_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("prediction.db");
+        let engine = PredictionEngine::new(db_path.clone(), None);
+
+        {
+            let mut models = engine.models.lock().await;
+            models.insert(
+                ("u1".to_string(), "a1".to_string()),
+                UserModel::new("u1".to_string(), "a1".to_string()),
+            );
+            models.insert(
+                ("u2".to_string(), "a1".to_string()),
+                UserModel::new("u2".to_string(), "a1".to_string()),
+            );
+        }
+
+        engine.flush_all().await;
+
+        // No sleep, no retry: the rows must be readable the instant flush_all
+        // resolves.
+        let conn = Connection::open(&db_path).expect("open db");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM user_models", [], |r| r.get(0))
+            .expect("count rows");
+        assert_eq!(count, 2, "flush_all returned before writes were durable");
     }
 }
