@@ -1073,11 +1073,19 @@ impl SessionManager {
             // the first still-visible user message for untitled sessions.
             let stored: Option<String> = row.get(5)?;
             let first_user: Option<String> = row.get(7)?;
+            // The fallback is a raw stored user message, which carries the
+            // `[sender_id: …]` plumbing line — without stripping it every
+            // untitled conversation is listed as "[sender_id: webchat:…]".
+            let first_user_clean = first_user
+                .as_deref()
+                .map(crate::channel_reply::strip_sender_prefix)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
             let picked = stored
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .or_else(|| first_user.as_deref().map(str::trim));
+                .or(first_user_clean);
             let title = picked
                 .map(|s| duduclaw_core::truncate_chars(s, SESSION_TITLE_MAX_CHARS))
                 .unwrap_or_default();

@@ -6554,81 +6554,15 @@ impl MethodHandler {
     /// heartbeat-driven consumers; channel_reply / dispatcher always read fresh
     /// from the lock-protected registry so they see the previous version until the
     /// next scan).
+    /// Thin wrapper over [`crate::channel_reply::update_agent_toml_with`] — the
+    /// single implementation of "edit agent.toml + hot-reload", shared with the
+    /// chat-command path (`/model`) so the two can never drift on the atomic
+    /// write or the registry rescan.
     async fn update_agent_toml<F>(&self, agent_id: &str, mutate: F) -> Result<bool, String>
     where
         F: FnOnce(&mut toml::Table) -> Result<(), String>,
     {
-        if !is_valid_agent_id(agent_id) {
-            return Err(format!("Invalid agent_id: {agent_id}"));
-        }
-
-        let reg = self.registry.read().await;
-        let agent = reg
-            .get(agent_id)
-            .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
-        let agent_toml_path = agent.dir.join("agent.toml");
-        drop(reg);
-
-        let content = tokio::fs::read_to_string(&agent_toml_path)
-            .await
-            .map_err(|e| format!("Failed to read agent.toml: {e}"))?;
-
-        let mut table: toml::Table = content
-            .parse()
-            .map_err(|e| format!("Failed to parse agent.toml: {e}"))?;
-
-        mutate(&mut table)?;
-
-        let new_content = toml::to_string_pretty(&table)
-            .map_err(|e| format!("Failed to serialise agent.toml: {e}"))?;
-
-        // Atomic write: temp file + rename
-        let tmp_path = agent_toml_path.with_extension("toml.tmp");
-        tokio::fs::write(&tmp_path, &new_content)
-            .await
-            .map_err(|e| format!("Failed to write agent.toml.tmp: {e}"))?;
-        tokio::fs::rename(&tmp_path, &agent_toml_path)
-            .await
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                format!("Failed to commit agent.toml: {e}")
-            })?;
-
-        // Registry re-scan for hot-reload. This must be RELIABLE, not
-        // best-effort: the gateway has no periodic rescan, so a skipped scan
-        // here leaves the in-memory registry stale forever (agents answer —
-        // and WebChat displays — the OLD model until the next unrelated
-        // update/create or a restart; distributor-reported bug). The write
-        // lock is acquired unconditionally — reader guards are all bounded
-        // (longest: one system-prompt build), so this waits, it cannot hang.
-        // Scan failures (transient IO) retry inline before giving up.
-        let mut hot_reloaded = false;
-        for attempt in 1..=3u32 {
-            let mut reg = self.registry.write().await;
-            match reg.scan().await {
-                Ok(()) => {
-                    hot_reloaded = true;
-                    break;
-                }
-                Err(e) => {
-                    warn!(agent_id, attempt, error = %e, "registry rescan failed after agent.toml write — retrying");
-                    drop(reg);
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-            }
-        }
-        if hot_reloaded {
-            // Nudge live WebChat sockets to re-send their session_info frame
-            // so open dashboard tabs reflect the change without a reconnect.
-            let _ = crate::channel_reply::agent_config_events().send(agent_id.to_string());
-        } else {
-            warn!(
-                agent_id,
-                "registry rescan failed 3× — change persisted to agent.toml but in-memory consumers are stale until the next successful scan"
-            );
-        }
-
-        Ok(hot_reloaded)
+        crate::channel_reply::update_agent_toml_with(&self.registry, agent_id, mutate).await
     }
 
     /// Convenience: update only the `status` field in an agent's `agent.toml`.
@@ -23964,7 +23898,12 @@ impl MethodHandler {
                             "role": m.role,
                             // CJK-safe cap — long single turns are bounded so the
                             // payload stays sane; normal messages pass through whole.
-                            "content": duduclaw_core::truncate_chars(&m.content, CHAT_HISTORY_MSG_MAX_CHARS),
+                            // The `[sender_id: …]` line is model plumbing and must
+                            // not be replayed into the user's own bubble.
+                            "content": duduclaw_core::truncate_chars(
+                                crate::channel_reply::strip_sender_prefix(&m.content),
+                                CHAT_HISTORY_MSG_MAX_CHARS,
+                            ),
                             "timestamp": m.timestamp,
                             "tokens": m.tokens,
                         })
