@@ -210,9 +210,30 @@ fn normalize_payload(s: &str) -> String {
 
 /// Strip ANSI escape sequences (CSI + OSC + single-char ESC) from `s`.
 ///
-/// Necessary because the Claude TUI emits `\x1b[1C` (cursor-forward 1)
-/// between every visible character of rendered text — without stripping,
-/// the sentinel bytes are non-contiguous and `find` cannot locate them.
+/// Necessary because the Claude TUI positions text with cursor-move escapes
+/// (`ESC[<n>C` cursor-forward, `ESC[<n>G` cursor-horizontal-absolute) rather
+/// than literal spaces — without stripping, the sentinel bytes are
+/// non-contiguous and `find` cannot locate them.
+///
+/// # Known lossy behaviour: horizontal spacing (WP11-B, 2026-08-04)
+///
+/// Because those cursor moves are *dropped* rather than translated into
+/// spaces, any TUI text whose word gaps were painted as cursor moves comes
+/// out glued together (`"esc to interrupt"` → `"esctointerrupt"` — which is
+/// exactly why [`CHROME_MARKERS`] below is written in the space-less form).
+/// A live capture of `claude` 2.1.220 confirms both forms occur: the first
+/// full paint of a line uses literal spaces, later diff-repaints use cursor
+/// moves. This is the root cause of the "ASCII spaces vanished" half of the
+/// 2026-08-04 field report — the affected text was TUI chrome, not model
+/// output.
+///
+/// The behaviour is deliberately **left as-is**: every chrome heuristic in
+/// this module (and the sentinel scan itself) was tuned against the
+/// space-less form, so translating cursor moves into spaces here would break
+/// detection for a cosmetic gain on text that should never reach a user in the
+/// first place. The leak itself is fixed downstream, at the shared reply
+/// assembly point, by `duduclaw_gateway::cli_noise` — which matches
+/// whitespace-insensitively and therefore catches both render forms.
 ///
 /// Handled sequence forms:
 /// - **CSI**: `ESC [ ... <final byte 0x40-0x7E>` — covers cursor moves,
@@ -725,6 +746,30 @@ mod tests {
     }
 
     // ── Phase 3.C.2: strip_ansi tests ─────────────────────────────────
+
+    /// **WP11-B evidence pin (2026-08-04).** Byte-for-byte excerpt of a live
+    /// `claude` 2.1.220 PTY capture taken on this machine. It documents where
+    /// the customer's missing ASCII spaces actually go: the notice's *fresh*
+    /// paint carries literal spaces (they survive `strip_ansi` untouched), but
+    /// the surrounding column positioning is expressed as `ESC[<n>C` /
+    /// `ESC[<n>G`, which `strip_ansi` drops — so a diff-repaint of the same
+    /// line arrives glued together. Downstream mitigation lives in
+    /// `duduclaw_gateway::cli_noise`, which matches both forms.
+    #[test]
+    fn strip_ansi_documents_where_horizontal_spacing_is_lost() {
+        // Fresh paint: literal spaces present ⇒ preserved.
+        let fresh = "\r\x1b[2C\x1b[1B\x1b[38;5;220m⚠ Transcript saving is off — inherited \
+                     CLAUDE_CODE_CHILD_SESSION marker\x1b[38;5;246m · restart";
+        let out = strip_ansi(fresh);
+        assert!(out.contains("Transcript saving is off"), "got {out:?}");
+
+        // Column positioning instead of spaces ⇒ words glue together. This is
+        // the render form the customer saw.
+        let repaint = "\x1b[38;5;220m⚠\x1b[4G1 MCP server\x1b[1Cneeds\x1b[1Cauthentication";
+        let out = strip_ansi(repaint);
+        assert_eq!(out, "⚠1 MCP serverneedsauthentication");
+        assert!(!out.contains("server needs"), "cursor moves are dropped, not spaced");
+    }
 
     #[test]
     fn strip_ansi_removes_csi_cursor_forward() {

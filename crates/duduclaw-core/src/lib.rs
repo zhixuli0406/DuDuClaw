@@ -15,6 +15,7 @@ pub mod text_utils;
 pub mod tool_catalog;
 pub mod traits;
 pub mod types;
+pub mod zh_variant;
 
 pub use agent_guard::{check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES};
 pub use agent_rename::{rename_in_markdown, synced_trigger};
@@ -38,6 +39,7 @@ pub use text_utils::{truncate_bytes, truncate_chars};
 pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
 pub use traits::{Channel, ContainerRuntime, MemoryEngine};
 pub use types::*;
+pub use zh_variant::{contains_simplified, dominant_variant, to_traditional, ChineseVariant};
 
 // ── Delegation safety constants ──────────────────────────────
 

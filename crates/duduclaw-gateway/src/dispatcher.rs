@@ -305,6 +305,11 @@ fn short_failure_label(reason: crate::channel_reply::FailureReason) -> &'static 
         FailureReason::SpawnError => "子程序啟動失敗",
         FailureReason::EmptyResponse => "未產生回應內容",
         FailureReason::NoAccounts => "沒有可用帳號",
+        // WP10 M4 — accounts exist but none is selectable; the label states the
+        // recovery horizon the user is actually waiting on.
+        FailureReason::AccountsCoolingDownLong => "帳號額度用盡，冷卻中（最長 24 小時）",
+        FailureReason::AccountsCoolingDownShort => "帳號短暫冷卻中（數分鐘）",
+        FailureReason::AccountsCoolingDownUnknown => "帳號冷卻中，等待自動恢復",
         FailureReason::Unknown => "未知錯誤",
     }
 }
@@ -2432,6 +2437,18 @@ fn escape_markdown_v1(s: &str) -> String {
         .replace('[', "\\[")
 }
 
+/// Full outbound text preparation for the dispatcher's channel path.
+///
+/// **WP11-A (P1)**: delegation call-backs and proactive pushes reach a channel
+/// through [`forward_to_channel`], never through
+/// `channel_reply::build_reply_*`, so the AI-runtime internal-message filter
+/// has to run here as well — otherwise the same TUI chrome that leaked to the
+/// customer simply takes the other door. Order matters: strip runtime chrome
+/// first, then the DuDuClaw-internal markers/paths.
+pub(crate) fn prepare_channel_text(text: &str) -> String {
+    sanitize_for_channel(&crate::cli_noise::strip_cli_noise(text).text)
+}
+
 /// Sanitize agent response text before forwarding to a public channel.
 /// Strips internal paths, DUDUCLAW_SYSTEM markers, and other implementation details.
 fn sanitize_for_channel(text: &str) -> String {
@@ -2541,8 +2558,9 @@ async fn forward_to_channel(
         "teams" => 6900,
         _ => 3900,
     };
-    // Sanitize response text — strip internal paths and system markers before channel delivery
-    let safe_text = sanitize_for_channel(text);
+    // Strip AI-runtime chrome (WP11-A P1) + internal paths / system markers
+    // before channel delivery. See `prepare_channel_text`.
+    let safe_text = prepare_channel_text(text);
     // Escape agent name for Telegram MarkdownV1 to prevent formatting injection
     let safe_agent = escape_markdown_v1(responder_agent);
 
@@ -3095,6 +3113,32 @@ async fn build_typing_guard_for_sqlite_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **WP11-A (P1)**: the delegation-callback / proactive-push path must get
+    /// the same internal-message filter as `channel_reply::build_reply_*`.
+    /// Both cleaners run, and neither eats legitimate content.
+    #[test]
+    fn prepare_channel_text_strips_runtime_chrome_and_internal_markers() {
+        let input = "任務完成，共處理 3 筆。\n\
+             [DUDUCLAW_SYSTEM: internal note]\n\
+             ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker\n\
+             ⏵⏵ auto mode on (shift+tab to cycle)";
+        let out = prepare_channel_text(input);
+        assert!(out.contains("任務完成，共處理 3 筆。"));
+        assert!(!out.contains("CLAUDE_CODE_CHILD_SESSION"), "runtime chrome survived: {out}");
+        assert!(!out.contains("auto mode on"), "mode footer survived: {out}");
+        assert!(!out.contains("DUDUCLAW_SYSTEM"), "internal marker survived: {out}");
+    }
+
+    /// Same path, negative case: an ordinary answer that merely discusses the
+    /// same vocabulary must come out byte-identical.
+    #[test]
+    fn prepare_channel_text_keeps_ordinary_answers_intact() {
+        let input = "The integration is half-configured.\n\
+             The MCP server needs authentication before the tools become available.\n\
+             Set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 if you want transcripts kept";
+        assert_eq!(prepare_channel_text(input), input);
+    }
 
     #[test]
     fn validate_channel_id_googlechat_and_teams() {
