@@ -656,7 +656,6 @@ L1 驗證器在模擬最終 SOUL.md 上強制執行這些邊界。
 skill_auto_activate = true
 skill_security_scan = true
 gvu_enabled = true                 # 啟用 GVU 自我博弈迴圈
-cognitive_memory = false           # Phase 3（情節/語意分層）
 max_silence_hours = 12.0           # 靜默破壞器閾值
 max_gvu_generations = 3            # GVU 最大嘗試輪數
 observation_period_hours = 24.0    # SOUL.md 變更觀察期
@@ -675,7 +674,7 @@ peer_signals = false               # Peer Agent 信號
 
 | 工具 | 說明 |
 |------|------|
-| `evolution_toggle` | 切換 `gvu_enabled`、`cognitive_memory` 等旗標 |
+| `evolution_toggle` | 切換 `gvu_enabled` 等旗標（`cognitive_memory` 自 D7 起不再可設定——認知記憶層永遠常駐，寫入這個鍵會被拒絕） |
 | `evolution_status` | 查詢 Agent 的進化引擎設定和狀態 |
 
 ---

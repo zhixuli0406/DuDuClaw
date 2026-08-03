@@ -131,6 +131,12 @@ D1 讓你能*撤銷*一個投毒來源；D2 則在源頭就攔下大部分毒物
 
 **排序端信任。**`origin_trust` 現在會參與取回排序（權重 `w_trust`，預設 0.10）：每個候選的分數會乘上 `(1 − w_trust) + w_trust · origin_trust`，讓未經驗證的頻道蒸餾事實（trust 0.3）無法勝過策展過的事實（trust 1.0）。在 HippoRAG-lite graph 中，一個三元組的邊會依其 `origin_trust` 加權，縮小低信任事實的 Personalized-PageRank 質量，直接抑制「單一投毒三元組被 PPR 放大兩跳」這條路徑。舊資料列（trust 1.0）的排序與 D2 之前逐位元組相同。
 
+### 自動建檔的知識庫頁面（WP5c）
+
+對話蒸餾現在有第二個 sink：長效參考文件（章程／SOP／規格／政策）會落成該 AI 員工 `auto/` 命名空間下的一頁 wiki，而不是一堆記憶列。信任模型刻意共用而非另立一套——頁面 frontmatter 的 `trust` 是 `0.300`，與 `origin.rs` 給 `channel` 類別的上限同值，`source_type` 為 `raw_dialogue`（排序係數 0.6）。呼叫端無法把任一項調高；升級為策展信任是人工動作，在策展台執行。
+
+記憶端每頁只留一列指標——`subject = wiki:auto/<doc_type>/<slug>`、`predicate = documented_in`、origin `channel`、trust 0.3——文件全文只存在一處，而接替、回溯與檢索在記憶端仍然照常運作。移除一頁時以**精確 subject**（`expire_by_subject`）讓該指標失效，絕不走 `invalidate_by_origin`——那會把所有從對話學到的記憶一併帶走。詳見 [17 — Wiki 知識層](17-wiki-knowledge-layer.md)。
+
 ### 圖檢索演進（D3）
 
 HippoRAG-lite graph 獲得四項各自獨立的改良（對齊 HippoRAG 2 + LightRAG）。每一項都是 fail-safe：在沒有 alias、圖很小、且 embedding seeding 關閉時，排序與先前的 per-query 建圖**逐位元組相同**。

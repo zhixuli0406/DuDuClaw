@@ -290,6 +290,50 @@ Auto-ingested content defaults:
 
 ---
 
+## 自動建檔（`auto/` 命名空間，WP5c）
+
+以前在通道貼一份公司章程什麼都不會留下：蒸餾分類器看的是**助理回覆長度**，兩千字的文件配一句「好的」就整條管線跳過。WP5c 補上第二個 sink。
+
+**判別**（`knowledge_route.rs`，決定性案例零 LLM 成本）：
+
+| 層 | 規則 |
+|---|---|
+| L0 排除 | 少於 80 字 · 短提問 · `scan_input` 任一命中 · LLM fallback 敘事 |
+| L1 訊號 | 文件性名詞（+40）、明示建檔動詞（+50）、`第…條` ≥2 次（+35）、≥3 行編號條列（+25）、markdown 結構（+10）、長度（+15/+30）、標題行（+10）；扣分：第一人稱偏好（−45）、時效情境（−35）、代名詞密度（−20）、多重提問（−25） |
+| 閾值 | ≥65 建檔 · 30–64 交小模型仲裁 · <30 走記憶 |
+
+判別**只看使用者文字**，且在 `classify_for_ingest` 之前執行。
+
+**頁面位置**：該 AI 員工自己的 `auto/{charter,sop,spec,policy,reference}/<slug>.md`。人工策展目錄（`entities/`、`concepts/`、`sources/`、`synthesis/`）在這條路徑上不可達。
+
+**自動頁與人工頁的差別**：
+
+| | 自動建檔 | 人工策展 |
+|---|---|---|
+| `author` | `auto-distill` | operator / agent id |
+| `tags` | 含 `auto-distilled` | — |
+| `layer` | `context`——**永不自動注入** | `identity` / `core` 會注入 |
+| `trust` | `0.300`（`channel` 來源上限） | 最高 `1.0` |
+| `source_type` | `raw_dialogue`（排序係數 0.6） | `verified_fact`（1.2）等 |
+| 可搜尋 | 是（刻意不設 `do_not_inject`） | 是 |
+
+「不注入」是整份設計的風險支點：判別錯誤的代價是知識庫多一頁，而不是每一次回覆的系統提示被污染。
+
+**決定性**：頁面 key 為 `auto/<doc_type>/<slug>.md`，`slug` 取小模型提案並以 `^[a-z0-9][a-z0-9-]{0,63}$` 嚴格驗證，不合格則退回 `<doc_type>-<sha8(NFKC 正規化標題)>`。內容相同再貼一次不寫檔；內容不同則覆寫並在版本紀錄追加一行。
+
+**四道閘門，全部 fail-closed，全部退回記憶路徑**：
+
+1. `.scope.toml`——`[namespaces.auto]` 可設 `operator_only` 或指向其他 capability 的 `read_only` 來關閉自動建檔。與共享 wiki 的 fail-safe 不同，檔案存在但解析失敗會**停止**寫入。
+2. 對整頁文字跑 `scan_input`，任一規則命中即丟棄。
+3. 同源爆量偵測（`knowledge_guard`）。
+4. 每日斷路器：每位 AI 員工每天 20 頁 + 20 次灰帶仲裁。
+
+**記憶只留指標，不留全文**：一列 `subject = wiki:auto/<doc_type>/<slug>`、`predicate = documented_in`，`store_temporal` 會自動接替舊指標，策展台移除時也能精準讓這一頁的指標失效。
+
+**管理介面**：儀表板 → 記憶與知識 → 策展台 → 自動建檔（檢視／確認為正式知識／分享到共享知識庫／移除）。
+
+---
+
 ## CLAUDE_WIKI 範本
 
 現在每個新 Agent 的 `CLAUDE.md` 都包含一個 CLAUDE_WIKI 範本，教導 LLM 如何使用 wiki 工具：

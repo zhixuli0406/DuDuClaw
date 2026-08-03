@@ -131,6 +131,24 @@ D1 lets you *undo* a poisoned source; D2 stops most poison from landing in the f
 
 **Ranking-side trust.** `origin_trust` now participates in retrieval ranking (weight `w_trust`, default 0.10): each candidate's score is multiplied by `(1 − w_trust) + w_trust · origin_trust`, so an unverified channel-distilled fact (trust 0.3) can't outrank a curated one (trust 1.0). In the HippoRAG-lite graph, a triple's edges are weighted by its `origin_trust`, shrinking a low-trust fact's Personalized-PageRank mass — this directly damps the "single poisoned triple amplified two hops by PPR" path. Legacy rows (trust 1.0) rank byte-identically to the pre-D2 path.
 
+### Auto-filed knowledge pages (WP5c)
+
+Conversation distillation now has a second sink: durable reference documents
+(charter / SOP / spec / policy) become a wiki page under the agent's `auto/`
+namespace instead of a pile of memory rows. The trust model is deliberately
+shared rather than parallel — the page's frontmatter `trust` is `0.300`, the
+same ceiling `origin.rs` gives the `channel` class, and its `source_type` is
+`raw_dialogue` (ranking factor 0.6). A caller cannot raise either; promotion to
+curated trust is a human action in the curation station.
+
+Memory keeps exactly one pointer row per page —
+`subject = wiki:auto/<doc_type>/<slug>`, `predicate = documented_in`, origin
+`channel`, trust 0.3 — so the document's full text lives in one place while
+supersession, rollback and retrieval still work on the memory side. Removing a
+page expires that pointer by **exact subject** (`expire_by_subject`), never via
+`invalidate_by_origin`, which would take every conversationally-learned memory
+with it. See [17 — Wiki Knowledge Layer](17-wiki-knowledge-layer.md#auto-filed-pages-auto-namespace-wp5c).
+
 ### Graph retrieval evolution (D3)
 
 The HippoRAG-lite graph gained four independent refinements (HippoRAG 2 + LightRAG alignment). Each is fail-safe: with no aliases, a small graph, and embedding seeding off, ranking is **byte-identical** to the earlier per-query build.

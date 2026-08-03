@@ -44,7 +44,7 @@ pub use user_code::{
 pub use user_profile::{
     consolidate_profile, profile_block, profile_traits, record_trait, ProfileTrait,
 };
-pub use wiki::{SourceType, WikiFts, WikiLayer, WikiStore};
+pub use wiki::{serialize_page, SourceType, WikiFts, WikiLayer, WikiPage, WikiStore};
 
 // ── Night Engine (N3/N4 deterministic memory passes) ──
 pub mod night;
