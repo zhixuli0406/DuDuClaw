@@ -1145,6 +1145,13 @@ export interface McpOAuthProvider {
   configured: boolean;
   token_status: 'none' | 'authenticated' | 'expired';
   expires_at: string | null;
+  /**
+   * The exact redirect URI to register in the provider's console, derived
+   * server-side from the live gateway port. Absent on older gateways — the UI
+   * falls back to its built-in default, which is only correct on the default
+   * port.
+   */
+  redirect_uri?: string;
 }
 
 /** Fields that can be updated on an agent via `agents.update`. All optional. */
@@ -2613,6 +2620,38 @@ export interface DistributorPatch {
 // API namespace
 // ── WebChat session history (WP3 — resume past conversations) ───────────────
 
+// ── Google credential paths (service account / Apps Script bridge) ────────
+
+/** One configured-or-not credential section, plus its parse error if broken. */
+export interface GoogleCredentialSection {
+  configured: boolean;
+  /** Present only for the service-account section. */
+  key_file?: string;
+  /** Present only for the service-account section. */
+  subject?: string;
+  /** Present only for the Apps Script section. */
+  url?: string;
+  /** Non-empty when the section exists but cannot be used. */
+  error: string;
+}
+
+export interface GoogleCredentialsStatus {
+  /** `config.toml [integrations] google_workspace` — the master gate. */
+  integration_enabled: boolean;
+  /** Which path a real tool call would take right now. */
+  effective: 'direct' | 'apps_script' | 'none';
+  service_account: GoogleCredentialSection;
+  apps_script: GoogleCredentialSection;
+  /** Scope list to hand a Workspace admin for delegation. */
+  required_scopes: string[];
+}
+
+export type GoogleCredentialsInput =
+  | { mode: 'service_account'; key_file: string; subject: string }
+  /** Omit `secret` to keep the stored one while editing the URL. */
+  | { mode: 'apps_script'; url: string; secret?: string }
+  | { mode: 'none' };
+
 /** One past WebChat session, as returned by `chat.sessions.list`
  *  (newest first, archived excluded). */
 export interface ChatSessionSummary {
@@ -3675,6 +3714,25 @@ export const api = {
         identifier,
         ...(channel ? { channel } : {}),
       }) as Promise<IdentityResolveResult>,
+  },
+  /**
+   * The two Google credential paths that need no per-customer OAuth client:
+   * service-account domain-wide delegation and the Apps Script bridge. The
+   * OAuth path keeps its own connect flow under `mcp.oauth.*`.
+   *
+   * `get` never returns the stored bridge secret — only whether one is set.
+   */
+  googleCredentials: {
+    get: () => client.call('google.credentials.get') as Promise<GoogleCredentialsStatus>,
+    set: (params: GoogleCredentialsInput) =>
+      client.call('google.credentials.set', params) as Promise<{ ok: boolean; mode: string }>,
+    test: () =>
+      client.call('google.credentials.test') as Promise<{
+        ok: boolean;
+        path: string;
+        account?: string;
+        detail: string;
+      }>,
   },
   mcp: {
     list: () =>

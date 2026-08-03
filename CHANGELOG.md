@@ -2,6 +2,71 @@
 
 ## [Unreleased]
 
+### Added
+- **Google Workspace 兩條免自建 OAuth client 的憑證路徑**：原本每個客戶都要
+  自己到 Google Cloud 開 OAuth client（且我方 app 未通過驗證前不能對外服務），
+  現在同一組 19 個工具有三種授權方式，`google_status` 會明講目前生效的是哪一種。
+  - **服務帳號＋網域委派**（`google_service_account.rs`）：我方出一個服務帳號，
+    客戶的 Workspace 超管在 Admin console 授權該 client id 與 scope 清單即可，
+    **不需要 Google 應用程式驗證或 CASA**。設定走 `config.toml`
+    `[integrations.google_service_account] key_file / subject`；RS256 assertion
+    以 `jsonwebtoken` 簽發，token 依 `(client_email, subject)` 快取並提前 120 秒
+    續期。限制照實寫進錯誤訊息與文件：**只支援 Workspace 網域，個人 @gmail.com
+    不可能委派**。設定了但壞掉一律回報錯誤，不靜默退回 OAuth。
+  - **Apps Script 橋接**（`google_apps_script.rs` ＋
+    `templates/apps-script/duduclaw-bridge.gs`）：使用者在自己帳號部署一份 web
+    app，DuDuClaw 用共用密鑰呼叫。**個人 Gmail 也能用**，因為 Google 只看到
+    使用者執行自己的腳本。覆蓋 Gmail（搜尋／讀取／草稿）、行事曆（列出／建立）、
+    Sheets（讀取／附加）八個動作；Drive／Docs／Slides／Forms／Tasks 明確回
+    「橋接不支援」而非空結果。安全面：網址白名單為 `script.google.com`（精確
+    比對，擋 `script.google.com.evil.test`）、強制 https 與 `/exec` 路徑、
+    重導每一跳重新驗證、密鑰比照通道 token 加密存放且不進日誌。
+  - `GoogleBackend` 後端選擇器把三條路收斂成一個工具面：七個 Gmail／行事曆／
+    Sheets handler 改走 `*_via` 包裝，橋接回應映射成與原生工具相同的結構，
+    agent 分不出是哪條路答的。
+  - **Dashboard 設定介面**：管理 → 整合／工具連線 → Google 新增「憑證方式」區塊
+    （`GoogleCredentialPaths.tsx`），三選一切換 ＋ 儲存 ＋ **測試連線**（服務帳號
+    真的去換 token、橋接真的打 `status` 動作並回報腳本以哪個 Google 帳號執行）。
+    後端 `google.credentials.get/set/test` 三個 admin-gated RPC：`get` 只回報
+    密鑰「有沒有設」而不回傳內容、存檔前先驗證（金鑰檔讀得到、subject 是信箱、
+    網址過白名單）、切換模式會清掉另一種的設定避免實際生效與畫面不一致、
+    留白密鑰時沿用既有值。scope 清單附複製按鈕給客戶管理員。
+    總開關 `google_workspace` 沒開時顯示警告——否則憑證測試會過但工具不會出現。
+  - 新文件 `docs/guides/google-no-oauth-client.md`。
+
+### Changed
+- **側邊欄用語與結構調整**（2026-07-30 客戶回饋第四輪）：「首頁」改稱
+  「儀表板」、「Skill」改稱「技能庫」、「記憶與知識」改稱「記憶」；原本的
+  「對話」列改成「新對話」（點下去直接開一段新的，舊對話保留可續聊），
+  其下新增可收合的「對話紀錄」群組，列出最近 15 則對話（新的在上，跨通道
+  的對話帶 LINE／Telegram 等來源標籤）。個人版與企業版同步套用；⌘K 的
+  「新對話」與側邊欄同一行為。折疊成 icon 模式時對話紀錄不顯示。
+- **對話清單與續聊收斂到 `useConversationsStore`**：側邊欄「對話紀錄」與
+  `/chat` 左欄共用同一份列表與 resume 實作，不再各寫一份而漂移。`/chat`
+  左欄維持原樣（可跨 AI 員工、跨通道看到全部對話），側邊欄只是捷徑。
+
+### Fixed
+- **OAuth 重新導向網址寫死 3000 埠，導致整個授權流程走不完**（Google／Notion／
+  GitHub 三個整合共用同一段程式，全部受影響）：`handle_mcp_oauth_providers` 與
+  `handle_mcp_oauth_start` 都硬編 `http://localhost:3000/api/mcp/oauth/callback`，
+  但 callback 路由掛在 gateway 自己的埠上（預設 18789）。實測：3000 連線被拒、
+  18789 回 200。使用者照畫面指示在 Google Console 註冊 3000，授權完瀏覽器被導到
+  沒有東西在聽的埠，token 永遠拿不到，dashboard 一直停在「未連線」。改由
+  `mcp_oauth::redirect_uri()` 依實際監聽埠推導（沿用 `DUDUCLAW_PORT` 的解析順序），
+  並隨 `mcp.oauth.providers` 回傳，前端改顯示後端給的真實值而非常數。
+- **OAuth 設定教學漏掉兩個必卡步驟**：畫面上的四步沒有「啟用八個 Google API」與
+  「設定 OAuth 同意畫面（測試中狀態要加自己為測試使用者）」——前者讓每個工具呼叫
+  回 403，後者讓授權當場被 Google 擋掉。兩步已補進面板（`extraSetupSteps` 插槽，
+  其他 provider 不受影響），並附上測試中狀態 refresh token 七天過期的提醒。
+- **`google_status` 對非 OAuth 憑證回報假的「NOT connected」**：它只檢查 OAuth
+  vault，所以用服務帳號或 Apps Script 橋接的客戶會看到「未連線」，但工具其實
+  是通的。改為先回報實際生效的憑證來源，再列 OAuth 細節。
+- **從側邊欄續聊會被連線握手蓋掉**：`/chat` 尚未連線時從側邊欄點開歷史
+  對話，聊天 socket 隨後送來的 `session_info` 會把 session id 覆寫成這條
+  連線自己的 id——畫面留著恢復的逐字稿，下一句卻開了新對話。改由
+  `resumedExplicitly` 旗標保護明確恢復的 session，判定邏輯抽成純函式
+  `sessionIdAfterHello` 並加上回歸測試。
+
 ## [1.47.0] - 2026-07-30 — Google Workspace 全覆蓋＋遠端 MCP＋記憶知識整併
 
 ### Added
