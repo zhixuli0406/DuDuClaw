@@ -35,6 +35,132 @@ use crate::skill_lifecycle::gap_accumulator::GapAccumulator;
 use crate::skill_lifecycle::lift::LiftTrackerStore;
 use crate::skill_lifecycle::sandbox_trial::SandboxStore;
 
+/// Opening literal of the sender-metadata line prepended to every stored user
+/// message. Shared by the writer and [`strip_sender_prefix`] so the two can
+/// never drift.
+pub const SENDER_PREFIX_OPEN: &str = "[sender_id: ";
+
+/// Remove the `[sender_id: …]` metadata line from a stored user message.
+///
+/// The prefix exists so the model knows who is speaking in a group chat, but it
+/// is internal plumbing: when it reaches a human it shows up as
+/// `[sender_id: webchat:127.0.0.1:c8c8bb27]` above their own words, and — worse
+/// — as the *title* of the conversation in the sidebar, because an untitled
+/// session falls back to its first user message. Every display path (transcript
+/// replay, session listing) strips it.
+///
+/// Only a well-formed marker is removed: the line must open with the exact
+/// literal, close with `]`, and be a single line. Text a user happened to type
+/// that merely resembles it is left alone.
+pub fn strip_sender_prefix(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix(SENDER_PREFIX_OPEN) else {
+        return text;
+    };
+    // The id itself never contains a newline; refuse to swallow more than one
+    // line if the close bracket is missing.
+    let Some(close) = rest.find(']') else {
+        return text;
+    };
+    if rest[..close].contains('\n') {
+        return text;
+    }
+    match rest[close + 1..].strip_prefix('\n') {
+        Some(body) => body,
+        // `[sender_id: x]` with nothing after it — the whole message was the
+        // marker; there is no body to show.
+        None if rest[close + 1..].is_empty() => "",
+        None => text,
+    }
+}
+
+/// Edit an agent's `agent.toml` and hot-reload the registry.
+///
+/// The single implementation behind both the dashboard's `agents.update` RPC
+/// and the in-chat `/model` command. Writes atomically (temp + rename) and then
+/// re-scans the registry — the rescan is deliberately RELIABLE rather than
+/// best-effort, because the gateway has no periodic rescan and a skipped one
+/// leaves every consumer answering with the old config until a restart.
+pub async fn update_agent_toml_with<F>(
+registry: &Arc<RwLock<AgentRegistry>>,
+agent_id: &str,
+mutate: F,
+) -> Result<bool, String>
+where
+F: FnOnce(&mut toml::Table) -> Result<(), String>,
+{
+    if !duduclaw_core::is_valid_agent_id(agent_id) {
+        return Err(format!("Invalid agent_id: {agent_id}"));
+    }
+
+    let reg = registry.read().await;
+    let agent = reg
+        .get(agent_id)
+        .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+    let agent_toml_path = agent.dir.join("agent.toml");
+    drop(reg);
+
+    let content = tokio::fs::read_to_string(&agent_toml_path)
+        .await
+        .map_err(|e| format!("Failed to read agent.toml: {e}"))?;
+
+    let mut table: toml::Table = content
+        .parse()
+        .map_err(|e| format!("Failed to parse agent.toml: {e}"))?;
+
+    mutate(&mut table)?;
+
+    let new_content = toml::to_string_pretty(&table)
+        .map_err(|e| format!("Failed to serialise agent.toml: {e}"))?;
+
+    // Atomic write: temp file + rename
+    let tmp_path = agent_toml_path.with_extension("toml.tmp");
+    tokio::fs::write(&tmp_path, &new_content)
+        .await
+        .map_err(|e| format!("Failed to write agent.toml.tmp: {e}"))?;
+    tokio::fs::rename(&tmp_path, &agent_toml_path)
+        .await
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("Failed to commit agent.toml: {e}")
+        })?;
+
+    // Registry re-scan for hot-reload. This must be RELIABLE, not
+    // best-effort: the gateway has no periodic rescan, so a skipped scan
+    // here leaves the in-memory registry stale forever (agents answer —
+    // and WebChat displays — the OLD model until the next unrelated
+    // update/create or a restart; distributor-reported bug). The write
+    // lock is acquired unconditionally — reader guards are all bounded
+    // (longest: one system-prompt build), so this waits, it cannot hang.
+    // Scan failures (transient IO) retry inline before giving up.
+    let mut hot_reloaded = false;
+    for attempt in 1..=3u32 {
+        let mut reg = registry.write().await;
+        match reg.scan().await {
+            Ok(()) => {
+                hot_reloaded = true;
+                break;
+            }
+            Err(e) => {
+                warn!(agent_id, attempt, error = %e, "registry rescan failed after agent.toml write — retrying");
+                drop(reg);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+    if hot_reloaded {
+        // Nudge live WebChat sockets to re-send their session_info frame
+        // so open dashboard tabs reflect the change without a reconnect.
+        let _ = agent_config_events().send(agent_id.to_string());
+    } else {
+        warn!(
+            agent_id,
+            "registry rescan failed 3× — change persisted to agent.toml but in-memory consumers are stale until the next successful scan"
+        );
+    }
+
+    Ok(hot_reloaded)
+}
+
 /// Shared channel status map, accessible by both channel bots and the RPC handler.
 pub type ChannelStatusMap = Arc<RwLock<std::collections::HashMap<String, ChannelState>>>;
 
@@ -1336,9 +1462,12 @@ async fn build_reply_with_session_inner(
         text.to_string()
     };
 
-    // Prepend sender metadata so the agent can identify who is talking
+    // Prepend sender metadata so the agent can identify who is talking. This is
+    // plumbing for the model, NOT something a human should ever read — strip it
+    // with `strip_sender_prefix` on every display path (transcript replay,
+    // conversation titles).
     let sanitized_text = if user_id != "anonymous" && !user_id.is_empty() {
-        format!("[sender_id: {user_id}]\n{sanitized_text}")
+        format!("{SENDER_PREFIX_OPEN}{user_id}]\n{sanitized_text}")
     } else {
         sanitized_text
     };
@@ -5814,6 +5943,10 @@ async fn spawn_claude_cli_with_env(
         None
     };
 
+    // Split accumulators — see `parse_claude_stream_json_complete` for why.
+    // `assistant_text` appends (a reply is a sequence of text blocks across
+    // one or more `assistant` events); the terminal `result` event replaces.
+    let mut assistant_text = String::new();
     let mut result_text = String::new();
     // RFC-22 P1-7: capture token usage from `result` event so cost_telemetry
     // can be recorded for channel-path replies (previously: 0 entries for
@@ -6197,7 +6330,11 @@ async fn spawn_claude_cli_with_env(
                                                 Some("text") => {
                                                     text_blocks += 1;
                                                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                                        result_text = text.to_string();
+                                                        // Append, never replace: overwriting kept
+                                                        // only the LAST fragment of a long reply,
+                                                        // which reached the user as a few
+                                                        // characters with a two-digit token count.
+                                                        assistant_text.push_str(text);
                                                     }
                                                 }
                                                 Some("thinking") => {
@@ -6297,6 +6434,11 @@ async fn spawn_claude_cli_with_env(
                     "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process"
                 );
                 let _ = child.kill().await;
+                if result_text.is_empty() && !assistant_text.is_empty() {
+                    // No authoritative `result` text (tool-use turn, or the CLI
+                    // omitted it) — the accumulated assistant prose IS the reply.
+                    result_text = std::mem::take(&mut assistant_text);
+                }
                 if result_text.is_empty() {
                     return Err(format!(
                         "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s, no output)"
@@ -6353,6 +6495,14 @@ async fn spawn_claude_cli_with_env(
         ));
     }
 
+    // Normal completion: with no authoritative `result` text (tool-use turns,
+    // or a CLI that omits the event), the accumulated assistant prose IS the
+    // reply. Folding it in here is what stops a long answer from arriving as
+    // its last fragment.
+    let mut result_text = result_text;
+    if result_text.is_empty() && !assistant_text.is_empty() {
+        result_text = std::mem::take(&mut assistant_text);
+    }
     let result_text = result_text.trim().to_string();
     if result_text.is_empty() {
         return Err(format!("Empty response from claude CLI ({diag})"));
@@ -6510,7 +6660,18 @@ pub(crate) struct StreamParseResult {
 pub(crate) fn parse_claude_stream_json_complete(
     stdout: &str,
 ) -> Result<StreamParseResult, String> {
-    let mut text = String::new();
+    // Two separate accumulators, because the two event kinds mean different
+    // things (2026-08-03 truncation fix):
+    //  * `assistant_text` ACCUMULATES — a reply arrives as a sequence of text
+    //    blocks, possibly spread over several `assistant` events. Overwriting
+    //    per block (the previous behaviour) silently kept only the LAST
+    //    fragment, which is why a long answer showed up as a few characters
+    //    with a two-digit token count.
+    //  * `result_text` REPLACES — the terminal `result` event carries the
+    //    authoritative full answer, so appending it would duplicate everything
+    //    the assistant events already contributed.
+    let mut assistant_text = String::new();
+    let mut result_text: Option<String> = None;
     let mut usage: Option<crate::cost_telemetry::TokenUsage> = None;
     let mut model: Option<String> = None;
     let mut diag = StreamDiagnostics::default();
@@ -6547,11 +6708,11 @@ pub(crate) fn parse_claude_stream_json_complete(
                     return Err(format!("claude CLI stream error: {err_text}"));
                 }
                 if let Some(t) = event.get("result").and_then(|r| r.as_str()) {
-                    // Only overwrite with the result event's text when non-empty;
-                    // tool-use turns often have empty `result` because the real
-                    // answer landed in intermediate assistant text blocks.
+                    // Only take the result event's text when non-empty; tool-use
+                    // turns often have empty `result` because the real answer
+                    // landed in intermediate assistant text blocks.
                     if !t.is_empty() {
-                        text = t.to_string();
+                        result_text = Some(t.to_string());
                     }
                 }
                 if let Some(usage_val) = event.get("usage") {
@@ -6586,7 +6747,11 @@ pub(crate) fn parse_claude_stream_json_complete(
                                 if let Some(t) =
                                     block.get("text").and_then(|t| t.as_str())
                                 {
-                                    text = t.to_string();
+                                    // Append: blocks are consecutive spans of one
+                                    // reply, not competing candidates. No separator
+                                    // — the API already encodes any needed
+                                    // whitespace inside the block text.
+                                    assistant_text.push_str(t);
                                 }
                             }
                             Some("thinking") => {
@@ -6605,7 +6770,7 @@ pub(crate) fn parse_claude_stream_json_complete(
     }
 
     Ok(StreamParseResult {
-        text,
+        text: result_text.unwrap_or(assistant_text),
         usage,
         model,
         diagnostics: diag,
@@ -8184,6 +8349,60 @@ mod stream_json_parser_tests {
         assert_eq!(parsed.diagnostics.assistant_events, 1);
     }
 
+
+    // ── Truncated-reply reproduction (2026-08-03 client report) ──────────
+    //
+    // Reported as "我的回覆有完整輸出，但你那端只看到幾個字" with token counts
+    // in the tens. These cases pin down which stream shapes lose text.
+
+    /// A long answer the CLI splits across several text blocks in ONE message.
+    #[test]
+    fn repro_multiple_text_blocks_in_one_message_are_all_kept() {
+        let stdout = line_event(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"第一段。"},{"type":"text","text":"第二段。"},{"type":"text","text":"第三段。"}]}}"#,
+        );
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "第一段。第二段。第三段。");
+        assert_eq!(parsed.diagnostics.text_blocks, 3);
+    }
+
+    /// A long answer streamed as several `assistant` events (no result event —
+    /// the shape produced when the turn is cut short or the CLI omits it).
+    #[test]
+    fn repro_multiple_assistant_events_are_all_kept() {
+        let stdout = String::new()
+            + &line_event(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"開頭"}]}}"#)
+            + &line_event(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"中段"}]}}"#)
+            + &line_event(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"結尾"}]}}"#);
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "開頭中段結尾");
+    }
+
+    /// The result event carries the authoritative full answer; it must win over
+    /// whatever the intermediate assistant events accumulated (otherwise the
+    /// final text would be duplicated).
+    #[test]
+    fn result_event_replaces_accumulated_assistant_text() {
+        let stdout = String::new()
+            + &line_event(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"開頭"}]}}"#)
+            + &line_event(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"中段"}]}}"#)
+            + &line_event(r#"{"type":"result","subtype":"success","result":"開頭中段結尾"}"#);
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "開頭中段結尾");
+    }
+
+    /// A tool-use turn: narration, then the tool call, then the real answer.
+    /// All assistant prose belongs to the reply.
+    #[test]
+    fn repro_tool_use_turn_keeps_narration_and_answer() {
+        let stdout = String::new()
+            + &line_event(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"我查一下。"},{"type":"tool_use","name":"gmail_search","input":{}}]}}"#)
+            + &line_event(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"共有 3 封未讀。"}]}}"#);
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "我查一下。共有 3 封未讀。");
+        assert_eq!(parsed.diagnostics.tool_use_blocks, 1);
+    }
+
     #[test]
     fn extracts_token_usage_from_result_event() {
         let stdout = line_event(
@@ -8540,5 +8759,52 @@ mod moa_and_provenance_wiring_tests {
         );
         assert!(decision.block_reason.is_some(), "Enforce + tainted arg ⇒ blocked");
         assert!(!decision.flags.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sender_prefix_tests {
+    use super::strip_sender_prefix;
+
+    #[test]
+    fn strips_a_well_formed_marker() {
+        assert_eq!(
+            strip_sender_prefix("[sender_id: webchat:127.0.0.1:c8c8bb27]\n你是誰"),
+            "你是誰"
+        );
+    }
+
+    #[test]
+    fn keeps_the_rest_of_a_multi_line_body() {
+        let stored = "[sender_id: telegram:42]\n第一行\n第二行";
+        assert_eq!(strip_sender_prefix(stored), "第一行\n第二行");
+    }
+
+    #[test]
+    fn leaves_untagged_text_untouched() {
+        for text in ["你是誰", "", "[not a sender] hi", "sender_id: x"] {
+            assert_eq!(strip_sender_prefix(text), text, "mangled {text:?}");
+        }
+    }
+
+    #[test]
+    fn refuses_to_swallow_more_than_the_marker_line() {
+        // A malformed marker (no close bracket on its own line) must not eat the
+        // user's message — showing plumbing is ugly, losing their words is worse.
+        let text = "[sender_id: broken\nline two]\nbody";
+        assert_eq!(strip_sender_prefix(text), text);
+    }
+
+    #[test]
+    fn a_marker_only_message_yields_empty_not_the_marker() {
+        assert_eq!(strip_sender_prefix("[sender_id: webchat:1]"), "");
+    }
+
+    #[test]
+    fn does_not_strip_when_no_newline_follows_the_marker() {
+        // `[sender_id: x] hello` was never produced by the writer; treat it as
+        // the user's own text rather than guessing.
+        let text = "[sender_id: x] hello";
+        assert_eq!(strip_sender_prefix(text), text);
     }
 }

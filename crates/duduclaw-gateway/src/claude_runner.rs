@@ -2515,6 +2515,11 @@ async fn call_claude_streaming(
         }
     });
 
+    // Split accumulators — same contract as the channel path: `assistant_text`
+    // appends (a reply is a sequence of text blocks, possibly across several
+    // `assistant` events), the terminal `result` event replaces. Overwriting per
+    // block kept only the last fragment of a long answer.
+    let mut assistant_text = String::new();
     let mut result_text = String::new();
     let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
     let mut last_tool_reported: Option<String> = None;
@@ -2584,7 +2589,7 @@ async fn call_claude_streaming(
                                             match block_type {
                                                 Some("text") => {
                                                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                                        result_text = text.to_string();
+                                                        assistant_text.push_str(text);
                                                     }
                                                 }
                                                 Some("tool_use") => {
@@ -2664,6 +2669,12 @@ async fn call_claude_streaming(
         ));
     }
 
+    // No authoritative `result` text (tool-use turn, or the CLI omitted it) —
+    // the accumulated assistant prose IS the reply.
+    let mut result_text = result_text;
+    if result_text.is_empty() && !assistant_text.is_empty() {
+        result_text = std::mem::take(&mut assistant_text);
+    }
     let result_text = result_text.trim().to_string();
     if result_text.is_empty() {
         return Err("Empty response from claude CLI".to_string());
