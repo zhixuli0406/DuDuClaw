@@ -231,6 +231,38 @@ impl WebChatState {
 /// the token must be valid, the user must exist, be `Active`, and not be flagged
 /// `must_change_password`. Production behavior is identical — `authenticate`
 /// delegates here.
+/// Stable, id-safe owner tag for an authenticated user.
+///
+/// A raw user id cannot go into a session id directly: ids are `:`-delimited
+/// and the session id is surfaced to the dashboard, so embedding the account
+/// identifier would both break parsing and leak who owns a conversation. A
+/// truncated SHA-256 is stable across connections (which is the whole point —
+/// it survives page reloads), collision-resistant enough at 12 hex chars for
+/// per-installation user counts, and reveals nothing.
+pub fn webchat_owner_tag(auth_user: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(auth_user.as_bytes());
+    hex::encode(digest)[..12].to_string()
+}
+
+/// Whether `want` is a webchat session this owner may resume.
+///
+/// Ownership is by AUTHENTICATED USER, not by connection: a session created in
+/// one tab must stay resumable after a reload, from a second tab, or from the
+/// sidebar's 對話紀錄. Fail-closed for everything else — a different user's tag,
+/// a session from another channel (`telegram:` / `discord:` never carry this
+/// prefix), or a crafted id that merely starts with the same characters (the
+/// trailing separator makes `…{tag}evil:` fail).
+///
+/// Pure — exported for tests.
+pub fn owns_webchat_session(want: &str, owner_tag: &str) -> bool {
+    if owner_tag.is_empty() {
+        return false;
+    }
+    let scope = format!("webchat:webchat:{owner_tag}:");
+    want.starts_with(&scope)
+}
+
 fn authenticate_with(
     jwt_config: &JwtConfig,
     user_db: &UserDb,
@@ -290,19 +322,17 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
         }
     };
 
-    // Use IP for rate limiting (per-IP connection count), but add random suffix for
-    // session isolation so users behind NAT get independent sessions (R3-H6).
+    // Use IP for rate limiting (per-IP connection count). The session id itself
+    // is keyed by the AUTHENTICATED user (below), not the IP — see
+    // `webchat_owner_tag`.
     let rate_limit_id = format!("webchat:{peer_ip}");
     let session_uuid = uuid::Uuid::new_v4().to_string();
     let session_suffix = truncate_bytes(&session_uuid, 8);
-    let user_id = format!("webchat:{peer_ip}:{session_suffix}");
 
     if !state.acquire_connection(&rate_limit_id).await {
         warn!("WebChat connection limit reached for {rate_limit_id}");
         return;
     }
-
-    info!("WebChat connection established: {user_id}");
 
     let (mut sink, mut stream) = socket.split();
 
@@ -310,7 +340,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     // The first frame MUST be `{"type":"auth","token":"<jwt>"}`. Without a
     // valid token the connection is closed before any agent/LLM interaction.
     // Timeout-guarded to prevent Slowloris-style resource exhaustion.
-    {
+    let auth_user = {
         let auth_timeout = std::time::Duration::from_secs(10);
         let authed = match tokio::time::timeout(auth_timeout, stream.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
@@ -321,17 +351,31 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
             }
             _ => Err("authentication handshake timed out or closed".to_string()),
         };
-        if let Err(e) = authed {
-            warn!("WebChat auth failed for {user_id}: {e}");
-            let err = ChatMessage::Error { message: format!("authentication failed: {e}") };
-            if let Ok(json) = serde_json::to_string(&err) {
-                let _ = sink.send(Message::Text(json.into())).await;
+        match authed {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("WebChat auth failed from {peer_ip}: {e}");
+                let err = ChatMessage::Error { message: format!("authentication failed: {e}") };
+                if let Ok(json) = serde_json::to_string(&err) {
+                    let _ = sink.send(Message::Text(json.into())).await;
+                }
+                let _ = sink.send(Message::Close(None)).await;
+                state.release_connection(&rate_limit_id).await;
+                return;
             }
-            let _ = sink.send(Message::Close(None)).await;
-            state.release_connection(&rate_limit_id).await;
-            return;
         }
-    }
+    };
+
+    // Ownership anchor. The authenticated user is the only durable identity this
+    // socket has; the per-connection random suffix is NOT one. Keying sessions by
+    // the connection (the previous behaviour) meant every page reload minted a
+    // new "owner", so the resume guard rejected the user's own conversations —
+    // history was readable over the dashboard RPC but never continuable, which
+    // read as "the chat keeps resetting itself".
+    let owner_tag = webchat_owner_tag(&auth_user);
+    let user_id = format!("webchat:{owner_tag}:{session_suffix}");
+
+    info!("WebChat connection established: {user_id}");
 
     // The default (main) agent id — still needed later for resume-ownership
     // checks; the rest of the session_info fields are built by the shared helper.
@@ -517,11 +561,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     // on a fresh one — it fails closed here. That is the
                                     // cost of closing the cross-user read/write hole
                                     // until webchat gains a real authenticated user id.
-                                    let owns_session = want == session_id
-                                        || want.starts_with(&format!("{session_id}#"));
+                                    let owns_session = owns_webchat_session(&want, &owner_tag);
                                     if !owns_session {
                                         warn!(
-                                            "WebChat resume denied: session {want} not owned by connection {session_id}"
+                                            "WebChat resume denied: session {want} not owned by this user"
                                         );
                                         let err = ChatMessage::Error {
                                             message: "conversation not found".to_string(),
@@ -988,6 +1031,80 @@ async fn save_webchat_attachments(
         }
     }
     refs
+}
+
+#[cfg(test)]
+mod resume_ownership_tests {
+    use super::*;
+
+    /// The tag must be identical across connections — that is the entire fix.
+    /// Keying on the per-connection UUID meant a page reload orphaned every
+    /// conversation the user had just had.
+    #[test]
+    fn owner_tag_is_stable_for_the_same_user() {
+        assert_eq!(webchat_owner_tag("user-abc"), webchat_owner_tag("user-abc"));
+        assert_ne!(webchat_owner_tag("user-abc"), webchat_owner_tag("user-xyz"));
+        assert_eq!(webchat_owner_tag("user-abc").len(), 12);
+    }
+
+    /// The tag must not carry the account identifier: session ids reach the
+    /// dashboard, and "who owns this conversation" is not public information.
+    #[test]
+    fn owner_tag_does_not_leak_the_user_id() {
+        let tag = webchat_owner_tag("boss@customer.com");
+        assert!(!tag.contains("boss"), "{tag}");
+        assert!(!tag.contains('@'), "{tag}");
+        assert!(tag.chars().all(|c| c.is_ascii_hexdigit()), "{tag}");
+    }
+
+    #[test]
+    fn owner_may_resume_their_own_sessions_including_derived_ones() {
+        let tag = webchat_owner_tag("user-abc");
+        let base = format!("webchat:webchat:{tag}:conn1");
+        assert!(owns_webchat_session(&base, &tag));
+        // A different connection's suffix is still the same user — this is the
+        // page-reload case that used to fail.
+        assert!(owns_webchat_session(&format!("webchat:webchat:{tag}:conn2"), &tag));
+        // Per-agent / per-conversation derived ids.
+        assert!(owns_webchat_session(&format!("{base}#agent:sales#conv:x1"), &tag));
+    }
+
+    #[test]
+    fn another_users_session_is_refused() {
+        let mine = webchat_owner_tag("user-abc");
+        let theirs = webchat_owner_tag("user-xyz");
+        assert!(!owns_webchat_session(&format!("webchat:webchat:{theirs}:conn1"), &mine));
+    }
+
+    #[test]
+    fn cross_channel_ids_are_refused() {
+        let tag = webchat_owner_tag("user-abc");
+        for want in [
+            "telegram:12345",
+            "discord:thread:999",
+            "line:U0001",
+            // An internal work session (cron / delegation) is not a webchat one.
+            "agent:sales#cron",
+        ] {
+            assert!(!owns_webchat_session(want, &tag), "accepted {want}");
+        }
+    }
+
+    #[test]
+    fn a_prefix_lookalike_tag_is_refused() {
+        // The trailing separator is what stops `…{tag}evil:` from matching —
+        // an unanchored prefix check would let a crafted id through.
+        let tag = webchat_owner_tag("user-abc");
+        assert!(!owns_webchat_session(&format!("webchat:webchat:{tag}evil:conn1"), &tag));
+    }
+
+    #[test]
+    fn an_empty_owner_tag_never_owns_anything() {
+        // Fail closed: an unauthenticated/blank anchor must not become a
+        // wildcard that matches every session.
+        assert!(!owns_webchat_session("webchat:webchat::conn1", ""));
+        assert!(!owns_webchat_session("webchat:webchat:abc:conn1", ""));
+    }
 }
 
 #[cfg(test)]
