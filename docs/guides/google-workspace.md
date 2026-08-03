@@ -78,6 +78,24 @@ which is why they are served natively here.
   approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append"]
   ```
 
+## Choosing a credential path
+
+Three ways to authorize the same nineteen tools. They differ in who has to set
+something up, and in whether Google needs to have verified an app first.
+
+| | Personal @gmail.com | Workspace domain | Who sets it up | Tool coverage |
+|---|---|---|---|---|
+| **OAuth client** (below) | ✅ | ✅ | each customer creates their own Google Cloud OAuth client | all 19 |
+| **Service account + domain-wide delegation** | ❌ | ✅ | the domain's super admin authorizes one client id | all 19 |
+| **Apps Script bridge** | ✅ | ✅ (unless the admin disables Apps Script) | the end user deploys a script in their own account | Gmail / Calendar / Sheets only |
+
+When more than one is configured the order of precedence is service account →
+OAuth vault → Apps Script bridge; the bridge sits last because it covers the
+fewest tools. `google_status` names the source actually in effect.
+
+The two credential-free paths are documented in
+[google-no-oauth-client.md](google-no-oauth-client.md).
+
 ## Prerequisites: create a Google OAuth client
 
 You supply your own Google OAuth client (DuDuClaw never ships shared
@@ -100,8 +118,14 @@ credentials). One-time setup:
 5. Under **Authorized redirect URIs**, add exactly:
 
    ```
-   http://localhost:3000/api/mcp/oauth/callback
+   http://localhost:18789/api/mcp/oauth/callback
    ```
+
+   18789 is the gateway's default port. If you run it elsewhere (`DUDUCLAW_PORT`),
+   register that port instead — the dashboard's setup step shows the exact URI,
+   derived from the port the gateway is actually listening on. A mismatch here
+   is silent: Google redirects the browser to a port with nothing on it, so the
+   token never arrives and the page stays on "not connected".
 
 6. Copy the generated **Client ID** and **Client secret**.
 
@@ -172,6 +196,6 @@ current scopes.
 - **`403` with a scope list** — The token is missing required scopes. Reconnect
   to re-consent.
 - **Redirect URI mismatch during consent** — The redirect URI in your Google
-  OAuth client must be exactly `http://localhost:3000/api/mcp/oauth/callback`.
+  OAuth client must be exactly `http://localhost:18789/api/mcp/oauth/callback`.
 
 Run `google_status` at any time for a live diagnosis.

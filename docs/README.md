@@ -107,6 +107,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/docuseal.md](guides/docuseal.md) | DocuSeal 簽署工作流（`duduclaw-docuseal-mcp` 開源 wrapper：10 工具、cloud+self-hosted、webhook 驗簽） | Current |
 | [guides/professional-software.md](guides/professional-software.md) | 專業軟體整合（Photoshop / AutoCAD 社群 MCP）：支援矩陣、per-agent `.mcp.json` 安裝、capability 治理、ezdxf 降級、RCE 風險聲明 | Current |
 | [guides/google-workspace.md](guides/google-workspace.md) | Native Google Workspace integration — all eight services (Gmail / Calendar / Sheets / Drive / Docs / Slides / Forms / Tasks), nineteen MCP tools, GA APIs only (no preview gate), OAuth setup, draft-only + append-only safety | Current |
+| [guides/google-no-oauth-client.md](guides/google-no-oauth-client.md) | Google 兩條免自建 OAuth client 的路徑（服務帳號網域委派、Apps Script 橋接），含覆蓋度差異、安全性質與已排除方案的實測數據 | Current |
 | [guides/notion.md](guides/notion.md) | Native Notion integration (search / page read / page append, four MCP tools, OAuth setup, external-knowledge-source boundary) | Current |
 | [guides/github.md](guides/github.md) | Native GitHub integration (issue/PR search + read + comment, five MCP tools, OAuth App setup, public-comment safety) | Current |
 | [guides/evals.md](guides/evals.md) | Agent behavior evals / regression suite (`duduclaw eval`), CI gate, GVU yardstick | Current |

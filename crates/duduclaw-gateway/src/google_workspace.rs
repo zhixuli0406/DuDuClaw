@@ -21,6 +21,8 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::google_apps_script;
+use crate::google_service_account::{self, ServiceAccountConfig, ServiceAccountError};
 use crate::mcp_oauth;
 
 /// Provider id in the `mcp_oauth` vault.
@@ -127,6 +129,15 @@ pub enum GoogleAuthError {
     ClientConfigMissing,
     /// A refresh attempt was made and failed.
     RefreshFailed(String),
+    /// `[integrations.google_service_account]` is configured but unusable
+    /// (missing/malformed key file, bad subject, or Google rejected the
+    /// assertion). Carries the already-actionable inner message; never key
+    /// material — see [`crate::google_service_account`].
+    ServiceAccount(String),
+    /// `[integrations.google_apps_script]` is configured but unusable (bad URL,
+    /// missing secret). Carries the already-actionable inner message; never the
+    /// secret — see [`crate::google_apps_script`].
+    AppsScript(String),
 }
 
 impl std::fmt::Display for GoogleAuthError {
@@ -148,6 +159,8 @@ impl std::fmt::Display for GoogleAuthError {
                 f,
                 "Failed to refresh Google authorization ({e}). Reconnect Google from the dashboard Integrations → Google page."
             ),
+            GoogleAuthError::ServiceAccount(e) => write!(f, "{e}"),
+            GoogleAuthError::AppsScript(e) => write!(f, "{e}"),
         }
     }
 }
@@ -427,17 +440,96 @@ pub struct SlidesReadResult {
     pub slides: Vec<SlideText>,
 }
 
+// ── Backend selection ───────────────────────────────────────────────────────
+
+/// Which credential path a Google call should take.
+///
+/// Three sources exist because no single one covers every customer:
+/// `Direct` needs a Google-verified OAuth app (or the customer's own client),
+/// `Direct` via service account needs a Workspace domain and a super admin, and
+/// [`AppsScript`](GoogleBackend::AppsScript) is the only one a personal
+/// `@gmail.com` user can set up alone. Both `Direct` variants collapse into one
+/// here because downstream they are identical: a bearer token against the REST
+/// APIs.
+pub enum GoogleBackend {
+    /// A bearer access token — from the OAuth vault or a service-account
+    /// assertion. All nineteen tools work.
+    Direct(String),
+    /// The user-deployed Apps Script web app. Gmail / Calendar / Sheets only.
+    AppsScript(google_apps_script::BridgeConfig),
+}
+
+/// Resolve the credential path for this home.
+///
+/// Precedence — most-deliberate configuration first: service account, then
+/// OAuth vault, then the Apps Script bridge. The bridge sits last because it
+/// covers the fewest tools; a home with both a working OAuth connection and a
+/// deployed bridge gets the fuller surface.
+pub async fn resolve_backend(home_dir: &Path) -> Result<GoogleBackend, GoogleAuthError> {
+    match get_valid_google_token(home_dir).await {
+        Ok(token) => Ok(GoogleBackend::Direct(token)),
+        Err(direct_err) => {
+            match google_apps_script::config_for_home(home_dir) {
+                Ok(Some(cfg)) => Ok(GoogleBackend::AppsScript(cfg)),
+                // A broken bridge config is reported as-is: the operator wrote
+                // that section on purpose, so its error is more useful than the
+                // "you never connected Google" one it would otherwise hide.
+                Err(bridge_err) => Err(GoogleAuthError::AppsScript(bridge_err.to_string())),
+                Ok(None) => Err(direct_err),
+            }
+        }
+    }
+}
+
 // ── Token acquisition ───────────────────────────────────────────────────────
+
+/// Read `[integrations.google_service_account]` from the home's `config.toml`.
+///
+/// An unreadable config is treated as "not configured" (same fail-safe posture
+/// as [`integration_enabled`]) — a present but malformed section is an error, so
+/// a typo cannot silently downgrade the operator to the OAuth path.
+fn service_account_config(
+    home_dir: &Path,
+) -> Result<Option<ServiceAccountConfig>, ServiceAccountError> {
+    let Ok(raw) = std::fs::read_to_string(home_dir.join("config.toml")) else {
+        return Ok(None);
+    };
+    google_service_account::parse_config(&raw, home_dir)
+}
 
 /// Return a valid Google access token, refreshing in place if expired.
 ///
-/// Fast path returns the stored non-expired token. On expiry we use the
-/// user-stored client credentials (persisted at OAuth-config time) to run a
-/// refresh grant, persist the new token, and return it. Every failure mode maps
-/// to an actionable [`GoogleAuthError`] that guides the user back to the
-/// dashboard.
+/// Two credential sources, checked in this order:
+///
+/// 1. **Service account + domain-wide delegation**, when
+///    `[integrations.google_service_account]` is configured. Deliberate operator
+///    configuration wins over a per-user OAuth token — silently preferring a
+///    stale vault token would make the operator's intent unobservable. See
+///    [`crate::google_service_account`] for why this path exists (it needs no
+///    Google app verification) and what it costs (Workspace domains only).
+/// 2. **OAuth vault** — the per-user connect flow. Fast path returns the stored
+///    non-expired token; on expiry we use the user-stored client credentials
+///    (persisted at OAuth-config time) to run a refresh grant, persist the new
+///    token, and return it.
+///
+/// Every failure mode maps to an actionable [`GoogleAuthError`].
 pub async fn get_valid_google_token(home_dir: &Path) -> Result<String, GoogleAuthError> {
-    // Fast path: `get_token` already filters out expired tokens.
+    // Source 1 — service account. A configured-but-broken service account is an
+    // error, never a silent fall-through to OAuth: the operator asked for this
+    // credential, so a misconfiguration has to be visible rather than masked by
+    // whatever token happens to be in the vault.
+    match service_account_config(home_dir) {
+        Ok(Some(cfg)) => {
+            return google_service_account::get_token(&cfg, REQUIRED_SCOPES)
+                .await
+                .map_err(|e| GoogleAuthError::ServiceAccount(e.to_string()));
+        }
+        Ok(None) => {}
+        Err(e) => return Err(GoogleAuthError::ServiceAccount(e.to_string())),
+    }
+
+    // Source 2 — OAuth vault. Fast path: `get_token` already filters out
+    // expired tokens.
     if let Some(t) = mcp_oauth::get_token(home_dir, GOOGLE_PROVIDER) {
         return Ok(t.access_token);
     }
@@ -1973,6 +2065,344 @@ fn scope_guidance(api_error_body: &str) -> String {
          Reconnect Google from the dashboard Integrations → Google page to grant: {}.",
         REQUIRED_SCOPES.join(", ")
     )
+}
+
+// ── Backend-aware wrappers ──────────────────────────────────────────────────
+//
+// One entry point per tool that both credential paths can serve. Handlers call
+// these instead of the raw `token`-taking functions, so adding the Apps Script
+// bridge did not mean teaching nineteen call sites about backends.
+//
+// The bridge speaks its own JSON shape (it is a hand-written Apps Script, not
+// the Google REST API), so each wrapper maps that shape onto the SAME result
+// struct the direct path returns. The agent — and the tool schema — cannot tell
+// which credential answered, which is the point: one tool surface, three ways
+// to authorize it.
+
+/// Extract a string field from a bridge response, defaulting to empty.
+fn bs(v: &Value, key: &str) -> String {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or_default().to_string()
+}
+
+/// Extract a u64 field from a bridge response, defaulting to 0.
+fn bu(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+/// Map a bridge failure onto the shared API-error type.
+fn bridge_err(e: google_apps_script::BridgeError) -> GoogleApiError {
+    GoogleApiError::Api { status: 502, message: e.to_string() }
+}
+
+/// Search mail through whichever backend is configured.
+pub async fn gmail_search_via(
+    backend: &GoogleBackend,
+    query: &str,
+    max_results: u32,
+) -> Result<GmailSearchResult, GoogleApiError> {
+    match backend {
+        GoogleBackend::Direct(token) => gmail_search(token, query, max_results).await,
+        GoogleBackend::AppsScript(cfg) => {
+            let v = google_apps_script::call(
+                cfg,
+                google_apps_script::BridgeAction::GmailSearch,
+                json!({ "query": query, "limit": max_results }),
+            )
+            .await
+            .map_err(bridge_err)?;
+            let messages: Vec<GmailMessageMeta> = v
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|m| GmailMessageMeta {
+                            id: bs(m, "message_id"),
+                            // Apps Script's GmailApp exposes threads, but the
+                            // bridge returns the first message of each; there is
+                            // no separate thread id to report.
+                            thread_id: String::new(),
+                            from: bs(m, "from"),
+                            subject: bs(m, "subject"),
+                            date: bs(m, "date"),
+                            snippet: bs(m, "snippet"),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(GmailSearchResult { count: messages.len(), messages })
+        }
+    }
+}
+
+/// Read one message through whichever backend is configured.
+pub async fn gmail_read_via(
+    backend: &GoogleBackend,
+    message_id: &str,
+) -> Result<GmailReadResult, GoogleApiError> {
+    match backend {
+        GoogleBackend::Direct(token) => gmail_read(token, message_id).await,
+        GoogleBackend::AppsScript(cfg) => {
+            let v = google_apps_script::call(
+                cfg,
+                google_apps_script::BridgeAction::GmailRead,
+                json!({ "message_id": message_id }),
+            )
+            .await
+            .map_err(bridge_err)?;
+            let attachments = v
+                .get("attachments")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|a| GmailAttachment { filename: bs(a, "name"), size: bu(a, "size") })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let body = bs(&v, "body");
+            Ok(GmailReadResult {
+                id: bs(&v, "message_id"),
+                thread_id: String::new(),
+                from: bs(&v, "from"),
+                to: bs(&v, "to"),
+                subject: bs(&v, "subject"),
+                date: bs(&v, "date"),
+                // The bridge has no separate snippet concept; the first line of
+                // the body is the honest equivalent rather than a fabricated one.
+                snippet: duduclaw_core::truncate_chars(body.lines().next().unwrap_or(""), 200),
+                body,
+                body_truncated: v.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false),
+                attachments,
+            })
+        }
+    }
+}
+
+/// Create a draft through whichever backend is configured.
+pub async fn gmail_create_draft_via(
+    backend: &GoogleBackend,
+    to: &str,
+    subject: &str,
+    body_text: &str,
+    cc: Option<&str>,
+) -> Result<GmailDraftResult, GoogleApiError> {
+    match backend {
+        GoogleBackend::Direct(token) => {
+            gmail_create_draft(token, to, subject, body_text, cc).await
+        }
+        GoogleBackend::AppsScript(cfg) => {
+            // The shipped bridge script takes no cc field. Rather than silently
+            // dropping a recipient the user asked for, refuse.
+            if cc.is_some_and(|c| !c.trim().is_empty()) {
+                return Err(bridge_err(google_apps_script::BridgeError::Unsupported(
+                    "gmail_create_draft with cc".into(),
+                )));
+            }
+            let v = google_apps_script::call(
+                cfg,
+                google_apps_script::BridgeAction::GmailCreateDraft,
+                json!({ "to": to, "subject": subject, "body": body_text }),
+            )
+            .await
+            .map_err(bridge_err)?;
+            Ok(GmailDraftResult {
+                draft_id: bs(&v, "draft_id"),
+                message_id: bs(&v, "message_id"),
+                to: to.to_string(),
+                subject: subject.to_string(),
+            })
+        }
+    }
+}
+
+/// List calendar events through whichever backend is configured.
+pub async fn calendar_list_events_via(
+    backend: &GoogleBackend,
+    time_min: Option<&str>,
+    time_max: Option<&str>,
+    max_results: u32,
+) -> Result<CalendarEventsResult, GoogleApiError> {
+    match backend {
+        GoogleBackend::Direct(token) => {
+            calendar_list_events(token, time_min, time_max, max_results).await
+        }
+        GoogleBackend::AppsScript(cfg) => {
+            // The bridge takes a forward-looking day count, not a range. A
+            // caller-supplied window is honoured as "days from now"; anything
+            // else falls back to the same 7-day default the direct path uses.
+            let days = days_until(time_max).unwrap_or(7);
+            let v = google_apps_script::call(
+                cfg,
+                google_apps_script::BridgeAction::CalendarListEvents,
+                json!({ "days": days }),
+            )
+            .await
+            .map_err(bridge_err)?;
+            let events: Vec<CalendarEvent> = v
+                .get("events")
+                .and_then(|e| e.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .take(max_results.max(1) as usize)
+                        .map(|e| CalendarEvent {
+                            id: bs(e, "id"),
+                            summary: bs(e, "title"),
+                            start: bs(e, "start"),
+                            end: bs(e, "end"),
+                            location: Some(bs(e, "location")).filter(|s| !s.is_empty()),
+                            html_link: String::new(),
+                            meet_link: None,
+                            attendees_count: 0,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(CalendarEventsResult { count: events.len(), events })
+        }
+    }
+}
+
+/// Create a calendar event through whichever backend is configured.
+pub async fn calendar_create_event_via(
+    backend: &GoogleBackend,
+    summary: &str,
+    start_rfc3339: &str,
+    end_rfc3339: &str,
+    description: Option<&str>,
+    attendees: Option<&[String]>,
+    with_meet: bool,
+) -> Result<CalendarCreateResult, GoogleApiError> {
+    match backend {
+        GoogleBackend::Direct(token) => {
+            calendar_create_event(
+                token,
+                summary,
+                start_rfc3339,
+                end_rfc3339,
+                description,
+                attendees,
+                with_meet,
+            )
+            .await
+        }
+        GoogleBackend::AppsScript(cfg) => {
+            // Attendees and Meet links are outside the shipped script's action
+            // surface. Creating the event minus the guests the user listed would
+            // look like success while quietly failing the actual request.
+            if attendees.is_some_and(|a| !a.is_empty()) {
+                return Err(bridge_err(google_apps_script::BridgeError::Unsupported(
+                    "calendar_create_event with attendees".into(),
+                )));
+            }
+            if with_meet {
+                return Err(bridge_err(google_apps_script::BridgeError::Unsupported(
+                    "calendar_create_event with a Meet link".into(),
+                )));
+            }
+            let v = google_apps_script::call(
+                cfg,
+                google_apps_script::BridgeAction::CalendarCreateEvent,
+                json!({
+                    "title": summary,
+                    "start": start_rfc3339,
+                    "end": end_rfc3339,
+                    "description": description.unwrap_or(""),
+                }),
+            )
+            .await
+            .map_err(bridge_err)?;
+            Ok(CalendarCreateResult {
+                id: bs(&v, "id"),
+                summary: bs(&v, "title"),
+                start: bs(&v, "start"),
+                end: end_rfc3339.to_string(),
+                html_link: String::new(),
+                meet_link: None,
+            })
+        }
+    }
+}
+
+/// Read a sheet range through whichever backend is configured.
+pub async fn sheets_read_via(
+    backend: &GoogleBackend,
+    spreadsheet_id: &str,
+    range: &str,
+) -> Result<SheetsReadResult, GoogleApiError> {
+    match backend {
+        GoogleBackend::Direct(token) => sheets_read(token, spreadsheet_id, range).await,
+        GoogleBackend::AppsScript(cfg) => {
+            let v = google_apps_script::call(
+                cfg,
+                google_apps_script::BridgeAction::SheetsRead,
+                json!({ "spreadsheet": spreadsheet_id, "range": range }),
+            )
+            .await
+            .map_err(bridge_err)?;
+            let rows: Vec<Vec<String>> = v
+                .get("values")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|row| {
+                            row.as_array()
+                                .map(|cells| cells.iter().map(cell_to_string).collect())
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(SheetsReadResult {
+                range: range.to_string(),
+                row_count: rows.len(),
+                // The bridge caps at 200 rows server-side; a full page back is
+                // the only signal available that more may exist.
+                rows_truncated: rows.len() >= 200,
+                rows,
+            })
+        }
+    }
+}
+
+/// Append a sheet row through whichever backend is configured.
+pub async fn sheets_append_via(
+    backend: &GoogleBackend,
+    spreadsheet_id: &str,
+    range: &str,
+    values: Vec<String>,
+) -> Result<SheetsAppendResult, GoogleApiError> {
+    match backend {
+        GoogleBackend::Direct(token) => {
+            sheets_append(token, spreadsheet_id, range, values).await
+        }
+        GoogleBackend::AppsScript(cfg) => {
+            let cells = values.len() as u64;
+            let v = google_apps_script::call(
+                cfg,
+                google_apps_script::BridgeAction::SheetsAppend,
+                json!({ "spreadsheet": spreadsheet_id, "values": values }),
+            )
+            .await
+            .map_err(bridge_err)?;
+            let row = bu(&v, "row");
+            Ok(SheetsAppendResult {
+                updated_range: if row > 0 { format!("row {row}") } else { range.to_string() },
+                updated_rows: 1,
+                updated_cells: cells,
+            })
+        }
+    }
+}
+
+/// Days from now until an RFC3339 timestamp, for translating the direct path's
+/// time range onto the bridge's day-count parameter. `None` when absent or
+/// unparseable — the caller then uses its own default rather than guessing.
+fn days_until(time_max: Option<&str>) -> Option<u32> {
+    let ts = time_max?;
+    let target = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    let now = chrono::Utc::now();
+    let delta = target.with_timezone(&chrono::Utc) - now;
+    let days = delta.num_days();
+    if days <= 0 { Some(1) } else { Some(days.min(365) as u32) }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
