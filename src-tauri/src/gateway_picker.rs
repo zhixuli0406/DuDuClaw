@@ -374,14 +374,24 @@ pub fn gateway_last() -> Result<DesktopGatewayState, String> {
 }
 
 /// The local sidecar's live status for the "本機" card (polled by the picker).
+/// `Running` is re-verified against the port on every poll: an *attached*
+/// gateway can die without any event reaching the manager, and the card must
+/// not keep claiming 運行中 for a port that refuses connections.
 #[tauri::command]
 pub fn gateway_local_status(manager: State<'_, Arc<SidecarManager>>) -> LocalStatus {
+    let port = manager.port();
     let status = match manager.status() {
-        SidecarStatus::Running => "running",
+        SidecarStatus::Running => {
+            if lifecycle::is_listening(lifecycle::DEFAULT_HOST, port) {
+                "running"
+            } else {
+                "stopped"
+            }
+        }
+        SidecarStatus::Starting => "starting",
         SidecarStatus::Stopped => "stopped",
         SidecarStatus::Error => "error",
     };
-    let port = manager.port();
     LocalStatus {
         status: status.to_string(),
         port,
