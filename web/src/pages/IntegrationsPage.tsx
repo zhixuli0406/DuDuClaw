@@ -11,9 +11,16 @@ import { GoogleIntegrationPage } from './GoogleIntegrationPage';
 import { NotionIntegrationPage } from './NotionIntegrationPage';
 import { GitHubIntegrationPage } from './GitHubIntegrationPage';
 
-/** Google Workspace 分頁隨原廠 OAuth App 驗證進度開放 — 下個版本翻 true
- *  （後端工具面另有 config.toml [integrations] google_workspace 旗標）。 */
-const GOOGLE_INTEGRATION_ENABLED = false;
+/**
+ * Google Workspace 分頁。v1.48.0 起開放：原本等的是原廠 OAuth App 驗證，
+ * 但驗證只擋「使用者自建 OAuth client」那一條路，服務帳號網域委派與
+ * Apps Script 橋接都不需要它（見 docs/guides/google-no-oauth-client.md），
+ * 所以分頁本身沒有理由繼續隱藏。
+ *
+ * 後端工具面仍有各自的閘：`config.toml [integrations] google_workspace`
+ * 控制 19 個工具對 agent 是否可見，設定頁在總開關沒開時會明講這件事。
+ */
+const GOOGLE_INTEGRATION_ENABLED = true;
 
 const TAB_IDS = ['mcp', 'google', 'notion', 'github', 'keys', 'odoo', 'identity'] as const;
 type TabId = (typeof TAB_IDS)[number];

@@ -22,6 +22,13 @@ export interface SettingsNavItem {
   value: string;
   label: ReactNode;
   icon?: ComponentType<{ className?: string }>;
+  /**
+   * Draws attention to an item that needs the operator NOW (an update is
+   * waiting, a check failed). Deliberately a live signal rather than static
+   * emphasis: a permanently-bold row stops being noticed within a day, while a
+   * dot that only appears when there is something to do keeps its meaning.
+   */
+  badge?: 'attention';
 }
 export interface SettingsNavGroup {
   label?: ReactNode;
@@ -77,6 +84,12 @@ export function SettingsShell({
               >
                 {item.icon && <item.icon />}
                 {item.label}
+                {item.badge === 'attention' && (
+                  <span
+                    className="ml-auto size-1.5 shrink-0 rounded-full bg-brand"
+                    aria-hidden="true"
+                  />
+                )}
               </BaseTabs.Tab>
             ))}
           </div>

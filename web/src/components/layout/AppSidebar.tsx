@@ -101,7 +101,8 @@ function NavRow({ item, count, collapsed }: { item: NavItem; count: number; coll
   const startNew = useConversationsStore((s) => s.startNew);
   // Action rows (新對話) run their side effect before the NavLink navigates, so
   // the row does what it says even when the target page is already open.
-  const onClick = item.action === 'newConversation' ? () => startNew() : undefined;
+  const isAction = item.action === 'newConversation';
+  const onClick = isAction ? () => startNew() : undefined;
   return (
     <SidebarMenuItem>
       <NavLink
@@ -110,7 +111,17 @@ function NavRow({ item, count, collapsed }: { item: NavItem; count: number; coll
         data-tour={`nav:${item.to}`}
         title={collapsed ? label : undefined}
         onClick={onClick}
-        className={navClass}
+        className={({ isActive }) =>
+          cn(
+            navClass({ isActive }),
+            // 2026-08-03 client feedback ("改得醒目一點"): 新對話 is the one row
+            // that DOES something rather than going somewhere, and as a plain
+            // nav row it disappeared among its neighbours. An outlined chip
+            // reads as a button without shouting like a filled CTA — the sidebar
+            // already has enough amber.
+            isAction && 'border border-sidebar-border bg-sidebar-accent/40 font-medium text-sidebar-foreground hover:bg-sidebar-accent',
+          )
+        }
       >
         <span className="relative flex shrink-0">
           <Icon />
