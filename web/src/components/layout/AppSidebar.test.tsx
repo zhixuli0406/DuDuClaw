@@ -92,8 +92,10 @@ describe('AppSidebar (Multica shell)', () => {
     expect(screen.queryByRole('link', { name: /Task Board/i })).not.toBeInTheDocument();
     // 設定 collapsed by default too.
     expect(screen.queryByRole('link', { name: /About/i })).not.toBeInTheDocument();
-    // Hidden on Personal: AI staff roster + pet studio (desktop-only).
-    expect(screen.queryByRole('link', { name: /^Agents$/i })).not.toBeInTheDocument();
+    // AI 員工 is back on Personal too (2026-08-04, D11 overturns the
+    // 2026-07-29 decision to hide the roster).
+    expect(screen.getByRole('link', { name: /^Agents$/i })).toBeInTheDocument();
+    // Still hidden on Personal: pet studio (desktop-only, and jsdom is not Tauri).
     expect(screen.queryByRole('link', { name: /Pet studio/i })).not.toBeInTheDocument();
 
     // Expanding 進階 reveals the folded work surfaces.

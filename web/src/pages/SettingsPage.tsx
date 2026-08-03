@@ -1,6 +1,5 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { useIntl } from 'react-intl';
-import { api } from '@/lib/api';
 import { useNavigate, useSearchParams } from 'react-router';
 import {
   Settings,
@@ -14,7 +13,6 @@ import {
   Server,
   Sparkles,
   EyeOff,
-  Download,
   KeyRound,
   Bot,
 } from 'lucide-react';
@@ -34,7 +32,6 @@ import { AutopilotTab } from '@/components/settings/sections/AutopilotTab';
 import { SkillSynthesisTab } from '@/components/settings/sections/SkillSynthesisTab';
 import { RedactionTab } from '@/components/settings/sections/RedactionTab';
 import { DoctorTab } from '@/components/settings/sections/DoctorTab';
-import { UpdateTab } from '@/components/settings/sections/UpdateTab';
 import { BrowserTab } from '@/components/settings/sections/BrowserTab';
 import { AutomationTab } from '@/components/settings/sections/AutomationTab';
 
@@ -42,7 +39,7 @@ import { AutomationTab } from '@/components/settings/sections/AutomationTab';
  *  set; unknown values fall back to `general`. */
 const VALID_TABS = [
   'general', 'account', 'system', 'container', 'heartbeat', 'voice',
-  'proactive', 'automation', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'update', 'browser',
+  'proactive', 'automation', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser',
 ] as const;
 type TabId = (typeof VALID_TABS)[number];
 
@@ -63,11 +60,14 @@ export function SettingsPage() {
   // Legacy deep-link redirects (bookmarks / older links) instead of a blank tab:
   //  - branding moved to /manage/distributors (R5)
   //  - the cron/排程任務 settings tab was unified into the /routines page.
+  //  - 系統更新 became its own management entry (2026-08-04, D18).
   useEffect(() => {
     if (tabParam === 'branding') {
       navigate('/manage/distributors?tab=branding', { replace: true });
     } else if (tabParam === 'cron') {
       navigate('/routines', { replace: true });
+    } else if (tabParam === 'update') {
+      navigate('/manage/updates', { replace: true });
     }
   }, [tabParam, navigate]);
 
@@ -82,26 +82,6 @@ export function SettingsPage() {
 
   const t = (id: string) => intl.formatMessage({ id });
 
-  // Surface a waiting update on the rail itself. Joanna's note was "make it
-  // more obvious" — a dot that appears only when an update actually exists is
-  // what makes it findable, whereas permanent emphasis just becomes wallpaper.
-  // Best-effort: a failed check leaves the rail unchanged rather than crying wolf.
-  const [updateWaiting, setUpdateWaiting] = useState(false);
-  useEffect(() => {
-    let cancelled = false;
-    api.system
-      .checkUpdate()
-      .then((info) => {
-        if (!cancelled) setUpdateWaiting(Boolean(info?.available));
-      })
-      .catch(() => {
-        /* offline / rate-limited — no badge, no noise */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   // Rail groups mirror the former everyday / advanced split.
   const navGroups: SettingsNavGroup[] = [
     {
@@ -111,12 +91,8 @@ export function SettingsPage() {
         { value: 'account', label: t('settings.account'), icon: KeyRound },
         { value: 'voice', label: t('settings.voice'), icon: Mic },
         { value: 'proactive', label: t('settings.proactive'), icon: Zap },
-        {
-          value: 'update',
-          label: t('settings.update'),
-          icon: Download,
-          ...(updateWaiting ? { badge: 'attention' as const } : {}),
-        },
+        // 系統更新 moved to its own management entry (2026-08-04, D18) —
+        // `?tab=update` redirects there, see the effect above.
       ],
     },
     {
@@ -173,9 +149,6 @@ export function SettingsPage() {
         </SettingsTab>
         <SettingsTab value="doctor" title={t('settings.doctor')} description={t('settings.doctor.desc')}>
           <DoctorTab />
-        </SettingsTab>
-        <SettingsTab value="update" title={t('settings.update')}>
-          <UpdateTab />
         </SettingsTab>
         <SettingsTab value="browser" title={t('settings.browser')} description={t('settings.browser.desc')}>
           <BrowserTab />

@@ -5,6 +5,7 @@
 export { AttachmentChip } from './AttachmentChip';
 export { MessageBubble } from './MessageBubble';
 export { TypingIndicator } from './TypingIndicator';
+export { ThinkingOrbIndicator, type ThinkingState } from './ThinkingOrbIndicator';
 export { TaskInsights } from './TaskInsights';
 export { CenterStage, CornerDuDu } from './ChatStage';
 export { EmployeeRow, type EmployeeRowAgent } from './EmployeeRow';

@@ -19,7 +19,9 @@ import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
 import { fuzzyMatch, highlightSegments } from '@/lib/fuzzy';
 import {
-  manageNav,
+  allManageNav,
+  conversationsEntry,
+  inboxEntry,
   manageEntry,
   navGroupsForEdition,
   primaryItemsForEdition,
@@ -134,6 +136,10 @@ export function CommandPalette() {
     // `navGroups`, so they must NOT be appended again (duplicate route id).
     const navSources: Array<{ item: NavItem; groupLabel: string }> = [
       ...primaryItemsForEdition(isPersonal).map((item) => ({ item, groupLabel: 'navGroup.daily' })),
+      // 收件匣 and 對話紀錄 left / never joined the standing rail (2026-08-04,
+      // D17) — ⌘K is how you reach them by name, so fold them back in here.
+      { item: inboxEntry, groupLabel: 'navGroup.daily' },
+      { item: conversationsEntry, groupLabel: 'navGroup.daily' },
       ...navGroupsForEdition(isPersonal).flatMap((group) =>
         group.items.map((item) => ({ item, groupLabel: group.label })),
       ),
@@ -161,7 +167,7 @@ export function CommandPalette() {
 
     // Zone D management pages live behind a single sidebar entry, so ⌘K is the
     // primary way to reach them directly (dashboard-redesign §3.1, T1.3).
-    const manageCommands: Command[] = manageNav
+    const manageCommands: Command[] = allManageNav
       .filter((item) => isVisible(item, user?.role, isPersonal, visibilityCtx))
       .map((item) => ({
         id: `nav:${item.to}`,

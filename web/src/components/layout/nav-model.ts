@@ -3,6 +3,7 @@ import {
   Inbox,
   MessageCircle,
   MessageCirclePlus,
+  MessagesSquare,
   KanbanSquare,
   ListChecks,
   GitFork,
@@ -37,6 +38,8 @@ import {
   FolderOpen,
   PawPrint,
   Package,
+  LogIn,
+  Download,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -82,7 +85,8 @@ export type NavGroup = {
 /**
  * Single source of truth for the "嘟嘟事務所" navigation, re-grouped for the
  * Multica app shell (WP0.4, spec §5.1). The Sidebar renders, top to bottom:
- *   1. `dailyItems` — flat, no group label (儀表板 / 收件匣 / 新對話).
+ *   1. `dailyItems` — flat, no group label (新對話 / 儀表板; 收件匣 moved to the
+ *      footer bell on 2026-08-04, D17).
  *   1b. the `對話紀錄` zone — dynamic, sourced from `useConversationsStore`
  *      (2026-07-30 client feedback); on Personal it sits between the daily row
  *      and `personalPrimaryItems`, mirroring where 對話 used to be.
@@ -113,8 +117,9 @@ export type NavGroup = {
  * only the phrasing and the pre-navigation side effect changed.
  */
 export const dailyItems: NavItem[] = [
-  { to: '/', icon: Home, label: 'nav.home', desc: 'nav.home.desc', ownScope: true },
-  { to: '/inbox', icon: Inbox, label: 'nav.inbox', desc: 'nav.inbox.desc', badge: 'inbox' },
+  // 2026-08-04 client feedback (D17): 新對話 leads the rail. It is the one row
+  // people reach for every single session, and it was previously buried under
+  // 儀表板 / 收件匣.
   {
     to: '/chat',
     icon: MessageCirclePlus,
@@ -124,7 +129,37 @@ export const dailyItems: NavItem[] = [
     action: 'newConversation',
     ownScope: true,
   },
+  { to: '/', icon: Home, label: 'nav.home', desc: 'nav.home.desc', ownScope: true },
+  // 收件匣 left the standing navigation on 2026-08-04 (D17). The page and its
+  // route stay — the entry point is now the footer notification bell, which
+  // lights up only when something actually needs a decision. See
+  // `inboxEntry` below (kept so ⌘K, breadcrumbs and deep links still resolve).
 ];
+
+/**
+ * 收件匣 — route + label kept alive after it left the standing navigation
+ * (2026-08-04, D17). The sidebar footer bell is the entry point; this entry is
+ * what lets ⌘K, the breadcrumb resolver and existing deep links keep working.
+ */
+export const inboxEntry: NavItem = {
+  to: '/inbox',
+  icon: Inbox,
+  label: 'nav.inbox',
+  desc: 'nav.inbox.desc',
+  badge: 'inbox',
+};
+
+/**
+ * 對話紀錄 — the full conversation list (2026-08-04, D17). The sidebar zone
+ * shows only the newest few and links here for everything else.
+ */
+export const conversationsEntry: NavItem = {
+  to: '/conversations',
+  icon: MessagesSquare,
+  label: 'nav.conversations',
+  desc: 'nav.conversations.desc',
+  ownScope: true,
+};
 
 /**
  * The 員工 roster entry — the "全部員工 →" link under the LIVE staff zone, the
@@ -137,9 +172,12 @@ export const staffEntry: NavItem = {
   label: 'nav.agents',
   desc: 'nav.agents.desc',
   ownScope: true,
-  // Personal IA (2026-07-29): the roster page + LIVE staff zone are hidden —
-  // Personal talks to its AI through 對話, not an HR-style roster.
-  personalHidden: true,
+  // 2026-08-04 client decision (D11) OVERTURNS the 2026-07-29 Personal IA call
+  // that hid this page: Joanna's users do go looking for "my AI employees", and
+  // hiding the roster made the product feel like it had lost them. The page is
+  // visible on every edition again — only the LIVE staff zone stays
+  // enterprise-only (see AppSidebar), because a one-person office does not need
+  // a standing roster widget.
 };
 
 /**
@@ -250,6 +288,8 @@ function pickItems(paths: string[]): NavItem[] {
  * `/knowledge` used to hold here (and leaves 進階).
  */
 export const personalPrimaryItems: NavItem[] = pickItems([
+  // AI 員工 back on the primary rail for Personal too (2026-08-04, D11).
+  '/agents',
   '/routines',
   '/world',
   '/skills',
@@ -298,25 +338,47 @@ export function primaryItemsForEdition(isPersonal: boolean): NavItem[] {
 export const manageNav: NavItem[] = [
   { to: '/manage/channels', icon: Radio, label: 'manage.channels', desc: 'manage.channels.desc', minRole: 'admin' },
   { to: '/manage/integrations', icon: Plug, label: 'manage.integrations', desc: 'manage.integrations.desc', minRole: 'admin' },
+  // 帳戶與登入 — lifted out of the billing page's second tab (2026-08-04, D16 /
+  // D18). One-click CLI sign-in was the single most-asked-for thing nobody
+  // could find; it now has its own top-level management entry.
+  { to: '/manage/accounts', icon: LogIn, label: 'manage.accounts', desc: 'manage.accounts.desc', minRole: 'admin' },
+  // 系統更新 — lifted out of the settings page's tab rail (2026-08-04, D18).
+  { to: '/manage/updates', icon: Download, label: 'manage.updates', desc: 'manage.updates.desc', minRole: 'admin' },
+  // 進階設定 — everything else, folded one level down. Nothing was removed;
+  // `manageAdvancedNav` below is the full former list minus the four surfaces
+  // promoted above.
+  { to: '/manage/advanced', icon: Settings, label: 'manage.advanced', desc: 'manage.advanced.desc', minRole: 'manager' },
+];
+
+/**
+ * The management surfaces folded under 進階設定 (2026-08-04, D18). These keep
+ * their original routes — bookmarks, ⌘K and deep links are unaffected — they
+ * simply no longer occupy a top-level rail slot. The `ManageShell` reveals them
+ * as a sub-list whenever the viewer is inside this subtree.
+ */
+export const manageAdvancedNav: NavItem[] = [
   { to: '/manage/billing', icon: CreditCard, label: 'manage.billing', desc: 'manage.billing.desc', minRole: 'manager' },
-  { to: '/manage/inference', icon: Cpu, label: 'manage.inference', desc: 'manage.inference.desc', minRole: 'admin' },
-  { to: '/manage/reliability', icon: Activity, label: 'manage.reliability', desc: 'manage.reliability.desc', minRole: 'admin' },
-  { to: '/manage/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin' },
-  { to: '/manage/governance', icon: Scale, label: 'manage.governance', desc: 'manage.governance.desc', minRole: 'admin', enterprise: true },
+  // 授權 hidden on Personal (2026-07-29 client feedback). The page stays
+  // URL-reachable (`/manage/license`) and ⌘K still finds it on other editions.
+  { to: '/manage/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager', personalHidden: true },
+  { to: '/manage/distributors', icon: Store, label: 'manage.distributors', desc: 'manage.distributors.desc', minRole: 'admin' },
+  { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },
   { to: '/manage/users', icon: Users, label: 'manage.users', desc: 'manage.users.desc', minRole: 'admin', enterprise: true },
   // Departments are an org grouping — an Enterprise concept. Personal is a
   // single-owner form factor with no departments, so this page (and the
   // department dropdowns that draw from it — agent-create dialog, skill-install
   // scope) are hidden in the Personal edition.
   { to: '/manage/departments', icon: Network, label: 'manage.departments', desc: 'manage.departments.desc', minRole: 'admin', enterprise: true },
-  // 授權 hidden on Personal (2026-07-29 client feedback). The page stays
-  // URL-reachable (`/manage/license`) and ⌘K still finds it on other editions.
-  { to: '/manage/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager', personalHidden: true },
-  { to: '/manage/distributors', icon: Store, label: 'manage.distributors', desc: 'manage.distributors.desc', minRole: 'admin' },
-  { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },
+  { to: '/manage/governance', icon: Scale, label: 'manage.governance', desc: 'manage.governance.desc', minRole: 'admin', enterprise: true },
+  { to: '/manage/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin' },
+  { to: '/manage/reliability', icon: Activity, label: 'manage.reliability', desc: 'manage.reliability.desc', minRole: 'admin' },
+  { to: '/manage/inference', icon: Cpu, label: 'manage.inference', desc: 'manage.inference.desc', minRole: 'admin' },
   { to: '/manage/logs', icon: FileText, label: 'manage.logs', desc: 'manage.logs.desc', minRole: 'manager' },
   { to: '/manage/system', icon: Settings, label: 'manage.system', desc: 'manage.system.desc', minRole: 'admin' },
 ];
+
+/** Every management destination — the five rail entries plus what 進階設定 holds. */
+export const allManageNav: NavItem[] = [...manageNav, ...manageAdvancedNav];
 
 /**
  * Resolve the breadcrumb trail for a pathname (dashboard-redesign §8, paperclip
@@ -327,13 +389,16 @@ export const manageNav: NavItem[] = [
  */
 export function crumbsFor(pathname: string): Array<{ labelId: string; to?: string }> {
   if (pathname.startsWith('/manage')) {
-    const item = manageNav.find((i) => pathname.startsWith(i.to));
+    const item = allManageNav.find((i) => pathname.startsWith(i.to));
+    const advanced = manageAdvancedNav.some((i) => i.to === item?.to);
     return [
       { labelId: manageEntry.label, to: '/manage' },
+      // Folded surfaces read as 管理 / 進階設定 / X so the trail matches the rail.
+      ...(advanced ? [{ labelId: 'manage.advanced', to: '/manage/advanced' }] : []),
       ...(item ? [{ labelId: item.label }] : []),
     ];
   }
-  const flat: NavItem[] = [...dailyItems, staffEntry];
+  const flat: NavItem[] = [...dailyItems, inboxEntry, conversationsEntry, staffEntry];
   for (const item of flat) {
     if (item.to === pathname || (item.to !== '/' && pathname.startsWith(item.to))) {
       return [{ labelId: item.crumb ?? item.label }];
@@ -351,15 +416,19 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
 /**
  * Zone A quick-access routes for the mobile bottom nav (§4.3). The `+ 交辦任務`
  * center action is injected by MobileBottomNav itself (and links to the task
- * board's create intent). Side slots: 儀表板 / 收件匣 | ＋ | 對話. The task board
- * now sits in the desktop sidebar's 工作 group; on mobile it stays reachable via
- * the ＋交辦 action, Home task cards, ⌘K, and its URL (the compact 4-slot bottom
- * bar is kept — 對話 is the primary mobile entry).
+ * board's create intent). Side slots: 儀表板 / 對話 | ＋ | 對話紀錄 / 任務.
+ *
+ * 2026-08-04 (D17): 收件匣 gave up its slot to 對話紀錄. Its count now shows as a
+ * bell in the mobile top bar (`MainLayout`), which only appears when something
+ * is pending — so no bottom-bar item carries a badge any more.
  */
 export const mobileNavItems: NavItem[] = [
   { to: '/', icon: Home, label: 'nav.home', desc: 'nav.home.desc' },
-  { to: '/inbox', icon: Inbox, label: 'nav.inbox', desc: 'nav.inbox.desc', badge: 'inbox' },
   { to: '/chat', icon: MessageCircle, label: 'nav.chat', desc: 'nav.chat.desc' },
+  // 2026-08-04 (D17): 收件匣 left the standing navigation; 對話紀錄 takes the
+  // slot so the full conversation list is one tap away on a phone too. The
+  // inbox is still reachable from the drawer's notification bell.
+  { to: '/conversations', icon: MessagesSquare, label: 'nav.conversations', desc: 'nav.conversations.desc' },
   // Task board restored as a primary nav item (R2); keeps the two side groups
   // balanced 2/2 around the centre ＋交辦 action.
   { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc' },

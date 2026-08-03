@@ -14,7 +14,7 @@ import { formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useTourStore } from '@/stores/tour-store';
 import { Card, Button, Badge, Input, Textarea } from '@/components/mds';
-import { Field, CompletionBadge } from '@/components/onboarding';
+import { Field, CompletionBadge, RuntimeSetupCard } from '@/components/onboarding';
 import { DuDu } from '@/components/mascot';
 import type { DuduFace } from '@/components/mascot/faces';
 import {
@@ -26,6 +26,7 @@ import {
   Plug,
   Cpu,
   Terminal,
+  RefreshCw,
 } from 'lucide-react';
 
 // ---------------------------------------------------------------------------
@@ -237,6 +238,9 @@ export function WelcomePage() {
     () => restoreWelcomeProgress(INITIAL)?.state ?? INITIAL,
   );
   const [detect, setDetect] = useState<RuntimeDetect | null>(null);
+  const [detecting, setDetecting] = useState(false);
+  /** runtime → its own credential file is present (codex / gemini / grok). */
+  const [cliCreds, setCliCreds] = useState<Record<string, boolean> | null>(null);
   const [deploying, setDeploying] = useState(false);
   const [deployed, setDeployed] = useState(false);
   /** Agent was created but a post-create settings step failed — success page
@@ -259,17 +263,40 @@ export function WelcomePage() {
 
   const patch = useCallback((p: Partial<WizardState>) => setState((s) => ({ ...s, ...p })), []);
 
-  // Best-effort runtime detection — degrade silently if it errors.
-  useEffect(() => {
-    let alive = true;
+  /**
+   * Re-probe the host for installed CLIs / Claude OAuth.
+   *
+   * WP2.4 — this used to be a bare `useEffect(…, [])`, so the wizard probed
+   * exactly once per mount: after installing or signing in (or walking back to
+   * step 2) the badges kept showing the stale first answer and the only way to
+   * refresh was to close the dashboard and reopen it. It is now a callable that
+   * every "重新偵測" button, the step-2 entry, and the install / login success
+   * paths all drive.
+   */
+  const refreshDetect = useCallback(() => {
+    setDetecting(true);
     api.runtime
       .detect()
-      .then((d) => alive && setDetect(d))
-      .catch(() => {/* no badges */});
-    return () => {
-      alive = false;
-    };
+      .then(setDetect)
+      .catch(() => {/* keep whatever we had; badges degrade, not crash */})
+      .finally(() => setDetecting(false));
+    // Sign-in state for the non-Claude CLIs is the presence of their own
+    // credential file (Claude's comes from `detect.claude_oauth`). Manager-only
+    // RPC — a non-admin viewer just doesn't get the "未登入" prompt.
+    api.accounts
+      .cliCredentials()
+      .then((r) =>
+        setCliCreds(
+          Object.fromEntries((r.credentials ?? []).map((c) => [c.runtime, c.present])),
+        ),
+      )
+      .catch(() => setCliCreds(null));
   }, []);
+
+  // Probe on mount, and again whenever the backend step is (re-)entered.
+  useEffect(() => {
+    if (step === 1 || step === 2) refreshDetect();
+  }, [step, refreshDetect]);
 
   // Industry template availability — a failed call degrades to "no templates"
   // so the industry step silently disappears on OSS installs.
@@ -395,7 +422,10 @@ export function WelcomePage() {
     if (!detect) return undefined;
     switch (b) {
       case 'claudeSub':
-        return detect.claude_oauth || detect.claude_cli;
+        // Installation only. Being signed in is a separate, stricter thing the
+        // setup card below reports — a green badge here on a signed-out CLI is
+        // exactly how the live run ended up with an agent that couldn't answer.
+        return detect.claude_cli;
       case 'claudeApi':
         return undefined; // an API key isn't "installed" — no badge
       case 'genericApi':
@@ -681,18 +711,38 @@ export function WelcomePage() {
                 })}
               </div>
 
+              {/* Always-available re-probe. The badges above are a snapshot; a
+                  user who installs or signs in elsewhere (or in the card below)
+                  must be able to refresh here instead of restarting the app. */}
+              <div className="flex items-center justify-end">
+                <Button variant="ghost" size="sm" disabled={detecting} onClick={refreshDetect}>
+                  <RefreshCw className={detecting ? 'animate-spin' : undefined} />
+                  {intl.formatMessage({ id: 'welcome.runtime.redetect' })}
+                </Button>
+              </div>
+
               {/* Backend-specific sub-inputs */}
+              {/* Claude subscription — install + sign in without leaving the
+                  wizard (D16). Already signed in ⇒ just confirm the plan. */}
               {state.backend === 'claudeSub' && detect && (
-                <Card className="p-4">
-                  <p className="text-sm text-muted-foreground">
-                    {detect.claude_oauth
-                      ? intl.formatMessage(
-                          { id: 'welcome.backend.claudeLoggedIn' },
-                          { plan: detect.claude_subscription ?? 'OAuth' },
-                        )
-                      : intl.formatMessage({ id: 'welcome.backend.claudeLoginHint' })}
-                  </p>
-                </Card>
+                detect.claude_cli && detect.claude_oauth ? (
+                  <Card className="p-4">
+                    <p className="text-sm text-muted-foreground">
+                      {intl.formatMessage(
+                        { id: 'welcome.backend.claudeLoggedIn' },
+                        { plan: detect.claude_subscription ?? 'OAuth' },
+                      )}
+                    </p>
+                  </Card>
+                ) : (
+                  <RuntimeSetupCard
+                    provider="claude"
+                    installed={detect.claude_cli}
+                    loggedIn={detect.claude_oauth}
+                    onDetect={refreshDetect}
+                    detecting={detecting}
+                  />
+                )
               )}
 
               {state.backend === 'claudeApi' && (
@@ -810,6 +860,25 @@ export function WelcomePage() {
                     })}
                   </div>
                 </Card>
+              )}
+
+              {/* Install / sign in for the picked CLI, in place (D16). */}
+              {state.backend === 'otherCli' && detect && (
+                <RuntimeSetupCard
+                  provider={state.otherCli}
+                  installed={
+                    state.otherCli === 'codex'
+                      ? detect.codex
+                      : state.otherCli === 'gemini'
+                        ? detect.gemini
+                        : detect.antigravity
+                  }
+                  // Antigravity keeps no observable credential file, so its
+                  // sign-in state stays unknown and the login row is hidden.
+                  loggedIn={cliCreds ? cliCreds[state.otherCli] : undefined}
+                  onDetect={refreshDetect}
+                  detecting={detecting}
+                />
               )}
             </>
           )}

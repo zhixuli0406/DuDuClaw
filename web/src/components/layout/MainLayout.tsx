@@ -1,5 +1,5 @@
 import { Suspense, useEffect } from 'react';
-import { Outlet, useLocation, useNavigate } from 'react-router';
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router';
 import { AppSidebar } from './AppSidebar';
 import { MobileBottomNav } from './MobileBottomNav';
 import { GuidedTour } from '@/components/tour/GuidedTour';
@@ -16,14 +16,40 @@ import {
   SidebarTrigger,
   NavProgress,
 } from '@/components/mds';
-import { ArrowUpCircle, X } from 'lucide-react';
+import { ArrowUpCircle, Bell, X } from 'lucide-react';
 import { useIntl } from 'react-intl';
+import { useApprovalsStore } from '@/stores/approvals-store';
 import { useTourStore } from '@/stores/tour-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useBrandingStore, useEffectiveName } from '@/lib/branding';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useNavProgressStore } from '@/stores/nav-progress-store';
 import { useUpdateStore } from '@/stores/update-store';
+
+/**
+ * Mobile inbox bell (2026-08-04, D17). Silent while nothing is pending — an
+ * always-on icon in a 12px-tall bar is just furniture; one that appears when
+ * there is a decision waiting is a signal.
+ */
+function MobileInboxBell() {
+  const intl = useIntl();
+  const count = useApprovalsStore((s) => s.pendingCount);
+  if (count <= 0) return null;
+  const label = intl.formatMessage({ id: 'nav.inbox.pending' }, { count });
+  return (
+    <NavLink
+      to="/inbox"
+      aria-label={label}
+      title={label}
+      className="relative ml-auto grid size-8 shrink-0 place-items-center rounded-md text-brand outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50"
+    >
+      <Bell className="size-4" />
+      <span className="absolute -right-0.5 -top-0.5 inline-flex min-w-4 items-center justify-center rounded-full bg-brand px-1 text-[9px] font-medium leading-none tabular-nums text-brand-foreground">
+        {count > 99 ? '99+' : count}
+      </span>
+    </NavLink>
+  );
+}
 
 /**
  * Route-transition fallback. Flips the NavProgress store on while a lazy page
@@ -68,7 +94,7 @@ function UpdateBanner() {
         {intl.formatMessage({ id: 'update.notification' }, { version: notification.latest_version })}
       </span>
       <button
-        onClick={() => navigate('/manage/system?tab=update')}
+        onClick={() => navigate('/manage/updates')}
         className="ml-auto whitespace-nowrap rounded-md bg-warning px-2 py-0.5 text-xs font-medium text-white transition-colors hover:bg-warning/90"
       >
         {intl.formatMessage({ id: 'update.viewDetails' })}
@@ -113,6 +139,10 @@ function AppShell() {
         <div className="flex h-12 shrink-0 items-center gap-2 border-b border-surface-border px-3 md:hidden">
           <SidebarTrigger />
           <span className="truncate text-sm font-medium text-foreground">{brandName}</span>
+          {/* 收件匣 left the bottom bar on 2026-08-04 (D17). On a phone the
+              drawer's bell is two taps away, so the signal lives here instead —
+              and only appears when something is actually waiting. */}
+          <MobileInboxBell />
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">

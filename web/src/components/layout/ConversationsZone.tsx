@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
-import { useNavigate } from 'react-router';
+import { NavLink, useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
-import { ChevronDown } from 'lucide-react';
+import { ArrowRight, ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from '@/lib/toast';
 import { sessionChannel } from '@/lib/session-channel';
@@ -17,15 +17,15 @@ import {
   SidebarMenuItem,
   sidebarMenuButtonVariants,
 } from '@/components/mds';
+import { conversationsEntry } from './nav-model';
 
 /**
- * How many past conversations the rail lists. The client asked for 15 (newest
- * first) — enough to cover "what was I doing", short enough that the rest of
- * the nav stays reachable without scrolling past a wall of titles. Everything
- * older stays on the chat page's own list, which is unfiltered and searchable
- * by employee.
+ * How many past conversations the rail lists. Cut from 15 to 5 on 2026-08-04
+ * (D17): fifteen titles pushed every other navigation group below the fold, and
+ * "what was I just doing" only ever needs the last handful. Everything older
+ * lives on the full 對話紀錄 page, which the 查看全部 row links to.
  */
-const RAIL_LIMIT = 15;
+const RAIL_LIMIT = 5;
 
 /**
  * 對話紀錄 — the sidebar conversation-history zone (2026-07-30 client feedback).
@@ -136,6 +136,21 @@ export function ConversationsZone({
                 </SidebarMenuItem>
               );
             })
+          )}
+          {/* 查看全部 — the rest of the history lives on its own page (D17).
+              Pointless when there is nothing to see yet, so it waits for the
+              first conversation. */}
+          {shown.length > 0 && (
+          <SidebarMenuItem>
+            <NavLink
+              to={conversationsEntry.to}
+              data-tour={`nav:${conversationsEntry.to}`}
+              className={cn(sidebarMenuButtonVariants({ size: 'sm' }), 'px-2 text-brand hover:text-brand')}
+            >
+              <span className="flex-1 truncate">{intl.formatMessage({ id: 'sidebar.allConversations' })}</span>
+              <ArrowRight className="size-3.5" />
+            </NavLink>
+          </SidebarMenuItem>
           )}
         </SidebarMenu>
       )}

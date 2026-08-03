@@ -23,12 +23,16 @@ describe('AccountsPage (MDS)', () => {
     const user = userEvent.setup();
     renderWithProviders(<AccountsPage />);
 
-    await user.click(screen.getByRole('button', { name: /一鍵登入/ }));
+    // 2026-08-04 (WP3): the picker's chrome is i18n'd, so this asserts the
+    // English catalogue the test provider loads rather than hardcoded zh-TW.
+    await user.click(screen.getByRole('button', { name: /One-click sign-in/i }));
     const grokOption = await screen.findByRole('button', { name: /Grok/ });
     await user.click(grokOption);
 
     // CliLoginModal opened for the grok runtime — title + Docker volume caveat.
-    expect(await screen.findByText(/Grok（SuperGrok 訂閱）\s*一鍵登入/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Sign in to Grok \(SuperGrok subscription\)/i),
+    ).toBeInTheDocument();
     expect(
       await screen.findByText(/duduclaw-grok volume/),
     ).toBeInTheDocument();

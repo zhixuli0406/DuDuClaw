@@ -86,19 +86,24 @@ function Field({
   );
 }
 
-const CLI_OPTIONS: ReadonlyArray<[LoginRuntime, string]> = [
+/**
+ * The CLIs one-click sign-in can drive. Labels are product names, so they stay
+ * verbatim; the one that needs a qualifier ("which subscription is this?")
+ * carries an i18n key instead.
+ */
+const CLI_OPTIONS: ReadonlyArray<[LoginRuntime, string, string?]> = [
   ['claude', 'Claude'],
   ['codex', 'Codex'],
   ['gemini', 'Gemini'],
   ['antigravity', 'Antigravity (agy)'],
-  ['grok', 'Grok（SuperGrok 訂閱）'],
+  ['grok', 'Grok', 'cliLogin.runtime.grok.suffix'],
 ];
 
 /** Card titles for the CLI-store credential section. */
 const CLI_CRED_LABELS: Record<string, string> = {
   codex: 'Codex CLI',
   gemini: 'Gemini CLI',
-  grok: 'Grok CLI（SuperGrok 訂閱）',
+  grok: 'Grok CLI',
 };
 
 /**
@@ -164,7 +169,7 @@ export function AccountsPage() {
           </Button>
           <Button variant="outline" size="sm" onClick={() => setPickerOpen(true)}>
             <LogIn />
-            一鍵登入
+            {intl.formatMessage({ id: 'accounts.cliLogin' })}
           </Button>
           <Button variant="brand" size="sm" onClick={() => setShowAddDialog(true)}>
             <Plus />
@@ -177,10 +182,10 @@ export function AccountsPage() {
       <Dialog open={pickerOpen} onOpenChange={(o) => !o && setPickerOpen(false)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>選擇要登入的 CLI</DialogTitle>
+            <DialogTitle>{intl.formatMessage({ id: 'accounts.cliLogin.pick' })}</DialogTitle>
           </DialogHeader>
           <div className="grid grid-cols-2 gap-2">
-            {CLI_OPTIONS.map(([rt, label]) => (
+            {CLI_OPTIONS.map(([rt, label, suffixKey]) => (
               <Button
                 key={rt}
                 variant="outline"
@@ -189,12 +194,12 @@ export function AccountsPage() {
                   setLoginRuntime(rt);
                 }}
               >
-                {label}
+                {suffixKey ? `${label}${intl.formatMessage({ id: suffixKey })}` : label}
               </Button>
             ))}
           </div>
           <p className="text-xs text-muted-foreground">
-            會在伺服器以 PTY 驅動該 CLI 的原生登入流程並串到這裡。Claude 走 setup-token（遠端可用）；其餘走 localhost 回呼（限自架）。
+            {intl.formatMessage({ id: 'accounts.cliLogin.pickHint' })}
           </p>
         </DialogContent>
       </Dialog>
@@ -288,7 +293,10 @@ export function AccountsPage() {
                         <KeyRound className="h-4 w-4 text-muted-foreground" />
                       </div>
                       <div>
-                        <p className="font-medium text-foreground">{CLI_CRED_LABELS[c.runtime] ?? c.runtime}</p>
+                        <p className="font-medium text-foreground">
+                          {CLI_CRED_LABELS[c.runtime] ?? c.runtime}
+                          {c.runtime === 'grok' && intl.formatMessage({ id: 'cliLogin.runtime.grok.suffix' })}
+                        </p>
                         <p className="font-mono text-xs text-muted-foreground">{c.store}</p>
                       </div>
                     </div>
