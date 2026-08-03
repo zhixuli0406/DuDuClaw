@@ -3,9 +3,13 @@ import { useIntl } from 'react-intl';
 import {
   Share2Icon,
   HistoryIcon,
-  ShieldAlertIcon,
   SearchIcon,
   XIcon,
+  FileTextIcon,
+  CheckCircle2Icon,
+  Trash2Icon,
+  EyeIcon,
+  EraserIcon,
 } from 'lucide-react';
 import {
   Tabs,
@@ -27,12 +31,12 @@ import {
   type MemoryGraphEdge,
   type MemoryGraphResult,
   type MemoryChainEntry,
-  type ApprovalItem,
+  type AutoWikiPage,
 } from '@/lib/api';
 import { timeAgo } from '@/lib/format';
 import { isImeComposing } from '@/lib/keyboard';
 
-type CurateTab = 'graph' | 'timeline' | 'queue';
+type CurateTab = 'graph' | 'timeline' | 'auto';
 
 /** A fact key that the graph tab can hand off to the timeline tab. */
 interface FactKey {
@@ -41,11 +45,20 @@ interface FactKey {
 }
 
 /**
- * KnowledgeCuration — the D6 HITL knowledge-curation station, mounted as a view
+ * KnowledgeCuration — the HITL knowledge-curation station, mounted as a view
  * inside KnowledgeHubPage. Three sub-tabs: the SPO 知識圖譜 (force-directed
- * viewer + provenance panel), 事實歷史 (supersession timeline), and 待審知識
- * (quarantine review queue). All copy is end-user facing zh-TW — no internal
- * terms (origin_trust / PPR / quarantined) leak into the UI.
+ * viewer + provenance panel), 事實歷史 (supersession timeline), and 自動建檔
+ * (WP5c audit surface for pages the AI filed on its own).
+ *
+ * WP5c / D20 changed this station's job. Auto-filing is now unattended, so the
+ * old 待審知識 approval queue no longer belongs here — it moved out to the
+ * inbox. **Only the tab was removed**: the burst-quarantine backend
+ * (`approvals.list/decide` + `knowledge_quarantine`) is untouched and still
+ * produces items, because same-origin burst detection keeps running. Deleting
+ * the backend too would have created a queue with no release path.
+ *
+ * All copy is end-user facing zh-TW — no internal terms (origin_trust / PPR /
+ * namespace / distill) leak into the UI.
  */
 export function KnowledgeCuration({ agentId }: { agentId: string }) {
   const intl = useIntl();
@@ -68,7 +81,7 @@ export function KnowledgeCuration({ agentId }: { agentId: string }) {
       <TabsList>
         <TabsTab value="graph">{intl.formatMessage({ id: 'curate.tab.graph' })}</TabsTab>
         <TabsTab value="timeline">{intl.formatMessage({ id: 'curate.tab.timeline' })}</TabsTab>
-        <TabsTab value="queue">{intl.formatMessage({ id: 'curate.tab.queue' })}</TabsTab>
+        <TabsTab value="auto">{intl.formatMessage({ id: 'curate.tab.auto' })}</TabsTab>
       </TabsList>
 
       <TabsPanel value="graph">
@@ -77,8 +90,8 @@ export function KnowledgeCuration({ agentId }: { agentId: string }) {
       <TabsPanel value="timeline">
         <TimelineTab agentId={agentId} pinnedFact={pinnedFact} />
       </TabsPanel>
-      <TabsPanel value="queue">
-        <QueueTab agentId={agentId} />
+      <TabsPanel value="auto">
+        <AutoPagesTab agentId={agentId} />
       </TabsPanel>
     </Tabs>
   );
@@ -423,132 +436,275 @@ function FactTimeline({ chain }: { chain: MemoryChainEntry[] }) {
   );
 }
 
-// ── Queue tab ───────────────────────────────────────────────
+// ── Auto-filed pages tab (WP5c audit surface) ───────────────
 
-interface QuarantinePayload {
-  origin?: string;
-  subject?: string;
-  quarantined_ids?: string[];
-  memory_db?: string;
-}
-
-function QueueTab({ agentId }: { agentId: string }) {
+/**
+ * 自動建檔 — every page the AI created from a conversation on its own, with
+ * where it came from and three reversible actions.
+ *
+ * Rollback semantics matter here. 「移除」 archives ONE page and expires ONLY
+ * that page's memory pointer. The separate 「清除所有自動蒐集的知識」 button is
+ * the blunt instrument (it expires every conversationally-learned memory this
+ * AI staff member has) and says so in its confirmation — the two must never
+ * read as the same action.
+ */
+function AutoPagesTab({ agentId }: { agentId: string }) {
   const intl = useIntl();
-  const [items, setItems] = useState<ApprovalItem[] | null>(null);
-  const [busyId, setBusyId] = useState<string | null>(null);
-  const [purgeTarget, setPurgeTarget] = useState<ApprovalItem | null>(null);
+  const [pages, setPages] = useState<AutoWikiPage[] | null>(null);
+  const [busyPath, setBusyPath] = useState<string | null>(null);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [preview, setPreview] = useState<{ path: string; content: string } | null>(null);
+  const [promoteTarget, setPromoteTarget] = useState<AutoWikiPage | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<AutoWikiPage | null>(null);
+  const [purgeOpen, setPurgeOpen] = useState(false);
 
-  const fetchQueue = useCallback(async () => {
+  const fetchPages = useCallback(async () => {
     try {
-      const res = await api.approvals.list(agentId, 'knowledge_quarantine');
-      setItems(res.approvals);
+      const res = await api.wiki.autoPages(agentId);
+      setPages(res.pages);
     } catch {
-      setItems([]);
+      setPages([]);
     }
   }, [agentId]);
 
-  useEffect(() => { fetchQueue(); }, [fetchQueue]);
+  useEffect(() => {
+    setPreview(null);
+    fetchPages();
+  }, [fetchPages]);
 
-  // Optimistic remove + refetch after a decision.
-  const decide = useCallback(async (item: ApprovalItem, approve: boolean, reason?: string) => {
-    setBusyId(item.id);
-    setError('');
-    setItems((prev) => prev?.filter((i) => i.id !== item.id) ?? prev);
-    try {
-      await api.approvals.decide(item.id, approve, reason);
-    } catch {
-      setError(intl.formatMessage({ id: 'curate.queue.actionFailed' }));
-    } finally {
-      setBusyId(null);
-      fetchQueue();
-    }
-  }, [fetchQueue, intl]);
+  const run = useCallback(
+    async (path: string, action: () => Promise<unknown>, successId?: string) => {
+      setBusyPath(path);
+      setError('');
+      setNotice('');
+      try {
+        await action();
+        if (successId) setNotice(intl.formatMessage({ id: successId }));
+      } catch {
+        setError(intl.formatMessage({ id: 'curate.auto.actionFailed' }));
+      } finally {
+        setBusyPath(null);
+        setPromoteTarget(null);
+        setRemoveTarget(null);
+        setPurgeOpen(false);
+        fetchPages();
+      }
+    },
+    [fetchPages, intl],
+  );
 
-  const purgeOrigin = useCallback(async (item: ApprovalItem) => {
-    const payload = item.payload as QuarantinePayload;
-    const origin = payload?.origin;
-    setBusyId(item.id);
-    setError('');
-    setItems((prev) => prev?.filter((i) => i.id !== item.id) ?? prev);
-    try {
-      if (origin) await api.memory.invalidateOrigin(agentId, origin);
-      await api.approvals.decide(item.id, false, 'purge origin');
-    } catch {
-      setError(intl.formatMessage({ id: 'curate.queue.actionFailed' }));
-    } finally {
-      setBusyId(null);
-      setPurgeTarget(null);
-      fetchQueue();
-    }
-  }, [agentId, fetchQueue, intl]);
+  const view = useCallback(
+    async (page: AutoWikiPage) => {
+      if (preview?.path === page.path) {
+        setPreview(null);
+        return;
+      }
+      setBusyPath(page.path);
+      try {
+        const res = await api.wiki.read(agentId, page.path);
+        setPreview({ path: page.path, content: res.content });
+      } catch {
+        setError(intl.formatMessage({ id: 'curate.auto.actionFailed' }));
+      } finally {
+        setBusyPath(null);
+      }
+    },
+    [agentId, intl, preview],
+  );
 
-  if (items === null) {
-    return <div className="flex justify-center py-16"><Spinner /></div>;
-  }
-
-  if (items.length === 0) {
-    return <Empty icon={ShieldAlertIcon} title={intl.formatMessage({ id: 'curate.queue.empty' })} />;
+  if (pages === null) {
+    return (
+      <div className="flex justify-center py-16">
+        <Spinner />
+      </div>
+    );
   }
 
   return (
     <div className="space-y-3">
       {error && <p className="text-sm text-destructive">{error}</p>}
-      {items.map((item) => {
-        const payload = item.payload as QuarantinePayload;
-        const count = payload?.quarantined_ids?.length ?? 0;
-        return (
-          <Card key={item.id} data-size="sm" className="border-warning/40">
+      {notice && <p className="text-sm text-success">{notice}</p>}
+
+      {pages.length === 0 ? (
+        <Empty
+          icon={FileTextIcon}
+          title={intl.formatMessage({ id: 'curate.auto.empty.title' })}
+          description={intl.formatMessage({ id: 'curate.auto.empty.desc' })}
+        />
+      ) : (
+        pages.map((page) => (
+          <Card key={page.path} data-size="sm">
             <CardContent className="space-y-3">
-              <div className="flex items-start gap-2">
-                <ShieldAlertIcon className="mt-0.5 size-4 shrink-0 text-warning" />
-                <p className="text-sm text-foreground">{item.summary}</p>
+              <div className="flex flex-wrap items-center gap-2">
+                <FileTextIcon className="size-4 shrink-0 text-muted-foreground" />
+                <span className="text-sm font-medium text-foreground">{page.title}</span>
+                <Badge variant="secondary">{page.doc_type_label}</Badge>
               </div>
+
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                {payload?.origin && (
-                  <span>{intl.formatMessage({ id: 'curate.queue.source' })}：<span className="text-foreground">{payload.origin}</span></span>
+                <span>
+                  {intl.formatMessage({ id: 'curate.auto.updated' })}：
+                  <span className="text-foreground">{timeAgo(page.updated)}</span>
+                </span>
+                <span>
+                  {intl.formatMessage({ id: 'curate.auto.revisions' })}：
+                  <span className="font-mono tabular-nums text-foreground">
+                    {page.revision_count}
+                  </span>
+                </span>
+                {page.sources.length > 0 && (
+                  <span className="truncate" title={page.sources.join('\n')}>
+                    {intl.formatMessage({ id: 'curate.auto.source' })}：
+                    <span className="text-foreground">
+                      {formatSource(page.sources[page.sources.length - 1])}
+                    </span>
+                  </span>
                 )}
-                {payload?.subject && (
-                  <span>{intl.formatMessage({ id: 'curate.queue.subject' })}：<span className="text-foreground">{payload.subject}</span></span>
-                )}
-                {count > 0 && (
-                  <span>{intl.formatMessage({ id: 'curate.queue.count' })}：<span className="font-mono tabular-nums text-foreground">{count}</span></span>
-                )}
-                <span className="ml-auto">{timeAgo(item.created_at)}</span>
               </div>
+
               <div className="flex flex-wrap gap-2">
-                <Button variant="brand" size="sm" disabled={busyId === item.id} onClick={() => decide(item, true)}>
-                  {intl.formatMessage({ id: 'curate.queue.approve' })}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={busyPath === page.path}
+                  onClick={() => view(page)}
+                >
+                  <EyeIcon />
+                  {intl.formatMessage({ id: 'curate.auto.view' })}
                 </Button>
-                <Button variant="outline" size="sm" disabled={busyId === item.id} onClick={() => decide(item, false)}>
-                  {intl.formatMessage({ id: 'curate.queue.reject' })}
+                <Button
+                  variant="brand"
+                  size="sm"
+                  disabled={busyPath === page.path}
+                  onClick={() => setPromoteTarget(page)}
+                >
+                  <CheckCircle2Icon />
+                  {intl.formatMessage({ id: 'curate.auto.promote' })}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={busyPath === page.path}
+                  onClick={() =>
+                    run(page.path, () => api.wiki.share(agentId, page.path), 'curate.auto.shared')
+                  }
+                >
+                  <Share2Icon />
+                  {intl.formatMessage({ id: 'curate.auto.share' })}
                 </Button>
                 <Button
                   variant="destructive"
                   size="sm"
-                  disabled={busyId === item.id || !payload?.origin}
-                  onClick={() => setPurgeTarget(item)}
+                  disabled={busyPath === page.path}
+                  onClick={() => setRemoveTarget(page)}
                 >
-                  {intl.formatMessage({ id: 'curate.queue.purge' })}
+                  <Trash2Icon />
+                  {intl.formatMessage({ id: 'curate.auto.remove' })}
                 </Button>
               </div>
+
+              {preview?.path === page.path && (
+                <pre className="max-h-80 overflow-auto rounded-lg border border-surface-border bg-muted/30 p-3 text-xs whitespace-pre-wrap break-words text-foreground">
+                  {preview.content}
+                </pre>
+              )}
             </CardContent>
           </Card>
-        );
-      })}
+        ))
+      )}
+
+      {/* Nuclear option — deliberately separated from the per-page 移除. */}
+      <div className="flex justify-end pt-2">
+        <Button variant="ghost" size="sm" onClick={() => setPurgeOpen(true)}>
+          <EraserIcon />
+          {intl.formatMessage({ id: 'curate.auto.purgeAll' })}
+        </Button>
+      </div>
 
       <ConfirmDialog
-        open={!!purgeTarget}
-        onClose={() => setPurgeTarget(null)}
-        onConfirm={() => purgeTarget && purgeOrigin(purgeTarget)}
-        title={intl.formatMessage({ id: 'curate.queue.purge.confirmTitle' })}
+        open={!!promoteTarget}
+        onClose={() => setPromoteTarget(null)}
+        onConfirm={() =>
+          promoteTarget &&
+          run(
+            promoteTarget.path,
+            () => api.wiki.promote(agentId, promoteTarget.path),
+            'curate.auto.promoted',
+          )
+        }
+        title={intl.formatMessage({ id: 'curate.auto.promote.confirmTitle' })}
         message={intl.formatMessage(
-          { id: 'curate.queue.purge.confirmMsg' },
-          { origin: (purgeTarget?.payload as QuarantinePayload)?.origin ?? '' },
+          { id: 'curate.auto.promote.confirmMsg' },
+          { title: promoteTarget?.title ?? '' },
         )}
-        confirmLabel={intl.formatMessage({ id: 'curate.queue.purge.confirmBtn' })}
-        busy={busyId === purgeTarget?.id}
+        confirmLabel={intl.formatMessage({ id: 'curate.auto.promote.confirmBtn' })}
+        busy={busyPath === promoteTarget?.path}
+      />
+
+      <ConfirmDialog
+        open={!!removeTarget}
+        onClose={() => setRemoveTarget(null)}
+        onConfirm={() =>
+          removeTarget && run(removeTarget.path, () => api.wiki.archive(agentId, removeTarget.path))
+        }
+        title={intl.formatMessage({ id: 'curate.auto.remove.confirmTitle' })}
+        message={intl.formatMessage(
+          { id: 'curate.auto.remove.confirmMsg' },
+          { title: removeTarget?.title ?? '' },
+        )}
+        confirmLabel={intl.formatMessage({ id: 'curate.auto.remove.confirmBtn' })}
+        busy={busyPath === removeTarget?.path}
+      />
+
+      <ConfirmDialog
+        open={purgeOpen}
+        onClose={() => setPurgeOpen(false)}
+        onConfirm={() => run('*', () => api.memory.invalidateOrigin(agentId, 'channel'))}
+        title={intl.formatMessage({ id: 'curate.auto.purgeAll.confirmTitle' })}
+        message={intl.formatMessage({ id: 'curate.auto.purgeAll.confirmMsg' })}
+        confirmLabel={intl.formatMessage({ id: 'curate.auto.purgeAll.confirmBtn' })}
+        busy={busyPath === '*'}
       />
     </div>
   );
+}
+
+/** Channel token → the name the user knows it by. Unlisted tokens pass through. */
+const CHANNEL_LABELS: Record<string, string> = {
+  telegram: 'Telegram',
+  discord: 'Discord',
+  slack: 'Slack',
+  line: 'LINE',
+  whatsapp: 'WhatsApp',
+  feishu: '飛書',
+  googlechat: 'Google Chat',
+  msteams: 'Microsoft Teams',
+  teams: 'Microsoft Teams',
+  wecom: '企業微信',
+  dingtalk: '釘釘',
+  email: 'Email',
+  webchat: '網頁對話',
+};
+
+/**
+ * `conversation:telegram:12345:2026-08-04T10:12:33Z` → `Telegram · 8/4 10:12`.
+ *
+ * Session ids carry colons of their own (`webchat:conn#agent:a#conv:x`), so the
+ * timestamp is located by shape rather than by field position. Anything
+ * unfamiliar passes through unchanged — this is a display helper on an audit
+ * screen and must never throw.
+ */
+export function formatSource(source: string): string {
+  const parts = source.split(':');
+  if (parts[0] !== 'conversation' || parts.length < 3) return source;
+  const channel = parts[1];
+  const label = CHANNEL_LABELS[channel] ?? channel;
+  const iso = source.slice(source.indexOf(`${channel}:`) + channel.length + 1);
+  const tsStart = iso.search(/\d{4}-\d{2}-\d{2}T/);
+  if (tsStart < 0) return label;
+  const t = new Date(iso.slice(tsStart));
+  if (Number.isNaN(t.getTime())) return label;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${label} · ${t.getMonth() + 1}/${t.getDate()} ${pad(t.getHours())}:${pad(t.getMinutes())}`;
 }

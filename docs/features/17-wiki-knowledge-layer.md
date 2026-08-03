@@ -290,6 +290,64 @@ Low trust by default — the agent can promote to higher layers after verificati
 
 ---
 
+## Auto-Filed Pages (`auto/` namespace, WP5c)
+
+Pasting a company charter into a channel used to leave nothing behind: the
+distillation classifier gated on the *assistant reply* length, so a 2,000-char
+document answered with "got it" was skipped entirely. WP5c adds a second sink.
+
+**Grading** (`knowledge_route.rs`, zero LLM cost for the decisive cases):
+
+| Layer | Rule |
+|---|---|
+| L0 exclusions | < 80 chars · a short question · any `scan_input` rule hit · LLM-fallback narrative |
+| L1 signals | document nouns (+40), explicit "file this" verbs (+50), `第…條` article markers ×2 (+35), ≥3 numbered lines (+25), markdown structure (+10), length (+15/+30), title line (+10); minus first-person preference (−45), time-bound context (−35), pronoun density (−20), multiple questions (−25) |
+| Thresholds | ≥ 65 file · 30–64 ask the utility model · < 30 memory path |
+
+Grading reads **only the user's text** and runs before `classify_for_ingest`.
+
+**Where pages land:** `auto/{charter,sop,spec,policy,reference}/<slug>.md` in the
+agent's own wiki. The hand-curated directories (`entities/`, `concepts/`,
+`sources/`, `synthesis/`) are unreachable from this path.
+
+**How an auto page differs from a curated one:**
+
+| | Auto-filed | Curated |
+|---|---|---|
+| `author` | `auto-distill` | operator / agent id |
+| `tags` | includes `auto-distilled` | — |
+| `layer` | `context` — **never auto-injected** | `identity` / `core` participate |
+| `trust` | `0.300` (the `channel` origin ceiling) | up to `1.0` |
+| `source_type` | `raw_dialogue` (ranking factor 0.6) | `verified_fact` (1.2) etc. |
+| Searchable | yes (`do_not_inject` deliberately unset) | yes |
+
+Non-injection is the design's risk pivot: a misgraded page costs one extra page
+in the knowledge base, never a polluted system prompt.
+
+**Determinism.** The page key is `auto/<doc_type>/<slug>.md` where `slug` is the
+utility model's proposal validated against `^[a-z0-9][a-z0-9-]{0,63}$`, falling
+back to `<doc_type>-<sha8(NFKC-normalised title)>`. Re-pasting identical content
+is a no-op; changed content overwrites the body and appends a revision-log line.
+
+**Gates, all fail-closed, all degrading to the memory path:**
+
+1. `.scope.toml` — `[namespaces.auto]` may be `operator_only` / `read_only` for
+   another capability to disable auto-filing. Unlike the shared-wiki fail-safe,
+   a file that exists but does not parse **stops** the write.
+2. `scan_input` over the rendered page text — any rule match drops the page.
+3. Same-origin burst detection (`knowledge_guard`).
+4. Daily circuit breaker: 20 pages + 20 grey-band arbitrations per agent.
+
+**Memory keeps a pointer, not the text:** one row with
+`subject = wiki:auto/<doc_type>/<slug>`, `predicate = documented_in`, so
+`store_temporal` supersedes the previous pointer and the curation station can
+expire exactly this page's row on removal.
+
+**Operator surface:** dashboard → 記憶與知識 → 策展台 → 自動建檔 (view / confirm
+as curated / share to the shared wiki / remove).
+
+---
+
 ## CLAUDE_WIKI Template
 
 Every new agent's `CLAUDE.md` now includes a CLAUDE_WIKI template that teaches the LLM how to use wiki tools:

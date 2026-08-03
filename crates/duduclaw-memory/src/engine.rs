@@ -2148,6 +2148,45 @@ impl SqliteMemoryEngine {
         })
     }
 
+    /// Expire every currently-valid memory whose `subject` **exactly** equals
+    /// `subject` (WP5c precise rollback).
+    ///
+    /// `invalidate_by_origin` is the blunt instrument — it expires every fact
+    /// from a whole source. Removing ONE auto-filed knowledge page must not
+    /// take unrelated conversational memories with it, so the curation
+    /// station's per-page rollback comes through here instead: the page's
+    /// memory pointer carries `subject = "wiki:auto/<doc_type>/<slug>"`, and
+    /// exact equality on that subject touches nothing else.
+    ///
+    /// Returns the number of rows expired. Superseded (already-closed) rows
+    /// are left alone so the history chain stays readable.
+    pub async fn expire_by_subject(
+        &self,
+        agent_id: &str,
+        subject: &str,
+        reason: &str,
+    ) -> Result<usize> {
+        if subject.trim().is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let n = conn
+            .execute(
+                "UPDATE memories
+                 SET valid_until = ?1, invalidated_by_event = ?2, invalidated_at = ?1
+                 WHERE agent_id = ?3 AND subject = ?4 AND valid_until IS NULL",
+                params![now, reason, agent_id, subject],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        drop(conn);
+        if n > 0 {
+            // Dropping a valid triple invalidates any cached graph snapshot.
+            self.bump_graph_generation(agent_id);
+        }
+        Ok(n)
+    }
+
     /// Count currently-valid memories for an agent filtered by tag substring
     /// (F2b helper). Matches against the JSON-encoded `tags` column.
     pub async fn count_active_with_tag(&self, agent_id: &str, tag: &str) -> Result<u32> {

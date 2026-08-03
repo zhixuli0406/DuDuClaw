@@ -131,6 +131,12 @@ D1 は汚染されたソースを*取り消す*ことができます；D2 はほ
 
 **ランキング側の信頼。**`origin_trust` は取得ランキングに参加するようになりました（重み `w_trust`、デフォルト 0.10）：各候補のスコアは `(1 − w_trust) + w_trust · origin_trust` で乗算されるため、未検証のチャネル蒸留事実（trust 0.3）はキュレートされた事実（trust 1.0）を上回れません。HippoRAG-lite graph では、トリプルのエッジがその `origin_trust` で重み付けされ、低信頼な事実の Personalized-PageRank の質量を縮小します。これは「単一の汚染トリプルが PPR によって2ホップ増幅される」経路を直接抑制します。レガシー行（trust 1.0）は D2 以前のパスとバイト単位で同一にランクされます。
 
+### 自動作成されたナレッジページ（WP5c）
+
+会話蒸留に 2 つ目のシンクが加わりました。長期的な参照文書（定款 / SOP / 仕様 / ポリシー）は、多数の記憶行ではなく、その AI スタッフの `auto/` 名前空間配下の wiki ページになります。信頼モデルは別系統を作らず共有しています——ページの frontmatter の `trust` は `0.300` で、`origin.rs` が `channel` クラスに与える上限と同じ値、`source_type` は `raw_dialogue`（ランキング係数 0.6）です。呼び出し側はどちらも引き上げられません。承認済みの信頼度への昇格はキュレーション画面での人の操作です。
+
+記憶側にはページごとにポインタ行が 1 つだけ残ります——`subject = wiki:auto/<doc_type>/<slug>`、`predicate = documented_in`、origin は `channel`、trust 0.3。文書の全文は 1 か所にのみ存在し、置き換え・ロールバック・検索は記憶側でこれまで通り機能します。ページを削除する際は**正確な subject**（`expire_by_subject`）でそのポインタだけを失効させます。`invalidate_by_origin` は使いません——会話から学んだ記憶をすべて巻き込んでしまうためです。詳細は [17 — Wiki ナレッジ層](17-wiki-knowledge-layer.md) を参照してください。
+
 ### グラフ検索の進化（D3）
 
 HippoRAG-lite graph は4つの独立した改良を得ました（HippoRAG 2 + LightRAG との整合）。いずれも fail-safe です：エイリアスなし、小さなグラフ、embedding seeding オフのとき、ランキングは以前のクエリ毎ビルドと**バイト単位で同一**です。
