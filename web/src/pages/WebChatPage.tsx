@@ -1,12 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useSearchParams } from 'react-router';
-import { useChatStore, historyToMessages, type PendingAttachment } from '@/stores/chat-store';
-import { api, type ChatSessionSummary } from '@/lib/api';
+import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
+import { type ChatSessionSummary } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useAuthStore } from '@/stores/auth-store';
-import { hasMinRole } from '@/lib/roles';
-import { sessionChannel, isConversationSession } from '@/lib/session-channel';
+import { useConversationsStore } from '@/stores/conversations-store';
+import { sessionChannel } from '@/lib/session-channel';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
 import { Plus, Paperclip, Eye, EyeOff, MessagesSquare, ArrowLeft, PanelLeftOpen } from 'lucide-react';
@@ -64,9 +63,7 @@ export function WebChatPage() {
     sessionsRevision,
     connect,
     send,
-    reset,
     selectAgent,
-    resumeSession,
   } = useChatStore();
 
   const agents = useAgentsStore((s) => s.agents);
@@ -134,28 +131,19 @@ export function WebChatPage() {
   // (2026-07-29 client feedback). Non-admins stay scoped to the selected
   // employee (the RPC rejects unscoped listing for them, fail-closed).
   // Internal work sessions (cron / delegation runs) are filtered out.
-  const role = useAuthStore((s) => s.user?.role);
-  const canListAll = hasMinRole(role, 'admin');
-  const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
-  const [sessionsState, setSessionsState] = useState<'idle' | 'loading' | 'error' | 'ready'>('idle');
-
-  const loadSessions = async () => {
-    setSessionsState('loading');
-    try {
-      const res = await api.chatSessions.list(
-        canListAll ? { limit: 100 } : { ...(historyAgentId ? { agent_id: historyAgentId } : {}), limit: 50 },
-      );
-      setSessions((res?.sessions ?? []).filter((s) => isConversationSession(s.session_id)));
-      setSessionsState('ready');
-    } catch {
-      setSessionsState('error');
-    }
-  };
+  //
+  // The listing + resume live in `useConversationsStore` so this column and the
+  // sidebar 對話紀錄 zone can never drift apart (2026-07-30).
+  const sessions = useConversationsStore((s) => s.sessions);
+  const sessionsState = useConversationsStore((s) => s.status);
+  const loadSessions = useConversationsStore((s) => s.fetch);
+  const resumeConversation = useConversationsStore((s) => s.resume);
+  const startNewConversation = useConversationsStore((s) => s.startNew);
 
   useEffect(() => {
     if (connectionState === 'connected') void loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [historyAgentId, connectionState, canListAll]);
+  }, [historyAgentId, connectionState]);
 
   // Refresh the list whenever a reply lands (`sessionsRevision` bumps once per
   // completed turn) so a just-created conversation appears — and stays
@@ -166,18 +154,12 @@ export function WebChatPage() {
   }, [sessionsRevision]);
 
   const handleResume = async (session: ChatSessionSummary) => {
-    try {
-      const hist = await api.chatSessions.history(session.session_id);
-      // Cross-channel sessions belong to whichever employee handles that
-      // channel — switch the partner first so the server's cross-agent resume
-      // guard accepts the follow-up turn (the main agent maps to the DuDu chip).
-      const owner = hist.agent_id || session.agent_id;
-      if (owner) selectAgent(owner === mainAgentId ? null : owner);
-      resumeSession(session.session_id, historyToMessages(hist.messages ?? []));
-      if (isMobile) setMobileShowList(false);
-    } catch {
+    const ok = await resumeConversation(session);
+    if (!ok) {
       toast.error(intl.formatMessage({ id: 'webchat.history.loadFailed', defaultMessage: '無法載入這個對話' }));
+      return;
     }
+    if (isMobile) setMobileShowList(false);
   };
 
   const partnerName = partner?.display_name ?? agentName;
@@ -200,8 +182,7 @@ export function WebChatPage() {
   const empty = messages.length === 0;
 
   const newConversation = () => {
-    reset();
-    void loadSessions();
+    startNewConversation();
     if (isMobile) setMobileShowList(false);
   };
 

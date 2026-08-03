@@ -104,6 +104,21 @@ export function applyStep(tree: readonly StepNode[], frame: StepFrame): readonly
   return tree; // unknown phase — ignore
 }
 
+/**
+ * Which session id survives a fresh `session_info` hello (pure — exported for
+ * tests). A conversation the user explicitly resumed wins over the connection's
+ * own id: resuming from the sidebar 對話紀錄 happens BEFORE the chat socket
+ * exists, so adopting the hello id there would silently start a new thread on
+ * the next send while the resumed transcript is still on screen.
+ */
+export function sessionIdAfterHello(
+  current: string | null,
+  resumedExplicitly: boolean,
+  helloSessionId: string,
+): string | null {
+  return resumedExplicitly && current ? current : helloSessionId;
+}
+
 /** Where the assistant is in the current turn — drives DuDu's face (V7/T7.1). */
 export type ChatPhase = 'idle' | 'thinking' | 'speaking' | 'done' | 'error';
 
@@ -130,6 +145,15 @@ interface ChatStore {
    * session) or the next send (read by the server as a cross-agent resume).
    */
   readonly ownSessionId: string | null;
+  /**
+   * True while the view shows a conversation the user explicitly resumed, so the
+   * first `session_info` after a connect must NOT overwrite `sessionId` with the
+   * connection's own id. Resuming from the sidebar 對話紀錄 happens BEFORE the
+   * chat socket exists — without this flag the follow-up send would silently
+   * open a new thread instead of continuing the conversation on screen. Cleared
+   * by `reset` / `selectAgent`, which both leave the resumed conversation.
+   */
+  readonly resumedExplicitly: boolean;
   /**
    * The conversation nonce for the conversation currently open (bumped on every
    * `/new`, partner switch, and resume). Sent on each `user_message` as `conv`;
@@ -420,7 +444,14 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 state.ownSessionId === null && typeof data.session_id === 'string'
                   ? data.session_id
                   : state.ownSessionId,
-              sessionId: data.session_id,
+              // A conversation resumed before/while the socket came up keeps its
+              // own id — the connection's base id is recorded as `ownSessionId`
+              // above and is what `reset` / `selectAgent` fall back to.
+              sessionId: sessionIdAfterHello(
+                state.sessionId,
+                state.resumedExplicitly,
+                data.session_id,
+              ),
               agentName: data.agent_name,
               agentIcon: data.agent_icon,
               supportsVision: data.supports_vision ?? false,
@@ -601,6 +632,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     viseme: REST_VISEME,
     sessionId: null,
     ownSessionId: null,
+    resumedExplicitly: false,
     convId: nextConvId(),
     sessionsRevision: 0,
     agentName: effectiveName(),
@@ -645,6 +677,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         // the previous partner; keeping it would make the next send read as a
         // cross-agent resume and be rejected by the server's identity guard.
         sessionId: state.ownSessionId,
+        resumedExplicitly: false,
       }));
     },
 
@@ -652,6 +685,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
       clearVisemeIdle();
       set({
         sessionId,
+        resumedExplicitly: true,
         messages: [...messages],
         steps: [],
         stepTree: [],
@@ -750,6 +784,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         phase: 'idle',
         viseme: REST_VISEME,
         sessionId: target,
+        resumedExplicitly: false,
         convId: nextConvId(),
       });
     },

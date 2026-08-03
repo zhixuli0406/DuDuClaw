@@ -4,6 +4,7 @@ import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { WebChatPage } from './WebChatPage';
 import { useChatStore } from '@/stores/chat-store';
+import { useAuthStore } from '@/stores/auth-store';
 import { api } from '@/lib/api';
 
 beforeEach(() => {
@@ -78,6 +79,9 @@ describe('WebChatPage', () => {
     const listSpy = vi
       .spyOn(api.chatSessions, 'list')
       .mockResolvedValue({ sessions: [] } as never);
+    // `chat.sessions.list` is fail-closed: only an admin may enumerate without
+    // scoping to an agent, so the viewer has to be one for the RPC to fire.
+    useAuthStore.setState({ user: { display_name: 'Boss', role: 'admin' } as never });
     useChatStore.setState({ connectionState: 'connected' as never, sessionsRevision: 0 });
 
     renderWithProviders(<WebChatPage />);

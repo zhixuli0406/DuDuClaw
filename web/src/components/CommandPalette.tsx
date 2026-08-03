@@ -33,6 +33,7 @@ import { CharacterAvatar } from '@/components/character';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useConversationsStore } from '@/stores/conversations-store';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useThemeStore } from '@/stores/theme-store';
@@ -150,7 +151,12 @@ export function CommandPalette() {
         keywords: `${item.label.replace(/^nav\./, '')} ${item.to} ${t(item.desc)}`,
         icon: item.icon,
         route: item.to,
-        perform: () => navigate(item.to),
+        // Action rows (新對話) clear the chat view first, so ⌘K behaves exactly
+        // like clicking the sidebar row — see `NavItem.action`.
+        perform: () => {
+          if (item.action === 'newConversation') useConversationsStore.getState().startNew();
+          navigate(item.to);
+        },
       }));
 
     // Zone D management pages live behind a single sidebar entry, so ⌘K is the
