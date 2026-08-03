@@ -22,6 +22,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 - [Why DuDuClaw?](#why)
 - [Architecture at a glance](#architecture)
+- [Prerequisites](#prerequisites)
 - [Install](#install)
 - [Quick start](#quickstart)
 - [Feature overview](#features)
@@ -70,13 +71,35 @@ DuDuClaw (plumbing)
 
 The Rust workspace is 20 crates: the `duduclaw-core` foundation, the `duduclaw-gateway` service layer, the `duduclaw-llm` unified API layer, `duduclaw-inference` for local models, `duduclaw-memory` for cognitive memory, `duduclaw-security`, and more. Full design in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+<a id="prerequisites"></a>
+
+## Prerequisites
+
+DuDuClaw doesn't ship its own LLM — you need an AI brain first. Pick one (you can also set this up later in the browser wizard):
+
+- Install and log in to [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Antigravity
+- Bring an API key for any OpenAI-compatible provider
+- Or use a local GGUF model — no cloud account needed
+
 <a id="install"></a>
 
 ## Install
 
-### npm (recommended, all platforms including Windows)
+### Desktop app (recommended for personal use)
 
-The only prerequisite is [Node.js](https://nodejs.org/) 20+:
+A native Tauri build that starts the local gateway automatically when you launch it — no terminal required — and shares `~/.duduclaw` with the CLI. Download from [Releases](https://github.com/zhixuli0406/DuDuClaw/releases):
+
+| Platform | File | Notes |
+|----------|------|-------|
+| macOS (Apple Silicon / Intel) | `DuDuClaw_*.dmg` | Signed + Apple notarized, opens cleanly |
+| Windows x64 | `DuDuClaw_*_x64_en-US.msi` | No Authenticode certificate yet, so SmartScreen warns; click "More info" then "Run anyway" to install — unblock details in [docs/guides/desktop-unblock.md](docs/guides/desktop-unblock.md) |
+| Linux | `*_amd64.AppImage` / `.deb` | No signing needed |
+
+Open it and you're done — the in-app wizard walks you through picking an AI backend and creating your first agent, no commands needed.
+
+### npm (advanced / server use, all platforms including Windows)
+
+For running on a server, scripting automation, or if you just prefer the command line. The only prerequisite is [Node.js](https://nodejs.org/) 20+:
 
 ```bash
 npm install -g duduclaw
@@ -91,28 +114,6 @@ This installs a prebuilt binary for your platform (macOS ARM64/x64, Linux x64/AR
 ```bash
 brew install zhixuli0406/tap/duduclaw
 ```
-
-### One-line install
-
-```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
-```
-
-```powershell
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
-```
-
-### Desktop app
-
-A native Tauri desktop build that starts the local gateway on launch and shares `~/.duduclaw` with the CLI. Download from [Releases](https://github.com/zhixuli0406/DuDuClaw/releases):
-
-| Platform | File | Notes |
-|----------|------|-------|
-| macOS (Apple Silicon / Intel) | `DuDuClaw_*.dmg` | Signed + Apple notarized, opens cleanly |
-| Windows x64 | `DuDuClaw_*_x64_en-US.msi` | No Authenticode certificate yet, so SmartScreen warns; click "More info" then "Run anyway", or use the CLI build instead |
-| Linux | `*_amd64.AppImage` / `.deb` | No signing needed |
 
 ### Build from source
 
@@ -138,20 +139,15 @@ pip install duduclaw
 
 ## Quick start
 
-You still need an AI brain, any one of five (you can also set it up later in the browser wizard): install and log in to [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Antigravity; bring an API key for any OpenAI-compatible provider; or use a local GGUF model.
+- **Desktop app**: just open it — the gateway starts automatically and the wizard appears right inside the app.
+- **npm / Homebrew / build from source**:
 
-```bash
-# 1. First-run setup (optional — you can also finish it in the browser wizard)
-duduclaw onboard
+  ```bash
+  duduclaw run                  # start everything (gateway + channels + scheduler + dispatcher)
+  open http://localhost:18789   # open the dashboard
+  ```
 
-# 2. Start everything (gateway + channels + scheduler + dispatcher)
-duduclaw run
-
-# 3. Open the dashboard
-open http://localhost:18789
-```
-
-The first visit walks you through a wizard: pick an AI backend, create your first agent, then chat with it in the built-in WebChat. Later, paste a bot token on the Channels page to put the same agent on Telegram, LINE, Discord, and the rest, without restarting.
+Either way, the first visit takes you through a wizard: pick an AI backend, create your first agent, then chat with it in the built-in WebChat — no need to run `duduclaw onboard` from a terminal first. Later, paste a bot token on the Channels page to put the same agent on Telegram, LINE, Discord, and the rest, without restarting.
 
 Useful next steps:
 
@@ -190,7 +186,7 @@ Full feature list in [docs/features/feature-inventory.md](docs/features/feature-
 ## CLI commands
 
 ```
-duduclaw onboard             # first-run setup (--yes to skip prompts)
+duduclaw onboard             # first-run setup; the browser wizard covers this now, use for headless/scripted setups (--yes to skip prompts)
 duduclaw run                 # start everything (gateway + channels + heartbeat + cron + dispatcher)
 duduclaw agent               # interactive chat; subcommands create / list / inspect / pause / resume / run
 duduclaw wizard              # industry-template setup
