@@ -22,6 +22,13 @@ interface PanelState {
   conn: ConnState;
   scopes: string[];
   expiresAt: string | null;
+  /**
+   * The redirect URI the user must register, as reported by the gateway. The
+   * module constant below is only a fallback for older gateways — it is wrong
+   * whenever `DUDUCLAW_PORT` differs, which is exactly the mistake that made
+   * every consent flow dead-end before this was derived server-side.
+   */
+  redirectUri: string;
 }
 
 export interface IntegrationConnectPanelProps {
@@ -41,6 +48,8 @@ export interface IntegrationConnectPanelProps {
   clientSecretPlaceholder: string;
   /** Capabilities unlocked once connected — each id is a full i18n key. */
   capabilities: ReadonlyArray<{ icon: LucideIcon; id: string }>;
+  /** Extra setup steps inserted after step 1 — full i18n keys, in order. */
+  extraSetupSteps?: readonly string[];
   /** Optional transform for a granted-scope badge label (Google strips its URL prefix). */
   formatScope?: (scope: string) => string;
 }
@@ -65,11 +74,17 @@ export function IntegrationConnectPanel({
   clientIdPlaceholder,
   clientSecretPlaceholder,
   capabilities,
+  extraSetupSteps = [],
   formatScope,
 }: IntegrationConnectPanelProps) {
   const intl = useIntl();
   const t = useCallback((suffix: string) => intl.formatMessage({ id: `${prefix}.${suffix}` }), [intl, prefix]);
-  const [state, setState] = useState<PanelState>({ conn: 'loading', scopes: [], expiresAt: null });
+  const [state, setState] = useState<PanelState>({
+    conn: 'loading',
+    scopes: [],
+    expiresAt: null,
+    redirectUri: OAUTH_REDIRECT_URI,
+  });
   const [clientId, setClientId] = useState('');
   const [clientSecret, setClientSecret] = useState('');
   const [busy, setBusy] = useState(false);
@@ -89,6 +104,7 @@ export function IntegrationConnectPanel({
         conn: status.authenticated ? 'connected' : configured ? 'configured' : 'unconfigured',
         scopes,
         expiresAt: status.expires_at,
+        redirectUri: provider?.redirect_uri || OAUTH_REDIRECT_URI,
       });
     } catch {
       setNotice({ kind: 'error', text: t('error.load') });
@@ -236,11 +252,19 @@ export function IntegrationConnectPanel({
                   <ExternalLink className="size-3" />
                 </a>
               </li>
+              {/* Providers whose console needs API enablement / a consent
+                  screen before a client can be created supply these two extra
+                  steps. Omitting them was a guaranteed dead end: unenabled APIs
+                  403 every call, and an unconfigured consent screen blocks the
+                  authorization outright. */}
+              {extraSetupSteps.map((id) => (
+                <li key={id}>{intl.formatMessage({ id })}</li>
+              ))}
               <li>{t('setup.step2')}</li>
               <li>
                 {t('setup.step3')}
                 <code className="ml-1 select-all rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground">
-                  {OAUTH_REDIRECT_URI}
+                  {state.redirectUri}
                 </code>
               </li>
               <li>{t('setup.step4')}</li>

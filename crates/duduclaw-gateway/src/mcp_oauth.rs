@@ -48,6 +48,27 @@ const PENDING_TTL_SECS: u64 = 600; // 10 minutes
 
 /// Return built-in OAuth provider templates.
 /// `client_id` and `client_secret` are empty — user must configure them.
+/// The gateway's own port, mirroring the CLI's resolution order so the two can
+/// never disagree (`duduclaw run` reads `DUDUCLAW_PORT`, defaulting to 18789).
+pub fn gateway_port() -> u16 {
+    std::env::var("DUDUCLAW_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(18789)
+}
+
+/// The OAuth redirect URI users must register with each provider.
+///
+/// This MUST match where the gateway actually serves
+/// `GET /api/mcp/oauth/callback` (registered on the same axum router as
+/// everything else). It was previously hardcoded to port 3000 while the gateway
+/// listened on 18789, so every provider redirected the browser to a port with
+/// nothing on it and no OAuth flow could complete — the callback never fired,
+/// no token was ever stored, and the dashboard sat on "not connected".
+pub fn redirect_uri() -> String {
+    format!("http://localhost:{}/api/mcp/oauth/callback", gateway_port())
+}
+
 pub fn builtin_providers(redirect_uri: &str) -> Vec<McpOAuthConfig> {
     vec![
         McpOAuthConfig {
@@ -606,6 +627,55 @@ pub fn remove_client_config(home_dir: &Path, provider_id: &str) -> Result<(), St
         return Ok(());
     }
     save_client_configs(home_dir, &configs)
+}
+
+#[cfg(test)]
+mod redirect_uri_tests {
+    use super::*;
+
+    /// The redirect URI is the one value the user copies into Google/Notion/
+    /// GitHub's console, and it must point at the port the gateway actually
+    /// serves `/api/mcp/oauth/callback` on. It was hardcoded to 3000 while the
+    /// gateway listened on 18789, so every consent flow redirected into a dead
+    /// port and no token was ever stored. Lock the default here.
+    #[test]
+    fn redirect_uri_targets_the_gateway_default_port() {
+        // `DUDUCLAW_PORT` is process-global; only assert the default when the
+        // environment has not overridden it, so a parallel test that sets it
+        // cannot make this one flaky.
+        if std::env::var("DUDUCLAW_PORT").is_ok() {
+            return;
+        }
+        assert_eq!(gateway_port(), 18789, "must match the CLI's `duduclaw run` default");
+        assert_eq!(
+            redirect_uri(),
+            "http://localhost:18789/api/mcp/oauth/callback",
+            "redirect URI must point at the port serving the callback route"
+        );
+    }
+
+    /// The path half must stay byte-identical to the axum route registration in
+    /// `server.rs` (`.route("/api/mcp/oauth/callback", …)`).
+    #[test]
+    fn redirect_uri_path_matches_the_registered_route() {
+        assert!(
+            redirect_uri().ends_with("/api/mcp/oauth/callback"),
+            "got {}",
+            redirect_uri()
+        );
+    }
+
+    /// Every built-in provider hands the user the same registered URI — a
+    /// per-provider drift would silently break just one integration.
+    #[test]
+    fn all_builtin_providers_share_the_derived_redirect_uri() {
+        let uri = redirect_uri();
+        let providers = builtin_providers(&uri);
+        assert!(!providers.is_empty(), "expected built-in providers");
+        for p in &providers {
+            assert_eq!(p.redirect_uri, uri, "provider {} drifted", p.provider_id);
+        }
+    }
 }
 
 #[cfg(test)]

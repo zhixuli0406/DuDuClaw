@@ -45,7 +45,7 @@ One-time setup:
 3. Set the **Authorization callback URL** to exactly:
 
    ```
-   http://localhost:3000/api/mcp/oauth/callback
+   http://localhost:18789/api/mcp/oauth/callback
    ```
 
 4. Register the app, then copy the **Client ID** and click **Generate a new
@@ -96,6 +96,6 @@ OAuth layer — no configuration needed.
 - **`404` "not found"** — Check the owner/repo/number, or grant `repo` for a
   private repository.
 - **Callback URL mismatch during consent** — The OAuth App's Authorization
-  callback URL must be exactly `http://localhost:3000/api/mcp/oauth/callback`.
+  callback URL must be exactly `http://localhost:18789/api/mcp/oauth/callback`.
 
 Run `github_status` at any time for a live diagnosis.

@@ -49,7 +49,7 @@ credentials). One-time setup:
    URI:
 
    ```
-   http://localhost:3000/api/mcp/oauth/callback
+   http://localhost:18789/api/mcp/oauth/callback
    ```
 
 4. Copy the **OAuth client ID** and **OAuth client secret**.
