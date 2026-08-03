@@ -205,6 +205,7 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
 fn tray_status_label(manager: &Arc<SidecarManager>) -> String {
     match manager.status() {
         SidecarStatus::Running => format!("● 運行中 (port {})", manager.port()),
+        SidecarStatus::Starting => "◌ 啟動中".to_string(),
         SidecarStatus::Stopped => "○ 已停止".to_string(),
         SidecarStatus::Error => "▲ 異常".to_string(),
     }

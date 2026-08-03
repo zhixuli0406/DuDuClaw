@@ -118,11 +118,21 @@ export function GatewayPickerPage() {
     setError(null);
     try {
       // Ensure the sidecar is up (a prior remote pick may have stopped it),
-      // then poll briefly for readiness before connecting.
+      // then poll for readiness before connecting. `running` is port-verified
+      // on the Rust side, so waiting through `starting` here is what makes the
+      // health check below succeed on a cold spawn; bail early on `error`.
       await gatewayStartLocal().catch(() => {});
+      // The poll window must outlast the Rust-side READY_TIMEOUT (45s in
+      // sidecar.rs) — otherwise a cold start (DB migrations + channel boot)
+      // is still legitimately `starting` when we give up and we report a
+      // bogus "cannot connect". Rust resolves to running/error by 45s, so
+      // 50s of headroom is enough to always read the real verdict.
+      const POLL_MS = 300;
+      const MAX_WAIT_MS = 50_000;
+      const maxPolls = Math.ceil(MAX_WAIT_MS / POLL_MS);
       let status = await gatewayLocalStatus();
-      for (let i = 0; i < 20 && status.status !== 'running'; i++) {
-        await new Promise((r) => setTimeout(r, 300));
+      for (let i = 0; i < maxPolls && status.status !== 'running' && status.status !== 'error'; i++) {
+        await new Promise((r) => setTimeout(r, POLL_MS));
         status = await gatewayLocalStatus();
       }
       const record: GatewayRecord = {
@@ -237,7 +247,8 @@ export function GatewayPickerPage() {
   // Non-desktop: never render the picker.
   if (!isTauri()) return <Navigate to="/" replace />;
 
-  const localRunning = local?.status === 'running';
+  // `starting` also shows 連線 — clicking waits for readiness, then connects.
+  const localRunning = local?.status === 'running' || local?.status === 'starting';
 
   // Auto-select splash: shown while the launch policy resolves a gateway. No
   // buttons — the page connects on its own, revealing the picker only on
@@ -427,8 +438,10 @@ function StatusDot({ status }: { status: string }) {
   const color =
     status === 'running'
       ? 'bg-success'
-      : status === 'error'
-        ? 'bg-destructive'
-        : 'bg-muted-foreground/40';
+      : status === 'starting'
+        ? 'bg-amber-500'
+        : status === 'error'
+          ? 'bg-destructive'
+          : 'bg-muted-foreground/40';
   return <span className={`inline-block size-1.5 rounded-full ${color}`} aria-hidden />;
 }

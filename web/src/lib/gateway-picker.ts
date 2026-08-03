@@ -27,9 +27,10 @@ export interface HealthReport {
   error: string | null;
 }
 
-/** Local sidecar status for the "本機" card. */
+/** Local sidecar status for the "本機" card. `starting` = spawned but the
+ * gateway has not answered on its port yet (running is port-verified). */
 export interface LocalStatus {
-  status: 'running' | 'stopped' | 'error';
+  status: 'running' | 'starting' | 'stopped' | 'error';
   port: number;
   url: string;
 }

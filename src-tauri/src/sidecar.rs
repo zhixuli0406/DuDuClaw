@@ -8,9 +8,9 @@
 //! the documented API but has NOT been compiled in this environment (no Tauri
 //! toolchain) — see the TODO doc's Phase D verification notes.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::AppHandle;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
@@ -21,9 +21,17 @@ use crate::lifecycle;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidecarStatus {
     Stopped,
+    /// Spawned but the gateway has not answered on its port yet. `Running` is
+    /// only reported once the port actually accepts connections — the picker's
+    /// "本機" card must never say 運行中 for a gateway that refuses connects.
+    Starting,
     Running,
     Error,
 }
+
+/// How long a freshly-spawned gateway may take to bind its port before we give
+/// up and surface Error (cold start loads channels/DB migrations).
+const READY_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub struct SidecarManager {
     child: Mutex<Option<CommandChild>>,
@@ -34,6 +42,11 @@ pub struct SidecarManager {
     shutting_down: AtomicBool,
     /// True when we attached to an externally-managed gateway (do not kill it).
     attached: AtomicBool,
+    /// Spawn generation. Bumped on every spawn/stop/reset so the event-drain
+    /// and readiness tasks of a superseded child can detect they are stale and
+    /// must not touch shared state (prevents a killed child's Terminated event
+    /// from clobbering the replacement's status or double-restarting).
+    generation: AtomicU64,
 }
 
 impl SidecarManager {
@@ -44,6 +57,7 @@ impl SidecarManager {
             port: Mutex::new(lifecycle::DEFAULT_PORT),
             shutting_down: AtomicBool::new(false),
             attached: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -60,23 +74,58 @@ impl SidecarManager {
     }
 
     /// Reclaim a sidecar orphaned by a previous crash: if a pidfile points at a
-    /// live process, kill it so we start from a clean slate (§D2.1 / §D2.3).
+    /// live process **that is still a DuDuClaw gateway**, kill it so we start
+    /// from a clean slate (§D2.1 / §D2.3).
+    ///
+    /// Identity is verified before any signal is sent: a pidfile can outlive its
+    /// process (hard crash, power loss) and the OS recycles PIDs, so a stale
+    /// file may well point at an unrelated user process — killing that would be
+    /// data loss in someone else's editor. On a mismatch we only clear the
+    /// pidfile and warn.
+    ///
+    /// Blocks until the orphan has actually exited (bounded): its listener stays
+    /// bound during the gateway's graceful shutdown, and the attach-vs-spawn
+    /// port probe that runs right after this would otherwise latch onto the
+    /// dying process — reporting 運行中 for a gateway that is seconds from dead.
     fn reclaim_orphan(&self) {
         let pidfile = lifecycle::sidecar_pidfile();
         if let Ok(contents) = std::fs::read_to_string(&pidfile) {
             if let Ok(pid) = contents.trim().parse::<u32>() {
-                #[cfg(unix)]
-                unsafe {
-                    // SIGTERM; ignore errors (process may already be gone).
-                    libc_kill(pid as i32, 15);
+                let probe = probe_pid_identity(pid).unwrap_or_default();
+                if probe.trim().is_empty() {
+                    // No such process — the pidfile is simply stale.
+                    tracing::debug!("stale sidecar pidfile pid={pid}: process already gone");
+                } else if !pid_identity_matches(&probe) {
+                    tracing::warn!(
+                        "sidecar pidfile pid={pid} now belongs to an unrelated process ({}) \
+                         — refusing to kill it, clearing the stale pidfile only",
+                        probe.trim()
+                    );
+                } else {
+                    #[cfg(unix)]
+                    unsafe {
+                        // SIGTERM; ignore errors (process may already be gone).
+                        libc_kill(pid as i32, 15);
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while libc_kill(pid as i32, 0) == 0 && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(150));
+                        }
+                        if libc_kill(pid as i32, 0) == 0 {
+                            // Refused to die gracefully — force it and give the OS a
+                            // beat to release the port.
+                            libc_kill(pid as i32, 9);
+                            std::thread::sleep(Duration::from_millis(300));
+                        }
+                    }
+                    #[cfg(windows)]
+                    {
+                        // /F is forceful; the port is released as soon as it returns.
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/PID", &pid.to_string(), "/F"])
+                            .status();
+                    }
+                    tracing::info!("reclaimed orphaned sidecar pid={pid}");
                 }
-                #[cfg(windows)]
-                {
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/F"])
-                        .status();
-                }
-                tracing::info!("reclaimed orphaned sidecar pid={pid}");
             }
         }
         let _ = std::fs::remove_file(&pidfile);
@@ -96,10 +145,28 @@ impl SidecarManager {
 
     /// Plan + start the gateway. Attaches to an already-running gateway (§D1) or
     /// spawns the bundled sidecar on a free port (§D2.2). Idempotent-ish: a
-    /// second call while running is a no-op.
+    /// second call while running (verified live) or still starting is a no-op.
     pub fn start(self: &Arc<Self>, app: &AppHandle) -> Result<u16, String> {
-        if self.status() == SidecarStatus::Running {
-            return Ok(self.port());
+        // A previous stop() (remote pick released the sidecar, tray restart)
+        // must not leave auto-restart permanently disabled for this fresh start.
+        self.shutting_down.store(false, Ordering::SeqCst);
+        match self.status() {
+            SidecarStatus::Starting => return Ok(self.port()),
+            SidecarStatus::Running => {
+                // Trust but verify: an *attached* gateway can die without any
+                // event ever reaching us (we hold no child handle), leaving a
+                // stale Running that used to make this a permanent no-op — the
+                // 連線 button could never revive the gateway.
+                if lifecycle::is_listening(lifecycle::DEFAULT_HOST, self.port()) {
+                    return Ok(self.port());
+                }
+                tracing::warn!(
+                    "gateway on port {} no longer answers — re-planning",
+                    self.port()
+                );
+                self.reset_dead();
+            }
+            SidecarStatus::Stopped | SidecarStatus::Error => self.reset_dead(),
         }
         self.reclaim_orphan();
 
@@ -123,6 +190,21 @@ impl SidecarManager {
         }
     }
 
+    /// Discard whatever we were tracking before re-planning: kill a spawned
+    /// child we no longer trust (so a re-spawn can't race it for the port) and
+    /// bump the generation so its pending Terminated event is ignored. Attached
+    /// gateways are never killed — we only forget them.
+    fn reset_dead(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if !self.attached.load(Ordering::SeqCst) {
+            if let Some(child) = self.child.lock().unwrap().take() {
+                let _ = child.kill();
+            }
+        }
+        self.attached.store(false, Ordering::SeqCst);
+        self.set_status(SidecarStatus::Stopped);
+    }
+
     fn spawn_sidecar(self: &Arc<Self>, app: &AppHandle, port: u16) -> Result<u16, String> {
         let sidecar = app
             .shell()
@@ -144,12 +226,45 @@ impl SidecarManager {
             .map_err(|e| format!("sidecar spawn failed: {e}"))?;
 
         let pid = child.pid();
+        let my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.write_pidfile(pid);
         *self.port.lock().unwrap() = port;
         *self.child.lock().unwrap() = Some(child);
         self.attached.store(false, Ordering::SeqCst);
-        self.set_status(SidecarStatus::Running);
-        tracing::info!("spawned gateway sidecar pid={pid} port={port}");
+        self.set_status(SidecarStatus::Starting);
+        tracing::info!("spawned gateway sidecar pid={pid} port={port} — waiting for readiness");
+
+        // Readiness watcher: flip Starting → Running only once the port actually
+        // answers, so the "本機" card never claims 運行中 for a gateway that
+        // still refuses connections (the old behavior behind the picker's
+        // "could not connect" right after app relaunch).
+        let me = Arc::clone(self);
+        tauri::async_runtime::spawn_blocking(move || {
+            let deadline = Instant::now() + READY_TIMEOUT;
+            loop {
+                if me.generation.load(Ordering::SeqCst) != my_gen
+                    || me.status() != SidecarStatus::Starting
+                {
+                    return; // superseded or already resolved (crash → Error)
+                }
+                if lifecycle::is_listening(lifecycle::DEFAULT_HOST, port) {
+                    if me.generation.load(Ordering::SeqCst) == my_gen {
+                        me.set_status(SidecarStatus::Running);
+                        tracing::info!("gateway sidecar ready on port {port}");
+                    }
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    tracing::error!(
+                        "gateway sidecar did not answer on port {port} within {}s",
+                        READY_TIMEOUT.as_secs()
+                    );
+                    me.set_status(SidecarStatus::Error);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
 
         // Drain sidecar stdout/stderr and react to termination (§D2.5).
         let me = Arc::clone(self);
@@ -164,6 +279,9 @@ impl SidecarManager {
                         tracing::warn!(target: "sidecar", "{}", String::from_utf8_lossy(&line));
                     }
                     CommandEvent::Terminated(payload) => {
+                        if me.generation.load(Ordering::SeqCst) != my_gen {
+                            break; // we were superseded — the replacement owns state
+                        }
                         me.clear_pidfile();
                         *me.child.lock().unwrap() = None;
                         if me.shutting_down.load(Ordering::SeqCst) {
@@ -171,7 +289,7 @@ impl SidecarManager {
                         } else {
                             tracing::error!("sidecar exited unexpectedly: {payload:?}");
                             me.set_status(SidecarStatus::Error);
-                            me.restart_with_backoff(&app2);
+                            me.restart_with_backoff(&app2, my_gen);
                         }
                         break;
                     }
@@ -185,13 +303,17 @@ impl SidecarManager {
 
     /// Restart the sidecar after an unexpected exit, with exponential backoff and
     /// a hard cap so a crash-loop trips into Error instead of hammering (§D2.5).
-    fn restart_with_backoff(self: &Arc<Self>, app: &AppHandle) {
+    /// `failed_gen` is the generation that died — if someone else (user click,
+    /// tray restart) already spawned a replacement, this task must stand down.
+    fn restart_with_backoff(self: &Arc<Self>, app: &AppHandle, failed_gen: u64) {
         const MAX_ATTEMPTS: u32 = 5;
         let me = Arc::clone(self);
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             for attempt in 1..=MAX_ATTEMPTS {
-                if me.shutting_down.load(Ordering::SeqCst) {
+                if me.shutting_down.load(Ordering::SeqCst)
+                    || me.generation.load(Ordering::SeqCst) != failed_gen
+                {
                     return;
                 }
                 let delay = Duration::from_millis(500u64.saturating_mul(1 << (attempt - 1)));
@@ -211,12 +333,24 @@ impl SidecarManager {
     /// we merely attached to.
     pub fn stop(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        // Supersede any in-flight readiness/event tasks so a Terminated event
+        // arriving after a later start() can't clobber the fresh state.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         if self.attached.load(Ordering::SeqCst) {
             self.set_status(SidecarStatus::Stopped);
             return;
         }
         if let Some(child) = self.child.lock().unwrap().take() {
-            // CommandChild::kill sends a terminate; the gateway flushes on signal.
+            // NOTE: `CommandChild::kill` is *not* a graceful terminate —
+            // tauri-plugin-shell forwards it to `std::process::Child::kill`,
+            // i.e. SIGKILL on Unix / TerminateProcess on Windows. The gateway
+            // gets no signal handler run (it has no SIGTERM handler either), so
+            // nothing is flushed here; what we buy is that the port is released
+            // immediately and app quit can never hang on a wedged sidecar. That
+            // trade-off is deliberate for desktop quit.
+            // KNOWN DEBT: send SIGTERM + bounded wait first (and add a SIGTERM
+            // handler to the gateway) so shutdown flushes state like the
+            // Ctrl+C / auto-update path does.
             let _ = child.kill();
         }
         self.clear_pidfile();
@@ -262,4 +396,92 @@ fn notify_sidecar_failure(app: &AppHandle) {
 extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+/// Ask the OS what process currently owns `pid`, returning the raw probe output
+/// (`ps -p <pid> -o comm=` on Unix, `tasklist /FI "PID eq <pid>" /FO CSV` on
+/// Windows). `None` means the probe itself could not run; an empty string means
+/// no such process.
+fn probe_pid_identity(pid: u32) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+    #[cfg(windows)]
+    {
+        // tasklist prints a CSV row per match, or an "INFO: No tasks..." line
+        // when the filter matches nothing. Note the filter text itself never
+        // contains our binary name, so scanning the whole output is safe.
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Does the process-name probe output identify a DuDuClaw gateway?
+///
+/// Fail-closed: anything we cannot positively identify (empty output, the
+/// Windows "no tasks" notice, an unrelated binary name) returns `false`, so the
+/// caller never signals a process it did not spawn.
+fn pid_identity_matches(probe_output: &str) -> bool {
+    probe_output
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        // The Windows no-match notice is informational text, not a process row.
+        .filter(|l| !l.starts_with("INFO:"))
+        .any(|l| l.to_ascii_lowercase().contains("duduclaw"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pid_identity_matches;
+
+    #[test]
+    fn matches_unix_comm_output() {
+        assert!(pid_identity_matches("duduclaw\n"));
+        assert!(pid_identity_matches("/usr/local/bin/duduclaw\n"));
+        // macOS bundle path form.
+        assert!(pid_identity_matches(
+            "/Applications/DuDuClaw.app/Contents/MacOS/duduclaw\n"
+        ));
+    }
+
+    #[test]
+    fn matches_windows_tasklist_row() {
+        assert!(pid_identity_matches(
+            "\"duduclaw.exe\",\"4242\",\"Console\",\"1\",\"81,234 K\"\n"
+        ));
+    }
+
+    #[test]
+    fn rejects_recycled_pid_owned_by_another_process() {
+        // The exact scenario this guard exists for: pidfile survived, the OS
+        // handed the PID to something else. Killing these would be user data loss.
+        assert!(!pid_identity_matches("Code Helper\n"));
+        assert!(!pid_identity_matches("/usr/bin/ssh\n"));
+        assert!(!pid_identity_matches(
+            "\"chrome.exe\",\"4242\",\"Console\",\"1\",\"512,000 K\"\n"
+        ));
+    }
+
+    #[test]
+    fn rejects_absent_process() {
+        assert!(!pid_identity_matches(""));
+        assert!(!pid_identity_matches("   \n\n"));
+        assert!(!pid_identity_matches(
+            "INFO: No tasks are running which match the specified criteria.\n"
+        ));
+    }
 }
