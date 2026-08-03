@@ -542,7 +542,7 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "agent_id", description: "Target agent name", required: true },
             ParamDef {
                 name: "field",
-                description: "Config field to toggle: gvu_enabled, cognitive_memory, skill_auto_activate, \
+                description: "Config field to toggle: gvu_enabled, skill_auto_activate, \
                                skill_security_scan (booleans); max_silence_hours, max_gvu_generations, \
                                observation_period_hours, skill_token_budget, max_active_skills (numbers); \
                                stagnation_enabled (bool), stagnation_window_seconds (int, 60–604800), \
@@ -2864,14 +2864,108 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
     row.cron_timezone = cron_timezone;
 
     match store.insert(&row).await {
-        Ok(()) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Task '{name}' scheduled (id: {task_id}, cron: {cron})")}]
-        }),
+        Ok(()) => {
+            // WP6.4 — channel receipt. The old result text was an English
+            // developer string ("Task 'x' scheduled (id: …)"), which the agent
+            // paraphrased however it liked, so the user often got no
+            // confirmation at all and never learned the routine is visible and
+            // editable on the dashboard. The result is now the exact zh-TW
+            // sentence to relay, plus a machine-readable summary line for the
+            // model. The dashboard side of the same action is the
+            // `cron.changed` event raised by the MCP dispatch tail.
+            let receipt = cron_created_receipt(name, cron, row.cron_timezone.as_deref());
+            serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "{receipt}\n\n(請把上面這句話原樣轉達給使用者。id: {task_id})"
+                )}]
+            })
+        }
         Err(e) => serde_json::json!({
             "content": [{"type": "text", "text": format!("Error: failed to persist task: {e}")}],
             "isError": true
         }),
     }
+}
+
+/// Render a cron expression as a zh-TW phrase for the channel receipt.
+///
+/// Deliberately small: it covers the shapes users actually dictate in chat
+/// ("每天早上九點", "每週一", "每小時") and falls back to the raw expression
+/// rather than guessing. A wrong-but-confident schedule description is worse
+/// than showing the expression — the user cannot spot the error.
+///
+/// Accepts 5-field (`m h dom mon dow`) and 6-field (`s m h dom mon dow`) forms.
+///
+/// ## Day-of-week convention
+///
+/// The `cron` crate (0.15) follows the **Quartz** convention, NOT the classic
+/// Unix crontab one: `1` = Sunday … `7` = Saturday, and `0` is not a valid
+/// day. Reading it as Unix (`0` = Sunday) shifts every weekday by one and
+/// produces a confident, wrong sentence — the exact failure this function was
+/// written to avoid. `0` and anything above `7` therefore return `None` so the
+/// receipt falls back to the raw expression instead of guessing.
+/// `humanize_cron_matches_the_cron_crate` pins this against the real scheduler.
+fn humanize_cron_zh(cron: &str) -> Option<String> {
+    let f: Vec<&str> = cron.split_whitespace().collect();
+    let f: &[&str] = match f.len() {
+        5 => &f[..],
+        6 => &f[1..],
+        _ => return None,
+    };
+    let (min, hour, dom, mon, dow) = (f[0], f[1], f[2], f[3], f[4]);
+    if mon != "*" || dom != "*" {
+        return None;
+    }
+    let m: u32 = min.parse().ok()?;
+    if m > 59 {
+        return None;
+    }
+
+    // 每小時 — "M * * * *". Only when the day-of-week is unrestricted:
+    // "0 * * * 2" fires hourly *on Mondays only*, so calling it "每小時" would
+    // promise the user 24×7 coverage they are not getting.
+    if hour == "*" {
+        if dow != "*" {
+            return None;
+        }
+        return Some(if m == 0 {
+            "每小時整點".to_string()
+        } else {
+            format!("每小時第 {m} 分")
+        });
+    }
+
+    let h: u32 = hour.parse().ok()?;
+    if h > 23 {
+        return None;
+    }
+    let time = format!("{h:02}:{m:02}");
+    match dow {
+        "*" => Some(format!("每天 {time}")),
+        d => {
+            // Quartz: 1 = Sunday … 7 = Saturday.
+            let names = ["日", "一", "二", "三", "四", "五", "六"];
+            let idx: usize = d.parse().ok()?;
+            if !(1..=7).contains(&idx) {
+                return None;
+            }
+            let name = names[idx - 1];
+            Some(format!("每週{name} {time}"))
+        }
+    }
+}
+
+/// The exact zh-TW sentence a channel user should see after a routine is
+/// created — names the routine, when it runs, and where to find it.
+fn cron_created_receipt(name: &str, cron: &str, timezone: Option<&str>) -> String {
+    let when = match humanize_cron_zh(cron) {
+        Some(h) => match timezone {
+            Some(tz) => format!("{h}（{tz}）"),
+            None => h,
+        },
+        None => format!("排程 {cron}"),
+    };
+    format!("已建立例行工作：「{name}」，{when} 執行。可在 dashboard 的「例行工作」頁查看或修改。")
 }
 
 // ── Cron task management handlers ─────────────────────────────
@@ -3501,7 +3595,6 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
         skill_auto_activate = false
         skill_security_scan = true
         gvu_enabled = false
-        cognitive_memory = false
         max_silence_hours = 12.0
         max_gvu_generations = 3
         observation_period_hours = 24.0
@@ -4957,9 +5050,20 @@ async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> Value {
     }
     let evo = doc.get_mut("evolution").unwrap().as_table_mut().unwrap();
 
+    // D7 (2026-08-04): cognitive memory is permanently resident. The field is
+    // answered explicitly (rather than falling through to "unknown field") so
+    // an agent that still tries to flip it gets told why it no longer exists.
+    if field == "cognitive_memory" {
+        return serde_json::json!({
+            "content": [{"type": "text", "text":
+                "cognitive_memory is no longer configurable — the cognitive memory layer \
+                 is always on since 2026-08-04. Nothing was changed."}]
+        });
+    }
+
     // Validate field name and apply to the correct TOML section.
     let boolean_fields = [
-        "gvu_enabled", "cognitive_memory",
+        "gvu_enabled",
         "skill_auto_activate", "skill_security_scan",
     ];
     let numeric_fields = [
@@ -5127,7 +5231,7 @@ async fn handle_evolution_status_tool(params: &Value, home_dir: &Path, default_a
         "Evolution status for agent '{agent_id}':\n\
          \n\
          GVU self-play:     {}\n\
-         Cognitive memory:  {}\n\
+         Cognitive memory:  always on\n\
          \n\
          Skill auto-activate:  {}\n\
          Skill security scan:  {}\n\
@@ -5143,7 +5247,7 @@ async fn handle_evolution_status_tool(params: &Value, home_dir: &Path, default_a
            window_seconds:    {} ({:.1}h)\n\
            trigger_threshold: {}\n\
            action:            {}",
-        evo.gvu_enabled, evo.cognitive_memory,
+        evo.gvu_enabled,
         evo.skill_auto_activate, evo.skill_security_scan,
         evo.skill_token_budget, evo.max_active_skills,
         evo.max_silence_hours, evo.max_gvu_generations, evo.observation_period_hours,
@@ -9024,6 +9128,38 @@ pub(crate) async fn handle_tools_call(
             Some(&arguments),
         );
     }
+
+    // ── WP6: channel-action → dashboard live feedback ──────────
+    // Everything this subprocess persists on behalf of a channel command
+    // (a cron routine, a memory write, a synthesised skill) is invisible to
+    // the dashboard until the operator reloads — and invisible reads as
+    // broken. Raise one whitelisted `events.db` row; the gateway's existing
+    // `spawn_events_db_poll` tail pushes it to every connected dashboard,
+    // which refetches the matching page. Best-effort: never affects `result`.
+    //
+    // The caller agent is resolved the same way the audit trail resolves it —
+    // a delegated call is attributed to the real sender, not to the default
+    // agent — and falls back to the memory write namespace, which is exactly
+    // the key `memory.db` rows are stored under and therefore exactly what
+    // MemoryBrowser filters on.
+    let feedback_agent = std::env::var(duduclaw_core::ENV_DELEGATION_SENDER)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if ns_ctx.write_namespace.is_empty() {
+                default_agent.to_string()
+            } else {
+                ns_ctx.write_namespace.clone()
+            }
+        });
+    duduclaw_gateway::dashboard_feedback::emit_for_tool(
+        home_dir,
+        tool_name,
+        &arguments,
+        &result,
+        &feedback_agent,
+    )
+    .await;
 
     jsonrpc_response(id, result)
 }
@@ -14304,6 +14440,221 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    // ── WP6: channel receipt for routine creation ────────────────
+
+    /// The receipt must name the routine, say when it runs in plain zh-TW, and
+    /// point at the dashboard page — the three things a user needs to believe
+    /// the routine exists.
+    #[test]
+    fn cron_receipt_is_human_zh_tw_and_points_at_the_dashboard() {
+        let r = cron_created_receipt("每日晨報", "0 9 * * *", Some("Asia/Taipei"));
+        assert!(r.contains("每日晨報"), "{r}");
+        assert!(r.contains("每天 09:00"), "{r}");
+        assert!(r.contains("Asia/Taipei"), "{r}");
+        assert!(r.contains("例行工作"), "{r}");
+        // No raw cron expression leaked into the user-facing sentence.
+        assert!(!r.contains("0 9 * * *"), "{r}");
+    }
+
+    /// Weekly / hourly / 6-field forms all render.
+    ///
+    /// Values are asserted against the **real scheduler** below
+    /// (`humanize_cron_matches_the_cron_crate`); this case only pins the exact
+    /// wording so a rename can't silently change the user-visible string.
+    #[test]
+    fn humanize_cron_covers_the_shapes_users_dictate() {
+        assert_eq!(humanize_cron_zh("30 8 * * *").as_deref(), Some("每天 08:30"));
+        assert_eq!(humanize_cron_zh("0 0 30 8 * * *").as_deref(), None); // 7 fields
+        assert_eq!(humanize_cron_zh("0 30 8 * * *").as_deref(), Some("每天 08:30"));
+        assert_eq!(humanize_cron_zh("0 * * * *").as_deref(), Some("每小時整點"));
+        assert_eq!(humanize_cron_zh("15 * * * *").as_deref(), Some("每小時第 15 分"));
+    }
+
+    /// **The weekday claim is checked against the scheduler, not against my
+    /// reading of it.** Asserting `"0 9 * * 1" == "每週一"` would just restate
+    /// the assumption under test; the `cron` crate is Quartz-flavoured
+    /// (1 = Sunday), so that assumption was wrong and the receipt confidently
+    /// named the wrong day.
+    ///
+    /// Here the oracle is `cron::Schedule` itself: compute the next actual
+    /// fire time the way `CronScheduler` does, read the weekday and clock off
+    /// it, and require the zh-TW sentence to agree.
+    #[test]
+    fn humanize_cron_matches_the_cron_crate() {
+        use chrono::{Datelike, Timelike};
+
+        // The zh-TW weekday name for a real `chrono::Weekday`.
+        fn zh_weekday(w: chrono::Weekday) -> &'static str {
+            match w {
+                chrono::Weekday::Sun => "日",
+                chrono::Weekday::Mon => "一",
+                chrono::Weekday::Tue => "二",
+                chrono::Weekday::Wed => "三",
+                chrono::Weekday::Thu => "四",
+                chrono::Weekday::Fri => "五",
+                chrono::Weekday::Sat => "六",
+            }
+        }
+
+        for dow in 1..=7u32 {
+            let expr = format!("0 9 * * {dow}");
+            // Same 5→6 field normalisation `handle_schedule_task` applies.
+            let schedule: cron::Schedule = format!("0 {expr}")
+                .parse()
+                .unwrap_or_else(|e| panic!("{expr} must parse: {e}"));
+
+            let next = schedule
+                .upcoming(chrono::Utc)
+                .next()
+                .unwrap_or_else(|| panic!("{expr} must have an upcoming fire"));
+            let expected = format!(
+                "每週{} {:02}:{:02}",
+                zh_weekday(next.weekday()),
+                next.hour(),
+                next.minute()
+            );
+
+            assert_eq!(
+                humanize_cron_zh(&expr).as_deref(),
+                Some(expected.as_str()),
+                "{expr} fires on {} at {}:{:02} — the receipt must say so",
+                next.weekday(),
+                next.hour(),
+                next.minute()
+            );
+
+            // Every subsequent fire must land on the same weekday, otherwise
+            // "每週X" is the wrong shape of promise entirely.
+            for fire in schedule.upcoming(chrono::Utc).take(5) {
+                assert_eq!(fire.weekday(), next.weekday(), "{expr} drifts weekday");
+            }
+        }
+
+        // Daily / hourly agree with the scheduler too.
+        let daily: cron::Schedule = "0 30 8 * * *".parse().unwrap();
+        let f = daily.upcoming(chrono::Utc).next().unwrap();
+        assert_eq!(
+            humanize_cron_zh("30 8 * * *").as_deref(),
+            Some(format!("每天 {:02}:{:02}", f.hour(), f.minute()).as_str())
+        );
+    }
+
+    /// Reviewer counter-examples, kept as their own case so a regression names
+    /// itself. `0` is not a valid Quartz day-of-week, and an hourly expression
+    /// pinned to one weekday is not "每小時".
+    #[test]
+    fn humanize_cron_rejects_the_shapes_it_would_describe_wrongly() {
+        // Unix-crontab "0 = Sunday" is not valid here — fall back, don't guess.
+        assert_eq!(humanize_cron_zh("0 9 * * 0"), None);
+        assert_eq!(humanize_cron_zh("0 9 * * 8"), None);
+        // Hourly *restricted to one weekday* must not be sold as plain hourly.
+        assert_eq!(humanize_cron_zh("0 * * * 2"), None);
+        assert_eq!(humanize_cron_zh("15 * * * 5"), None);
+
+        // The receipt then carries the raw expression, which the user can audit.
+        let r = cron_created_receipt("每週報", "0 * * * 2", None);
+        assert!(r.contains("排程 0 * * * 2"), "{r}");
+    }
+
+    /// End-to-end for the WP6 emission point: creating a routine the way a
+    /// channel conversation does (`schedule_task`) persists the row AND raises
+    /// the `cron.changed` row the gateway tail turns into a dashboard push.
+    /// Without the second half, RoutinesPage stays blank until a manual reload.
+    #[tokio::test]
+    async fn schedule_task_persists_and_raises_cron_changed() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+
+        let args = serde_json::json!({
+            "name": "每日晨報",
+            "cron": "0 9 * * *",
+            "task": "整理今天的行程",
+            "agent_id": "agnes",
+            "cron_timezone": "Asia/Taipei",
+        });
+        let result = handle_schedule_task(&args, home).await;
+        assert!(
+            result.get("isError").is_none(),
+            "schedule_task should succeed: {result}"
+        );
+
+        // The routine is in the store the dashboard's `cron.list` reads.
+        let store = duduclaw_gateway::cron_store::CronStore::open(home).unwrap();
+        let rows = store.list_all().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "每日晨報");
+
+        // The channel receipt is the zh-TW sentence, not a developer string.
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("已建立例行工作"), "{text}");
+        assert!(text.contains("每天 09:00"), "{text}");
+
+        // ...and the dashboard learns about it.
+        duduclaw_gateway::dashboard_feedback::emit_for_tool(
+            home,
+            "schedule_task",
+            &args,
+            &result,
+            "agnes",
+        )
+        .await;
+        let bus = duduclaw_gateway::events_store::EventBusStore::open(home).unwrap();
+        let events = bus.fetch_since(0, 50).await.unwrap();
+        let row = events
+            .iter()
+            .find(|r| r.event == duduclaw_gateway::dashboard_feedback::EV_CRON_CHANGED)
+            .expect("cron.changed must be raised");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+        assert_eq!(payload["action"], "created");
+        assert_eq!(payload["name"], "每日晨報");
+        assert_eq!(payload["agent_id"], "agnes");
+    }
+
+    /// A rejected `schedule_task` (bad cron) persists nothing and must stay
+    /// silent — a dashboard refetch triggered by a phantom event would show the
+    /// user the absence of what they were just told about.
+    #[tokio::test]
+    async fn rejected_schedule_task_raises_no_event() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+
+        let args = serde_json::json!({
+            "name": "壞排程",
+            "cron": "not a cron",
+            "task": "x",
+        });
+        let result = handle_schedule_task(&args, home).await;
+        assert_eq!(result["isError"], true);
+
+        duduclaw_gateway::dashboard_feedback::emit_for_tool(
+            home,
+            "schedule_task",
+            &args,
+            &result,
+            "agnes",
+        )
+        .await;
+        let bus = duduclaw_gateway::events_store::EventBusStore::open(home).unwrap();
+        let events = bus.fetch_since(0, 50).await.unwrap();
+        assert!(events
+            .iter()
+            .all(|r| r.event != duduclaw_gateway::dashboard_feedback::EV_CRON_CHANGED));
+    }
+
+    /// Shapes it cannot describe correctly fall back to the raw expression —
+    /// never a confident wrong description the user cannot audit.
+    #[test]
+    fn unhandled_cron_shapes_fall_back_to_the_raw_expression() {
+        assert_eq!(humanize_cron_zh("0 9 1 * *"), None); // day-of-month
+        assert_eq!(humanize_cron_zh("*/5 * * * *"), None); // step
+        assert_eq!(humanize_cron_zh("0 9 * 3 *"), None); // month
+        assert_eq!(humanize_cron_zh("garbage"), None);
+
+        let r = cron_created_receipt("季報", "*/5 * * * *", None);
+        assert!(r.contains("排程 */5 * * * *"), "{r}");
+        assert!(r.contains("例行工作"), "{r}");
     }
 
     /// `os_watch_status` must key its lookup on the *calling* agent (the value

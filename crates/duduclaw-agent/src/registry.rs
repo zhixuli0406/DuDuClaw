@@ -232,7 +232,12 @@ impl AgentRegistry {
     /// low→high precedence (`[global-only, department-minus-local, local]`) so
     /// the highest-precedence skills sit at the tail, matching the prior
     /// global-then-local ordering.
-    fn compose_skill_layers(
+    /// `pub` since WP6: the dashboard's `skills.list` re-reads the three layers
+    /// from disk on demand (the in-memory snapshot misses skills written
+    /// out-of-band by the MCP tools / synthesis pipeline) and must compose them
+    /// with the exact same precedence the scan uses, or the dashboard would
+    /// show a different skill set than the agent actually loads.
+    pub fn compose_skill_layers(
         global: &[SkillFile],
         department: Vec<SkillFile>,
         local: Vec<SkillFile>,

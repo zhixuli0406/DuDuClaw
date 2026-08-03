@@ -565,6 +565,21 @@ async fn graduate_trajectories(
                     }),
                 );
 
+                // WP6: auto-synthesised skills are the least visible thing the
+                // platform produces — nobody asked for them, so nobody thinks
+                // to reload SkillMarketPage. Push the change to the dashboard.
+                crate::dashboard_feedback::emit(
+                    &config.home_dir,
+                    crate::dashboard_feedback::EV_SKILL_CHANGED,
+                    serde_json::json!({
+                        "action": "synthesized",
+                        "agent_id": &config.target_agent_id,
+                        "skill": &synthesized.name,
+                        "quality_score": traj.quality_score,
+                    }),
+                )
+                .await;
+
                 used_names.push(synthesized.name.clone());
                 graduated += 1;
             }
