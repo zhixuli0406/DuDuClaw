@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.49.0] - 2026-08-03 — 對話截斷與續聊修復＋chat 內切換模型
+
 ### Fixed
 - **長回覆只剩最後幾個字**（客戶回饋第五輪）：stream-json 解析把每個 text block
   `text = ...` **覆蓋**而非累加，所以一則跨多個 text block／多個 `assistant` 事件
