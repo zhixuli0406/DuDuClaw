@@ -12132,7 +12132,9 @@ fn arg_u32(args: &Value, key: &str, default: u32) -> u32 {
 }
 
 async fn handle_google_status(home_dir: &Path) -> Value {
-    use duduclaw_gateway::google_workspace::{GOOGLE_PROVIDER, REQUIRED_SCOPES};
+    use duduclaw_gateway::google_workspace::{
+        GOOGLE_PROVIDER, GoogleBackend, REQUIRED_SCOPES, resolve_backend,
+    };
     use duduclaw_gateway::mcp_oauth;
 
     let token = mcp_oauth::load_tokens(home_dir)
@@ -12141,6 +12143,25 @@ async fn handle_google_status(home_dir: &Path) -> Value {
     let configured = mcp_oauth::has_client_config(home_dir, GOOGLE_PROVIDER);
 
     let mut out = String::new();
+
+    // Lead with the credential source actually in effect. Three exist (OAuth
+    // vault, service-account delegation, Apps Script bridge) and the OAuth
+    // detail below only describes the first — without this line a customer on
+    // delegation or the bridge reads "NOT connected" while their tools work.
+    match resolve_backend(home_dir).await {
+        Ok(GoogleBackend::Direct(_)) => {
+            out.push_str("Credential source: direct API token (OAuth vault or service-account delegation). All 19 tools available.\n\n");
+        }
+        Ok(GoogleBackend::AppsScript(cfg)) => {
+            out.push_str(&format!(
+                "Credential source: {}. Gmail / Calendar / Sheets are available; Drive, Docs, Slides, Forms and Tasks need OAuth or a service account.\n\n",
+                cfg.describe()
+            ));
+        }
+        Err(e) => {
+            out.push_str(&format!("Credential source: none usable — {e}\n\n"));
+        }
+    }
     match token {
         None => {
             out.push_str("Google Workspace: NOT connected.\n");
@@ -12204,11 +12225,11 @@ async fn handle_gmail_search(args: &Value, home_dir: &Path) -> Value {
     };
     let max = arg_u32(args, "max_results", 10);
 
-    let token = match gw::get_valid_google_token(home_dir).await {
-        Ok(t) => t,
+    let backend = match gw::resolve_backend(home_dir).await {
+        Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
-    match gw::gmail_search(&token, query, max).await {
+    match gw::gmail_search_via(&backend, query, max).await {
         Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
         Err(e) => tool_error(&e.to_string()),
     }
@@ -12222,11 +12243,11 @@ async fn handle_gmail_read(args: &Value, home_dir: &Path) -> Value {
         _ => return tool_error("Missing required parameter: message_id"),
     };
 
-    let token = match gw::get_valid_google_token(home_dir).await {
-        Ok(t) => t,
+    let backend = match gw::resolve_backend(home_dir).await {
+        Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
-    match gw::gmail_read(&token, message_id).await {
+    match gw::gmail_read_via(&backend, message_id).await {
         Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
         Err(e) => tool_error(&e.to_string()),
     }
@@ -12253,11 +12274,11 @@ async fn handle_gmail_create_draft(args: &Value, home_dir: &Path) -> Value {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
 
-    let token = match gw::get_valid_google_token(home_dir).await {
-        Ok(t) => t,
+    let backend = match gw::resolve_backend(home_dir).await {
+        Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
-    match gw::gmail_create_draft(&token, to, subject, body, cc).await {
+    match gw::gmail_create_draft_via(&backend, to, subject, body, cc).await {
         Ok(r) => tool_text(&format!(
             "Draft created — NOT sent. Review and send it manually in Gmail.\nDraft ID: {}\nTo: {}\nSubject: {}",
             r.draft_id, r.to, r.subject
@@ -12291,11 +12312,11 @@ async fn handle_calendar_list_events(args: &Value, home_dir: &Path) -> Value {
     }
     let max = arg_u32(args, "max_results", 20);
 
-    let token = match gw::get_valid_google_token(home_dir).await {
-        Ok(t) => t,
+    let backend = match gw::resolve_backend(home_dir).await {
+        Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
-    match gw::calendar_list_events(&token, time_min, time_max, max).await {
+    match gw::calendar_list_events_via(&backend, time_min, time_max, max).await {
         Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
         Err(e) => tool_error(&e.to_string()),
     }
@@ -12346,12 +12367,12 @@ async fn handle_calendar_create_event(args: &Value, home_dir: &Path) -> Value {
         })
         .unwrap_or(false);
 
-    let token = match gw::get_valid_google_token(home_dir).await {
-        Ok(t) => t,
+    let backend = match gw::resolve_backend(home_dir).await {
+        Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
-    match gw::calendar_create_event(
-        &token,
+    match gw::calendar_create_event_via(
+        &backend,
         summary,
         start,
         end,
@@ -12404,11 +12425,11 @@ async fn handle_sheets_read(args: &Value, home_dir: &Path) -> Value {
         _ => return tool_error("Missing required parameter: range"),
     };
 
-    let token = match gw::get_valid_google_token(home_dir).await {
-        Ok(t) => t,
+    let backend = match gw::resolve_backend(home_dir).await {
+        Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
-    match gw::sheets_read(&token, spreadsheet, range).await {
+    match gw::sheets_read_via(&backend, spreadsheet, range).await {
         Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
         Err(e) => tool_error(&e.to_string()),
     }
@@ -12442,11 +12463,11 @@ async fn handle_sheets_append(args: &Value, home_dir: &Path) -> Value {
         return tool_error("Parameter 'values' must contain at least one cell");
     }
 
-    let token = match gw::get_valid_google_token(home_dir).await {
-        Ok(t) => t,
+    let backend = match gw::resolve_backend(home_dir).await {
+        Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
-    match gw::sheets_append(&token, spreadsheet, range, values).await {
+    match gw::sheets_append_via(&backend, spreadsheet, range, values).await {
         Ok(r) => tool_text(&format!(
             "Appended 1 row to the sheet.\nUpdated range: {}\nUpdated rows: {}\nUpdated cells: {}",
             r.updated_range, r.updated_rows, r.updated_cells
