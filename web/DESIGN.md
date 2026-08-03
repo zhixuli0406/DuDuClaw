@@ -210,7 +210,8 @@ Badge variant：`default`（bg-primary）/ `secondary` / `destructive`（`bg-des
 
 - Root：`SidebarProvider` 容器 `h-svh bg-app-shell` + 左 `Sidebar variant="inset"`（浮島，`p-2`）+ 右 `SidebarInset`（`bg-page-canvas m-2 rounded-xl ring-1 ring-surface-border shadow`）。**無全域 topbar，每頁自帶 `PageHeader`。**
 - Sidebar 寬 256（可拖 200–360，存 localStorage），可折疊 icon 模式，行動版轉 Sheet 抽屜。
-- 導航分組（單一來源 `layout/nav-model.ts`）：**個人**（首頁 / 收件匣 / 對話）→ **工作**（任務 / 計畫 / 執行紀錄 / 畫布 / 例行 / 時間軸 / 用量 / 並行分身）→ **公司**（員工 / 團隊 / 世界 / 記憶 / 技能 / Widget / 知識庫 / 成長）→ **設定**（管理 / 關於）。非管理者整組依可見性規則隱藏。
+- 導航分組（單一來源 `layout/nav-model.ts`）：**個人**（儀表板 / 收件匣 / 新對話）→ **對話紀錄**（最近 15 則，新的在上，`ConversationsZone` 動態產生，icon 模式不顯示）→ **工作**（任務 / 計畫 / 執行紀錄 / 畫布 / 例行 / 時間軸 / 用量 / 並行分身）→ **公司**（員工 / 團隊 / 世界 / 記憶 / 技能庫 / Widget / 知識庫 / 成長）→ **設定**（管理 / 關於）。非管理者整組依可見性規則隱藏。
+- 導航項可帶兩個修飾：`crumb` 讓側邊欄用動作口吻（新對話）而麵包屑保留名詞（對話）；`action: 'newConversation'` 在導航前先清空對話檢視，側邊欄與 ⌘K 走同一條路徑。
 - Menu item：`rounded-md p-2 h-8 text-sm`，未選 `text-muted-foreground`，hover `bg-sidebar-accent/70`，active `bg-sidebar-accent text-sidebar-accent-foreground font-medium`。active 判定 `pathname === href || startsWith(href + "/")`。
 - Sidebar footer 承載：主題切換、Edition / 升級卡、成本 / XP 摘要（原 header HUD 內容遷入）；語言 / 登出在公司下拉。⌘K 開 Command Palette。
 

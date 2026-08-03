@@ -2,6 +2,7 @@ import {
   Home,
   Inbox,
   MessageCircle,
+  MessageCirclePlus,
   KanbanSquare,
   ListChecks,
   GitFork,
@@ -57,6 +58,19 @@ export type NavItem = Gated & {
    * (approvals + blocked + budget), tracked by `useApprovalsStore`.
    */
   badge?: 'inbox';
+  /**
+   * Breadcrumb label override. The sidebar row can be phrased as an action
+   * ("新對話") while the page it lands on keeps its noun ("對話"). Defaults to
+   * `label` when absent.
+   */
+  crumb?: string;
+  /**
+   * Side effect to run before navigating, for rows that are actions rather than
+   * plain destinations. `'newConversation'` clears the chat view so 新對話 truly
+   * starts a fresh thread — from the sidebar AND from ⌘K, not just one of them.
+   * The previous conversation is preserved and stays resumable.
+   */
+  action?: 'newConversation';
 };
 
 export type NavGroup = {
@@ -68,7 +82,10 @@ export type NavGroup = {
 /**
  * Single source of truth for the "嘟嘟事務所" navigation, re-grouped for the
  * Multica app shell (WP0.4, spec §5.1). The Sidebar renders, top to bottom:
- *   1. `dailyItems` — flat, no group label (Home / Inbox / Chat).
+ *   1. `dailyItems` — flat, no group label (儀表板 / 收件匣 / 新對話).
+ *   1b. the `對話紀錄` zone — dynamic, sourced from `useConversationsStore`
+ *      (2026-07-30 client feedback); on Personal it sits between the daily row
+ *      and `personalPrimaryItems`, mirroring where 對話 used to be.
  *   2. the `工作` group (`navGroups[0]`) — collapsible GroupLabel.
  *   3. a LIVE 員工 zone — dynamic, sourced from the agents store, not static
  *      nav items (see AppSidebar). `staffEntry` is its "全部員工 →" link.
@@ -87,11 +104,26 @@ export type NavGroup = {
  * gate (WP11, fail-closed).
  */
 
-/** Flat, always-first daily items (rendered with no section header). */
+/**
+ * Flat, always-first daily items (rendered with no section header).
+ *
+ * 2026-07-30 client feedback: the 對話 row became 「新對話」— an action that
+ * starts a fresh thread — and the conversations it produces are listed by the
+ * 對話紀錄 group rendered right below (see `ConversationsZone`). Same route;
+ * only the phrasing and the pre-navigation side effect changed.
+ */
 export const dailyItems: NavItem[] = [
   { to: '/', icon: Home, label: 'nav.home', desc: 'nav.home.desc', ownScope: true },
   { to: '/inbox', icon: Inbox, label: 'nav.inbox', desc: 'nav.inbox.desc', badge: 'inbox' },
-  { to: '/chat', icon: MessageCircle, label: 'nav.chat', desc: 'nav.chat.desc', ownScope: true },
+  {
+    to: '/chat',
+    icon: MessageCirclePlus,
+    label: 'nav.newChat',
+    desc: 'nav.newChat.desc',
+    crumb: 'nav.chat',
+    action: 'newConversation',
+    ownScope: true,
+  },
 ];
 
 /**
@@ -304,14 +336,14 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
   const flat: NavItem[] = [...dailyItems, staffEntry];
   for (const item of flat) {
     if (item.to === pathname || (item.to !== '/' && pathname.startsWith(item.to))) {
-      return [{ labelId: item.label }];
+      return [{ labelId: item.crumb ?? item.label }];
     }
   }
   for (const group of navGroups) {
     const item = group.items.find(
       (i) => i.to === pathname || (i.to !== '/' && pathname.startsWith(i.to)),
     );
-    if (item) return [{ labelId: item.label }];
+    if (item) return [{ labelId: item.crumb ?? item.label }];
   }
   return [];
 }
@@ -319,7 +351,7 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
 /**
  * Zone A quick-access routes for the mobile bottom nav (§4.3). The `+ 交辦任務`
  * center action is injected by MobileBottomNav itself (and links to the task
- * board's create intent). Side slots: 首頁 / 收件匣 | ＋ | 對話. The task board
+ * board's create intent). Side slots: 儀表板 / 收件匣 | ＋ | 對話. The task board
  * now sits in the desktop sidebar's 工作 group; on mobile it stays reachable via
  * the ＋交辦 action, Home task cards, ⌘K, and its URL (the compact 4-slot bottom
  * bar is kept — 對話 is the primary mobile entry).

@@ -54,12 +54,14 @@ import {
   dailyItems,
   navGroups,
   personalAdvancedGroup,
-  primaryItemsForEdition,
+  personalPrimaryItems,
   staffEntry,
   type NavItem,
 } from './nav-model';
 import { isTauri } from '@/lib/gateway-picker';
 import { EditionBadge } from './EditionBadge';
+import { ConversationsZone } from './ConversationsZone';
+import { useConversationsStore } from '@/stores/conversations-store';
 
 const GROUP_COLLAPSE_KEY = 'duduclaw:ui:nav-collapsed';
 const LIVE_LIMIT = 5;
@@ -96,6 +98,10 @@ function NavRow({ item, count, collapsed }: { item: NavItem; count: number; coll
   const Icon = item.icon;
   const label = intl.formatMessage({ id: item.label });
   const navClass = useNavClass(collapsed);
+  const startNew = useConversationsStore((s) => s.startNew);
+  // Action rows (新對話) run their side effect before the NavLink navigates, so
+  // the row does what it says even when the target page is already open.
+  const onClick = item.action === 'newConversation' ? () => startNew() : undefined;
   return (
     <SidebarMenuItem>
       <NavLink
@@ -103,6 +109,7 @@ function NavRow({ item, count, collapsed }: { item: NavItem; count: number; coll
         end={item.to === '/'}
         data-tour={`nav:${item.to}`}
         title={collapsed ? label : undefined}
+        onClick={onClick}
         className={navClass}
       >
         <span className="relative flex shrink-0">
@@ -458,8 +465,10 @@ export function AppSidebar() {
   const workItems = filterVisible(navGroups[0].items, user?.role, isPersonal, ctx);
   const companyItems = filterVisible(navGroups[1].items, user?.role, isPersonal, ctx);
   const settingsItems = filterVisible(navGroups[2].items, user?.role, isPersonal, ctx);
-  // Personal IA (2026-07-29): flat primary row + collapsed 設定 / 進階 groups.
-  const primaryItems = filterVisible(primaryItemsForEdition(isPersonal), user?.role, isPersonal, ctx);
+  // The daily row is shared by both editions; Personal adds a second flat row
+  // BELOW the 對話紀錄 zone so the zone lands where 對話 used to sit.
+  const dailyRow = filterVisible(dailyItems, user?.role, isPersonal, ctx);
+  const personalRow = filterVisible(personalPrimaryItems, user?.role, isPersonal, ctx);
   const advancedItems = filterVisible(personalAdvancedGroup.items, user?.role, isPersonal, ctx);
 
   const badgeFor = (badge: NavItem['badge']): number => (badge === 'inbox' ? inboxCount : 0);
@@ -514,14 +523,32 @@ export function AppSidebar() {
       </SidebarHeader>
 
       <SidebarContent>
-        {/* Flat top rows — daily items (+ Personal 主區), no group label. */}
+        {/* Flat top row — 儀表板 / 收件匣 / 新對話, no group label. */}
         <SidebarGroup>
           <SidebarMenu>
-            {(isPersonal ? primaryItems : dailyItems).map((item) => (
+            {dailyRow.map((item) => (
               <NavRow key={item.to} item={item} count={badgeFor(item.badge)} collapsed={collapsed} />
             ))}
           </SidebarMenu>
         </SidebarGroup>
+
+        {/* 對話紀錄 — recent conversations, directly under 新對話 (2026-07-30). */}
+        <ConversationsZone
+          collapsed={collapsed}
+          sectionCollapsed={isSectionCollapsed('navGroup.conversations')}
+          onToggle={() => toggleSection('navGroup.conversations')}
+        />
+
+        {/* Personal 主區 — the remaining flat rows, below the conversations. */}
+        {isPersonal && personalRow.length > 0 && (
+          <SidebarGroup>
+            <SidebarMenu>
+              {personalRow.map((item) => (
+                <NavRow key={item.to} item={item} count={badgeFor(item.badge)} collapsed={collapsed} />
+              ))}
+            </SidebarMenu>
+          </SidebarGroup>
+        )}
 
         {isPersonal ? (
           /* Personal IA (2026-07-29): no 工作/公司 groups, no staff zone —

@@ -4,6 +4,7 @@ import {
   frameBelongsToConversation,
   historyToMessages,
   isResumeNotFound,
+  sessionIdAfterHello,
   useChatStore,
 } from './chat-store';
 
@@ -199,5 +200,43 @@ describe('G1 — leaving a resumed session restores the connection own session',
     useChatStore.getState().selectAgent('sales-bot');
     expect(useChatStore.getState().sessionId).toBe('webchat:conn-own');
     expect(useChatStore.getState().selectedAgentId).toBe('sales-bot');
+  });
+});
+
+// Resuming from the sidebar 對話紀錄 (2026-07-30) happens while the chat socket
+// may still be disconnected: the page then mounts, connects, and the server's
+// `session_info` hello arrives AFTER the resume. Adopting the hello id there
+// would leave the resumed transcript on screen while the next send silently
+// opened a brand-new thread — the failure this guard exists to prevent.
+describe('sessionIdAfterHello (resume-before-connect guard)', () => {
+  it('keeps an explicitly resumed session id when the hello lands afterwards', () => {
+    expect(sessionIdAfterHello('webchat:past-42', true, 'webchat:conn-own')).toBe('webchat:past-42');
+  });
+
+  it('adopts the connection id for a normal (non-resumed) connect', () => {
+    expect(sessionIdAfterHello(null, false, 'webchat:conn-own')).toBe('webchat:conn-own');
+    expect(sessionIdAfterHello('webchat:stale', false, 'webchat:conn-own')).toBe('webchat:conn-own');
+  });
+
+  it('falls back to the connection id when the flag is set but nothing is resumed', () => {
+    expect(sessionIdAfterHello(null, true, 'webchat:conn-own')).toBe('webchat:conn-own');
+  });
+
+  it('resumeSession arms the flag; reset and selectAgent disarm it', () => {
+    useChatStore.setState({
+      ownSessionId: 'webchat:conn-own',
+      sessionId: 'webchat:conn-own',
+      selectedAgentId: null,
+      resumedExplicitly: false,
+    });
+    useChatStore.getState().resumeSession('webchat:past-42', []);
+    expect(useChatStore.getState().resumedExplicitly).toBe(true);
+
+    useChatStore.getState().reset();
+    expect(useChatStore.getState().resumedExplicitly).toBe(false);
+
+    useChatStore.getState().resumeSession('webchat:past-42', []);
+    useChatStore.getState().selectAgent('sales-bot');
+    expect(useChatStore.getState().resumedExplicitly).toBe(false);
   });
 });

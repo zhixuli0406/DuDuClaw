@@ -36,9 +36,11 @@ describe('AppSidebar (Multica shell)', () => {
     renderSidebar();
     // Flat daily items (no group header). Inbox appears twice (the nav row +
     // the footer bell shortcut), so assert at least one.
-    expect(screen.getByRole('link', { name: /Home/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Dashboard/i })).toBeInTheDocument();
     expect(screen.getAllByRole('link', { name: /Inbox/i }).length).toBeGreaterThan(0);
-    expect(screen.getByRole('link', { name: /Chat/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /New chat/i })).toBeInTheDocument();
+    // 對話紀錄 zone sits right below 新對話 (2026-07-30 client feedback).
+    expect(screen.getByText(/^Conversations$/)).toBeInTheDocument();
     // The three group labels.
     expect(screen.getByText(/^Work$/)).toBeInTheDocument();
     expect(screen.getByText(/^Company$/)).toBeInTheDocument();
@@ -55,18 +57,18 @@ describe('AppSidebar (Multica shell)', () => {
     expect(screen.queryByRole('link', { name: /Reports/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Manage/i })).not.toBeInTheDocument();
     // …while open surfaces stay.
-    expect(screen.getByRole('link', { name: /Home/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Dashboard/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /About/i })).toBeInTheDocument();
   });
 
   it('marks the current route active (aria-current + accent class)', () => {
-    // Default MemoryRouter route is '/', so Home is the active spine.
+    // Default MemoryRouter route is '/', so Dashboard is the active spine.
     renderSidebar();
-    const home = screen.getByRole('link', { name: /Home/i });
+    const home = screen.getByRole('link', { name: /Dashboard/i });
     expect(home).toHaveAttribute('aria-current', 'page');
     expect(home.className).toContain('bg-sidebar-accent');
     // A non-active item carries neither.
-    const chat = screen.getByRole('link', { name: /Chat/i });
+    const chat = screen.getByRole('link', { name: /New chat/i });
     expect(chat).not.toHaveAttribute('aria-current', 'page');
   });
 

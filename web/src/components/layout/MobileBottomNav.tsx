@@ -8,7 +8,7 @@ import { mobileNavItems, type NavItem } from './nav-model';
 
 /**
  * MobileBottomNav — Zone A quick access on small screens (§4.3). Slots:
- * 首頁 / 收件匣 / ＋交辦（center raised action, links to the task board's create
+ * 儀表板 / 收件匣 / ＋交辦（center raised action, links to the task board's create
  * intent） / 對話 / 任務. Hidden at md+ (the sidebar takes over). The inbox slot
  * carries the live "needs me" count. Two balanced side groups (2 left / 2 right)
  * flank the centre ＋交辦; the ＋ remains the quick create entry.
