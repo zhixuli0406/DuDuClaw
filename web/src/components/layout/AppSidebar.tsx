@@ -52,6 +52,7 @@ import {
 } from '@/components/mds';
 import {
   dailyItems,
+  inboxEntry,
   navGroups,
   personalAdvancedGroup,
   personalPrimaryItems,
@@ -114,12 +115,13 @@ function NavRow({ item, count, collapsed }: { item: NavItem; count: number; coll
         className={({ isActive }) =>
           cn(
             navClass({ isActive }),
-            // 2026-08-03 client feedback ("改得醒目一點"): 新對話 is the one row
-            // that DOES something rather than going somewhere, and as a plain
-            // nav row it disappeared among its neighbours. An outlined chip
-            // reads as a button without shouting like a filled CTA — the sidebar
-            // already has enough amber.
-            isAction && 'border border-sidebar-border bg-sidebar-accent/40 font-medium text-sidebar-foreground hover:bg-sidebar-accent',
+            // 新對話 is the one row that DOES something rather than going
+            // somewhere, and as a plain nav row it disappeared among its
+            // neighbours (2026-08-03 feedback). 2026-08-04 (D17) it also moved
+            // to the top of the rail and got a brand-tinted chip: still not a
+            // filled CTA, but unmistakably the primary action.
+            isAction &&
+              'border border-brand/30 bg-brand/8 font-medium text-sidebar-foreground hover:bg-brand/14 [&>span>svg]:text-brand',
           )
         }
       >
@@ -534,7 +536,8 @@ export function AppSidebar() {
       </SidebarHeader>
 
       <SidebarContent>
-        {/* Flat top row — 儀表板 / 收件匣 / 新對話, no group label. */}
+        {/* Flat top row — 新對話 then 儀表板, no group label. 收件匣 left this
+            row on 2026-08-04 (D17); the footer bell is its entry point now. */}
         <SidebarGroup>
           <SidebarMenu>
             {dailyRow.map((item) => (
@@ -623,21 +626,38 @@ export function AppSidebar() {
       <SidebarFooter>
         {!collapsed && <EditionCard />}
         <div className={cn('flex items-center gap-1', collapsed && 'flex-col')}>
-          {/* Notification bell — needs-me inbox quick-jump. */}
+          {/* Notification bell — the only standing entry to 收件匣 since it left
+              the navigation (2026-08-04, D17). Quiet by default; it lights up
+              and carries a count only when something actually needs a decision. */}
           <NavLink
-            to="/inbox"
-            aria-label={intl.formatMessage({ id: 'nav.inbox' })}
-            title={intl.formatMessage({ id: 'nav.inbox' })}
+            to={inboxEntry.to}
+            data-tour={`nav:${inboxEntry.to}`}
+            aria-label={
+              inboxCount > 0
+                ? intl.formatMessage({ id: 'nav.inbox.pending' }, { count: inboxCount })
+                : intl.formatMessage({ id: 'nav.inbox' })
+            }
+            title={
+              inboxCount > 0
+                ? intl.formatMessage({ id: 'nav.inbox.pending' }, { count: inboxCount })
+                : intl.formatMessage({ id: 'nav.inbox' })
+            }
             className={({ isActive }) =>
               cn(
                 'relative grid size-8 place-items-center rounded-md outline-none transition-colors hover:bg-sidebar-accent/70 focus-visible:ring-2 focus-visible:ring-sidebar-ring',
-                isActive ? 'text-sidebar-accent-foreground' : 'text-muted-foreground',
+                isActive
+                  ? 'text-sidebar-accent-foreground'
+                  : inboxCount > 0
+                    ? 'text-brand'
+                    : 'text-muted-foreground',
               )
             }
           >
             <Bell className="size-4" />
             {inboxCount > 0 && (
-              <span className="absolute right-1 top-1 size-1.5 rounded-full bg-brand" aria-hidden="true" />
+              <span className="absolute -right-0.5 -top-0.5 inline-flex min-w-4 items-center justify-center rounded-full bg-brand px-1 text-[9px] font-medium leading-none tabular-nums text-brand-foreground">
+                {inboxCount > 99 ? '99+' : inboxCount}
+              </span>
             )}
           </NavLink>
           {/* Theme toggle (light → dark → system). */}

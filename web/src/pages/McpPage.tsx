@@ -9,6 +9,7 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { toast } from '@/lib/toast';
 import { api, type McpServerDef, type McpCatalogItem, type McpOAuthProvider, type McpImportCandidate, type McpServerEntry } from '@/lib/api';
 import { DangerZone } from '@/components/settings/controls';
+import { OAUTH_REDIRECT_URI } from '@/components/IntegrationConnectPanel';
 import {
   Button,
   Badge,
@@ -63,7 +64,7 @@ import {
   MoreHorizontal,
 } from 'lucide-react';
 
-type Tab = 'agents' | 'marketplace' | 'oauth';
+type Tab = 'agents' | 'marketplace';
 type AgentLite = { name: string; display_name: string };
 
 const categoryIcons: Record<string, typeof Globe> = {
@@ -194,11 +195,17 @@ export function McpPage() {
       (Array.isArray(cfg.servers) ? cfg.servers.map((s) => s.name) : Object.keys(cfg.servers)).includes(catalogId),
     );
 
+  // 2026-08-04 (D19): the separate 授權 sub-tab is gone. Services that need a
+  // sign-in now show their state and their 授權 button on their own card, in
+  // line under the servers they belong to — one place, not two.
   const tabOptions: SegmentedOption<Tab>[] = [
     { value: 'agents', label: intl.formatMessage({ id: 'mcp.tab.agents' }) },
     { value: 'marketplace', label: intl.formatMessage({ id: 'mcp.tab.marketplace' }) },
-    { value: 'oauth', label: intl.formatMessage({ id: 'mcp.tab.oauth' }) },
   ];
+
+  // Google keeps its own dedicated tab on the integrations page (19 Workspace
+  // tools, its own setup story), so it is not repeated in this list.
+  const connectProviders = oauthProviders.filter((p) => p.provider_id !== 'google');
 
   return (
     <div className="space-y-6">
@@ -293,8 +300,11 @@ export function McpPage() {
               </ListGridContainer>
             </div>
           )}
+
+          {/* Services that need a sign-in before their tools work (D19). */}
+          <OAuthTab providers={connectProviders} showToast={showToast} />
         </div>
-      ) : activeTab === 'marketplace' ? (
+      ) : (
         <MarketplaceTab
           catalog={filteredCatalog}
           categories={categories}
@@ -313,8 +323,6 @@ export function McpPage() {
             }
           }}
         />
-      ) : (
-        <OAuthTab providers={oauthProviders} showToast={showToast} />
       )}
 
       {/* Add Server Dialog */}
@@ -878,12 +886,18 @@ function OAuthTab({
     }
   };
 
+  // Rendered inline under the server list since 2026-08-04 (D19). With nothing
+  // to connect there is nothing to say — an empty-state card here would just be
+  // noise between two real sections.
+  if (providers.length === 0) return null;
+
   return (
-    <div className="space-y-4">
-      <h2 className="text-sm font-medium text-foreground">{intl.formatMessage({ id: 'mcp.oauth.title' })}</h2>
-      {providers.length === 0 ? (
-        <Empty icon={Shield} title={intl.formatMessage({ id: 'mcp.empty' })} />
-      ) : (
+    <div className="space-y-4 pt-2">
+      <div>
+        <h2 className="text-sm font-medium text-foreground">{intl.formatMessage({ id: 'mcp.oauth.title' })}</h2>
+        <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'mcp.oauth.sectionDesc' })}</p>
+      </div>
+      {(
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {providers.map((provider) => {
             const status = statusBadge(provider, intl);
@@ -1013,6 +1027,23 @@ function ConfigureOAuthDialog({
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">Provider</label>
             <Input type="text" value={provider.name} readOnly className="bg-muted/50" />
+          </div>
+
+          {/* The exact callback address to register in the provider's console.
+              Registering a different one is what silently dead-ends the consent
+              flow, so it is shown here (server-derived — the built-in default is
+              only right on the default port) rather than left to be guessed. */}
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {intl.formatMessage({ id: 'mcp.oauth.redirectUri' })}
+            </label>
+            <Input
+              type="text"
+              value={provider.redirect_uri || OAUTH_REDIRECT_URI}
+              readOnly
+              onFocus={(e) => e.currentTarget.select()}
+              className="bg-muted/50 font-mono text-xs"
+            />
           </div>
 
           <div className="space-y-1.5">

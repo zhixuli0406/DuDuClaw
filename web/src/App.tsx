@@ -80,6 +80,11 @@ const PetStudioPage = lazyPage(() => import('./pages/PetStudioPage'), 'PetStudio
 const AboutPage = lazyPage(() => import('./pages/AboutPage'), 'AboutPage');
 const DistributorsPage = lazyPage(() => import('./pages/DistributorsPage'), 'DistributorsPage');
 const OSPage = lazyPage(() => import('./pages/OSPage'), 'OSPage');
+// WP9 (2026-08-04 IA rework): full conversation history + the two management
+// surfaces lifted out of billing / settings + the 進階設定 index.
+const ConversationsPage = lazyPage(() => import('./pages/ConversationsPage'), 'ConversationsPage');
+const SystemUpdatePage = lazyPage(() => import('./pages/SystemUpdatePage'), 'SystemUpdatePage');
+const ManageAdvancedPage = lazyPage(() => import('./pages/ManageAdvancedPage'), 'ManageAdvancedPage');
 
 /** Lightweight route-transition fallback while a lazy page chunk loads. */
 function PageFallback() {
@@ -152,6 +157,9 @@ export function App() {
               {/* v2 (T1.5): /webchat renamed to /chat; old path redirects. */}
               <Route path="chat" element={<WebChatPage />} />
               <Route path="webchat" element={<Navigate to="/chat" replace />} />
+              {/* Full conversation history (2026-08-04, D17) — the sidebar zone
+                  lists the newest five and links here for the rest. */}
+              <Route path="conversations" element={<ConversationsPage />} />
 
               {/* ── 工作 ── */}
               <Route path="tasks" element={<TaskBoardPage />} />
@@ -222,9 +230,14 @@ export function App() {
                   <Route path="license" element={<LicenseShell />} />
                   <Route path="migrate" element={<MigratePage />} />
                   <Route path="logs" element={<LogsPage />} />
+                  {/* 進階設定 index — the surfaces folded a level down (D18). */}
+                  <Route path="advanced" element={<ManageAdvancedPage />} />
                 </Route>
                 <Route element={<RoleGuard minRole="admin" />}>
                   <Route path="channels" element={<ChannelsPage />} />
+                  {/* 帳戶與登入 / 系統更新 — promoted out of billing / settings. */}
+                  <Route path="accounts" element={<AccountsPage />} />
+                  <Route path="updates" element={<SystemUpdatePage />} />
                   <Route path="integrations" element={<IntegrationsPage />} />
                   <Route path="inference" element={<InferencePage />} />
                   <Route path="reliability" element={<ReliabilityPage />} />

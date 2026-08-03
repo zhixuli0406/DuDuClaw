@@ -242,6 +242,24 @@ export interface WikiSearchHit {
   context_lines: string[];
 }
 
+/**
+ * WP5c — one auto-filed knowledge page, as listed by the curation station's
+ * 自動建檔 audit tab. `sources` carries the conversation chain that produced
+ * the page; `revision_count` mirrors the page's in-body revision log.
+ */
+export interface AutoWikiPage {
+  path: string;
+  title: string;
+  updated: string;
+  /** charter | sop | spec | policy | reference */
+  doc_type: string;
+  /** Localised label already resolved by the backend (章程 / 流程 / …). */
+  doc_type_label: string;
+  sources: string[];
+  revision_count: number;
+  trust: number;
+}
+
 export interface WikiLintReport {
   total_pages: number;
   index_entries: number;
@@ -1335,8 +1353,57 @@ export interface RuntimeDetect {
   codex: boolean;
   gemini: boolean;
   antigravity: boolean;
+  /** Present since the R4 Grok runtime; older gateways omit it. */
+  grok?: boolean;
   claude_oauth: boolean;
   claude_subscription: string | null;
+}
+
+/** Providers `runtime.install` knows how to install (hard-coded gateway whitelist). */
+export type InstallableProvider = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok';
+
+/**
+ * Result of `runtime.install`. A decline is a normal answer, not an error: the
+ * gateway hands back the exact command to paste so the user is never stuck.
+ */
+export type RuntimeInstallStart =
+  | {
+      started: true;
+      provider: InstallableProvider;
+      session_id: string;
+      command: string;
+      docs_url: string;
+      timeout_secs: number;
+    }
+  | {
+      started: false;
+      provider: InstallableProvider;
+      /** `already_installed` | `already_running` | `prerequisite_missing`
+       *  | `posix_script_on_windows` | `install_target_not_on_probe_path`
+       *  | `spawn_failed` */
+      reason: string;
+      command: string;
+      prerequisite: string | null;
+      docs_url: string;
+    };
+
+/** `runtime.install.output` event — one line of installer output. */
+export interface RuntimeInstallOutput {
+  session_id: string;
+  provider: InstallableProvider;
+  data: string;
+}
+
+/** `runtime.install.status` event — terminal result of one install run. */
+export interface RuntimeInstallStatus {
+  session_id: string;
+  provider: InstallableProvider;
+  status: 'succeeded' | 'failed' | 'timeout';
+  exit_code: number | null;
+  /** Authoritative: is the binary actually resolvable now? */
+  detected: boolean;
+  command: string;
+  docs_url: string;
 }
 
 // ── Expert packs (專家包) ─────────────────────────
@@ -3011,6 +3078,12 @@ export const api = {
      *  "choose your AI backend" picker. Presence booleans only, no secrets. */
     detect: () =>
       client.call('runtime.detect') as Promise<RuntimeDetect>,
+    /** Install a missing CLI on the gateway host (admin). `provider` is the
+     *  ONLY parameter — the gateway maps it to a hard-coded command. Returns
+     *  as soon as the child is spawned; progress arrives as
+     *  `runtime.install.output` / `runtime.install.status` events. */
+    install: (provider: InstallableProvider) =>
+      client.call('runtime.install', { provider }) as Promise<RuntimeInstallStart>,
   },
   // Expert packs (專家包) — all admin-only, fail-closed server-side.
   experts: {
@@ -3251,6 +3324,31 @@ export const api = {
       client.call('wiki.read', { agent_id: agentId, page_path: pagePath }) as Promise<{ content: string; path: string }>,
     search: (agentId: string, query: string, limit = 10) =>
       client.call('wiki.search', { agent_id: agentId, query, limit }) as Promise<{ hits: WikiSearchHit[] }>,
+    /** WP5c — pages the AI filed on its own, with their conversation source chain. */
+    autoPages: (agentId: string) =>
+      client.call('wiki.auto_pages', { agent_id: agentId }) as Promise<{
+        pages: AutoWikiPage[];
+        exists: boolean;
+      }>,
+    /** Confirm an auto-filed page as curated knowledge (raises trust, starts injecting). */
+    promote: (agentId: string, pagePath: string) =>
+      client.call('wiki.promote', { agent_id: agentId, page_path: pagePath }) as Promise<{
+        promoted: boolean;
+        path: string;
+      }>,
+    /** Remove one auto-filed page and expire exactly its memory pointer. */
+    archive: (agentId: string, pagePath: string) =>
+      client.call('wiki.archive', { agent_id: agentId, page_path: pagePath }) as Promise<{
+        archived: boolean;
+        pointers_expired: number;
+        path: string;
+      }>,
+    /** Copy an auto-filed page into the shared knowledge base. */
+    share: (agentId: string, pagePath: string) =>
+      client.call('wiki.share', { agent_id: agentId, page_path: pagePath }) as Promise<{
+        shared: boolean;
+        path: string;
+      }>,
     lint: (agentId: string) =>
       client.call('wiki.lint', { agent_id: agentId }) as Promise<WikiLintReport>,
     stats: (agentId: string) =>

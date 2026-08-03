@@ -40,18 +40,30 @@ beforeEach(() => {
 });
 
 describe('ConversationsZone (sidebar 對話紀錄)', () => {
-  it('lists recent conversations, newest first, capped at 15', async () => {
+  // 2026-08-04 (D17): the rail was cut from 15 rows to 5 + a 查看全部 link,
+  // because fifteen titles pushed the rest of the navigation below the fold.
+  it('lists the five most recent conversations, newest first, then links to the full list', async () => {
     vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: fakeSessions(20) } as never);
     renderZone();
 
     await waitFor(() => expect(screen.getByText('對話 1')).toBeInTheDocument());
     // The server orders by last_active DESC, so the rail must preserve that
-    // order and take the FIRST 15 — not an arbitrary slice.
-    expect(screen.getByText('對話 15')).toBeInTheDocument();
-    expect(screen.queryByText('對話 16')).not.toBeInTheDocument();
+    // order and take the FIRST 5 — not an arbitrary slice.
+    expect(screen.getByText('對話 5')).toBeInTheDocument();
+    expect(screen.queryByText('對話 6')).not.toBeInTheDocument();
     const rows = screen.getAllByRole('button').filter((b) => /^對話 \d+$/.test(b.textContent ?? ''));
-    expect(rows).toHaveLength(15);
+    expect(rows).toHaveLength(5);
     expect(rows[0]).toHaveTextContent('對話 1');
+    // Everything older is one click away.
+    const seeAll = screen.getByRole('link', { name: /See all/i });
+    expect(seeAll).toHaveAttribute('href', '/conversations');
+  });
+
+  it('hides the 查看全部 link while there is no history to see', async () => {
+    vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: [] } as never);
+    renderZone();
+    await waitFor(() => expect(screen.getByText(/No conversations yet/i)).toBeInTheDocument());
+    expect(screen.queryByRole('link', { name: /See all/i })).not.toBeInTheDocument();
   });
 
   it('resumes a conversation into the chat view when a row is clicked', async () => {

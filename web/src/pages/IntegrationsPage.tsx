@@ -1,15 +1,13 @@
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useSearchParams } from 'react-router';
-import { Plug, KeyRound, Building2, UserSearch, Mail, FileText, Github } from 'lucide-react';
-import { Tabs, TabsList, TabsTab, TabsPanel } from '@/components/mds';
+import { Plug, Building2, UserSearch, Mail } from 'lucide-react';
+import { Tabs, TabsList, TabsTab, TabsPanel, Separator } from '@/components/mds';
 import { McpPage } from './McpPage';
 import { McpKeysPage } from './McpKeysPage';
 import { OdooPage } from './OdooPage';
 import { IdentityPage } from './IdentityPage';
 import { GoogleIntegrationPage } from './GoogleIntegrationPage';
-import { NotionIntegrationPage } from './NotionIntegrationPage';
-import { GitHubIntegrationPage } from './GitHubIntegrationPage';
 
 /**
  * Google Workspace 分頁。v1.48.0 起開放：原本等的是原廠 OAuth App 驗證，
@@ -22,17 +20,23 @@ import { GitHubIntegrationPage } from './GitHubIntegrationPage';
  */
 const GOOGLE_INTEGRATION_ENABLED = true;
 
-const TAB_IDS = ['mcp', 'google', 'notion', 'github', 'keys', 'odoo', 'identity'] as const;
+const TAB_IDS = ['mcp', 'google', 'odoo', 'identity'] as const;
 type TabId = (typeof TAB_IDS)[number];
 
 /**
- * IntegrationsPage — the `/manage/integrations` surface merging MCP servers,
- * MCP keys and Odoo into one tabbed page (dashboard-redesign §3.2, WP6-T6.2).
- * adm-gated (via ManageShell + RPC); function-first naming ("整合／工具連線")
- * per the §3 ruling on management-surface technical terms. Mirrors the active
- * tab to `?tab=` (replicates the legacy TabbedMerge behavior on local mds Tabs,
- * matching GovernanceShell / BillingShell). Panels mount lazily — only the
- * active page is rendered, preserving TabbedMerge's single-mount behavior.
+ * IntegrationsPage — the `/manage/integrations` surface. Four entries since
+ * 2026-08-04 (D19): 工具伺服器 / Google / Odoo / 身分解析.
+ *
+ * What changed, and why: the page had grown to seven tabs, three of which
+ * (Notion, GitHub, plus the MCP page's own OAuth sub-tab) were three different
+ * doors onto the same authorization flow. Connecting a service is now something
+ * you do on that service's own card inside 工具伺服器 — the card shows the
+ * connection state and carries the 授權 button — instead of a separate page you
+ * had to know existed. MCP access keys moved under the same tab rather than
+ * getting a top-level slot of their own; nothing was removed.
+ *
+ * Older `?tab=notion|github|keys` links land on 工具伺服器, where all three now
+ * live. The active tab still mirrors to `?tab=` so deep links keep working.
  */
 export function IntegrationsPage() {
   const intl = useIntl();
@@ -67,18 +71,6 @@ export function IntegrationsPage() {
               {intl.formatMessage({ id: 'integrations.tab.google' })}
             </TabsTab>
           )}
-          <TabsTab value="notion">
-            <FileText />
-            {intl.formatMessage({ id: 'integrations.tab.notion' })}
-          </TabsTab>
-          <TabsTab value="github">
-            <Github />
-            {intl.formatMessage({ id: 'integrations.tab.github' })}
-          </TabsTab>
-          <TabsTab value="keys">
-            <KeyRound />
-            {intl.formatMessage({ id: 'integrations.tab.keys' })}
-          </TabsTab>
           <TabsTab value="odoo">
             <Building2 />
             {intl.formatMessage({ id: 'integrations.tab.odoo' })}
@@ -89,22 +81,17 @@ export function IntegrationsPage() {
           </TabsTab>
         </TabsList>
         <TabsPanel value="mcp">
-          <McpPage />
+          <div className="space-y-8">
+            <McpPage />
+            <Separator />
+            <McpKeysPage />
+          </div>
         </TabsPanel>
         {GOOGLE_INTEGRATION_ENABLED && (
           <TabsPanel value="google">
             <GoogleIntegrationPage />
           </TabsPanel>
         )}
-        <TabsPanel value="notion">
-          <NotionIntegrationPage />
-        </TabsPanel>
-        <TabsPanel value="github">
-          <GitHubIntegrationPage />
-        </TabsPanel>
-        <TabsPanel value="keys">
-          <McpKeysPage />
-        </TabsPanel>
         <TabsPanel value="odoo">
           <OdooPage />
         </TabsPanel>

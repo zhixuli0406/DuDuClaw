@@ -10,6 +10,7 @@ import {
   Info,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { extractAuthUrl } from '@/lib/cli-auth-url';
 import { isImeComposing } from '@/lib/keyboard';
 import { client } from '@/lib/ws-client';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, Button, Input } from '@/components/mds';
@@ -38,28 +39,15 @@ function stripAnsi(s: string): string {
 }
 /* eslint-enable no-control-regex */
 
-/**
- * Pull the OAuth authorize URL out of the (ANSI-stripped) login output so the
- * dashboard can render it as a one-click link — many users don't realise the URL
- * is buried in the terminal output. The gateway widens the PTY so the URL stays
- * on a single line, making this a clean single-match extraction.
- */
-function extractAuthUrl(clean: string): string | null {
-  const urls = clean.match(/https?:\/\/[^\s"'<>)\]]+/g);
-  if (!urls) return null;
-  const oauth = urls.find((u) => /oauth|authorize|auth\.|\/cai\//i.test(u));
-  const pick = oauth ?? urls.reduce((a, b) => (b.length > a.length ? b : a));
-  return pick.replace(/[.,)\]]+$/, ''); // drop trailing punctuation the TUI may append
-}
-
 export type LoginRuntime = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok';
 
+/** Product names — verbatim. Grok's subscription qualifier is appended from i18n. */
 const RUNTIME_LABELS: Record<LoginRuntime, string> = {
   claude: 'Claude',
   codex: 'Codex',
   gemini: 'Gemini',
   antigravity: 'Antigravity (agy)',
-  grok: 'Grok（SuperGrok 訂閱）',
+  grok: 'Grok',
 };
 
 interface Props {
@@ -145,14 +133,24 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
             .then((r) =>
               setRegisterMsg(
                 r.registered
-                  ? '帳號已加入'
+                  ? intl.formatMessage({ id: 'cliLogin.registered' })
                   : r.reason === 'cli_store'
-                    ? `登入成功，憑證已存入 ${r.store ?? 'CLI 憑證儲存'}，此 CLI 的 AI 員工可直接使用，不需要另外新增帳號`
-                    : `登入成功，但未自動加入帳號${r.reason ? `（${r.reason}）` : ''}`,
+                    ? intl.formatMessage(
+                        { id: 'cliLogin.registered.cliStore' },
+                        { store: r.store ?? intl.formatMessage({ id: 'cliLogin.registered.cliStore.fallback' }) },
+                      )
+                    : r.reason
+                      ? intl.formatMessage({ id: 'cliLogin.registered.noneReason' }, { reason: r.reason })
+                      : intl.formatMessage({ id: 'cliLogin.registered.none' }),
               ),
             )
             .catch((e: unknown) =>
-              setRegisterMsg(`帳號註冊失敗：${e instanceof Error ? e.message : String(e)}`),
+              setRegisterMsg(
+                intl.formatMessage(
+                  { id: 'cliLogin.registerFailed' },
+                  { message: e instanceof Error ? e.message : String(e) },
+                ),
+              ),
             )
             .finally(() => onSuccess?.());
         } else {
@@ -164,7 +162,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
       offOut();
       offStatus();
     };
-  }, [open, onSuccess]);
+  }, [open, onSuccess, intl]);
 
   // Auto-scroll the terminal.
   useEffect(() => {
@@ -196,20 +194,27 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
     if (status === 'succeeded')
       return (
         <span className="inline-flex items-center gap-1 text-sm text-success">
-          <CheckCircle2 className="h-4 w-4" /> 登入成功
+          <CheckCircle2 className="h-4 w-4" /> {intl.formatMessage({ id: 'cliLogin.status.succeeded' })}
         </span>
       );
     if (status === 'failed' || status === 'error')
       return (
         <span className="inline-flex items-center gap-1 text-sm text-destructive">
-          <XCircle className="h-4 w-4" /> {status === 'error' ? errMsg ?? '啟動失敗' : '登入失敗'}
+          <XCircle className="h-4 w-4" />{' '}
+          {status === 'error'
+            ? errMsg ?? intl.formatMessage({ id: 'cliLogin.status.startFailed' })
+            : intl.formatMessage({ id: 'cliLogin.status.failed' })}
         </span>
       );
     if (status === 'exited')
-      return <span className="text-sm text-muted-foreground">流程已結束（未偵測到成功訊號）</span>;
+      return (
+        <span className="text-sm text-muted-foreground">
+          {intl.formatMessage({ id: 'cliLogin.status.exited' })}
+        </span>
+      );
     return (
       <span className="inline-flex items-center gap-1 text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" /> 進行中…
+        <Loader2 className="h-4 w-4 animate-spin" /> {intl.formatMessage({ id: 'cliLogin.status.running' })}
       </span>
     );
   };
@@ -218,16 +223,22 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
     <Dialog open={open} onOpenChange={(o) => { if (!o) void handleClose(); }}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{`${RUNTIME_LABELS[runtime]} 一鍵登入`}</DialogTitle>
+          <DialogTitle>
+            {intl.formatMessage(
+              { id: 'cliLogin.title' },
+              {
+                runtime:
+                  RUNTIME_LABELS[runtime] +
+                  (runtime === 'grok' ? intl.formatMessage({ id: 'cliLogin.runtime.grok.suffix' }) : ''),
+              },
+            )}
+          </DialogTitle>
         </DialogHeader>
         <div className="space-y-3">
           {!remoteSafe && (
             <div className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span>
-                此 CLI 使用 localhost 回呼登入：僅在「Dashboard 與瀏覽器在同一台機器」（自架）可完成。
-                遠端 Cloud 請改用 API key。
-              </span>
+              <span>{intl.formatMessage({ id: 'cliLogin.remoteWarning' })}</span>
             </div>
           )}
           {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
@@ -246,7 +257,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
           {authUrl && status === 'running' && (
             <div className="space-y-1.5 rounded-lg border border-warning/30 bg-warning/5 p-3">
               <p className="text-xs font-medium text-muted-foreground">
-                ① 點此開啟授權網址 → 完成授權後複製驗證碼 → ② 貼到下方按 Enter
+                {intl.formatMessage({ id: 'cliLogin.steps' })}
               </p>
               <a
                 href={authUrl}
@@ -254,7 +265,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
                 rel="noreferrer"
                 className="inline-flex items-center gap-2 rounded-lg bg-brand px-3 py-2 text-sm font-medium text-brand-foreground transition hover:bg-brand/90"
               >
-                <ExternalLink className="h-4 w-4" /> 開啟授權網址
+                <ExternalLink className="h-4 w-4" /> {intl.formatMessage({ id: 'cliLogin.openUrl' })}
               </a>
               <p className="select-all break-all font-mono text-[10px] text-muted-foreground">{authUrl}</p>
             </div>
@@ -267,7 +278,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
             ref={outRef}
             className="h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-surface-border bg-stone-950/90 p-3 font-mono text-[12px] leading-relaxed text-stone-100"
           >
-            {clean.trim() || '啟動登入程序中…'}
+            {clean.trim() || intl.formatMessage({ id: 'cliLogin.starting' })}
           </pre>
 
           <div className="flex items-center gap-2">
@@ -280,7 +291,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
                   void sendInput();
                 }
               }}
-              placeholder="貼上驗證碼 / 輸入回應後按 Enter"
+              placeholder={intl.formatMessage({ id: 'cliLogin.inputPlaceholder' })}
               disabled={status !== 'running'}
               autoComplete="off"
               spellCheck={false}
@@ -289,7 +300,8 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
               variant="outline"
               onClick={() => void sendInput()}
               disabled={status !== 'running'}
-              title="送出"
+              title={intl.formatMessage({ id: 'cliLogin.send' })}
+              aria-label={intl.formatMessage({ id: 'cliLogin.send' })}
             >
               <SendHorizonal className="h-4 w-4" />
             </Button>
@@ -303,11 +315,11 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
             <StatusBadge />
             <div className="flex gap-2">
               <Button variant="outline" onClick={() => void handleClose()}>
-                {status === 'running' ? '取消' : '關閉'}
+                {intl.formatMessage({ id: status === 'running' ? 'common.cancel' : 'common.close' })}
               </Button>
               {status === 'succeeded' && (
                 <Button variant="default" onClick={onClose}>
-                  完成
+                  {intl.formatMessage({ id: 'common.done' })}
                 </Button>
               )}
             </div>

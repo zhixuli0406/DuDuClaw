@@ -1,24 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { useSearchParams } from 'react-router';
+import { useNavigate, useSearchParams } from 'react-router';
 import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
-import { type ChatSessionSummary } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useConversationsStore } from '@/stores/conversations-store';
-import { sessionChannel } from '@/lib/session-channel';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
-import { Plus, Paperclip, Eye, EyeOff, MessagesSquare, ArrowLeft, PanelLeftOpen } from 'lucide-react';
+import { Plus, Paperclip, Eye, EyeOff, MessagesSquare } from 'lucide-react';
 import { toast } from '@/lib/toast';
 import {
   Button,
   SubmitButton,
-  Empty,
-  Skeleton,
-  ResizablePanelGroup,
-  ResizablePanel,
-  ResizableHandle,
-  useIsMobile,
 } from '@/components/mds';
 import {
   AttachmentChip,
@@ -38,7 +30,6 @@ import {
 import { CharacterAvatar } from '@/components/character';
 import { AgentGlyph } from '@/lib/agent-glyph';
 import { DuDu } from '@/components/mascot';
-import { timeAgo } from '@/lib/format';
 import { isImageMime, readAttachment } from '@/lib/attachments';
 
 export function WebChatPage() {
@@ -59,7 +50,6 @@ export function WebChatPage() {
     isRecording,
     ttsEnabled,
     setTtsEnabled,
-    sessionId,
     sessionsRevision,
     connect,
     send,
@@ -71,11 +61,10 @@ export function WebChatPage() {
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
 
   const [searchParams] = useSearchParams();
-  const isMobile = useIsMobile();
+  const navigate = useNavigate();
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [pttCapturing, setPttCapturing] = useState(false);
-  const [mobileShowList, setMobileShowList] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -124,20 +113,13 @@ export function WebChatPage() {
     if (mainAgentId && selectedAgentId === mainAgentId) selectAgent(null);
   }, [mainAgentId, selectedAgentId, selectAgent]);
 
-  // ── Session list (left column) ──────────────────────────────────────────────
+  // ── Conversation history ────────────────────────────────────────────────────
   //
-  // Admins see EVERY conversation session — including those held on Telegram /
-  // Discord / other channels — separated per session with a channel badge
-  // (2026-07-29 client feedback). Non-admins stay scoped to the selected
-  // employee (the RPC rejects unscoped listing for them, fail-closed).
-  // Internal work sessions (cron / delegation runs) are filtered out.
-  //
-  // The listing + resume live in `useConversationsStore` so this column and the
-  // sidebar 對話紀錄 zone can never drift apart (2026-07-30).
-  const sessions = useConversationsStore((s) => s.sessions);
-  const sessionsState = useConversationsStore((s) => s.status);
+  // The list itself moved out on 2026-08-04 (D17) — it duplicated the sidebar
+  // 對話紀錄 zone, and everything older now lives on `/conversations`. What
+  // stays here is the refresh: a completed turn must make the just-created
+  // conversation appear in those two places without a manual reload.
   const loadSessions = useConversationsStore((s) => s.fetch);
-  const resumeConversation = useConversationsStore((s) => s.resume);
   const startNewConversation = useConversationsStore((s) => s.startNew);
 
   useEffect(() => {
@@ -152,15 +134,6 @@ export function WebChatPage() {
     if (sessionsRevision > 0 && connectionState === 'connected') void loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionsRevision]);
-
-  const handleResume = async (session: ChatSessionSummary) => {
-    const ok = await resumeConversation(session);
-    if (!ok) {
-      toast.error(intl.formatMessage({ id: 'webchat.history.loadFailed', defaultMessage: '無法載入這個對話' }));
-      return;
-    }
-    if (isMobile) setMobileShowList(false);
-  };
 
   const partnerName = partner?.display_name ?? agentName;
 
@@ -183,7 +156,6 @@ export function WebChatPage() {
 
   const newConversation = () => {
     startNewConversation();
-    if (isMobile) setMobileShowList(false);
   };
 
   const handleSend = () => {
@@ -311,93 +283,6 @@ export function WebChatPage() {
     [intl],
   );
 
-  // ── Left column: partner picker + session list ────────────────────────────────
-  const listColumn = (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-surface-border px-3">
-        <MessagesSquare className="size-4 shrink-0 text-muted-foreground" />
-        <h1 className="truncate text-sm font-medium">{intl.formatMessage({ id: 'webchat.history.title', defaultMessage: 'Conversations' })}</h1>
-        <Button variant="brand" size="sm" className="ml-auto" onClick={newConversation}>
-          <Plus />
-          <span className="hidden sm:inline">{intl.formatMessage({ id: 'webchat.reset', defaultMessage: 'New conversation' })}</span>
-        </Button>
-      </div>
-
-      {agents.length > 0 && (
-        <div className="shrink-0 border-b border-surface-border">
-          <EmployeeRow agents={staffAgents} selectedId={selectedAgentId} onSelect={selectAgent} />
-        </div>
-      )}
-
-      <div className="min-h-0 flex-1 overflow-y-auto p-2">
-        {sessionsState === 'loading' ? (
-          <div className="space-y-2 p-1">
-            {Array.from({ length: 4 }).map((_, i) => (
-              <Skeleton key={i} className="h-10 w-full" />
-            ))}
-          </div>
-        ) : sessionsState === 'error' ? (
-          <Empty
-            icon={MessagesSquare}
-            title={intl.formatMessage({ id: 'webchat.history.error', defaultMessage: "Couldn't load history" })}
-            action={
-              <Button variant="outline" size="sm" onClick={loadSessions}>
-                {intl.formatMessage({ id: 'webchat.history.retry', defaultMessage: 'Retry' })}
-              </Button>
-            }
-          />
-        ) : sessions.length === 0 ? (
-          <Empty
-            icon={MessagesSquare}
-            title={intl.formatMessage({ id: 'webchat.history.empty', defaultMessage: 'No past conversations yet' })}
-            variant="dashed"
-            className="mt-4"
-          />
-        ) : (
-          <ul className="space-y-0.5">
-            {sessions.map((s) => {
-              const active = s.session_id === sessionId;
-              const channel = sessionChannel(s.session_id);
-              const ownerName = agents.find((a) => a.name === s.agent_id)?.display_name ?? s.agent_id;
-              return (
-                <li key={s.session_id}>
-                  <button
-                    type="button"
-                    onClick={() => handleResume(s)}
-                    className={cn(
-                      'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors',
-                      active ? 'bg-surface-selected' : 'hover:bg-surface-hover',
-                    )}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm text-foreground">
-                        {s.title || intl.formatMessage({ id: 'webchat.history.untitled', defaultMessage: '(Untitled)' })}
-                      </p>
-                      <p className="flex items-center gap-1.5 truncate text-xs text-muted-foreground">
-                        {channel && (
-                          <span className="shrink-0 rounded bg-muted px-1 py-px text-[10px] leading-4">
-                            {channel.label}
-                          </span>
-                        )}
-                        <span className="truncate">
-                          {ownerName}
-                          {' · '}
-                          {intl.formatMessage({ id: 'webchat.history.turns', defaultMessage: '{count} turns' }, { count: s.turns })}
-                          {' · '}
-                          {timeAgo(s.last_active)}
-                        </span>
-                      </p>
-                    </div>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </div>
-    </div>
-  );
-
   // ── Conversation status dot ───────────────────────────────────────────────────
   const statusTone =
     connectionState === 'connected' ? 'bg-success' : connectionState === 'connecting' ? 'bg-warning' : 'bg-muted-foreground';
@@ -413,11 +298,6 @@ export function WebChatPage() {
     <div className="flex h-full min-h-0 flex-col">
       {/* Session header — partner identity + status + companion + actions. */}
       <div className="flex h-12 shrink-0 items-center gap-2 border-b border-surface-border px-3">
-        {isMobile && (
-          <Button variant="ghost" size="icon-sm" onClick={() => setMobileShowList(true)} aria-label={intl.formatMessage({ id: 'webchat.history.title', defaultMessage: 'Conversations' })}>
-            <PanelLeftOpen />
-          </Button>
-        )}
         {selectedAgentId ? (
           <CharacterAvatar agentId={selectedAgentId} name={partnerName} size={26} variant="avatar" animated={false} />
         ) : (
@@ -438,6 +318,18 @@ export function WebChatPage() {
         </span>
         <div className="ml-auto flex items-center gap-0.5">
           <VoicePlayToggle />
+          {/* 對話紀錄 lives in the sidebar (newest five) and on its own page —
+              the page-local duplicate list was removed 2026-08-04 (D17), so
+              this is the way back to older threads from here. */}
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => navigate('/conversations')}
+            title={intl.formatMessage({ id: 'nav.conversations' })}
+            aria-label={intl.formatMessage({ id: 'nav.conversations' })}
+          >
+            <MessagesSquare />
+          </Button>
           <Button
             variant="ghost"
             size="icon-sm"
@@ -449,6 +341,14 @@ export function WebChatPage() {
           </Button>
         </div>
       </div>
+
+      {/* Staff strip — pick who you are talking to. Previously the top of the
+          removed left column; it is conversation chrome, not history chrome. */}
+      {staffAgents.length > 0 && (
+        <div className="shrink-0 border-b border-surface-border">
+          <EmployeeRow agents={staffAgents} selectedId={selectedAgentId} onSelect={selectAgent} />
+        </div>
+      )}
 
       {/* Conversation */}
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
@@ -581,31 +481,12 @@ export function WebChatPage() {
     </div>
   );
 
+  // Single column since 2026-08-04 (D17): the page-local history list duplicated
+  // the sidebar 對話紀錄 zone, so the split view went with it. The conversation
+  // now gets the full width, which is what a chat surface wanted anyway.
   return (
     <div className="-mx-4 -mt-4 flex min-h-0 flex-1 md:-mx-6 md:-mt-6 md:-mb-6">
-      {isMobile ? (
-        mobileShowList ? (
-          <div className="flex h-full w-full flex-col">
-            <div className="flex h-12 shrink-0 items-center gap-2 border-b border-surface-border px-2">
-              <Button variant="ghost" size="icon-sm" onClick={() => setMobileShowList(false)} aria-label={intl.formatMessage({ id: 'common.back' })}>
-                <ArrowLeft />
-              </Button>
-              <span className="text-sm font-medium">{intl.formatMessage({ id: 'webchat.history.title', defaultMessage: 'Conversations' })}</span>
-            </div>
-            <div className="min-h-0 flex-1">{listColumn}</div>
-          </div>
-        ) : (
-          <div className="w-full">{chatColumn}</div>
-        )
-      ) : (
-        <ResizablePanelGroup orientation="horizontal" id="chat-split" className="h-full w-full">
-          <ResizablePanel defaultSize={300} minSize={240} maxSize={420} className="border-r border-surface-border">
-            {listColumn}
-          </ResizablePanel>
-          <ResizableHandle />
-          <ResizablePanel minSize="45">{chatColumn}</ResizablePanel>
-        </ResizablePanelGroup>
-      )}
+      <div className="w-full">{chatColumn}</div>
     </div>
   );
 }

@@ -1,19 +1,22 @@
 import { NavLink, useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
 import { Plus } from 'lucide-react';
-import { useApprovalsStore } from '@/stores/approvals-store';
 import { useSystemStore } from '@/stores/system-store';
 import { cn } from '@/lib/utils';
 import { mobileNavItems, type NavItem } from './nav-model';
 
 /**
  * MobileBottomNav — Zone A quick access on small screens (§4.3). Slots:
- * 儀表板 / 收件匣 / ＋交辦（center raised action, links to the task board's create
- * intent） / 對話 / 任務. Hidden at md+ (the sidebar takes over). The inbox slot
- * carries the live "needs me" count. Two balanced side groups (2 left / 2 right)
- * flank the centre ＋交辦; the ＋ remains the quick create entry.
+ * 儀表板 / 對話 / ＋交辦（center raised action, links to the task board's create
+ * intent） / 對話紀錄 / 任務. Hidden at md+ (the sidebar takes over). Two balanced
+ * side groups (2 left / 2 right) flank the centre ＋交辦; the ＋ remains the quick
+ * create entry.
+ *
+ * 2026-08-04 (D17): 收件匣 left this bar, taking the only badge with it. The
+ * pending count now shows as a bell in the mobile top bar (`MainLayout`) that
+ * appears only when something is actually waiting.
  */
-function BottomNavLink({ item, inboxCount }: { item: NavItem; inboxCount: number }) {
+function BottomNavLink({ item }: { item: NavItem }) {
   const intl = useIntl();
   const Icon = item.icon;
   return (
@@ -27,17 +30,7 @@ function BottomNavLink({ item, inboxCount }: { item: NavItem; inboxCount: number
         )
       }
     >
-      <span className="relative">
-        <Icon className="size-5" />
-        {item.badge === 'inbox' && inboxCount > 0 && (
-          <span
-            className="absolute -right-2 -top-1.5 inline-flex min-w-4 items-center justify-center rounded-full bg-brand px-1 text-[9px] font-medium leading-none text-brand-foreground tabular-nums"
-            aria-label={intl.formatMessage({ id: 'nav.inbox.pending' }, { count: inboxCount })}
-          >
-            {inboxCount > 99 ? '99+' : inboxCount}
-          </span>
-        )}
-      </span>
+      <Icon className="size-5" />
       <span className="truncate">{intl.formatMessage({ id: item.label })}</span>
     </NavLink>
   );
@@ -46,7 +39,6 @@ function BottomNavLink({ item, inboxCount }: { item: NavItem; inboxCount: number
 export function MobileBottomNav() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const inboxCount = useApprovalsStore((s) => s.pendingCount);
   // Personal IA (2026-07-29 client feedback round 2): the centre ＋交辦 quick
   // action is task-board chrome — hidden on Personal like the sidebar button.
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
@@ -66,7 +58,7 @@ export function MobileBottomNav() {
     >
       <div className="flex flex-1 items-stretch">
         {left.map((item) => (
-          <BottomNavLink key={item.to} item={item} inboxCount={inboxCount} />
+          <BottomNavLink key={item.to} item={item} />
         ))}
       </div>
 
@@ -90,7 +82,7 @@ export function MobileBottomNav() {
 
       <div className="flex flex-1 items-stretch">
         {right.map((item) => (
-          <BottomNavLink key={item.to} item={item} inboxCount={inboxCount} />
+          <BottomNavLink key={item.to} item={item} />
         ))}
       </div>
     </nav>

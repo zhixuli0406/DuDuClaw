@@ -7,7 +7,7 @@ import en from '@/i18n/en.json';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { ManageShell } from './ManageShell';
-import { manageNav } from './nav-model';
+import { manageAdvancedNav, allManageNav } from './nav-model';
 
 /** Render ManageShell with a real nested-route tree (NavLink + Outlet need it —
  *  Zone D is real routing, not `?tab=`, per WP4.1). */
@@ -18,7 +18,7 @@ function renderManage(initialPath: string) {
         <Routes>
           <Route path="/" element={<div>Home page</div>} />
           <Route path="manage" element={<ManageShell />}>
-            {manageNav.map((item) => (
+            {allManageNav.map((item) => (
               <Route
                 key={item.to}
                 path={item.to.replace('/manage/', '')}
@@ -41,22 +41,41 @@ beforeEach(() => {
   useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
 });
 
-describe('ManageShell (Multica Settings-式 rail, WP4.1)', () => {
-  it('groups the rail into 營運 / 帳務與授權 / 治理 with group labels', () => {
+describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
+  it('renders the five primary entries in the client-decided order', () => {
     renderManage('/manage/channels');
-    expect(screen.getByText('Operations')).toBeInTheDocument();
-    expect(screen.getByText('Billing & licensing')).toBeInTheDocument();
-    // "Governance" appears twice — the group label and the manage.governance
-    // nav item share the same English string; assert both are present.
-    expect(screen.getAllByText('Governance').length).toBe(2);
+    const links = screen
+      .getAllByRole('link')
+      .map((el) => el.textContent?.trim())
+      .filter(Boolean);
+    expect(links).toEqual([
+      en['manage.channels'],
+      en['manage.integrations'],
+      en['manage.accounts'],
+      en['manage.updates'],
+      en['manage.advanced'],
+    ]);
+    // The former group labels are gone with the grouping itself.
+    expect(screen.queryByText('Operations')).not.toBeInTheDocument();
+    expect(screen.queryByText('Billing & licensing')).not.toBeInTheDocument();
   });
 
-  it('renders every manageNav item as a link for an admin+enterprise viewer', () => {
-    renderManage('/manage/channels');
-    for (const item of manageNav) {
+  it('unfolds the 進階設定 sub-list, and keeps 進階設定 lit, inside that subtree', () => {
+    renderManage('/manage/billing');
+    // Every folded surface is reachable from the rail once you are inside it.
+    for (const item of manageAdvancedNav) {
       const label = en[item.label as keyof typeof en] as string;
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument();
     }
+    // The parent row stays highlighted so you can see where you are.
+    const parent = screen.getByRole('link', { name: en['manage.advanced'] });
+    expect(parent.className).toContain('bg-surface-selected');
+  });
+
+  it('keeps the rail five rows tall outside the 進階設定 subtree', () => {
+    renderManage('/manage/channels');
+    expect(screen.queryByRole('link', { name: en['manage.billing'] })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: en['manage.system'] })).not.toBeInTheDocument();
   });
 
   it('marks the active route with aria-current and the selected-surface class', () => {
@@ -65,38 +84,34 @@ describe('ManageShell (Multica Settings-式 rail, WP4.1)', () => {
     expect(active).toHaveAttribute('aria-current', 'page');
     expect(active.className).toContain('bg-surface-selected');
 
-    const inactive = screen.getByRole('link', { name: en['manage.billing'] });
+    const inactive = screen.getByRole('link', { name: en['manage.integrations'] });
     expect(inactive).not.toHaveAttribute('aria-current', 'page');
     expect(inactive.className).toContain('text-muted-foreground');
   });
 
   it('renders the routed child page inside the content pane', () => {
-    renderManage('/manage/billing');
-    expect(screen.getByText('/manage/billing page')).toBeInTheDocument();
+    renderManage('/manage/accounts');
+    expect(screen.getByText('/manage/accounts page')).toBeInTheDocument();
   });
 
-  it('hides admin-gated items and collapses the now-empty Operations group for a manager-only viewer', () => {
+  it('hides admin-gated items for a manager-only viewer', () => {
     useAuthStore.setState({ user: { display_name: 'M', role: 'manager' } as never });
     renderManage('/manage/billing');
-    // Every Operations item (channels/integrations/inference/system) requires
-    // admin, so the whole group — including its label — disappears.
-    expect(screen.queryByText('Operations')).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: en['manage.channels'] })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: en['manage.system'] })).not.toBeInTheDocument();
-    // Manager-visible items remain in their groups.
-    expect(screen.getByText('Billing & licensing')).toBeInTheDocument();
+    // 進階設定 is manager-visible, and so is what a manager may see under it.
+    expect(screen.getByRole('link', { name: en['manage.advanced'] })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: en['manage.billing'] })).toBeInTheDocument();
-    expect(screen.getByText('Governance')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: en['manage.logs'] })).toBeInTheDocument();
   });
 
   it('hides enterprise-only items on the personal edition', () => {
     useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
-    renderManage('/manage/channels');
+    renderManage('/manage/security');
     expect(screen.queryByRole('link', { name: en['manage.governance'] })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: en['manage.users'] })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: en['manage.departments'] })).not.toBeInTheDocument();
-    // Non-enterprise-gated items in the same group stay visible.
+    // Non-enterprise-gated items in the same sub-list stay visible.
     expect(screen.getByRole('link', { name: en['manage.security'] })).toBeInTheDocument();
   });
 
@@ -109,6 +124,5 @@ describe('ManageShell (Multica Settings-式 rail, WP4.1)', () => {
     useAuthStore.setState({ user: { display_name: 'E', role: 'employee' } as never });
     renderManage('/manage/channels');
     expect(screen.getByText('Home page')).toBeInTheDocument();
-    expect(screen.queryByText('Operations')).not.toBeInTheDocument();
   });
 });

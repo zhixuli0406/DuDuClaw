@@ -1,6 +1,7 @@
 import { useIntl } from 'react-intl';
-import { AudioLines, Ear, Loader2, Volume2 } from 'lucide-react';
+import { AudioLines, Loader2, Volume2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { ThinkingOrbIndicator } from './ThinkingOrbIndicator';
 import type { TalkModeHandle } from './useTalkMode';
 import type { TalkStatus } from './talk-mode';
 
@@ -87,7 +88,14 @@ export function TalkModeStatusPill({ status, className }: { status: TalkStatus; 
       )}
     >
       {status === 'listening' && (
-        <Ear className="h-3.5 w-3.5 animate-pulse motion-reduce:animate-none" />
+        // The pill's role="status" text already announces "聆聽中…" — mark the
+        // orb decorative so screen readers don't double-announce it. Visually
+        // clamped to the same 14px (size-3.5) footprint as the other status
+        // icons in this pill (thinking-orbs only tunes 64/20px presets, so we
+        // scale 20px down to 14px instead of requesting an untuned size).
+        <span className="inline-flex size-3.5 shrink-0 items-center justify-center overflow-hidden">
+          <ThinkingOrbIndicator state="listening" decorative className="scale-[0.7]" />
+        </span>
       )}
       {status === 'transcribing' && (
         <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" />
