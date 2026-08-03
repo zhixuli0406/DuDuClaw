@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.48.0] - 2026-08-03 — 免自建 OAuth client 的 Google 憑證路徑＋側邊欄對話紀錄
+
 ### Added
 - **Google Workspace 兩條免自建 OAuth client 的憑證路徑**：原本每個客戶都要
   自己到 Google Cloud 開 OAuth client（且我方 app 未通過驗證前不能對外服務），
