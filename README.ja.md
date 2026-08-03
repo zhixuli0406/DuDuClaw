@@ -22,6 +22,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 - [なぜ DuDuClaw なのか](#why)
 - [アーキテクチャ概要](#architecture)
+- [前提条件](#prerequisites)
 - [インストール](#install)
 - [クイックスタート](#quickstart)
 - [機能一覧](#features)
@@ -70,13 +71,35 @@ DuDuClaw (plumbing)
 
 Rust ワークスペースは 20 crate 構成:基盤の `duduclaw-core`、サービス層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、ローカル推論 `duduclaw-inference`、認知メモリ `duduclaw-memory`、セキュリティ層 `duduclaw-security` など。全体設計は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
 
+<a id="prerequisites"></a>
+
+## 前提条件
+
+DuDuClaw 自体には LLM が含まれません。まず AI の頭脳を用意してください(ブラウザのセットアップウィザードで後から設定することも可能です):
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、Antigravity のいずれかを入れてログインする
+- 任意の OpenAI 互換プロバイダの API キーを用意する
+- あるいはローカル GGUF モデルを使う(クラウドアカウント不要)
+
 <a id="install"></a>
 
 ## インストール
 
-### npm(推奨、Windows 含む全プラットフォーム)
+### デスクトップアプリ(個人利用におすすめ)
 
-前提条件は [Node.js](https://nodejs.org/) 20+ のみ:
+Tauri 製のネイティブビルド。起動するだけでローカル gateway が自動で立ち上がり、ターミナル操作は一切不要です。CLI と `~/.duduclaw` を共有します。[Releases](https://github.com/zhixuli0406/DuDuClaw/releases) からダウンロード:
+
+| プラットフォーム | ファイル | 備考 |
+|------|------|------|
+| macOS(Apple Silicon / Intel) | `DuDuClaw_*.dmg` | 署名 + Apple 公証済み、そのまま開けます |
+| Windows x64 | `DuDuClaw_*_x64_en-US.msi` | Authenticode 証明書は未購入のため SmartScreen が警告します。「詳細情報」→「実行」でインストール可能。解除手順は [docs/guides/desktop-unblock.md](docs/guides/desktop-unblock.md) を参照 |
+| Linux | `*_amd64.AppImage` / `.deb` | 署名不要 |
+
+開けばそれだけで完結します——アプリ内のウィザードが AI バックエンドの選択と最初のエージェント作成まで案内してくれるので、コマンドを打つ必要はありません。
+
+### npm(上級者 / サーバー用途、Windows 含む全プラットフォーム)
+
+サーバーで動かしたい、スクリプトで自動化したい、あるいは単にコマンドラインが好き、という場合はこちら。前提条件は [Node.js](https://nodejs.org/) 20+ のみ:
 
 ```bash
 npm install -g duduclaw
@@ -91,28 +114,6 @@ npm install -g duduclaw
 ```bash
 brew install zhixuli0406/tap/duduclaw
 ```
-
-### ワンライナーインストール
-
-```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
-```
-
-```powershell
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
-```
-
-### デスクトップアプリ
-
-Tauri 製のネイティブデスクトップ版。起動時にローカル gateway を自動で立ち上げ、CLI と `~/.duduclaw` を共有します。[Releases](https://github.com/zhixuli0406/DuDuClaw/releases) からダウンロード:
-
-| プラットフォーム | ファイル | 備考 |
-|------|------|------|
-| macOS(Apple Silicon / Intel) | `DuDuClaw_*.dmg` | 署名 + Apple 公証済み、そのまま開けます |
-| Windows x64 | `DuDuClaw_*_x64_en-US.msi` | Authenticode 証明書は未購入のため SmartScreen が警告します。「詳細情報」→「実行」で起動、気になる場合は CLI 版を |
-| Linux | `*_amd64.AppImage` / `.deb` | 署名不要 |
 
 ### ソースからビルド
 
@@ -138,20 +139,15 @@ pip install duduclaw
 
 ## クイックスタート
 
-AI の頭脳が 1 つ必要です(ブラウザのセットアップウィザードで後から設定も可能)。5 つから選べます:[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、Antigravity のいずれかを入れてログインする、任意の OpenAI 互換プロバイダの API キーを用意する、ローカル GGUF モデルを使う。
+- **デスクトップ版**:アプリを開くだけ。gateway は自動起動し、ウィザードもアプリ内にそのまま表示されます。
+- **npm / Homebrew / ソースビルド**:
 
-```bash
-# 1. 初回セットアップ(省略可 — ブラウザのウィザードでも完了できます)
-duduclaw onboard
+  ```bash
+  duduclaw run                  # まとめて起動(gateway + チャネル + スケジューラ + dispatcher)
+  open http://localhost:18789   # ダッシュボードを開く
+  ```
 
-# 2. まとめて起動(gateway + チャネル + スケジューラ + dispatcher)
-duduclaw run
-
-# 3. ダッシュボードを開く
-open http://localhost:18789
-```
-
-初回アクセスではウィザードが案内します:AI バックエンドを選ぶ → 最初のエージェントを作る → 内蔵 WebChat でそのまま会話。あとは Channels ページに bot token を貼れば、同じエージェントを再起動なしで Telegram・LINE・Discord などに接続できます。
+どちらの方法でも、初回アクセスではウィザードが案内します:AI バックエンドを選ぶ → 最初のエージェントを作る → 内蔵 WebChat でそのまま会話。先にターミナルで `duduclaw onboard` を実行する必要はありません。あとは Channels ページに bot token を貼れば、同じエージェントを再起動なしで Telegram・LINE・Discord などに接続できます。
 
 よく使う次の一歩:
 
@@ -190,7 +186,7 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 ## CLI コマンド
 
 ```
-duduclaw onboard             # 初回セットアップ(--yes でプロンプトをスキップ)
+duduclaw onboard             # 初回セットアップ;通常はブラウザのウィザードで完了、ヘッドレス/スクリプト向け(--yes でプロンプトをスキップ)
 duduclaw run                 # まとめて起動(gateway + channels + heartbeat + cron + dispatcher)
 duduclaw agent               # ターミナルで対話。サブコマンド create / list / inspect / pause / resume / run
 duduclaw wizard              # 業種テンプレートでセットアップ

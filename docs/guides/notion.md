@@ -58,11 +58,13 @@ credentials). One-time setup:
 
 ## Connect from the dashboard
 
-1. Go to **Integrations → Notion** (`/manage/integrations?tab=notion`).
-2. Paste the OAuth client ID and secret, then click **Connect Notion**.
-3. A Notion consent window opens. Choose the workspace and pages to grant, then
-   approve. The window confirms success and the dashboard flips to
-   **Notion is connected**.
+1. Go to **Manage → Integrations → Tool servers** (`/manage/integrations`).
+2. Scroll to **Services that need authorization** and find the **Notion** card.
+3. Click **Configure** on the card. Paste the OAuth client ID and secret — the
+   dialog also shows the exact callback URL to register, which must match what
+   you entered in step 3 above.
+4. A Notion consent window opens. Choose the workspace and pages to grant, then
+   approve. The card flips to **Authenticated**.
 
 The client credentials are persisted (secret encrypted at rest) so
 re-authorizing later does not require re-entering the secret.

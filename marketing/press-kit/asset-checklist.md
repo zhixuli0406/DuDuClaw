@@ -75,6 +75,7 @@
 | 內容 | 路徑 | 狀態 |
 |---|---|---|
 | 高解析 Logo（512 / 1024 / 2048 px PNG + SVG） | `marketing/press-kit/logos/` | TODO |
+| 純爪印去背版（無 amber 方塊，透明底，供安裝文件插圖） | `marketing/press-kit/paw-transparent.svg` + `paw-transparent-1024.png` | DONE 2026-08-04（僅 1024px；512/2048 尚未產出） |
 | 創辦人正臉照（高 + 中 + 低解析） | `marketing/press-kit/portraits/` | TODO 自拍 |
 | 一句話簡介 zh-TW + EN | `marketing/press-kit/boilerplate.md` | TODO |
 | 三段不同字數的產品描述（30 / 100 / 250 字） | `marketing/press-kit/boilerplate.md` | TODO |

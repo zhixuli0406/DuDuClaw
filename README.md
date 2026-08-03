@@ -22,6 +22,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 - [為什麼需要 DuDuClaw?](#why)
 - [架構一覽](#architecture)
+- [環境準備](#prerequisites)
 - [安裝](#install)
 - [快速開始](#quickstart)
 - [功能總覽](#features)
@@ -70,13 +71,35 @@ DuDuClaw (plumbing)
 
 Rust workspace 由 20 個 crate 組成:核心地基 `duduclaw-core`、服務層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、本地推論 `duduclaw-inference`、認知記憶 `duduclaw-memory`、安全層 `duduclaw-security` 等。完整設計見 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
+<a id="prerequisites"></a>
+
+## 環境準備
+
+DuDuClaw 本身不含 LLM,需要一個 AI 大腦。五選一(之後也能在瀏覽器引導中設定):
+
+- 裝好 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli) 或 Antigravity 其中之一並登入
+- 準備一把 API key,走任何 OpenAI 相容供應商
+- 或用本地 GGUF 模型,不需要任何雲端帳號
+
 <a id="install"></a>
 
 ## 安裝
 
-### npm(推薦,所有平台含 Windows)
+### 桌面應用程式(個人使用推薦)
 
-前置需求只有 [Node.js](https://nodejs.org/) 20+:
+Tauri 原生桌面版,啟動應用程式時會自動拉起本機 Gateway,全程免碰終端機,與 CLI 共用 `~/.duduclaw`。到 [Releases](https://github.com/zhixuli0406/DuDuClaw/releases) 下載:
+
+| 平台 | 檔案 | 備註 |
+|------|------|------|
+| macOS(Apple Silicon / Intel) | `DuDuClaw_*.dmg` | 已簽章 + Apple 公證,直接開 |
+| Windows x64 | `DuDuClaw_*_x64_en-US.msi` | 未購買 Authenticode 憑證,SmartScreen 會示警;點「更多資訊」→「仍要執行」即可安裝,解鎖細節見 [docs/guides/desktop-unblock.md](docs/guides/desktop-unblock.md) |
+| Linux | `*_amd64.AppImage` / `.deb` | 免簽 |
+
+裝好打開就是完整體驗——啟動精靈會在應用程式內帶你設定 AI 後端與第一個 agent,不需要另外跑指令。
+
+### npm(進階 / 伺服器用途,所有平台含 Windows)
+
+想在伺服器上跑、寫腳本自動化,或單純習慣命令列,可以改用 npm。前置需求只有 [Node.js](https://nodejs.org/) 20+:
 
 ```bash
 npm install -g duduclaw
@@ -91,28 +114,6 @@ npm install -g duduclaw
 ```bash
 brew install zhixuli0406/tap/duduclaw
 ```
-
-### 一行安裝
-
-```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
-```
-
-```powershell
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
-```
-
-### 桌面應用程式
-
-Tauri 原生桌面版,啟動時自動拉起本機 gateway,與 CLI 共用 `~/.duduclaw`。到 [Releases](https://github.com/zhixuli0406/DuDuClaw/releases) 下載:
-
-| 平台 | 檔案 | 備註 |
-|------|------|------|
-| macOS(Apple Silicon / Intel) | `DuDuClaw_*.dmg` | 已簽章 + Apple 公證,直接開 |
-| Windows x64 | `DuDuClaw_*_x64_en-US.msi` | 未購買 Authenticode 憑證,SmartScreen 會示警;點「更多資訊」→「仍要執行」。介意的話請改用 CLI 版 |
-| Linux | `*_amd64.AppImage` / `.deb` | 免簽 |
 
 ### 從原始碼建構
 
@@ -138,20 +139,15 @@ pip install duduclaw
 
 ## 快速開始
 
-還需要一個 AI 大腦,五選一(可以之後在瀏覽器引導中設定):裝好 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli) 或 Antigravity 其中之一並登入;準備一把 API key 走任何 OpenAI 相容供應商;或用本地 GGUF 模型。
+- **桌面版**:直接開啟應用程式,Gateway 會自動啟動,應用程式內會直接顯示引導精靈。
+- **npm / Homebrew / 原始碼安裝**:
 
-```bash
-# 1. 首次設定(也可跳過,直接在瀏覽器引導中完成)
-duduclaw onboard
+  ```bash
+  duduclaw run                  # 啟動(gateway + 通道 + 排程 + dispatcher 一次拉起)
+  open http://localhost:18789   # 打開管理後台
+  ```
 
-# 2. 啟動(gateway + 通道 + 排程 + dispatcher 一次拉起)
-duduclaw run
-
-# 3. 打開管理後台
-open http://localhost:18789
-```
-
-第一次打開會進入引導精靈:選 AI 後端 → 建立第一個 agent → 直接在內建 WebChat 對話。之後到 Channels 頁貼上 bot token,就能把同一個 agent 接上 Telegram、LINE、Discord 等平台,不用重啟。
+無論走哪條路,第一次打開都會進入引導精靈,所有設定都在瀏覽器裡完成:選 AI 後端 → 建立第一個 agent → 直接在內建 WebChat 對話,不必先在終端機跑 `duduclaw onboard`。之後到 Channels 頁貼上 bot token,就能把同一個 agent 接上 Telegram、LINE、Discord 等平台,不用重啟。
 
 常用的下一步:
 
@@ -190,7 +186,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 ## CLI 指令
 
 ```
-duduclaw onboard             # 首次設定(--yes 跳過互動)
+duduclaw onboard             # 首次設定;瀏覽器引導已涵蓋,此為無頭/腳本場景用(--yes 跳過互動)
 duduclaw run                 # 一鍵啟動(gateway + channels + heartbeat + cron + dispatcher)
 duduclaw agent               # CLI 互動式對話;子指令 create / list / inspect / pause / resume / run
 duduclaw wizard              # 產業模板互動式設定

@@ -97,12 +97,14 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description | Status |
 |----------|-------------|--------|
 | [guides/memory-and-knowledge.md](guides/memory-and-knowledge.md) | 記憶與知識庫完整使用說明（兩者差異、知識庫寫入/分類/L0–L3 層級、自動帶入 vs 主動搜尋、記憶刪除、FAQ） | Current |
+| [guides/memory-vs-knowledge.html](guides/memory-vs-knowledge.html) | 記憶 vs 知識庫（終端使用者版，自包含 HTML，可直接寄給客戶；WP5c 全自動分流上線後改寫） | Current |
 | [guides/goal-loop.md](guides/goal-loop.md) | 自主目標迴圈（`/goal` 入口、AutonomyLevel 五級、`[goal_loop]`/`[dispatch]`/`[dispatch_guard]` 設定、needs_human 按鈕） | Current |
 | [guides/topology-evolution.md](guides/topology-evolution.md) | 半自動拓撲演化（D5，human-gated 路由改派提案、`[topology_evolution]` 設定、觀察期自動回滾、`topology.list` RPC） | Current |
 | [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |
 | [guides/mcp-bridge.md](guides/mcp-bridge.md) | Mounting external MCP servers (`[[mcp.external]]`, stdio + Streamable HTTP `url` mounts) + `secret://`/`bearer_token` credentials + per-SaaS recipes (Gmail/Plane/Chatwoot/Invoice Ninja/WooCommerce) | Current |
+| [guides/google-workspace-integration.md](guides/google-workspace-integration.md) | Google Workspace 設定指南（選路徑導覽：自建 OAuth client／服務帳號網域委派／Apps Script 橋接三選一，逐步操作 + 11 個 scope 用途一覽 + 設定頁按鈕對照，D5：不預埋官方憑證） | Current |
 | [guides/google-mcp.md](guides/google-mcp.md) | Google 官方 remote MCP 掛載（**進階選項**：`preset = "google:<svc>"`、preview 資格與不可出貨條款、與原生工具的覆蓋對照） | Current |
 | [guides/docuseal.md](guides/docuseal.md) | DocuSeal 簽署工作流（`duduclaw-docuseal-mcp` 開源 wrapper：10 工具、cloud+self-hosted、webhook 驗簽） | Current |
 | [guides/professional-software.md](guides/professional-software.md) | 專業軟體整合（Photoshop / AutoCAD 社群 MCP）：支援矩陣、per-agent `.mcp.json` 安裝、capability 治理、ezdxf 降級、RCE 風險聲明 | Current |

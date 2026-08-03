@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>記憶跟知識庫，差在哪</title>
+<style>
+  :root {
+    --bg: #fafaf9;
+    --bg-card: #ffffff;
+    --text: #292524;
+    --text-soft: #57534e;
+    --border: #e7e5e4;
+    --accent: #d97706;
+    --accent-soft: #fef3e2;
+    --accent-border: #fcd9a8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1917;
+      --bg-card: #24211f;
+      --text: #f5f5f4;
+      --text-soft: #d6d3d1;
+      --border: #3a3532;
+      --accent: #fb923c;
+      --accent-soft: #3a2a17;
+      --accent-border: #6b4a20;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Microsoft JhengHei", sans-serif;
+    line-height: 1.85;
+    font-size: 16px;
+  }
+  .wrap {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 5rem;
+  }
+  h1 {
+    font-size: 1.9rem;
+    font-weight: 700;
+    margin: 0 0 0.4rem;
+    letter-spacing: 0.01em;
+  }
+  .subtitle {
+    color: var(--text-soft);
+    font-size: 1rem;
+    margin: 0 0 2.2rem;
+  }
+  .lede {
+    font-size: 1.1rem;
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-border);
+    border-radius: 0.9rem;
+    padding: 1.2rem 1.4rem;
+    margin-bottom: 2.6rem;
+  }
+  h2 {
+    font-size: 1.3rem;
+    font-weight: 700;
+    margin: 2.6rem 0 0.9rem;
+    padding-top: 0.4rem;
+    border-top: 1px solid var(--border);
+  }
+  h2:first-of-type { border-top: none; padding-top: 0; }
+  p { margin: 0 0 1rem; color: var(--text); }
+  .soft { color: var(--text-soft); }
+  strong { color: var(--accent); font-weight: 600; }
+  .example {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 0.75rem;
+    padding: 1rem 1.2rem;
+    margin: 0.8rem 0 1.2rem;
+    font-size: 0.97rem;
+  }
+  .example .say {
+    color: var(--text);
+    font-style: normal;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0 1.6rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 0.9rem;
+    overflow: hidden;
+    font-size: 0.95rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.85rem 1rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  tr:last-child td { border-bottom: none; }
+  th {
+    background: var(--accent-soft);
+    font-weight: 700;
+    width: 22%;
+  }
+  td:first-child { font-weight: 600; }
+  ul { margin: 0 0 1.2rem; padding-left: 1.3rem; }
+  li { margin-bottom: 0.4rem; }
+  .closing {
+    margin-top: 2.6rem;
+    padding-top: 1.4rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.95rem;
+    color: var(--text-soft);
+  }
+  @media (max-width: 600px) {
+    .wrap { padding: 2rem 1rem 3.5rem; }
+    h1 { font-size: 1.5rem; }
+    table, thead, tbody, th, td, tr { display: block; }
+    th { width: auto; }
+    tr { border: 1px solid var(--border); border-radius: 0.75rem; margin-bottom: 0.8rem; overflow: hidden; }
+    td, th { border-bottom: 1px solid var(--border); }
+    td:last-child, tr th:last-of-type { border-bottom: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>記憶跟知識庫，差在哪</h1>
+  <p class="subtitle">給每天在跟 AI 員工對話的你</p>
+
+  <div class="lede">
+    你跟 AI 員工說一句「以後叫我老闆就好」，隔天開一個新的對話，它照樣叫你老闆，沒人幫它把這句話複製貼上進去。這是記憶在運作。
+  </div>
+
+  <h2>記憶：它自己記住的事</h2>
+  <p>平常聊天裡冒出來的具體事情、你做的決定、你的喜好，AI 員工會自己抓重點記下來，你不用特別交代「記一下」。它記的是一條一條的小事實，不是整篇對話的錄音。</p>
+  <p>記憶不是寫死不變的。同一件事你後來講法不一樣，舊的那條會被標成「已經被取代」，新的接上去，兩條都還留著，攤開來看得到整個變化過程。很久沒被用到、也不重要的記憶，會慢慢被收起來，不會一直堆在那裡占位子。</p>
+  <p>記憶頁可以一條一條瀏覽，也可以刪掉，但沒有編輯按鈕。<strong>不能直接改，是因為記憶要留得住「當時說了什麼、什麼時候說的」，直接改字等於把歷史抹掉，以後查不出原本講的是什麼。</strong>想改內容，直接講一次新的就好，舊的會自動被新的接替，不用動手改字。</p>
+  <p>刪除很簡單。記憶清單上把游標移到某一條，右邊會冒出垃圾桶圖示，點兩下（第二下是確認）就刪掉了。</p>
+
+  <h2>稱呼、喜好、回覆方式，也是自動記</h2>
+  <p>你希望它怎麼稱呼你、回覆要多長、語氣要怎樣，這些同樣是聽過一次就記住，之後每一輪對話都照著做，不用你每次開新對話都再交代一遍。</p>
+  <div class="example">
+    <p class="say" style="margin:0">跟它說「叫我老闆就好」，或者「以後回覆給我簡短一點，不要落落長」，這種話講白了最好用，系統一聽就抓得住重點，馬上記進去。</p>
+  </div>
+  <p>拐彎抹角提一句、或聊到一半順口帶過的偏好，系統不一定抓得到。想確保它記住，講清楚一句最保險。</p>
+
+  <h2>知識庫：長期要查的文件</h2>
+  <p>公司章程、SOP、規格書這類資料，你貼進對話，AI 員工回你一句「好，我記下來了」。這句話很短，但背後系統認得出這是一份要長期查閱的文件，會自動整理成一頁放進知識庫，不用你再多說一句「存進知識庫」。</p>
+  <div class="example">
+    <p class="say" style="margin:0">比如你貼一段退貨規則「七天內未拆封可退，運費由買方負擔」，只要內容夠完整、看得出是一份規定，它會自動幫你整理成一頁，不會只停在記憶裡。</p>
+  </div>
+  <p>想確保一定會建檔，直接說「幫我存進知識庫」或「記到知識庫」，這句話永遠有效，不用等系統自己判斷。系統判斷得比較保守，寧可漏掉一份文件讓你補一句，也不會把閒聊寫成正式文件。</p>
+  <p>這份內容只會留在知識庫那一頁，記憶那邊不會另外存一份一模一樣的全文，頂多留一句提醒，說這件事已經整理進知識庫了，不會兩邊各放一份、互相打架。</p>
+  <p>AI 員工自動建的頁面，會先出現在儀表板「記憶與知識 → 策展台 → 自動建檔」分頁。打開來可以看完整內容，可以按「移除」拿掉，也可以按「分享到共享知識庫」讓其他 AI 員工一起讀得到。</p>
+
+  <h2>該用哪一個</h2>
+  <table>
+    <thead>
+      <tr><th></th><th>記憶</th><th>知識庫</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>什麼時候用</td>
+        <td>對話裡冒出來的事實、偏好、決定，不用交代，讓它自己記</td>
+        <td>章程、SOP、規格書這類要一直查的文件，值得整理成一頁</td>
+      </tr>
+      <tr>
+        <td>在哪裡看</td>
+        <td>儀表板「記憶與知識」頁，一條一條列出來</td>
+        <td>儀表板「記憶與知識 → 知識庫」；剛建好的先在「策展台 → 自動建檔」</td>
+      </tr>
+      <tr>
+        <td>怎麼刪除</td>
+        <td>記憶清單上點垃圾桶圖示，點兩下確認</td>
+        <td>知識庫頁面裡刪除；自動建的在策展台按「移除」</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>不會被記的東西</h2>
+  <ul>
+    <li>打招呼、「好」、「收到」這種沒有實質內容的簡短回應，講了也是白講。</li>
+    <li>臨時交代的一次性任務，比如「幫我訂晚上七點的位子」，做完就結束了，不會變成一條長期留著的記憶。</li>
+    <li>單純的閒聊、沒有具體事實或決定的對話，也一樣不會進記憶。</li>
+  </ul>
+  <p class="soft">系統會先擋掉這些沒內容的句子，不會每一句都認真記一遍。</p>
+
+  <p class="closing">文件貼進去內容太短、看不出是一份正式規定，系統可能不會自動建檔。這時候補一句「存進知識庫」最快，不用等它自己判斷。</p>
+
+</div>
+</body>
+</html>

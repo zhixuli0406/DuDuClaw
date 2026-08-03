@@ -64,10 +64,13 @@ repositories.
 
 ## Connect from the dashboard
 
-1. Go to **Integrations → GitHub** (`/manage/integrations?tab=github`).
-2. Paste the Client ID and Client secret, then click **Connect GitHub**.
-3. A GitHub consent window opens. Approve access. The window confirms success and
-   the dashboard flips to **GitHub is connected**.
+1. Go to **Manage → Integrations → Tool servers** (`/manage/integrations`).
+2. Scroll to **Services that need authorization** and find the **GitHub** card.
+3. Click **Configure** on the card. Paste the Client ID and Client secret — the
+   dialog also shows the exact callback URL to register, which must match what
+   you entered in step 3 above.
+4. A GitHub consent window opens. Approve access. The card flips to
+   **Authenticated**.
 
 The client credentials are persisted (secret encrypted at rest) so
 re-authorizing later does not require re-entering the secret.
