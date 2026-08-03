@@ -138,10 +138,184 @@ pub fn runtime_mode_for_agent(agent_dir: &Path) -> RuntimeMode {
         .and_then(|b| b.as_bool())
         .unwrap_or(false);
     if enabled {
+        // WP10 (2026-08-04 field incident): honour the runtime demotion
+        // breaker. An agent whose interactive REPL keeps wedging is routed
+        // back to fresh-spawn `claude -p` for a cooldown window instead of
+        // re-entering the stall → unhealthy → evict → respawn loop on every
+        // single message. Config still says PtyPool; only the *effective*
+        // mode degrades, and it self-heals when the window expires.
+        if let Some(agent_id) = agent_dir.file_name().and_then(|s| s.to_str())
+            && is_agent_demoted(agent_id)
+        {
+            return RuntimeMode::FreshSpawn;
+        }
         RuntimeMode::PtyPool
     } else {
         RuntimeMode::FreshSpawn
     }
+}
+
+// ── WP10: PTY-pool demotion breaker ──────────────────────────────────
+//
+// Field incident (Joanna, 2026-08-04, v1.48/1.49): a single OAuth account
+// shared with the operator's own Claude Code session made the interactive
+// REPL stall repeatedly. Each stall evicted the pool session, respawned a
+// fresh `claude` REPL, stalled again 120 s later, and — because the stall
+// was booked against the *account* — exhausted the one-account rotator.
+// The user experience was a dead assistant for the rest of the session.
+//
+// The breaker converts that into a graceful degradation: after
+// `DEMOTE_AFTER_FAILURES` consecutive transport-level PTY failures, the
+// agent falls back to the (known-working) fresh-spawn `claude -p` path for
+// `DEMOTE_WINDOW`. Any successful pool invoke clears the counter.
+
+/// Consecutive PTY transport failures before an agent is demoted.
+const DEMOTE_AFTER_FAILURES: u32 = 2;
+
+/// How long a demoted agent stays on the fresh-spawn path.
+const DEMOTE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DemotionState {
+    consecutive_failures: u32,
+    demoted_until: Option<std::time::Instant>,
+}
+
+static PTY_DEMOTIONS: OnceLock<std::sync::Mutex<HashMap<String, DemotionState>>> = OnceLock::new();
+
+fn demotions() -> &'static std::sync::Mutex<HashMap<String, DemotionState>> {
+    PTY_DEMOTIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Pure decision helper: given the current state and `now`, is the agent
+/// currently demoted to fresh-spawn? Extracted so the policy is unit-testable
+/// without touching the process-global map or the clock.
+fn demotion_active(state: &DemotionState, now: std::time::Instant) -> bool {
+    state.demoted_until.is_some_and(|until| now < until)
+}
+
+/// Pure state transition for a transport-level PTY failure.
+fn demotion_after_failure(state: DemotionState, now: std::time::Instant) -> DemotionState {
+    let consecutive_failures = state.consecutive_failures.saturating_add(1);
+    let demoted_until = if consecutive_failures >= DEMOTE_AFTER_FAILURES {
+        Some(now + DEMOTE_WINDOW)
+    } else {
+        state.demoted_until
+    };
+    DemotionState {
+        consecutive_failures,
+        demoted_until,
+    }
+}
+
+/// True when `agent_id` is currently demoted to the fresh-spawn path.
+pub fn is_agent_demoted(agent_id: &str) -> bool {
+    let Ok(map) = demotions().lock() else {
+        return false; // poisoned ⇒ fail open to configured behaviour
+    };
+    map.get(agent_id)
+        .is_some_and(|s| demotion_active(s, std::time::Instant::now()))
+}
+
+/// Record a transport-level PTY failure for `agent_id`. Returns true when this
+/// failure tripped the breaker (i.e. the agent just became demoted).
+pub fn record_pty_transport_failure(agent_id: &str) -> bool {
+    let Ok(mut map) = demotions().lock() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    let prev = map.get(agent_id).copied().unwrap_or_default();
+    let was_demoted = demotion_active(&prev, now);
+    let next = demotion_after_failure(prev, now);
+    let newly_demoted = !was_demoted && demotion_active(&next, now);
+    map.insert(agent_id.to_string(), next);
+    if newly_demoted {
+        warn!(
+            agent_id,
+            consecutive_failures = next.consecutive_failures,
+            window_secs = DEMOTE_WINDOW.as_secs(),
+            "pty_runtime: interactive REPL kept failing — demoting agent to \
+             fresh-spawn `claude -p` for the cooldown window"
+        );
+    }
+    newly_demoted
+}
+
+/// Clear the failure streak after a successful pool invoke.
+pub fn record_pty_success(agent_id: &str) {
+    if let Ok(mut map) = demotions().lock() {
+        map.remove(agent_id);
+    }
+}
+
+/// True when `err` describes a failure of the **PTY transport** (the
+/// interactive REPL wedged, never booted, died, or dropped the sentinel
+/// protocol) rather than a failure of the *account* behind it.
+///
+/// This distinction is the WP10 fix for the exhaustion chain: a wedged REPL
+/// must not be booked against the OAuth account's health, because the very
+/// same account answers fine over fresh-spawn `claude -p`. Conflating the two
+/// is what turned one stall into "All accounts exhausted" for single-account
+/// installs.
+///
+/// **The list below is derived from the `Display` impls of `PtyError`,
+/// `SessionError` and `PoolError` (`duduclaw-cli-runtime/src/error.rs`) — the
+/// complete set of strings this layer can produce — not from the handful of
+/// messages that happened to show up in one incident log.** Keep it in sync
+/// when a variant is added there.
+///
+/// Two deliberate exclusions:
+/// - `SessionError::CliError("CLI reported error: {0}")` wraps **arbitrary CLI
+///   output**, which is exactly where a genuine rate-limit / billing / auth
+///   error surfaces. Treating it as transport would let a real account problem
+///   escape cooldown forever.
+/// - `SessionError::UnknownCliKind` is a config error that fails identically on
+///   every account and every transport; account cooldown is the wrong lever but
+///   so is the demotion breaker, so it is left to the generic path.
+///
+/// Matching is on whole phrases (project convention #2: no unanchored
+/// substring checks for routing decisions) — a bare `contains("sentinel")`
+/// would misfire on a user asking about Sentinel-2 satellite imagery.
+pub fn is_pty_transport_error(err: &str) -> bool {
+    /// Whole-phrase markers, each a verbatim slice of a `Display` impl in
+    /// `duduclaw-cli-runtime::error`. Long enough to be unambiguous in prose.
+    const TRANSPORT_MARKERS: [&str; 16] = [
+        // ── PtyError ──
+        "failed to open pty",
+        "failed to spawn child process",
+        "pty i/o error",
+        "pty closed unexpectedly",
+        "read timed out after",
+        "write timed out after",
+        "background task panicked",
+        // ── SessionError ──
+        "session is currently handling another request",
+        "session has been shut down",
+        "cli returned malformed frame (no sentinel match)",
+        "invoke timed out after",
+        "interactive repl stalled",
+        "interactive repl exceeded hard cap",
+        "boot timed out after",
+        "child process exited during invoke",
+        // ── PoolError ──
+        // `Exhausted` renders "pool capacity exhausted for agent_id={0}";
+        // `ShuttingDown` renders "pool is shutting down". The shared prefix
+        // "pool " plus the distinct tails would need two entries, so match the
+        // unambiguous stem of each below.
+        "pool capacity exhausted for agent_id",
+    ];
+    // `PoolError::ShuttingDown` + the gateway's own empty-payload marker are
+    // matched separately so the array above stays a 1:1 mirror of the enums.
+    const EXTRA_MARKERS: [&str; 2] = [
+        "pool is shutting down",
+        // Gateway-side protocol failure raised in this module when the REPL
+        // returns no usable payload.
+        "pty_runtime: empty payload",
+    ];
+
+    let low = err.to_ascii_lowercase();
+    TRANSPORT_MARKERS.iter().any(|m| low.contains(m))
+        || EXTRA_MARKERS.iter().any(|m| low.contains(m))
 }
 
 /// Returns true when `DUDUCLAW_PTY_DISABLE_RETRY=1` is set. Operators
@@ -499,6 +673,32 @@ pub async fn acquire_for_account_with_model(
 /// Diagnostics — number of cached sessions across all agents.
 pub fn session_count() -> usize {
     PTY_POOL.get().map(|p| p.session_count()).unwrap_or(0)
+}
+
+/// WP10 (2026-08-04) — tear down every cached in-process PTY session.
+///
+/// The out-of-process worker path already had a shutdown chain
+/// (`worker_supervisor::shutdown`, SIGTERM → grace → SIGKILL), but the
+/// in-process `PTY_POOL` had **none**: `PtyPool::shutdown` existed and was
+/// never called by the gateway. Every live interactive `claude` REPL child
+/// was therefore orphaned at gateway exit and survived the restart, so a
+/// wedged install stayed wedged across restarts while accumulating one
+/// detached Node process per pooled session.
+///
+/// Safe to call when the pool was never initialised (no-op) and idempotent —
+/// `PtyPool::shutdown` cancels its own token and drains the session map.
+pub async fn shutdown_pool() {
+    let Some(pool) = PTY_POOL.get() else {
+        return;
+    };
+    let live = pool.session_count();
+    if live > 0 {
+        info!(
+            sessions = live,
+            "pty_runtime: shutting down cached PTY sessions"
+        );
+    }
+    pool.shutdown().await;
 }
 
 /// Phase 7 — switch `acquire_and_invoke` to the out-of-process transport.
@@ -1841,5 +2041,204 @@ mod tests {
         unsafe { std::env::set_var("DUDUCLAW_DISABLE_PTY_POOL", "1") };
         assert_eq!(runtime_mode_for_agent(dir.path()), RuntimeMode::FreshSpawn);
         unsafe { std::env::remove_var("DUDUCLAW_DISABLE_PTY_POOL") };
+    }
+}
+
+// ── WP10 (2026-08-04 field incident) regression tests ────────────────
+#[cfg(test)]
+mod wp10_tests {
+    use super::*;
+    use std::time::{Duration as StdDuration, Instant};
+
+    /// M2: the classifier must mirror the FULL `Display` set of
+    /// `PtyError` / `SessionError` / `PoolError`, not just the strings that
+    /// appeared in one incident log.
+    #[test]
+    fn every_transport_variant_display_is_classified() {
+        use std::time::Duration as D;
+        use duduclaw_cli_runtime::{PoolError, PtyError, SessionError};
+
+        // Constructed from the real enums so a renamed/reworded variant breaks
+        // this test instead of silently falling through to `on_error`.
+        let transport: Vec<String> = vec![
+            PtyError::Closed.to_string(),
+            PtyError::ReadTimeout(D::from_secs(5)).to_string(),
+            PtyError::WriteTimeout(D::from_secs(5)).to_string(),
+            PtyError::OpenPty("no ptmx".into()).to_string(),
+            PtyError::TaskPanicked("boom".into()).to_string(),
+            SessionError::Busy.to_string(),
+            SessionError::Shutdown.to_string(),
+            SessionError::MalformedResponse.to_string(),
+            SessionError::InvokeTimeout(D::from_secs(30)).to_string(),
+            SessionError::BootTimeout(D::from_secs(45)).to_string(),
+            SessionError::ChildExited { code: Some(1) }.to_string(),
+            SessionError::InvokeStall {
+                idle: D::from_secs(120),
+                saw_progress: false,
+            }
+            .to_string(),
+            SessionError::InvokeHardCap {
+                hard_cap: D::from_secs(1800),
+                saw_progress: true,
+            }
+            .to_string(),
+            PoolError::Exhausted("agnes".into()).to_string(),
+            PoolError::ShuttingDown.to_string(),
+        ];
+        for e in &transport {
+            assert!(
+                is_pty_transport_error(e),
+                "unclassified transport error would burn account health: {e}"
+            );
+        }
+    }
+
+    /// The two deliberate exclusions. `CliError` wraps arbitrary CLI output —
+    /// classifying it as transport would let a real rate-limit escape cooldown.
+    #[test]
+    fn cli_reported_errors_stay_account_attributable() {
+        use duduclaw_cli_runtime::SessionError;
+        let rate_limited =
+            SessionError::CliError("rate limit exceeded, retry after 60s".into()).to_string();
+        assert!(
+            !is_pty_transport_error(&rate_limited),
+            "a CLI-reported rate limit must still cool the account down"
+        );
+        let billing = SessionError::CliError("credit balance is too low".into()).to_string();
+        assert!(!is_pty_transport_error(&billing));
+        assert!(!is_pty_transport_error(
+            &SessionError::UnknownCliKind("frobnicator".into()).to_string()
+        ));
+    }
+
+    /// M3: convention #2 — no unanchored substring checks for routing
+    /// decisions. A bare `contains("sentinel")` misfired on ordinary prose.
+    #[test]
+    fn sentinel_matching_is_anchored_to_the_whole_phrase() {
+        // Real protocol failure ⇒ transport.
+        assert!(is_pty_transport_error(
+            "CLI returned malformed frame (no sentinel match)"
+        ));
+        // User content that merely mentions the word ⇒ NOT transport.
+        for benign in [
+            "使用者問 Sentinel-2 衛星影像的解析度",
+            "Sentinel-2 imagery has 10m resolution",
+            "the sentinel value is -1",
+            "claude CLI stream error: sentinel node unreachable",
+        ] {
+            assert!(
+                !is_pty_transport_error(benign),
+                "prose about sentinels must not be treated as a transport failure: {benign}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_errors_are_distinguished_from_account_errors() {
+        // The exact strings the incident log carried.
+        assert!(is_pty_transport_error(
+            "interactive REPL stalled: no substantive progress for 120s (mid_task=false)"
+        ));
+        assert!(is_pty_transport_error(
+            "All accounts exhausted. Last error: interactive REPL stalled: no substantive \
+             progress for 120s (mid_task=true)"
+        ));
+        assert!(is_pty_transport_error(
+            "interactive REPL exceeded hard cap 1800s (mid_task=true)"
+        ));
+        assert!(is_pty_transport_error("boot timed out after 45s"));
+        assert!(is_pty_transport_error(
+            "pty_runtime: empty payload (session marked unhealthy)"
+        ));
+
+        // Genuine account-level failures must still be booked against the
+        // account — otherwise rotation would never cool a bad account down.
+        assert!(!is_pty_transport_error("rate limit exceeded"));
+        assert!(!is_pty_transport_error("credit balance is too low"));
+        assert!(!is_pty_transport_error("Not logged in · Please run /login"));
+        assert!(!is_pty_transport_error("claude CLI not found in PATH"));
+    }
+
+    #[test]
+    fn breaker_trips_only_after_the_configured_streak() {
+        let now = Instant::now();
+        let s0 = DemotionState::default();
+        assert!(!demotion_active(&s0, now));
+
+        let s1 = demotion_after_failure(s0, now);
+        assert_eq!(s1.consecutive_failures, 1);
+        assert!(
+            !demotion_active(&s1, now),
+            "a single wedge must not demote — transient stalls happen"
+        );
+
+        let s2 = demotion_after_failure(s1, now);
+        assert_eq!(s2.consecutive_failures, DEMOTE_AFTER_FAILURES);
+        assert!(demotion_active(&s2, now), "second consecutive wedge demotes");
+    }
+
+    #[test]
+    fn demotion_expires_so_the_agent_self_heals() {
+        let now = Instant::now();
+        let tripped = demotion_after_failure(demotion_after_failure(Default::default(), now), now);
+        assert!(demotion_active(&tripped, now));
+        // Still demoted just before the window closes...
+        assert!(demotion_active(
+            &tripped,
+            now + DEMOTE_WINDOW - StdDuration::from_secs(1)
+        ));
+        // ...and back on the PTY path afterwards. Degradation is bounded.
+        assert!(!demotion_active(&tripped, now + DEMOTE_WINDOW));
+    }
+
+    #[test]
+    fn success_clears_the_streak_for_a_real_agent_id() {
+        let agent = "wp10-streak-agent";
+        record_pty_success(agent); // start clean
+        assert!(!is_agent_demoted(agent));
+        assert!(!record_pty_transport_failure(agent), "1st wedge: no demote");
+        assert!(record_pty_transport_failure(agent), "2nd wedge: demote");
+        assert!(is_agent_demoted(agent));
+        record_pty_success(agent);
+        assert!(
+            !is_agent_demoted(agent),
+            "a clean invoke must restore the configured PTY routing"
+        );
+    }
+
+    #[test]
+    fn demoted_agent_routes_to_fresh_spawn_despite_pty_pool_enabled() {
+        // Regression for the incident's inner loop: agent.toml says PtyPool,
+        // the REPL keeps wedging, and every message paid the stall tax again.
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("wp10-demoted-agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[runtime]\npty_pool_enabled = true\n",
+        )
+        .unwrap();
+
+        record_pty_success("wp10-demoted-agent"); // clean slate
+        assert_eq!(runtime_mode_for_agent(&agent_dir), RuntimeMode::PtyPool);
+
+        record_pty_transport_failure("wp10-demoted-agent");
+        record_pty_transport_failure("wp10-demoted-agent");
+        assert_eq!(
+            runtime_mode_for_agent(&agent_dir),
+            RuntimeMode::FreshSpawn,
+            "a repeatedly-wedged agent must degrade to `claude -p`, not stay dead"
+        );
+
+        record_pty_success("wp10-demoted-agent");
+        assert_eq!(runtime_mode_for_agent(&agent_dir), RuntimeMode::PtyPool);
+    }
+
+    #[tokio::test]
+    async fn shutdown_pool_is_safe_before_init() {
+        // The gateway shutdown chain calls this unconditionally; an
+        // uninitialised pool must be a no-op, never a panic that would abort
+        // the rest of the shutdown sequence.
+        shutdown_pool().await;
     }
 }

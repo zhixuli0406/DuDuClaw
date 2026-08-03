@@ -204,6 +204,18 @@ impl RotationStrategy {
     }
 }
 
+/// WP10 M4 — coarse reason the rotator has nothing to hand out, used purely to
+/// pick the right recovery horizon in the user-facing message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnavailableReason {
+    /// A billing-class cooldown is active (24 h) — recovery is hours away.
+    LongCooldown,
+    /// Rate-limit or transient-error cooldown — recovery is minutes away.
+    ShortCooldown,
+    /// Cannot attribute it to a cooldown; the caller must hedge.
+    Unknown,
+}
+
 /// Public status for monitoring.
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountStatus {
@@ -610,13 +622,31 @@ impl AccountRotator {
         }
     }
 
+    /// Record a generic (non-billing, non-rate-limit) failure for an account.
+    ///
+    /// **WP10 fix (2026-08-04 field incident)**: marking `is_healthy = false`
+    /// used to leave `cooldown_until = None`. `Account::is_available` only
+    /// forgives an unhealthy account once its cooldown has *expired*, so an
+    /// account with no cooldown at all was permanently unavailable — for a
+    /// single-account install that meant every subsequent message failed with
+    /// "All accounts exhausted" until the 5-minute rotator cache happened to
+    /// rebuild or the 60 s health probe managed a successful
+    /// `claude auth status`. Attaching the standard cooldown makes the
+    /// degradation self-healing and bounded.
     pub async fn on_error(&self, account_id: &str) {
         let mut accounts = self.accounts.write().await;
         if let Some(acc) = accounts.iter_mut().find(|a| a.id == account_id) {
             acc.consecutive_errors += 1;
             if acc.consecutive_errors >= 3 {
-                warn!(account = account_id, "Account marked unhealthy after 3 errors");
+                let until = Utc::now() + chrono::Duration::seconds(self.cooldown_seconds as i64);
+                warn!(
+                    account = account_id,
+                    cooldown = self.cooldown_seconds,
+                    "Account marked unhealthy after 3 errors — cooling down (auto-recovers)"
+                );
                 acc.is_healthy = false;
+                // Never shorten an existing (e.g. 24 h billing) cooldown.
+                acc.cooldown_until = Some(acc.cooldown_until.map_or(until, |cur| cur.max(until)));
             }
         }
     }
@@ -651,6 +681,35 @@ impl AccountRotator {
         let mut accounts = self.accounts.write().await;
         for acc in accounts.iter_mut() {
             acc.spent_this_month = 0;
+        }
+    }
+
+    /// WP10 M4 — why is nothing selectable right now?
+    ///
+    /// Called on the "no account available" path so the user-facing message can
+    /// state a realistic recovery horizon instead of one generic sentence. Only
+    /// information already in memory is used; nothing is probed.
+    ///
+    /// The tiers are separated by cooldown length because that IS the recovery
+    /// horizon: billing exhaustion books 24 h, while rate-limit and generic
+    /// errors book `cooldown_seconds` (120 s by default). Anything above an
+    /// hour is therefore billing-class.
+    pub async fn unavailable_reason(&self) -> UnavailableReason {
+        let accounts = self.accounts.read().await;
+        let now = Utc::now();
+        let longest = accounts
+            .iter()
+            .filter(|a| !a.is_available())
+            .filter_map(|a| a.cooldown_until)
+            .filter(|cd| *cd > now)
+            .max();
+        match longest {
+            Some(cd) if (cd - now) > chrono::Duration::hours(1) => UnavailableReason::LongCooldown,
+            Some(_) => UnavailableReason::ShortCooldown,
+            // Unavailable for a non-cooldown reason (expired token, budget
+            // exhausted, unhealthy with no cooldown attached) — or no accounts
+            // at all. Callers must use conservative wording here.
+            None => UnavailableReason::Unknown,
         }
     }
 
@@ -1655,5 +1714,150 @@ mod subscription_oauth_tests {
         assert!(ids.contains(&"openai"));
         assert!(ids.contains(&"github"));
         assert!(ids.contains(&"qwen"));
+    }
+}
+
+// ── WP10 (2026-08-04 field incident) regression tests ────────────────
+#[cfg(test)]
+mod wp10_on_error_recovery_tests {
+    use super::*;
+
+    fn oauth_account(id: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            auth_method: AuthMethod::OAuth,
+            provider: "anthropic".to_string(),
+            priority: 1,
+            monthly_budget_cents: 0,
+            tags: vec![],
+            profile: "default".to_string(),
+            email: String::new(),
+            subscription: "max".to_string(),
+            label: id.to_string(),
+            expires_at: None,
+            api_key: String::new(),
+            // An anthropic OAuth account is only "available" with a setup
+            // token or an OS-keychain credentials dir — mirror the real
+            // single-account install (keychain OAuth, no explicit token).
+            oauth_token: None,
+            credentials_dir: Some(PathBuf::from("/tmp/wp10-fake-credentials")),
+            is_healthy: true,
+            consecutive_errors: 0,
+            spent_this_month: 0,
+            cooldown_until: None,
+            last_used: None,
+            total_requests: 0,
+        }
+    }
+
+    /// The incident shape: ONE OAuth account. Three generic errors used to
+    /// mark it unhealthy with `cooldown_until = None`, and `is_available()`
+    /// only forgives an unhealthy account whose cooldown has EXPIRED — so a
+    /// `None` cooldown meant permanently unavailable, and every later message
+    /// died with "All accounts exhausted".
+    #[tokio::test]
+    async fn single_account_recovers_after_generic_errors() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(oauth_account("oauth-default")).await;
+
+        for _ in 0..3 {
+            rotator.on_error("oauth-default").await;
+        }
+
+        // Unhealthy right now — that part is intended.
+        assert!(
+            rotator.select().await.is_none(),
+            "3 consecutive errors should take the account out of rotation"
+        );
+
+        // ...but the outage must be BOUNDED. A cooldown has to exist, or the
+        // account can never come back on its own.
+        {
+            let accounts = rotator.accounts.read().await;
+            let acc = accounts.iter().find(|a| a.id == "oauth-default").unwrap();
+            assert!(!acc.is_healthy);
+            let cd = acc
+                .cooldown_until
+                .expect("on_error must attach a cooldown so recovery is automatic");
+            assert!(cd > Utc::now(), "cooldown should be in the future");
+        }
+
+        // Simulate the cooldown elapsing: the account becomes available again
+        // with no operator intervention and no gateway restart.
+        {
+            let mut accounts = rotator.accounts.write().await;
+            let acc = accounts.iter_mut().find(|a| a.id == "oauth-default").unwrap();
+            acc.cooldown_until = Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        assert!(
+            rotator.select().await.is_some(),
+            "an expired cooldown must return the sole account to rotation"
+        );
+    }
+
+    /// WP10 M4 — the tier must follow the actual cooldown horizon, because
+    /// "a few minutes" and "up to 24 hours" are what the user plans around.
+    #[tokio::test]
+    async fn unavailable_reason_tiers_by_cooldown_length() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(oauth_account("acc")).await;
+
+        // Healthy ⇒ nothing to attribute.
+        assert_eq!(
+            rotator.unavailable_reason().await,
+            UnavailableReason::Unknown
+        );
+
+        // Rate limit books `cooldown_seconds` (120 s) ⇒ short.
+        rotator.on_rate_limited("acc").await;
+        assert_eq!(
+            rotator.unavailable_reason().await,
+            UnavailableReason::ShortCooldown
+        );
+
+        // Billing books 24 h ⇒ long, and must win over the short window.
+        rotator.on_billing_exhausted("acc").await;
+        assert_eq!(
+            rotator.unavailable_reason().await,
+            UnavailableReason::LongCooldown
+        );
+    }
+
+    /// Unhealthy with no cooldown at all is NOT attributable — the caller must
+    /// hedge rather than promise a horizon it cannot know.
+    #[tokio::test]
+    async fn unavailable_reason_is_unknown_without_a_cooldown() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        let mut acc = oauth_account("acc");
+        acc.is_healthy = false;
+        rotator.push_account_for_test(acc).await;
+        assert_eq!(
+            rotator.unavailable_reason().await,
+            UnavailableReason::Unknown
+        );
+    }
+
+    /// A generic error must never shorten a longer billing cooldown.
+    #[tokio::test]
+    async fn on_error_never_shortens_an_existing_longer_cooldown() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(oauth_account("acc")).await;
+
+        rotator.on_billing_exhausted("acc").await; // 24 h
+        let billing_until = {
+            let accounts = rotator.accounts.read().await;
+            accounts.iter().find(|a| a.id == "acc").unwrap().cooldown_until.unwrap()
+        };
+
+        for _ in 0..3 {
+            rotator.on_error("acc").await; // 120 s — must not win
+        }
+
+        let accounts = rotator.accounts.read().await;
+        let cd = accounts.iter().find(|a| a.id == "acc").unwrap().cooldown_until.unwrap();
+        assert_eq!(
+            cd, billing_until,
+            "a 120s generic cooldown must not override the 24h billing cooldown"
+        );
     }
 }
