@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { parsePredictionMemory, toPercent } from './memory-format';
+import {
+  parsePredictionMemory,
+  toPercent,
+  summarizeMemory,
+  memoryLayerMessageId,
+  memorySourceMessageId,
+} from './memory-format';
 
 describe('parsePredictionMemory', () => {
   it('parses the prediction-deviation telemetry format', () => {
@@ -47,5 +53,104 @@ describe('toPercent', () => {
     expect(toPercent(0)).toBe(0);
     expect(toPercent(1.5)).toBe(100);
     expect(toPercent(-0.2)).toBe(0);
+  });
+});
+
+describe('summarizeMemory', () => {
+  it('returns short single-line content untouched', () => {
+    expect(summarizeMemory('客戶的合約報價是三萬元')).toBe('客戶的合約報價是三萬元');
+  });
+
+  it('keeps only the first non-empty line of a multi-line memory', () => {
+    expect(summarizeMemory('\n\n偏好用繁體中文回覆\n其餘細節在下面\n更多細節')).toBe(
+      '偏好用繁體中文回覆',
+    );
+  });
+
+  it('collapses runs of whitespace', () => {
+    expect(summarizeMemory('報價   是    三萬元')).toBe('報價 是 三萬元');
+  });
+
+  it('cuts a long memory at a sentence boundary when one fits', () => {
+    const long = `${'一'.repeat(30)}。${'二'.repeat(80)}`;
+    const out = summarizeMemory(long, 60);
+    expect(out).toBe(`${'一'.repeat(30)}。`);
+    expect(out.length).toBeLessThan(long.length);
+  });
+
+  it('hard-cuts with an ellipsis when no usable sentence boundary exists', () => {
+    const long = '合'.repeat(200);
+    const out = summarizeMemory(long, 40);
+    expect(out.endsWith('…')).toBe(true);
+    expect(Array.from(out).length).toBe(41);
+  });
+
+  it('never splits a surrogate pair (emoji stay whole)', () => {
+    const out = summarizeMemory('🐾'.repeat(100), 10);
+    // 10 emoji + the ellipsis, and every emoji is still a complete codepoint.
+    expect(Array.from(out)).toHaveLength(11);
+    expect(out.includes('�')).toBe(false);
+    expect(out.startsWith('🐾🐾')).toBe(true);
+  });
+
+  it('keeps a regional-indicator flag whole at the budget boundary', () => {
+    // 🇹🇼 is two codepoints; a codepoint budget of 90 would cut between them
+    // and leave a bare 🇹 behind. As one grapheme the line fits exactly.
+    const line = `${'台'.repeat(89)}🇹🇼`;
+    const out = summarizeMemory(line, 90);
+    expect(out).toBe(line);
+    expect(out).toContain('🇹🇼');
+    expect(out.endsWith('…')).toBe(false);
+  });
+
+  it('keeps a ZWJ family sequence whole at the budget boundary', () => {
+    // 👨‍👩‍👧‍👦 is 7 codepoints (4 emoji + 3 ZWJ) but one grapheme, so 86 + 1
+    // fits where a codepoint budget of 90 would have shredded it into pieces.
+    const line = `${'家'.repeat(86)}👨‍👩‍👧‍👦`;
+    const out = summarizeMemory(line, 90);
+    expect(out).toBe(line);
+    // The sequence survives as a unit at the very end, not as a severed prefix.
+    expect(out.endsWith('👨‍👩‍👧‍👦')).toBe(true);
+    expect(out.endsWith('…')).toBe(false);
+  });
+
+  it('cuts between graphemes, never inside one, when truncation does happen', () => {
+    const line = '🇹🇼'.repeat(20);
+    const out = summarizeMemory(line, 5);
+    expect(out).toBe(`${'🇹🇼'.repeat(5)}…`);
+  });
+});
+
+describe('memoryLayerMessageId', () => {
+  it('maps the cognitive layers to end-user wording keys', () => {
+    expect(memoryLayerMessageId('episodic')).toBe('memory.layer.episodic');
+    expect(memoryLayerMessageId('SEMANTIC')).toBe('memory.layer.semantic');
+    expect(memoryLayerMessageId('procedural')).toBe('memory.layer.procedural');
+  });
+
+  it('returns null for missing or unknown layers so no chip renders', () => {
+    expect(memoryLayerMessageId(undefined)).toBeNull();
+    expect(memoryLayerMessageId('')).toBeNull();
+    expect(memoryLayerMessageId('archival')).toBeNull();
+  });
+});
+
+describe('memorySourceMessageId', () => {
+  it('prefers the source_event mapping', () => {
+    expect(memorySourceMessageId('footprint_distill')).toBe('memory.source.footprint');
+    expect(memorySourceMessageId('user_profile_consolidation')).toBe('memory.source.profile');
+    expect(memorySourceMessageId('decision_resolve')).toBe('memory.source.decision');
+  });
+
+  it('falls back to tags when the origin lives there instead', () => {
+    expect(memorySourceMessageId(undefined, ['reflexion'])).toBe('memory.source.reflexion');
+    expect(memorySourceMessageId('unmapped_pipeline', ['footprint-distill'])).toBe(
+      'memory.source.footprint',
+    );
+  });
+
+  it('falls back to the conversation wording when nothing is stamped', () => {
+    expect(memorySourceMessageId()).toBe('memory.source.conversation');
+    expect(memorySourceMessageId('brand_new_pipeline', ['misc'])).toBe('memory.source.conversation');
   });
 });

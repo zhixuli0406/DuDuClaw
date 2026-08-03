@@ -997,7 +997,15 @@ pub struct EvolutionConfig {
     #[serde(default = "default_true")]
     pub gvu_enabled: bool,
 
-    /// Enable cognitive memory layer with episodic/semantic separation.
+    /// DEPRECATED (D7, 2026-08-04): the cognitive memory layer is now a
+    /// permanent part of the platform and can no longer be switched off.
+    ///
+    /// The field is retained **only** so existing `agent.toml` / `config.toml`
+    /// files that still carry `[evolution] cognitive_memory = …` keep
+    /// deserializing (serde compatibility). Every read path must go through
+    /// [`EvolutionConfig::cognitive_memory_enabled`], which returns `true`
+    /// unconditionally and logs one deprecation warning per process the first
+    /// time a stored `false` is observed.
     #[serde(default = "default_true")]
     pub cognitive_memory: bool,
 
@@ -1145,7 +1153,33 @@ impl EvolutionConfig {
                 || self.skill_auto_activate
                 || self.skill_behavior_monitor_enabled)
     }
+
+    /// Whether the cognitive memory layer is active. **Always `true`** since
+    /// D7 (2026-08-04): cognitive memory is a permanent platform capability,
+    /// not a feature flag.
+    ///
+    /// The deprecated [`Self::cognitive_memory`] field is still parsed for
+    /// backward compatibility with configs written before D7; an explicit
+    /// `false` in such a config is ignored, and the first one observed in this
+    /// process logs a single deprecation warning (further occurrences are
+    /// silent — this is called on every reply path).
+    pub fn cognitive_memory_enabled(&self) -> bool {
+        if !self.cognitive_memory {
+            COGNITIVE_MEMORY_DEPRECATION_WARNED.call_once(|| {
+                tracing::warn!(
+                    "`[evolution] cognitive_memory = false` is deprecated and ignored: \
+                     cognitive memory is always on since 2026-08-04. \
+                     Remove the key from your agent.toml / config.toml."
+                );
+            });
+        }
+        true
+    }
 }
+
+/// One-shot guard so the `cognitive_memory` deprecation warning is logged at
+/// most once per process, however many agents still carry the old key.
+static COGNITIVE_MEMORY_DEPRECATION_WARNED: std::sync::Once = std::sync::Once::new();
 
 /// Read `[evolution] enabled` (the master kill-switch) from an agent's
 /// `agent.toml`, for callsites that don't hold a parsed [`EvolutionConfig`].
@@ -2451,6 +2485,40 @@ mod tests {
         }
         assert_eq!(AgentRole::from_str("front_desk").unwrap(), AgentRole::TeamLeader);
         assert_eq!(AgentRole::from_str("Front Desk").unwrap(), AgentRole::TeamLeader);
+    }
+
+    // ── D7: cognitive memory is always on ──────────────────────────
+
+    /// A pre-D7 config that still says `cognitive_memory = false` must keep
+    /// deserializing (no hard error, no missing-field failure) and must be
+    /// treated as ENABLED — the flag was removed, not honoured.
+    #[test]
+    fn legacy_cognitive_memory_false_parses_and_is_treated_as_on() {
+        let raw = "\
+            skill_auto_activate = true\n\
+            skill_security_scan = true\n\
+            gvu_enabled = false\n\
+            cognitive_memory = false\n";
+        let cfg: EvolutionConfig = toml::from_str(raw).expect("legacy config must still parse");
+        // Raw field preserved (round-trips back to disk untouched)…
+        assert!(!cfg.cognitive_memory, "raw deprecated field is preserved as parsed");
+        // …but the behavioural accessor ignores it.
+        assert!(
+            cfg.cognitive_memory_enabled(),
+            "cognitive memory is always on since D7"
+        );
+        // Unrelated flags still parse normally.
+        assert!(!cfg.gvu_enabled);
+        assert!(cfg.enabled, "master switch defaults to true");
+    }
+
+    /// Absent key ⇒ default true, and the accessor agrees.
+    #[test]
+    fn absent_cognitive_memory_defaults_to_on() {
+        let cfg: EvolutionConfig =
+            toml::from_str("skill_auto_activate = false\nskill_security_scan = true\n").unwrap();
+        assert!(cfg.cognitive_memory);
+        assert!(cfg.cognitive_memory_enabled());
     }
 
     // ── R4: Grok runtime type ──────────────────────────────────────

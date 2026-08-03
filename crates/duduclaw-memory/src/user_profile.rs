@@ -22,9 +22,35 @@ use duduclaw_core::types::{MemoryEntry, MemoryLayer};
 /// from the raw-trait listing so it never recurses into itself.
 const SUMMARY_PREDICATE: &str = "profile_summary";
 
-/// The `subject` value for a user's facts.
+/// Normalize a channel-supplied user id into the durable identity the profile
+/// is keyed on.
+///
+/// WebChat mints `webchat:<owner-tag>:<per-connection-nonce>`; the trailing
+/// segment is re-rolled on every page reload. Keying the profile on the raw id
+/// makes write and read agree *within* one connection and lose everything
+/// between connections — the gap is invisible in a single session and total
+/// across sessions. The owner tag is the durable identity; the connection
+/// nonce is not. Every other channel already supplies a stable id and is
+/// returned unchanged.
+///
+/// `':'` is ASCII, so the byte index used to split is always a char boundary
+/// (no raw mid-char slicing, project convention #1).
+pub fn stable_user_id(user_id: &str) -> &str {
+    const WEBCHAT: &str = "webchat:";
+    let Some(rest) = user_id.strip_prefix(WEBCHAT) else {
+        return user_id;
+    };
+    match rest.rfind(':') {
+        Some(idx) if idx > 0 => &user_id[..WEBCHAT.len() + idx],
+        _ => user_id,
+    }
+}
+
+/// The `subject` value for a user's facts. Normalizing here (rather than at
+/// each call site) keeps every path — record, read, history, MCP tool — keyed
+/// identically by construction.
 pub fn user_subject(user_id: &str) -> String {
-    format!("user:{user_id}")
+    format!("user:{}", stable_user_id(user_id))
 }
 
 /// One currently-valid profile trait.
@@ -35,17 +61,53 @@ pub struct ProfileTrait {
     pub value: String,
 }
 
+/// Default origin for profile writes: an explicit, operator/agent-initiated
+/// `user_profile` record (legacy alias of `user_direct`, trust ceiling 1.0).
+const DEFAULT_PROFILE_ORIGIN: &str = "user_profile";
+
 /// Record (or update) one preference trait about a user. Re-recording the same
 /// `predicate` supersedes the prior value via the temporal chain.
 ///
 /// `origin_trust` in `[0,1]` marks how much to trust the source (channel-derived
 /// facts should be < 1.0); it flows through `store_temporal`'s trust clamp.
+///
+/// Writes are stamped with the `user_profile` origin. Callers whose provenance
+/// is weaker than a deliberate profile write — notably the conversation
+/// distillation pipeline — must use [`record_trait_with_origin`] instead so the
+/// v1.41 trust ceiling for their own origin class applies (a distilled trait
+/// must not launder itself into `user_direct` trust).
 pub async fn record_trait(
     engine: &SqliteMemoryEngine,
     agent_id: &str,
     user_id: &str,
     predicate: &str,
     value: &str,
+    origin_trust: f64,
+) -> Result<String> {
+    record_trait_with_origin(
+        engine,
+        agent_id,
+        user_id,
+        predicate,
+        value,
+        DEFAULT_PROFILE_ORIGIN,
+        origin_trust,
+    )
+    .await
+}
+
+/// [`record_trait`] with an explicit origin class (see
+/// `duduclaw_memory::origin`). `store_temporal` clamps `origin_trust` down to
+/// that class's ceiling, so a low-trust source cannot claim profile-grade
+/// trust however high a value it declares.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_trait_with_origin(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    user_id: &str,
+    predicate: &str,
+    value: &str,
+    origin: &str,
     origin_trust: f64,
 ) -> Result<String> {
     let entry = MemoryEntry {
@@ -65,7 +127,7 @@ pub async fn record_trait(
         subject: Some(user_subject(user_id)),
         predicate: Some(predicate.to_string()),
         object: Some(value.to_string()),
-        origin: Some("user_profile".to_string()),
+        origin: Some(origin.to_string()),
         origin_trust: Some(origin_trust.clamp(0.0, 1.0)),
         ..Default::default()
     };
@@ -263,6 +325,35 @@ mod tests {
             .unwrap();
         let valid = history.iter().filter(|r| r.valid_until.is_none()).count();
         assert_eq!(valid, 1, "exactly one currently-valid summary");
+    }
+
+    #[test]
+    fn stable_user_id_drops_only_the_webchat_connection_nonce() {
+        // WebChat: the trailing per-connection nonce is dropped…
+        assert_eq!(stable_user_id("webchat:owner-alice:1a2b3c4d"), "webchat:owner-alice");
+        // …including when the owner tag itself contains colons.
+        assert_eq!(stable_user_id("webchat:user:alice:1a2b3c4d"), "webchat:user:alice");
+        // Nothing to drop → unchanged.
+        assert_eq!(stable_user_id("webchat:alice"), "webchat:alice");
+        // Every other channel supplies an already-stable id.
+        for id in ["u123", "telegram_88991", "U04ABCDEF", "anonymous"] {
+            assert_eq!(stable_user_id(id), id);
+        }
+    }
+
+    #[tokio::test]
+    async fn webchat_profile_survives_a_reconnect() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        // Recorded on one WebSocket connection…
+        record_trait(&engine, "a", "webchat:alice:aaaa1111", "prefers", "tea", 1.0)
+            .await
+            .unwrap();
+        // …must still be visible after a page reload mints a new nonce.
+        let block = profile_block(&engine, "a", "webchat:alice:bbbb2222")
+            .await
+            .unwrap()
+            .expect("profile must survive the reconnect");
+        assert!(block.contains("tea"), "block: {block}");
     }
 
     #[tokio::test]

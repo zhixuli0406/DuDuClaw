@@ -27,7 +27,6 @@ format = "pretty"  # pretty | json
 # Per-agent overrides go in agent.toml [evolution]; these are global defaults.
 # [evolution]
 # gvu_enabled = true                        # Enable GVU (Generator-Verifier-Updater) loop
-# cognitive_memory = true                   # Episodic/semantic memory layer
 # max_silence_hours = 12.0                  # Silence breaker threshold
 # max_gvu_generations = 3                   # Max attempts per GVU cycle (adaptive up to 7)
 # observation_period_hours = 24.0           # SOUL.md observation window before confirm/rollback

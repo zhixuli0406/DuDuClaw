@@ -1,6 +1,5 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useIntl } from 'react-intl';
-import { Link } from 'react-router';
 import { cn } from '@/lib/utils';
 import {
   api,
@@ -8,7 +7,17 @@ import {
   type MemoryChainEntry,
   type MemoryAtRecord,
 } from '@/lib/api';
-import { parsePredictionMemory, toPercent, type PredictionMemory } from '@/lib/memory-format';
+import { client } from '@/lib/ws-client';
+import { debounceTrailing } from '@/lib/debounce';
+import { useConnectionStore } from '@/stores/connection-store';
+import {
+  parsePredictionMemory,
+  summarizeMemory,
+  memoryLayerMessageId,
+  memorySourceMessageId,
+  toPercent,
+  type PredictionMemory,
+} from '@/lib/memory-format';
 import {
   groupByCategory,
   type MemoryCategoryId,
@@ -33,7 +42,6 @@ import {
   HistoryIcon,
   ChevronDownIcon,
   ChevronUpIcon,
-  ChevronRightIcon,
   Trash2Icon,
   BriefcaseIcon,
   UsersIcon,
@@ -49,16 +57,24 @@ import {
 } from 'lucide-react';
 
 /**
- * MemoryBrowser — the "記憶" surface, laid out the way the 2026-07-30 client
- * feedback asked for (Perplexity's memory page as the reference): a category
- * rail on the left, category cards on the right, and a hover-revealed delete
- * on every row.
+ * MemoryBrowser — the "記憶" surface, rebuilt for WP5a / decision D6
+ * (2026-08-04 client meeting: "make it like Perplexity's memory page").
+ *
+ * Shape: one memory per row, newest first, each row a single-sentence summary;
+ * clicking a row expands the full text plus what the system knows about that
+ * memory — which kind it is, how it was recorded, when, its subject/predicate
+ * and the supersession chain behind it. The category rail on the left stays as
+ * a filter over the same flat list, so the "one row per memory" reading never
+ * changes shape between views.
+ *
+ * Deliberately **no editing** (D6): a memory is either kept or forgotten.
+ * Deleting is a soft delete on the backend (`memory.forget` archives the row),
+ * so a mis-click is recoverable by an operator, but the UI still asks for a
+ * second click before firing.
  *
  * Grouping is deterministic and local (see `lib/memory-category.ts`) — the
  * backend has no topic field and adding an LLM pass per entry would cost on
- * every page view. Deleting is a soft delete on the backend (`memory.forget`
- * archives the row), so a mis-click is recoverable by an operator, but the UI
- * still asks for a second click before firing.
+ * every page view.
  */
 
 /** Icon name (from the category table) → the actual lucide component. */
@@ -76,46 +92,95 @@ const CATEGORY_ICONS: Record<string, typeof BrainIcon> = {
   Boxes: BoxesIcon,
 };
 
-/** How many entries a category card previews before "show all". */
-const CARD_PREVIEW = 5;
+/** Newest first — the default order the memory list is read in (WP5a item 2). */
+function byRecency(a: MemoryEntry, b: MemoryEntry): number {
+  const ta = Date.parse(a.timestamp);
+  const tb = Date.parse(b.timestamp);
+  // Unparseable timestamps sink to the bottom rather than scrambling the list.
+  if (Number.isNaN(ta) && Number.isNaN(tb)) return 0;
+  if (Number.isNaN(ta)) return 1;
+  if (Number.isNaN(tb)) return -1;
+  return tb - ta;
+}
 
 export function MemoryBrowser({ agentId, query }: { agentId: string; query: string }) {
   const intl = useIntl();
+  const connectionState = useConnectionStore((s) => s.state);
   const [entries, setEntries] = useState<ReadonlyArray<MemoryEntry>>([]);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<MemoryCategoryId | 'all'>('all');
-  // Cognitive memory is ON by default — the empty state must not tell users to
-  // "enable" something already running. `false` (explicitly disabled in agent
-  // settings) selects the disabled-variant copy; `null` = unknown/loading.
-  const [cognitiveMemory, setCognitiveMemory] = useState<boolean | null>(null);
 
-  // Browse on agent change.
+  /** Refetch this agent's memories. `showSpinner` is false for background
+   *  refreshes (WP6 live push) so an incoming memory doesn't blank the list
+   *  the user is reading. */
+  const browse = useCallback(
+    async (showSpinner: boolean) => {
+      if (!agentId) return;
+      if (showSpinner) setLoading(true);
+      try {
+        const res = await api.memory.browse(agentId, 200);
+        setEntries([...(res?.entries ?? [])].sort(byRecency));
+      } catch (e) {
+        console.warn('[api]', e);
+        toast.error(
+          intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }),
+        );
+        setEntries([]);
+      } finally {
+        if (showSpinner) setLoading(false);
+      }
+    },
+    [agentId, intl],
+  );
+
+  // Browse on agent change. WP5b / D7 — cognitive memory is always-on now, so
+  // there is no per-agent flag to look up and no "go enable it" empty state.
+  // M3: also keyed on `connectionState`, so a reconnect re-reads once and the
+  // view cannot be stranded on state from before the socket dropped.
   useEffect(() => {
     if (!agentId) return;
-    setLoading(true);
+    if (connectionState !== 'authenticated') return;
     setSelected('all');
-    api.memory.browse(agentId, 200).then((res) => {
-      setEntries(res?.entries ?? []);
-    }).catch((e) => {
-      console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
-      setEntries([]);
-    }).finally(() => setLoading(false));
-    setCognitiveMemory(null);
-    api.agents.inspect(agentId).then((detail) => {
-      setCognitiveMemory(detail?.evolution?.cognitive_memory ?? null);
-    }).catch(() => {
-      // Best-effort — the empty state just falls back to the default copy.
-      setCognitiveMemory(null);
+    void browse(true);
+  }, [agentId, browse, connectionState]);
+
+  // WP6 — data the agent collected or distilled during a channel conversation
+  // used to sit in `memory.db` unseen until reload ("看不到的東西使用者會認為
+  // 它壞掉"). The gateway pushes `memory.changed` on every write path (MCP
+  // `memory_store`, the prediction-driven episodic write on the reply path);
+  // refetch when it concerns the agent on screen. Events carrying no
+  // `agent_id` are treated as "might be this agent" — refetch rather than
+  // risk missing the update. Skipped while a search is active so the push
+  // cannot yank the user's result list out from under them.
+  // M3: gated on `connectionState`, so a dropped socket re-subscribes on
+  // reconnect. The catch-up read itself comes from the browse effect above,
+  // which shares the dependency (same shape as RoutinesPage) — events raised
+  // while the socket was down are gone, so without that re-read the page would
+  // keep showing pre-outage state and look broken.
+  // M4: a distill pass raises one event per persisted fact; debounce the burst
+  // so one pasted document costs one refetch, not a dozen.
+  useEffect(() => {
+    if (!agentId) return;
+    if (connectionState !== 'authenticated') return;
+    const refresh = debounceTrailing(() => void browse(false));
+    const unsubscribe = client.subscribe('memory.changed', (payload) => {
+      const p = (payload ?? {}) as { agent_id?: string | null };
+      if (p.agent_id && p.agent_id !== agentId) return;
+      if (query.trim()) return;
+      refresh();
     });
-  }, [agentId, intl]);
+    return () => {
+      refresh.cancel();
+      unsubscribe();
+    };
+  }, [agentId, query, browse, connectionState]);
 
   const handleSearch = useCallback(async () => {
     if (!query.trim() || !agentId) return;
     setLoading(true);
     try {
       const result = await api.memory.search(agentId, query, 200);
-      setEntries(result?.entries ?? []);
+      setEntries([...(result?.entries ?? [])].sort(byRecency));
     } catch (e) {
       console.warn('[api]', e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
@@ -152,33 +217,22 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
         />
       );
     }
-    // Two empty-state variants: cognitive memory explicitly disabled → explain
-    // and link to settings; otherwise (default-on) → explain that substantive
-    // conversations auto-distill here, with NO enable call-to-action.
-    const disabled = cognitiveMemory === false;
+    // One empty state, written for someone who has never heard of a "memory
+    // layer": say what puts things on this list and what does not.
     return (
       <CollectionPageState
         state="empty"
         icon={BrainIcon}
-        title={intl.formatMessage({
-          id: disabled ? 'memory.empty.memories.disabled' : 'memory.empty.memories',
-        })}
-        action={
-          disabled ? (
-            <Link
-              to="/agents"
-              className="inline-flex items-center gap-1.5 text-sm font-medium text-brand hover:underline"
-            >
-              {intl.formatMessage({ id: 'memory.empty.memories.action' })}
-              <ArrowRightIcon className="size-3.5" />
-            </Link>
-          ) : undefined
-        }
+        title={intl.formatMessage({ id: 'memory.empty.memories' })}
+        description={intl.formatMessage({ id: 'memory.empty.memories.how' })}
       />
     );
   }
 
   const activeBucket = selected === 'all' ? null : buckets.find((b) => b.category.id === selected);
+  // `selected === 'all'` shows every memory in one recency-ordered list; the
+  // rail narrows that same list rather than switching to a different layout.
+  const visible = selected === 'all' ? entries : (activeBucket?.entries ?? []);
 
   return (
     <div className="flex flex-col gap-4 md:flex-row md:items-start md:gap-6">
@@ -189,36 +243,34 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
         onSelect={setSelected}
       />
       <div className="min-w-0 flex-1">
-        {selected === 'all' ? (
-          <div className="grid gap-3 lg:grid-cols-2 2xl:grid-cols-3">
-            {buckets.map((bucket) => (
-              <CategoryCard
-                key={bucket.category.id}
-                bucket={bucket}
-                onShowAll={() => setSelected(bucket.category.id)}
-                onForgotten={handleForgotten}
-              />
-            ))}
-          </div>
-        ) : activeBucket ? (
-          <div className="flex flex-col gap-1.5">
-            <h2 className="flex items-center gap-2 px-2 pb-1 text-sm font-medium text-foreground">
-              <CategoryIcon name={activeBucket.category.icon} className="size-4 text-brand" />
-              {intl.formatMessage({ id: activeBucket.category.label })}
-              <span className="font-mono text-xs tabular-nums text-muted-foreground">
-                {activeBucket.entries.length}
-              </span>
-            </h2>
-            {activeBucket.entries.map((entry) => (
-              <MemoryItem key={entry.id} entry={entry} onForgotten={handleForgotten} />
-            ))}
-          </div>
-        ) : (
+        {visible.length === 0 ? (
           <CollectionPageState
             state="empty"
             icon={BrainIcon}
             title={intl.formatMessage({ id: 'memory.category.empty' })}
           />
+        ) : (
+          <div className="flex flex-col gap-1">
+            <h2 className="flex items-center gap-2 px-2 pb-1 text-sm font-medium text-foreground">
+              {activeBucket ? (
+                <>
+                  <CategoryIcon name={activeBucket.category.icon} className="size-4 text-brand" />
+                  {intl.formatMessage({ id: activeBucket.category.label })}
+                </>
+              ) : (
+                <>
+                  <LayersIcon className="size-4 text-brand" />
+                  {intl.formatMessage({ id: 'memory.list.recent' })}
+                </>
+              )}
+              <span className="font-mono text-xs tabular-nums text-muted-foreground">
+                {visible.length}
+              </span>
+            </h2>
+            {visible.map((entry) => (
+              <MemoryRow key={entry.id} entry={entry} onForgotten={handleForgotten} />
+            ))}
+          </div>
         )}
       </div>
     </div>
@@ -305,79 +357,6 @@ function RailItem({
   );
 }
 
-/** One category as a card: a few entries plus a "show all" affordance. */
-function CategoryCard({
-  bucket,
-  onShowAll,
-  onForgotten,
-}: {
-  bucket: CategoryBucket<MemoryEntry>;
-  onShowAll: () => void;
-  onForgotten: (id: string) => void;
-}) {
-  const intl = useIntl();
-  const preview = bucket.entries.slice(0, CARD_PREVIEW);
-  const rest = bucket.entries.length - preview.length;
-  return (
-    <Card data-size="sm" className="h-full">
-      <CardContent className="space-y-1">
-        <div className="flex items-center gap-2 pb-1">
-          <CategoryIcon name={bucket.category.icon} className="size-4 shrink-0 text-brand" />
-          <h3 className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
-            {intl.formatMessage({ id: bucket.category.label })}
-          </h3>
-          <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
-            {bucket.entries.length}
-          </span>
-        </div>
-        {preview.map((entry) => (
-          <MemoryItem key={entry.id} entry={entry} onForgotten={onForgotten} compact />
-        ))}
-        {rest > 0 && (
-          <button
-            type="button"
-            onClick={onShowAll}
-            className="flex items-center gap-1 px-2 pt-1 text-xs font-medium text-brand hover:underline"
-          >
-            {intl.formatMessage({ id: 'memory.category.showAll' }, { count: rest })}
-            <ChevronRightIcon className="size-3" />
-          </button>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-/**
- * A memory entry. Prediction-deviation telemetry renders as a "learning
- * signal" card; everything else is a slim row with an expandable supersession
- * history and a hover-revealed delete.
- */
-function MemoryItem({
-  entry,
-  onForgotten,
-  compact = false,
-}: {
-  entry: MemoryEntry;
-  onForgotten: (id: string) => void;
-  compact?: boolean;
-}) {
-  const intl = useIntl();
-  const prediction = parsePredictionMemory(entry.content);
-  if (prediction) {
-    if (!compact) {
-      return <PredictionMemoryCard entry={entry} data={prediction} onForgotten={onForgotten} />;
-    }
-    // Inside a category card there is no room for the full card, but the raw
-    // English telemetry string must never reach the user either — summarize it.
-    const summary = `${intl.formatMessage({ id: 'memory.prediction.label' })} · ${toPercent(
-      prediction.expected,
-    )}% → ${toPercent(prediction.inferred)}%`;
-    return <MemoryRow entry={entry} onForgotten={onForgotten} compact displayText={summary} />;
-  }
-  return <MemoryRow entry={entry} onForgotten={onForgotten} compact={compact} />;
-}
-
 function MemoryListSkeleton() {
   return (
     <div className="flex flex-col gap-1.5" role="status" aria-label="Loading">
@@ -447,53 +426,67 @@ function ForgetButton({
   );
 }
 
-/** A single memory entry rendered as a slim row with an expandable history. */
+/**
+ * One memory = one row: a single-sentence summary, when it was recorded, a
+ * delete affordance, and a disclosure that opens the full detail panel. The
+ * whole row is the toggle (the chevron is decorative and marked
+ * `aria-hidden`), so there is one control per row for keyboard users instead
+ * of a summary and a separate button competing for the same job.
+ */
 function MemoryRow({
   entry,
   onForgotten,
-  compact = false,
-  displayText,
 }: {
   entry: MemoryEntry;
   onForgotten: (id: string) => void;
-  compact?: boolean;
-  /** Overrides the row text (used to humanize telemetry-shaped content). */
-  displayText?: string;
 }) {
   const intl = useIntl();
   const [open, setOpen] = useState(false);
-  const text = displayText ?? entry.content;
+  const prediction = parsePredictionMemory(entry.content);
+  // Prediction telemetry is a fixed English string; never show it raw.
+  const summary = prediction
+    ? `${intl.formatMessage({ id: 'memory.prediction.label' })} · ${toPercent(
+        prediction.expected,
+      )}% → ${toPercent(prediction.inferred)}%`
+    : summarizeMemory(entry.content);
+  const layerId = memoryLayerMessageId(entry.layer);
+
   return (
-    <div className="group rounded-lg border border-transparent transition-colors hover:border-surface-border hover:bg-accent/30">
-      <div className="flex h-9 items-center gap-2 px-2">
-        <BrainIcon className="size-4 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate text-sm text-foreground" title={text}>
-          {text}
-        </span>
-        {!compact && entry.tags[0] && (
+    <div
+      className={cn(
+        'group rounded-lg border transition-colors',
+        open
+          ? 'border-surface-border bg-accent/20'
+          : 'border-transparent hover:border-surface-border hover:bg-accent/30',
+      )}
+    >
+      <div className="flex min-h-9 items-center gap-2 px-2">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="flex min-w-0 flex-1 items-center gap-2 py-1.5 text-left"
+        >
+          {open ? (
+            <ChevronUpIcon className="size-4 shrink-0 text-brand" aria-hidden />
+          ) : (
+            <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+          )}
+          <span className="min-w-0 flex-1 truncate text-sm text-foreground">{summary}</span>
+        </button>
+        {layerId && (
           <Badge variant="secondary" className="hidden shrink-0 sm:inline-flex">
-            {entry.tags[0]}
+            {intl.formatMessage({ id: layerId })}
           </Badge>
         )}
         <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
           {timeAgo(entry.timestamp)}
         </span>
         <ForgetButton entry={entry} onForgotten={onForgotten} />
-        {!compact && (
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-expanded={open}
-            aria-label={intl.formatMessage({ id: 'memory.history.toggle' })}
-            onClick={() => setOpen((v) => !v)}
-            className="shrink-0"
-          >
-            {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
-          </Button>
-        )}
       </div>
       {open && (
-        <div className="px-2 pb-2">
+        <div className="space-y-2 px-2 pb-2">
+          <MemoryDetail entry={entry} prediction={prediction} />
           <MemoryHistory agentId={entry.agent_id} memoryId={entry.id} />
         </div>
       )}
@@ -502,69 +495,127 @@ function MemoryRow({
 }
 
 /**
- * Renders a prediction-deviation episodic memory as a human-readable "learning
- * signal" card instead of the raw English telemetry string (which users can't
- * parse). See {@link parsePredictionMemory}.
+ * The expanded half of a row: the memory in full, plus what the system knows
+ * about it — which kind of memory it is, how it came to be recorded, exactly
+ * when, and how often it has been recalled since. Everything is phrased for an
+ * end user; the internal `episodic` / `source_event` vocabulary is translated
+ * in `lib/memory-format.ts`.
  */
-function PredictionMemoryCard({
+function MemoryDetail({
   entry,
-  data,
-  onForgotten,
+  prediction,
 }: {
   entry: MemoryEntry;
-  data: PredictionMemory;
-  onForgotten: (id: string) => void;
+  prediction: PredictionMemory | null;
 }) {
+  const intl = useIntl();
+  const layerId = memoryLayerMessageId(entry.layer);
+  const sourceId = memorySourceMessageId(entry.source_event, entry.tags);
+  const recorded = Number.isNaN(Date.parse(entry.timestamp))
+    ? entry.timestamp
+    : new Date(entry.timestamp).toLocaleString();
+
+  return (
+    <Card data-size="sm">
+      <CardContent className="space-y-3">
+        {prediction ? (
+          <PredictionDetail data={prediction} />
+        ) : (
+          <p className="whitespace-pre-wrap text-sm text-foreground">{entry.content}</p>
+        )}
+
+        <dl className="grid gap-x-4 gap-y-1.5 border-t border-surface-border pt-3 text-xs sm:grid-cols-2">
+          {layerId && (
+            <DetailField
+              label={intl.formatMessage({ id: 'memory.detail.kind' })}
+              value={intl.formatMessage({ id: layerId })}
+            />
+          )}
+          <DetailField
+            label={intl.formatMessage({ id: 'memory.detail.source' })}
+            value={intl.formatMessage({ id: sourceId })}
+          />
+          <DetailField
+            label={intl.formatMessage({ id: 'memory.detail.recorded' })}
+            value={recorded}
+          />
+          {typeof entry.access_count === 'number' && (
+            <DetailField
+              label={intl.formatMessage({ id: 'memory.detail.recalled' })}
+              value={intl.formatMessage(
+                { id: 'memory.detail.recalled.value' },
+                { count: entry.access_count },
+              )}
+            />
+          )}
+        </dl>
+
+        {entry.tags.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {entry.tags.map((tag) => (
+              <Badge key={tag} variant="secondary">
+                {tag}
+              </Badge>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function DetailField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex gap-2">
+      <dt className="shrink-0 text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 break-words text-foreground">{value}</dd>
+    </div>
+  );
+}
+
+/**
+ * A prediction-deviation memory, rendered as a readable "learning signal"
+ * instead of the raw English telemetry string. See {@link parsePredictionMemory}.
+ */
+function PredictionDetail({ data }: { data: PredictionMemory }) {
   const intl = useIntl();
   const expectedPct = toPercent(data.expected);
   const actualPct = toPercent(data.inferred);
   const lower = data.inferred < data.expected;
 
   return (
-    <Card data-size="sm" className="group">
-      <CardContent className="space-y-2.5">
-        <div className="flex items-center justify-between gap-2">
-          <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-brand">
-            <ActivityIcon className="size-3.5 shrink-0" />
-            <span className="truncate">{entry.agent_id}</span>
-            <span className="text-muted-foreground">
-              · {intl.formatMessage({ id: 'memory.prediction.label' })}
-            </span>
-          </span>
-          <span className="flex shrink-0 items-center gap-1 font-mono text-xs tabular-nums text-muted-foreground">
-            <ClockIcon className="size-3" />
-            {timeAgo(entry.timestamp)}
-            <ForgetButton entry={entry} onForgotten={onForgotten} />
-          </span>
-        </div>
-        <p className="text-sm text-foreground">
-          {intl.formatMessage({ id: 'memory.prediction.satisfaction' })}{' '}
-          <span className="tabular-nums text-muted-foreground">{expectedPct}%</span>
-          <ArrowRightIcon className="mx-1 inline size-3 text-muted-foreground" />
-          <span className={cn('font-medium tabular-nums', lower ? 'text-destructive' : 'text-success')}>
-            {actualPct}%
-          </span>
-        </p>
-        <div className="flex flex-wrap gap-1.5">
-          <Badge variant="secondary">
-            {intl.formatMessage({ id: 'memory.prediction.surprise' }, { value: toPercent(data.surprise) })}
+    <div className="space-y-2.5">
+      <span className="flex items-center gap-1.5 text-xs font-medium text-brand">
+        <ActivityIcon className="size-3.5 shrink-0" />
+        {intl.formatMessage({ id: 'memory.prediction.label' })}
+      </span>
+      <p className="text-sm text-foreground">
+        {intl.formatMessage({ id: 'memory.prediction.satisfaction' })}{' '}
+        <span className="tabular-nums text-muted-foreground">{expectedPct}%</span>
+        <ArrowRightIcon className="mx-1 inline size-3 text-muted-foreground" />
+        <span className={cn('font-medium tabular-nums', lower ? 'text-destructive' : 'text-success')}>
+          {actualPct}%
+        </span>
+      </p>
+      <div className="flex flex-wrap gap-1.5">
+        <Badge variant="secondary">
+          {intl.formatMessage({ id: 'memory.prediction.surprise' }, { value: toPercent(data.surprise) })}
+        </Badge>
+        {data.corrected && (
+          <Badge variant="secondary" className="bg-warning/15 text-warning">
+            {intl.formatMessage({ id: 'memory.prediction.corrected' })}
           </Badge>
-          {data.corrected && (
-            <Badge variant="secondary" className="bg-warning/15 text-warning">
-              {intl.formatMessage({ id: 'memory.prediction.corrected' })}
-            </Badge>
-          )}
-          {data.followUp && (
-            <Badge variant="secondary" className="bg-info/15 text-info">
-              {intl.formatMessage({ id: 'memory.prediction.followUp' })}
-            </Badge>
-          )}
-        </div>
-        <p className="text-xs text-muted-foreground">
-          {intl.formatMessage({ id: 'memory.prediction.note' })}
-        </p>
-      </CardContent>
-    </Card>
+        )}
+        {data.followUp && (
+          <Badge variant="secondary" className="bg-info/15 text-info">
+            {intl.formatMessage({ id: 'memory.prediction.followUp' })}
+          </Badge>
+        )}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {intl.formatMessage({ id: 'memory.prediction.note' })}
+      </p>
+    </div>
   );
 }
 
