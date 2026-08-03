@@ -154,10 +154,17 @@ impl ChatCommand {
     /// Safety words that affect agent operation (`!STOP`, `!STOP ALL`, `!RESUME`)
     /// should only be usable by admins to prevent denial-of-service by
     /// arbitrary group members. `!STATUS` is read-only and allowed for all.
+    ///
+    /// `/model <name>` writes `agent.toml` and changes what every subsequent
+    /// turn costs, so it is admin-only too — but only in its *setter* form:
+    /// bare `/model` just reports the current model and stays open to everyone.
     pub fn requires_admin(&self) -> bool {
         matches!(
             self,
-            ChatCommand::SafetyStop | ChatCommand::SafetyStopAll | ChatCommand::SafetyResume
+            ChatCommand::SafetyStop
+                | ChatCommand::SafetyStopAll
+                | ChatCommand::SafetyResume
+                | ChatCommand::Model(Some(_))
         )
     }
 }
@@ -461,24 +468,81 @@ async fn handle_pair(ctx: &ReplyContext, session_id: &str, code: &str) -> String
     }
 }
 
+/// Guard the value that is about to be written into `agent.toml [model]
+/// preferred`. This string is later handed to CLI runtimes as an argument and
+/// stored in a config file, so it is validated as a strict identifier rather
+/// than trusted: model ids are vendor slugs (`claude-opus-5`,
+/// `deepseek-chat`, `gpt-5.1`), never paths, flags or shell text.
+///
+/// Deliberately a *shape* check, not an allow-list: new models appear between
+/// releases, and rejecting a valid one the operator wants would be worse than
+/// letting a typo through — a wrong-but-well-formed id surfaces immediately as
+/// a provider error on the next turn.
+fn validate_model_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("模型名稱不可為空。".to_string());
+    }
+    if name.len() > 64 {
+        return Err("模型名稱過長（上限 64 字元）。".to_string());
+    }
+    if name.starts_with('-') {
+        return Err("模型名稱不可以 `-` 開頭。".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'))
+    {
+        return Err("模型名稱只能包含英數字與 - _ . : / 。".to_string());
+    }
+    Ok(())
+}
+
 async fn handle_model(ctx: &ReplyContext, agent_id: &str, new_model: Option<&str>) -> String {
     let reg = ctx.registry.read().await;
     let agent = reg.get(agent_id).or_else(|| reg.main_agent());
 
     match agent {
         Some(a) => {
-            let current = &a.config.model.preferred;
+            let current = a.config.model.preferred.clone();
+            let resolved_id = a.config.agent.name.clone();
+            // Drop the read guard before the write path re-acquires it.
+            drop(reg);
             match new_model {
                 Some(name) => {
-                    // Show the requested model — actual switching requires config update
-                    format!(
-                        "🔄 Current model: `{current}`\n\
-                         Requested: `{name}`\n\
-                         ⚠️ Model switching via chat is read-only. \
-                         Update `agent.toml [model] preferred` to change."
+                    let name = name.trim();
+                    if name == current {
+                        return format!("🤖 已經在用 `{current}` 了，沒有變更。");
+                    }
+                    if let Err(e) = validate_model_name(name) {
+                        return format!("⚠️ {e}");
+                    }
+                    let target = name.to_string();
+                    match crate::channel_reply::update_agent_toml_with(
+                        &ctx.registry,
+                        &resolved_id,
+                        move |table| {
+                            let model = table
+                                .entry("model")
+                                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                                .as_table_mut()
+                                .ok_or("agent.toml [model] is not a table")?;
+                            model.insert("preferred".into(), toml::Value::String(target));
+                            Ok(())
+                        },
                     )
+                    .await
+                    {
+                        // The rescan is what makes the change take effect now;
+                        // say so plainly when it did not land rather than
+                        // reporting a success the next turn will contradict.
+                        Ok(true) => format!("✅ 已切換模型：`{current}` → `{name}`，下一則訊息就會生效。"),
+                        Ok(false) => format!(
+                            "⚠️ 已寫入設定（`{current}` → `{name}`），但熱重載失敗，要重啟 gateway 才會生效。"
+                        ),
+                        Err(e) => format!("⚠️ 切換失敗：{e}"),
+                    }
                 }
-                None => format!("🤖 Current model: `{current}`"),
+                None => format!("🤖 目前模型：`{current}`\n輸入 `/model <名稱>` 可切換（僅限管理員）。"),
             }
         }
         None => "⚠️ No agent found.".to_string(),
@@ -1319,5 +1383,55 @@ mod tests {
             Some(ChatCommand::SafetyStatus)
         );
         assert_eq!(parse_command("!停止", None), Some(ChatCommand::SafetyStop));
+    }
+}
+
+#[cfg(test)]
+mod model_switch_tests {
+    use super::*;
+
+    /// `/model <name>` writes agent.toml and changes what every turn costs, so
+    /// it must not be usable by an arbitrary group member. Bare `/model` only
+    /// reports, and stays open.
+    #[test]
+    fn setting_a_model_requires_admin_but_reading_does_not() {
+        assert!(ChatCommand::Model(Some("claude-opus-5".into())).requires_admin());
+        assert!(!ChatCommand::Model(None).requires_admin());
+    }
+
+    #[test]
+    fn validate_model_name_accepts_real_vendor_slugs() {
+        for ok in [
+            "claude-opus-5",
+            "claude-sonnet-4-6",
+            "gpt-5.1",
+            "deepseek-chat",
+            "qwen/qwen3-32b",
+            "claude-opus-5[1m]".trim_end_matches(['[', '1', 'm', ']']),
+        ] {
+            assert!(validate_model_name(ok).is_ok(), "rejected {ok}");
+        }
+    }
+
+    #[test]
+    fn validate_model_name_rejects_argument_and_shell_shapes() {
+        // The value ends up as a CLI argument and inside a config file.
+        for bad in [
+            "",
+            "--dangerously-skip-permissions",
+            "model name",
+            "model;rm -rf /",
+            "$(whoami)",
+            "model\nprefer = \"x\"",
+            "../../etc/passwd\0",
+        ] {
+            assert!(validate_model_name(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_model_name_rejects_an_over_long_value() {
+        assert!(validate_model_name(&"a".repeat(65)).is_err());
+        assert!(validate_model_name(&"a".repeat(64)).is_ok());
     }
 }
