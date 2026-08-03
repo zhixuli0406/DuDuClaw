@@ -1,5 +1,6 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { api } from '@/lib/api';
 import { useNavigate, useSearchParams } from 'react-router';
 import {
   Settings,
@@ -81,6 +82,26 @@ export function SettingsPage() {
 
   const t = (id: string) => intl.formatMessage({ id });
 
+  // Surface a waiting update on the rail itself. Joanna's note was "make it
+  // more obvious" — a dot that appears only when an update actually exists is
+  // what makes it findable, whereas permanent emphasis just becomes wallpaper.
+  // Best-effort: a failed check leaves the rail unchanged rather than crying wolf.
+  const [updateWaiting, setUpdateWaiting] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.system
+      .checkUpdate()
+      .then((info) => {
+        if (!cancelled) setUpdateWaiting(Boolean(info?.available));
+      })
+      .catch(() => {
+        /* offline / rate-limited — no badge, no noise */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Rail groups mirror the former everyday / advanced split.
   const navGroups: SettingsNavGroup[] = [
     {
@@ -90,7 +111,12 @@ export function SettingsPage() {
         { value: 'account', label: t('settings.account'), icon: KeyRound },
         { value: 'voice', label: t('settings.voice'), icon: Mic },
         { value: 'proactive', label: t('settings.proactive'), icon: Zap },
-        { value: 'update', label: t('settings.update'), icon: Download },
+        {
+          value: 'update',
+          label: t('settings.update'),
+          icon: Download,
+          ...(updateWaiting ? { badge: 'attention' as const } : {}),
+        },
       ],
     },
     {
