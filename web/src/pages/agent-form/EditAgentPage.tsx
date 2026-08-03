@@ -12,7 +12,6 @@ import {
   type ComputerUseConfig,
   type ContractConfig,
   type RuntimeProvider,
-  type RuntimeDetect,
   type AgentOdooOverride,
 } from '@/lib/api';
 import { ModelSelect } from '@/components/shared/ModelSelect';
@@ -202,26 +201,9 @@ export function EditAgentPage() {
     [],
   );
 
-  // Change 3 — cached runtime.detect result (claude_oauth drives PTY default).
-  const [runtimeDetect, setRuntimeDetect] = useState<RuntimeDetect | null>(null);
-  // True for the session when the PTY-pool toggles were auto-enabled by the
-  // OAuth default-enable materialization (surfaces a hint under the PTY section).
-  const [ptyDefaultedThisSession, setPtyDefaultedThisSession] = useState(false);
-  // One-time guard for the PTY-pool OAuth materialization per agent load — reset
-  // in the agent-load effect so switching agents re-evaluates the default.
-  const ptyDefaultAppliedRef = useRef(false);
-  // Fetch runtime.detect once; errors are non-fatal (treat as not detected, so
-  // the PTY default-enable simply never fires).
-  useEffect(() => {
-    let alive = true;
-    api.runtime
-      .detect()
-      .then((d) => alive && setRuntimeDetect(d))
-      .catch(() => {/* not detected → no PTY-pool default-enable */});
-    return () => {
-      alive = false;
-    };
-  }, []);
+  // (The former `runtime.detect` fetch lived here purely to feed the PTY-pool
+  // default-enable effect removed further down; with that effect gone the call
+  // had no remaining consumer, so it was dropped along with it.)
   // Departments pre-created in the registry (may have no members yet) — merged
   // into the free-input datalist alongside the in-use set below.
   const [registryDepartments, setRegistryDepartments] = useState<string[]>([]);
@@ -342,7 +324,12 @@ export function EditAgentPage() {
         skill_auto_activate: agent.evolution?.skill_auto_activate ?? false,
         skill_security_scan: agent.evolution?.skill_security_scan ?? true,
         gvu_enabled: agent.evolution?.gvu_enabled ?? true,
-        cognitive_memory: agent.evolution?.cognitive_memory ?? true,
+        // WP5b / D7 — always-on, and no longer a writable field: the gateway
+        // dropped `cognitive_memory` from the agents.update allowlist, so this
+        // value is inert on save. A stale `false` left in an agent.toml is
+        // ignored at read time (one deprecation warning), never rewritten.
+        // Kept only so the form's shape still matches the API type.
+        cognitive_memory: true,
         sticker_enabled: agent.sticker?.enabled ?? false,
         sticker_probability: agent.sticker?.probability ?? 0.3,
         sticker_intensity_threshold: agent.sticker?.intensity_threshold ?? 0.7,
@@ -369,8 +356,6 @@ export function EditAgentPage() {
         worker_managed: rt?.worker_managed ?? DEFAULT_RUNTIME.worker_managed,
       });
       setRuntimeDirty(false);
-      ptyDefaultAppliedRef.current = false;
-      setPtyDefaultedThisSession(false);
       setEvoAdv(DEFAULT_EVOLUTION_ADVANCED);
       setEvoAdvDirty(false);
       setCtAdv(DEFAULT_CONTAINER_ADVANCED);
@@ -800,31 +785,14 @@ export function EditAgentPage() {
     };
   }, []);
 
-  // Change 3c — one-time PTY-pool + Worker default-enable. Fires once per agent
-  // load when Claude Code CLI OAuth is detected, the effective runtime provider
-  // is 'claude', api_mode is cli/auto, and pty_pool_enabled was never
-  // materialized in agent.toml (absent from inspect). Marks the runtime section
-  // dirty + bumps the counter so autosave persists it; once written, inspect
-  // returns the explicit value and this never fires again.
-  useEffect(() => {
-    if (!agent || !runtimeDetect || ptyDefaultAppliedRef.current) return;
-    const providerEff = agent.runtime?.provider ?? 'claude';
-    const apiMode = agent.model?.api_mode ?? 'cli';
-    const ptyUnset = agent.runtime?.pty_pool_enabled === undefined;
-    if (
-      runtimeDetect.claude_oauth === true &&
-      providerEff === 'claude' &&
-      (apiMode === 'cli' || apiMode === 'auto') &&
-      ptyUnset
-    ) {
-      ptyDefaultAppliedRef.current = true;
-      setRuntime((prev) => ({ ...prev, pty_pool_enabled: true, worker_managed: true }));
-      setRuntimeDirty(true);
-      setPtyDefaultedThisSession(true);
-      sectionsDirtyRef.current = true;
-      bumpChange();
-    }
-  }, [agent, runtimeDetect, bumpChange]);
+  // WP10 (2026-08-04 field incident): the former "Change 3c" effect silently
+  // wrote `pty_pool_enabled = true` + `worker_managed = true` into agent.toml
+  // the moment an OAuth user merely OPENED this page — autosave persisted it
+  // without any interaction. That contradicted the documented default (PTY pool
+  // off; the Anthropic `claude -p` OAuth block that motivated it was paused on
+  // 2026-06-15 and never took effect), and it put production installs on the
+  // interactive REPL path, where a contended single OAuth account stalls.
+  // The toggles remain available above for deliberate opt-in.
 
   if (loading) {
     return (
@@ -1280,9 +1248,6 @@ export function EditAgentPage() {
               <RowSwitch label={t('agents.runtime.ptyPoolEnabled')} checked={runtime.pty_pool_enabled} onChange={(v) => updateRuntime('pty_pool_enabled', v)} />
               <RowSwitch label={t('agents.runtime.workerManaged')} checked={runtime.worker_managed} onChange={(v) => updateRuntime('worker_managed', v)} />
             </SettingsCard>
-            {ptyDefaultedThisSession && (
-              <p className="rounded-md bg-primary/10 px-3 py-2 text-xs text-primary">{t('agents.runtime.ptyOauthDefault')}</p>
-            )}
           </SettingsSection>
 
           <SettingsSection title={t('settings.container')}>
@@ -1365,7 +1330,12 @@ export function EditAgentPage() {
           <SettingsSection title={t('agents.evo.desc')}>
             <SettingsCard>
               <RowSwitch label={t('agents.edit.gvuEnabled')} description={t('agents.edit.gvuEnabled.help')} checked={form.gvu_enabled ?? true} onChange={(v) => updateField('gvu_enabled', v)} />
-              <RowSwitch label={t('agents.edit.cognitiveMemory')} description={t('agents.edit.cognitiveMemory.help')} checked={form.cognitive_memory ?? false} onChange={(v) => updateField('cognitive_memory', v)} />
+              {/* WP5b / D7 — cognitive memory is now always-on infrastructure,
+                  not a per-agent feature flag, so its toggle is gone. The
+                  gateway no longer accepts `cognitive_memory` in agents.update
+                  either: a stale `cognitive_memory = false` still sitting in an
+                  agent.toml is IGNORED at read time (and logs one deprecation
+                  warning), not rewritten. Nothing here needs to migrate it. */}
               <RowNumber label={t('agents.adv.maxGvuGenerations')} value={form.max_gvu_generations ?? 3} min={0} onChange={(v) => updateField('max_gvu_generations', v)} />
               <RowNumber label={t('agents.adv.observationHours')} value={form.observation_period_hours ?? 24} min={0} step={0.5} onChange={(v) => updateField('observation_period_hours', v)} />
             </SettingsCard>

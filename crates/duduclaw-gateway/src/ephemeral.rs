@@ -302,11 +302,13 @@ pub fn scaffold(home_dir: &Path, spec: &EphemeralSpawnSpec) -> Result<ScaffoldRe
     hb_tbl.insert("cron".into(), toml::Value::String(String::new()));
     table.insert("heartbeat".into(), toml::Value::Table(hb_tbl));
 
+    // D7 (2026-08-04): `cognitive_memory` is no longer written — the layer is
+    // always on, so emitting the key would only bake a dead flag into every
+    // ephemeral agent.toml. Heartbeat / GVU / skill activation stay hard OFF.
     let mut evo_tbl = toml::Table::new();
     evo_tbl.insert("skill_auto_activate".into(), toml::Value::Boolean(false));
     evo_tbl.insert("skill_security_scan".into(), toml::Value::Boolean(true));
     evo_tbl.insert("gvu_enabled".into(), toml::Value::Boolean(false));
-    evo_tbl.insert("cognitive_memory".into(), toml::Value::Boolean(false));
     table.insert("evolution".into(), toml::Value::Table(evo_tbl));
 
     let mut caps_tbl = toml::Table::new();

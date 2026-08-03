@@ -55,3 +55,120 @@ export function parsePredictionMemory(content: string): PredictionMemory | null 
 export function toPercent(ratio: number): number {
   return Math.max(0, Math.min(100, Math.round(ratio * 100)));
 }
+
+/** Sentence terminators we are willing to cut a summary on (CJK + ASCII). */
+const SENTENCE_END = ['。', '！', '？', '；', '\n', '. ', '! ', '? ', '; '];
+
+/**
+ * Lazily-built grapheme segmenter, or `null` where `Intl.Segmenter` is absent.
+ * `undefined` = not probed yet.
+ */
+let graphemeSegmenter: Intl.Segmenter | null | undefined;
+
+/**
+ * Split a string into user-perceived characters.
+ *
+ * Codepoints are not a safe unit to cut on: a 🇹🇼 flag is two regional
+ * indicators and 👨‍👩‍👧‍👦 is seven codepoints joined by ZWJ, so a budget that
+ * lands mid-sequence would leave half a flag or a stray lone emoji behind.
+ * `Intl.Segmenter` with grapheme granularity keeps those clusters whole.
+ *
+ * Where `Intl.Segmenter` is unavailable (very old runtimes) this falls back to
+ * codepoints via `Array.from` — still never splitting a surrogate pair, but a
+ * composed emoji sequence may be cut at an internal boundary.
+ */
+function graphemes(input: string): string[] {
+  if (graphemeSegmenter === undefined) {
+    graphemeSegmenter =
+      typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function'
+        ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+        : null;
+  }
+  if (!graphemeSegmenter) return Array.from(input);
+  return Array.from(graphemeSegmenter.segment(input), (s) => s.segment);
+}
+
+/**
+ * Collapse a memory's stored content into the one-line summary the list row
+ * shows (WP5a / D6: "a list of memories, one line each, expand for detail").
+ *
+ * Rules, in order: take the first non-empty line; if it still exceeds the
+ * budget, cut at the last sentence terminator that fits; otherwise hard-cut and
+ * append an ellipsis. `maxChars` counts grapheme clusters (see
+ * {@link graphemes}), never bytes or UTF-16 indices, so CJK, flags and ZWJ
+ * emoji sequences all survive the cut intact.
+ */
+export function summarizeMemory(content: string, maxChars = 90): string {
+  const firstLine = content
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l.length > 0);
+  const line = (firstLine ?? content.trim()).replace(/\s+/g, ' ');
+  const chars = graphemes(line);
+  if (chars.length <= maxChars) return line;
+
+  const head = chars.slice(0, maxChars).join('');
+  // Prefer a sentence boundary, but only if it keeps a useful amount of text.
+  let cut = -1;
+  for (const t of SENTENCE_END) {
+    const i = head.lastIndexOf(t);
+    if (i > cut) cut = i + t.trimEnd().length;
+  }
+  if (cut >= Math.floor(maxChars * 0.4)) return head.slice(0, cut);
+  return `${head.trimEnd()}…`;
+}
+
+/**
+ * Cognitive layer → i18n message id, in end-user words rather than the internal
+ * `episodic` / `semantic` vocabulary (WP5a item 3). Unknown or missing layers
+ * return `null` so the row simply shows no chip.
+ */
+export function memoryLayerMessageId(layer?: string): string | null {
+  switch (layer?.toLowerCase()) {
+    case 'episodic':
+      return 'memory.layer.episodic';
+    case 'semantic':
+      return 'memory.layer.semantic';
+    case 'procedural':
+      return 'memory.layer.procedural';
+    default:
+      return null;
+  }
+}
+
+/**
+ * Where a memory came from → i18n message id, again in plain words ("noted
+ * from a conversation", not "distillation pipeline"). Anything unrecognized
+ * falls back to the conversation wording, which is true for every write path
+ * that does not stamp an explicit origin.
+ */
+export function memorySourceMessageId(sourceEvent?: string, tags: readonly string[] = []): string {
+  const key = sourceEvent?.toLowerCase() ?? '';
+  const byEvent: Readonly<Record<string, string>> = {
+    footprint_distill: 'memory.source.footprint',
+    prediction_episodic: 'memory.source.prediction',
+    reflexion_consolidation: 'memory.source.reflexion',
+    persona_suppression_induction: 'memory.source.profile',
+    user_profile: 'memory.source.profile',
+    user_profile_consolidation: 'memory.source.profile',
+    decision_capture: 'memory.source.decision',
+    decision_resolve: 'memory.source.decision',
+    agent_mood: 'memory.source.mood',
+  };
+  if (byEvent[key]) return byEvent[key];
+
+  const byTag: Readonly<Record<string, string>> = {
+    'footprint-distill': 'memory.source.footprint',
+    'user-profile': 'memory.source.profile',
+    'profile-summary': 'memory.source.profile',
+    reflexion: 'memory.source.reflexion',
+    'probation-rule': 'memory.source.reflexion',
+    'retired-rule': 'memory.source.reflexion',
+    decision: 'memory.source.decision',
+  };
+  for (const tag of tags) {
+    const hit = byTag[tag.toLowerCase()];
+    if (hit) return hit;
+  }
+  return 'memory.source.conversation';
+}

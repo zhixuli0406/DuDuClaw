@@ -2823,15 +2823,9 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         true
     };
 
-    let enable_cognitive_memory: bool = if !skip_prompts && !quick_mode {
-        Confirm::new()
-            .with_prompt("啟用認知記憶分層？（情節 vs 語意記憶）")
-            .default(true)
-            .interact()
-            .unwrap_or(true)
-    } else {
-        false
-    };
+    // D7 (2026-08-04): cognitive memory is always on — no prompt, no config key.
+    // (The old prompt also defaulted to `false` in quick/headless mode, which
+    // silently shipped memory-less agents.)
 
     // ── Confirm ──────────────────────────────────────────────
     if !skip_prompts {
@@ -2870,7 +2864,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         println!("  ├ 月預算：${}", style(monthly_budget_usd).cyan());
         println!("  ├ 自主進化：{}", style("已啟用（預測驅動）").green());
         if enable_gvu { println!("  │  ├ GVU 博弈：{}", style("已啟用").green()); }
-        if enable_cognitive_memory { println!("  │  └ 認知記憶：{}", style("已啟用").green()); }
+        println!("  │  └ 認知記憶：{}", style("常駐").green());
         if !line_token.is_empty() { println!("  ├ LINE：{}", style("已設定").green()); }
         if !telegram_token.is_empty() { println!("  ├ Telegram：{}", style("已設定").green()); }
         if !discord_token.is_empty() { println!("  ├ Discord：{}", style("已設定").green()); }
@@ -3125,7 +3119,6 @@ allowed_channels = ["*"]
 skill_auto_activate = true
 skill_security_scan = true
 gvu_enabled = {gvu_enabled}
-cognitive_memory = {cognitive_memory}
 max_silence_hours = 12.0
 max_gvu_generations = 3
 observation_period_hours = 24.0
@@ -3133,7 +3126,6 @@ skill_token_budget = 2500
 max_active_skills = 5
 "#,
         gvu_enabled = enable_gvu,
-        cognitive_memory = enable_cognitive_memory,
     );
     tokio::fs::write(&agent_toml_path, agent_toml).await.map_err(|e| {
         DuDuClawError::Config(format!("Failed to write {}: {e}", agent_toml_path.display()))
