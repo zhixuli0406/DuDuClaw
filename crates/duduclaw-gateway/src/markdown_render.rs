@@ -742,6 +742,55 @@ mod tests {
 
     const SAMPLE: &str = "# 標題\n\n這是 **粗體** 與 `code` 和 [連結](https://example.com)。\n\n| 名稱 | 狀態 |\n|------|------|\n| foo | ok |\n| 中文名 | 進行中 |\n\n```rust\nfn main() {}\n```\n\n> 引用文字\n\n- 項目一\n- 項目二";
 
+    /// **WP11-B regression guard (2026-08-04).** A customer's Telegram reply
+    /// arrived with every ASCII space missing while the CJK ran fine, and the
+    /// Telegram render chain was the prime suspect. It is not: this pins that
+    /// `to_telegram_html` (and its siblings) preserve inter-word spaces in
+    /// mixed CJK/English text, in paragraphs, headings, lists, quotes, code
+    /// fences and table cells alike. The spaces are lost upstream — the CLI TUI
+    /// expresses horizontal spacing with cursor-move escapes that
+    /// `duduclaw_cli_runtime::envelope::strip_ansi` removes; see `cli_noise`.
+    #[test]
+    fn renderers_preserve_ascii_spaces_in_mixed_text() {
+        const MIXED: &str = "# Release notes 發佈說明\n\n\
+             Transcript saving is off — 這是內部訊息 with **bold words** and `inline code`。\n\
+             - first item 第一項\n\
+             - second item 第二項\n\n\
+             > quoted sentence 引用句子\n\n\
+             | Name 名稱 | State 狀態 |\n|---|---|\n| deploy job | in progress 進行中 |\n\n\
+             ```sh\necho \"hello world\"\n```";
+        const PHRASES: &[&str] = &[
+            "Release notes",
+            "Transcript saving is off",
+            "bold words",
+            "inline code",
+            "first item",
+            "second item",
+            "quoted sentence",
+            "in progress",
+            "hello world",
+        ];
+        let rendered: Vec<(&str, String)> = vec![
+            ("telegram", to_telegram_html(MIXED)),
+            ("whatsapp", to_whatsapp_text(MIXED)),
+            ("googlechat", to_googlechat_text(MIXED)),
+            ("line", to_line_plain(MIXED)),
+            ("teams", to_teams_markdown(MIXED)),
+            ("discord", preprocess_discord_markdown(MIXED)),
+        ];
+        for (name, out) in &rendered {
+            for phrase in PHRASES {
+                // LINE strips inline markers, so bold/code markers may vanish —
+                // the *words* and the space between them must not.
+                assert!(
+                    out.contains(phrase),
+                    "{name} lost the space in {phrase:?}\n--- rendered ---\n{out}"
+                );
+            }
+            assert!(!out.contains("Transcriptsaving"), "{name} glued words together");
+        }
+    }
+
     #[test]
     fn parse_blocks_structure() {
         let blocks = parse_markdown_blocks(SAMPLE);
