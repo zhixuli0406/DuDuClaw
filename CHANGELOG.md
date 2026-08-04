@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.51.1] - 2026-08-04 — 技能庫回填+更新自動重試+引導名稱
+
 ### Fixed
 - **技能庫頁一片空白**：新 AI 員工本來就該內建 docx／xlsx／pptx／pdf 等技能，但這段
   種子程式只掛在 MCP `create_agent` 一條路徑上。從 dashboard 引導、`duduclaw onboard`
