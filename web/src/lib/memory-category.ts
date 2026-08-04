@@ -130,7 +130,12 @@ const KEYWORDS: Readonly<Record<Exclude<MemoryCategoryId, 'other'>, readonly str
     '匯款', '稅', 'invoice', 'payment', 'budget', 'cost', 'price', 'billing', 'refund',
   ],
   footprint: ['使用時長', '活躍時段', '前景應用程式'],
-  learning: ['prediction deviation', '學習訊號', '預期', '滿意度'],
+  // WP15: telemetry no longer reaches this list at all — the gateway returns it
+  // as a separate `signals` array. Only the unmistakable marker is kept, as a
+  // safety net for an older gateway that still serves one merged list; the
+  // former generic terms ('預期', '滿意度') were dropped because they mis-filed
+  // ordinary memories ("客戶滿意度調查在下週") as machine learning signals.
+  learning: ['prediction deviation', '學習訊號'],
 };
 
 /**

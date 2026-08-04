@@ -361,6 +361,47 @@ fn min_rfc3339(a: String, b: String) -> String {
     }
 }
 
+/// `source_event` values written by the platform's own telemetry pipelines
+/// rather than by anything the user said. **The single source of truth** for
+/// the memory page's "系統學習紀錄 / system learning log" split (WP15).
+///
+/// - `prediction_episodic` — the prediction router's per-turn deviation record
+///   (`crates/duduclaw-gateway/src/prediction/router.rs`), the row the client
+///   saw as "學習訊號 70% → 52%".
+/// - `agent_mood` — the agent's own mood snapshot (`[mood] …`, written by the
+///   `agent_mood` MCP tool).
+///
+/// Everything else — conversation distillation, profile facts, reflexion
+/// rules, decisions, footprint round-ups, manual `memory_store` writes — is
+/// *about the user* and belongs in the main list.
+pub const SYSTEM_SIGNAL_SOURCE_EVENTS: &[&str] = &["prediction_episodic", "agent_mood"];
+
+/// Content prefix of a prediction-deviation record, consulted **only when
+/// `source_event` is empty** — i.e. rows written before the origin was
+/// stamped (older agent DBs carry the same telemetry unattributed).
+/// Deliberately the one and only content sniff in this classification, and
+/// deliberately unreachable for any row that *does* declare an origin: a
+/// stamped `conversation_summary` quoting the telemetry verbatim is a memory
+/// about the user, and the column must be allowed to overrule the text.
+/// Mirrors the `format!` in `duduclaw-gateway/src/prediction/router.rs` and
+/// the frontend regex in `web/src/lib/memory-format.ts`.
+pub const PREDICTION_CONTENT_PREFIX: &str = "Prediction deviation:";
+
+/// True when an entry is platform telemetry rather than a user-facing memory.
+///
+/// `source_event` decides; the content prefix is a fallback for unattributed
+/// rows only. Keep in sync with [`SqliteMemoryEngine::SIGNAL_PREDICATE`], the
+/// SQL form of the same rule — `list_recent_split` filters in SQL (so the row
+/// limit is per-list), while `memory.search` results are partitioned in Rust
+/// with this.
+pub fn is_system_signal(source_event: &str, content: &str) -> bool {
+    let ev = source_event.trim();
+    if !ev.is_empty() {
+        return SYSTEM_SIGNAL_SOURCE_EVENTS.contains(&ev);
+    }
+    content.trim_start().starts_with(PREDICTION_CONTENT_PREFIX)
+}
+
 /// Trimmed `Option<String>` equality used for D1 reaffirm object matching.
 /// `None == None`; a present value never equals an absent one.
 fn object_opt_eq(a: &Option<String>, b: &Option<String>) -> bool {
@@ -1067,6 +1108,67 @@ impl SqliteMemoryEngine {
 
     /// Select clause for all memory columns (qualified with table alias `m.`).
     const SELECT_COLS: &str = "m.id, m.agent_id, m.content, m.timestamp, m.tags, m.layer, m.importance, m.access_count, m.last_accessed, m.source_event";
+
+    /// SQL predicate (on table alias `m`) matching the rows
+    /// [`is_system_signal`] classifies as telemetry. Kept adjacent to that
+    /// function — the two MUST stay in sync, and every test in this module
+    /// that touches the split asserts both agree.
+    ///
+    /// Shape mirrors the Rust branch exactly: a stamped `source_event` decides
+    /// on its own, and only an empty one falls through to the content prefix.
+    /// `GLOB` rather than `LIKE` because `LIKE` is case-insensitive in SQLite
+    /// while Rust's `starts_with` is not; the explicit `ltrim` character set
+    /// matches `trim` / `trim_start`, which strip tabs and newlines too.
+    const SIGNAL_PREDICATE: &str = "(CASE \
+           WHEN ltrim(rtrim(COALESCE(m.source_event, ''), ' '||char(9)||char(10)||char(13)), ' '||char(9)||char(10)||char(13)) <> '' \
+           THEN ltrim(rtrim(m.source_event, ' '||char(9)||char(10)||char(13)), ' '||char(9)||char(10)||char(13)) \
+                IN ('prediction_episodic', 'agent_mood') \
+           ELSE ltrim(COALESCE(m.content, ''), ' '||char(9)||char(10)||char(13)) \
+                GLOB 'Prediction deviation:*' \
+         END)";
+
+    /// Split the `limit` most-recent entries into (user memories, system
+    /// learning signals), newest first, each list capped at `limit`
+    /// independently.
+    ///
+    /// WP15 (2026-08-04 client feedback: "記憶頁滿屏都是學習訊號,記憶還沒更新
+    /// 對嗎?"). A single `list_recent` could not answer that question: the
+    /// prediction router writes one episodic row per Moderate-error turn, so on
+    /// a chatty agent telemetry both *buries* and — because of the `LIMIT` —
+    /// *evicts* the things the user actually told the agent. Splitting in SQL
+    /// means each list gets its own budget: a thousand telemetry rows can no
+    /// longer push a single user memory off the page.
+    pub async fn list_recent_split(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<MemoryEntry>, Vec<MemoryEntry>)> {
+        let conn = self.conn.lock().await;
+        let query = |negate: bool| -> Result<Vec<MemoryEntry>> {
+            let sql = format!(
+                "SELECT {cols} FROM memories AS m \
+                 WHERE m.agent_id = ?1 AND m.quarantined = 0 AND {not}{pred} \
+                 ORDER BY m.timestamp DESC LIMIT ?2",
+                cols = Self::SELECT_COLS,
+                not = if negate { "NOT " } else { "" },
+                pred = Self::SIGNAL_PREDICATE,
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![agent_id, limit as i64], Self::row_to_entry)
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+            }
+            Ok(out)
+        };
+        let memories = query(true)?;
+        let signals = query(false)?;
+        Ok((memories, signals))
+    }
 
 
     /// Return up to `limit` most-recent memory entries for `agent_id`, newest first.
@@ -3473,6 +3575,192 @@ mod tests {
             last_accessed: None,
             source_event: String::new(),
         }
+    }
+
+    // ── WP15: user memories vs. system learning signals ──────────────────
+
+    /// The SQL predicate and the Rust predicate must classify identically —
+    /// `list_recent_split` uses the former, `memory.search` the latter, and a
+    /// drift between them would show telemetry in one surface but not the
+    /// other.
+    #[tokio::test]
+    async fn browse_splits_telemetry_out_of_the_memory_list() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "wp15-agent";
+
+        let mut told = make_entry(agent, "客戶的合約報價是三萬元", vec![]);
+        told.source_event = "conversation_summary".to_string();
+        let told_id = told.id.clone();
+        engine.store(agent, told).await.unwrap();
+
+        let mut deviation = make_entry(
+            agent,
+            "Prediction deviation: expected satisfaction 0.70, inferred 0.52 (delta 0.18). \
+             Topic surprise: 1.00. Corrections: yes. Follow-ups: no.",
+            vec![],
+        );
+        deviation.source_event = "prediction_episodic".to_string();
+        engine.store(agent, deviation).await.unwrap();
+
+        // Same telemetry written before the origin was stamped: `source_event`
+        // is empty, so the content prefix is the only thing left to go on.
+        let legacy = make_entry(
+            agent,
+            "Prediction deviation: expected satisfaction 0.90, inferred 0.40 (delta 0.50). \
+             Topic surprise: 0.10. Corrections: no. Follow-ups: no.",
+            vec![],
+        );
+        engine.store(agent, legacy).await.unwrap();
+
+        // Review counter-example: a *stamped* memory that happens to quote the
+        // telemetry verbatim (a conversation summary about the feature, say) is
+        // a memory about the user. A declared origin overrules the text — the
+        // prefix must never be reachable for an attributed row.
+        let mut quoting = make_entry(
+            agent,
+            "Prediction deviation: expected satisfaction 0.75, inferred 0.61 — 客戶問這行是什麼",
+            vec![],
+        );
+        quoting.source_event = "conversation_summary".to_string();
+        let quoting_id = quoting.id.clone();
+        engine.store(agent, quoting).await.unwrap();
+
+        let mut mood = make_entry(agent, "[mood] focused: shipping WP15", vec![]);
+        mood.source_event = "agent_mood".to_string();
+        engine.store(agent, mood).await.unwrap();
+
+        let (memories, signals) = engine.list_recent_split(agent, 50).await.unwrap();
+        let memory_ids: Vec<&str> = memories.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(memories.len(), 2, "the user-told fact + the quoting summary");
+        assert!(memory_ids.contains(&told_id.as_str()));
+        assert!(
+            memory_ids.contains(&quoting_id.as_str()),
+            "a stamped origin must beat the content prefix"
+        );
+        assert_eq!(signals.len(), 3, "both telemetry origins + the legacy row");
+        // SQL and Rust classifiers agree on every row.
+        for e in &signals {
+            assert!(is_system_signal(&e.source_event, &e.content));
+        }
+        for e in &memories {
+            assert!(!is_system_signal(&e.source_event, &e.content));
+        }
+    }
+
+    /// The reason the split lives in SQL rather than in the dashboard: with one
+    /// shared `LIMIT`, a burst of telemetry evicts real memories entirely.
+    #[tokio::test]
+    async fn telemetry_burst_cannot_evict_user_memories() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "wp15-flood";
+
+        let mut old = make_entry(agent, "老闆喜歡簡短的回覆", vec![]);
+        old.timestamp = Utc::now() - Duration::days(3);
+        let old_id = old.id.clone();
+        engine.store(agent, old).await.unwrap();
+
+        for i in 0..30 {
+            let mut t = make_entry(
+                agent,
+                &format!("Prediction deviation: expected satisfaction 0.7{i}, inferred 0.5."),
+                vec![],
+            );
+            t.source_event = "prediction_episodic".to_string();
+            engine.store(agent, t).await.unwrap();
+        }
+
+        // A limit far smaller than the telemetry volume still surfaces the fact.
+        let (memories, signals) = engine.list_recent_split(agent, 5).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].id, old_id);
+        assert_eq!(signals.len(), 5, "signals get their own budget");
+    }
+
+    #[test]
+    fn system_signal_classifier_is_conservative() {
+        // Curated / conversational origins are never telemetry.
+        for ev in [
+            "",
+            "conversation_summary",
+            "footprint_distill",
+            "reflexion_consolidation",
+            "user_profile",
+            "decision_capture",
+            "curated",
+        ] {
+            assert!(!is_system_signal(ev, "老闆的生日是三月一號"), "{ev}");
+        }
+        // A memory that merely mentions the phrase is not telemetry.
+        assert!(!is_system_signal(
+            "",
+            "客戶問我 Prediction deviation: 是什麼意思"
+        ));
+        assert!(is_system_signal("prediction_episodic", ""));
+        assert!(is_system_signal(" agent_mood ", "[mood] tired"));
+    }
+
+    /// The content prefix is a fallback for *unattributed* rows only — a
+    /// declared origin always decides. Otherwise any memory that quotes the
+    /// telemetry (a summary of a conversation about this very feature) would be
+    /// swept out of the user's list by its own text.
+    #[test]
+    fn content_prefix_only_applies_to_unattributed_rows() {
+        let telemetry = "Prediction deviation: expected satisfaction 0.70, inferred 0.52.";
+        // Stamped as a conversation summary → a memory, whatever the text says.
+        assert!(!is_system_signal("conversation_summary", telemetry));
+        assert!(!is_system_signal("curated", telemetry));
+        // Unattributed with the same text → telemetry from an older write path.
+        assert!(is_system_signal("", telemetry));
+        assert!(is_system_signal("   ", telemetry));
+        // Leading whitespace and case are handled the way the SQL twin does.
+        assert!(is_system_signal("", &format!("\n\t{telemetry}")));
+        assert!(!is_system_signal("", "prediction deviation: lowercased"));
+    }
+
+    /// Row-level proof that the SQL predicate and the Rust predicate agree,
+    /// including on the attributed-but-quoting case that motivated the
+    /// `source_event`-wins rule.
+    #[tokio::test]
+    async fn sql_and_rust_signal_predicates_agree_row_for_row() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "wp15-parity";
+        let telemetry = "Prediction deviation: expected satisfaction 0.70, inferred 0.52.";
+
+        for (source_event, content) in [
+            ("prediction_episodic", telemetry),
+            ("agent_mood", "[mood] focused"),
+            ("", telemetry),
+            ("", "\n  Prediction deviation: leading whitespace"),
+            ("", "prediction deviation: lowercased, not the real format"),
+            ("conversation_summary", telemetry),
+            ("curated", "客戶的合約報價是三萬元"),
+            ("", "老闆的生日是三月一號"),
+            ("footprint_distill", "2026-08-01 活躍時段 Top3"),
+        ] {
+            let mut e = make_entry(agent, content, vec![]);
+            e.source_event = source_event.to_string();
+            engine.store(agent, e).await.unwrap();
+        }
+
+        let (memories, signals) = engine.list_recent_split(agent, 100).await.unwrap();
+        assert_eq!(memories.len() + signals.len(), 9, "no row lost by the split");
+        for e in &signals {
+            assert!(
+                is_system_signal(&e.source_event, &e.content),
+                "SQL called it a signal, Rust did not: {:?} / {:?}",
+                e.source_event,
+                e.content
+            );
+        }
+        for e in &memories {
+            assert!(
+                !is_system_signal(&e.source_event, &e.content),
+                "SQL called it a memory, Rust did not: {:?} / {:?}",
+                e.source_event,
+                e.content
+            );
+        }
+        assert_eq!(signals.len(), 4, "two stamped + two unattributed-with-prefix");
     }
 
     #[test]

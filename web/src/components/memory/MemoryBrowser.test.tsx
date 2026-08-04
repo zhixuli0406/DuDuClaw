@@ -6,15 +6,29 @@ import { renderWithProviders } from '@/test/render';
 import { useConnectionStore } from '@/stores/connection-store';
 import { MemoryBrowser } from './MemoryBrowser';
 
-/** Route each RPC this component issues to a canned response. */
-function mockCalls(entries: unknown[]) {
+/** Route each RPC this component issues to a canned response. `signals` is the
+ *  gateway's WP15 second list — platform learning telemetry, already split out
+ *  of `entries` server-side. */
+function mockCalls(entries: unknown[], signals: unknown[] = []) {
   mockWsClient.call.mockImplementation((method: string) => {
-    if (method === 'memory.browse') return Promise.resolve({ entries });
+    if (method === 'memory.browse') return Promise.resolve({ entries, signals });
     if (method === 'memory.forget') return Promise.resolve({ success: true, forgotten: true });
     if (method === 'memory.history') return Promise.resolve({ subject: '', predicate: '', current_id: null, chain: [] });
     return Promise.resolve({});
   });
 }
+
+/** One prediction-deviation row, exactly as the router writes it. */
+const SIGNAL = {
+  id: 'p1',
+  agent_id: 'agnes',
+  content:
+    'Prediction deviation: expected satisfaction 0.70, inferred 0.52 (delta 0.18). Topic surprise: 1.00. Corrections: yes. Follow-ups: no.',
+  timestamp: '2026-08-03T12:00:00Z',
+  tags: [],
+  layer: 'episodic',
+  source_event: 'prediction_episodic',
+};
 
 const ENTRIES = [
   {
@@ -189,23 +203,36 @@ describe('MemoryBrowser', () => {
     expect(await screen.findByText(/No memory matches "nothing-here"/)).toBeInTheDocument();
   });
 
-  it('humanizes prediction telemetry instead of showing the raw string', async () => {
-    const user = userEvent.setup();
-    mockCalls([
-      {
-        id: 'p1',
-        agent_id: 'agnes',
-        content:
-          'Prediction deviation: expected satisfaction 0.75, inferred 0.61 (delta 0.14). Topic surprise: 1.00. Corrections: yes. Follow-ups: no.',
-        timestamp: '2026-08-03T12:00:00Z',
-        tags: [],
-        layer: 'episodic',
-        source_event: 'prediction_episodic',
-      },
-    ]);
+  // ── WP15: learning telemetry lives in its own section ──────────────────
+
+  it('keeps learning signals out of the memory list', async () => {
+    mockCalls(ENTRIES, [SIGNAL]);
     renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
 
-    const row = await screen.findByText(/Learning signal · 75% → 61%/);
+    // The main list is exactly the three user memories — the telemetry row is
+    // nowhere in it, collapsed or otherwise.
+    const list = (await screen.findByText(/Recent memories/)).parentElement as HTMLElement;
+    expect(within(list).getAllByRole('button', { expanded: false })).toHaveLength(3);
+    expect(within(list).queryByText(/Learning signal/)).not.toBeInTheDocument();
+    // And the rail — which counts the same list — never grows a signals bucket.
+    expect(await screen.findByRole('button', { name: /All\s*3/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Learning signals\s*\d/ })).not.toBeInTheDocument();
+  });
+
+  it('files learning signals under a collapsed system section', async () => {
+    const user = userEvent.setup();
+    mockCalls(ENTRIES, [SIGNAL]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    // Collapsed by default: the count and the plain-words explanation show,
+    // the rows do not.
+    const toggle = await screen.findByRole('button', { name: /System learning log\s*1/ });
+    expect(screen.getByText(/Not things you told me/)).toBeInTheDocument();
+    expect(screen.queryByText(/Learning signal · 70% → 52%/)).not.toBeInTheDocument();
+
+    await user.click(toggle);
+    const row = screen.getByText(/Learning signal · 70% → 52%/);
+    // Even expanded, the raw English telemetry is never shown verbatim.
     expect(screen.queryByText(/Prediction deviation:/)).not.toBeInTheDocument();
 
     await user.click(row);
@@ -213,6 +240,39 @@ describe('MemoryBrowser', () => {
     expect(detail).not.toBeNull();
     expect(within(detail as HTMLElement).getByText('Self-check on how a reply landed')).toBeInTheDocument();
     expect(screen.getByText(/You corrected me/i)).toBeInTheDocument();
+  });
+
+  it('keeps the split while searching', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'memory.search')
+        return Promise.resolve({ entries: [ENTRIES[0]], signals: [SIGNAL] });
+      if (method === 'memory.browse') return Promise.resolve({ entries: [], signals: [] });
+      return Promise.resolve({});
+    });
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="合約" />);
+
+    // A search result set is partitioned the same way a browse is.
+    const list = (await screen.findByText(/Recent memories/)).parentElement as HTMLElement;
+    expect(within(list).getByText('客戶的合約報價是三萬元')).toBeInTheDocument();
+    expect(within(list).queryByText(/Learning signal/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /System learning log\s*1/ })).toBeInTheDocument();
+  });
+
+  it('hides the section entirely when there are no signals', async () => {
+    mockCalls(ENTRIES, []);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+    await screen.findByText(/Recent memories/);
+    expect(screen.queryByText('System learning log')).not.toBeInTheDocument();
+  });
+
+  // The client's exact question — "記憶還沒更新對嗎?" — with telemetry piling up
+  // and nothing remembered. Both halves of the answer have to be on screen.
+  it('shows the empty memory state alongside the signals that are not memories', async () => {
+    mockCalls([], [SIGNAL, { ...SIGNAL, id: 'p2' }]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    expect(await screen.findByText('Nothing remembered yet')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /System learning log\s*2/ })).toBeInTheDocument();
   });
 
   // ── WP6: channel-action → dashboard live feedback ──────────────────────
