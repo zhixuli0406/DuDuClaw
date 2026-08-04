@@ -458,7 +458,33 @@ async fn agentcompanies_round_trip_preserves_identity_soul_skills_hierarchy() {
     assert!(worker_md.contains("kind: agent"));
     assert!(worker_md.contains("slug: worker"));
     assert!(worker_md.contains("reportsTo: boss"));
-    assert!(worker_md.contains("skills:\n  - hello-skill"));
+    // Membership, not position. `scaffold_agent_dir` seeds the bundled skills
+    // (WP19 — every agent-creation path now does, so a migrated team starts
+    // with the same baseline capability as a hand-created one), and the
+    // exporter sorts the list, so `hello-skill` is no longer the first entry.
+    // Anchoring on both newlines keeps this from matching a longer name that
+    // merely starts with `hello-skill`.
+    assert!(
+        worker_md.contains("\n  - hello-skill\n"),
+        "the imported skill must survive the round trip: {worker_md}"
+    );
+    // Pin the seeding as deliberate: a migrated agent gets the bundled skills
+    // too, and the seed is idempotent — it must not have clobbered the
+    // imported `hello-skill` above.
+    let bundled = duduclaw_agent::builtin_skills::BUILTIN_SKILLS
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(
+            duduclaw_agent::builtin_skills::BUILTIN_SKILL_FILES
+                .iter()
+                .map(|(n, _)| *n),
+        );
+    for name in bundled {
+        assert!(
+            worker_md.contains(&format!("\n  - {name}\n")),
+            "a scaffolded agent must also carry the bundled skill `{name}`: {worker_md}"
+        );
+    }
     assert!(worker_md.ends_with(worker_soul));
     let contract_doc =
         std::fs::read_to_string(out.join("agents/boss/docs/contract.md")).unwrap();
