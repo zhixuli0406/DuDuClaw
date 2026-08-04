@@ -109,12 +109,6 @@ This installs a prebuilt binary for your platform (macOS ARM64/x64, Linux x64/AR
 
 > ⚠️ If the install asks you for Rust / MSVC Build Tools and a 1.5-hour compile, you took a wrong turn. That path is "build from source" for contributors; regular users should use the npm command above.
 
-### Homebrew (macOS / Linux)
-
-```bash
-brew install zhixuli0406/tap/duduclaw
-```
-
 ### Build from source
 
 Prerequisites: [Rust](https://rustup.rs/) 1.85+, [Node.js](https://nodejs.org/) 20+.
@@ -140,7 +134,7 @@ pip install duduclaw
 ## Quick start
 
 - **Desktop app**: just open it — the gateway starts automatically and the wizard appears right inside the app.
-- **npm / Homebrew / build from source**:
+- **npm / build from source**:
 
   ```bash
   duduclaw run                  # start everything (gateway + channels + scheduler + dispatcher)

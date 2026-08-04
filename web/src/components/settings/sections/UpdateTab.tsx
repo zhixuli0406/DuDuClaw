@@ -226,15 +226,13 @@ export function UpdateTab() {
                 </div>
               )}
 
-              {/* Homebrew hint */}
+              {/* Homebrew installs: tap is frozen, guide the user to migrate
+                  to npm or the desktop app instead of a stale `brew upgrade`. */}
               {isHomebrew && (
                 <div className="rounded-lg bg-warning/10 p-4 ring-1 ring-inset ring-warning/20">
                   <p className="text-sm text-warning">
                     {intl.formatMessage({ id: 'settings.update.brewHint' })}
                   </p>
-                  <code className="mt-2 block rounded bg-stone-800 px-3 py-2 text-sm text-emerald-400">
-                    brew upgrade {updateInfo.brew_formula ?? 'duduclaw'}
-                  </code>
                 </div>
               )}
 
