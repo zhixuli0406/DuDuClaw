@@ -322,7 +322,30 @@ export interface SkillInfo {
   name: string;
   agent_id?: string;
   content: string;
+  /** Which layer the skill came from: company-wide / department / this staffer. */
+  scope?: 'global' | 'department' | 'agent';
   security_status?: 'pass' | 'warn' | 'fail';
+}
+
+/**
+ * One directory the gateway actually walked while answering `skills.list`.
+ *
+ * Without this an empty list is unfalsifiable from the browser — "no skills
+ * installed" and "the folder I expected isn't the folder that gets read" look
+ * identical. The empty state prints these so a customer can self-diagnose.
+ */
+export interface SkillScanPath {
+  layer: 'global' | 'department' | 'agent';
+  path: string;
+  exists: boolean;
+  count: number;
+}
+
+/** Aggregate (`skills.list` with no `agent_id`) — every layer, every staffer. */
+export interface SkillsListAll {
+  global_skills: SkillInfo[];
+  agents: Array<{ agent_id: string; display_name?: string; skills: SkillInfo[] }>;
+  scanned?: SkillScanPath[];
 }
 
 export interface HeartbeatInfo {
@@ -3427,8 +3450,13 @@ export const api = {
       client.call('shared_wiki.stats') as Promise<SharedWikiStats>,
   },
   skills: {
-    list: (agentId?: string) =>
-      client.call('skills.list', { agent_id: agentId }) as Promise<{ skills: SkillInfo[] }>,
+    list: (agentId: string) =>
+      client.call('skills.list', { agent_id: agentId }) as Promise<{
+        skills: SkillInfo[];
+        scanned?: SkillScanPath[];
+      }>,
+    /** Aggregate across every layer and every staffer (no `agent_id`). */
+    listAll: () => client.call('skills.list', {}) as Promise<SkillsListAll>,
     content: (agentId: string, skillName: string) =>
       client.call('skills.content', {
         agent_id: agentId,
@@ -3527,8 +3555,18 @@ export const api = {
         /** Non-null when a newer binary is already on disk — restart to apply. */
         restart_pending_version?: string | null;
       }>,
+    /**
+     * Installing an update = download + checksum + signature + extract + swap,
+     * and the download stage now retries transient failures twice (5s / 15s
+     * back-off, `updater::DOWNLOAD_RETRY_DELAYS_SECS`) on top of a 300s HTTP
+     * timeout per attempt. The default 30s RPC timeout would abandon a request
+     * the gateway is still working on and paint the button red while the
+     * install actually completed — the shape of the 2026-08-04 "failed once,
+     * worked on retry" field report. 10 minutes covers the worst legitimate
+     * case; the gateway's own timeouts still bound it from the other side.
+     */
     applyUpdate: () =>
-      client.call('system.apply_update', {}) as Promise<{
+      client.call('system.apply_update', {}, false, 600000) as Promise<{
         success: boolean;
         message: string;
         needs_restart: boolean;
@@ -3632,8 +3670,15 @@ export const api = {
       client.call('tools.builtin_catalog') as Promise<{ tools: BuiltinToolEntry[] }>,
   },
   skillMarket: {
+    /** `total_indexed === 0` means the market index itself never loaded (the
+     *  GitHub refresh is best-effort and swallows its error) — a very
+     *  different message than "your query matched nothing". */
     search: (query: string) =>
-      client.call('skills.search', { query }) as Promise<{ skills: SkillIndexEntry[] }>,
+      client.call('skills.search', { query }) as Promise<{
+        skills: SkillIndexEntry[];
+        source?: string;
+        total_indexed?: number;
+      }>,
   },
   models: {
     list: () =>

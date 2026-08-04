@@ -146,6 +146,7 @@ pub mod prompt_compression;
 pub mod prompt_identity;
 pub mod prompt_minimal;
 pub mod protocol;
+pub mod builtin_skills_seed_migration;
 pub mod pty_default_migration;
 pub mod pty_runtime;
 pub mod files_api;

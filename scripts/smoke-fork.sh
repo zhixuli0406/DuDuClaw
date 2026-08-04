@@ -28,7 +28,9 @@ cargo test -p duduclaw-fork --lib --no-fail-fast
 echo "[smoke] (3/5) cargo test cli fork surface (mcp_fork, mcp_fork_exec, planner, builtin_skills)"
 cargo test -p duduclaw-cli --lib mcp_fork --no-fail-fast
 cargo test -p duduclaw-cli --lib mcp_planner --no-fail-fast
-cargo test -p duduclaw-cli --lib builtin_skills --no-fail-fast
+# `builtin_skills` moved to duduclaw-agent so the gateway (which cannot depend
+# on duduclaw-cli) can seed a new staffer from its own creation paths.
+cargo test -p duduclaw-agent --lib builtin_skills --no-fail-fast
 cargo test -p duduclaw-cli --lib "mcp_memory_handlers::tests::cluster" --no-fail-fast
 
 echo "[smoke] (4/5) cargo test durability checkpoint (fork/rewind + persistence)"

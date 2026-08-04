@@ -122,4 +122,115 @@ describe('SkillMarketPage', () => {
     const after = mockWsClient.call.mock.calls.filter((c) => c[0] === 'skills.list').length;
     expect(after).toBe(before + 1);
   });
+
+  // ── "The skill library shows nothing" ────────────────────────────────
+  //
+  // The tab used to open on `agents[0]`, which is whichever agent the
+  // gateway's HashMap yielded first — unrelated to the staffer the customer
+  // actually talks to. Skills sitting on any other staffer were invisible with
+  // no hint that a picker was the reason.
+
+  describe('My Skills', () => {
+    const twoAgents = [
+      { name: 'agnes', display_name: 'Agnes' },
+      { name: 'bruno', display_name: 'Bruno' },
+    ];
+
+    it('defaults to the aggregate view and shows skills from every staffer', async () => {
+      const user = userEvent.setup();
+      mockWsClient.call.mockImplementation((method: string, params?: unknown) => {
+        if (method === 'agents.list') return Promise.resolve({ agents: twoAgents });
+        if (method === 'skills.list') {
+          // The aggregate call carries no agent_id.
+          expect((params as { agent_id?: string } | undefined)?.agent_id).toBeUndefined();
+          return Promise.resolve({
+            global_skills: [{ name: 'company-tone', content: '', scope: 'global' }],
+            agents: [
+              { agent_id: 'agnes', skills: [] },
+              { agent_id: 'bruno', skills: [{ name: 'invoice-ocr', content: '', scope: 'agent' }] },
+            ],
+          });
+        }
+        return Promise.resolve({});
+      });
+
+      renderWithProviders(<SkillMarketPage />);
+      await user.click(screen.getByRole('radio', { name: 'My Skills' }));
+
+      // Belongs to a staffer the old default would never have selected.
+      await waitFor(() => expect(screen.getByText('invoice-ocr')).toBeInTheDocument());
+      expect(screen.getByText('company-tone')).toBeInTheDocument();
+      expect(screen.getByText('Bruno')).toBeInTheDocument();
+    });
+
+    it('names the folders it scanned when the list is empty', async () => {
+      const user = userEvent.setup();
+      mockWsClient.call.mockImplementation((method: string) => {
+        if (method === 'agents.list') return Promise.resolve({ agents: twoAgents });
+        if (method === 'skills.list')
+          return Promise.resolve({
+            global_skills: [],
+            agents: [],
+            scanned: [
+              { layer: 'global', path: '/home/.duduclaw/skills', exists: false, count: 0 },
+              {
+                layer: 'agent',
+                path: '/home/.duduclaw/agents/agnes/SKILLS',
+                exists: true,
+                count: 0,
+              },
+            ],
+          });
+        return Promise.resolve({});
+      });
+
+      renderWithProviders(<SkillMarketPage />);
+      await user.click(screen.getByRole('radio', { name: 'My Skills' }));
+
+      await waitFor(() => expect(screen.getByText('No skills here yet')).toBeInTheDocument());
+      expect(screen.getByText('/home/.duduclaw/skills')).toBeInTheDocument();
+      expect(screen.getByText('does not exist')).toBeInTheDocument();
+      expect(screen.getByText('/home/.duduclaw/agents/agnes/SKILLS')).toBeInTheDocument();
+    });
+
+    it('shows a read failure as an error, not as "you have no skills"', async () => {
+      const user = userEvent.setup();
+      mockWsClient.call.mockImplementation((method: string) => {
+        if (method === 'agents.list') return Promise.resolve({ agents: twoAgents });
+        if (method === 'skills.list') return Promise.reject(new Error('Agent not found: agnes'));
+        return Promise.resolve({});
+      });
+
+      renderWithProviders(<SkillMarketPage />);
+      await user.click(screen.getByRole('radio', { name: 'My Skills' }));
+
+      await waitFor(() =>
+        expect(screen.getByText('Could not read the skill list')).toBeInTheDocument(),
+      );
+      expect(screen.getByText(/Agent not found: agnes/)).toBeInTheDocument();
+      expect(screen.queryByText('No skills here yet')).not.toBeInTheDocument();
+    });
+  });
+
+  // A market index that never loaded returns zero hits for every query, which
+  // is indistinguishable from "nothing matched" unless we read `total_indexed`.
+  it('distinguishes an unloaded market index from an empty result set', async () => {
+    const user = userEvent.setup();
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'skills.search') return Promise.resolve({ skills: [], total_indexed: 0 });
+      return Promise.resolve({});
+    });
+
+    renderWithProviders(<SkillMarketPage />);
+    await user.click(screen.getByText('security'));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          'The market index has not loaded — check the connection to GitHub and try again.',
+        ),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText('No matching skills found')).not.toBeInTheDocument();
+  });
 });
