@@ -95,6 +95,19 @@ describe('AppSidebar (Multica shell)', () => {
     // AI 員工 is back on Personal too (2026-08-04, D11 overturns the
     // 2026-07-29 decision to hide the roster).
     expect(screen.getByRole('link', { name: /^Agents$/i })).toBeInTheDocument();
+    // WP14 client-annotated order: 新對話 → 例行工作 → 技能庫 → 記憶 → AI 員工
+    // → 世界. Read straight off the rendered rail, so a reshuffle in
+    // `nav-model` cannot silently drift from what the client signed off.
+    const order = screen
+      .getAllByRole('link')
+      .map((el) => el.textContent?.trim())
+      .filter(Boolean) as string[];
+    const seq = ['New chat', 'Routines', 'Skills', 'Memory', 'Agents', 'World'];
+    const positions = seq.map((l) => order.indexOf(l));
+    // Every one of the six must actually be on the rail — otherwise a -1 would
+    // let this assertion pass while the row was missing entirely.
+    expect(positions.every((i) => i >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
     // Still hidden on Personal: pet studio (desktop-only, and jsdom is not Tauri).
     expect(screen.queryByRole('link', { name: /Pet studio/i })).not.toBeInTheDocument();
 
@@ -102,6 +115,56 @@ describe('AppSidebar (Multica shell)', () => {
     await user.click(screen.getByText(/^Advanced$/));
     expect(screen.getByRole('link', { name: /Task Board/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Reports/i })).toBeInTheDocument();
+  });
+
+  // WP14 (2026-08-04) — the two editions must present the same six surfaces in
+  // the same order. This is the Enterprise half of the pair; the Personal half
+  // is asserted in the personal-IA case above, using the same rendered-order
+  // read so neither can drift without the other failing.
+  it('enterprise edition: 公司 group follows the same 技能庫→記憶→AI 員工→世界 order', () => {
+    useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
+    renderSidebar();
+    const order = screen
+      .getAllByRole('link')
+      .map((el) => el.textContent?.trim())
+      .filter(Boolean) as string[];
+    const seq = ['Skills', 'Memory', 'Agents', 'World', 'Team'];
+    const positions = seq.map((l) => order.indexOf(l));
+    // -1 guard: a missing row would otherwise sneak through as "sorted".
+    expect(positions.every((i) => i >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
+    // 例行工作 leads 工作 and 任務看板 closes it — the Enterprise stand-in for
+    // folding the board into 進階.
+    expect(order.indexOf('Routines')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Routines'));
+    expect(order.indexOf('Routines')).toBeLessThan(order.indexOf('Reports'));
+    expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Reports'));
+  });
+
+  // WP14 (2026-08-04): the footer cost chip is gone; the slot now answers
+  // "which build am I on?" from the gateway's own `system.status`.
+  it('shows the running version in the footer instead of a spend figure', () => {
+    useSystemStore.setState({
+      status: { edition_profile: 'enterprise', version: '1.51.0' } as never,
+    });
+    renderSidebar();
+    expect(screen.getByText('v1.51.0')).toBeInTheDocument();
+    // No dollar figure anywhere in the rail any more.
+    expect(screen.queryByText(/^\$\d/)).not.toBeInTheDocument();
+  });
+
+  // Before the gateway handshake lands, `system.status` is null. The footer must
+  // stay silent rather than render a bare "v" or the literal "undefined" — the
+  // classic shape of this bug.
+  it('renders no version text at all while the gateway status is unknown', () => {
+    useSystemStore.setState({ status: null } as never);
+    const { container } = renderSidebar();
+    expect(screen.queryByText(/^v\d/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^v$/)).not.toBeInTheDocument();
+    expect(container.textContent).not.toContain('undefined');
+    expect(container.textContent).not.toContain('NaN');
+    // The rest of the footer card still renders — only the version line is gone.
+    expect(screen.getByText('Lv —')).toBeInTheDocument();
   });
 
   it('opens the command palette from the search trigger', async () => {

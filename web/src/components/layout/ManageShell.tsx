@@ -88,9 +88,13 @@ export function ManageShell() {
   // 進階設定 holds everything that isn't one of the four promoted surfaces
   // (2026-08-04, D18). Its sub-list unfolds only while the viewer is inside the
   // subtree — the rail stays five rows tall the rest of the time.
+  // Matched against the UNGATED list on purpose: a viewer who deep-links to a
+  // surface their edition hides from the rail (e.g. Personal → /manage/security)
+  // should still see 進階設定 lit rather than a rail that claims they are
+  // nowhere.
   const inAdvanced =
     location.pathname.startsWith('/manage/advanced') ||
-    advanced.some((i) => location.pathname.startsWith(i.to));
+    manageAdvancedNav.some((i) => location.pathname.startsWith(i.to));
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">

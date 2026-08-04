@@ -269,21 +269,63 @@ export function SidebarHeader({
   );
 }
 
+/** Fade depth (px) applied to whichever edge still has content scrolled past it. */
+const SIDEBAR_FADE_PX = 12;
+
+/**
+ * Scrollable nav body.
+ *
+ * The soft edge fade is applied ONLY to an edge that actually has more content
+ * beyond it. It used to be unconditional, which permanently washed out the top
+ * 12px of the first nav row even when nothing was scrolled — the very first row
+ * (新對話) looked clipped/obscured, reported by the client on 2026-08-04 as
+ * 「上方被擋住」. A fade is an affordance for hidden content; with no hidden
+ * content it is just damage.
+ */
 export function SidebarContent({
   className,
   style,
+  onScroll,
   ...props
 }: ComponentPropsWithoutRef<'div'>) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [edges, setEdges] = useState({ top: false, bottom: false });
+
+  const measure = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const top = el.scrollTop > 1;
+    const bottom = el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+    setEdges((prev) => (prev.top === top && prev.bottom === bottom ? prev : { top, bottom }));
+  }, []);
+
+  useEffect(() => {
+    measure();
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    // Nav groups collapse/expand and the staff zone loads async — the scroll
+    // extent changes without a scroll event, so observe the box too.
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    for (const child of Array.from(el.children)) ro.observe(child);
+    return () => ro.disconnect();
+  }, [measure]);
+
+  const top = edges.top ? `${SIDEBAR_FADE_PX}px` : '0';
+  const bottom = edges.bottom ? `calc(100% - ${SIDEBAR_FADE_PX}px)` : '100%';
+  const mask = `linear-gradient(to bottom, transparent 0, #000 ${top}, #000 ${bottom}, transparent 100%)`;
+
   return (
     <div
+      ref={ref}
       data-slot="sidebar-content"
-      style={{
-        maskImage:
-          'linear-gradient(to bottom, transparent 0, #000 12px, #000 calc(100% - 12px), transparent 100%)',
-        WebkitMaskImage:
-          'linear-gradient(to bottom, transparent 0, #000 12px, #000 calc(100% - 12px), transparent 100%)',
-        ...style,
+      data-fade-top={edges.top ? '' : undefined}
+      data-fade-bottom={edges.bottom ? '' : undefined}
+      onScroll={(e) => {
+        measure();
+        onScroll?.(e);
       }}
+      style={{ maskImage: mask, WebkitMaskImage: mask, ...style }}
       className={cn(
         'flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2',
         className

@@ -167,15 +167,36 @@ export function AccountsPage() {
             <RefreshCw />
             {intl.formatMessage({ id: 'accounts.rotate' })}
           </Button>
-          <Button variant="outline" size="sm" onClick={() => setPickerOpen(true)}>
-            <LogIn />
-            {intl.formatMessage({ id: 'accounts.cliLogin' })}
-          </Button>
           <Button variant="brand" size="sm" onClick={() => setShowAddDialog(true)}>
             <Plus />
             {intl.formatMessage({ id: 'accounts.add' })}
           </Button>
         </div>
+      </div>
+
+      {/*
+        一鍵登入 hero (2026-08-04, WP14). It used to be a small outline button
+        wedged between 輪換 and 新增 above the budget tiles — the one thing every
+        new user must do, dressed as the least important control on the page and
+        buried in a spend readout. It now opens the page as a full-width card
+        with room for what it actually does.
+      */}
+      <div className="flex flex-wrap items-center gap-4 rounded-xl border border-brand/30 bg-brand/8 p-4">
+        <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-brand/15 text-brand">
+          <LogIn className="size-5" />
+        </span>
+        <div className="min-w-56 flex-1">
+          <p className="text-sm font-medium text-foreground">
+            {intl.formatMessage({ id: 'accounts.cliLogin.heroTitle' })}
+          </p>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {intl.formatMessage({ id: 'accounts.cliLogin.pickHint' })}
+          </p>
+        </div>
+        <Button variant="brand" onClick={() => setPickerOpen(true)}>
+          <LogIn />
+          {intl.formatMessage({ id: 'accounts.cliLogin' })}
+        </Button>
       </div>
 
       {/* CLI picker for one-click login */}

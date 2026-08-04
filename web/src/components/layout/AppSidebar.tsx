@@ -27,8 +27,6 @@ import { hasMinRole } from '@/lib/roles';
 import { filterVisible } from '@/lib/nav-visibility';
 import { useForksExist } from '@/hooks/useForksExist';
 import { useEffectiveName, useEffectiveLogo } from '@/lib/branding';
-import { useTodayCost } from '@/components/growth/useTodayCost';
-import { CoinChip } from '@/components/ui';
 import {
   SidebarHeader,
   SidebarContent,
@@ -398,14 +396,23 @@ function SearchTrigger({ collapsed }: { collapsed: boolean }) {
   );
 }
 
-/** Footer edition card carrying today's spend + company level (spec §5.1). */
+/**
+ * Footer edition card: edition badge + company level, closed by the running
+ * version number.
+ *
+ * 2026-08-04 (WP14 client annotation) the running-total spend chip was removed
+ * from here. A dollar figure parked in the corner of every screen reads as a
+ * meter running against you, and the number people actually needed from that
+ * spot — "which build am I on?" — was nowhere in the UI. Spend itself is
+ * unchanged and still lives on 管理 → 進階設定 → 帳務.
+ */
 function EditionCard() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const role = useAuthStore((s) => s.user?.role);
-  const canSeeCost = hasMinRole(role, 'manager');
-  const { cents, mode } = useTodayCost({ enabled: canSeeCost });
   const companyLevel = useGrowthStore((s) => s.snapshot?.level ?? null);
+  // The gateway's own version, from `system.status` — the same build that is
+  // serving this dashboard, not whatever the bundle was compiled against.
+  const version = useSystemStore((s) => s.status?.version ?? null);
 
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-sidebar-border p-2">
@@ -422,12 +429,13 @@ function EditionCard() {
             : `Lv.${companyLevel}`}
         </button>
       </div>
-      {canSeeCost && cents !== null && mode !== 'loading' && (
-        <CoinChip
-          cents={cents}
-          onClick={() => navigate('/manage/billing')}
-          title={`${intl.formatMessage({ id: mode === 'today' ? 'hud.cost.today' : 'hud.cost.cumulative' })} · ${intl.formatMessage({ id: 'nav.billing' })}`}
-        />
+      {version && (
+        <p
+          className="px-0.5 font-mono text-[10px] leading-none tabular-nums text-sidebar-foreground/60"
+          title={intl.formatMessage({ id: 'sidebar.version' }, { version })}
+        >
+          v{version}
+        </p>
       )}
     </div>
   );
