@@ -360,8 +360,14 @@ pub async fn decide_from_channel(
         Err(e) => return Some(Err(format!("開啟使用者資料庫失敗：{e}"))),
     };
 
-    // Map the clicking channel account → a dashboard user (verified link only).
-    let user_id = match db.find_user_id_by_channel(channel, channel_user_id) {
+    // Map the clicking channel account → a dashboard user. VERIFIED links only:
+    // the doc comment always claimed this, but the lookup it used
+    // (`find_user_id_by_channel`) deliberately also returns *pending* rows so
+    // the OTP flow can find the binding it is about to confirm. An unverified
+    // row means "someone typed this channel id into the binding form" — with
+    // the old call, filing an unverified binding against a manager/admin
+    // account was enough to inherit their approval rights from that chat.
+    let user_id = match db.find_verified_user_id_by_channel(channel, channel_user_id) {
         Ok(Some(uid)) => uid,
         Ok(None) => {
             return Some(Err(

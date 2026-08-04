@@ -176,6 +176,31 @@ impl UserDb {
         .map_err(|e| format!("channel lookup failed: {e}"))
     }
 
+    /// Reverse lookup restricted to **verified** bindings — the only form
+    /// admissible as an authenticated identity.
+    ///
+    /// [`Self::find_user_id_by_channel`] deliberately also returns *pending*
+    /// (unverified) rows because the OTP flow itself must find the row it is
+    /// about to verify. Any caller doing an authorization decision must use
+    /// THIS method instead: an unverified row is merely "someone typed this
+    /// channel id into the binding form", which must never be treated as proof
+    /// of who is on the other end.
+    pub fn find_verified_user_id_by_channel(
+        &self,
+        channel: &str,
+        channel_user_id: &str,
+    ) -> Result<Option<String>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT user_id FROM channel_identities
+             WHERE channel = ?1 AND channel_user_id = ?2 AND verified = 1",
+            params![channel, channel_user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("channel lookup failed: {e}"))
+    }
+
     /// All verified channel identities for a user (login targets).
     pub fn verified_channels_for_user(&self, user_id: &str) -> Result<Vec<ChannelIdentity>, String> {
         let conn = self.conn();
@@ -605,6 +630,33 @@ mod tests {
         assert!(db
             .bind_channel_identity(&victim.id, "telegram", "tg-shared", true)
             .is_ok());
+    }
+
+    #[test]
+    fn verified_only_lookup_ignores_pending_bindings() {
+        let db = db();
+        let u = db
+            .create_user("u@example.com", "U", "pw-unused-123456", UserRole::Employee)
+            .unwrap();
+        // A pending (unverified) binding: the OTP flow must still find it…
+        db.bind_channel_identity(&u.id, "telegram", "tg-pending", false).unwrap();
+        assert_eq!(
+            db.find_user_id_by_channel("telegram", "tg-pending").unwrap(),
+            Some(u.id.clone())
+        );
+        // …but it is NOT an authenticated identity.
+        assert_eq!(
+            db.find_verified_user_id_by_channel("telegram", "tg-pending")
+                .unwrap(),
+            None
+        );
+        // Once verified, both agree.
+        db.bind_channel_identity(&u.id, "telegram", "tg-pending", true).unwrap();
+        assert_eq!(
+            db.find_verified_user_id_by_channel("telegram", "tg-pending")
+                .unwrap(),
+            Some(u.id)
+        );
     }
 
     #[test]

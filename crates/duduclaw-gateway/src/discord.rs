@@ -1968,6 +1968,41 @@ async fn handle_component_interaction(
         return;
     }
 
+    // Generic ApprovalBroker buttons (WP20): every `approvals.db` gate.
+    if matches!(action, "approval_ok" | "approval_no") {
+        let discord_uid = data["user"]["id"]
+            .as_str()
+            .or_else(|| data["member"]["user"]["id"].as_str())
+            .unwrap_or("");
+        let outcome = if discord_uid.is_empty() {
+            Some(Err("無法識別點擊者身分".to_string()))
+        } else {
+            crate::approval_notify::decide_from_channel(
+                &ctx.home_dir, "discord", discord_uid, custom_id,
+            )
+            .await
+        };
+        match outcome {
+            Some(Ok(m)) => {
+                let original = data["message"]["content"].as_str().unwrap_or("");
+                let content = if original.is_empty() { m } else { format!("{original}\n\n{m}") };
+                send_interaction_response(http, interaction_id, interaction_token, 7, Some(json!({
+                    "content": content,
+                    "components": [],
+                }))).await;
+            }
+            Some(Err(m)) => {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral(format!("⚠️ {m}")))).await;
+            }
+            None => {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral("⚠️ 無效的核准動作".to_string()))).await;
+            }
+        }
+        return;
+    }
+
     // Goal-loop buttons (P2a): needs_human retry/done/abort + autonomy kickoff.
     if matches!(
         action,

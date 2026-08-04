@@ -821,6 +821,28 @@ async fn handle_interactive_envelope(
         }
     }
 
+    // Generic ApprovalBroker buttons (WP20): every `approvals.db` gate.
+    if !slack_uid.is_empty() {
+        if let Some(result) = crate::approval_notify::decide_from_channel(
+            &ctx.home_dir, "slack", slack_uid, action_id,
+        )
+        .await
+        {
+            match result {
+                Ok(m) => {
+                    let original = payload["message"]["text"].as_str().unwrap_or("");
+                    let text = if original.is_empty() { m } else { format!("{original}\n\n{m}") };
+                    replace_original_via_response_url(http, response_url, &text).await;
+                }
+                Err(m) => {
+                    respond_via_response_url(http, response_url, "ephemeral", &format!("⚠️ {m}"))
+                        .await;
+                }
+            }
+            return;
+        }
+    }
+
     // Goal-loop buttons (P2a): needs_human retry/done/abort + autonomy kickoff.
     if !slack_uid.is_empty() {
         if let Some(result) = crate::goal_notify::decide_from_channel(

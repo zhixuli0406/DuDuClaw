@@ -13636,6 +13636,21 @@ impl MethodHandler {
         } else {
             rec.built_by_agent.clone()
         };
+        // WP20 note — this `.await` now also performs the channel push that
+        // tells a human the approval exists (`ApprovalBroker::request` →
+        // `approval_notify`). That makes this RPC wait on a bot API call,
+        // bounded at 15s by `NOTIFY_TIMEOUT`.
+        //
+        // The trade-off was taken deliberately, in this direction: detaching
+        // the push (as `spawn_install_notify` does) would return "submitted"
+        // before anything was actually delivered, and a silent delivery failure
+        // is precisely the bug WP20 exists to remove — the operator would again
+        // learn nothing until the TTL auto-denied. Blocking keeps the failure
+        // visible in the same call the user is watching. Submitting a skill for
+        // review is a deliberate, low-frequency action, so a worst-case 15s is
+        // acceptable here; if this ever moves onto a hot path, push the send
+        // into a task and surface delivery status separately rather than
+        // silently dropping it.
         let approval_id = match broker
             .request(
                 &agent_for_approval,
