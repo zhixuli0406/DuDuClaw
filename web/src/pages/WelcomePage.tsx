@@ -12,6 +12,7 @@ import {
 } from '@/lib/api';
 import { formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAuthStore } from '@/stores/auth-store';
 import { useTourStore } from '@/stores/tour-store';
 import { Card, Button, Badge, Input, Textarea } from '@/components/mds';
 import { Field, CompletionBadge, RuntimeSetupCard } from '@/components/onboarding';
@@ -103,6 +104,13 @@ interface WizardState {
   readonly genericModel: string;
   readonly genericKey: string;
   readonly localModel: string;
+  /**
+   * What the product should call the PERSON using it (optional). Distinct from
+   * `displayName`, which names the AI employee being created. Saved onto the
+   * signed-in account's `display_name` so the dashboard greeting stops saying
+   * 「晚安 Administrator」 (2026-08-04 client report, WP18-C).
+   */
+  readonly ownerName: string;
   readonly displayName: string;
   readonly agentId: string;
   readonly trigger: string;
@@ -118,6 +126,7 @@ const INITIAL: WizardState = {
   genericModel: '',
   genericKey: '',
   localModel: DEFAULT_LOCAL_MODEL,
+  ownerName: '',
   displayName: '',
   agentId: '',
   trigger: '',
@@ -579,7 +588,25 @@ export function WelcomePage() {
       warned = true;
     }
 
-    // 5. Refresh roster so FirstRunGate lets the app through, then offer tour.
+    // 5. Save 「怎麼稱呼你」 onto the signed-in account (WP18-C). Reuses the
+    // existing `users.update` RPC — no new field, no new schema — and mirrors
+    // the result into the auth store so the greeting is right on the very first
+    // render of the dashboard instead of after the next reload.
+    const me = useAuthStore.getState().user;
+    const ownerName = state.ownerName.trim();
+    if (ownerName && me && ownerName !== me.display_name) {
+      try {
+        await api.users.update({ user_id: me.id, display_name: ownerName });
+        useAuthStore
+          .getState()
+          .setUser({ ...me, display_name: ownerName }, useAuthStore.getState().bindings);
+      } catch {
+        // Optional nicety — never worth blocking or warning about. The greeting
+        // simply keeps its fallback, and 管理 → 使用者 can set it later.
+      }
+    }
+
+    // 6. Refresh roster so FirstRunGate lets the app through, then offer tour.
     try {
       await fetchAgents();
     } catch {
@@ -983,6 +1010,23 @@ export function WelcomePage() {
           {/* Step 4 — create the first AI staff member */}
           {step === 4 && (
             <Card className="p-4">
+              {/* Optional, and asked first because it is about the human, not
+                  the AI employee: without it a fresh install greets its owner
+                  as 「Administrator」 (the seeded DB placeholder). Skipping
+                  keeps the existing warm fallback. */}
+              <Field
+                label={intl.formatMessage({ id: 'welcome.identity.ownerName' })}
+                help={intl.formatMessage({ id: 'welcome.identity.ownerName.hint' })}
+              >
+                <Input
+                  type="text"
+                  value={state.ownerName}
+                  onChange={(e) => patch({ ownerName: e.target.value })}
+                  placeholder={intl.formatMessage({ id: 'welcome.identity.ownerName.placeholder' })}
+                  maxLength={64}
+                />
+              </Field>
+
               {/* Template picker — CEO by default, front-desk when an industry is staged. */}
               {roster && roster.roles.some((r) => r.kind === 'ceo' || r.kind === 'front_desk') && (
                 <Field label={intl.formatMessage({ id: 'welcome.template.title' })}>

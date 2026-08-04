@@ -554,14 +554,7 @@ export function AppSidebar() {
           </SidebarMenu>
         </SidebarGroup>
 
-        {/* 對話紀錄 — recent conversations, directly under 新對話 (2026-07-30). */}
-        <ConversationsZone
-          collapsed={collapsed}
-          sectionCollapsed={isSectionCollapsed('navGroup.conversations')}
-          onToggle={() => toggleSection('navGroup.conversations')}
-        />
-
-        {/* Personal 主區 — the remaining flat rows, below the conversations. */}
+        {/* Personal 主區 — the remaining flat rows. */}
         {isPersonal && personalRow.length > 0 && (
           <SidebarGroup>
             <SidebarMenu>
@@ -572,28 +565,9 @@ export function AppSidebar() {
           </SidebarGroup>
         )}
 
-        {isPersonal ? (
-          /* Personal IA (2026-07-29): no 工作/公司 groups, no staff zone —
-             設定 (collapsed) then 進階 (collapsed) close the rail. */
-          <>
-            <NavGroupSection
-              label={navGroups[2].label}
-              items={settingsItems}
-              badgeFor={badgeFor}
-              collapsed={collapsed}
-              sectionCollapsed={isSectionCollapsed(navGroups[2].label)}
-              onToggle={() => toggleSection(navGroups[2].label)}
-            />
-            <NavGroupSection
-              label={personalAdvancedGroup.label}
-              items={advancedItems}
-              badgeFor={badgeFor}
-              collapsed={collapsed}
-              sectionCollapsed={isSectionCollapsed(personalAdvancedGroup.label)}
-              onToggle={() => toggleSection(personalAdvancedGroup.label)}
-            />
-          </>
-        ) : (
+        {/* Enterprise working area — 工作 / LIVE 員工 / 公司. Personal has no
+            equivalent: its six primary surfaces are the flat row above. */}
+        {!isPersonal && (
           <>
             <NavGroupSection
               label={navGroups[0].label}
@@ -618,16 +592,41 @@ export function AppSidebar() {
               sectionCollapsed={isSectionCollapsed(navGroups[1].label)}
               onToggle={() => toggleSection(navGroups[1].label)}
             />
-
-            <NavGroupSection
-              label={navGroups[2].label}
-              items={settingsItems}
-              badgeFor={badgeFor}
-              collapsed={collapsed}
-              sectionCollapsed={isSectionCollapsed(navGroups[2].label)}
-              onToggle={() => toggleSection(navGroups[2].label)}
-            />
           </>
+        )}
+
+        {/* 對話紀錄 — moved out from under 新對話 to just above 設定 on
+            2026-08-04 (WP18-B client feedback). Leading the rail with a list of
+            past conversation titles pushed the six annotated primary surfaces
+            (例行工作 → … → 世界) down the page; the history is a "what was I
+            just doing" lookup, so it belongs at the tail of the working area.
+            One slot, both editions — the rail order must not fork. */}
+        <ConversationsZone
+          collapsed={collapsed}
+          sectionCollapsed={isSectionCollapsed('navGroup.conversations')}
+          onToggle={() => toggleSection('navGroup.conversations')}
+        />
+
+        {/* 設定 closes the rail on both editions… */}
+        <NavGroupSection
+          label={navGroups[2].label}
+          items={settingsItems}
+          badgeFor={badgeFor}
+          collapsed={collapsed}
+          sectionCollapsed={isSectionCollapsed(navGroups[2].label)}
+          onToggle={() => toggleSection(navGroups[2].label)}
+        />
+
+        {/* …with Personal's collapsed 進階 group after it (2026-07-29 IA). */}
+        {isPersonal && (
+          <NavGroupSection
+            label={personalAdvancedGroup.label}
+            items={advancedItems}
+            badgeFor={badgeFor}
+            collapsed={collapsed}
+            sectionCollapsed={isSectionCollapsed(personalAdvancedGroup.label)}
+            onToggle={() => toggleSection(personalAdvancedGroup.label)}
+          />
         )}
       </SidebarContent>
 

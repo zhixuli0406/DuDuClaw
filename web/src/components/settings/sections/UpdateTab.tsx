@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
+import { client } from '@/lib/ws-client';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
@@ -12,11 +13,45 @@ import {
 import { RowSwitch } from '@/pages/agent-form/form-rows';
 import { RefreshCw, Download, CheckCircle, XCircle } from 'lucide-react';
 
+/**
+ * Should the failure box add 「通常是網路或發布傳播延遲，稍後再試」?
+ *
+ * Only for download-stage failures — the ones the gateway already retried twice
+ * (`updater::FailureClass::Transient`) before surfacing them, where waiting
+ * genuinely is the fix. Deliberately an ALLOWLIST of the download-stage message
+ * shapes (`updater::fetch_asset_bytes`) rather than a denylist of integrity
+ * errors: an unrecognised failure gets no advice instead of possibly-wrong
+ * advice, and telling someone to "try again later" after a checksum or
+ * signature mismatch would paper over exactly the case that must fail closed.
+ */
+export function showsNetworkHint(message: string): boolean {
+  // NOT anchored: the caller prefixes the gateway text with a localised
+  // 「更新失敗: 」, so an anchored pattern would never match in practice.
+  if (/download failed:/i.test(message)) return true;
+  if (/Failed to read (Update archive|Checksum file|Signature file)/i.test(message)) return true;
+  const http = message.match(/download returned HTTP (\d{3})/i);
+  // Mirrors `updater::classify_http_status` — a 410 Gone is a permanent answer
+  // and must not be dressed up as "the release hasn't propagated yet".
+  if (http) return RETRYABLE_HTTP.has(Number(http[1])) || Number(http[1]) >= 500;
+  return false;
+}
+
+/** Non-5xx statuses the gateway treats as retryable (`classify_http_status`). */
+const RETRYABLE_HTTP = new Set([403, 404, 408, 425, 429]);
+
+/** Live download-retry state pushed by the gateway during an install. */
+interface RetryState {
+  attempt: number;
+  maxAttempts: number;
+}
+
 export function UpdateTab() {
   const intl = useIntl();
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState('');
+  /** Non-null only while the gateway is on a RETRY (attempt ≥ 2). */
+  const [retry, setRetry] = useState<RetryState | null>(null);
   const [installed, setInstalled] = useState(false);
   const [autoUpdate, setAutoUpdate] = useState(false);
   const [edition, setEdition] = useState('community');
@@ -47,10 +82,24 @@ export function UpdateTab() {
   // [H1] useRef guard prevents double-click race — declared before handleCheck
   const installingRef = useRef(false);
 
+  // The gateway retries a failed download twice (5s / 15s back-off). Without
+  // this the button would sit on a silent "安裝中…" for up to 20 extra seconds
+  // and then flash red, which is exactly what made the 2026-08-04 field report
+  // read as "it just failed" — the user had no way to know a retry was running.
+  useEffect(() =>
+    client.subscribe('system.update_progress', (payload) => {
+      const p = payload as { attempt?: number; max_attempts?: number };
+      if (typeof p?.attempt !== 'number' || typeof p?.max_attempts !== 'number') return;
+      // Attempt 1 is the ordinary first try — nothing to announce.
+      setRetry(p.attempt > 1 ? { attempt: p.attempt, maxAttempts: p.max_attempts } : null);
+    }),
+  []);
+
   const handleCheck = useCallback(async () => {
     if (installingRef.current) return; // [R2:NM4] block check during install
     setChecking(true);
     setError('');
+    setRetry(null);
     setInstalled(false);
     setUpdateInfo(null); // [R2:NL3] clear stale data immediately
     try {
@@ -72,6 +121,7 @@ export function UpdateTab() {
     installingRef.current = true;
     setInstalling(true);
     setError('');
+    setRetry(null);
     try {
       const result = await api.system.applyUpdate();
       if (result.success) {
@@ -84,6 +134,7 @@ export function UpdateTab() {
       setError(`${intl.formatMessage({ id: 'settings.update.failed' })}${msg ? `: ${msg}` : ''}`);
     } finally {
       setInstalling(false);
+      setRetry(null);
       installingRef.current = false;
     }
   };
@@ -140,9 +191,17 @@ export function UpdateTab() {
       {error && (
         <div className="rounded-lg bg-destructive/10 p-4 ring-1 ring-inset ring-destructive/20">
           <div className="flex items-center gap-2">
-            <XCircle className="h-5 w-5 text-destructive" />
+            <XCircle className="h-5 w-5 shrink-0 text-destructive" />
             <span className="text-sm text-destructive">{error}</span>
           </div>
+          {/* The gateway already retried twice before this landed. Say what the
+              remaining likely cause is — but never on an integrity failure,
+              where "try again later" would be the wrong thing to do. */}
+          {showsNetworkHint(error) && (
+            <p className="mt-2 pl-7 text-xs text-destructive/80">
+              {intl.formatMessage({ id: 'settings.update.failedHint' })}
+            </p>
+          )}
         </div>
       )}
 
@@ -263,9 +322,14 @@ export function UpdateTab() {
                   className="w-full py-3"
                 >
                   <Download />
-                  {installing
-                    ? intl.formatMessage({ id: 'settings.update.installing' })
-                    : intl.formatMessage({ id: 'settings.update.install' })}
+                  {!installing
+                    ? intl.formatMessage({ id: 'settings.update.install' })
+                    : retry
+                      ? intl.formatMessage(
+                          { id: 'settings.update.retrying' },
+                          { attempt: retry.attempt, total: retry.maxAttempts },
+                        )
+                      : intl.formatMessage({ id: 'settings.update.installing' })}
                 </Button>
               )}
             </>

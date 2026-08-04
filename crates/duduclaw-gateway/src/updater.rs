@@ -125,6 +125,12 @@ pub async fn on_disk_version() -> Option<String> {
 
 /// Maximum download + decompressed binary size: 200 MB. [H5][R2:NC2]
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+/// Back-off between download retries, in seconds. Length + 1 = max attempts
+/// (2026-08-04 field report: a v1.50.0 → v1.51.0 install failed with a red
+/// error seconds after the release was published, and the very next manual
+/// click succeeded — GitHub asset propagation lag / a dropped connection).
+/// Applies ONLY to download-class failures; integrity failures never retry.
+const DOWNLOAD_RETRY_DELAYS_SECS: [u64; 2] = [5, 15];
 /// Maximum release notes length: 8 KB. [M1]
 const MAX_RELEASE_NOTES_CHARS: usize = 8192;
 /// Binary verification timeout. [R2:NL1]
@@ -178,6 +184,104 @@ pub struct ApplyResult {
     pub success: bool,
     pub message: String,
     pub needs_restart: bool,
+}
+
+/// Progress signal emitted while an update is being applied, so the dashboard
+/// can say "下載中（重試 1/3）" instead of sitting on a silent spinner and then
+/// flashing red. Purely informational — never carries a decision.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateProgress {
+    /// Machine-readable stage: currently only `"downloading"`.
+    pub phase: &'static str,
+    /// 1-based attempt number (1 = first try, ≥2 = retry).
+    pub attempt: u32,
+    /// Total attempts this stage will make before giving up.
+    pub max_attempts: u32,
+}
+
+/// Callback type for [`apply_update_with_progress`].
+pub type ProgressSink<'a> = &'a (dyn Fn(UpdateProgress) + Send + Sync);
+
+/// Whether a failed update stage may be retried.
+///
+/// The split is the whole point of the retry feature: a flaky download is worth
+/// another attempt, a failed *integrity* check never is — retrying past a bad
+/// checksum or a bad Ed25519 signature would turn a fail-closed security gate
+/// into "try until it slips through". [S1][C1]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    /// Network / HTTP / release-propagation failure — safe to retry.
+    Transient,
+    /// Integrity or permanent failure — must surface immediately.
+    Fatal,
+}
+
+/// A stage failure carrying its retry classification.
+#[derive(Debug, Clone)]
+struct StageError {
+    class: FailureClass,
+    message: String,
+}
+
+impl StageError {
+    fn transient(message: impl Into<String>) -> Self {
+        Self { class: FailureClass::Transient, message: message.into() }
+    }
+    fn fatal(message: impl Into<String>) -> Self {
+        Self { class: FailureClass::Fatal, message: message.into() }
+    }
+}
+
+/// Classify an unsuccessful HTTP status from a release-asset fetch.
+///
+/// 404 is deliberately transient here: the dashboard only ever downloads a URL
+/// the gateway itself resolved from the release, so "asset not there yet"
+/// means propagation lag, not a wrong URL. 403 covers expired signed CDN URLs
+/// and secondary rate limits; 5xx / 408 / 425 / 429 are the usual suspects.
+fn classify_http_status(status: reqwest::StatusCode) -> FailureClass {
+    if status.is_server_error() {
+        return FailureClass::Transient;
+    }
+    match status.as_u16() {
+        403 | 404 | 408 | 425 | 429 => FailureClass::Transient,
+        _ => FailureClass::Fatal,
+    }
+}
+
+/// Run `op` until it succeeds, a [`FailureClass::Fatal`] error surfaces, or the
+/// attempts run out. `delays` holds the back-off before each RETRY, so
+/// `max_attempts = delays.len() + 1`. `on_attempt(attempt, max_attempts)` fires
+/// before every attempt (including the first) for UI progress.
+async fn with_retries<T, F, Fut>(
+    delays: &[u64],
+    on_attempt: &(dyn Fn(u32, u32) + Send + Sync),
+    mut op: F,
+) -> Result<T, StageError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T, StageError>>,
+{
+    let max_attempts = delays.len() as u32 + 1;
+    let mut attempt = 1u32;
+    loop {
+        on_attempt(attempt, max_attempts);
+        match op(attempt).await {
+            Ok(v) => return Ok(v),
+            Err(e) if e.class == FailureClass::Transient && attempt < max_attempts => {
+                let delay = delays.get((attempt - 1) as usize).copied().unwrap_or(15);
+                warn!(
+                    attempt,
+                    max_attempts,
+                    retry_in_secs = delay,
+                    error = %e.message,
+                    "Update download failed — retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +574,18 @@ pub async fn check_update() -> Result<UpdateInfo, String> {
 // Apply update
 // ---------------------------------------------------------------------------
 
+/// Apply an update without progress reporting (CLI / auto-update loop).
 pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<ApplyResult, String> {
+    apply_update_with_progress(download_url, checksum_url, &|_| {}).await
+}
+
+/// Apply an update, reporting download attempts through `on_progress` so the
+/// dashboard can show "下載中（重試 N/M）" while a transient failure is retried.
+pub async fn apply_update_with_progress(
+    download_url: &str,
+    checksum_url: &str,
+    on_progress: ProgressSink<'_>,
+) -> Result<ApplyResult, String> {
     // [C2] Concurrency guard
     if UPDATE_IN_PROGRESS
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -557,98 +672,24 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
 
-    // Download archive
-    let resp = client
-        .get(download_url)
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Download returned HTTP {}", resp.status()));
-    }
-
-    // [H5] Size limit
-    if let Some(len) = resp.content_length() {
-        if len > MAX_DOWNLOAD_BYTES {
-            return Err(format!("Download too large: {len} bytes (limit: {MAX_DOWNLOAD_BYTES})"));
-        }
-    }
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read download: {e}"))?;
-
-    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
-        return Err(format!("Download exceeded size limit: {} bytes", bytes.len()));
-    }
-
-    info!(size = bytes.len(), "Download complete");
-
-    // [C1][R2:NH2] SHA-256 checksum verification — HARD FAIL
-    // (empty checksum_url already rejected at function entry [R3:H1])
-    info!("Verifying SHA-256 checksum...");
-    let checksum_resp = client
-        .get(checksum_url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch checksum file: {e}"))?;
-
-    if !checksum_resp.status().is_success() {
-        return Err(format!(
-            "Checksum file unavailable (HTTP {}) — refusing update without integrity verification",
-            checksum_resp.status()
-        ));
-    }
-
-    let checksum_text = checksum_resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read checksum: {e}"))?;
-
-    // Scan tokens for the first 64-char hex digest so both `shasum`
-    // ("<hash>  <file>") and PowerShell `Format-List` ("Hash : <HASH>")
-    // sidecar formats parse.
-    let expected = extract_sha256_token(&checksum_text)
-        .ok_or_else(|| "Checksum file has invalid format (no SHA-256 digest found)".to_string())?;
-    let computed = format!("{:x}", Sha256::digest(&bytes));
-
-    if computed != expected {
-        return Err(format!(
-            "SHA-256 checksum mismatch!\n  Expected: {expected}\n  Computed: {computed}"
-        ));
-    }
-    info!("SHA-256 checksum verified");
-
-    // [S1] minisign Ed25519 signature verification — HARD FAIL.
-    // The public key is pinned in the binary, so this holds even if the
-    // GitHub release (and its .sha256 sidecar) is attacker-controlled.
+    // [S1] minisign signature URL is derived, not client-supplied — validate
+    // it before any network work so a bad shape fails fast, not mid-retry.
     let signature_url = format!("{download_url}.minisig");
     if !is_valid_download_url(&signature_url) {
         return Err(format!("Rejected unsafe signature URL: {signature_url}"));
     }
-    info!("Verifying Ed25519 signature...");
-    let sig_resp = client
-        .get(&signature_url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch signature file: {e}"))?;
 
-    if !sig_resp.status().is_success() {
-        return Err(format!(
-            "Signature file unavailable (HTTP {}) — refusing unsigned update",
-            sig_resp.status()
-        ));
-    }
-
-    let sig_text = sig_resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read signature: {e}"))?;
-
-    verify_minisign_signature(&bytes, &sig_text)?;
-    info!("Ed25519 signature verified");
+    // Download + verify, retrying ONLY download-class failures. A checksum or
+    // signature failure aborts on the first attempt (fail-closed [S1][C1]).
+    let bytes = with_retries(
+        &DOWNLOAD_RETRY_DELAYS_SECS,
+        &|attempt, max_attempts| {
+            on_progress(UpdateProgress { phase: "downloading", attempt, max_attempts })
+        },
+        |_attempt| download_and_verify_once(&client, download_url, checksum_url, &signature_url),
+    )
+    .await
+    .map_err(|e| e.message)?;
 
     // Extract binary
     info!("Extracting binary...");
@@ -677,6 +718,105 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
         let _ = tokio::fs::remove_file(&tmp_path).await;
     }
     result
+}
+
+/// Fetch a release asset body once, classifying every failure. Network errors
+/// and retryable HTTP statuses come back [`FailureClass::Transient`]; anything
+/// else is fatal.
+async fn fetch_asset_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    what: &str,
+) -> Result<Vec<u8>, StageError> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| StageError::transient(format!("{what} download failed: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let msg = format!("{what} download returned HTTP {status}");
+        return Err(match classify_http_status(status) {
+            FailureClass::Transient => StageError::transient(msg),
+            FailureClass::Fatal => StageError::fatal(msg),
+        });
+    }
+
+    // [H5] Size limit — a declared over-limit body is not worth retrying.
+    if let Some(len) = resp.content_length() {
+        if len > MAX_DOWNLOAD_BYTES {
+            return Err(StageError::fatal(format!(
+                "{what} too large: {len} bytes (limit: {MAX_DOWNLOAD_BYTES})"
+            )));
+        }
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| StageError::transient(format!("Failed to read {what}: {e}")))?;
+
+    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+        return Err(StageError::fatal(format!(
+            "{what} exceeded size limit: {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Verify a downloaded archive against its checksum sidecar and its minisign
+/// signature. Every failure here is [`FailureClass::Fatal`] — an integrity gate
+/// that a retry loop could wear down would not be a gate. [S1][C1][R2:NH2]
+fn verify_archive_integrity(
+    bytes: &[u8],
+    checksum_text: &str,
+    sig_text: &str,
+) -> Result<(), StageError> {
+    // Scan tokens for the first 64-char hex digest so both `shasum`
+    // ("<hash>  <file>") and PowerShell `Format-List` ("Hash : <HASH>")
+    // sidecar formats parse.
+    let expected = extract_sha256_token(checksum_text).ok_or_else(|| {
+        StageError::fatal("Checksum file has invalid format (no SHA-256 digest found)")
+    })?;
+    let computed = format!("{:x}", Sha256::digest(bytes));
+    if computed != expected {
+        return Err(StageError::fatal(format!(
+            "SHA-256 checksum mismatch!\n  Expected: {expected}\n  Computed: {computed}"
+        )));
+    }
+    info!("SHA-256 checksum verified");
+
+    // The public key is pinned in the binary, so this holds even if the
+    // GitHub release (and its .sha256 sidecar) is attacker-controlled.
+    verify_minisign_signature(bytes, sig_text).map_err(StageError::fatal)?;
+    info!("Ed25519 signature verified");
+    Ok(())
+}
+
+/// One download + verify attempt: archive, checksum sidecar, signature sidecar,
+/// then the two integrity checks.
+async fn download_and_verify_once(
+    client: &reqwest::Client,
+    download_url: &str,
+    checksum_url: &str,
+    signature_url: &str,
+) -> Result<Vec<u8>, StageError> {
+    let bytes = fetch_asset_bytes(client, download_url, "Update archive").await?;
+    info!(size = bytes.len(), "Download complete");
+
+    // (empty checksum_url already rejected at apply_update entry [R3:H1])
+    info!("Verifying SHA-256 checksum...");
+    let checksum_bytes = fetch_asset_bytes(client, checksum_url, "Checksum file").await?;
+    let checksum_text = String::from_utf8_lossy(&checksum_bytes).into_owned();
+
+    info!("Verifying Ed25519 signature...");
+    let sig_bytes = fetch_asset_bytes(client, signature_url, "Signature file").await?;
+    let sig_text = String::from_utf8_lossy(&sig_bytes).into_owned();
+
+    verify_archive_integrity(&bytes, &checksum_text, &sig_text)?;
+    Ok(bytes)
 }
 
 /// Inner apply logic after tmp file is written. Caller cleans up tmp on error.
@@ -1311,6 +1451,122 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
             .browser_download_url
             .starts_with("https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.46.2/duduclaw-"));
         assert!(is_valid_download_url(&r.assets[0].browser_download_url));
+    }
+
+    // ── download retry vs. integrity fail-closed (2026-08-04 field report) ──
+
+    #[test]
+    fn classify_http_status_splits_transient_from_fatal() {
+        use reqwest::StatusCode;
+        // Release-asset propagation lag / CDN hiccups / throttling → retry.
+        for s in [403u16, 404, 408, 425, 429, 500, 502, 503, 504] {
+            assert_eq!(
+                classify_http_status(StatusCode::from_u16(s).unwrap()),
+                FailureClass::Transient,
+                "HTTP {s} should be retryable"
+            );
+        }
+        // Anything else is a real "this will never work" answer.
+        for s in [400u16, 401, 410, 451] {
+            assert_eq!(
+                classify_http_status(StatusCode::from_u16(s).unwrap()),
+                FailureClass::Fatal,
+                "HTTP {s} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn integrity_failures_are_always_fatal() {
+        // Signature is valid for exactly b"FAKE_BINARY".
+        let good = b"FAKE_BINARY";
+        let good_sum = format!("{:x}", Sha256::digest(good));
+
+        // Happy path: matching digest + valid signature.
+        assert!(verify_archive_integrity(good, &format!("{good_sum}  duduclaw.tar.gz\n"), TEST_SIG).is_ok());
+
+        // Checksum mismatch → fatal, never retried.
+        let wrong_sum = "a".repeat(64);
+        let err = verify_archive_integrity(good, &wrong_sum, TEST_SIG).unwrap_err();
+        assert_eq!(err.class, FailureClass::Fatal);
+        assert!(err.message.contains("checksum mismatch"));
+
+        // Unparseable checksum sidecar → fatal.
+        assert_eq!(
+            verify_archive_integrity(good, "no digest here", TEST_SIG).unwrap_err().class,
+            FailureClass::Fatal
+        );
+
+        // Signature over different bytes → fatal (checksum sidecar can be
+        // rewritten by whoever tampered with the archive; the pinned key can't).
+        let tampered = b"FAKE_BINARY_TAMPERED";
+        let tampered_sum = format!("{:x}", Sha256::digest(tampered));
+        let err = verify_archive_integrity(tampered, &tampered_sum, TEST_SIG).unwrap_err();
+        assert_eq!(err.class, FailureClass::Fatal);
+        assert!(err.message.contains("FAILED"));
+    }
+
+    #[tokio::test]
+    async fn with_retries_retries_transient_then_succeeds() {
+        use std::sync::atomic::AtomicU32;
+        let calls = AtomicU32::new(0);
+        let seen: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+        // Zero delays keep the test instant; production uses [5, 15].
+        let out: Result<&str, StageError> = with_retries(
+            &[0, 0],
+            &|a, m| seen.lock().unwrap().push((a, m)),
+            |_| {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if n < 3 {
+                        Err(StageError::transient(format!("boom {n}")))
+                    } else {
+                        Ok("installed")
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), "installed");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // Progress reported for every attempt, including the first.
+        assert_eq!(*seen.lock().unwrap(), vec![(1, 3), (2, 3), (3, 3)]);
+    }
+
+    #[tokio::test]
+    async fn with_retries_gives_up_after_max_attempts() {
+        use std::sync::atomic::AtomicU32;
+        let calls = AtomicU32::new(0);
+        let out: Result<(), StageError> = with_retries(&[0, 0], &|_, _| {}, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(StageError::transient("always down")) }
+        })
+        .await;
+        assert_eq!(out.unwrap_err().message, "always down");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "1 initial + 2 retries");
+    }
+
+    #[tokio::test]
+    async fn with_retries_never_retries_fatal() {
+        use std::sync::atomic::AtomicU32;
+        let calls = AtomicU32::new(0);
+        let out: Result<(), StageError> = with_retries(&[0, 0], &|_, _| {}, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(StageError::fatal("SHA-256 checksum mismatch!")) }
+        })
+        .await;
+        assert!(out.unwrap_err().message.contains("checksum mismatch"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an integrity failure must abort on the first attempt"
+        );
+    }
+
+    #[test]
+    fn retry_delays_match_the_documented_policy() {
+        // 2 retries at 5s / 15s — the UI's "重試 N/3" copy is derived from this.
+        assert_eq!(DOWNLOAD_RETRY_DELAYS_SECS, [5, 15]);
     }
 
     #[test]

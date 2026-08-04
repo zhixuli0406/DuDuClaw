@@ -17,6 +17,11 @@ function renderSidebar() {
   );
 }
 
+/** True when `a` precedes `b` in document order. */
+function precedes(a: Element, b: Element): boolean {
+  return Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
@@ -39,7 +44,7 @@ describe('AppSidebar (Multica shell)', () => {
     expect(screen.getByRole('link', { name: /Dashboard/i })).toBeInTheDocument();
     expect(screen.getAllByRole('link', { name: /Inbox/i }).length).toBeGreaterThan(0);
     expect(screen.getByRole('link', { name: /New chat/i })).toBeInTheDocument();
-    // 對話紀錄 zone sits right below 新對話 (2026-07-30 client feedback).
+    // 對話紀錄 zone (moved above 設定 on 2026-08-04, WP18-B).
     expect(screen.getByText(/^Conversations$/)).toBeInTheDocument();
     // The three group labels.
     expect(screen.getByText(/^Work$/)).toBeInTheDocument();
@@ -108,6 +113,11 @@ describe('AppSidebar (Multica shell)', () => {
     // let this assertion pass while the row was missing entirely.
     expect(positions.every((i) => i >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
+    // WP18-B: 對話紀錄 sits AFTER 世界 and BEFORE 設定 — never in front of the
+    // six primary surfaces, which is where it used to be.
+    const conversations = screen.getByText(/^Conversations$/);
+    expect(precedes(screen.getByRole('link', { name: /World/i }), conversations)).toBe(true);
+    expect(precedes(conversations, screen.getByText(/^Settings$/))).toBe(true);
     // Still hidden on Personal: pet studio (desktop-only, and jsdom is not Tauri).
     expect(screen.queryByRole('link', { name: /Pet studio/i })).not.toBeInTheDocument();
 
@@ -139,6 +149,13 @@ describe('AppSidebar (Multica shell)', () => {
     expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Routines'));
     expect(order.indexOf('Routines')).toBeLessThan(order.indexOf('Reports'));
     expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Reports'));
+    // WP18-B: the 對話紀錄 slot is identical on Enterprise — after the 公司
+    // group's last row, before 設定. If the two editions ever fork here, one of
+    // these two assertions fails.
+    const conversations = screen.getByText(/^Conversations$/);
+    expect(precedes(screen.getByText(/^Company$/), conversations)).toBe(true);
+    expect(precedes(screen.getByRole('link', { name: /World/i }), conversations)).toBe(true);
+    expect(precedes(conversations, screen.getByText(/^Settings$/))).toBe(true);
   });
 
   // WP14 (2026-08-04): the footer cost chip is gone; the slot now answers

@@ -30,10 +30,11 @@ const RAIL_LIMIT = 5;
 /**
  * 對話紀錄 — the sidebar conversation-history zone (2026-07-30 client feedback).
  *
- * Sits directly under 新對話 and mirrors the New chat + Recents rail people
- * already know. Rows resume the stored session in place; the chat page's left
- * column keeps the full list (all employees, all channels), so this zone is a
- * shortcut, never the only way in.
+ * Sits at the tail of the working area, directly above 設定 (moved there on
+ * 2026-08-04, WP18-B — it used to sit under 新對話, where it split the
+ * client-annotated primary order). Rows resume the stored session in place; the
+ * chat page's left column keeps the full list (all employees, all channels), so
+ * this zone is a shortcut, never the only way in.
  *
  * Renders nothing in the icon-only collapsed rail: fifteen indistinguishable
  * bubbles would be noise, and 新對話 is still one click away there.
