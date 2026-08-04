@@ -880,6 +880,101 @@ pub fn line_goal_kickoff_quick_reply(approval_id: &str) -> Value {
     })
 }
 
+// ── Generic ApprovalBroker buttons (WP20) ────────────────────────
+//
+// The install-approval buttons above decide an `install_requests` row (the
+// dashboard 安裝簽核 workflow); the goal buttons decide a task / kickoff. NEITHER
+// covers the **generic `ApprovalBroker`** (`approvals.db`) — the store every
+// MCP install-class gate, capability grant, skill activation and knowledge
+// quarantine actually blocks on. This third family is that missing codec.
+//
+// Action id convention (same `duduclaw:{action}:{id}` scheme, same inbound
+// dispatchers):
+//   duduclaw:approval_ok:{approval_id}  — approve (broker.decide(.., true))
+//   duduclaw:approval_no:{approval_id}  — deny    (broker.decide(.., false))
+//
+// The prefixes are deliberately distinct from `install_approve` / `goal_*` so
+// the three parsers never claim each other's presses (each dispatcher tries
+// them in order and falls through on `None`).
+
+/// Build the callback/action id for a generic ApprovalBroker button.
+pub fn approval_action_id(approve: bool, approval_id: &str) -> String {
+    let verb = if approve { "approval_ok" } else { "approval_no" };
+    format!("duduclaw:{verb}:{approval_id}")
+}
+
+/// Parse a generic approval action id → `(approval_id, approve)`.
+/// Returns `None` for anything that is not a well-formed approval action
+/// (fail-closed: an unrecognised or id-less button is ignored, never treated
+/// as an approve).
+pub fn parse_approval_action(data: &str) -> Option<(String, bool)> {
+    if let Some(id) = data.strip_prefix("duduclaw:approval_ok:") {
+        if !id.is_empty() {
+            return Some((id.to_string(), true));
+        }
+    }
+    if let Some(id) = data.strip_prefix("duduclaw:approval_no:") {
+        if !id.is_empty() {
+            return Some((id.to_string(), false));
+        }
+    }
+    None
+}
+
+/// Telegram inline keyboard: approve / deny a broker approval.
+pub fn telegram_broker_approval_buttons(approval_id: &str) -> Value {
+    json!({
+        "inline_keyboard": [[
+            { "text": "✅ 同意", "callback_data": approval_action_id(true, approval_id) },
+            { "text": "❌ 拒絕", "callback_data": approval_action_id(false, approval_id) }
+        ]]
+    })
+}
+
+/// Discord action row: approve / deny a broker approval.
+pub fn discord_broker_approval_buttons(approval_id: &str) -> Value {
+    json!({
+        "type": 1,
+        "components": [
+            { "type": 2, "style": 3, "label": "✅ 同意", "custom_id": approval_action_id(true, approval_id) },
+            { "type": 2, "style": 4, "label": "❌ 拒絕", "custom_id": approval_action_id(false, approval_id) }
+        ]
+    })
+}
+
+/// Slack actions block: approve / deny a broker approval.
+pub fn slack_broker_approval_buttons(approval_id: &str) -> Value {
+    json!({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button", "style": "primary",
+                "text": { "type": "plain_text", "text": "✅ 同意" },
+                "action_id": approval_action_id(true, approval_id),
+                "value": approval_id
+            },
+            {
+                "type": "button", "style": "danger",
+                "text": { "type": "plain_text", "text": "❌ 拒絕" },
+                "action_id": approval_action_id(false, approval_id),
+                "value": approval_id
+            }
+        ]
+    })
+}
+
+/// LINE quickReply: approve / deny postbacks for a broker approval.
+pub fn line_broker_approval_quick_reply(approval_id: &str) -> Value {
+    json!({
+        "items": [
+            { "type": "action", "action": { "type": "postback", "label": "✅ 同意",
+                "data": approval_action_id(true, approval_id), "displayText": "同意此項核可" } },
+            { "type": "action", "action": { "type": "postback", "label": "❌ 拒絕",
+                "data": approval_action_id(false, approval_id), "displayText": "拒絕此項核可" } }
+        ]
+    })
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1142,5 +1237,72 @@ mod tests {
         let qr = line_quick_reply();
         assert_eq!(qr["items"][0]["action"]["type"], "postback");
         assert_eq!(qr["items"][0]["action"]["data"], "duduclaw:new_session");
+    }
+
+    // ── WP20: generic ApprovalBroker button codec ──────────────
+
+    #[test]
+    fn approval_action_roundtrip() {
+        let ok = approval_action_id(true, "ap-1");
+        let no = approval_action_id(false, "ap-1");
+        assert_eq!(ok, "duduclaw:approval_ok:ap-1");
+        assert_eq!(no, "duduclaw:approval_no:ap-1");
+        assert_eq!(parse_approval_action(&ok), Some(("ap-1".into(), true)));
+        assert_eq!(parse_approval_action(&no), Some(("ap-1".into(), false)));
+    }
+
+    #[test]
+    fn approval_action_rejects_malformed_and_foreign() {
+        // No id ⇒ None (fail-closed, never an implicit approve).
+        assert_eq!(parse_approval_action("duduclaw:approval_ok:"), None);
+        assert_eq!(parse_approval_action("duduclaw:approval_no:"), None);
+        assert_eq!(parse_approval_action("garbage"), None);
+        // The three button families never claim each other's presses.
+        assert_eq!(parse_approval_action("duduclaw:install_approve:r1"), None);
+        assert_eq!(parse_approval_action("duduclaw:goal_kickoff_ok:a1"), None);
+        assert_eq!(parse_install_approval_action("duduclaw:approval_ok:a1"), None);
+        assert_eq!(parse_goal_action("duduclaw:approval_ok:a1"), None);
+    }
+
+    #[test]
+    fn approval_button_markup_carries_the_id_on_all_four_channels() {
+        let tg = telegram_broker_approval_buttons("a9");
+        assert_eq!(
+            tg["inline_keyboard"][0][0]["callback_data"],
+            "duduclaw:approval_ok:a9"
+        );
+        assert_eq!(
+            tg["inline_keyboard"][0][1]["callback_data"],
+            "duduclaw:approval_no:a9"
+        );
+
+        let dc = discord_broker_approval_buttons("a9");
+        assert_eq!(dc["components"][0]["custom_id"], "duduclaw:approval_ok:a9");
+        // Discord dispatchers split custom_id on ':' — the verb must be segment 2.
+        let cid = dc["components"][1]["custom_id"].as_str().unwrap();
+        assert_eq!(cid.splitn(3, ':').nth(1), Some("approval_no"));
+
+        let sl = slack_broker_approval_buttons("a9");
+        assert_eq!(sl["elements"][0]["action_id"], "duduclaw:approval_ok:a9");
+        assert_eq!(sl["elements"][0]["value"], "a9");
+
+        let ln = line_broker_approval_quick_reply("a9");
+        assert_eq!(ln["items"][0]["action"]["data"], "duduclaw:approval_ok:a9");
+        assert_eq!(ln["items"][1]["action"]["data"], "duduclaw:approval_no:a9");
+    }
+
+    #[test]
+    fn approval_callback_data_fits_telegram_64_byte_limit() {
+        // Approval ids are UUIDv4 (36 chars). Telegram silently rejects a
+        // callback_data over 64 bytes — the buttons would render and then do
+        // nothing, which is exactly the failure mode WP20 exists to remove.
+        let uuid = "123e4567-e89b-12d3-a456-426614174000";
+        assert_eq!(uuid.len(), 36);
+        for approve in [true, false] {
+            let id = approval_action_id(approve, uuid);
+            assert!(id.len() <= 64, "callback_data too long ({}): {id}", id.len());
+            // …and it still round-trips at that length.
+            assert_eq!(parse_approval_action(&id), Some((uuid.to_string(), approve)));
+        }
     }
 }

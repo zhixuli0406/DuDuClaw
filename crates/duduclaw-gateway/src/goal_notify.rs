@@ -387,7 +387,12 @@ fn kickoff_button_markup(channel: &str, approval_id: &str) -> serde_json::Value 
 /// Send a message carrying inline buttons on one of the four button-capable
 /// channels. `markup` is the platform-native structure from
 /// [`goal_button_markup`] / [`kickoff_button_markup`].
-async fn send_with_markup(
+///
+/// `pub(crate)`: also the button sender for `approval_notify` (WP20), which
+/// pushes generic `ApprovalBroker` approvals to the same four channels — one
+/// tested implementation of the Discord DM-open dance / Slack block shape /
+/// LINE push envelope rather than a third copy.
+pub(crate) async fn send_with_markup(
     http: &reqwest::Client,
     channel: &str,
     token: &str,

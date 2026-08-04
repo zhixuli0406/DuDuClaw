@@ -79,6 +79,27 @@ const CHANNEL_SUMMARY_MAX_CHARS: usize = 500;
 /// `decided_by` marker used when the TTL expiry path denies an approval.
 pub const DECIDED_BY_TTL: &str = "system:ttl";
 
+/// WP20: fraction of the TTL that must elapse before the "still waiting, about
+/// to auto-deny" reminder is pushed (⅔ ⇒ the nudge lands with a third of the
+/// window left).
+pub const REMIND_AT_FRACTION: f64 = 2.0 / 3.0;
+
+/// WP20: shortest TTL that earns a reminder. Below this, the nudge and the
+/// auto-denial would land within seconds of each other — two notifications for
+/// one non-event, and the human has no realistic window to act on the first.
+/// Short-TTL approvals rely on the initial push alone.
+pub const REMIND_MIN_TTL_SECONDS: i64 = 120;
+
+/// WP20: `action_kind`s that own their channel notification already and must
+/// NOT receive the generic pending-approval push (it would double-notify with
+/// a second, conflicting set of buttons). `goal_kickoff` is pushed by
+/// `goal_notify::notify_goal_kickoff` with its own retry bookkeeping.
+const SELF_NOTIFYING_KINDS: &[&str] = &["goal_kickoff"];
+
+/// Hard cap on the generic push so a hung channel API can never stall the
+/// caller that is filing the approval.
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ── Types ───────────────────────────────────────────────────
 
 /// Opaque approval identifier (UUIDv4 string).
@@ -193,6 +214,20 @@ pub struct ApprovalRecord {
     pub decided_at: Option<String>,
     pub decided_by: Option<String>,
     pub ttl_seconds: i64,
+    /// WP20: the channel the pending-approval push was actually delivered to
+    /// (`telegram` / `slack` / …). `None` = never pushed (no destination, or a
+    /// kind that owns its own notification). Persisted so the TTL reminder and
+    /// the inbound button handler can both reason about "where did this go".
+    #[serde(default)]
+    pub notify_channel: Option<String>,
+    /// WP20: the chat/user id the push was delivered to, paired with
+    /// [`Self::notify_channel`].
+    #[serde(default)]
+    pub notify_chat_id: Option<String>,
+    /// WP20: when the "about to expire" reminder was sent (RFC3339). `None` =
+    /// not yet reminded; the column doubles as the race-safe once-only guard.
+    #[serde(default)]
+    pub reminded_at: Option<String>,
 }
 
 impl ApprovalRecord {
@@ -213,6 +248,42 @@ impl ApprovalRecord {
             Some(exp) => now >= exp,
             None => true, // unparseable created_at ⇒ fail closed
         }
+    }
+
+    /// The RFC3339 instant this approval expires, for rendering a human
+    /// deadline in the channel message. `None` on an unparseable timestamp.
+    pub fn deadline_rfc3339(&self) -> Option<String> {
+        self.expires_at().map(|t| t.to_rfc3339())
+    }
+
+    /// WP20: true when the pending approval has burned through
+    /// [`REMIND_AT_FRACTION`] of its TTL and has not been reminded yet — the
+    /// "about to auto-deny" nudge is due.
+    ///
+    /// Deliberately NOT a new background loop: evaluated on the paths that
+    /// already touch a pending row (`poll` — which `await_decision` drives every
+    /// couple of seconds — and the `expire_stale` sweep).
+    pub(crate) fn reminder_due(&self, now: DateTime<Utc>) -> bool {
+        if self.status != ApprovalStatus::Pending || self.reminded_at.is_some() {
+            return false;
+        }
+        // Too short a window for a nudge to be actionable — see
+        // [`REMIND_MIN_TTL_SECONDS`].
+        if self.ttl_seconds < REMIND_MIN_TTL_SECONDS {
+            return false;
+        }
+        let Ok(created) = DateTime::parse_from_rfc3339(&self.created_at) else {
+            return false; // unparseable ⇒ is_stale already denies it; no nudge
+        };
+        let created = created.with_timezone(&Utc);
+        let elapsed = (now - created).num_milliseconds();
+        let ttl_ms = self.ttl_seconds.saturating_mul(1000);
+        if ttl_ms <= 0 {
+            return false;
+        }
+        // Due once REMIND_AT_FRACTION of the window has elapsed, but not after
+        // it has already expired (that path is a denial, not a reminder).
+        elapsed >= (ttl_ms as f64 * REMIND_AT_FRACTION) as i64 && elapsed < ttl_ms
     }
 }
 
@@ -272,6 +343,35 @@ impl ApprovalStore {
              CREATE INDEX IF NOT EXISTS idx_approvals_agent  ON approvals(agent_id);",
         )
         .map_err(|e| format!("init approvals schema: {e}"))?;
+        Self::migrate(conn)?;
+        Ok(())
+    }
+
+    /// Idempotent additive migration (same shape as `task_store`): every column
+    /// is nullable, so an old `approvals.db` upgrades in place and a downgrade
+    /// still reads every pre-existing column.
+    fn migrate(conn: &Connection) -> Result<(), String> {
+        let existing: HashSet<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(approvals)")
+                .map_err(|e| format!("pragma approvals: {e}"))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| format!("pragma query: {e}"))?;
+            rows.filter_map(Result::ok).collect()
+        };
+        // WP20: channel push bookkeeping.
+        let migrations: &[(&str, &str)] = &[
+            ("notify_channel", "notify_channel TEXT"),
+            ("notify_chat_id", "notify_chat_id TEXT"),
+            ("reminded_at", "reminded_at TEXT"),
+        ];
+        for (col, ddl) in migrations {
+            if !existing.contains(*col) {
+                conn.execute(&format!("ALTER TABLE approvals ADD COLUMN {ddl}"), [])
+                    .map_err(|e| format!("add column {col}: {e}"))?;
+            }
+        }
         Ok(())
     }
 
@@ -281,8 +381,9 @@ impl ApprovalStore {
         conn.execute(
             "INSERT INTO approvals
                 (id, agent_id, action_kind, summary, payload, status,
-                 created_at, decided_at, decided_by, ttl_seconds)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 created_at, decided_at, decided_by, ttl_seconds,
+                 notify_channel, notify_chat_id, reminded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 rec.id.as_str(),
                 rec.agent_id,
@@ -294,17 +395,54 @@ impl ApprovalStore {
                 rec.decided_at,
                 rec.decided_by,
                 rec.ttl_seconds,
+                rec.notify_channel,
+                rec.notify_chat_id,
+                rec.reminded_at,
             ],
         )
         .map_err(|e| format!("insert approval: {e}"))?;
         Ok(())
     }
 
+    /// WP20: record where the pending-approval push landed. Best-effort
+    /// bookkeeping — never gates the approval itself.
+    async fn set_notify_target(
+        &self,
+        id: &ApprovalId,
+        channel: &str,
+        chat_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE approvals SET notify_channel = ?1, notify_chat_id = ?2 WHERE id = ?3",
+            params![channel, chat_id, id.as_str()],
+        )
+        .map_err(|e| format!("set notify target: {e}"))?;
+        Ok(())
+    }
+
+    /// WP20: claim the once-only reminder slot. The `reminded_at IS NULL AND
+    /// status = 'pending'` guard makes this the race winner — two concurrent
+    /// pollers (gateway sweep + a blocked MCP process) cannot both send.
+    /// Returns `true` when THIS caller won and should actually push.
+    async fn claim_reminder(&self, id: &ApprovalId, at: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE approvals SET reminded_at = ?1
+                 WHERE id = ?2 AND reminded_at IS NULL AND status = 'pending'",
+                params![at, id.as_str()],
+            )
+            .map_err(|e| format!("claim reminder: {e}"))?;
+        Ok(n > 0)
+    }
+
     async fn get(&self, id: &ApprovalId) -> Result<Option<ApprovalRecord>, String> {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT id, agent_id, action_kind, summary, payload, status,
-                    created_at, decided_at, decided_by, ttl_seconds
+                    created_at, decided_at, decided_by, ttl_seconds,
+                    notify_channel, notify_chat_id, reminded_at
              FROM approvals WHERE id = ?1",
             params![id.as_str()],
             row_to_record,
@@ -341,7 +479,8 @@ impl ApprovalStore {
                 let mut stmt = conn
                     .prepare(
                         "SELECT id, agent_id, action_kind, summary, payload, status,
-                                created_at, decided_at, decided_by, ttl_seconds
+                                created_at, decided_at, decided_by, ttl_seconds,
+                                notify_channel, notify_chat_id, reminded_at
                          FROM approvals
                          WHERE status = 'pending' AND agent_id = ?1
                          ORDER BY created_at ASC",
@@ -358,7 +497,8 @@ impl ApprovalStore {
                 let mut stmt = conn
                     .prepare(
                         "SELECT id, agent_id, action_kind, summary, payload, status,
-                                created_at, decided_at, decided_by, ttl_seconds
+                                created_at, decided_at, decided_by, ttl_seconds,
+                                notify_channel, notify_chat_id, reminded_at
                          FROM approvals
                          WHERE status = 'pending'
                          ORDER BY created_at ASC",
@@ -390,6 +530,9 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRecord> {
         decided_at: row.get(7)?,
         decided_by: row.get(8)?,
         ttl_seconds: row.get(9)?,
+        notify_channel: row.get(10)?,
+        notify_chat_id: row.get(11)?,
+        reminded_at: row.get(12)?,
     })
 }
 
@@ -440,6 +583,9 @@ impl ApprovalBroker {
             decided_at: None,
             decided_by: None,
             ttl_seconds: ttl,
+            notify_channel: None,
+            notify_chat_id: None,
+            reminded_at: None,
         };
         let id = rec.id.clone();
         self.store.insert(&rec).await?;
@@ -450,7 +596,101 @@ impl ApprovalBroker {
             ttl_seconds = ttl,
             "approval requested"
         );
+        // WP20: a pending approval nobody can see is a guaranteed TTL denial.
+        // Push it to the humans who can decide it, on the channel they are
+        // actually on. Best-effort and time-boxed — a channel outage must never
+        // stop the approval from being filed.
+        self.push_new_request(&rec).await;
         Ok(id)
+    }
+
+    /// The DuDuClaw home directory backing this broker, or `None` for an
+    /// in-memory (test) store. Channel notification needs it to read the
+    /// encrypted channel config, the agent registry, and `users.db`; deriving
+    /// it from `approvals.db`'s parent keeps [`ApprovalBroker::request`]'s
+    /// signature untouched (every existing caller keeps working) while making
+    /// the notification automatically OFF under `open_in_memory` — so no unit
+    /// test ever attempts a network send.
+    fn home_dir(&self) -> Option<PathBuf> {
+        self.store
+            .db_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+    }
+
+    /// WP20: push the freshly-filed approval to a channel and record where it
+    /// landed. Silent no-op for in-memory stores and for kinds that own their
+    /// own notification ([`SELF_NOTIFYING_KINDS`]).
+    async fn push_new_request(&self, rec: &ApprovalRecord) {
+        if SELF_NOTIFYING_KINDS.contains(&rec.action_kind.as_str()) {
+            return;
+        }
+        let Some(home) = self.home_dir() else { return };
+        let fut = crate::approval_notify::notify_new_approval(&home, rec);
+        match tokio::time::timeout(NOTIFY_TIMEOUT, fut).await {
+            Ok(Some((channel, chat_id))) => {
+                if let Err(e) = self
+                    .store
+                    .set_notify_target(&rec.id, &channel, &chat_id)
+                    .await
+                {
+                    warn!(approval_id = %rec.id, error = %e, "approval push: target write failed");
+                }
+            }
+            Ok(None) => {
+                warn!(
+                    approval_id = %rec.id,
+                    action_kind = %rec.action_kind,
+                    "approval push: no reachable channel destination — this approval \
+                     is only visible in the dashboard and WILL auto-deny at TTL"
+                );
+            }
+            Err(_) => warn!(approval_id = %rec.id, "approval push timed out"),
+        }
+    }
+
+    /// WP20: send the "about to auto-deny" nudge exactly once, if due. Called
+    /// from the paths that already read a pending row, so no new loop exists.
+    async fn maybe_remind(&self, rec: &ApprovalRecord, now: DateTime<Utc>) {
+        if !rec.reminder_due(now) {
+            return;
+        }
+        let Some(home) = self.home_dir() else { return };
+        // Claim first, send second: losing the race means someone else is
+        // sending, and a claim that is never followed by a successful send is
+        // strictly better than a reminder storm.
+        match self.store.claim_reminder(&rec.id, &now.to_rfc3339()).await {
+            Ok(true) => {
+                let fut = crate::approval_notify::notify_reminder(&home, rec);
+                match tokio::time::timeout(NOTIFY_TIMEOUT, fut).await {
+                    // The reminder is also the retry: when the FIRST push found
+                    // no destination (or failed), `notify_reminder` re-resolves
+                    // the chain and may land somewhere new. That destination
+                    // must be written back — `notify_chat_id` is what the
+                    // inbound button handler matches the presser against, so
+                    // without this the reminder would carry buttons that can
+                    // never authorize anyone (dead buttons, the exact
+                    // silent-failure class WP20 exists to remove).
+                    Ok(Some((channel, chat_id))) => {
+                        if notify_target_changed(rec, &channel, &chat_id) {
+                            if let Err(e) =
+                                self.store.set_notify_target(&rec.id, &channel, &chat_id).await
+                            {
+                                warn!(approval_id = %rec.id, error = %e,
+                                      "approval reminder: target write-back failed");
+                            }
+                        }
+                    }
+                    Ok(None) => warn!(
+                        approval_id = %rec.id,
+                        "approval reminder: still no reachable destination"
+                    ),
+                    Err(_) => warn!(approval_id = %rec.id, "approval reminder timed out"),
+                }
+            }
+            Ok(false) => {}
+            Err(e) => warn!(approval_id = %rec.id, error = %e, "approval reminder claim failed"),
+        }
     }
 
     /// Fetch the full record (payload included) for re-dispatch.
@@ -467,21 +707,20 @@ impl ApprovalBroker {
             .get(id)
             .await?
             .ok_or_else(|| format!("approval {id} not found"))?;
-        if rec.is_stale(Utc::now()) {
+        let now = Utc::now();
+        if rec.is_stale(now) {
             // Best-effort expire; ignore race (someone may have just decided).
             let _ = self
                 .store
-                .decide_if_pending(
-                    id,
-                    ApprovalStatus::Expired,
-                    DECIDED_BY_TTL,
-                    &Utc::now().to_rfc3339(),
-                )
+                .decide_if_pending(id, ApprovalStatus::Expired, DECIDED_BY_TTL, &now.to_rfc3339())
                 .await?;
             // Re-read to report the authoritative post-expiry status.
             let fresh = self.store.get(id).await?;
             return Ok(fresh.map(|r| r.status).unwrap_or(ApprovalStatus::Expired));
         }
+        // WP20: `await_decision` drives this every couple of seconds while a
+        // caller blocks, so the ⅔-TTL nudge rides along for free.
+        self.maybe_remind(&rec, now).await;
         Ok(rec.status)
     }
 
@@ -523,6 +762,19 @@ impl ApprovalBroker {
         Ok(())
     }
 
+    /// Test-only seam: stamp the delivered notification destination without
+    /// going through a real channel send, so `approval_notify`'s inbound tests
+    /// can exercise the destination-match authorization path.
+    #[cfg(test)]
+    pub(crate) async fn set_notify_target_for_test(
+        &self,
+        id: &ApprovalId,
+        channel: &str,
+        chat_id: &str,
+    ) -> Result<(), String> {
+        self.store.set_notify_target(id, channel, chat_id).await
+    }
+
     /// All pending approvals, optionally filtered to one agent. Sweeps
     /// stale rows first so the returned set never contains an expired
     /// pending row.
@@ -552,6 +804,17 @@ impl ApprovalBroker {
                     )
                     .await?;
                 expired += n as u64;
+            } else if rec.reminder_due(now) && self.home_dir().is_some() {
+                // WP20: piggyback the ⅔-TTL reminder on the sweep that already
+                // walks every pending row — covers approvals nobody is polling.
+                //
+                // Detached, unlike the `poll` path: `expire_stale` runs inside
+                // the dashboard's `approvals.list` RPC, and awaiting N channel
+                // sends there would make a UI call as slow as the slowest bot
+                // API. The once-only DB claim inside `maybe_remind` still
+                // guarantees a single send per approval.
+                let broker = self.clone();
+                tokio::spawn(async move { broker.maybe_remind(&rec, now).await });
             }
         }
         if expired > 0 {
@@ -602,6 +865,18 @@ impl ApprovalBroker {
             tokio::time::sleep(poll_interval).await;
         }
     }
+}
+
+/// WP20: whether a delivered destination differs from what the record already
+/// records, i.e. whether it must be written back.
+///
+/// This matters because a reminder doubles as the retry for a first push that
+/// found nothing: the record then still has `notify_channel = None`, while the
+/// reminder's buttons are live in some chat. Without the write-back, the
+/// inbound handler has nothing to match the presser against and those buttons
+/// authorize no one.
+pub(crate) fn notify_target_changed(rec: &ApprovalRecord, channel: &str, chat_id: &str) -> bool {
+    rec.notify_channel.as_deref() != Some(channel) || rec.notify_chat_id.as_deref() != Some(chat_id)
 }
 
 // ── Decision source: agent.toml [capabilities] ──────────────
@@ -961,6 +1236,9 @@ mod tests {
             decided_at: None,
             decided_by: None,
             ttl_seconds: 1,
+            notify_channel: None,
+            notify_chat_id: None,
+            reminded_at: None,
         };
         let id = rec.id.clone();
         b.store.insert(&rec).await.unwrap();
@@ -989,6 +1267,9 @@ mod tests {
             decided_at: None,
             decided_by: None,
             ttl_seconds: 1,
+            notify_channel: None,
+            notify_chat_id: None,
+            reminded_at: None,
         };
         let id = rec.id.clone();
         b.store.insert(&rec).await.unwrap();
@@ -1031,6 +1312,9 @@ mod tests {
             decided_at: None,
             decided_by: None,
             ttl_seconds: 1,
+            notify_channel: None,
+            notify_chat_id: None,
+            reminded_at: None,
         };
         b.store.insert(&stale).await.unwrap();
         let pending = b.list_pending(None).await.unwrap();
@@ -1070,6 +1354,9 @@ mod tests {
             decided_at: None,
             decided_by: None,
             ttl_seconds: 1,
+            notify_channel: None,
+            notify_chat_id: None,
+            reminded_at: None,
         };
         let id = rec.id.clone();
         b.store.insert(&rec).await.unwrap();
@@ -1210,6 +1497,9 @@ mod tests {
             decided_at: None,
             decided_by: None,
             ttl_seconds: 300,
+            notify_channel: None,
+            notify_chat_id: None,
+            reminded_at: None,
         };
         let msg = pending_summary_for_channel(&rec);
         assert!(msg.contains("需要您的核准"));
@@ -1217,6 +1507,154 @@ mod tests {
         assert!(msg.contains("&lt;all&gt;"));
         assert!(msg.contains("&amp;"));
         assert!(!msg.contains("<all>"));
+    }
+
+    // ── WP20: TTL reminder scheduling ───────────────────────
+
+    /// Build a pending record created `age_secs` ago with the given TTL.
+    fn aged(age_secs: i64, ttl: i64, reminded: bool) -> ApprovalRecord {
+        ApprovalRecord {
+            id: ApprovalId::new(),
+            agent_id: "a".into(),
+            action_kind: "mcp_install".into(),
+            summary: "s".into(),
+            payload: json!({}),
+            status: ApprovalStatus::Pending,
+            created_at: (Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339(),
+            decided_at: None,
+            decided_by: None,
+            ttl_seconds: ttl,
+            notify_channel: None,
+            notify_chat_id: None,
+            reminded_at: reminded.then(|| Utc::now().to_rfc3339()),
+        }
+    }
+
+    #[test]
+    fn reminder_fires_once_in_the_last_third_of_the_ttl() {
+        let now = Utc::now();
+        // 300s TTL ⇒ due from 200s in.
+        assert!(!aged(10, 300, false).reminder_due(now), "too early");
+        assert!(!aged(199, 300, false).reminder_due(now), "just before ⅔");
+        assert!(aged(210, 300, false).reminder_due(now), "inside the last third");
+        assert!(aged(299, 300, false).reminder_due(now));
+        // Already expired ⇒ that is a denial, not a nudge.
+        assert!(!aged(301, 300, false).reminder_due(now));
+        // Already reminded ⇒ never again (the DB column is the once-only guard).
+        assert!(!aged(210, 300, true).reminder_due(now));
+    }
+
+    #[test]
+    fn reminder_is_suppressed_for_very_short_ttls() {
+        let now = Utc::now();
+        // A 60s gate: the ⅔ mark is 40s in, leaving 20s — the nudge and the
+        // auto-denial would arrive back to back for no actionable gain.
+        assert!(!aged(50, 60, false).reminder_due(now));
+        assert!(!aged(90, 119, false).reminder_due(now));
+        // At the floor and above, the nudge is worth sending.
+        assert!(aged(90, 120, false).reminder_due(now));
+        assert_eq!(REMIND_MIN_TTL_SECONDS, 120);
+    }
+
+    #[test]
+    fn reminder_target_write_back_only_when_it_differs() {
+        let mut r = aged(210, 300, false);
+        // First push found nothing ⇒ the reminder's destination is new.
+        assert!(notify_target_changed(&r, "telegram", "555"));
+        r.notify_channel = Some("telegram".into());
+        r.notify_chat_id = Some("555".into());
+        // Same destination as before ⇒ no pointless write.
+        assert!(!notify_target_changed(&r, "telegram", "555"));
+        // Re-resolved elsewhere (first destination went away) ⇒ write back.
+        assert!(notify_target_changed(&r, "telegram", "666"));
+        assert!(notify_target_changed(&r, "slack", "555"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reminder_retry_leaves_no_stale_target_when_nothing_is_reachable() {
+        // An on-disk broker in an empty home: no config, no agents, no users.db
+        // ⇒ the reminder finds no destination. It must still consume the
+        // once-only slot (no storm) and must NOT invent a notify target.
+        let dir = tempfile::tempdir().unwrap();
+        let b = ApprovalBroker::open(dir.path()).unwrap();
+        let rec = aged(210, 300, false);
+        let id = rec.id.clone();
+        b.store.insert(&rec).await.unwrap();
+
+        b.maybe_remind(&rec, Utc::now()).await;
+        let after = b.get(&id).await.unwrap().unwrap();
+        assert!(after.reminded_at.is_some(), "slot consumed");
+        assert_eq!(after.notify_channel, None, "no phantom destination");
+        assert_eq!(after.notify_chat_id, None);
+        // Second call is a no-op (the claim already lost).
+        b.maybe_remind(&after, Utc::now()).await;
+        assert_eq!(
+            b.get(&id).await.unwrap().unwrap().reminded_at,
+            after.reminded_at
+        );
+    }
+
+    #[test]
+    fn reminder_never_fires_for_terminal_or_unparseable_rows() {
+        let now = Utc::now();
+        let mut decided = aged(210, 300, false);
+        decided.status = ApprovalStatus::Approved;
+        assert!(!decided.reminder_due(now));
+
+        let mut broken = aged(210, 300, false);
+        broken.created_at = "not-a-timestamp".into();
+        assert!(!broken.reminder_due(now));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reminder_slot_is_claimed_exactly_once() {
+        let b = broker();
+        let rec = aged(210, 300, false);
+        let id = rec.id.clone();
+        b.store.insert(&rec).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        assert!(b.store.claim_reminder(&id, &now).await.unwrap(), "first claim wins");
+        assert!(
+            !b.store.claim_reminder(&id, &now).await.unwrap(),
+            "second claim must lose (no reminder storm)"
+        );
+        assert!(b.get(&id).await.unwrap().unwrap().reminded_at.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reminder_slot_cannot_be_claimed_on_a_decided_row() {
+        let b = broker();
+        let id = b.request("a", "mcp_install", "s", json!({}), 300).await.unwrap();
+        b.decide(&id, true, "u").await.unwrap();
+        assert!(!b
+            .store
+            .claim_reminder(&id, &Utc::now().to_rfc3339())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn notify_target_round_trips() {
+        let b = broker();
+        let id = b.request("a", "mcp_install", "s", json!({}), 300).await.unwrap();
+        // Fresh row has no destination (in-memory store never pushes).
+        let fresh = b.get(&id).await.unwrap().unwrap();
+        assert_eq!(fresh.notify_channel, None);
+        assert_eq!(fresh.notify_chat_id, None);
+
+        b.store.set_notify_target(&id, "telegram", "555").await.unwrap();
+        let after = b.get(&id).await.unwrap().unwrap();
+        assert_eq!(after.notify_channel.as_deref(), Some("telegram"));
+        assert_eq!(after.notify_chat_id.as_deref(), Some("555"));
+    }
+
+    #[test]
+    fn self_notifying_kinds_skip_the_generic_push() {
+        // goal_kickoff owns its own buttoned push (goal_notify) — a second
+        // generic push would show two conflicting button sets.
+        assert!(SELF_NOTIFYING_KINDS.contains(&"goal_kickoff"));
+        assert!(!SELF_NOTIFYING_KINDS.contains(&"mcp_install"));
+        assert!(!SELF_NOTIFYING_KINDS.contains(&"capability_grant"));
     }
 
     #[test]

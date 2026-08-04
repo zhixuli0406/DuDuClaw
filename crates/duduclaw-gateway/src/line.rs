@@ -617,6 +617,25 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
         }
     }
 
+    // Generic ApprovalBroker buttons (WP20): every `approvals.db` gate.
+    if sender != "unknown" {
+        if let Some(result) = crate::approval_notify::decide_from_channel(
+            &state.ctx.home_dir, "line", sender, data,
+        )
+        .await
+        {
+            let answer = match result {
+                Ok(msg) => msg,
+                Err(msg) => format!("⚠️ {msg}"),
+            };
+            let messages = vec![serde_json::json!({ "type": "text", "text": answer })];
+            if !send_reply_rich(&state.http, token, reply_token, messages.clone()).await {
+                push_message_rich(&state.http, token, sender, messages).await;
+            }
+            return;
+        }
+    }
+
     // Goal-loop buttons (P2a): needs_human retry/done/abort + autonomy kickoff.
     if sender != "unknown" {
         if let Some(result) = crate::goal_notify::decide_from_channel(
