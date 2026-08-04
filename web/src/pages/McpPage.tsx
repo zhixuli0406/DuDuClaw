@@ -818,7 +818,9 @@ function statusBadge(
   if (!provider.configured) {
     return { label: intl.formatMessage({ id: 'mcp.oauth.notConfigured' }), variant: 'secondary' };
   }
-  switch (provider.token_status) {
+  // Older gateways sent only `status`; both are accepted so a connected
+  // provider never renders as unauthenticated because of a key-name mismatch.
+  switch (provider.token_status ?? provider.status) {
     case 'authenticated':
       return { label: intl.formatMessage({ id: 'mcp.oauth.authenticated' }), variant: 'secondary', className: 'bg-success/15 text-success' };
     case 'expired':
@@ -910,10 +912,41 @@ function OAuthTab({
                       <Globe className="size-5 text-muted-foreground" />
                     </div>
                     <div className="min-w-0">
-                      <h3 className="truncate text-base font-medium text-foreground">{provider.name}</h3>
+                      <h3 className="truncate text-base font-medium text-foreground">
+                        {provider.name || provider.provider_id}
+                      </h3>
                       <Badge variant={status.variant} className={status.className}>{status.label}</Badge>
                     </div>
                   </div>
+
+                  {/* What is stored. Without this the card is silent about the
+                      credentials it holds, and a saved integration is
+                      indistinguishable from an empty one. */}
+                  {provider.configured && provider.client_id && (
+                    <dl className="space-y-1 rounded-md bg-muted/50 px-2.5 py-2 text-xs">
+                      <div className="flex flex-wrap items-baseline gap-x-2">
+                        <dt className="text-muted-foreground">
+                          {intl.formatMessage({ id: 'mcp.oauth.clientId' })}
+                        </dt>
+                        <dd className="min-w-0 break-all font-mono text-foreground">
+                          {provider.client_id}
+                        </dd>
+                      </div>
+                      <div className="flex flex-wrap items-baseline gap-x-2">
+                        <dt className="text-muted-foreground">
+                          {intl.formatMessage({ id: 'mcp.oauth.clientSecret' })}
+                        </dt>
+                        <dd className="min-w-0 text-foreground">
+                          {provider.has_client_secret
+                            ? intl.formatMessage(
+                                { id: 'mcp.oauth.secretStored' },
+                                { mask: provider.client_secret_masked || '••••' },
+                              )
+                            : intl.formatMessage({ id: 'mcp.oauth.secretNone' })}
+                        </dd>
+                      </div>
+                    </dl>
+                  )}
 
                   {/* Scopes */}
                   {provider.scopes.length > 0 && (
@@ -948,13 +981,19 @@ function OAuthTab({
                 </CardContent>
 
                 {/* Actions */}
-                <div className="flex gap-2 border-t border-surface-border px-4 pt-3">
-                  {!provider.configured && (
-                    <Button variant="brand" size="sm" onClick={() => setConfigureProvider(provider)}>
-                      <KeyRound />
-                      {intl.formatMessage({ id: 'mcp.oauth.configure' })}
-                    </Button>
-                  )}
+                <div className="flex flex-wrap gap-2 border-t border-surface-border px-4 pt-3">
+                  {/* Always offered: once configured, the button used to vanish,
+                      so a wrong client id could only be corrected by revoking. */}
+                  <Button
+                    variant={provider.configured ? 'outline' : 'brand'}
+                    size="sm"
+                    onClick={() => setConfigureProvider(provider)}
+                  >
+                    <KeyRound />
+                    {intl.formatMessage({
+                      id: provider.configured ? 'mcp.oauth.editCredentials' : 'mcp.oauth.configure',
+                    })}
+                  </Button>
                   {provider.configured && provider.token_status !== 'authenticated' && !isPending && (
                     <Button variant="brand" size="sm" onClick={() => handleAuthenticate(provider)}>
                       <Shield />
@@ -996,7 +1035,7 @@ function ConfigureOAuthDialog({
   showToast: (type: 'success' | 'error', message: string) => void;
 }) {
   const intl = useIntl();
-  const [clientId, setClientId] = useState('');
+  const [clientId, setClientId] = useState(provider.client_id ?? '');
   const [clientSecret, setClientSecret] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
@@ -1026,7 +1065,12 @@ function ConfigureOAuthDialog({
         <div className="space-y-4">
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">Provider</label>
-            <Input type="text" value={provider.name} readOnly className="bg-muted/50" />
+            <Input
+              type="text"
+              value={provider.name ?? provider.provider_id}
+              readOnly
+              className="bg-muted/50"
+            />
           </div>
 
           {/* The exact callback address to register in the provider's console.
@@ -1062,11 +1106,20 @@ function ConfigureOAuthDialog({
             <label className="text-xs font-medium text-muted-foreground">
               {intl.formatMessage({ id: 'mcp.oauth.clientSecret' })}
             </label>
+            {/* Blank keeps the stored secret — the gateway falls back to the
+                saved client config when none is supplied. */}
             <Input
               type="password"
               value={clientSecret}
               onChange={(e) => setClientSecret(e.target.value)}
-              placeholder="Client Secret"
+              placeholder={
+                provider.has_client_secret
+                  ? intl.formatMessage(
+                      { id: 'mcp.oauth.secretKeep' },
+                      { mask: provider.client_secret_masked || '••••' },
+                    )
+                  : 'Client Secret'
+              }
             />
           </div>
 

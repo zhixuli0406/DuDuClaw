@@ -68,6 +68,12 @@ export const useMcpStore = create<McpStore>((set, get) => ({
     }
   },
   startOAuth: async (providerId, clientId?, clientSecret?) => {
+    // Recorded before consent opens. `authenticated` is true for a stale but
+    // refreshable token, so re-authorizing an already-connected provider would
+    // otherwise report success on the first poll — off the old token that was
+    // already on file. Success has to mean a token that actually moved.
+    const baseline =
+      get().oauthProviders.find((p) => p.provider_id === providerId)?.expires_at ?? null;
     const result = await api.mcp.oauthStart(providerId, clientId, clientSecret);
     const authUrl = result.auth_url;
 
@@ -87,7 +93,11 @@ export const useMcpStore = create<McpStore>((set, get) => ({
       const timer = setTimeout(async () => {
         try {
           const status = await api.mcp.oauthStatus(providerId);
-          if (status.authenticated) {
+          const fresh =
+            status.access_token_valid === true ||
+            (status.access_token_valid === undefined && status.authenticated) ||
+            (!!status.expires_at && !!baseline && status.expires_at > baseline);
+          if (fresh) {
             set({ _oauthPollTimer: undefined });
             await get().fetchOAuthProviders();
             return;

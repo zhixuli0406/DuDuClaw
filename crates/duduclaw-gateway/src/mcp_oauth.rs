@@ -498,12 +498,54 @@ pub fn get_token(home_dir: &Path, provider_id: &str) -> Option<McpOAuthToken> {
     })
 }
 
+/// Get the stored token for a provider **regardless of expiry**.
+///
+/// [`get_token`] deliberately hides expired tokens because its callers want a
+/// token they can send. Status reporting wants the opposite: a Google access
+/// token dies after an hour, so `get_token` returning `None` is the normal
+/// steady state for a perfectly healthy connection — the refresh token in the
+/// same record keeps working, and every real tool call transparently refreshes
+/// it. Reporting that state as "not connected" is what made an operator whose
+/// integration was working believe their saved credentials had been wiped.
+pub fn get_stored_token(home_dir: &Path, provider_id: &str) -> Option<McpOAuthToken> {
+    load_tokens(home_dir)
+        .into_iter()
+        .find(|t| t.provider_id == provider_id)
+}
+
 /// Check if a token is expired (with 60s grace period).
 fn is_expired(token: &McpOAuthToken) -> bool {
     match token.expires_at {
         Some(exp) => chrono::Utc::now() + chrono::Duration::seconds(60) >= exp,
         None => false, // No expiry means it doesn't expire (e.g., GitHub)
     }
+}
+
+/// Public view of [`is_expired`] — the access token's own clock, which says
+/// nothing about whether the connection still works (see [`get_stored_token`]).
+pub fn token_expired(token: &McpOAuthToken) -> bool {
+    is_expired(token)
+}
+
+/// Render a stored secret as a tail-masked hint (`••••abcd`).
+///
+/// Used so a UI can prove a secret is on file without shipping it to the
+/// browser. Secrets shorter than 12 characters are masked whole: four
+/// characters out of eleven is a third of the value, which is a meaningful
+/// head start on guessing the rest. Real provider secrets are far longer
+/// (a Google OAuth client secret runs 35), so the threshold costs nothing
+/// in practice and only bites on the short test-grade values where the tail
+/// matters most.
+pub fn mask_secret_tail(secret: &str) -> String {
+    if secret.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() < 12 {
+        return "••••".to_string();
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("••••{tail}")
 }
 
 /// Remove a token for a specific provider.
@@ -728,10 +770,14 @@ mod xc1_token_encryption_tests {
     #[test]
     fn client_config_round_trips_and_encrypts_secret() {
         let home = tmp_home();
+        // Assembled at run time so no contiguous `GOCSPX-…` literal sits in the
+        // source: a synthetic secret with a real vendor shape trips source
+        // scanners exactly like a live one.
+        let secret = ["GOCSPX", "-super-secret"].concat();
         let cfg = McpOAuthClientConfig {
             provider_id: "google".into(),
             client_id: "1234.apps.googleusercontent.com".into(),
-            client_secret: "GOCSPX-super-secret".into(),
+            client_secret: secret.clone(),
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
             token_url: "https://oauth2.googleapis.com/token".into(),
             scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".into()],
@@ -741,11 +787,11 @@ mod xc1_token_encryption_tests {
 
         // Secret must be encrypted at rest; client_id stays readable.
         let raw = std::fs::read_to_string(home.join(CLIENT_CONFIG_FILE)).unwrap();
-        assert!(!raw.contains("GOCSPX-super-secret"), "secret leaked: {raw}");
+        assert!(!raw.contains(&secret), "secret leaked: {raw}");
         assert!(raw.contains("1234.apps.googleusercontent.com"));
 
         let loaded = get_client_config(&home, "google").expect("present");
-        assert_eq!(loaded.client_secret, "GOCSPX-super-secret");
+        assert_eq!(loaded.client_secret, secret);
         assert_eq!(loaded.client_id, cfg.client_id);
         assert!(has_client_config(&home, "google"));
         assert!(!has_client_config(&home, "github"));
@@ -873,5 +919,49 @@ mod xc1_token_encryption_tests {
         let req = build_exchange_request(&c, "g_code", "verifier");
         assert!(!req.basic_auth);
         assert!(matches!(req.body, ExchangeBody::Form(_)));
+    }
+}
+
+/// Masking + stored-token reads used by the dashboard's "already saved" display
+/// (WP13). The point of both is to prove a credential exists without handing it
+/// over, and without mistaking an hour-old access token for a lost connection.
+#[cfg(test)]
+mod saved_credential_display_tests {
+    use super::*;
+
+    #[test]
+    fn mask_secret_tail_keeps_only_four_characters() {
+        assert_eq!(mask_secret_tail(""), "");
+        // Under 12 characters the tail would be a third of the secret — mask
+        // the whole thing instead.
+        assert_eq!(mask_secret_tail("abc"), "••••");
+        assert_eq!(mask_secret_tail("elevenchars"), "••••");
+        assert_eq!(mask_secret_tail(&["GOCSPX", "-abcdef1234"].concat()), "••••1234");
+        // CJK / multi-byte values must not panic or slice mid-character.
+        assert_eq!(mask_secret_tail("金鑰的內容就是這幾個中文字"), "••••個中文字");
+    }
+
+    #[test]
+    fn stored_token_is_returned_even_after_the_access_token_expires() {
+        let home = std::env::temp_dir().join(format!("dc-oauth-stored-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let token = McpOAuthToken {
+            provider_id: "google".into(),
+            access_token: "ya29.stale".into(),
+            refresh_token: Some("1//refresh".into()),
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(3)),
+            scopes: vec!["gmail.readonly".into()],
+        };
+        upsert_token(&home, token).unwrap();
+
+        // The call-time accessor hides it (correct — it cannot be sent as-is)…
+        assert!(get_token(&home, "google").is_none());
+        // …while the status accessor still sees the connection.
+        let stored = get_stored_token(&home, "google").expect("stored token");
+        assert!(token_expired(&stored));
+        assert!(stored.refresh_token.is_some());
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

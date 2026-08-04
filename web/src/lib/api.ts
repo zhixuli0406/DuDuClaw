@@ -995,6 +995,14 @@ export interface OdooConfig {
   poll_interval_seconds: number;
   poll_models: string[];
   webhook_enabled: boolean;
+  /**
+   * Whether each write-only credential is on file. The values stay server-side;
+   * these flags are what let the form say "已儲存（留空表示不變更）" instead of
+   * showing the same dots whether or not anything was ever saved.
+   */
+  has_api_key?: boolean;
+  has_password?: boolean;
+  has_webhook_secret?: boolean;
   unblock_models?: string[];
   features_crm: boolean;
   features_sale: boolean;
@@ -1157,12 +1165,30 @@ export interface MarketplaceServer {
 
 export interface McpOAuthProvider {
   provider_id: string;
-  name: string;
+  /** Display name. Absent on older gateways — fall back to `provider_id`. */
+  name?: string;
   auth_url: string;
   scopes: string[];
   configured: boolean;
   token_status: 'none' | 'authenticated' | 'expired';
+  /** Legacy alias of `token_status` (older gateways sent only this one). */
+  status?: 'none' | 'authenticated' | 'expired';
   expires_at: string | null;
+  /**
+   * The saved OAuth client id, in full. Client ids are public by design (they
+   * travel in the authorization URL), and showing the real value is the whole
+   * point: a field left on its placeholder is what makes a working integration
+   * look like it lost its settings.
+   */
+  client_id?: string;
+  /** Whether a client secret is on file. The value itself never leaves the gateway. */
+  has_client_secret?: boolean;
+  /** Tail-masked hint for the stored secret, e.g. `••••9f3c`. */
+  client_secret_masked?: string;
+  /** A refresh token is on file — an expired access token renews itself. */
+  can_refresh?: boolean;
+  /** Whether the stored access token is still within its lifetime. */
+  access_token_valid?: boolean;
   /**
    * The exact redirect URI to register in the provider's console, derived
    * server-side from the live gateway port. Absent on older gateways — the UI
@@ -3260,17 +3286,24 @@ export const api = {
       client.call('accounts.update', params) as Promise<{ success: boolean; changes: string[] }>,
   },
   memory: {
+    /**
+     * WP15 — both memory reads come back pre-split by the gateway:
+     * `entries` is what the user told the agent, `signals` is the platform's
+     * own learning telemetry (prediction deviations, mood snapshots). The
+     * split is done server-side so each list has its own row budget; see
+     * `duduclaw_memory::is_system_signal` for the classification.
+     */
     search: (agentId: string, query: string, limit = 20) =>
       client.call('memory.search', {
         agent_id: agentId,
         query,
         limit,
-      }) as Promise<{ entries: MemoryEntry[] }>,
+      }) as Promise<{ entries: MemoryEntry[]; signals?: MemoryEntry[] }>,
     browse: (agentId: string, limit = 20) =>
       client.call('memory.browse', {
         agent_id: agentId,
         limit,
-      }) as Promise<{ entries: MemoryEntry[] }>,
+      }) as Promise<{ entries: MemoryEntry[]; signals?: MemoryEntry[] }>,
     keyFacts: (agentId: string, limit = 50) =>
       client.call('memory.key_facts', {
         agent_id: agentId,
@@ -3852,7 +3885,11 @@ export const api = {
       }) as Promise<{ auth_url: string; state: string }>,
     oauthStatus: (providerId: string) =>
       client.call('mcp.oauth.status', { provider_id: providerId }) as Promise<{
+        /** Connection state — true while a refresh token can renew the access token. */
         authenticated: boolean;
+        /** Whether the access token itself is still fresh (it lasts ~1h on Google). */
+        access_token_valid?: boolean;
+        can_refresh?: boolean;
         expires_at: string | null;
         scopes?: string[];
       }>,
