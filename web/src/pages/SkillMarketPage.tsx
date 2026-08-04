@@ -3,7 +3,14 @@ import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
-import { api, type SkillIndexEntry, type SharedSkillInfo, type SkillInfo, type SkillLeaderboardEntry } from '@/lib/api';
+import {
+  api,
+  type SkillIndexEntry,
+  type SharedSkillInfo,
+  type SkillInfo,
+  type SkillScanPath,
+  type SkillLeaderboardEntry,
+} from '@/lib/api';
 import { client } from '@/lib/ws-client';
 import { debounceTrailing } from '@/lib/debounce';
 import { useConnectionStore } from '@/stores/connection-store';
@@ -101,6 +108,10 @@ export function SkillMarketPage() {
   const [results, setResults] = useState<SkillIndexEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
+  // How many entries the server-side market index holds. Zero after a search
+  // means the GitHub index never loaded (offline / rate-limited) rather than
+  // "nothing matched" — the refresh failure is swallowed server-side.
+  const [indexed, setIndexed] = useState<number | null>(null);
   const [installSkill, setInstallSkill] = useState<SkillIndexEntry | null>(null);
   const [showUrlImport, setShowUrlImport] = useState(false);
 
@@ -115,10 +126,12 @@ export function SkillMarketPage() {
       try {
         const res = await api.skillMarket.search(q);
         setResults(res?.skills ?? []);
+        setIndexed(res?.total_indexed ?? null);
       } catch (e) {
         console.warn('[api]', e);
         toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
         setResults([]);
+        setIndexed(null);
       } finally {
         setLoading(false);
       }
@@ -203,6 +216,7 @@ export function SkillMarketPage() {
             results={results}
             loading={loading}
             searched={searched}
+            indexed={indexed}
             onInstall={setInstallSkill}
           />
         )}
@@ -314,6 +328,7 @@ function MarketTab({
   results,
   loading,
   searched,
+  indexed,
   onInstall,
 }: {
   query: string;
@@ -321,6 +336,7 @@ function MarketTab({
   results: SkillIndexEntry[];
   loading: boolean;
   searched: boolean;
+  indexed: number | null;
   onInstall: (skill: SkillIndexEntry) => void;
 }) {
   const intl = useIntl();
@@ -328,12 +344,19 @@ function MarketTab({
   if (loading) return <CollectionPageState state="loading" />;
 
   if (searched && results.length === 0) {
+    // The gateway refreshes the market index from GitHub on a best-effort
+    // basis and drops the error on the floor. Offline or rate-limited, the
+    // index stays at zero entries and every search "finds nothing" — which
+    // reads as an empty market rather than a failed fetch.
+    const indexUnavailable = indexed === 0;
     return (
       <CollectionPageState
-        state="empty"
+        state={indexUnavailable ? 'error' : 'empty'}
         icon={Search}
-        title={intl.formatMessage({ id: 'skills.market.noResults' })}
-        description={query ? `"${query}"` : undefined}
+        title={intl.formatMessage({
+          id: indexUnavailable ? 'skills.market.indexEmpty' : 'skills.market.noResults',
+        })}
+        description={!indexUnavailable && query ? `"${query}"` : undefined}
       />
     );
   }
@@ -664,37 +687,115 @@ function securityDot(status?: string): string {
   return 'bg-muted-foreground';
 }
 
-const MY_SKILLS_COLUMNS = 'minmax(0,1fr) auto 2.5rem';
+const MY_SKILLS_COLUMNS = 'minmax(0,1fr) auto auto 2.5rem';
+
+/** Sentinel agent-picker value for the aggregate ("every staffer") view. */
+const ALL_AGENTS = '__all__';
+
+/**
+ * The scanned-paths block the empty/error states render.
+ *
+ * Reported by a customer as "the skill page shows nothing" — from the browser
+ * that claim was untestable, because the UI drew the same "no data" box for
+ * *no skills exist*, *the request failed*, and *the folder being read is not
+ * the folder skills were written to*. Printing the directories the gateway
+ * actually walked, with their per-layer counts, turns a support round-trip
+ * into something the customer can read off the screen.
+ */
+function ScanPathList({ scanned }: { scanned: SkillScanPath[] }) {
+  const intl = useIntl();
+  if (scanned.length === 0) return null;
+  // The same directory shows up once per agent in the aggregate view.
+  const seen = new Set<string>();
+  const unique = scanned.filter((s) => {
+    if (seen.has(s.path)) return false;
+    seen.add(s.path);
+    return true;
+  });
+  return (
+    <div className="mt-4 space-y-1 text-left">
+      <p className="text-xs font-medium text-muted-foreground">
+        {intl.formatMessage({ id: 'skills.my.scannedPaths' })}
+      </p>
+      <ul className="space-y-0.5">
+        {unique.map((s) => (
+          <li key={s.path} className="flex items-center gap-2 font-mono text-xs text-muted-foreground">
+            <span
+              className={cn(
+                'size-1.5 shrink-0 rounded-full',
+                s.exists ? (s.count > 0 ? 'bg-success' : 'bg-warning') : 'bg-muted-foreground',
+              )}
+            />
+            <span className="truncate" title={s.path}>{s.path}</span>
+            <span className="shrink-0 tabular-nums">
+              {s.exists
+                ? intl.formatMessage({ id: 'skills.my.scanCount' }, { count: s.count })
+                : intl.formatMessage({ id: 'skills.my.scanMissing' })}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 function MySkillsTab({ filter }: { filter: string }) {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
   const { agents, fetchAgents } = useAgentsStore();
-  const [selectedAgent, setSelectedAgent] = useState<string>('');
+  // Defaults to the aggregate view. Defaulting to `agents[0]` meant the picker
+  // landed on whichever agent the gateway's `HashMap` happened to yield first
+  // — an order that is neither stable across restarts nor related to the agent
+  // the customer actually talks to on Telegram. Anyone whose skills sat on a
+  // different staffer saw a permanently empty list and no hint that a picker
+  // was the reason.
+  const [selectedAgent, setSelectedAgent] = useState<string>(ALL_AGENTS);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [scanned, setScanned] = useState<SkillScanPath[]>([]);
+  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [shareSuccess, setShareSuccess] = useState<string | null>(null);
 
   useEffect(() => {
     fetchAgents();
   }, [fetchAgents]);
-  useEffect(() => {
-    if (agents.length > 0 && !selectedAgent) setSelectedAgent(agents[0].name);
-  }, [agents, selectedAgent]);
+
+  const displayNameOf = useCallback(
+    (name: string) => agents.find((a) => a.name === name)?.display_name || name,
+    [agents],
+  );
 
   /** Refetch the selected agent's skills. `showSpinner` is false for the WP6
    *  live refresh so a newly synthesised skill doesn't flash the list away. */
   const loadSkills = useCallback(
     async (showSpinner: boolean) => {
-      if (!selectedAgent) return;
       if (showSpinner) setLoading(true);
       try {
-        const result = await api.skills.list(selectedAgent);
-        setSkills(result?.skills ?? []);
+        if (selectedAgent === ALL_AGENTS) {
+          const result = await api.skills.listAll();
+          const merged: SkillInfo[] = [
+            ...(result?.global_skills ?? []).map((s) => ({ ...s, scope: 'global' as const })),
+            ...(result?.agents ?? []).flatMap((a) =>
+              (a.skills ?? []).map((s) => ({ ...s, agent_id: s.agent_id ?? a.agent_id })),
+            ),
+          ];
+          setSkills(merged);
+          setScanned(result?.scanned ?? []);
+        } else {
+          const result = await api.skills.list(selectedAgent);
+          setSkills(result?.skills ?? []);
+          setScanned(result?.scanned ?? []);
+        }
+        setError(null);
       } catch (e) {
         console.warn('[api]', e);
+        // Also surfaced inline: a toast is gone in seconds and the list below
+        // then reads as "you have no skills", which is a different — and
+        // wrong — statement than "we could not read them".
+        setError(formatError(e));
         toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
         setSkills([]);
+        setScanned([]);
       } finally {
         if (showSpinner) setLoading(false);
       }
@@ -705,10 +806,9 @@ function MySkillsTab({ filter }: { filter: string }) {
   // M3: keyed on `connectionState` (same shape as RoutinesPage) so a reconnect
   // re-reads once — pushes raised while the socket was down are gone.
   useEffect(() => {
-    if (!selectedAgent) return;
     if (connectionState !== 'authenticated') return;
     void loadSkills(true);
-  }, [selectedAgent, loadSkills, connectionState]);
+  }, [loadSkills, connectionState]);
 
   // WP6 — auto-synthesised skills are the least visible thing the platform
   // produces: nobody asked for them, so nobody thinks to reload this page. The
@@ -718,12 +818,11 @@ function MySkillsTab({ filter }: { filter: string }) {
   // M4: a synthesis run graduates several skills back-to-back; debounce so the
   // burst costs one refetch.
   useEffect(() => {
-    if (!selectedAgent) return;
     if (connectionState !== 'authenticated') return;
     const refresh = debounceTrailing(() => void loadSkills(false));
     const unsubscribe = client.subscribe('skill.changed', (payload) => {
       const p = (payload ?? {}) as { agent_id?: string | null };
-      if (p.agent_id && p.agent_id !== selectedAgent) return;
+      if (selectedAgent !== ALL_AGENTS && p.agent_id && p.agent_id !== selectedAgent) return;
       refresh();
     });
     return () => {
@@ -733,10 +832,13 @@ function MySkillsTab({ filter }: { filter: string }) {
   }, [selectedAgent, loadSkills, connectionState]);
 
   const handleShare = useCallback(
-    async (skillName: string) => {
-      if (!selectedAgent) return;
+    async (skillName: string, ownerAgent?: string) => {
+      // In the aggregate view there is no single "selected" agent — share the
+      // skill as the staffer it actually belongs to.
+      const owner = ownerAgent || (selectedAgent === ALL_AGENTS ? '' : selectedAgent);
+      if (!owner) return;
       try {
-        await api.sharedSkills.share(selectedAgent, skillName);
+        await api.sharedSkills.share(owner, skillName);
         setShareSuccess(skillName);
         setTimeout(() => setShareSuccess(null), 2000);
       } catch (e) {
@@ -769,16 +871,29 @@ function MySkillsTab({ filter }: { filter: string }) {
             onValueChange={setSelectedAgent}
             agents={agents}
             placeholder={intl.formatMessage({ id: 'skills.my.selectAgent' })}
+            allOption={intl.formatMessage({ id: 'skills.my.allAgents' })}
           />
         </div>
 
         {loading ? (
           <CollectionPageState state="loading" />
+        ) : error ? (
+          <div className="space-y-2 rounded-xl border border-destructive/30 bg-destructive/10 p-4">
+            <p className="text-sm font-medium text-destructive">
+              {intl.formatMessage({ id: 'skills.my.loadError' })}
+            </p>
+            <p className="font-mono text-xs break-all text-destructive/80">{error}</p>
+            <Button variant="outline" size="sm" onClick={() => void loadSkills(true)}>
+              {intl.formatMessage({ id: 'world.error.retry' })}
+            </Button>
+          </div>
         ) : visible.length === 0 ? (
           <CollectionPageState
             state="empty"
             icon={Sparkles}
-            title={intl.formatMessage({ id: q ? 'skills.market.noResults' : 'common.noData' })}
+            title={intl.formatMessage({ id: q ? 'skills.market.noResults' : 'skills.my.empty' })}
+            description={q ? undefined : intl.formatMessage({ id: 'skills.my.emptyHint' })}
+            action={q ? undefined : <ScanPathList scanned={scanned} />}
           />
         ) : (
           <div className="overflow-hidden rounded-xl border border-surface-border">
@@ -788,6 +903,7 @@ function MySkillsTab({ filter }: { filter: string }) {
               header={
                 <ListGridHeader>
                   <ListGridHeaderCell>{intl.formatMessage({ id: 'skills.my.col.name' })}</ListGridHeaderCell>
+                  <ListGridHeaderCell>{intl.formatMessage({ id: 'skills.my.col.owner' })}</ListGridHeaderCell>
                   <ListGridHeaderCell>{intl.formatMessage({ id: 'skills.my.col.security' })}</ListGridHeaderCell>
                   <ListGridHeaderCell aria-hidden />
                 </ListGridHeader>
@@ -795,10 +911,11 @@ function MySkillsTab({ filter }: { filter: string }) {
             >
               {visible.map((skill) => (
                 <InstalledSkillRow
-                  key={skill.name}
+                  key={`${skill.scope ?? 'agent'}:${skill.agent_id ?? ''}:${skill.name}`}
                   skill={skill}
+                  owner={skill.agent_id ? displayNameOf(skill.agent_id) : ''}
                   shared={shareSuccess === skill.name}
-                  onShare={() => handleShare(skill.name)}
+                  onShare={() => handleShare(skill.name, skill.agent_id)}
                 />
               ))}
             </ListGridContainer>
@@ -811,15 +928,18 @@ function MySkillsTab({ filter }: { filter: string }) {
 
 function InstalledSkillRow({
   skill,
+  owner,
   shared,
   onShare,
 }: {
   skill: SkillInfo;
+  owner: string;
   shared: boolean;
   onShare: () => void;
 }) {
   const intl = useIntl();
   const status = skill.security_status;
+  const scope = skill.scope ?? 'agent';
   return (
     <ListGridRow className="cursor-default">
       <ListGridCell className="gap-2">
@@ -827,6 +947,17 @@ function InstalledSkillRow({
         <span className="truncate text-sm font-medium text-foreground" title={skill.name}>
           {skill.name}
         </span>
+      </ListGridCell>
+      <ListGridCell className="gap-2">
+        <Badge variant="secondary">{intl.formatMessage({ id: `skills.my.scope.${scope}` })}</Badge>
+        {scope === 'agent' && owner && (
+          <>
+            <ActorAvatar actorType="agent" size="xs" name={owner} />
+            <span className="truncate text-xs text-muted-foreground" title={owner}>
+              {owner}
+            </span>
+          </>
+        )}
       </ListGridCell>
       <ListGridCell>
         <span className={cn('mr-2 size-1.5 shrink-0 rounded-full', securityDot(status))} />
@@ -852,7 +983,9 @@ function InstalledSkillRow({
             <MoreHorizontal />
           </DropdownMenuTrigger>
           <DropdownMenuContent>
-            <DropdownMenuItem onClick={onShare} disabled={shared}>
+            {/* A company-wide (global) skill has no owning staffer, so there is
+                nothing to share *from* — the RPC needs an agent_id. */}
+            <DropdownMenuItem onClick={onShare} disabled={shared || !skill.agent_id}>
               {shared ? <CheckCircle /> : <Share2 />}
               {shared
                 ? intl.formatMessage({ id: 'skills.my.shared' })
@@ -865,27 +998,36 @@ function InstalledSkillRow({
   );
 }
 
-/** Small agent picker shared by the install/adopt/my-skills surfaces. */
+/** Small agent picker shared by the install/adopt/my-skills surfaces.
+ *  `allOption`, when given, prepends an aggregate "every staffer" entry whose
+ *  value is `ALL_AGENTS`. */
 function AgentSelect({
   value,
   onValueChange,
   agents,
   placeholder,
+  allOption,
 }: {
   value: string;
   onValueChange: (v: string) => void;
   agents: ReadonlyArray<{ name: string; display_name: string; icon?: string }>;
   placeholder?: string;
+  allOption?: string;
 }) {
   const current = agents.find((a) => a.name === value);
+  const label =
+    value === ALL_AGENTS && allOption
+      ? allOption
+      : current
+        ? `${glyphText(current.icon)} ${current.display_name}`
+        : placeholder;
   return (
     <Select value={value} onValueChange={(v) => onValueChange(String(v))}>
       <SelectTrigger className="w-52">
-        <SelectValue placeholder={placeholder}>
-          {current ? `${glyphText(current.icon)} ${current.display_name}` : placeholder}
-        </SelectValue>
+        <SelectValue placeholder={placeholder}>{label}</SelectValue>
       </SelectTrigger>
       <SelectContent>
+        {allOption && <SelectItem value={ALL_AGENTS}>{allOption}</SelectItem>}
         {agents.map((a) => (
           <SelectItem key={a.name} value={a.name}>
             {glyphText(a.icon) + ' ' + a.display_name}

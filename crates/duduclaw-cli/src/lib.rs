@@ -18,7 +18,6 @@ pub mod mcp_auth_strategy;
 pub mod mcp_fork;                // RFC-26 P3: Live Run Forking tool surface
 pub mod mcp_fork_exec;           // RFC-26 P4: real branch execution + background driver
 pub mod mcp_planner;             // RFC-26 P6.1: clarify-first Plan Mode
-pub mod builtin_skills;          // RFC-26 P6.3: bundled SKILL.md set
 pub mod mcp_refresh;             // v1.16.0: refresh-token credential type
 pub mod mcp_dispatch;          // W20-P1 Phase 2A: transport-agnostic dispatcher
 pub(crate) mod mcp_http_errors; // W20-P1 Phase 2B: JSON-RPC ↔ HTTP status mapping
@@ -2903,6 +2902,11 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             DuDuClawError::Config(format!("Failed to create directory {}: {e}", dir.display()))
         })?;
     }
+    // Seed the bundled skills. Previously only the MCP `create_agent` tool did
+    // this, so an operator who onboarded from the CLI or the dashboard ended up
+    // with an empty SKILLS/ and a blank Skills page. Best-effort — never fail
+    // onboarding over a nicety.
+    let _ = duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS"));
 
     // config.toml — encrypt API key with AES-256-GCM (M-4)
     let config_path = home.join("config.toml");
@@ -4049,6 +4053,8 @@ pub(crate) async fn scaffold_agent_dir(
             DuDuClawError::Agent(format!("Failed to create {}: {e}", dir.display()))
         })?;
     }
+    // Same seeding as the MCP `create_agent` path — see `duduclaw onboard`.
+    let _ = duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS"));
 
     let AgentScaffold {
         name: agent_name,

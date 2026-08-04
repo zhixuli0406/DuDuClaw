@@ -1,5 +1,7 @@
 pub mod account_rotator;
 pub mod budget;
+/// RFC-26 P6.3: the bundled SKILL.md set every new AI staffer is seeded with.
+pub mod builtin_skills;
 pub mod contract;
 pub mod heartbeat;
 pub mod ipc;

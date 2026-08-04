@@ -3540,7 +3540,7 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
     let _ = tokio::fs::create_dir_all(agent_dir.join("SKILLS")).await;
     // RFC-26 P6.3: seed the deep-agents default skill set (code-review / refactor
     // / test-writer / git-workflow). Idempotent; never overwrites operator edits.
-    match crate::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS")) {
+    match duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS")) {
         Ok(written) if !written.is_empty() => {
             info!(agent = name, skills = ?written, "seeded built-in skills");
         }
@@ -11754,7 +11754,11 @@ async fn handle_skill_extract(args: &Value, home_dir: &Path, default_agent: &str
     //   2. <skills>/<skill_name>.md         (legacy DuDuClaw flat layout)
     //   3. <skills>/<skill_name>            (raw stem already containing .md)
     let agent_dir = home_dir.join("agents").join(agent_id);
-    let skills_dir = agent_dir.join("skills");
+    // `SKILLS` (uppercase) is the directory the loader and every other write
+    // path use. The lowercase spelling here only worked because macOS/APFS is
+    // case-insensitive by default; on Linux — and on a case-sensitive APFS
+    // volume — this missed every skill and reported "not found".
+    let skills_dir = agent_dir.join("SKILLS");
     let candidates = [
         skills_dir.join(skill_name).join("SKILL.md"),
         skills_dir.join(format!("{}.md", skill_name)),

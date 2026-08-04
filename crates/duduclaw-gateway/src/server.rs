@@ -1389,6 +1389,25 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // channel_reply can short-circuit cheaply; agents that don't opt in
     // never trigger a spawn. See
     // `commercial/docs/TODO-cli-pty-pool-worker.md` for the full design.
+    // (The `pty_runtime::init` this describes runs below, after the two
+    // one-time migrations that must precede it.)
+
+    // WP19 one-time migration (2026-08-04): backfill the bundled skills into
+    // the company-wide layer for installs created before v1.51.1, where only
+    // the MCP `create_agent` path seeded them — every other onboarding route
+    // left the customer with a permanently blank Skills page. Marker-gated, so
+    // a skill deleted on purpose afterwards stays deleted. Never blocks boot.
+    {
+        let report = crate::builtin_skills_seed_migration::run(&home_dir);
+        if !report.seeded.is_empty() {
+            info!(
+                count = report.seeded.len(),
+                skills = ?report.seeded,
+                "WP19 built-in skills backfill applied"
+            );
+        }
+    }
+
     // WP10 one-time migration (2026-08-04): undo the PTY-pool settings the
     // dashboard's agent edit page wrote WITHOUT user consent between v1.44 and
     // v1.49. Must run BEFORE `pty_runtime::init` so the first reply of this

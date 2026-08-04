@@ -5766,6 +5766,7 @@ impl MethodHandler {
             let _ = tokio::fs::remove_dir_all(&agent_dir).await;
             return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
         }
+        Self::seed_builtin_skills(&skills_dir);
 
         let mut agent_config = toml::toml! {
             [agent]
@@ -6365,6 +6366,7 @@ impl MethodHandler {
             tokio::fs::create_dir_all(agent_dir.join("SKILLS"))
                 .await
                 .map_err(|e| format!("Failed to create directory: {e}"))?;
+            Self::seed_builtin_skills(&agent_dir.join("SKILLS"));
             tokio::fs::write(agent_dir.join("SOUL.md"), &soul_md)
                 .await
                 .map_err(|e| format!("Failed to write SOUL.md: {e}"))?;
@@ -12000,6 +12002,132 @@ impl MethodHandler {
 
     // ── Skills ──────────────────────────────────────────────
 
+    /// Seed the bundled skills (docx / xlsx / pptx / pdf / …) into a freshly
+    /// created staffer's `SKILLS/`.
+    ///
+    /// This used to happen on exactly one of the five agent-creation paths —
+    /// the MCP `create_agent` tool. Anyone who onboarded through the dashboard,
+    /// `duduclaw onboard`, or the industry wizard got an empty `SKILLS/` and,
+    /// since nothing else ever writes `<home>/skills/` either, a permanently
+    /// blank Skills page. "The skill library shows nothing" was literally true
+    /// and had nothing to do with the page's read path.
+    ///
+    /// Best-effort by design: seeding is a nicety, and an unwritable skills dir
+    /// must not fail agent creation. `install_builtin_skills` never overwrites
+    /// an existing `<name>/SKILL.md`, so calling it again is a no-op.
+    fn seed_builtin_skills(skills_dir: &std::path::Path) {
+        match duduclaw_agent::builtin_skills::install_builtin_skills(skills_dir) {
+            Ok(names) if !names.is_empty() => {
+                info!(dir = %skills_dir.display(), skills = ?names, "seeded built-in skills");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(dir = %skills_dir.display(), error = %e, "failed to seed built-in skills");
+            }
+        }
+    }
+
+    /// One entry of the `scanned` diagnostic block returned by `skills.list`.
+    ///
+    /// The "技能庫什麼都看不到" support loop is unfalsifiable without this: an
+    /// empty list is indistinguishable from "the directory I expected does not
+    /// exist" / "it exists but holds zero `.md` files". Returning the exact
+    /// paths that were walked plus their per-layer counts lets the dashboard
+    /// empty state answer the question on screen instead of requiring shell
+    /// access to the customer's machine.
+    fn skill_layer_diag(layer: &str, dir: &std::path::Path, count: usize) -> Value {
+        json!({
+            "layer": layer,
+            "path": dir.display().to_string(),
+            "exists": dir.is_dir(),
+            "count": count,
+        })
+    }
+
+    /// Re-read an agent's department + per-agent skill layers from disk and
+    /// compose them over the (already re-read) global layer.
+    ///
+    /// Extracted from the single-agent branch so the aggregate branch
+    /// (`agent_id` absent) can use the exact same disk-truth path — before this
+    /// it fell back to the cached `agent.skills` snapshot and therefore showed
+    /// a *different* skill set than the per-agent view, missing every skill
+    /// written out-of-band (MCP `skill_graduate` / synthesis pipeline) and the
+    /// whole department layer.
+    async fn read_agent_skill_layers(
+        &self,
+        agent: &duduclaw_agent::registry::LoadedAgent,
+        global_skills: &[duduclaw_agent::registry::SkillFile],
+    ) -> (Vec<Value>, Vec<Value>) {
+        let local_dir = agent.dir.join("SKILLS");
+        let local_skills =
+            duduclaw_agent::registry::AgentRegistry::load_skills(&local_dir).await;
+
+        let dept = agent.config.agent.department.trim();
+        let dept_dir = if !dept.is_empty() && duduclaw_core::is_valid_department(dept) {
+            Some(duduclaw_agent::skill_loader::department_skills_dir(
+                &self.home_dir,
+                dept,
+            ))
+        } else {
+            None
+        };
+        let dept_skills = match &dept_dir {
+            Some(d) => duduclaw_agent::registry::AgentRegistry::load_skills(d).await,
+            None => Vec::new(),
+        };
+
+        // Layer membership decides the badge. Deriving it from "is this name
+        // also in the global layer?" mislabelled an agent-local override of a
+        // global skill as `global`.
+        let local_names: std::collections::HashSet<String> =
+            local_skills.iter().map(|s| s.name.clone()).collect();
+        let dept_names: std::collections::HashSet<String> =
+            dept_skills.iter().map(|s| s.name.clone()).collect();
+
+        let mut diag = vec![Self::skill_layer_diag(
+            "agent",
+            &local_dir,
+            local_skills.len(),
+        )];
+        if let Some(d) = &dept_dir {
+            diag.push(Self::skill_layer_diag("department", d, dept_skills.len()));
+        }
+
+        let verdicts = self.load_skill_scan_verdicts();
+        let composed = duduclaw_agent::registry::AgentRegistry::compose_skill_layers(
+            global_skills,
+            dept_skills,
+            local_skills,
+        );
+        let skills: Vec<Value> = composed
+            .iter()
+            .map(|s| {
+                let scope = if local_names.contains(&s.name) {
+                    "agent"
+                } else if dept_names.contains(&s.name) {
+                    "department"
+                } else {
+                    "global"
+                };
+                // Include `content` so the dashboard "My Skills" tab can render a
+                // preview — the SkillInfo frontend contract requires it, and omitting
+                // it made `skill.content.slice(...)` throw whenever an agent had skills.
+                let mut obj = json!({
+                    "name": s.name,
+                    "size": s.content.len(),
+                    "scope": scope,
+                    "content": s.content,
+                    "agent_id": agent.config.agent.name,
+                });
+                if let Some(v) = verdicts.get(&s.name) {
+                    obj["security_status"] = v.clone();
+                }
+                obj
+            })
+            .collect();
+        (skills, diag)
+    }
+
     async fn handle_skills_list(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str());
         let reg = self.registry.read().await;
@@ -12008,12 +12136,11 @@ impl MethodHandler {
         // `reg.global_skills()`. A skill graduated by the synthesis pipeline
         // lands in `<home>/skills/` without a `registry.scan()`, so the cached
         // list would both hide it and mislabel its `scope` badge as "agent".
-        let global_skills = duduclaw_agent::registry::AgentRegistry::load_skills(
-            &self.home_dir.join("skills"),
-        )
-        .await;
-        let global_names: std::collections::HashSet<&str> =
-            global_skills.iter().map(|s| s.name.as_str()).collect();
+        let global_dir = self.home_dir.join("skills");
+        let global_skills =
+            duduclaw_agent::registry::AgentRegistry::load_skills(&global_dir).await;
+        let global_diag =
+            Self::skill_layer_diag("global", &global_dir, global_skills.len());
 
         // Scan verdicts recorded at install-approval time (Bug#9) — attach as
         // `security_status` so the "My Skills" security column shows the real
@@ -12041,42 +12168,13 @@ impl MethodHandler {
                         // Listing only the agent's own `SKILLS/` would fix the
                         // freshness bug by deleting global and department
                         // skills from the view — a worse lie than the stale one.
-                        let local_skills = duduclaw_agent::registry::AgentRegistry::load_skills(
-                            &agent.dir.join("SKILLS"),
+                        let (skills, mut scanned) =
+                            self.read_agent_skill_layers(agent, &global_skills).await;
+                        scanned.push(global_diag);
+                        WsFrame::ok_response(
+                            "",
+                            json!({ "agent_id": id, "skills": skills, "scanned": scanned }),
                         )
-                        .await;
-                        let dept = agent.config.agent.department.trim();
-                        let dept_skills = if !dept.is_empty()
-                            && duduclaw_core::is_valid_department(dept)
-                        {
-                            duduclaw_agent::registry::AgentRegistry::load_skills(
-                                &duduclaw_agent::skill_loader::department_skills_dir(
-                                    &self.home_dir,
-                                    dept,
-                                ),
-                            )
-                            .await
-                        } else {
-                            Vec::new()
-                        };
-                        let disk_skills =
-                            duduclaw_agent::registry::AgentRegistry::compose_skill_layers(
-                                &global_skills,
-                                dept_skills,
-                                local_skills,
-                            );
-                        // Include `content` so the dashboard "My Skills" tab can render a
-                        // preview — the SkillInfo frontend contract requires it, and omitting
-                        // it made `skill.content.slice(...)` throw whenever an agent had skills.
-                        let skills: Vec<Value> = disk_skills.iter().map(|s| {
-                            let scope = if global_names.contains(s.name.as_str()) { "global" } else { "agent" };
-                            let mut obj = json!({ "name": s.name, "size": s.content.len(), "scope": scope, "content": s.content });
-                            if let Some(v) = verdict_of(&s.name) {
-                                obj["security_status"] = v;
-                            }
-                            obj
-                        }).collect();
-                        WsFrame::ok_response("", json!({ "agent_id": id, "skills": skills }))
                     }
                     None => WsFrame::error_response("", &format!("Agent not found: {id}")),
                 }
@@ -12086,7 +12184,12 @@ impl MethodHandler {
                 let global: Vec<Value> = global_skills
                     .iter()
                     .map(|s| {
-                        let mut obj = json!({ "name": s.name, "size": s.content.len() });
+                        let mut obj = json!({
+                            "name": s.name,
+                            "size": s.content.len(),
+                            "scope": "global",
+                            "content": s.content,
+                        });
                         if let Some(v) = verdict_of(&s.name) {
                             obj["security_status"] = v;
                         }
@@ -12094,29 +12197,26 @@ impl MethodHandler {
                     })
                     .collect();
 
-                // Per-agent skills
+                // Per-agent skills — re-read from disk, exactly like the
+                // single-agent branch. `agent.skills` is the scan-time snapshot
+                // and silently omits anything written out-of-band.
                 let mut all_skills = Vec::new();
+                let mut scanned = vec![global_diag];
                 for agent in reg.list() {
-                    let skills: Vec<Value> = agent
-                        .skills
-                        .iter()
-                        .map(|s| {
-                            let scope = if global_names.contains(s.name.as_str()) {
-                                "global"
-                            } else {
-                                "agent"
-                            };
-                            let mut obj =
-                                json!({ "name": s.name, "size": s.content.len(), "scope": scope });
-                            if let Some(v) = verdict_of(&s.name) {
-                                obj["security_status"] = v;
-                            }
-                            obj
-                        })
+                    let (skills, diag) =
+                        self.read_agent_skill_layers(agent, &global_skills).await;
+                    // The aggregate view already lists the global layer once
+                    // under `global_skills`; repeating it per agent would show
+                    // the same skill N times.
+                    let own: Vec<Value> = skills
+                        .into_iter()
+                        .filter(|s| s["scope"] != "global")
                         .collect();
+                    scanned.extend(diag);
                     all_skills.push(json!({
                         "agent_id": agent.config.agent.name,
-                        "skills": skills,
+                        "display_name": agent.config.agent.display_name,
+                        "skills": own,
                     }));
                 }
                 WsFrame::ok_response(
@@ -12124,6 +12224,7 @@ impl MethodHandler {
                     json!({
                         "global_skills": global,
                         "agents": all_skills,
+                        "scanned": scanned,
                     }),
                 )
             }
@@ -16235,7 +16336,35 @@ impl MethodHandler {
             ),
         );
 
-        match crate::updater::apply_update(&pending.download_url, &pending.checksum_url).await {
+        // Progress bridge — the download stage retries transient failures
+        // (2026-08-04 field report: first install click failed red, the retry
+        // succeeded). Without this the dashboard would sit on a silent spinner
+        // for up to 20s of back-off with no idea anything was being retried.
+        let progress_tx = self.event_tx.read().await.clone();
+        let progress_version = pending.version.clone();
+        let on_progress = move |p: crate::updater::UpdateProgress| {
+            let Some(tx) = progress_tx.as_ref() else { return };
+            let frame = WsFrame::Event {
+                event: "system.update_progress".to_string(),
+                payload: json!({
+                    "version": progress_version,
+                    "phase": p.phase,
+                    "attempt": p.attempt,
+                    "max_attempts": p.max_attempts,
+                }),
+                seq: None,
+                state_version: None,
+            };
+            let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
+        };
+
+        match crate::updater::apply_update_with_progress(
+            &pending.download_url,
+            &pending.checksum_url,
+            &on_progress,
+        )
+        .await
+        {
             Ok(result) => {
                 *self.pending_update.write().await = None;
 
@@ -29665,6 +29794,191 @@ mod skills_install_scan_tests {
             .find(|s| s["name"] == "invoice-ocr")
             .expect("the agent's own skill must appear");
         assert_eq!(local["scope"], "agent");
+    }
+
+    /// Build the same one-agent-plus-one-global-skill fixture the test above
+    /// uses, so the aggregate-view assertions read against a known layout.
+    fn write_skills_fixture(root: &std::path::Path) {
+        let global_dir = root.join("skills");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::write(
+            global_dir.join("company-tone.md"),
+            "---\nname: company-tone\n---\n\n用公司語氣回覆。\n",
+        )
+        .unwrap();
+
+        let agent_dir = root.join("agents").join("agnes");
+        std::fs::create_dir_all(agent_dir.join("SKILLS")).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            include_str!("../../../templates/evaluator/agent.toml")
+                .replace("name = \"evaluator\"", "name = \"agnes\""),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("SKILLS").join("invoice-ocr.md"),
+            "---\nname: invoice-ocr\n---\n\n讀發票。\n",
+        )
+        .unwrap();
+    }
+
+    /// The aggregate branch (`skills.list` with no `agent_id`) backs the "全部
+    /// AI 員工" default view. It used to serve `agent.skills` — the scan-time
+    /// snapshot — so a skill written out-of-band after the last scan was
+    /// visible in the per-agent view and missing from the aggregate one. Both
+    /// branches must now read the same disk truth.
+    #[tokio::test]
+    async fn skills_list_aggregate_reads_disk_not_the_scan_snapshot() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = home.path();
+        write_skills_fixture(root);
+
+        let handler = MethodHandler::new(root.to_path_buf()).await;
+        {
+            let mut reg = handler.registry.write().await;
+            reg.scan().await.expect("scan");
+        }
+
+        // Written AFTER the scan — exactly what `skill_graduate` / the
+        // synthesis pipeline do.
+        std::fs::write(
+            root.join("agents")
+                .join("agnes")
+                .join("SKILLS")
+                .join("late-arrival.md"),
+            "---\nname: late-arrival\n---\n\n掃描後才寫入。\n",
+        )
+        .unwrap();
+
+        let frame = handler.handle_skills_list(json!({})).await;
+        let payload = match &frame {
+            WsFrame::Response {
+                payload: Some(p), ..
+            } => p.clone(),
+            _ => panic!("skills.list failed: {}", frame_error_text(&frame)),
+        };
+
+        let agents = payload["agents"].as_array().expect("agents array");
+        let agnes = agents
+            .iter()
+            .find(|a| a["agent_id"] == "agnes")
+            .expect("agnes must be listed");
+        let names: Vec<&str> = agnes["skills"]
+            .as_array()
+            .expect("skills array")
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"late-arrival"),
+            "a skill written after the last scan must still be listed, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"company-tone"),
+            "the global layer is listed once under `global_skills`; repeating it \
+             per agent would show the same skill N times, got {names:?}"
+        );
+
+        let global: Vec<&str> = payload["global_skills"]
+            .as_array()
+            .expect("global_skills array")
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert_eq!(global, vec!["company-tone"]);
+    }
+
+    /// An empty skill list is unfalsifiable from the browser without the
+    /// directories that were actually walked. "技能庫什麼都看不到" stayed an
+    /// unresolvable support ticket precisely because the UI could not tell
+    /// "no skills exist" from "the folder being read is not the folder skills
+    /// were written to".
+    #[tokio::test]
+    async fn skills_list_reports_the_directories_it_scanned() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = home.path();
+        write_skills_fixture(root);
+
+        let handler = MethodHandler::new(root.to_path_buf()).await;
+        {
+            let mut reg = handler.registry.write().await;
+            reg.scan().await.expect("scan");
+        }
+
+        let frame = handler.handle_skills_list(json!({ "agent_id": "agnes" })).await;
+        let payload = match &frame {
+            WsFrame::Response {
+                payload: Some(p), ..
+            } => p.clone(),
+            _ => panic!("skills.list failed: {}", frame_error_text(&frame)),
+        };
+        let scanned = payload["scanned"].as_array().expect("scanned array");
+
+        let global = scanned
+            .iter()
+            .find(|s| s["layer"] == "global")
+            .expect("the global layer must be reported");
+        assert_eq!(global["exists"], true);
+        assert_eq!(global["count"], 1);
+        assert_eq!(
+            global["path"].as_str().unwrap(),
+            root.join("skills").display().to_string(),
+            "the reported path must be the one actually read"
+        );
+
+        let agent = scanned
+            .iter()
+            .find(|s| s["layer"] == "agent")
+            .expect("the per-agent layer must be reported");
+        assert_eq!(agent["count"], 1);
+    }
+
+    /// Every agent-creation path must seed the bundled skills. Wiring it to
+    /// the MCP `create_agent` tool alone meant a dashboard-onboarded customer
+    /// got an empty `SKILLS/` — and, since nothing writes `<home>/skills/`
+    /// either, a permanently blank Skills page.
+    #[tokio::test]
+    async fn agent_creation_seeds_the_builtin_skills() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = home.path();
+        let skills_dir = root.join("agents").join("newbie").join("SKILLS");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        MethodHandler::seed_builtin_skills(&skills_dir);
+
+        let loaded =
+            duduclaw_agent::registry::AgentRegistry::load_skills(&skills_dir).await;
+        assert!(
+            !loaded.is_empty(),
+            "a freshly created staffer must start with skills the loader can see"
+        );
+        // Seeding writes `<name>/SKILL.md`; the loader keys those on the
+        // parent directory name. If the two layouts ever drift apart the
+        // skills would be on disk yet invisible — the exact failure mode the
+        // customer reported.
+        for (name, _) in duduclaw_agent::builtin_skills::BUILTIN_SKILLS {
+            assert!(
+                loaded.iter().any(|s| s.name == *name),
+                "seeded skill `{name}` must be visible to the loader"
+            );
+        }
+
+        // Idempotent: re-seeding must not duplicate or clobber.
+        std::fs::write(
+            skills_dir
+                .join(duduclaw_agent::builtin_skills::BUILTIN_SKILLS[0].0)
+                .join("SKILL.md"),
+            "# edited by the operator\n",
+        )
+        .unwrap();
+        MethodHandler::seed_builtin_skills(&skills_dir);
+        let after = std::fs::read_to_string(
+            skills_dir
+                .join(duduclaw_agent::builtin_skills::BUILTIN_SKILLS[0].0)
+                .join("SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(after, "# edited by the operator\n", "operator edits must win");
     }
 
     /// WP6 — a routine created from the dashboard must announce itself on the
