@@ -198,10 +198,13 @@ export const navGroups: NavGroup[] = [
     // 工作 — the work itself.
     label: 'navGroup.work',
     items: [
-      // 任務看板 restored to the primary sidebar (2026-07-12 walkthrough): it's the
-      // canonical work surface, so it leads the 工作 group. Still reachable from the
-      // Home task-summary cards, the mobile ＋交辦 action, and ⌘K.
-      { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc', ownScope: true },
+      // 例行工作 leads the 工作 group (2026-08-04 WP14 client annotation): the
+      // agreed priority order across BOTH editions is 新對話 → 例行工作 → 技能庫
+      // → 記憶 → AI 員工 → 世界, and 任務看板 is explicitly demoted (folded into
+      // 進階 on Personal; last row of this group on Enterprise, where no 進階
+      // group exists). Nothing was removed — the board keeps its route, the Home
+      // task-summary cards, the mobile ＋交辦 action, and ⌘K.
+      { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', minRole: 'manager' },
       // U4 co-edited plans — shared step lists between the user and an AI employee.
       { to: '/plans', icon: ListChecks, label: 'nav.plans', desc: 'nav.plans.desc', ownScope: true },
       // G12 run inspector — per-run transcripts (session turns + tool receipts).
@@ -210,7 +213,6 @@ export const navGroups: NavGroup[] = [
       { to: '/canvas', icon: Presentation, label: 'nav.canvas', desc: 'nav.canvas.desc', ownScope: true },
       // WP1.4 file panel — attachments an AI staff member received/produced.
       { to: '/files', icon: FolderOpen, label: 'nav.files', desc: 'nav.files.desc', ownScope: true },
-      { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', minRole: 'manager' },
       // G11 Work Timeline — company-level Gantt of every AI staff member's runs.
       { to: '/timeline', icon: ChartGantt, label: 'nav.timeline', desc: 'nav.timeline.desc', minRole: 'manager' },
       { to: '/reports', icon: BarChart3, label: 'nav.reports', desc: 'nav.reports.desc', minRole: 'manager' },
@@ -221,6 +223,10 @@ export const navGroups: NavGroup[] = [
       // Progressive disclosure: hidden until the first fork ever runs — a
       // dormant RFC-26 surface shouldn't occupy nav space with a dead page.
       { to: '/forks', icon: GitFork, label: 'nav.forks', desc: 'nav.forks.desc', minRole: 'manager', requiresData: 'forks' },
+      // 任務看板 — demoted to the tail of the group (2026-08-04 WP14). Enterprise
+      // has no 進階 group to fold it into, so "least prominent slot" is the
+      // closest equivalent to the Personal treatment.
+      { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc', ownScope: true },
     ],
   },
   {
@@ -228,11 +234,14 @@ export const navGroups: NavGroup[] = [
     // widgets, growth.
     label: 'navGroup.company',
     items: [
-      staffEntry,
-      { to: '/org', icon: Users2, label: 'nav.team', desc: 'nav.team.desc', minRole: 'manager', personalHidden: true },
-      { to: '/world', icon: Globe2, label: 'nav.world', desc: 'nav.world.desc', ownScope: true },
-      { to: '/memory', icon: Brain, label: 'nav.memory', desc: 'nav.memory.desc', ownScope: true },
+      // Ordered 技能庫 → 記憶 → AI 員工 → 世界 to match the Personal primary rail
+      // (2026-08-04 WP14): the two editions must not present the same six
+      // surfaces in two different orders.
       { to: '/skills', icon: Puzzle, label: 'nav.skills', desc: 'nav.skills.desc' },
+      { to: '/memory', icon: Brain, label: 'nav.memory', desc: 'nav.memory.desc', ownScope: true },
+      staffEntry,
+      { to: '/world', icon: Globe2, label: 'nav.world', desc: 'nav.world.desc', ownScope: true },
+      { to: '/org', icon: Users2, label: 'nav.team', desc: 'nav.team.desc', minRole: 'manager', personalHidden: true },
       // 專家包 — install/manage bundled AI teams; experts.* RPCs are admin-only.
       { to: '/experts', icon: Package, label: 'nav.experts', desc: 'nav.experts.desc', minRole: 'admin' },
       // Widget 工坊 — custom dashboard cards (AI-built / HTML / shared).
@@ -288,12 +297,17 @@ function pickItems(paths: string[]): NavItem[] {
  * `/knowledge` used to hold here (and leaves 進階).
  */
 export const personalPrimaryItems: NavItem[] = pickItems([
-  // AI 員工 back on the primary rail for Personal too (2026-08-04, D11).
-  '/agents',
+  // 2026-08-04 WP14 client annotation fixes this order outright:
+  //   1 新對話 · 2 例行工作 · 3 技能庫 · 4 記憶 · 5 AI 員工 · 6 世界
+  // 新對話 lives in `dailyItems` (rendered above this row), so rows 2-6 are
+  // exactly what follows. 桌寵工作室 stays at the tail — it is desktop-only and
+  // was not part of the annotated list.
   '/routines',
-  '/world',
   '/skills',
   '/memory',
+  // AI 員工 back on the primary rail for Personal too (2026-08-04, D11).
+  '/agents',
+  '/world',
   '/pet-studio',
 ]);
 
@@ -301,6 +315,8 @@ export const personalPrimaryItems: NavItem[] = pickItems([
 export const personalAdvancedGroup: NavGroup = {
   label: 'navGroup.advanced',
   items: pickItems([
+    // 任務看板 folded in here on 2026-08-04 (WP14): still one click away, no
+    // longer competing with the six surfaces people actually open daily.
     '/tasks',
     '/plans',
     '/runs',
@@ -355,6 +371,14 @@ export const manageNav: NavItem[] = [
  * their original routes — bookmarks, ⌘K and deep links are unaffected — they
  * simply no longer occupy a top-level rail slot. The `ManageShell` reveals them
  * as a sub-list whenever the viewer is inside this subtree.
+ *
+ * Order invariant (2026-08-04 WP14 client annotation): the money surfaces
+ * (帳務 → 授權 → 經銷) come FIRST and 設定 stays LAST, so "where do I see what
+ * this costs" is never below the catch-all settings row.
+ *
+ * 安全 / 可靠性 / 日誌 carry `personalHidden` — operator-grade diagnostics that a
+ * one-person office never opens, and which made the advanced list read as a wall
+ * of jargon. The routes stay URL-reachable and every other edition keeps them.
  */
 export const manageAdvancedNav: NavItem[] = [
   { to: '/manage/billing', icon: CreditCard, label: 'manage.billing', desc: 'manage.billing.desc', minRole: 'manager' },
@@ -370,10 +394,10 @@ export const manageAdvancedNav: NavItem[] = [
   // scope) are hidden in the Personal edition.
   { to: '/manage/departments', icon: Network, label: 'manage.departments', desc: 'manage.departments.desc', minRole: 'admin', enterprise: true },
   { to: '/manage/governance', icon: Scale, label: 'manage.governance', desc: 'manage.governance.desc', minRole: 'admin', enterprise: true },
-  { to: '/manage/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin' },
-  { to: '/manage/reliability', icon: Activity, label: 'manage.reliability', desc: 'manage.reliability.desc', minRole: 'admin' },
+  { to: '/manage/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin', personalHidden: true },
+  { to: '/manage/reliability', icon: Activity, label: 'manage.reliability', desc: 'manage.reliability.desc', minRole: 'admin', personalHidden: true },
   { to: '/manage/inference', icon: Cpu, label: 'manage.inference', desc: 'manage.inference.desc', minRole: 'admin' },
-  { to: '/manage/logs', icon: FileText, label: 'manage.logs', desc: 'manage.logs.desc', minRole: 'manager' },
+  { to: '/manage/logs', icon: FileText, label: 'manage.logs', desc: 'manage.logs.desc', minRole: 'manager', personalHidden: true },
   { to: '/manage/system', icon: Settings, label: 'manage.system', desc: 'manage.system.desc', minRole: 'admin' },
 ];
 

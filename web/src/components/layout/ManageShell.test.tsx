@@ -107,12 +107,42 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
 
   it('hides enterprise-only items on the personal edition', () => {
     useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
-    renderManage('/manage/security');
+    renderManage('/manage/billing');
     expect(screen.queryByRole('link', { name: en['manage.governance'] })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: en['manage.users'] })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: en['manage.departments'] })).not.toBeInTheDocument();
-    // Non-enterprise-gated items in the same sub-list stay visible.
+    // Non-gated items in the same sub-list stay visible.
+    expect(screen.getByRole('link', { name: en['manage.billing'] })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: en['manage.inference'] })).toBeInTheDocument();
+  });
+
+  // 2026-08-04 (WP14): operator-grade diagnostics leave the Personal rail. The
+  // routes stay reachable — only the advanced sub-list stops advertising them.
+  it('hides 安全 / 可靠性 / 日誌 on the personal edition and keeps them on enterprise', () => {
+    useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+    const { unmount } = renderManage('/manage/billing');
+    expect(screen.queryByRole('link', { name: en['manage.security'] })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: en['manage.reliability'] })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: en['manage.logs'] })).not.toBeInTheDocument();
+    unmount();
+
+    useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
+    renderManage('/manage/billing');
     expect(screen.getByRole('link', { name: en['manage.security'] })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: en['manage.reliability'] })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: en['manage.logs'] })).toBeInTheDocument();
+  });
+
+  // 帳務 first, 設定 last — the client-annotated order of the advanced list.
+  it('keeps the money surfaces above 設定 in the 進階設定 sub-list', () => {
+    renderManage('/manage/billing');
+    const labels = screen
+      .getAllByRole('link')
+      .map((el) => el.textContent?.trim())
+      .filter(Boolean) as string[];
+    expect(labels.indexOf(en['manage.billing'])).toBeLessThan(labels.indexOf(en['manage.system']));
+    expect(labels.indexOf(en['manage.license'])).toBeLessThan(labels.indexOf(en['manage.system']));
+    expect(labels.at(-1)).toBe(en['manage.system']);
   });
 
   it('redirects bare /manage to the first surface the viewer can see', () => {

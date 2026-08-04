@@ -11,6 +11,7 @@ import {
   SidebarMenuItem,
   SidebarMenuButton,
   SidebarMenuBadge,
+  SidebarContent,
 } from '../sidebar';
 
 function Shell() {
@@ -67,5 +68,32 @@ describe('<Sidebar>', () => {
     const { container } = renderWithProviders(<Shell />);
     const inset = container.querySelector('[data-slot="sidebar-inset"]')!;
     expect(inset).toHaveClass('bg-page-canvas', 'rounded-xl', 'ring-1');
+  });
+
+  // 2026-08-04 (WP14) regression: the edge fade used to be unconditional, which
+  // permanently washed out the top 12px of the first nav row — the client read
+  // it as 「上方被擋住」. Unscrolled content must be fully opaque at both edges.
+  it('does not fade the top edge while the nav is not scrolled', () => {
+    const { container } = renderWithProviders(
+      <SidebarProvider>
+        <Sidebar>
+          <SidebarContent>
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton>New chat</SidebarMenuButton>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </SidebarContent>
+        </Sidebar>
+      </SidebarProvider>,
+    );
+    const content = container.querySelector<HTMLElement>('[data-slot="sidebar-content"]')!;
+    // jsdom reports zero scroll extent → nothing is hidden → no fade at all.
+    expect(content).not.toHaveAttribute('data-fade-top');
+    expect(content).not.toHaveAttribute('data-fade-bottom');
+    // Opaque from 0 straight through to 100% — no 12px ramp at either end.
+    expect(content.style.maskImage).toBe(
+      'linear-gradient(transparent 0, rgb(0, 0, 0) 0, rgb(0, 0, 0) 100%, transparent 100%)',
+    );
   });
 });
