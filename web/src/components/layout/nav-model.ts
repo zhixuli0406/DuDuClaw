@@ -86,15 +86,20 @@ export type NavGroup = {
  * Single source of truth for the "嘟嘟事務所" navigation, re-grouped for the
  * Multica app shell (WP0.4, spec §5.1). The Sidebar renders, top to bottom:
  *   1. `dailyItems` — flat, no group label (新對話 / 儀表板; 收件匣 moved to the
- *      footer bell on 2026-08-04, D17).
- *   1b. the `對話紀錄` zone — dynamic, sourced from `useConversationsStore`
- *      (2026-07-30 client feedback); on Personal it sits between the daily row
- *      and `personalPrimaryItems`, mirroring where 對話 used to be.
+ *      footer bell on 2026-08-04, D17). On Personal, `personalPrimaryItems`
+ *      follows immediately in the same flat block.
  *   2. the `工作` group (`navGroups[0]`) — collapsible GroupLabel.
  *   3. a LIVE 員工 zone — dynamic, sourced from the agents store, not static
  *      nav items (see AppSidebar). `staffEntry` is its "全部員工 →" link.
  *   4. the `公司` group (`navGroups[1]`) — collapsible.
- *   5. the `設定` group (`navGroups[2]`) — collapsible: 管理 + 關於.
+ *      (2-4 are Enterprise-only; Personal's equivalents are the flat row.)
+ *   5. the `對話紀錄` zone — dynamic, sourced from `useConversationsStore`.
+ *      Moved here from directly under 新對話 on 2026-08-04 (WP18-B): the
+ *      annotated primary order 新對話 → 例行工作 → 技能庫 → 記憶 → AI 員工 →
+ *      世界 must not be interrupted by a list of past conversation titles.
+ *      Identical slot on both editions.
+ *   6. the `設定` group (`navGroups[2]`) — collapsible: 管理 + 關於; then
+ *      Personal's collapsed `進階` group.
  *
  * `navGroups` deliberately excludes the daily items so the flat daily row maps
  * 1:1 to its render block; the command palette and breadcrumb resolver fold

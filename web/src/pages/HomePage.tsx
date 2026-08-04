@@ -5,6 +5,7 @@ import { api, type DashboardLayoutWidget, type CustomWidgetSummary } from '@/lib
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useSystemStore } from '@/stores/system-store';
 import { useVisibleAgents } from '@/lib/data-scope';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
@@ -59,6 +60,37 @@ function greetingBucket(hour: number): 'morning' | 'afternoon' | 'evening' | 'ni
 }
 
 /**
+ * The display name the bootstrap admin row is seeded with (see
+ * `duduclaw-auth/src/db.rs`). It is a database placeholder, not a name anyone
+ * chose — which is why a fresh single-owner install greeted its owner with
+ * 「晚安 Administrator」 (2026-08-04 client report).
+ */
+const PLACEHOLDER_DISPLAY_NAME = 'Administrator';
+
+/**
+ * Whose name goes in the greeting line.
+ *
+ * On the single-owner Personal edition the account is created by the installer,
+ * never by a human typing a name, so the seeded placeholder is treated as "not
+ * set" and the warm fallback (老闆 / there) is used instead. The onboarding
+ * wizard's 「怎麼稱呼你」 field writes a real `display_name`, which then shows.
+ *
+ * Enterprise is deliberately untouched: those accounts are provisioned by an
+ * admin who typed the name, so even a literal "Administrator" there is a
+ * deliberate choice and must be shown verbatim.
+ */
+export function greetingName(
+  displayName: string | undefined | null,
+  isPersonal: boolean,
+  fallback: string,
+): string {
+  const name = (displayName ?? '').trim();
+  if (!name) return fallback;
+  if (isPersonal && name === PLACEHOLDER_DISPLAY_NAME) return fallback;
+  return name;
+}
+
+/**
  * HomePage (`/`) — Multica-style work overview (WP1.5). A reading-type container
  * (§5.2): a plain greeting line, the fixed 用量摘要 KPI strip (§5.5), then the
  * per-user widget list (server-persisted order + visibility, catalog role-filtered
@@ -69,6 +101,7 @@ export function HomePage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const user = useAuthStore((s) => s.user);
+  const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   // Data-scoped: an employee sees only their own AI staff (§3.4 WP11-T11.3).
   const agents = useVisibleAgents();
@@ -339,7 +372,13 @@ export function HomePage() {
 
   const greeting = intl.formatMessage(
     { id: `home.greeting.${greetingBucket(new Date().getHours())}` },
-    { name: user?.display_name || intl.formatMessage({ id: 'home.greeting.fallbackName' }) },
+    {
+      name: greetingName(
+        user?.display_name,
+        isPersonal,
+        intl.formatMessage({ id: 'home.greeting.fallbackName' }),
+      ),
+    },
   );
 
   return (
