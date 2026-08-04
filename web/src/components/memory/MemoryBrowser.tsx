@@ -75,6 +75,16 @@ import {
  * Grouping is deterministic and local (see `lib/memory-category.ts`) — the
  * backend has no topic field and adding an LLM pass per entry would cost on
  * every page view.
+ *
+ * WP15 (2026-08-04 client feedback: a memory page that was wall-to-wall
+ * "學習訊號 70% → 52%" rows, prompting "記憶還沒更新對嗎?"): the main list
+ * carries only memories *about the user*. The platform's own learning
+ * telemetry — one prediction-deviation row per Moderate-error turn — is a
+ * separate, collapsed section at the bottom. The split is made by the gateway
+ * (`duduclaw_memory::is_system_signal`, keyed on `source_event`), which
+ * returns the two lists under `entries` and `signals`; doing it there rather
+ * than filtering here is what stops a telemetry burst from consuming the row
+ * limit and evicting real memories entirely.
  */
 
 /** Icon name (from the category table) → the actual lucide component. */
@@ -107,6 +117,8 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
   const [entries, setEntries] = useState<ReadonlyArray<MemoryEntry>>([]);
+  /** WP15 — platform learning telemetry, kept out of the list above. */
+  const [signals, setSignals] = useState<ReadonlyArray<MemoryEntry>>([]);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<MemoryCategoryId | 'all'>('all');
 
@@ -120,12 +132,14 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
       try {
         const res = await api.memory.browse(agentId, 200);
         setEntries([...(res?.entries ?? [])].sort(byRecency));
+        setSignals([...(res?.signals ?? [])].sort(byRecency));
       } catch (e) {
         console.warn('[api]', e);
         toast.error(
           intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }),
         );
         setEntries([]);
+        setSignals([]);
       } finally {
         if (showSpinner) setLoading(false);
       }
@@ -181,10 +195,12 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
     try {
       const result = await api.memory.search(agentId, query, 200);
       setEntries([...(result?.entries ?? [])].sort(byRecency));
+      setSignals([...(result?.signals ?? [])].sort(byRecency));
     } catch (e) {
       console.warn('[api]', e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
       setEntries([]);
+      setSignals([]);
     } finally {
       setLoading(false);
     }
@@ -200,32 +216,41 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
 
   const buckets = useMemo(() => groupByCategory(entries as MemoryEntry[]), [entries]);
 
-  /** Drop a forgotten entry from local state — no refetch, no scroll jump. */
+  /** Drop a forgotten entry from local state — no refetch, no scroll jump.
+   *  Both lists are swept: the same row control appears in either section. */
   const handleForgotten = useCallback((id: string) => {
     setEntries((prev) => prev.filter((e) => e.id !== id));
+    setSignals((prev) => prev.filter((e) => e.id !== id));
   }, []);
 
   if (loading) return <MemoryListSkeleton />;
 
+  // The telemetry section renders under every branch below — including the
+  // empty one. That is the honest answer to "記憶還沒更新對嗎?": no memories
+  // yet, and here is the machine bookkeeping that is not one.
+  const signalSection = <SystemSignals signals={signals} onForgotten={handleForgotten} />;
+
   if (entries.length === 0) {
-    if (query.trim()) {
-      return (
-        <CollectionPageState
-          state="empty"
-          icon={BrainIcon}
-          title={intl.formatMessage({ id: 'memory.empty.search' }, { query })}
-        />
-      );
-    }
-    // One empty state, written for someone who has never heard of a "memory
-    // layer": say what puts things on this list and what does not.
     return (
-      <CollectionPageState
-        state="empty"
-        icon={BrainIcon}
-        title={intl.formatMessage({ id: 'memory.empty.memories' })}
-        description={intl.formatMessage({ id: 'memory.empty.memories.how' })}
-      />
+      <div className="flex flex-col gap-6">
+        {query.trim() ? (
+          <CollectionPageState
+            state="empty"
+            icon={BrainIcon}
+            title={intl.formatMessage({ id: 'memory.empty.search' }, { query })}
+          />
+        ) : (
+          // One empty state, written for someone who has never heard of a
+          // "memory layer": say what puts things on this list and what does not.
+          <CollectionPageState
+            state="empty"
+            icon={BrainIcon}
+            title={intl.formatMessage({ id: 'memory.empty.memories' })}
+            description={intl.formatMessage({ id: 'memory.empty.memories.how' })}
+          />
+        )}
+        {signalSection}
+      </div>
     );
   }
 
@@ -242,7 +267,7 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
         selected={selected}
         onSelect={setSelected}
       />
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1 space-y-6">
         {visible.length === 0 ? (
           <CollectionPageState
             state="empty"
@@ -272,8 +297,67 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
             ))}
           </div>
         )}
+        {signalSection}
       </div>
     </div>
+  );
+}
+
+/**
+ * WP15 — the platform's own learning telemetry, parked below the memories in a
+ * section that is collapsed until asked for.
+ *
+ * These rows are not things the user told the agent: the prediction router
+ * writes one per turn whose outcome missed its forecast, and the dashboard used
+ * to interleave them with real memories, which read as "the memory never
+ * updated". Kept visible rather than hidden outright — the count answers "is it
+ * doing anything?" without the rows crowding out what the user came to read.
+ */
+function SystemSignals({
+  signals,
+  onForgotten,
+}: {
+  signals: ReadonlyArray<MemoryEntry>;
+  onForgotten: (id: string) => void;
+}) {
+  const intl = useIntl();
+  const [open, setOpen] = useState(false);
+  if (signals.length === 0) return null;
+
+  return (
+    <section className="rounded-xl border border-surface-border bg-surface-muted/40">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-3 py-2.5 text-left"
+      >
+        {open ? (
+          <ChevronUpIcon className="size-4 shrink-0 text-brand" aria-hidden />
+        ) : (
+          <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+        )}
+        <ActivityIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+        <span className="text-sm font-medium text-foreground">
+          {intl.formatMessage({ id: 'memory.signals.title' })}
+        </span>
+        <span className="font-mono text-xs tabular-nums text-muted-foreground">
+          {signals.length}
+        </span>
+      </button>
+      <div className="px-3 pb-3">
+        <p className="text-xs text-muted-foreground">
+          {intl.formatMessage({ id: 'memory.signals.note' })}
+        </p>
+        {open && (
+          <div className="mt-2 flex flex-col gap-1">
+            {signals.map((entry) => (
+              <MemoryRow key={entry.id} entry={entry} onForgotten={onForgotten} />
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -465,14 +549,18 @@ function MemoryRow({
           type="button"
           onClick={() => setOpen((v) => !v)}
           aria-expanded={open}
-          className="flex min-w-0 flex-1 items-center gap-2 py-1.5 text-left"
+          className="flex min-w-0 flex-1 items-start gap-2 py-1.5 text-left"
         >
           {open ? (
-            <ChevronUpIcon className="size-4 shrink-0 text-brand" aria-hidden />
+            <ChevronUpIcon className="mt-0.5 size-4 shrink-0 text-brand" aria-hidden />
           ) : (
-            <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+            <ChevronDownIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
           )}
-          <span className="min-w-0 flex-1 truncate text-sm text-foreground">{summary}</span>
+          {/* WP15: two lines, not one. `truncate` cut the summary at whatever
+              the column width happened to be, so on a narrow viewport a row
+              could show a fraction of its 90-character budget and lose the
+              part that identified the memory. */}
+          <span className="line-clamp-2 min-w-0 flex-1 text-sm text-foreground">{summary}</span>
         </button>
         {layerId && (
           <Badge variant="secondary" className="hidden shrink-0 sm:inline-flex">

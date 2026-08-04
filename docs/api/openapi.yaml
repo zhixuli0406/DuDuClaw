@@ -874,13 +874,21 @@ paths:
                   default: 10
       responses:
         "200":
-          description: Memory search results
+          description: >-
+            Memory search results, split the same way `memory.browse` splits
+            them (matching memories vs. matching learning telemetry).
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  results:
+                  entries:
+                    description: Matching memories about the user.
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MemoryEntry"
+                  signals:
+                    description: Matching system learning signals.
                     type: array
                     items:
                       $ref: "#/components/schemas/MemoryEntry"
@@ -905,13 +913,25 @@ paths:
                   default: 0
       responses:
         "200":
-          description: Memory entries
+          description: >-
+            Memory entries, split into user-facing memories and the platform's
+            own learning telemetry. Each list is capped at `limit`
+            independently, so a burst of telemetry cannot evict memories.
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   entries:
+                    description: Memories about the user — what the agent was told.
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MemoryEntry"
+                  signals:
+                    description: >-
+                      System learning signals (prediction-deviation records,
+                      mood snapshots). Classified by `source_event`; see
+                      `duduclaw_memory::is_system_signal`.
                     type: array
                     items:
                       $ref: "#/components/schemas/MemoryEntry"

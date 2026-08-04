@@ -89,21 +89,26 @@ function graphemes(input: string): string[] {
 }
 
 /**
- * Collapse a memory's stored content into the one-line summary the list row
- * shows (WP5a / D6: "a list of memories, one line each, expand for detail").
+ * Collapse a memory's stored content into the summary the list row shows
+ * (WP5a / D6: "a list of memories, expand for detail").
  *
- * Rules, in order: take the first non-empty line; if it still exceeds the
- * budget, cut at the last sentence terminator that fits; otherwise hard-cut and
- * append an ellipsis. `maxChars` counts grapheme clusters (see
- * {@link graphemes}), never bytes or UTF-16 indices, so CJK, flags and ZWJ
- * emoji sequences all survive the cut intact.
+ * Rules, in order: flatten every non-empty line into one string joined by
+ * `·`; if it exceeds the budget, cut at the last sentence terminator that
+ * fits; otherwise hard-cut and append an ellipsis. `maxChars` counts grapheme
+ * clusters (see {@link graphemes}), never bytes or UTF-16 indices, so CJK,
+ * flags and ZWJ emoji sequences all survive the cut intact.
+ *
+ * WP15: this used to keep only the *first* line, which hid the substance of
+ * any memory written with a heading ("客戶資料更新 / 公司: … / 電話: …" showed
+ * just the heading). Joining the lines keeps the identifying detail on the
+ * row; the full text is still one click away in the detail panel.
  */
 export function summarizeMemory(content: string, maxChars = 90): string {
-  const firstLine = content
+  const lines = content
     .split('\n')
     .map((l) => l.trim())
-    .find((l) => l.length > 0);
-  const line = (firstLine ?? content.trim()).replace(/\s+/g, ' ');
+    .filter((l) => l.length > 0);
+  const line = (lines.length > 0 ? lines.join(' · ') : content.trim()).replace(/\s+/g, ' ');
   const chars = graphemes(line);
   if (chars.length <= maxChars) return line;
 

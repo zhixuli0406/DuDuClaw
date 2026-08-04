@@ -24,8 +24,9 @@ pub use code_map::{CodeMap, CodeMapConfig, RankedFile, SymbolInfo, SymbolKind};
 pub use embedding::VectorIndex;
 pub use vector::{EmbeddingProvider, NgramHashEmbedder};
 pub use engine::{
-    DecisionResolveOutcome, DecisionView, KeyFact, SqliteMemoryEngine, TemporalMeta,
-    TemporalRecord, word_jaccard,
+    is_system_signal, DecisionResolveOutcome, DecisionView, KeyFact, SqliteMemoryEngine,
+    TemporalMeta, TemporalRecord, word_jaccard, PREDICTION_CONTENT_PREFIX,
+    SYSTEM_SIGNAL_SOURCE_EVENTS,
 };
 pub use feedback::{CitationTracker, DrainOnDrop, TrustSignal, WikiCitation};
 pub use gdpr::{gdpr_erase, gdpr_export, GdprEraseSummary};

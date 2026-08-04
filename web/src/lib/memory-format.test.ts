@@ -61,9 +61,11 @@ describe('summarizeMemory', () => {
     expect(summarizeMemory('客戶的合約報價是三萬元')).toBe('客戶的合約報價是三萬元');
   });
 
-  it('keeps only the first non-empty line of a multi-line memory', () => {
-    expect(summarizeMemory('\n\n偏好用繁體中文回覆\n其餘細節在下面\n更多細節')).toBe(
-      '偏好用繁體中文回覆',
+  // WP15 — a memory written as "heading / detail / detail" must not show up on
+  // the row as just its heading.
+  it('joins every non-empty line so the detail survives onto the row', () => {
+    expect(summarizeMemory('\n\n客戶資料更新\n公司: 嘟嘟數位\n電話: 0912-345-678')).toBe(
+      '客戶資料更新 · 公司: 嘟嘟數位 · 電話: 0912-345-678',
     );
   });
 
