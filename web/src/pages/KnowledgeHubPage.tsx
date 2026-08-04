@@ -8,6 +8,7 @@ import {
   type WikiSearchHit,
   type WikiLintReport,
   type WikiStats,
+  type MemoryGraphEdge,
 } from '@/lib/api';
 import {
   BookOpenIcon,
@@ -424,7 +425,22 @@ function GraphView({ agentId }: { agentId: string }) {
   const intl = useIntl();
   const [pages, setPages] = useState<ReadonlyArray<WikiPageMeta>>([]);
   const [pageContents, setPageContents] = useState<Record<string, string>>({});
+  const [memoryEdges, setMemoryEdges] = useState<ReadonlyArray<MemoryGraphEdge>>([]);
   const [loading, setLoading] = useState(false);
+
+  // WP16 — the topic graph blends what the AI learned (`memory.graph` SPO
+  // triples) into the page graph. Optional data: a permission error or an
+  // agent with no memory db degrades to a tags/folders-only graph.
+  useEffect(() => {
+    let cancelled = false;
+    setMemoryEdges([]);
+    api.memory.graph(agentId, 400)
+      .then((res) => {
+        if (!cancelled) setMemoryEdges(res?.edges ?? []);
+      })
+      .catch(() => { /* graph still works without memory edges */ });
+    return () => { cancelled = true; };
+  }, [agentId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -463,7 +479,13 @@ function GraphView({ agentId }: { agentId: string }) {
   return (
     <Card>
       <CardContent>
-        <WikiGraph pages={pages} pageContents={pageContents} width={900} height={550} />
+        <WikiGraph
+          pages={pages}
+          pageContents={pageContents}
+          memoryEdges={memoryEdges}
+          width={900}
+          height={550}
+        />
       </CardContent>
     </Card>
   );
