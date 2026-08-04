@@ -262,10 +262,13 @@ export function IdentityPage() {
                 htmlFor="identity-api-key"
                 help={apiKeySet ? t('identity.apiKeySetHint') : t('identity.apiKeyHint')}
               >
+                {/* Dots alone do not say whether a key is stored. The saved case
+                    spells it out — including that leaving it blank keeps the
+                    stored key rather than clearing it. */}
                 <Input
                   id="identity-api-key"
                   type="password"
-                  placeholder={apiKeySet ? '••••••••' : 'secret_…'}
+                  placeholder={apiKeySet ? t('integrations.secretKeep') : 'secret_…'}
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
                 />

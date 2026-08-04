@@ -137,7 +137,16 @@ export function GoogleCredentialPaths() {
           )}
         </p>
 
+        {/* "Bound" and "in effect" are different facts and are shown side by
+            side: a credential can be on file while a different path is the one
+            actually serving calls. Collapsing them is what let a configured
+            integration read as empty. */}
         <div className="flex flex-wrap items-center gap-2 text-sm">
+          {status.effective !== 'none' && (
+            <Badge className="bg-success/15 text-success">
+              {t('google.cred.badge.configured', '憑證已設定')}
+            </Badge>
+          )}
           <span className="text-muted-foreground">{t('google.cred.effective', '目前生效')}</span>
           <Badge variant={status.effective === 'none' ? 'outline' : 'default'}>
             {effectiveLabel}

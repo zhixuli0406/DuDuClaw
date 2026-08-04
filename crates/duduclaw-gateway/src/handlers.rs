@@ -9,7 +9,7 @@ use duduclaw_auth::models::{AccessLevel, UserRole};
 use duduclaw_auth::{self, JwtConfig, UserContext, UserDb};
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_core::truncate_bytes;
-use duduclaw_memory::SqliteMemoryEngine;
+use duduclaw_memory::{is_system_signal, SqliteMemoryEngine};
 use rusqlite::params;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
@@ -3347,6 +3347,10 @@ fn scrub_secrets_from_text(raw: &str) -> String {
         token.to_string()
     }
 
+    // WP12: this scrubber keeps `scheme://host{path}` intact, so a credential
+    // carried in the PATH (Telegram's `/bot<token>/getMe`) survived it. Run the
+    // shape-driven redactor first, then the existing URL/kv rules.
+    let raw = crate::secret_redact::redact_secrets(raw).into_owned();
     raw.split_whitespace()
         .map(scrub_token)
         .collect::<Vec<_>>()
@@ -3956,18 +3960,10 @@ impl MethodHandler {
         }
     }
 
-    /// Update a channel's runtime connection state (called by channel bots).
-    pub async fn set_channel_state(&self, name: &str, connected: bool, error: Option<String>) {
-        let mut map = self.channel_status.write().await;
-        map.insert(
-            name.to_string(),
-            ChannelState {
-                connected,
-                last_event: Some(chrono::Utc::now()),
-                error,
-            },
-        );
-    }
+    // WP12 (M6): `set_channel_state` was removed here. It was a zero-caller
+    // duplicate of `channel_reply::set_channel_connected` that bypassed both the
+    // credential redaction and the snapshot/broadcast path — a trap for the next
+    // channel author. Use `set_channel_connected` instead.
 
     /// Get the shared channel status map for use by channel bots.
     pub fn channel_status(&self) -> &Arc<RwLock<std::collections::HashMap<String, ChannelState>>> {
@@ -7161,6 +7157,19 @@ impl MethodHandler {
                     if let Some(val) = params_clone.get(*param_key).and_then(|v| v.as_str()) {
                         if !val.is_empty() {
                             let toml_key = toml_key_override.unwrap_or(param_key);
+                            // WP12 (M1) — same write-boundary shape check as
+                            // `channels.add`: a corrupted Telegram token must
+                            // not be silently encrypted into agent.toml.
+                            // Scoped to the primary credential field on purpose:
+                            // a future `[channels.telegram]` field (webhook
+                            // secret, chat id…) must not be validated as if it
+                            // were a bot token.
+                            let validated = if *toml_key_override == Some("bot_token") {
+                                crate::config_crypto::validate_channel_token(channel, val)?
+                            } else {
+                                val.to_string()
+                            };
+                            let val: &str = &validated;
                             // Sensitive tokens: enc-only when encryption is
                             // available (MED-B parity with channels.add — the
                             // plaintext key is REMOVED, never blanked, because
@@ -9653,6 +9662,16 @@ impl MethodHandler {
             return WsFrame::error_response("", "Missing 'config.token' parameter");
         }
 
+        // WP12 — validate the credential shape BEFORE it is encrypted and
+        // stored. A malformed Telegram token used to be persisted silently and
+        // only surfaced later as a permanently-offline channel; now the save
+        // either normalises it or refuses with an actionable message.
+        let token = match crate::config_crypto::validate_channel_token(channel_type, token) {
+            Ok(t) => t,
+            Err(msg) => return WsFrame::error_response("", &msg),
+        };
+        let token = token.as_str();
+
         // Cloud-tier channel cap (self-host is never capped — Apache 2.0).
         let channel_count = self.count_configured_channels().await;
         if let Some(msg) = self.tier_limit_message("channel", channel_count).await {
@@ -10663,7 +10682,9 @@ impl MethodHandler {
 
         let db_path = self.agent_memory_db_path(agent_id);
         if !db_path.exists() {
-            return WsFrame::ok_response("", json!({ "entries": [] }));
+            // Same shape as a populated response (and as `memory.browse`): a
+            // caller must never have to special-case a missing `signals` key.
+            return WsFrame::ok_response("", json!({ "entries": [], "signals": [] }));
         }
 
         let mut engine = match SqliteMemoryEngine::new(&db_path) {
@@ -10677,8 +10698,19 @@ impl MethodHandler {
 
         match engine.search(agent_id, query, limit).await {
             Ok(entries) => {
-                let results: Vec<Value> = entries.iter().map(memory_entry_row).collect();
-                WsFrame::ok_response("", json!({ "entries": results }))
+                // WP15: same split as `memory.browse` so a search never drops
+                // the user back into a telemetry-flooded list. Search already
+                // ranks a bounded set, so partitioning in Rust is enough here.
+                let (signals, results): (Vec<_>, Vec<_>) = entries
+                    .iter()
+                    .partition(|e| is_system_signal(&e.source_event, &e.content));
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "entries": results.into_iter().map(memory_entry_row).collect::<Vec<_>>(),
+                        "signals": signals.into_iter().map(memory_entry_row).collect::<Vec<_>>(),
+                    }),
+                )
             }
             Err(e) => WsFrame::error_response("", &format!("Memory search failed: {e}")),
         }
@@ -10701,7 +10733,7 @@ impl MethodHandler {
 
         let db_path = self.agent_memory_db_path(agent_id);
         if !db_path.exists() {
-            return WsFrame::ok_response("", json!({ "entries": [] }));
+            return WsFrame::ok_response("", json!({ "entries": [], "signals": [] }));
         }
 
         let engine = match SqliteMemoryEngine::new(&db_path) {
@@ -10711,10 +10743,15 @@ impl MethodHandler {
             }
         };
 
-        match engine.list_recent(agent_id, limit).await {
-            Ok(entries) => {
-                let rows: Vec<Value> = entries.iter().map(memory_entry_row).collect();
-                WsFrame::ok_response("", json!({ "entries": rows }))
+        // WP15: two lists, two budgets. `entries` is what the user told the
+        // agent; `signals` is the platform's own learning telemetry, which the
+        // dashboard files under a separate collapsed section instead of
+        // letting it bury (and, via the shared LIMIT, evict) real memories.
+        match engine.list_recent_split(agent_id, limit).await {
+            Ok((memories, signals)) => {
+                let rows: Vec<Value> = memories.iter().map(memory_entry_row).collect();
+                let signal_rows: Vec<Value> = signals.iter().map(memory_entry_row).collect();
+                WsFrame::ok_response("", json!({ "entries": rows, "signals": signal_rows }))
             }
             Err(e) => WsFrame::error_response("", &format!("Memory browse failed: {e}")),
         }
@@ -18807,6 +18844,15 @@ impl MethodHandler {
                 "poll_interval_seconds": cfg.poll_interval_seconds,
                 "poll_models": cfg.poll_models,
                 "webhook_enabled": cfg.webhook_enabled,
+                // Whether each write-only credential is on file. The values stay
+                // server-side, but without these flags the form shows the same
+                // `••••••••` placeholder whether a secret is stored or not — the
+                // user cannot tell a saved credential from an empty field, which
+                // is the same confusion the Google tab caused.
+                "has_api_key": !cfg.api_key_enc.is_empty(),
+                "has_password": !cfg.password_enc.is_empty(),
+                "has_webhook_secret": !cfg.webhook_secret_enc.is_empty()
+                    || !cfg.webhook_secret.is_empty(),
                 "unblock_models": cfg.unblock_models,
                 "features_crm": cfg.features_crm,
                 "features_sale": cfg.features_sale,
@@ -22184,51 +22230,101 @@ impl MethodHandler {
         use crate::mcp_oauth;
 
         let redirect_uri = mcp_oauth::redirect_uri();
-        let google_enabled = crate::google_workspace::integration_enabled(&self.home_dir);
-        let providers: Vec<_> = mcp_oauth::builtin_providers(&redirect_uri)
-            .into_iter()
-            .filter(|p| google_enabled || p.provider_id != crate::google_workspace::GOOGLE_PROVIDER)
-            .collect();
+        // Every built-in provider is listed, Google included. Filtering Google
+        // out when `[integrations] google_workspace` is off used to hide the
+        // *tools* gate behind a *credentials* lie: the Google tab (visible since
+        // v1.49.0) reads this list to decide whether credentials are on file, so
+        // a filtered-out provider rendered the "you have not set this up yet"
+        // form on top of a working, fully-configured integration. The tools gate
+        // is surfaced where it belongs — the Google tab prints an explicit
+        // warning when it is off, and the MCP tab hides the Google card itself.
+        let providers = mcp_oauth::builtin_providers(&redirect_uri);
 
         let results: Vec<Value> = providers
             .iter()
             .map(|p| {
-                let token = mcp_oauth::get_token(&self.home_dir, &p.provider_id);
-                let status = match &token {
-                    Some(t) => {
-                        if let Some(exp) = t.expires_at {
-                            if chrono::Utc::now() >= exp {
-                                "expired"
-                            } else {
-                                "authenticated"
-                            }
-                        } else {
-                            "authenticated"
-                        }
-                    }
-                    None => "none",
-                };
-                // `configured` reflects persisted client credentials — the
-                // built-in templates always carry empty client_id, so checking
-                // the stored config is what tells us the user has set up creds.
-                let configured =
-                    !p.client_id.is_empty() || mcp_oauth::has_client_config(&self.home_dir, &p.provider_id);
-                json!({
-                    "provider_id": p.provider_id,
-                    "auth_url": p.auth_url,
-                    "scopes": p.scopes,
-                    "configured": configured,
-                    "status": status,
-                    "expires_at": token.and_then(|t| t.expires_at),
-                    // The exact URI to register with the provider. Derived from
-                    // the live gateway port — a UI constant would drift the
-                    // moment anyone sets DUDUCLAW_PORT.
-                    "redirect_uri": p.redirect_uri,
-                })
+                let token = mcp_oauth::get_stored_token(&self.home_dir, &p.provider_id);
+                let stored = mcp_oauth::get_client_config(&self.home_dir, &p.provider_id);
+                Self::oauth_provider_entry(p, token, stored)
             })
             .collect();
 
         WsFrame::ok_response("", json!({ "providers": results }))
+    }
+
+    /// Build one `mcp.oauth.providers` row. Pure — takes what was loaded from
+    /// disk so the display contract can be tested without a live gateway.
+    ///
+    /// Two rules this encodes:
+    ///  - **Expiry is not connection state.** An expired access token that still
+    ///    carries a refresh token is refreshed transparently on the next call,
+    ///    so it reports `authenticated`. Only a token that expired with nothing
+    ///    to refresh from really needs the user to authorize again. Google
+    ///    access tokens last an hour, which made the old expiry-based reading
+    ///    call every healthy connection "not connected" within the hour.
+    ///  - **Saved credentials must be visible.** The client id goes back in full
+    ///    (it is public — it travels in the authorization URL); the client
+    ///    secret never does, only proof one is on file plus a four-character
+    ///    tail so the operator can tell which secret is stored.
+    fn oauth_provider_entry(
+        p: &crate::mcp_oauth::McpOAuthConfig,
+        token: Option<crate::mcp_oauth::McpOAuthToken>,
+        stored: Option<crate::mcp_oauth::McpOAuthClientConfig>,
+    ) -> Value {
+        use crate::mcp_oauth;
+
+        let expired = token
+            .as_ref()
+            .map(mcp_oauth::token_expired)
+            .unwrap_or(false);
+        let can_refresh = token
+            .as_ref()
+            .map(|t| t.refresh_token.is_some())
+            .unwrap_or(false);
+        let status = match &token {
+            Some(_) if !expired || can_refresh => "authenticated",
+            Some(_) => "expired",
+            None => "none",
+        };
+
+        // `configured` reflects persisted client credentials — the built-in
+        // templates always carry an empty client_id, so the stored config is
+        // what tells us the user has set theirs up.
+        let client_id = if p.client_id.is_empty() {
+            stored
+                .as_ref()
+                .map(|c| c.client_id.clone())
+                .unwrap_or_default()
+        } else {
+            p.client_id.clone()
+        };
+        let stored_secret = stored
+            .as_ref()
+            .map(|c| c.client_secret.as_str())
+            .unwrap_or("");
+
+        json!({
+            "provider_id": p.provider_id,
+            "name": Self::oauth_provider_name(&p.provider_id),
+            "auth_url": p.auth_url,
+            "scopes": p.scopes,
+            "configured": !client_id.is_empty(),
+            "client_id": client_id,
+            "has_client_secret": !stored_secret.is_empty(),
+            "client_secret_masked": mcp_oauth::mask_secret_tail(stored_secret),
+            "status": status,
+            // `status` is the historical key; `token_status` is what the
+            // dashboard's provider type has always read — it was never sent, so
+            // every connected provider rendered as unauthenticated. Both go out.
+            "token_status": status,
+            "can_refresh": can_refresh,
+            "access_token_valid": token.is_some() && !expired,
+            "expires_at": token.and_then(|t| t.expires_at),
+            // The exact URI to register with the provider. Derived from the live
+            // gateway port — a UI constant would drift the moment anyone sets
+            // DUDUCLAW_PORT.
+            "redirect_uri": p.redirect_uri,
+        })
     }
 
     /// Start an OAuth flow: generate PKCE, store pending state, return auth URL.
@@ -22607,22 +22703,47 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "provider_id is required"),
         };
 
-        let token = mcp_oauth::get_token(&self.home_dir, provider_id);
+        // Connection state, not access-token freshness: a Google access token
+        // expires every hour, and reporting that as "not connected" is what made
+        // a working integration look like it had lost its credentials. A token
+        // with a refresh token attached is connected; the refresh happens on the
+        // next call. Only an expired token with nothing to refresh from needs
+        // the user to authorize again.
+        let token = mcp_oauth::get_stored_token(&self.home_dir, provider_id);
         match token {
-            Some(t) => WsFrame::ok_response(
-                "",
-                json!({
-                    "authenticated": true,
-                    "expires_at": t.expires_at,
-                    "scopes": t.scopes,
-                }),
-            ),
+            Some(t) => {
+                let expired = mcp_oauth::token_expired(&t);
+                let can_refresh = t.refresh_token.is_some();
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "authenticated": !expired || can_refresh,
+                        "access_token_valid": !expired,
+                        "can_refresh": can_refresh,
+                        "expires_at": t.expires_at,
+                        "scopes": t.scopes,
+                    }),
+                )
+            }
             None => WsFrame::ok_response(
                 "",
                 json!({
                     "authenticated": false,
+                    "access_token_valid": false,
+                    "can_refresh": false,
                 }),
             ),
+        }
+    }
+
+    /// Display name for a built-in OAuth provider (proper nouns, untranslated).
+    fn oauth_provider_name(provider_id: &str) -> String {
+        match provider_id {
+            "google" => "Google".to_string(),
+            "github" => "GitHub".to_string(),
+            "notion" => "Notion".to_string(),
+            "slack" => "Slack".to_string(),
+            other => other.to_string(),
         }
     }
 
@@ -30382,10 +30503,15 @@ mod channels_add_enc_only_tests {
         let home = tempfile::tempdir().expect("tempdir");
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
+        // Split so no contiguous vendor-shaped literal sits in the source: a
+        // synthetic token with a real vendor shape trips source scanners exactly
+        // like a live one.
+        let bot_token = ["xoxb", "-bot-token"].concat();
+        let app_token = ["xapp", "-app-token"].concat();
         let frame = add_channel(
             &handler,
             "slack",
-            json!({ "token": "xoxb-bot-token", "secret": "xapp-app-token" }),
+            json!({ "token": bot_token, "secret": app_token }),
         )
         .await;
         assert!(
@@ -30413,14 +30539,14 @@ mod channels_add_enc_only_tests {
             "slack_bot_token",
         )
         .await;
-        assert_eq!(bot.as_deref(), Some("xoxb-bot-token"));
+        assert_eq!(bot, Some(bot_token));
         let app = crate::config_crypto::read_encrypted_config_field(
             home.path(),
             "channels",
             "slack_app_token",
         )
         .await;
-        assert_eq!(app.as_deref(), Some("xapp-app-token"));
+        assert_eq!(app, Some(app_token));
     }
 
     #[tokio::test]
@@ -30483,7 +30609,9 @@ mod channels_add_enc_only_tests {
         let home = tempfile::tempdir().expect("tempdir");
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
-        let frame = add_channel(&handler, "telegram", json!({ "token": "tg-token" })).await;
+        // Assembled at run time — see the note in `slack_secrets_are_enc_only…`.
+        let tg_token = ["1234567890", ":AAtest", "TELEGRAMtokenFIXTUREvalue01"].concat();
+        let frame = add_channel(&handler, "telegram", json!({ "token": tg_token })).await;
         assert!(
             matches!(frame, WsFrame::Response { ok: true, .. }),
             "{frame:?}"
@@ -30503,7 +30631,7 @@ mod channels_add_enc_only_tests {
             "telegram_bot_token",
         )
         .await;
-        assert_eq!(tok.as_deref(), Some("tg-token"));
+        assert_eq!(tok, Some(tg_token));
 
         // Presence checks see the enc-only channel.
         assert_eq!(
@@ -30544,10 +30672,12 @@ mod channels_add_enc_only_tests {
             "{created:?}"
         );
 
+        // Assembled at run time — see the note in `slack_secrets_are_enc_only…`.
+        let tg_token = ["1234567891", ":AAagent", "TELEGRAMtokenFIXTUREvalu1"].concat();
         let updated = handler
             .handle_agents_update(json!({
                 "agent_id": "enc-bot",
-                "telegram_bot_token": "tg-agent-token",
+                "telegram_bot_token": tg_token,
                 "wecom_corp_id": "corp-id-plain",
                 "wecom_corp_secret": "corp-secret-value",
                 "dingtalk_app_secret": "ding-secret-value",
@@ -30576,7 +30706,7 @@ mod channels_add_enc_only_tests {
         let enc = tg["bot_token_enc"].as_str().unwrap();
         assert_eq!(
             crate::config_crypto::resolve_agent_token(&Some(enc.to_string()), "", home.path(),),
-            "tg-agent-token",
+            tg_token,
             "enc-only roundtrip must recover the original token"
         );
 
@@ -31807,5 +31937,362 @@ mod wp5c_auto_page_rpc_tests {
         let raw = std::fs::read_to_string(&wiki).unwrap();
         assert!(raw.contains("七天內未拆封可退"));
         assert!(raw.contains("author: \"operator\""));
+    }
+}
+
+/// Display contract for saved integration credentials (WP13).
+///
+/// A customer whose Google integration was working — "測試連線" green, all 19
+/// tools reachable — reported that their saved credentials had disappeared,
+/// because the settings form showed nothing but placeholders. Nothing had been
+/// lost: the read path reported connection state from the access token's own
+/// expiry (a Google access token dies after an hour) and never sent the stored
+/// client id back at all. These tests pin the corrected contract: what is saved
+/// is visible, and the secret still never leaves the gateway.
+#[cfg(test)]
+mod google_credentials_display_tests {
+    use super::*;
+    use crate::mcp_oauth::{McpOAuthClientConfig, McpOAuthConfig, McpOAuthToken};
+
+    fn google_template() -> McpOAuthConfig {
+        crate::mcp_oauth::builtin_providers("http://localhost:3000/api/mcp/oauth/callback")
+            .into_iter()
+            .find(|p| p.provider_id == "google")
+            .expect("google is a built-in provider")
+    }
+
+    /// The synthetic Google client secret, assembled at run time so no
+    /// contiguous `GOCSPX-…` literal sits in the source (source scanners flag a
+    /// fake one exactly like a live one).
+    fn google_client_secret() -> String {
+        ["GOCSPX", "-super-", "secret-value-9f3c"].concat()
+    }
+
+    fn saved_client() -> McpOAuthClientConfig {
+        McpOAuthClientConfig {
+            provider_id: "google".into(),
+            client_id: "1234567890-abcdef.apps.googleusercontent.com".into(),
+            client_secret: google_client_secret(),
+            auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".into()],
+            redirect_uri: "http://localhost:3000/api/mcp/oauth/callback".into(),
+        }
+    }
+
+    fn expired_token_with_refresh() -> McpOAuthToken {
+        McpOAuthToken {
+            provider_id: "google".into(),
+            access_token: "ya29.expired".into(),
+            refresh_token: Some("1//refresh".into()),
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(2)),
+            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".into()],
+        }
+    }
+
+    #[test]
+    fn google_saved_client_id_comes_back_but_the_secret_never_does() {
+        let entry =
+            MethodHandler::oauth_provider_entry(&google_template(), None, Some(saved_client()));
+
+        assert_eq!(entry["configured"], json!(true));
+        assert_eq!(
+            entry["client_id"],
+            json!("1234567890-abcdef.apps.googleusercontent.com"),
+            "the saved client id must be shown — a placeholder reads as data loss"
+        );
+        assert_eq!(entry["has_client_secret"], json!(true));
+        assert_eq!(entry["client_secret_masked"], json!("••••9f3c"));
+
+        // The whole response, serialized, must not contain the secret in any form.
+        let raw = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !raw.contains(&google_client_secret()),
+            "client secret leaked into the dashboard payload: {raw}"
+        );
+        assert!(!raw.contains("super-secret"), "secret fragment leaked: {raw}");
+    }
+
+    #[test]
+    fn google_expired_access_token_with_refresh_token_still_reads_as_connected() {
+        let entry = MethodHandler::oauth_provider_entry(
+            &google_template(),
+            Some(expired_token_with_refresh()),
+            Some(saved_client()),
+        );
+
+        // The hour-old access token is stale, but the connection is live.
+        assert_eq!(entry["token_status"], json!("authenticated"));
+        assert_eq!(entry["status"], json!("authenticated"));
+        assert_eq!(entry["can_refresh"], json!(true));
+        assert_eq!(entry["access_token_valid"], json!(false));
+    }
+
+    #[test]
+    fn google_expired_token_without_refresh_needs_reauthorization() {
+        let mut token = expired_token_with_refresh();
+        token.refresh_token = None;
+        let entry =
+            MethodHandler::oauth_provider_entry(&google_template(), Some(token), Some(saved_client()));
+
+        assert_eq!(entry["token_status"], json!("expired"));
+        assert_eq!(entry["can_refresh"], json!(false));
+    }
+
+    #[test]
+    fn google_with_nothing_saved_reports_unconfigured() {
+        let entry = MethodHandler::oauth_provider_entry(&google_template(), None, None);
+
+        assert_eq!(entry["configured"], json!(false));
+        assert_eq!(entry["client_id"], json!(""));
+        assert_eq!(entry["has_client_secret"], json!(false));
+        assert_eq!(entry["client_secret_masked"], json!(""));
+        assert_eq!(entry["token_status"], json!("none"));
+    }
+
+    #[test]
+    fn google_provider_carries_a_display_name_for_the_card() {
+        let entry = MethodHandler::oauth_provider_entry(&google_template(), None, None);
+        assert_eq!(entry["name"], json!("Google"));
+        assert_eq!(MethodHandler::oauth_provider_name("github"), "GitHub");
+    }
+}
+
+/// The Odoo tab holds the same shape of write-only credentials as the OAuth
+/// providers, so it gets the same guarantee, asserted the same way: the config
+/// read path proves what is stored without ever shipping the stored value.
+///
+/// Symmetric with `google_credentials_display_tests` — the whole serialized
+/// response is scanned, not individual fields, because a leak would most likely
+/// arrive through a field nobody thought to assert on.
+#[cfg(test)]
+mod odoo_credentials_display_tests {
+    use super::*;
+
+    const API_KEY: &str = "odoo-api-key-8e41f7c2";
+    const PASSWORD: &str = "odoo-password-3b9d0a";
+    const WEBHOOK_SECRET: &str = "odoo-webhook-secret-77c1";
+
+    /// A config.toml with all three credentials stored, in the encrypted-at-rest
+    /// shape `odoo.configure` writes.
+    async fn handler_with_stored_credentials() -> (tempfile::TempDir, MethodHandler) {
+        let home = tempfile::tempdir().unwrap();
+        let enc = |v: &str| {
+            crate::config_crypto::encrypt_value(v, home.path())
+                .expect("encryption keyfile is writable in a temp home")
+        };
+        let config = format!(
+            r#"
+[odoo]
+url = "https://mycompany.odoo.com"
+db = "mycompany"
+protocol = "jsonrpc"
+auth_method = "api_key"
+username = "admin@mycompany.com"
+api_key_enc = "{}"
+password_enc = "{}"
+webhook_enabled = true
+webhook_secret_enc = "{}"
+"#,
+            enc(API_KEY),
+            enc(PASSWORD),
+            enc(WEBHOOK_SECRET),
+        );
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        (home, handler)
+    }
+
+    fn payload(frame: WsFrame) -> Value {
+        match frame {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => p,
+            other => panic!("expected ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn odoo_config_reports_stored_credentials_without_returning_them() {
+        let (_home, handler) = handler_with_stored_credentials().await;
+        let body = payload(handler.handle_odoo_config().await);
+
+        assert_eq!(body["has_api_key"], json!(true));
+        assert_eq!(body["has_password"], json!(true));
+        assert_eq!(body["has_webhook_secret"], json!(true));
+
+        // Whole-payload scan: no credential, in plaintext or ciphertext, in any
+        // field. The encrypted forms are checked too — they are still the
+        // credential, just wrapped, and the browser has no business holding one.
+        let raw = serde_json::to_string(&body).unwrap();
+        for secret in [API_KEY, PASSWORD, WEBHOOK_SECRET] {
+            assert!(
+                !raw.contains(secret),
+                "odoo credential leaked into the dashboard payload: {raw}"
+            );
+        }
+        for key in ["api_key", "password", "webhook_secret"] {
+            assert!(
+                body.get(key).is_none() && body.get(format!("{key}_enc")).is_none(),
+                "`{key}` must not be a field of the config response: {raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn odoo_config_reports_absent_credentials_as_not_stored() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[odoo]\nurl = \"https://mycompany.odoo.com\"\ndb = \"mycompany\"\n",
+        )
+        .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let body = payload(handler.handle_odoo_config().await);
+
+        // Distinguishing these two cases is the entire point — without it the
+        // form shows identical dots whether or not anything was ever saved.
+        assert_eq!(body["has_api_key"], json!(false));
+        assert_eq!(body["has_password"], json!(false));
+        assert_eq!(body["has_webhook_secret"], json!(false));
+    }
+}
+
+#[cfg(test)]
+mod wp15_memory_split_tests {
+    //! WP15 — `memory.browse` / `memory.search` return two lists: `entries`
+    //! (memories about the user) and `signals` (the platform's own learning
+    //! telemetry). These tests pin the *response shape* on both endpoints,
+    //! including the db-not-found early returns, so a caller never has to
+    //! special-case a missing `signals` key.
+    use super::*;
+
+    fn payload(frame: WsFrame) -> Value {
+        match frame {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(d),
+                ..
+            } => d,
+            other => panic!("expected an ok response, got {other:?}"),
+        }
+    }
+
+    /// Contents of the two lists, as string vectors, for readable assertions.
+    fn lists(body: &Value) -> (Vec<String>, Vec<String>) {
+        let pluck = |key: &str| -> Vec<String> {
+            body.get(key)
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("`{key}` must be present and an array: {body}"))
+                .iter()
+                .map(|e| e["content"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        (pluck("entries"), pluck("signals"))
+    }
+
+    fn entry(agent: &str, content: &str, source_event: &str) -> duduclaw_core::types::MemoryEntry {
+        duduclaw_core::types::MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: content.to_string(),
+            timestamp: Utc::now(),
+            tags: vec![],
+            embedding: None,
+            layer: Default::default(),
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: source_event.to_string(),
+        }
+    }
+
+    const TELEMETRY: &str = "Prediction deviation: expected satisfaction 0.70, inferred 0.52 \
+                             (delta 0.18). Topic surprise: 1.00. Corrections: yes. Follow-ups: no.";
+    const MEMORY: &str = "The satisfaction survey for Acme is due on Friday";
+
+    async fn seed(home: &std::path::Path, agent: &str) {
+        let db = home.join("agents").join(agent).join("memory.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        engine
+            .store(agent, entry(agent, MEMORY, "conversation_summary"))
+            .await
+            .unwrap();
+        engine
+            .store(agent, entry(agent, TELEMETRY, "prediction_episodic"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browse_returns_both_lists_when_the_db_is_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let body = payload(
+            handler
+                .handle_memory_browse(json!({ "agent_id": "no-such-agent" }))
+                .await,
+        );
+        assert_eq!(lists(&body), (vec![], vec![]));
+    }
+
+    #[tokio::test]
+    async fn search_returns_both_lists_when_the_db_is_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let body = payload(
+            handler
+                .handle_memory_search(json!({ "agent_id": "no-such-agent", "query": "anything" }))
+                .await,
+        );
+        // The early return must be shaped exactly like `memory.browse`'s.
+        assert_eq!(lists(&body), (vec![], vec![]));
+    }
+
+    #[tokio::test]
+    async fn browse_files_telemetry_under_signals() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = "wp15-browse";
+        seed(home.path(), agent).await;
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let body = payload(
+            handler
+                .handle_memory_browse(json!({ "agent_id": agent, "limit": 50 }))
+                .await,
+        );
+        let (entries, signals) = lists(&body);
+        assert_eq!(entries, vec![MEMORY.to_string()]);
+        assert_eq!(signals, vec![TELEMETRY.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn search_splits_its_results_the_same_way() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = "wp15-search";
+        seed(home.path(), agent).await;
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // "satisfaction" appears in both rows, so the split — not the query —
+        // is what keeps the telemetry out of `entries`.
+        let body = payload(
+            handler
+                .handle_memory_search(json!({
+                    "agent_id": agent,
+                    "query": "satisfaction",
+                    "limit": 50,
+                }))
+                .await,
+        );
+        let (entries, signals) = lists(&body);
+        assert!(
+            entries.iter().all(|c| !c.starts_with("Prediction deviation")),
+            "telemetry must never reach the memory list: {entries:?}"
+        );
+        assert_eq!(entries, vec![MEMORY.to_string()]);
+        assert_eq!(signals, vec![TELEMETRY.to_string()]);
     }
 }

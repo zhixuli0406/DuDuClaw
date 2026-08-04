@@ -53,6 +53,18 @@ export function OdooPage() {
   const [username, setUsername] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [password, setPassword] = useState('');
+  /**
+   * Which write-only credentials are already on file. The values never come
+   * back from the gateway, so without these flags a stored api key and an empty
+   * one render identically (`••••••••`) — the user cannot tell whether anything
+   * was ever saved, and a blank field looks like it would erase the credential
+   * (it does not: omitting it keeps what is stored).
+   */
+  const [savedCreds, setSavedCreds] = useState({
+    apiKey: false,
+    password: false,
+    webhookSecret: false,
+  });
 
   // Polling / Webhook — defaults match OdooConfig::default() in config.rs
   const [pollEnabled, setPollEnabled] = useState(true);
@@ -107,6 +119,11 @@ export function OdooPage() {
         setPollInterval(String(configRes.poll_interval_seconds ?? 60));
         setPollModels((configRes.poll_models ?? []).join(','));
         setWebhookEnabled(configRes.webhook_enabled ?? false);
+        setSavedCreds({
+          apiKey: configRes.has_api_key ?? false,
+          password: configRes.has_password ?? false,
+          webhookSecret: configRes.has_webhook_secret ?? false,
+        });
         setGlobalUnblockModels((configRes.unblock_models ?? []).join(', '));
         setFeatures({
           crm: configRes.features_crm ?? true,
@@ -317,7 +334,7 @@ export function OdooPage() {
               value={apiKey}
               onChange={setApiKey}
               type="password"
-              placeholder="••••••••"
+              placeholder={savedCreds.apiKey ? t('integrations.secretKeep') : '••••••••'}
               autoComplete="off"
               tier="text"
             />
@@ -327,7 +344,7 @@ export function OdooPage() {
               value={password}
               onChange={setPassword}
               type="password"
-              placeholder="••••••••"
+              placeholder={savedCreds.password ? t('integrations.secretKeep') : '••••••••'}
               autoComplete="off"
               tier="text"
             />
@@ -492,7 +509,7 @@ export function OdooPage() {
               value={webhookSecret}
               onChange={setWebhookSecret}
               type="password"
-              placeholder="••••••••"
+              placeholder={savedCreds.webhookSecret ? t('integrations.secretKeep') : '••••••••'}
               tier="text"
             />
           )}
