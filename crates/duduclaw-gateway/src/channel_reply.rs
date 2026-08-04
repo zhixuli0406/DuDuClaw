@@ -596,14 +596,33 @@ fn persist_channel_status_snapshot(snapshot: serde_json::Value) {
 /// Helper to update a channel's connection state and broadcast the change to dashboard clients.
 pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connected: bool, error: Option<String>, event_tx: Option<&tokio::sync::broadcast::Sender<String>>) {
     let now = chrono::Utc::now();
+    // WP12: several channel APIs carry the credential IN THE URL (Telegram's
+    // `/bot<token>/getMe`, WeCom `?corpsecret=`, DingTalk `?appsecret=`), so a
+    // raw transport error prints a working bot token. This is the single choke
+    // point for every channel's error text — it feeds the dashboard roster, the
+    // `channels.status_changed` WS event AND `channel_status.json` on disk, so
+    // redacting here covers all three sinks for all nine channels at once.
+    let error = crate::secret_redact::redact_opt(error);
     let error_clone = error.clone();
+    // M3 — state de-duplication. A poller in a retry loop calls this on every
+    // tick; before WP12 that meant a WS broadcast and a `channel_status.json`
+    // rewrite every 3 seconds forever during an outage. The observable state is
+    // `(connected, error)`, so only a *change* in that pair is news. The
+    // in-memory `last_event` timestamp is still refreshed either way.
     {
         let mut map = status.write().await;
+        let state_changed = map
+            .get(name)
+            .map(|prev| prev.connected != connected || prev.error != error)
+            .unwrap_or(true);
         map.insert(name.to_string(), ChannelState {
             connected,
             last_event: Some(now),
             error,
         });
+        if !state_changed {
+            return;
+        }
         // Snapshot for the out-of-process `channel_status` MCP tool.
         let snapshot = serde_json::json!({
             "updated_at": now.to_rfc3339(),
@@ -8830,7 +8849,8 @@ mod routing_helper_tests {
         let mut env = HashMap::new();
         env.insert(
             "ANTHROPIC_API_KEY".to_string(),
-            "sk-ant-real-key-value".to_string(),
+            // Split so no contiguous vendor-shaped literal sits in the source.
+            ["sk-", "ant-", "real-key-value"].concat(),
         );
         assert!(!env_vars_indicate_oauth(&env));
     }
@@ -9103,5 +9123,111 @@ mod sender_prefix_tests {
         // the user's own text rather than guessing.
         let text = "[sender_id: x] hello";
         assert_eq!(strip_sender_prefix(text), text);
+    }
+}
+
+/// WP12 — the channel-status choke point must never publish a live credential.
+#[cfg(test)]
+mod channel_status_redaction_tests {
+    use super::*;
+
+    // Fixtures are assembled at run time from fragments: a synthetic token that
+    // still carries the real vendor shape trips source scanners exactly like a
+    // live one, and a blocked push is indistinguishable from a real leak until
+    // someone reads the diff.
+
+    const TG_ID: &str = "7000000001";
+
+    fn tg_secret() -> String {
+        ["AAExample", "Example", "Example", "Example", "XYZ12"].concat()
+    }
+
+    /// The error shape the dashboard showed before the fix — note the corrupted
+    /// `-` separator.
+    fn leaky() -> String {
+        format!(
+            "error sending request for url (https://api.telegram.org/bot{TG_ID}-{}/getMe)",
+            tg_secret()
+        )
+    }
+
+    #[tokio::test]
+    async fn error_text_is_redacted_before_it_reaches_the_dashboard_and_disk() {
+        let status: ChannelStatusMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(4);
+
+        set_channel_connected(&status, "telegram", false, Some(leaky()), Some(&tx)).await;
+
+        // 1. The in-memory map (feeds `channels.status`).
+        let stored = status.read().await.get("telegram").and_then(|s| s.error.clone());
+        let stored = stored.expect("error must be recorded");
+        assert!(
+            !stored.contains(&tg_secret()),
+            "secret leaked into channel status: {stored}"
+        );
+        assert!(!stored.contains(TG_ID), "bot id leaked: {stored}");
+        // Still diagnostic: host, method and the wrong separator remain visible.
+        assert!(stored.contains("api.telegram.org"), "{stored}");
+        assert!(stored.contains("/getMe"), "{stored}");
+        assert!(stored.contains("bot7000***-***YZ12"), "{stored}");
+
+        // 2. The broadcast event (feeds `channels.status_changed` over the WS).
+        let event = rx.try_recv().expect("status change must be broadcast");
+        assert!(
+            !event.contains(&tg_secret()),
+            "secret leaked into the WS event: {event}"
+        );
+    }
+
+    /// M3 — a poller in a retry loop must not rewrite the snapshot file and
+    /// re-broadcast to every dashboard client on every tick.
+    #[tokio::test]
+    async fn repeating_the_same_state_produces_no_further_events() {
+        let status: ChannelStatusMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(16);
+        let err = || Some("dns error: nodename nor servname provided".to_string());
+
+        // First observation of the failure is news.
+        set_channel_connected(&status, "telegram", false, err(), Some(&tx)).await;
+        assert!(rx.try_recv().is_ok(), "first transition must broadcast");
+
+        // The next five identical ticks are not.
+        for _ in 0..5 {
+            set_channel_connected(&status, "telegram", false, err(), Some(&tx)).await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "unchanged state must not re-broadcast (and must not rewrite the snapshot)"
+        );
+
+        // A different error IS news again.
+        set_channel_connected(&status, "telegram", false, Some("connection refused".into()), Some(&tx)).await;
+        assert!(rx.try_recv().is_ok(), "changed error text must broadcast");
+
+        // Recovery is news.
+        set_channel_connected(&status, "telegram", true, None, Some(&tx)).await;
+        assert!(rx.try_recv().is_ok(), "recovery must broadcast");
+        set_channel_connected(&status, "telegram", true, None, Some(&tx)).await;
+        assert!(rx.try_recv().is_err(), "steady connected state must stay quiet");
+    }
+
+    /// De-duplication must not freeze the liveness timestamp.
+    #[tokio::test]
+    async fn last_event_is_refreshed_even_when_the_state_is_unchanged() {
+        let status: ChannelStatusMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        set_channel_connected(&status, "telegram", true, None, None).await;
+        let first = status.read().await.get("telegram").and_then(|s| s.last_event);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        set_channel_connected(&status, "telegram", true, None, None).await;
+        let second = status.read().await.get("telegram").and_then(|s| s.last_event);
+        assert!(second > first, "last_event must still advance: {first:?} → {second:?}");
+    }
+
+    #[tokio::test]
+    async fn ordinary_errors_pass_through_unchanged() {
+        let status: ChannelStatusMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        set_channel_connected(&status, "line", false, Some("not configured".into()), None).await;
+        let stored = status.read().await.get("line").and_then(|s| s.error.clone());
+        assert_eq!(stored.as_deref(), Some("not configured"));
     }
 }

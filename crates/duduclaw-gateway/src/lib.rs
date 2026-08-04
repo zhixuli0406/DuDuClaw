@@ -180,6 +180,8 @@ pub mod computer_use;
 pub mod computer_use_orchestrator;
 pub mod browser_router;
 pub mod screenshot_audit;
+/// Credential redaction for operator-visible channel diagnostics (WP12).
+pub mod secret_redact;
 pub mod risk_detector;
 pub mod defensive_prompt;
 pub mod updater;

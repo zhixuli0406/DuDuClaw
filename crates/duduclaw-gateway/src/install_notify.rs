@@ -240,7 +240,13 @@ async fn send_with_buttons(
                 "text": text,
                 "reply_markup": crate::channel_format::telegram_approval_buttons(request_id),
             });
-            let resp = http.post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
+            let resp = http
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                // WP12: reqwest's Display embeds the URL, which carries the bot token.
+                .map_err(|e| crate::secret_redact::redact_secrets(&e.to_string()).into_owned())?;
             if !resp.status().is_success() {
                 return Err(format!("telegram HTTP {}", resp.status()));
             }

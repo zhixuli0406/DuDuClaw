@@ -132,12 +132,122 @@ pub(crate) fn resolve_agent_token(
     plaintext.to_string()
 }
 
+/// Repair a Telegram bot token whose `:` separator was lost (WP12).
+///
+/// A Telegram bot token is **always** `<bot_id>:<secret>` — BotFather has never
+/// issued one without the colon, and the id part is always decimal. A customer
+/// upgrade surfaced a stored token in which the colon had been replaced by a
+/// hyphen, which makes every Bot API call address a bot that does
+/// not exist, so the channel shows up permanently offline.
+///
+/// This is a **read-time** compatibility repair for values already sitting in a
+/// config file. The guards are deliberately narrow so a healthy token can never
+/// be rewritten:
+///
+/// - the value must contain **no** colon at all — a well-formed token always
+///   does, so this can only ever fire on an already-broken value; and
+/// - it must match `<5–16 digits>-<≥30 chars of [A-Za-z0-9_-]>`.
+///
+/// Only the **first** hyphen is restored; hyphens inside the secret (which are
+/// legal) are untouched. Everything else is returned byte-identical.
+pub fn repair_telegram_token(raw: &str) -> std::borrow::Cow<'_, str> {
+    let t = raw.trim();
+    if t.contains(':') {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let Some(idx) = t.find('-') else {
+        return std::borrow::Cow::Borrowed(raw);
+    };
+    let (id, rest) = t.split_at(idx);
+    // `-` is a single ASCII byte, so this cannot land mid-char.
+    let secret = &rest[1..];
+    let id_ok = (5..=16).contains(&id.len()) && id.chars().all(|c| c.is_ascii_digit());
+    let secret_ok = secret.len() >= 30
+        && secret
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if id_ok && secret_ok {
+        tracing::warn!(
+            "Telegram bot token for bot id {id} is missing its ':' separator — \
+             repaired in memory for this run. Re-save the token in the dashboard \
+             to fix the stored value."
+        );
+        std::borrow::Cow::Owned(format!("{id}:{secret}"))
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    }
+}
+
+/// Whether a config field name denotes a Telegram bot token, so the read path
+/// knows to apply [`repair_telegram_token`].
+fn is_telegram_token_field(field_base: &str) -> bool {
+    field_base == "telegram_bot_token"
+}
+
+/// Whether `token` is a structurally valid Telegram bot token.
+///
+/// Deliberately generous — this gates a *save*, so a false reject is worse than
+/// a false accept. It only asserts the two properties BotFather has always
+/// guaranteed: a decimal bot id, a `:` separator, and a URL-safe secret.
+pub fn is_valid_telegram_token(token: &str) -> bool {
+    let Some((id, secret)) = token.split_once(':') else {
+        return false;
+    };
+    (5..=20).contains(&id.len())
+        && id.chars().all(|c| c.is_ascii_digit())
+        && secret.len() >= 20
+        && secret
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Validate (and where possible silently repair) a channel credential at the
+/// **write** boundary.
+///
+/// Before WP12 nothing between the dashboard text field and the encrypted
+/// config checked the shape of a channel token: `channels.add` and the
+/// `agents.update` channel closure both only tested `is_empty()`. A token that
+/// arrived corrupted — a hyphen where the colon belongs —
+/// was encrypted and stored, and the first sign of trouble was the channel
+/// silently sitting offline. Now the save either fixes it or refuses it with a
+/// message the operator can act on.
+///
+/// Returns the value to persist, or a user-facing (zh-TW) error.
+/// Channels other than Telegram pass through unchanged — their token formats
+/// are not stable enough to gate on.
+pub fn validate_channel_token(channel: &str, token: &str) -> Result<String, String> {
+    if channel != "telegram" {
+        return Ok(token.to_string());
+    }
+    let candidate = repair_telegram_token(token.trim()).into_owned();
+    if is_valid_telegram_token(&candidate) {
+        Ok(candidate)
+    } else {
+        Err("Telegram Bot Token 格式不正確。正確格式是「數字:英數字串」（例如 123456789:AAE...），\
+             中間是半形冒號。請從 BotFather 的訊息完整複製後再貼上。"
+            .to_string())
+    }
+}
+
 /// Read a config field, trying the encrypted version first.
 ///
 /// For example, `decrypt_config_field(table, "channels", "telegram_bot_token", home_dir)`
 /// will try `channels.telegram_bot_token_enc` first, decrypt it, and fall back
 /// to `channels.telegram_bot_token` if the encrypted field is missing or empty.
 pub fn decrypt_config_field(
+    table: &toml::Table,
+    section: &str,
+    field_base: &str,
+    home_dir: &Path,
+) -> Option<String> {
+    let raw = decrypt_config_field_raw(table, section, field_base, home_dir)?;
+    if is_telegram_token_field(field_base) {
+        return Some(repair_telegram_token(&raw).into_owned());
+    }
+    Some(raw)
+}
+
+fn decrypt_config_field_raw(
     table: &toml::Table,
     section: &str,
     field_base: &str,
@@ -325,6 +435,156 @@ pub fn resolve_agent_channel_token_via_reports_to(
         "reports_to chain exceeded max hops while resolving channel token"
     );
     None
+}
+
+/// WP12 — Telegram token shape: repair, validation, and the config round-trip.
+#[cfg(test)]
+mod telegram_token_tests {
+    use super::*;
+
+    // Fixtures are assembled at run time from fragments. Every value here is
+    // fake, but a *fake* token carrying a real vendor shape still trips GitHub
+    // push protection and other source scanners, and a blocked push looks
+    // exactly like a real leak until someone reads the diff. Splitting the
+    // literals keeps the scanners quiet without changing what the tests assert.
+
+    const TG_ID: &str = "7000000001";
+
+    /// A 35-character URL-safe secret, the length BotFather issues.
+    fn tg_secret() -> String {
+        ["AAExample", "Example", "Example", "Example", "XYZ12"].concat()
+    }
+
+    /// The canonical `<id>:<secret>` form.
+    fn good() -> String {
+        format!("{TG_ID}:{}", tg_secret())
+    }
+
+    /// The corrupted `<id>-<secret>` form WP12 was reported with.
+    fn broken() -> String {
+        format!("{TG_ID}-{}", tg_secret())
+    }
+
+    #[test]
+    fn broken_separator_is_repaired() {
+        assert_eq!(repair_telegram_token(&broken()), good());
+    }
+
+    #[test]
+    fn healthy_token_is_returned_byte_identical() {
+        // The critical safety property: a good token is never rewritten.
+        let good = good();
+        assert!(matches!(
+            repair_telegram_token(&good),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(repair_telegram_token(&good), good);
+    }
+
+    #[test]
+    fn hyphens_inside_the_secret_survive_the_repair() {
+        // Only the FIRST hyphen is the separator; the rest belong to the secret.
+        let secret = ["AAExample-", "Example", "Example", "Example-", "XYZ12"].concat();
+        let broken = format!("7000000002-{secret}");
+        assert_eq!(repair_telegram_token(&broken), format!("7000000002:{secret}"));
+    }
+
+    #[test]
+    fn non_token_hyphenated_values_are_never_touched() {
+        let slack_token = ["xoxb", "-1234567890-", "abcdefghijklmnopqrst"].concat();
+        for s in [
+            "2026-08-04".to_string(),                     // a date
+            "12345-abc".to_string(),                      // too-short secret
+            format!("abc-{}", tg_secret()),               // non-numeric bot id
+            format!("1234-{}", tg_secret()),              // bot id too short
+            slack_token,                                  // a Slack token
+            String::new(),
+        ] {
+            assert!(
+                matches!(repair_telegram_token(&s), std::borrow::Cow::Borrowed(_)),
+                "must not rewrite: {s}"
+            );
+            assert_eq!(repair_telegram_token(&s), s);
+        }
+    }
+
+    #[test]
+    fn already_colon_separated_values_short_circuit() {
+        // Even a weird value keeps its colon untouched — the repair only ever
+        // considers colon-less input.
+        let odd = "not-a-token:but-has-a-colon";
+        assert_eq!(repair_telegram_token(odd), odd);
+    }
+
+    #[test]
+    fn validity_check_accepts_real_tokens_and_rejects_the_broken_shape() {
+        assert!(is_valid_telegram_token(&good()));
+        assert!(!is_valid_telegram_token(&broken()));
+        assert!(!is_valid_telegram_token("123456789:short"));
+        assert!(!is_valid_telegram_token(&format!("abcdefg:{}", tg_secret())));
+        assert!(!is_valid_telegram_token(""));
+    }
+
+    #[test]
+    fn write_boundary_normalises_broken_and_rejects_garbage() {
+        // Broken separator → silently repaired on save.
+        assert_eq!(
+            validate_channel_token("telegram", &broken()).unwrap(),
+            good()
+        );
+        // Surrounding whitespace from a paste is trimmed.
+        assert_eq!(
+            validate_channel_token("telegram", &format!("  {}\n", good())).unwrap(),
+            good()
+        );
+        // Unusable value → actionable error instead of a silent offline channel.
+        let err = validate_channel_token("telegram", "please-paste-your-token").unwrap_err();
+        assert!(err.contains("Telegram Bot Token"), "{err}");
+        // Other channels are pass-through — their formats are not gated.
+        assert_eq!(
+            validate_channel_token("line", "whatever/token+value==").unwrap(),
+            "whatever/token+value==".to_string()
+        );
+    }
+
+    /// M1 — the validator is only ever applied to the primary credential.
+    /// Non-token fields (chat ids, webhook secrets, future additions) must pass
+    /// through untouched even under the `telegram` channel name.
+    #[test]
+    fn validation_is_a_no_op_for_non_telegram_channels() {
+        for channel in ["discord", "slack", "line", "whatsapp", "feishu", "wecom", "dingtalk"] {
+            let odd = "9876543210-notATelegramTokenButLooksLikeOne1234";
+            assert_eq!(
+                validate_channel_token(channel, odd).unwrap(),
+                odd.to_string(),
+                "{channel} must not be gated by the Telegram rule"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_broken_token_is_repaired_on_read() {
+        // A config file that already contains the corrupted value (the customer's
+        // situation) must yield a working token without a manual re-save.
+        let table: toml::Table =
+            format!("[channels]\ntelegram_bot_token = \"{}\"\n", broken())
+                .parse()
+                .unwrap();
+        let home = std::env::temp_dir().join("duduclaw-wp12-nonexistent");
+        let got = decrypt_config_field(&table, "channels", "telegram_bot_token", &home);
+        assert_eq!(got, Some(good()));
+    }
+
+    #[test]
+    fn read_repair_is_scoped_to_the_telegram_field() {
+        // A Discord/LINE token that happens to look hyphenated must not be
+        // rewritten — only `telegram_bot_token` goes through the repair.
+        let table: toml::Table =
+            format!("[channels]\ndiscord_bot_token = \"{}\"\n", broken()).parse().unwrap();
+        let home = std::env::temp_dir().join("duduclaw-wp12-nonexistent");
+        let got = decrypt_config_field(&table, "channels", "discord_bot_token", &home);
+        assert_eq!(got, Some(broken()));
+    }
 }
 
 #[cfg(test)]
