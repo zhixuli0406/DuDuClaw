@@ -80,7 +80,10 @@ fn scrub_sensitive(msg: &str) -> String {
         "api_key=", "token=", "secret=", "password=", "credential=",
         "Bearer ", "Bot ", "ANTHROPIC_API_KEY=",
     ];
-    let mut result = msg.to_string();
+    // WP12: prefix scanning misses credentials embedded in a URL *path* — a
+    // Telegram error prints `…/bot<token>/getMe`, which none of the prefixes
+    // above match. Run the shape-driven redactor first.
+    let mut result = crate::secret_redact::redact_secrets(msg).into_owned();
     for prefix in &sensitive_prefixes {
         // Loop to handle multiple occurrences of the same prefix
         let mut search_from = 0;

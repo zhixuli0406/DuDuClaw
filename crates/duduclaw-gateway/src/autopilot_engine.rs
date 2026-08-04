@@ -1506,7 +1506,7 @@ async fn send_channel_text(
                 .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
                 .send()
                 .await
-                .map_err(|e| format!("telegram send: {e}"))?;
+                .map_err(|e| format!("telegram send: {}", crate::secret_redact::redact_secrets(&e.to_string())))?;
             if !resp.status().is_success() {
                 return Err(format!("telegram API {}", resp.status()));
             }

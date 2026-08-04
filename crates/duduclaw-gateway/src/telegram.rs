@@ -223,6 +223,10 @@ pub async fn start_telegram_bots(
                     let token = crate::config_crypto::resolve_agent_token(
                         &tg.bot_token_enc, &tg.bot_token, home_dir,
                     );
+                    // WP12: repair a stored token whose ':' was lost before it
+                    // reaches dedup — otherwise the same bot could be seen as
+                    // two different tokens.
+                    let token = crate::config_crypto::repair_telegram_token(&token).into_owned();
                     if !token.is_empty() {
                         tokens.push((agent.config.agent.name.clone(), token));
                     }
@@ -285,32 +289,72 @@ async fn spawn_telegram_bot(
 
     let api_base = format!("{}/bot{}", TELEGRAM_API, token);
 
-    // Verify token
-    match client.get(format!("{api_base}/getMe")).send().await {
-        Ok(resp) => {
-            if let Ok(data) = resp.json::<TgResponse<TgUser>>().await {
-                if data.ok {
-                    if let Some(user) = &data.result {
-                        let name = user.username.as_deref().unwrap_or("unknown");
-                        info!("Telegram bot connected: @{name} (label: {label})");
-                        // Only register commands for the global bot
-                        if agent_name.is_none() {
-                            register_commands(&client, &api_base).await;
-                        }
+    // Verify token. The verification result decides only whether we give up
+    // *now*: a rejection by Telegram (`ok: false`) is authoritative and fatal,
+    // but a transport failure or an unparseable body is NOT — see the
+    // `TokenCheck` doc for why (WP12: "設定更新後會掉").
+    let check = match client.get(format!("{api_base}/getMe")).send().await {
+        Ok(resp) => match resp.json::<TgResponse<TgUser>>().await {
+            Ok(data) if data.ok => {
+                if let Some(user) = &data.result {
+                    let name = user.username.as_deref().unwrap_or("unknown");
+                    info!("Telegram bot connected: @{name} (label: {label})");
+                    // Only register commands for the global bot
+                    if agent_name.is_none() {
+                        register_commands(&client, &api_base).await;
                     }
-                    set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
-                } else {
-                    let desc = data.description.unwrap_or_default();
-                    warn!("Telegram getMe failed for {label}: {desc}");
-                    set_channel_connected(&ctx.channel_status, &label, false, Some(desc), Some(&ctx.event_tx)).await;
-                    return None;
                 }
+                TokenCheck::Verified
             }
+            // M2: only an authoritative *token* rejection is fatal here. A 429
+            // (rate limit) or a 5xx says nothing about the credential, so it is
+            // treated exactly like a transport failure — symmetric with the
+            // `poll_loop` rule below.
+            Ok(data) if is_token_rejection(data.error_code) => {
+                TokenCheck::Rejected(data.description.unwrap_or_default())
+            }
+            Ok(data) => TokenCheck::Unverified(format!(
+                "Telegram API {} — {}",
+                data.error_code.unwrap_or(0),
+                data.description.unwrap_or_default()
+            )),
+            Err(e) => TokenCheck::Unverified(
+                crate::secret_redact::redact_secrets(&e.to_string()).into_owned(),
+            ),
+        },
+        Err(e) => TokenCheck::Unverified(
+            crate::secret_redact::redact_secrets(&e.to_string()).into_owned(),
+        ),
+    };
+
+    match check {
+        TokenCheck::Verified => {
+            set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
         }
-        Err(e) => {
-            warn!("Telegram connection failed for {label}: {e}");
-            set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string()), Some(&ctx.event_tx)).await;
+        TokenCheck::Rejected(desc) => {
+            // Telegram answered and said no — the token really is wrong.
+            // Giving up here is correct; retrying would just hammer the API.
+            warn!("Telegram getMe rejected for {label}: {desc}");
+            set_channel_connected(&ctx.channel_status, &label, false, Some(desc), Some(&ctx.event_tx)).await;
             return None;
+        }
+        TokenCheck::Unverified(err) => {
+            // Transport-level failure (DNS not up yet after a machine wake or
+            // an app upgrade, proxy hiccup, TLS reset) or an unparseable body.
+            // Before WP12 this `return None`d, so the channel stayed dead until
+            // someone re-saved the token or restarted the gateway — exactly the
+            // "Telegram 設定更新後會掉" report. `poll_loop` already retries every
+            // 3s and flips the channel back to connected on the first good
+            // response, so hand off to it instead of dying.
+            warn!("Telegram getMe unverified for {label} ({err}) — starting the poller anyway; it will retry");
+            set_channel_connected(
+                &ctx.channel_status,
+                &label,
+                false,
+                Some(format!("connecting — {err}")),
+                Some(&ctx.event_tx),
+            )
+            .await;
         }
     }
 
@@ -319,6 +363,45 @@ async fn spawn_telegram_bot(
     });
 
     Some(handle)
+}
+
+/// Retry delay after `n` consecutive transport failures: 3s doubling to a 60s
+/// ceiling (M3).
+///
+/// A flat 3s meant a long outage (laptop asleep, office WAN down overnight) hit
+/// `api.telegram.org` 1,200 times an hour per bot. The ceiling keeps recovery
+/// prompt — a channel is back online within a minute of the network returning —
+/// while a multi-bot install no longer hammers the API during an outage.
+fn transport_backoff(consecutive_errors: u32) -> std::time::Duration {
+    const BASE_SECS: u64 = 3;
+    const CAP_SECS: u64 = 60;
+    let doublings = consecutive_errors.saturating_sub(1).min(u32::BITS - 1);
+    let secs = BASE_SECS.saturating_mul(1u64 << doublings).min(CAP_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Whether a Telegram `error_code` means "this token is not valid".
+///
+/// 401 Unauthorized and 404 Not Found are the two codes the Bot API returns for
+/// a bad/unknown token. Everything else (429 rate limit, 5xx) is transient and
+/// must NOT be read as a credential problem. Shared by the startup probe and
+/// the polling loop so the two agree.
+fn is_token_rejection(error_code: Option<i64>) -> bool {
+    matches!(error_code, Some(401) | Some(404))
+}
+
+/// Outcome of the startup `getMe` probe.
+///
+/// The distinction matters: only [`TokenCheck::Rejected`] is evidence that the
+/// *token* is bad. Treating a network error as a bad token (the pre-WP12
+/// behaviour) permanently disables a perfectly good channel.
+enum TokenCheck {
+    /// Telegram confirmed the token.
+    Verified,
+    /// Telegram answered `ok: false` — authoritative rejection.
+    Rejected(String),
+    /// We never got an answer. Says nothing about the token.
+    Unverified(String),
 }
 
 /// Register bot commands with Telegram.
@@ -355,8 +438,11 @@ async fn register_commands(client: &reqwest::Client, api_base: &str) {
 // ── Internal ────────────────────────────────────────────────
 
 async fn read_telegram_token(home_dir: &Path) -> Option<String> {
-    crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "telegram_bot_token").await
+    crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "telegram_bot_token")
+        .await
+        .map(|t| crate::config_crypto::repair_telegram_token(&t).into_owned())
 }
+
 
 async fn poll_loop(
     client: reqwest::Client,
@@ -367,7 +453,18 @@ async fn poll_loop(
 ) {
     let mut offset: i64 = 0;
     let mut consecutive_errors: u32 = 0;
+    /// Consecutive authoritative auth rejections (401/404) after which the
+    /// poller stops. Bounded because WP12 lets an *unverified* token reach this
+    /// loop: a genuinely bad token must not be polled forever.
+    const MAX_AUTH_REJECTIONS: u32 = 3;
+    let mut auth_rejections: u32 = 0;
     info!("Telegram polling started");
+
+    // M4 note: `consecutive_errors` is intentionally NOT a give-up condition for
+    // transport failures. An interleaved outage (fail, fail, succeed, fail…)
+    // resets it, which is correct — the channel is genuinely usable in between.
+    // Only [`is_token_rejection`] terminates the poller, because only Telegram
+    // itself can tell us the credential is unusable.
 
     // Get bot username for mention detection
     let bot_username = get_bot_username(&client, &api_base).await.unwrap_or_default();
@@ -379,9 +476,12 @@ async fn poll_loop(
             Ok(r) => r,
             Err(e) => {
                 consecutive_errors += 1;
-                warn!("Telegram poll error: {e}");
-                set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string()), Some(&ctx.event_tx)).await;
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                // WP12: reqwest's Display embeds the request URL, and a Telegram
+                // URL carries the bot token in its path.
+                let err = crate::secret_redact::redact_secrets(&e.to_string()).into_owned();
+                warn!("Telegram [{label}] poll error: {err}");
+                set_channel_connected(&ctx.channel_status, &label, false, Some(err), Some(&ctx.event_tx)).await;
+                tokio::time::sleep(transport_backoff(consecutive_errors)).await;
                 continue;
             }
         };
@@ -390,9 +490,10 @@ async fn poll_loop(
             Ok(d) => d,
             Err(e) => {
                 consecutive_errors += 1;
-                warn!("Telegram [{label}] parse error: {e}");
-                set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string()), Some(&ctx.event_tx)).await;
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let err = crate::secret_redact::redact_secrets(&e.to_string()).into_owned();
+                warn!("Telegram [{label}] parse error: {err}");
+                set_channel_connected(&ctx.channel_status, &label, false, Some(err), Some(&ctx.event_tx)).await;
+                tokio::time::sleep(transport_backoff(consecutive_errors)).await;
                 continue;
             }
         };
@@ -400,6 +501,26 @@ async fn poll_loop(
         if !data.ok {
             consecutive_errors += 1;
             let desc = data.description.unwrap_or_default();
+            // 401 Unauthorized / 404 Not Found = Telegram rejecting the token
+            // itself. Anything else (429 rate limit, 5xx) is transient and keeps
+            // the existing retry-forever behaviour.
+            if is_token_rejection(data.error_code) {
+                auth_rejections += 1;
+                if auth_rejections >= MAX_AUTH_REJECTIONS {
+                    error!("Telegram [{label}] stopped — token rejected {auth_rejections}× ({desc})");
+                    set_channel_connected(
+                        &ctx.channel_status,
+                        &label,
+                        false,
+                        Some(format!("Bot Token 無效（{desc}）— 請在儀表板重新填入")),
+                        Some(&ctx.event_tx),
+                    )
+                    .await;
+                    return;
+                }
+            } else {
+                auth_rejections = 0;
+            }
             warn!("Telegram [{label}] API error: {desc}");
             set_channel_connected(&ctx.channel_status, &label, false, Some(desc), Some(&ctx.event_tx)).await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -410,6 +531,7 @@ async fn poll_loop(
             info!("Telegram [{label}] polling recovered after {consecutive_errors} errors");
         }
         consecutive_errors = 0;
+        auth_rejections = 0;
         set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
 
         if let Some(updates) = data.result {
@@ -1774,5 +1896,42 @@ async fn send_reply(
             }
             Err(e) => error!("Telegram send error: {e}"),
         }
+    }
+}
+
+/// WP12 — startup/poll agreement on what counts as a bad token, and the
+/// transport retry schedule.
+#[cfg(test)]
+mod wp12_resilience_tests {
+    use super::*;
+
+    #[test]
+    fn only_401_and_404_are_token_rejections() {
+        // Authoritative: Telegram says the credential itself is unusable.
+        assert!(is_token_rejection(Some(401)));
+        assert!(is_token_rejection(Some(404)));
+        // Transient: says nothing about the token — the channel must survive.
+        for code in [None, Some(0), Some(400), Some(403), Some(409), Some(429), Some(500), Some(502), Some(503)] {
+            assert!(
+                !is_token_rejection(code),
+                "{code:?} must not be treated as a bad token"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_backoff_doubles_from_3s_and_caps_at_60s() {
+        let secs = |n| transport_backoff(n).as_secs();
+        assert_eq!(secs(0), 3, "first retry is prompt");
+        assert_eq!(secs(1), 3);
+        assert_eq!(secs(2), 6);
+        assert_eq!(secs(3), 12);
+        assert_eq!(secs(4), 24);
+        assert_eq!(secs(5), 48);
+        assert_eq!(secs(6), 60, "ceiling reached");
+        assert_eq!(secs(7), 60);
+        // A multi-day outage must not overflow the shift.
+        assert_eq!(secs(1_000), 60);
+        assert_eq!(secs(u32::MAX), 60);
     }
 }

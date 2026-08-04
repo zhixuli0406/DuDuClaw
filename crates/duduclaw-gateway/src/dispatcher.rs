@@ -2614,7 +2614,7 @@ async fn forward_to_channel(
                     }
                 }
                 let resp = http.post(&url).json(&payload).send().await
-                    .map_err(|e| format!("telegram send chunk {}/{}: {e}", i + 1, total))?;
+                    .map_err(|e| format!("telegram send chunk {}/{}: {}", i + 1, total, crate::secret_redact::redact_secrets(&e.to_string())))?;
                 if !resp.status().is_success() {
                     // Retry without parse_mode in case Markdown causes issues on this chunk.
                     // A failure here (network error or non-2xx) MUST propagate as Err —

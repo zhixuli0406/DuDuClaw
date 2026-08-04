@@ -399,7 +399,13 @@ async fn send_with_markup(
         "telegram" => {
             let url = format!("https://api.telegram.org/bot{token}/sendMessage");
             let body = json!({ "chat_id": chat_id, "text": text, "reply_markup": markup });
-            let resp = http.post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
+            let resp = http
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                // WP12: reqwest's Display embeds the URL, which carries the bot token.
+                .map_err(|e| crate::secret_redact::redact_secrets(&e.to_string()).into_owned())?;
             if !resp.status().is_success() {
                 return Err(format!("telegram HTTP {}", resp.status()));
             }
