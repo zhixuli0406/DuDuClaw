@@ -38,18 +38,21 @@ instance:
 {
   "mcpServers": {
     "duduclaw-work": {
-      "command": "/opt/homebrew/bin/duduclaw",
+      "command": "/path/to/duduclaw",
       "args": ["mcp-server"],
       "env": { "DUDUCLAW_HOME": "/Users/you/dd-work", "DUDUCLAW_PORT": "18789", "DUDUCLAW_INSTANCE": "work" }
     },
     "duduclaw-play": {
-      "command": "/opt/homebrew/bin/duduclaw",
+      "command": "/path/to/duduclaw",
       "args": ["mcp-server"],
       "env": { "DUDUCLAW_HOME": "/Users/you/dd-play", "DUDUCLAW_PORT": "18790", "DUDUCLAW_INSTANCE": "play" }
     }
   }
 }
 ```
+
+`"command"` should be the absolute path to your `duduclaw` binary — run `which duduclaw`
+to find it (e.g. the npm global bin directory, or the desktop app's bundled binary).
 
 ## Must-differ checklist
 

@@ -109,12 +109,6 @@ npm install -g duduclaw
 
 > ⚠️ 如果安裝過程要求你裝 Rust / MSVC Build Tools 並編譯 1.5 小時,代表走錯路徑了。那是給貢獻者的「從原始碼建構」;一般使用請用上面的 npm 指令。
 
-### Homebrew(macOS / Linux)
-
-```bash
-brew install zhixuli0406/tap/duduclaw
-```
-
 ### 從原始碼建構
 
 前置需求:[Rust](https://rustup.rs/) 1.85+、[Node.js](https://nodejs.org/) 20+。
@@ -140,7 +134,7 @@ pip install duduclaw
 ## 快速開始
 
 - **桌面版**:直接開啟應用程式,Gateway 會自動啟動,應用程式內會直接顯示引導精靈。
-- **npm / Homebrew / 原始碼安裝**:
+- **npm / 原始碼安裝**:
 
   ```bash
   duduclaw run                  # 啟動(gateway + 通道 + 排程 + dispatcher 一次拉起)

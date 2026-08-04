@@ -308,7 +308,7 @@ Notes by install method:
 | Install method | Behavior |
 |----------------|----------|
 | Standalone / npm | Self-update in place (npm registry metadata goes stale until the next `npm i -g duduclaw`, harmless) |
-| Homebrew | Self-update refuses; run `brew upgrade duduclaw` |
+| Homebrew (legacy, unmaintained) | Self-update refuses; the tap is frozen — reinstall via npm or the desktop app instead |
 | Source (`cargo`/`target/`) | Self-update allowed but a rebuild will overwrite |
 
 ---

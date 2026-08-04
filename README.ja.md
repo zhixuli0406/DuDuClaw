@@ -109,12 +109,6 @@ npm install -g duduclaw
 
 > ⚠️ インストール中に Rust / MSVC Build Tools の導入と 1.5 時間のコンパイルを求められたら、それは間違ったルートです。「ソースからビルド」はコントリビュータ向け。通常利用は上の npm コマンドを使ってください。
 
-### Homebrew(macOS / Linux)
-
-```bash
-brew install zhixuli0406/tap/duduclaw
-```
-
 ### ソースからビルド
 
 前提条件:[Rust](https://rustup.rs/) 1.85+、[Node.js](https://nodejs.org/) 20+。
@@ -140,7 +134,7 @@ pip install duduclaw
 ## クイックスタート
 
 - **デスクトップ版**:アプリを開くだけ。gateway は自動起動し、ウィザードもアプリ内にそのまま表示されます。
-- **npm / Homebrew / ソースビルド**:
+- **npm / ソースビルド**:
 
   ```bash
   duduclaw run                  # まとめて起動(gateway + チャネル + スケジューラ + dispatcher)
