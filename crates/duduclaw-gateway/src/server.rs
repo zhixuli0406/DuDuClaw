@@ -4393,6 +4393,18 @@ async fn handle_mcp_oauth_callback(
 
     info!(provider = %pending.provider_id, "MCP OAuth authentication successful");
 
+    // Connecting Google IS the opt-in: flip the `[integrations]
+    // google_workspace` gate so the 19 workspace tools actually reach agents.
+    // Leaving it to a manual config.toml edit made "connected" a lie — the
+    // credential test passed while every tool call dead-ended.
+    if pending.provider_id == "google" {
+        match crate::google_workspace::enable_integration(home_dir) {
+            Ok(true) => info!("enabled [integrations] google_workspace in config.toml"),
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "could not auto-enable google_workspace integration; enable it manually in config.toml"),
+        }
+    }
+
     axum::response::Html(
         "<html><body style=\"font-family: system-ui, sans-serif; display: flex; \
          justify-content: center; align-items: center; height: 100vh; margin: 0; \

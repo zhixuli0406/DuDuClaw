@@ -48,6 +48,51 @@ pub fn integration_enabled(home_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Flip `config.toml [integrations] google_workspace = true` in place.
+///
+/// Called when the operator completes a Google connection through the
+/// dashboard (OAuth consent or saved service-account / Apps Script
+/// credentials): connecting IS the opt-in, so the default-hidden gate must not
+/// stay closed behind a working credential — that combination dead-ends every
+/// tool call while the credential test shows green. toml_edit round-trips the
+/// file so operator comments and formatting survive (unlike the wholesale
+/// `write_config_table` rewrite, which is fine for explicit saves but not for
+/// a side effect). Missing config.toml is created; malformed TOML is an error
+/// rather than a silent overwrite. Returns Ok(true) when the file changed,
+/// Ok(false) when the flag was already on.
+pub fn enable_integration(home_dir: &Path) -> std::io::Result<bool> {
+    if integration_enabled(home_dir) {
+        return Ok(false);
+    }
+    let path = home_dir.join("config.toml");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("config.toml is not valid TOML, refusing to rewrite it: {e}"),
+        )
+    })?;
+    doc.as_table_mut()
+        .entry("integrations")
+        .or_insert(toml_edit::table())
+        .as_table_mut()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "[integrations] exists but is not a table",
+            )
+        })?
+        .insert("google_workspace", toml_edit::value(true));
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(true)
+}
+
 const GMAIL_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const CALENDAR_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const SHEETS_BASE: &str = "https://sheets.googleapis.com/v4/spreadsheets";
@@ -120,8 +165,12 @@ pub const REQUIRED_SCOPES: &[&str] = &[
 /// Failures obtaining a usable Google access token from the vault.
 #[derive(Debug)]
 pub enum GoogleAuthError {
-    /// No `google` token stored — the user has never connected.
-    NotConnected,
+    /// No `google` token stored — the user has never connected. Carries the
+    /// token-vault path that was searched: the gateway and an agent-side MCP
+    /// server each resolve DUDUCLAW_HOME independently, and a mismatch makes a
+    /// freshly connected account look like it was never connected. Naming the
+    /// path turns that from a mystery into a one-glance diagnosis.
+    NotConnected { vault: std::path::PathBuf },
     /// Token expired and no refresh_token is available → full re-auth needed.
     NoRefreshToken,
     /// Token expired, refresh_token present, but the client credentials used to
@@ -143,9 +192,10 @@ pub enum GoogleAuthError {
 impl std::fmt::Display for GoogleAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GoogleAuthError::NotConnected => write!(
+            GoogleAuthError::NotConnected { vault } => write!(
                 f,
-                "Google is not connected. Open the dashboard Integrations → Google page and connect your Google account first."
+                "Google is not connected: no token found in {}. Open the dashboard Integrations → Google page and connect your Google account first. If you already connected there, the dashboard's gateway may be using a different DUDUCLAW_HOME than this process — compare the path above with the gateway's home directory.",
+                vault.display()
             ),
             GoogleAuthError::NoRefreshToken => write!(
                 f,
@@ -540,7 +590,11 @@ pub async fn get_valid_google_token(home_dir: &Path) -> Result<String, GoogleAut
         .find(|t| t.provider_id == GOOGLE_PROVIDER);
     let existing = match existing {
         Some(t) => t,
-        None => return Err(GoogleAuthError::NotConnected),
+        None => {
+            return Err(GoogleAuthError::NotConnected {
+                vault: home_dir.join(mcp_oauth::TOKEN_FILE),
+            })
+        }
     };
 
     let refresh_tok = match existing.refresh_token.as_deref() {

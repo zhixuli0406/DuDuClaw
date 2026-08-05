@@ -22867,6 +22867,16 @@ impl MethodHandler {
             _ => {}
         }
 
+        // Saving a working credential IS the opt-in — flip the master gate in
+        // the same write so the tools this credential unlocks actually reach
+        // agents, instead of requiring a manual `google_workspace = true`
+        // config.toml edit that nothing pointed to except a warning banner.
+        // Clearing credentials (mode "none") leaves the gate untouched: the
+        // OAuth-vault path may still be in use.
+        if mode != "none" {
+            integrations.insert("google_workspace".into(), toml::Value::Boolean(true));
+        }
+
         table.insert("integrations".into(), toml::Value::Table(integrations));
         if let Err(e) = self.write_config_table(&config_path, &table).await {
             return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));

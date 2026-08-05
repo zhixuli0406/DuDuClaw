@@ -163,7 +163,7 @@ export function GoogleCredentialPaths() {
             <span>
               {t(
                 'google.cred.gateOff',
-                'Google 整合的總開關還沒開，工具不會出現在 AI 員工面前（憑證測試仍會通過）。要開啟請在 config.toml 加上 [integrations] google_workspace = true。',
+                'Google 整合的總開關還沒開，工具不會出現在 AI 員工面前（憑證測試仍會通過）。完成 Google 連線或儲存憑證時會自動開啟；也可手動在 config.toml 加上 [integrations] google_workspace = true。',
               )}
             </span>
           </div>

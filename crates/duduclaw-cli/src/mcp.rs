@@ -6542,7 +6542,14 @@ async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState, caller_agent: &s
     };
     let global_cfg = duduclaw_odoo::OdooConfig::from_toml(&global_table);
     if !global_cfg.is_configured() {
-        return mcp_error("Odoo not configured. Add [odoo] section to config.toml with url and db.");
+        // Name the file actually read: the dashboard's `odoo.configure` writes
+        // the gateway's config.toml, and if this process resolved a different
+        // DUDUCLAW_HOME, "configured in the dashboard" and "configured here"
+        // are different files — the path is the diagnosis.
+        return mcp_error(&format!(
+            "Odoo not configured: no [odoo] url/db in {}. Configure Odoo from the dashboard, or add the [odoo] section there. If the dashboard already shows Odoo configured, its gateway may be using a different DUDUCLAW_HOME than this process.",
+            config_path.display()
+        ));
     }
     odoo.set_global(global_cfg.clone()).await;
 
@@ -9087,7 +9094,7 @@ pub(crate) async fn handle_tools_call(
             && !duduclaw_gateway::google_workspace::integration_enabled(home_dir) =>
         {
             serde_json::json!({
-                "content": [{"type": "text", "text": "Google Workspace 整合尚未在此版本開放，將於後續版本提供。（操作者可在 config.toml [integrations] 設 google_workspace = true 搶先啟用）"}],
+                "content": [{"type": "text", "text": "Google Workspace 整合尚未啟用。請操作者在 dashboard 的 整合 → Google 頁面完成連線或儲存憑證（會自動啟用），或手動在 config.toml 加上 [integrations] google_workspace = true。"}],
                 "isError": true
             })
         }
