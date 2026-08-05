@@ -32,6 +32,28 @@ fn open_main_window(app: AppHandle) {
     show_main_window(&app);
 }
 
+/// Open an http(s) URL in the system default browser. The dashboard (a remote
+/// gateway origin) invokes this for OAuth consent pages and outbound links —
+/// `window.open` / `target="_blank"` are silent no-ops in the wry webview, so
+/// every "open in browser" affordance funnels through here. Fail-closed: the
+/// URL must parse and carry an http/https scheme before it reaches the OS
+/// opener, so remote pages can never launch `file://` or custom-scheme
+/// handlers through the shell.
+#[tauri::command]
+fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    let parsed = url::Url::parse(&url).map_err(|e| format!("invalid url: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "refusing to open non-http(s) scheme: {}",
+            parsed.scheme()
+        ));
+    }
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(parsed.as_str(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -47,6 +69,7 @@ fn main() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
@@ -56,6 +79,7 @@ fn main() {
         .manage(manager.clone())
         .invoke_handler(tauri::generate_handler![
             open_main_window,
+            open_external_url,
             pet_gen::pet_list,
             pet_gen::pet_generate,
             pet_gen::pet_active_get,

@@ -958,6 +958,7 @@
   "mcp.oauth.revoked": "{provider} 認證已撤銷",
   "mcp.oauth.success": "{provider} 認證成功",
   "mcp.oauth.waiting": "等待認證中...",
+  "mcp.oauth.manualUrlHint": "若授權頁面沒有自動開啟，請複製此網址到瀏覽器完成授權：",
   "mcp.oauth.configureTitle": "設定 OAuth 憑證",
   "mcp.oauth.clientId": "Client ID",
   "mcp.oauth.clientSecret": "Client Secret",

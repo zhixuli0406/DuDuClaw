@@ -30,6 +30,7 @@
     "autostart:allow-disable",
     "autostart:allow-is-enabled",
     "allow-open-main-window",
+    "allow-open-external-url",
     "allow-pet-list",
     "allow-pet-generate",
     "allow-pet-active-get",

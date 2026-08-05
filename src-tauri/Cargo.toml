@@ -24,6 +24,12 @@ tauri-build = { version = "2", features = [] }
 # distributed as a signed DMG (Developer ID), so this is fine.
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-shell = "2"
+# System-browser opener for OAuth consent pages + outbound links. The wry
+# webview has no new-window handler, so `window.open` / `target="_blank"` are
+# silent no-ops in the shell — the dashboard funnels them through the
+# `open_external_url` command instead. The plugin's own permissions are NOT
+# granted to any webview; only the validating command is exposed.
+tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-autostart = "2"
