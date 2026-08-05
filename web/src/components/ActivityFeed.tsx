@@ -64,6 +64,16 @@ const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
     color: 'text-brand',
     bgColor: 'bg-brand/10',
   },
+  memory_distilled: {
+    icon: Sparkles,
+    color: 'text-purple-500',
+    bgColor: 'bg-purple-100 dark:bg-purple-900/30',
+  },
+  wiki_written: {
+    icon: Layers,
+    color: 'text-emerald-500',
+    bgColor: 'bg-emerald-100 dark:bg-emerald-900/30',
+  },
   skill_learned: {
     icon: Sparkles,
     color: 'text-purple-500',
@@ -110,6 +120,8 @@ const TIER: Record<ActivityType, Tier> = {
   evolution_triggered: 2,
   autopilot_triggered: 2,
   autopilot_lag: 2,
+  memory_distilled: 2,
+  wiki_written: 2,
   agent_reply: 3,
 };
 

@@ -602,6 +602,8 @@ export type ActivityType =
   | 'task_assigned'
   | 'agent_reply'
   | 'agent_created'
+  | 'memory_distilled'
+  | 'wiki_written'
   | 'skill_learned'
   | 'evolution_triggered'
   | 'autopilot_triggered'

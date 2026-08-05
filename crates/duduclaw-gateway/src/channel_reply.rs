@@ -653,6 +653,57 @@ pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connec
     }
 }
 
+/// Best-effort activity-feed append + live `activity.new` broadcast for
+/// conversation-side events (agent replies, key-fact distillation). Channel
+/// conversations previously left zero trace in 紀錄/即時動態 — the feed only
+/// knew about task lifecycle and a few MCP tools. Never affects reply
+/// delivery: every failure is logged and swallowed.
+pub(crate) async fn post_conversation_activity(
+    home_dir: &std::path::Path,
+    event_tx: &tokio::sync::broadcast::Sender<String>,
+    agent_id: &str,
+    event_type: &str,
+    summary: String,
+) {
+    let store = match crate::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, "conversation activity skipped: task store open failed");
+            return;
+        }
+    };
+    let row = crate::task_store::ActivityRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: event_type.to_string(),
+        agent_id: agent_id.to_string(),
+        task_id: None,
+        summary,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        metadata: None,
+    };
+    if let Err(e) = store.append_activity(&row).await {
+        tracing::debug!(error = %e, "conversation activity append failed");
+        return;
+    }
+    // Same JSON shape as handlers::activity_row_to_json so the dashboard's
+    // existing `activity.new` subscribers render it unchanged.
+    let frame = crate::protocol::WsFrame::event(
+        "activity.new",
+        serde_json::json!({
+            "id": row.id,
+            "type": row.event_type,
+            "agent_id": row.agent_id,
+            "task_id": row.task_id,
+            "summary": row.summary,
+            "timestamp": row.timestamp,
+            "metadata": serde_json::Value::Null,
+        }),
+    );
+    if let Ok(json) = serde_json::to_string(&frame) {
+        let _ = event_tx.send(json);
+    }
+}
+
 // ── User sentiment detection ───────────────────────────────
 
 /// Detect user satisfaction heuristic from message text (zero LLM cost).
@@ -2467,6 +2518,23 @@ async fn build_reply_with_session_inner(
             }
         }
 
+        // Trace the turn in the activity feed (agent detail 紀錄/即時動態).
+        // Tier-3 in the dashboard feed, so it informs without flooding.
+        {
+            let (ch, _) = parse_session_id_parts(session_id);
+            let summary = format!(
+                "回覆 {} 對話「{}」",
+                channel_display_name(ch),
+                duduclaw_core::truncate_chars(&sanitized_text, 40),
+            );
+            let home = ctx.home_dir.clone();
+            let tx = ctx.event_tx.clone();
+            let aid = agent_id.clone();
+            tokio::spawn(async move {
+                post_conversation_activity(&home, &tx, &aid, "agent_reply", summary).await;
+            });
+        }
+
         // ── RFC-24: Decision Continuity capture (async, non-blocking) ──
         // When the outbound reply offers an enumerated choice ("方案 A/B/C",
         // "Option 1/2", a lettered list under a "which one?" question), persist
@@ -2764,6 +2832,8 @@ async fn build_reply_with_session_inner(
                 let chat_id_for_facts = cid.to_string();
                 let session_for_facts = session_id.to_string();
                 let home_for_facts = ctx.home_dir.clone();
+                let home_for_activity = ctx.home_dir.clone();
+                let tx_for_activity = ctx.event_tx.clone();
                 tokio::spawn(async move {
                     let prompt = format!(
                         "Extract 2-4 key factual insights from this conversation turn \
@@ -2785,15 +2855,17 @@ async fn build_reply_with_session_inner(
                     };
 
                     // Store facts in spawn_blocking (SqliteMemoryEngine is !Send)
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let agent_for_activity = agent_id_for_facts.clone();
+                    let stored = tokio::task::spawn_blocking(move || {
                         let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
                             Ok(e) => e,
                             Err(e) => {
                                 tracing::warn!(error = %e, "Failed to open memory engine for fact storage");
-                                return;
+                                return 0usize;
                             }
                         };
                         let rt = tokio::runtime::Handle::current();
+                        let mut stored = 0usize;
                         for line in facts_text.lines() {
                             let fact = line.trim_start_matches(&['-', '•', '*', ' '][..]).trim();
                             if fact.len() < 10 { continue; }
@@ -2804,13 +2876,29 @@ async fn build_reply_with_session_inner(
                                     continue;
                                 }
                             }
-                            let _ = rt.block_on(engine.store_fact(
+                            if rt.block_on(engine.store_fact(
                                 &agent_id_for_facts, fact,
                                 &channel_for_facts, &chat_id_for_facts,
                                 &session_for_facts,
-                            ));
+                            )).is_ok() {
+                                stored += 1;
+                            }
                         }
-                    }).await;
+                        stored
+                    }).await.unwrap_or(0);
+
+                    // Make the distillation visible: memory writes previously
+                    // happened in total silence, which read as "沒有記憶".
+                    if stored > 0 {
+                        post_conversation_activity(
+                            &home_for_activity,
+                            &tx_for_activity,
+                            &agent_for_activity,
+                            "memory_distilled",
+                            format!("從對話萃取 {stored} 筆關鍵事實（記憶 → 關鍵洞察）"),
+                        )
+                        .await;
+                    }
                 });
             }
         }
@@ -8477,6 +8565,22 @@ fn estimate_tokens(text: &str) -> u32 {
 }
 
 /// Parse session_id "telegram:12345" or "telegram:12345:thread" into (channel, chat_id).
+/// Human-facing channel label for activity summaries ("telegram" → "Telegram").
+fn channel_display_name(channel: &str) -> &'static str {
+    match channel {
+        "telegram" => "Telegram",
+        "line" => "LINE",
+        "discord" => "Discord",
+        "slack" => "Slack",
+        "whatsapp" => "WhatsApp",
+        "feishu" => "飛書",
+        "googlechat" => "Google Chat",
+        "teams" => "Teams",
+        "webchat" => "WebChat",
+        _ => "頻道",
+    }
+}
+
 fn parse_session_id_parts(session_id: &str) -> (&str, &str) {
     let parts: Vec<&str> = session_id.splitn(3, ':').collect();
     match parts.len() {
