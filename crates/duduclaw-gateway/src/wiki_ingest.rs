@@ -113,16 +113,29 @@ pub fn classify_for_ingest(user_text: &str, assistant_reply: &str) -> IngestTier
         return IngestTier::Skip;
     }
 
-    // Complex knowledge indicators → Cloud
+    // Complex knowledge indicators → Cloud. The decision/standard group exists
+    // because "把它當成團隊標準" turns are exactly the ones that must yield SPO
+    // triples (the curation station's knowledge graph is built from them), yet
+    // they read as plain requests — without escalation they fall to the Local
+    // tier, whose entity heuristic ignores the reply and stores nothing.
     let cloud_indicators = [
         "explain", "why", "how does", "compare", "difference between",
         "analyze", "strategy", "architecture", "design",
+        "standard", "policy", "adopt", "decide", "decision", "convention",
         "\u{70ba}\u{4ec0}\u{9ebc}", // 為什麼
         "\u{600e}\u{9ebc}", // 怎麼
         "\u{5206}\u{6790}", // 分析
         "\u{6bd4}\u{8f03}", // 比較
         "\u{7b56}\u{7565}", // 策略
         "\u{67b6}\u{69cb}", // 架構
+        "\u{6a19}\u{6e96}", // 標準
+        "\u{898f}\u{7bc4}", // 規範
+        "\u{6c7a}\u{5b9a}", // 決定
+        "\u{63a1}\u{7528}", // 採用
+        "\u{7576}\u{6210}", // 當成
+        "\u{4f5c}\u{70ba}", // 作為
+        "\u{5b9a}\u{6848}", // 定案
+        "\u{7d0d}\u{5165}", // 納入
     ];
     if cloud_indicators.iter().any(|p| user_lower.contains(p)) && reply_len > 200 {
         return IngestTier::Cloud;
@@ -1072,11 +1085,11 @@ async fn run_ingest_inner(
             return;
         }
         IngestTier::Local => {
-            debug!(agent = agent_id, "Conversation distill: local extraction");
+            info!(agent = agent_id, "Conversation distill: local extraction");
             extract_local_facts(user_text, assistant_reply)
         }
         IngestTier::Cloud => {
-            debug!(agent = agent_id, "Conversation distill: cloud extraction");
+            info!(agent = agent_id, "Conversation distill: cloud extraction");
             let prompt = build_cloud_ingest_prompt(user_text, assistant_reply);
 
             // Utility dispatch (RFC-25 N2): this agent's `[runtime] provider` +
@@ -1695,11 +1708,27 @@ mod tests {
 
     #[test]
     fn test_classify_local_medium() {
+        let user = "Where can customers download the latest invoice for their electronics order?";
+        let reply = "Customers can download invoices from the account portal under Orders. \
+                     Each order row has an invoice button that generates a PDF copy. \
+                     Invoices stay available for two years after the purchase date.";
+        assert_eq!(classify_for_ingest(user, reply), IngestTier::Local);
+    }
+
+    /// Policy/standard/decision wording escalates to Cloud — these turns carry
+    /// the durable domain rules the knowledge graph is built from, and the
+    /// Local tier's entity heuristic would store nothing for them.
+    #[test]
+    fn test_classify_cloud_policy_decision() {
         let user = "What are the return policy details for electronic products?";
         let reply = "Our return policy for electronic products allows returns within 30 days of purchase. \
                      The product must be in its original packaging with all accessories included. \
                      A receipt or proof of purchase is required. Refunds are processed within 5-7 business days.";
-        assert_eq!(classify_for_ingest(user, reply), IngestTier::Local);
+        assert_eq!(classify_for_ingest(user, reply), IngestTier::Cloud);
+
+        let user_zh = "幫我查詢 ADLC 開發方法，並把它當成 DuDuClaw 團隊標準";
+        let reply_zh = "已完成調查並整理 ADLC 六階段迭代流程，以下為完整團隊標準文件內容。".repeat(10);
+        assert_eq!(classify_for_ingest(user_zh, &reply_zh), IngestTier::Cloud);
     }
 
     #[test]

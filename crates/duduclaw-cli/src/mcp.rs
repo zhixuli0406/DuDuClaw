@@ -10202,6 +10202,33 @@ async fn handle_wiki_read(args: &Value, home_dir: &Path, default_agent: &str) ->
     }
 }
 
+/// Best-effort activity-feed trace for knowledge writes. Wiki pages used to
+/// land with zero dashboard footprint — the owner had no way to see "the agent
+/// filed something" without opening the wiki itself. Mirrors
+/// `handle_activity_post`'s storage path; failure never fails the tool.
+async fn post_wiki_activity(home_dir: &Path, agent_id: &str, summary: String, page_path: &str) {
+    let actor = if is_valid_agent_id(agent_id) { agent_id } else { "system" };
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, "wiki activity skipped: task store open failed");
+            return;
+        }
+    };
+    let row = duduclaw_gateway::task_store::ActivityRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: "wiki_written".to_string(),
+        agent_id: actor.to_string(),
+        task_id: None,
+        summary,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        metadata: Some(serde_json::json!({ "page_path": page_path }).to_string()),
+    };
+    if store.append_activity(&row).await.is_ok() {
+        append_bus_event(home_dir, "activity.new", &activity_row_to_json(&row)).await;
+    }
+}
+
 async fn handle_wiki_write(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
     let page_path = match args.get("page_path").and_then(|v| v.as_str()) {
@@ -10299,6 +10326,14 @@ async fn handle_wiki_write(args: &Value, home_dir: &Path, default_agent: &str) -
     }
 
     let verb = if is_new { "Created" } else { "Updated" };
+    let title = extract_frontmatter_title(content).unwrap_or_else(|| page_path.to_string());
+    post_wiki_activity(
+        home_dir,
+        default_agent,
+        format!("寫入知識庫「{title}」"),
+        page_path,
+    )
+    .await;
     tool_text(&format!("{} wiki page: {}", verb, page_path))
 }
 
@@ -11063,7 +11098,16 @@ async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, caller_agent: &
     );
 
     match write_result {
-        Ok(()) => tool_text(&format!("Written shared wiki page: {} (by: {})", page_path, caller_agent)),
+        Ok(()) => {
+            post_wiki_activity(
+                home_dir,
+                caller_agent,
+                format!("寫入共享知識庫「{page_path}」"),
+                page_path,
+            )
+            .await;
+            tool_text(&format!("Written shared wiki page: {} (by: {})", page_path, caller_agent))
+        }
         Err(e) => tool_error(&format!("Failed to write shared wiki page: {e}")),
     }
 }
