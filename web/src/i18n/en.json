@@ -959,6 +959,7 @@
   "mcp.oauth.revoked": "{provider} authentication revoked",
   "mcp.oauth.success": "{provider} authenticated successfully",
   "mcp.oauth.waiting": "Waiting for authentication...",
+  "mcp.oauth.manualUrlHint": "If the consent page didn't open, copy this URL into a browser to finish authorizing:",
   "mcp.oauth.configureTitle": "Configure OAuth Credentials",
   "mcp.oauth.clientId": "Client ID",
   "mcp.oauth.clientSecret": "Client Secret",

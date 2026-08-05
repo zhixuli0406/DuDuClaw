@@ -958,6 +958,7 @@
   "mcp.oauth.revoked": "{provider} の認証を取り消しました",
   "mcp.oauth.success": "{provider} の認証に成功しました",
   "mcp.oauth.waiting": "認証を待機中...",
+  "mcp.oauth.manualUrlHint": "認証ページが自動で開かない場合は、このURLをブラウザーにコピーして認証を完了してください：",
   "mcp.oauth.configureTitle": "OAuth 認証情報を設定",
   "mcp.oauth.clientId": "クライアント ID",
   "mcp.oauth.clientSecret": "クライアントシークレット",

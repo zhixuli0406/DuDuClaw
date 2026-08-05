@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
+import { openExternal } from '@/lib/external-link';
 import { useMcpStore } from '@/stores/mcp-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -839,6 +840,9 @@ function OAuthTab({
 }) {
   const intl = useIntl();
   const [pendingProvider, setPendingProvider] = useState<string | null>(null);
+  /** Consent URL of the in-flight authorization — kept on the card as a
+      select-all manual fallback in case no browser window appeared. */
+  const [pendingAuthUrl, setPendingAuthUrl] = useState<string | null>(null);
   const [configureProvider, setConfigureProvider] = useState<McpOAuthProvider | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -848,30 +852,45 @@ function OAuthTab({
     };
   }, []);
 
+  /**
+   * Track an in-flight authorization: open the consent page (desktop-shell
+   * aware — `window.open` is a no-op in the wry webview), surface the URL as
+   * a manual fallback, and poll until the token lands. Shared by the card's
+   * authenticate button and the credentials dialog so both get the same
+   * pending UI + polling.
+   */
+  const beginAuthorization = (provider: McpOAuthProvider, authUrl: string) => {
+    setPendingProvider(provider.provider_id);
+    setPendingAuthUrl(authUrl);
+    openExternal(authUrl);
+
+    // Start local polling for UI feedback
+    let attempts = 0;
+    if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+    pollTimerRef.current = setInterval(async () => {
+      attempts += 1;
+      if (attempts > 100) {
+        if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+        setPendingProvider(null);
+        setPendingAuthUrl(null);
+        return;
+      }
+      const updatedProviders = useMcpStore.getState().oauthProviders;
+      const updated = updatedProviders.find((p) => p.provider_id === provider.provider_id);
+      if (updated?.token_status === 'authenticated') {
+        if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+        setPendingProvider(null);
+        setPendingAuthUrl(null);
+        showToast('success', intl.formatMessage({ id: 'mcp.oauth.success' }, { provider: provider.name }));
+      }
+    }, 3000);
+  };
+
   const handleAuthenticate = async (provider: McpOAuthProvider) => {
     setPendingProvider(provider.provider_id);
     try {
       const authUrl = await useMcpStore.getState().startOAuth(provider.provider_id);
-      window.open(authUrl, '_blank');
-
-      // Start local polling for UI feedback
-      let attempts = 0;
-      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-      pollTimerRef.current = setInterval(async () => {
-        attempts += 1;
-        if (attempts > 100) {
-          if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-          setPendingProvider(null);
-          return;
-        }
-        const updatedProviders = useMcpStore.getState().oauthProviders;
-        const updated = updatedProviders.find((p) => p.provider_id === provider.provider_id);
-        if (updated?.token_status === 'authenticated') {
-          if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-          setPendingProvider(null);
-          showToast('success', intl.formatMessage({ id: 'mcp.oauth.success' }, { provider: provider.name }));
-        }
-      }, 3000);
+      beginAuthorization(provider, authUrl);
     } catch {
       setPendingProvider(null);
       showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
@@ -978,6 +997,18 @@ function OAuthTab({
                       {intl.formatMessage({ id: 'mcp.oauth.waiting' })}
                     </div>
                   )}
+                  {/* Manual fallback while waiting — completes the flow in any
+                      browser if no consent window appeared. */}
+                  {isPending && pendingAuthUrl && (
+                    <div className="space-y-1 rounded-md bg-muted/50 px-2.5 py-2">
+                      <p className="text-xs text-muted-foreground">
+                        {intl.formatMessage({ id: 'mcp.oauth.manualUrlHint' })}
+                      </p>
+                      <p className="select-all break-all font-mono text-[11px] text-foreground">
+                        {pendingAuthUrl}
+                      </p>
+                    </div>
+                  )}
                 </CardContent>
 
                 {/* Actions */}
@@ -1019,6 +1050,7 @@ function OAuthTab({
           provider={configureProvider}
           onClose={() => setConfigureProvider(null)}
           showToast={showToast}
+          onAuthStarted={(authUrl) => beginAuthorization(configureProvider, authUrl)}
         />
       )}
     </div>
@@ -1029,10 +1061,14 @@ function ConfigureOAuthDialog({
   provider,
   onClose,
   showToast,
+  onAuthStarted,
 }: {
   provider: McpOAuthProvider;
   onClose: () => void;
   showToast: (type: 'success' | 'error', message: string) => void;
+  /** The consent flow started — the parent opens the URL + owns the pending
+      UI/polling (the dialog closes right away, so it can't host either). */
+  onAuthStarted: (authUrl: string) => void;
 }) {
   const intl = useIntl();
   const [clientId, setClientId] = useState(provider.client_id ?? '');
@@ -1046,7 +1082,7 @@ function ConfigureOAuthDialog({
     setSubmitting(true);
     try {
       const authUrl = await useMcpStore.getState().startOAuth(provider.provider_id, clientId.trim(), clientSecret.trim() || undefined);
-      window.open(authUrl, '_blank');
+      onAuthStarted(authUrl);
       showToast('success', intl.formatMessage({ id: 'mcp.oauth.waiting' }));
       onClose();
     } catch {

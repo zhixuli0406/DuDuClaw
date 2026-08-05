@@ -10,6 +10,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { openExternal } from '@/lib/external-link';
 import { Card, CardHeader, CardTitle, CardContent, Button, Badge, Input } from '@/components/mds';
 
 /** The OAuth redirect URI the gateway serves — users must register this exact
@@ -108,6 +109,13 @@ export function IntegrationConnectPanel({
   const clientIdTouched = useRef(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ kind: 'error' | 'info'; text: string } | null>(null);
+  /**
+   * The consent URL of the in-flight authorization, kept on screen as
+   * select-all text while polling. This is the escape hatch when no browser
+   * window appears (an outdated desktop shell, a popup blocker): the user can
+   * copy it into any browser and the poll below still detects success.
+   */
+  const [authUrl, setAuthUrl] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const refresh = useCallback(async () => {
@@ -176,6 +184,7 @@ export function IntegrationConnectPanel({
           (!!status.expires_at && !!baseline && status.expires_at > baseline);
         if (fresh) {
           if (pollRef.current) clearInterval(pollRef.current);
+          setAuthUrl(null);
           setNotice({ kind: 'info', text: t('connected.toast') });
           await refresh();
         }
@@ -192,7 +201,9 @@ export function IntegrationConnectPanel({
       setNotice(null);
       try {
         const { auth_url } = await api.mcp.oauthStart(providerId, id, secret);
-        window.open(auth_url, '_blank', 'noopener');
+        // Desktop-shell aware: window.open is a no-op in the wry webview.
+        openExternal(auth_url);
+        setAuthUrl(auth_url);
         setNotice({ kind: 'info', text: t('waiting') });
         startPolling(state.expiresAt);
         return true;
@@ -302,6 +313,17 @@ export function IntegrationConnectPanel({
           }
         >
           {notice.text}
+        </div>
+      )}
+
+      {/* Manual fallback while an authorization is in flight — if no consent
+          window appeared, the URL itself completes the flow in any browser. */}
+      {authUrl && (
+        <div className="space-y-1 rounded-lg border border-surface-border bg-muted/40 px-3 py-2">
+          <p className="text-xs text-muted-foreground">
+            {intl.formatMessage({ id: 'mcp.oauth.manualUrlHint' })}
+          </p>
+          <p className="select-all break-all font-mono text-[11px] text-foreground">{authUrl}</p>
         </div>
       )}
 

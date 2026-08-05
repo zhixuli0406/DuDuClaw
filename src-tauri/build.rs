@@ -14,6 +14,7 @@ fn main() {
     // and capabilities/remote-gateway.json in sync with this list.
     let commands: &[&str] = &[
         "open_main_window",
+        "open_external_url",
         "pet_list",
         "pet_generate",
         "pet_active_get",
