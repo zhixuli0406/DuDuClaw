@@ -794,6 +794,10 @@ mod tests {
         assert!(!d1.contains(&"mcp__duduclaw__send_message".to_string()));
         assert!(d1.contains(&"execute_program".to_string()));
 
-        std::fs::remove_dir_all(&home).unwrap();
+        // Close the store before cleanup — Windows locks approvals.db while a
+        // connection is open (remove_dir_all fails with error 32), and temp-dir
+        // cleanup is best-effort anyway.
+        drop(s);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
