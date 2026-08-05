@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Fixed
+- **桌面版 OAuth 授權彈窗全滅**：桌面殼的 wry webview 沒有 new-window handler，
+  `window.open` / `target="_blank"` 是靜默 no-op——MCP OAuth（Google/Notion/GitHub）
+  的授權頁點了沒反應、CLI 登入連結打不開、所有外連（定價頁、檔案下載）全數死路。
+  桌面殼新增 `open_external_url` command（Rust 端驗證 http/https 才交給系統瀏覽器，
+  remote 頁面拿不到 opener 原生權限）；前端 `openExternal()` helper 接手三處 OAuth
+  `window.open`，並在開機時安裝全域 `target="_blank"` 攔截器涵蓋其餘外連。授權進行中
+  面板會顯示可全選複製的授權網址——就算殼太舊沒有這個 command，貼到任何瀏覽器
+  一樣能完成（callback 是 gateway 的 HTTP endpoint，輪詢會自動偵測成功）。
+- **Google 連好了工具卻到不了 AI 員工面前**：dashboard 完成 OAuth 連線／儲存憑證後，
+  `[integrations] google_workspace` 總開關仍是關的——19 個 Google 工具不會出現在
+  tools/list，憑證測試綠燈但每次呼叫都死路，唯一的線索是一條要求手改 config.toml
+  的警告。現在「完成連線就是選擇加入」：OAuth callback 成功（google）與憑證儲存
+  都會自動把開關寫進 config.toml（toml_edit 原地修改，保留註解與排版；config 格式
+  錯誤時拒寫並留 log，不會整檔覆蓋）。
+- **「Google 未連線」／「Odoo 未設定」看不出在哪找過**：gateway 與 agent 端 MCP server
+  各自解析 `DUDUCLAW_HOME`，一旦不一致，dashboard 連好的帳號在 agent 眼裡就像從沒
+  連過，錯誤訊息卻隻字不提路徑。現在兩者都會列出實際查找的檔案路徑
+  （`mcp-oauth-tokens.json` / `config.toml`）並提示比對 gateway 的 home 目錄，
+  home 不一致從玄學變成一眼可判。
+
 ## [1.52.2] - 2026-08-05 — 對話痕跡全面可見+決策句知識圖譜
 
 ### Added
