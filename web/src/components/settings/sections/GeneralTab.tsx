@@ -12,7 +12,7 @@ import {
   SettingsSaveState,
 } from '@/components/mds';
 import { AdvancedSection, type SelectOption } from '@/components/settings/controls';
-import { RowSelect } from '@/pages/agent-form/form-rows';
+import { RowSelect, RowSwitch } from '@/pages/agent-form/form-rows';
 import { SettingRow } from './shared';
 
 export function GeneralTab() {
@@ -22,6 +22,11 @@ export function GeneralTab() {
   const [logLevel, setLogLevel] = useState('info');
   const [rotationStrategy, setRotationStrategy] = useState('priority');
   const [defaultLanguage, setDefaultLanguage] = useState('');
+  // Login/boot autostart — applied immediately via system.autostart.set (it is
+  // an OS-level registration, not a config.toml field, so it bypasses Save).
+  // null = unsupported platform or status not loaded yet → row hidden.
+  const [autostart, setAutostart] = useState<boolean | null>(null);
+  const [autostartBusy, setAutostartBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -44,7 +49,30 @@ export function GeneralTab() {
       console.warn("[api]", e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     });
+    // Best-effort: non-admin sessions / older gateways just keep the row hidden.
+    api.system.autostartStatus().then((s) => {
+      if (s.supported) setAutostart(s.enabled);
+    }).catch(() => {});
   }, [intl]);
+
+  const handleAutostartToggle = async (next: boolean) => {
+    setAutostartBusy(true);
+    const prev = autostart;
+    setAutostart(next);
+    try {
+      const s = await api.system.autostartSet(next);
+      setAutostart(s.enabled);
+      toast.success(intl.formatMessage({
+        id: next ? 'settings.general.autostart.enabled' : 'settings.general.autostart.disabled',
+      }));
+    } catch (e) {
+      console.warn('[api]', e);
+      setAutostart(prev);
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setAutostartBusy(false);
+    }
+  };
 
   const handleSave = async () => {
     setSaving(true);
@@ -119,6 +147,15 @@ export function GeneralTab() {
             onChange={setDefaultLanguage}
             options={languageOptions}
           />
+          {/* Login/boot autostart — hidden when unsupported or not admin */}
+          {autostart !== null && (
+            <RowSwitch
+              label={intl.formatMessage({ id: 'settings.general.autostart' })}
+              description={intl.formatMessage({ id: 'settings.general.autostart.help' })}
+              checked={autostart}
+              onChange={(v) => { if (!autostartBusy) void handleAutostartToggle(v); }}
+            />
+          )}
           {/* Replay the guided tour */}
           <SettingsRow label={intl.formatMessage({ id: 'settings.general.replayTour' })}>
             <Button variant="outline" size="sm" onClick={() => startTour()}>

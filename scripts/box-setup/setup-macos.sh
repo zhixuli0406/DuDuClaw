@@ -201,7 +201,8 @@ cat > "$LAUNCHD_PLIST" <<PLIST
   <key>ProgramArguments</key>
   <array>
     <string>${CARGO_BIN}</string>
-    <string>serve</string>
+    <string>run</string>
+    <string>--yes</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

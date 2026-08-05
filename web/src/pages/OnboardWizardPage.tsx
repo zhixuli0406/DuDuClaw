@@ -44,6 +44,8 @@ interface WizardState {
   readonly features: ReadonlyArray<Feature>;
   readonly importFile: File | null;
   readonly importPreview: ReadonlyArray<ReadonlyArray<string>>;
+  /** Register the gateway to start at login (system.autostart.set on deploy). */
+  readonly autostart: boolean;
 }
 
 const INITIAL_STATE: WizardState = {
@@ -55,6 +57,7 @@ const INITIAL_STATE: WizardState = {
   features: [],
   importFile: null,
   importPreview: [],
+  autostart: true,
 };
 
 const TOTAL_STEPS = 5;
@@ -557,13 +560,15 @@ function Step4({
 
 function Step5({
   state,
+  onChange,
   intl,
 }: {
   state: WizardState;
+  onChange: (patch: Partial<WizardState>) => void;
   intl: ReturnType<typeof useIntl>;
 }) {
   return (
-    <div className="mx-auto max-w-lg">
+    <div className="mx-auto max-w-lg space-y-4">
       <Card className="p-4">
         <h3 className="text-base font-medium leading-snug text-foreground">
           {intl.formatMessage({ id: 'wizard.summary' })}
@@ -618,6 +623,26 @@ function Step5({
             </dd>
           </div>
         </dl>
+      </Card>
+
+      {/* Login autostart opt-in — applied on deploy, failure is non-fatal. */}
+      <Card className="p-4">
+        <label className="flex cursor-pointer items-start gap-3">
+          <input
+            type="checkbox"
+            checked={state.autostart}
+            onChange={(e) => onChange({ autostart: e.target.checked })}
+            className="mt-0.5 size-4 shrink-0 accent-brand"
+          />
+          <span className="min-w-0">
+            <span className="block text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: 'wizard.autostart' })}
+            </span>
+            <span className="mt-0.5 block text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'wizard.autostart.desc' })}
+            </span>
+          </span>
+        </label>
       </Card>
     </div>
   );
@@ -708,6 +733,15 @@ export function OnboardWizardPage() {
           `Features: ${state.features.join(', ')}`,
         ].join('\n'),
       });
+      // Best-effort: autostart registration must not fail the deploy — the
+      // agent is already created; the toggle also lives in 設定 → 一般.
+      if (state.autostart) {
+        try {
+          await api.system.autostartSet(true);
+        } catch (e) {
+          console.warn('[wizard] autostart registration failed', e);
+        }
+      }
       setDeployed(true);
     } catch {
       setError(intl.formatMessage({ id: 'wizard.deploy.error' }));
@@ -753,7 +787,7 @@ export function OnboardWizardPage() {
           {step === 2 && <Step2 state={state} onChange={updateState} intl={intl} />}
           {step === 3 && <Step3 selected={state.features} onToggle={toggleFeature} intl={intl} />}
           {step === 4 && <Step4 state={state} onChange={updateState} intl={intl} />}
-          {step === 5 && <Step5 state={state} intl={intl} />}
+          {step === 5 && <Step5 state={state} onChange={updateState} intl={intl} />}
         </div>
 
         {/* Error */}

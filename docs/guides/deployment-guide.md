@@ -261,18 +261,25 @@ duduclaw service logs --lines 50
 duduclaw service uninstall
 ```
 
+`install` / `uninstall` register (or remove) a **user-level** autostart entry —
+no sudo required — and never touch a running gateway; the change takes effect
+at the next login. The same registration can be toggled from the dashboard
+(Settings → General → Start at login), which the onboarding wizard also offers
+on its final step.
+
 ### macOS (launchd)
 
 Creates `~/Library/LaunchAgents/com.duduclaw.gateway.plist`
 
 ### Linux (systemd)
 
-Creates `~/.config/systemd/user/duduclaw.service`
+Creates `~/.config/systemd/user/duduclaw.service` and enables it via the
+`default.target.wants` symlink (equivalent to `systemctl --user enable duduclaw`).
 
-```bash
-# Enable auto-start on login
-systemctl --user enable duduclaw
-```
+### Windows
+
+Creates the `DuDuClaw` value under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
 ---
 
