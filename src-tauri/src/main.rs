@@ -100,6 +100,8 @@ fn main() {
             gateway_picker::gateway_local_status,
             gateway_picker::gateway_start_local,
             gateway_picker::gateway_open_picker,
+            updater::desktop_update_status,
+            updater::desktop_restart_and_update,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

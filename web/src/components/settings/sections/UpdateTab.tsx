@@ -11,6 +11,7 @@ import {
   SettingsCard,
 } from '@/components/mds';
 import { RowSwitch } from '@/pages/agent-form/form-rows';
+import { stagedDesktopUpdateVersion, restartAndUpdateDesktop } from '@/lib/desktop-update';
 import { RefreshCw, Download, CheckCircle, XCircle } from 'lucide-react';
 
 /**
@@ -81,6 +82,41 @@ export function UpdateTab() {
 
   // [H1] useRef guard prevents double-click race — declared before handleCheck
   const installingRef = useRef(false);
+
+  // Desktop shell only: version of the shell update already downloaded and
+  // waiting for a restart. The update-ready notification tells the user to
+  // click「重啟並更新」— render that button here, where the notification sends
+  // them, not only in the tray menu they cannot find (2026-08-05 report).
+  // Null outside the shell / nothing staged, so browsers see no change.
+  const [stagedVersion, setStagedVersion] = useState<string | null>(null);
+  const [restarting, setRestarting] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () =>
+      stagedDesktopUpdateVersion().then((v) => {
+        if (!cancelled) setStagedVersion(v);
+      });
+    void refresh();
+    // The background download can finish while the tab is open.
+    const timer = setInterval(refresh, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
+  const handleRestartAndUpdate = useCallback(async () => {
+    setRestarting(true);
+    try {
+      // Success never resolves — the shell relaunches out from under us.
+      await restartAndUpdateDesktop();
+    } catch (err) {
+      setRestarting(false);
+      toast.error(
+        intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(err) }),
+      );
+    }
+  }, [intl]);
 
   // The gateway retries a failed download twice (5s / 15s back-off). Without
   // this the button would sit on a silent "安裝中…" for up to 20 extra seconds
@@ -168,6 +204,27 @@ export function UpdateTab() {
             />
           </SettingsCard>
         </SettingsSection>
+      )}
+
+      {/* Desktop shell update staged and ready — the in-page counterpart of
+          the tray「重啟並更新」item. Shown unconditionally (before any manual
+          check): the user typically lands here straight from the update-ready
+          notification. */}
+      {stagedVersion && (
+        <div className="flex flex-wrap items-center gap-3 rounded-lg bg-warning/10 p-4 ring-1 ring-inset ring-warning/20">
+          <RefreshCw className="h-5 w-5 shrink-0 text-warning" />
+          <span className="min-w-0 flex-1 text-sm text-warning">
+            {intl.formatMessage(
+              { id: 'settings.update.desktopStaged' },
+              { version: stagedVersion },
+            )}
+          </span>
+          <Button variant="brand" size="sm" onClick={handleRestartAndUpdate} disabled={restarting}>
+            {restarting
+              ? intl.formatMessage({ id: 'settings.update.restarting' })
+              : intl.formatMessage({ id: 'settings.update.restartAndUpdate' })}
+          </Button>
+        </div>
       )}
 
       <div className="flex items-center justify-end">
