@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.52.3] - 2026-08-05 — 桌面 OAuth 彈窗修復+Google 整合自動啟用
+
 ### Fixed
 - **桌面版 OAuth 授權彈窗全滅**：桌面殼的 wry webview 沒有 new-window handler，
   `window.open` / `target="_blank"` 是靜默 no-op——MCP OAuth（Google/Notion/GitHub）
