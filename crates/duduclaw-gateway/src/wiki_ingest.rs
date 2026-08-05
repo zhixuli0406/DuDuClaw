@@ -1055,7 +1055,9 @@ async fn run_ingest_inner(
     // making a second utility call for the same turn.
     if let Some(facts) = pre_extracted {
         if facts.is_empty() {
-            debug!(agent = agent_id, "Conversation distill: nothing to store (knowledge fallback)");
+            // info!, not debug!: production gateways run at INFO, and "why did
+            // this turn produce zero memories" must be answerable from the log.
+            info!(agent = agent_id, "Conversation distill: nothing to store (knowledge fallback)");
             return;
         }
         persist_facts(agent_id, home_dir, memory_db, facts).await;
@@ -1066,7 +1068,7 @@ async fn run_ingest_inner(
 
     let facts = match tier {
         IngestTier::Skip => {
-            debug!(agent = agent_id, "Conversation distill: skip (trivial conversation)");
+            info!(agent = agent_id, "Conversation distill: skip (trivial conversation)");
             return;
         }
         IngestTier::Local => {
@@ -1113,7 +1115,7 @@ async fn run_ingest_inner(
     };
 
     if facts.is_empty() {
-        debug!(agent = agent_id, "Conversation distill: nothing to store");
+        info!(agent = agent_id, "Conversation distill: nothing to store");
         return;
     }
 

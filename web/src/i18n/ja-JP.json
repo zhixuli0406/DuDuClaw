@@ -2708,6 +2708,7 @@
   "sidebar.newTask": "新規タスク",
   "sidebar.allStaff": "全スタッフ",
   "sidebar.noStaff": "AIスタッフはまだいません",
+  "sidebar.conversationsError": "会話履歴を読み込めませんでした。タップして再試行",
   "sidebar.noConversations": "会話履歴はまだありません",
   "sidebar.pause": "一時停止",
   "sidebar.resume": "再開",

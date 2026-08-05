@@ -2708,6 +2708,7 @@
   "sidebar.newTask": "New task",
   "sidebar.allStaff": "All staff",
   "sidebar.noStaff": "No AI staff yet",
+  "sidebar.conversationsError": "Couldn't load conversations — tap to retry",
   "sidebar.noConversations": "No conversations yet",
   "sidebar.pause": "Pause",
   "sidebar.resume": "Resume",

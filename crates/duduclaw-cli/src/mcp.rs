@@ -3463,7 +3463,7 @@ async fn handle_cancel_reminder(params: &Value, home_dir: &Path, default_agent: 
 // ── Sub-agent management handlers ───────────────────────────
 
 /// Create a persistent sub-agent directory with agent.toml, SOUL.md, etc.
-async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
+async fn handle_create_agent(params: &Value, home_dir: &Path, caller_agent: &str) -> Value {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let display_name = params.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -3625,6 +3625,36 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
             error = %e,
             "Failed to install agent-file-guard hook via MCP create_agent"
         );
+    }
+
+    // Surface the creation in the dashboard activity feed (紀錄/即時動態).
+    // Without this, spawning a whole team leaves zero visible trace until the
+    // next agents.list poll. Best-effort — feed failure never fails the tool.
+    {
+        let actor = if is_valid_agent_id(caller_agent) { caller_agent } else { "system" };
+        match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+            Ok(store) => {
+                let row = duduclaw_gateway::task_store::ActivityRow {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    event_type: "agent_created".to_string(),
+                    agent_id: actor.to_string(),
+                    task_id: None,
+                    summary: format!("建立新 AI 員工「{display_name}」({name})，角色:{role}"),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    metadata: Some(
+                        serde_json::json!({ "created_agent": name, "role": role }).to_string(),
+                    ),
+                };
+                if let Err(e) = store.append_activity(&row).await {
+                    tracing::warn!(agent = %name, error = %e, "create_agent: activity append failed");
+                } else {
+                    append_bus_event(home_dir, "activity.new", &activity_row_to_json(&row)).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(agent = %name, error = %e, "create_agent: open task store failed");
+            }
+        }
     }
 
     serde_json::json!({
@@ -8833,7 +8863,7 @@ pub(crate) async fn handle_tools_call(
         "create_reminder" => handle_create_reminder(&arguments, home_dir, default_agent).await,
         "list_reminders" => handle_list_reminders(&arguments, home_dir, default_agent).await,
         "cancel_reminder" => handle_cancel_reminder(&arguments, home_dir, default_agent).await,
-        "create_agent" => handle_create_agent(&arguments, home_dir).await,
+        "create_agent" => handle_create_agent(&arguments, home_dir, default_agent).await,
         "list_agents" => handle_list_agents(&arguments, home_dir).await,
         "create_task" => handle_create_task(&arguments, home_dir, default_agent).await,
         "check_responses" => handle_check_responses(&arguments, home_dir).await,

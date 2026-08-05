@@ -601,6 +601,7 @@ export type ActivityType =
   | 'task_blocked'
   | 'task_assigned'
   | 'agent_reply'
+  | 'agent_created'
   | 'skill_learned'
   | 'evolution_triggered'
   | 'autopilot_triggered'

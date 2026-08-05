@@ -2708,6 +2708,7 @@
   "sidebar.newTask": "交辦任務",
   "sidebar.allStaff": "全部員工",
   "sidebar.noStaff": "尚無 AI 員工",
+  "sidebar.conversationsError": "對話紀錄載入失敗，點一下重試",
   "sidebar.noConversations": "還沒有對話紀錄",
   "sidebar.pause": "暫停",
   "sidebar.resume": "復工",
