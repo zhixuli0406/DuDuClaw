@@ -81,7 +81,9 @@ jobs:
               }
             }' > request.json
 
+          # --retry covers transient 429/5xx (incl. 529 overloaded) with backoff
           http_code=$(curl -sS -o response.json -w '%{http_code}' \
+            --retry 4 --retry-delay 10 --retry-max-time 180 \
             https://api.anthropic.com/v1/messages \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
