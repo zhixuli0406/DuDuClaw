@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+- **問題回報與建議網頁**：`https://zhixuli0406.github.io/DuDuClaw/` 上線一張
+  中文回報表單（GitHub Pages 靜態頁，零自建伺服器、前端零秘密）。使用者填完
+  表單導向 GitHub issue 預填頁送出（截圖/影片直接拖曳上傳）；帶表單標記的
+  issue 由 GitHub Actions 觸發 `claude-haiku-4-5` 做語意分類（bug/enhancement/
+  question/documentation + 嚴重度）、標題正規化與內容格式化，自動上
+  `feedback` 與分類標籤，原文保留在 `<details>`。issue 內容降格為資料
+  （XML 包裹 + JSON schema 約束輸出）防 prompt injection；workflow 以
+  `gh api` + `jq` 組請求防 script injection。需設 repo secret
+  `ANTHROPIC_API_KEY`，未設時自動略過整理。見 `docs/guides/feedback-page.md`。
+
 ## [1.52.4] - 2026-08-05 — 系統更新頁重啟並更新按鈕
 
 ### Fixed

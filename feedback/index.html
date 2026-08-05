@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DuDuClaw 問題回報與建議</title>
+<meta name="description" content="回報 DuDuClaw 的問題或提出建議，內容會整理成 GitHub issue 讓開發團隊追蹤。">
+<style>
+  /* MDS (Multica-derived Design System) tokens — mirrors web/src/index.css.
+     Static page has no Tailwind; tokens and component classes are hand-rolled
+     from the MDS spec (surfaces / radius scale / type scale / focus ring). */
+  @font-face {
+    font-family: 'Inter Variable';
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: swap;
+    src: url('./inter-latin-wght-normal.woff2') format('woff2-variations');
+  }
+  :root {
+    --page-canvas: oklch(0.988087 0 0);
+    --surface: oklch(1 0 0);
+    --surface-foreground: oklch(0.141 0.005 285.823);
+    --surface-border: oklch(0.92 0.004 286.32);
+    --foreground: oklch(0.141 0.005 285.823);
+    --muted: oklch(0.967 0.001 286.375);
+    --muted-foreground: oklch(0.552 0.016 285.938);
+    --border: oklch(0.945 0.003 286.32);
+    --input: oklch(0.92 0.004 286.32);
+    --input-bg: transparent;
+    --ring: oklch(0.705 0.015 286.067);
+    --primary: oklch(0.21 0.006 285.885);
+    --brand: oklch(0.55 0.16 255);
+    --brand-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.577 0.245 27.325);
+    --success: oklch(0.55 0.16 145);
+    --surface-shadow: 0 1px 2px rgb(15 23 42 / 0.04), 0 1px 1px rgb(15 23 42 / 0.03);
+    --seg-active-shadow: 0 1px 2px rgb(15 23 42 / 0.08);
+    --radius: 0.625rem;
+    --radius-sm: calc(var(--radius) * 0.6);   /* 6px  — segmented item */
+    --radius-md: calc(var(--radius) * 0.8);   /* 8px  — segmented container */
+    --radius-lg: var(--radius);               /* 10px — button / input */
+    --radius-xl: calc(var(--radius) * 1.4);   /* 14px — card */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page-canvas: oklch(0.18 0.005 285.823);
+      --surface: oklch(0.21 0.006 285.885);
+      --surface-foreground: oklch(0.985 0 0);
+      --surface-border: oklch(1 0 0 / 10%);
+      --foreground: oklch(0.985 0 0);
+      --muted: oklch(0.274 0.006 286.033);
+      --muted-foreground: oklch(0.705 0.015 286.067);
+      --border: oklch(1 0 0 / 6%);
+      --input: oklch(1 0 0 / 15%);
+      --input-bg: oklch(1 0 0 / 3%);
+      --ring: oklch(0.552 0.016 285.938);
+      --primary: oklch(0.92 0.004 286.32);
+      --brand: oklch(0.65 0.16 255);
+      --destructive: oklch(0.704 0.191 22.216);
+      --success: oklch(0.65 0.15 145);
+      --surface-shadow: 0 1px 2px rgb(0 0 0 / 0.2), 0 1px 1px rgb(0 0 0 / 0.16);
+      --seg-active-shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { -webkit-font-smoothing: antialiased; text-autospace: ideograph-alpha ideograph-numeric; }
+  body {
+    font-family: 'Inter Variable', -apple-system, "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+    background: var(--page-canvas);
+    color: var(--foreground);
+    font-size: 0.875rem;
+    line-height: 1.65;
+    min-height: 100vh;
+    padding: 2.5rem 1rem 4rem;
+  }
+  .wrap { max-width: 40rem; margin: 0 auto; }
+
+  header.page { margin-bottom: 1.5rem; }
+  header.page .mark { font-size: 1.75rem; line-height: 1; }
+  header.page h1 { font-size: 1.25rem; font-weight: 600; margin-top: 0.6rem; letter-spacing: -0.01em; }
+  header.page p { color: var(--muted-foreground); margin-top: 0.35rem; }
+
+  .card {
+    background: var(--surface);
+    color: var(--surface-foreground);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--surface-shadow);
+    padding: 1.25rem 1.25rem 1.5rem;
+  }
+
+  /* Segmented (MDS §4) — type toggle */
+  .segmented {
+    display: flex;
+    gap: 0.125rem;
+    border-radius: var(--radius-md);
+    background: var(--muted);
+    padding: 0.125rem;
+    margin-bottom: 1.25rem;
+  }
+  .segmented label {
+    flex: 1;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    padding: 0.4rem 0.65rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--muted-foreground);
+    cursor: pointer;
+    user-select: none;
+    transition: color 0.15s, background-color 0.15s;
+  }
+  .segmented label:hover { color: var(--foreground); }
+  .segmented input { position: absolute; opacity: 0; pointer-events: none; }
+  .segmented label:has(input:checked) {
+    background: var(--surface);
+    color: var(--foreground);
+    box-shadow: var(--seg-active-shadow);
+  }
+  .segmented label:has(input:focus-visible) {
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 50%, transparent);
+  }
+
+  .field { margin-bottom: 1.1rem; }
+  .field > label {
+    display: block;
+    font-weight: 500;
+    margin-bottom: 0.35rem;
+  }
+  .field .opt { color: var(--muted-foreground); font-weight: 400; font-size: 0.75rem; }
+
+  input[type="text"], textarea, select {
+    width: 100%;
+    min-width: 0;
+    border: 1px solid var(--input);
+    border-radius: var(--radius-lg);
+    background: var(--input-bg);
+    color: var(--foreground);
+    font: inherit;
+    font-size: 1rem;             /* text-base on mobile, md:text-sm below */
+    padding: 0.25rem 0.625rem;
+    height: 2.25rem;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  @media (min-width: 768px) {
+    input[type="text"], textarea, select { font-size: 0.875rem; height: 2rem; }
+  }
+  input::placeholder, textarea::placeholder { color: var(--muted-foreground); }
+  input[type="text"]:focus-visible, textarea:focus-visible, select:focus-visible {
+    border-color: var(--ring);
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 50%, transparent);
+  }
+  textarea {
+    height: auto;
+    min-height: 6.5rem;
+    padding: 0.375rem 0.625rem;
+    resize: vertical;
+  }
+  select {
+    appearance: none;
+    padding-right: 2rem;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.55rem center;
+  }
+  select:invalid { color: var(--muted-foreground); }
+  select option { color: initial; }
+
+  .hint { font-size: 0.75rem; color: var(--muted-foreground); margin-top: 0.3rem; }
+  .env-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem 0.75rem; }
+  @media (max-width: 480px) { .env-grid { grid-template-columns: 1fr; } }
+
+  /* brandSubtle callout (MDS button brandSubtle surface treatment) */
+  .callout {
+    display: flex;
+    gap: 0.55rem;
+    align-items: flex-start;
+    border: 1px solid color-mix(in oklab, var(--brand) 28%, transparent);
+    background: color-mix(in oklab, var(--brand) 7%, transparent);
+    border-radius: var(--radius-lg);
+    padding: 0.7rem 0.85rem;
+    margin-bottom: 1.25rem;
+  }
+  .callout svg { flex-shrink: 0; margin-top: 0.15rem; color: var(--brand); }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.375rem;
+    flex-shrink: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-lg);
+    font: inherit;
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+    outline: none;
+    transition: color 0.15s, background-color 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+  }
+  .btn:focus-visible {
+    border-color: var(--ring);
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 50%, transparent);
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn svg { flex-shrink: 0; pointer-events: none; }
+  .btn-brand {
+    height: 2.25rem;
+    padding: 0 0.75rem;
+    border-color: var(--brand);
+    background: var(--brand);
+    color: var(--brand-foreground);
+    width: 100%;
+  }
+  .btn-brand:hover { background: color-mix(in oklab, var(--brand) 90%, transparent); }
+  .btn-brand:active { background: color-mix(in oklab, var(--brand) 85%, transparent); transform: translateY(1px); }
+  .btn-outline {
+    height: 2rem;
+    padding: 0 0.625rem;
+    border-color: var(--border);
+    background: var(--page-canvas);
+    color: var(--foreground);
+  }
+  .btn-outline:hover { background: var(--muted); }
+  .btn-ghost {
+    height: 2rem;
+    padding: 0 0.625rem;
+    background: transparent;
+    color: var(--muted-foreground);
+  }
+  .btn-ghost:hover { background: var(--muted); color: var(--foreground); }
+
+  .error { color: var(--destructive); font-size: 0.75rem; margin-top: 0.3rem; display: none; }
+  .field.invalid .error { display: block; }
+  .field.invalid input, .field.invalid textarea { border-color: var(--destructive); }
+
+  /* step 2 panel */
+  #step2 { display: none; }
+  #step2.show { display: block; }
+  #form-card.hide { display: none; }
+  #step2 h2 { font-size: 1rem; font-weight: 500; line-height: 1.4; }
+  .steps { list-style: none; counter-reset: n; margin: 1rem 0 1.25rem; }
+  .steps li {
+    counter-increment: n;
+    position: relative;
+    padding-left: 2.15rem;
+    margin-bottom: 0.8rem;
+  }
+  .steps li::before {
+    content: counter(n);
+    position: absolute;
+    left: 0; top: 0.12rem;
+    width: 1.375rem; height: 1.375rem;
+    border-radius: 50%;
+    background: var(--brand);
+    color: var(--brand-foreground);
+    font-weight: 500;
+    font-size: 0.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .step2-actions { display: flex; flex-direction: column; gap: 0.6rem; }
+  .copied { color: var(--success); font-size: 0.75rem; text-align: center; visibility: hidden; }
+  .copied.show { visibility: visible; }
+
+  footer { margin-top: 1.5rem; color: var(--muted-foreground); font-size: 0.75rem; text-align: center; }
+  footer a { color: var(--muted-foreground); text-decoration: underline; text-underline-offset: 4px; }
+  footer a:hover { color: var(--foreground); }
+  strong { font-weight: 500; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="page">
+    <div class="mark" aria-hidden="true">🐾</div>
+    <h1>DuDuClaw 問題回報與建議</h1>
+    <p>遇到問題或有想法都歡迎告訴我們，內容會直接進入開發團隊的追蹤清單。</p>
+  </header>
+
+  <div class="card" id="form-card">
+    <form id="fb-form" novalidate>
+      <div class="segmented" role="radiogroup" aria-label="回報類型">
+        <label><input type="radio" name="type" value="bug" checked>回報問題</label>
+        <label><input type="radio" name="type" value="suggestion">提出建議</label>
+      </div>
+
+      <div class="field" id="f-title">
+        <label for="title">標題</label>
+        <input type="text" id="title" maxlength="120" placeholder="用一句話說明問題或建議">
+        <div class="error">請填寫標題</div>
+      </div>
+
+      <div class="field" id="f-desc">
+        <label for="desc" id="desc-label">發生什麼事？</label>
+        <textarea id="desc" placeholder="盡量具體描述：你做了什麼、看到什麼結果"></textarea>
+        <div class="error">請填寫描述</div>
+      </div>
+
+      <div class="field bug-only" id="f-steps">
+        <label for="steps">重現步驟 <span class="opt">（選填）</span></label>
+        <textarea id="steps" rows="3" style="min-height:4.5rem" placeholder="1. 開啟…&#10;2. 點擊…&#10;3. 出現…"></textarea>
+      </div>
+
+      <div class="field bug-only" id="f-expected">
+        <label for="expected">預期行為 <span class="opt">（選填）</span></label>
+        <input type="text" id="expected" placeholder="你原本預期會發生什麼">
+      </div>
+
+      <div class="field">
+        <label>環境資訊 <span class="opt">（選填，有填修起來更快）</span></label>
+        <div class="env-grid">
+          <input type="text" id="version" placeholder="DuDuClaw 版本，如 1.52.4">
+          <select id="os" aria-label="作業系統">
+            <option value="">作業系統</option>
+            <option>macOS</option>
+            <option>Windows</option>
+            <option>Linux</option>
+            <option>其他</option>
+          </select>
+          <select id="channel" aria-label="使用介面">
+            <option value="">在哪個介面遇到的</option>
+            <option>Dashboard 網頁</option>
+            <option>桌面版</option>
+            <option>Telegram</option>
+            <option>LINE</option>
+            <option>Discord</option>
+            <option>Slack</option>
+            <option>WhatsApp</option>
+            <option>Feishu 飛書</option>
+            <option>Google Chat</option>
+            <option>Microsoft Teams</option>
+            <option>WebChat</option>
+            <option>CLI 指令列</option>
+            <option>其他</option>
+          </select>
+          <input type="text" id="contact" placeholder="聯絡方式（選填）">
+        </div>
+      </div>
+
+      <div class="callout">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        <span>想附上截圖或影片？按下方按鈕後會前往 GitHub 頁面，把檔案直接<strong>拖曳進文字框</strong>就會自動上傳。</span>
+      </div>
+
+      <button type="submit" class="btn btn-brand">整理內容，前往送出
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+      </button>
+    </form>
+  </div>
+
+  <div class="card" id="step2">
+    <h2>內容準備好了，最後一步：</h2>
+    <ol class="steps">
+      <li>按下方按鈕開啟 GitHub，內容已自動帶入（需要登入 GitHub，沒有帳號可以免費註冊）。</li>
+      <li>要附截圖或影片的話，把檔案拖曳到 GitHub 頁面的文字框裡。</li>
+      <li>按頁面最下方的 <strong>Create</strong>（送出）就完成了，之後的進度都能在該頁追蹤。</li>
+    </ol>
+    <div class="step2-actions">
+      <a class="btn btn-brand" id="gh-link" href="#" target="_blank" rel="noopener">在 GitHub 送出回報
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+      </a>
+      <button type="button" class="btn btn-outline" id="copy-btn">GitHub 頁面內容不完整？點此複製全文再貼上</button>
+      <div class="copied" id="copied-msg">已複製到剪貼簿 ✓</div>
+      <button type="button" class="btn btn-ghost" id="back-btn">← 返回修改</button>
+    </div>
+  </div>
+
+  <footer>
+    送出後的回報都在 <a href="https://github.com/zhixuli0406/DuDuClaw/issues" target="_blank" rel="noopener">GitHub Issues</a> 公開追蹤
+  </footer>
+</div>
+
+<script>
+(function () {
+  var REPO_URL = "https://github.com/zhixuli0406/DuDuClaw/issues/new";
+  var MARKER = "<!-- duduclaw-feedback-form v1 -->";
+  var URL_LIMIT = 7500; // keep prefilled URL within browser/GitHub limits
+
+  var form = document.getElementById("fb-form");
+  var fullMarkdown = "";
+
+  function typeValue() {
+    return form.querySelector('input[name="type"]:checked').value;
+  }
+
+  function syncTypeUI() {
+    var isBug = typeValue() === "bug";
+    document.querySelectorAll(".bug-only").forEach(function (el) {
+      el.style.display = isBug ? "" : "none";
+    });
+    document.getElementById("desc-label").textContent = isBug ? "發生什麼事？" : "你的建議是什麼？";
+    document.getElementById("desc").placeholder = isBug
+      ? "盡量具體描述：你做了什麼、看到什麼結果"
+      : "描述你想要的功能或改進，以及它能幫你解決什麼";
+  }
+  form.querySelectorAll('input[name="type"]').forEach(function (r) {
+    r.addEventListener("change", syncTypeUI);
+  });
+  syncTypeUI();
+
+  function val(id) { return document.getElementById(id).value.trim(); }
+
+  function buildMarkdown() {
+    var isBug = typeValue() === "bug";
+    var lines = [MARKER, ""];
+    lines.push("### 類型", "", isBug ? "🐛 問題回報" : "💡 功能建議", "");
+    lines.push(isBug ? "### 發生什麼事" : "### 建議內容", "", val("desc"), "");
+    if (isBug && val("steps")) lines.push("### 重現步驟", "", val("steps"), "");
+    if (isBug && val("expected")) lines.push("### 預期行為", "", val("expected"), "");
+    var env = [];
+    if (val("version")) env.push("| DuDuClaw 版本 | " + val("version") + " |");
+    if (val("os")) env.push("| 作業系統 | " + val("os") + " |");
+    if (val("channel")) env.push("| 使用介面 | " + val("channel") + " |");
+    if (env.length) {
+      lines.push("### 環境", "", "| 項目 | 內容 |", "| --- | --- |");
+      lines.push.apply(lines, env);
+      lines.push("");
+    }
+    if (val("contact")) lines.push("### 聯絡方式", "", val("contact"), "");
+    lines.push("### 附件", "", "（截圖或影片請直接拖曳到這個文字框）", "");
+    return lines.join("\n");
+  }
+
+  function validate() {
+    var ok = true;
+    [["f-title", "title"], ["f-desc", "desc"]].forEach(function (pair) {
+      var field = document.getElementById(pair[0]);
+      var filled = !!val(pair[1]);
+      field.classList.toggle("invalid", !filled);
+      if (!filled) ok = false;
+    });
+    return ok;
+  }
+
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    if (!validate()) return;
+
+    fullMarkdown = buildMarkdown();
+    var title = val("title");
+    var url = REPO_URL + "?title=" + encodeURIComponent(title) + "&body=" + encodeURIComponent(fullMarkdown);
+
+    if (url.length > URL_LIMIT) {
+      // body too long for a URL: prefill a stub, user pastes the copied full text
+      var stub = MARKER + "\n\n（內容較長，請按表單頁的「複製全文」後貼到這裡）\n";
+      url = REPO_URL + "?title=" + encodeURIComponent(title) + "&body=" + encodeURIComponent(stub);
+      document.getElementById("copy-btn").textContent = "內容較長：點此複製全文，貼到 GitHub 文字框";
+    }
+
+    document.getElementById("gh-link").href = url;
+    document.getElementById("form-card").classList.add("hide");
+    document.getElementById("step2").classList.add("show");
+    window.scrollTo({ top: 0 });
+  });
+
+  document.getElementById("back-btn").addEventListener("click", function () {
+    document.getElementById("step2").classList.remove("show");
+    document.getElementById("form-card").classList.remove("hide");
+  });
+
+  document.getElementById("copy-btn").addEventListener("click", function () {
+    navigator.clipboard.writeText(fullMarkdown).then(function () {
+      var msg = document.getElementById("copied-msg");
+      msg.classList.add("show");
+      setTimeout(function () { msg.classList.remove("show"); }, 2500);
+    });
+  });
+})();
+</script>
+</body>
+</html>
