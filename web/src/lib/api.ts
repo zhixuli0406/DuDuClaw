@@ -193,6 +193,17 @@ export interface SystemStatus {
   edition_profile?: EditionProfile;
 }
 
+/** Response of `system.autostart.status` / `system.autostart.set` — the
+ *  login/boot registration state of the gateway (launchd LaunchAgent on macOS,
+ *  systemd user unit on Linux, HKCU Run key on Windows). */
+export interface AutostartStatus {
+  supported: boolean;
+  enabled: boolean;
+  method: 'launchd' | 'systemd-user' | 'windows-run-key' | 'unsupported';
+  /** Human-readable registration location (plist/unit path, registry key). */
+  detail: string;
+}
+
 export interface LogEntry {
   level: 'trace' | 'debug' | 'info' | 'warn' | 'error';
   target: string;
@@ -3514,6 +3525,13 @@ export const api = {
   system: {
     status: () =>
       client.call('system.status') as Promise<SystemStatus>,
+    /** Login/boot autostart registration state (admin). */
+    autostartStatus: () =>
+      client.call('system.autostart.status') as Promise<AutostartStatus>,
+    /** Register/unregister the gateway to start at login/boot (admin).
+     *  Registration only — never starts or stops the running gateway. */
+    autostartSet: (enabled: boolean) =>
+      client.call('system.autostart.set', { enabled }) as Promise<AutostartStatus>,
     doctor: () =>
       // Extended timeout: the gateway runs live probes concurrently (MCP
       // server cold-start ~10s, grok -p ping ~15s+version 5s) — worst case

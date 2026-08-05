@@ -1,9 +1,13 @@
-//! Service management helpers — generates systemd/launchd configuration.
+//! Service management helpers.
 //!
-//! **NOTE**: These functions intentionally only *print* commands and config
-//! snippets for the user to run manually. They do NOT execute system-level
-//! service commands, because that requires elevated privileges and varies
-//! by OS/distribution. This is by design (CLI-H1).
+//! `install` / `uninstall` / `status` go through `duduclaw_core::autostart` —
+//! the same user-level registration (launchd LaunchAgent / systemd user unit /
+//! HKCU Run key) the dashboard `system.autostart.*` RPCs use, so the two
+//! surfaces can never drift. User-level registration needs no elevation, so
+//! these now actually write (the former print-only design, CLI-H1, predates
+//! the user-level mechanism). Registration changes never touch a running
+//! gateway process — that stays with `start` / `stop`, which keep the original
+//! per-platform print-or-kill behaviour.
 
 #[allow(unused_imports)]
 use duduclaw_core::error::{DuDuClawError, Result};
@@ -37,68 +41,18 @@ pub async fn handle_service(action: ServiceAction) -> Result<()> {
 mod systemd {
     use duduclaw_core::error::Result;
 
-    /// Generate and print the systemd unit file.
-    pub async fn install() -> Result<()> {
-        let exe = std::env::current_exe().unwrap_or_default();
-        let service_content = format!(
-            r#"[Unit]
-Description=DuDuClaw AI Assistant
-After=network.target docker.service
-Wants=docker.service
-
-[Service]
-Type=simple
-User=duduclaw
-Group=duduclaw
-ExecStart={exe} run --yes
-ExecStop=/bin/kill -SIGTERM $MAINPID
-# `always` (not `on-failure`): self-update exits 0 after graceful shutdown
-# and relies on the supervisor to relaunch if in-process re-exec fails.
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-"#,
-            exe = exe.display()
-        );
-
-        let path = "/etc/systemd/system/duduclaw.service";
-        println!("Systemd service unit:\n");
-        println!("{}", service_content);
-        println!("Run with sudo to install:");
-        println!("  sudo tee {} <<'EOF'\n{}EOF", path, service_content);
-        println!("  sudo systemctl daemon-reload");
-        println!("  sudo systemctl enable duduclaw");
-        Ok(())
-    }
-
     pub async fn start() -> Result<()> {
-        println!("Run: sudo systemctl start duduclaw");
+        println!("Run: systemctl --user start duduclaw");
         Ok(())
     }
 
     pub async fn stop() -> Result<()> {
-        println!("Run: sudo systemctl stop duduclaw");
-        Ok(())
-    }
-
-    pub async fn status() -> Result<()> {
-        println!("Run: systemctl status duduclaw");
+        println!("Run: systemctl --user stop duduclaw");
         Ok(())
     }
 
     pub async fn logs() -> Result<()> {
-        println!("Run: journalctl -u duduclaw -f");
-        Ok(())
-    }
-
-    pub async fn uninstall() -> Result<()> {
-        println!("Run:");
-        println!("  sudo systemctl stop duduclaw");
-        println!("  sudo systemctl disable duduclaw");
-        println!("  sudo rm /etc/systemd/system/duduclaw.service");
-        println!("  sudo systemctl daemon-reload");
+        println!("Run: journalctl --user -u duduclaw -f");
         Ok(())
     }
 }
@@ -113,51 +67,18 @@ mod launchd {
     /// Default port used by the DuDuClaw gateway.
     const DEFAULT_PORT: u16 = 18789;
 
-    /// Generate and print the launchd plist.
-    pub async fn install() -> Result<()> {
-        let exe = std::env::current_exe().unwrap_or_default();
-        let home = dirs::home_dir().unwrap_or_default();
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>dev.duduclaw</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-        <string>run</string>
-        <string>--yes</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{home}/Library/Logs/duduclaw.stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>{home}/Library/Logs/duduclaw.stderr.log</string>
-</dict>
-</plist>"#,
-            exe = exe.display(),
-            home = home.display(),
-        );
-        let plist_path = home.join("Library/LaunchAgents/dev.duduclaw.plist");
-        println!("LaunchAgent plist for: {}\n", plist_path.display());
-        println!("{}", plist);
-        println!(
-            "\nTo install, save the above to {} and run:",
-            plist_path.display()
-        );
-        println!("  launchctl load {}", plist_path.display());
-        Ok(())
-    }
-
     pub async fn start() -> Result<()> {
         let home = dirs::home_dir().unwrap_or_default();
-        let plist_path = home.join("Library/LaunchAgents/dev.duduclaw.plist");
-        println!("Run: launchctl load {}", plist_path.display());
+        let plist_path = duduclaw_core::autostart::launchd_plist_path_in(
+            &home,
+            duduclaw_core::autostart::LAUNCHD_LABEL,
+        );
+        if plist_path.exists() {
+            println!("Run: launchctl load {}", plist_path.display());
+        } else {
+            println!("No LaunchAgent registered. Run `duduclaw service install` first,");
+            println!("or start in the foreground with `duduclaw run`.");
+        }
         Ok(())
     }
 
@@ -167,13 +88,21 @@ mod launchd {
             .and_then(|p| p.parse().ok())
             .unwrap_or(DEFAULT_PORT);
 
-        // 1. Unload from launchctl (stops auto-restart via KeepAlive)
+        // 1. Unload from launchctl (stops auto-restart via KeepAlive). Both the
+        //    current and the legacy label, whichever is registered.
         let home = dirs::home_dir().unwrap_or_default();
-        let plist_path = home.join("Library/LaunchAgents/dev.duduclaw.plist");
         println!("Unloading LaunchAgent...");
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", &plist_path.to_string_lossy()])
-            .status();
+        for label in [
+            duduclaw_core::autostart::LAUNCHD_LABEL,
+            duduclaw_core::autostart::LEGACY_LAUNCHD_LABEL,
+        ] {
+            let plist_path = duduclaw_core::autostart::launchd_plist_path_in(&home, label);
+            if plist_path.exists() {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["unload", &plist_path.to_string_lossy()])
+                    .status();
+            }
+        }
 
         // 2. Find process occupying the port.
         //    M13: `lsof -ti :PORT` returns whatever happens to hold the port —
@@ -267,77 +196,40 @@ mod launchd {
         }
     }
 
-    pub async fn status() -> Result<()> {
-        println!("Run: launchctl list | grep duduclaw");
-        Ok(())
-    }
-
     pub async fn logs() -> Result<()> {
-        // L34: launchd writes StandardOutPath/StandardErrorPath under
-        // ~/Library/Logs (see the plist above), not /tmp.
-        let home = dirs::home_dir().unwrap_or_default();
-        let stdout_log = home.join("Library/Logs/duduclaw.stdout.log");
-        let stderr_log = home.join("Library/Logs/duduclaw.stderr.log");
+        // The LaunchAgent writes StandardOutPath/StandardErrorPath under the
+        // DuDuClaw state root (see duduclaw_core::autostart::launchd_plist).
+        let logs = duduclaw_core::platform::duduclaw_home().join("logs");
         println!(
             "Run: tail -f {} {}",
-            stdout_log.display(),
-            stderr_log.display()
+            logs.join("gateway.stdout.log").display(),
+            logs.join("gateway.stderr.log").display()
         );
-        Ok(())
-    }
-
-    pub async fn uninstall() -> Result<()> {
-        let home = dirs::home_dir().unwrap_or_default();
-        let plist_path = home.join("Library/LaunchAgents/dev.duduclaw.plist");
-        println!("Run:");
-        println!("  launchctl unload {}", plist_path.display());
-        println!("  rm {}", plist_path.display());
         Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Windows — Windows Service via sc.exe
+// Windows — per-user Run key (registration) + process hints
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "windows")]
 mod windows_svc {
     use duduclaw_core::error::Result;
 
-    pub async fn install() -> Result<()> {
-        let exe = std::env::current_exe().unwrap_or_default();
-        println!("Windows Service installation requires administrator privileges.");
-        println!(
-            "Run: sc create DuDuClaw binPath= \"{}\" start= auto",
-            exe.display()
-        );
-        println!("     sc description DuDuClaw \"DuDuClaw AI Assistant\"");
-        Ok(())
-    }
-
     pub async fn start() -> Result<()> {
-        println!("Run (as admin): sc start DuDuClaw");
+        let exe = std::env::current_exe().unwrap_or_default();
+        println!("Run: \"{}\" run --yes", exe.display());
         Ok(())
     }
 
     pub async fn stop() -> Result<()> {
-        println!("Run (as admin): sc stop DuDuClaw");
-        Ok(())
-    }
-
-    pub async fn status() -> Result<()> {
-        println!("Run: sc query DuDuClaw");
+        println!("Run: taskkill /IM duduclaw.exe");
         Ok(())
     }
 
     pub async fn logs() -> Result<()> {
-        println!("Run: Get-EventLog -LogName Application -Source DuDuClaw");
-        Ok(())
-    }
-
-    pub async fn uninstall() -> Result<()> {
-        println!("Run (as admin):");
-        println!("  sc stop DuDuClaw");
-        println!("  sc delete DuDuClaw");
+        let logs = duduclaw_core::platform::duduclaw_home().join("logs");
+        println!("Log directory: {}", logs.display());
         Ok(())
     }
 }
@@ -346,17 +238,25 @@ mod windows_svc {
 // Platform dispatch
 // ---------------------------------------------------------------------------
 
+/// Render an [`AutostartStatus`] for the console.
+fn print_autostart(s: &duduclaw_core::autostart::AutostartStatus) {
+    let state = if !s.supported {
+        "unsupported"
+    } else if s.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    println!("Autostart: {state} (method: {}, {})", s.method, s.detail);
+}
+
 async fn install_service() -> Result<()> {
-    #[cfg(target_os = "linux")]
-    return systemd::install().await;
-    #[cfg(target_os = "macos")]
-    return launchd::install().await;
-    #[cfg(target_os = "windows")]
-    return windows_svc::install().await;
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    return Err(DuDuClawError::Config(
-        "Unsupported platform for service installation".into(),
-    ));
+    let status = duduclaw_core::autostart::enable()?;
+    println!("✓ Registered DuDuClaw to start at login.");
+    print_autostart(&status);
+    println!("The gateway will start automatically at your next login.");
+    println!("To start it right now: duduclaw run  (or `duduclaw service start`)");
+    Ok(())
 }
 
 async fn start_service() -> Result<()> {
@@ -386,16 +286,14 @@ async fn stop_service() -> Result<()> {
 }
 
 async fn service_status() -> Result<()> {
-    #[cfg(target_os = "linux")]
-    return systemd::status().await;
+    print_autostart(&duduclaw_core::autostart::status());
     #[cfg(target_os = "macos")]
-    return launchd::status().await;
+    println!("Live process check: launchctl list | grep duduclaw");
+    #[cfg(target_os = "linux")]
+    println!("Live process check: systemctl --user status duduclaw");
     #[cfg(target_os = "windows")]
-    return windows_svc::status().await;
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    return Err(DuDuClawError::Config(
-        "Unsupported platform for service management".into(),
-    ));
+    println!("Live process check: tasklist | findstr duduclaw");
+    Ok(())
 }
 
 async fn service_logs(lines: usize) -> Result<()> {
@@ -413,14 +311,9 @@ async fn service_logs(lines: usize) -> Result<()> {
 }
 
 async fn uninstall_service() -> Result<()> {
-    #[cfg(target_os = "linux")]
-    return systemd::uninstall().await;
-    #[cfg(target_os = "macos")]
-    return launchd::uninstall().await;
-    #[cfg(target_os = "windows")]
-    return windows_svc::uninstall().await;
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    return Err(DuDuClawError::Config(
-        "Unsupported platform for service management".into(),
-    ));
+    let status = duduclaw_core::autostart::disable()?;
+    println!("✓ Removed the login autostart registration.");
+    print_autostart(&status);
+    println!("A running gateway is NOT affected — stop it with `duduclaw service stop`.");
+    Ok(())
 }

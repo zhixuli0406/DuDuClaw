@@ -1,5 +1,6 @@
 pub mod agent_guard;
 pub mod agent_rename;
+pub mod autostart;
 pub mod config;
 pub mod cron_tz;
 pub mod department;

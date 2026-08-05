@@ -16,10 +16,11 @@ mod sidecar;
 use std::sync::Arc;
 
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     AppHandle, Manager, RunEvent, WindowEvent,
 };
+use tauri_plugin_autostart::ManagerExt;
 
 use sidecar::{SidecarManager, SidecarStatus};
 
@@ -157,6 +158,18 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
     let switch_gw = MenuItem::with_id(app, "switch_gateway", "切換 Gateway", true, None::<&str>)?;
     let mascot = MenuItem::with_id(app, "toggle_mascot", "顯示/隱藏桌寵", true, None::<&str>)?;
     let restart = MenuItem::with_id(app, "restart", "重啟背景服務", true, None::<&str>)?;
+    // Login-item registration for the desktop shell itself (the gateway rides
+    // along as its sidecar). Backed by tauri-plugin-autostart — LaunchAgent on
+    // macOS, per-user registry Run key on Windows, XDG autostart on Linux.
+    let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
+    let autostart = CheckMenuItem::with_id(
+        app,
+        "autostart",
+        "開機自動啟動",
+        true,
+        autostart_on,
+        None::<&str>,
+    )?;
     let status = MenuItem::with_id(
         app,
         "status",
@@ -168,10 +181,11 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
     let quit = MenuItem::with_id(app, "quit", "結束", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&open, &switch_gw, &mascot, &status, &restart, &sep, &quit],
+        &[&open, &switch_gw, &mascot, &autostart, &status, &restart, &sep, &quit],
     )?;
 
     let manager_for_menu = manager.clone();
+    let autostart_item = autostart.clone();
     TrayIconBuilder::with_id("main-tray")
         .icon(app.default_window_icon().unwrap().clone())
         .tooltip("DuDuClaw")
@@ -186,6 +200,22 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
             "toggle_mascot" => {
                 if let Err(e) = mascot_window::toggle_mascot_window(app) {
                     tracing::warn!("toggle desktop pet failed: {e}");
+                }
+            }
+            "autostart" => {
+                // The check item toggles itself on click; apply the new state
+                // to the OS registration and roll the checkmark back if the
+                // plugin call fails so the menu never lies about reality.
+                let want = autostart_item.is_checked().unwrap_or(false);
+                let autolaunch = app.autolaunch();
+                let result = if want {
+                    autolaunch.enable()
+                } else {
+                    autolaunch.disable()
+                };
+                if let Err(e) = result {
+                    tracing::warn!("autostart toggle failed: {e}");
+                    let _ = autostart_item.set_checked(!want);
                 }
             }
             "restart" => {

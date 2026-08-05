@@ -4621,6 +4621,14 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_system_update_config(params).await
             }
+            "system.autostart.status" => {
+                require_admin!();
+                self.handle_system_autostart_status().await
+            }
+            "system.autostart.set" => {
+                require_admin!();
+                self.handle_system_autostart_set(params).await
+            }
             "system.version" => self.handle_system_version().await,
             "system.check_update" => {
                 require_admin!();
@@ -5459,6 +5467,8 @@ impl MethodHandler {
                     { "name": "runtime.install", "description": "Install a missing AI runtime CLI from a hard-coded whitelist (admin)" },
                     { "name": "system.config", "description": "View system config" },
                     { "name": "system.update_config", "description": "Update system config (log_level, rotation, allowed_origins)" },
+                    { "name": "system.autostart.status", "description": "Login/boot autostart registration status (admin)" },
+                    { "name": "system.autostart.set", "description": "Enable/disable gateway autostart at login/boot (admin)" },
                     { "name": "accounts.add", "description": "Add a new account" },
                     { "name": "accounts.update_budget", "description": "Update account monthly budget" },
                     { "name": "system.version", "description": "Version info" },
@@ -16243,6 +16253,62 @@ impl MethodHandler {
                 }
             }
             Err(e) => WsFrame::error_response("", &format!("Failed to read config.toml: {e}")),
+        }
+    }
+
+    /// `system.autostart.status` — report the login/boot registration state.
+    async fn handle_system_autostart_status(&self) -> WsFrame {
+        let s = tokio::task::spawn_blocking(duduclaw_core::autostart::status)
+            .await
+            .unwrap_or_else(|_| duduclaw_core::autostart::AutostartStatus {
+                supported: false,
+                enabled: false,
+                method: "unsupported",
+                detail: String::new(),
+            });
+        WsFrame::ok_response(
+            "",
+            json!({
+                "supported": s.supported,
+                "enabled": s.enabled,
+                "method": s.method,
+                "detail": s.detail,
+            }),
+        )
+    }
+
+    /// `system.autostart.set { enabled: bool }` — write/remove the user-level
+    /// autostart registration (launchd plist / systemd user unit / HKCU Run
+    /// key). Registration only: the running gateway process is never touched,
+    /// so disabling from the dashboard cannot kill the gateway serving this
+    /// very request. Takes effect at the next login/boot.
+    async fn handle_system_autostart_set(&self, params: Value) -> WsFrame {
+        let Some(enabled) = params.get("enabled").and_then(|v| v.as_bool()) else {
+            return WsFrame::error_response("", "missing boolean field: enabled");
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            if enabled {
+                duduclaw_core::autostart::enable()
+            } else {
+                duduclaw_core::autostart::disable()
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(s)) => {
+                info!(enabled = s.enabled, method = s.method, "system.autostart.set applied");
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "supported": s.supported,
+                        "enabled": s.enabled,
+                        "method": s.method,
+                        "detail": s.detail,
+                    }),
+                )
+            }
+            Ok(Err(e)) => WsFrame::error_response("", &format!("autostart change failed: {e}")),
+            Err(e) => WsFrame::error_response("", &format!("autostart task failed: {e}")),
         }
     }
 

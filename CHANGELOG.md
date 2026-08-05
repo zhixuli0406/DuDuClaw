@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Added
+- **開機自動啟動，四個入口一次到位**：gateway 現在可以註冊成登入即啟動的常駐服務，
+  而且四個地方都能設——儀表板「設定 → 一般」的開關（即改即生效，附結果提示）、
+  新手引導最後一步的勾選（預設開啟，部署助理時一併套用；就算註冊失敗也不會擋部署）、
+  CLI `duduclaw service install / uninstall / status`（從「只印指令要你自己貼」升級為
+  真正寫入），以及桌面版系統匣選單的「開機自動啟動」勾選項（桌面殼自己登入自啟，
+  gateway 以 sidecar 隨行）。三平台都是**使用者層級**註冊，不需要管理員權限：
+  macOS 寫 LaunchAgent（`com.duduclaw.gateway.plist`）、Linux 寫 systemd user unit
+  並直接建立 enable symlink（沒有可用的 `systemctl` 也能運作）、Windows 寫
+  HKCU Run 登錄值。所有入口共用同一個 `duduclaw-core::autostart` 模組
+  （新 RPC：`system.autostart.status` / `system.autostart.set`，admin 限定），
+  介面之間不會再各寫各的漂移。啟用／停用**只改開機註冊、絕不碰正在執行的服務**——
+  否則從儀表板按「停用」會把正在回應這個請求的 gateway 自己殺掉。
+
+### Fixed
+- **`setup-macos.sh` 產生的 launchd plist 指向不存在的 `serve` 子命令**：照著一鍵
+  腳本裝完，開機後 gateway 根本起不來（launchd 反覆重啟一個立刻退出的進程）。
+  改為實際存在的 `run --yes`。同時統一 launchd label：CLI 舊說明用的
+  `dev.duduclaw` 與腳本的 `com.duduclaw.gateway` 並存會造成雙重註冊，現在啟用／
+  停用都會順手清掉舊 label 的 plist。
+
 ## [1.51.2] - 2026-08-04 — 審批推通道按鈕核決+migrate 測試修正
 
 ### Fixed
