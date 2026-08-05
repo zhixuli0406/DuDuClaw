@@ -27254,6 +27254,11 @@ mod migrate_validation_tests {
 
     #[test]
     fn source_absolute_is_allowed() {
+        // `is_absolute` is platform-semantic: on Windows a path without a drive
+        // prefix (like `/Users/x`) is NOT absolute, so probe the native form.
+        #[cfg(windows)]
+        assert!(validate_migrate_source(Some("C:\\Users\\x\\.openclaw")).is_ok());
+        #[cfg(not(windows))]
         assert!(validate_migrate_source(Some("/Users/x/.openclaw")).is_ok());
     }
 

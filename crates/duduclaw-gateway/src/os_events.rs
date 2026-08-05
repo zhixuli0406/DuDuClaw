@@ -874,7 +874,12 @@ goal_acceptance = "月報含 {file_name} 的資料"
             )
             .unwrap();
         };
-        write_cfg(&format!("\"{}\"", watched.path().display()));
+        // TOML basic strings treat `\` as an escape — Windows temp paths would
+        // parse-fail (and `\` is a legal separator either way), so normalize.
+        write_cfg(&format!(
+            "\"{}\"",
+            watched.path().display().to_string().replace('\\', "/")
+        ));
 
         let home = tempfile::tempdir().unwrap();
         let reg = OsWatcherRegistry::new(home.path().to_path_buf());
