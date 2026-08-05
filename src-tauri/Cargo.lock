@@ -956,7 +956,7 @@ checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
 
 [[package]]
 name = "duduclaw-core"
-version = "1.52.2"
+version = "1.52.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-pets"
-version = "1.52.2"
+version = "1.52.3"
 dependencies = [
  "chrono",
  "duduclaw-core",

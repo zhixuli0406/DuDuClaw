@@ -34,6 +34,8 @@ fn main() {
         "gateway_local_status",
         "gateway_start_local",
         "gateway_open_picker",
+        "desktop_update_status",
+        "desktop_restart_and_update",
     ];
     tauri_build::try_build(
         tauri_build::Attributes::new()

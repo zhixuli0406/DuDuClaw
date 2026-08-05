@@ -119,6 +119,28 @@ pub fn install_pending(app: &AppHandle) -> bool {
     }
 }
 
+/// Version of the staged-but-not-installed update, if any. Invoked by the
+/// dashboard 系統更新 page so the「重啟並更新」affordance exists in-page and not
+/// only in the tray menu (the update-ready notification points users at a
+/// button they otherwise could not find — 2026-08-05 field report).
+#[tauri::command]
+pub fn desktop_update_status(app: AppHandle) -> Option<String> {
+    let state = app.try_state::<PendingUpdate>()?;
+    let guard = state.0.lock().unwrap();
+    guard.as_ref().map(|(update, _)| update.version.clone())
+}
+
+/// Install the staged update and relaunch. Errors when nothing is staged
+/// (the page only shows the button after `desktop_update_status` returned a
+/// version, but the stage can race with a quit-path install).
+#[tauri::command]
+pub fn desktop_restart_and_update(app: AppHandle) -> Result<(), String> {
+    if install_pending(&app) {
+        app.restart();
+    }
+    Err("no staged update to install".into())
+}
+
 /// Tray "檢查更新 / 重啟並更新" click handler. If an update is already staged,
 /// install and relaunch; otherwise run an immediate check (with feedback even
 /// when already up to date, unlike the silent background tick).
