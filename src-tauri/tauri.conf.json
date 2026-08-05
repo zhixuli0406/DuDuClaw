@@ -71,7 +71,9 @@
       "endpoints": [
         "https://github.com/zhixuli0406/DuDuClaw/releases/download/desktop-updater/latest.json"
       ],
-      "dialog": true,
+      "windows": {
+        "installMode": "passive"
+      },
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ2RTBGMDdBQ0U5Mjg2QjMKUldTemhwTE9ldkRnUnJxOFlmcEtSanhucXFWdUlhL0lNcENWUyt0WmpiYnhjTXc1ZU5JOThjQ2EK"
     }
   }

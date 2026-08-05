@@ -12,6 +12,7 @@ mod lifecycle;
 mod mascot_window;
 mod pet_gen;
 mod sidecar;
+mod updater;
 
 use std::sync::Arc;
 
@@ -79,6 +80,13 @@ fn main() {
         .setup(move |app| {
             let handle = app.handle().clone();
 
+            // Hot-update (§D4): stage new versions in the background, apply on
+            // restart/quit. Without this the updater plugin is inert and the
+            // shell silently freezes on whatever version was installed.
+            app.manage(updater::PendingUpdate::default());
+            app.manage(updater::UpdateMenuItem(std::sync::Mutex::new(None)));
+            updater::spawn_update_watcher(handle.clone());
+
             // Create the desktop-pet window up front (hidden); the tray toggles
             // its visibility. Non-fatal if it fails (e.g. transparency
             // unsupported) — the main app is unaffected.
@@ -141,6 +149,9 @@ fn main() {
                 if let Some(mgr) = app.try_state::<Arc<SidecarManager>>() {
                     mgr.stop();
                 }
+                // Apply any staged update on the way out so the next manual
+                // launch runs the new version (Chrome-style hot update).
+                updater::install_pending(app);
             }
         });
 }
@@ -177,11 +188,17 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
         false,
         None::<&str>,
     )?;
+    // Hot-update entry: the background watcher retitles this to
+    // 「🔄 重啟並更新到 vX.Y.Z」once a new version is staged.
+    let check_update = MenuItem::with_id(app, "check_update", "檢查更新", true, None::<&str>)?;
+    if let Some(slot) = app.try_state::<updater::UpdateMenuItem>() {
+        *slot.0.lock().unwrap() = Some(check_update.clone());
+    }
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "結束", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&open, &switch_gw, &mascot, &autostart, &status, &restart, &sep, &quit],
+        &[&open, &switch_gw, &mascot, &autostart, &status, &restart, &check_update, &sep, &quit],
     )?;
 
     let manager_for_menu = manager.clone();
@@ -222,8 +239,13 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
                 manager_for_menu.stop();
                 let _ = manager_for_menu.start(app);
             }
+            "check_update" => {
+                updater::on_tray_check_update(app);
+            }
             "quit" => {
                 manager_for_menu.stop();
+                // exit(0) fires RunEvent::ExitRequested, which applies any
+                // staged update (main.rs run handler).
                 app.exit(0);
             }
             _ => {}
