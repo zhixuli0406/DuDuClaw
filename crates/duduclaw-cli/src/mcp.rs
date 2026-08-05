@@ -10868,16 +10868,20 @@ impl DeptVisibility {
 /// Single shared-wiki page-enumeration predicate honouring department read
 /// isolation (F4/F5). Every read-side tool (`ls`, `stats`, `lint`) enumerates
 /// through this so other departments' pages never leak into a listing, a
-/// contributor count, or a lint report. Paths are returned wiki-relative.
+/// contributor count, or a lint report. Paths are returned wiki-relative and
+/// `/`-normalized: page paths are platform-independent identifiers (the same
+/// form `page_path` takes on input), so Windows must not surface `\` here —
+/// `Path::join` accepts `/` on every platform, so joining back is safe.
 fn collect_visible_shared_pages(
     home_dir: &Path,
     wiki_dir: &Path,
     caller_agent: &str,
-) -> Vec<std::path::PathBuf> {
+) -> Vec<String> {
     let visibility = DeptVisibility::for_agent(home_dir, caller_agent);
     collect_md_files(wiki_dir, wiki_dir)
         .into_iter()
-        .filter(|rel| visibility.allows(&rel.to_string_lossy().replace('\\', "/")))
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .filter(|rel| visibility.allows(rel))
         .collect()
 }
 
@@ -10900,11 +10904,11 @@ async fn handle_shared_wiki_ls(home_dir: &Path, caller_agent: &str) -> Value {
         let full_path = wiki_dir.join(rel_path);
         let content = std::fs::read_to_string(&full_path).unwrap_or_default();
         let title = extract_frontmatter_title(&content)
-            .unwrap_or_else(|| rel_path.to_string_lossy().to_string());
+            .unwrap_or_else(|| rel_path.clone());
         let updated = extract_frontmatter_updated(&content).unwrap_or_else(|| "?".to_string());
         let author = extract_frontmatter_field(&content, "author")
             .unwrap_or_else(|| "unknown".to_string());
-        lines.push(format!("  {} — {} (by: {}, updated: {})", rel_path.display(), title, author, updated));
+        lines.push(format!("  {rel_path} — {title} (by: {author}, updated: {updated})"));
     }
 
     tool_text(&lines.join("\n"))
@@ -11358,10 +11362,10 @@ async fn handle_shared_wiki_stats(home_dir: &Path, caller_agent: &str) -> Value 
             .unwrap_or_else(|| "unknown".to_string());
         *author_counts.entry(author).or_default() += 1;
 
-        let dir = rel_path.parent()
-            .and_then(|p| p.to_str())
-            .unwrap_or("root")
-            .to_string();
+        let dir = match rel_path.rsplit_once('/') {
+            Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+            _ => "root".to_string(),
+        };
         *dir_counts.entry(dir).or_default() += 1;
 
         let updated = extract_frontmatter_updated(&content).unwrap_or_default();
@@ -11548,7 +11552,7 @@ async fn handle_shared_wiki_lint(home_dir: &Path, caller_agent: &str) -> Value {
     for rel_path in &pages {
         let full_path = wiki_dir.join(rel_path);
         let content = std::fs::read_to_string(&full_path).unwrap_or_default();
-        let rel_str = rel_path.to_string_lossy().to_string();
+        let rel_str = rel_path.clone();
 
         if let Err(e) = validate_wiki_frontmatter(&content) {
             schema_violations.push((rel_str.clone(), e));
