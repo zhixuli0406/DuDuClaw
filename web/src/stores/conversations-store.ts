@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api, type ChatSessionSummary } from '@/lib/api';
+import { client } from '@/lib/ws-client';
 import { isConversationSession } from '@/lib/session-channel';
 import { hasMinRole } from '@/lib/roles';
 import { useAgentsStore } from './agents-store';
@@ -48,7 +49,15 @@ function mainAgentId(): string | null {
   return useAgentsStore.getState().agents.find((a) => a.role === 'main')?.name ?? null;
 }
 
-export const useConversationsStore = create<ConversationsState>((set, get) => ({
+export const useConversationsStore = create<ConversationsState>((set, get) => {
+  // Channel conversations (Telegram/Discord/…) land server-side without any
+  // webchat-local trigger; the gateway broadcasts `chat.sessions.updated`
+  // after each saved turn so this list stays live without a reload.
+  client.subscribe('chat.sessions.updated', () => {
+    void get().fetch();
+  });
+
+  return {
   sessions: [],
   status: 'idle',
 
@@ -103,4 +112,5 @@ export const useConversationsStore = create<ConversationsState>((set, get) => ({
     useChatStore.getState().reset();
     void get().fetch();
   },
-}));
+  };
+});

@@ -59,6 +59,11 @@ const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
     color: 'text-muted-foreground',
     bgColor: 'bg-muted',
   },
+  agent_created: {
+    icon: UserCheck,
+    color: 'text-brand',
+    bgColor: 'bg-brand/10',
+  },
   skill_learned: {
     icon: Sparkles,
     color: 'text-purple-500',
@@ -96,6 +101,7 @@ const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
 type Tier = 1 | 2 | 3;
 const TIER: Record<ActivityType, Tier> = {
   task_created: 1,
+  agent_created: 1,
   task_completed: 1,
   task_blocked: 1,
   error: 1,

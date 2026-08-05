@@ -623,8 +623,9 @@ async fn graduate_trajectories(
 /// unreadable `memory.db` returns an empty `Vec` and synthesis proceeds on
 /// trajectory metadata alone. All errors are swallowed (logged at `debug`).
 ///
-/// The per-agent DB path mirrors `handlers.rs::agent_memory_db_path`:
-/// `agents/<id>/state/memory.db` preferred, `agents/<id>/memory.db` fallback.
+/// The DB path mirrors `handlers.rs::agent_memory_db_path`:
+/// `agents/<id>/state/memory.db` preferred, then `agents/<id>/memory.db`,
+/// then the shared `<home>/memory.db` (the live write path).
 async fn fetch_episodic_evidence(
     home_dir: &Path,
     agent_id: &str,
@@ -644,10 +645,13 @@ async fn fetch_episodic_evidence(
     let agent_dir = home_dir.join("agents").join(agent_id);
     let db_path = {
         let state_path = agent_dir.join("state").join("memory.db");
+        let legacy_path = agent_dir.join("memory.db");
         if state_path.exists() {
             state_path
+        } else if legacy_path.exists() {
+            legacy_path
         } else {
-            agent_dir.join("memory.db")
+            home_dir.join("memory.db")
         }
     };
     if !db_path.exists() {

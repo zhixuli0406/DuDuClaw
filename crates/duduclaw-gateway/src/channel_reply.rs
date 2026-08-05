@@ -2450,6 +2450,23 @@ async fn build_reply_with_session_inner(
             warn!("Failed to save assistant message to session: {e}");
         }
 
+        // Notify dashboard clients that a session gained a turn, so the
+        // conversation sidebar re-lists without a webchat-local trigger.
+        // Channel conversations (Telegram/Discord/…) otherwise stay
+        // invisible until a full reload.
+        {
+            let event = crate::protocol::WsFrame::event(
+                "chat.sessions.updated",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                }),
+            );
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = ctx.event_tx.send(json);
+            }
+        }
+
         // ── RFC-24: Decision Continuity capture (async, non-blocking) ──
         // When the outbound reply offers an enumerated choice ("方案 A/B/C",
         // "Option 1/2", a lettered list under a "which one?" question), persist

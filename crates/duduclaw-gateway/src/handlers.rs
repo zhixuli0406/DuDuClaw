@@ -10661,16 +10661,23 @@ impl MethodHandler {
         memory_retrieval_weights_from_table(table.as_ref())
     }
 
-    /// Resolve the per-agent memory.db path.
-    /// Prefers `agents/<id>/state/memory.db`, falls back to `agents/<id>/memory.db`.
+    /// Resolve the memory.db path for an agent's read RPCs.
+    /// Prefers `agents/<id>/state/memory.db`, then `agents/<id>/memory.db`,
+    /// then the shared `<home>/memory.db` — the live write path
+    /// (`server.rs` `.with_memory_db`) points every engine at the shared file,
+    /// so per-agent files only exist on old installs. Every engine query
+    /// filters by `agent_id`, so reading the shared file stays agent-scoped.
     fn agent_memory_db_path(&self, agent_id: &str) -> PathBuf {
         let agent_dir = self.home_dir.join("agents").join(agent_id);
         let state_path = agent_dir.join("state").join("memory.db");
         if state_path.exists() {
-            state_path
-        } else {
-            agent_dir.join("memory.db")
+            return state_path;
         }
+        let legacy_path = agent_dir.join("memory.db");
+        if legacy_path.exists() {
+            return legacy_path;
+        }
+        self.home_dir.join("memory.db")
     }
 
     async fn handle_memory_search(&self, params: Value) -> WsFrame {

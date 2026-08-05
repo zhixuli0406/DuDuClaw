@@ -52,6 +52,7 @@ export function ConversationsZone({
   const navigate = useNavigate();
 
   const sessions = useConversationsStore((s) => s.sessions);
+  const listStatus = useConversationsStore((s) => s.status);
   const fetchSessions = useConversationsStore((s) => s.fetch);
   const resume = useConversationsStore((s) => s.resume);
 
@@ -103,9 +104,21 @@ export function ConversationsZone({
       {!sectionCollapsed && (
         <SidebarMenu>
           {shown.length === 0 ? (
-            <p className="px-2 py-1.5 text-xs text-muted-foreground">
-              {intl.formatMessage({ id: 'sidebar.noConversations' })}
-            </p>
+            listStatus === 'error' ? (
+              // A failed listing must not read as "no conversations" — offer a
+              // retry instead of a lie.
+              <button
+                type="button"
+                onClick={() => void fetchSessions()}
+                className="px-2 py-1.5 text-left text-xs text-muted-foreground underline-offset-2 hover:underline"
+              >
+                {intl.formatMessage({ id: 'sidebar.conversationsError' })}
+              </button>
+            ) : (
+              <p className="px-2 py-1.5 text-xs text-muted-foreground">
+                {intl.formatMessage({ id: 'sidebar.noConversations' })}
+              </p>
+            )
           ) : (
             shown.map((s) => {
               const channel = sessionChannel(s.session_id);
