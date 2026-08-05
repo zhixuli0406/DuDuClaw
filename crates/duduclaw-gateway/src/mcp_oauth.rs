@@ -41,7 +41,7 @@ pub struct PendingOAuth {
     pub created_at: std::time::Instant,
 }
 
-const TOKEN_FILE: &str = "mcp-oauth-tokens.json";
+pub const TOKEN_FILE: &str = "mcp-oauth-tokens.json";
 const PENDING_TTL_SECS: u64 = 600; // 10 minutes
 
 // ── Built-in provider configs ───────────────────────────────
