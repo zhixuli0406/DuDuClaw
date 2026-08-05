@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+- **對話終於在儀表板留下痕跡**：三條先前完全靜默的路徑接上活動流（紀錄／即時動態，
+  含即時推播）——每次頻道回覆（`agent_reply`：「回覆 Telegram 對話『…』」）、
+  key-fact 萃取入庫（`memory_distilled`：「從對話萃取 N 筆關鍵事實」）、以及
+  `wiki_write`／`shared_wiki_write` 知識頁寫入（`wiki_written`：「寫入知識庫『…』」）。
+  在此之前，一段建立四人團隊、寫了知識頁、存了三筆記憶的對話，在儀表板上是零動靜。
+
+### Fixed
+- **決策句萃不出知識圖譜三元組**：「把 ADLC 當成團隊標準」這類決策發言被分類成
+  Local 蒸餾級——而 Local 萃取只對使用者文字跑實體啟發式、完全不看回覆內容，
+  結果是零筆入庫、策展台知識圖譜永遠空白。分類器新增決策／標準關鍵字
+  （標準、規範、決定、採用、當成、作為、定案、納入、policy、standard、adopt 等），
+  這類對話升級 Cloud 萃取產出真正的 SPO 三元組，餵進知識圖譜與事實歷史。
+  蒸餾 tier 選擇同步升為 info log，之後「這輪為什麼沒進記憶」直接看 log 可判。
+- **CI 三個 Windows-only 測試修正**：capability_grants 清理 tempdir 前先關閉
+  SQLite 連線（Windows 鎖檔 error 32）；migrate 絕對路徑測試分平台
+  （`/Users/x` 在 Windows 不是絕對路徑）；os_events 監看路徑寫入 TOML 前
+  正規化 `/`（反斜線是跳脫序列會 parse-fail）。Windows CI 全綠。
+
 ## [1.52.1] - 2026-08-05 — 記憶頁與對話側欄修復+桌面真熱更新
 
 ### Added
