@@ -113,11 +113,26 @@ pub fn parse_stream_json(stdout: &str) -> Result<EvalTranscript, String> {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
                 {
-                    let err_text = event
-                        .get("result")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("Unknown stream-json error");
-                    return Err(format!("claude CLI stream error: {err_text}"));
+                    // WP2.1: a `max_turns` overrun is OBSERVED AGENT
+                    // BEHAVIOUR, not an infrastructure failure — the run's
+                    // tool activity and text are all here, and assertions
+                    // like `max_tool_calls` exist precisely to fail a
+                    // runaway tool loop. Treating it as a hard stream error
+                    // made such agents' worst behaviour permanently
+                    // unrecordable (bumping the budget does not converge —
+                    // the loop just fills whatever cap it is given).
+                    // Infrastructure errors (rate limits, session limits,
+                    // API failures) remain hard errors: they record nothing
+                    // about the agent, and a fabricated baseline is worse
+                    // than none.
+                    let subtype = t.last_result_subtype.as_deref().unwrap_or("");
+                    if subtype != "error_max_turns" {
+                        let err_text = event
+                            .get("result")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("Unknown stream-json error");
+                        return Err(format!("claude CLI stream error: {err_text}"));
+                    }
                 }
                 if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
                     // Non-empty result text wins; tool-use turns often carry
@@ -439,4 +454,22 @@ mod tests {
         assert_eq!(t.tool_uses[0].result_text.as_deref(), Some("read out"));
         assert_eq!(t.tool_uses[1].result_text.as_deref(), Some("bash out"));
     }
+
+    /// WP2.1: an `error_max_turns` result is observed agent behaviour (a
+    /// runaway tool loop) — parseable, so assertions can fail it; only
+    /// infrastructure errors stay hard errors.
+    #[test]
+    fn max_turns_overrun_is_parseable_but_other_errors_stay_hard() {
+        let overrun = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"t1\",\"input\":{}}]}}\n",
+            "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"num_turns\":13,\"result\":\"\"}",
+        );
+        let t = parse_stream_json(overrun).expect("max_turns overrun must be assessable");
+        assert_eq!(t.tool_uses.len(), 1);
+        assert_eq!(t.last_result_subtype.as_deref(), Some("error_max_turns"));
+
+        let rate_limited = "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You've hit your session limit\"}";
+        assert!(parse_stream_json(rate_limited).is_err(), "infra errors must stay hard");
+    }
+
 }
