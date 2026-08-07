@@ -23,15 +23,40 @@
 //! secret-looking keys are masked *before* serialization, and the
 //! serialized input is capped at [`AUDIT_INPUT_MAX_CHARS`] chars
 //! (CJK-safe `truncate_chars`) with an explicit `input_truncated: true`
-//! marker. With the existing 5 MB rotation ([`maybe_rotate_tool_calls`])
-//! the worst case is ~1.2k full-size records per rotation window — the
-//! rotation cadence shortens under heavy tool traffic, trading history
-//! *depth* for input *completeness*. Operators who need longer retention
-//! should archive the `.jsonl.old` file, not raise the cap.
+//! marker. B3b (below) later added a second capped field, `result_text`,
+//! to every record — roughly doubling average record size versus the
+//! input-only estimate this note originally made. With the rotation cap
+//! raised to [`TOOL_CALLS_ROTATION_MAX_BYTES`] (16 MB, up from the original
+//! 5 MB — 2026-08 M4 review) the rotation cadence lands in the same
+//! ballpark as before B3b, rather than shortening under the extra
+//! per-record weight. The rotation cadence still shortens under heavy tool
+//! traffic in general, trading history *depth* for input/result
+//! *completeness*. Operators who need longer retention should archive the
+//! `.jsonl.old` file, not raise the cap further.
+//!
+//! ## Tool-call RESULT capture (B3b, GroundEval arXiv:2606.22737)
+//!
+//! `duduclaw-core::grounding::check_grounded` — the B3 zero-LLM grounding
+//! pre-check wired into `dispatch_engine.rs` — compares an agent's final
+//! answer against `result_text` on each evidence record, but until B3b no
+//! writer ever populated that field, so the gate perpetually observed
+//! `ResultTextMissing` and degraded (inert-by-default). This is the fix:
+//! [`append_tool_call_with_input`] gained an additional optional
+//! `result_text` parameter, masked via [`mask_sensitive_text`] (a
+//! free-text-oriented sibling of [`mask_sensitive_json`] — tool *results*
+//! are prose/mixed text, not a JSON key tree) and capped at
+//! [`AUDIT_RESULT_TEXT_MAX_CHARS`] chars. Captured for BOTH success and
+//! error outcomes (an error's text is still useful context, and
+//! `check_grounded` already excludes `is_error` evidence from grounding —
+//! see `duduclaw_core::grounding::ToolEvidence::is_error`). Old rows and
+//! old callers stay valid: `result_text`/`result_text_truncated` are
+//! additive optional fields, same backward-compatibility shape as `input`.
 
 use std::path::Path;
+use std::sync::LazyLock;
 
 use chrono::Utc;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -308,12 +333,32 @@ pub fn append_tool_call_with_extras(
     };
 
     use std::io::Write;
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    // 0600 on create: since result_text landed, rows can carry business
+    // data (e.g. Odoo reads), so the file must not be world/group-readable.
+    // mode() only applies at creation — pre-existing files keep their bits,
+    // hence the explicit tighten below for upgraded installs.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
         Ok(mut f) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = f.metadata() {
+                    if meta.permissions().mode() & 0o077 != 0 {
+                        let mut perms = meta.permissions();
+                        perms.set_mode(0o600);
+                        if let Err(e) = f.set_permissions(perms) {
+                            warn!("failed to tighten tool_calls.jsonl to 0600: {e}");
+                        }
+                    }
+                }
+            }
             // Warn (not silently swallow) like the security_audit.jsonl
             // sibling path — a failed lock means concurrent writers may
             // interleave lines (2026-07 MED).
@@ -378,6 +423,8 @@ const SENSITIVE_VALUE_PREFIXES: &[&str] = &[
     "github_pat_",
     "AKIA",
     "Bearer ",
+    "Basic ",
+    "Token ",
     "glpat-",
 ];
 
@@ -387,6 +434,19 @@ fn is_sensitive_key(key: &str) -> bool {
 
 fn is_sensitive_value(v: &str) -> bool {
     SENSITIVE_VALUE_PREFIXES.iter().any(|p| v.starts_with(p))
+}
+
+/// Build a regex alternation of [`SENSITIVE_KEYS`], tolerating `-`/`_`
+/// interchange: header spellings like `x-api-key` / `Api-Key` must match the
+/// `api_key` entry even though the constant list only spells it with an
+/// underscore (2026-08 H2/H3 review PoC: `x-api-key: sk-live-abc123` was
+/// previously unmasked).
+fn sensitive_keys_pattern() -> String {
+    SENSITIVE_KEYS
+        .iter()
+        .map(|k| regex::escape(k).replace('_', "[-_]"))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// Recursively mask secret-looking values inside a JSON tree. Returns a new
@@ -424,6 +484,129 @@ fn mask_at_depth(v: &serde_json::Value, depth: usize) -> serde_json::Value {
     }
 }
 
+// ── B3b: tool RESULT text capture (GroundEval evidence source) ────────────
+//
+// `mask_sensitive_json` above walks a structured JSON *input* tree by key.
+// A tool's RESULT is free text — sometimes a serialized JSON object dumped
+// into the MCP `text` block (many handlers `serde_json::to_string(_pretty)`
+// a struct), sometimes prose, sometimes both — so it has no key tree to
+// walk. These three patterns scan the rendered text for secret-shaped
+// substrings instead, most-specific-first so an already-masked span is
+// never re-matched by a looser later pass.
+
+/// Cap on the serialized (masked) tool RESULT text stored per tool-call
+/// record. Chars, not bytes — CJK-safe via `truncate_chars`. Deliberately
+/// smaller than [`AUDIT_INPUT_MAX_CHARS`]: this exists purely as B3
+/// grounding-precheck evidence (GroundEval, arXiv:2606.22737) — a
+/// contiguous-run overlap check needs the tool's key wording, not its full
+/// payload.
+pub const AUDIT_RESULT_TEXT_MAX_CHARS: usize = 2000;
+
+/// Matches `"<KEY>":"<value>"` (optionally spaced) as produced when a tool
+/// result embeds a JSON object as its text. Case-insensitive on the key
+/// against [`SENSITIVE_KEYS`]; the value group tolerates escaped quotes.
+static SENSITIVE_TEXT_JSON_KV_RE: LazyLock<Regex> = LazyLock::new(|| {
+    let keys = sensitive_keys_pattern();
+    Regex::new(&format!(r#"(?i)"({keys})"\s*:\s*"((?:[^"\\]|\\.)*)""#))
+        .expect("static SENSITIVE_TEXT_JSON_KV_RE must compile")
+});
+
+/// Matches plain `<key>: <value>` / `<key>=<value>` text (not JSON-quoted),
+/// e.g. a handler's narrated summary line, and consumes the **rest of the
+/// line** as the value (H2 review PoC: `password: correct horse battery
+/// staple` previously only masked the first whitespace-delimited token,
+/// leaving the rest of the passphrase in the clear — over-masking the whole
+/// line is the accepted tradeoff, project security convention 4).
+///
+/// The left boundary is deliberately NOT `\b`: Rust's `regex` crate treats
+/// CJK ideographs as Unicode word characters, so `\b` never fires at a
+/// CJK↔ASCII seam (H3 PoC: `密碼password: hunter2` has no boundary between
+/// `碼` and `p`, so the old `\bpassword\b` never matched). Instead the left
+/// side is a capturing group that matches start-of-string or any non-ASCII
+/// -word-char — including CJK — and the replacement re-emits that captured
+/// character so nothing is eaten from the surrounding text. The right side
+/// keeps `\b` (only ASCII suffix collisions like `mypassword`/`token_count`
+/// are a concern there, and Unicode `\b` still filters those correctly).
+static SENSITIVE_TEXT_PLAIN_KV_RE: LazyLock<Regex> = LazyLock::new(|| {
+    let keys = sensitive_keys_pattern();
+    Regex::new(&format!(r#"(?i)(^|[^A-Za-z0-9_])({keys})\b\s*[:=]\s*([^\n]+)"#))
+        .expect("static SENSITIVE_TEXT_PLAIN_KV_RE must compile")
+});
+
+/// Matches a bare [`SENSITIVE_VALUE_PREFIXES`] token wherever it appears in
+/// free text (unlike [`is_sensitive_value`], not anchored to a whole-string
+/// match) — catches a leaked credential pasted mid-sentence into a tool's
+/// narrated result. Case-insensitive (H2 PoC: `bearer eyJ...` lowercase was
+/// previously unmatched since the prefix list only spells `Bearer `).
+static SENSITIVE_TEXT_VALUE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    let alts: Vec<String> = SENSITIVE_VALUE_PREFIXES
+        .iter()
+        .map(|p| regex::escape(p))
+        .collect();
+    Regex::new(&format!(r#"(?i)(?:{})[^\s"')\]}}]*"#, alts.join("|")))
+        .expect("static SENSITIVE_TEXT_VALUE_TOKEN_RE must compile")
+});
+
+/// Matches a `<scheme>://<user>:<password>@` connection-string credential
+/// segment (postgres/mongodb/redis/amqp/mysql/…) and masks only the password
+/// half, keeping `scheme://user:` and the trailing `@` intact for context
+/// (H3 PoC: `postgres://admin:Sup3rS3cret@db.internal:5432/prod`).
+static SENSITIVE_TEXT_CONN_STRING_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)([a-z][a-z0-9+.-]*://[^/\s:@]+:)[^@\s]+(@)"#)
+        .expect("static SENSITIVE_TEXT_CONN_STRING_RE must compile")
+});
+
+/// Matches a Telegram Bot API URL path segment (`/bot<id>:<token>`), masking
+/// only the token half (H3 PoC:
+/// `https://api.telegram.org/bot7123456789:AAH9xQabc/sendMessage`).
+static SENSITIVE_TEXT_TELEGRAM_BOT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(/bot\d+:)[A-Za-z0-9_-]+"#)
+        .expect("static SENSITIVE_TEXT_TELEGRAM_BOT_RE must compile")
+});
+
+/// Matches a Slack Incoming Webhook URL, masking the secret path segment
+/// after `services/` (H3: `hooks.slack.com/services/...` leaks the webhook
+/// credential in the URL path itself).
+static SENSITIVE_TEXT_SLACK_WEBHOOK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(hooks\.slack\.com/services/)[A-Za-z0-9/]+"#)
+        .expect("static SENSITIVE_TEXT_SLACK_WEBHOOK_RE must compile")
+});
+
+/// Best-effort masking for free-text tool **result** output (as opposed to
+/// [`mask_sensitive_json`], which walks a structured JSON *input* tree).
+/// Six passes, in this specific order: JSON key/value, bare
+/// credential-prefixed tokens, connection-string passwords, Telegram bot
+/// URLs, Slack webhook URLs, then plain `key: value`.
+///
+/// The prefix pass deliberately runs BEFORE the plain-kv pass, not after:
+/// [`SENSITIVE_VALUE_PREFIXES`] includes multi-word prefixes like
+/// `"Bearer "`, so a value like `authorization: Bearer xyz123` must be
+/// caught by the prefix pass's whitespace-tolerant match on `Bearer xyz123`
+/// as a whole. The plain-kv pass now consumes the rest of the line as its
+/// value (H2 fix — see its own doc comment), so running it first would no
+/// longer strand an orphaned token either way, but the prefix/conn-string/
+/// URL passes stay first on principle: they identify a credential by its
+/// *shape*, independent of any recognized key name, so they should get the
+/// first look at the raw text.
+///
+/// Bias: over-masking is acceptable, under-masking is not (project security
+/// convention 4 — gates fail closed). This is a heuristic scan, not a
+/// guarantee — it shares the same key/prefix allowlists as
+/// [`mask_sensitive_json`] (now `-`/`_`-tolerant, see [`sensitive_keys_pattern`]).
+pub fn mask_sensitive_text(text: &str) -> String {
+    let masked = SENSITIVE_TEXT_JSON_KV_RE.replace_all(text, |caps: &regex::Captures| {
+        format!("\"{}\":\"***\"", &caps[1])
+    });
+    let masked = SENSITIVE_TEXT_VALUE_TOKEN_RE.replace_all(&masked, "***");
+    let masked = SENSITIVE_TEXT_CONN_STRING_RE.replace_all(&masked, "${1}***${2}");
+    let masked = SENSITIVE_TEXT_TELEGRAM_BOT_RE.replace_all(&masked, "${1}***");
+    let masked = SENSITIVE_TEXT_SLACK_WEBHOOK_RE.replace_all(&masked, "${1}***");
+    let masked = SENSITIVE_TEXT_PLAIN_KV_RE.replace_all(&masked, |caps: &regex::Captures| {
+        format!("{}{}: ***", &caps[1], &caps[2])
+    });
+    masked.into_owned()
+}
+
 /// Read-only verb tokens: a tool name whose `_`-split tokens include one of
 /// these is treated as read-only and its input is **not** captured (it left
 /// no state change to reconstruct). Token equality, never substring —
@@ -441,16 +624,28 @@ pub fn is_readonly_tool_name(name: &str) -> bool {
 }
 
 /// Variant of [`append_tool_call`] that additionally captures the tool's
-/// **input arguments** (R4 — record full inputs, not just outcomes).
+/// **input arguments** and **result text** (R4 — record full inputs, not
+/// just outcomes; B3b — record output text too, so the B3 grounding
+/// pre-check in `dispatch_engine.rs` has evidence to compare a claim
+/// against instead of perpetually observing `ResultTextMissing`).
 ///
 /// Behavior:
-/// - `input = None` or a read-only tool name ⇒ byte-identical record shape
-///   to [`append_tool_call`] (no new fields).
-/// - Otherwise the record gains `input` (masked via
-///   [`mask_sensitive_json`], serialized, capped at
-///   [`AUDIT_INPUT_MAX_CHARS`] chars) and `input_truncated: bool`.
+/// - `input = None` or a read-only tool name ⇒ no `input`/`input_truncated`
+///   fields (same skip rule as before B3b).
+/// - Otherwise the record gains `input` (masked via [`mask_sensitive_json`],
+///   serialized, capped at [`AUDIT_INPUT_MAX_CHARS`] chars) and
+///   `input_truncated: bool`.
+/// - `result_text = None` or an empty/all-whitespace string ⇒ no
+///   `result_text`/`result_text_truncated` fields. Otherwise the record
+///   gains `result_text` (masked via [`mask_sensitive_text`], capped at
+///   [`AUDIT_RESULT_TEXT_MAX_CHARS`] chars) and, only when truncation
+///   actually happened, `result_text_truncated: true`. Captured
+///   unconditionally on both success AND error (an error tool's text is
+///   still useful context — `check_grounded` already excludes
+///   `is_error` evidence from grounding, so this never lets a failed call
+///   masquerade as supporting evidence).
 ///
-/// Old consumers keep working: both fields are additive and optional.
+/// Old consumers keep working: every field here is additive and optional.
 pub fn append_tool_call_with_input(
     home_dir: &Path,
     agent_id: &str,
@@ -458,6 +653,7 @@ pub fn append_tool_call_with_input(
     params_summary: &str,
     success: bool,
     input: Option<&serde_json::Value>,
+    result_text: Option<&str>,
 ) {
     let mut extras: Vec<(&str, serde_json::Value)> = Vec::new();
     if let Some(raw) = input {
@@ -472,6 +668,21 @@ pub fn append_tool_call_with_input(
             };
             extras.push(("input", serde_json::Value::String(rendered)));
             extras.push(("input_truncated", serde_json::Value::Bool(truncated)));
+        }
+    }
+    if let Some(raw_result) = result_text {
+        let masked = mask_sensitive_text(raw_result);
+        if !masked.trim().is_empty() {
+            let truncated = masked.chars().count() > AUDIT_RESULT_TEXT_MAX_CHARS;
+            let rendered = if truncated {
+                duduclaw_core::truncate_chars(&masked, AUDIT_RESULT_TEXT_MAX_CHARS)
+            } else {
+                masked
+            };
+            extras.push(("result_text", serde_json::Value::String(rendered)));
+            if truncated {
+                extras.push(("result_text_truncated", serde_json::Value::Bool(true)));
+            }
         }
     }
     append_tool_call_with_extras(home_dir, agent_id, tool_name, params_summary, success, &extras)
@@ -529,7 +740,20 @@ pub fn read_tool_calls_since(
         .collect()
 }
 
-/// Rotate `tool_calls.jsonl` if it exceeds 5 MB.
+/// Rotation threshold for `tool_calls.jsonl`, in bytes.
+///
+/// Raised from 5 MB to 16 MB (2026-08 M4 review): B3b's `result_text`
+/// capture added a second capped free-text field to every record, pushing
+/// average record size up roughly 50-100% versus the input-only design this
+/// cap was originally sized for — the old 5 MB threshold was rotating (and
+/// thus losing) the audit trail well ahead of the original retention
+/// intent. 16 MB restores a comparable retention window; per-record size is
+/// still independently bounded by [`AUDIT_INPUT_MAX_CHARS`] and
+/// [`AUDIT_RESULT_TEXT_MAX_CHARS`], so this only affects *how many* records
+/// accumulate before rotation, not how large any single one can get.
+pub const TOOL_CALLS_ROTATION_MAX_BYTES: u64 = 16 * 1024 * 1024; // 16 MB
+
+/// Rotate `tool_calls.jsonl` if it exceeds [`TOOL_CALLS_ROTATION_MAX_BYTES`].
 ///
 /// Renames the current file to `.jsonl.old` (overwriting any previous backup)
 /// and starts a fresh file. Only checks file size every 64 calls to avoid
@@ -546,9 +770,8 @@ fn maybe_rotate_tool_calls(path: &std::path::Path) {
         return;
     }
 
-    const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
     if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() > MAX_SIZE {
+        && meta.len() > TOOL_CALLS_ROTATION_MAX_BYTES {
             let backup = path.with_extension("jsonl.old");
             // Ignore ENOENT: a concurrent caller may have already rotated.
             match std::fs::rename(path, &backup) {
@@ -765,6 +988,309 @@ mod tests {
         assert!(m["content"].as_str().unwrap().ends_with("***"));
     }
 
+    // ── B3b: result-text masking ─────────────────────────
+
+    #[test]
+    fn mask_text_masks_json_kv_pairs_embedded_in_free_text() {
+        let text = r#"Connected. {"api_key":"sk-live-abcdef","status":"ok"}"#;
+        let masked = mask_sensitive_text(text);
+        assert!(masked.contains(r#""api_key":"***""#));
+        assert!(!masked.contains("sk-live-abcdef"));
+        assert!(masked.contains(r#""status":"ok""#), "non-secret key untouched");
+    }
+
+    #[test]
+    fn mask_text_masks_plain_key_value_lines() {
+        let text = "Login succeeded.\ntoken: abc.def.ghi\nuser: agnes";
+        let masked = mask_sensitive_text(text);
+        assert!(masked.contains("token: ***"));
+        assert!(!masked.contains("abc.def.ghi"));
+        assert!(masked.contains("user: agnes"), "non-secret key untouched");
+    }
+
+    #[test]
+    fn mask_text_masks_bare_value_prefix_tokens_mid_sentence() {
+        let text = "here is the token you asked for: sk-ant-api03-verylongsecrettoken, keep it safe";
+        let masked = mask_sensitive_text(text);
+        assert!(!masked.contains("verylongsecrettoken"));
+        assert!(masked.contains("***"));
+    }
+
+    #[test]
+    fn mask_text_key_match_is_word_boundary_not_substring() {
+        // `author` must survive even though it contains the letters of `auth`.
+        let text = "author: agnes, authorization: Bearer xyz123";
+        let masked = mask_sensitive_text(text);
+        assert!(masked.contains("author: agnes"), "author must not be masked");
+        assert!(!masked.contains("xyz123"));
+    }
+
+    #[test]
+    fn mask_text_is_cjk_safe() {
+        let text = "查詢結果：password: 憑證繁體中文密碼內容 完成";
+        let masked = mask_sensitive_text(text); // must not panic on multi-byte content
+        assert!(masked.contains("password: ***"));
+        assert!(!masked.contains("憑證繁體中文密碼內容"));
+    }
+
+    #[test]
+    fn mask_text_leaves_plain_prose_untouched() {
+        let text = "Refund policy: 30 days from purchase, receipt required.";
+        assert_eq!(mask_sensitive_text(text), text);
+    }
+
+    // ── 2026-08 H2/H3 review PoCs ─────────────────────────
+
+    #[test]
+    fn mask_text_masks_basic_auth_header() {
+        // H2 PoC: SENSITIVE_VALUE_PREFIXES previously had no "Basic "/"Token "
+        // entries, so an Authorization: Basic header leaked the base64
+        // credential in full.
+        let text = "Authorization: Basic YWRtaW46c3VwZXJzZWNyZXQ=";
+        let masked = mask_sensitive_text(text);
+        assert!(!masked.contains("YWRtaW46c3VwZXJzZWNyZXQ="));
+        assert!(masked.contains("***"));
+    }
+
+    #[test]
+    fn mask_text_masks_lowercase_bearer_token() {
+        // H2 PoC: SENSITIVE_TEXT_VALUE_TOKEN_RE had no `(?i)` flag, so a
+        // lowercase `bearer` prefix (as some clients/log lines render it)
+        // sailed through unmasked.
+        let text = "authorization: bearer eyJhbGciOiJIUzI1NiJ9.xxx.yyy";
+        let masked = mask_sensitive_text(text);
+        assert!(!masked.contains("eyJhbGciOiJIUzI1NiJ9.xxx.yyy"));
+        assert!(masked.contains("***"));
+    }
+
+    #[test]
+    fn mask_text_masks_full_multiword_passphrase() {
+        // H2 PoC: the plain-kv pass previously only consumed the first
+        // whitespace-delimited token, leaving the rest of a multi-word
+        // secret (e.g. a diceware passphrase) in the clear.
+        let text = "password: correct horse battery staple";
+        let masked = mask_sensitive_text(text);
+        assert!(!masked.contains("correct horse battery staple"));
+        assert!(!masked.contains("horse"), "must not leak any word of the passphrase");
+        assert!(masked.contains("password: ***"));
+    }
+
+    #[test]
+    fn mask_text_masks_connection_string_password() {
+        // H3 PoC: DB/queue connection-string passwords (postgres, mongodb,
+        // redis, amqp, ...) were not recognized as a secret shape at all.
+        let text = "postgres://admin:Sup3rS3cret@db.internal:5432/prod";
+        let masked = mask_sensitive_text(text);
+        assert!(!masked.contains("Sup3rS3cret"));
+        assert!(masked.contains("postgres://admin:***@db.internal:5432/prod"));
+    }
+
+    #[test]
+    fn mask_text_masks_telegram_bot_url_token() {
+        // H3 PoC: a Telegram Bot API URL embeds the bot token directly in
+        // the path — no recognized key name, no recognized value prefix.
+        let text = "https://api.telegram.org/bot7123456789:AAH9xQabc/sendMessage";
+        let masked = mask_sensitive_text(text);
+        assert!(!masked.contains("AAH9xQabc"));
+        assert!(masked.contains("/bot7123456789:***/sendMessage"));
+    }
+
+    #[test]
+    fn mask_text_masks_slack_webhook_path() {
+        // H3: Slack incoming-webhook URLs carry the credential in the URL
+        // path itself.
+        let text = "posting to https://hooks.slack.com/services/T00/B00/XXXXXXXXXXXXXXXXXXXXXXXX ok";
+        let masked = mask_sensitive_text(text);
+        assert!(!masked.contains("T00/B00/XXXXXXXXXXXXXXXXXXXXXXXX"));
+        assert!(masked.contains("hooks.slack.com/services/***"));
+    }
+
+    #[test]
+    fn mask_text_masks_hyphenated_key_spelling() {
+        // H3 PoC: SENSITIVE_KEYS spells this "api_key" (underscore); a
+        // hyphenated header spelling like `x-api-key` previously escaped
+        // both the JSON-kv and plain-kv passes entirely.
+        let text = "x-api-key: sk-live-abc123";
+        let masked = mask_sensitive_text(text);
+        assert!(!masked.contains("sk-live-abc123"));
+        assert!(masked.contains("x-api-key: ***"));
+    }
+
+    #[test]
+    fn mask_text_masks_key_immediately_after_cjk_text() {
+        // H3 PoC: Rust's `regex` crate treats CJK ideographs as Unicode
+        // word characters, so a plain `\b`-anchored key regex never fires
+        // at a CJK↔ASCII seam — `密碼password: hunter2` previously left the
+        // secret fully exposed because `\bpassword\b` never matched.
+        let text = "使用者密碼password: hunter2secret";
+        let masked = mask_sensitive_text(text);
+        assert!(!masked.contains("hunter2secret"));
+        assert!(masked.contains("password: ***"));
+        assert!(masked.contains("使用者密碼"), "CJK prefix text must survive untouched");
+    }
+
+    // ── B3b: result-text capture records ─────────────────
+
+    #[test]
+    fn result_text_captured_and_masked_for_success() {
+        let home = fresh_home();
+        append_tool_call_with_input(
+            &home,
+            "agnes",
+            "memory_search",
+            "ok",
+            true,
+            None,
+            Some(r#"Refund policy: 30 days. {"api_key":"sk-live-xyz"}"#),
+        );
+        let rec = read_last_record(&home);
+        let stored = rec["result_text"].as_str().unwrap();
+        assert!(stored.contains("Refund policy: 30 days"));
+        assert!(!stored.contains("sk-live-xyz"), "secret in result must be masked");
+        assert!(rec.get("result_text_truncated").is_none(), "no marker when untruncated");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn result_text_captured_for_error_outcome_too() {
+        let home = fresh_home();
+        append_tool_call_with_input(
+            &home,
+            "agnes",
+            "odoo_partner_search",
+            "ok",
+            false,
+            None,
+            Some("Odoo error: permission denied"),
+        );
+        let rec = read_last_record(&home);
+        assert_eq!(rec["success"], false);
+        assert_eq!(rec["result_text"], "Odoo error: permission denied");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn result_text_skipped_when_none_or_empty() {
+        let home = fresh_home();
+        append_tool_call_with_input(&home, "agnes", "tasks_create", "ok", true, None, None);
+        append_tool_call_with_input(&home, "agnes", "tasks_create", "ok", true, None, Some("   "));
+        let body = std::fs::read_to_string(home.join("tool_calls.jsonl")).unwrap();
+        for line in body.lines() {
+            let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(rec.get("result_text").is_none(), "no result_text expected: {line}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn oversized_result_text_truncated_with_marker_cjk_safe() {
+        let home = fresh_home();
+        let big = "繁體中文結果".repeat(1000); // > AUDIT_RESULT_TEXT_MAX_CHARS
+        append_tool_call_with_input(&home, "agnes", "memory_search", "ok", true, None, Some(&big));
+        let rec = read_last_record(&home);
+        assert_eq!(rec["result_text_truncated"], true);
+        assert!(
+            rec["result_text"].as_str().unwrap().chars().count() <= AUDIT_RESULT_TEXT_MAX_CHARS
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Gate-activation check (B3b task requirement #3): before this change,
+    /// every `tool_calls.jsonl` row lacked `result_text`, so
+    /// `duduclaw_core::grounding::check_grounded` could only ever observe
+    /// `ResultTextMissing` for production evidence — the B3 pre-check in
+    /// `dispatch_engine.rs` was permanently degraded/inert. This test drives
+    /// the real writer (`append_tool_call_with_input`) then feeds the
+    /// persisted row straight into the shared `duduclaw-core` grounding
+    /// primitive (the same one `dispatch_engine::grounding_precheck` wraps)
+    /// to prove the evidence source is now live, without needing to touch
+    /// `dispatch_engine.rs` itself.
+    #[test]
+    fn result_text_activates_grounding_evidence_end_to_end() {
+        use duduclaw_core::grounding::{check_grounded, GroundingOutcome, ToolEvidence};
+
+        let home = fresh_home();
+        append_tool_call_with_input(
+            &home,
+            "agnes",
+            "memory_search",
+            "ok",
+            true,
+            None,
+            Some("Refund policy: 30 days from purchase, receipt required."),
+        );
+        let rec = read_last_record(&home);
+
+        let evidence = vec![ToolEvidence {
+            tool_name: rec["tool_name"].as_str().unwrap().to_string(),
+            result_text: rec["result_text"].as_str().map(String::from),
+            // Fix-2 C1b added this field to the shared struct; unset here
+            // keeps this pre-existing audit.rs test's behavior unchanged
+            // (mechanical fixup, no audit.rs production logic touched).
+            input_text: None,
+            is_error: !rec["success"].as_bool().unwrap(),
+        }];
+
+        // Claim overlaps the tool evidence → Grounded, not ResultTextMissing.
+        let grounded = check_grounded(
+            "Refund policy: 30 days from purchase, receipt required.",
+            &evidence,
+            Some("memory_search"),
+            12,
+        );
+        assert_eq!(
+            grounded,
+            GroundingOutcome::Grounded {
+                tool_name: "memory_search".to_string()
+            }
+        );
+
+        // Claim does NOT overlap the same evidence → NotGrounded (still not
+        // ResultTextMissing — the gate genuinely evaluates now).
+        let not_grounded = check_grounded(
+            "I handled the request successfully.",
+            &evidence,
+            Some("memory_search"),
+            12,
+        );
+        assert_eq!(not_grounded, GroundingOutcome::NotGrounded);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── File permissions ──────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_calls_jsonl_is_created_and_kept_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = fresh_home();
+        append_tool_call_with_input(&home, "agnes", "tasks_create", "ok", true, None, None);
+        let path = home.join("tool_calls.jsonl");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "fresh file must be 0600, got {mode:#o}");
+
+        // Upgraded installs: a pre-existing world-readable file gets
+        // tightened on the next append, not left as-is.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        append_tool_call_with_input(&home, "agnes", "tasks_create", "ok", true, None, None);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "existing file must be tightened, got {mode:#o}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── M4: rotation cap ──────────────────────────────────
+
+    #[test]
+    fn rotation_cap_raised_to_16mb() {
+        // M4 review: result_text (B3b) roughly doubled average record size
+        // under the old 5 MB cap, over-shortening retention. Locks in the
+        // raised cap so a future edit can't silently shrink it back down.
+        assert_eq!(TOOL_CALLS_ROTATION_MAX_BYTES, 16 * 1024 * 1024);
+    }
+
     // ── Read-only heuristic ─────────────────────────────
 
     #[test]
@@ -789,7 +1315,7 @@ mod tests {
     fn input_captured_masked_for_state_changing_tool() {
         let home = fresh_home();
         let input = serde_json::json!({ "title": "發布", "api_key": "sk-live-xyz" });
-        append_tool_call_with_input(&home, "agnes", "tasks_create", "ok", true, Some(&input));
+        append_tool_call_with_input(&home, "agnes", "tasks_create", "ok", true, Some(&input), None);
         let rec = read_last_record(&home);
         assert_eq!(rec["tool_name"], "tasks_create");
         assert_eq!(rec["success"], true);
@@ -804,8 +1330,8 @@ mod tests {
     fn input_skipped_for_readonly_tool_and_none() {
         let home = fresh_home();
         let input = serde_json::json!({ "query": "q" });
-        append_tool_call_with_input(&home, "agnes", "memory_search", "ok", true, Some(&input));
-        append_tool_call_with_input(&home, "agnes", "tasks_create", "ok", true, None);
+        append_tool_call_with_input(&home, "agnes", "memory_search", "ok", true, Some(&input), None);
+        append_tool_call_with_input(&home, "agnes", "tasks_create", "ok", true, None, None);
         let body = std::fs::read_to_string(home.join("tool_calls.jsonl")).unwrap();
         for line in body.lines() {
             let rec: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -820,7 +1346,7 @@ mod tests {
         // > AUDIT_INPUT_MAX_CHARS of multi-byte content.
         let big = "繁體中文稽核".repeat(1500);
         let input = serde_json::json!({ "content": big });
-        append_tool_call_with_input(&home, "agnes", "shared_wiki_write", "ok", true, Some(&input));
+        append_tool_call_with_input(&home, "agnes", "shared_wiki_write", "ok", true, Some(&input), None);
         let rec = read_last_record(&home);
         assert_eq!(rec["input_truncated"], true);
         assert!(rec["input"].as_str().unwrap().chars().count() <= AUDIT_INPUT_MAX_CHARS);
@@ -840,6 +1366,7 @@ mod tests {
             "ok: hash=def",
             true,
             Some(&serde_json::json!({ "content": "soul text" })),
+            None,
         );
         let since = "2000-01-01T00:00:00Z";
         let rows = read_tool_calls_since(&home, "agnes", since);
