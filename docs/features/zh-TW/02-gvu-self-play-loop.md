@@ -2,6 +2,14 @@
 
 > Agent 自己撰寫、審查、精煉自身人格設定——全自動，橫跨兩個回饋迴圈。
 
+> **自 Evolution v3（2026-08-06）起，本篇描述的是非預設的逃生門路徑。**
+> 下文的 Generator→Verifier→Updater 迴圈在 agent 透過
+> `agent.toml [evolution] legacy_soul_evolution = true` 明確選用時仍原封不動
+> 運作，但預設的進化目的地已改為 **playbook**（小顆粒、可個別淘汰的行為
+> 規則），`SOUL.md` 對 agent 預設唯讀。目前預設機制見
+> [`docs/features/38-aee-playbook-evolution.md`](38-aee-playbook-evolution.md)，
+> 技術細節見 [`docs/architecture/evolution-engine.md`](../../architecture/evolution-engine.md) 第十二章。
+
 ---
 
 ## 比喻：一人分飾三角的編劇室——外加導演剪輯版

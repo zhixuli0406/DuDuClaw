@@ -634,6 +634,20 @@ function OverviewTab({
                 ? intl.formatMessage({ id: 'common.enabled' })
                 : intl.formatMessage({ id: 'common.disabled' })}
             </PropertyRow>
+            {/* Evolution v3: runtime-true GVU toggle (agent.toml `[evolution]
+                gvu_enabled`, WP0.1 — not the struct default). Full diagnostics
+                (stagnation/telemetry/playbook) live on the 記憶 › 自主學習 tab;
+                this is just the at-a-glance state on the staff member's own card. */}
+            <PropertyRow label={intl.formatMessage({ id: 'agentDetail.field.evolution' })}>
+              <Badge
+                variant="secondary"
+                className={detail.evolution?.gvu_enabled ? 'bg-success/15 text-success' : undefined}
+              >
+                {detail.evolution?.gvu_enabled
+                  ? intl.formatMessage({ id: 'common.enabled' })
+                  : intl.formatMessage({ id: 'common.disabled' })}
+              </Badge>
+            </PropertyRow>
           </CardContent>
         </Card>
       </div>

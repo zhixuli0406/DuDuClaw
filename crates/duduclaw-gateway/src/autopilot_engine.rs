@@ -2646,4 +2646,58 @@ mod tests {
         assert!(tasks.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    // ── WP21 欠帳① — bus-dispatch producer inventory ──────────────
+    //
+    // `action_delegate` → `enqueue_prompt` is the autopilot `delegate` action's
+    // only path onto `message_queue.db`, gated by `dispatcher::gate_bus_dispatch`
+    // (the "sqlite_queue" rail). Before the v1.53 legacy-window flip
+    // (`GateOutcome::LegacyNoSender` → DENY, see `delegation_gate.rs`), every
+    // producer's sender stamp must be pinned so a future refactor here can't
+    // silently drop it and make every autopilot delegation invisible. Must be
+    // the exact `duduclaw_core::SYSTEM_SENDERS` spelling ("autopilot"), not a
+    // near-miss like "autopilot-engine" or "autopilot_rule".
+    #[tokio::test(flavor = "current_thread")]
+    async fn action_delegate_stamps_autopilot_as_system_sender() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("duduclaw-autopilot-delegate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let store = Arc::new(AutopilotStore::open(&tmp_dir).unwrap());
+        let ts = Arc::new(TaskStore::open(&tmp_dir).unwrap());
+        let mq = Arc::new(MessageQueue::open(&tmp_dir).unwrap());
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let engine = AutopilotEngine::new(tmp_dir.clone(), store, ts, Some(mq.clone()), rx);
+
+        let action = serde_json::json!({
+            "target_agent": "worker",
+            "prompt": "整理今天的收件匣",
+        });
+        let fields = serde_json::Map::new();
+        engine
+            .action_delegate(&action, &fields, None)
+            .await
+            .expect("action_delegate should enqueue successfully");
+
+        let pending = mq.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 1, "exactly one row enqueued");
+        let msg = &pending[0];
+        assert_eq!(msg.target, "worker");
+        assert_eq!(msg.sender, "autopilot");
+        assert_eq!(
+            msg.sender_agent.as_deref(),
+            Some("autopilot"),
+            "sender_agent must carry the SYSTEM_SENDERS spelling"
+        );
+        assert_eq!(
+            msg.origin_agent.as_deref(),
+            Some("autopilot"),
+            "origin_agent must carry the SYSTEM_SENDERS spelling"
+        );
+        assert!(
+            duduclaw_core::is_system_sender(msg.sender_agent.as_deref().unwrap()),
+            "stamped sender must pass the WP21 C1 gate's is_system_sender check"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }

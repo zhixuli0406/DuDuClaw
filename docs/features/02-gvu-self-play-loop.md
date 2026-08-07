@@ -2,6 +2,16 @@
 
 > The agent writes, reviews, and refines its own personality — automatically, across two feedback loops.
 
+> **Since Evolution v3 (2026-08-06), this is the non-default legacy path.** The
+> Generator→Verifier→Updater loop described below still runs exactly as written
+> when an agent opts in via `agent.toml [evolution] legacy_soul_evolution =
+> true`, but the default evolution target is now the **playbook** (small,
+> independently-retirable behavior rules) rather than a full `SOUL.md`
+> rewrite — `SOUL.md` is read-only for agents by default. See
+> [`docs/features/38-aee-playbook-evolution.md`](38-aee-playbook-evolution.md)
+> for the current default and [`docs/architecture/evolution-engine.md`](../architecture/evolution-engine.md)
+> ch.12 for the technical detail.
+
 ---
 
 ## The Metaphor: A One-Person Writer's Room — With a Director's Cut

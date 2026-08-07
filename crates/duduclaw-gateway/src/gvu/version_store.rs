@@ -38,6 +38,14 @@ pub struct VersionMetrics {
     pub contract_violations: u32,
     /// Total conversations in the measurement period.
     pub conversations_count: u32,
+    /// WP0.4 (R5): whether `feedback.jsonl` existed when this metric was
+    /// computed. `positive_feedback_ratio` is `0.0` both when feedback was
+    /// genuinely all-negative AND when the file simply doesn't exist (common
+    /// on low-traffic installs) — those two cases must not be conflated.
+    /// `#[serde(default)]` so pre-WP0.4 rows deserialize as `false`
+    /// (unknown/unavailable) rather than silently claiming measured data.
+    #[serde(default)]
+    pub feedback_available: bool,
 }
 
 /// Lifecycle status of a SOUL.md version.
@@ -50,6 +58,14 @@ pub enum VersionStatus {
     Confirmed,
     /// Observation failed — this version was rolled back.
     RolledBack,
+    /// WP0.4 (R5): the observation window ran past the hard no-data ceiling
+    /// (default 14 days) without ever collecting enough conversations to
+    /// judge the outcome. SOUL.md content is left as-is (no evidence either
+    /// way — a low-traffic install should not be punished), but this status
+    /// is deliberately NOT `Confirmed`: it must never count toward
+    /// "confirmed" statistics, and dashboard/CLI surfaces should render it
+    /// as "unverified", not "passed".
+    ExpiredNoData,
 }
 
 impl VersionStatus {
@@ -58,6 +74,7 @@ impl VersionStatus {
             Self::Observing => "observing",
             Self::Confirmed => "confirmed",
             Self::RolledBack => "rolled_back",
+            Self::ExpiredNoData => "expired_no_data",
         }
     }
 
@@ -65,6 +82,7 @@ impl VersionStatus {
         match s {
             "confirmed" => Self::Confirmed,
             "rolled_back" => Self::RolledBack,
+            "expired_no_data" => Self::ExpiredNoData,
             _ => Self::Observing,
         }
     }
@@ -184,6 +202,12 @@ impl VersionStore {
             CREATE INDEX IF NOT EXISTS idx_deferred_agent
                 ON deferred_gvu(agent_id, status);
 
+            CREATE TABLE IF NOT EXISTS gvu_low_data_alerts (
+                version_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                sent_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS gvu_experiment_log (
                 id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
@@ -195,7 +219,19 @@ impl VersionStore {
                 description TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_experiment_agent_time
-                ON gvu_experiment_log(agent_id, timestamp DESC);"
+                ON gvu_experiment_log(agent_id, timestamp DESC);
+
+            CREATE TABLE IF NOT EXISTS gvu_consolidations (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                from_bytes INTEGER NOT NULL,
+                to_bytes INTEGER,
+                detail TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_consolidations_agent
+                ON gvu_consolidations(agent_id, attempted_at DESC);"
         ).map_err(|e| e.to_string())?;
 
         // Idempotent migration: add rollback_diff_hash to pre-existing DBs.
@@ -318,6 +354,53 @@ impl VersionStore {
         Ok(())
     }
 
+    /// WP0.4 (R5): mark a version `expired_no_data` — the observation window
+    /// ran past the hard no-data ceiling without ever collecting enough
+    /// traffic to judge. Deliberately distinct from `mark_confirmed`: this
+    /// status is never treated as "passed" by anything reading `status`.
+    /// SOUL.md content is untouched (no rollback — no evidence either way).
+    pub fn mark_expired_no_data(&self, version_id: &str, post_metrics: &VersionMetrics) -> Result<(), String> {
+        let conn = self.open()?;
+        let json = serde_json::to_string(post_metrics).map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE soul_versions SET status = 'expired_no_data', post_metrics_json = ?1 WHERE version_id = ?2",
+            params![json, version_id],
+        ).map_err(|e| e.to_string())?;
+        info!(
+            version = version_id,
+            "Soul version expired without sufficient observation data — marked unverified (NOT confirmed)"
+        );
+        Ok(())
+    }
+
+    /// WP0.4: has a one-time "insufficient observation data" alert already
+    /// been sent for this version? Backs the not-repeated requirement on the
+    /// soft warn-threshold alert in `ObservationFinalizer`.
+    pub fn low_data_alert_sent(&self, version_id: &str) -> bool {
+        let conn = match self.open() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        conn.query_row(
+            "SELECT 1 FROM gvu_low_data_alerts WHERE version_id = ?1",
+            params![version_id],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    /// WP0.4: record that the one-time "insufficient observation data" alert
+    /// has been sent for this version. Idempotent (`INSERT OR IGNORE`).
+    pub fn mark_low_data_alert_sent(&self, version_id: &str, agent_id: &str) -> Result<(), String> {
+        let conn = self.open()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO gvu_low_data_alerts (version_id, agent_id, sent_at) VALUES (?1, ?2, ?3)",
+            params![version_id, agent_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     // ── Crypto helpers ─────────────────────────────────────────
 
     /// Encrypt rollback_diff if crypto is available, otherwise return as-is.
@@ -423,6 +506,100 @@ impl VersionStore {
         })
     }
 
+    // ── WP0.2: consolidation attempts (frequency lock + audit) ──────────
+
+    /// When this agent last *attempted* a SOUL.md consolidation, successful or
+    /// not.
+    ///
+    /// Deliberately "attempted", not "succeeded": consolidation is a whole-file
+    /// LLM rewrite, by far the most expensive call the GVU stack makes. If the
+    /// budget only counted successes, an agent whose consolidations keep failing
+    /// the collapse guard would pay for one on every single trigger — the exact
+    /// runaway-spend shape WP0.3's cooldown exists to prevent, just with a
+    /// bigger price tag.
+    pub fn last_consolidation_at(&self, agent_id: &str) -> Option<DateTime<Utc>> {
+        let conn = self.open().ok()?;
+        let raw: String = conn
+            .query_row(
+                "SELECT MAX(attempted_at) FROM gvu_consolidations WHERE agent_id = ?1",
+                params![agent_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()?;
+        DateTime::parse_from_rfc3339(&raw)
+            .ok()
+            .map(|d| d.with_timezone(&Utc))
+    }
+
+    /// Open a consolidation audit row. Returns its id, or `None` if the write
+    /// failed — the caller MUST treat `None` as "do not proceed", since an
+    /// unrecorded attempt would not consume the frequency budget and could loop.
+    pub fn record_consolidation_attempt(&self, agent_id: &str, from_bytes: usize) -> Option<String> {
+        let conn = self.open().ok()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO gvu_consolidations
+             (id, agent_id, attempted_at, outcome, from_bytes, to_bytes, detail)
+             VALUES (?1, ?2, ?3, 'attempted', ?4, NULL, NULL)",
+            params![id, agent_id, Utc::now().to_rfc3339(), from_bytes as i64],
+        )
+        .ok()?;
+        Some(id)
+    }
+
+    /// Close a consolidation audit row with its outcome (`applied`, `rejected`,
+    /// `generation_failed`, …). Best-effort: a lost audit row must not undo an
+    /// already-applied consolidation.
+    pub fn finish_consolidation(
+        &self,
+        id: &str,
+        outcome: &str,
+        to_bytes: Option<usize>,
+        detail: &str,
+    ) {
+        let Ok(conn) = self.open() else { return };
+        if let Err(e) = conn.execute(
+            "UPDATE gvu_consolidations SET outcome = ?2, to_bytes = ?3, detail = ?4 WHERE id = ?1",
+            params![
+                id,
+                outcome,
+                to_bytes.map(|b| b as i64),
+                duduclaw_core::truncate_bytes(detail, 1000),
+            ],
+        ) {
+            warn!("Failed to close consolidation audit row: {e}");
+        }
+    }
+
+    /// Consolidation history for an agent, newest first (dashboard / audit).
+    pub fn consolidation_history(&self, agent_id: &str, limit: usize) -> Vec<ConsolidationRecord> {
+        let Ok(conn) = self.open() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, agent_id, attempted_at, outcome, from_bytes, to_bytes, detail
+             FROM gvu_consolidations WHERE agent_id = ?1
+             ORDER BY attempted_at DESC, rowid DESC LIMIT ?2",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![agent_id, limit], |row| {
+            Ok(ConsolidationRecord {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                attempted_at: row.get(2)?,
+                outcome: row.get(3)?,
+                from_bytes: row.get::<_, i64>(4)? as usize,
+                to_bytes: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
+                detail: row.get(6)?,
+            })
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
     // ── GVU Experiment Log ──────────────────────────────────
 
     /// Record a GVU experiment outcome.
@@ -463,6 +640,17 @@ impl VersionStore {
     }
 
     /// Get recent experiment log entries for an agent (newest first).
+    ///
+    /// `ORDER BY timestamp DESC, rowid DESC` — the `rowid` tiebreak matters.
+    /// `timestamp` is an RFC-3339 *string* and `to_rfc3339()` uses chrono's
+    /// `AutoSi` precision, so two experiments logged inside the same clock tick
+    /// (or by a platform with coarse `SystemTime` granularity) can serialize to
+    /// byte-identical strings. With no tiebreak SQLite is free to return those
+    /// rows in either order, and every stagnation signal in
+    /// [`crate::gvu::stagnation`] scans this list newest-first and stops at the
+    /// first `applied` row — so an ambiguous tie can flip an agent between
+    /// "recovered" and "still stuck". `rowid` is monotonic in insertion order,
+    /// which is exactly the intended ordering when timestamps collide.
     pub fn get_experiments(&self, agent_id: &str, limit: usize) -> Vec<ExperimentLogEntry> {
         let conn = match self.open() {
             Ok(c) => c,
@@ -474,7 +662,7 @@ impl VersionStore {
                     duration_secs, outcome, description
              FROM gvu_experiment_log
              WHERE agent_id = ?1
-             ORDER BY timestamp DESC
+             ORDER BY timestamp DESC, rowid DESC
              LIMIT ?2",
         ) {
             Ok(s) => s,
@@ -663,6 +851,22 @@ pub struct ExperimentLogEntry {
     pub outcome: String,
     /// Human-readable description of what happened.
     pub description: String,
+}
+
+/// One WP0.2 consolidation attempt (audit / dashboard row).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationRecord {
+    pub id: String,
+    pub agent_id: String,
+    /// RFC-3339 timestamp, kept as a string — this is a display/audit record,
+    /// not an input to any decision (the frequency lock reads
+    /// [`VersionStore::last_consolidation_at`] instead).
+    pub attempted_at: String,
+    /// `attempted` → `applied` / `rejected` / `generation_failed` / …
+    pub outcome: String,
+    pub from_bytes: usize,
+    pub to_bytes: Option<usize>,
+    pub detail: Option<String>,
 }
 
 impl ExperimentLogEntry {

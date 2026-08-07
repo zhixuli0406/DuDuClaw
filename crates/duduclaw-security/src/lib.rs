@@ -14,7 +14,6 @@ pub mod os_reconcile;
 pub mod perception;
 pub mod policy_kernel;
 pub mod rate_limiter;
-pub mod rbac;
 pub mod safety_word;
 pub mod security_posture;
 pub mod secret_manager;

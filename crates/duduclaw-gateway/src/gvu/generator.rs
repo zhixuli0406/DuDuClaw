@@ -84,6 +84,10 @@ impl Generator {
                 super::version_store::VersionStatus::Confirmed => "confirmed",
                 super::version_store::VersionStatus::RolledBack => "ROLLED BACK",
                 super::version_store::VersionStatus::Observing => "observing",
+                // WP0.4 (R5): unverified — insufficient traffic ever
+                // arrived. Distinct label so the Generator's history
+                // context doesn't read this as a validated success.
+                super::version_store::VersionStatus::ExpiredNoData => "unverified (no data)",
             };
 
             let metrics_str = format!(

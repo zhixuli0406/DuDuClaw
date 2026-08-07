@@ -366,7 +366,12 @@ mod verifier_tests {
     }
 
     #[test]
-    fn composite_verifier_rejects_low_judge_score() {
+    fn low_judge_score_is_a_measure_dimension_not_a_veto() {
+        // WP2.4 §2.5.3 / B10: L3 was demoted from veto to score. `verify_all`
+        // now approves, carries the judge score as `confidence`, and emits an
+        // advisory. The accept/reject decision belongs to the commit gate
+        // (`verifier_measure::commit_verdict`); the legacy SOUL path re-applies
+        // an explicit floor in `loop_::LEGACY_JUDGE_FLOOR`.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let vs = VersionStore::new(tmp.path());
         let p = make_proposal("Valid content here");
@@ -377,8 +382,15 @@ mod verifier_tests {
             feedback: "Poor quality".into(),
         };
 
-        let result = verify_all(&p, "soul", &[], &[], &vs, Some(&judge));
-        assert!(matches!(result, VerificationResult::Rejected { .. }));
+        match verify_all(&p, "soul", &[], &[], &vs, Some(&judge)) {
+            VerificationResult::Approved { confidence, advisories } => {
+                assert!((confidence - 0.3).abs() < 1e-9);
+                assert!(advisories.iter().any(|a| a.source_layer == "L3-LLMJudge"));
+            }
+            VerificationResult::Rejected { gradient } => {
+                panic!("judge must no longer veto; got {}", gradient.critique)
+            }
+        }
     }
 }
 
@@ -741,15 +753,15 @@ mod updater_tests {
     }
 
     #[test]
-    fn judge_auto_confirms_after_cap_with_no_data() {
-        // Observation age >= 72h with conversations < 5 → Confirm by
-        // the no-traffic timeout policy (#10). Otherwise the version
-        // sits in `observing` forever, blocking the next GVU loop.
+    fn judge_extends_with_warning_after_cap_with_no_data() {
+        // Observation age >= 72h with conversations < 5 → keep observing
+        // with a low-data warning (WP0.4). The old policy auto-confirmed
+        // here, which rubber-stamped versions with zero evidence.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let vs = VersionStore::new(tmp.path());
         let updater = Updater::new(vs, None);
 
-        let version = make_aged_version(80); // past 72h cap
+        let version = make_aged_version(80); // past 72h soft cap
         let post = VersionMetrics {
             conversations_count: 0,
             ..Default::default()
@@ -757,14 +769,15 @@ mod updater_tests {
         let now = Utc::now();
         assert!(matches!(
             updater.judge_outcome_at(&version, &post, now),
-            OutcomeVerdict::Confirm
+            OutcomeVerdict::ExtendObservationLowDataWarn { .. }
         ));
     }
 
     #[test]
-    fn judge_auto_confirms_exactly_at_cap_boundary() {
+    fn judge_warns_exactly_at_cap_boundary() {
         // Exactly 72h is the inclusive boundary — pin the >= comparison
-        // so a future refactor doesn't accidentally drift to >.
+        // so a future refactor doesn't accidentally drift to >. Under
+        // WP0.4 the low-data branch warns and keeps observing.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let vs = VersionStore::new(tmp.path());
         let updater = Updater::new(vs, None);
@@ -777,7 +790,7 @@ mod updater_tests {
         let now = Utc::now();
         assert!(matches!(
             updater.judge_outcome_at(&version, &post, now),
-            OutcomeVerdict::Confirm
+            OutcomeVerdict::ExtendObservationLowDataWarn { .. }
         ));
     }
 
@@ -839,14 +852,14 @@ mod updater_tests {
         let vs = VersionStore::new(tmp.path());
         let updater = Updater::new(vs, None);
 
-        let version = make_aged_version(1000); // ~42 days old
+        let version = make_aged_version(1000); // ~42 days old, past 14d hard ceiling
         let post = VersionMetrics {
             conversations_count: 0,
             ..Default::default()
         };
         assert!(matches!(
             updater.judge_outcome(&version, &post),
-            OutcomeVerdict::Confirm,
+            OutcomeVerdict::ExpiredNoData,
         ));
     }
 
@@ -1658,5 +1671,664 @@ mod soul_patch_apply_e2e_tests {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WP0.2 (R2) — cap-deadlock breaker, end-to-end through GvuLoop
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod consolidate_loop_tests {
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+
+    use crate::gvu::consolidate;
+    use crate::gvu::loop_::{GvuLoop, GvuOutcome};
+    use crate::gvu::version_store::{VersionMetrics, VersionStore};
+
+    /// Records every prompt the loop sends so a test can assert on *which*
+    /// LLM calls were made, not just on the final outcome. That distinction is
+    /// the whole point of B2 (judge-after-deterministic) and of the WP0.2
+    /// frequency lock.
+    #[derive(Clone, Default)]
+    struct LlmSpy {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl LlmSpy {
+        fn calls(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
+        }
+        fn judge_calls(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|p| p.starts_with("You are an evolution quality judge"))
+                .count()
+        }
+        fn consolidate_calls(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|p| p.contains("SOUL.md CONSOLIDATION engine"))
+                .count()
+        }
+        fn generator_calls(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|p| p.starts_with("You are the evolution engine for agent"))
+                .count()
+        }
+    }
+
+    /// `<tmp>/agents/<agent>` with the given SOUL.md and a zero GVU cooldown
+    /// (the WP0.3 per-agent cooldown defaults to 60 min and would otherwise
+    /// swallow the second `run()` in the rate-limit test before the WP0.2
+    /// frequency lock is ever consulted).
+    fn agent_dir_with(soul: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agents").join("ceo-assistant");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SOUL.md"), soul).unwrap();
+        // These are legacy-SOUL-path tests by construction (they assert on
+        // SOUL.md bytes, judge prompts and `SoulVersion` rows), so they take
+        // the WP2.6 escape hatch explicitly. AEE — the default since WP2.6 —
+        // never writes SOUL.md and would have nothing here to assert on.
+        fs::write(
+            dir.join("agent.toml"),
+            "[evolution]\ngvu_enabled = true\ngvu_cooldown_minutes = 0\nlegacy_soul_evolution = true\n",
+        )
+        .unwrap();
+        (root, dir)
+    }
+
+    /// The B-window `ceo-assistant` shape: over the byte cap, with an identity
+    /// partition and accumulated evolution increments.
+    fn over_cap_soul() -> String {
+        crate::gvu::consolidate::tests::b_window_soul()
+    }
+
+    fn identity_body(soul: &str) -> String {
+        use crate::gvu::soul_partition::{PartitionedSoul, SectionMutability};
+        PartitionedSoul::parse(soul)
+            .sections
+            .iter()
+            .find(|s| s.mutability == SectionMutability::Immutable)
+            .map(|s| s.content.clone())
+            .unwrap()
+    }
+
+    /// A faithful compression of [`over_cap_soul`]: identity byte-identical,
+    /// every header retained, behaviour bullets merged down.
+    fn faithful_compression(original: &str) -> String {
+        let ident = identity_body(original);
+        let mut s = String::new();
+        s.push_str("# ceo-assistant\n\n## Core Identity\n");
+        s.push_str(&ident);
+        s.push_str("\n\n## 回應風格\n\n");
+        for i in 0..28 {
+            s.push_str(&format!(
+                "- 規則 {i}：先結論後依據，不寫客套開場，長度以能讀完為準。\n"
+            ));
+        }
+        s.push_str("\n## Escalation Rules\n\n");
+        for i in 0..22 {
+            s.push_str(&format!(
+                "- 升級條件 {i}：金流、對外發言、不可逆操作一律等人拍板。\n"
+            ));
+        }
+        s.push_str("\n## Learned Patterns\n\n- 使用者偏好條列式摘要。\n");
+        s
+    }
+
+    fn consolidate_reply(soul: &str) -> String {
+        serde_json::json!({
+            "consolidated_soul": soul,
+            "summary": "合併重複條目、移除已被取代的演化增量",
+        })
+        .to_string()
+    }
+
+    const JUDGE_APPROVE: &str = r#"{"approved": true, "score": 0.9, "feedback": "ok"}"#;
+
+    fn new_loop(db: &std::path::Path) -> GvuLoop {
+        // No alert sink: unit tests assert on outcomes and on disk state, and
+        // alerting degrades to `tracing::warn!` (see `GvuLoop::raise_alert`).
+        GvuLoop::new(db, Some(24.0), Some(3))
+    }
+
+    // ── The deadlock is actually broken ─────────────────────────────
+
+    #[tokio::test]
+    async fn over_cap_soul_enters_consolidate_mode_and_regains_headroom() {
+        let original = over_cap_soul();
+        let (_root, dir) = agent_dir_with(&original);
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let gvu = new_loop(db.path());
+
+        let compressed = faithful_compression(&original);
+        let spy = LlmSpy::default();
+        let spy2 = spy.clone();
+        let compressed2 = compressed.clone();
+
+        let outcome = gvu
+            .run(
+                "ceo-assistant",
+                &dir,
+                "trigger",
+                VersionMetrics::default(),
+                &[],
+                &[],
+                move |prompt: String| {
+                    let spy = spy2.clone();
+                    let compressed = compressed2.clone();
+                    async move {
+                        spy.prompts.lock().unwrap().push(prompt.clone());
+                        if prompt.starts_with("You are an evolution quality judge") {
+                            Ok(JUDGE_APPROVE.to_string())
+                        } else {
+                            Ok(consolidate_reply(&compressed))
+                        }
+                    }
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, GvuOutcome::Applied(_)),
+            "expected the consolidation to apply, got {outcome:?}"
+        );
+
+        // The ordinary Generator was never invoked — over cap, an additive
+        // proposal is guaranteed to die at the apply gate, so building one is
+        // pure waste.
+        assert_eq!(spy.generator_calls(), 0);
+        assert_eq!(spy.consolidate_calls(), 1);
+
+        let after = fs::read_to_string(dir.join("SOUL.md")).unwrap();
+        assert!(
+            !consolidate::is_over_cap(&after),
+            "SOUL.md is still over cap after consolidation ({} bytes)",
+            after.len()
+        );
+        assert!(after.len() < original.len());
+        // Identity survived byte-for-byte.
+        assert_eq!(identity_body(&after), identity_body(&original));
+        // And a normal observation window is open, so the change can roll back.
+        let vs = VersionStore::new(db.path());
+        assert!(vs.get_observing_version("ceo-assistant").is_some());
+        let history = vs.consolidation_history("ceo-assistant", 10);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].outcome, "applied");
+        assert!(history[0].to_bytes.unwrap() < history[0].from_bytes);
+    }
+
+    // ── Collapse protection: a bad compression must not land ────────
+
+    #[tokio::test]
+    async fn collapsed_rewrite_is_rejected_and_soul_md_is_left_untouched() {
+        // The context-collapse failure mode: structurally valid (identity
+        // copied, every header present) but the instructions are gone.
+        let original = over_cap_soul();
+        let (_root, dir) = agent_dir_with(&original);
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let gvu = new_loop(db.path());
+
+        let ident = identity_body(&original);
+        let stub = format!(
+            "# ceo-assistant\n\n## Core Identity\n{ident}\n\n## 回應風格\n\n- 簡潔。\n\n\
+             ## Escalation Rules\n\n- 問人。\n\n## Learned Patterns\n\n- 條列。\n"
+        );
+
+        let spy = LlmSpy::default();
+        let spy2 = spy.clone();
+        let outcome = gvu
+            .run(
+                "ceo-assistant",
+                &dir,
+                "trigger",
+                VersionMetrics::default(),
+                &[],
+                &[],
+                move |prompt: String| {
+                    let spy = spy2.clone();
+                    let stub = stub.clone();
+                    async move {
+                        spy.prompts.lock().unwrap().push(prompt.clone());
+                        if prompt.starts_with("You are an evolution quality judge") {
+                            Ok(JUDGE_APPROVE.to_string())
+                        } else {
+                            Ok(consolidate_reply(&stub))
+                        }
+                    }
+                },
+            )
+            .await;
+
+        match outcome {
+            GvuOutcome::Skipped { reason } => {
+                assert!(reason.contains("collapse"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected the collapsed rewrite to be refused, got {other:?}"),
+        }
+        // Fail-closed: the file on disk is byte-for-byte what it was.
+        assert_eq!(fs::read_to_string(dir.join("SOUL.md")).unwrap(), original);
+        // And the judge was never paid for a candidate the deterministic
+        // collapse guard could reject on its own (B2 ordering).
+        assert_eq!(spy.judge_calls(), 0);
+
+        let vs = VersionStore::new(db.path());
+        assert!(vs.get_observing_version("ceo-assistant").is_none());
+        let history = vs.consolidation_history("ceo-assistant", 10);
+        assert_eq!(history[0].outcome, "collapse_guard");
+    }
+
+    // ── Frequency lock ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn consolidation_is_limited_to_one_attempt_per_week() {
+        let original = over_cap_soul();
+        let (_root, dir) = agent_dir_with(&original);
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let gvu = new_loop(db.path());
+
+        // First attempt fails the collapse guard (a rewrite that barely
+        // shrinks), which still consumes the weekly budget — the budget counts
+        // attempts, because the whole-file rewrite is what costs money.
+        let barely = original.replacen("- 規則 0：回覆時先給結論，再給依據，避免冗長鋪陳與客套開場。\n", "", 1);
+        let spy = LlmSpy::default();
+
+        for expected_consolidate_calls in [1usize, 1usize] {
+            let spy2 = spy.clone();
+            let barely = barely.clone();
+            let outcome = gvu
+                .run(
+                    "ceo-assistant",
+                    &dir,
+                    "trigger",
+                    VersionMetrics::default(),
+                    &[],
+                    &[],
+                    move |prompt: String| {
+                        let spy = spy2.clone();
+                        let barely = barely.clone();
+                        async move {
+                            spy.prompts.lock().unwrap().push(prompt.clone());
+                            Ok(consolidate_reply(&barely))
+                        }
+                    },
+                )
+                .await;
+            assert!(matches!(outcome, GvuOutcome::Skipped { .. }));
+            // On the second pass the count must NOT have grown: the frequency
+            // lock returns before any LLM call.
+            assert_eq!(
+                spy.consolidate_calls(),
+                expected_consolidate_calls,
+                "consolidation was not rate-limited"
+            );
+        }
+
+        let vs = VersionStore::new(db.path());
+        assert_eq!(
+            vs.consolidation_history("ceo-assistant", 10).len(),
+            1,
+            "a rate-limited run must not open a second audit row"
+        );
+        assert_eq!(fs::read_to_string(dir.join("SOUL.md")).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn under_cap_soul_takes_the_ordinary_path_not_consolidate_mode() {
+        let (_root, dir) = agent_dir_with("# a\n\n## 核心價值\n\n- 誠實\n");
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let gvu = new_loop(db.path());
+
+        let spy = LlmSpy::default();
+        let spy2 = spy.clone();
+        let _ = gvu
+            .run(
+                "ceo-assistant",
+                &dir,
+                "trigger",
+                VersionMetrics::default(),
+                &[],
+                &[],
+                move |prompt: String| {
+                    let spy = spy2.clone();
+                    async move {
+                        spy.prompts.lock().unwrap().push(prompt);
+                        Err::<String, String>("no llm in this test".to_string())
+                    }
+                },
+            )
+            .await;
+
+        assert_eq!(spy.consolidate_calls(), 0);
+        assert!(spy.generator_calls() > 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// B2 (§5.5) — deterministic verification runs before the paid L3 judge
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod judge_ordering_tests {
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+
+    use crate::gvu::loop_::GvuLoop;
+    use crate::gvu::version_store::VersionMetrics;
+
+    fn agent_dir_with(soul: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agents").join("agent-b2");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SOUL.md"), soul).unwrap();
+        // B2 asserts on the legacy path's judge ORDERING, so it pins the
+        // legacy engine explicitly (WP2.6 made AEE the default).
+        fs::write(
+            dir.join("agent.toml"),
+            "[evolution]\ngvu_enabled = true\ngvu_cooldown_minutes = 0\nlegacy_soul_evolution = true\n",
+        )
+        .unwrap();
+        (root, dir)
+    }
+
+    #[tokio::test]
+    async fn l1_rejection_never_reaches_the_judge_llm() {
+        // Root cause: the loop used to build the judge prompt and burn the LLM
+        // call BEFORE running any deterministic layer, so a proposal that L1
+        // was always going to reject on a plain string check still cost a full
+        // judge round-trip every generation. With three generations that is
+        // three wasted calls per cycle.
+        let (_root, dir) = agent_dir_with("# B2\n\n## 核心價值\n\n- 誠實\n");
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let gvu = GvuLoop::new(db.path(), Some(24.0), Some(3));
+
+        let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = prompts.clone();
+
+        // A patch body carrying a must_not pattern — a pure L1 string check.
+        let generator_reply = serde_json::json!({
+            "soul_patch": {
+                "section": "核心價值",
+                "op": "append_within",
+                "content": "- 代理其他 agent 撰寫意見",
+            },
+            "proposed_changes": "add a rule",
+            "rationale": "because",
+        })
+        .to_string();
+
+        let _ = gvu
+            .run(
+                "agent-b2",
+                &dir,
+                "trigger",
+                VersionMetrics::default(),
+                &["代理其他 agent 撰寫意見".to_string()],
+                &[],
+                move |prompt: String| {
+                    let sink = sink.clone();
+                    let reply = generator_reply.clone();
+                    async move {
+                        sink.lock().unwrap().push(prompt);
+                        Ok(reply)
+                    }
+                },
+            )
+            .await;
+
+        let calls = prompts.lock().unwrap().clone();
+        let judge_calls = calls
+            .iter()
+            .filter(|p| p.starts_with("You are an evolution quality judge"))
+            .count();
+        let generator_calls = calls
+            .iter()
+            .filter(|p| p.starts_with("You are the evolution engine for agent"))
+            .count();
+
+        assert!(generator_calls >= 1, "the generator must still run");
+        assert_eq!(
+            judge_calls, 0,
+            "an L1-rejected proposal must not cost a judge call (B2); prompts seen: {}",
+            calls.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_proposal_still_reaches_the_judge() {
+        // The other half of B2: reordering must not silently disable L3.
+        let (_root, dir) = agent_dir_with(
+            "# B2\n\n## 核心價值\n\n- 誠實\n- 精準\n- 主動回報\n- 不越權\n- 留下紀錄\n",
+        );
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let gvu = GvuLoop::new(db.path(), Some(24.0), Some(1));
+
+        let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = prompts.clone();
+
+        let generator_reply = serde_json::json!({
+            "soul_patch": {
+                "section": "核心價值",
+                "op": "append_within",
+                "content": "- 回覆前先確認對方的實際問題",
+            },
+            "proposed_changes": "add a clarifying rule",
+            "rationale": "users asked for it",
+        })
+        .to_string();
+
+        let _ = gvu
+            .run(
+                "agent-b2",
+                &dir,
+                "trigger",
+                VersionMetrics::default(),
+                &[],
+                &[],
+                move |prompt: String| {
+                    let sink = sink.clone();
+                    let reply = generator_reply.clone();
+                    async move {
+                        let is_judge = prompt.starts_with("You are an evolution quality judge");
+                        sink.lock().unwrap().push(prompt);
+                        if is_judge {
+                            Ok(r#"{"approved": true, "score": 0.9, "feedback": "ok"}"#.to_string())
+                        } else {
+                            Ok(reply)
+                        }
+                    }
+                },
+            )
+            .await;
+
+        let judge_calls = prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with("You are an evolution quality judge"))
+            .count();
+        assert_eq!(
+            judge_calls, 1,
+            "a proposal that clears every deterministic layer must still be judged"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WP0.2 second face of R2 — an approved proposal that would BREACH the cap
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod consolidate_projected_cap_tests {
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+
+    use crate::gvu::consolidate;
+    use crate::gvu::loop_::{GvuLoop, GvuOutcome};
+    use crate::gvu::soul_partition::{PartitionedSoul, SectionMutability};
+    use crate::gvu::version_store::VersionMetrics;
+
+    const IDENTITY: &str = "我是嘟嘟數位的執行長助理，負責彙整營運資訊、追蹤決策進度。";
+
+    /// Under both hard caps, but above the consolidation target — i.e. there is
+    /// accumulated bloat available to reclaim. This is the regime where an
+    /// otherwise-fine proposal tips SOUL.md over the edge.
+    fn near_cap_soul() -> String {
+        let mut s = String::new();
+        s.push_str("# ceo-assistant\n\n## Core Identity\n\n");
+        s.push_str(IDENTITY);
+        s.push_str("\n\n## 回應風格\n\n");
+        for i in 0..55 {
+            s.push_str(&format!(
+                "- 規則 {i}：先結論後依據，不寫客套開場，長度以能讀完為準。\n"
+            ));
+        }
+        s.push_str("\n## Escalation Rules\n\n");
+        for i in 0..40 {
+            s.push_str(&format!(
+                "- 升級條件 {i}：金流、對外發言、不可逆操作一律等人拍板。\n"
+            ));
+        }
+        s
+    }
+
+    fn identity_body(soul: &str) -> String {
+        PartitionedSoul::parse(soul)
+            .sections
+            .iter()
+            .find(|s| s.mutability == SectionMutability::Immutable)
+            .map(|s| s.content.clone())
+            .unwrap()
+    }
+
+    fn faithful_compression(original: &str) -> String {
+        let ident = identity_body(original);
+        let mut s = String::new();
+        s.push_str("# ceo-assistant\n\n## Core Identity\n");
+        s.push_str(&ident);
+        s.push_str("\n\n## 回應風格\n\n");
+        for i in 0..30 {
+            s.push_str(&format!(
+                "- 規則 {i}：先結論後依據，不寫客套開場，長度以能讀完為準。\n"
+            ));
+        }
+        s.push_str("\n## Escalation Rules\n\n");
+        for i in 0..20 {
+            s.push_str(&format!(
+                "- 升級條件 {i}：金流、對外發言、不可逆操作一律等人拍板。\n"
+            ));
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn approved_proposal_that_would_breach_the_cap_consolidates_first() {
+        let original = near_cap_soul();
+        // Self-verifying preconditions: this fixture must exercise the
+        // *projected* branch, not the already-over-cap one.
+        assert!(
+            !consolidate::is_over_cap(&original),
+            "fixture must start UNDER the caps ({} bytes)",
+            original.len()
+        );
+        assert!(
+            original.len() > consolidate::target_bytes(),
+            "fixture must have reclaimable bloat ({} bytes vs {} target)",
+            original.len(),
+            consolidate::target_bytes()
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agents").join("ceo-assistant");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SOUL.md"), &original).unwrap();
+        // The *projected* cap branch lives inside the legacy generation loop
+        // (an approved SOUL patch that would overflow the cap), so this test
+        // pins the legacy engine. The already-over-cap branch is checked
+        // before the WP2.6 mode switch and therefore covers both engines.
+        fs::write(
+            dir.join("agent.toml"),
+            "[evolution]\ngvu_enabled = true\ngvu_cooldown_minutes = 0\nlegacy_soul_evolution = true\n",
+        )
+        .unwrap();
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let gvu = GvuLoop::new(db.path(), Some(24.0), Some(1));
+
+        // A perfectly reasonable patch — it is only its SIZE that breaks the cap.
+        let mut bulky = String::new();
+        for i in 0..12 {
+            bulky.push_str(&format!(
+                "- 新規則 {i}：跨部門請求先確認負責人與期限，再回覆時程。\n"
+            ));
+        }
+        let generator_reply = serde_json::json!({
+            "soul_patch": { "section": "回應風格", "op": "append_within", "content": bulky },
+            "proposed_changes": "add cross-team clarification rules",
+            "rationale": "repeated confusion about ownership",
+        })
+        .to_string();
+
+        let compressed = faithful_compression(&original);
+        let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = prompts.clone();
+
+        let outcome = gvu
+            .run(
+                "ceo-assistant",
+                &dir,
+                "trigger",
+                VersionMetrics::default(),
+                &[],
+                &[],
+                move |prompt: String| {
+                    let sink = sink.clone();
+                    let generator_reply = generator_reply.clone();
+                    let compressed = compressed.clone();
+                    async move {
+                        sink.lock().unwrap().push(prompt.clone());
+                        if prompt.starts_with("You are an evolution quality judge") {
+                            Ok(r#"{"approved": true, "score": 0.9, "feedback": "ok"}"#.to_string())
+                        } else if prompt.contains("SOUL.md CONSOLIDATION engine") {
+                            Ok(serde_json::json!({
+                                "consolidated_soul": compressed,
+                                "summary": "合併重複條目",
+                            })
+                            .to_string())
+                        } else {
+                            Ok(generator_reply)
+                        }
+                    }
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, GvuOutcome::Applied(_)),
+            "expected consolidation to run and apply, got {outcome:?}"
+        );
+
+        let calls = prompts.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|p| p.starts_with("You are the evolution engine for agent")),
+            "the ordinary generator must run first — SOUL.md was still under cap"
+        );
+        assert!(
+            calls.iter().any(|p| p.contains("SOUL.md CONSOLIDATION engine")),
+            "the cap-breaching proposal should have diverted into consolidate mode"
+        );
+
+        // The bulky proposal was NOT written; the compression was.
+        let after = fs::read_to_string(dir.join("SOUL.md")).unwrap();
+        assert!(!after.contains("新規則 0"), "the cap-breaching patch must not land");
+        assert!(after.len() < original.len());
+        assert!(!consolidate::is_over_cap(&after));
+        assert_eq!(identity_body(&after), identity_body(&original));
     }
 }
