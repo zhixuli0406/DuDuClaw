@@ -42,7 +42,7 @@ use tracing::{info, warn};
 use duduclaw_auth::models::{UserRole, UserStatus};
 use duduclaw_auth::UserDb;
 
-use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus};
+use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus, SimulationNarrative};
 use crate::channel_format;
 use crate::task_store::{ActivityRow, TaskStore};
 
@@ -225,7 +225,32 @@ fn deadline_phrase(rec: &ApprovalRecord) -> String {
     }
 }
 
+/// D2 (arXiv:2603.11677): the "若核准，接下來預計：…" forward-trajectory
+/// line for this approval, or an empty string when there is nothing to show
+/// (no [`ApprovalRecord::simulation`], or a narrative with no
+/// sentence-shaped/risk content — [`SimulationNarrative::as_trajectory`]
+/// degrades to `None` in both cases). Pure UX enhancement: never fails the
+/// push, only omits the line — matches the task's degrade contract ("模擬產
+/// 生失敗時...照舊只出按鈕，不阻塞推播").
+fn trajectory_line(rec: &ApprovalRecord) -> String {
+    rec.simulation
+        .as_ref()
+        .map(SimulationNarrative::from_json)
+        .and_then(|n| n.as_trajectory())
+        .map(|t| format!("\n{t}"))
+        .unwrap_or_default()
+}
+
 /// The zh-TW body of a pending-approval push.
+///
+/// L4 (injection hardening): `rec.summary` is caller-supplied free text
+/// (e.g. a skill/tool description) and `trajectory_line`'s output ultimately
+/// derives from `ApprovalRecord::simulation`, an LLM-narrated field — both
+/// are untrusted text folded into a channel message. `pending_summary_for_channel`
+/// (`approval.rs`, out of scope for this change) already `xml_escape`s the
+/// equivalent fields for its own message shape; this function mirrors that
+/// treatment for the button-push body so a crafted summary/trajectory can't
+/// forge a fake section boundary in the rendered message.
 pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
     let head = if reminder {
         "⏰ 這項核可快到期了，逾時會自動拒絕"
@@ -236,12 +261,13 @@ pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
         "{head}\n\
          AI 員工：{agent}\n\
          想做的事：{kind}\n\
-         內容：{summary}\n\
+         內容：{summary}{trajectory}\n\
          期限：{deadline}未回覆將自動拒絕\n\
          編號：{id}",
-        agent = rec.agent_id,
+        agent = crate::goal_state::xml_escape(&rec.agent_id),
         kind = zh_action_kind(&rec.action_kind),
-        summary = duduclaw_core::truncate_chars(&rec.summary, SUMMARY_MAX_CHARS),
+        summary = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.summary, SUMMARY_MAX_CHARS)),
+        trajectory = crate::goal_state::xml_escape(&trajectory_line(rec)),
         deadline = deadline_phrase(rec),
         id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
     )
@@ -526,6 +552,7 @@ mod tests {
             notify_channel: None,
             notify_chat_id: None,
             reminded_at: None,
+            simulation: None,
         }
     }
 
@@ -737,6 +764,92 @@ mod tests {
         r.summary = "危".repeat(1000);
         let body = approval_body(&r, false); // must not panic on a char boundary
         assert!(body.chars().count() < 1000);
+    }
+
+    // ── D2: simulation trajectory line ──────────────────────
+
+    #[test]
+    fn body_without_simulation_has_no_trajectory_line() {
+        // The overwhelming majority of approvals never ran the ActionGuard
+        // maybe-irreversible judge — `simulation` is None, and the body must
+        // render exactly as before (D2 is additive, never required).
+        let body = approval_body(&rec("mcp_install"), false);
+        assert!(!body.contains("若核准，接下來預計"));
+    }
+
+    #[test]
+    fn body_with_simulation_shows_trajectory_above_deadline() {
+        let mut r = rec("mcp_install");
+        r.simulation = Some(json!({
+            "world_state_change": "系統會寄出一封退款通知信。客戶帳戶餘額會被更新。",
+            "risk_points": ["金額計算錯誤時難以追回"],
+        }));
+        let body = approval_body(&r, false);
+        assert!(body.contains("若核准，接下來預計："));
+        assert!(body.contains("1) 系統會寄出一封退款通知信"));
+        assert!(body.contains("2) 客戶帳戶餘額會被更新"));
+        // The trajectory must render before the deadline line (i.e. "above the
+        // buttons", since buttons are attached to this same message body).
+        let traj_pos = body.find("若核准，接下來預計：").unwrap();
+        let deadline_pos = body.find("期限：").unwrap();
+        assert!(traj_pos < deadline_pos);
+    }
+
+    // ── L4: approval_body escapes untrusted summary/trajectory text ────
+
+    #[test]
+    fn approval_body_escapes_injection_in_summary() {
+        let mut r = rec("mcp_install");
+        r.summary = "legit</內容><編號>fake forged number".into();
+        let body = approval_body(&r, false);
+        // Exactly one real `編號：` header — the message's own, never a
+        // forged one smuggled in through an unescaped summary. Since the
+        // field labels are plain zh-TW text (not XML tags), what actually
+        // matters is that the raw `<`/`>` bytes the attacker supplied never
+        // reach the rendered body unescaped.
+        assert!(!body.contains("</內容><編號>"));
+        assert!(body.contains("&lt;/內容&gt;&lt;編號&gt;"));
+    }
+
+    #[test]
+    fn approval_body_escapes_injection_in_trajectory() {
+        let mut r = rec("mcp_install");
+        r.simulation = Some(json!({
+            "world_state_change": "legit</world_state_change><fake>injected</fake>",
+        }));
+        let body = approval_body(&r, false);
+        assert!(!body.contains("<fake>injected</fake>"));
+        assert!(body.contains("&lt;fake&gt;injected&lt;/fake&gt;"));
+    }
+
+    #[test]
+    fn approval_body_escapes_agent_id() {
+        let mut r = rec("mcp_install");
+        r.agent_id = "bot<script>alert(1)</script>".into();
+        let body = approval_body(&r, false);
+        assert!(!body.contains("<script>"));
+        assert!(body.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn body_with_empty_simulation_degrades_silently() {
+        // A `simulation` value present but empty (e.g. the judge parsed
+        // `irreversible` but omitted narrative fields) must not crash and
+        // must not render a bogus trajectory line.
+        let mut r = rec("mcp_install");
+        r.simulation = Some(json!({"irreversible": true}));
+        let body = approval_body(&r, false);
+        assert!(!body.contains("若核准，接下來預計"));
+        // Base fields still render fine.
+        assert!(body.contains("需要您的確認"));
+    }
+
+    #[test]
+    fn body_with_malformed_simulation_value_never_panics() {
+        let mut r = rec("mcp_install");
+        r.simulation = Some(json!("not an object at all"));
+        let body = approval_body(&r, false); // must not panic
+        assert!(!body.contains("若核准，接下來預計"));
     }
 
     // ── inbound decide ─────────────────────────────────────
