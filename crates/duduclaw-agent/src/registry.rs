@@ -749,3 +749,133 @@ mod load_skills_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod duplicate_name_scan_tests {
+    //! WP22 T4 — `AgentRegistry::scan` collapses two directories that share
+    //! an `[agent] name` (last-wins into the `name`-keyed map) and logs a
+    //! `tracing::warn!` naming both directories rather than either silently
+    //! dropping one or panicking. Callers that need to *detect* (not just
+    //! survive) the collision — `delegation.set` in duduclaw-gateway — do not
+    //! use this registry for that; they scan `agents/` directly, precisely
+    //! because this last-wins collapse already discards the information they
+    //! need. This module proves the collapse itself stays safe.
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A full, deserializable `agent.toml` — anything short of every
+    /// non-`#[serde(default)]` section (`agent`/`model`/`container`/
+    /// `heartbeat`/`budget`/`permissions`/`evolution`) fails to parse and the
+    /// directory is skipped by `scan()` before it ever reaches the
+    /// name-collision path, which would make this fixture test nothing.
+    fn write_full_agent_toml(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!(
+                r#"[agent]
+name = "{name}"
+display_name = "{name}"
+role = "specialist"
+status = "active"
+trigger = "@{name}"
+reports_to = ""
+icon = "🤖"
+department = ""
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 5000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = ["*"]
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = true
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Two directories, same `[agent] name` — `scan()` must complete without
+    /// panicking or erroring, and the registry ends up with exactly one
+    /// `name`-keyed entry (not two, not zero) pointing at *some* directory.
+    /// The `tracing::warn!` this triggers (see `scan()` around the
+    /// `loaded.get(&name)` check) is exercised by this same call; asserting
+    /// on log content would require a subscriber harness this crate doesn't
+    /// otherwise carry, so the behavioural contract — safe, non-panicking,
+    /// deterministic single-entry collapse — is what's pinned here.
+    #[tokio::test]
+    async fn scan_survives_duplicate_agent_name_across_two_directories() {
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        write_full_agent_toml(&agents_dir.join("sales-old"), "sales-lead");
+        write_full_agent_toml(&agents_dir.join("sales-new"), "sales-lead");
+
+        let mut registry = AgentRegistry::new(agents_dir);
+        let result = registry.scan().await;
+        assert!(result.is_ok(), "duplicate name must not fail the scan: {result:?}");
+
+        let matches: Vec<&LoadedAgent> = registry
+            .list()
+            .into_iter()
+            .filter(|a| a.config.agent.name == "sales-lead")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "last-wins collapse must leave exactly one entry, not {}",
+            matches.len()
+        );
+        assert!(
+            matches[0].dir.ends_with("sales-old") || matches[0].dir.ends_with("sales-new"),
+            "surviving entry must point at one of the two real directories: {:?}",
+            matches[0].dir
+        );
+    }
+
+    /// Control: distinct names across distinct directories are unaffected —
+    /// the collision path must not fire on non-duplicates.
+    #[tokio::test]
+    async fn scan_keeps_both_agents_when_names_differ() {
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        write_full_agent_toml(&agents_dir.join("sales"), "sales-lead");
+        write_full_agent_toml(&agents_dir.join("warehouse"), "warehouse-lead");
+
+        let mut registry = AgentRegistry::new(agents_dir);
+        registry.scan().await.unwrap();
+
+        let names: std::collections::HashSet<&str> =
+            registry.list().iter().map(|a| a.config.agent.name.as_str()).collect();
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["sales-lead", "warehouse-lead"])
+        );
+    }
+}

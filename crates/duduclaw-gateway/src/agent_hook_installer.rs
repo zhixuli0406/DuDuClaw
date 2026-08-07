@@ -6,6 +6,13 @@
 //! an agent-structure file (`agent.toml` / `SOUL.md` / etc.) outside the
 //! canonical `<home>/agents/<name>/` tree.
 //!
+//! WP1.1 (SOUL.md 唯讀化, `DESIGN-evolution-v3-aee.md` §1.9.2 C3): the same
+//! hook additionally refuses `SOUL.md` writes *inside* the canonical tree
+//! when the target is the caller's own agent directory
+//! (`duduclaw_core::check_own_soul_write`) — personality is
+//! operator-managed (dashboard), not self-writable even in the right
+//! location. See `duduclaw_core::GuardDecision::BlockedOwnSoulWrite`.
+//!
 //! This is the enforcement layer for Option 3 of the "missing agents on
 //! dashboard" bug: agents must use the `create_agent` MCP tool to scaffold
 //! new agents — the raw Write tool is hard-gated.
@@ -80,8 +87,22 @@ pub async fn ensure_agent_hook_settings(
         _ => json!({}),
     };
 
+    // WP22 T2 fix — the hook subprocess does not inherit `DUDUCLAW_AGENT_ID`
+    // (that env is only injected into the MCP server child process), so the
+    // caller-scope rule in `check_caller_scope` was inert in production. The
+    // agent directory's basename is embedded directly into the installed
+    // command instead: `agent_dir` is always `<home>/agents/<id>/` (or the
+    // `.ephemeral/<eph-id>/` scaffold), so its file name IS the identity the
+    // hook should claim — no env round-trip required, and the agent cannot
+    // forge it without rewriting its own `.claude/settings.json`, which is
+    // itself frozen by `ProtectedSurface::HookSettings`.
+    let agent_id = agent_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+
     // Merge our hook descriptor into hooks.PreToolUse.
-    let updated = merge_agent_file_guard_hook(&mut root, duduclaw_bin);
+    let updated = merge_agent_file_guard_hook(&mut root, duduclaw_bin, agent_id);
     if !updated {
         debug!(path = %settings_path.display(), "Hook already up to date");
         return Ok(());
@@ -109,7 +130,16 @@ pub async fn ensure_agent_hook_settings(
 ///
 /// Returns `true` if anything changed (caller should persist), `false`
 /// if the hook was already present and up to date.
-fn merge_agent_file_guard_hook(root: &mut Value, duduclaw_bin: &Path) -> bool {
+///
+/// # Upgrading a stale entry (WP22 T2)
+///
+/// No special-case code is needed to migrate a pre-WP22-T2 entry (installed
+/// with the old `"<bin>" hook agent-file-guard` command, no `--agent`): the
+/// lookup below identifies "our" entry purely by [`HOOK_TAG`], then compares
+/// it against `desired_entry` for byte-for-byte equality. An old-format
+/// command never equals the new `--agent`-suffixed one, so the existing
+/// "found but different → overwrite in place" branch upgrades it for free.
+fn merge_agent_file_guard_hook(root: &mut Value, duduclaw_bin: &Path, agent_id: &str) -> bool {
     let hooks = root
         .as_object_mut()
         .expect("root must be object — checked by caller")
@@ -130,7 +160,7 @@ fn merge_agent_file_guard_hook(root: &mut Value, duduclaw_bin: &Path) -> bool {
         *pre_tool_use = json!([]);
     }
 
-    let desired_command = build_hook_command(duduclaw_bin);
+    let desired_command = build_hook_command(duduclaw_bin, agent_id);
     // Bash is included so the guard can catch agents that bypass Write/Edit
     // by running `mkdir -p /project/.claude/agents/foo` or `cat > .../agent.toml`
     // via the shell. The CLI handler dispatches on tool name internally.
@@ -167,13 +197,30 @@ fn merge_agent_file_guard_hook(root: &mut Value, duduclaw_bin: &Path) -> bool {
 ///
 /// Uses the absolute path to the `duduclaw` binary so it works regardless
 /// of the agent's PATH or cwd. No shell metacharacters are injected.
-fn build_hook_command(duduclaw_bin: &Path) -> String {
+///
+/// # WP22 T2 — self-identifying hook command
+///
+/// `DUDUCLAW_AGENT_ID` never reaches this subprocess in production (only the
+/// MCP server child process gets it), which left `check_caller_scope`
+/// permanently inert. The fix bakes the identity into the installed command
+/// itself as `--agent <agent_id>`: `resolve_hook_caller` (CLI side) reads it
+/// arg-first, env-second. `agent_id` is only appended when it already has the
+/// canonical agent-id shape ([`duduclaw_core::is_valid_agent_id`]) — an empty
+/// or malformed directory name (should not happen for a real agent directory)
+/// falls back to the pre-T2 command rather than injecting an unquoted-looking
+/// oddity, which is no worse than the previous inert state.
+fn build_hook_command(duduclaw_bin: &Path, agent_id: &str) -> String {
     // Claude Code hook commands are executed via the user's shell, so
-    // quote the binary path defensively in case it contains spaces.
-    format!(
-        "\"{}\" hook agent-file-guard",
-        duduclaw_bin.display()
-    )
+    // quote both the binary path and the agent id defensively — the path
+    // may contain spaces, and the id, while already validated, gets the
+    // same treatment on general principle (defense in depth, not because
+    // `is_valid_agent_id` currently allows anything shell-special).
+    let base = format!("\"{}\" hook agent-file-guard", duduclaw_bin.display());
+    if duduclaw_core::is_valid_agent_id(agent_id) {
+        format!("{base} --agent \"{agent_id}\"")
+    } else {
+        base
+    }
 }
 
 /// Resolve the absolute path to the currently running `duduclaw` binary.
@@ -213,12 +260,11 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0][HOOK_TAG], HOOK_ID);
         assert_eq!(arr[0]["matcher"], "Write|Edit|MultiEdit|Bash");
-        assert!(
-            arr[0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap()
-                .contains("hook agent-file-guard")
-        );
+        let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("hook agent-file-guard"));
+        // WP22 T2 — the agent directory's own basename is baked into the
+        // command so the hook can self-identify without relying on env.
+        assert!(cmd.contains("--agent \"myagent\""), "command: {cmd}");
     }
 
     #[tokio::test]
@@ -340,9 +386,91 @@ mod tests {
 
     #[test]
     fn build_hook_command_quotes_path() {
-        let cmd = build_hook_command(Path::new("/path with spaces/duduclaw"));
+        let cmd = build_hook_command(Path::new("/path with spaces/duduclaw"), "myagent");
         assert!(cmd.starts_with('"'));
         assert!(cmd.contains("/path with spaces/duduclaw"));
         assert!(cmd.contains("hook agent-file-guard"));
+    }
+
+    #[test]
+    fn build_hook_command_quotes_the_agent_id_too() {
+        let cmd = build_hook_command(Path::new("/usr/local/bin/duduclaw"), "sales-rep");
+        assert!(cmd.contains("--agent \"sales-rep\""), "command: {cmd}");
+    }
+
+    #[test]
+    fn build_hook_command_falls_back_when_agent_id_is_invalid() {
+        // Empty / malformed directory basenames (should not happen for a real
+        // agent directory, but the installer must not inject garbage into a
+        // shell command) fall back to the pre-T2 shape — no worse than the
+        // inert state this fix replaces.
+        for bad_id in ["", "has spaces", "has/slash", "semi;colon"] {
+            let cmd = build_hook_command(Path::new("/usr/local/bin/duduclaw"), bad_id);
+            assert!(!cmd.contains("--agent"), "id={bad_id:?} cmd={cmd}");
+            assert!(cmd.contains("hook agent-file-guard"));
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_pre_wp22_t2_entry_missing_the_agent_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("myagent");
+        std::fs::create_dir_all(agent_dir.join(".claude")).unwrap();
+
+        // Simulate a settings.json installed by the old installer: our tag
+        // is present, but the command has no `--agent` suffix.
+        let stale = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    HOOK_TAG: HOOK_ID,
+                    "matcher": "Write|Edit|MultiEdit|Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "\"/usr/local/bin/duduclaw\" hook agent-file-guard",
+                    }]
+                }]
+            }
+        });
+        std::fs::write(
+            agent_dir.join(".claude/settings.json"),
+            serde_json::to_string_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+
+        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+
+        let settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let arr = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "must upgrade in place, not append a duplicate");
+        let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("--agent \"myagent\""), "command: {cmd}");
+    }
+
+    #[tokio::test]
+    async fn installed_hook_command_carries_the_agent_flag_and_the_settings_file_is_a_protected_surface(
+    ) {
+        // Integration assertion tying WP22 T2's two halves together: the
+        // installed command self-identifies, AND the file that carries it
+        // cannot be rewritten by the agent it names (frozen outright by
+        // `ProtectedSurface::HookSettings`).
+        let home = tempfile::tempdir().unwrap();
+        let agent_dir = home.path().join("agents").join("sales-rep");
+        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+
+        let settings_path = agent_dir.join(".claude/settings.json");
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.contains("--agent \"sales-rep\""), "command: {cmd}");
+
+        assert_eq!(
+            duduclaw_core::classify_identity_surface(&settings_path, home.path()),
+            Some(duduclaw_core::ProtectedSurface::HookSettings),
+        );
     }
 }

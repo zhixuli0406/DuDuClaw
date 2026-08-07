@@ -73,7 +73,12 @@ const MAX_QUEUE_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// Sender/origin identity recorded on bus tasks submitted via the A2A surface.
 /// Lowercase-alphanumeric-with-hyphens so it passes `is_valid_agent_id`-style
 /// filters applied to envelope fields elsewhere.
-pub(crate) const A2A_SENDER: &str = "a2a-client";
+///
+/// Aliased to the core constant rather than re-spelled: WP21's dispatcher gate
+/// decides whether to trust an inbound A2A task by comparing this exact string
+/// against [`duduclaw_core::ACP_CLIENT_SENDER`] (`[acp] trusted = true`). Two
+/// independent literals could drift apart and silently strand the opt-in.
+pub(crate) const A2A_SENDER: &str = duduclaw_core::ACP_CLIENT_SENDER;
 
 // ── Params parsing ──────────────────────────────────────────
 
@@ -91,6 +96,13 @@ pub(crate) struct ParsedSendMessage {
     /// Whether `configuration.blocking = true` was requested (unsupported —
     /// noted in metadata; the response is still `submitted`).
     pub blocking_requested: bool,
+    /// `message.metadata.delegation_depth`, carried onto the bus task's
+    /// `delegation_depth` field (WP21 T7, design doc §2.6). Defaults to `0`
+    /// when absent or invalid (missing, negative, non-integer); clamped to
+    /// [`duduclaw_core::MAX_DELEGATION_DEPTH`] when it exceeds the ceiling —
+    /// never rejected, since an external client overshooting the cap is not a
+    /// protocol error, just a value the dispatcher will re-cap regardless.
+    pub delegation_depth: u8,
 }
 
 /// Parse/validation failure → spec-shaped JSON-RPC error.
@@ -205,24 +217,53 @@ pub(crate) fn parse_message_send_params(
         .and_then(|b| b.as_bool())
         .unwrap_or(false);
 
+    let delegation_depth = parse_delegation_depth(message);
+
     Ok(ParsedSendMessage {
         text,
         context_id,
         client_message_id,
         skipped_parts,
         blocking_requested,
+        delegation_depth,
     })
+}
+
+/// Read `message.metadata.delegation_depth` (WP21 T7) — the A2A v1.0 Message
+/// object's optional free-form `metadata` map is the natural home for a
+/// DuDuClaw-specific extension field, same spelling as the bus envelope's own
+/// `delegation_depth` key.
+///
+/// Fail-closed to `0`, never an error: missing `metadata`, a missing key, a
+/// non-integer JSON value (string/bool/float — `serde_json::Value::as_i64`
+/// only accepts values parsed as integers), or a negative value are all
+/// treated as "no depth supplied". A value above the project ceiling is
+/// clamped rather than rejected (see the field doc on
+/// [`ParsedSendMessage::delegation_depth`]).
+fn parse_delegation_depth(message: &Value) -> u8 {
+    message
+        .get("metadata")
+        .and_then(|m| m.get("delegation_depth"))
+        .and_then(|v| v.as_i64())
+        .filter(|d| *d >= 0)
+        .map(|d| d.min(duduclaw_core::MAX_DELEGATION_DEPTH as i64) as u8)
+        .unwrap_or(0)
 }
 
 // ── Bus enqueue ─────────────────────────────────────────────
 
 /// Build the exact `agent_message` envelope the gateway AgentDispatcher
 /// consumes (see module docs for the field-for-field schema).
+///
+/// `delegation_depth` defaults to `0` unless the caller's `message.metadata`
+/// carried one (see [`parse_delegation_depth`], WP21 T7) — it is never
+/// re-derived here so this stays a pure envelope builder.
 pub(crate) fn build_bus_task_json(
     message_id: &str,
     agent_id: &str,
     payload: &str,
     timestamp: &str,
+    delegation_depth: u8,
 ) -> Value {
     serde_json::json!({
         "type": "agent_message",
@@ -230,7 +271,7 @@ pub(crate) fn build_bus_task_json(
         "agent_id": agent_id,
         "payload": payload,
         "timestamp": timestamp,
-        "delegation_depth": 0,
+        "delegation_depth": delegation_depth,
         "origin_agent": A2A_SENDER,
         "sender_agent": A2A_SENDER,
     })
@@ -382,7 +423,13 @@ pub(crate) async fn enqueue_and_respond(
 ) -> Value {
     let task_id = uuid::Uuid::new_v4().to_string();
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let entry = build_bus_task_json(&task_id, target_agent, &parsed.text, &timestamp);
+    let entry = build_bus_task_json(
+        &task_id,
+        target_agent,
+        &parsed.text,
+        &timestamp,
+        parsed.delegation_depth,
+    );
     let line = entry.to_string();
 
     let home = home_dir.to_path_buf();

@@ -315,6 +315,94 @@ mod message_send_tests {
         assert_eq!(response["error"]["code"], -32004);
     }
 
+    // ── delegation_depth carry-through (WP21 T7) ─────────────
+
+    #[test]
+    fn parse_delegation_depth_absent_defaults_to_zero() {
+        let parsed = parse_message_send_params(&send_params(vec![text_part("hi")]))
+            .expect("valid params parse");
+        assert_eq!(parsed.delegation_depth, 0);
+    }
+
+    #[test]
+    fn parse_delegation_depth_carries_metadata_value() {
+        let params = serde_json::json!({
+            "message": {
+                "role": "user",
+                "parts": [text_part("hi")],
+                "metadata": { "delegation_depth": 3 },
+            }
+        });
+        let parsed = parse_message_send_params(&params).expect("parses");
+        assert_eq!(parsed.delegation_depth, 3);
+    }
+
+    #[test]
+    fn parse_delegation_depth_invalid_values_default_to_zero() {
+        for metadata in [
+            serde_json::json!({ "delegation_depth": -1 }),
+            serde_json::json!({ "delegation_depth": "3" }),
+            serde_json::json!({ "delegation_depth": 2.5 }),
+            serde_json::json!({ "delegation_depth": true }),
+            serde_json::json!({}),
+        ] {
+            let params = serde_json::json!({
+                "message": {
+                    "role": "user",
+                    "parts": [text_part("hi")],
+                    "metadata": metadata,
+                }
+            });
+            let parsed = parse_message_send_params(&params).expect("parses");
+            assert_eq!(
+                parsed.delegation_depth, 0,
+                "metadata {metadata:?} must default to depth 0"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_delegation_depth_clamps_to_project_ceiling() {
+        let params = serde_json::json!({
+            "message": {
+                "role": "user",
+                "parts": [text_part("hi")],
+                "metadata": { "delegation_depth": 999 },
+            }
+        });
+        let parsed = parse_message_send_params(&params).expect("parses");
+        assert_eq!(
+            parsed.delegation_depth,
+            duduclaw_core::MAX_DELEGATION_DEPTH,
+            "value above the ceiling must clamp, not pass through or error"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_and_respond_writes_carried_delegation_depth_to_bus_line() {
+        let home = tempfile::TempDir::new().unwrap();
+        let mut index = BusTaskIndex::default();
+        let id = serde_json::json!(41);
+
+        let mut carried = parsed("deep delegation");
+        carried.delegation_depth = 3;
+
+        enqueue_and_respond(
+            &id,
+            &carried,
+            "default",
+            "agent-main",
+            home.path(),
+            &mut index,
+        )
+        .await;
+
+        let content =
+            std::fs::read_to_string(home.path().join("bus_queue.jsonl")).expect("queue written");
+        let line: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(line["delegation_depth"], 3);
+    }
+
     // ── Bus task schema golden ──────────────────────────────
 
     #[test]
@@ -325,7 +413,7 @@ mod message_send_tests {
         // Optional response-side fields (response, in_reply_to, coalesced_ids,
         // turn_id, session_id) must be ABSENT on submissions, matching the
         // dispatcher's own skip_serializing_if behavior.
-        let v = build_bus_task_json("task-1", "agent-x", "do the thing", "2026-07-05T00:00:00Z");
+        let v = build_bus_task_json("task-1", "agent-x", "do the thing", "2026-07-05T00:00:00Z", 0);
         let obj = v.as_object().expect("object");
 
         assert_eq!(obj.len(), 8, "exactly the 8 submission fields, got: {obj:?}");
@@ -347,8 +435,8 @@ mod message_send_tests {
     #[test]
     fn append_bus_task_writes_whole_lines_and_takes_advisory_lock() {
         let home = tempfile::TempDir::new().unwrap();
-        let line1 = build_bus_task_json("t1", "agent-x", "one", "ts").to_string();
-        let line2 = build_bus_task_json("t2", "agent-x", "two", "ts").to_string();
+        let line1 = build_bus_task_json("t1", "agent-x", "one", "ts", 0).to_string();
+        let line2 = build_bus_task_json("t2", "agent-x", "two", "ts", 0).to_string();
         append_bus_task_sync(home.path(), &line1).expect("first append");
         append_bus_task_sync(home.path(), &line2).expect("second append");
 
@@ -371,7 +459,7 @@ mod message_send_tests {
 
     #[test]
     fn probe_maps_queue_observations_to_states() {
-        let queued = build_bus_task_json("t-queued", "agent-x", "hi", "ts").to_string();
+        let queued = build_bus_task_json("t-queued", "agent-x", "hi", "ts", 0).to_string();
         let response = serde_json::json!({
             "type": "agent_response",
             "message_id": "resp-1",
@@ -405,6 +493,7 @@ mod message_send_tests {
             client_message_id: None,
             skipped_parts: 0,
             blocking_requested: false,
+            delegation_depth: 0,
         }
     }
 

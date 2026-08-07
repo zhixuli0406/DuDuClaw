@@ -762,8 +762,9 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
                 qdb.execute(
                     "INSERT INTO message_queue \
                      (id, sender, target, payload, status, retry_count, delegation_depth, \
-                      created_at) \
-                     VALUES (?1, 'heartbeat-scheduler', ?2, ?3, 'pending', 0, 0, ?4)",
+                      sender_agent, origin_agent, created_at) \
+                     VALUES (?1, 'heartbeat-scheduler', ?2, ?3, 'pending', 0, 0, \
+                      'heartbeat', 'heartbeat', ?4)",
                     rusqlite::params![&id, &agent, &payload, &now],
                 )
                 .map_err(|e| format!("enqueue todo wake-up: {e}"))?;
@@ -800,8 +801,9 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
                 qdb.execute(
                     "INSERT INTO message_queue \
                      (id, sender, target, payload, status, retry_count, delegation_depth, \
-                      created_at) \
-                     VALUES (?1, 'heartbeat-scheduler', ?2, ?3, 'pending', 0, 0, ?4)",
+                      sender_agent, origin_agent, created_at) \
+                     VALUES (?1, 'heartbeat-scheduler', ?2, ?3, 'pending', 0, 0, \
+                      'heartbeat', 'heartbeat', ?4)",
                     rusqlite::params![&id, &agent, &payload, &now],
                 )
                 .map_err(|e| format!("enqueue stall wake-up: {e}"))?;
@@ -1347,5 +1349,138 @@ mod tests {
             summary.contains("drift:") && summary.contains("current=") && summary.contains("expected="),
             "drift audit summary should include current + expected hash; got: {summary}"
         );
+    }
+
+    // ── WP21 collateral fix: `poll_assigned_tasks` enqueues wake-ups by
+    //    writing raw SQL directly to `message_queue`. The v1.53 dispatcher
+    //    delegation gate (`delegation_gate.rs`) will flip its "no sender
+    //    stamped" branch from ALLOW to DENY, so every row this function
+    //    inserts must carry `sender_agent`/`origin_agent = "heartbeat"` (the
+    //    `duduclaw_core::SYSTEM_SENDERS` spelling — NOT the `sender` column's
+    //    `heartbeat-scheduler`, which stays as-is for existing queries/UI). ──
+
+    /// Minimal `tasks.db` schema covering exactly the columns
+    /// `poll_assigned_tasks`'s two queries touch (real schema in
+    /// `duduclaw-gateway/src/task_store.rs` has far more; this mirrors just
+    /// what's read).
+    fn init_test_tasks_db(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                 id          TEXT PRIMARY KEY,
+                 title       TEXT NOT NULL,
+                 status      TEXT NOT NULL,
+                 priority    TEXT NOT NULL DEFAULT 'medium',
+                 assigned_to TEXT NOT NULL,
+                 goal_mode   INTEGER,
+                 created_at  TEXT NOT NULL,
+                 updated_at  TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    }
+
+    /// Minimal `message_queue.db` schema mirroring the production shape in
+    /// `duduclaw-gateway/src/message_queue.rs` (subset — only the columns
+    /// `poll_assigned_tasks`'s INSERT and this test's read-back use).
+    fn init_test_queue_db(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message_queue (
+                 id               TEXT PRIMARY KEY,
+                 sender           TEXT NOT NULL,
+                 target           TEXT NOT NULL,
+                 payload          TEXT NOT NULL,
+                 status           TEXT NOT NULL,
+                 retry_count      INTEGER NOT NULL DEFAULT 0,
+                 delegation_depth INTEGER NOT NULL DEFAULT 0,
+                 origin_agent     TEXT,
+                 sender_agent     TEXT,
+                 created_at       TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_assigned_tasks_stamps_heartbeat_sender_for_todo_wakeup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        let tasks_path = home.join("tasks.db");
+        let queue_path = home.join("message_queue.db");
+        init_test_tasks_db(&tasks_path);
+        init_test_queue_db(&queue_path);
+
+        let now = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = rusqlite::Connection::open(&tasks_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, priority, assigned_to, goal_mode, created_at, updated_at) \
+                 VALUES ('t1', '待辦任務', 'todo', 'high', 'worker', 0, ?1, ?1)",
+                rusqlite::params![&now],
+            )
+            .unwrap();
+        }
+
+        poll_assigned_tasks(home, "worker").await.unwrap();
+
+        let conn = rusqlite::Connection::open(&queue_path).unwrap();
+        let (sender, sender_agent, origin_agent): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT sender, sender_agent, origin_agent FROM message_queue WHERE target = 'worker'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(sender, "heartbeat-scheduler", "sender column stays unchanged");
+        assert_eq!(
+            sender_agent.as_deref(),
+            Some("heartbeat"),
+            "sender_agent must be stamped with the SYSTEM_SENDERS spelling"
+        );
+        assert_eq!(
+            origin_agent.as_deref(),
+            Some("heartbeat"),
+            "origin_agent must be stamped with the SYSTEM_SENDERS spelling"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_assigned_tasks_stamps_heartbeat_sender_for_stall_wakeup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        let tasks_path = home.join("tasks.db");
+        let queue_path = home.join("message_queue.db");
+        init_test_tasks_db(&tasks_path);
+        init_test_queue_db(&queue_path);
+
+        // updated_at 40 minutes ago — past the 30-minute stall cutoff.
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(40)).to_rfc3339();
+        {
+            let conn = rusqlite::Connection::open(&tasks_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, priority, assigned_to, goal_mode, created_at, updated_at) \
+                 VALUES ('t2', '停滯任務', 'in_progress', 'medium', 'worker', 0, ?1, ?1)",
+                rusqlite::params![&stale],
+            )
+            .unwrap();
+        }
+
+        poll_assigned_tasks(home, "worker").await.unwrap();
+
+        let conn = rusqlite::Connection::open(&queue_path).unwrap();
+        let (sender_agent, origin_agent): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT sender_agent, origin_agent FROM message_queue WHERE target = 'worker'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(sender_agent.as_deref(), Some("heartbeat"));
+        assert_eq!(origin_agent.as_deref(), Some("heartbeat"));
     }
 }

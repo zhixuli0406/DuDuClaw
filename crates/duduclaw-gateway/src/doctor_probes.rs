@@ -80,9 +80,14 @@ pub async fn mcp_cold_start_probe(home: &Path) -> McpColdStartReport {
         .iter()
         .any(|(k, _)| k == duduclaw_core::ENV_MCP_API_KEY);
 
+    // The probe claims `doctor-probe` and signs it with the install's
+    // `identity.key` (WP21 debt ⑧) when one exists, so that flipping
+    // `[delegation] require_identity_token = true` does not turn a healthy
+    // MCP server into a red doctor result. Signed ≠ authorized: `doctor-probe`
+    // is no agent's ancestor and no system sender, so it still cannot delegate.
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.arg("mcp-server")
-        .env(duduclaw_core::ENV_AGENT_ID, "doctor-probe")
+        .envs(duduclaw_core::agent_identity_env_vars(home, "doctor-probe"))
         .envs(forward.iter().map(|(k, v)| (k.clone(), v.clone())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

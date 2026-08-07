@@ -42,6 +42,91 @@ pub enum GuardDecision {
         file_name: String,
         attempted_path: PathBuf,
     },
+    /// WP21 欠帳 ②: the write would change `[agent] reports_to` / `department`
+    /// / `name` in a canonical `agent.toml` — the very fields the A2A
+    /// delegation predicate and the whitelist resolver read. Only
+    /// `agent_update` / the dashboard (which carry the C4 authorization gate)
+    /// may change them.
+    BlockedOrgFieldChange {
+        file_name: String,
+        attempted_path: PathBuf,
+        /// Human-readable `field：「before」→「after」` entries.
+        changed: Vec<String>,
+    },
+    /// WP21 欠帳 ②: the write would change a protected section of
+    /// `<home>/config.toml` (`[delegation]` / `[acp]`) — the policy and trust
+    /// switches the delegation gate itself consults.
+    BlockedProtectedSection {
+        file_name: String,
+        attempted_path: PathBuf,
+        changed: Vec<String>,
+    },
+    /// WP21 欠帳 ②: the write targets a delegation-authority file but its
+    /// effect could not be verified (unparseable TOML on either side, or an
+    /// edit whose resulting content could not be reconstructed). Fail closed.
+    BlockedUnverifiable {
+        file_name: String,
+        attempted_path: PathBuf,
+        reason: String,
+    },
+    /// WP21 欠帳 ②: a Bash command that looks like it writes a
+    /// delegation-authority file. Heuristic — see
+    /// [`crate::org_field_guard::check_bash_protected_write`].
+    BlockedBashProtectedWrite {
+        file_name: String,
+        /// The write-shaped fragment that matched (for the message).
+        verb: String,
+    },
+    /// WP21 review follow-up: the write targets a file that decides *who the
+    /// caller is* (`identity.key`, an agent's `.mcp.json` identity env) or
+    /// *whether this guard runs at all* (`.claude/settings.json`). See
+    /// [`crate::org_field_guard::check_identity_surface_write`].
+    BlockedIdentitySurface {
+        file_name: String,
+        attempted_path: PathBuf,
+        reason: String,
+    },
+    /// WP22 T2: the write targets **another** agent's directory. The WP21
+    /// content guards had no notion of *who* was writing, so agent A could
+    /// still rewrite agent B's `SOUL.md` / `MEMORY.md` / anything else. See
+    /// [`crate::org_field_guard::check_caller_scope`].
+    BlockedForeignAgentDir {
+        /// The caller's own agent id (from `DUDUCLAW_AGENT_ID`).
+        caller: String,
+        /// The agent directory that owns the target path.
+        owner: String,
+        attempted_path: PathBuf,
+    },
+    /// WP22 T2: `require_identity_token = true` and the caller's identity claim
+    /// failed verification — every write under `<home>/agents/` is refused,
+    /// because there is no trustworthy way to tell whose directory this is.
+    BlockedUntrustedCaller {
+        /// The (unverified) claimed id, for the operator-facing message.
+        caller: String,
+        attempted_path: PathBuf,
+    },
+    /// WP22 T2: an agent-identified caller tried to write `<home>/config.toml`.
+    /// WP21 only froze `[delegation]` / `[acp]`; the whole file is now off
+    /// limits to agents (every legitimate writer goes through Rust, not this
+    /// hook). Operators without an agent identity are unaffected.
+    BlockedHomeConfigWrite {
+        caller: String,
+        attempted_path: PathBuf,
+    },
+    /// WP1.1 C3 (SOUL.md 唯讀化, `DESIGN-evolution-v3-aee.md` §1.9.2): an
+    /// agent-identified caller tried to write `SOUL.md` inside its OWN agent
+    /// directory via Write/Edit/Bash. [`Self::BlockedForeignAgentDir`] only
+    /// covers *another* agent's directory — a caller writing inside its own
+    /// directory previously fell through as [`Self::NotAgentFile`]. SOUL.md
+    /// is now off-limits even to its owner: personality is operator-managed
+    /// (dashboard), mirroring the MCP-side `agent_update_soul` C2 gate. Not
+    /// gated by `can_modify_own_soul` — that flag is the C2 gate's only
+    /// escape hatch (design §1.9.2 C4); the one self-modification route is
+    /// the `agent_update_soul` MCP tool.
+    BlockedOwnSoulWrite {
+        caller: String,
+        attempted_path: PathBuf,
+    },
 }
 
 impl GuardDecision {
@@ -64,6 +149,80 @@ impl GuardDecision {
                  the dashboard and registry only recognise agents under ~/.duduclaw/agents/<name>/.",
                 file_name,
                 attempted_path.display()
+            )),
+            Self::BlockedOrgFieldChange { attempted_path, changed, .. } => Some(format!(
+                "已封鎖：組織欄位（name/reports_to/department）不可直接修改，請透過 agent_update 或儀表板調整。\n\
+                 檔案：{}\n\
+                 偵測到的變更：{}\n\
+                 原因：這些欄位是委派授權的判定依據，允許 agent 自行改寫等同自助提權。",
+                attempted_path.display(),
+                changed.join("；")
+            )),
+            Self::BlockedProtectedSection { attempted_path, changed, .. } => Some(format!(
+                "已封鎖：委派設定（config.toml 的 [delegation] / [acp] 段）不可直接修改，請透過儀表板或由管理者調整。\n\
+                 檔案：{}\n\
+                 偵測到的變更：{}",
+                attempted_path.display(),
+                changed.join("；")
+            )),
+            Self::BlockedUnverifiable { file_name, attempted_path, reason } => Some(format!(
+                "已封鎖：無法驗證這次對 {} 的寫入內容，為保護組織／委派設定一律拒絕。\n\
+                 檔案：{}\n\
+                 原因：{}",
+                file_name,
+                attempted_path.display(),
+                reason
+            )),
+            Self::BlockedBashProtectedWrite { file_name, verb } => Some(format!(
+                "已封鎖：偵測到可能改寫 {} 的 shell 指令（含 `{}`）。\n\
+                 組織欄位（name/reports_to/department）、委派設定與身分設定不可直接修改，\
+                 請透過 agent_update 或儀表板調整。",
+                file_name, verb
+            )),
+            Self::BlockedIdentitySurface { file_name, attempted_path, reason } => Some(format!(
+                "已封鎖：{} 屬於身分與保護機制設定，不可直接修改。\n\
+                 檔案：{}\n\
+                 原因：{}",
+                file_name,
+                attempted_path.display(),
+                reason
+            )),
+            Self::BlockedForeignAgentDir { caller, owner, attempted_path } => Some(format!(
+                "已封鎖：不能修改其他 AI 員工的檔案（{}）。\n\
+                 檔案：{}\n\
+                 你的身分：{}\n\
+                 每位 AI 員工只能修改自己的資料夾；需要對方調整，請改用委派請對方處理，\
+                 或由管理者從儀表板調整。",
+                owner,
+                attempted_path.display(),
+                caller
+            )),
+            Self::BlockedUntrustedCaller { caller, attempted_path } => Some(format!(
+                "已封鎖：身分驗證未通過（已啟用嚴格模式 require_identity_token），\
+                 無法確認你是哪一位 AI 員工，因此暫停所有對 AI 員工資料夾的寫入。\n\
+                 檔案：{}\n\
+                 宣稱的身分：{}\n\
+                 請聯絡管理者確認身分設定（identity.key / .mcp.json）是否正確。",
+                attempted_path.display(),
+                caller
+            )),
+            Self::BlockedHomeConfigWrite { caller, attempted_path } => Some(format!(
+                "已封鎖：系統設定檔 config.toml 不可由 AI 員工直接修改，\
+                 請透過儀表板或由管理者調整。\n\
+                 檔案：{}\n\
+                 你的身分：{}",
+                attempted_path.display(),
+                caller
+            )),
+            Self::BlockedOwnSoulWrite { caller, attempted_path } => Some(format!(
+                "已封鎖：SOUL.md 是人格設定檔，AI 員工不可直接改寫（即使是自己的）。\n\
+                 檔案：{}\n\
+                 你的身分：{}\n\
+                 人格設定一律由管理者透過儀表板調整；若管理者已為此 agent 開放自我修改\
+                 （agent.toml 的 [permissions] can_modify_own_soul = true），\
+                 請改呼叫 agent_update_soul 這個 MCP 工具，而不是直接寫檔。",
+                attempted_path.display(),
+                caller
             )),
             _ => None,
         }
