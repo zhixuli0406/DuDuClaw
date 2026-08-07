@@ -379,6 +379,18 @@ export interface AuditEvent {
   details: Record<string, unknown>;
 }
 
+// ── Delegation permissions (WP21 §2.8) ──
+/** How the gateway decides whether one AI staffer may hand work to another. */
+export type DelegationPolicy = 'department' | 'hierarchy' | 'open';
+
+export interface DelegationSettings {
+  policy: DelegationPolicy;
+  /** Unordered agent-id pairs — a pair permits delegation in both directions. */
+  allow: Array<[string, string]>;
+  /** Operator-facing notes about values the gateway had to fall back on. */
+  warnings: string[];
+}
+
 // ── Unified audit log (merges security, tool_call, channel_failure, feedback) ──
 export type UnifiedAuditSource = 'security' | 'tool_call' | 'channel_failure' | 'feedback';
 
@@ -819,8 +831,67 @@ export interface EvolutionVersion {
   applied_at: string;
   observation_end: string;
   status: string;
+  /** WP0.4: was the one-time "insufficient observation data" alert already
+   *  sent for this version? Only meaningful when `status === 'ExpiredNoData'`. */
+  low_data_alert_sent?: boolean;
   pre_metrics: EvolutionMetrics;
   post_metrics: EvolutionMetrics | null;
+}
+
+/** One AVO §2.4 stagnation signal — `kind` selects which of the optional
+ *  numeric fields are populated (see `gvu::stagnation::StagnationSignal`). */
+export interface EvolutionStagnationSignal {
+  kind: 'consecutive_non_applied' | 'zero_apply_window' | 'repeated_rejection_reason';
+  count?: number;
+  threshold?: number;
+  days?: number;
+  trigger_count?: number;
+  occurrences?: number;
+  reason_prefix?: string;
+}
+
+export interface EvolutionStagnationSnapshot {
+  agent_id: string;
+  is_stagnant: boolean;
+  signals: EvolutionStagnationSignal[];
+  /** zh-TW human summary from the backend — kept for debugging/logs only;
+   *  the UI renders `signals` through i18n instead so all three locales agree. */
+  summary: string | null;
+  checked_at: string;
+}
+
+export interface EvolutionTelemetrySummary {
+  agent_id: string;
+  days: number;
+  total: number;
+  /** stage ("verify" | "apply") -> layer/gate name -> rejection count. */
+  by_stage_layer: Record<string, Record<string, number>>;
+}
+
+export interface EvolutionConsolidation {
+  id: string;
+  agent_id: string;
+  attempted_at: string;
+  outcome: string;
+  from_bytes: number;
+  to_bytes: number | null;
+  detail: string | null;
+}
+
+export interface PlaybookEntry {
+  id: string;
+  content: string;
+  category: 'repair' | 'optimize' | 'innovate' | 'regulatory' | 'explore';
+  state: 'probation' | 'active' | 'stale' | 'retired';
+  signals_match: string[];
+  eval_cases: string[];
+  success_streak: number;
+  revision: number;
+  helpful: number;
+  harmful: number;
+  net_score: number;
+  origin: string;
+  created_at: string;
 }
 
 export interface BrowserAuditEntry {
@@ -2525,6 +2596,16 @@ export type ApprovalKind =
   | 'wiki_ingest'
   | (string & {});
 
+/** D1/D2: the ActionGuard judge's forward-simulation narrative — "what will
+ *  the world look like after this call runs", predicted before the decision
+ *  is made. Only present for approval kinds that ran that judge (the
+ *  overwhelming majority never do); absent/`null` means "no prediction was
+ *  made", not "nothing will happen". */
+export interface ApprovalSimulation {
+  world_state_change: string;
+  risk_points: string[];
+}
+
 export interface ApprovalItem {
   id: string;
   agent_id: string;
@@ -2534,6 +2615,8 @@ export interface ApprovalItem {
   payload: unknown;
   created_at: string;
   ttl_seconds: number;
+  /** Absent on older/other approval kinds — render nothing, not a placeholder. */
+  simulation?: ApprovalSimulation | null;
 }
 
 // ── BUD: budget incident console (WP14-T14.6) ──────────────────
@@ -3524,6 +3607,63 @@ export const api = {
       client.call('evolution.history', { agent_id: agentId ?? '', limit }) as Promise<{
         versions: EvolutionVersion[];
       }>,
+    /** Superset of `history`: same optional `agent_id`/`limit` scoping, plus
+     *  the WP0.4 `ExpiredNoData` status and the one-time low-data alert flag. */
+    versions: (agentId?: string, limit = 20) =>
+      client.call('evolution.versions', { agent_id: agentId ?? '', limit }) as Promise<{
+        versions: EvolutionVersion[];
+      }>,
+    /** AVO §2.4 stagnation detector snapshot. Empty `agentId` scopes to every
+     *  registered agent (one snapshot per agent, in registry order). */
+    stagnation: (agentId?: string) =>
+      client.call('evolution.stagnation', { agent_id: agentId ?? '' }) as Promise<{
+        snapshots: EvolutionStagnationSnapshot[];
+      }>,
+    /** WP0.6 Verifier/Updater rejection distribution over a trailing window. */
+    telemetry: (agentId?: string, days = 7) =>
+      client.call('evolution.telemetry', { agent_id: agentId ?? '', days }) as Promise<EvolutionTelemetrySummary>,
+    /** WP0.2 consolidation (whole-SOUL.md-rewrite) attempt audit trail. */
+    consolidations: (agentId?: string, limit = 20) =>
+      client.call('evolution.consolidations', { agent_id: agentId ?? '', limit }) as Promise<{
+        consolidations: EvolutionConsolidation[];
+      }>,
+  },
+  /** Playbook — gene-shaped experience entries the AEE evolution loop writes
+   *  instead of rewriting SOUL.md (TODO-evolution-v3-2026-08.md §Phase 1). */
+  playbook: {
+    list: (agentId: string) =>
+      client.call('playbook.list', { agent_id: agentId }) as Promise<{
+        agent_id: string;
+        entries: PlaybookEntry[];
+      }>,
+    /** Human-initiated terminal retirement of one entry. */
+    retire: (agentId: string, id: string, reason?: string) =>
+      client.call('playbook.retire', { agent_id: agentId, id, reason: reason ?? '' }) as Promise<{
+        success: boolean;
+        retired: boolean;
+        reason?: string;
+      }>,
+    /** Lossless GEP-gene-shaped JSON export (local schema alignment, D5=B — no hub I/O). */
+    export: (agentId: string) =>
+      client.call('playbook.export', { agent_id: agentId }) as Promise<{
+        agent_id: string;
+        gene_schema: string;
+        genes: unknown[];
+      }>,
+  },
+  /** Delegation permissions (WP21 §2.8) — owner/admin only, gateway-side gated.
+   *  `allow` holds unordered agent-id pairs; a pair means the two may hand work
+   *  to each other in both directions. */
+  delegation: {
+    get: () =>
+      client.call('delegation.get') as Promise<DelegationSettings>,
+    set: (params: { policy?: DelegationPolicy; allow?: Array<[string, string]> }) =>
+      client.call('delegation.set', params) as Promise<{
+        success: boolean;
+        policy: DelegationPolicy;
+        allow: Array<[string, string]>;
+        applied: boolean;
+      }>,
   },
   system: {
     status: () =>
@@ -3560,6 +3700,9 @@ export const api = {
         allowed_origins?: string[];
         // Structured [skills] gap_digest_enabled for the daily skill-gap digest toggle.
         gap_digest_enabled?: boolean;
+        // Structured [memory] novelty_gate for the memory-dedup-gate toggle
+        // (absent ⇒ true, matching the gateway's fail-closed default).
+        novelty_gate_enabled?: boolean;
       }>,
     updateConfig: (fields: Record<string, unknown>) =>
       client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean; hot_reloaded?: string[] }>,

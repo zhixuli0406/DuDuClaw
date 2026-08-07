@@ -61,6 +61,8 @@ export function SystemTab() {
   // [gateway] allowed_origins — remote-access allowlist (chips + draft input).
   const [origins, setOrigins] = useState<string[]>([]);
   const [originDraft, setOriginDraft] = useState('');
+  // [memory] novelty_gate — B1 write-time memory dedup gate (default: on).
+  const [noveltyGate, setNoveltyGate] = useState(true);
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -103,6 +105,8 @@ export function SystemTab() {
       // allowed_origins comes back as a structured array (not parsed from TOML).
       const ao = (res as Record<string, unknown>)?.allowed_origins;
       setOrigins(Array.isArray(ao) ? (ao.filter((v) => typeof v === 'string') as string[]) : []);
+      // novelty_gate_enabled comes back structured too (not parsed from TOML).
+      setNoveltyGate(res.novelty_gate_enabled ?? true);
     }).catch((e) => {
       console.warn('[api]', e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
@@ -149,6 +153,7 @@ export function SystemTab() {
       // Always send the current allowlist so a save reflects add/remove edits.
       // Empty array = loopback-only (the default). Hot-applied server-side.
       payload.allowed_origins = origins;
+      payload.novelty_gate_enabled = noveltyGate;
 
       await api.system.updateConfig(payload);
       setAuthToken('');
@@ -353,6 +358,18 @@ export function SystemTab() {
             value={logFormat}
             onChange={setLogFormat}
             options={logFormatOptions}
+          />
+        </SettingsCard>
+      </SettingsSection>
+
+      {/* Memory — B1 write-time dedup gate */}
+      <SettingsSection title={intl.formatMessage({ id: 'settings.system.memory' })}>
+        <SettingsCard>
+          <RowSwitch
+            label={intl.formatMessage({ id: 'settings.system.noveltyGate' })}
+            description={intl.formatMessage({ id: 'settings.system.noveltyGate.help' })}
+            checked={noveltyGate}
+            onChange={setNoveltyGate}
           />
         </SettingsCard>
       </SettingsSection>

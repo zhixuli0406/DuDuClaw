@@ -15,12 +15,14 @@ import {
   EyeOff,
   KeyRound,
   Bot,
+  Share2,
 } from 'lucide-react';
 import {
   SettingsShell,
   SettingsTab,
   type SettingsNavGroup,
 } from '@/components/mds';
+import { useAuthStore } from '@/stores/auth-store';
 import { GeneralTab } from '@/components/settings/sections/GeneralTab';
 import { AccountTab } from '@/components/settings/sections/AccountTab';
 import { SystemTab } from '@/components/settings/sections/SystemTab';
@@ -34,12 +36,13 @@ import { RedactionTab } from '@/components/settings/sections/RedactionTab';
 import { DoctorTab } from '@/components/settings/sections/DoctorTab';
 import { BrowserTab } from '@/components/settings/sections/BrowserTab';
 import { AutomationTab } from '@/components/settings/sections/AutomationTab';
+import { DelegationTab } from '@/components/settings/sections/DelegationTab';
 
 /** Settings sub-tab whitelist (spec §5.3 式3). `?tab=` is validated against this
  *  set; unknown values fall back to `general`. */
 const VALID_TABS = [
   'general', 'account', 'system', 'container', 'heartbeat', 'voice',
-  'proactive', 'automation', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser',
+  'proactive', 'automation', 'delegation', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser',
 ] as const;
 type TabId = (typeof VALID_TABS)[number];
 
@@ -71,9 +74,14 @@ export function SettingsPage() {
     }
   }, [tabParam, navigate]);
 
-  const activeTab: TabId = (VALID_TABS as readonly string[]).includes(tabParam ?? '')
-    ? (tabParam as TabId)
-    : 'general';
+  // 委派權限 is owner/admin-only (WP21 §2.8): the rail entry, the panel and the
+  // `?tab=delegation` deep link all disappear for anyone else. The gateway
+  // gates `delegation.get/set` too — this is the courtesy layer.
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+
+  const tabAllowed = (tab: string) =>
+    (VALID_TABS as readonly string[]).includes(tab) && (tab !== 'delegation' || isAdmin);
+  const activeTab: TabId = tabAllowed(tabParam ?? '') ? (tabParam as TabId) : 'general';
   const setTab = (next: string) => {
     const nextParams = new URLSearchParams(searchParams);
     nextParams.set('tab', next);
@@ -102,6 +110,9 @@ export function SettingsPage() {
         { value: 'container', label: t('settings.container'), icon: Container },
         { value: 'heartbeat', label: t('settings.heartbeat'), icon: HeartPulse },
         { value: 'automation', label: t('settings.automation.tab'), icon: Bot },
+        ...(isAdmin
+          ? [{ value: 'delegation', label: t('settings.delegation'), icon: Share2 }]
+          : []),
         { value: 'autopilot', label: t('settings.autopilot'), icon: Workflow },
         { value: 'skillSynthesis', label: t('settings.skillSynthesis'), icon: Sparkles },
         { value: 'redaction', label: t('settings.redaction'), icon: EyeOff },
@@ -138,6 +149,15 @@ export function SettingsPage() {
         <SettingsTab value="automation" title={t('settings.automation.tab')} description={t('settings.automation.tab.desc')}>
           <AutomationTab />
         </SettingsTab>
+        {isAdmin && (
+          <SettingsTab
+            value="delegation"
+            title={t('settings.delegation')}
+            description={t('settings.delegation.desc')}
+          >
+            <DelegationTab />
+          </SettingsTab>
+        )}
         <SettingsTab value="autopilot" title={t('settings.autopilot')} description={t('settings.autopilot.desc')}>
           <AutopilotTab />
         </SettingsTab>
