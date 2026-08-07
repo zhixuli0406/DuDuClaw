@@ -74,9 +74,199 @@ pub struct RuntimeContext {
 pub enum RuntimeChunk {
     Text(String),
     ToolUse { name: String, input: serde_json::Value },
-    ToolResult { output: String },
+    /// `is_error` (T10, design §9): whether the paired tool call failed.
+    /// Added alongside T10's codex/gemini producers — this variant had zero
+    /// constructors anywhere in the repo before T10 (verified by grep), so
+    /// adding a field here breaks no existing caller.
+    ToolResult { output: String, is_error: bool },
     Done(RuntimeResponse),
     Error(String),
+}
+
+/// T10 consumer-side fold (design §9's "消費端": "AgentRuntime execute 路徑
+/// 把 chunks 中的工具事件彙整成與 WP-A4 同形態的收集結果上浮"): pair each
+/// `ToolUse` chunk with the [`RuntimeChunk::ToolResult`] that follows it (in
+/// emission order — codex/gemini both emit a tool's use and its result as
+/// adjacent chunks, never interleaved with a different tool's pair, so
+/// positional pairing is sufficient here — unlike claude_runner.rs's WP-A4
+/// collector, which needs id-based pairing because Claude CAN interleave
+/// multiple concurrent tool_use blocks before any tool_result arrives). A
+/// `ToolUse` with no following `ToolResult` (stream ended mid-call) is still
+/// recorded, success = true (provisional — an attempted call is still
+/// evidence, same convention as every other producer in this module). This
+/// is what keeps `runtime/codex.rs` and `runtime/gemini.rs` from having to
+/// duplicate `NativeToolEvent`-building logic, and what keeps
+/// `prediction::task_observe` from needing any runtime-specific code (design
+/// §8.2's stated purpose for routing through `RuntimeChunk` here).
+///
+/// R1: also lifts `ToolUse.input`/`ToolResult.output` into
+/// `NativeToolEvent::input_text`/`result_text` (masked + capped via
+/// [`native_event_input_text_from_value`]/[`native_event_result_text`]) when
+/// the producer populated them — `codex.rs`/`gemini.rs` (T10) now do for at
+/// least some event shapes; a producer that still emits the pre-R1
+/// placeholders (`input: Value::Null`, `output: String::new()`) yields `None`
+/// for both, byte-identical to before.
+pub fn native_tool_events_from_chunks(chunks: &[RuntimeChunk]) -> Vec<NativeToolEvent> {
+    let mut events = Vec::new();
+    let mut iter = chunks.iter().peekable();
+    while let Some(chunk) = iter.next() {
+        if let RuntimeChunk::ToolUse { name, input } = chunk {
+            let input_text = native_event_input_text_from_value(input);
+            let (success, result_text) = match iter.peek() {
+                Some(RuntimeChunk::ToolResult { output, is_error }) => {
+                    let is_error = *is_error;
+                    let result_text = native_event_result_text(output);
+                    iter.next(); // consume the paired ToolResult
+                    (!is_error, result_text)
+                }
+                _ => (true, None), // unpaired — provisional success (see doc comment)
+            };
+            events.push(NativeToolEvent {
+                tool_name: name.clone(),
+                success,
+                result_text,
+                input_text,
+            });
+        }
+    }
+    events
+}
+
+// ── WP-A4/A5/T10: runtime-neutral native-tool collector ─────────────────
+//
+// See `commercial/docs/design-task-forward-model-2026-08-06.md` §5.3, §8.2,
+// §9. Goal loop dispatch (`dispatcher.rs` → `claude_runner.rs`, and — for
+// non-Claude agents — the same call chain's `runtime_dispatch::run_agent_prompt`
+// → `AgentRuntime::execute`) is the ONE place native (non-MCP-audit) tool
+// evidence can be captured for the A3 forward-model's `Full` fidelity. This
+// struct is deliberately minimal and carries nothing provider-specific (no
+// Claude `tool_use_id`, no codex `item.id`, no gemini `tool_id`) — the raw
+// tool/command name plus a success flag is everything
+// `prediction::tool_class::ToolClass::classify` needs, and everything the A3
+// diff algorithm consumes downstream.
+
+/// One native tool invocation observed during a single dispatch call,
+/// runtime-neutral by construction.
+///
+/// R1 (2026-08, `wiki/reports/memory-quality/2026-08/wp-a10-live-test-2026-08-06.md`
+/// §6): `result_text`/`input_text` let this evidence actually participate in
+/// the B3 grounding pre-check (`dispatch_engine::grounding_precheck`) — before
+/// R1 a native event carried only `tool_name`/`success`, so an honest task
+/// that only used native tools (Read/Write/Bash) could never reach
+/// `Grounded`, only `Degraded`. Both fields are populated ONLY through
+/// [`native_event_input_text`]/[`native_event_result_text`] (or a producer
+/// that already delegates to them, e.g. [`native_tool_events_from_chunks`]) —
+/// those helpers mask (`duduclaw_security::audit::mask_sensitive_text`) BEFORE
+/// truncating, so no unmasked tool text is ever allowed to land here. `None`
+/// when the source runtime's event stream never captured any (never
+/// fabricated) — the pre-R1 producers/tests that only ever set
+/// `tool_name`/`success` keep that meaning unchanged.
+#[derive(Debug, Clone)]
+pub struct NativeToolEvent {
+    pub tool_name: String,
+    pub success: bool,
+    /// Masked + CJK-safe-truncated tool result text, when the producer's
+    /// event stream carried one. Capped at [`NATIVE_EVENT_RESULT_MAX_CHARS`].
+    pub result_text: Option<String>,
+    /// Masked + CJK-safe-truncated tool call input/arguments text, when the
+    /// producer's event stream carried one. Capped at
+    /// [`NATIVE_EVENT_INPUT_MAX_CHARS`]. Used by the B3 grounding pre-check's
+    /// Fix-2 C1b self-echo subtraction
+    /// (`duduclaw_core::grounding::shares_contiguous_run_excluding_echo`) —
+    /// native tools have no `SELF_ECHO_TOOL_NAMES` deny-list concept, but the
+    /// same "don't ground a claim on its own echoed input" logic still
+    /// applies whenever input text happens to be available.
+    pub input_text: Option<String>,
+}
+
+/// Char cap for [`NativeToolEvent::input_text`] — reuses the audit trail's
+/// own cap (`tool_calls.jsonl`'s `input` field) so the same tool's text is
+/// bounded identically regardless of which capture path recorded it.
+pub const NATIVE_EVENT_INPUT_MAX_CHARS: usize = duduclaw_security::audit::AUDIT_INPUT_MAX_CHARS;
+/// Char cap for [`NativeToolEvent::result_text`] — reuses the audit trail's
+/// own cap (`tool_calls.jsonl`'s `result_text` field), see
+/// [`NATIVE_EVENT_INPUT_MAX_CHARS`].
+pub const NATIVE_EVENT_RESULT_MAX_CHARS: usize = duduclaw_security::audit::AUDIT_RESULT_TEXT_MAX_CHARS;
+
+/// Mask + CJK-safe-truncate raw text before it is allowed to become a
+/// [`NativeToolEvent::input_text`]. The ONLY sanctioned way to populate that
+/// field — masking always runs before truncation (a secret split across the
+/// truncation boundary must still be caught). An empty/all-whitespace result
+/// (nothing captured, or the source text was empty) is `None`, never an
+/// empty-string placeholder.
+pub fn native_event_input_text(raw: &str) -> Option<String> {
+    mask_and_cap(raw, NATIVE_EVENT_INPUT_MAX_CHARS)
+}
+
+/// Same contract as [`native_event_input_text`], for
+/// [`NativeToolEvent::result_text`].
+pub fn native_event_result_text(raw: &str) -> Option<String> {
+    mask_and_cap(raw, NATIVE_EVENT_RESULT_MAX_CHARS)
+}
+
+/// [`native_event_input_text`] variant for a tool call's raw
+/// `serde_json::Value` input/arguments — stringifies first (a bare JSON
+/// string is used verbatim, anything else is compact-serialized), then masks
+/// and caps exactly like the `&str` entry point. `Null` and an empty string
+/// are both "nothing captured" ⇒ `None`.
+pub fn native_event_input_text_from_value(v: &serde_json::Value) -> Option<String> {
+    let text = match v {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    native_event_input_text(&text)
+}
+
+/// Shared mask-then-truncate-then-empty-check tail for
+/// [`native_event_input_text`]/[`native_event_result_text`].
+fn mask_and_cap(raw: &str, max_chars: usize) -> Option<String> {
+    let masked = duduclaw_security::audit::mask_sensitive_text(raw);
+    let trimmed = masked.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(duduclaw_core::truncate_chars(trimmed, max_chars))
+}
+
+tokio::task_local! {
+    /// Sink for [`NativeToolEvent`]s collected while ONE dispatch call runs,
+    /// populated by whichever execution path actually handles it: Claude CLI
+    /// stream-json parsing in `claude_runner.rs::call_claude_streaming`
+    /// (WP-A4), or an `AgentRuntime::execute` implementation below —
+    /// `codex.rs`/`gemini.rs` (T10) and `openai_compat.rs` (WP-A5).
+    ///
+    /// The caller (`dispatcher.rs`, when dispatching a goal-loop task) enters
+    /// this scope before invoking the call chain and reads the accumulated
+    /// events back afterward. Task-locals thread transparently through the
+    /// entire async call chain within the same tokio task (ordinary
+    /// function/`.await` boundaries, NOT `tokio::spawn`), so no intermediate
+    /// function in the chain (`call_claude_for_agent_impl`,
+    /// `runtime_dispatch::run_agent_prompt[_text]`) needs to know this
+    /// collector exists.
+    ///
+    /// Absent scope — every non-goal-loop dispatch path: channel reply,
+    /// cron, reminders, ACP — is a complete no-op. Every write site below
+    /// uses `try_with`, never panics on a missing scope, and never affects
+    /// the response returned to the caller (design R5: "forward model 不得
+    /// 成為派工失敗原因").
+    pub static NATIVE_TOOL_COLLECTOR: std::sync::Arc<std::sync::Mutex<Vec<NativeToolEvent>>>;
+}
+
+/// Best-effort bulk push into [`NATIVE_TOOL_COLLECTOR`], if a caller has
+/// scoped one. A missing scope, or the mutex being poisoned by an unrelated
+/// panic elsewhere, degrades to a silent no-op — collector failure must
+/// never surface as a dispatch failure (design R5). No-op on an empty batch
+/// (avoids taking the lock for nothing on the common non-goal-loop path).
+pub fn extend_native_tool_events(events: Vec<NativeToolEvent>) {
+    if events.is_empty() {
+        return;
+    }
+    let _ = NATIVE_TOOL_COLLECTOR.try_with(|collector| {
+        if let Ok(mut guard) = collector.lock() {
+            guard.extend(events);
+        }
+    });
 }
 
 /// Abstract runtime for executing agent tasks.
@@ -262,10 +452,12 @@ pub fn duduclaw_mcp_server_json(agent_id: &str) -> Option<serde_json::Value> {
         return None;
     }
     let mut env = serde_json::Map::new();
-    env.insert(
-        duduclaw_core::ENV_AGENT_ID.to_string(),
-        serde_json::Value::String(agent_id.to_string()),
-    );
+    // Identity pair: `DUDUCLAW_AGENT_ID` plus, when `<home>/identity.key`
+    // exists, the WP21 debt ⑧ `DUDUCLAW_AGENT_TOKEN` that proves DuDuClaw
+    // issued that id. No key ⇒ id only, i.e. the pre-WP21 env block verbatim.
+    for (k, v) in duduclaw_core::agent_identity_env_vars_default(agent_id) {
+        env.insert(k, serde_json::Value::String(v));
+    }
     // Shared forward set (home/port/instance + MCP auth). CLIs like Grok spawn
     // MCP children with ONLY this declared env block — a missing
     // DUDUCLAW_MCP_API_KEY here means the server dies at boot (M6 fail-closed)
@@ -385,6 +577,17 @@ mod tests {
     use super::*;
     use duduclaw_core::types::CapabilitiesConfig;
 
+    /// Test helper: a text-less `NativeToolEvent` (pre-R1 shape) — most
+    /// existing tests only care about `tool_name`/`success`.
+    fn native(tool_name: &str, success: bool) -> NativeToolEvent {
+        NativeToolEvent {
+            tool_name: tool_name.to_string(),
+            success,
+            result_text: None,
+            input_text: None,
+        }
+    }
+
     #[test]
     fn native_sandbox_noop_when_disabled() {
         // Default caps → native_sandbox = false → helper is a no-op success even
@@ -441,6 +644,175 @@ mod tests {
         assert!(
             apply_native_sandbox(&mut cmd, Some(&caps), Some(Path::new("/tmp")), "test").is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn native_tool_collector_noop_without_scope() {
+        // No `NATIVE_TOOL_COLLECTOR::scope` entered — must not panic, must
+        // silently drop the events (design R5: absent scope is a no-op).
+        extend_native_tool_events(vec![native("Bash", true)]);
+    }
+
+    #[tokio::test]
+    async fn native_tool_collector_accumulates_when_scoped() {
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        NATIVE_TOOL_COLLECTOR
+            .scope(collector.clone(), async {
+                extend_native_tool_events(vec![native("Bash", true), native("Read", false)]);
+                extend_native_tool_events(vec![native("Write", true)]);
+            })
+            .await;
+        let events = collector.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].tool_name, "Bash");
+        assert!(events[0].success);
+        assert_eq!(events[1].tool_name, "Read");
+        assert!(!events[1].success);
+    }
+
+    #[tokio::test]
+    async fn native_tool_collector_empty_batch_is_noop() {
+        // Empty batches must not even take the lock (dead code would panic
+        // if this somehow poisoned an unscoped run) — asserts no panic and
+        // no scope required for a zero-event flush.
+        extend_native_tool_events(vec![]);
+    }
+
+    // ── T10: native_tool_events_from_chunks ─────────────────────────────
+
+    fn tool_use(name: &str) -> RuntimeChunk {
+        RuntimeChunk::ToolUse { name: name.to_string(), input: serde_json::json!({}) }
+    }
+    fn tool_result(is_error: bool) -> RuntimeChunk {
+        RuntimeChunk::ToolResult { output: String::new(), is_error }
+    }
+
+    #[test]
+    fn native_tool_events_from_chunks_pairs_success() {
+        let chunks = vec![tool_use("shell"), tool_result(false)];
+        let events = native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "shell");
+        assert!(events[0].success);
+    }
+
+    #[test]
+    fn native_tool_events_from_chunks_pairs_failure() {
+        let chunks = vec![tool_use("shell"), tool_result(true)];
+        let events = native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].success);
+    }
+
+    #[test]
+    fn native_tool_events_from_chunks_unpaired_tool_use_is_provisional_success() {
+        let chunks = vec![tool_use("shell")];
+        let events = native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].success);
+    }
+
+    #[test]
+    fn native_tool_events_from_chunks_multiple_pairs_in_order() {
+        let chunks = vec![
+            tool_use("tasks_create"),
+            tool_result(false),
+            tool_use("shell"),
+            tool_result(true),
+        ];
+        let events = native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].tool_name, "tasks_create");
+        assert!(events[0].success);
+        assert_eq!(events[1].tool_name, "shell");
+        assert!(!events[1].success);
+    }
+
+    #[test]
+    fn native_tool_events_from_chunks_ignores_text_and_done() {
+        let chunks = vec![
+            RuntimeChunk::Text("hello".to_string()),
+            tool_use("shell"),
+            tool_result(false),
+            RuntimeChunk::Done(RuntimeResponse {
+                content: "done".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                model_used: "m".to_string(),
+                runtime_name: "codex".to_string(),
+            }),
+        ];
+        let events = native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn native_tool_events_from_chunks_empty_is_empty() {
+        assert!(native_tool_events_from_chunks(&[]).is_empty());
+    }
+
+    // ── R1: native_tool_events_from_chunks carries masked text ──────────
+
+    #[test]
+    fn native_tool_events_from_chunks_captures_result_and_input_text() {
+        let chunks = vec![
+            RuntimeChunk::ToolUse {
+                name: "Bash".to_string(),
+                input: serde_json::json!({"command": "cat report.md"}),
+            },
+            RuntimeChunk::ToolResult {
+                output: "quarterly revenue: 1.2M".to_string(),
+                is_error: false,
+            },
+        ];
+        let events = native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].result_text.as_deref(), Some("quarterly revenue: 1.2M"));
+        assert!(events[0].input_text.as_deref().unwrap().contains("cat report.md"));
+    }
+
+    #[test]
+    fn native_tool_events_from_chunks_masks_secrets_in_result_text() {
+        let chunks = vec![
+            RuntimeChunk::ToolUse { name: "Bash".to_string(), input: serde_json::Value::Null },
+            RuntimeChunk::ToolResult {
+                output: "token: sk-ant-api03-verysecretvalue1234567890".to_string(),
+                is_error: false,
+            },
+        ];
+        let events = native_tool_events_from_chunks(&chunks);
+        let result_text = events[0].result_text.as_deref().unwrap();
+        assert!(
+            !result_text.contains("sk-ant-api03-verysecretvalue1234567890"),
+            "secret leaked into NativeToolEvent.result_text: {result_text}"
+        );
+    }
+
+    #[test]
+    fn native_tool_events_from_chunks_null_input_and_empty_output_stay_none() {
+        // The pre-R1 placeholder shape (Value::Null / empty String) — every
+        // producer that hasn't been upgraded to capture text yet must still
+        // yield `None`, never a fabricated empty-string placeholder.
+        let chunks = vec![
+            RuntimeChunk::ToolUse { name: "Bash".to_string(), input: serde_json::Value::Null },
+            RuntimeChunk::ToolResult { output: String::new(), is_error: false },
+        ];
+        let events = native_tool_events_from_chunks(&chunks);
+        assert!(events[0].result_text.is_none());
+        assert!(events[0].input_text.is_none());
+    }
+
+    #[test]
+    fn native_tool_events_from_chunks_unpaired_tool_use_has_no_result_text() {
+        let chunks = vec![RuntimeChunk::ToolUse {
+            name: "Bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+        }];
+        let events = native_tool_events_from_chunks(&chunks);
+        assert!(events[0].success);
+        assert!(events[0].result_text.is_none());
+        assert!(events[0].input_text.is_some());
     }
 
     #[test]

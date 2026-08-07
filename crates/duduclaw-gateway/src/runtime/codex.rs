@@ -94,6 +94,159 @@ struct CodexUsage {
     output_tokens: u64,
 }
 
+/// Parse a complete `codex exec --json` stdout buffer into `(content,
+/// input_tokens, output_tokens, chunks)`.
+///
+/// T10 (design commercial/docs/design-task-forward-model-2026-08-06.md
+/// §8.2/§9): the previously zero-constructor `RuntimeChunk::ToolUse` /
+/// `ToolResult` variants (`runtime/mod.rs`) are populated from `item.
+/// completed` events whose `item.type` is `command_execution` or
+/// `mcp_tool_call` — the two tool-item types `codex exec --json` emits
+/// alongside the `message` item this parser already reads for `content`.
+/// `execute()` below folds `chunks` into `NativeToolEvent`s via
+/// [`super::native_tool_events_from_chunks`] — the same runtime-neutral fold
+/// `gemini.rs` uses, so `prediction::task_observe` never needs
+/// codex-specific code (design §8.2's stated purpose for routing through
+/// `RuntimeChunk`).
+///
+/// Schema grounded in the published `codex exec --json` event reference
+/// (item fields: `status` ∈ {in_progress, completed, failed};
+/// `command_execution` carries `command`/`aggregated_output`/`exit_code`;
+/// `mcp_tool_call` carries `server`/`tool`/`arguments`/`result`/`error`) —
+/// NOT verified against the Rust source (`codex-rs/core/protocol.rs`)
+/// directly, so exact field names are treated as best-effort: an
+/// absent/renamed field degrades to skipping that event, never a
+/// fabricated tool name or success value.
+fn parse_codex_stdout(stdout: &str) -> (String, u64, u64, Vec<super::RuntimeChunk>) {
+    use super::RuntimeChunk;
+
+    let mut content = String::new();
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut chunks: Vec<RuntimeChunk> = Vec::new();
+
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<CodexEvent>(line) {
+            match event.event_type.as_str() {
+                "item.completed" => {
+                    // Extract text from message items
+                    if let Some(item) = event.extra.get("item") {
+                        match item.get("type").and_then(|t| t.as_str()) {
+                            Some("message") => {
+                                if let Some(text) = item
+                                    .get("content")
+                                    .and_then(|c| c.as_array())
+                                    .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(|t| t.as_str()) == Some("output_text")))
+                                    .and_then(|b| b.get("text"))
+                                    .and_then(|t| t.as_str())
+                                {
+                                    content = text.to_string();
+                                }
+                            }
+                            Some("command_execution") => {
+                                // ToolClass::classify maps codex's shell tool
+                                // via the literal name "shell" (see
+                                // `prediction/tool_class.rs`'s cross-runtime
+                                // Exec alias table) — this is a synthesized
+                                // label, not something read off the wire
+                                // (the command_execution item has no
+                                // separate "tool name" field; the item TYPE
+                                // itself is the signal).
+                                let status = item.get("status").and_then(|s| s.as_str());
+                                // "failed" is the only documented failure
+                                // status; anything else (including an
+                                // absent field) is treated as
+                                // attempted-and-not-known-to-have-failed,
+                                // matching this collector's optimistic
+                                // default on the claude/gemini paths.
+                                let is_error = status == Some("failed");
+                                let input = item.get("command").cloned().unwrap_or(serde_json::Value::Null);
+                                // R1: the documented `aggregated_output` field
+                                // carries the shell command's actual stdout —
+                                // captured verbatim here; masking + capping
+                                // happens downstream in
+                                // `native_tool_events_from_chunks` (never
+                                // guessed at when absent).
+                                let output = item
+                                    .get("aggregated_output")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                chunks.push(RuntimeChunk::ToolUse { name: "shell".to_string(), input });
+                                chunks.push(RuntimeChunk::ToolResult { output, is_error });
+                            }
+                            Some("mcp_tool_call") => {
+                                if let Some(tool) = item.get("tool").and_then(|t| t.as_str()) {
+                                    let status = item.get("status").and_then(|s| s.as_str());
+                                    let is_error = status == Some("failed");
+                                    let input = item.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+                                    // R1: dual-name tolerance — the documented
+                                    // shape is `result.content[].text`
+                                    // (mirrors an MCP tool_result content
+                                    // array); on failure fall back to
+                                    // `error.message`. Neither present ⇒
+                                    // empty output, never fabricated.
+                                    let output = extract_mcp_tool_call_output(&item)
+                                        .unwrap_or_default();
+                                    chunks.push(RuntimeChunk::ToolUse { name: tool.to_string(), input });
+                                    chunks.push(RuntimeChunk::ToolResult { output, is_error });
+                                }
+                                // No "tool" field ⇒ skip (don't fabricate a
+                                // name) rather than record an "unknown"
+                                // placeholder.
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "turn.completed" => {
+                    // Extract token usage
+                    if let Some(usage) = event.extra.get("usage") {
+                        if let Ok(u) = serde_json::from_value::<CodexUsage>(usage.clone()) {
+                            input_tokens = u.input_tokens;
+                            output_tokens = u.output_tokens;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    (content, input_tokens, output_tokens, chunks)
+}
+
+/// R1: extract an `mcp_tool_call` item's output text for `RuntimeChunk::ToolResult`.
+/// Tries the documented success shape first (`result.content[].text`, the
+/// same content-block array MCP `tool_result`s use), then falls back to
+/// `error.message` on failure. `None` when neither is present — the caller
+/// treats that as "nothing captured", never fabricates a placeholder.
+fn extract_mcp_tool_call_output(item: &serde_json::Value) -> Option<String> {
+    if let Some(arr) = item.pointer("/result/content").and_then(|c| c.as_array()) {
+        let parts: Vec<&str> = arr
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !parts.is_empty() {
+            return Some(parts.join("\n"));
+        }
+    }
+    // A bare string result (undocumented but tolerated — dual-shape).
+    if let Some(s) = item.get("result").and_then(|r| r.as_str()) {
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    item.pointer("/error/message")
+        .and_then(|m| m.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 // ── AgentRuntime impl ───────────────────────────────────────────
 
 #[async_trait]
@@ -224,45 +377,8 @@ impl AgentRuntime for CodexRuntime {
 
         // Parse JSONL output
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut content = String::new();
-        let mut input_tokens: u64 = 0;
-        let mut output_tokens: u64 = 0;
-
-        for line in stdout.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(event) = serde_json::from_str::<CodexEvent>(line) {
-                match event.event_type.as_str() {
-                    "item.completed" => {
-                        // Extract text from message items
-                        if let Some(item) = event.extra.get("item") {
-                            if item.get("type").and_then(|t| t.as_str()) == Some("message") {
-                                if let Some(text) = item
-                                    .get("content")
-                                    .and_then(|c| c.as_array())
-                                    .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(|t| t.as_str()) == Some("output_text")))
-                                    .and_then(|b| b.get("text"))
-                                    .and_then(|t| t.as_str())
-                                {
-                                    content = text.to_string();
-                                }
-                            }
-                        }
-                    }
-                    "turn.completed" => {
-                        // Extract token usage
-                        if let Some(usage) = event.extra.get("usage") {
-                            if let Ok(u) = serde_json::from_value::<CodexUsage>(usage.clone()) {
-                                input_tokens = u.input_tokens;
-                                output_tokens = u.output_tokens;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let (mut content, input_tokens, output_tokens, chunks) = parse_codex_stdout(&stdout);
+        super::extend_native_tool_events(super::native_tool_events_from_chunks(&chunks));
 
         if content.is_empty() {
             // Fallback: use the last line as content
@@ -397,6 +513,9 @@ impl CodexRuntime {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         std::fs::write(&config_path, content).map_err(|e| e.to_string())?;
+        // Carries DUDUCLAW_AGENT_TOKEN in plaintext — restrict to the owning
+        // OS user (0600 on Unix; no-op on Windows).
+        duduclaw_core::platform::set_owner_only(&config_path).ok();
         Ok(true)
     }
 
@@ -431,6 +550,167 @@ mod tests {
         let usage: CodexUsage = serde_json::from_value(event.extra.get("usage").unwrap().clone()).unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
+    }
+
+    // ── T10: parse_codex_stdout → RuntimeChunk → NativeToolEvent ────────
+
+    #[test]
+    fn parse_codex_stdout_emits_tool_use_and_tool_result_chunks() {
+        // The literal T10 ask: `RuntimeChunk::ToolUse`/`ToolResult` must
+        // actually get constructed, not bypassed.
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"docs\nsrc\n","exit_code":0,"status":"completed"}}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_codex_stdout(stdout);
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(chunks[0], super::super::RuntimeChunk::ToolUse { .. }));
+        match &chunks[1] {
+            super::super::RuntimeChunk::ToolResult { is_error, .. } => assert!(!is_error),
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_codex_stdout_collects_command_execution_success() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"docs\nsrc\n","exit_code":0,"status":"completed"}}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_codex_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "shell");
+        assert!(events[0].success);
+    }
+
+    #[test]
+    fn parse_codex_stdout_collects_command_execution_failure() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc false","aggregated_output":"","exit_code":1,"status":"failed"}}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_codex_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "shell");
+        assert!(!events[0].success);
+    }
+
+    #[test]
+    fn parse_codex_stdout_collects_mcp_tool_call() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"id":"item_5","type":"mcp_tool_call","server":"duduclaw","tool":"tasks_create","arguments":{"title":"x"},"result":{"content":[{"type":"text","text":"ok"}]},"error":null,"status":"completed"}}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_codex_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "tasks_create");
+        assert!(events[0].success);
+        assert_eq!(events[0].result_text.as_deref(), Some("ok"));
+        assert!(events[0].input_text.as_deref().unwrap().contains("title"));
+    }
+
+    #[test]
+    fn parse_codex_stdout_collects_mcp_tool_call_failure() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"id":"item_6","type":"mcp_tool_call","server":"duduclaw","tool":"tasks_create","arguments":null,"result":null,"error":{"message":"boom"},"status":"failed"}}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_codex_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].success);
+        // R1: on failure, the item's `error.message` is captured as
+        // `result_text` — dual-shape fallback from the documented
+        // `result.content[].text` success shape.
+        assert_eq!(events[0].result_text.as_deref(), Some("boom"));
+    }
+
+    // ── R1: result_text / input_text capture ─────────────────────────────
+
+    #[test]
+    fn parse_codex_stdout_command_execution_captures_aggregated_output() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"docs\nsrc\n","exit_code":0,"status":"completed"}}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_codex_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events[0].result_text.as_deref(), Some("docs\nsrc"));
+        assert!(events[0].input_text.as_deref().unwrap().contains("bash -lc ls"));
+    }
+
+    #[test]
+    fn parse_codex_stdout_command_execution_empty_output_is_none() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc true","aggregated_output":"","exit_code":0,"status":"completed"}}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_codex_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert!(events[0].result_text.is_none());
+    }
+
+    #[test]
+    fn parse_codex_stdout_masks_secret_in_command_execution_output() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"cat .env","aggregated_output":"ANTHROPIC_API_KEY=sk-ant-api03-verysecretvalue1234567890","exit_code":0,"status":"completed"}}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_codex_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        let result_text = events[0].result_text.as_deref().unwrap();
+        assert!(
+            !result_text.contains("sk-ant-api03-verysecretvalue1234567890"),
+            "secret leaked into result_text: {result_text}"
+        );
+    }
+
+    #[test]
+    fn parse_codex_stdout_mixed_events_content_and_tools() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","aggregated_output":"x","exit_code":0,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call","server":"duduclaw","tool":"memory_search","arguments":{},"result":{},"error":null,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"message","content":[{"type":"output_text","text":"Hello world"}]}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}"#,
+            "\n",
+        );
+        let (content, input_tokens, output_tokens, chunks) = parse_codex_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(content, "Hello world");
+        assert_eq!(input_tokens, 10);
+        assert_eq!(output_tokens, 5);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].tool_name, "shell");
+        assert_eq!(events[1].tool_name, "memory_search");
+    }
+
+    #[test]
+    fn parse_codex_stdout_missing_tool_field_skips_not_fabricates() {
+        // mcp_tool_call with no "tool" field — must be skipped, never
+        // recorded under a fabricated "unknown" placeholder.
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"id":"item_7","type":"mcp_tool_call","server":"duduclaw","status":"completed"}}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_codex_stdout(stdout);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn parse_codex_stdout_no_tool_items_is_empty_events() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"type":"message","content":[{"type":"output_text","text":"hi"}]}}"#,
+            "\n",
+        );
+        let (content, _, _, chunks) = parse_codex_stdout(stdout);
+        assert_eq!(content, "hi");
+        assert!(chunks.is_empty());
     }
 
     fn caps(

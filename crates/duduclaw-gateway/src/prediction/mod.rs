@@ -19,5 +19,19 @@ pub mod rule_lifecycle;
 pub mod subagent_prediction;
 pub mod user_model;
 
+// ── A3 task-forward-model (design-task-forward-model-2026-08-06.md) ──
+// Parallel to the conversational PredictionEngine above (design §4.3) —
+// predicts what a goal-loop dispatch round will DO (tool classes, call
+// volume, outcome, artifact shape), not user reaction. Not wired into any
+// hot path yet (WP-A9 is out of scope for this change).
+pub mod tool_class;
+pub mod task_forward;
+pub mod task_forward_store;
+pub mod task_observe;
+pub mod transition;
+pub mod foresight_gate;
+// ── A4 rule induce/update/prune (design §6.5) ──
+pub mod task_rule_induce;
+
 #[cfg(test)]
 mod tests;

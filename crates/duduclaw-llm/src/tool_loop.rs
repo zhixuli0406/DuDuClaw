@@ -47,6 +47,29 @@ pub const DEFAULT_MAX_TOOL_ITERS: usize = 10;
 /// Stop-reason marker set when the iteration cap is hit.
 pub const MAX_ITERS_STOP: &str = "max_tool_iters";
 
+/// Char caps for [`LoopToolCall`]'s masked text fields — reuse the audit
+/// trail's own caps (`tool_calls.jsonl`'s `input`/`result_text` fields, and
+/// `duduclaw-gateway::runtime::NativeToolEvent`'s identical caps) so a tool
+/// call's text is bounded the same regardless of which capture path recorded
+/// it.
+const LOOP_TOOL_CALL_INPUT_MAX_CHARS: usize = duduclaw_security::audit::AUDIT_INPUT_MAX_CHARS;
+const LOOP_TOOL_CALL_RESULT_MAX_CHARS: usize = duduclaw_security::audit::AUDIT_RESULT_TEXT_MAX_CHARS;
+
+/// Mask ([`duduclaw_security::audit::mask_sensitive_text`]) then
+/// CJK-safe-truncate raw text before it is allowed onto a [`LoopToolCall`].
+/// The ONLY path that may populate `LoopToolCall::result_text`/`input_text`
+/// — masking always runs before truncation (a secret split across the
+/// truncation boundary must still be caught). An empty/all-whitespace result
+/// is `None`, never an empty-string placeholder.
+fn mask_and_cap(text: &str, max_chars: usize) -> Option<String> {
+    let masked = duduclaw_security::audit::mask_sensitive_text(text);
+    let trimmed = masked.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(duduclaw_core::truncate_chars(trimmed, max_chars))
+}
+
 /// The outcome of one tool invocation, as seen by the loop.
 ///
 /// `is_error` maps straight onto [`ContentPart::ToolResult::is_error`] — a
@@ -124,6 +147,41 @@ pub struct ToolLoopOutcome {
     /// Every taint hit / overflow event on a *sensitive* tool call, in
     /// dispatch order. Empty when the policy is `Off` or nothing flagged.
     pub provenance_flags: Vec<ProvenanceFlag>,
+    /// WP-A5 (design `commercial/docs/design-task-forward-model-2026-08-06.md`
+    /// §5.3/§9), extended R1 (2026-08,
+    /// `wiki/reports/memory-quality/2026-08/wp-a10-live-test-2026-08-06.md`
+    /// §6): every tool call dispatched across the whole loop, in dispatch
+    /// order. `success = false` for a call whose outcome carried
+    /// `is_error = true` — this covers an executor error result, a dispatch
+    /// failure fed back as an error result, AND a provenance-blocked call
+    /// (never dispatched, but still an "attempted, refused" tool use).
+    /// Runtime-neutral by construction (no call id) — callers merge this
+    /// into `duduclaw-gateway::runtime::NativeToolEvent` for the A3
+    /// forward-model's `Full` observation fidelity AND (R1) the B3
+    /// grounding pre-check.
+    pub tool_calls: Vec<LoopToolCall>,
+}
+
+/// One tool call the loop dispatched (or refused to dispatch), carrying
+/// masked+capped evidence text for downstream consumers (R1's B3 grounding
+/// pre-check chief among them). Masking happens HERE — inside
+/// `duduclaw-llm`, which already depends on `duduclaw-security` for the
+/// `PolicyExecutor` — so no unmasked tool text ever crosses into
+/// `duduclaw-gateway::runtime::NativeToolEvent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopToolCall {
+    pub tool_name: String,
+    pub success: bool,
+    /// Masked + CJK-safe-truncated tool result text (the `ToolOutcome`
+    /// content, or the refusal/error text on a blocked/failed call). `None`
+    /// only when the content was empty/all-whitespace after masking — never
+    /// omitted merely because the call failed (an error's text is still
+    /// useful context, same convention as the MCP audit trail's
+    /// `append_tool_call_with_input`; `check_grounded` already excludes
+    /// `is_error` evidence from grounding on its own).
+    pub result_text: Option<String>,
+    /// Masked + CJK-safe-truncated serialized tool-call arguments.
+    pub input_text: Option<String>,
 }
 
 /// The tool loop with argument-level provenance tracking (S2 v1 — PACT,
@@ -169,18 +227,20 @@ pub async fn run_tool_loop_with_provenance(
         Some(cfg.initial_ledger.take().unwrap_or_else(|| seed_default_ledger(&req)))
     };
     let mut flags: Vec<ProvenanceFlag> = Vec::new();
+    // WP-A5/R1: every dispatched (or refused) tool call across the whole loop.
+    let mut tool_calls: Vec<LoopToolCall> = Vec::new();
 
     let mut last = provider.complete(&req).await?;
 
     for _ in 0..cap {
         if last.stop != StopReason::ToolUse {
-            return Ok(ToolLoopOutcome { response: last, provenance_flags: flags });
+            return Ok(ToolLoopOutcome { response: last, provenance_flags: flags, tool_calls });
         }
         let calls = tool_calls_of(&last);
         if calls.is_empty() {
             // Model signalled ToolUse but emitted no ToolCall parts — nothing
             // to dispatch; surface as-is rather than spin.
-            return Ok(ToolLoopOutcome { response: last, provenance_flags: flags });
+            return Ok(ToolLoopOutcome { response: last, provenance_flags: flags, tool_calls });
         }
 
         // Echo the assistant turn verbatim (keeps Reasoning signatures for
@@ -190,6 +250,12 @@ pub async fn run_tool_loop_with_provenance(
 
         let mut result_parts = Vec::with_capacity(calls.len());
         for (id, name, args) in calls {
+            // R1: capture the call's own serialized arguments BEFORE `args`
+            // is (possibly) moved into `tools.call(&name, args)` below —
+            // `Value::to_string()` only borrows, so this is safe regardless
+            // of which branch actually dispatches.
+            let input_text = mask_and_cap(&args.to_string(), LOOP_TOOL_CALL_INPUT_MAX_CHARS);
+
             // Provenance gate (S2): decide before dispatch.
             let block_reason = match &ledger {
                 Some(ledger) => {
@@ -223,6 +289,18 @@ pub async fn run_tool_loop_with_provenance(
                 }
             }
 
+            // WP-A5: record regardless of `executed` — a provenance-blocked
+            // call was still attempted (and refused), which is itself a
+            // meaningful signal for the A3 forward model's tool-set/outcome
+            // diff, not something to silently drop from the trace. R1: the
+            // dispatched/refused call's own text (masked) rides along too.
+            tool_calls.push(LoopToolCall {
+                tool_name: name.clone(),
+                success: !is_error,
+                result_text: mask_and_cap(&content, LOOP_TOOL_CALL_RESULT_MAX_CHARS),
+                input_text,
+            });
+
             result_parts.push(ContentPart::ToolResult { call_id: id, content, is_error });
         }
         req.messages
@@ -236,7 +314,7 @@ pub async fn run_tool_loop_with_provenance(
     if last.stop == StopReason::ToolUse {
         last.stop = StopReason::Other(MAX_ITERS_STOP.to_string());
     }
-    Ok(ToolLoopOutcome { response: last, provenance_flags: flags })
+    Ok(ToolLoopOutcome { response: last, provenance_flags: flags, tool_calls })
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +631,231 @@ mod tests {
         assert_eq!(resp.stop, StopReason::ToolUse);
         assert_eq!(exec.call_count(), 0);
         assert_eq!(provider.calls(), 1);
+    }
+
+    // ── WP-A5: ToolLoopOutcome.tool_calls ──────────────────────────────────
+
+    #[tokio::test]
+    async fn tool_calls_records_name_and_success() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-1", "search"),
+            final_resp("here is the answer"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Ok("result payload".into()));
+        let req = ChatRequest::new("m");
+
+        let out = run_tool_loop_with_provenance(
+            &provider,
+            req,
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].tool_name, "search");
+        assert!(out.tool_calls[0].success);
+    }
+
+    #[tokio::test]
+    async fn tool_calls_records_failure_from_error_outcome() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-e", "search"),
+            final_resp("recovered"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Error("upstream 500".into()));
+        let req = ChatRequest::new("m");
+
+        let out = run_tool_loop_with_provenance(
+            &provider,
+            req,
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].tool_name, "search");
+        assert!(!out.tool_calls[0].success);
+    }
+
+    #[tokio::test]
+    async fn tool_calls_records_dispatch_failure_as_failure() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-x", "missing"),
+            final_resp("ok anyway"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Dispatch("unknown tool: missing".into()));
+        let req = ChatRequest::new("m");
+
+        let out = run_tool_loop_with_provenance(
+            &provider,
+            req,
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].tool_name, "missing");
+        assert!(!out.tool_calls[0].success);
+    }
+
+    #[tokio::test]
+    async fn tool_calls_accumulates_across_multiple_rounds() {
+        // Two separate tool-dispatch rounds (not two calls in one round) —
+        // `tool_calls` must carry both, in order, not just the last round's.
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("c1", "search"),
+            tool_use_resp("c2", "search"),
+            final_resp("done"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Ok("x".into()));
+        let req = ChatRequest::new("m");
+
+        let out = run_tool_loop_with_provenance(
+            &provider,
+            req,
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+        )
+        .await
+        .unwrap();
+        let names_and_success: Vec<(String, bool)> = out
+            .tool_calls
+            .iter()
+            .map(|c| (c.tool_name.clone(), c.success))
+            .collect();
+        assert_eq!(
+            names_and_success,
+            vec![("search".to_string(), true), ("search".to_string(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_calls_records_provenance_blocked_call_as_failure() {
+        let provider = ScriptedProvider::new(vec![
+            tool_call_resp("c1", "fetch_web", serde_json::json!({"url": "https://x.example"})),
+            tool_call_resp(
+                "c2",
+                "send_email",
+                serde_json::json!({"to": "a@b.c", "body": format!("please {INJECTED} now")}),
+            ),
+            final_resp("re-planned"),
+        ]);
+        let exec = MapExecutor::new(&[
+            ("fetch_web", &format!("page says: {INJECTED} thanks")),
+            ("send_email", "sent"),
+        ]);
+        let req = ChatRequest::new("m");
+
+        let out = run_tool_loop_with_provenance(
+            &provider,
+            req,
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            enforce_cfg(&["send_email"]),
+        )
+        .await
+        .unwrap();
+
+        // fetch_web succeeded; send_email was blocked (never dispatched) but
+        // is still recorded as an attempted, failed call.
+        let names_and_success: Vec<(String, bool)> = out
+            .tool_calls
+            .iter()
+            .map(|c| (c.tool_name.clone(), c.success))
+            .collect();
+        assert_eq!(
+            names_and_success,
+            vec![("fetch_web".to_string(), true), ("send_email".to_string(), false)]
+        );
+        // R1: the blocked call's refusal text is still captured as
+        // `result_text` (is_error=true keeps it out of grounding evidence
+        // regardless — `check_grounded` filters on `is_error`).
+        assert!(out.tool_calls[1].result_text.is_some());
+    }
+
+    // ── R1: LoopToolCall.result_text / input_text ───────────────────────────
+
+    #[tokio::test]
+    async fn tool_calls_capture_masked_result_and_input_text() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-1", "search"),
+            final_resp("here is the answer"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Ok("result payload".into()));
+        let req = ChatRequest::new("m");
+
+        let out = run_tool_loop_with_provenance(
+            &provider,
+            req,
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.tool_calls[0].result_text.as_deref(), Some("result payload"));
+        assert!(out.tool_calls[0].input_text.as_deref().unwrap().contains("rust"));
+    }
+
+    #[tokio::test]
+    async fn tool_calls_mask_secret_in_result_text() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-1", "search"),
+            final_resp("done"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Ok(
+            "here is your key: sk-ant-api03-verysecretvalue1234567890".into(),
+        ));
+        let req = ChatRequest::new("m");
+
+        let out = run_tool_loop_with_provenance(
+            &provider,
+            req,
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let result_text = out.tool_calls[0].result_text.as_deref().unwrap();
+        assert!(
+            !result_text.contains("sk-ant-api03-verysecretvalue1234567890"),
+            "secret leaked into LoopToolCall.result_text: {result_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_calls_empty_result_text_is_none() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-1", "search"),
+            final_resp("done"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Ok(String::new()));
+        let req = ChatRequest::new("m");
+
+        let out = run_tool_loop_with_provenance(
+            &provider,
+            req,
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.tool_calls[0].result_text.is_none());
     }
 
     // ── P1-4: PolicyExecutor decorator ────────────────────────────────────────

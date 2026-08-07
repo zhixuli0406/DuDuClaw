@@ -380,6 +380,17 @@ pub struct MetaCognition {
     #[serde(default)]
     pub consecutive_accurate: u64,
 
+    /// Consecutive NON-negligible predictions counter (WP0.4/0.7 — R7).
+    ///
+    /// Mirror of [`Self::consecutive_accurate`]: increments when a prediction
+    /// lands outside `Negligible`, resets to 0 on a `Negligible` prediction.
+    /// Feeds the symmetric recovery rule in [`Self::evaluate_and_adjust`] that
+    /// raises `negligible_upper` back toward its default after a long stretch
+    /// of non-trivial errors — without this, the high-confidence penalty only
+    /// ever lowers `negligible_upper` and it never recovers (R7).
+    #[serde(default)]
+    pub consecutive_non_negligible: u64,
+
     // ── Hardening: anti-feedback-loop (Risk 3) ─────────────────
 
     /// CUSUM change-point detector — replaces fixed evaluation interval.
@@ -445,6 +456,7 @@ impl Default for MetaCognition {
             total_predictions: 0,
             surprise_deficit: SurpriseDeficitTracker::default(),
             consecutive_accurate: 0,
+            consecutive_non_negligible: 0,
             change_detector: ChangePointDetector::default(),
             original_sig_improvement_rate: None,
             proactive_threshold: 0.5,
@@ -494,10 +506,14 @@ impl MetaCognition {
         self.surprise_deficit.record(error.composite_error);
 
         // Track consecutive accurate predictions (high-confidence penalty)
+        // and its mirror — consecutive non-negligible predictions (WP0.7
+        // recovery rule below).
         if error.category == ErrorCategory::Negligible {
             self.consecutive_accurate += 1;
+            self.consecutive_non_negligible = 0;
         } else {
             self.consecutive_accurate = 0;
+            self.consecutive_non_negligible += 1;
         }
 
         // --- Hardening: CUSUM change-point detection (Risk 3) ---
@@ -615,6 +631,28 @@ impl MetaCognition {
             adjusted = true;
         }
 
+        // --- R7 symmetry fix: significant_upper recovery ---
+        // Mirror of the down-ratchet above. Without this, `significant_upper`
+        // only ever moves down (any Critical burst permanently narrows the
+        // Significant band) even after the system has been well-behaved for
+        // a long stretch — the exact one-way-compression failure mode
+        // diagnosed as R7. Trigger logic mirrors the down-ratchet (same
+        // windowed crit_proportion signal, opposite direction, same 0.05
+        // step) and requires a FULL window of recent data so a cold-start
+        // empty window (crit_proportion defaults to 0.0) can't spuriously
+        // raise the threshold before there's any real signal. Bounded at the
+        // AdaptiveThresholds default (0.8) — this rule may only repair prior
+        // down-ratchets, never push significant_upper past its healthy
+        // baseline.
+        if self.recent_categories.len() >= RECENT_CATEGORY_WINDOW && crit_proportion < 0.05 {
+            let default_significant_upper = AdaptiveThresholds::default().significant_upper;
+            let raised = (self.thresholds.significant_upper + 0.05).min(default_significant_upper);
+            if (raised - self.thresholds.significant_upper).abs() > f64::EPSILON {
+                self.thresholds.significant_upper = raised;
+                adjusted = true;
+            }
+        }
+
         // --- Hardening: high-confidence penalty (Risk 2) ---
         // When predictions are accurate for too long, the prediction space may
         // have narrowed rather than improved. Lower thresholds to let more
@@ -629,6 +667,26 @@ impl MetaCognition {
             // Reset to prevent repeated penalty application on every subsequent
             // evaluate_and_adjust call (which would drive threshold to minimum).
             self.consecutive_accurate = 0;
+        }
+
+        // --- R7 symmetry fix: negligible_upper recovery ---
+        // Mirror of the high-confidence penalty above. Same trigger
+        // (streak > 200), same step (0.03), opposite direction and opposite
+        // streak counter — a long run of non-trivial errors implies the
+        // Negligible band may have been over-narrowed by a past penalty
+        // application, so widen it back. Bounded at the AdaptiveThresholds
+        // default (0.2) so this can only undo prior penalties, never grow
+        // negligible_upper past its healthy baseline.
+        if self.consecutive_non_negligible > 200 {
+            let default_negligible_upper = AdaptiveThresholds::default().negligible_upper;
+            self.thresholds.negligible_upper =
+                (self.thresholds.negligible_upper + 0.03).min(default_negligible_upper);
+            adjusted = true;
+            info!(
+                consecutive = self.consecutive_non_negligible,
+                "Negligible threshold recovery applied — raising negligible threshold (R7)"
+            );
+            self.consecutive_non_negligible = 0;
         }
 
         // Clamp all thresholds to valid ranges
@@ -1032,6 +1090,197 @@ mod bug4_tests {
         assert!(
             meta.thresholds.significant_upper < baseline_sig_upper,
             "recent-Critical-heavy window must lower significant_upper"
+        );
+    }
+}
+
+// ── WP0.7: threshold symmetry (R7) ──────────────────────────────────────────
+//
+// R7 diagnosis: `negligible_upper` and `significant_upper` had only-ever-down
+// adjustment rules (the high-confidence penalty, and the M35 Critical-
+// proportion ratchet respectively). Over a long enough production run this
+// one-way compression permanently narrows the Significant band, so GVU's
+// trigger rate decays independent of whether the agent's actual behaviour
+// improved. These tests pin the mirrored recovery rules added above: they
+// must (a) actually raise the threshold back when the opposite condition
+// holds for long enough, and (b) never push past the `AdaptiveThresholds`
+// default — the recovery can only undo a prior penalty, not overshoot it.
+#[cfg(test)]
+mod wp07_threshold_symmetry_tests {
+    use super::*;
+
+    /// Drive `record_prediction`-equivalent bookkeeping without constructing
+    /// a full `PredictionError` — only the streak counters are under test.
+    fn push_negligible_streak(meta: &mut MetaCognition, n: u64) {
+        for _ in 0..n {
+            meta.consecutive_accurate += 1;
+            meta.consecutive_non_negligible = 0;
+        }
+    }
+
+    fn push_non_negligible_streak(meta: &mut MetaCognition, n: u64) {
+        for _ in 0..n {
+            meta.consecutive_accurate = 0;
+            meta.consecutive_non_negligible += 1;
+        }
+    }
+
+    /// Local copy of the `bug4_tests::push_categories` helper — kept
+    /// module-local rather than shared across `#[cfg(test)]` modules to
+    /// avoid coupling two independently-owned test files together.
+    fn push_categories(meta: &mut MetaCognition, category: ErrorCategory, n: usize) {
+        for _ in 0..n {
+            meta.recent_categories.push_back(category);
+            while meta.recent_categories.len() > RECENT_CATEGORY_WINDOW {
+                meta.recent_categories.pop_front();
+            }
+        }
+    }
+
+    #[test]
+    fn negligible_upper_lowers_then_recovers() {
+        let mut meta = MetaCognition::default();
+        let default_negligible = AdaptiveThresholds::default().negligible_upper;
+        assert!((meta.thresholds.negligible_upper - default_negligible).abs() < 1e-9);
+
+        // Simulate the high-confidence penalty firing (long accurate streak).
+        push_negligible_streak(&mut meta, 201);
+        meta.evaluate_and_adjust();
+        assert!(
+            meta.thresholds.negligible_upper < default_negligible,
+            "penalty must lower negligible_upper below default"
+        );
+        let lowered = meta.thresholds.negligible_upper;
+
+        // Now the opposite: a long streak of non-negligible predictions
+        // must raise it back — this is the R7 fix under test.
+        push_non_negligible_streak(&mut meta, 201);
+        meta.evaluate_and_adjust();
+        assert!(
+            meta.thresholds.negligible_upper > lowered,
+            "R7 fix: negligible_upper must recover after a long non-negligible streak \
+             (was {lowered}, now {})",
+            meta.thresholds.negligible_upper
+        );
+    }
+
+    #[test]
+    fn negligible_upper_recovery_never_exceeds_default() {
+        let mut meta = MetaCognition::default();
+        let default_negligible = AdaptiveThresholds::default().negligible_upper;
+
+        // Even with an enormous non-negligible streak (many recovery cycles
+        // worth), the threshold must never overshoot the design default.
+        for _ in 0..20 {
+            push_non_negligible_streak(&mut meta, 201);
+            meta.evaluate_and_adjust();
+        }
+        assert!(
+            meta.thresholds.negligible_upper <= default_negligible + 1e-9,
+            "negligible_upper must never exceed its default ceiling (got {})",
+            meta.thresholds.negligible_upper
+        );
+    }
+
+    #[test]
+    fn significant_upper_lowers_then_recovers() {
+        let mut meta = MetaCognition::default();
+        let default_significant = AdaptiveThresholds::default().significant_upper;
+        assert!((meta.thresholds.significant_upper - default_significant).abs() < 1e-9);
+
+        // Simulate the M35 down-ratchet firing (window heavy with Critical).
+        push_categories(&mut meta, ErrorCategory::Critical, RECENT_CATEGORY_WINDOW);
+        meta.evaluate_and_adjust();
+        assert!(
+            meta.thresholds.significant_upper < default_significant,
+            "down-ratchet must lower significant_upper below default"
+        );
+        let lowered = meta.thresholds.significant_upper;
+
+        // Now a full window of well-behaved (non-Critical) predictions must
+        // raise it back — the R7 fix under test.
+        push_categories(&mut meta, ErrorCategory::Negligible, RECENT_CATEGORY_WINDOW);
+        meta.evaluate_and_adjust();
+        assert!(
+            meta.thresholds.significant_upper > lowered,
+            "R7 fix: significant_upper must recover after a clean window \
+             (was {lowered}, now {})",
+            meta.thresholds.significant_upper
+        );
+    }
+
+    #[test]
+    fn significant_upper_recovery_never_exceeds_default() {
+        let mut meta = MetaCognition::default();
+        let default_significant = AdaptiveThresholds::default().significant_upper;
+
+        for _ in 0..20 {
+            push_categories(&mut meta, ErrorCategory::Negligible, RECENT_CATEGORY_WINDOW);
+            meta.evaluate_and_adjust();
+        }
+        assert!(
+            meta.thresholds.significant_upper <= default_significant + 1e-9,
+            "significant_upper must never exceed its default ceiling (got {})",
+            meta.thresholds.significant_upper
+        );
+    }
+
+    /// Long-term simulated distribution: alternating "down-pressure" /
+    /// "up-pressure" epochs must keep both thresholds bounded within
+    /// [clamp floor, default] — no unbounded one-directional drift over many
+    /// cycles (R7 acceptance criterion: "長期單向漂移不再發生、且有界").
+    ///
+    /// The two underlying signals are independent (streak counters vs. the
+    /// `recent_categories` window), so each epoch drives BOTH thresholds in
+    /// the same direction: a down-pressure epoch feeds a long
+    /// accurate/negligible streak (→ negligible_upper penalty) together with
+    /// a Critical-heavy category window (→ significant_upper down-ratchet);
+    /// an up-pressure epoch feeds the mirror image of each.
+    #[test]
+    fn long_run_alternating_distribution_stays_bounded() {
+        let mut meta = MetaCognition::default();
+        let default_negligible = AdaptiveThresholds::default().negligible_upper;
+        let default_significant = AdaptiveThresholds::default().significant_upper;
+
+        for cycle in 0..50 {
+            if cycle % 2 == 0 {
+                // Down-pressure epoch: pushes both thresholds down.
+                push_negligible_streak(&mut meta, 201);
+                push_categories(&mut meta, ErrorCategory::Critical, RECENT_CATEGORY_WINDOW);
+            } else {
+                // Up-pressure epoch: pushes both thresholds back up (R7 fix).
+                push_non_negligible_streak(&mut meta, 201);
+                push_categories(&mut meta, ErrorCategory::Negligible, RECENT_CATEGORY_WINDOW);
+            }
+            meta.evaluate_and_adjust();
+
+            // Bounded: never below the hard clamp floor, never above default.
+            assert!(
+                meta.thresholds.negligible_upper >= 0.1 - 1e-9
+                    && meta.thresholds.negligible_upper <= default_negligible + 1e-9,
+                "negligible_upper drifted out of bounds at cycle {cycle}: {}",
+                meta.thresholds.negligible_upper
+            );
+            assert!(
+                meta.thresholds.significant_upper >= 0.4 - 1e-9
+                    && meta.thresholds.significant_upper <= default_significant + 1e-9,
+                "significant_upper drifted out of bounds at cycle {cycle}: {}",
+                meta.thresholds.significant_upper
+            );
+        }
+
+        // After ending on an up-pressure epoch (cycle 49 is odd), both
+        // thresholds should have recovered back to (or near) default —
+        // proof that the drift is genuinely two-way, not just "less bad".
+        assert!(
+            (meta.thresholds.negligible_upper - default_negligible).abs() < 0.05,
+            "negligible_upper should recover close to default after an up-pressure epoch, got {}",
+            meta.thresholds.negligible_upper
+        );
+        assert!(
+            (meta.thresholds.significant_upper - default_significant).abs() < 0.05,
+            "significant_upper should recover close to default after an up-pressure epoch, got {}",
+            meta.thresholds.significant_upper
         );
     }
 }

@@ -39,6 +39,22 @@ use super::engine::ErrorCategory;
 
 /// `source_event` written by `reflexion::maybe_consolidate` (F2b).
 pub const RULE_SOURCE_EVENT: &str = "reflexion_consolidation";
+/// `source_event` written by `task_rule_induce::maybe_induce_task_rule`
+/// (WP-A4, design §6.5 T8/T9: task-layer rules go through this same
+/// ACE/ExpeL lifecycle machinery directly, never through `playbook`).
+/// Deliberately distinct from [`RULE_SOURCE_EVENT`] so
+/// `list_valid_by_source_event` scans never mix dialogue-layer
+/// (`reflexion.rs`) and task-layer (`task_rule_induce.rs`) rules — the
+/// channel-reply F2a injection (`select_rules`) must never surface a
+/// task-layer rule, and the goal-loop dispatch injection
+/// (`select_task_rules`) must never surface a dialogue-layer one.
+pub const TASK_RULE_SOURCE_EVENT: &str = "task_forward_induction";
+/// Tag distinguishing a task-layer rule (WP-A4) from a dialogue-layer
+/// (F2b `reflexion.rs`) one — both live on `MemoryLayer::Semantic` and
+/// share this module's `RuleStats`/probation/retirement machinery, so the
+/// tag is the human-legible marker of provenance (the `source_event`
+/// difference above is the machine-enforced one).
+pub const TASK_RULE_TAG: &str = "task-rule";
 /// Tag appended on retirement; F2a selection excludes entries carrying it.
 pub const RETIRED_RULE_TAG: &str = "retired-rule";
 /// Tag appended to a freshly consolidated rule (WP2 Janus trial period).
@@ -51,6 +67,12 @@ pub const PROBATION_RULE_TAG: &str = "probation-rule";
 pub const PROBATION_GRADUATE_HELPFUL: u32 = 3;
 /// Max rules injected per turn — mirrors the F2a mistake-injection cap.
 pub const INJECTION_LIMIT: usize = 3;
+/// Max WP-A4 task rules injected per goal-loop dispatch round — smaller than
+/// [`INJECTION_LIMIT`] since the dispatch prompt already carries the `<state>`
+/// block, judge feedback, and acceptance criteria; task rules are a small
+/// addendum, not the primary steering signal (design §6.5 item 2: "取 cap
+/// 2").
+pub const TASK_RULE_INJECTION_LIMIT: usize = 2;
 /// Janus trial period (WP2): new rules start on probation with the minimum
 /// possible credit → `helpful = 1, harmful = 0`. A single harmful strike
 /// during probation retires the rule outright (see [`settle_injected_rules`]);
@@ -63,7 +85,11 @@ const RETIRED_IMPORTANCE: f64 = 1.0;
 const STATS_KEY: &str = "rule_stats";
 /// Candidate scan bound before ranking — keeps per-turn work O(1)-ish even
 /// for agents that accumulated many rules over months.
-const CANDIDATE_SCAN_CAP: usize = 50;
+///
+/// `pub(crate)` so `crate::playbook` can scan the same window (WP1.2/1.3):
+/// `PLAYBOOK_MAX_ENTRIES` (40) is deliberately kept <= this cap so ranking
+/// never sees a truncated candidate set.
+pub(crate) const CANDIDATE_SCAN_CAP: usize = 50;
 
 /// Helpful/harmful lifecycle counters persisted in entry metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -147,8 +173,35 @@ pub async fn select_rules(
     agent_id: &str,
     limit: usize,
 ) -> Vec<InjectedRule> {
+    select_rules_by_source_event(engine, agent_id, RULE_SOURCE_EVENT, limit).await
+}
+
+/// Same selection/ranking contract as [`select_rules`], scoped to WP-A4
+/// task-layer rules ([`TASK_RULE_SOURCE_EVENT`]) instead of F2b dialogue
+/// rules. Used by `goal_loop.rs`'s dispatch-prompt injection step — kept as
+/// a distinct public entry point (rather than a `source_event` parameter on
+/// `select_rules` itself) so every existing `select_rules` call site keeps
+/// its exact prior signature.
+pub async fn select_task_rules(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    limit: usize,
+) -> Vec<InjectedRule> {
+    select_rules_by_source_event(engine, agent_id, TASK_RULE_SOURCE_EVENT, limit).await
+}
+
+/// Shared selection/ranking body for [`select_rules`] and
+/// [`select_task_rules`] — identical logic, only the `source_event` scan
+/// filter differs (see those functions' docs for why the two must never
+/// share a scan).
+async fn select_rules_by_source_event(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    source_event: &str,
+    limit: usize,
+) -> Vec<InjectedRule> {
     let rows = match engine
-        .list_valid_by_source_event(agent_id, RULE_SOURCE_EVENT, CANDIDATE_SCAN_CAP)
+        .list_valid_by_source_event(agent_id, source_event, CANDIDATE_SCAN_CAP)
         .await
     {
         Ok(rows) => rows,
@@ -368,6 +421,37 @@ mod tests {
         RuleStats::from_metadata(&meta)
     }
 
+    /// Same as `store_rule` but with an explicit `source_event` + `tags` —
+    /// used by the WP-A4 isolation test below to simulate a
+    /// `task_rule_induce`-written row without depending on that module.
+    async fn store_rule_with_source(
+        engine: &SqliteMemoryEngine,
+        agent: &str,
+        content: &str,
+        stats: RuleStats,
+        source_event: &str,
+        tags: Vec<String>,
+    ) -> String {
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: content.to_string(),
+            timestamp: chrono::Utc::now(),
+            tags,
+            embedding: None,
+            layer: MemoryLayer::Semantic,
+            importance: 8.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: source_event.to_string(),
+        };
+        let meta = TemporalMeta {
+            metadata: Some(serde_json::json!({ "rule_stats": stats })),
+            ..Default::default()
+        };
+        engine.store_temporal(agent, entry, meta).await.unwrap()
+    }
+
     #[tokio::test]
     async fn settlement_increments_correct_counter_per_category() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
@@ -547,5 +631,65 @@ mod tests {
         let selected = select_rules(&engine, agent, INJECTION_LIMIT).await;
         assert_eq!(selected.len(), 1);
         assert!(!selected[0].probation);
+    }
+
+    // ── WP-A4: select_task_rules / select_rules source_event isolation ──
+
+    #[tokio::test]
+    async fn select_task_rules_never_surfaces_dialogue_rules_and_vice_versa() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-a4-isolation";
+
+        let dialogue_id = store_rule(&engine, agent, "dialogue rule", RuleStats::initial(), 0, true).await;
+        let task_id = store_rule_with_source(
+            &engine,
+            agent,
+            "task rule",
+            RuleStats::initial(),
+            TASK_RULE_SOURCE_EVENT,
+            vec![TASK_RULE_TAG.to_string(), PROBATION_RULE_TAG.to_string()],
+        )
+        .await;
+
+        let dialogue_selected = select_rules(&engine, agent, INJECTION_LIMIT).await;
+        assert_eq!(dialogue_selected.len(), 1);
+        assert_eq!(dialogue_selected[0].id, dialogue_id);
+
+        let task_selected = select_task_rules(&engine, agent, INJECTION_LIMIT).await;
+        assert_eq!(task_selected.len(), 1);
+        assert_eq!(task_selected[0].id, task_id);
+    }
+
+    #[tokio::test]
+    async fn select_task_rules_ranks_and_excludes_retired_same_as_select_rules() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-a4-rank";
+        let low = store_rule_with_source(
+            &engine, agent, "low", RuleStats { helpful: 3, harmful: 2 },
+            TASK_RULE_SOURCE_EVENT, vec![TASK_RULE_TAG.to_string()],
+        )
+        .await;
+        let high = store_rule_with_source(
+            &engine, agent, "high", RuleStats { helpful: 7, harmful: 2 },
+            TASK_RULE_SOURCE_EVENT, vec![TASK_RULE_TAG.to_string()],
+        )
+        .await;
+
+        let selected = select_task_rules(&engine, agent, INJECTION_LIMIT).await;
+        let got: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(got, vec![high.as_str(), low.as_str()]);
+
+        // Retire `high` via the shared settle function, then confirm
+        // selection excludes it — same lifecycle machinery as dialogue rules.
+        settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
+        settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
+        settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
+        settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
+        settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
+        let retired = settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
+        assert_eq!(retired, vec![high.clone()]);
+        let after = select_task_rules(&engine, agent, INJECTION_LIMIT).await;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, low);
     }
 }

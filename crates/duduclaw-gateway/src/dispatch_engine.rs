@@ -41,8 +41,8 @@
 //!   itself errors, the task is parked as `needs_human` — never auto-accepted,
 //!   never looped.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -50,7 +50,13 @@ use chrono::Utc;
 use tokio::time;
 use tracing::{debug, info, warn};
 
-use crate::task_store::TaskStore;
+use crate::runtime::NativeToolEvent;
+use crate::task_store::{TaskRow, TaskStore};
+
+// `catch_unwind` for futures — same extension trait
+// `subagent_prediction::spawn_record` uses (design R5: forward-model
+// bookkeeping must never panic the review hot path).
+use futures_util::FutureExt as _;
 
 /// Default worker lease. A claim not renewed within this window is a zombie.
 pub const DEFAULT_LEASE_SECS: i64 = 300;
@@ -565,80 +571,53 @@ const TOOL_ACTIVITY_LINE_CAP: usize = 20;
 /// Safety char budget for the whole `<tool_activity>` block.
 const TOOL_ACTIVITY_CHAR_CAP: usize = 4000;
 
-/// One `tool_calls.jsonl` line's fields relevant to the review window.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ToolActivityRecord {
-    tool_name: String,
-    success: bool,
-}
-
-/// Filter raw `tool_calls.jsonl` content (one JSON object per line, written
-/// by `duduclaw_security::audit::append_tool_call*`) down to the records for
-/// `agent_id` whose `timestamp` falls in `[since, until]` inclusive.
-/// Malformed lines, other agents, and out-of-window records are silently
-/// dropped — this is a best-effort evidence summary, not a second audit
-/// trail (the canonical trail is the file itself). A bad `since`/`until`
-/// bound (should never happen — both are RFC3339 stamps from the task
-/// store / `Utc::now()`) yields an empty result rather than panicking.
-fn filter_tool_activity(
-    jsonl: &str,
-    agent_id: &str,
-    since: &str,
-    until: &str,
-) -> Vec<ToolActivityRecord> {
-    let (Ok(since_dt), Ok(until_dt)) = (
-        chrono::DateTime::parse_from_rfc3339(since),
-        chrono::DateTime::parse_from_rfc3339(until),
-    ) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for line in jsonl.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if v.get("agent_id").and_then(|a| a.as_str()) != Some(agent_id) {
-            continue;
-        }
-        let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) else {
-            continue;
-        };
-        let Ok(ts_dt) = chrono::DateTime::parse_from_rfc3339(ts) else {
-            continue;
-        };
-        if ts_dt < since_dt || ts_dt > until_dt {
-            continue;
-        }
-        let Some(tool_name) = v.get("tool_name").and_then(|t| t.as_str()) else {
-            continue;
-        };
-        let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
-        out.push(ToolActivityRecord {
-            tool_name: tool_name.to_string(),
-            success,
-        });
-    }
-    out
-}
+// WP-A3 (2026-08): `ToolActivityRecord` / `filter_tool_activity` /
+// `read_tool_activity_records` were extracted to `crate::tool_activity` so
+// the A3 task-forward-model observation layer (`prediction::task_observe`)
+// can share the exact same `tool_calls.jsonl` evidence shape instead of
+// reimplementing it a second time. Pure code motion — behavior unchanged,
+// this module's own tests below still exercise these functions directly.
+use crate::tool_activity::{ToolActivityRecord, read_tool_activity_records};
 
 /// Aggregate filtered records into the `<tool_activity>` prompt block: one
 /// line per distinct tool (`name: N ok, M err`, sorted by name for
 /// determinism), capped at [`TOOL_ACTIVITY_LINE_CAP`] lines and
 /// [`TOOL_ACTIVITY_CHAR_CAP`] chars (CJK-safe truncation). `None` when there
 /// is nothing to show — the caller omits the block entirely.
-fn format_tool_activity(records: &[ToolActivityRecord]) -> Option<String> {
-    if records.is_empty() {
+///
+/// BUG-2 fix (WP-A10 §6 復驗): `native` is the WP-A4 native-tool collector's
+/// evidence for this same round (Read/Write/Bash — whatever the runtime saw
+/// that never went through an MCP tool call). It is aggregated into the SAME
+/// block the judge already reads, one line per tool, tagged `(native)` so a
+/// same-named MCP tool never silently merges counts with a different
+/// evidence source. Only the name + an ok/err count is rendered here — this
+/// is deliberate and unchanged by R1 (2026-08): since R1 a native event MAY
+/// carry masked `result_text`/`input_text` (see [`NativeToolEvent`]'s doc
+/// comment), but that text is used ONLY for the B3 grounding pre-check
+/// ([`grounding_precheck`]), never folded into this judge-facing prompt
+/// block — keeps the judge prompt from ballooning with raw tool output and
+/// keeps the judge's own injection surface unchanged. Before the original
+/// BUG-2 fix the judge saw nothing at all for non-MCP tool use, which is
+/// what let honest Read/Write/Bash work read as "zero tool call evidence";
+/// a name+count line was already strictly more than that.
+fn format_tool_activity(records: &[ToolActivityRecord], native: &[NativeToolEvent]) -> Option<String> {
+    if records.is_empty() && native.is_empty() {
         return None;
     }
-    let mut counts: std::collections::BTreeMap<&str, (u32, u32)> =
+    let mut counts: std::collections::BTreeMap<String, (u32, u32)> =
         std::collections::BTreeMap::new();
     for r in records {
-        let entry = counts.entry(r.tool_name.as_str()).or_insert((0, 0));
+        let entry = counts.entry(r.tool_name.clone()).or_insert((0, 0));
         if r.success {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+        }
+    }
+    for e in native {
+        let key = format!("{} (native)", e.tool_name);
+        let entry = counts.entry(key).or_insert((0, 0));
+        if e.success {
             entry.0 += 1;
         } else {
             entry.1 += 1;
@@ -660,20 +639,296 @@ fn format_tool_activity(records: &[ToolActivityRecord]) -> Option<String> {
     Some(format!("<tool_activity>\n{body}\n</tool_activity>"))
 }
 
-/// Read `tool_calls.jsonl` under `home_dir` and build the `<tool_activity>`
-/// block for one task's claim→review window. Missing/unreadable/unparseable
-/// audit file ⇒ `None` (omit the block; the judge behaves exactly as before
-/// this feature existed — reviews never fail over an observability gap).
-fn read_tool_activity_block(
-    home_dir: &std::path::Path,
-    agent_id: &str,
-    since: &str,
-    until: &str,
-) -> Option<String> {
-    let path = home_dir.join("tool_calls.jsonl");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let records = filter_tool_activity(&raw, agent_id, since, until);
-    format_tool_activity(&records)
+// ── B3: GroundedSpec production pre-check (arXiv:2606.22737) ──────────────
+//
+// Lifts the eval-only trace-grounding assertion (WP4 GroundEval,
+// `duduclaw-cli/src/eval/assertions.rs`, `[[expect.grounded]]`) into the goal
+// loop's own zero-LLM acceptance chain — a claim provably unsupported by tool
+// evidence is rejected without spending a judge LLM call, exactly like the
+// WP2.4 `outcome_spec` deterministic check it runs alongside. The shared
+// overlap primitive lives in `duduclaw_core::grounding` (moved there in the
+// same change so both crates use byte-identical matching logic).
+//
+// ## Evidence source is already multi-runtime
+//
+// Evidence is read from the same `tool_calls.jsonl` window `<tool_activity>`
+// already reads ([`read_tool_activity_records`]). That trail is written by
+// the MCP dispatch layer in `duduclaw-cli/src/mcp.rs`
+// (`append_tool_call_with_input`), which sits BELOW the runtime abstraction:
+// every runtime that calls a DuDuClaw MCP tool — Claude, Codex, Gemini,
+// Antigravity, or an openai-compat backend — produces an identical
+// `tool_calls.jsonl` row regardless of which CLI drove the call. No
+// per-runtime branching is needed here; a runtime is transparently exactly
+// as "seen" as its MCP tool usage.
+//
+// ## Current behavior — read before trusting this gate in production
+//
+// B3b activated the evidence source: `tool_calls.jsonl` rows now capture the
+// tool's masked **input**, a `success` bool, AND (for most state-changing
+// tools) the tool's masked **output** text (`append_tool_call_with_input`,
+// `duduclaw-cli/src/mcp.rs`). This gate is therefore live, not inert — a
+// `review` task whose claim is unsupported by any captured tool result CAN
+// be rejected here, before the judge is ever invoked.
+//
+// R1 (2026-08, `wiki/reports/memory-quality/2026-08/wp-a10-live-test-2026-08-06.md`
+// §6) extended the SAME evidence merge to the WP-A4/A5/T10 native-tool
+// collector: `NativeToolEvent` now carries masked `result_text`/`input_text`
+// when the originating runtime's own event stream captured them (Claude
+// `tool_result` content blocks, codex `aggregated_output`/`mcp_tool_call
+// result`, gemini `tool_result.output`, the openai-compat direct-API tool
+// loop). Before R1 a native event carried only `tool_name`/`success`, so an
+// honest task done entirely with native tools (Read/Write/Bash — no MCP
+// call at all) could never reach `Grounded`, only perpetually `Degraded`.
+// Native evidence is folded into the SAME `ToolEvidence` list the MCP
+// records build and passed through the SAME `check_grounded` call — there is
+// no longer a structural reason native evidence cannot ground a claim.
+//
+// Three cases still fall through to the judge unchanged (never reject):
+// - **Read-only tools produce no audit row at all**
+//   (`duduclaw_security::audit::is_readonly_tool_name` — `tasks_list`,
+//   `memory_search`'s sibling `*_get`/`*_status` tools, etc. never even
+//   reach `is_state_changing`). A task whose claim rests entirely on a
+//   lookup, not a mutation, has NO evidence in the window → `Skip`
+//   ("no tool_use in claim→review window").
+// - **Self-echo tools never capture `result_text`** (Fix-2 C1a,
+//   `duduclaw_core::grounding::SELF_ECHO_TOOL_NAMES` — `tasks_complete`,
+//   `tasks_update`, `activity_post`, ...): their MCP response is
+//   substantially the caller's own input echoed back, so capturing it as
+//   evidence would let a claim "ground" against its own words. These
+//   degrade to `ResultTextMissing`/skip, exactly like an ordinary
+//   observability gap.
+// - **Every recorded call errored** → `Degraded` ("no successful tool call
+//   in window") — an execution problem, not a fabrication the judge's
+//   `correctness` aspect needs a second zero-LLM pass on.
+//
+// Fix-2 C1b adds a second, orthogonal safeguard even on a genuinely captured
+// `result_text`: a span shared with the final claim is disqualified if that
+// same span also appears in the call's OWN input
+// (`shares_contiguous_run_excluding_echo`) — so a tool that isn't fully
+// self-echoing (e.g. mixes a genuine store-assigned id into a response that
+// also restates part of the request) still can't be "grounded" purely on
+// the restated part.
+//
+// A separate, orthogonal limitation remains: this is a literal-overlap check
+// (same as the eval version). An agent that legitimately paraphrases or
+// translates a tool result (e.g. summarizing an English API response in
+// 繁體中文) can fail it even though the claim is well-founded — the reject
+// feedback explicitly asks the agent to quote the tool's key original
+// wording rather than paraphrase, to steer around this false-positive mode.
+
+/// Conservative default overlap threshold for the production pre-check.
+/// Deliberately LOWER than the offline eval default (12 chars,
+/// `default_min_overlap_chars` in `duduclaw-cli/src/eval/case.rs`): this
+/// gate runs unattended on every goal-mode review in production, where a
+/// false-positive reject burns a whole revision round. The eval suite is
+/// author-curated (a human picks `min_overlap_chars` per assertion); this
+/// gate has no such per-task tuning, so it defaults to catching only
+/// blatantly unsupported claims. A false negative here is not a silent
+/// miss — the MAV judge's `correctness`/`completeness` aspects remain a
+/// second, LLM-backed lens on the same claim.
+const DEFAULT_GROUNDING_MIN_OVERLAP_CHARS: usize = 6;
+
+/// Tuning for the B3 grounding pre-check. Read from `config.toml [dispatch]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GroundingPrecheckConfig {
+    /// Default ON (per task brief: "預設開啟但保守"). Set
+    /// `[dispatch] grounding_precheck_enabled = false` to disable.
+    enabled: bool,
+    /// `[dispatch] grounding_min_overlap_chars`, chars (CJK-safe char count,
+    /// not bytes). Must be >= 1; a non-positive/malformed value falls back
+    /// to the default rather than degrading to "everything overlaps".
+    min_overlap_chars: usize,
+}
+
+impl Default for GroundingPrecheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_overlap_chars: DEFAULT_GROUNDING_MIN_OVERLAP_CHARS,
+        }
+    }
+}
+
+impl GroundingPrecheckConfig {
+    /// Isolated `toml::Table` parse — mirrors [`dispatch_engine_enabled`]'s
+    /// read pattern so an unrelated/malformed `config.toml` section can
+    /// never break this. Absent file/section/field ⇒ the conservative
+    /// default (on, low threshold).
+    fn from_home(home_dir: &std::path::Path) -> Self {
+        let default = Self::default();
+        let config_path = home_dir.join("config.toml");
+        let Ok(content) = std::fs::read_to_string(&config_path) else {
+            return default;
+        };
+        let Ok(table) = content.parse::<toml::Table>() else {
+            return default;
+        };
+        let Some(section) = table.get("dispatch").and_then(|v| v.as_table()) else {
+            return default;
+        };
+        let enabled = section
+            .get("grounding_precheck_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.enabled);
+        let min_overlap_chars = section
+            .get("grounding_min_overlap_chars")
+            .and_then(|v| v.as_integer())
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(default.min_overlap_chars);
+        Self {
+            enabled,
+            min_overlap_chars,
+        }
+    }
+}
+
+/// Outcome of the B3 grounding pre-check — more granular than a bool so the
+/// caller can log a degrade distinctly from a genuine pass, and so a
+/// disabled/pure-text task is visibly a `Skip`, never confused with a
+/// `Grounded` pass that had nothing to disprove it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GroundingPrecheck {
+    /// The check does not apply: disabled, or no `tool_use` evidence exists
+    /// in the claim→review window at all (a pure-text task, or a task whose
+    /// tool calls never reached the MCP server). Proceed to the judge
+    /// unchanged.
+    Skip { reason: &'static str },
+    /// Evidence exists but is not usable for grounding (no successful call,
+    /// or no call captured `result_text` — a read-only-tool observability
+    /// gap, or a Fix-2 C1a self-echo tool that deliberately never captures
+    /// one; see the module doc). Proceed to the judge unchanged; this is a
+    /// fail-open quality-gate degrade, never a fail-closed reject.
+    Degraded { reason: &'static str },
+    /// At least one successful tool call's result shares the required
+    /// contiguous run with the claimed result. Proceed to the judge
+    /// unchanged. Carries the grounding tool's name so the caller can (Fix-2
+    /// C1c) decline to log a `confirmed_facts` entry for evidence sourced
+    /// from a self-echo tool — belt-and-suspenders alongside C1a/C1b, which
+    /// already keep such evidence out of `check_grounded` in the first
+    /// place.
+    Grounded { tool_name: String },
+    /// Evidence with result text exists and none of it backs the claim —
+    /// reject before the judge is ever invoked.
+    Reject { feedback: String },
+}
+
+/// Run the B3 grounding pre-check for one task's claim→review window.
+/// `result` is the agent's self-reported final answer (`task.result_summary`,
+/// same text the judge sees); `records` is the window's MCP tool-call
+/// evidence ([`read_tool_activity_records`]).
+///
+/// `native` is the WP-A4/A5/T10 native-tool collector's evidence for this
+/// same round (BUG-2 fix, WP-A10 §6 復驗; R1 text capture, 2026-08). Since
+/// R1, a native event MAY carry `result_text`/`input_text` (captured
+/// straight from the originating runtime's own event stream — see the
+/// module doc) — when it does, it is merged into the SAME
+/// [`duduclaw_core::grounding::ToolEvidence`] list the MCP records build and
+/// can reach every outcome `check_grounded` produces, including `Grounded`.
+/// A native event with no captured text (the pre-R1 shape, and still the
+/// common case for producers not yet upgraded) behaves exactly as before:
+/// it can only ever nudge the `Skip`/`Degraded` reason string, never
+/// upgrade the outcome on its own.
+fn grounding_precheck(
+    result: &str,
+    records: &[ToolActivityRecord],
+    native: &[NativeToolEvent],
+    config: GroundingPrecheckConfig,
+) -> GroundingPrecheck {
+    if !config.enabled {
+        return GroundingPrecheck::Skip { reason: "disabled" };
+    }
+
+    // Only a successful, non-self-echo native event counts as a real
+    // "the agent used a tool" signal — mirrors the MCP-side self-echo
+    // exclusion (Fix-2 C1a) and keeps a failed/no-op native call from
+    // upgrading the reason string.
+    let has_native_signal = native
+        .iter()
+        .any(|e| e.success && !duduclaw_core::grounding::is_self_echo_tool(&e.tool_name));
+
+    if records.is_empty() && !has_native_signal {
+        // No MCP tool_use evidence in the window, and no successful
+        // non-self-echo native tool use either. Never reject a task for not
+        // using tools it never claimed to need (requirement: "純文字任務
+        // (無 tool_use)不套用").
+        return GroundingPrecheck::Skip {
+            reason: "no tool_use in claim→review window",
+        };
+    }
+
+    let mut evidence: Vec<duduclaw_core::grounding::ToolEvidence> = records
+        .iter()
+        .map(|r| duduclaw_core::grounding::ToolEvidence {
+            tool_name: r.tool_name.clone(),
+            result_text: r.result_text.clone(),
+            // Fix-2 C1b: subtract self-echoed spans (this call's own input)
+            // from what counts as grounding evidence.
+            input_text: r.input_text.clone(),
+            is_error: !r.success,
+        })
+        .collect();
+    // R1: native evidence (Read/Write/Bash, ...) merges in as first-class
+    // grounding evidence — a `NativeToolEvent` with `result_text: None`
+    // behaves identically to an MCP `ToolActivityRecord` with `result_text:
+    // None` (ResultTextMissing / NoEvidence, never Grounded on its own).
+    evidence.extend(native.iter().map(|e| duduclaw_core::grounding::ToolEvidence {
+        tool_name: e.tool_name.clone(),
+        result_text: e.result_text.clone(),
+        input_text: e.input_text.clone(),
+        is_error: !e.success,
+    }));
+    let evidence_count = evidence.len();
+
+    match duduclaw_core::grounding::check_grounded(
+        result,
+        &evidence,
+        None,
+        config.min_overlap_chars,
+    ) {
+        // Every recorded call errored — nothing successful to ground
+        // against. Degrade, not reject: an all-error tool window is an
+        // execution problem the judge's `correctness` aspect already
+        // scrutinizes; this gate's job is catching fabricated *success*
+        // claims, not re-deriving tool failure.
+        duduclaw_core::grounding::GroundingOutcome::NoEvidence => GroundingPrecheck::Degraded {
+            reason: if has_native_signal {
+                "no successful MCP tool call in window (native tool evidence present but also lacks captured result_text)"
+            } else {
+                "no successful tool call in window"
+            },
+        },
+        // A read-only-tool observability gap, a Fix-2 C1a self-echo tool
+        // that never captures output text, OR (R1) native evidence exists
+        // but none of it carried result_text either. Fail-open either way.
+        duduclaw_core::grounding::GroundingOutcome::ResultTextMissing => {
+            GroundingPrecheck::Degraded {
+                reason: if records.is_empty() {
+                    // Native-only window (BUG-2's original case): the old,
+                    // more specific reason string stays intact.
+                    "native tool evidence present but lacks captured result_text for grounding"
+                } else if has_native_signal {
+                    "tool evidence lacks captured result_text (native tool evidence also present, same limitation)"
+                } else {
+                    "tool evidence lacks captured result_text"
+                },
+            }
+        }
+        duduclaw_core::grounding::GroundingOutcome::Grounded { tool_name } => {
+            GroundingPrecheck::Grounded { tool_name }
+        }
+        duduclaw_core::grounding::GroundingOutcome::NotGrounded => GroundingPrecheck::Reject {
+            feedback: format!(
+                "零成本 grounding 前置檢查未通過（GroundEval，未進判官）：本輪任務窗口內有 {} \
+                 筆成功的工具呼叫紀錄，但回覆內容與任何一筆工具結果都沒有共同的 {} 字元以上連續片段，\
+                 判定為缺乏證據支持的宣稱。請在最終回覆中直接引用工具實際回傳的關鍵原文再重新提交\
+                 （已知限制：若你對工具結果做了改寫、摘要或中英轉換，字面比對可能誤判——請盡量保留\
+                 關鍵原文用詞，例如數字、代號、專有名詞）。",
+                evidence_count,
+                config.min_overlap_chars
+            ),
+        },
+    }
 }
 
 // ── Engine ──────────────────────────────────────────────────
@@ -694,6 +949,13 @@ pub struct DispatchEngine {
     /// Iterative Kanban soft cap passed to `reject_review` (drives the
     /// `diminishing` flag; does NOT block the loop).
     soft_cap: i64,
+    /// WP-A9: A3 task-forward-model (design §4.2). `None` ⇒ the settle hook
+    /// is a complete no-op — same as before this field existed (design
+    /// §7.3's `enabled = false` default-off contract). Shared with the
+    /// `GoalLoopDriver`'s predict hook via the same `Arc` (see the
+    /// caller-side wiring notes in `handlers.rs`) so both hooks read/write
+    /// the same in-memory statistical-bucket cache.
+    forward_model: Option<Arc<crate::prediction::task_forward_store::TaskForwardModel>>,
 }
 
 impl DispatchEngine {
@@ -706,7 +968,20 @@ impl DispatchEngine {
             running: Arc::new(AtomicBool::new(false)),
             home_dir: None,
             soft_cap: DEFAULT_SOFT_CAP,
+            forward_model: None,
         }
+    }
+
+    /// WP-A9: wire the A3 task-forward-model settle hook. Omit (default
+    /// `None`) to keep the hook a no-op — the `[task_forward_model] enabled`
+    /// gate (design §7.3) is enforced by the caller deciding whether to
+    /// construct a `TaskForwardModel` at all, not by a flag read here.
+    pub fn with_forward_model(
+        mut self,
+        forward_model: Arc<crate::prediction::task_forward_store::TaskForwardModel>,
+    ) -> Self {
+        self.forward_model = Some(forward_model);
+        self
     }
 
     pub fn with_lease_secs(mut self, secs: i64) -> Self {
@@ -821,6 +1096,42 @@ impl DispatchEngine {
             let result = task.result_summary.clone().unwrap_or_default();
             let mut task_desc = format!("{}\n{}", task.title, task.description);
 
+            // ── BUG-2 fix (WP-A10 §6 復驗): take the WP-A4/A5/T10 native-tool
+            // evidence for this round ONCE, up front, so B3 grounding, the
+            // judge's `<tool_activity>` block, AND the A3 settle hook below
+            // all share the same evidence — before this fix only A3 ever
+            // saw it (`dispatcher.rs` bridges it unconditionally for every
+            // goal-loop dispatch, independent of `[task_forward_model]
+            // enabled`, so it is always safe to take here regardless of
+            // whether A3 itself is on).
+            //
+            // `take_native_evidence` is remove-once semantics (its own doc
+            // comment: "a round is only ever settled once"). `settle_forward_model`
+            // below must NOT call it again — it now takes the value computed
+            // here by reference, or it would silently observe `None` and A3
+            // would degrade `full` back to `mcp_only` even though the
+            // collector actually ran (this is the exact half-fix the WP-A10
+            // report warned against).
+            let round = (task.revision_round as u32).saturating_add(1);
+            let native_evidence: Option<Vec<NativeToolEvent>> =
+                crate::prediction::task_observe::take_native_evidence(&task.id, round);
+            let native_slice: &[NativeToolEvent] = native_evidence.as_deref().unwrap_or(&[]);
+
+            // ── WP-A9: converge deterministic / grounding / judge outcome
+            // into ONE settle call instead of three (design §4.2) — each
+            // branch below sets `observed_outcome` (+ a feedback string for
+            // the A3 transition write) instead of `continue`-ing
+            // immediately; the actual `continue` happens once, after the
+            // shared settle tail near the end of this loop body.
+            // `new_confirmed_facts` collects this round's zero-LLM pass
+            // signals for the A1 `confirmed_facts` wiring (see
+            // `goal_state.rs`'s "Honesty note" doc comment — this is that
+            // follow-up).
+            let mut observed_outcome: Option<crate::prediction::task_forward::ObservedOutcome> =
+                None;
+            let mut judge_feedback_for_settle: Option<String> = None;
+            let mut new_confirmed_facts: Vec<String> = Vec::new();
+
             // ── WP2.4: deterministic outcome acceptance (BEFORE the judge) ──
             // A goal that declares a structured outcome contract (`json:` /
             // `files:`, persisted as an `outcome:<b64>` tag) is validated at
@@ -856,29 +1167,85 @@ impl DispatchEngine {
                             task = %task.id, %status, defects = check.defects.len(),
                             "WP2.4 outcome 校驗未通過 → 跳過判官，直接退回 revising"
                         );
-                        continue;
+                        observed_outcome =
+                            Some(crate::prediction::task_forward::ObservedOutcome::Rejected);
+                        judge_feedback_for_settle = Some(feedback);
+                    } else {
+                        deterministic_note = Some(
+                            "結構化產出驗收（outcome schema）已通過 deterministic 零成本校驗。"
+                                .to_string(),
+                        );
+                        new_confirmed_facts.push(
+                            "結構化產出驗收（outcome schema）已通過 deterministic 零成本校驗。"
+                                .to_string(),
+                        );
                     }
-                    deterministic_note = Some(
-                        "結構化產出驗收（outcome schema）已通過 deterministic 零成本校驗。"
-                            .to_string(),
-                    );
                 }
             }
 
-            // WP4 GroundEval: fold tool-call evidence for this task's
-            // claim→review window into the prompt (best-effort, never
-            // fails the review — see `read_tool_activity_block`).
-            if let Some(home) = &self.home_dir {
-                let agent_id = task
-                    .claimed_by
-                    .clone()
-                    .unwrap_or_else(|| task.assigned_to.clone());
-                let since = task
-                    .claimed_at
-                    .clone()
-                    .unwrap_or_else(|| task.created_at.clone());
-                if let Some(block) = read_tool_activity_block(home, &agent_id, &since, &now) {
-                    task_desc = format!("{task_desc}\n\n{block}");
+            // WP4 GroundEval / B3: read the task's claim→review tool-call
+            // evidence once, then (1) run the zero-LLM grounding pre-check
+            // (B3, before the judge) and (2) fold the same evidence into the
+            // `<tool_activity>` prompt block (WP4, unchanged) — both read the
+            // exact same window, so a single read keeps them consistent.
+            // WP-A9: skipped once the deterministic check above already
+            // decided this round's outcome (mirrors the old `continue`).
+            if observed_outcome.is_none() {
+                if let Some(home) = &self.home_dir {
+                    let agent_id = task
+                        .claimed_by
+                        .clone()
+                        .unwrap_or_else(|| task.assigned_to.clone());
+                    let since = task
+                        .claimed_at
+                        .clone()
+                        .unwrap_or_else(|| task.created_at.clone());
+                    let records = read_tool_activity_records(home, &agent_id, &since, &now);
+
+                    let grounding_config = GroundingPrecheckConfig::from_home(home);
+                    match grounding_precheck(&result, &records, native_slice, grounding_config) {
+                        GroundingPrecheck::Reject { feedback } => {
+                            let status = self
+                                .store
+                                .reject_review(&task.id, &feedback, self.soft_cap)
+                                .await?;
+                            // Phase closed (a rejection re-opens the loop) → revoke
+                            // scoped grants, mirroring the judge-rejection path.
+                            self.revoke_task_grants(&task.id).await;
+                            info!(
+                                task = %task.id, %status,
+                                "B3 grounding 前置檢查未通過 → 跳過判官，直接退回 revising"
+                            );
+                            observed_outcome =
+                                Some(crate::prediction::task_forward::ObservedOutcome::Rejected);
+                            judge_feedback_for_settle = Some(feedback);
+                        }
+                        GroundingPrecheck::Grounded { tool_name } => {
+                            debug!(task = %task.id, tool = %tool_name, "B3 grounding 前置檢查通過");
+                            // Fix-2 C1c: neutral wording (the previous
+                            // "已通過…有工具佐證" overstated a pass-once
+                            // check as a durable verified fact) and — as a
+                            // second, belt-and-suspenders line of defense on
+                            // top of C1a/C1b already keeping self-echo
+                            // evidence out of `check_grounded` — only
+                            // logged when the grounding tool is not itself
+                            // on the self-echo deny-list.
+                            if !duduclaw_core::grounding::is_self_echo_tool(&tool_name) {
+                                new_confirmed_facts
+                                    .push("本輪 grounding 前置檢查通過。".to_string());
+                            }
+                        }
+                        GroundingPrecheck::Degraded { reason } => {
+                            debug!(task = %task.id, reason, "B3 grounding 前置檢查 degrade（跳過，交由判官）");
+                        }
+                        GroundingPrecheck::Skip { reason } => {
+                            debug!(task = %task.id, reason, "B3 grounding 前置檢查略過");
+                        }
+                    }
+
+                    if let Some(block) = format_tool_activity(&records, native_slice) {
+                        task_desc = format!("{task_desc}\n\n{block}");
+                    }
                 }
             }
 
@@ -890,37 +1257,310 @@ impl DispatchEngine {
                     format!("{task_desc}\n\n<deterministic_check>{note}</deterministic_check>");
             }
 
-            match judge.judge(&criteria, &task_desc, &result).await {
-                Ok(v) if v.passed => {
-                    self.store.accept_review(&task.id, &v.feedback).await?;
-                    // WP3 (PORTICO): task phase closed → auto-revoke its grants.
-                    self.revoke_task_grants(&task.id).await;
-                    info!(task = %task.id, "goal-mode 驗收通過 → done");
+            // WP-A9: skipped once a prior phase already decided the outcome.
+            if observed_outcome.is_none() {
+                match judge.judge(&criteria, &task_desc, &result).await {
+                    Ok(v) if v.passed => {
+                        self.store.accept_review(&task.id, &v.feedback).await?;
+                        // WP3 (PORTICO): task phase closed → auto-revoke its grants.
+                        self.revoke_task_grants(&task.id).await;
+                        info!(task = %task.id, "goal-mode 驗收通過 → done");
+                        observed_outcome =
+                            Some(crate::prediction::task_forward::ObservedOutcome::Accepted);
+                        judge_feedback_for_settle = Some(v.feedback.clone());
+                    }
+                    Ok(v) => {
+                        let status = self
+                            .store
+                            .reject_review(&task.id, &v.feedback, self.soft_cap)
+                            .await?;
+                        // WP3 (PORTICO): a rejection re-opens the loop for a retry,
+                        // but the review phase closed — revoke so the retry must
+                        // re-request any scoped tool it still needs.
+                        self.revoke_task_grants(&task.id).await;
+                        info!(task = %task.id, %status, "goal-mode 驗收未通過");
+                        observed_outcome =
+                            Some(crate::prediction::task_forward::ObservedOutcome::Rejected);
+                        judge_feedback_for_settle = Some(v.feedback.clone());
+                    }
+                    Err(e) => {
+                        // Fail-safe: judge itself failed — park for a human, do NOT
+                        // auto-accept and do NOT loop.
+                        warn!(task = %task.id, error = %e, "goal-mode judge 失敗 → needs_human（待人工）");
+                        self.store
+                            .mark_needs_human(&task.id, &format!("judge unavailable: {e}"))
+                            .await?;
+                        // WP3 (PORTICO): parked for a human → revoke task grants.
+                        self.revoke_task_grants(&task.id).await;
+                        observed_outcome =
+                            Some(crate::prediction::task_forward::ObservedOutcome::Escalated);
+                        judge_feedback_for_settle = Some(format!("judge unavailable: {e}"));
+                    }
                 }
-                Ok(v) => {
-                    let status = self
-                        .store
-                        .reject_review(&task.id, &v.feedback, self.soft_cap)
-                        .await?;
-                    // WP3 (PORTICO): a rejection re-opens the loop for a retry,
-                    // but the review phase closed — revoke so the retry must
-                    // re-request any scoped tool it still needs.
-                    self.revoke_task_grants(&task.id).await;
-                    info!(task = %task.id, %status, "goal-mode 驗收未通過");
-                }
-                Err(e) => {
-                    // Fail-safe: judge itself failed — park for a human, do NOT
-                    // auto-accept and do NOT loop.
-                    warn!(task = %task.id, error = %e, "goal-mode judge 失敗 → needs_human（待人工）");
-                    self.store
-                        .mark_needs_human(&task.id, &format!("judge unavailable: {e}"))
-                        .await?;
-                    // WP3 (PORTICO): parked for a human → revoke task grants.
-                    self.revoke_task_grants(&task.id).await;
+            }
+
+            // ── A1 leftover: persist this round's deterministic pass
+            // signals into the task's `GoalStateSnapshot.confirmed_facts`
+            // (goal_state.rs) so the NEXT round's `<state>` block is no
+            // longer permanently empty (see that module's "Honesty note"
+            // doc comment). Unconditional — independent of the
+            // `[task_forward_model]` toggle below. Best-effort: a failure
+            // here must never affect the verdict already committed above.
+            if !new_confirmed_facts.is_empty() {
+                self.persist_confirmed_facts(&task.id, &new_confirmed_facts).await;
+            }
+
+            // ── WP-A9: A3 settle hook (design §4.2) ──
+            // `forward_model` is `None` unless `[task_forward_model] enabled
+            // = true` — with it `None`, this entire block is skipped and
+            // review behavior (including every `continue` point above,
+            // which are unconditional regardless of this hook) is
+            // byte-identical to before A3 existed (design §7.3). A failure
+            // inside is caught and logged, never allowed to alter the
+            // verdict already committed above (R5).
+            if let (Some(fm), Some(outcome)) = (self.forward_model.clone(), observed_outcome) {
+                let settle_fut = self.settle_forward_model(
+                    &fm,
+                    &task,
+                    outcome,
+                    judge_feedback_for_settle.as_deref(),
+                    native_evidence.as_deref(),
+                );
+                if let Err(e) = std::panic::AssertUnwindSafe(settle_fut).catch_unwind().await {
+                    warn!(task = %task.id, "A3 forward-model settle hook panicked: {e:?}");
                 }
             }
         }
         Ok(())
+    }
+
+    /// WP-A9 settle-side helper (design §4.2): observe this round's tool
+    /// evidence, diff it against the WP-A9 predict hook's stored prediction,
+    /// persist the error / fold it into the statistical bucket, and
+    /// (fidelity permitting) write a WP-B2 transition sample to episodic
+    /// memory. Entirely best-effort — every failure path here is logged and
+    /// swallowed; the review verdict (`accept_review` / `reject_review` /
+    /// `mark_needs_human`) has already been durably committed by the time
+    /// this runs.
+    async fn settle_forward_model(
+        &self,
+        fm: &Arc<crate::prediction::task_forward_store::TaskForwardModel>,
+        task: &TaskRow,
+        outcome: crate::prediction::task_forward::ObservedOutcome,
+        judge_feedback: Option<&str>,
+        native_evidence: Option<&[NativeToolEvent]>,
+    ) {
+        let round = (task.revision_round as u32).saturating_add(1);
+        let Some(prediction) = fm.get_prediction(&task.id, round).await else {
+            debug!(
+                task = %task.id, round,
+                "A3 settle: no logged prediction for this round (predict hook off, or a gap) — skipping"
+            );
+            return;
+        };
+
+        let agent_id = task
+            .claimed_by
+            .clone()
+            .unwrap_or_else(|| task.assigned_to.clone());
+        let since = task
+            .claimed_at
+            .clone()
+            .unwrap_or_else(|| task.created_at.clone());
+        let until = Utc::now().to_rfc3339();
+
+        let runtime = self
+            .home_dir
+            .as_deref()
+            .map(|home| {
+                let agent_dir = crate::outcome_spec::agent_work_dir(home, &agent_id);
+                crate::runtime_config::agent_runtime_provider(&agent_dir)
+            })
+            .unwrap_or_default();
+
+        // Deterministic artifact-shape hint from the same `OutcomeSpec` the
+        // WP2.4 check above already parsed from `task.tags` (design §4.2
+        // point 2: "outcome spec 通過 ⇒ 至少 StructuredJson/FileWrite").
+        let observed_artifact = match crate::outcome_spec::OutcomeSpec::from_tags(&task.tags) {
+            Some(crate::outcome_spec::OutcomeSpec::Json(_)) => {
+                crate::prediction::task_forward::ArtifactShape::StructuredJson
+            }
+            Some(crate::outcome_spec::OutcomeSpec::Files(_)) => {
+                crate::prediction::task_forward::ArtifactShape::FileWrite
+            }
+            _ => crate::prediction::task_forward::ArtifactShape::TextOnly,
+        };
+
+        // WP-A4/A5/T10: `native_evidence` is whatever `dispatcher.rs` bridged
+        // over for this exact (task_id, round) — see
+        // `task_observe::record_native_evidence`'s doc comment for why this
+        // is a process-lifetime in-memory hop rather than a SQL read.
+        // `None` (no collector ran, or the entry was never bridged — the
+        // common case until every dispatch path opts in) falls back to the
+        // pre-existing `McpOnly`/`None` behavior inside `observe_round`
+        // unchanged.
+        //
+        // BUG-2 fix (WP-A10 §6 復驗): this is now passed IN by the caller
+        // (`review_goal_tasks`, taken ONCE at the top of that loop body and
+        // shared with B3 grounding + the judge's `<tool_activity>` block)
+        // rather than taken here. `take_native_evidence` is remove-once —
+        // calling it a second time here would always observe `None` (the
+        // caller already removed the entry), silently degrading every
+        // settled round from `full` back to `mcp_only`.
+        let observation = crate::prediction::task_observe::observe_round(
+            self.home_dir.as_deref(),
+            &agent_id,
+            runtime,
+            &task.id,
+            round,
+            (&since, &until),
+            outcome,
+            observed_artifact,
+            None,
+            native_evidence,
+        );
+
+        let thresholds = crate::prediction::metacognition::AdaptiveThresholds::default();
+        match crate::prediction::task_forward::diff(prediction, observation, &thresholds) {
+            crate::prediction::task_forward::DiffOutcome::Unobservable { reason } => {
+                debug!(task = %task.id, round, reason, "A3 settle: unobservable this round");
+            }
+            crate::prediction::task_forward::DiffOutcome::Computed(error) => {
+                if let Err(e) = fm.settle_prediction(&error).await {
+                    warn!(task = %task.id, round, error = %e, "A3 settle_prediction failed (non-fatal)");
+                }
+                if let Some(home) = &self.home_dir {
+                    let db_path = home.join("memory.db");
+                    match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+                        Ok(engine) => {
+                            if crate::prediction::transition::should_write_transition(&error) {
+                                if let Err(e) = crate::prediction::transition::write_transition(
+                                    &engine,
+                                    &agent_id,
+                                    &error,
+                                    judge_feedback,
+                                )
+                                .await
+                                {
+                                    warn!(task = %task.id, round, error = %e, "A3 transition write failed (non-fatal)");
+                                }
+                            }
+
+                            // ── WP-A4 prune: settle whichever task rules were
+                            // injected into THIS round's dispatch prompt
+                            // (`goal_loop.rs`'s injection step, bookkept via
+                            // `fm.record_injected_task_rules`). Reuses the
+                            // SAME unmodified `rule_lifecycle::
+                            // settle_injected_rules` channel-reply's F2a
+                            // already uses — task-layer rules ride the
+                            // identical rule_stats/Janus-probation/
+                            // net-zero-retirement lifecycle (design §6.5
+                            // T9). Empty when nothing was injected this
+                            // round (rule_induction off, or no active rules
+                            // existed) — the settle call is then a no-op.
+                            let injected_ids = fm.take_injected_task_rules(&task.id, round).await;
+                            if !injected_ids.is_empty() {
+                                let retired = crate::prediction::rule_lifecycle::settle_injected_rules(
+                                    &engine,
+                                    &agent_id,
+                                    &injected_ids,
+                                    error.category,
+                                )
+                                .await;
+                                if !retired.is_empty() {
+                                    debug!(
+                                        task = %task.id, round, retired = retired.len(),
+                                        "A4 task-rule settle retired net-zero rules"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => warn!(
+                            task = %task.id, round, error = %e,
+                            "A3 transition: memory.db open failed (non-fatal)"
+                        ),
+                    }
+
+                    // ── WP-A4 induce: opens its own embedder-attached engine
+                    // handle internally (mirrors `reflexion.rs`'s own
+                    // independent-instance convention) — gated on the
+                    // `[task_forward_model] rule_induction` sub-switch
+                    // (design §6.5; defaults true, A3 `enabled` already
+                    // gates the outer `if let Some(fm) = ...` this whole
+                    // match lives inside).
+                    let rule_induction_enabled =
+                        crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(home)
+                            .rule_induction;
+                    if rule_induction_enabled {
+                        if let Err(e) =
+                            crate::prediction::task_rule_induce::maybe_induce_task_rule(&db_path, &error)
+                                .await
+                        {
+                            warn!(task = %task.id, round, error = %e, "A4 induce failed (non-fatal)");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A1 leftover (see `goal_state.rs`'s "Honesty note" doc comment):
+    /// read-merge-write append `facts` onto the task's persisted
+    /// `GoalStateSnapshot.confirmed_facts`, CJK-safe truncated to ≤120
+    /// chars each and capped to the 6 most recent overall. A single call
+    /// per review pass (the caller batches this round's facts into one
+    /// `Vec` first) — avoids the read-merge-write race that calling this
+    /// once per fact would hit (each call would read the DB row as it
+    /// stood before any of this round's writes, so a second call would
+    /// clobber the first). Best-effort: a store failure here must never
+    /// affect the review verdict.
+    ///
+    /// M7 migration: previously did its own read-then-`set_goal_state_json`-
+    /// the-whole-blob, which raced `goal_loop.rs::capture_round_state`'s
+    /// `pending_hypotheses` write onto the SAME `goal_state_json` column —
+    /// whichever writer's `UPDATE` landed second won with a value computed
+    /// from a stale read, silently discarding the other writer's field (the
+    /// exact lost-update `task_store.rs::merge_goal_state_json` was built to
+    /// close; see that method's doc comment, which named this call site as
+    /// the follow-up). Now touches ONLY the `confirmed_facts` key inside the
+    /// merge closure — reading it fresh under the store's connection lock
+    /// rather than trusting the caller-supplied `goal_state_json` snapshot,
+    /// so a concurrent `pending_hypotheses` write is never clobbered.
+    async fn persist_confirmed_facts(&self, task_id: &str, facts: &[String]) {
+        if facts.is_empty() {
+            return;
+        }
+        let capped_facts: Vec<String> = facts
+            .iter()
+            .map(|f| duduclaw_core::truncate_chars(f, 120))
+            .collect();
+        const MAX_CONFIRMED_FACTS: usize = 6;
+        if let Err(e) = self
+            .store
+            .merge_goal_state_json(task_id, move |v| {
+                let mut existing: Vec<String> = v
+                    .get("confirmed_facts")
+                    .and_then(|cf| cf.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                existing.extend(capped_facts);
+                if existing.len() > MAX_CONFIRMED_FACTS {
+                    let drop = existing.len() - MAX_CONFIRMED_FACTS;
+                    existing.drain(0..drop);
+                }
+                v["confirmed_facts"] = serde_json::json!(existing);
+            })
+            .await
+        {
+            debug!(
+                task = task_id, error = %e,
+                "dispatch_engine: confirmed_facts persist failed (non-fatal)"
+            );
+        }
     }
 
     /// WP3 (PORTICO): revoke every capability grant bound to a task when its
@@ -951,7 +1591,42 @@ impl DispatchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: `filter_tool_activity` has no production caller left in
+    // this module after WP-A3's extraction (production code now goes
+    // through `read_tool_activity_records`, which calls it internally in
+    // `tool_activity.rs`) — imported here explicitly so the outer `use` in
+    // this file doesn't trigger an unused-import warning on a plain
+    // `cargo check` (which excludes `#[cfg(test)]` code).
+    use crate::tool_activity::filter_tool_activity;
     use crate::task_store::{TaskRow, TaskStore};
+
+    /// Test helper: a text-less `NativeToolEvent` (pre-R1 shape) — most
+    /// existing tests only care about `tool_name`/`success`.
+    fn native(tool_name: &str, success: bool) -> NativeToolEvent {
+        NativeToolEvent {
+            tool_name: tool_name.to_string(),
+            success,
+            result_text: None,
+            input_text: None,
+        }
+    }
+
+    /// R1 test helper: a `NativeToolEvent` carrying masked result/input
+    /// text, as a producer that captured the runtime's own event stream
+    /// would build it.
+    fn native_with_text(
+        tool_name: &str,
+        success: bool,
+        result_text: &str,
+        input_text: Option<&str>,
+    ) -> NativeToolEvent {
+        NativeToolEvent {
+            tool_name: tool_name.to_string(),
+            success,
+            result_text: Some(result_text.to_string()),
+            input_text: input_text.map(String::from),
+        }
+    }
 
     fn pending_goal(id: &str) -> TaskRow {
         let mut t = TaskRow::new(
@@ -1315,11 +1990,12 @@ mod tests {
 
         let t = store.get_task("g3").await.unwrap().unwrap();
         assert_eq!(t.status, "needs_human", "judge failure never auto-accepts");
-        assert!(t
-            .judge_feedback
-            .as_deref()
-            .unwrap_or("")
-            .contains("judge unavailable"));
+        assert!(
+            t.judge_feedback
+                .as_deref()
+                .unwrap_or("")
+                .contains("judge unavailable")
+        );
     }
 
     #[tokio::test]
@@ -1400,11 +2076,12 @@ mod tests {
         let t = store.get_task("og1").await.unwrap().unwrap();
         assert_eq!(t.status, "revising");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "judge must not be called");
-        assert!(t
-            .judge_feedback
-            .as_deref()
-            .unwrap_or("")
-            .contains("report.docx"));
+        assert!(
+            t.judge_feedback
+                .as_deref()
+                .unwrap_or("")
+                .contains("report.docx")
+        );
     }
 
     #[tokio::test]
@@ -1482,6 +2159,231 @@ mod tests {
         );
     }
 
+    // ── WP-A9 item 4: `confirmed_facts` wiring (A1 leftover) ────
+
+    #[tokio::test]
+    async fn confirmed_facts_persisted_after_deterministic_outcome_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        let work_dir = dir.path().join("agents").join("w");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(work_dir.join("report.docx"), b"content").unwrap();
+        let tag = crate::outcome_spec::OutcomeSpec::parse("files:report.docx")
+            .unwrap()
+            .to_tag()
+            .unwrap();
+        seed_review_with(&store, "og-cf", &tag, "報表已產出 report.docx").await;
+
+        let judge = Arc::new(StubJudge {
+            outcome: Ok(AcceptanceVerdict {
+                passed: true,
+                feedback: "ok".into(),
+            }),
+        });
+        let engine =
+            DispatchEngine::new(store.clone(), Some(judge)).with_home_dir(dir.path().to_path_buf());
+        engine.tick_once().await.unwrap();
+
+        let t = store.get_task("og-cf").await.unwrap().unwrap();
+        assert_eq!(t.status, "done");
+        let snapshot = crate::goal_state::GoalStateSnapshot::from_json(t.goal_state_json.as_deref());
+        assert_eq!(
+            snapshot.confirmed_facts.len(),
+            1,
+            "the deterministic outcome-spec pass must record exactly one confirmed fact"
+        );
+        assert!(
+            snapshot.confirmed_facts[0].contains("outcome schema"),
+            "confirmed fact must describe the deterministic check that passed, got: {:?}",
+            snapshot.confirmed_facts
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_facts_caps_to_six_most_recent_and_truncates_cjk_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        store.insert_task(&pending_goal("cf2")).await.unwrap();
+
+        let existing = crate::goal_state::GoalStateSnapshot {
+            pending_hypotheses: Vec::new(),
+            confirmed_facts: (0..6).map(|i| format!("old fact {i}")).collect(),
+        };
+        store
+            .set_goal_state_json("cf2", Some(&existing.to_json()))
+            .await
+            .unwrap();
+
+        let engine = DispatchEngine::new(store.clone(), None);
+        // A CJK string well past the 120-char cap — must not panic on a
+        // mid-codepoint byte slice (project convention: CJK-safe truncation).
+        let long_cjk_fact = "測試".repeat(200);
+        // M7: no longer takes a caller-supplied snapshot — reads the fresh
+        // DB state itself under `merge_goal_state_json`'s lock.
+        engine
+            .persist_confirmed_facts("cf2", &[long_cjk_fact.clone()])
+            .await;
+
+        let t = store.get_task("cf2").await.unwrap().unwrap();
+        let snap = crate::goal_state::GoalStateSnapshot::from_json(t.goal_state_json.as_deref());
+        assert_eq!(snap.confirmed_facts.len(), 6, "capped to the 6 most recent entries");
+        assert!(
+            !snap.confirmed_facts.contains(&"old fact 0".to_string()),
+            "oldest entry must be dropped once the cap is exceeded"
+        );
+        assert!(snap.confirmed_facts.last().unwrap().chars().count() <= 120);
+    }
+
+    /// M7 regression: `persist_confirmed_facts` must never clobber a
+    /// `pending_hypotheses` key that already exists on the SAME
+    /// `goal_state_json` blob (written by `goal_loop.rs::capture_round_state`
+    /// via the same `merge_goal_state_json` API) — the exact lost-update the
+    /// migration off the old read-then-`set_goal_state_json`-the-whole-blob
+    /// pattern closes. Simulates the interleaving directly (both writers
+    /// targeting the store, not relying on real concurrency timing) by
+    /// seeding `pending_hypotheses` first, then persisting confirmed facts,
+    /// and asserting BOTH keys survive.
+    #[tokio::test]
+    async fn persist_confirmed_facts_does_not_clobber_pending_hypotheses() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        store.insert_task(&pending_goal("cf-merge")).await.unwrap();
+
+        // Simulates `goal_loop.rs::capture_round_state`'s write landing
+        // first, going through the SAME merge API.
+        store
+            .merge_goal_state_json("cf-merge", |v| {
+                v["pending_hypotheses"] = serde_json::json!(["hyp A", "hyp B"]);
+            })
+            .await
+            .unwrap();
+
+        let engine = DispatchEngine::new(store.clone(), None);
+        engine
+            .persist_confirmed_facts("cf-merge", &["fact one".to_string()])
+            .await;
+
+        let t = store.get_task("cf-merge").await.unwrap().unwrap();
+        let snap = crate::goal_state::GoalStateSnapshot::from_json(t.goal_state_json.as_deref());
+        assert_eq!(snap.confirmed_facts, vec!["fact one".to_string()]);
+        assert_eq!(
+            snap.pending_hypotheses,
+            vec!["hyp A".to_string(), "hyp B".to_string()],
+            "concurrently-written pending_hypotheses must survive the confirmed_facts merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_confirmed_facts_is_a_noop_on_empty_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        store.insert_task(&pending_goal("cf-empty")).await.unwrap();
+        let engine = DispatchEngine::new(store.clone(), None);
+        engine.persist_confirmed_facts("cf-empty", &[]).await;
+        let t = store.get_task("cf-empty").await.unwrap().unwrap();
+        assert!(t.goal_state_json.is_none(), "no facts ⇒ no write at all");
+    }
+
+    /// Fix-2 C1c: end-to-end `review_goal_tasks` wiring — genuine (non-echo)
+    /// grounding evidence records the NEW neutral wording, not the old
+    /// overstated "已通過…有工具佐證" claim.
+    #[tokio::test]
+    async fn confirmed_facts_neutral_wording_for_genuine_grounded_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tool_calls.jsonl"),
+            "{\"timestamp\":\"2026-07-11T10:02:00Z\",\"agent_id\":\"w\",\"tool_name\":\"memory_search\",\"success\":true,\"result_text\":\"Refund policy: 30 days from purchase, receipt required.\"}\n",
+        )
+        .unwrap();
+
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        store.insert_task(&pending_goal("cf-ground")).await.unwrap();
+        store
+            .atomic_claim("cf-ground", "w", "2026-07-11T10:00:00Z", "2026-07-11T10:05:00Z")
+            .await
+            .unwrap()
+            .is_claimed();
+        store
+            .complete_task(
+                "cf-ground",
+                "Refund policy: 30 days from purchase, receipt required.",
+                "w",
+            )
+            .await
+            .unwrap();
+
+        let judge = Arc::new(StubJudge {
+            outcome: Ok(AcceptanceVerdict {
+                passed: true,
+                feedback: "ok".into(),
+            }),
+        });
+        let engine = DispatchEngine::new(store.clone(), Some(judge))
+            .with_home_dir(dir.path().to_path_buf());
+        engine.review_goal_tasks().await.unwrap();
+
+        let t = store.get_task("cf-ground").await.unwrap().unwrap();
+        assert_eq!(t.status, "done");
+        let snapshot = crate::goal_state::GoalStateSnapshot::from_json(t.goal_state_json.as_deref());
+        assert_eq!(snapshot.confirmed_facts.len(), 1);
+        assert_eq!(snapshot.confirmed_facts[0], "本輪 grounding 前置檢查通過。");
+        assert!(
+            !snapshot.confirmed_facts[0].contains("有工具佐證"),
+            "must use the C1c neutral wording, not the old overstated claim"
+        );
+    }
+
+    /// Fix-2 C1c belt-and-suspenders: even in the hypothetical case where a
+    /// self-echo tool's `result_text` WAS captured (bypassing the C1a
+    /// source-level suppression — simulated here by hand-writing the audit
+    /// row directly, since the real MCP dispatch path no longer produces
+    /// one), `review_goal_tasks` must not record a `confirmed_facts` entry
+    /// for it, even though `grounding_precheck` itself still reports
+    /// `Grounded`.
+    #[tokio::test]
+    async fn confirmed_facts_not_recorded_when_grounding_tool_is_self_echo() {
+        let dir = tempfile::tempdir().unwrap();
+        let echoed = "refund #4821 approved for customer";
+        std::fs::write(
+            dir.path().join("tool_calls.jsonl"),
+            format!(
+                "{{\"timestamp\":\"2026-07-11T10:02:00Z\",\"agent_id\":\"w\",\"tool_name\":\"mcp__duduclaw__tasks_complete\",\"success\":true,\"result_text\":\"{echoed}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        store.insert_task(&pending_goal("cf-echo")).await.unwrap();
+        store
+            .atomic_claim("cf-echo", "w", "2026-07-11T10:00:00Z", "2026-07-11T10:05:00Z")
+            .await
+            .unwrap()
+            .is_claimed();
+        store
+            .complete_task("cf-echo", &format!("Done: {echoed}"), "w")
+            .await
+            .unwrap();
+
+        let judge = Arc::new(StubJudge {
+            outcome: Ok(AcceptanceVerdict {
+                passed: true,
+                feedback: "ok".into(),
+            }),
+        });
+        let engine = DispatchEngine::new(store.clone(), Some(judge))
+            .with_home_dir(dir.path().to_path_buf());
+        engine.review_goal_tasks().await.unwrap();
+
+        let t = store.get_task("cf-echo").await.unwrap().unwrap();
+        assert_eq!(t.status, "done", "the judge still accepts independently");
+        let snapshot = crate::goal_state::GoalStateSnapshot::from_json(t.goal_state_json.as_deref());
+        assert!(
+            snapshot.confirmed_facts.is_empty(),
+            "self-echo tool evidence must never be credited as a confirmed fact: {:?}",
+            snapshot.confirmed_facts
+        );
+    }
+
     // ── WP4 GroundEval: `<tool_activity>` judge evidence ────────
 
     #[test]
@@ -1526,7 +2428,35 @@ mod tests {
 
     #[test]
     fn format_tool_activity_none_when_empty() {
-        assert!(format_tool_activity(&[]).is_none());
+        assert!(format_tool_activity(&[], &[]).is_none());
+    }
+
+    /// BUG-2 fix (WP-A10 §6 復驗): native-only evidence (no MCP records at
+    /// all) still produces a block — this is the exact case that used to
+    /// leave the judge staring at "zero tool call evidence" despite the
+    /// agent having actually run Read/Write/Bash.
+    #[test]
+    fn format_tool_activity_native_only_produces_block() {
+        let evidence = vec![native("Read", true), native("Write", true)];
+        let block = format_tool_activity(&[], &evidence).unwrap();
+        assert!(block.contains("Read (native): 1 ok, 0 err"));
+        assert!(block.contains("Write (native): 1 ok, 0 err"));
+    }
+
+    /// A same-named MCP tool and native tool must not silently merge counts
+    /// — the `(native)` suffix keeps them as distinct lines.
+    #[test]
+    fn format_tool_activity_merges_mcp_and_native_without_collapsing_names() {
+        let records = vec![ToolActivityRecord {
+            tool_name: "Bash".into(),
+            success: true,
+            result_text: None,
+            input_text: None,
+        }];
+        let evidence = vec![native("Bash", false)];
+        let block = format_tool_activity(&records, &evidence).unwrap();
+        assert!(block.contains("Bash: 1 ok, 0 err"));
+        assert!(block.contains("Bash (native): 0 ok, 1 err"));
     }
 
     #[test]
@@ -1535,17 +2465,23 @@ mod tests {
             ToolActivityRecord {
                 tool_name: "memory_search".into(),
                 success: true,
+                result_text: None,
+                input_text: None,
             },
             ToolActivityRecord {
                 tool_name: "memory_search".into(),
                 success: false,
+                result_text: None,
+                input_text: None,
             },
             ToolActivityRecord {
                 tool_name: "Bash".into(),
                 success: true,
+                result_text: None,
+                input_text: None,
             },
         ];
-        let block = format_tool_activity(&records).unwrap();
+        let block = format_tool_activity(&records, &[]).unwrap();
         assert!(block.starts_with("<tool_activity>\n"));
         assert!(block.ends_with("\n</tool_activity>"));
         assert!(block.contains("memory_search: 1 ok, 1 err"));
@@ -1558,9 +2494,11 @@ mod tests {
             .map(|i| ToolActivityRecord {
                 tool_name: format!("tool_{i:02}"),
                 success: true,
+                result_text: None,
+                input_text: None,
             })
             .collect();
-        let block = format_tool_activity(&records).unwrap();
+        let block = format_tool_activity(&records, &[]).unwrap();
         let line_count = block.lines().count();
         // 20 tool lines + the "N more omitted" line + 2 XML fence lines.
         assert_eq!(line_count, 20 + 1 + 2);
@@ -1568,33 +2506,587 @@ mod tests {
     }
 
     #[test]
-    fn read_tool_activity_block_missing_file_is_none() {
+    fn read_tool_activity_records_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_tool_activity_block(
+        let records = read_tool_activity_records(
             dir.path(),
             "w",
             "2026-07-11T10:00:00Z",
-            "2026-07-11T10:05:00Z"
-        )
-        .is_none());
+            "2026-07-11T10:05:00Z",
+        );
+        assert!(records.is_empty());
+        assert!(format_tool_activity(&records, &[]).is_none());
     }
 
     #[test]
-    fn read_tool_activity_block_reads_and_filters() {
+    fn read_tool_activity_records_reads_and_filters() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("tool_calls.jsonl"),
             "{\"timestamp\":\"2026-07-11T10:02:00Z\",\"agent_id\":\"w\",\"tool_name\":\"Read\",\"success\":true}\n",
         )
         .unwrap();
-        let block = read_tool_activity_block(
+        let records = read_tool_activity_records(
             dir.path(),
             "w",
             "2026-07-11T10:00:00Z",
             "2026-07-11T10:05:00Z",
+        );
+        assert_eq!(records.len(), 1);
+        let block = format_tool_activity(&records, &[]).unwrap();
+        assert!(block.contains("Read: 1 ok, 0 err"));
+    }
+
+    /// Same fixture as `read_tool_activity_records_reads_and_filters`, but
+    /// exercising the `result_text` capture the B3 grounding pre-check
+    /// depends on — no production writer sets this key today (see the
+    /// `ToolActivityRecord::result_text` doc comment), but the reader is
+    /// forward-compatible with a future one.
+    #[test]
+    fn read_tool_activity_records_captures_optional_result_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tool_calls.jsonl"),
+            "{\"timestamp\":\"2026-07-11T10:02:00Z\",\"agent_id\":\"w\",\"tool_name\":\"memory_search\",\"success\":true,\"result_text\":\"policy: 30 days\"}\n",
         )
         .unwrap();
-        assert!(block.contains("Read: 1 ok, 0 err"));
+        let records = read_tool_activity_records(
+            dir.path(),
+            "w",
+            "2026-07-11T10:00:00Z",
+            "2026-07-11T10:05:00Z",
+        );
+        assert_eq!(records[0].result_text.as_deref(), Some("policy: 30 days"));
+    }
+
+    // ── B3: grounding pre-check (`grounding_precheck`) ──────────
+
+    fn ok_record(tool: &str, result_text: &str) -> ToolActivityRecord {
+        ToolActivityRecord {
+            tool_name: tool.to_string(),
+            success: true,
+            result_text: Some(result_text.to_string()),
+            input_text: None,
+        }
+    }
+
+    /// Fix-2 C1b variant: also carries the call's own masked input text, so
+    /// tests can exercise `shares_contiguous_run_excluding_echo` through the
+    /// full `grounding_precheck` path.
+    fn ok_record_with_input(tool: &str, result_text: &str, input_text: &str) -> ToolActivityRecord {
+        ToolActivityRecord {
+            tool_name: tool.to_string(),
+            success: true,
+            result_text: Some(result_text.to_string()),
+            input_text: Some(input_text.to_string()),
+        }
+    }
+
+    #[test]
+    fn grounding_precheck_passes_when_result_overlaps_tool_evidence() {
+        let records = vec![ok_record(
+            "mcp__duduclaw__tasks_create",
+            "task created: refund #4821 approved for customer",
+        )];
+        let outcome = grounding_precheck(
+            "Result: refund #4821 approved for customer, ticket closed.",
+            &records,
+            &[],
+            GroundingPrecheckConfig {
+                enabled: true,
+                min_overlap_chars: 10,
+            },
+        );
+        assert_eq!(
+            outcome,
+            GroundingPrecheck::Grounded {
+                tool_name: "mcp__duduclaw__tasks_create".to_string()
+            }
+        );
+    }
+
+    /// CJK case: char-counted overlap (not byte-counted), traditional
+    /// Chinese business text — mirrors the eval suite's CJK grounding case.
+    #[test]
+    fn grounding_precheck_passes_with_cjk_overlap() {
+        let records = vec![ok_record(
+            "mcp__duduclaw__memory_search",
+            "查詢結果：退款政策為三十天內可全額退款，需出示收據。",
+        )];
+        let outcome = grounding_precheck(
+            "已為您確認：退款政策為三十天內可全額退款。",
+            &records,
+            &[],
+            GroundingPrecheckConfig {
+                enabled: true,
+                min_overlap_chars: 8,
+            },
+        );
+        assert_eq!(
+            outcome,
+            GroundingPrecheck::Grounded {
+                tool_name: "mcp__duduclaw__memory_search".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn grounding_precheck_rejects_unsupported_claim() {
+        let records = vec![ok_record(
+            "mcp__duduclaw__memory_search",
+            "policy: refunds within 30 days of purchase",
+        )];
+        let outcome = grounding_precheck(
+            "I have processed a full refund and shipped a replacement unit today.",
+            &records,
+            &[],
+            GroundingPrecheckConfig {
+                enabled: true,
+                min_overlap_chars: 12,
+            },
+        );
+        match outcome {
+            GroundingPrecheck::Reject { feedback } => {
+                assert!(feedback.contains("grounding"), "{feedback}");
+                assert!(feedback.contains("引用"), "{feedback}"); // steers the retry toward quoting evidence
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// CJK reject case: a claim whose specific figures do not appear in any
+    /// tool result must still be caught with CJK char counting.
+    #[test]
+    fn grounding_precheck_rejects_unsupported_cjk_claim() {
+        let records = vec![ok_record(
+            "mcp__duduclaw__memory_search",
+            "查詢結果：本月營收為新台幣一百二十萬元整。",
+        )];
+        let outcome = grounding_precheck(
+            "已完成分析，本季獲利創下歷史新高，達五百萬元。",
+            &records,
+            &[],
+            GroundingPrecheckConfig {
+                enabled: true,
+                min_overlap_chars: 8,
+            },
+        );
+        assert!(matches!(outcome, GroundingPrecheck::Reject { .. }));
+    }
+
+    /// Fix-2 C1b: even when a call's `result_text` happens to overlap the
+    /// final claim, if that overlap is only the caller's OWN input echoed
+    /// back, it must not ground the claim — degrades exactly like
+    /// "no usable evidence", never a false Grounded.
+    #[test]
+    fn grounding_precheck_does_not_ground_on_input_echoed_result_text() {
+        let records = vec![ok_record_with_input(
+            "mcp__duduclaw__tasks_complete",
+            "Completed: refund #4821 approved for customer",
+            "refund #4821 approved for customer",
+        )];
+        // Final claim kept identical to the excluded input text so every
+        // candidate window is provably inside the excluded span (a claim
+        // wrapped in different surrounding prose can incidentally create a
+        // stray boundary-straddling window that isn't itself an echo — see
+        // the sibling test in `duduclaw-core/src/grounding.rs` for the same
+        // note).
+        let outcome = grounding_precheck(
+            "refund #4821 approved for customer",
+            &records,
+            &[],
+            GroundingPrecheckConfig {
+                enabled: true,
+                min_overlap_chars: 10,
+            },
+        );
+        assert!(
+            matches!(outcome, GroundingPrecheck::Reject { .. }),
+            "self-echoed overlap must not ground the claim: {outcome:?}"
+        );
+    }
+
+    /// Companion case: the SAME record also carries genuine new information
+    /// (a store-assigned id not present in the input) — grounding on that
+    /// span must still work.
+    #[test]
+    fn grounding_precheck_still_grounds_on_genuine_non_echoed_span() {
+        let records = vec![ok_record_with_input(
+            "mcp__duduclaw__tasks_create",
+            "task created with id task-zx88-store-assigned",
+            "create a follow-up task",
+        )];
+        let outcome = grounding_precheck(
+            "Created it: task-zx88-store-assigned",
+            &records,
+            &[],
+            GroundingPrecheckConfig {
+                enabled: true,
+                min_overlap_chars: 10,
+            },
+        );
+        assert_eq!(
+            outcome,
+            GroundingPrecheck::Grounded {
+                tool_name: "mcp__duduclaw__tasks_create".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn grounding_precheck_skips_pure_text_task_with_no_tool_use() {
+        let outcome = grounding_precheck(
+            "這是一個純文字回覆，沒有呼叫任何工具。",
+            &[], // no tool_use at all in the window
+            &[], // and no native evidence either
+            GroundingPrecheckConfig::default(),
+        );
+        assert_eq!(
+            outcome,
+            GroundingPrecheck::Skip {
+                reason: "no tool_use in claim→review window"
+            }
+        );
+    }
+
+    /// BUG-2 fix (WP-A10 §6 復驗): when there is NO MCP evidence but the
+    /// WP-A4 native collector DID see a successful non-self-echo tool call
+    /// that carries no `result_text` (the pre-R1 shape), the result must
+    /// upgrade from `Skip` (which would falsely imply "no tool_use at all")
+    /// to `Degraded` with an accurate reason — and must NOT become
+    /// `Grounded`, since there is no text to overlap-check against. See
+    /// `grounding_precheck_native_evidence_with_result_text_reaches_grounded`
+    /// below for the R1 case where native evidence DOES carry text.
+    #[test]
+    fn grounding_precheck_degrades_not_skips_when_only_native_evidence_exists() {
+        let native_evidence = vec![native("Write", true)];
+        let outcome = grounding_precheck(
+            "我已經寫入 report.md 檔案。",
+            &[], // no MCP tool_use in the window
+            &native_evidence,
+            GroundingPrecheckConfig::default(),
+        );
+        assert_eq!(
+            outcome,
+            GroundingPrecheck::Degraded {
+                reason: "native tool evidence present but lacks captured result_text for grounding"
+            }
+        );
+    }
+
+    /// A failed (or self-echo) native event must NOT upgrade the reason —
+    /// it carries no real "the agent used a tool" signal.
+    #[test]
+    fn grounding_precheck_still_skips_when_native_evidence_all_failed() {
+        let native_evidence = vec![native("Bash", false)];
+        let outcome = grounding_precheck(
+            "純文字回覆。",
+            &[],
+            &native_evidence,
+            GroundingPrecheckConfig::default(),
+        );
+        assert_eq!(
+            outcome,
+            GroundingPrecheck::Skip {
+                reason: "no tool_use in claim→review window"
+            }
+        );
+    }
+
+    /// Disabled config short-circuits before native evidence is even
+    /// consulted — must stay a plain `Skip { reason: "disabled" }`.
+    #[test]
+    fn grounding_precheck_disabled_ignores_native_evidence() {
+        let native_evidence = vec![native("Write", true)];
+        let outcome = grounding_precheck(
+            "anything",
+            &[],
+            &native_evidence,
+            GroundingPrecheckConfig {
+                enabled: false,
+                min_overlap_chars: 6,
+            },
+        );
+        assert_eq!(outcome, GroundingPrecheck::Skip { reason: "disabled" });
+    }
+
+    // ── R1: native evidence with captured text ──────────────────────────
+
+    /// R1's actual deliverable: a task done entirely with native tools
+    /// (Read/Write/Bash — no MCP call at all) whose native evidence DOES
+    /// carry masked `result_text` overlapping the claim must reach
+    /// `Grounded`, not perpetually `Degraded`.
+    #[test]
+    fn grounding_precheck_native_evidence_with_result_text_reaches_grounded() {
+        let native_evidence = vec![native_with_text(
+            "Write",
+            true,
+            "wrote report.md with quarterly revenue: 1.2M",
+            None,
+        )];
+        let outcome = grounding_precheck(
+            "Done — report.md now contains quarterly revenue: 1.2M.",
+            &[], // no MCP evidence at all — purely native
+            &native_evidence,
+            GroundingPrecheckConfig {
+                enabled: true,
+                min_overlap_chars: 10,
+            },
+        );
+        assert_eq!(outcome, GroundingPrecheck::Grounded { tool_name: "Write".to_string() });
+    }
+
+    /// The R1 mirror image: native evidence WITH text, but the claim shares
+    /// no overlap with it — must reject, exactly like an MCP-evidence
+    /// mismatch would.
+    #[test]
+    fn grounding_precheck_native_evidence_with_result_text_rejects_unsupported_claim() {
+        let native_evidence = vec![native_with_text(
+            "Bash",
+            true,
+            "total: 42 files processed, 0 errors",
+            None,
+        )];
+        let outcome = grounding_precheck(
+            "I have refunded the customer and closed the ticket.",
+            &[],
+            &native_evidence,
+            GroundingPrecheckConfig {
+                enabled: true,
+                min_overlap_chars: 10,
+            },
+        );
+        assert!(matches!(outcome, GroundingPrecheck::Reject { .. }), "{outcome:?}");
+    }
+
+    /// R1 + Fix-2 C1b: native evidence's own `input_text` still subtracts
+    /// self-echoed spans — a native tool has no `SELF_ECHO_TOOL_NAMES` deny
+    /// -list membership, but the generic echo-exclusion logic in
+    /// `check_grounded` applies uniformly regardless of tool identity.
+    #[test]
+    fn grounding_precheck_native_evidence_does_not_ground_on_echoed_input() {
+        let native_evidence = vec![native_with_text(
+            "Bash",
+            true,
+            "ran: refund for order #1234",
+            Some("refund for order #1234"),
+        )];
+        let outcome = grounding_precheck(
+            "refund for order #1234",
+            &[],
+            &native_evidence,
+            GroundingPrecheckConfig {
+                enabled: true,
+                min_overlap_chars: 10,
+            },
+        );
+        assert!(
+            matches!(outcome, GroundingPrecheck::Reject { .. }),
+            "self-echoed native input must not ground the claim: {outcome:?}"
+        );
+    }
+
+    /// R1: native AND MCP evidence both present, only the native side
+    /// actually grounds the claim — the merge must not drop it.
+    #[test]
+    fn grounding_precheck_grounds_on_native_evidence_when_mcp_evidence_is_unrelated() {
+        let records = vec![ToolActivityRecord {
+            tool_name: "mcp__duduclaw__memory_search".into(),
+            success: true,
+            result_text: Some("unrelated policy lookup, no matching content".into()),
+            input_text: None,
+        }];
+        let native_evidence =
+            vec![native_with_text("Write", true, "wrote quarterly-report.md successfully", None)];
+        let outcome = grounding_precheck(
+            "I wrote quarterly-report.md successfully.",
+            &records,
+            &native_evidence,
+            GroundingPrecheckConfig {
+                enabled: true,
+                min_overlap_chars: 10,
+            },
+        );
+        assert_eq!(outcome, GroundingPrecheck::Grounded { tool_name: "Write".to_string() });
+    }
+
+    #[test]
+    fn grounding_precheck_skips_when_disabled() {
+        let records = vec![ok_record("Bash", "irrelevant")];
+        let outcome = grounding_precheck(
+            "anything",
+            &records,
+            &[],
+            GroundingPrecheckConfig {
+                enabled: false,
+                min_overlap_chars: 6,
+            },
+        );
+        assert_eq!(outcome, GroundingPrecheck::Skip { reason: "disabled" });
+    }
+
+    /// The production degrade case (see the B3 module doc): tool_use
+    /// evidence exists but the audit trail never captured `result_text` —
+    /// today's universal case for every writer. Must degrade (fall through
+    /// to the judge), never reject a task over an observability gap.
+    #[test]
+    fn grounding_precheck_degrades_when_result_text_missing() {
+        let records = vec![ToolActivityRecord {
+            tool_name: "mcp__duduclaw__tasks_create".into(),
+            success: true,
+            // No result_text: either an ordinary writer gap, or (Fix-2 C1a)
+            // this tool is on the self-echo deny-list and never gets one.
+            result_text: None,
+            input_text: None,
+        }];
+        let outcome = grounding_precheck(
+            "Task created and refund issued.",
+            &records,
+            &[],
+            GroundingPrecheckConfig::default(),
+        );
+        assert_eq!(
+            outcome,
+            GroundingPrecheck::Degraded {
+                reason: "tool evidence lacks captured result_text"
+            }
+        );
+    }
+
+    /// Same MCP evidence shape, but native evidence ALSO exists this round
+    /// — the reason string must mention it (still `Degraded`, never
+    /// `Grounded`, since in THIS fixture neither the MCP record nor the
+    /// native event carries `result_text` — see
+    /// `grounding_precheck_native_evidence_with_result_text_reaches_grounded`
+    /// for the R1 case where native evidence DOES carry text).
+    #[test]
+    fn grounding_precheck_degrades_with_native_hint_when_result_text_missing() {
+        let records = vec![ToolActivityRecord {
+            tool_name: "mcp__duduclaw__tasks_create".into(),
+            success: true,
+            result_text: None,
+            input_text: None,
+        }];
+        let native_evidence = vec![native("Write", true)];
+        let outcome = grounding_precheck(
+            "Task created and refund issued.",
+            &records,
+            &native_evidence,
+            GroundingPrecheckConfig::default(),
+        );
+        assert_eq!(
+            outcome,
+            GroundingPrecheck::Degraded {
+                reason: "tool evidence lacks captured result_text (native tool evidence also present, same limitation)"
+            }
+        );
+    }
+
+    #[test]
+    fn grounding_precheck_degrades_when_every_call_errored() {
+        let records = vec![ToolActivityRecord {
+            tool_name: "mcp__duduclaw__tasks_create".into(),
+            success: false,
+            result_text: Some("permission denied".into()),
+            input_text: None,
+        }];
+        let outcome = grounding_precheck(
+            "Task created successfully.",
+            &records,
+            &[],
+            GroundingPrecheckConfig::default(),
+        );
+        assert_eq!(
+            outcome,
+            GroundingPrecheck::Degraded {
+                reason: "no successful tool call in window"
+            }
+        );
+    }
+
+    #[test]
+    fn grounding_precheck_config_reads_dispatch_section() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[dispatch]\ngrounding_precheck_enabled = false\ngrounding_min_overlap_chars = 20\n",
+        )
+        .unwrap();
+        let cfg = GroundingPrecheckConfig::from_home(dir.path());
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.min_overlap_chars, 20);
+    }
+
+    #[test]
+    fn grounding_precheck_config_defaults_on_missing_or_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        // No config.toml at all.
+        let cfg = GroundingPrecheckConfig::from_home(dir.path());
+        assert_eq!(cfg, GroundingPrecheckConfig::default());
+
+        // Malformed section: a non-positive threshold must not disable the
+        // overlap requirement (would make every claim trivially "grounded").
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[dispatch]\ngrounding_min_overlap_chars = 0\n",
+        )
+        .unwrap();
+        let cfg = GroundingPrecheckConfig::from_home(dir.path());
+        assert_eq!(cfg.min_overlap_chars, DEFAULT_GROUNDING_MIN_OVERLAP_CHARS);
+    }
+
+    /// End-to-end wiring: `review_goal_tasks` rejects a goal task whose
+    /// result is provably ungrounded in its own tool-call window *before*
+    /// ever invoking the judge — the judge stub records whether it was
+    /// called at all.
+    #[tokio::test]
+    async fn review_goal_tasks_rejects_via_grounding_precheck_before_judge() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tool_calls.jsonl"),
+            "{\"timestamp\":\"2026-07-11T10:02:00Z\",\"agent_id\":\"w\",\"tool_name\":\"memory_search\",\"success\":true,\"result_text\":\"Refund policy: 30 days from purchase, receipt required.\"}\n",
+        )
+        .unwrap();
+
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        let g = pending_goal("g1");
+        store.insert_task(&g).await.unwrap();
+        store
+            .atomic_claim("g1", "w", "2026-07-11T10:00:00Z", "2026-07-11T10:05:00Z")
+            .await
+            .unwrap()
+            .is_claimed();
+        // Deliberately shares no >= 6-char run with the tool evidence above
+        // (verified: no accidental collision like "refund" would be — that
+        // word alone is exactly the default `min_overlap_chars` and bit a
+        // first draft of this test).
+        store
+            .complete_task("g1", "I handled the request successfully.", "w")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_task("g1").await.unwrap().unwrap().status,
+            "review"
+        );
+
+        let judge = Arc::new(CapturingJudge {
+            outcome: Ok(AcceptanceVerdict {
+                passed: true,
+                feedback: "should never be reached".into(),
+            }),
+            captured_task: std::sync::Mutex::new(None),
+        });
+        let engine = DispatchEngine::new(store.clone(), Some(judge.clone()))
+            .with_home_dir(dir.path().to_path_buf());
+
+        engine.review_goal_tasks().await.unwrap();
+
+        assert!(
+            judge.captured_task.lock().unwrap().is_none(),
+            "grounding pre-check must reject before the judge is ever called"
+        );
+        let row = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(row.status, "revising");
     }
 
     /// Judge stub that records the `task` string it was called with, so the
@@ -1775,11 +3267,13 @@ mod tests {
         let lease_secs: i64 = 1;
         let now = Utc::now();
         let lease = (now + chrono::Duration::seconds(lease_secs)).to_rfc3339();
-        assert!(store
-            .atomic_claim("long", "w", &now.to_rfc3339(), &lease)
-            .await
-            .unwrap()
-            .is_claimed());
+        assert!(
+            store
+                .atomic_claim("long", "w", &now.to_rfc3339(), &lease)
+                .await
+                .unwrap()
+                .is_claimed()
+        );
         let guard = LeaseRenewalGuard::spawn(store.clone(), "long".into(), "w".into(), lease_secs);
 
         let engine = DispatchEngine::new(store.clone(), None).with_lease_secs(lease_secs);
@@ -1814,11 +3308,13 @@ mod tests {
 
         // Claimed with a 5-minute lease, then the worker vanishes (no ticker,
         // no tasks_renew). All timestamps crafted — deterministic.
-        assert!(store
-            .atomic_claim("gone", "w", "2026-07-01T10:00:00Z", "2026-07-01T10:05:00Z")
-            .await
-            .unwrap()
-            .is_claimed());
+        assert!(
+            store
+                .atomic_claim("gone", "w", "2026-07-01T10:00:00Z", "2026-07-01T10:05:00Z")
+                .await
+                .unwrap()
+                .is_claimed()
+        );
 
         // At expiry (10:05) and inside the grace window (< 10:10): NOT yet
         // reclaimed — conservative reclaim waits one further full window.

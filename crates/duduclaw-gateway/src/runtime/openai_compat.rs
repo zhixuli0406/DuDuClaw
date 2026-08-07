@@ -382,14 +382,41 @@ impl OpenAiCompatRuntime {
             "OpenAiCompatRuntime: MCP tool loop"
         );
 
-        let resp = duduclaw_llm::run_tool_loop(
+        // WP-A5 (design commercial/docs/design-task-forward-model-2026-08-06.md
+        // §5.3/§9): use the provenance-tracking variant (policy `Off` by
+        // default here, so behavior is otherwise byte-identical to
+        // `run_tool_loop`) purely to get `ToolLoopOutcome.tool_calls` — the
+        // A3 forward-model's smallest `Full`-fidelity upgrade path. The
+        // collected calls are pushed into the SAME `NATIVE_TOOL_COLLECTOR`
+        // task-local that claude_runner.rs (WP-A4) and codex/gemini (T10)
+        // use, so `dispatcher.rs`'s bridging logic doesn't need a
+        // runtime-specific branch.
+        let loop_outcome = duduclaw_llm::run_tool_loop_with_provenance(
             &provider,
             req,
             &guarded,
             duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
+            duduclaw_llm::ProvenanceConfig::default(),
         )
         .await
         .map_err(|e| format!("openai-compat tool loop error: {e}"))?;
+        // R1: `LoopToolCall` already carries masked+capped result/input text
+        // (masking happens inside `duduclaw-llm::tool_loop`, which already
+        // depends on `duduclaw-security` for `PolicyExecutor`) — carried
+        // through verbatim, never re-masked here.
+        crate::runtime::extend_native_tool_events(
+            loop_outcome
+                .tool_calls
+                .into_iter()
+                .map(|call| crate::runtime::NativeToolEvent {
+                    tool_name: call.tool_name,
+                    success: call.success,
+                    result_text: call.result_text,
+                    input_text: call.input_text,
+                })
+                .collect(),
+        );
+        let resp = loop_outcome.response;
 
         // A tool-only round is NOT an empty reply — the loop keeps going. Only a
         // loop that terminates with no answer text is an EmptyResponse.

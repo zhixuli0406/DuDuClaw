@@ -198,6 +198,30 @@ async fn poll_and_dispatch_sqlite(
         // ACK immediately to prevent double-pickup
         queue.ack(&msg.id).await?;
 
+        // ── WP21 C1: same gate as the JSONL rail ──────────────────────────
+        // `send_to_agent` enqueues here, so this is the choke point for the
+        // MCP delegation path (its front-door check only produces a nicer
+        // error). Gated after the ACK: a denied row must reach the `failed`
+        // terminal state, never bounce back to `pending` and re-deny forever.
+        let gate = crate::delegation_gate::gate_bus_dispatch(
+            home_dir,
+            registry,
+            msg.sender_agent.as_deref(),
+            msg.origin_agent.as_deref(),
+            &msg.target,
+            &msg.id,
+            "sqlite_queue",
+        )
+        .await;
+        if let crate::delegation_gate::GateOutcome::Deny(denied) = gate {
+            let notice = crate::delegation_gate::denial_notice(&denied);
+            queue.fail(&msg.id, &notice).await?;
+            // Consume any delegation callback so the requester sees the
+            // refusal instead of waiting for a reply that will never come.
+            forward_delegation_response(home_dir, &msg.id, &notice, &msg.target).await;
+            continue;
+        }
+
         let delegation = DelegationEnv {
             depth: msg.delegation_depth as u8,
             origin: msg.origin_agent.clone().unwrap_or_default(),
@@ -235,13 +259,44 @@ async fn poll_and_dispatch_sqlite(
             .scope(msg.session_id.clone(), dispatch_fut);
         let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
             .scope(msg.turn_id.clone(), dispatch_fut);
-        let result = match msg.reply_channel.clone() {
-            Some(rc) if !rc.is_empty() => {
+
+        // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
+        // collector scoped — the design's A3 forward model only observes
+        // goal-loop rounds, so every other dispatch (plain send_to_agent,
+        // cron/reminder-triggered delegation) pays zero cost here. Detected
+        // via the same `[goal-loop task_id=... iter=...]` marker
+        // `build_typing_guard_for_sqlite_message` above already parses for
+        // its own (unrelated) purpose.
+        let goal_loop_ref = extract_goal_loop_task_id_and_round(&msg.payload);
+        let native_collector = goal_loop_ref
+            .map(|_| Arc::new(std::sync::Mutex::new(Vec::<crate::runtime::NativeToolEvent>::new())));
+
+        let result = match (native_collector.clone(), msg.reply_channel.clone()) {
+            (Some(collector), Some(rc)) if !rc.is_empty() => {
+                crate::runtime::NATIVE_TOOL_COLLECTOR
+                    .scope(collector, crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut))
+                    .await
+            }
+            (Some(collector), _) => {
+                crate::runtime::NATIVE_TOOL_COLLECTOR.scope(collector, dispatch_fut).await
+            }
+            (None, Some(rc)) if !rc.is_empty() => {
                 crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut).await
             }
-            _ => dispatch_fut.await,
+            (None, _) => dispatch_fut.await,
         };
         drop(typing_guard);
+
+        // WP-A4/A5/T10: bridge whatever the collector accumulated over to
+        // `dispatch_engine.rs::settle_forward_model`, keyed by (task_id,
+        // round) — see `task_observe::record_native_evidence`'s doc comment.
+        // Best-effort: a poisoned mutex or empty batch degrades silently
+        // (`record_native_evidence`/`extend_native_tool_events` never
+        // panic), never affects the dispatch result already computed above.
+        if let (Some((task_id, round)), Some(collector)) = (goal_loop_ref, native_collector) {
+            let events = collector.lock().map(|g| g.clone()).unwrap_or_default();
+            crate::prediction::task_observe::record_native_evidence(task_id, round, events);
+        }
 
         match result {
             Ok(response) => {
@@ -463,6 +518,19 @@ async fn poll_and_dispatch(
     let mut to_dispatch: Vec<BusMessage> = Vec::new();
     let mut remaining_lines: Vec<String> = Vec::new();
     let mut proactive_sends: Vec<ProactiveSend> = Vec::new();
+    // Messages consumed (removed from the queue) without producing a dispatch:
+    // oversized, depth-exceeded, invalid id, delegation-denied. They still
+    // require the queue rewrite below — without this counter a poll cycle that
+    // consumed *only* such messages returned early, left them on disk, and
+    // re-processed them every 5 s forever.
+    let mut consumed_without_dispatch: usize = 0;
+    // Error `agent_response` lines synthesized during classification. They are
+    // folded into the rewrite instead of being appended directly, because the
+    // rewrite below replaces the whole file and would otherwise erase them.
+    let mut synthetic_responses: Vec<String> = Vec::new();
+    // WP21 C1 denials: (message, denial) pairs awaiting their user-facing
+    // notice once the queue has been rewritten.
+    let mut denied_delegations: Vec<(BusMessage, duduclaw_core::DelegationDenied)> = Vec::new();
 
     for line in &lines {
         // Proactive-care / webhook notifications: consume-and-deliver. These
@@ -476,11 +544,13 @@ async fn poll_and_dispatch(
             Ok(msg) if msg.msg_type == "agent_message" => {
                 if !duduclaw_core::is_valid_agent_id(&msg.agent_id) {
                     warn!("Invalid agent_id in bus queue, skipping");
+                    consumed_without_dispatch += 1;
                     continue;
                 }
                 // Enforce payload size limit (BE-H6) — drop, do NOT keep in queue
                 if msg.payload.len() > 100_000 {
                     warn!(id = %msg.message_id, len = msg.payload.len(), "Dropping oversized message (removed from queue)");
+                    consumed_without_dispatch += 1;
                 } else if msg.delegation_depth >= MAX_DELEGATION_DEPTH {
                     // Delegation depth exceeded — drop to prevent infinite loops
                     warn!(
@@ -516,17 +586,41 @@ async fn poll_and_dispatch(
                         turn_id: msg.turn_id.clone(),
                         session_id: msg.session_id.clone(),
                     };
-                    if let Ok(json) = serde_json::to_string(&err_response) {
-                        if let Err(e) = append_line(&queue_path, &json).await {
-                            warn!(
-                                id = %msg.message_id,
-                                error = %e,
-                                "Failed to write delegation depth-exceeded error response"
-                            );
-                        }
+                    consumed_without_dispatch += 1;
+                    match serde_json::to_string(&err_response) {
+                        Ok(json) => synthetic_responses.push(json),
+                        Err(e) => warn!(
+                            id = %msg.message_id,
+                            error = %e,
+                            "Failed to serialize delegation depth-exceeded error response"
+                        ),
                     }
                 } else {
-                    to_dispatch.push(msg);
+                    // ── WP21 C1: department × rank isolation ──────────────
+                    // The real choke point. Anything that can append a line
+                    // here (spawn_agent, spawn_ephemeral, ACP `message/send`,
+                    // a hand-written JSONL row) is judged by the same
+                    // predicate before a CLI process is ever spawned.
+                    let outcome = crate::delegation_gate::gate_bus_dispatch(
+                        home_dir,
+                        registry,
+                        msg.sender_agent.as_deref(),
+                        msg.origin_agent.as_deref(),
+                        &msg.agent_id,
+                        &msg.message_id,
+                        "bus_dispatch",
+                    )
+                    .await;
+                    match outcome {
+                        crate::delegation_gate::GateOutcome::Deny(denied) => {
+                            // Consumed, never dispatched, never retried — the
+                            // relation will not change by waiting, so a retry
+                            // would only re-deny in a loop.
+                            consumed_without_dispatch += 1;
+                            denied_delegations.push((msg, denied));
+                        }
+                        _ => to_dispatch.push(msg),
+                    }
                 }
             }
             _ => {
@@ -536,7 +630,39 @@ async fn poll_and_dispatch(
         }
     }
 
-    if to_dispatch.is_empty() && proactive_sends.is_empty() {
+    // WP21 C1: turn each denial into an `agent_response` the requester can
+    // read, so a refused delegation surfaces as a failed task with a reason
+    // instead of a task that silently never runs.
+    for (msg, denied) in &denied_delegations {
+        let notice = crate::delegation_gate::denial_notice(denied);
+        let err_response = BusMessage {
+            msg_type: "agent_response".to_string(),
+            message_id: uuid::Uuid::new_v4().to_string(),
+            agent_id: msg.agent_id.clone(),
+            payload: notice,
+            timestamp: Utc::now().to_rfc3339(),
+            response: None,
+            in_reply_to: Some(msg.message_id.clone()),
+            delegation_depth: msg.delegation_depth,
+            hop_depth: msg.hop_depth,
+            origin_agent: msg.origin_agent.clone(),
+            sender_agent: Some(msg.agent_id.clone()),
+            coalesced_ids: vec![],
+            turn_id: msg.turn_id.clone(),
+            session_id: msg.session_id.clone(),
+        };
+        match serde_json::to_string(&err_response) {
+            Ok(json) => synthetic_responses.push(json),
+            Err(e) => warn!(
+                id = %msg.message_id,
+                error = %e,
+                "Failed to serialize delegation-denied response"
+            ),
+        }
+    }
+    remaining_lines.extend(synthetic_responses);
+
+    if to_dispatch.is_empty() && proactive_sends.is_empty() && consumed_without_dispatch == 0 {
         return Ok(());
     }
 
@@ -565,6 +691,15 @@ async fn poll_and_dispatch(
     tokio::fs::rename(&tmp_path, &queue_path)
         .await
         .map_err(|e| format!("Failed to rename temp bus_queue: {e}"))?;
+
+    // ── WP21 C1: tell the requester why nothing will happen ──────────────
+    // A refused delegation must not look like a hang. If the original
+    // `spawn_agent` ran inside a channel turn, a delegation callback is
+    // waiting on this message id; consume it with the denial notice.
+    for (msg, denied) in &denied_delegations {
+        let notice = crate::delegation_gate::denial_notice(denied);
+        forward_delegation_response(home_dir, &msg.message_id, &notice, &msg.agent_id).await;
+    }
 
     // ── Deliver proactive notifications (already removed from the queue) ──
     for send in proactive_sends {
@@ -1333,6 +1468,45 @@ pub async fn dispatch_taskspec(
             "Executing step: {}",
             &step_desc,
         );
+
+        // ── WP21 C1 (TaskSpec rail) ──────────────────────────────────────
+        // A `create_task` step may name ANY agent, and this executor reaches
+        // `dispatch_to_agent` without ever touching `bus_queue.jsonl` or the
+        // SQLite queue — so without this check the multi-step planner is a
+        // complete way around the delegation policy. The task owner
+        // (`spec.agent_id`) is the sender; a step that runs on the owner
+        // itself is not a delegation and is never judged (self-delegation is
+        // a hard DENY in core).
+        if target_agent != spec.agent_id {
+            if let crate::delegation_gate::GateOutcome::Deny(denied) =
+                crate::delegation_gate::gate_bus_dispatch(
+                    home_dir,
+                    registry,
+                    Some(&spec.agent_id),
+                    None,
+                    &target_agent,
+                    &spec.task_id,
+                    "task_spec",
+                )
+                .await
+            {
+                let notice = crate::delegation_gate::denial_notice(&denied);
+                warn!(
+                    task = %spec.task_id,
+                    step = step_index,
+                    agent = %target_agent,
+                    "TaskSpec step delegation denied — task failed, no agent spawned"
+                );
+                // Terminal, not retryable: the org relation will not change by
+                // waiting, so `mark_failed`'s retry ladder would only re-deny.
+                if let Some(s) = spec.steps.get_mut(step_index) {
+                    s.status = StepStatus::Failed;
+                }
+                spec.status = TaskStatus::Failed;
+                spec.save(agent_dir).ok();
+                return Err(notice);
+            }
+        }
 
         // Build prompt with prior step context
         let prompt = match build_step_prompt(spec, step_index) {
@@ -3000,6 +3174,23 @@ fn extract_goal_loop_task_id(payload: &str) -> Option<&str> {
     if id.is_empty() { None } else { Some(id) }
 }
 
+/// Like [`extract_goal_loop_task_id`] but also parses the `iter=<n>` round
+/// number from the same marker. WP-A4/A5/T10's native-tool bridge (see
+/// `prediction::task_observe::record_native_evidence`) needs both to key
+/// its `(task_id, round)` store — the round matches what
+/// `dispatch_engine.rs::settle_forward_model` computes on the review side
+/// (`task.revision_round + 1`, the same value `goal_loop.rs::enqueue_work`
+/// stamps here as `next_iter`).
+fn extract_goal_loop_task_id_and_round(payload: &str) -> Option<(&str, u32)> {
+    let task_id = extract_goal_loop_task_id(payload)?;
+    const ITER_MARKER: &str = " iter=";
+    let start = payload.find(ITER_MARKER)? + ITER_MARKER.len();
+    let rest = &payload[start..];
+    let end = rest.find(']')?;
+    let round: u32 = rest[..end].parse().ok()?;
+    Some((task_id, round))
+}
+
 /// Read a task's originating channel (`source_channel`/`source_chat_id`,
 /// stamped at `/goal` kickoff — see `task_store.rs`'s P5 fields) directly
 /// from `tasks.db`. Read-only, best-effort — a bare query rather than a
@@ -3138,6 +3329,168 @@ mod tests {
              The MCP server needs authentication before the tools become available.\n\
              Set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 if you want transcripts kept";
         assert_eq!(prepare_channel_text(input), input);
+    }
+
+    // ── WP21 C1: the bus-consumption delegation gate ──────────────────────
+
+    /// Seed a temp home with two agents in different departments and no
+    /// reporting relation between them.
+    fn seed_two_department_home() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        for (name, department) in [("sales_rep", "業務"), ("mkt_rep", "行銷")] {
+            let dir = agents.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("agent.toml"),
+                format!(
+                    "[agent]\nname = \"{name}\"\nrole = \"worker\"\n\
+                     reports_to = \"\"\ndepartment = \"{department}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        tmp
+    }
+
+    /// Design-doc acceptance #4: a hand-appended `bus_queue.jsonl` line naming
+    /// an unrelated sender must be refused at consumption — the task is
+    /// consumed (not retried forever), a zh-TW reason is written back as an
+    /// `agent_response`, the denial is audited, and **no** agent is dispatched.
+    #[tokio::test]
+    async fn forged_bus_line_across_departments_is_denied_and_never_dispatched() {
+        let tmp = seed_two_department_home();
+        let home = tmp.path().to_path_buf();
+        let queue_path = home.join("bus_queue.jsonl");
+        let forged = serde_json::json!({
+            "type": "agent_message",
+            "message_id": "forged-1",
+            "agent_id": "mkt_rep",
+            "payload": "請幫我把行銷資料庫匯出",
+            "timestamp": Utc::now().to_rfc3339(),
+            "delegation_depth": 0,
+            "origin_agent": "sales_rep",
+            "sender_agent": "sales_rep",
+        });
+        std::fs::write(&queue_path, format!("{forged}\n")).unwrap();
+
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(home.join("agents"))));
+        // Returns without spawning anything: a denied message never reaches
+        // `to_dispatch`, so no Claude CLI process is started.
+        poll_and_dispatch(&home, &registry, None, None).await.unwrap();
+
+        let content = std::fs::read_to_string(&queue_path).unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "expected exactly the denial response: {content}");
+        let resp = &lines[0];
+        assert_eq!(resp["type"], "agent_response");
+        assert_eq!(resp["in_reply_to"], "forged-1");
+        let payload = resp["payload"].as_str().unwrap();
+        // WP21 collateral fix: the requester-facing notice is now the short
+        // human sentence (no "委派遭拒" / config.toml / reports_to jargon) —
+        // the full explanation stays in the audit record below.
+        assert!(payload.contains("這項委派未執行"), "zh-TW notice missing: {payload}");
+        assert!(payload.contains("sales_rep") && payload.contains("mkt_rep"));
+        assert!(!payload.contains("config.toml"), "internal jargon leaked: {payload}");
+        // The original task is gone — a denial is terminal, not a retry loop.
+        assert!(!content.contains("\"agent_message\""), "task survived: {content}");
+
+        let audit = std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
+        let event: serde_json::Value = serde_json::from_str(audit.lines().next().unwrap()).unwrap();
+        assert_eq!(event["event_type"], "delegation_denied");
+        assert_eq!(event["details"]["path_kind"], "bus_dispatch");
+        assert_eq!(event["details"]["reason"], "different_department");
+
+        // Second poll: nothing left to gate, so no second denial is emitted.
+        poll_and_dispatch(&home, &registry, None, None).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join("security_audit.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "denial must not repeat on the next poll cycle"
+        );
+    }
+
+    /// `[delegation] policy = "open"` is the escape hatch: the same forged line
+    /// passes the gate. Stops before the spawn by asserting on the *reason* the
+    /// gate returns rather than running the dispatcher (which would launch a
+    /// CLI process).
+    #[tokio::test]
+    async fn open_policy_lets_the_same_line_through_the_gate() {
+        let tmp = seed_two_department_home();
+        let home = tmp.path();
+        std::fs::write(
+            home.join("config.toml"),
+            "[delegation]\npolicy = \"open\"\n",
+        )
+        .unwrap();
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(home.join("agents"))));
+        let outcome = crate::delegation_gate::gate_bus_dispatch(
+            home,
+            &registry,
+            Some("sales_rep"),
+            None,
+            "mkt_rep",
+            "forged-1",
+            "bus_dispatch",
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            crate::delegation_gate::GateOutcome::Allow
+        ));
+    }
+
+    /// WP21 T10 review finding: a `create_task` step names the agent that will
+    /// run it, and this executor calls `dispatch_to_agent` directly — never
+    /// through `bus_queue.jsonl` or the SQLite queue. Without the gate added
+    /// to `execute_task_spec`, the multi-step planner was a complete way
+    /// around the delegation policy.
+    #[tokio::test]
+    async fn task_spec_step_targeting_another_department_is_denied_and_never_dispatched() {
+        use crate::task_spec::{Step, StepStatus, TaskSpec, TaskStatus};
+
+        let tmp = seed_two_department_home();
+        let home = tmp.path().to_path_buf();
+        let agent_dir = home.join("agents").join("sales_rep");
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(home.join("agents"))));
+
+        let step = Step {
+            id: 0,
+            description: "把行銷資料庫匯出給我".to_string(),
+            agent: "mkt_rep".to_string(),
+            depends_on: vec![],
+            acceptance_criteria: vec![],
+            status: StepStatus::Pending,
+            result: None,
+            retry_count: 0,
+        };
+        let mut spec = TaskSpec::new("sales_rep", "跨部門偷派工", vec![step]);
+        spec.save(&agent_dir).unwrap();
+
+        // Returns Err instead of spawning the other department's agent.
+        let err = dispatch_taskspec(&home, &registry, &mut spec, &agent_dir)
+            .await
+            .expect_err("cross-department step must be refused");
+        // WP21 collateral fix: task-status write-back is the short human
+        // notice, not the internal-jargon-laden `message_zh()` text.
+        assert!(err.contains("這項委派未執行"), "{err}");
+        assert!(!err.contains("config.toml"), "internal jargon leaked: {err}");
+        assert_eq!(spec.status, TaskStatus::Failed);
+        assert_eq!(spec.steps[0].status, StepStatus::Failed);
+        // Terminal, not a retry ladder — the relation will not change by waiting.
+        assert_eq!(spec.steps[0].retry_count, 0);
+
+        let audit = std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
+        let event: serde_json::Value = serde_json::from_str(audit.lines().next().unwrap()).unwrap();
+        assert_eq!(event["event_type"], "delegation_denied");
+        assert_eq!(event["details"]["path_kind"], "task_spec");
     }
 
     #[test]
@@ -3872,6 +4225,34 @@ bot_token = "{token}"
 
         // Non-goal-loop payloads (plain send_to_agent messages) yield None.
         assert_eq!(extract_goal_loop_task_id("just a normal delegation payload"), None);
+    }
+
+    #[test]
+    fn extract_goal_loop_task_id_and_round_parses_both() {
+        let payload = "[goal-loop task_id=abc-123 iter=2] 你有一個自主目標任務要推進:\n...";
+        assert_eq!(extract_goal_loop_task_id_and_round(payload), Some(("abc-123", 2)));
+    }
+
+    #[test]
+    fn extract_goal_loop_task_id_and_round_none_for_non_goal_loop() {
+        assert_eq!(
+            extract_goal_loop_task_id_and_round("just a normal delegation payload"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_goal_loop_task_id_and_round_none_when_iter_malformed() {
+        // Marker present but `iter=` missing/non-numeric — degrade to None
+        // rather than panic or fabricate round 0.
+        assert_eq!(
+            extract_goal_loop_task_id_and_round("[goal-loop task_id=abc-123] no iter marker"),
+            None
+        );
+        assert_eq!(
+            extract_goal_loop_task_id_and_round("[goal-loop task_id=abc-123 iter=oops] text"),
+            None
+        );
     }
 
     #[tokio::test]
