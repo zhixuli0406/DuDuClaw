@@ -8,4 +8,4 @@ try:
 except PackageNotFoundError:
     # Fallback for running from a source checkout that isn't pip-installed.
     # Kept in sync with pyproject.toml by scripts/release.sh (pyinit manifest).
-    __version__ = "1.52.4"
+    __version__ = "1.53.0"

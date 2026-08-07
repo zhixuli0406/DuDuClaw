@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.53.0] - 2026-08-07 — 任務層世界模型與 AEE 進化引擎
+
 ### Added
 - **問題回報與建議網頁**：`https://zhixuli0406.github.io/DuDuClaw/` 上線一張
   中文回報表單（GitHub Pages 靜態頁，零自建伺服器、前端零秘密）。使用者填完
