@@ -40,6 +40,16 @@ pub struct EvalOptions {
     pub no_judge: bool,
     /// Write a JSON report to this path.
     pub report: Option<PathBuf>,
+    /// Precise `EvalCaseRef` selection: the case file's filename stem
+    /// (`--case`, repeatable / comma-separated). Unlike `--filter` (a
+    /// substring match on the human-readable `[case] name`, which is not
+    /// guaranteed unique — B4) this is an exact match against the stable
+    /// per-file id. Empty ⇒ no restriction.
+    pub case: Vec<String>,
+    /// Directory names to exclude from discovery (e.g. `held-out`), matched
+    /// against path components relative to the discovery root. Empty ⇒
+    /// include everything (current behavior, unchanged).
+    pub exclude_dir: Vec<String>,
 }
 
 /// Judge outcome attached to a case report.
@@ -54,6 +64,8 @@ struct JudgeOutcome {
 /// Full result for one case.
 #[derive(serde::Serialize)]
 struct CaseReport {
+    /// Stable `EvalCaseRef` id — the case file's filename stem (B4).
+    id: String,
     name: String,
     path: String,
     passed: bool,
@@ -101,10 +113,11 @@ async fn run_eval(home: &Path, opts: &EvalOptions, judge_caller: &dyn LlmCaller)
         }
     };
 
-    let case_paths = match case::discover_cases(&root) {
+    let mut case_paths = match case::discover_cases(&root) {
         Ok(p) => p,
         Err(e) => {
             return vec![CaseReport {
+                id: "<discovery>".into(),
                 name: "<discovery>".into(),
                 path: root.display().to_string(),
                 passed: false,
@@ -118,14 +131,61 @@ async fn run_eval(home: &Path, opts: &EvalOptions, judge_caller: &dyn LlmCaller)
         }
     };
 
+    // `--exclude-dir` (B4): drop any case whose path — relative to the
+    // discovery root — has a directory component matching an excluded name
+    // (e.g. `held-out`). Applied before the uniqueness check and `--case`
+    // filter so excluded cases never participate in either.
+    if !opts.exclude_dir.is_empty() {
+        case_paths.retain(|p| !path_excluded(&root, p, &opts.exclude_dir));
+    }
+
+    // Suite-wide `EvalCaseRef` uniqueness (B4): the filename stem is the
+    // stable case id. A collision makes `--case` ambiguous and silently
+    // shadows one case's results with another's, so the whole suite fails
+    // fast with the offending pair named — never a partial silent run.
+    {
+        let mut seen: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+        for p in &case_paths {
+            let id = case_id(p);
+            if let Some(prev) = seen.insert(id.clone(), p.clone()) {
+                return vec![CaseReport {
+                    id: id.clone(),
+                    name: "<duplicate-case-id>".into(),
+                    path: root.display().to_string(),
+                    passed: false,
+                    error: Some(format!(
+                        "duplicate case id {id:?} (filename stem must be unique across the suite): {} and {}",
+                        prev.display(),
+                        p.display()
+                    )),
+                    assertions: Vec::new(),
+                    judge: None,
+                    tool_calls: Vec::new(),
+                    diagnostics: None,
+                    duration_ms: 0,
+                }];
+            }
+        }
+    }
+
+    // `--case` (B4): exact `EvalCaseRef` selection, evaluated against the
+    // filename stem before any TOML parsing — unlike `--filter` this never
+    // needs to load a case to decide whether to run it.
+    if !opts.case.is_empty() {
+        let wanted: std::collections::HashSet<&str> = opts.case.iter().map(String::as_str).collect();
+        case_paths.retain(|p| wanted.contains(case_id(p).as_str()));
+    }
+
     let mut reports = Vec::new();
     for path in case_paths {
         let started = std::time::Instant::now();
+        let id = case_id(&path);
         let loaded = case::load_case(&path);
         let case_file = match loaded {
             Ok(c) => c,
             Err(e) => {
                 reports.push(CaseReport {
+                    id,
                     name: path
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -150,13 +210,39 @@ async fn run_eval(home: &Path, opts: &EvalOptions, judge_caller: &dyn LlmCaller)
             }
         }
 
-        reports.push(run_one(&path, &case_file, home, mode, opts.no_judge, judge_caller).await);
+        reports.push(run_one(&path, &id, &case_file, home, mode, opts.no_judge, judge_caller).await);
     }
     reports
 }
 
+/// The stable `EvalCaseRef` id for a case file: its filename stem. Matches
+/// the existing `commercial/evals/` convention (360 shipped cases, each
+/// filename already globally unique) — `[case] name` stays the human-readable
+/// title, never the identity.
+fn case_id(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("<unnamed>")
+        .to_string()
+}
+
+/// True when `path` (relative to `root`) has a directory component matching
+/// one of `exclude_dirs` by exact name. Falls back to matching against the
+/// absolute path's components when `path` doesn't start with `root` (e.g. a
+/// caller-supplied absolute path outside the walked root).
+fn path_excluded(root: &Path, path: &Path, exclude_dirs: &[String]) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.components().any(|c| {
+        matches!(c, std::path::Component::Normal(os) if os
+            .to_str()
+            .map(|s| exclude_dirs.iter().any(|d| d == s))
+            .unwrap_or(false))
+    })
+}
+
 async fn run_one(
     path: &Path,
+    id: &str,
     case_file: &case::EvalCaseFile,
     home: &Path,
     mode: RunMode,
@@ -165,6 +251,7 @@ async fn run_one(
 ) -> CaseReport {
     let started = std::time::Instant::now();
     let mut report = CaseReport {
+        id: id.to_string(),
         name: case_file.case.name.clone(),
         path: path.display().to_string(),
         passed: false,
@@ -305,7 +392,20 @@ fn render(reports: &[CaseReport], opts: &EvalOptions) -> duduclaw_core::error::R
     }
 
     if let Some(report_path) = &opts.report {
+        let suite = opts
+            .path
+            .as_deref()
+            .unwrap_or_else(|| Path::new("evals"))
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("evals")
+            .to_string();
         let json = serde_json::json!({
+            // WP2.2 machine contract (`duduclaw-gateway::eval_runner::EvalReport`):
+            // {suite, total, passed, per_case: [{id, passed, failed_assertions, ...}]}.
+            // `suite`/`per_case` are additive to the pre-existing human/CI
+            // fields below — no existing consumer's keys are removed.
+            "suite": suite,
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "mode": if opts.replay { "replay" } else { "live" },
             "total": total,
@@ -315,6 +415,7 @@ fn render(reports: &[CaseReport], opts: &EvalOptions) -> duduclaw_core::error::R
                 "label": label,
                 "count": count,
             })).collect::<Vec<_>>(),
+            "per_case": per_case_json(reports),
             "cases": reports,
         });
         std::fs::write(report_path, serde_json::to_string_pretty(&json)? + "\n")?;
@@ -322,6 +423,55 @@ fn render(reports: &[CaseReport], opts: &EvalOptions) -> duduclaw_core::error::R
         println!();
     }
     Ok(())
+}
+
+/// Per-case machine contract for `--report` (WP2.2's `EvalRunner` parses
+/// exactly this shape). Every field is sourced from data the case run
+/// already produced — nothing here is fabricated. `failed_assertions` names
+/// each failed `[expect]` check (`AssertionResult::name`, already a
+/// descriptive string e.g. `"must_use_tools: tasks_create"`); a case that
+/// died before assertions ran (spawn/parse/replay failure) reports its
+/// `error` as the sole entry so `failed_assertions` is never empty on a
+/// failure. `mast_class` is `None` for a passing case.
+fn per_case_json(reports: &[CaseReport]) -> Vec<serde_json::Value> {
+    use duduclaw_gateway::mast;
+    reports
+        .iter()
+        .map(|r| {
+            let failed_assertions: Vec<String> = if !r.assertions.is_empty() {
+                r.assertions
+                    .iter()
+                    .filter(|a| !a.passed)
+                    .map(|a| a.name.clone())
+                    .collect()
+            } else if let Some(e) = &r.error {
+                vec![format!("error: {e}")]
+            } else {
+                Vec::new()
+            };
+            let judge_score = r.judge.as_ref().map(|j| j.score);
+            let mast_class = if r.passed {
+                None
+            } else if let Some(e) = &r.error {
+                Some(mast::classify_eval_error(e).display())
+            } else {
+                let first_failed = r
+                    .assertions
+                    .iter()
+                    .find(|a| !a.passed)
+                    .map(|a| mast::classify_eval_assertion(&a.name).display());
+                Some(first_failed.unwrap_or_else(|| mast::MastLabel::Unclassified.display()))
+            };
+            serde_json::json!({
+                "id": r.id,
+                "name": r.name,
+                "passed": r.passed,
+                "failed_assertions": failed_assertions,
+                "judge_score": judge_score,
+                "mast_class": mast_class,
+            })
+        })
+        .collect()
 }
 
 /// Deterministically attribute each failure onto a MAST label
@@ -364,6 +514,7 @@ mod tests {
 
     fn report(name: &str, passed: bool, error: Option<&str>, assertions: Vec<(&str, bool)>) -> CaseReport {
         CaseReport {
+            id: name.into(),
             name: name.into(),
             path: "p".into(),
             passed,
@@ -439,6 +590,8 @@ mod tests {
             record: false,
             no_judge: false,
             report: None,
+            case: Vec::new(),
+            exclude_dir: Vec::new(),
         }
     }
 
@@ -542,6 +695,8 @@ mod tests {
             record: false,
             no_judge: true,
             report: None,
+            case: Vec::new(),
+            exclude_dir: Vec::new(),
         };
         let reports = run_eval(&examples, &o, &judge).await;
         assert_eq!(reports.len(), 1);
@@ -569,6 +724,8 @@ mod tests {
             record: false,
             no_judge: true,
             report: None,
+            case: Vec::new(),
+            exclude_dir: Vec::new(),
         };
         let reports = run_eval(&examples, &o, &judge).await;
         assert_eq!(reports.len(), 1);
@@ -594,9 +751,131 @@ mod tests {
             record: false,
             no_judge: true,
             report: None,
+            case: Vec::new(),
+            exclude_dir: Vec::new(),
         };
         let reports = run_eval(dir.path(), &o, &judge).await;
         assert_eq!(reports.len(), 1);
         assert!(!reports[0].passed);
+    }
+
+    // ── B4: EvalCaseRef (filename-stem ids), --case, --exclude-dir ─────
+
+    /// Add a second, independent case to a suite directory already seeded by
+    /// `write_suite` (its case stays `refund-flow`).
+    fn add_case(dir: &Path, stem: &str) {
+        let case = format!(
+            "[case]\nname = \"{stem}-name\"\nagent = \"support-bot\"\nprompt = \"hi\"\n\n[expect]\noutput_contains = [\"Refund approved\"]\n"
+        );
+        std::fs::write(dir.join(format!("{stem}.toml")), case).unwrap();
+        std::fs::write(dir.join(format!("{stem}.transcript.jsonl")), TRANSCRIPT).unwrap();
+    }
+
+    #[tokio::test]
+    async fn case_flag_selects_by_filename_stem_not_display_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_suite(dir.path(), "[expect]\noutput_contains = [\"order #1234\"]\n\n", "");
+        add_case(dir.path(), "upsell-001");
+
+        let mut o = opts(&root);
+        o.case = vec!["upsell-001".to_string()];
+        let reports = run_eval(dir.path(), &o, &StubJudge("unused")).await;
+        assert_eq!(reports.len(), 1, "only the requested case id runs");
+        assert_eq!(reports[0].id, "upsell-001");
+        // `--case` matches the filename stem, not `[case] name` (which is
+        // "upsell-001-name" here) — proves it's id-based, not name-based.
+        assert_eq!(reports[0].name, "upsell-001-name");
+    }
+
+    #[tokio::test]
+    async fn case_flag_accepts_multiple_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_suite(dir.path(), "[expect]\noutput_contains = [\"order #1234\"]\n\n", "");
+        add_case(dir.path(), "upsell-001");
+        add_case(dir.path(), "upsell-002");
+
+        let mut o = opts(&root);
+        o.case = vec!["refund-flow".to_string(), "upsell-002".to_string()];
+        let reports = run_eval(dir.path(), &o, &StubJudge("unused")).await;
+        let mut ids: Vec<&str> = reports.iter().map(|r| r.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["refund-flow", "upsell-002"]);
+    }
+
+    #[tokio::test]
+    async fn exclude_dir_skips_matching_subdirectory_default_includes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_suite(dir.path(), "[expect]\noutput_contains = [\"order #1234\"]\n\n", "");
+        let held_out = dir.path().join("held-out");
+        std::fs::create_dir(&held_out).unwrap();
+        add_case(&held_out, "heldout-001");
+
+        // Default (no --exclude-dir): both cases run — current behavior unchanged.
+        let reports = run_eval(dir.path(), &opts(&root), &StubJudge("unused")).await;
+        assert_eq!(reports.len(), 2, "held-out is discovered by default");
+
+        // --exclude-dir held-out: only the top-level case runs.
+        let mut o = opts(&root);
+        o.exclude_dir = vec!["held-out".to_string()];
+        let reports = run_eval(dir.path(), &o, &StubJudge("unused")).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].id, "refund-flow");
+    }
+
+    #[tokio::test]
+    async fn duplicate_filename_stem_fails_the_whole_suite() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_suite(dir.path(), "[expect]\noutput_contains = [\"order #1234\"]\n\n", "");
+        // A same-named case nested under a subdirectory: same stable id
+        // (`refund-flow`) as the top-level case — must be rejected, not
+        // silently shadow one result with the other's.
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        add_case(&nested, "refund-flow");
+
+        let reports = run_eval(dir.path(), &opts(&root), &StubJudge("unused")).await;
+        assert_eq!(reports.len(), 1, "suite fails fast as a single report, no partial run");
+        assert!(!reports[0].passed);
+        let err = reports[0].error.as_ref().expect("error must be set");
+        assert!(err.contains("duplicate case id"), "unexpected error: {err}");
+        assert!(err.contains("refund-flow"), "error should name the colliding id: {err}");
+    }
+
+    #[tokio::test]
+    async fn report_json_carries_suite_and_per_case_machine_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_suite(
+            dir.path(),
+            "[expect]\nmust_use_tools = [\"Bash\"]\noutput_contains = [\"order #1234\"]\n\n",
+            "",
+        );
+        let report_path = dir.path().join("report.json");
+        let mut o = opts(&root);
+        o.report = Some(report_path.clone());
+
+        let reports = run_eval(dir.path(), &o, &StubJudge("unused")).await;
+        assert!(!reports[0].passed, "must_use_tools = Bash never fires in TRANSCRIPT");
+        render(&reports, &o).unwrap();
+
+        let raw = std::fs::read_to_string(&report_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(json["suite"], serde_json::json!(root.file_name().unwrap().to_str().unwrap()));
+        assert_eq!(json["total"], serde_json::json!(1));
+        assert_eq!(json["passed"], serde_json::json!(0));
+
+        let per_case = json["per_case"].as_array().unwrap();
+        assert_eq!(per_case.len(), 1);
+        let case = &per_case[0];
+        assert_eq!(case["id"], serde_json::json!("refund-flow"));
+        assert_eq!(case["name"], serde_json::json!("refund-flow"));
+        assert_eq!(case["passed"], serde_json::json!(false));
+        let failed = case["failed_assertions"].as_array().unwrap();
+        assert!(
+            failed.iter().any(|v| v.as_str().unwrap().contains("must_use_tools")),
+            "failed_assertions should name the failing check: {failed:?}"
+        );
+        assert!(case["mast_class"].is_string(), "a failed case must carry a mast_class");
+        assert!(case["judge_score"].is_null(), "no [judge] configured for this case");
     }
 }

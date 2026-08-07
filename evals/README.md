@@ -3,7 +3,7 @@
 Harness-level eval / regression suite for DuDuClaw agents, run with:
 
 ```bash
-duduclaw eval [PATH] [--filter NAME] [--replay | --record] [--no-judge] [--report out.json]
+duduclaw eval [PATH] [--filter NAME] [--case ID[,ID...]] [--exclude-dir NAME] [--replay | --record] [--no-judge] [--report out.json]
 ```
 
 Each case sends one prompt to an agent through the **same CLI harness
@@ -100,7 +100,14 @@ Notes:
 - The `[judge]` rubric also runs in replay mode (it scores the recorded final
   answer); pass `--no-judge` for a fully deterministic, zero-cost run.
 - `--report out.json` writes a machine-readable report (per-case assertions,
-  judge score/rationale, transcript diagnostics, durations).
+  judge score/rationale, transcript diagnostics, durations), plus a terse
+  `{suite, total, passed, per_case}` shape for programmatic consumers.
+- A case's stable id is its **filename stem** (`[case] name` is only the
+  human-readable title). `--case ID` selects cases exactly by id
+  (repeatable/comma-separated); `--filter NAME` is a substring match on
+  `name`. Duplicate filename stems in the same run fail the suite fast.
+- `--exclude-dir NAME` (repeatable) skips case files under a directory of
+  that name, e.g. `--exclude-dir held-out`. Default: include everything.
 
 ## Try it now
 

@@ -245,8 +245,13 @@ pub struct WorkerSpec {
     /// worker's CONTRACT.toml `must_not` and SOUL.md overlay section.
     #[serde(default)]
     pub overlay: Vec<String>,
-    /// Optional team.toml override for the functional department; empty ⇒
-    /// the shared-kit default (`duduclaw_core::org::department_for_kit`).
+    /// team.toml functional-department hint. Deserialized for schema
+    /// parity with the CLI expert-catalog converter
+    /// (`duduclaw-cli::expert::team_convert`), which still uses it; the
+    /// dashboard team-staging path in this module ignores it and stamps
+    /// every scaffolded member's `[agent] department` with the team's
+    /// `industry` instead (WP21 same-department horizontal delegation —
+    /// see `team_department`).
     #[serde(default)]
     pub department: String,
 }
@@ -516,6 +521,24 @@ fn append_overlay_to_soul(src: &str, overlay: &[String]) -> String {
     out
 }
 
+/// WP21: the department that binds every scaffolded team member together
+/// for same-department horizontal delegation. The team's `industry` is the
+/// single source of truth — it overrides whatever functional-department
+/// label a shared kit or a team.toml worker-level override would otherwise
+/// contribute, so front desk and every worker in the same staged team always
+/// land on the identical department string and can delegate laterally.
+/// Defensive only: `industry` is a required, slug-validated field on every
+/// manifest that reaches this point, so `None` should be unreachable in
+/// practice — but an empty/missing value must never write an empty
+/// `department` (fail-closed: no injection, not a panic or an invalid file).
+fn team_department(manifest: &TeamManifest) -> Option<&str> {
+    let industry = manifest.industry.trim();
+    if industry.is_empty() {
+        return None;
+    }
+    Some(industry)
+}
+
 /// Assemble the front-desk (team lead) role from the industry pack.
 fn assemble_front_desk(premium_dir: &Path, manifest: &TeamManifest) -> Result<AssembledRole, String> {
     let pack_dir = premium_dir.join(&manifest.pack);
@@ -528,7 +551,7 @@ fn assemble_front_desk(premium_dir: &Path, manifest: &TeamManifest) -> Result<As
         &manifest.front_desk.display_name,
         "",
         None,
-        None,
+        team_department(manifest),
         true, // the team lead delegates to workers
     )?;
     // Surface trigger/display defaults from the patched doc for UI prefill.
@@ -562,13 +585,12 @@ fn assemble_worker(
     let soul_md = append_overlay_to_soul(&soul_src, &spec.overlay);
     let contract_toml = append_overlay_to_contract(&contract_src, &spec.overlay)?;
     let trigger = if spec.trigger.is_empty() { spec.name.clone() } else { spec.trigger.clone() };
-    // WP-ORG: workers land in their functional department (team.toml override
-    // wins over the shared-kit default; neither ⇒ department-less as before).
-    let department = if spec.department.trim().is_empty() {
-        duduclaw_core::org::department_for_kit(&spec.kit)
-    } else {
-        Some(spec.department.trim())
-    };
+    // WP21: every worker's `department` is the team's industry, not the
+    // kit's functional label (`docs-admin` → 行政, etc.) and not a
+    // team.toml worker-level override — see `team_department`. Same-
+    // department horizontal collaboration requires the whole staged team
+    // (front desk + workers) to share one identical department value.
+    let department = team_department(manifest);
     let agent_toml = patch_agent_toml(
         &agent_src,
         &spec.name,
@@ -675,6 +697,98 @@ fn agent_name_field(agent_toml: &str) -> Option<String> {
         .and_then(|t| t.get("name"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+// ── WP2.1 方案 A:題庫隨產業包安裝 ──────────────────────────────────────
+
+/// Locate the shipped eval suite for a premium role.
+///
+/// Two layouts are accepted, first match wins:
+/// 1. `<premium_dir>/evals/<role>/` — the shipped/white-label bundle layout
+///    (the packaging step places `evals/` inside the premium tree);
+/// 2. `<premium_dir>/../evals/<role>/` — the dev checkout, where
+///    `commercial/templates-premium/` and `commercial/evals/` (the authoring
+///    SSOT) are siblings.
+fn premium_eval_suite_dir(premium_dir: &Path, role_default_name: &str) -> Option<PathBuf> {
+    let candidates = [
+        premium_dir.join("evals").join(role_default_name),
+        premium_dir.parent()?.join("evals").join(role_default_name),
+    ];
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
+/// Install the eval suite shipped with a premium role into
+/// `<home>/evals/<final_name>/` (the default `eval_suites_root`), so a
+/// pack-deployed agent gets its behavioural baseline — and with it the AEE
+/// case dimension + E1 assertion replay — from day one.
+///
+/// - The suite is keyed by the role's DEFAULT agent name; when the operator
+///   renamed the agent at creation, every case's `[case] agent` field is
+///   rewritten to the final name (the suite directory is named `final_name`
+///   either way — `eval_scorer::has_suite` keys on the directory).
+/// - An existing destination directory is left untouched (`Ok(None)`):
+///   overwriting would clobber baselines the customer may have re-recorded.
+/// - No shipped suite for this role is `Ok(None)` too — free-tier roles and
+///   self-authored agents simply don't have one, which the scorer already
+///   treats as "dimension absent", not an error.
+pub async fn install_eval_suite(
+    premium_dir: &Path,
+    role_default_name: &str,
+    final_name: &str,
+    home_dir: &Path,
+) -> Result<Option<usize>, String> {
+    let Some(src) = premium_eval_suite_dir(premium_dir, role_default_name) else {
+        return Ok(None);
+    };
+    let dest = home_dir.join("evals").join(final_name);
+    if dest.exists() {
+        return Ok(None);
+    }
+
+    let mut installed = 0usize;
+    let mut stack = vec![(src.clone(), dest.clone())];
+    while let Some((from, to)) = stack.pop() {
+        tokio::fs::create_dir_all(&to)
+            .await
+            .map_err(|e| format!("create {}: {e}", to.display()))?;
+        let mut entries = tokio::fs::read_dir(&from)
+            .await
+            .map_err(|e| format!("read {}: {e}", from.display()))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| format!("read entry in {}: {e}", from.display()))?
+        {
+            let path = entry.path();
+            let target = to.join(entry.file_name());
+            if path.is_dir() {
+                stack.push((path, target));
+                continue;
+            }
+            let is_case_toml = path.extension().and_then(|e| e.to_str()) == Some("toml");
+            if is_case_toml && role_default_name != final_name {
+                // Rename-safe: the case must reference the agent that will
+                // actually run it.
+                let content = tokio::fs::read_to_string(&path)
+                    .await
+                    .map_err(|e| format!("read {}: {e}", path.display()))?;
+                let needle = format!("\"{role_default_name}\"");
+                let replacement = format!("\"{final_name}\"");
+                let rewritten = content.replacen(&needle, &replacement, 1);
+                tokio::fs::write(&target, rewritten)
+                    .await
+                    .map_err(|e| format!("write {}: {e}", target.display()))?;
+            } else {
+                tokio::fs::copy(&path, &target)
+                    .await
+                    .map_err(|e| format!("copy {}: {e}", target.display()))?;
+            }
+            if is_case_toml {
+                installed += 1;
+            }
+        }
+    }
+    Ok(Some(installed))
 }
 
 #[cfg(test)]
@@ -849,6 +963,9 @@ summary = "留真人"
         assert!(role.agent_toml.contains("name = \"foo-docs\""));
         assert!(role.agent_toml.contains("reports_to = \"foo-assistant\""));
         assert!(!role.agent_toml.contains("CHANGE-ME"));
+        // WP21: worker department is the team's industry, not the kit's
+        // functional label (the docs-admin kit would otherwise map to 行政).
+        assert!(role.agent_toml.contains("department = \"foo\""));
         // CONTRACT gains overlay entries and still parses; base rule intact.
         let parsed: toml::Table = role.contract_toml.parse().unwrap();
         let must_not = parsed["boundaries"]["must_not"].as_array().unwrap();
@@ -870,6 +987,95 @@ summary = "留真人"
         assert!(role.agent_toml.contains("# pack comment"));
         assert!(role.agent_toml.contains("can_send_cross_agent = true"));
         assert!(role.extras_dir.is_some());
+        // WP21: front desk lands in the same department as its workers
+        // (the team's industry) so horizontal delegation is possible.
+        assert!(role.agent_toml.contains("department = \"foo\""));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn team_department_matches_front_desk_and_worker() {
+        // Both roles must resolve to the *same* department string — that's
+        // the whole point of WP21 same-department horizontal delegation.
+        let tmp = fixture_premium_dir("dept-match");
+        let m = load_team_manifest(&tmp, "foo").unwrap();
+        let front = assemble_role(&tmp, &m, FRONT_DESK_ROLE_ID).unwrap();
+        let worker = assemble_role(&tmp, &m, "foo-docs").unwrap();
+        let dept = |toml_src: &str| -> String {
+            let parsed: toml::Table = toml_src.parse().unwrap();
+            parsed["agent"]["department"].as_str().unwrap().to_string()
+        };
+        let front_dept = dept(&front.agent_toml);
+        let worker_dept = dept(&worker.agent_toml);
+        assert_eq!(front_dept, "foo");
+        assert_eq!(worker_dept, "foo");
+        assert_eq!(front_dept, worker_dept);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn team_department_overrides_kit_and_worker_level_department() {
+        // Even when the shared kit would default to a functional label
+        // (docs-admin ⇒ 行政) or team.toml sets a worker-level department
+        // override, the team's industry always wins.
+        let tmp = fixture_premium_dir("dept-override");
+        let mut m = load_team_manifest(&tmp, "foo").unwrap();
+        m.workers[0].department = "some-other-label".to_string();
+        let worker = assemble_worker(&tmp, &m, &m.workers[0]).unwrap();
+        let parsed: toml::Table = worker.agent_toml.parse().unwrap();
+        assert_eq!(
+            parsed["agent"]["department"].as_str().unwrap(),
+            "foo",
+            "industry must override both the kit default and the worker-level toml override"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn team_department_defensive_empty_industry_is_not_injected() {
+        // Defensive: `industry` is a required, slug-validated field on every
+        // manifest that reaches assembly (load_team_manifest enforces it),
+        // so this is unreachable via the real loader — but the injection
+        // helper itself must never write an empty `department`.
+        let mut m_empty = TeamManifest {
+            schema: 1,
+            industry: "   ".to_string(),
+            pack: "foo-pro".to_string(),
+            label: "Foo".to_string(),
+            front_desk: FrontDeskSpec {
+                name: "foo-assistant".to_string(),
+                display_name: String::new(),
+                summary: String::new(),
+            },
+            workers: vec![WorkerSpec {
+                kit: "docs-admin".to_string(),
+                name: "foo-docs".to_string(),
+                display_name: String::new(),
+                trigger: String::new(),
+                summary: String::new(),
+                overlay: Vec::new(),
+                department: String::new(),
+            }],
+            humans: Vec::new(),
+            excluded: Vec::new(),
+        };
+        assert_eq!(team_department(&m_empty), None);
+
+        let tmp = fixture_premium_dir("dept-empty");
+        let front = assemble_front_desk(&tmp, &m_empty).unwrap();
+        assert!(
+            !front.agent_toml.contains("department ="),
+            "no industry ⇒ no department injected for front desk"
+        );
+        let worker = assemble_worker(&tmp, &m_empty, &m_empty.workers[0]).unwrap();
+        assert!(
+            !worker.agent_toml.contains("department ="),
+            "no industry ⇒ no department injected for worker"
+        );
+
+        // A present-but-blank industry behaves the same as absent.
+        m_empty.industry = String::new();
+        assert_eq!(team_department(&m_empty), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -890,5 +1096,80 @@ summary = "留真人"
         assert!(assemble_role(&tmp, &m, "not-a-role").is_err());
         assert!(assemble_role(&tmp, &m, "../../etc/passwd").is_err());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod eval_suite_install_tests {
+    use super::*;
+
+    fn fixture(role: &str) -> (tempfile::TempDir, PathBuf, tempfile::TempDir) {
+        let commercial = tempfile::tempdir().unwrap();
+        let premium = commercial.path().join("templates-premium");
+        std::fs::create_dir_all(&premium).unwrap();
+        // Sibling authoring layout: <commercial>/evals/<role>/
+        let suite = commercial.path().join("evals").join(role);
+        std::fs::create_dir_all(suite.join("held-out")).unwrap();
+        std::fs::write(
+            suite.join("c1.toml"),
+            format!("[case]\nname = \"c1\"\nagent = \"{role}\"\nprompt = \"hi\"\n"),
+        )
+        .unwrap();
+        std::fs::write(suite.join("c1.transcript.jsonl"), "{}\n").unwrap();
+        std::fs::write(
+            suite.join("held-out").join("h1.toml"),
+            format!("[case]\nname = \"h1\"\nagent = \"{role}\"\nprompt = \"hi\"\n"),
+        )
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        (commercial, premium, home)
+    }
+
+    #[tokio::test]
+    async fn installs_suite_with_transcripts_and_holdout() {
+        let (_c, premium, home) = fixture("law-intake");
+        let n = install_eval_suite(&premium, "law-intake", "law-intake", home.path())
+            .await
+            .unwrap();
+        assert_eq!(n, Some(2), "two case tomls installed (main + held-out)");
+        let dest = home.path().join("evals").join("law-intake");
+        assert!(dest.join("c1.toml").is_file());
+        assert!(dest.join("c1.transcript.jsonl").is_file());
+        assert!(dest.join("held-out").join("h1.toml").is_file());
+    }
+
+    #[tokio::test]
+    async fn renamed_agent_gets_rewritten_case_agent_fields() {
+        let (_c, premium, home) = fixture("law-intake");
+        let n = install_eval_suite(&premium, "law-intake", "my-lawyer", home.path())
+            .await
+            .unwrap();
+        assert_eq!(n, Some(2));
+        let dest = home.path().join("evals").join("my-lawyer");
+        let case = std::fs::read_to_string(dest.join("c1.toml")).unwrap();
+        assert!(case.contains("agent = \"my-lawyer\""), "{case}");
+        assert!(!case.contains("law-intake"), "old name fully replaced in the agent field: {case}");
+    }
+
+    #[tokio::test]
+    async fn existing_destination_is_never_clobbered() {
+        let (_c, premium, home) = fixture("law-intake");
+        let dest = home.path().join("evals").join("law-intake");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("customer.toml"), "keep").unwrap();
+        let n = install_eval_suite(&premium, "law-intake", "law-intake", home.path())
+            .await
+            .unwrap();
+        assert_eq!(n, None, "existing suite dir is skipped");
+        assert_eq!(std::fs::read_to_string(dest.join("customer.toml")).unwrap(), "keep");
+    }
+
+    #[tokio::test]
+    async fn role_without_shipped_suite_is_a_clean_none() {
+        let (_c, premium, home) = fixture("law-intake");
+        let n = install_eval_suite(&premium, "no-such-role", "x", home.path())
+            .await
+            .unwrap();
+        assert_eq!(n, None);
     }
 }

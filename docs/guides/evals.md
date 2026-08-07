@@ -41,15 +41,27 @@ recursively, run in sorted order). It defaults to `./evals`.
 
 | Flag | Meaning |
 |------|---------|
-| `--filter <substr>` | Only run cases whose `[case] name` contains `<substr>`. |
+| `--filter <substr>` | Only run cases whose `[case] name` contains `<substr>`. Substring match — not guaranteed unique, see `--case` below. |
+| `--case <id>` | Exact case selection by stable id (the case file's **filename stem**, e.g. `p0-ceo-boundary-money-001`). Repeatable or comma‑separated. Never loads a case just to decide whether to run it, and never ambiguous the way `--filter` can be. |
+| `--exclude-dir <name>` | Exclude case files under a directory of this name (repeatable), e.g. `--exclude-dir held-out` to skip a held‑out rotation. Omit to include everything (default, unchanged). |
 | `--replay` | Parse recorded `*.transcript.jsonl` files instead of running the agent live (offline, zero credentials). Mutually exclusive with `--record`. |
 | `--record` | Live‑run, then write the raw stream‑json next to each case as a `*.transcript.jsonl` baseline for future `--replay`. |
 | `--no-judge` | Skip the `[judge]` rubric even when a case enables it (fully deterministic, zero‑cost). |
 | `--report <path>` | Write a JSON report (per‑case assertions, judge score/rationale, transcript diagnostics, durations). |
 
+**Case ids and suite uniqueness.** Every case's stable id is its filename stem
+(`[case] name` stays the human‑readable title, not the identity — `--filter`
+matches `name`, `--case` matches the id). A suite fails fast at load time if
+two case files under the same run share a filename stem — a silent id
+collision would make `--case` ambiguous.
+
 **Exit code:** the process exits **non‑zero when any case fails**, so it drops
 straight into a CI gate. A human‑readable table is printed to the console; the
-`--report` file is the machine‑readable counterpart.
+`--report` file is the machine‑readable counterpart — it now also carries a
+terse `{suite, total, passed, per_case: [{id, name, passed, failed_assertions,
+judge_score, mast_class}]}` shape (in addition to the existing detailed
+`cases` array) for programmatic consumers such as the gateway's
+`eval_runner`.
 
 ---
 
@@ -191,6 +203,40 @@ observability gap.
 Typical workflow: author a case, run `--record` once to capture a known‑good
 transcript, commit the `*.transcript.jsonl`, then let CI run `--replay` on every
 PR. Refresh the baseline with `--record` when you *intend* the behavior to change.
+
+Recording isolation: at spawn time the runner rewrites the agent's `.mcp.json`
+into a **temporary copy** whose `DUDUCLAW_HOME` points at the eval home (and
+whose `DUDUCLAW_MCP_API_KEY` is a placeholder), so recording inside a sandbox
+home never writes tool side effects into — or leaks credentials from — your
+real deployment. The original file is never modified.
+
+---
+
+## Bootstrapping a suite from SOUL.md (`eval-scaffold`)
+
+Writing the first case from a blank page is the hard part — and the playbook
+`Add` pipeline requires ≥1 linked eval case (G6) plus E1 assertions, so an
+agent with no suite cannot grow new playbook entries. `eval-scaffold` derives
+draft cases from what you already wrote — the agent's own SOUL.md behaviour
+rules (identity sections are never touched), zero LLM:
+
+```bash
+duduclaw eval-scaffold --agent my-bot
+# → <home>/evals-drafts/my-bot/draft-*.toml, one per behaviour rule
+```
+
+Drafts are deliberately **not runnable**: each `prompt` is a TODO you must
+write (the tool will not invent user messages), and they land OUTSIDE the live
+suites root so an unreviewed draft can never contaminate a baseline. Review
+flow:
+
+1. Fill in `prompt` with a message that actually provokes the rule.
+2. Tighten `[expect]` (at least one tool/output assertion).
+3. Move the file to `<home>/evals/my-bot/` and run
+   `duduclaw eval <that dir> --record`.
+
+Re‑running the command never overwrites drafts you have edited
+(`--force` to regenerate).
 
 ---
 

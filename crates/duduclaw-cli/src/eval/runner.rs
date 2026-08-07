@@ -98,6 +98,88 @@ impl Drop for TempPromptFile {
     }
 }
 
+/// WP2.1 side-effect fix: an agent directory copied into a sandbox home (or
+/// provisioned by a template) may carry a `.mcp.json` whose duduclaw server
+/// entry still points `DUDUCLAW_HOME` at the ORIGINAL (often production)
+/// home — a live eval run would then write tasks/memory/audit into
+/// production data even though the operator asked for an isolated run.
+///
+/// This rewrites the duduclaw entries (identified by an `mcp-server` arg) to
+/// `DUDUCLAW_HOME = <eval home>` and returns the rewritten JSON. Non-duduclaw
+/// servers (playwright, …) are untouched. `None` ⇒ nothing needed rewriting
+/// (already correct, or no duduclaw entry) — caller passes the original file.
+/// A parse failure also returns `None`: degrading to today's behavior beats
+/// refusing to run over a hand-edited config.
+pub fn rewrite_mcp_home(raw: &str, home: &Path) -> Option<String> {
+    let mut v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let servers = v.get_mut("mcpServers")?.as_object_mut()?;
+    let home_str = home.to_string_lossy().into_owned();
+    let mut changed = false;
+    for (_name, server) in servers.iter_mut() {
+        let is_duduclaw = server
+            .get("args")
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("mcp-server")));
+        if !is_duduclaw {
+            continue;
+        }
+        let obj = server.as_object_mut()?;
+        let env = obj
+            .entry("env")
+            .or_insert_with(|| serde_json::Value::Object(Default::default()))
+            .as_object_mut()?;
+        if env.get("DUDUCLAW_HOME").and_then(|h| h.as_str()) != Some(home_str.as_str()) {
+            env.insert(
+                "DUDUCLAW_HOME".to_string(),
+                serde_json::Value::String(home_str.clone()),
+            );
+            changed = true;
+        }
+        // The CLI's init event echoes the MCP server env into the recorded
+        // stream — a production `DUDUCLAW_MCP_API_KEY` would land verbatim in
+        // every shipped transcript (found the hard way: 24 recorded baselines
+        // carried the real key before this existed). The stdio transport never
+        // authenticates with it, so a placeholder is functionally identical.
+        if env
+            .get("DUDUCLAW_MCP_API_KEY")
+            .and_then(|k| k.as_str())
+            .is_some_and(|k| k != "eval-local")
+        {
+            env.insert(
+                "DUDUCLAW_MCP_API_KEY".to_string(),
+                serde_json::Value::String("eval-local".to_string()),
+            );
+            changed = true;
+        }
+    }
+    if changed {
+        serde_json::to_string_pretty(&v).ok()
+    } else {
+        None
+    }
+}
+
+/// Temp `.mcp.json` guard (same lifetime discipline as [`TempPromptFile`]).
+struct TempMcpFile(PathBuf);
+
+impl TempMcpFile {
+    fn create(content: &str) -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!(
+            "duduclaw-eval-mcp-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, content)
+            .map_err(|e| format!("cannot write rewritten mcp config: {e}"))?;
+        Ok(TempMcpFile(path))
+    }
+}
+
+impl Drop for TempMcpFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Spawn `claude` for the case's agent and return raw stream-json stdout.
 async fn run_live(case: &EvalCaseFile, home: &Path) -> Result<String, String> {
     let agent_dir = home.join("agents").join(&case.case.agent);
@@ -114,19 +196,38 @@ async fn run_live(case: &EvalCaseFile, home: &Path) -> Result<String, String> {
         .or_else(|| duduclaw_core::which_claude_in_home(home))
         .ok_or_else(|| "claude CLI not found (PATH + known install locations)".to_string())?;
 
-    // Keep the guard alive for the whole child lifetime.
+    // Keep the guards alive for the whole child lifetime.
     let sys_file = match case.case.system_prompt.as_deref() {
         Some(sp) if !sp.trim().is_empty() => Some(TempPromptFile::create(sp)?),
         _ => None,
+    };
+    let mcp_original = agent_dir.join(".mcp.json");
+    let mut mcp_temp: Option<TempMcpFile> = None;
+    let mcp_path: Option<PathBuf> = if mcp_original.exists() {
+        match std::fs::read_to_string(&mcp_original) {
+            Ok(raw) => match rewrite_mcp_home(&raw, home) {
+                Some(rewritten) => {
+                    let guard = TempMcpFile::create(&rewritten)?;
+                    let p = guard.0.clone();
+                    mcp_temp = Some(guard);
+                    Some(p)
+                }
+                None => Some(mcp_original.clone()),
+            },
+            Err(_) => Some(mcp_original.clone()),
+        }
+    } else {
+        None
     };
 
     let capabilities = duduclaw_gateway::runtime::load_agent_capabilities(&agent_dir);
     let args = build_eval_cli_args(
         case,
         capabilities.as_ref(),
-        &agent_dir,
+        mcp_path.as_deref(),
         sys_file.as_ref().map(|f| f.0.as_path()),
     );
+    let _keep_alive = &mcp_temp;
 
     let mut cmd = tokio::process::Command::new(&claude);
     cmd.args(&args)
@@ -170,7 +271,7 @@ async fn run_live(case: &EvalCaseFile, home: &Path) -> Result<String, String> {
 fn build_eval_cli_args(
     case: &EvalCaseFile,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
-    agent_dir: &Path,
+    mcp_config: Option<&Path>,
     system_prompt_file: Option<&Path>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
@@ -199,8 +300,7 @@ fn build_eval_cli_args(
         args.push(denied.join(","));
     }
 
-    let mcp_json = agent_dir.join(".mcp.json");
-    if mcp_json.exists() {
+    if let Some(mcp_json) = mcp_config {
         args.push("--mcp-config".into());
         args.push(mcp_json.to_string_lossy().into_owned());
         args.push("--strict-mcp-config".into());
@@ -242,8 +342,7 @@ mod tests {
     #[test]
     fn cli_args_mirror_harness_invocation() {
         let c = case("model = \"claude-haiku-4-5\"\nmax_turns = 7\n");
-        let dir = tempfile::tempdir().unwrap();
-        let args = build_eval_cli_args(&c, None, dir.path(), None);
+        let args = build_eval_cli_args(&c, None, None, None);
         let joined = args.join(" ");
         assert!(joined.contains("-p hi there"));
         assert!(joined.contains("--model claude-haiku-4-5"));
@@ -265,13 +364,51 @@ mod tests {
             ..Default::default()
         };
         let sys = dir.path().join("sys.txt");
-        let args = build_eval_cli_args(&c, Some(&caps), dir.path(), Some(&sys));
+        let mcp = dir.path().join(".mcp.json");
+        let args = build_eval_cli_args(&c, Some(&caps), Some(&mcp), Some(&sys));
         let joined = args.join(" ");
         assert!(joined.contains("--allowedTools"));
         assert!(joined.contains("--disallowedTools Bash"));
         assert!(joined.contains("--mcp-config"));
         assert!(joined.contains("--strict-mcp-config"));
         assert!(joined.contains("--system-prompt-file"));
+    }
+
+    // ── WP2.1 side-effect fix: DUDUCLAW_HOME rewrite ─────────────────
+
+    #[test]
+    fn rewrite_points_duduclaw_home_at_the_eval_home() {
+        let raw = r#"{"mcpServers":{"duduclaw":{"command":"/usr/local/bin/duduclaw","args":["mcp-server"],"env":{"DUDUCLAW_HOME":"/Users/prod/.duduclaw","DUDUCLAW_AGENT_ID":"law-intake","DUDUCLAW_MCP_API_KEY":"ddc_prod_deadbeef"}},"playwright":{"command":"npx","args":["@anthropic-ai/mcp-server-playwright"]}}}"#;
+        let out = rewrite_mcp_home(raw, Path::new("/tmp/sandbox-home")).expect("must rewrite");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["mcpServers"]["duduclaw"]["env"]["DUDUCLAW_HOME"],
+            "/tmp/sandbox-home",
+            "duduclaw server must point at the eval home"
+        );
+        // The production MCP key never reaches the recorded stream.
+        assert_eq!(v["mcpServers"]["duduclaw"]["env"]["DUDUCLAW_MCP_API_KEY"], "eval-local");
+        // Sibling env vars and non-duduclaw servers are untouched.
+        assert_eq!(v["mcpServers"]["duduclaw"]["env"]["DUDUCLAW_AGENT_ID"], "law-intake");
+        assert!(v["mcpServers"]["playwright"].get("env").is_none());
+    }
+
+    #[test]
+    fn rewrite_inserts_home_when_env_was_absent() {
+        let raw = r#"{"mcpServers":{"duduclaw":{"command":"duduclaw","args":["mcp-server"]}}}"#;
+        let out = rewrite_mcp_home(raw, Path::new("/tmp/h")).expect("must rewrite");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mcpServers"]["duduclaw"]["env"]["DUDUCLAW_HOME"], "/tmp/h");
+    }
+
+    #[test]
+    fn rewrite_is_a_noop_when_already_correct_or_unparseable() {
+        let correct = r#"{"mcpServers":{"duduclaw":{"command":"duduclaw","args":["mcp-server"],"env":{"DUDUCLAW_HOME":"/tmp/h"}}}}"#;
+        assert!(rewrite_mcp_home(correct, Path::new("/tmp/h")).is_none());
+        assert!(rewrite_mcp_home("not json", Path::new("/tmp/h")).is_none());
+        // No duduclaw entry ⇒ nothing to do.
+        let other = r#"{"mcpServers":{"playwright":{"command":"npx","args":["x"]}}}"#;
+        assert!(rewrite_mcp_home(other, Path::new("/tmp/h")).is_none());
     }
 
     #[tokio::test]
