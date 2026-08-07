@@ -1,6 +1,6 @@
 {
   "name": "@duduclaw/darwin-x64",
-  "version": "1.52.4",
+  "version": "1.53.0",
   "description": "DuDuClaw CE binary for macOS x64 (Intel)",
   "license": "Apache-2.0",
   "repository": {
