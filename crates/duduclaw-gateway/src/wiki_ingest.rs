@@ -872,7 +872,7 @@ async fn run_knowledge_branch(
 
     // Memory keeps a pointer, never the full text (G3).
     let pointer_written =
-        persist_wiki_pointer(agent_id, memory_db, &page_path, &title, &summary).await;
+        persist_wiki_pointer(agent_id, memory_db, home_dir, &page_path, &title, &summary).await;
 
     // WP6: the auto-filed page also produced a memory row, so MemoryBrowser
     // must refresh. Reusing `memory.changed` (rather than widening the
@@ -924,6 +924,7 @@ async fn run_knowledge_branch(
 pub async fn persist_wiki_pointer(
     agent_id: &str,
     memory_db: &Path,
+    home_dir: &Path,
     page_path: &str,
     title: &str,
     summary: &str,
@@ -957,10 +958,15 @@ pub async fn persist_wiki_pointer(
     };
 
     let db = memory_db.to_path_buf();
+    let home = home_dir.to_path_buf();
     let agent = agent_id.to_string();
     let result = tokio::task::spawn_blocking(move || {
-        let engine =
-            SqliteMemoryEngine::new(&db).map_err(|e| format!("open memory engine: {e}"))?;
+        // R2: route through the factory so `[memory] novelty_gate` applies to
+        // this gateway-internal write path too (pointer rows are (s,p,o)
+        // triples, so supersession — not the gate — still dedups same-page
+        // pointers; the gate only matters for the plain-content path).
+        let engine = crate::memory_factory::build_memory_engine(&db, &home)
+            .map_err(|e| format!("open memory engine: {e}"))?;
         let rt = tokio::runtime::Handle::current();
         rt.block_on(engine.store_temporal(&agent, entry, meta))
             .map_err(|e| format!("store pointer: {e}"))
@@ -1191,8 +1197,16 @@ async fn persist_facts(
 
     let home_for_blocking = home.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut engine =
-            SqliteMemoryEngine::new(&db).map_err(|e| format!("open memory engine: {e}"))?;
+        // R2: routes through the shared factory so `[memory] novelty_gate`
+        // (previously only wired at the MCP server's engine construction)
+        // also governs this path — the main "conversation → knowledge"
+        // auto-write path, and genuinely gate-relevant: `store_facts_protected`
+        // leaves `TemporalMeta.subject`/`predicate` unset for any fact whose
+        // `DistilledFact::triple()` is `None` (a "plain" semantic belief, not
+        // an explicit-triple supersession), so those writes DO reach the B1
+        // check inside `store_temporal`.
+        let mut engine = crate::memory_factory::build_memory_engine(&db, &home_for_blocking)
+            .map_err(|e| format!("open memory engine: {e}"))?;
         engine.set_memory_quota_gb(quota_gb);
         let rt = tokio::runtime::Handle::current();
         rt.block_on(store_facts_protected(
