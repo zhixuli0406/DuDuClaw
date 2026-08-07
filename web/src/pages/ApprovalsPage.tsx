@@ -12,6 +12,7 @@ import {
   Check,
   X,
   Clock,
+  Compass,
 } from 'lucide-react';
 import { api, type ApprovalItem, type ApprovalKind } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
@@ -161,6 +162,14 @@ export function ApprovalsPage() {
                             </span>
                           </div>
                           <p className="mt-1.5 break-words text-sm text-foreground">{item.summary}</p>
+                          {/* D1/D2: forward-simulation narrative, when the judge ran it — absent
+                              on the overwhelming majority of approval kinds, renders nothing. */}
+                          {item.simulation && item.simulation.world_state_change.trim() !== '' && (
+                            <p className="mt-1.5 flex items-start gap-1.5 text-xs text-muted-foreground">
+                              <Compass className="mt-0.5 size-3 shrink-0" />
+                              <span className="break-words">{item.simulation.world_state_change}</span>
+                            </p>
+                          )}
                           <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                             <span className="flex items-center gap-1">
                               <Clock className="size-3" />

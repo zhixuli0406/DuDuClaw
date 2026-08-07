@@ -104,6 +104,8 @@ pub mod situation_classifier;
 pub mod canvas;
 pub mod direct_api;
 pub mod delegation;
+/// WP21 C1 — delegation gate on the bus-consumption path (`dispatcher.rs`).
+pub mod delegation_gate;
 pub mod delegation_router;
 pub mod discord;
 pub mod discord_voice;
@@ -116,6 +118,7 @@ pub mod cli_auth;
 pub mod cli_noise;
 pub mod handlers;
 pub mod knowledge_guard;
+pub mod memory_factory;
 // WP5c — conversation → knowledge-base semantic routing.
 pub mod knowledge_route;
 pub mod auto_wiki_page;
@@ -136,6 +139,7 @@ pub mod metrics;
 pub mod otel;
 pub mod failover;
 pub mod gvu;
+pub mod playbook;
 pub mod prediction;
 pub mod reflexion;
 pub mod run_steps;
@@ -238,6 +242,11 @@ pub mod trajectory_guard;
 pub mod night_engine;
 pub mod night_llm;
 
+// WP-A3 (task-forward-model design, 2026-08-06): shared `tool_calls.jsonl`
+// record shape + window filter, used by both `dispatch_engine` (judge
+// evidence block) and `prediction::task_observe` (A3 observation layer).
+pub mod tool_activity;
+
 // ── G1: durable multi-agent dispatch engine (atomic claim / zombie reclaim /
 //        dependency unlock / goal-mode judge acceptance) ──
 pub mod dispatch_engine;
@@ -246,6 +255,13 @@ pub mod dispatch_engine;
 //        tasks, enforces iteration/wall-clock/concurrency caps, and re-dispatches
 //        judge-rejected tasks with feedback ──
 pub mod goal_loop;
+// ── A1: structured <state> block (StateAct arXiv:2410.02810) round-tripped
+//        through the goal loop's dispatch prompt + agent self-report ──
+pub mod goal_state;
+// ── A2: (state_hash, action) visit graph (Graph-Based Exploration
+//        arXiv:2512.24156) — structural loop detection, replaces the old
+//        two-round identical-feedback oscillation guard ──
+pub mod goal_visit_graph;
 // ── D4: pluggable dispatch policy (agent selection = data) + LLMCompiler-style
 //        goal decomposition (planner → dependency DAG) ──
 pub mod dispatch_policy;
@@ -257,3 +273,6 @@ pub mod goal_plan;
 pub mod outcome_spec;
 // ── P2a: goal-loop channel push + decision (needs_human exit + autonomy kickoff) ──
 pub mod goal_notify;
+// ── WP2.2: gateway-side subprocess driver for `duduclaw eval --replay`
+//         (B1 cli↔gateway dependency-direction boundary) ──
+pub mod eval_runner;

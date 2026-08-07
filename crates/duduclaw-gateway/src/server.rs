@@ -191,6 +191,67 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    // WP21 debt ⑧ — mint `<home>/identity.key` if absent, before any MCP env
+    // block is assembled, so every `.mcp.json` / runtime config written later
+    // in this boot carries a signable `DUDUCLAW_AGENT_TOKEN`. Never rotates an
+    // existing key (that would invalidate tokens held by live CLI children).
+    // Failure is warn-not-fatal: no key ⇒ `IdentityVerdict::Disabled` ⇒ the
+    // pre-WP21 behaviour, which is exactly the right degradation.
+    match duduclaw_core::ensure_identity_key(&home_dir) {
+        Ok(_) => {
+            let strict = duduclaw_core::require_identity_token_from_home(&home_dir);
+            info!(
+                require_identity_token = strict,
+                "MCP caller-identity signing key ready ({})",
+                duduclaw_core::identity_key_path(&home_dir).display()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not create the MCP caller-identity key — caller ids stay \
+                 unverified (env-var impersonation remains possible); this does \
+                 not affect any other functionality"
+            );
+        }
+    }
+
+    // WP22 T1 — bootstrap `<home>/org.toml`, the authoritative record of who
+    // reports to whom. Seeding happens **once**, only when the file is absent:
+    // re-importing every boot would re-open the very hole this file closes
+    // (tamper with `agent.toml`, wait for a restart, watch the tampered value
+    // get promoted to authority). An operator who edits `agent.toml` by hand
+    // adopts the change explicitly with `duduclaw org sync`; `duduclaw doctor`
+    // reports the drift until they do. Agents with no record keep resolving
+    // from their `agent.toml`, so a failure here degrades to the pre-WP22
+    // behaviour rather than to an outage.
+    match duduclaw_core::org_store::seed_if_absent(&home_dir) {
+        Ok(Some(count)) => info!(
+            agents = count,
+            "organisational authority seeded at {} (one-time bootstrap from agent.toml)",
+            duduclaw_core::org_store::org_store_path(&home_dir).display()
+        ),
+        Ok(None) => {
+            let drift = duduclaw_core::org_store::detect_drift(&home_dir);
+            if drift.is_empty() {
+                info!("organisational authority loaded from org.toml");
+            } else {
+                tracing::warn!(
+                    agents = drift.len(),
+                    "org.toml disagrees with {} agent.toml mirror(s) — delegation uses \
+                     org.toml; run `duduclaw org sync` (or fix via the dashboard org chart) \
+                     to adopt the file edits. `duduclaw doctor` lists them.",
+                    drift.len()
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not create org.toml — organisational authority falls back to each \
+             agent.toml (pre-WP22 behaviour); delegation still works"
+        ),
+    }
+
     // Install operator-configured extra allowed Origins for dashboard WS/CORS.
     // Empty by default => built-in loopback origins only (no behaviour change).
     let extra_origins = init_allowed_origins(config.allowed_origins.clone());
@@ -576,12 +637,21 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let gvu_db_path = home_dir.join("evolution.db");
     // Load encryption key for rollback_diff at rest (reuses existing keyfile)
     let gvu_encryption_key = crate::config_crypto::load_keyfile_public(&home_dir);
-    let gvu_loop = Arc::new(crate::gvu::loop_::GvuLoop::with_encryption(
-        &gvu_db_path,
-        None, // observation_hours — will be set per-agent from config
-        None, // max_generations — will be set per-agent from config
-        gvu_encryption_key.as_ref(),
-    ));
+    let gvu_loop = Arc::new(
+        crate::gvu::loop_::GvuLoop::with_encryption(
+            &gvu_db_path,
+            None, // observation_hours — will be set per-agent from config
+            None, // max_generations — will be set per-agent from config
+            gvu_encryption_key.as_ref(),
+        )
+        // WP0.2: consolidate-mode alerts (SOUL.md cap deadlock cleared, or
+        // failed to clear) land in the Activity Feed + evolution events
+        // instead of a log line nobody reads.
+        .with_alert_sink(crate::gvu::consolidate::GvuAlertSink {
+            home_dir: home_dir.clone(),
+            prediction_engine: prediction_engine.clone(),
+        }),
+    );
     info!(
         "GVU evolution loop initialized (encryption: {})",
         if gvu_encryption_key.is_some() {
@@ -612,9 +682,46 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!("ObservationFinalizer scheduled — 30 min interval");
     }
 
+    // ── WP0.5: GVU stagnation detector (30 min ticks, same cadence as
+    // ObservationFinalizer) ───────────────────────────────────────────────
+    // Diagnostic finding (TODO-evolution-v3-2026-08.md §0): GVU can loop
+    // forever without ever landing a change, and nothing surfaced that fact
+    // to a human — a production agent burned 20 GVU cycles with zero
+    // applies before anyone noticed, from a manual DB inspection. This
+    // sweeps every agent with GVU history and raises a de-duplicated
+    // Activity Feed + evolution-event alert the first time it enters a
+    // stagnant state.
+    {
+        let monitor = Arc::new(crate::gvu::stagnation::StagnationMonitor::new(
+            &gvu_db_path,
+            gvu_encryption_key,
+            home_dir.join("agents"),
+            home_dir.clone(),
+            prediction_engine.clone(),
+        ));
+        tokio::spawn(monitor.run(std::time::Duration::from_secs(1800)));
+        info!("GVU stagnation detector scheduled — 30 min interval");
+    }
+
     // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
     let (event_tx, _) = broadcast::channel::<String>(64);
     handler.set_event_tx(event_tx.clone()).await;
+
+    // WP0.8 (R8, 2026-08-06): the MistakeNotebook Arc is built HERE — before
+    // `reply_ctx` — rather than at its historical construction site further
+    // down (the `shared_gvu_ctx` block, see "P1 (2026-05-09)" below), so both
+    // consumers share one instance.
+    //
+    // Root cause of the zero-write bug: `ReplyContext::with_mistake_notebook`
+    // had literally zero call sites in the whole workspace, so
+    // `ctx.mistake_notebook` was permanently `None` and every
+    // `if let Some(ref nb) = ctx.mistake_notebook` write path in
+    // `channel_reply.rs` was dead code. The notebook is the sole input to the
+    // Reflexion loop (F2a prompt injection + F2b rule consolidation), so a
+    // permanently-empty notebook silently disabled both.
+    let mistake_notebook = Arc::new(crate::gvu::mistake_notebook::MistakeNotebook::new(
+        &home_dir.join("evolution.db"),
+    ));
 
     // Start channel bots if configured
     let reply_ctx = Arc::new(
@@ -628,6 +735,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .with_prediction_engine(prediction_engine.clone())
         .with_gvu_loop(gvu_loop.clone())
         .with_memory_db(home_dir.join("memory.db"))
+        .with_mistake_notebook(mistake_notebook.clone())
         .with_redaction_manager(handler.get_redaction_manager().await),
     );
     // Inject reply context into handler for channel hot-start/stop
@@ -711,16 +819,35 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     );
     info!("Night Engine scheduler started (idle-time N1–N4, disabled per-agent by default)");
 
+    // ── Playbook stale/capacity sweep (WP1.2 G5) ──
+    // Gateway-owned periodic loop, NOT hooked into
+    // `duduclaw_agent::HeartbeatScheduler::run`'s tick body as the design doc
+    // originally suggested: `duduclaw-agent` does not depend on
+    // `duduclaw-gateway` (it's the reverse), so calling into
+    // `crate::playbook` from that crate would introduce a dependency cycle.
+    // This follows the exact same shape as `night_engine::spawn_night_engine`
+    // just above — scan the shared registry on an interval, throttled
+    // per-agent to 24h in-process. `run_decay`'s SQL excludes the semantic
+    // layer, so playbook entries (semantic-layer rows) are never swept by it —
+    // this loop is their only stale/capacity lifecycle driver.
+    crate::playbook::spawn_playbook_sweep_loop(
+        home_dir.clone(),
+        handler.registry().clone(),
+        3600, // check hourly; per-agent work only actually runs every 24h
+    );
+    info!("Playbook sweep loop started (stale/capacity lifecycle, G5)");
+
     // P1 (2026-05-09): build the GvuTriggerCtx once and share it across the
     // silence-event consumer and the dispatcher so both code paths fire GVU
     // through the same plumbing (loop / notebook / home dir). Constructed
     // before the silence consumer spawn — see #3.3 in
     // commercial/docs/TODO-runtime-health-fixes-202605.md for context.
+    // WP0.8: `notebook` reuses the same Arc handed to `reply_ctx` above —
+    // one notebook instance for the channel-reply write path and the
+    // GVU-trigger read path.
     let shared_gvu_ctx = Arc::new(crate::prediction::subagent_prediction::GvuTriggerCtx {
         gvu_loop: gvu_loop.clone(),
-        notebook: Some(Arc::new(
-            crate::gvu::mistake_notebook::MistakeNotebook::new(&home_dir.join("evolution.db")),
-        )),
+        notebook: Some(mistake_notebook.clone()),
         home_dir: home_dir.clone(),
     });
 
@@ -1157,7 +1284,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             };
             let judge: Arc<dyn crate::dispatch_engine::AcceptanceJudge> =
                 Arc::new(crate::dispatch_engine::LlmAcceptanceJudge::new(caller));
-            let engine = Arc::new(
+            let mut dispatch_engine_builder =
                 crate::dispatch_engine::DispatchEngine::new(ts.clone(), Some(judge))
                     // WP4 GroundEval: fold `tool_calls.jsonl` evidence into
                     // the goal-mode acceptance judge prompt.
@@ -1166,8 +1293,29 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                     // rejection past it flags `diminishing` on the board.
                     .with_soft_cap(
                         crate::goal_loop::GoalLoopConfig::from_home(&home_dir).soft_cap,
+                    );
+            // WP-A9: A3 task-forward-model — default OFF (design §7.3).
+            // Constructed exactly once here and shared (same `Arc`) with the
+            // goal loop driver's predict hook via `handler.set_forward_model`
+            // so both hooks read/write one coherent in-memory statistical
+            // bucket cache instead of two never-reconciled copies (see
+            // `MethodHandler::forward_model`'s doc comment).
+            let tfm_cfg =
+                crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(
+                    &home_dir,
+                );
+            if tfm_cfg.enabled {
+                let forward_model = Arc::new(
+                    crate::prediction::task_forward_store::TaskForwardModel::new(
+                        home_dir.join("prediction.db"),
                     ),
-            );
+                );
+                handler.set_forward_model(forward_model.clone()).await;
+                dispatch_engine_builder =
+                    dispatch_engine_builder.with_forward_model(forward_model);
+                info!("A3 task-forward-model enabled ([task_forward_model] enabled = true)");
+            }
+            let engine = Arc::new(dispatch_engine_builder);
             bg_handles.push(tokio::spawn(async move { engine.run().await }));
             info!("Dispatch engine started (durable SQLite派工：殭屍回收 + goal-mode 驗收)");
 

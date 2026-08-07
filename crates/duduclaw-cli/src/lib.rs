@@ -10,6 +10,9 @@ use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 mod acp;
 mod eval;                 // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
+mod playbook_export;      // WP2.2/B4 batch: gene JSON export CLI (`duduclaw playbook export`)
+mod eval_scaffold;        // WP2.1: free-tier eval draft bootstrap (`duduclaw eval-scaffold`)
+mod playbook_migrate;     // WP1.4: SOUL.md → playbook migration drafts (`duduclaw playbook migrate-soul`)
 mod portability;          // Personal-edition data portability: export/import ~/.duduclaw
 mod premium_templates;    // Licensed industry templates (commercial/templates-premium), gated by premium_templates feature
 mod mcp;
@@ -286,6 +289,12 @@ enum Commands {
     /// Run system diagnostics
     Doctor,
 
+    /// Inspect and maintain the organisational authority (`~/.duduclaw/org.toml`)
+    Org {
+        #[command(subcommand)]
+        command: OrgCommands,
+    },
+
     /// Manage the DuDuClaw background service
     Service {
         #[command(subcommand)]
@@ -490,6 +499,19 @@ enum Commands {
     Mcp(McpCommands),
 
     /// Interactive industry-specific agent setup wizard
+    /// WP2.1 — 從 agent 自己的 SOUL.md 行為規則產生 eval 草稿題(零 LLM),
+    /// 落在 <home>/evals-drafts/<agent>/,人審補 prompt 後移入 <home>/evals/<agent>/
+    /// 再以 `duduclaw eval <dir> --record` 錄基線。
+    EvalScaffold {
+        /// Agent id whose SOUL.md to scaffold from.
+        #[arg(long)]
+        agent: String,
+
+        /// Overwrite existing draft files (default: skip).
+        #[arg(long)]
+        force: bool,
+    },
+
     Wizard,
 
     /// Red-team test an agent against its behavioral contract
@@ -518,6 +540,8 @@ enum Commands {
     ///     duduclaw eval evals/support --record          # refresh baselines
     ///     duduclaw eval evals/support --replay          # offline regression
     ///     duduclaw eval evals --replay --report out.json
+    ///     duduclaw eval evals/support --case refund-flow,upsell-001
+    ///     duduclaw eval evals/support --exclude-dir held-out
     Eval {
         /// Case file or suite directory (default: ./evals)
         path: Option<PathBuf>,
@@ -542,7 +566,25 @@ enum Commands {
         /// Write a JSON report to this path
         #[arg(long)]
         report: Option<PathBuf>,
+
+        /// Precise case selection by stable id (the case file's filename
+        /// stem, e.g. `p0-ceo-boundary-money-001`) — repeatable or
+        /// comma-separated. Exact match, unlike `--filter`'s substring match
+        /// on the human-readable `[case] name` (B4: `name` uniqueness is
+        /// unenforced, `--filter` can silently select the wrong subset).
+        #[arg(long, value_delimiter = ',')]
+        case: Vec<String>,
+
+        /// Exclude case files under a directory of this name (repeatable),
+        /// e.g. `--exclude-dir held-out` to skip the held-out rotation.
+        /// Omit to include everything (current behavior, unchanged).
+        #[arg(long = "exclude-dir")]
+        exclude_dir: Vec<String>,
     },
+
+    /// Playbook maintenance (§1.4 gene JSON export, D5=B).
+    #[command(subcommand)]
+    Playbook(PlaybookCommands),
 
     /// Manually re-forward a completed delegation response (v1.8.21+).
     ///
@@ -739,7 +781,20 @@ enum HookCommands {
     /// Reads Claude Code hook JSON on stdin. On block, writes a
     /// human-readable reason to stderr and exits with code 2 so Claude
     /// Code surfaces the block to the agent.
-    AgentFileGuard,
+    AgentFileGuard {
+        /// The calling agent's directory id, baked into the installed hook
+        /// command by `agent_hook_installer::build_hook_command` (WP22 T2).
+        ///
+        /// `DUDUCLAW_AGENT_ID` never reaches this subprocess in production —
+        /// only the MCP server child process gets it — so the ambient env
+        /// var alone made the caller-scope rule inert. This flag is the
+        /// fix: it is trusted over the env var (see `resolve_hook_caller`)
+        /// because it lives inside `.claude/settings.json`, which is itself
+        /// a frozen `ProtectedSurface::HookSettings` file the agent cannot
+        /// rewrite to claim a different id.
+        #[arg(long)]
+        agent: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -851,6 +906,29 @@ enum OsCommands {
     /// Diagnose OS-native integration: notification helper availability, a live
     /// test notification, and per-agent os_native / [os_watch] path status.
     Doctor,
+}
+
+/// WP22 T1 — operator-facing maintenance of `~/.duduclaw/org.toml`.
+///
+/// The org fields inside each `agent.toml` are a display mirror; the store is
+/// what delegation reads. Editing `agent.toml` by hand therefore no longer
+/// takes effect on its own — `org sync` is the explicit human action that
+/// adopts such an edit into the authority.
+#[derive(Subcommand)]
+enum OrgCommands {
+    /// Show the authoritative org record and any drift from the agent.toml mirrors
+    Show,
+
+    /// Adopt `agent.toml` org fields into the authoritative store
+    Sync {
+        /// Only sync this agent (directory name); omit to sync all
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Show what would change without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -989,6 +1067,49 @@ enum MemoryCommands {
         /// Number of timed iterations.
         #[arg(long, default_value_t = 50)]
         iters: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlaybookCommands {
+    /// Export one agent's active playbook entries as a GEP-gene-shaped JSON
+    /// array (`commercial/docs/DESIGN-evolution-v3-aee.md` §1.4, D5=B: local
+    /// schema alignment only, no hub I/O). An agent with no active entries
+    /// exports `[]` (never fabricated data).
+    ///
+    /// Example:
+    ///     duduclaw playbook export --agent support-bot --out genes.json
+    Export {
+        /// Agent id whose playbook to export.
+        #[arg(long)]
+        agent: String,
+
+        /// Write the JSON array here (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// WP1.4 — extract the behaviour rules GVU accumulated in an agent's
+    /// SOUL.md into a reviewable draft (`playbook_migration_draft.toml`),
+    /// then apply the human-reviewed keepers through the normal playbook
+    /// `Add` validation pipeline (G6 eval-case link + WP2.8 E1 assertions
+    /// are enforced — unfilled rules are rejected, by design).
+    ///
+    /// Examples:
+    ///     duduclaw playbook migrate-soul --agent ceo-assistant           # step 1: draft
+    ///     duduclaw playbook migrate-soul --agent ceo-assistant --apply   # step 3: apply reviewed draft
+    MigrateSoul {
+        /// Agent id whose SOUL.md to harvest.
+        #[arg(long)]
+        agent: String,
+
+        /// Apply the reviewed draft (step 3) instead of generating it.
+        #[arg(long)]
+        apply: bool,
+
+        /// Step 1 only: print the candidates without writing the draft file.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1366,6 +1487,10 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Gateway => cmd_run_server(true).await,
         Commands::Status => cmd_status().await,
         Commands::Doctor => cmd_doctor().await,
+        Commands::Org { command } => match command {
+            OrgCommands::Show => cmd_org_show(),
+            OrgCommands::Sync { agent, dry_run } => cmd_org_sync(agent.as_deref(), dry_run),
+        },
         Commands::Service { command } => {
             match command {
                 ServiceCommands::Install => service::handle_service(service::ServiceAction::Install).await,
@@ -1434,6 +1559,13 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             std::process::exit(code);
         }
         Commands::Mcp(mcp_cmd) => cmd_mcp(mcp_cmd, &duduclaw_home()).await,
+        Commands::EvalScaffold { agent, force } => {
+            eval_scaffold::cmd_eval_scaffold(
+                &duduclaw_home(),
+                eval_scaffold::ScaffoldOptions { agent, force },
+            )
+            .await
+        }
         Commands::Wizard => wizard::cmd_wizard(&duduclaw_home()).await,
         Commands::Test { name, bank } => cmd_test_agent(&name, bank.as_deref()).await,
         Commands::Eval {
@@ -1443,6 +1575,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             record,
             no_judge,
             report,
+            case,
+            exclude_dir,
         } => {
             eval::cmd_eval(
                 &duduclaw_home(),
@@ -1453,7 +1587,23 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                     record,
                     no_judge,
                     report,
+                    case,
+                    exclude_dir,
                 },
+            )
+            .await
+        }
+        Commands::Playbook(PlaybookCommands::Export { agent, out }) => {
+            playbook_export::cmd_playbook_export(
+                &duduclaw_home(),
+                playbook_export::ExportOptions { agent, out },
+            )
+            .await
+        }
+        Commands::Playbook(PlaybookCommands::MigrateSoul { agent, apply, dry_run }) => {
+            playbook_migrate::cmd_migrate_soul(
+                &duduclaw_home(),
+                playbook_migrate::MigrateOptions { agent, apply, dry_run },
             )
             .await
         }
@@ -1485,7 +1635,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Proxy { bind, key, default_provider } => {
             proxy::run(&bind, key, default_provider).await
         }
-        Commands::Hook(HookCommands::AgentFileGuard) => cmd_hook_agent_file_guard().await,
+        Commands::Hook(HookCommands::AgentFileGuard { agent }) => {
+            cmd_hook_agent_file_guard(agent.as_deref()).await
+        }
         Commands::License(license_cmd) => license::run(license_cmd).await,
         Commands::Expert { command } => expert::run(command).await,
         Commands::WeeklyReport {
@@ -1599,6 +1751,10 @@ async fn cmd_evolution(
                     Decision::Extended { extra_hours } => {
                         format!("EXTENDED (+{extra_hours:.1}h)")
                     }
+                    // WP0.4 (R5): ran past the hard no-data ceiling without
+                    // ever collecting enough traffic — unverified, not a
+                    // confirm. See duduclaw_gateway::gvu::version_store::VersionStatus::ExpiredNoData.
+                    Decision::ExpiredNoData => "EXPIRED_NO_DATA (unverified — insufficient traffic)".to_string(),
                     Decision::Failed { error } => format!("FAILED ({error})"),
                 };
                 println!(
@@ -2094,7 +2250,10 @@ fn print_rewards(results: &[(String, f64)]) {
 }
 
 /// Cross-platform by design: pure Rust, no bash, no shell quoting issues.
-async fn cmd_hook_agent_file_guard() -> duduclaw_core::error::Result<()> {
+///
+/// `agent_id_arg` is the WP22 T2 fix for `resolve_hook_caller`'s env-only
+/// identity: see that function's doc comment.
+async fn cmd_hook_agent_file_guard(agent_id_arg: Option<&str>) -> duduclaw_core::error::Result<()> {
     use std::io::Read;
     use std::path::PathBuf;
 
@@ -2121,6 +2280,7 @@ async fn cmd_hook_agent_file_guard() -> duduclaw_core::error::Result<()> {
         .unwrap_or("");
 
     let home = duduclaw_home();
+    let caller = resolve_hook_caller(&home, agent_id_arg);
 
     let decision = match tool_name {
         "Write" | "Edit" | "MultiEdit" => {
@@ -2131,7 +2291,46 @@ async fn cmd_hook_agent_file_guard() -> duduclaw_core::error::Result<()> {
                 // No file_path — nothing to check, fail open.
                 return Ok(());
             };
-            duduclaw_core::check_agent_file_write(&PathBuf::from(file_path_str), &home)
+            let file_path = PathBuf::from(file_path_str);
+
+            // Stage 0 (WP22 T2) — caller scope. Coarsest and cheapest: may
+            // this caller touch this directory at all? Runs first so a write
+            // into someone else's agent directory is refused for the honest
+            // reason, whatever the file happens to contain.
+            let scoped = duduclaw_core::check_caller_scope(&file_path, &home, &caller);
+            if !scoped.is_allowed() {
+                scoped
+            } else {
+                // Stage 0.5 (WP1.1 C3, SOUL.md 唯讀化) — SOUL.md is off-limits
+                // to its own owning agent too, not just to foreign agents
+                // (Stage 0 above). Runs before Stage 1's location guard,
+                // which would otherwise allow a write to SOUL.md's own
+                // canonical path.
+                let own_soul = duduclaw_core::check_own_soul_write(&file_path, &home, &caller);
+                if !own_soul.is_allowed() {
+                    own_soul
+                } else {
+                    // Stage 1 — location guard (is this agent-structure file
+                    // allowed to live here at all?).
+                    let located = duduclaw_core::check_agent_file_write(&file_path, &home);
+                    if !located.is_allowed() {
+                        located
+                    } else {
+                        // Stage 2 (WP21 欠帳 ②) — content guard for the files the
+                        // A2A delegation predicate reads. `None` when the path is
+                        // not one of them; stage 3 then guards the files that
+                        // decide *who the caller is* and *whether this hook runs
+                        // at all*.
+                        check_protected_toml_tool_call(tool_name, &envelope, &file_path, &home)
+                            .or_else(|| {
+                                check_identity_surface_tool_call(
+                                    tool_name, &envelope, &file_path, &home,
+                                )
+                            })
+                            .unwrap_or(located)
+                    }
+                }
+            }
         }
         "Bash" => {
             let Some(command) = envelope
@@ -2140,7 +2339,12 @@ async fn cmd_hook_agent_file_guard() -> duduclaw_core::error::Result<()> {
             else {
                 return Ok(());
             };
-            duduclaw_core::check_bash_command(command, &home)
+            let sentinel = duduclaw_core::check_bash_command(command, &home);
+            if !sentinel.is_allowed() {
+                sentinel
+            } else {
+                duduclaw_core::check_bash_protected_write(command, &home, &caller)
+            }
         }
         // Other tool calls (Read, Grep, WebSearch, etc.) are none of our business.
         _ => return Ok(()),
@@ -2155,6 +2359,419 @@ async fn cmd_hook_agent_file_guard() -> duduclaw_core::error::Result<()> {
     }
 
     Ok(())
+}
+
+/// WP22 T2 — resolve who is driving this hook, for the directory-scope rule.
+///
+/// # Fix: `--agent` takes priority over the `DUDUCLAW_AGENT_ID` env var
+///
+/// `DUDUCLAW_AGENT_ID` is injected only into the MCP server child process —
+/// this hook subprocess (spawned directly by Claude Code, never through the
+/// MCP server) does not receive it in production, which left the
+/// caller-scope rule fully implemented but permanently inert. The fix:
+/// `agent_hook_installer::build_hook_command` now bakes the caller's own
+/// agent-directory id into the installed command as `--agent <id>`, and this
+/// function trusts `agent_id_arg` **ahead of** the env var:
+///
+/// - The command string lives inside `<agent_dir>/.claude/settings.json`,
+///   which `ProtectedSurface::HookSettings` freezes outright — an agent
+///   cannot rewrite it to claim a different id.
+/// - The env var is exactly the kind of ambient value a subprocess
+///   environment could be made to carry, and — per the gap this fix closes —
+///   is not even populated for this subprocess in the common case anyway.
+///
+/// The claimed id — from either source — still goes through the same
+/// [`duduclaw_core::verify_identity_claim`] token check as before: `--agent`
+/// supplies *who is claiming*, not a bypass of *whether the claim is
+/// cryptographically verified*. `DUDUCLAW_AGENT_TOKEN` is still read only
+/// from the env (there is no `--token` flag; a token is a credential, not
+/// something to put in a process's argv where `ps` can see it) — an
+/// `--agent`-only claim with no env token behaves exactly like an
+/// env-`DUDUCLAW_AGENT_ID`-only claim did before this fix: soft mode accepts
+/// it as [`duduclaw_core::HookCaller::Agent`], strict mode (`
+/// require_identity_token = true`) rejects it into
+/// [`duduclaw_core::HookCaller::Untrusted`].
+///
+/// An absent claim (both `agent_id_arg` and the env var empty) yields
+/// [`duduclaw_core::HookCaller::Absent`], which is deliberately unrestricted:
+/// this hook is registered only inside an agent's own `.claude/settings.json`,
+/// so no claim means an operator running by hand, and the WP21 content
+/// guards still apply to them.
+fn resolve_hook_caller(
+    home: &std::path::Path,
+    agent_id_arg: Option<&str>,
+) -> duduclaw_core::HookCaller {
+    let from_arg = agent_id_arg.map(str::trim).filter(|s| !s.is_empty());
+    let from_env = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let claimed = from_arg.unwrap_or_else(|| from_env.trim());
+    if claimed.is_empty() {
+        tracing::debug!(
+            "agent-file-guard: no --agent flag and no DUDUCLAW_AGENT_ID in env — caller-scope rule skipped"
+        );
+        return duduclaw_core::HookCaller::Absent;
+    }
+    let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
+    let require = duduclaw_core::require_identity_token_from_home(home);
+    match duduclaw_core::verify_identity_claim(home, claimed, token.trim(), require) {
+        duduclaw_core::IdentityVerdict::Rejected => {
+            duduclaw_core::HookCaller::Untrusted(claimed.to_string())
+        }
+        _ => duduclaw_core::HookCaller::Agent(claimed.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod resolve_hook_caller_tests {
+    //! WP22 T2 fix verification: `--agent` must win over `DUDUCLAW_AGENT_ID`,
+    //! and an `--agent`-only claim (no env token) must behave exactly like
+    //! the pre-fix env-only claim did — soft mode accepts it, strict mode
+    //! rejects it. See `resolve_hook_caller`'s doc comment for the full
+    //! rationale.
+    //!
+    //! `DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN` are process-wide, so
+    //! every test here serializes on `ENV_LOCK` — same convention as
+    //! `mcp.rs`'s `agent_identity_tests` module.
+
+    use super::resolve_hook_caller;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_env() {
+        // SAFETY: env mutation serialized via ENV_LOCK by every caller.
+        unsafe {
+            std::env::remove_var(duduclaw_core::ENV_AGENT_ID);
+            std::env::remove_var(duduclaw_core::ENV_AGENT_TOKEN);
+        }
+    }
+
+    #[test]
+    fn agent_flag_takes_priority_over_env_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        clear_env();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, "env-claimed-agent");
+        }
+
+        // No identity.key on this fresh home ⇒ `IdentityVerdict::Disabled`,
+        // which is still trusted — isolates the arg-vs-env precedence from
+        // token verification.
+        let caller = resolve_hook_caller(tmp.path(), Some("arg-claimed-agent"));
+
+        clear_env();
+        assert_eq!(
+            caller,
+            duduclaw_core::HookCaller::Agent("arg-claimed-agent".to_string()),
+            "the --agent flag must win over DUDUCLAW_AGENT_ID"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_env_when_agent_flag_absent() {
+        // Regression pin: before this fix, the env var was the only source —
+        // that path must keep working unchanged for the still-unmodified
+        // (or not-yet-upgraded) call sites.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        clear_env();
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, "env-only-agent");
+        }
+
+        let caller = resolve_hook_caller(tmp.path(), None);
+
+        clear_env();
+        assert_eq!(
+            caller,
+            duduclaw_core::HookCaller::Agent("env-only-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_agent_flag_falls_back_to_env() {
+        // clap gives `Some("")` for `--agent ""`; must be treated like a
+        // missing flag, matching the existing empty-env-var handling.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        clear_env();
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, "env-only-agent");
+        }
+
+        let caller = resolve_hook_caller(tmp.path(), Some("   "));
+
+        clear_env();
+        assert_eq!(
+            caller,
+            duduclaw_core::HookCaller::Agent("env-only-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_flag_without_env_token_is_soft_mode_agent() {
+        // Soft mode (the default — no config.toml at all here, so
+        // `require_identity_token` defaults to false): an --agent claim with
+        // no DUDUCLAW_AGENT_TOKEN in env is `Unverified`, which is still
+        // trusted — exactly how an env-only claim behaved before this fix.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        clear_env();
+        duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+
+        let caller = resolve_hook_caller(tmp.path(), Some("agent-x"));
+
+        clear_env();
+        assert_eq!(
+            caller,
+            duduclaw_core::HookCaller::Agent("agent-x".to_string()),
+            "no env token + soft mode must still resolve to a trusted Agent"
+        );
+    }
+
+    #[test]
+    fn agent_flag_without_env_token_is_untrusted_in_strict_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        clear_env();
+        duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = true\n",
+        )
+        .unwrap();
+
+        let caller = resolve_hook_caller(tmp.path(), Some("agent-x"));
+
+        clear_env();
+        assert_eq!(
+            caller,
+            duduclaw_core::HookCaller::Untrusted("agent-x".to_string()),
+            "strict mode must reject an --agent claim with no verifying token"
+        );
+    }
+
+    #[test]
+    fn no_agent_flag_and_no_env_is_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        clear_env();
+
+        let caller = resolve_hook_caller(tmp.path(), None);
+
+        assert_eq!(caller, duduclaw_core::HookCaller::Absent);
+    }
+
+    // ── WP22 T5: `org sync` must not run inside an agent session ──────────
+    //
+    // Lives in this module (rather than its own) because it mutates the same
+    // two process-wide env vars and therefore has to share `ENV_LOCK`.
+
+    #[test]
+    fn agent_session_is_detected_from_either_identity_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        assert_eq!(
+            super::agent_session_identity(),
+            None,
+            "an operator terminal carries neither var"
+        );
+
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, "sales-rep");
+        }
+        assert_eq!(
+            super::agent_session_identity().as_deref(),
+            Some("sales-rep")
+        );
+
+        // A token without an id still means "something is acting as an agent".
+        clear_env();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_TOKEN, "aa11");
+        }
+        assert!(super::agent_session_identity().is_some());
+
+        // Whitespace-only values are not an identity.
+        clear_env();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, "   ");
+        }
+        assert_eq!(super::agent_session_identity(), None);
+        clear_env();
+    }
+
+    #[test]
+    fn org_sync_refuses_inside_an_agent_session_and_says_why_in_zh_tw() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, "sales-rep");
+        }
+
+        let err = super::cmd_org_sync(None, false).unwrap_err();
+        let msg = err.to_string();
+        clear_env();
+
+        assert!(msg.contains("sales-rep"), "{msg}");
+        assert!(msg.contains("管理者"), "{msg}");
+        // The refusal must fire before any argument validation, so a nonexistent
+        // `--agent` cannot be used to probe which branch ran.
+        assert!(!msg.contains("找不到"), "{msg}");
+
+        let dry = {
+            // SAFETY: serialized via ENV_LOCK.
+            unsafe {
+                std::env::set_var(duduclaw_core::ENV_AGENT_ID, "sales-rep");
+            }
+            let r = super::cmd_org_sync(Some("ghost"), true).unwrap_err().to_string();
+            clear_env();
+            r
+        };
+        assert!(
+            dry.contains("管理者"),
+            "--dry-run must be refused too (it is a probe of the same authority): {dry}"
+        );
+    }
+
+    #[test]
+    fn org_sync_is_not_refused_for_an_operator() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        // No identity env ⇒ the refusal must not fire. The command then hits
+        // its normal argument validation, which is how we observe that it got
+        // past the gate without needing a real `$DUDUCLAW_HOME`.
+        let msg = super::cmd_org_sync(Some("definitely-not-an-agent"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("找不到"), "expected arg validation, got: {msg}");
+    }
+}
+
+/// WP21 欠帳 ② — content guard for the two files the A2A delegation predicate
+/// reads (`<home>/agents/<id>/agent.toml`, `<home>/config.toml`).
+///
+/// Returns `None` when `file_path` is not one of them (caller keeps the
+/// location-guard verdict). Otherwise reconstructs the post-write content from
+/// the tool envelope and hands it to
+/// [`duduclaw_core::check_protected_toml_write`]. A write whose effect cannot
+/// be reconstructed is DENIED — fail closed, since the whole point is that the
+/// judged party must not be able to edit the evidence.
+fn check_protected_toml_tool_call(
+    tool_name: &str,
+    envelope: &serde_json::Value,
+    file_path: &std::path::Path,
+    home: &std::path::Path,
+) -> Option<duduclaw_core::GuardDecision> {
+    duduclaw_core::classify_protected_toml(file_path, home)?;
+
+    let existing = std::fs::read_to_string(file_path).ok();
+
+    match reconstruct_written_content(tool_name, envelope, existing.as_deref()) {
+        Some(new_content) => Some(duduclaw_core::check_protected_toml_write(
+            file_path,
+            home,
+            existing.as_deref(),
+            &new_content,
+        )),
+        None => Some(duduclaw_core::GuardDecision::BlockedUnverifiable {
+            file_name: file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("(unknown)")
+                .to_string(),
+            attempted_path: duduclaw_core::agent_guard::lexical_normalize(file_path),
+            reason: format!("無法從 {tool_name} 的參數還原寫入後的內容"),
+        }),
+    }
+}
+
+/// WP21 review follow-up — guard for the files that decide *who the caller is*
+/// (`<home>/identity.key`, an agent's `.mcp.json` identity env block) and
+/// *whether this hook runs at all* (`<agent_dir>/.claude/settings.json`).
+///
+/// Without this, the WP21 org-field guard is self-disarming: an agent may
+/// delete its own `PreToolUse` hook entry, or paste a peer's
+/// `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN` pair (readable from that
+/// peer's `.mcp.json`) into its own, and the next MCP server it drives claims
+/// to be that peer — in strict mode as well as soft mode.
+///
+/// Returns `None` when `file_path` is not one of those files.
+fn check_identity_surface_tool_call(
+    tool_name: &str,
+    envelope: &serde_json::Value,
+    file_path: &std::path::Path,
+    home: &std::path::Path,
+) -> Option<duduclaw_core::GuardDecision> {
+    let surface = duduclaw_core::classify_identity_surface(file_path, home)?;
+    // Only `.mcp.json` is judged on content; the other two are refused
+    // outright, so their post-write content is irrelevant (and `identity.key`
+    // is binary — reading it as a string would fail anyway).
+    let (existing, new_content) = if surface == duduclaw_core::ProtectedSurface::AgentMcpJson {
+        let existing = std::fs::read_to_string(file_path).ok();
+        let new_content = reconstruct_written_content(tool_name, envelope, existing.as_deref());
+        (existing, new_content)
+    } else {
+        (None, None)
+    };
+    Some(duduclaw_core::check_identity_surface_write(
+        file_path,
+        home,
+        existing.as_deref(),
+        new_content.as_deref(),
+    ))
+}
+
+/// Reconstruct the file content a Write / Edit / MultiEdit call would produce.
+///
+/// `Edit` semantics are exact string replacement (`replace_all` → every
+/// occurrence, otherwise the first), which is what Claude Code performs, so
+/// the reconstruction is faithful rather than heuristic. Returns `None` when
+/// the envelope lacks what is needed — the caller treats that as a block.
+fn reconstruct_written_content(
+    tool_name: &str,
+    envelope: &serde_json::Value,
+    existing: Option<&str>,
+) -> Option<String> {
+    let input = envelope.get("tool_input")?;
+    match tool_name {
+        "Write" => input
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        "Edit" => apply_string_edit(existing?, input),
+        "MultiEdit" => {
+            let mut current = existing?.to_string();
+            for edit in input.get("edits")?.as_array()? {
+                current = apply_string_edit(&current, edit)?;
+            }
+            Some(current)
+        }
+        _ => None,
+    }
+}
+
+fn apply_string_edit(base: &str, edit: &serde_json::Value) -> Option<String> {
+    let old = edit.get("old_string").and_then(|v| v.as_str())?;
+    let new = edit.get("new_string").and_then(|v| v.as_str())?;
+    if old.is_empty() {
+        // Ambiguous (whole-file replace semantics vary) — refuse to guess.
+        return None;
+    }
+    let replace_all = edit
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some(if replace_all {
+        base.replace(old, new)
+    } else {
+        base.replacen(old, new, 1)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2808,18 +3425,24 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     };
 
     // ── 7. Evolution Engine (advanced mode) ──────────────────
+    // WP0.1 (2026-08-06, fixes root cause R3): fail-closed opt-in. Quick /
+    // headless mode never prompts, so it must default to `false` — silently
+    // shipping `gvu_enabled = true` to an unattended install is exactly the
+    // "invisible toggle" bug this WP closes. The interactive prompt still
+    // *suggests* enabling it (recommended), but that's a conscious choice the
+    // operator actively confirms, not a silent default.
     let enable_gvu: bool = if !skip_prompts && !quick_mode {
         println!();
         println!("  {} {}", style("🧬").bold(), style("自主進化引擎").bold());
-        println!("  預測驅動進化已預設啟用：AI 根據對話預測誤差自動進化。");
+        println!("  GVU 自我博弈迴路可讓 AI 根據對話預測誤差自動演化 SOUL.md（預設關閉，需手動啟用）。");
         println!();
         Confirm::new()
             .with_prompt("啟用 GVU 自我博弈迴路？（AI 自動審查修改，推薦）")
             .default(true)
             .interact()
-            .unwrap_or(true)
+            .unwrap_or(false)
     } else {
-        true
+        false
     };
 
     // D7 (2026-08-04): cognitive memory is always on — no prompt, no config key.
@@ -3135,6 +3758,16 @@ max_active_skills = 5
         DuDuClawError::Config(format!("Failed to write {}: {e}", agent_toml_path.display()))
     })?;
     println!("  {} {}", style("✓").green(), agent_toml_path.display());
+
+    // WP22 T1 — record the authoritative org placement in `<home>/org.toml`.
+    // The onboarding agent is a root, but the record still matters: a
+    // directory reusing a previously-removed agent's name would otherwise
+    // inherit that agent's stale store entry and quietly acquire a supervisor.
+    if let Some(entry) = duduclaw_core::org_store::read_mirror(&agent_toml_path) {
+        if let Err(e) = duduclaw_core::org_store::upsert(&home, &agent_name, entry) {
+            tracing::warn!(agent = %agent_name, error = %e, "org.toml upsert failed during onboard");
+        }
+    }
 
     // SOUL.md
     let soul_path = agent_dir.join("SOUL.md");
@@ -3561,6 +4194,272 @@ async fn cmd_status() -> duduclaw_core::error::Result<()> {
 }
 
 /// `duduclaw doctor`
+/// WP22 T1 — the `duduclaw doctor` row for organisational-authority drift.
+///
+/// Kept as its own function (rather than inline in `cmd_doctor`) so the check
+/// can be unit-tested against a temp home and so it stays a one-line insertion
+/// in the doctor body.
+///
+/// Reports, never repairs: adopting a hand edit of `agent.toml` is a human
+/// decision (`duduclaw org sync`), because the alternative — auto-adopting
+/// whatever the file says — is exactly the attack the store was built to stop.
+fn org_authority_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let name = "組織權威 (org.toml)".to_string();
+    if !duduclaw_core::org_store::store_exists(home) {
+        // WP22 T5 — distinguish "never built" from "was built, now gone".
+        // The second is the tail of a laundering attempt (delete the store so
+        // the mirrors get re-imported); DuDuClaw refuses that re-import, which
+        // leaves the operator with a silent degradation unless it is reported
+        // here.
+        if duduclaw_core::org_store::store_lost(home) {
+            return (
+                name,
+                CheckStatus::Fail,
+                "權威檔案不見了（曾經建立過）。委派判定已退回以各 AI 員工自己的 agent.toml 為準,\
+                 保護力下降。DuDuClaw 不會自動重建（那等於直接採信可能被改過的檔案）—— \
+                 請先用 `duduclaw org show` 對照,確認無誤後執行 `duduclaw org sync` 重建。"
+                    .into(),
+            );
+        }
+        return (
+            name,
+            CheckStatus::Warn,
+            "尚未建立。啟動 gateway 會自動建立;在此之前組織關係以各 agent.toml 為準（升級前行為）。"
+                .into(),
+        );
+    }
+    // A store that exists but records nobody, on a home that *has* agents, is
+    // the same degradation wearing a different hat (e.g. the store was deleted
+    // and a later gated write recreated it holding only its own entry, or the
+    // file was truncated).
+    let store = duduclaw_core::org_store::load(home);
+    if store.is_empty() && !duduclaw_core::org_store::scan_mirrors(home).is_empty() {
+        return (
+            name,
+            CheckStatus::Fail,
+            "權威檔案存在但沒有任何紀錄,委派判定已退回以各 AI 員工自己的 agent.toml 為準。\
+             請用 `duduclaw org show` 對照後執行 `duduclaw org sync` 重建。"
+                .into(),
+        );
+    }
+    let drift = duduclaw_core::org_store::detect_drift(home);
+    if drift.is_empty() {
+        // WP22 T5 — "no drift" is not the same as "fully covered". An agent
+        // that exists on disk with no store entry is governed by a file inside
+        // its own working directory (the compatibility fallback), which is the
+        // exact exposure T1 exists to remove. Before bootstrap that is the
+        // designed state and says nothing; *after* bootstrap it means the
+        // agent was created outside a gated path — or that the store was lost
+        // and only partially rebuilt, which is the tail of an attempted
+        // laundering and would otherwise read as a clean bill of health.
+        let unregistered: Vec<String> = duduclaw_core::org_store::scan_mirrors(home)
+            .into_iter()
+            .filter(|(id, _)| !store.contains(id))
+            .map(|(id, _)| id)
+            .collect();
+        if !unregistered.is_empty() {
+            let shown: Vec<&str> = unregistered.iter().map(String::as_str).take(5).collect();
+            let more = if unregistered.len() > shown.len() {
+                format!("… 等 {} 位", unregistered.len())
+            } else {
+                String::new()
+            };
+            return (
+                name,
+                CheckStatus::Warn,
+                format!(
+                    "{} 位 AI 員工尚未登錄權威資料（{}{more}）,他們的組織關係暫時以自己的 \
+                     agent.toml 為準,保護力較低。確認組織圖無誤後執行 `duduclaw org sync` 納入。",
+                    unregistered.len(),
+                    shown.join(", ")
+                ),
+            );
+        }
+        return (
+            name,
+            CheckStatus::Pass,
+            format!("{} 位 AI 員工已登錄,agent.toml 顯示內容一致。", store.len()),
+        );
+    }
+    let names: Vec<&str> = drift.iter().map(|d| d.agent_id.as_str()).take(5).collect();
+    let more = if drift.len() > names.len() {
+        format!("… 等 {} 位", drift.len())
+    } else {
+        String::new()
+    };
+    (
+        name,
+        CheckStatus::Warn,
+        format!(
+            "{} 位 AI 員工的 agent.toml 與權威資料不一致（{}{more}）。\
+             委派判定採用 org.toml。若是你自己改的,執行 `duduclaw org sync` 讓它生效;\
+             否則請用儀表板的組織圖修正。明細:`duduclaw org show`。",
+            drift.len(),
+            names.join(", ")
+        ),
+    )
+}
+
+/// Render one org placement for console output.
+fn org_entry_label(entry: &duduclaw_core::OrgEntry) -> String {
+    let parent = if entry.reports_to.is_empty() {
+        "(最上層)".to_string()
+    } else {
+        entry.reports_to.clone()
+    };
+    if entry.department.is_empty() {
+        format!("主管={parent}")
+    } else {
+        format!("主管={parent} 部門={}", entry.department)
+    }
+}
+
+/// `duduclaw org show` — the authoritative tree plus any mirror drift.
+fn cmd_org_show() -> duduclaw_core::error::Result<()> {
+    let home = duduclaw_home();
+    let path = duduclaw_core::org_store::org_store_path(&home);
+
+    println!("組織權威資料（委派判定的唯一依據）");
+    println!("{}", "=".repeat(48));
+    println!("檔案:{}", path.display());
+
+    if !duduclaw_core::org_store::store_exists(&home) {
+        println!(
+            "\n尚未建立。啟動 gateway（`duduclaw run`）會自動從各 agent.toml 匯入一次,\n\
+             或直接執行 `duduclaw org sync` 立即建立。\n\
+             在此之前,組織關係一律以各 AI 員工的 agent.toml 為準(與升級前行為相同)。"
+        );
+        return Ok(());
+    }
+
+    let store = duduclaw_core::org_store::load(&home);
+    if store.is_empty() {
+        println!("\n（目前沒有任何紀錄,所有 AI 員工都以自己的 agent.toml 為準）");
+    } else {
+        println!("\n已登錄 {} 位 AI 員工:", store.len());
+        for (agent_id, entry) in store.iter() {
+            println!("  • {agent_id}: {}", org_entry_label(entry));
+        }
+    }
+
+    let drift = duduclaw_core::org_store::detect_drift(&home);
+    if drift.is_empty() {
+        println!("\n✓ agent.toml 顯示內容與權威資料一致。");
+    } else {
+        println!("\n⚠ 有 {} 位 AI 員工的 agent.toml 與權威資料不一致:", drift.len());
+        for d in &drift {
+            println!("  • {}", d.agent_id);
+            println!("      實際採用(org.toml):{}", org_entry_label(&d.store));
+            println!("      檔案顯示(agent.toml):{}", org_entry_label(&d.mirror));
+        }
+        println!(
+            "\n委派判定採用 org.toml。若這些檔案編輯是你本人做的,執行 \
+             `duduclaw org sync` 讓它生效;\n若不是,代表有人動過 agent.toml —— \
+             用儀表板的組織圖修正即可,不必理會該檔案。"
+        );
+    }
+    Ok(())
+}
+
+/// Is this process running inside an agent's session?
+///
+/// The MCP server child process — and everything an agent's CLI backend spawns
+/// underneath it, `Bash` tool calls included — carries `DUDUCLAW_AGENT_ID`
+/// (and `DUDUCLAW_AGENT_TOKEN` when identity signing is on). An operator's own
+/// terminal carries neither, so this is a zero-false-positive discriminator.
+///
+/// Returns the claimed id (or the marker below when only a token is present),
+/// so the refusal message can name who was refused. Deliberately **not**
+/// verified against `identity.key`: the question here is "is anyone acting as
+/// an agent", not "is this claim genuine" — a forged claim should be refused
+/// just as hard as a real one, and clearing the vars to look like an operator
+/// is not something an agent can do to its own already-running process tree.
+fn agent_session_identity() -> Option<String> {
+    let id = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let id = id.trim();
+    if !id.is_empty() {
+        return Some(id.to_string());
+    }
+    let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
+    (!token.trim().is_empty()).then(|| "（未具名）".to_string())
+}
+
+/// The zh-TW refusal shown when an org-authority write is attempted from
+/// inside an agent session. Pure so it can be asserted without env mutation.
+fn refuse_org_write_in_agent_session(claimed: &str) -> String {
+    format!(
+        "這個指令不能在 AI 員工的工作階段中執行（偵測到身分:{claimed}）。\n\
+         組織關係（誰是誰的主管、屬於哪個部門）只能由管理者調整 —— \
+         否則 AI 員工只要改自己的設定檔再跑一次同步，就能把自己升職。\n\
+         請由管理者在自己的終端機執行 `duduclaw org sync`，\
+         或直接使用儀表板的組織圖。"
+    )
+}
+
+/// `duduclaw org sync` — the explicit human action that adopts hand edits of
+/// `agent.toml` into the authority.
+///
+/// This exists because the gateway deliberately seeds `org.toml` only once: an
+/// automatic re-import on every boot would let anyone who can write an
+/// `agent.toml` promote their edit to authority just by waiting for a restart.
+/// Making the adoption a typed command keeps that decision with a human.
+fn cmd_org_sync(agent: Option<&str>, dry_run: bool) -> duduclaw_core::error::Result<()> {
+    let home = duduclaw_home();
+
+    // WP22 T5 — `org sync` is the one command that promotes an `agent.toml`
+    // mirror to authority. Running it from inside an agent session would hand
+    // any agent with a shell the whole T1 boundary back: tamper with your own
+    // mirror (the Bash guard is a speed bump, `T=agent.toml; … > $T` evades
+    // it), then launder the edit with one perfectly legitimate CLI call. See
+    // [`refuse_org_write_in_agent_session`].
+    if let Some(claimed) = agent_session_identity() {
+        return Err(DuDuClawError::Agent(refuse_org_write_in_agent_session(
+            &claimed,
+        )));
+    }
+
+    if let Some(a) = agent {
+        if !home.join("agents").join(a).join("agent.toml").is_file() {
+            return Err(DuDuClawError::Agent(format!(
+                "找不到 AI 員工「{a}」的 agent.toml(請用目錄名稱)"
+            )));
+        }
+    }
+
+    let changes = duduclaw_core::org_store::sync_from_mirrors(&home, agent, dry_run)
+        .map_err(|e| DuDuClawError::Agent(format!("寫入 org.toml 失敗:{e}")))?;
+
+    if changes.is_empty() {
+        println!("組織權威資料已經與 agent.toml 一致,沒有需要匯入的變更。");
+        return Ok(());
+    }
+
+    println!(
+        "{} {} 項組織變更:",
+        if dry_run { "將匯入" } else { "已匯入" },
+        changes.len()
+    );
+    for c in &changes {
+        match &c.before {
+            Some(before) => println!(
+                "  • {}: {} → {}",
+                c.agent_id,
+                org_entry_label(before),
+                org_entry_label(&c.after)
+            ),
+            None => println!("  • {}(新增): {}", c.agent_id, org_entry_label(&c.after)),
+        }
+    }
+
+    if dry_run {
+        println!("\n（--dry-run:尚未寫入。移除該參數即可套用。）");
+    } else {
+        println!("\n✓ 已寫入 {}", duduclaw_core::org_store::org_store_path(&home).display());
+        println!("委派判定會立刻採用新的組織關係,不需要重啟。");
+    }
+    Ok(())
+}
+
 async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
 
@@ -3620,6 +4519,9 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
             "Agents directory not found. Run `duduclaw onboard`.".into(),
         ));
     }
+
+    // Check 2b (WP22 T1): organisational authority + mirror drift.
+    checks.push(org_authority_check(&home));
 
     // Check 3: Claude Code CLI
     match duduclaw_core::which_claude() {
@@ -4133,6 +5035,24 @@ skill_security_scan = true
         .await
         .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
 
+    // WP22 T1 — record the authoritative org placement in `<home>/org.toml`.
+    // This one call covers every CLI creation path that funnels through this
+    // scaffold: `duduclaw agent create`, the `migrate-from` importers
+    // (paperclip / hermes / openclaw), `expert install` and `expert` plugin
+    // imports. Without it, re-creating a directory that a *previous* agent of
+    // the same name once occupied would leave the old (stale) store record in
+    // charge of the new agent — the failure mode this task exists to prevent.
+    // Scaffolds are department-less; `expert install` records its department
+    // right after it patches it in. Best-effort: on failure the agent simply
+    // has no record, and the fallback rule keeps its `agent.toml` governing it.
+    if let Err(e) = duduclaw_core::org_store::upsert(
+        home,
+        agent_name,
+        duduclaw_core::OrgEntry::new(reports_to, ""),
+    ) {
+        tracing::warn!(agent = %agent_name, error = %e, "org.toml upsert failed while scaffolding agent");
+    }
+
     // SOUL.md — imported persona verbatim when supplied, else default template.
     let soul = soul_body.clone().unwrap_or_else(|| {
         format!(
@@ -4180,21 +5100,32 @@ skill_security_scan = true
     // DUDUCLAW_AGENT_ID lets the MCP subprocess self-identify; without it
     // every call falls back to `default_agent` and supervisor-relation
     // authorization breaks (mirrors mcp_template::ensure_duduclaw_absolute_path).
+    // `DUDUCLAW_AGENT_TOKEN` (WP21 debt ⑧) rides along when the install has an
+    // `identity.key`, so the id is provable rather than merely asserted.
+    let mcp_env: serde_json::Map<String, serde_json::Value> =
+        duduclaw_core::agent_identity_env_vars_default(agent_name)
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
     let mcp_json = serde_json::json!({
         "mcpServers": {
             "duduclaw": {
                 "command": mcp_bin,
                 "args": ["mcp-server"],
-                "env": { "DUDUCLAW_AGENT_ID": agent_name.clone() }
+                "env": mcp_env
             }
         }
     });
     let mcp_content = serde_json::to_string_pretty(&mcp_json).map_err(|e| {
         DuDuClawError::Agent(format!("Failed to serialise .mcp.json: {e}"))
     })?;
-    tokio::fs::write(agent_dir.join(".mcp.json"), mcp_content)
+    let mcp_json_path = agent_dir.join(".mcp.json");
+    tokio::fs::write(&mcp_json_path, mcp_content)
         .await
         .map_err(|e| DuDuClawError::Agent(format!("Failed to write .mcp.json: {e}")))?;
+    // Carries DUDUCLAW_AGENT_TOKEN in plaintext — restrict to the owning OS
+    // user (0600 on Unix; no-op on Windows, see platform::set_owner_only).
+    duduclaw_core::platform::set_owner_only(&mcp_json_path).ok();
 
     Ok(agent_dir)
 }
@@ -4995,6 +5926,7 @@ async fn cmd_http_server(
     let memory = mcp::maybe_with_semantic_embedder(
         SqliteMemoryEngine::new(&memory_db_path)
             .map_err(|e| DuDuClawError::Memory(format!("Failed to open memory DB: {e}")))?,
+        &home,
     );
 
     let default_agent = mcp::get_default_agent(&home).await;
@@ -5569,6 +6501,111 @@ async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
     }
 }
 
+/// WP22 T1 — `duduclaw doctor`'s organisational-authority row + `org sync`.
+#[cfg(test)]
+mod org_authority_tests {
+    use super::*;
+
+    fn write_agent(home: &std::path::Path, dir: &str, reports_to: &str, department: &str) {
+        let d = home.join("agents").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("agent.toml"),
+            format!(
+                "[agent]\nname = \"{dir}\"\ndisplay_name = \"{dir}\"\nrole = \"specialist\"\n\
+                 status = \"active\"\ntrigger = \"@{dir}\"\nreports_to = \"{reports_to}\"\n\
+                 department = \"{department}\"\nicon = \"x\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn doctor_row_warns_before_bootstrap_then_passes_then_reports_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_agent(home, "boss", "", "");
+        write_agent(home, "sales-lead", "boss", "業務");
+
+        // Not bootstrapped yet — a warning, not a failure: the fallback rule
+        // means delegation still works exactly as it did pre-WP22.
+        let (_, status, _) = org_authority_check(home);
+        assert_eq!(status, CheckStatus::Warn);
+
+        duduclaw_core::org_store::seed_if_absent(home).unwrap();
+        let (_, status, detail) = org_authority_check(home);
+        assert_eq!(status, CheckStatus::Pass, "{detail}");
+
+        // A hand edit of the mirror is reported, never auto-adopted.
+        write_agent(home, "sales-lead", "boss", "行銷");
+        let (_, status, detail) = org_authority_check(home);
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(detail.contains("sales-lead"), "{detail}");
+        assert!(detail.contains("org sync"), "{detail}");
+        assert_eq!(
+            duduclaw_core::org_store::load(home).get("sales-lead").unwrap().department,
+            "業務",
+            "doctor must not repair the authority"
+        );
+
+        // …and the operator's explicit sync clears it.
+        duduclaw_core::org_store::sync_from_mirrors(home, None, false).unwrap();
+        let (_, status, _) = org_authority_check(home);
+        assert_eq!(status, CheckStatus::Pass);
+    }
+
+    /// WP22 T5 — a *deleted* store is a different (and worse) state than a
+    /// never-built one: delegation has silently dropped back to the
+    /// `agent.toml` mirrors. Reported as a failure, and never auto-rebuilt.
+    #[test]
+    fn doctor_row_fails_loudly_when_the_store_was_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_agent(home, "boss", "", "");
+        write_agent(home, "sales-lead", "boss", "業務");
+        duduclaw_core::org_store::seed_if_absent(home).unwrap();
+
+        std::fs::remove_file(duduclaw_core::org_store::org_store_path(home)).unwrap();
+        let (_, status, detail) = org_authority_check(home);
+        assert_eq!(status, CheckStatus::Fail, "{detail}");
+        assert!(detail.contains("org sync"), "{detail}");
+        assert!(detail.contains("不見了"), "{detail}");
+
+        // And the follow-on state: a gated write recreates the file holding
+        // only its own entry (it must NOT re-import the mirrors), which is
+        // still a degradation and must still be reported.
+        duduclaw_core::org_store::upsert(home, "helper", duduclaw_core::OrgEntry::new("boss", ""))
+            .unwrap();
+        let store = duduclaw_core::org_store::load(home);
+        assert_eq!(store.len(), 1, "mirrors must not be re-imported: {store:?}");
+        let (_, status, detail) = org_authority_check(home);
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+    }
+
+    #[test]
+    fn doctor_row_fails_when_the_store_exists_but_records_nobody() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_agent(home, "boss", "", "");
+        std::fs::write(
+            duduclaw_core::org_store::org_store_path(home),
+            "schema = 1\n",
+        )
+        .unwrap();
+        let (_, status, detail) = org_authority_check(home);
+        assert_eq!(status, CheckStatus::Fail, "{detail}");
+        assert!(detail.contains("org sync"), "{detail}");
+    }
+
+    #[test]
+    fn entry_label_renders_root_and_department() {
+        let root = duduclaw_core::OrgEntry::new("", "");
+        assert!(org_entry_label(&root).contains("最上層"));
+        let staffed = duduclaw_core::OrgEntry::new("boss", "業務");
+        assert_eq!(org_entry_label(&staffed), "主管=boss 部門=業務");
+    }
+}
+
 #[cfg(test)]
 mod agent_scaffold_tests {
     use super::*;
@@ -5806,6 +6843,278 @@ mod log_level_config_tests {
         )
         .unwrap();
         assert_eq!(read_log_level_from_config(&dir.config_path()), None);
+    }
+}
+
+/// WP21 欠帳 ② — hook-envelope side of the org-field guard: reconstructing the
+/// post-write content from a Write / Edit / MultiEdit tool call, and the
+/// end-to-end decision on a real temp-dir agent tree.
+#[cfg(test)]
+mod protected_toml_hook_tests {
+    use super::*;
+    use duduclaw_core::GuardDecision;
+    use serde_json::json;
+
+    struct TempHome(std::path::PathBuf);
+    impl TempHome {
+        fn new() -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("duduclaw-orgguard-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(p.join("agents/agnes")).unwrap();
+            Self(p)
+        }
+        fn agent_toml(&self) -> std::path::PathBuf {
+            self.0.join("agents/agnes/agent.toml")
+        }
+        fn write_agent_toml(&self, body: &str) {
+            std::fs::write(self.agent_toml(), body).unwrap();
+        }
+    }
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const BASE: &str = "[agent]\nname = \"agnes\"\nreports_to = \"ceo\"\ndepartment = \"eng\"\n\n[model]\npreferred = \"sonnet\"\n";
+
+    fn write_envelope(path: &std::path::Path, content: &str) -> serde_json::Value {
+        json!({
+            "tool_name": "Write",
+            "tool_input": { "file_path": path.to_string_lossy(), "content": content }
+        })
+    }
+
+    fn edit_envelope(
+        path: &std::path::Path,
+        old: &str,
+        new: &str,
+    ) -> serde_json::Value {
+        json!({
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": path.to_string_lossy(),
+                "old_string": old,
+                "new_string": new
+            }
+        })
+    }
+
+    #[test]
+    fn write_changing_reports_to_is_blocked() {
+        let home = TempHome::new();
+        home.write_agent_toml(BASE);
+        let new = BASE.replace("\"ceo\"", "\"victim\"");
+        let env = write_envelope(&home.agent_toml(), &new);
+        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0)
+            .expect("path must be classified as protected");
+        assert!(matches!(d, GuardDecision::BlockedOrgFieldChange { .. }));
+        assert!(d.block_message().unwrap().contains("agent_update"));
+    }
+
+    #[test]
+    fn edit_changing_department_is_blocked() {
+        let home = TempHome::new();
+        home.write_agent_toml(BASE);
+        let env = edit_envelope(
+            &home.agent_toml(),
+            "department = \"eng\"",
+            "department = \"finance\"",
+        );
+        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0)
+            .unwrap();
+        assert!(matches!(d, GuardDecision::BlockedOrgFieldChange { .. }));
+    }
+
+    #[test]
+    fn edit_of_unrelated_field_is_allowed() {
+        let home = TempHome::new();
+        home.write_agent_toml(BASE);
+        let env = edit_envelope(
+            &home.agent_toml(),
+            "preferred = \"sonnet\"",
+            "preferred = \"opus\"",
+        );
+        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0)
+            .unwrap();
+        assert_eq!(d, GuardDecision::AllowedAgentWrite);
+        assert!(d.block_message().is_none());
+    }
+
+    #[test]
+    fn multiedit_sneaking_org_change_is_blocked() {
+        let home = TempHome::new();
+        home.write_agent_toml(BASE);
+        let env = json!({
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": home.agent_toml().to_string_lossy(),
+                "edits": [
+                    { "old_string": "preferred = \"sonnet\"", "new_string": "preferred = \"opus\"" },
+                    { "old_string": "reports_to = \"ceo\"", "new_string": "reports_to = \"victim\"" }
+                ]
+            }
+        });
+        let d = check_protected_toml_tool_call("MultiEdit", &env, &home.agent_toml(), &home.0)
+            .unwrap();
+        assert!(matches!(d, GuardDecision::BlockedOrgFieldChange { .. }));
+    }
+
+    #[test]
+    fn write_creating_new_agent_toml_is_allowed() {
+        let home = TempHome::new();
+        std::fs::create_dir_all(home.0.join("agents/fresh")).unwrap();
+        let path = home.0.join("agents/fresh/agent.toml");
+        let env = write_envelope(&path, BASE);
+        let d = check_protected_toml_tool_call("Write", &env, &path, &home.0).unwrap();
+        assert_eq!(d, GuardDecision::AllowedAgentWrite);
+    }
+
+    #[test]
+    fn write_of_broken_toml_is_blocked() {
+        let home = TempHome::new();
+        home.write_agent_toml(BASE);
+        let env = write_envelope(&home.agent_toml(), "[agent\nname =");
+        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0)
+            .unwrap();
+        assert!(matches!(d, GuardDecision::BlockedUnverifiable { .. }));
+    }
+
+    #[test]
+    fn write_without_content_field_is_blocked_fail_closed() {
+        let home = TempHome::new();
+        home.write_agent_toml(BASE);
+        let env = json!({
+            "tool_name": "Write",
+            "tool_input": { "file_path": home.agent_toml().to_string_lossy() }
+        });
+        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0)
+            .unwrap();
+        match d {
+            GuardDecision::BlockedUnverifiable { reason, .. } => {
+                assert!(reason.contains("還原"));
+            }
+            other => panic!("expected BlockedUnverifiable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_protected_path_returns_none() {
+        let home = TempHome::new();
+        let path = home.0.join("notes.md");
+        let env = write_envelope(&path, "hello");
+        assert!(check_protected_toml_tool_call("Write", &env, &path, &home.0).is_none());
+    }
+
+    #[test]
+    fn config_toml_delegation_change_is_blocked() {
+        let home = TempHome::new();
+        let path = home.0.join("config.toml");
+        std::fs::write(&path, "[delegation]\npolicy = \"department\"\n").unwrap();
+        let env = write_envelope(&path, "[delegation]\npolicy = \"open\"\n");
+        let d = check_protected_toml_tool_call("Write", &env, &path, &home.0).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedProtectedSection { .. }));
+    }
+
+    #[test]
+    fn config_toml_unrelated_change_is_allowed() {
+        let home = TempHome::new();
+        let path = home.0.join("config.toml");
+        std::fs::write(&path, "[general]\nlog_level = \"info\"\n").unwrap();
+        let env = write_envelope(&path, "[general]\nlog_level = \"debug\"\n");
+        let d = check_protected_toml_tool_call("Write", &env, &path, &home.0).unwrap();
+        assert_eq!(d, GuardDecision::AllowedAgentWrite);
+    }
+
+    // ── reconstruction primitives ──────────────────────────────────
+
+    #[test]
+    fn edit_replaces_only_first_occurrence_by_default() {
+        let env = edit_envelope(std::path::Path::new("/x/agent.toml"), "a", "b");
+        let out = reconstruct_written_content("Edit", &env, Some("aa")).unwrap();
+        assert_eq!(out, "ba");
+    }
+
+    #[test]
+    fn edit_replace_all_replaces_every_occurrence() {
+        let env = json!({
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/x/agent.toml",
+                "old_string": "a",
+                "new_string": "b",
+                "replace_all": true
+            }
+        });
+        let out = reconstruct_written_content("Edit", &env, Some("aa")).unwrap();
+        assert_eq!(out, "bb");
+    }
+
+    #[test]
+    fn edit_with_empty_old_string_is_unreconstructable() {
+        let env = edit_envelope(std::path::Path::new("/x/agent.toml"), "", "b");
+        assert!(reconstruct_written_content("Edit", &env, Some("aa")).is_none());
+    }
+
+    #[test]
+    fn edit_on_missing_file_is_unreconstructable() {
+        let env = edit_envelope(std::path::Path::new("/x/agent.toml"), "a", "b");
+        assert!(reconstruct_written_content("Edit", &env, None).is_none());
+    }
+
+    // ── identity / enforcement surface (review follow-up) ───────────
+
+    #[test]
+    fn editing_own_mcp_json_identity_is_blocked_end_to_end() {
+        let home = TempHome::new();
+        let path = home.0.join("agents/agnes/.mcp.json");
+        let mine = "{\"mcpServers\":{\"duduclaw\":{\"command\":\"/bin/duduclaw\",\"args\":[\"mcp-server\"],\"env\":{\"DUDUCLAW_AGENT_ID\":\"agnes\",\"DUDUCLAW_AGENT_TOKEN\":\"aa11\"}}}}";
+        std::fs::write(&path, mine).unwrap();
+
+        // Pasting a peer's id (and, in strict mode, their stolen token).
+        let env = edit_envelope(&path, "\"agnes\"", "\"ceo\"");
+        let d = check_identity_surface_tool_call("Edit", &env, &path, &home.0).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedIdentitySurface { .. }));
+
+        // An unrelated server addition still goes through.
+        let ok_env = edit_envelope(
+            &path,
+            "\"mcpServers\":{",
+            "\"mcpServers\":{\"playwright\":{\"command\":\"npx\"},",
+        );
+        assert_eq!(
+            check_identity_surface_tool_call("Edit", &ok_env, &path, &home.0).unwrap(),
+            GuardDecision::AllowedAgentWrite
+        );
+    }
+
+    #[test]
+    fn disarming_the_hook_settings_is_blocked() {
+        let home = TempHome::new();
+        let path = home.0.join("agents/agnes/.claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"hooks\":{\"PreToolUse\":[]}}").unwrap();
+        let env = write_envelope(&path, "{}");
+        let d = check_identity_surface_tool_call("Write", &env, &path, &home.0).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedIdentitySurface { .. }));
+        assert!(d.block_message().unwrap().contains("settings.json"));
+    }
+
+    #[test]
+    fn overwriting_the_identity_key_is_blocked() {
+        let home = TempHome::new();
+        let path = home.0.join("identity.key");
+        let env = write_envelope(&path, "x");
+        let d = check_identity_surface_tool_call("Write", &env, &path, &home.0).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedIdentitySurface { .. }));
+    }
+
+    #[test]
+    fn unrelated_paths_stay_none_for_the_identity_surface() {
+        let home = TempHome::new();
+        let path = home.0.join("agents/agnes/SOUL.md");
+        let env = write_envelope(&path, "hi");
+        assert!(check_identity_surface_tool_call("Write", &env, &path, &home.0).is_none());
     }
 }
 

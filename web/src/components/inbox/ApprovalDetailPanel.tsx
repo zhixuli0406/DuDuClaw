@@ -8,6 +8,7 @@ import {
   ChevronRight,
   ChevronDown,
   AlertTriangle,
+  Compass,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
@@ -25,7 +26,7 @@ import {
 } from '@/components/mds';
 import { timeAgo } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
-import type { ApprovalItem } from '@/lib/api';
+import type { ApprovalItem, ApprovalSimulation } from '@/lib/api';
 import {
   approvalRisk,
   riskNeedsConfirm,
@@ -75,6 +76,50 @@ const DESCRIBED_KINDS = new Set([
   'agent_hire',
   'wiki_ingest',
 ]);
+
+/** D1/D2: `true` when there is an actual narrative or risk point to show —
+ *  guards against rendering an empty section for a `simulation` object whose
+ *  fields are both blank/empty (the judge ran but produced nothing usable). */
+function hasSimulation(sim: ApprovalSimulation | null | undefined): sim is ApprovalSimulation {
+  if (!sim) return false;
+  return sim.world_state_change.trim() !== '' || sim.risk_points.length > 0;
+}
+
+/**
+ * D1/D2 (WebDreamer arXiv:2411.06559): "if approved, what happens next" —
+ * the ActionGuard judge's forward-simulation narrative, when the backend ran
+ * it for this approval kind. Rendered before the decision buttons so it's
+ * part of the evidence the operator reads BEFORE approving, mirroring the
+ * channel-side trajectory line (`approval_notify::approval_body`). Absent
+ * `simulation` (the overwhelming majority of approvals) renders nothing —
+ * purely additive, no placeholder, no "not available" text.
+ */
+function SimulationSection({ simulation, t }: { simulation: ApprovalSimulation; t: (id: string) => string }) {
+  return (
+    <Section title={t('approval.simulation.title')}>
+      <div className="space-y-2 rounded-lg bg-muted p-3">
+        <div className="flex items-start gap-2">
+          <Compass className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+          {simulation.world_state_change.trim() !== '' && (
+            <p className="min-w-0 flex-1 whitespace-pre-wrap text-sm text-foreground">
+              {simulation.world_state_change}
+            </p>
+          )}
+        </div>
+        {simulation.risk_points.length > 0 && (
+          <div className="pl-6">
+            <p className="text-xs font-medium text-muted-foreground">{t('approval.simulation.risks')}</p>
+            <ul className="mt-1 list-disc space-y-0.5 pl-4">
+              {simulation.risk_points.map((point, i) => (
+                <li key={i} className="text-xs text-muted-foreground">{point}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </Section>
+  );
+}
 
 function riskBadgeVariant(level: RiskLevel): 'destructive' | 'secondary' | 'outline' {
   return level === 'high' ? 'destructive' : level === 'medium' ? 'secondary' : 'outline';
@@ -203,6 +248,11 @@ function GenericApprovalView({
           )}
         </div>
       </Section>
+
+      {/* ── D1/D2: forward-simulation narrative, when the judge ran it ── */}
+      {hasSimulation(approval.simulation) && (
+        <SimulationSection simulation={approval.simulation} t={t} />
+      )}
 
       {/* ── Scope of impact (heuristic verification aid, arXiv:2606.05391) ── */}
       {hasPlanFacts(facts) && (

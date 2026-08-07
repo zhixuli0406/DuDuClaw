@@ -126,3 +126,30 @@ describe('<ApprovalDetailPanel> generic (U2 redesign)', () => {
     expect(onApprove).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('<ApprovalDetailPanel> D1/D2 simulation trajectory', () => {
+  it('renders nothing when simulation is absent (backward compat)', () => {
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval()} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByText('If approved, what happens next')).not.toBeInTheDocument();
+  });
+
+  it('renders nothing when simulation fields are both blank/empty', () => {
+    const approval = genericApproval({ simulation: { world_state_change: '   ', risk_points: [] } });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByText('If approved, what happens next')).not.toBeInTheDocument();
+  });
+
+  it('renders the narrative and risk points when simulation is present', () => {
+    const approval = genericApproval({
+      simulation: {
+        world_state_change: 'A refund email will be sent to the customer.',
+        risk_points: ['Amount miscalculation is hard to reverse'],
+      },
+    });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getByText('If approved, what happens next')).toBeInTheDocument();
+    expect(screen.getByText('A refund email will be sent to the customer.')).toBeInTheDocument();
+    expect(screen.getByText('Risks to watch for')).toBeInTheDocument();
+    expect(screen.getByText('Amount miscalculation is hard to reverse')).toBeInTheDocument();
+  });
+});

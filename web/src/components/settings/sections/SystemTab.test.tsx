@@ -79,3 +79,38 @@ describe('<SystemTab> remote-access allowlist', () => {
     expect(payload.allowed_origins).toEqual(['dash.example.com', 'added.example.com']);
   });
 });
+
+describe('<SystemTab> memory dedup gate ([memory] novelty_gate)', () => {
+  it('defaults the toggle to on when the field is absent from system.config', async () => {
+    renderWithProviders(<SystemTab />);
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Memory dedup gate' })).toBeChecked());
+  });
+
+  it('reflects a saved off state from system.config', async () => {
+    configMock.mockResolvedValue({ config: '', allowed_origins: [], novelty_gate_enabled: false });
+    renderWithProviders(<SystemTab />);
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Memory dedup gate' })).not.toBeChecked());
+  });
+
+  it('sends the toggled value in the update_config payload on save', async () => {
+    renderWithProviders(<SystemTab />);
+    // Wait for the async system.config() load to land (mirrors the allowlist
+    // tests above) before interacting — otherwise the load's `setNoveltyGate`
+    // can resolve AFTER the click and silently overwrite the toggle back.
+    await waitFor(() => expect(screen.getByText('dash.example.com')).toBeInTheDocument());
+    const toggle = screen.getByRole('switch', { name: 'Memory dedup gate' });
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalled());
+    // `updateConfigMock.mock.calls` accumulates across every test in this file
+    // (nothing clears it between tests) — take the LAST call, not the first,
+    // since an earlier describe block's test also saves.
+    const lastCall = updateConfigMock.mock.calls.at(-1) as [{ novelty_gate_enabled: boolean }];
+    expect(lastCall[0].novelty_gate_enabled).toBe(false);
+  });
+});

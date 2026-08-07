@@ -23,10 +23,13 @@ use crate::distributor_store::{
 };
 use crate::evolution_events::schema::StagnationDetectionConfig;
 use crate::extension::GatewayExtension;
+use crate::gvu::stagnation::{stagnation_snapshot, GvuStagnationConfig};
+use crate::gvu::telemetry::telemetry_summary;
 use crate::gvu::version_store::VersionStore;
 use crate::partner_store::{
     PartnerCustomerInput, PartnerCustomerPatch, PartnerProfileInput, PartnerStore,
 };
+use crate::playbook;
 use crate::protocol::WsFrame;
 use crate::task_store::{
     ActivityRow, CommentRow, PlanRow, PlanStepRow, TaskIterationRow, TaskRow, TaskStore,
@@ -3464,6 +3467,15 @@ pub struct MethodHandler {
     /// agent's `[os_watch] footprint` without a gateway restart. Background
     /// ingest + distill tasks are spawned once in `server.rs`.
     footprint: Arc<crate::footprint_distill::FootprintTracker>,
+    /// WP-A9: A3 task-forward-model, shared between the `DispatchEngine`
+    /// settle hook (constructed in `server.rs`) and the `GoalLoopDriver`
+    /// predict hook (built in `respawn_goal_loop_driver` below) so both
+    /// hooks read/write the SAME in-memory statistical-bucket cache instead
+    /// of two independently-loaded, never-reconciled copies. `None` unless
+    /// `[task_forward_model] enabled = true` at gateway startup (design
+    /// §7.3 — this field is never constructed at all when disabled, not
+    /// merely inert).
+    forward_model: RwLock<Option<Arc<crate::prediction::task_forward_store::TaskForwardModel>>>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -3564,6 +3576,7 @@ impl MethodHandler {
                 home_dir_for_registry,
                 std::collections::HashSet::new(),
             ),
+            forward_model: RwLock::new(None),
         }
     }
 
@@ -3678,6 +3691,28 @@ impl MethodHandler {
         *self.autopilot_store.write().await = Some(store);
     }
 
+    /// WP-A9: inject the A3 task-forward-model (called once at gateway
+    /// start, only when `[task_forward_model] enabled = true` — see
+    /// `server.rs`). Shared by both the `DispatchEngine` settle hook and
+    /// the `GoalLoopDriver` predict hook — see the `forward_model` field's
+    /// doc comment on why this must be the SAME `Arc`, not two separately
+    /// constructed models.
+    pub async fn set_forward_model(
+        &self,
+        model: Arc<crate::prediction::task_forward_store::TaskForwardModel>,
+    ) {
+        *self.forward_model.write().await = Some(model);
+    }
+
+    /// WP-A9: read back the shared A3 task-forward-model, if one was
+    /// injected. `None` when `[task_forward_model] enabled = false` (the
+    /// default) — callers treat that identically to "hook disabled".
+    pub async fn forward_model(
+        &self,
+    ) -> Option<Arc<crate::prediction::task_forward_store::TaskForwardModel>> {
+        self.forward_model.read().await.clone()
+    }
+
     /// Inject the event broadcast sender for task/activity real-time events.
     pub async fn set_event_tx(&self, tx: tokio::sync::broadcast::Sender<String>) {
         *self.event_tx.write().await = Some(tx);
@@ -3786,6 +3821,13 @@ impl MethodHandler {
         let cfg = crate::goal_loop::GoalLoopConfig::from_home(&self.home_dir);
         let mut driver =
             crate::goal_loop::GoalLoopDriver::new(ts, mq, cfg).with_home_dir(self.home_dir.clone());
+        // WP-A9: wire the SAME forward-model `Arc` the `DispatchEngine`
+        // settle hook uses (constructed once in `server.rs`, gated on
+        // `[task_forward_model] enabled`). `None` ⇒ predict hook stays a
+        // no-op, matching design §7.3's default-off contract.
+        if let Some(fm) = self.forward_model().await {
+            driver = driver.with_forward_model(fm);
+        }
         if let Some(policy) = crate::dispatch_policy::build_policy(&self.home_dir) {
             info!(policy = %policy.kind().as_str(), "Goal loop: dispatch policy active");
             driver = driver.with_policy(policy);
@@ -4621,6 +4663,18 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_system_update_config(params).await
             }
+            // ── WP21 §2.8: delegation permissions (owner/admin only) ─────
+            // Who may hand work to whom, org-wide. Admin-gated like every
+            // other config-writing RPC; the write takes effect on the next
+            // delegation decision (enforcement re-reads config.toml).
+            "delegation.get" => {
+                require_admin!();
+                self.handle_delegation_get().await
+            }
+            "delegation.set" => {
+                require_admin!();
+                self.handle_delegation_set(params, ctx).await
+            }
             "system.autostart.status" => {
                 require_admin!();
                 self.handle_system_autostart_status().await
@@ -4700,6 +4754,43 @@ impl MethodHandler {
             "evolution.history" => {
                 require_manager!();
                 self.handle_evolution_history(params).await
+            }
+            // Evolution v3 dashboard convergence (WP: TODO-evolution-v3-2026-08.md
+            // §"dashboard 統一收斂"). Same access bar as the rest of the
+            // `evolution.*` family — manager+ only, optional `agent_id` scopes to
+            // one agent server-side without an extra ACL round-trip.
+            "evolution.stagnation" => {
+                require_manager!();
+                self.handle_evolution_stagnation(params).await
+            }
+            "evolution.telemetry" => {
+                require_manager!();
+                self.handle_evolution_telemetry(params).await
+            }
+            "evolution.versions" => {
+                require_manager!();
+                self.handle_evolution_versions(params).await
+            }
+            "evolution.consolidations" => {
+                require_manager!();
+                self.handle_evolution_consolidations(params).await
+            }
+
+            // ── Playbook (agent-scoped gene-shaped experience entries) ──
+            // Read surfaces mirror the `memory.*` H2-fix ACL shape (Viewer);
+            // `retire` is a destructive-but-recoverable per-entry mutation, so
+            // it takes the same Owner bar as `memory.forget`.
+            "playbook.list" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_playbook_list(params).await
+            }
+            "playbook.export" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_playbook_export(params).await
+            }
+            "playbook.retire" => {
+                let _ = check_agent!(AccessLevel::Owner);
+                self.handle_playbook_retire(params).await
             }
 
             // ── Cost / cache-efficiency telemetry (admin only) ──
@@ -5467,6 +5558,8 @@ impl MethodHandler {
                     { "name": "runtime.install", "description": "Install a missing AI runtime CLI from a hard-coded whitelist (admin)" },
                     { "name": "system.config", "description": "View system config" },
                     { "name": "system.update_config", "description": "Update system config (log_level, rotation, allowed_origins)" },
+                    { "name": "delegation.get", "description": "Read the org-wide delegation policy + cross-department pairs (admin)" },
+                    { "name": "delegation.set", "description": "Update the delegation policy / cross-department pairs (admin)" },
                     { "name": "system.autostart.status", "description": "Login/boot autostart registration status (admin)" },
                     { "name": "system.autostart.set", "description": "Enable/disable gateway autostart at login/boot (admin)" },
                     { "name": "accounts.add", "description": "Add a new account" },
@@ -5701,6 +5794,46 @@ impl MethodHandler {
                 "Agent name must be lowercase alphanumeric with hyphens, max 64 chars",
             );
         }
+        // WP21 欠帳④ — the delegation system-sender ids (`cron`, `dashboard`,
+        // …) are *not agents* (design doc §2.3). An agent that claimed one
+        // would clear every delegation choke point unconditionally. MCP
+        // `create_agent` already rejects these (mcp.rs); this dashboard path
+        // creates agents too and must apply the same fail-closed check.
+        if duduclaw_core::is_reserved_agent_id(name) {
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "「{name}」是系統保留名稱,不能用來建立 AI 員工。\
+                     保留名稱包含 dashboard / webhook / cron / heartbeat / autopilot / \
+                     goal-loop-driver / a2a-client / default 以及任何以 __ 開頭的名稱,\
+                     請換一個名稱。"
+                ),
+            );
+        }
+
+        // WP22 T4 — reject a name collision against any *other* existing
+        // agent's directory name or `[agent] name` field. The directory-claim
+        // `create_dir` below only catches an exact directory-name match; it
+        // misses an existing agent whose `[agent] name` equals `name` while
+        // living under a differently-named directory — that gap is exactly
+        // what lets the registry's `name → LoadedAgent` map (last-wins) or the
+        // delegation `name → dir` resolver silently pick the wrong one.
+        // Rescan first (bounded) so a just-created sibling agent is visible.
+        if let Ok(mut reg) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.registry.write(),
+        )
+        .await
+        {
+            let _ = reg.scan().await;
+        }
+        let name_collides = self.registry.read().await.list().iter().any(|a| {
+            a.config.agent.name == name
+                || a.dir.file_name().and_then(|n| n.to_str()) == Some(name)
+        });
+        if name_collides {
+            return WsFrame::error_response("", &format!("已有同名的 AI 員工({name}),請換一個名稱"));
+        }
 
         // Optional org placement, validated BEFORE any filesystem effect.
         // `reports_to` must name an existing agent (the supervisor hierarchy
@@ -5778,6 +5911,10 @@ impl MethodHandler {
         }
         Self::seed_builtin_skills(&skills_dir);
 
+        // WP22 T1 — kept for the post-commit `org.toml` write below; the
+        // `toml!` macro consumes these by value.
+        let org_entry = duduclaw_core::OrgEntry::new(&reports_to, &department);
+
         let mut agent_config = toml::toml! {
             [agent]
             name = name
@@ -5847,6 +5984,15 @@ impl MethodHandler {
         if let Err(e) = tokio::fs::rename(&agent_toml_tmp, &agent_toml_path).await {
             let _ = tokio::fs::remove_file(&agent_toml_tmp).await;
             return WsFrame::error_response("", &format!("Failed to commit agent.toml: {e}"));
+        }
+
+        // WP22 T1 — the agent is committed, so record its authoritative org
+        // placement in `<home>/org.toml`. The `[agent] reports_to` /
+        // `department` keys written above are a display mirror from here on;
+        // delegation reads the store. Recorded *after* the commit so an
+        // aborted create never leaves a record behind for the id.
+        if let Err(e) = duduclaw_core::org_store::upsert(&self.home_dir, name, org_entry) {
+            warn!(agent = %name, error = %e, "org.toml upsert failed on agents.create");
         }
 
         // Honor an optional `soul` param (the agent's persona / system prompt).
@@ -6414,6 +6560,29 @@ impl MethodHandler {
             }
         };
 
+        // WP22 T1 — the staged team member is committed; record its
+        // authoritative org placement. Values are read back out of the patched
+        // document rather than from the override params, so the pack's own
+        // wiring (workers → the pack's front desk) is captured when the admin
+        // supplied no override. After the commit, so a rolled-back create
+        // never leaves a record behind for the id.
+        {
+            let agent_tbl = parsed_agent.get("agent").and_then(|v| v.as_table());
+            let field = |k: &str| {
+                agent_tbl
+                    .and_then(|t| t.get(k))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+            };
+            if let Err(e) = duduclaw_core::org_store::upsert(
+                &self.home_dir,
+                &name,
+                duduclaw_core::OrgEntry::new(field("reports_to"), field("department")),
+            ) {
+                warn!(agent = %name, error = %e, "org.toml upsert failed on templates.create_agent");
+            }
+        }
+
         // Same protections as agents.create: file-guard hook + registry rescan.
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
         if let Err(e) =
@@ -6428,6 +6597,28 @@ impl MethodHandler {
             }
         }
 
+        // WP2.1 方案 A:產業包若隨附此角色的行為題庫,一併落到
+        // `<home>/evals/<name>/`(預設 eval_suites_root),讓包裝出的
+        // AI 員工第一天就有 AEE case 維度與 E1 斷言重放的真實基線。
+        // 非致命:沒有題庫(免費角色/自建)或安裝失敗都不影響建立。
+        let eval_suite_cases = match pt::install_eval_suite(
+            &premium_dir,
+            &assembled.name,
+            &name,
+            &self.home_dir,
+        )
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(agent = %name, error = %e, "eval suite install failed on templates.create_agent");
+                None
+            }
+        };
+        if let Some(n) = eval_suite_cases {
+            info!(agent = %name, cases = n, "installed premium eval suite");
+        }
+
         info!(name, role_id, "Agent created from premium template");
         WsFrame::ok_response(
             "",
@@ -6438,7 +6629,8 @@ impl MethodHandler {
                     "name": name,
                     "role": final_role,
                     "role_id": role_id,
-                }
+                },
+                "eval_suite_cases": eval_suite_cases,
             }),
         )
     }
@@ -6749,6 +6941,51 @@ impl MethodHandler {
             (None, None)
         };
         let old_display_name_for_closure = old_display_name.clone();
+
+        // WP22 T1 — when this call moves the agent in the org tree, the
+        // authoritative `<home>/org.toml` record has to move with it. Only
+        // `reports_to` / `department` params trigger it: an unrelated edit must
+        // not quietly adopt a mirror value the operator has not synced. The
+        // same validation the mutation closure applies is repeated here so an
+        // invalid department can never reach the store (the closure rejects it,
+        // but only later).
+        //
+        // # WP22 T5 — computed here, committed only after the mirror write
+        //
+        // This used to `upsert` right here, before the mutation closure ran.
+        // The closure can still fail for a reason unrelated to the org fields
+        // (an invalid `role`, `api_mode`, cron expression, …), and on failure
+        // `update_agent_toml` leaves `agent.toml` untouched — so a rejected
+        // request could still move the agent in the authority while telling
+        // the caller it had failed. Deferring to the `Ok` arm makes the only
+        // possible divergence the safe one: mirror moved, authority stale
+        // (visible as drift in `duduclaw doctor`, no privilege gained).
+        let pending_org_entry: Option<duduclaw_core::OrgEntry> = {
+            let new_reports_to = params.get("reports_to").and_then(|v| v.as_str());
+            let new_department = params
+                .get("department")
+                .and_then(|v| v.as_str())
+                .map(str::trim);
+            let department_ok = new_department
+                .is_none_or(|d| d.is_empty() || duduclaw_core::is_valid_department(d));
+            if (new_reports_to.is_some() || new_department.is_some()) && department_ok {
+                // Carry over whichever half this call does not touch, from
+                // the current authority (store entry, else the mirror).
+                let store = duduclaw_core::org_store::load(&self.home_dir);
+                let current = store.get(&agent_id).cloned().unwrap_or_else(|| {
+                    duduclaw_core::org_store::read_mirror(
+                        &self.home_dir.join("agents").join(&agent_id).join("agent.toml"),
+                    )
+                    .unwrap_or_default()
+                });
+                Some(duduclaw_core::OrgEntry::new(
+                    new_reports_to.unwrap_or(&current.reports_to),
+                    new_department.unwrap_or(&current.department),
+                ))
+            } else {
+                None
+            }
+        };
 
         let params_clone = params.clone();
         let mut changes: Vec<String> = Vec::new();
@@ -7572,6 +7809,17 @@ impl MethodHandler {
 
         match result {
             Ok(hot_reloaded) => {
+                // WP22 T5 — the mirror write committed, so the authority may
+                // now follow. See `pending_org_entry`'s comment for why this
+                // is not done before the closure.
+                if let Some(entry) = pending_org_entry {
+                    if let Err(e) =
+                        duduclaw_core::org_store::upsert(&self.home_dir, &agent_id, entry)
+                    {
+                        warn!(agent = %agent_id, error = %e, "org.toml upsert failed on agents.update");
+                    }
+                }
+
                 // WP: sync SOUL.md / IDENTITY.md self-introduction text to
                 // the new display_name (see comment above the capture site).
                 // Best-effort: a missing file is skipped, an IO error is
@@ -16237,6 +16485,19 @@ impl MethodHandler {
                 .unwrap_or(false)
         };
 
+        // Structured [memory] novelty_gate so the dashboard Settings toggle
+        // shows the saved value (absent / malformed ⇒ true, matching the
+        // fail-closed default in `mcp.rs::novelty_gate_enabled_from_config`).
+        let novelty_gate_enabled: bool = {
+            let table = self.read_config_table(&config_path).await;
+            table
+                .get("memory")
+                .and_then(|s| s.as_table())
+                .and_then(|s| s.get("novelty_gate"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+        };
+
         match tokio::fs::read_to_string(&config_path).await {
             Ok(content) => {
                 // Mask sensitive fields
@@ -16247,7 +16508,13 @@ impl MethodHandler {
                             toml::to_string_pretty(&table).unwrap_or_else(|_| content.clone());
                         WsFrame::ok_response(
                             "",
-                            json!({ "config": masked, "voice": voice, "allowed_origins": allowed_origins, "gap_digest_enabled": gap_digest_enabled }),
+                            json!({
+                                "config": masked,
+                                "voice": voice,
+                                "allowed_origins": allowed_origins,
+                                "gap_digest_enabled": gap_digest_enabled,
+                                "novelty_gate_enabled": novelty_gate_enabled,
+                            }),
                         )
                     }
                     Err(_) => {
@@ -17631,6 +17898,649 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "versions": versions }))
     }
 
+    /// Resolve the `agent_id` param into a list of agent ids to scope a
+    /// dashboard query over: the single named agent, or every registered
+    /// agent when the param is absent/empty (mirrors `handle_evolution_history`'s
+    /// existing "empty → all agents" convention).
+    async fn resolve_evolution_agent_ids(&self, agent_id: &str) -> Vec<String> {
+        if !agent_id.is_empty() {
+            return vec![agent_id.to_string()];
+        }
+        let reg = self.registry.read().await;
+        reg.list().iter().map(|a| a.config.agent.name.clone()).collect()
+    }
+
+    /// `evolution.stagnation` — AVO §2.4 stagnation detector snapshot, exposed
+    /// read-only to the dashboard (WP0.5 wiring: the detector itself already
+    /// runs in `StagnationMonitor::tick`; this RPC lets an operator query the
+    /// same signals on demand instead of waiting for the next alert). Optional
+    /// `agent_id`; empty scopes to every registered agent.
+    async fn handle_evolution_stagnation(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_ids = self.resolve_evolution_agent_ids(agent_id).await;
+        let agents_dir = self.home_dir.join("agents");
+        let db_path = self.home_dir.join("evolution.db");
+
+        // No GVU history yet anywhere on this install — every agent is
+        // trivially "not stagnant" (there is nothing to be stuck on).
+        if !db_path.exists() {
+            let snapshots: Vec<Value> = agent_ids
+                .iter()
+                .map(|aid| {
+                    json!({
+                        "agent_id": aid,
+                        "is_stagnant": false,
+                        "signals": [],
+                        "summary": null,
+                        "checked_at": Utc::now().to_rfc3339(),
+                    })
+                })
+                .collect();
+            return WsFrame::ok_response("", json!({ "snapshots": snapshots }));
+        }
+
+        let vs = VersionStore::new(&db_path);
+        let snapshots: Vec<Value> = agent_ids
+            .iter()
+            .map(|aid| {
+                let cfg = GvuStagnationConfig::from_agent_dir(&agents_dir.join(aid));
+                let snap = stagnation_snapshot(&vs, aid, &cfg);
+                let stagnant = snap.is_stagnant();
+                json!({
+                    "agent_id": snap.agent_id,
+                    "is_stagnant": stagnant,
+                    "signals": snap.signals,
+                    "summary": if stagnant { Some(snap.summary_zh()) } else { None },
+                    "checked_at": snap.checked_at.to_rfc3339(),
+                })
+            })
+            .collect();
+        WsFrame::ok_response("", json!({ "snapshots": snapshots }))
+    }
+
+    /// `evolution.telemetry` — WP0.6 Verifier/Updater rejection distribution
+    /// (ABC §3.3 P2 diagnostic half). Optional `agent_id` (empty aggregates
+    /// every registered agent) + `days` (default 7, capped 1..=90).
+    async fn handle_evolution_telemetry(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let days = params.get("days").and_then(|v| v.as_i64()).unwrap_or(7).clamp(1, 90);
+        let agent_ids = self.resolve_evolution_agent_ids(agent_id).await;
+
+        let mut total: u64 = 0;
+        let mut by_stage_layer: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, u64>,
+        > = Default::default();
+        for aid in &agent_ids {
+            let summary = telemetry_summary(&self.home_dir, aid, days);
+            total += summary.total;
+            for (stage, layers) in summary.by_stage_layer {
+                let stage_entry = by_stage_layer.entry(stage).or_default();
+                for (layer, count) in layers {
+                    *stage_entry.entry(layer).or_insert(0) += count;
+                }
+            }
+        }
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "agent_id": agent_id,
+                "days": days,
+                "total": total,
+                "by_stage_layer": by_stage_layer,
+            }),
+        )
+    }
+
+    /// `evolution.versions` — observation-window version table, superset of
+    /// `evolution.history` with the WP0.4 `ExpiredNoData` status surfaced
+    /// explicitly and the one-time low-data alert flag (`gvu_low_data_alerts`)
+    /// joined in so the dashboard can render "observation window closed — not
+    /// enough data" distinctly from a pass/fail verdict.
+    async fn handle_evolution_versions(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(100) as usize;
+
+        let db_path = self.home_dir.join("evolution.db");
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "versions": [] }));
+        }
+        let vs = VersionStore::new(&db_path);
+        let agent_ids = self.resolve_evolution_agent_ids(agent_id).await;
+
+        let mut versions = Vec::new();
+        for aid in &agent_ids {
+            for v in vs.get_history(aid, limit) {
+                let low_data_alert_sent = vs.low_data_alert_sent(&v.version_id);
+                versions.push(json!({
+                    "version_id": v.version_id,
+                    "agent_id": v.agent_id,
+                    "soul_summary": v.soul_summary,
+                    "soul_hash": v.soul_hash,
+                    "applied_at": v.applied_at.to_rfc3339(),
+                    "observation_end": v.observation_end.to_rfc3339(),
+                    // Debug-format ("Observing"/"Confirmed"/"RolledBack"/
+                    // "ExpiredNoData") — kept identical to `evolution.history`'s
+                    // existing contract so the dashboard's version card can
+                    // switch on the same string set plus the new variant.
+                    "status": format!("{:?}", v.status),
+                    "low_data_alert_sent": low_data_alert_sent,
+                    "pre_metrics": {
+                        "positive_feedback_ratio": v.pre_metrics.positive_feedback_ratio,
+                        "prediction_error": v.pre_metrics.avg_prediction_error,
+                        "user_correction_rate": v.pre_metrics.user_correction_rate,
+                        "contract_violations": v.pre_metrics.contract_violations,
+                        "conversations_count": v.pre_metrics.conversations_count,
+                        "feedback_available": v.pre_metrics.feedback_available,
+                    },
+                    "post_metrics": v.post_metrics.as_ref().map(|m| json!({
+                        "positive_feedback_ratio": m.positive_feedback_ratio,
+                        "prediction_error": m.avg_prediction_error,
+                        "user_correction_rate": m.user_correction_rate,
+                        "contract_violations": m.contract_violations,
+                        "conversations_count": m.conversations_count,
+                        "feedback_available": m.feedback_available,
+                    })),
+                }));
+            }
+        }
+
+        versions.sort_by(|a, b| {
+            let ta = a.get("applied_at").and_then(|v| v.as_str()).unwrap_or("");
+            let tb = b.get("applied_at").and_then(|v| v.as_str()).unwrap_or("");
+            tb.cmp(ta)
+        });
+        versions.truncate(limit);
+
+        WsFrame::ok_response("", json!({ "versions": versions }))
+    }
+
+    /// `evolution.consolidations` — WP0.2 consolidation attempt audit trail
+    /// (`gvu_consolidations`): every whole-file SOUL.md rewrite the cap
+    /// deadlock breaker has attempted, with its outcome.
+    async fn handle_evolution_consolidations(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(100) as usize;
+
+        let db_path = self.home_dir.join("evolution.db");
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "consolidations": [] }));
+        }
+        let vs = VersionStore::new(&db_path);
+        let agent_ids = self.resolve_evolution_agent_ids(agent_id).await;
+
+        let mut records: Vec<Value> = Vec::new();
+        for aid in &agent_ids {
+            for r in vs.consolidation_history(aid, limit) {
+                records.push(json!({
+                    "id": r.id,
+                    "agent_id": r.agent_id,
+                    "attempted_at": r.attempted_at,
+                    "outcome": r.outcome,
+                    "from_bytes": r.from_bytes,
+                    "to_bytes": r.to_bytes,
+                    "detail": r.detail,
+                }));
+            }
+        }
+        records.sort_by(|a, b| {
+            let ta = a.get("attempted_at").and_then(|v| v.as_str()).unwrap_or("");
+            let tb = b.get("attempted_at").and_then(|v| v.as_str()).unwrap_or("");
+            tb.cmp(ta)
+        });
+        records.truncate(limit);
+
+        WsFrame::ok_response("", json!({ "consolidations": records }))
+    }
+
+    // ── Playbook (WP1.2/1.3 gene-shaped experience entries) ──────
+
+    /// `playbook.list` — every current playbook entry for one agent (all
+    /// lifecycle states, including `retired`, so the dashboard can show full
+    /// audit history; `select.rs`'s injection filtering is a separate, more
+    /// restrictive concern this RPC does not replicate).
+    async fn handle_playbook_list(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "agent_id": agent_id, "entries": [] }));
+        }
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+
+        let active = playbook::list_active(&engine, agent_id).await;
+        let entries: Vec<Value> = active
+            .into_iter()
+            .map(|(mem, meta, stats)| {
+                json!({
+                    "id": mem.id,
+                    "content": mem.content,
+                    "category": meta.category.as_str(),
+                    "state": meta.state.as_str(),
+                    "signals_match": meta.signals_match,
+                    "eval_cases": meta.eval_cases.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+                    "success_streak": meta.success_streak,
+                    "revision": meta.revision,
+                    "helpful": stats.helpful,
+                    "harmful": stats.harmful,
+                    "net_score": stats.net(),
+                    "origin": meta.origin,
+                    "created_at": mem.timestamp.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        WsFrame::ok_response("", json!({ "agent_id": agent_id, "entries": entries }))
+    }
+
+    /// `playbook.retire` — human-initiated terminal retirement of one entry
+    /// (mirrors `memory.forget`'s Owner-level, single-row, non-batch shape).
+    /// Goes through the same `PlaybookDelta::Retire` + `apply_deltas` path the
+    /// autonomous AEE loop uses — there is no separate "operator delete" code
+    /// path, so a manual retire is auditable exactly like an automatic one.
+    async fn handle_playbook_retire(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let entry_id = params.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let reason_raw = params.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let reason = if reason_raw.is_empty() { "operator manual retire" } else { reason_raw };
+
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+        if entry_id.is_empty() {
+            return WsFrame::error_response("", "Missing 'id' parameter");
+        }
+
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::error_response("", "Playbook entry not found");
+        }
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+
+        // `Retire` deltas never touch `must_not`/eval-case validation (see
+        // `delta::validate_delta`), so an empty contract slice + the agent's
+        // eval root are safe placeholders here — no CONTRACT.toml read needed
+        // for this op.
+        let eval_cases_root = self.home_dir.join("agents").join(agent_id).join("evals");
+        let delta = playbook::PlaybookDelta::Retire {
+            id: entry_id.to_string(),
+            reason: reason.to_string(),
+        };
+        let outcome = playbook::apply_deltas(
+            &engine,
+            agent_id,
+            vec![delta],
+            &[],
+            &eval_cases_root,
+            Utc::now(),
+        )
+        .await;
+
+        if let Some((_, reason)) = outcome.rejected.first() {
+            return WsFrame::error_response("", &format!("Retire rejected: {reason}"));
+        }
+        let retired = outcome
+            .applied
+            .iter()
+            .any(|op| matches!(op, playbook::AppliedOp::Retired { .. }));
+        if !retired {
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "success": false,
+                    "retired": false,
+                    "reason": "entry not found (already retired or unknown id)",
+                }),
+            );
+        }
+        WsFrame::ok_response("", json!({ "success": true, "retired": true, "id": entry_id }))
+    }
+
+    /// `playbook.export` — lossless GEP-gene-shaped JSON export (D5=B: local
+    /// schema alignment only, no hub I/O). Patches `x-duduclaw.entry_id` /
+    /// `.agent_id` onto each gene per `gene::to_gene`'s documented caller
+    /// contract (the pure function itself has no id to fill those with).
+    async fn handle_playbook_export(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::ok_response(
+                "",
+                json!({ "agent_id": agent_id, "gene_schema": playbook::gene::GENE_SCHEMA, "genes": [] }),
+            );
+        }
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+
+        let active = playbook::list_active(&engine, agent_id).await;
+        let genes: Vec<Value> = active
+            .into_iter()
+            .map(|(mem, meta, stats)| {
+                let mut gene = playbook::to_gene(&mem.content, &meta, &stats);
+                if let Some(obj) = gene.get_mut("x-duduclaw").and_then(|v| v.as_object_mut()) {
+                    obj.insert("entry_id".to_string(), json!(mem.id));
+                    obj.insert("agent_id".to_string(), json!(agent_id));
+                }
+                gene
+            })
+            .collect();
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "agent_id": agent_id,
+                "gene_schema": playbook::gene::GENE_SCHEMA,
+                "genes": genes,
+            }),
+        )
+    }
+}
+
+#[cfg(test)]
+mod evolution_v3_dashboard_tests {
+    //! Evolution v3 dashboard convergence RPCs (TODO-evolution-v3-2026-08.md
+    //! §"dashboard 統一收斂"): `evolution.stagnation` / `.telemetry` /
+    //! `.versions` / `.consolidations` and `playbook.list` / `.retire` /
+    //! `.export`. Mirrors the `MethodHandler::new(root).await` +
+    //! `handler.handle_xxx(json!({...})).await` harness used throughout this
+    //! file (see `skills_install_scan_tests` above).
+    use super::*;
+    use crate::gvu::telemetry::record_rejection;
+    use crate::gvu::version_store::{ExperimentLogEntry, SoulVersion, VersionMetrics, VersionStatus};
+    use crate::playbook::{EvalCaseRef, PlaybookCategory, PlaybookDelta};
+
+    fn payload(frame: &WsFrame) -> Value {
+        match frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => p.clone(),
+            WsFrame::Response { ok: false, error, .. } => {
+                panic!("RPC returned an error frame: {error:?}")
+            }
+            other => panic!("unexpected frame shape: {other:?}"),
+        }
+    }
+
+    fn error_text(frame: &WsFrame) -> String {
+        match frame {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    // ── evolution.stagnation ─────────────────────────────────
+
+    #[tokio::test]
+    async fn stagnation_with_no_gvu_history_is_never_stagnant() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_evolution_stagnation(json!({ "agent_id": "agent-a" }))
+            .await;
+        let p = payload(&frame);
+        let snapshots = p["snapshots"].as_array().expect("snapshots array");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0]["agent_id"], "agent-a");
+        assert_eq!(snapshots[0]["is_stagnant"], false);
+        assert!(snapshots[0]["signals"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stagnation_detects_consecutive_non_applied_signal() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let db_path = home.path().join("evolution.db");
+        let vs = VersionStore::new(&db_path);
+        for _ in 0..5 {
+            vs.record_experiment(&ExperimentLogEntry::new(
+                "agent-a",
+                3,
+                3,
+                std::time::Duration::from_secs(60),
+                "skipped",
+                "cap exceeded",
+            ));
+        }
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_evolution_stagnation(json!({ "agent_id": "agent-a" }))
+            .await;
+        let p = payload(&frame);
+        let snap = &p["snapshots"][0];
+        assert_eq!(snap["is_stagnant"], true);
+        assert!(!snap["signals"].as_array().unwrap().is_empty());
+        assert!(snap["summary"].as_str().unwrap().contains("agent-a"));
+    }
+
+    // ── evolution.telemetry ──────────────────────────────────
+
+    #[tokio::test]
+    async fn telemetry_aggregates_rejection_counts_by_stage_and_layer() {
+        let home = tempfile::tempdir().expect("tempdir");
+        record_rejection(home.path(), "agent-a", "verify", "L1-Deterministic", "too long", "c1", 1);
+        record_rejection(home.path(), "agent-a", "verify", "L1-Deterministic", "too long again", "c2", 2);
+        record_rejection(home.path(), "agent-a", "apply", "cap_lines", "over cap", "c3", 1);
+        // Different agent — must not leak into the "agent-a" summary.
+        record_rejection(home.path(), "agent-b", "verify", "L1-Deterministic", "unrelated", "c4", 1);
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_evolution_telemetry(json!({ "agent_id": "agent-a", "days": 7 }))
+            .await;
+        let p = payload(&frame);
+        assert_eq!(p["total"], 3);
+        assert_eq!(p["by_stage_layer"]["verify"]["L1-Deterministic"], 2);
+        assert_eq!(p["by_stage_layer"]["apply"]["cap_lines"], 1);
+    }
+
+    // ── evolution.versions ───────────────────────────────────
+
+    fn sample_version(agent_id: &str, status: VersionStatus) -> SoulVersion {
+        SoulVersion {
+            version_id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent_id.to_string(),
+            soul_hash: "deadbeef".to_string(),
+            soul_summary: "summary".to_string(),
+            applied_at: Utc::now(),
+            observation_end: Utc::now(),
+            status,
+            pre_metrics: VersionMetrics::default(),
+            post_metrics: None,
+            proposal_id: "prop-1".to_string(),
+            rollback_diff: "diff".to_string(),
+            rollback_diff_hash: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn versions_surfaces_expired_no_data_status_and_low_data_alert_flag() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let db_path = home.path().join("evolution.db");
+        let vs = VersionStore::new(&db_path);
+        let v = sample_version("agent-a", VersionStatus::Observing);
+        vs.record_version(&v).unwrap();
+        vs.mark_expired_no_data(&v.version_id, &VersionMetrics::default()).unwrap();
+        vs.mark_low_data_alert_sent(&v.version_id, "agent-a").unwrap();
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_evolution_versions(json!({ "agent_id": "agent-a" }))
+            .await;
+        let p = payload(&frame);
+        let versions = p["versions"].as_array().expect("versions array");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["status"], "ExpiredNoData");
+        assert_eq!(versions[0]["low_data_alert_sent"], true);
+    }
+
+    // ── evolution.consolidations ─────────────────────────────
+
+    #[tokio::test]
+    async fn consolidations_lists_attempts_newest_first() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let db_path = home.path().join("evolution.db");
+        let vs = VersionStore::new(&db_path);
+        let id1 = vs.record_consolidation_attempt("agent-a", 9000).expect("attempt 1");
+        vs.finish_consolidation(&id1, "rejected", None, "collapse guard tripped");
+        let id2 = vs.record_consolidation_attempt("agent-a", 9000).expect("attempt 2");
+        vs.finish_consolidation(&id2, "applied", Some(6000), "ok");
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_evolution_consolidations(json!({ "agent_id": "agent-a" }))
+            .await;
+        let p = payload(&frame);
+        let records = p["consolidations"].as_array().expect("consolidations array");
+        assert_eq!(records.len(), 2);
+        // Newest attempt (id2, applied) sorts first.
+        assert_eq!(records[0]["outcome"], "applied");
+        assert_eq!(records[0]["to_bytes"], 6000);
+        assert_eq!(records[1]["outcome"], "rejected");
+    }
+
+    // ── playbook.list / .retire / .export ────────────────────
+
+    /// Fixture eval case tree — mirrors `crate::playbook::store::tests::temp_eval_root`.
+    fn temp_eval_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let suite = dir.path().join("s");
+        std::fs::create_dir(&suite).unwrap();
+        std::fs::write(
+            suite.join("c.toml"),
+            "[case]\nname = \"c\"\nagent = \"a\"\nprompt = \"hi\"\n[judge]\nrubric = \"r\"\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Seed one playbook entry directly through `playbook::apply_deltas` — the
+    /// same write path the AEE loop uses — into the on-disk memory db the RPC
+    /// layer's `agent_memory_db_path` will resolve to.
+    async fn seed_playbook_entry(home: &std::path::Path, agent_id: &str) -> String {
+        let evals = temp_eval_root();
+        let state_dir = home.join("agents").join(agent_id).join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let db_path = state_dir.join("memory.db");
+        let engine = SqliteMemoryEngine::new(&db_path).expect("open memory db");
+
+        let add = PlaybookDelta::Add {
+            assertions: crate::playbook::entry::EntryAssertions { output_contains: vec!["ok".to_string()], ..Default::default() },
+            content: "always confirm the refund amount before issuing it".to_string(),
+            category: PlaybookCategory::Repair,
+            signals_match: vec!["mistake:capability".to_string()],
+            eval_cases: vec![EvalCaseRef("s/c".to_string())],
+            strategy: Vec::new(),
+            rationale: "seed".to_string(),
+        };
+        let outcome =
+            playbook::apply_deltas(&engine, agent_id, vec![add], &[], evals.path(), Utc::now()).await;
+        assert!(outcome.rejected.is_empty(), "seed Add must not be rejected: {:?}", outcome.rejected);
+
+        let active = playbook::list_active(&engine, agent_id).await;
+        active[0].0.id.clone()
+    }
+
+    #[tokio::test]
+    async fn playbook_list_returns_the_seeded_entry() {
+        let home = tempfile::tempdir().expect("tempdir");
+        seed_playbook_entry(home.path(), "agent-a").await;
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler.handle_playbook_list(json!({ "agent_id": "agent-a" })).await;
+        let p = payload(&frame);
+        let entries = p["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["category"], "repair");
+        assert_eq!(entries[0]["state"], "probation");
+        assert_eq!(entries[0]["helpful"], 1);
+        assert_eq!(entries[0]["harmful"], 0);
+    }
+
+    #[tokio::test]
+    async fn playbook_retire_marks_entry_retired() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let id = seed_playbook_entry(home.path(), "agent-a").await;
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_playbook_retire(json!({ "agent_id": "agent-a", "id": id, "reason": "no longer needed" }))
+            .await;
+        let p = payload(&frame);
+        assert_eq!(p["success"], true);
+        assert_eq!(p["retired"], true);
+
+        let list_frame = handler.handle_playbook_list(json!({ "agent_id": "agent-a" })).await;
+        let entries = payload(&list_frame);
+        assert_eq!(entries["entries"][0]["state"], "retired");
+    }
+
+    #[tokio::test]
+    async fn playbook_retire_unknown_id_reports_not_retired_without_erroring() {
+        let home = tempfile::tempdir().expect("tempdir");
+        seed_playbook_entry(home.path(), "agent-a").await;
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_playbook_retire(json!({ "agent_id": "agent-a", "id": "does-not-exist" }))
+            .await;
+        let p = payload(&frame);
+        assert_eq!(p["success"], false);
+        assert_eq!(p["retired"], false);
+    }
+
+    #[tokio::test]
+    async fn playbook_retire_missing_id_param_is_an_error() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_playbook_retire(json!({ "agent_id": "agent-a" }))
+            .await;
+        assert!(matches!(frame, WsFrame::Response { ok: false, .. }));
+        assert!(error_text(&frame).contains("id"));
+    }
+
+    #[tokio::test]
+    async fn playbook_export_produces_lossless_gene_json() {
+        let home = tempfile::tempdir().expect("tempdir");
+        seed_playbook_entry(home.path(), "agent-a").await;
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler.handle_playbook_export(json!({ "agent_id": "agent-a" })).await;
+        let p = payload(&frame);
+        assert_eq!(p["gene_schema"], playbook::gene::GENE_SCHEMA);
+        let genes = p["genes"].as_array().expect("genes array");
+        assert_eq!(genes.len(), 1);
+        assert_eq!(genes[0]["type"], "gene");
+        assert_eq!(genes[0]["category"], "repair");
+        assert_eq!(genes[0]["x-duduclaw"]["agent_id"], "agent-a");
+        assert!(!genes[0]["x-duduclaw"]["entry_id"].as_str().unwrap().is_empty());
+    }
+}
+
+impl MethodHandler {
     // ── Models ──────────────────────────────────────────────
 
     /// Detect which AI runtime CLIs are installed and whether Claude OAuth is
@@ -18078,6 +18988,31 @@ impl MethodHandler {
             }
         }
 
+        // ── [memory] novelty_gate (B1 write-time near-duplicate rejection) ──
+        // NOT hot-applied like gap_digest_enabled above: `mcp.rs::
+        // novelty_gate_enabled_from_config` is read once, when a `duduclaw
+        // mcp-server` process starts (`maybe_with_semantic_embedder`), and
+        // cached in that process's `SqliteMemoryEngine` for its lifetime.
+        // Persisting here is still correct — a NEW MCP server process (the
+        // next agent session under the default fresh-spawn CLI runtime picks
+        // this up on its very next turn) reads the new value — but an
+        // already-running long-lived session (PTY-pool mode) will not see
+        // the change until it restarts. Flagged in `changes` so the caller
+        // can surface the same "restart/new-session" honesty the dashboard
+        // needs instead of implying instant effect.
+        if let Some(v) = params.get("novelty_gate_enabled").and_then(|v| v.as_bool()) {
+            let memory = table
+                .entry("memory")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(memory) = memory {
+                memory.insert("novelty_gate".into(), toml::Value::Boolean(v));
+                changes.push(format!("memory.novelty_gate = {v} (applies to new sessions)"));
+            } else {
+                return WsFrame::error_response("", "Invalid [memory] section in config.toml");
+            }
+        }
+
         // ── G.4 [logging] format (pretty/json) ──
         if let Some(v) = params.get("log_format").and_then(|v| v.as_str()) {
             match v {
@@ -18414,6 +19349,461 @@ impl MethodHandler {
                 "applied": origins_applied || applied_immediate,
                 // Drivers that were abort+respawned with the new config.
                 "hot_reloaded": hot_reloaded,
+            }),
+        )
+    }
+
+    // ── WP21 §2.8 — delegation policy admin surface ──────────────────────────
+    //
+    // `config.toml [delegation]` is the org-wide answer to "which AI staffer may
+    // hand work to which". The enforcement points re-read it on every decision,
+    // so a dashboard write takes effect without a restart.
+    //
+    //   [delegation]
+    //   policy = "department"                        # department / hierarchy / open
+    //   allow  = [["sales-lead", "warehouse-lead"]]  # unordered pair ⇒ two-way
+    //
+    // Both RPCs are admin-gated in `dispatch` (same gate as `runtime.install` /
+    // `system.update_config`), and every accepted write is appended to the
+    // security audit log as `delegation_config_changed` with before/after.
+
+    /// Order-insensitive canonical form of a whitelist pair, so `["a","b"]` and
+    /// `["b","a"]` are the same entry for dedup purposes.
+    fn delegation_pair_key(a: &str, b: &str) -> (String, String) {
+        if a <= b {
+            (a.to_string(), b.to_string())
+        } else {
+            (b.to_string(), a.to_string())
+        }
+    }
+
+    /// Read `[delegation]` out of an already-parsed config table.
+    ///
+    /// Never fails: an absent section ⇒ the defaults (`department`, empty
+    /// whitelist); malformed values are dropped individually and reported in
+    /// `warnings` (zh-TW, operator-facing) rather than failing the whole read —
+    /// the dashboard must still be able to show and repair a bad config.
+    fn parse_delegation_section(
+        table: &toml::Table,
+    ) -> (String, Vec<(String, String)>, Vec<String>) {
+        use duduclaw_core::delegation_policy::DelegationPolicy;
+
+        let mut warnings: Vec<String> = Vec::new();
+        let section = table.get("delegation").and_then(|v| v.as_table());
+        let Some(section) = section else {
+            if table.get("delegation").is_some() {
+                warnings.push(
+                    "config.toml 的 [delegation] 區段格式有誤(不是一個設定區段),已改用預設值。"
+                        .to_string(),
+                );
+            }
+            return (
+                DelegationPolicy::default().as_str().to_string(),
+                Vec::new(),
+                warnings,
+            );
+        };
+
+        // policy — unknown value falls back to the (stricter) default + warning.
+        let raw_policy = section
+            .get("policy")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DelegationPolicy::default().as_str());
+        let (policy, policy_warning) = DelegationPolicy::from_config_value(raw_policy);
+        if let Some(w) = policy_warning {
+            warnings.push(w);
+        }
+
+        // allow — every item must be exactly two non-empty strings. Bad items
+        // are ignored individually (spec §2.2) so one typo cannot disable the
+        // whole whitelist.
+        let mut allow: Vec<(String, String)> = Vec::new();
+        match section.get("allow") {
+            None => {}
+            Some(toml::Value::Array(items)) => {
+                let mut seen: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                for (idx, item) in items.iter().enumerate() {
+                    let pair = item.as_array().filter(|a| a.len() == 2).and_then(|a| {
+                        let x = a[0].as_str().map(str::trim).filter(|s| !s.is_empty())?;
+                        let y = a[1].as_str().map(str::trim).filter(|s| !s.is_empty())?;
+                        Some((x.to_string(), y.to_string()))
+                    });
+                    match pair {
+                        None => warnings.push(format!(
+                            "config.toml [delegation] allow 第 {} 組設定格式有誤(每組必須剛好兩位 AI 員工),已忽略。",
+                            idx + 1
+                        )),
+                        Some((x, y)) if x == y => warnings.push(format!(
+                            "config.toml [delegation] allow 第 {} 組是同一位 AI 員工({x}),已忽略。",
+                            idx + 1
+                        )),
+                        Some((x, y)) => {
+                            let key = Self::delegation_pair_key(&x, &y);
+                            if seen.insert(key) {
+                                allow.push((x, y));
+                            }
+                        }
+                    }
+                }
+            }
+            Some(_) => warnings
+                .push("config.toml [delegation] allow 必須是配對清單,格式有誤已忽略。".to_string()),
+        }
+
+        (policy.as_str().to_string(), allow, warnings)
+    }
+
+    /// `delegation.get` — current policy + whitelist + any config warnings.
+    async fn handle_delegation_get(&self) -> WsFrame {
+        let table = self
+            .read_config_table(&self.home_dir.join("config.toml"))
+            .await;
+        let (policy, allow, warnings) = Self::parse_delegation_section(&table);
+        WsFrame::ok_response(
+            "",
+            json!({
+                "policy": policy,
+                "allow": allow.iter().map(|(a, b)| json!([a, b])).collect::<Vec<_>>(),
+                "warnings": warnings,
+            }),
+        )
+    }
+
+    /// `delegation.set` — validate and persist `{ policy?, allow? }`.
+    ///
+    /// Fail-closed: an unknown policy, a malformed pair, or a pair naming an
+    /// agent that does not exist rejects the WHOLE payload (nothing is written)
+    /// — a half-applied permission boundary is worse than none. Self-pairs and
+    /// duplicates are cleaned rather than rejected, because they carry no
+    /// meaning either way.
+    async fn handle_delegation_set(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        use duduclaw_core::delegation_policy::DelegationPolicy;
+
+        /// Guardrail on config size — a whitelist this long is a policy smell,
+        /// not a legitimate setup, and keeps the config file reviewable.
+        const MAX_ALLOW_PAIRS: usize = 200;
+
+        let policy_param = params.get("policy");
+        let allow_param = params.get("allow");
+        if policy_param.is_none() && allow_param.is_none() {
+            return WsFrame::error_response(
+                "",
+                "沒有要更新的項目。請提供 policy 或 allow(跨部門協作配對)。",
+            );
+        }
+
+        // ── policy ──
+        let new_policy = match policy_param {
+            None => None,
+            Some(v) => {
+                let raw = match v.as_str() {
+                    Some(s) => s,
+                    None => {
+                        return WsFrame::error_response("", "policy 必須是文字。");
+                    }
+                };
+                match DelegationPolicy::parse(raw) {
+                    Some(p) => Some(p),
+                    None => {
+                        return WsFrame::error_response(
+                            "",
+                            &format!(
+                                "無法辨識的委派模式「{}」。可用值:department(部門)/ hierarchy(階層)/ open(開放)。",
+                                duduclaw_core::truncate_chars(raw.trim(), 40)
+                            ),
+                        );
+                    }
+                }
+            }
+        };
+
+        // ── allow ──
+        let new_allow: Option<Vec<(String, String)>> = match allow_param {
+            None => None,
+            Some(v) => {
+                let items = match v.as_array() {
+                    Some(a) => a,
+                    None => {
+                        return WsFrame::error_response("", "allow 必須是配對清單。");
+                    }
+                };
+                if items.len() > MAX_ALLOW_PAIRS {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("跨部門協作配對最多 {MAX_ALLOW_PAIRS} 組。"),
+                    );
+                }
+                let mut raw_pairs: Vec<(String, String)> = Vec::new();
+                for (idx, item) in items.iter().enumerate() {
+                    let arr = match item.as_array() {
+                        Some(a) if a.len() == 2 => a,
+                        _ => {
+                            return WsFrame::error_response(
+                                "",
+                                &format!(
+                                    "第 {} 組配對格式有誤:每組必須剛好選兩位 AI 員工。",
+                                    idx + 1
+                                ),
+                            );
+                        }
+                    };
+                    let a = arr[0].as_str().map(str::trim).unwrap_or("");
+                    let b = arr[1].as_str().map(str::trim).unwrap_or("");
+                    if a.is_empty() || b.is_empty() {
+                        return WsFrame::error_response(
+                            "",
+                            &format!("第 {} 組配對還沒選滿兩位 AI 員工。", idx + 1),
+                        );
+                    }
+                    raw_pairs.push((a.to_string(), b.to_string()));
+                }
+
+                // WP21 欠帳③ — namespace unification: `gate_bus_dispatch` /
+                // `DispatchOrgView` / mcp.rs `org_snapshot` all key agents by
+                // their **directory name** (bus tasks carry `sender_agent` /
+                // `target` as directory names), while the registry's `get()` /
+                // `list()` index by `[agent] name`. Those two need not match.
+                // Validating (and persisting) whatever the caller typed against
+                // `config.agent.name` alone would accept a value that then
+                // never matches at enforcement time — a whitelist entry that
+                // passes save but silently grants nothing. So: resolve each id
+                // against the directory-name namespace first; if that misses,
+                // resolve via `name → directory name` and normalize to the
+                // directory name before it is ever written to config.toml.
+                //
+                // WP22 T4 — `[agent] name` is supposed to be unique, but
+                // nothing enforced that before this WP (create-time checks are
+                // new; existing installs can already have two directories
+                // sharing a name). Note this deliberately does NOT read
+                // through `self.registry`: `AgentRegistry::scan` already
+                // collapses same-name directories into a single last-wins
+                // entry keyed by name (see `duduclaw_agent::registry`), so by
+                // the time `reg.list()` is observable the duplicate-directory
+                // information needed to DETECT the collision is already gone
+                // — only one of the two directories would ever be visible.
+                // Scanning `<home>/agents/` directly here preserves both, so
+                // a name that maps to more than one directory can be flagged
+                // and rejected outright instead of silently resolved to
+                // whichever directory the registry happened to keep.
+                let (known_dirs, name_to_dir, ambiguous_names): (
+                    std::collections::HashSet<String>,
+                    std::collections::HashMap<String, String>,
+                    std::collections::HashSet<String>,
+                ) = {
+                    let mut dirs = std::collections::HashSet::new();
+                    let mut map: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    let mut ambiguous = std::collections::HashSet::new();
+                    if let Ok(entries) = std::fs::read_dir(self.home_dir.join("agents")) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if !path.is_dir() {
+                                continue;
+                            }
+                            let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+                                Some(n) => n.to_string(),
+                                None => continue,
+                            };
+                            dirs.insert(dir_name.clone());
+                            let Ok(content) = std::fs::read_to_string(path.join("agent.toml"))
+                            else {
+                                continue;
+                            };
+                            let Ok(table) = content.parse::<toml::Table>() else {
+                                continue;
+                            };
+                            let Some(name) = table
+                                .get("agent")
+                                .and_then(|a| a.get("name"))
+                                .and_then(|v| v.as_str())
+                            else {
+                                continue;
+                            };
+                            if let Some(existing_dir) = map.get(name) {
+                                if existing_dir != &dir_name {
+                                    ambiguous.insert(name.to_string());
+                                }
+                            }
+                            map.insert(name.to_string(), dir_name);
+                        }
+                    }
+                    (dirs, map, ambiguous)
+                };
+                // Returns `(resolved directory name, is_ambiguous)`. Directory
+                // names always take priority and are never ambiguous — the
+                // caller can always disambiguate by typing the directory name
+                // (design doc §5).
+                let resolve_to_dir_name = |id: &str| -> (Option<String>, bool) {
+                    if known_dirs.contains(id) {
+                        (Some(id.to_string()), false)
+                    } else if ambiguous_names.contains(id) {
+                        (None, true)
+                    } else {
+                        (name_to_dir.get(id).cloned(), false)
+                    }
+                };
+
+                // Every named agent must resolve — a whitelist pointing at a
+                // typo'd id silently grants nothing and looks like it works.
+                // An ambiguous name is rejected before "missing": it did
+                // resolve to *something*, just not unambiguously, which is a
+                // sharper problem than a plain typo.
+                let mut missing: Vec<String> = Vec::new();
+                let mut ambiguous_hits: Vec<String> = Vec::new();
+                let mut normalized_pairs: Vec<(String, String)> = Vec::new();
+                for (a, b) in &raw_pairs {
+                    let (ra, ra_ambiguous) = resolve_to_dir_name(a);
+                    let (rb, rb_ambiguous) = resolve_to_dir_name(b);
+                    if ra_ambiguous {
+                        if !ambiguous_hits.contains(a) {
+                            ambiguous_hits.push(a.clone());
+                        }
+                    } else if ra.is_none() && !missing.contains(a) {
+                        missing.push(a.clone());
+                    }
+                    if rb_ambiguous {
+                        if !ambiguous_hits.contains(b) {
+                            ambiguous_hits.push(b.clone());
+                        }
+                    } else if rb.is_none() && !missing.contains(b) {
+                        missing.push(b.clone());
+                    }
+                    if let (Some(ra), Some(rb)) = (ra, rb) {
+                        normalized_pairs.push((ra, rb));
+                    }
+                }
+                if !ambiguous_hits.is_empty() {
+                    return WsFrame::error_response(
+                        "",
+                        &format!(
+                            "名稱 {} 對應多個 AI 員工,請改用目錄名指定。",
+                            ambiguous_hits.join("、")
+                        ),
+                    );
+                }
+                if !missing.is_empty() {
+                    return WsFrame::error_response(
+                        "",
+                        &format!(
+                            "找不到這些 AI 員工:{}。請確認名稱後再儲存。",
+                            missing.join("、")
+                        ),
+                    );
+                }
+
+                // Self-pairs mean nothing (self-delegation is denied by the
+                // policy itself) — drop instead of rejecting the save. Dedup
+                // runs on the *normalized* (directory-name) ids, since a name
+                // and its own directory name could otherwise be entered as
+                // "two different" agents in the same pair.
+                let mut cleaned: Vec<(String, String)> = Vec::new();
+                let mut seen: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                for (a, b) in normalized_pairs {
+                    if a == b {
+                        continue;
+                    }
+                    if seen.insert(Self::delegation_pair_key(&a, &b)) {
+                        cleaned.push((a, b));
+                    }
+                }
+                Some(cleaned)
+            }
+        };
+
+        // ── persist ──
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        let (before_policy, before_allow, _) = Self::parse_delegation_section(&table);
+
+        // An existing-but-non-table [delegation] is operator data we refuse to
+        // silently destroy; report it instead of overwriting.
+        if table
+            .get("delegation")
+            .is_some_and(|v| v.as_table().is_none())
+        {
+            return WsFrame::error_response(
+                "",
+                "config.toml 的 [delegation] 區段格式有誤,請先修正設定檔後再儲存。",
+            );
+        }
+        let section = table
+            .entry("delegation")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .expect("delegation section verified as a table above");
+
+        if let Some(p) = new_policy {
+            section.insert("policy".into(), toml::Value::String(p.as_str().to_string()));
+        }
+        if let Some(pairs) = &new_allow {
+            section.insert(
+                "allow".into(),
+                toml::Value::Array(
+                    pairs
+                        .iter()
+                        .map(|(a, b)| {
+                            toml::Value::Array(vec![
+                                toml::Value::String(a.clone()),
+                                toml::Value::String(b.clone()),
+                            ])
+                        })
+                        .collect(),
+                ),
+            );
+        }
+
+        // Atomic write: temp + rename (same discipline as system.update_config).
+        let tmp_path = config_path.with_extension("toml.tmp");
+        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
+            return WsFrame::error_response("", &format!("寫入設定失敗:{e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return WsFrame::error_response("", &format!("儲存設定失敗:{e}"));
+        }
+
+        let after_policy = new_policy
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| before_policy.clone());
+        let after_allow = new_allow.clone().unwrap_or_else(|| before_allow.clone());
+
+        // Audit: who changed the org-wide delegation boundary, from what to what.
+        let pairs_json = |pairs: &Vec<(String, String)>| -> Value {
+            Value::Array(pairs.iter().map(|(a, b)| json!([a, b])).collect())
+        };
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "delegation_config_changed",
+                "dashboard",
+                duduclaw_security::audit::Severity::Warning,
+                json!({
+                    "actor_user_id": ctx.user_id,
+                    "actor_email": ctx.email,
+                    "actor_role": format!("{:?}", ctx.role).to_lowercase(),
+                    "before": { "policy": before_policy, "allow": pairs_json(&before_allow) },
+                    "after": { "policy": after_policy, "allow": pairs_json(&after_allow) },
+                }),
+            ),
+        );
+
+        info!(
+            actor = %ctx.email,
+            policy = %after_policy,
+            pairs = after_allow.len(),
+            "delegation.set committed"
+        );
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "policy": after_policy,
+                "allow": pairs_json(&after_allow),
+                // Enforcement re-reads config.toml per decision — no restart.
+                "applied": true,
             }),
         )
     }
@@ -24897,6 +26287,12 @@ impl MethodHandler {
                             "payload": r.payload,
                             "created_at": r.created_at,
                             "ttl_seconds": r.ttl_seconds,
+                            // D1/D2: the ActionGuard judge's forward-simulation
+                            // narrative (world_state_change + risk_points), when the
+                            // approval kind ran that judge. `null` for every other
+                            // kind (the overwhelming majority) — the dashboard
+                            // renders nothing when this is absent, purely additive.
+                            "simulation": r.simulation,
                         })
                     })
                     .collect();
@@ -27238,6 +28634,179 @@ mod archive_restore_tests {
         unarchive_restore_table(&mut t).unwrap();
         assert!(!enabled(&t, "evolution"));
         assert!(!enabled(&t, "heartbeat"));
+    }
+}
+
+#[cfg(test)]
+mod agents_remove_org_store_tests {
+    //! WP22 T1 follow-up — confirms the dashboard off-board paths
+    //! (`agents.remove` / `agents.archive`, both driven by
+    //! `offboard_agent_toml`) leave the `org.toml` authority record alone.
+    //!
+    //! Unlike MCP `agent_remove` (which relocates the agent directory to
+    //! `_trash` and only then calls `org_store::remove`, and the ephemeral GC
+    //! sweep, which does the same after `remove_dir_all`), the dashboard
+    //! handlers never move or delete the agent's directory — `agents.remove`
+    //! is a **soft** delete (`status = "deleted"`, `data_retained: true`,
+    //! see the RPC catalog entry "Soft-delete an agent (hidden, data
+    //! retained)") and `agents.archive` is explicitly a "recoverable
+    //! off-board". The agent keeps existing on disk with a live, writable
+    //! `agent.toml` in both cases, so clearing its `org_store` entry here
+    //! would reopen exactly the hole WP22 T1 closed: a still-live agent
+    //! would fall back to being governed by its own mirror again (see the
+    //! module doc on `duduclaw_core::org_store`, "Authority rule"). These
+    //! tests lock in that the entry survives both RPCs, so a future edit
+    //! that "fixes" the perceived orphan-record gap by adding
+    //! `org_store::remove` to these handlers gets caught immediately.
+    use super::*;
+
+    fn frame_ok(f: &WsFrame) -> bool {
+        matches!(f, WsFrame::Response { ok: true, .. })
+    }
+
+    fn frame_data(f: &WsFrame) -> Value {
+        match f {
+            WsFrame::Response { payload, .. } => payload.clone().unwrap_or(Value::Null),
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    /// A full, deserializable, non-main `agent.toml` — mirrors the fixture
+    /// in `agents_create_name_collision_tests::write_agent_toml`. The RPCs
+    /// under test parse the registry entry (for the main-agent guard) and
+    /// then rewrite this same file via `update_agent_toml`, so it must be a
+    /// complete, valid `AgentConfig`.
+    fn write_offboardable_agent_toml(dir: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!(
+                r#"[agent]
+name = "{name}"
+display_name = "{name}"
+role = "specialist"
+status = "active"
+trigger = "@{name}"
+reports_to = "root-lead"
+icon = "🤖"
+department = "銷售部"
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 5000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = ["*"]
+
+[evolution]
+micro_reflection = false
+meso_reflection = false
+macro_reflection = false
+skill_auto_activate = false
+skill_security_scan = true
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// `agents.remove` (dashboard soft-delete): the agent directory and its
+    /// `agent.toml` are left in place — only `status` flips to `"deleted"`
+    /// and the freeze kill-switch trips. The `org_store` entry seeded before
+    /// the call must still be there afterwards, byte-identical.
+    #[tokio::test]
+    async fn remove_preserves_org_store_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let agent_id = "org-remove-test";
+        write_offboardable_agent_toml(&home.path().join("agents").join(agent_id), agent_id);
+
+        let entry = duduclaw_core::org_store::OrgEntry::new("root-lead", "銷售部");
+        duduclaw_core::org_store::upsert(home.path(), agent_id, entry.clone()).unwrap();
+        assert!(
+            duduclaw_core::org_store::load(home.path()).contains(agent_id),
+            "fixture sanity: entry must exist before the call"
+        );
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_agents_remove(json!({ "agent_id": agent_id }))
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        assert_eq!(
+            frame_data(&frame)["status"].as_str(),
+            Some("deleted"),
+            "agents.remove is a soft-delete, not a hard delete"
+        );
+
+        // The directory (and its agent.toml) is untouched — this is the
+        // "data_retained: true" contract, not a relocation to _trash.
+        assert!(
+            home.path()
+                .join("agents")
+                .join(agent_id)
+                .join("agent.toml")
+                .exists(),
+            "soft-delete must not remove the agent directory"
+        );
+
+        let store = duduclaw_core::org_store::load(home.path());
+        assert!(
+            store.contains(agent_id),
+            "org_store entry must survive agents.remove — the agent still \
+             exists on disk with a writable agent.toml, so clearing the \
+             authority record would hand it back control of its own \
+             reports_to/department"
+        );
+        assert_eq!(store.get(agent_id), Some(&entry));
+    }
+
+    /// `agents.archive` is explicitly documented as a "recoverable
+    /// off-board" — the org_store entry must survive it too.
+    #[tokio::test]
+    async fn archive_preserves_org_store_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let agent_id = "org-archive-test";
+        write_offboardable_agent_toml(&home.path().join("agents").join(agent_id), agent_id);
+
+        let entry = duduclaw_core::org_store::OrgEntry::new("root-lead", "銷售部");
+        duduclaw_core::org_store::upsert(home.path(), agent_id, entry.clone()).unwrap();
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_agents_archive(json!({ "agent_id": agent_id }))
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        assert_eq!(frame_data(&frame)["status"].as_str(), Some("archived"));
+
+        let store = duduclaw_core::org_store::load(home.path());
+        assert!(
+            store.contains(agent_id),
+            "org_store entry must survive agents.archive"
+        );
+        assert_eq!(store.get(agent_id), Some(&entry));
     }
 }
 
@@ -30432,6 +32001,64 @@ mod d6_curation_tests {
         assert!(!crate::skill_gap_digest::gap_digest_enabled_from_str(&raw));
     }
 
+    /// [memory] novelty_gate round-trip: system.update_config persists the
+    /// flag and system.config exposes the structured value (default `true`
+    /// when absent, matching `mcp.rs::novelty_gate_enabled_from_config`'s
+    /// fail-closed default) for the dashboard toggle.
+    #[tokio::test]
+    async fn system_update_config_novelty_gate_enabled_round_trip() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Turn it off.
+        let frame = handler
+            .handle_system_update_config(json!({ "novelty_gate_enabled": false }))
+            .await;
+        assert!(frame_ok(&frame), "novelty_gate_enabled=false must persist: {frame:?}");
+
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let cfg: toml::Table = raw.parse().unwrap();
+        assert_eq!(cfg["memory"]["novelty_gate"].as_bool(), Some(false));
+
+        // system.config surfaces the structured flag for the dashboard.
+        let frame = handler.handle_system_config().await;
+        assert!(frame_ok(&frame));
+        let data = frame_data(&frame);
+        assert_eq!(
+            data.get("novelty_gate_enabled").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        // Turning it back on round-trips too.
+        let frame = handler
+            .handle_system_update_config(json!({ "novelty_gate_enabled": true }))
+            .await;
+        assert!(frame_ok(&frame));
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let cfg: toml::Table = raw.parse().unwrap();
+        assert_eq!(cfg["memory"]["novelty_gate"].as_bool(), Some(true));
+    }
+
+    /// Absent config ⇒ `system.config` reports the fail-closed default
+    /// (`true`), matching `mcp.rs::novelty_gate_enabled_from_config`'s
+    /// default so the dashboard toggle never shows a stale/wrong initial
+    /// state on a fresh install.
+    #[tokio::test]
+    async fn system_config_novelty_gate_enabled_defaults_true_when_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        // No config.toml at all yet.
+        std::fs::write(home.path().join("config.toml"), "").unwrap();
+
+        let frame = handler.handle_system_config().await;
+        assert!(frame_ok(&frame));
+        let data = frame_data(&frame);
+        assert_eq!(
+            data.get("novelty_gate_enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
     #[tokio::test]
     async fn system_update_config_rejects_bad_dispatch_policy_and_cap() {
         let home = tempfile::tempdir().unwrap();
@@ -32711,5 +34338,698 @@ mod wp15_memory_split_tests {
         );
         assert_eq!(entries, vec![MEMORY.to_string()]);
         assert_eq!(signals, vec![TELEMETRY.to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod delegation_admin_rpc_tests {
+    //! WP21 §2.8 — `delegation.get` / `delegation.set` dashboard RPCs.
+    use super::*;
+
+    /// Seed a scannable agent dir (the registry loads through the full
+    /// `AgentConfig` deserializer, so every required section must be present).
+    fn seed_agent(home: &std::path::Path, name: &str, department: &str) {
+        seed_agent_in_dir(home, name, name, department);
+    }
+
+    /// Same as [`seed_agent`] but the directory name and `[agent] name` can
+    /// differ — WP21 欠帳③ fixture: the registry indexes by `name`, while bus
+    /// tasks / the C1 predicate key agents by directory name.
+    fn seed_agent_in_dir(home: &std::path::Path, dir_name: &str, name: &str, department: &str) {
+        let dir = home.join("agents").join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"[agent]
+name = "{name}"
+display_name = "{name}"
+role = "specialist"
+status = "active"
+trigger = ""
+reports_to = ""
+department = "{department}"
+icon = "🤖"
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 5000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = ["*"]
+
+[evolution]
+micro_reflection = false
+meso_reflection = false
+macro_reflection = false
+skill_auto_activate = false
+skill_security_scan = true
+"#
+        );
+        std::fs::write(dir.join("agent.toml"), toml).unwrap();
+    }
+
+    fn frame_ok(f: &WsFrame) -> bool {
+        matches!(f, WsFrame::Response { ok: true, .. })
+    }
+
+    fn frame_data(f: &WsFrame) -> Value {
+        match f {
+            WsFrame::Response { payload, .. } => payload.clone().unwrap_or(Value::Null),
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    fn frame_error(f: &WsFrame) -> String {
+        match f {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            other => panic!("expected error frame, got {other:?}"),
+        }
+    }
+
+    fn admin_ctx() -> UserContext {
+        UserContext::admin_fallback()
+    }
+
+    fn manager_ctx() -> UserContext {
+        UserContext {
+            user_id: "m1".to_string(),
+            email: "m1@test.local".to_string(),
+            role: UserRole::Manager,
+            agent_access: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Fresh home, no `[delegation]` section ⇒ the safe defaults, never an error.
+    #[tokio::test]
+    async fn get_returns_defaults_without_config() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle("delegation.get", json!({}), &admin_ctx())
+            .await;
+        assert!(frame_ok(&frame), "get must not error: {frame:?}");
+        let data = frame_data(&frame);
+        assert_eq!(data["policy"], json!("department"));
+        assert_eq!(data["allow"], json!([]));
+        assert_eq!(data["warnings"], json!([]));
+    }
+
+    /// A garbage policy value and malformed whitelist rows are reported as
+    /// warnings and cleaned, not fatal — the operator must still see the page.
+    #[tokio::test]
+    async fn get_reports_warnings_for_bad_values() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[delegation]\npolicy = \"anarchy\"\nallow = [[\"a\", \"b\"], [\"solo\"], [\"c\", \"c\"], [\"b\", \"a\"]]\n",
+        )
+        .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let data = frame_data(
+            &handler
+                .handle("delegation.get", json!({}), &admin_ctx())
+                .await,
+        );
+
+        // Unknown policy falls back to the stricter default.
+        assert_eq!(data["policy"], json!("department"));
+        // ["b","a"] is the same unordered pair as ["a","b"] ⇒ deduped.
+        assert_eq!(data["allow"], json!([["a", "b"]]));
+        let warnings = data["warnings"].as_array().unwrap();
+        assert_eq!(
+            warnings.len(),
+            3,
+            "policy + short row + self-pair: {warnings:?}"
+        );
+    }
+
+    /// Both RPCs are owner/admin-only, fail-closed before any file I/O.
+    #[tokio::test]
+    async fn non_admin_is_denied() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = manager_ctx();
+        for (method, params) in [
+            ("delegation.get", json!({})),
+            ("delegation.set", json!({ "policy": "open" })),
+        ] {
+            let frame = handler.handle(method, params, &ctx).await;
+            assert!(!frame_ok(&frame), "{method} must deny a manager: {frame:?}");
+        }
+        assert!(
+            !home.path().join("config.toml").exists(),
+            "a denied call must not write config"
+        );
+    }
+
+    /// Happy path: policy + whitelist land in config.toml and read back.
+    #[tokio::test]
+    async fn set_persists_policy_and_pairs() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "sales-lead", "sales");
+        seed_agent(home.path(), "warehouse-lead", "warehouse");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle(
+                "delegation.set",
+                json!({ "policy": "hierarchy", "allow": [["sales-lead", "warehouse-lead"]] }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(frame_ok(&frame), "set must succeed: {frame:?}");
+
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(raw.contains("[delegation]"), "{raw}");
+        assert!(raw.contains("hierarchy"), "{raw}");
+
+        let data = frame_data(
+            &handler
+                .handle("delegation.get", json!({}), &admin_ctx())
+                .await,
+        );
+        assert_eq!(data["policy"], json!("hierarchy"));
+        assert_eq!(data["allow"], json!([["sales-lead", "warehouse-lead"]]));
+
+        // The change is auditable with actor + before/after.
+        let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("delegation_config_changed"), "{audit}");
+        assert!(audit.contains("\"before\""), "{audit}");
+        assert!(audit.contains("\"after\""), "{audit}");
+    }
+
+    /// WP21 欠帳③ — namespace unification, directory-name = agent-name case
+    /// (the common case, and what every other test in this module already
+    /// exercises implicitly via `seed_agent`). Spelled out explicitly so a
+    /// future change to the resolution order has one direct regression test.
+    #[tokio::test]
+    async fn set_keeps_ids_unchanged_when_dir_name_equals_agent_name() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "sales-lead", "sales");
+        seed_agent(home.path(), "warehouse-lead", "warehouse");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle(
+                "delegation.set",
+                json!({ "allow": [["sales-lead", "warehouse-lead"]] }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        assert_eq!(
+            frame_data(&frame)["allow"],
+            json!([["sales-lead", "warehouse-lead"]])
+        );
+    }
+
+    /// WP21 欠帳③ — the core regression: when an agent's directory name and
+    /// `[agent] name` differ, `delegation.set` must persist the **directory
+    /// name** (the namespace `gate_bus_dispatch` / `DispatchOrgView` actually
+    /// judge against — bus tasks carry `sender_agent`/`target` as directory
+    /// names), not the `name` the caller typed. Otherwise the pair passes
+    /// validation but the whitelist entry never matches at enforcement time.
+    /// This test proves both ends: the persisted value is normalized, and the
+    /// C1 predicate (`gate_bus_dispatch`) actually honours it afterward.
+    #[tokio::test]
+    async fn set_normalizes_name_to_directory_name_and_predicate_honours_it() {
+        let home = tempfile::tempdir().unwrap();
+        // Directory name != `[agent] name` for both agents in the pair, and
+        // the two are in different departments so nothing but the explicit
+        // whitelist entry could let a cross-department dispatch through.
+        seed_agent_in_dir(home.path(), "biz-dev-dir", "sales-lead", "sales");
+        seed_agent_in_dir(home.path(), "wh-dir", "warehouse-lead", "warehouse");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Caller enters the display `name`, not the directory name — exactly
+        // what the dashboard's agent picker would submit today.
+        let frame = handler
+            .handle(
+                "delegation.set",
+                json!({ "allow": [["sales-lead", "warehouse-lead"]] }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(frame_ok(&frame), "set must succeed: {frame:?}");
+
+        // Persisted value is normalized to directory names, not the typed name.
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(raw.contains("biz-dev-dir"), "{raw}");
+        assert!(raw.contains("wh-dir"), "{raw}");
+        assert!(!raw.contains("sales-lead"), "{raw}");
+        assert!(!raw.contains("warehouse-lead"), "{raw}");
+
+        let data = frame_data(
+            &handler
+                .handle("delegation.get", json!({}), &admin_ctx())
+                .await,
+        );
+        assert_eq!(data["allow"], json!([["biz-dev-dir", "wh-dir"]]));
+
+        // Predicate side: the C1 gate judges dispatch using the same
+        // directory-name namespace the bus actually carries. Cross-department
+        // strangers only get through via the whitelist — and only because the
+        // saved entry now matches that namespace instead of the stale `name`.
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(home.path().join("agents"))));
+        let outcome = crate::delegation_gate::gate_bus_dispatch(
+            home.path(),
+            &registry,
+            Some("biz-dev-dir"),
+            None,
+            "wh-dir",
+            "task-1",
+            "bus_dispatch",
+        )
+        .await;
+        assert!(
+            !matches!(outcome, crate::delegation_gate::GateOutcome::Deny(_)),
+            "whitelist must be enforceable after normalization: {outcome:?}"
+        );
+    }
+
+    /// A pair where one side is typed by directory name and the other by
+    /// `[agent] name` still resolves — either spelling is accepted as input,
+    /// both normalize to the same directory-name namespace.
+    #[tokio::test]
+    async fn set_accepts_either_dir_name_or_agent_name_as_input() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent_in_dir(home.path(), "biz-dev-dir", "sales-lead", "sales");
+        seed_agent_in_dir(home.path(), "wh-dir", "warehouse-lead", "warehouse");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle(
+                "delegation.set",
+                // "biz-dev-dir" (directory name) paired with "warehouse-lead"
+                // (agent name) — both resolve to the same directory-name pair.
+                json!({ "allow": [["biz-dev-dir", "warehouse-lead"]] }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        assert_eq!(
+            frame_data(&frame)["allow"],
+            json!([["biz-dev-dir", "wh-dir"]])
+        );
+    }
+
+    /// An unknown policy value rejects the whole payload (nothing written).
+    #[tokio::test]
+    async fn set_rejects_unknown_policy() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle(
+                "delegation.set",
+                json!({ "policy": "anarchy" }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(!frame_ok(&frame));
+        assert!(frame_error(&frame).contains("department"), "{frame:?}");
+        assert!(!home.path().join("config.toml").exists());
+    }
+
+    /// A pair naming a non-existent agent rejects the whole save and says
+    /// which id is unknown — a typo'd whitelist grants nothing silently.
+    #[tokio::test]
+    async fn set_rejects_unknown_agent_and_names_it() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "sales-lead", "sales");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle(
+                "delegation.set",
+                json!({ "allow": [["sales-lead", "ghost-lead"]] }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(!frame_ok(&frame));
+        let err = frame_error(&frame);
+        assert!(
+            err.contains("ghost-lead"),
+            "must name the missing agent: {err}"
+        );
+        assert!(
+            !home.path().join("config.toml").exists(),
+            "rejected payload must not be partially written"
+        );
+    }
+
+    /// Malformed rows are structural errors (reject); self-pairs and duplicate
+    /// pairs are meaningless rather than wrong, so they are cleaned silently.
+    #[tokio::test]
+    async fn set_rejects_bad_shapes_but_cleans_noise() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "a", "x");
+        seed_agent(home.path(), "b", "y");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = admin_ctx();
+
+        for bad in [
+            json!({ "allow": [["a"]] }),
+            json!({ "allow": [["a", "b", "c"]] }),
+            json!({ "allow": [["a", ""]] }),
+            json!({ "allow": "a,b" }),
+        ] {
+            let frame = handler.handle("delegation.set", bad.clone(), &ctx).await;
+            assert!(!frame_ok(&frame), "{bad} must be rejected: {frame:?}");
+        }
+
+        // Self-pair dropped, ["b","a"] deduped against ["a","b"].
+        let frame = handler
+            .handle(
+                "delegation.set",
+                json!({ "allow": [["a", "a"], ["a", "b"], ["b", "a"]] }),
+                &ctx,
+            )
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        assert_eq!(frame_data(&frame)["allow"], json!([["a", "b"]]));
+    }
+
+    /// A payload with neither field is a no-op error, not an accidental reset.
+    #[tokio::test]
+    async fn set_requires_at_least_one_field() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle("delegation.set", json!({}), &admin_ctx())
+            .await;
+        assert!(!frame_ok(&frame));
+        assert!(!home.path().join("config.toml").exists());
+    }
+
+    /// Writing `[delegation]` leaves the rest of config.toml intact.
+    #[tokio::test]
+    async fn set_preserves_unrelated_config() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[general]\ndefault_agent = \"kiki\"\n",
+        )
+        .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle("delegation.set", json!({ "policy": "open" }), &admin_ctx())
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(raw.contains("kiki"), "unrelated config lost: {raw}");
+        assert!(raw.contains("open"), "{raw}");
+    }
+
+    /// WP22 T4 — two directories sharing the same `[agent] name` is a
+    /// pre-existing-install case this WP cannot retroactively rename its way
+    /// out of (registry scan only warns, never blocks load). `delegation.set`
+    /// must treat that shared name as ambiguous and reject a pair naming it,
+    /// rather than silently resolving to whichever directory `map.insert`
+    /// happened to see last.
+    #[tokio::test]
+    async fn set_rejects_ambiguous_agent_name_and_names_it() {
+        let home = tempfile::tempdir().unwrap();
+        // Two directories, same `[agent] name` — the last-wins collision.
+        seed_agent_in_dir(home.path(), "sales-old", "sales-lead", "sales");
+        seed_agent_in_dir(home.path(), "sales-new", "sales-lead", "sales");
+        seed_agent(home.path(), "warehouse-lead", "warehouse");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle(
+                "delegation.set",
+                json!({ "allow": [["sales-lead", "warehouse-lead"]] }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(!frame_ok(&frame), "ambiguous name must be rejected: {frame:?}");
+        let err = frame_error(&frame);
+        assert!(err.contains("sales-lead"), "must name the ambiguous id: {err}");
+        assert!(
+            err.contains("多個"),
+            "must explain the ambiguity, not just 'not found': {err}"
+        );
+        assert!(
+            !home.path().join("config.toml").exists(),
+            "rejected payload must not be partially written"
+        );
+    }
+
+    /// The escape hatch: typing the directory name directly — never
+    /// ambiguous, since directory names are unique by construction (the
+    /// filesystem enforces it) — still resolves and saves normally even
+    /// though the *other* agent-name namespace is ambiguous elsewhere.
+    #[tokio::test]
+    async fn set_accepts_directory_name_despite_unrelated_ambiguous_name() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent_in_dir(home.path(), "sales-old", "sales-lead", "sales");
+        seed_agent_in_dir(home.path(), "sales-new", "sales-lead", "sales");
+        seed_agent(home.path(), "warehouse-lead", "warehouse");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle(
+                "delegation.set",
+                json!({ "allow": [["sales-new", "warehouse-lead"]] }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(frame_ok(&frame), "directory-name input must resolve: {frame:?}");
+        assert_eq!(
+            frame_data(&frame)["allow"],
+            json!([["sales-new", "warehouse-lead"]])
+        );
+    }
+}
+
+#[cfg(test)]
+mod agents_create_reserved_name_tests {
+    //! WP21 欠帳④ — `agents.create` (the dashboard "create agent" path) must
+    //! reject [`duduclaw_core::is_reserved_agent_id`] the same way MCP
+    //! `create_agent` already does (`crates/duduclaw-cli/src/mcp.rs`). An
+    //! agent claiming a system-sender id (`cron`, `dashboard`, …) would clear
+    //! every WP21 delegation choke point unconditionally.
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_every_reserved_system_sender_id_and_creates_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Every id here is otherwise a *valid* agent id shape (lowercase +
+        // hyphens, passes `is_valid_agent_id`) — the only thing that can
+        // reject it is the new `is_reserved_agent_id` check.
+        for reserved in [
+            "cron",
+            "dashboard",
+            "webhook",
+            "heartbeat",
+            "autopilot",
+            "goal-loop-driver",
+            "a2a-client",
+            "default",
+        ] {
+            let frame = handler
+                .handle_agents_create(json!({ "name": reserved, "display_name": "X" }))
+                .await;
+            assert!(
+                !matches!(frame, WsFrame::Response { ok: true, .. }),
+                "{reserved} must be rejected: {frame:?}"
+            );
+            assert!(
+                !home.path().join("agents").join(reserved).exists(),
+                "{reserved} must not create a directory"
+            );
+        }
+    }
+
+    /// `is_reserved_agent_id` is case-insensitive and also reserves the whole
+    /// `__…` namespace — both properties are exercised directly against the
+    /// core predicate here, since `is_valid_agent_id` (lowercase-only, no
+    /// underscore) would otherwise block these shapes before the reserved
+    /// check is ever reached, making them untestable through the dashboard
+    /// RPC alone.
+    #[test]
+    fn reserved_check_itself_is_case_insensitive_and_covers_dunder_prefix() {
+        assert!(duduclaw_core::is_reserved_agent_id("CRON"));
+        assert!(duduclaw_core::is_reserved_agent_id("Dashboard"));
+        assert!(duduclaw_core::is_reserved_agent_id("__deferred_gvu__"));
+        assert!(duduclaw_core::is_reserved_agent_id("__anything"));
+    }
+
+    /// A non-reserved, otherwise-valid name still succeeds — the new check
+    /// must not be over-broad.
+    #[tokio::test]
+    async fn non_reserved_name_still_succeeds() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_agents_create(json!({ "name": "sales-lead", "display_name": "Sales Lead" }))
+            .await;
+        assert!(
+            matches!(frame, WsFrame::Response { ok: true, .. }),
+            "{frame:?}"
+        );
+        assert!(home.path().join("agents").join("sales-lead").exists());
+    }
+}
+
+#[cfg(test)]
+mod agents_create_name_collision_tests {
+    //! WP22 T4 — `agents.create` must reject a `name` that collides with any
+    //! *existing* agent's directory name or `[agent] name` field, mirroring
+    //! MCP `create_agent` (`crates/duduclaw-cli/src/mcp.rs`). Without this,
+    //! `map.insert` in `AgentRegistry::scan` (last-wins) or the delegation
+    //! `name → dir` resolver can silently pick the wrong one of two agents
+    //! sharing a registry key.
+    use super::*;
+
+    /// A full, deserializable `agent.toml` — the collision check reads
+    /// through `self.registry`, which only ever indexes agents that parse
+    /// cleanly into `AgentConfig`. An `[agent]`-only stub (as `agents.create`
+    /// itself never writes) would silently fail to load and vanish from
+    /// `reg.list()`, defeating the very fixture meant to exercise the check.
+    fn write_agent_toml(dir: &std::path::Path, name: &str, reports_to: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!(
+                r#"[agent]
+name = "{name}"
+display_name = "{name}"
+role = "specialist"
+status = "active"
+trigger = "@{name}"
+reports_to = "{reports_to}"
+icon = "🤖"
+department = ""
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 5000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = ["*"]
+
+[evolution]
+micro_reflection = false
+meso_reflection = false
+macro_reflection = false
+skill_auto_activate = false
+skill_security_scan = true
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Plain case: the new agent's directory name matches an existing
+    /// directory exactly. `create_dir` would already fail this, but the
+    /// name-collision check runs first and must give the same zh-TW message.
+    #[tokio::test]
+    async fn rejects_name_matching_existing_directory() {
+        let home = tempfile::tempdir().unwrap();
+        write_agent_toml(&home.path().join("agents").join("ceo"), "ceo", "");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_agents_create(json!({ "name": "ceo", "display_name": "另一個 CEO" }))
+            .await;
+        assert!(
+            !matches!(frame, WsFrame::Response { ok: true, .. }),
+            "{frame:?}"
+        );
+    }
+
+    /// The gap WP22 T4 closes: an existing agent's directory name and its
+    /// `[agent] name` field have drifted apart. A new `agents.create` whose
+    /// `name` matches that *field* — not any directory — must still be
+    /// refused, even though `agents/<name>` does not exist yet.
+    #[tokio::test]
+    async fn rejects_name_matching_existing_name_field_in_other_dir() {
+        let home = tempfile::tempdir().unwrap();
+        write_agent_toml(
+            &home.path().join("agents").join("legacy-sales"),
+            "sales-alias",
+            "",
+        );
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_agents_create(json!({ "name": "sales-alias", "display_name": "新業務" }))
+            .await;
+        match frame {
+            WsFrame::Response { ok: false, error, .. } => {
+                let msg = error.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+                assert!(msg.contains("已有同名的 AI 員工"), "{msg}");
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        assert!(
+            !home.path().join("agents").join("sales-alias").exists(),
+            "a rejected create must not scaffold a directory"
+        );
+    }
+
+    /// Control: a fresh, non-colliding name still creates normally.
+    #[tokio::test]
+    async fn allows_non_colliding_name() {
+        let home = tempfile::tempdir().unwrap();
+        write_agent_toml(&home.path().join("agents").join("ceo"), "ceo", "");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_agents_create(json!({ "name": "brand-new-agent", "display_name": "全新員工" }))
+            .await;
+        assert!(
+            matches!(frame, WsFrame::Response { ok: true, .. }),
+            "{frame:?}"
+        );
+        assert!(home.path().join("agents").join("brand-new-agent").exists());
     }
 }
