@@ -12,6 +12,270 @@
   （XML 包裹 + JSON schema 約束輸出）防 prompt injection；workflow 以
   `gh api` + `jq` 組請求防 script injection。需設 repo secret
   `ANTHROPIC_API_KEY`，未設時自動略過整理。見 `docs/guides/feedback-page.md`。
+- **A2A 部門與階級隔離**（WP21）：團隊多人協作時，委派權限現在遵循組織結構與部門邊界。
+  三層政策（`config.toml [delegation] policy`）自主選擇：`department`（預設，上下級+同部門橫向）、
+  `hierarchy`（僅上下級）、`open`（舊行為逃生門）。跨部門合作支援精準白名單配對
+  （`allow = [["sales-lead", "warehouse-lead"]]`，無序=雙向）。MCP 前門(`send_to_agent`/`spawn_agent`)、
+  任務派遣（`tasks_create` / `tasks_update`）、多步驟計畫（`create_task`）、
+  例行工作（`schedule_task`）、bus 隊列消費皆執行驗證；手動寫入 bus_queue.jsonl
+  偽造發送者會被拒絕並寫入 audit log（本版對「完全沒有發送者欄位」的舊格式任務仍
+  放行並記 warning，下一版轉為拒絕）。Dashboard「進階設定 → 委派權限」卡讓管理員
+  即改即生效，無需重啟；`[acp] trusted = true` 可開通外部 A2A 呼叫（預設拒，
+  文件附風險警語）。見 `docs/features/37-delegation-isolation.md`。
+
+### Added
+- **MCP caller 身分識別**（WP21 進階安全）：gateway 啟動時自動在 `~/.duduclaw/identity.key`
+  生成一組 256-bit 隨機密鑰（檔案權限 0600），spawn 子 agent 時自動生成簽名身分 token（HMAC-SHA256 綁定 agent id），
+  注入 `DUDUCLAW_AGENT_TOKEN` 環境變數。MCP server 端驗證 token，無效身分會被拒絕。
+  `config.toml [delegation] require_identity_token = false`（預設軟模式：缺失/無效只警告；設為 true 進入嚴格模式，無效身分直接拒絕 MCP 啟動）。
+  升級順序很重要：先重啟 gateway 讓所有 agent 的 MCP 設定重新簽署，再開嚴格模式，順序反了會 MCP 拒絕開機。
+- **組織資料寫入保護**（WP21 權限邊界）：agent 經 Write/Edit/Bash 工具變更合法變更改由 `agent_update` 或儀表板統一管道。
+  凍結目標包括：`agent.toml [agent]` 的 `name`、`reports_to`、`department` 欄位；`config.toml [delegation]` 與 `[acp]` 全段；
+  `.mcp.json` 內的 `DUDUCLAW_AGENT_ID` 與 `DUDUCLAW_AGENT_TOKEN` 區塊；`.claude/settings.json` 整個檔案；`identity.key`。
+  PreToolUse hook 會攔截嘗試並記入 `tool_calls.jsonl` 帶 `org_placement_denied` 標記。
+- **白名單名稱正規化**（WP21 使用者友善）：儀表板委派權限卡接受 agent 的顯示名或目錄名，儲存時自動正規化為目錄名，
+  與判定端保持同一名稱空間（目錄名），避免顯示名異動導致配對失效。
+- **團隊佈署自動部門**（WP21 批量設定）：dashboard 一鍵佈署團隊時，佈署套件中的所有 agent 成員（前台人物 + 背景 worker）
+  的 `[agent] department` 欄位自動設為該產業代碼（來自 `team.toml [team] industry`）；產業包單獨安裝時也一併帶上 department。
+- **組織資料的權威儲存**（WP22 加固第二輪）：組織結構（誰匯報給誰、部門）的權威來源改為中央 `~/.duduclaw/org.toml`。
+  Gateway 首次啟動時自動從各 agent 設定匯入建立（`--seeded` 標記檔防重複），之後組織變更一律透過新指令 `duduclaw org sync`（CLI 操作者終端執行）
+  或儀表板進行，不再從 agent 目錄下 `agent.toml` 的組織欄位自動吸收。手動編輯 agent.toml 的 `reports_to` / `department` 後無法自動生效——必須執行
+  `duduclaw org sync` 同步。`duduclaw org show` 檢視目前的組織結構。`duduclaw doctor` 會偵測權威檔遺失、鏡像與權威不一致（漂移）等狀態。
+- **跨員工檔案隔離**（WP22 邊界強化）：AI 員工無法透過 Write/Edit/Bash 工具修改其他員工目錄下的任何檔案
+  （含 SOUL.md、記憶、設定等）；`~/.duduclaw/config.toml` 對所有員工整檔唯讀。非 Claude runtime
+  (codex/gemini 等) 在 workspace-write 沙箱下寫不到 `~/.duduclaw/` 目錄，從而無法篡改自己的組織設定影響委派判定（FullAccess 沙箱除外，屬操作者顯式選擇）。
+  跨員工的合法變更（改部員的 reports_to/department）必須走儀表板或 `agent_update` MCP。
+- **設定檔權限自動化**（WP22 安全基線）：含身分驗證 token 與 MCP 身分的執行時設定檔（`.mcp.json`、`identity.key` 等）
+  自動收緊為 0600（檔案所有者唯讀），防止其他進程讀取。
+- **重名防禦**（WP22 完整性）：建立與既有員工顯示名或目錄名重複的新員工時被拒；委派白名單輸入歧義名稱時要求改用目錄名。
+  系統保留名稱(`dashboard`, `webhook`, `cron` 等) 不能再用來建立 AI 員工。
+- **任務層 forward model**（Harness→LWM 方案 A）：goal 任務派工前依歷史統計預測本輪工具使用與成敗，
+  驗收後與實際軌跡（`tool_calls.jsonl`，程式化證據、不採 AI 自述）做 diff 累積統計，全程零 LLM、四階退階、
+  對五種 runtime 一視同仁。`config.toml [task_forward_model] enabled` 控制，**預設關閉**；關閉時派工行為逐位元組不變（有整合測試證明）。
+- **goal 任務結構化狀態**（StateAct）：每輪派工 prompt 帶 `<state>` 區塊（目標／已確認事實／待驗證假設／已排除做法）。
+  已排除做法由判官駁回紀錄程式化推導；已確認事實只來自零 LLM 檢查（outcome spec、grounding）通過項；
+  假設由 AI 員工經 `<state_update>` 標記自報、逐輪回填（解析失敗沿用上輪，不臆測）。狀態隨任務持久化，重啟不丟。
+- **goal 任務探索記帳**：`(state, action)` 訪問圖取代舊震盪偵測——同一狀態第二次駁回重派即升級人工介入
+  （時機與舊版一致），重複嘗試過的做法會在 prompt 中顯式標註禁止重複。
+- **驗收 grounding 前置檢查**：goal 任務結果宣稱在進 LLM 判官前，先以零 LLM 檢查與工具實際回傳內容的重疊
+  （`tool_calls.jsonl` 現會記錄遮罩後的工具輸出摘要）。自我回音類工具（`tasks_complete` 等）不計入證據；
+  查資料型任務（read-only 工具）自動跳過不誤殺。`[dispatch] grounding_precheck_enabled` 控制（預設開，保守門檻）。
+- **審批附模擬後果**（simulate-before-act）：不可逆工具的審批訊息與 goal 任務 `needs_human` 推播，
+  現在附上「若核准，接下來預計發生什麼」的模擬敘述與風險點（一次 LLM 呼叫、15 秒逾時、失敗降級照舊出按鈕），
+  模擬參考受保護的共享 wiki SOP（唯讀 namespace）。可逆性判定邏輯不變、解析失敗照舊 fail-closed 需要人工。
+- **記憶反偽驚訝閘門**：新語意記憶／反思規則寫入前先與既有內容比對相似度（char n-gram cosine，閾值 0.92，
+  與 playbook 去重同款），近似重複拒寫並記 audit，防記憶庫自我膨脹。`config.toml [memory] novelty_gate` 控制（預設開），
+  與語意向量檢索開關（`DUDUCLAW_SEMANTIC_VECTORS`）解耦。時間性事實更新（supersession）不受影響。
+- **錯誤筆記證據化**（Honest Lying 防護）：MistakeNotebook 條目新增程式化軌跡證據欄位
+  （哪個工具回錯、哪條檢查失敗），生產寫入路徑全數自動附上確定性證據；
+  無證據的純 AI 自述診斷不再參與反思規則合成，防止錯誤自我診斷被固化傳播。
+
+- **任務經驗規則管線**（WALL-E 式 induce/update/prune）：forward model 的預測誤差達 Significant 以上時，
+  從偏離維度**確定性合成**一條任務層規則（零 LLM、只陳述偏離不臆測原因），經反偽驚訝閘門後寫入語意記憶，
+  下輪派工注入「## 任務經驗規則」（上限 2 條），依下輪結果 helpful/harmful 結算、淨分歸零自動退休——
+  全部複用既有規則生死簿機制，不開新帳本。`[task_forward_model] rule_induction` 控制（隨總開關，預設關）。
+- **原生工具可觀測性升級（Full 保真度）**：goal 任務派工路徑上，claude／codex／gemini／openai-compat
+  四種 runtime 的原生工具呼叫（不只 MCP 工具）現在會被收集，並同時餵給三個消費者——
+  forward model 觀測（工具類別取聯集、次數取 max 不重複計數）、驗收判官的工具證據區塊
+  （原生事件標注 `(native)`，判官不再把檔案操作誠實完成的工作誤判為「零工具證據」而退回）、
+  grounding 驗收的分級理由。原生事件並攜帶遮罩後的輸入／輸出文字摘要（僅供 grounding 比對，
+  不進判官 prompt），使誠實引用工具原文的回覆在 goal 任務上能真正達到「有佐證」判定，
+  回音扣除規則同樣適用。antigravity／grok 無結構化工具事件，維持 MCP-only。
+  codex/gemini 的事件欄位名以雙名容錯解析，建議真 CLI 環境抽查後再依賴。
+- **審批模擬軌跡上儀表板**：審批詳情與卡片列表現在顯示「若核准，接下來預計…」模擬敘述與風險點
+  （無模擬資料時不顯示）；自主目標啟動核准（kickoff）訊息也附啟動後前三步預覽。
+- **記憶去重閘門開關**：儀表板系統設定新增「記憶去重閘門」開關（`[memory] novelty_gate`），
+  套用於下一次新對話。覆蓋面含 AI 員工經 MCP 工具主動寫入，以及閘道器內部的語意記憶
+  自動寫入路徑（反思規則合成、任務經驗規則、人格歸納、知識庫指標等——經統一工廠建構）。
+- **playbook 條目 E1 斷言**（Evolution v3 WP2.8，D8 拍板）：新的 playbook 條目必須自帶
+  機器可驗的合規形狀（必用／禁用工具、輸出必含／必不含子串），寫入時結構驗證、
+  對已錄製的 eval case transcript 零 LLM 重放（違反即決定性否決；無錄製則降級為提示，
+  隨 transcript 錄製逐案自動武裝）。既有條目不回填。
+- **演化手段稽核**（Evolution v3 WP2.10，D11 拍板）：playbook 演化提案除分數外同時稽核
+  「達成手段」——題庫洩漏（條目背誦測驗題）、驗證器弱化（恆真斷言）、失敗抑制指令
+  三類簽名決定性否決；judge 取悅類記入遙測與提示（不否決，待真實分佈再調閾值）。
+- **SOUL.md → playbook 遷移工具**（Evolution v3 WP1.4）：`duduclaw playbook migrate-soul --agent <id>`
+  從 SOUL.md 的行為規則分區抽取歷史累積的規則成人審草稿（身分分區永不觸碰），
+  審閱補上 eval case 連結與 E1 斷言後 `--apply` 走標準驗證管線入庫，逐條回報接受／拒絕。
+- **題庫基線 transcript 全量錄製**（Evolution v3 WP2.1 收尾）：18 個產業 agent × 360 題的
+  行為題庫已在隔離沙箱完成真機錄製並全數通過健康檢查，離線 replay 全套件可跑——
+  自我進化引擎的 case 評分維度與 E1 斷言重放自此有真實資料可用。基線現況 98 通過／262 失敗
+  屬預期（題庫的目的就是暴露行為缺口）。
+- **eval 錄製隔離修正**：live 錄製時 agent 的 `.mcp.json` 改寫為指向本次 eval home 的臨時副本
+  （原檔不動），且 `DUDUCLAW_MCP_API_KEY` 一律換成佔位值——修掉「沙箱錄製仍把工具副作用
+  寫進生產資料」與「生產 MCP 金鑰被 CLI init 事件回顯進 transcript」兩個隱患；
+  `error_max_turns` 的 run 改為可評測的失敗基線（工具活動完整錄下，由 `max_tool_calls`
+  等斷言判失敗），僅基礎設施錯誤（限流／session 上限）維持硬錯誤不入庫。
+- **題庫隨產業包安裝**（方案 A）：從產業板模建立 AI 員工時，若該角色隨附行為題庫，
+  自動安裝到 `<home>/evals/<員工名>/`（改名部署會同步改寫題目的 agent 欄位；
+  既有題庫目錄永不覆蓋）——包裝出的員工第一天就有自我進化的評測基線。
+- **`duduclaw eval-scaffold`**（免費功能）：從 agent 自己的 SOUL.md 行為規則產生 eval
+  草稿題（零 LLM、身分分區不觸碰），落在 `evals-drafts/` 避免未審閱題目混入基線；
+  操作者補上 prompt 與斷言、移入題庫後即可 `--record`——自建 agent 也能吃到完整
+  演化迴路（playbook 新條目的 eval-case 硬要求自此對免費用戶可達成）。
+- **法律事務所團隊補接案／諮詢兩崗**：lawfirm-team 新增 `law-intake`（接案行政）與
+  `law-consult`（法律諮詢）兩名 AI 成員（lawfirm 專屬 kit，法律業紅線內建於 SOUL/CONTRACT，
+  行為題庫直接對其出題）；原 `law-assistant` 題庫改綁前台總機 `lawfirm-assistant`。
+
+### Changed
+- **goal loop 震盪偵測**改由訪問圖結構性判定（對外事件與回饋字串不變）。
+- **`tool_calls.jsonl` 輪替上限 5MB→16MB**（記錄新增 result_text 欄位後單列變大，維持稽核保存窗）；
+  檔案權限收緊為 0600（記錄現含業務資料），既有寬鬆權限的檔案在下次寫入時自動收緊。
+
+### Fixed
+- **goal／cron／heartbeat／autopilot 派工的工具稽核歸屬錯誤**（活體驗證抓到的 P0）：
+  worker AI 員工執行的 MCP 工具呼叫，先前會被記到派工者（如 `goal-loop-driver`）名下，
+  導致 forward model 觀測永遠拿不到資料、grounding 驗收永遠跳過、驗收判官看不到工具證據而把
+  誠實完成的工作退回。現在系統發送者派工時稽核一律歸屬實際執行的員工；真人／員工間委派行為不變。
+
+### Security
+- **SOUL.md 人格層對 AI 員工唯讀化**（Evolution v3 WP1.1）：修補一個從未真正生效的閘門——
+  MCP 工具 `agent_update_soul` 自承「Bypasses file-protect hooks」可整份改寫 SOUL.md，
+  且預設的 in-process agent 身分持有 Admin 權限，實務上 AI 員工可自行改寫（甚至偽裝改寫他人）
+  人格檔；唯一理論上的守門旗標 `agent.toml [permissions] can_modify_own_soul`
+  過去**沒有任何程式碼讀取它**（`duduclaw-security::rbac` 全專案零呼叫者的死碼），20 個產業板模
+  寫 `= false` 但形同虛設。現在此工具對「AI 員工身分」呼叫者一律拒絕（除非該員工的
+  `can_modify_own_soul` 明確設為 `true`，且僅能自寫，不得跨員工），操作者／儀表板路徑不受影響；
+  Write/Edit/Bash 三個工具也新增 SOUL.md 自寫防護（先前的跨員工檔案隔離只擋改別人的檔案，
+  沒擋自己直接用檔案工具改自己的 SOUL.md）。從未生效的 `rbac.rs` 死碼已刪除，
+  其唯一有語意的功能（人格自寫旗標）已在 MCP 前門實作，另一功能（`validate_agent_creation`）
+  已被 WP21/WP22 的 `delegation_policy` 完整取代。見 `commercial/docs/DESIGN-evolution-v3-aee.md` §1.9。
+- **稽核遮罩強化**：工具輸出寫入稽核檔前的機密遮罩補齊多個實測繞過——小寫 `bearer`、
+  `Basic`/`Token` 認證頭、多字 passphrase 整行、連線字串密碼（`postgres://user:pass@`）、
+  Telegram bot URL token、Slack webhook 路徑、連字號拼法 key（`x-api-key`）、CJK 緊鄰 key
+  （中文字與 `password:` 相連時原本整條失配）。全部修補附繞過→遮蔽的回歸測試。
+- **狀態回填注入防護**：goal 任務的 `<state_update>` 自報通道、錯誤筆記注入 prompt 的使用者原文、
+  審批與 needs_human 推播文字，全面補上 XML 跳脫與資料框定——修補一個可用 121 字元 payload
+  偽造「已確認事實」的逃逸路徑（附 PoC 回歸測試）。
+- **grounding 證據反自我回音**：任務回寫類工具（`tasks_complete` 等）的輸出不再作為 grounding 證據
+  （agent 的自述經回音偽裝成「工具佐證」的通道已封死）；證據比對排除與呼叫輸入重疊的片段。
+- **ActionGuard 模擬參考反自證**：可逆性判官的 wiki 參考只讀 `.scope.toml` 標為唯讀／操作者專屬的
+  namespace（無政策檔一律不取，fail-closed），agent 本地 wiki 一律不取；參考內容明確限定
+  不得作為可逆性判定依據——封死「agent 先寫一頁『此操作可逆』的假 SOP 再繞過人工審批」的路徑。
+
+### Changed
+- **組織資料變更流程升級**（WP22 行為變更）：手動編輯 agent.toml 的 `reports_to` 或 `department` 欄位不再自動生效。
+  所有組織結構調整一律透過新指令 `duduclaw org sync`（操作者終端執行）、儀表板或 MCP `agent_update` 進行。
+  此舉防止 agent 自助修改組織圖影響委派判定，確保組織變更由人類操作者顯式決定。
+- **`config.toml` 對 AI 員工整檔唯讀**（WP22 安全邊界）：`~/.duduclaw/config.toml` 現為全局委派政策與 ACP 設定，
+  任何 AI 員工都無法透過 Write/Edit/Bash 工具改寫此檔案，防止員工自行調整全團隊委派規則。政策變更由操作者或儀表板進行。
+- **Agent 配置鎖定**（WP21 安全升級）：① agent 不再能使用 Write/Edit 工具改寫自己的 `name`、`reports_to`、`department`，
+  必須透過儀表板「AI 員工 → 詳情 → 編輯」或 MCP `agent_update` 變更；② agent 不能改寫自己的 `.claude/settings.json` 與
+  `.mcp.json` 身分區塊，權限管理走儀表板進階設定、與管理員協商；③ 系統發送者（dashboard/webhook/cron 等）操作不受限。
+- **組織層級委派行為變更**（WP21 升級說明）：① 祖父→孫層級派工從「被拒」改為「放行」
+  （越級指派現已支援）；② 無從屬關係且不同部門的 agent 互派從「全開」改為「被拒」
+  （非同部門/非上下級/非白名單配對一律fail-closed）；③ `create_agent` 省略 `reports_to` 時
+  改掛 caller 自己而非 main agent（阻止自助提權漏洞）；④ 系統保留名稱
+  （`dashboard` / `webhook` / `cron` / `heartbeat` / `autopilot` / `goal-loop-driver` /
+  `a2a-client` / `default`）不再能用來建立 AI 員工；⑤ `[delegation] policy = "open"`
+  可恢復舊行為。既有部署若依賴跨部門 tasks_create，升級後錯誤訊息會明確指引改政策或補組織關係；
+  強烈建議保持 `department` 預設（即使舊版未做任何檢查，新政策對前門路徑零回歸，只在後門
+  路徑對齊安全預期）。⑥ `agent_remove` 現在也受相同的子樹規則約束——只能移除自己
+  或自己團隊之下的 AI 員工，系統發送者與 `open` 政策照舊豁免。
+- **v1.53 預告**：所有系統派工來源已完成發送者戳記，v1.53 起無發送者標記的佇列任務（舊格式 bus_queue.jsonl 項目）將從「警告放行」改為「拒絕」，
+  強制升級到帶發送者的新格式；自動化腳本若直接 append bus_queue.jsonl 需要補上 `sender` 欄位。
+
+### Added
+- **Playbook 條目模型（Evolution v3 WP1.2，GEP gene 形）**：進化的新落地目的地。擴建既有
+  `rule_lifecycle`（Janus probation 底座不變）為 gene 形 schema——`category`
+  （repair/optimize/innovate）、`signals_match` 觸發信號（與 `MistakeCategory`/`FailureReason`
+  打通）、失敗歷史、至少連結 1 個 eval case（無連結一律拒絕入庫）、capsule 式應用記錄
+  （outcome/score）+ `success_streak`。條目內容強制緊湊（≤400 字元，論文實證擴寫成文件反而
+  降效）。確定性 delta 合併（非 LLM）；近重複偵測用 char n-gram cosine，閾值 0.92（刻意保守——
+  誤合併會靜默失去一條不同的規則，比多留一條冗餘更糟），命中即拒寫並記 audit；
+  per-agent 容量上限 + stale/archive 生命週期（複用既有 Ebbinghaus retrievability，不硬刪）。
+  新 CLI `duduclaw playbook export --agent <id> [--out <path>]` 匯出該 agent 目前生效條目為
+  GEP-gene 形 JSON（僅本地匯出，不接任何外部 hub，不 vendor 任何第三方程式碼）。
+- **注入通道升級（Evolution v3 WP1.3）**：「## Learned Rules」通道從「靜態 net-score 前 3 名」
+  改為「信號匹配優先＋分數排序補位」——當前錯誤模式／`FailureReason`／對話關鍵詞會先比對條目的
+  `signals_match`，命中的條目優先注入，其餘名額才依既有 net-score 排序遞補；token 預算
+  仍受 `prompt_compression` 管線約束，cache 斷點策略不變。
+- **Agentic Evolution Engine 迴圈（Evolution v3 WP2.1-2.5）**：GVU 的預設演化路徑改為 AEE——
+  每輪先依 `[evolution] strategy` 決定意圖（repair 消化 MistakeNotebook／optimize 精修低
+  streak 條目／innovate 探索新規則），Generator 內迴圈（≤3 輪，shadow 套用＋自跑 eval 子集，
+  不滿意就改，過程不落地）產出 playbook delta；**Gate/Measure 閘門分離**取代舊 8 層否決鏈——
+  Gate（`G-Safety`/`G-Contract`/`G-Canary-Static`/`G-Schema`/`G-Capacity`，零 LLM、保留否決權）
+  先過濾，只有通過 Gate 的候選才進 **Measure**（eval case 分數＋L3 judge 降級為一維分數＋
+  反諂媚＋新穎度＋mistake 相關度，皆無否決權，判官呼叫失敗記為「缺資料」而非「0 分」）；
+  提交閘採 **matches-or-improves**（AVO P7）——候選與現任 **champion**（整份 playbook 快照，
+  非單條目比較，避免「改善一條、悄悄搞砸三條」）逐維度比對，落在雜訊帶內視為打平可提交，
+  搭配三道防漂移配套。觀察窗判定降到**條目粒度**：條目 confirm/rollback 由其連結的 eval case
+  裁定，只回滾退步的那一條，不影響同批其他條目。全程遙測（`gvu/telemetry.rs`）記錄每層拒絕
+  原因，供 dashboard 拒絕分佈圖查詢。**AEE 從不寫入 SOUL.md**——SOUL cap 超標的整份壓回仍走
+  WP0.2 consolidate 路徑，與 AEE 迴圈正交。多 runtime 中立：eval 重放走子行程 +
+  `--report` JSON（不假設常駐 kernel 或特定 CLI stream 格式），LLM 判斷一律經
+  `run_utility_prompt` → account rotator，schema 不含任何單一 provider 專屬欄位。
+  詳見 `commercial/docs/DESIGN-evolution-v3-aee.md` 第一至三章。
+- **`duduclaw eval` 精準選題與跨 crate 重放（Evolution v3 WP2.1/2.2 前置，B4）**：新增
+  `--case <id>[,<id>...]`（依 `EvalCaseRef`——case 檔名 stem 精準比對，不同於 `--filter` 的
+  人類可讀 `[case] name` 子字串比對，後者唯一性不受強制）、`--exclude-dir <name>`（排除指定
+  目錄下的題目，用於 held-out 子集輪替，題庫內同名 id 會被檢查唯一性）、`--report <path>`
+  輸出 JSON 報告。AEE 迴圈透過子行程呼叫這條既有 CLI 路徑跑重放（B1 裁定：子行程 +
+  `--report` JSON，沿用 `migrate.scan` 的既有跨 crate 模式，不打破 cli→gateway 單向依賴）。
+- **新設定鍵**：`config.toml [evolution] eval_suites_root` / `eval_binary`（AEE 重放子行程找
+  題庫與 CLI 二進位的路徑，可覆寫預設）；`agent.toml [evolution] legacy_soul_evolution`
+  （`= true` 時該 agent 改走舊版 SOUL.md 改寫路徑，逃生門，見下方 Changed）、
+  `gvu_cooldown_minutes`（預設 60 分鐘）、`aee_settle_hours`（AEE 條目觀察窗，預設 24 小時，
+  上限 30 天）、`strategy`（`balanced`（預設）/`innovate`/`harden`/`repair_only`，決定每輪
+  repair/optimize/innovate 配比，取代裸 ε 探索，錯誤值會 `warn!` 並退回 `balanced`）、
+  `[evolution.noise_band]`（`cases`/`judge` 雜訊帶寬，供 matches-or-improves 判定）。
+- **Dashboard「自主學習」分頁**（記憶頁新分頁）：進化模式總覽（AEE/legacy 統計、啟用 agent
+  數）、版本歷史、停滯偵測卡（連續 N 輪全拒／D 天零套用／拒絕原因重複三種訊號）、拒絕遙測圖
+  （依驗證層級的拒絕次數分佈，7/30 天可切換）、整併（consolidate）紀錄、Playbook 條目卡片
+  （分類/狀態/helpful-harmful/success streak/連結 eval case 數，可一鍵匯出 gene JSON 或
+  手動 retire 單一條目）。新增 RPC：`evolution.status`、`evolution.versions`、
+  `evolution.stagnation`、`evolution.telemetry`、`evolution.consolidations`、
+  `playbook.list`、`playbook.export`、`playbook.retire`。
+
+### Changed
+- **進化引擎預設路徑改為 AEE（Evolution v3，行為變更）**：GVU 的預設演化目的地從「整份改寫
+  SOUL.md」轉為「擴建 playbook 條目」（見上方 Added）。維持舊行為需在 `agent.toml [evolution]`
+  明寫 `legacy_soul_evolution = true`，該旗標下 agent 繼續走本節下方「GVU 進化引擎止血」描述的
+  舊版 4 層驗證＋append-only SOUL.md 路徑（含本次的止血修復），**但舊路徑不會再獲得
+  AEE 的新防護**（Gate/Measure 分離、champion、條目級觀察窗、停滯偵測告警）。
+  升級後兩種路徑並存，非強制遷移；既有 35 版 SOUL.md 歷史可用人審流程半自動抽成 playbook 條目
+  （WP1.4，工具尚未隨本版出貨，見 `commercial/docs/TODO-evolution-v3-2026-08.md`）。
+- **`gvu_enabled` 預設統一為 opt-in（Evolution v3，行為變更）**：見下方 Fixed 的 R3 說明——
+  struct 層預設值原本誤寫為 `true`，現與實際 runtime 閘門一致統一為 `false`。多數線上安裝
+  的板模生成路徑本就明寫此 key（受影響有限），但**手動建立、未寫此 key 的 agent**，
+  升級後 GVU/AEE 會從「意外啟用」變成「需顯式開啟」——若原本依賴自動進化，
+  升級後請確認 `agent.toml [evolution] gvu_enabled = true`。
+
+### Fixed
+- **GVU/AEE 進化引擎止血（Evolution v3 Phase 0）**：三個月實證鑑識發現進化引擎不是「不會進化」，
+  是被自己的護欄與死鎖絞死、且死了沒人知道。本次修六處根因：
+  - **`gvu_enabled` 預設不一致（R3）**：`agent.toml [evolution] gvu_enabled` 的兩套預設方向相反——
+    struct 層預設 `true`、實際 runtime 閘門（`gvu::trigger::agent_gvu_enabled`）缺 key 時預設 `false`，
+    造成 dashboard 顯示與實際行為不一致。統一為 fail-closed opt-in（預設 `false`），並修正三處
+    生成 agent.toml 卻沒明寫此 key／寫成 `true` 的板模生成路徑（`duduclaw wizard`、`duduclaw onboard`
+    headless 模式、22 個產業付費板模 `commercial/templates-premium/*-pro`）。
+  - **SOUL.md cap 死鎖（R2）**：`SOUL_MAX_LINES`/`SOUL_MAX_BYTES` 過去是單向閥——一旦 SOUL.md
+    超過上限，之後所有提案都在同一道閘被拒（"Manual review required" 只寫 log，無人看得到），
+    agent 永久卡死無法再進化。新增 consolidate 模式（`gvu/consolidate.rs`）：偵測到已超 cap
+    或套用後會超 cap 時，改請 Generator 整份重寫壓回上限，並以六道防護抵禦 context collapse——
+    人格分區逐位元組鎖定（SHA-256 校驗）、章節結構鎖定、壓縮後 Measure 分數不得低於壓縮前
+    （否則整批拒絕）等；"Manual review required" 現在也會推 dashboard + 通道通知，不再只寫 log。
+  - **觀察窗品質閘空轉（R5）**：舊版「對話數 < 5 且超 72h → 無條件 Confirm」導致抽查的 confirmed
+    版本 post_metrics 全為 0——安全閥變成了「假裝有證據」的主要來源。移除無條件 confirm，新增
+    兩段式訊號：72h 軟性告警（仍延長觀察，但 dashboard 出現一次性提醒）、14 天硬性上限後標記
+    `ExpiredNoData`（**不算 confirmed，也不當作驗證失敗**，SOUL.md 內容維持原狀，僅止血不誤判）。
+  - **通道路徑繞過 GVU 節流（R4）**：`channel_reply.rs` 的 ε 探索／沉默計時器觸發路徑會直接呼叫 GVU，
+    未檢查 `gvu_enabled` 也沒有任何節流——實測某窗口 5 小時內連燒 6 次 GVU（每次 4-5 分鐘 LLM 時間）。
+    現在補上 `gvu_enabled` 檢查，並在 GVU 執行入口新增每 agent 冷卻時間
+    （`agent.toml [evolution] gvu_cooldown_minutes`，預設 60 分鐘，涵蓋所有呼叫路徑）。
+  - **判官順序顛倒（B2）**：確定性 `verify_all` 過去排在 L3 LLM judge 之後，B 窗全拒案例因此
+    白付 judge 的 LLM 費用；現在改為先跑零成本的確定性檢查，鐵定會被拒的候選不再燒 judge 錢。
+  - **MetaCognition 閾值只降不升（R7）**：`negligible_upper`/`significant_upper` 過去只有收緊
+    規則、沒有對稱的回升規則，長期會單向漂移到過度敏感。新增對稱回升邏輯，長期無異常訊號時
+    閾值會逐步鬆回預設值附近。
+  - **停滯偵測器（AVO §2.4）**：新增 `gvu/stagnation.rs`，每 30 分鐘掃描 `evolution.db`，偵測「連續 5 次
+    GVU 皆未套用」「14 天內有觸發但零套用」「拒絕原因重複 ≥3 次」三種停滯訊號，觸發時發 Activity Feed
+    貼文 + evolution event + log 警告（同一停滯狀態不重複告警）。
+  - 拒絕遙測（每次 verify/apply 記錄層級 + 原因，落 dashboard 拒絕分佈圖）與 MistakeNotebook
+    程式化軌跡證據化（`TrajectoryEvidence`，見上方「錯誤筆記證據化」）一併於本輪完成。
+  - Phase 1/2（SOUL.md 唯讀化、Playbook 條目模型、AEE 迴圈重排）已隨本版一併出貨，見上方
+    Added/Changed 與 `docs/features/38-aee-playbook-evolution.md`。設計全文見
+    `commercial/docs/TODO-evolution-v3-2026-08.md` / `commercial/docs/DESIGN-evolution-v3-aee.md`。
 
 ## [1.52.4] - 2026-08-05 — 系統更新頁重啟並更新按鈕
 

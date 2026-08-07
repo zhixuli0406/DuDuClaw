@@ -122,17 +122,31 @@
 
 ## Evolution System
 
+> **Evolution v3 (2026-08-06)**: the default evolution target moved from
+> rewriting `SOUL.md` to the **playbook** (small, independently-retirable
+> gene-shaped rules; `SOUL.md` is read-only for agents by default). The GVU²
+> rows below (Dual-Loop / 4+2 Layer Verification / SOUL.md Versioning) now
+> describe the **non-default legacy path** (`agent.toml [evolution]
+> legacy_soul_evolution = true`). See
+> [38-aee-playbook-evolution.md](38-aee-playbook-evolution.md) and
+> [evolution-engine.md](../architecture/evolution-engine.md) ch.12 for the
+> current default (AEE, Gate/Measure split, champion + matches-or-improves,
+> entry-level observation windows).
+
 | Feature | Description |
 |---------|-------------|
 | Prediction-Driven Engine | Active Inference + Dual Process Theory, ~90% zero LLM cost |
 | Dual Process Router | System 1 (rules) / System 2 (LLM reflection) |
-| GVU² Dual-Loop | Outer loop (Behavioral GVU — SOUL.md) + Inner loop (Task GVU — instant retry) |
-| 4+2 Layer Verification | L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety |
-| MistakeNotebook | Cross-loop error memory — records failure patterns, prevents regression |
-| SOUL.md Versioning | 24h observation period, atomic rollback, SHA-256 fingerprint |
-| MetaCognition | Self-calibrating error thresholds every 100 predictions |
+| AEE (v3 default) | Agentic Evolution Engine — Generator inner loop (≤3 rounds) → Gate (deterministic, veto) / Measure (scored, no veto) split → champion + matches-or-improves commit gate → entry-level accept/rollback against linked eval cases |
+| Playbook (v3 default) | Gene-shaped behavior rules (category/signals_match/eval_cases/success_streak), extends the existing rule_lifecycle store, 0.92-cosine dedup, capacity + stale/archive lifecycle |
+| GVU² Dual-Loop (legacy) | Outer loop (Behavioral GVU — SOUL.md rewrite) + Inner loop (Task GVU — instant retry); opt-in via `legacy_soul_evolution = true` |
+| 4+2 Layer Verification (legacy) | L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety |
+| MistakeNotebook | Cross-loop error memory — records failure patterns, prevents regression; entries now carry deterministic `TrajectoryEvidence` (which tool/assertion failed) so unverified self-reported diagnosis no longer feeds reflection consolidation (v3) |
+| SOUL.md Versioning (legacy) | 24h observation period, atomic rollback, SHA-256 fingerprint — applies to the legacy GVU path; SOUL.md cap-deadlock now breaks via a guarded consolidate rewrite instead of freezing the agent (v3 Phase 0) |
+| MetaCognition | Self-calibrating error thresholds every 100 predictions, now with a symmetric raise-back rule so thresholds don't drift one-directionally (v3 Phase 0) |
 | Adaptive Depth | MetaCognition-driven GVU iteration count (3-7 rounds based on history) |
-| Deferred GVU | Gradient accumulation + delayed retry (max 3 deferrals, 72h span, 9-21 effective rounds) |
+| Deferred GVU (legacy) | Gradient accumulation + delayed retry (max 3 deferrals, 72h span, 9-21 effective rounds) |
+| Stagnation Detector (v3) | Scans `evolution.db` every 30 min for consecutive-rejected / D-days-zero-apply / repeated-rejection-reason signals, posts to Activity Feed + dashboard |
 | ConversationOutcome | Zero-LLM conversation result detection (TaskType / Satisfaction / Completion), zh-TW + en |
 | Agent-as-Evaluator | Independent Evaluator Agent (Haiku cost control) for adversarial verification, structured JSON verdict |
 | Orchestrator Template | 5-step planning (Analyze → Decompose → Delegate → Evaluate → Synthesize) + complexity routing |

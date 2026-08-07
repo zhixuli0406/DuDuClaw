@@ -40,7 +40,7 @@
 | 安全認證 | **Ed25519 challenge-response** | 非對稱簽章，無密碼傳輸 |
 | API key 儲存 | **AES-256-GCM** | 對稱加密，base64 存於 config.toml |
 | 日誌推送 | **BroadcastLayer** tracing | 即時推播 log 到 WebSocket，零侵入 |
-| Evolution | **預測驅動 + GVU 自我博弈** | 90% 零 LLM 成本，Significant/Critical 才觸發 GVU 迴圈 |
+| Evolution | **預測驅動 + AEE playbook 進化**（GVU 整份改寫 SOUL.md 降為選配逃生門） | 90% 零 LLM 成本，Significant/Critical 才觸發；`SOUL.md` 對 agent 唯讀 |
 | Token 計算 | **CJK-aware heuristic** | CJK 字元 ~1.5 chars/token，ASCII ~4 chars/token |
 
 ---
@@ -334,11 +334,18 @@ GET https://api.anthropic.com/v1/models
 
 ---
 
-## 七、自主進化引擎（Prediction-Driven + GVU）
+## 七、自主進化引擎（Prediction-Driven + AEE / GVU）
 
-> 完整技術文件：[docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md)
+> 完整技術文件：[docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md)（第十二章為 v3 現況）
 
 進化引擎以**預測誤差**驅動，取代固定計時器反思，約 90% 的對話零 LLM 成本。
+
+**v3（2026-08-06）現況**：§7.2 描述的 GVU 迴圈——整份改寫 `SOUL.md`——現在是
+**非預設的逃生門**（`agent.toml [evolution] legacy_soul_evolution = true` 才會
+啟用）。預設路徑改為 **AEE**：`SOUL.md` 對 agent 唯讀，學習落地成 playbook
+行為規則（獨立驗證、獨立回滾），詳見
+[docs/features/38-aee-playbook-evolution.md](docs/features/38-aee-playbook-evolution.md)。
+§7.2/§7.3 對啟用 `legacy_soul_evolution` 的 agent 仍原封不動有效。
 
 ### 7.1 預測引擎（Phase 1）
 
@@ -579,9 +586,9 @@ allow_network = true
 allow_shell = false
 
 [evolution]
-gvu_enabled = true
+gvu_enabled = true          # 預設 false，opt-in；啟用後預設走 AEE，非整份改寫 SOUL.md
 max_silence_hours = 12.0
-observation_period_hours = 24.0
+observation_period_hours = 24.0   # legacy_soul_evolution=true 時才適用；AEE 用 aee_settle_hours
 ```
 
 ### 12.2 `config.toml`（全域）

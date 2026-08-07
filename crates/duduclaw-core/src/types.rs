@@ -38,7 +38,13 @@ pub enum AgentRole {
     /// work. Typically has `reports_to = ""` or a parent org. `front_desk` is
     /// the expert-pack roster name for the same thing (the team's 對外窗口 that
     /// workers report to) — accepted here so installed packs load.
-    #[serde(alias = "tl", alias = "lead", alias = "teamlead", alias = "front_desk", alias = "front-desk")]
+    #[serde(
+        alias = "tl",
+        alias = "lead",
+        alias = "teamlead",
+        alias = "front_desk",
+        alias = "front-desk"
+    )]
     TeamLeader,
     /// Product Manager — drives research and feature proposals for a
     /// specific project / domain.
@@ -101,7 +107,7 @@ impl std::str::FromStr for AgentRole {
                 return Err(format!(
                     "invalid role '{s}'. valid values: {}",
                     Self::valid_values_help()
-                ))
+                ));
             }
         })
     }
@@ -429,7 +435,14 @@ mod edition_cap_tests {
         for k in ["business", "enterprise", "oem", "partner", "self_host_pro"] {
             assert!(!EditionProfile::from_tier_key(k).is_personal(), "{k}");
         }
-        for k in ["opensource", "hobby", "solo", "studio", "personal_pro_self_host", ""] {
+        for k in [
+            "opensource",
+            "hobby",
+            "solo",
+            "studio",
+            "personal_pro_self_host",
+            "",
+        ] {
             assert!(EditionProfile::from_tier_key(k).is_personal(), "{k}");
         }
     }
@@ -902,8 +915,11 @@ impl CapabilitiesConfig {
         fn base(entry: &str) -> &str {
             entry.split('(').next().unwrap_or(entry).trim()
         }
-        let bare_denied =
-            |tool: &str| self.denied_tools.iter().any(|d| d.trim().eq_ignore_ascii_case(tool));
+        let bare_denied = |tool: &str| {
+            self.denied_tools
+                .iter()
+                .any(|d| d.trim().eq_ignore_ascii_case(tool))
+        };
         if !self.allowed_tools.is_empty() {
             WRITE_TOOLS.iter().any(|tool| {
                 !bare_denied(tool)
@@ -994,7 +1010,19 @@ pub struct EvolutionConfig {
     pub external_factors: ExternalFactorsConfig,
 
     /// Enable GVU (Generator-Verifier-Updater) loop for evolution proposals.
-    #[serde(default = "default_true")]
+    ///
+    /// **Default `false` (WP0.1, 2026-08-06 — fixes root cause R3).** Before
+    /// this fix the struct default was `true` while the actual runtime gate
+    /// (`gvu::trigger::agent_gvu_enabled` in duduclaw-gateway, which reads
+    /// `agent.toml` directly rather than through this struct) defaulted a
+    /// missing/absent key to `false`. The two defaults pointed opposite
+    /// directions: dashboard code paths that render this struct's default
+    /// showed GVU as "on", while the agent silently never ran it — 19 of 20
+    /// production template agents were affected. Fail-closed opt-in wins:
+    /// GVU only runs for agents whose `agent.toml` explicitly sets
+    /// `gvu_enabled = true`. Template/scaffold generators must write the key
+    /// explicitly (even when `false`) so the toggle is visible, not implicit.
+    #[serde(default)]
     pub gvu_enabled: bool,
 
     /// DEPRECATED (D7, 2026-08-04): the cognitive memory layer is now a
@@ -1022,7 +1050,6 @@ pub struct EvolutionConfig {
     pub observation_period_hours: f64,
 
     // ── Skill lifecycle ──
-
     /// Token budget for skills in system prompt (default 2500).
     #[serde(default = "default_skill_token_budget")]
     pub skill_token_budget: u32,
@@ -1032,7 +1059,6 @@ pub struct EvolutionConfig {
     pub max_active_skills: usize,
 
     // ── Skill auto-synthesis (P0) ──
-
     /// Enable automatic skill synthesis from episodic memory when repeated
     /// domain gaps are detected.
     #[serde(default)]
@@ -1051,7 +1077,6 @@ pub struct EvolutionConfig {
     pub skill_trial_ttl: u32,
 
     // ── Cross-agent skill migration (P2) ──
-
     /// Enable automatic skill graduation to global scope when lift is proven.
     #[serde(default)]
     pub skill_graduation_enabled: bool,
@@ -1069,7 +1094,6 @@ pub struct EvolutionConfig {
     pub skill_recommendation_threshold: f64,
 
     // ── Curiosity-driven exploration (P4) ──
-
     /// Enable curiosity-driven proactive exploration of underexplored domains.
     #[serde(default)]
     pub curiosity_enabled: bool,
@@ -1083,7 +1107,6 @@ pub struct EvolutionConfig {
     pub curiosity_max_daily: u32,
 
     // ── Behavior monitoring (P1) ──
-
     /// Enable behavioral drift detection after skill activation.
     #[serde(default)]
     pub skill_behavior_monitor_enabled: bool,
@@ -1093,7 +1116,6 @@ pub struct EvolutionConfig {
     pub skill_behavior_drift_threshold: f64,
 
     // ── Stagnation detection (P0 config, P1 suppress action) ──
-
     /// Configuration for the signal-stagnation detector.
     ///
     /// P0: only `log_only` action is active.
@@ -1109,7 +1131,9 @@ impl Default for EvolutionConfig {
             skill_auto_activate: false,
             skill_security_scan: true,
             external_factors: Default::default(),
-            gvu_enabled: true,
+            // WP0.1 (2026-08-06): default false — see field doc on
+            // `gvu_enabled` above for the R3 root-cause writeup.
+            gvu_enabled: false,
             cognitive_memory: true,
             max_silence_hours: 12.0,
             max_gvu_generations: 3,
@@ -1479,8 +1503,14 @@ mod sandbox_level_tests {
     #[test]
     fn codex_flag_values() {
         assert_eq!(SandboxLevel::ReadOnly.as_codex_flag(), "read-only");
-        assert_eq!(SandboxLevel::WorkspaceWrite.as_codex_flag(), "workspace-write");
-        assert_eq!(SandboxLevel::FullAccess.as_codex_flag(), "danger-full-access");
+        assert_eq!(
+            SandboxLevel::WorkspaceWrite.as_codex_flag(),
+            "workspace-write"
+        );
+        assert_eq!(
+            SandboxLevel::FullAccess.as_codex_flag(),
+            "danger-full-access"
+        );
     }
 }
 
@@ -1659,7 +1689,6 @@ pub struct ChannelBinding {
     pub description: String,
 }
 
-
 /// Per-agent Telegram channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
@@ -1668,7 +1697,6 @@ pub struct TelegramChannelConfig {
     pub bot_token: String,
     pub bot_token_enc: Option<String>,
 }
-
 
 /// Per-agent LINE channel settings.
 ///
@@ -1727,7 +1755,6 @@ impl LineChannelConfig {
     }
 }
 
-
 /// Per-agent Slack channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
@@ -1738,7 +1765,6 @@ pub struct SlackChannelConfig {
     pub bot_token: String,
     pub bot_token_enc: Option<String>,
 }
-
 
 /// Per-agent WhatsApp channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1753,7 +1779,6 @@ pub struct WhatsAppChannelConfig {
     pub app_secret_enc: Option<String>,
 }
 
-
 /// Per-agent Feishu (Lark) channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
@@ -1765,7 +1790,6 @@ pub struct FeishuChannelConfig {
     pub app_secret_enc: Option<String>,
     pub verification_token: String,
 }
-
 
 /// Per-agent WeCom (企業微信) channel settings — self-built app (自建應用).
 ///
@@ -1790,7 +1814,6 @@ pub struct WeComChannelConfig {
     pub encoding_aes_key_enc: Option<String>,
 }
 
-
 /// Per-agent DingTalk (釘釘) channel settings — enterprise internal robot.
 ///
 /// Inbound callbacks hit the global `POST /webhook/dingtalk` endpoint,
@@ -1805,7 +1828,6 @@ pub struct DingTalkChannelConfig {
     pub app_secret: String,
     pub app_secret_enc: Option<String>,
 }
-
 
 /// Per-agent Google Chat channel settings.
 ///
@@ -1825,7 +1847,6 @@ pub struct GoogleChatChannelConfig {
     pub service_account_json_enc: Option<String>,
 }
 
-
 /// Per-agent Microsoft Teams channel settings.
 ///
 /// Requires an Azure Bot resource whose messaging endpoint points at
@@ -1843,7 +1864,6 @@ pub struct TeamsChannelConfig {
     /// Entra tenant ID (required for single-tenant bots; empty = multi-tenant).
     pub tenant_id: String,
 }
-
 
 /// Top-level agent identity (the `[agent]` table in agent.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2057,7 +2077,6 @@ pub enum Expressiveness {
     Expressive,
 }
 
-
 impl Expressiveness {
     /// Probability multiplier for this expressiveness level.
     pub fn multiplier(self) -> f32 {
@@ -2197,9 +2216,7 @@ impl ProactiveConfig {
             self.quiet_hours_end = 23;
         }
         if self.max_turns == 0 {
-            tracing::warn!(
-                "proactive.max_turns is 0, bumping to default (8)"
-            );
+            tracing::warn!("proactive.max_turns is 0, bumping to default (8)");
             self.max_turns = 8;
         }
         if self.max_turns > 64 {
@@ -2349,7 +2366,6 @@ pub enum MemoryLayer {
     Procedural,
 }
 
-
 impl MemoryLayer {
     pub fn as_str(&self) -> &str {
         match self {
@@ -2380,7 +2396,6 @@ pub struct MemoryEntry {
     pub embedding: Option<Vec<f32>>,
 
     // ── Cognitive memory fields (Phase 3) ──
-
     /// Which cognitive layer this memory belongs to.
     #[serde(default)]
     pub layer: MemoryLayer,
@@ -2483,8 +2498,14 @@ mod tests {
             let p: Probe = toml::from_str(&format!("role = \"{raw}\"")).unwrap();
             assert_eq!(p.role, AgentRole::TeamLeader, "serde alias {raw}");
         }
-        assert_eq!(AgentRole::from_str("front_desk").unwrap(), AgentRole::TeamLeader);
-        assert_eq!(AgentRole::from_str("Front Desk").unwrap(), AgentRole::TeamLeader);
+        assert_eq!(
+            AgentRole::from_str("front_desk").unwrap(),
+            AgentRole::TeamLeader
+        );
+        assert_eq!(
+            AgentRole::from_str("Front Desk").unwrap(),
+            AgentRole::TeamLeader
+        );
     }
 
     // ── D7: cognitive memory is always on ──────────────────────────
@@ -2501,7 +2522,10 @@ mod tests {
             cognitive_memory = false\n";
         let cfg: EvolutionConfig = toml::from_str(raw).expect("legacy config must still parse");
         // Raw field preserved (round-trips back to disk untouched)…
-        assert!(!cfg.cognitive_memory, "raw deprecated field is preserved as parsed");
+        assert!(
+            !cfg.cognitive_memory,
+            "raw deprecated field is preserved as parsed"
+        );
         // …but the behavioural accessor ignores it.
         assert!(
             cfg.cognitive_memory_enabled(),
@@ -2594,8 +2618,7 @@ mod tests {
 
     #[test]
     fn evolution_master_enabled_reads_explicit_false() {
-        let tmp = std::env::temp_dir()
-            .join(format!("evo-master-off-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("evo-master-off-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("agent.toml"), "[evolution]\nenabled = false\n").unwrap();
         assert!(!evolution_master_enabled(&tmp));
@@ -2605,8 +2628,7 @@ mod tests {
     #[test]
     fn evolution_master_enabled_defaults_true_when_absent_or_missing() {
         // Missing file → true (not frozen). Present file without the key → true.
-        let tmp = std::env::temp_dir()
-            .join(format!("evo-master-default-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("evo-master-default-{}", uuid::Uuid::new_v4()));
         assert!(evolution_master_enabled(&tmp)); // no dir/file yet
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("agent.toml"), "[agent]\nname = \"x\"\n").unwrap();
@@ -2675,8 +2697,14 @@ mod tests {
 
     #[test]
     fn agent_role_kebab_case_wire_format() {
-        assert_eq!(serde_json::to_string(&AgentRole::TeamLeader).unwrap(), "\"team-leader\"");
-        assert_eq!(serde_json::to_string(&AgentRole::ProductManager).unwrap(), "\"product-manager\"");
+        assert_eq!(
+            serde_json::to_string(&AgentRole::TeamLeader).unwrap(),
+            "\"team-leader\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentRole::ProductManager).unwrap(),
+            "\"product-manager\""
+        );
         // Single-word variants stay identical to the old lowercase encoding.
         assert_eq!(serde_json::to_string(&AgentRole::Main).unwrap(), "\"main\"");
         assert_eq!(serde_json::to_string(&AgentRole::Qa).unwrap(), "\"qa\"");
@@ -2685,10 +2713,10 @@ mod tests {
     #[test]
     fn agent_role_serde_aliases_accepted() {
         let cases = [
-            ("\"engineer\"",           AgentRole::Developer),
-            ("\"quality-assurance\"",  AgentRole::Qa),
-            ("\"tl\"",                 AgentRole::TeamLeader),
-            ("\"pm\"",                 AgentRole::ProductManager),
+            ("\"engineer\"", AgentRole::Developer),
+            ("\"quality-assurance\"", AgentRole::Qa),
+            ("\"tl\"", AgentRole::TeamLeader),
+            ("\"pm\"", AgentRole::ProductManager),
         ];
         for (input, expected) in cases {
             let decoded: AgentRole = serde_json::from_str(input)
@@ -2700,14 +2728,14 @@ mod tests {
     #[test]
     fn agent_role_from_str_lenient_normalisation() {
         let cases = [
-            ("team-leader",      AgentRole::TeamLeader),
-            ("team_leader",      AgentRole::TeamLeader),
-            ("Team Leader",      AgentRole::TeamLeader),
-            ("  TEAM-LEADER  ",  AgentRole::TeamLeader),
-            ("product_manager",  AgentRole::ProductManager),
-            ("engineer",         AgentRole::Developer),
-            ("quality",          AgentRole::Qa),
-            ("main",             AgentRole::Main),
+            ("team-leader", AgentRole::TeamLeader),
+            ("team_leader", AgentRole::TeamLeader),
+            ("Team Leader", AgentRole::TeamLeader),
+            ("  TEAM-LEADER  ", AgentRole::TeamLeader),
+            ("product_manager", AgentRole::ProductManager),
+            ("engineer", AgentRole::Developer),
+            ("quality", AgentRole::Qa),
+            ("main", AgentRole::Main),
         ];
         for (input, expected) in cases {
             assert_eq!(
@@ -2726,7 +2754,11 @@ mod tests {
 
     #[test]
     fn agent_role_display_roundtrip() {
-        for role in [AgentRole::TeamLeader, AgentRole::ProductManager, AgentRole::Qa] {
+        for role in [
+            AgentRole::TeamLeader,
+            AgentRole::ProductManager,
+            AgentRole::Qa,
+        ] {
             let s = role.to_string();
             assert_eq!(AgentRole::from_str(&s).unwrap(), role);
         }
@@ -2752,9 +2784,18 @@ mod tests {
     #[test]
     fn edition_profile_parse_aliases_and_case() {
         assert_eq!(EditionProfile::parse("PERSONAL"), EditionProfile::Personal);
-        assert_eq!(EditionProfile::parse("  Enterprise  "), EditionProfile::Enterprise);
-        assert_eq!(EditionProfile::parse("individual"), EditionProfile::Personal);
-        assert_eq!(EditionProfile::parse("enterprise_edition"), EditionProfile::Enterprise);
+        assert_eq!(
+            EditionProfile::parse("  Enterprise  "),
+            EditionProfile::Enterprise
+        );
+        assert_eq!(
+            EditionProfile::parse("individual"),
+            EditionProfile::Personal
+        );
+        assert_eq!(
+            EditionProfile::parse("enterprise_edition"),
+            EditionProfile::Enterprise
+        );
     }
 
     #[test]
@@ -2778,7 +2819,11 @@ mod tests {
             "self-host-pro",
             "partner",
         ] {
-            assert_eq!(EditionProfile::from_tier_key(k), EditionProfile::Enterprise, "{k}");
+            assert_eq!(
+                EditionProfile::from_tier_key(k),
+                EditionProfile::Enterprise,
+                "{k}"
+            );
         }
         for k in [
             "opensource",
@@ -2789,7 +2834,11 @@ mod tests {
             "personal-pro-self-host",
             "",
         ] {
-            assert_eq!(EditionProfile::from_tier_key(k), EditionProfile::Personal, "{k}");
+            assert_eq!(
+                EditionProfile::from_tier_key(k),
+                EditionProfile::Personal,
+                "{k}"
+            );
         }
     }
 
@@ -2815,7 +2864,10 @@ mod tests {
             EditionProfile::Personal
         );
         // nothing set → default Personal
-        assert_eq!(EditionProfile::resolve(None, None, None), EditionProfile::Personal);
+        assert_eq!(
+            EditionProfile::resolve(None, None, None),
+            EditionProfile::Personal
+        );
         // empty strings are treated as unset and fall through
         assert_eq!(
             EditionProfile::resolve(Some("  "), Some(""), Some("business")),
@@ -2831,6 +2883,9 @@ mod tests {
             assert_eq!(back, ed);
         }
         // lowercase wire format
-        assert_eq!(serde_json::to_string(&EditionProfile::Personal).unwrap(), "\"personal\"");
+        assert_eq!(
+            serde_json::to_string(&EditionProfile::Personal).unwrap(),
+            "\"personal\""
+        );
     }
 }

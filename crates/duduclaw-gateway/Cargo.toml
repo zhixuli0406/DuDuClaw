@@ -21,6 +21,10 @@ duduclaw-os = { workspace = true }
 duduclaw-llm = { workspace = true }
 duduclaw-sandbox = { workspace = true }
 thiserror = { workspace = true }
+# WP2.2 eval_runner.rs: subprocess spawn/parse error wrapping (B1 cli↔gateway
+# boundary — the eval harness is driven out-of-process). Already a workspace
+# dependency used elsewhere in the tree, just not previously a direct dep here.
+anyhow = { workspace = true }
 tokio-util = "0.7"
 # Interactive CLI auth ("Dashboard 一鍵登入") drives each AI CLI's native login
 # command in a PTY. Same crate the cli-runtime uses, so no new transitive deps.

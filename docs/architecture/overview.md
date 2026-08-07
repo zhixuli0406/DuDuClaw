@@ -44,10 +44,11 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 ### Evolution
 - **Prediction-driven engine**: Active Inference + Dual Process Theory, ~90% zero LLM cost. Negligible/Moderate errors → zero cost; Significant → GVU reflection; Critical → emergency GVU loop.
 - **MetaCognition**: self-calibrating error thresholds every 100 predictions; drives Adaptive Depth (3-7 GVU rounds).
-- **GVU² self-play loop** (Generator→Verifier→Updater): TextGrad feedback, 4+2 layer verification (L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety).
+- **GVU² self-play loop** (Generator→Verifier→Updater): TextGrad feedback, 4+2 layer verification (L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety). **Non-default legacy path since Evolution v3** (`agent.toml [evolution] legacy_soul_evolution = true`) — see AEE below.
 - **Deferred GVU**: gradient accumulation + delayed retry (max 3 deferrals, 72h span, 9-21 effective rounds).
-- **MistakeNotebook**: cross-loop error memory prevents regression.
-- **SOUL.md versioning**: 24h observation period + auto-rollback, atomic write (temp + rename) with SHA-256 fingerprint.
+- **MistakeNotebook**: cross-loop error memory prevents regression; entries now carry deterministic `TrajectoryEvidence` (which tool/assertion failed) so reflection consolidation stops trusting unverified self-reported diagnosis (Evolution v3).
+- **SOUL.md versioning**: 24h observation period + auto-rollback, atomic write (temp + rename) with SHA-256 fingerprint. Applies to the legacy GVU path above; **`SOUL.md` is read-only for agents by default** since Evolution v3 (operator/dashboard writes only).
+- **AEE (Agentic Evolution Engine, v3 default)**: the default evolution target is no longer `SOUL.md` but a **playbook** of small, independently-retirable gene-shaped entries (category/signals/eval-case-linked), evolved through a Gate (deterministic, veto-keeping) / Measure (scored, no veto) split, a champion + matches-or-improves commit gate, and entry-level (not whole-file) observation windows. See `evolution-engine.md` ch.12 and `docs/features/38-aee-playbook-evolution.md`.
 - **Agent-as-Evaluator**: independent Evaluator Agent (Haiku cost control) for adversarial verification with structured JSON verdicts.
 - **ConversationOutcome**: zero-LLM conversation result detection (TaskType / Satisfaction / Completion) in zh-TW + en.
 - **External factors**: user feedback, security events, channel metrics, Odoo business context, peer agent signals feed into prediction engine and GVU reflections.
