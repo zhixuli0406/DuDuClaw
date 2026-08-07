@@ -274,6 +274,18 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
             })?;
     }
 
+    // WP22 T1 — record the authoritative org placement in `<home>/org.toml`.
+    // Wizard agents are roots (`reports_to = "none"`), but the record still
+    // matters: without it, a directory reusing the name of a previously
+    // removed agent would inherit that agent's stale store entry and quietly
+    // acquire a supervisor. Read back from the file just written so a template
+    // that ships its own `reports_to` / `department` is captured verbatim.
+    if let Some(entry) = duduclaw_core::org_store::read_mirror(&agent_toml_path) {
+        if let Err(e) = duduclaw_core::org_store::upsert(&home, &agent_name, entry) {
+            tracing::warn!(agent = %agent_name, error = %e, "org.toml upsert failed in wizard");
+        }
+    }
+
     // Ensure SOUL.md exists
     let soul_path = agent_dir.join("SOUL.md");
     if !soul_path.exists() {
@@ -703,7 +715,7 @@ allowed_channels = [{channel_lower_toml}]
 [evolution]
 skill_auto_activate = true
 skill_security_scan = true
-gvu_enabled = true
+gvu_enabled = false           # opt-in：預設關閉，避免板模產出的 agent 未經確認就自動改寫 SOUL.md（2026-08-06 WP0.1 修 R3）
 max_silence_hours = 12.0
 max_gvu_generations = 3
 observation_period_hours = 24.0

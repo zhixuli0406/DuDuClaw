@@ -365,6 +365,25 @@ pub fn scaffold(home_dir: &Path, spec: &EphemeralSpawnSpec) -> Result<ScaffoldRe
     std::fs::write(dir.join("ephemeral.toml"), meta_toml)
         .map_err(|e| format!("write ephemeral.toml: {e}"))?;
 
+    // WP22 T1 — record the ephemeral's placement in the authoritative store.
+    // `reports_to = <parent>` is precisely the relation that authorises this
+    // scaffold's dispatch, and `DispatchOrgView` now reads the store first; an
+    // ephemeral with no record would fall back to the `agent.toml` written
+    // above, i.e. to a file inside its own workspace. Department-less by
+    // design (an ephemeral inherits isolation, not org membership).
+    // Symmetric teardown lives in `sweep`.
+    if let Err(e) = duduclaw_core::org_store::upsert(
+        home_dir,
+        &agent_id,
+        duduclaw_core::OrgEntry::new(&spec.parent, ""),
+    ) {
+        tracing::warn!(
+            ephemeral = %agent_id,
+            error = %e,
+            "org.toml upsert failed for ephemeral scaffold"
+        );
+    }
+
     // Audit: creation (existing tool_calls.jsonl convention).
     duduclaw_security::audit::append_tool_call_with_extras(
         home_dir,
@@ -633,6 +652,16 @@ fn sweep_blocking(home_dir: &Path) -> usize {
         match std::fs::remove_dir_all(&canonical) {
             Ok(()) => {
                 removed += 1;
+                // WP22 T1 — the scaffold's authoritative record dies with it,
+                // after the directory is really gone (same ordering rationale
+                // as MCP `agent_remove`).
+                if let Err(e) = duduclaw_core::org_store::remove(home_dir, &name) {
+                    tracing::warn!(
+                        ephemeral = %name,
+                        error = %e,
+                        "org.toml removal failed during ephemeral GC"
+                    );
+                }
                 let parent = meta
                     .as_ref()
                     .map(|m| m.parent.as_str())
@@ -672,6 +701,28 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// WP21 欠帳 ②: `duduclaw_core::org_field_guard` guards
+    /// `<home>/agents/.ephemeral/<id>/agent.toml` against `reports_to` /
+    /// `department` tampering, but duduclaw-core cannot depend on the gateway
+    /// so it hard-codes the directory name. Renaming this constant without
+    /// updating the guard would silently un-protect every ephemeral agent's
+    /// org record — this test is the tripwire.
+    #[test]
+    fn ephemeral_dir_name_is_pinned_for_the_org_field_guard() {
+        assert_eq!(EPHEMERAL_DIR_NAME, ".ephemeral");
+        let home = Path::new("/home/.duduclaw");
+        let path = home
+            .join("agents")
+            .join(EPHEMERAL_DIR_NAME)
+            .join("eph-abc")
+            .join("agent.toml");
+        assert_eq!(
+            duduclaw_core::classify_protected_toml(&path, home),
+            Some(duduclaw_core::ProtectedTomlKind::AgentToml),
+            "org-field guard no longer recognises the ephemeral agent dir"
+        );
     }
 
     fn write_parent(home: &Path, name: &str, extra: &str) {

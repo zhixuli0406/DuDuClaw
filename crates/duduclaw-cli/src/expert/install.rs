@@ -462,6 +462,22 @@ async fn install_one_agent(
         }
     }
 
+    // WP22 T1 — re-record the authoritative org placement from the finished
+    // `agent.toml`. `scaffold_agent_dir` already stored `reports_to`, but two
+    // later steps can still move this agent: the `[agent] department` patch
+    // above, and the `agent.partial.toml` overlay (which is *not* section-
+    // filtered on the install side, so a pack may legitimately carry org
+    // fields). Adopting the final mirror once, here, is the only way the store
+    // and the file agree at the end of a pack install — otherwise `duduclaw
+    // doctor` would report drift on every freshly installed pack.
+    if let Some(entry) = duduclaw_core::org_store::read_mirror(
+        &ctx.home.join("agents").join(&final_id).join("agent.toml"),
+    ) {
+        if let Err(e) = duduclaw_core::org_store::upsert(&ctx.home, &final_id, entry) {
+            report.warning("agent-department", &final_id, format!("組織資料寫入失敗: {e}"));
+        }
+    }
+
     // Merge the pack's per-agent .mcp.json servers into the scaffolded file.
     // The scaffold already wrote `.mcp.json` with the wired `duduclaw` server;
     // pack-declared servers (e.g. a Photoshop MCP) are folded in alongside it

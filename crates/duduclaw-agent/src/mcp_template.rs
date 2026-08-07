@@ -88,6 +88,7 @@ pub fn ensure_playwright_in_config(agent_dir: &Path, headless: bool) -> Result<(
         .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
     std::fs::write(&path, json)
         .map_err(|e| format!("Failed to write MCP config: {e}"))?;
+    duduclaw_core::platform::set_owner_only(&path).ok();
 
     info!(path = %path.display(), "Playwright MCP server added to config");
     Ok(())
@@ -242,6 +243,37 @@ pub fn ensure_global_mcp_server() -> Result<bool, String> {
     Ok(true)
 }
 
+/// Derive the DuDuClaw home directory from an agent directory path.
+///
+/// Normally `agent_dir` is `<home>/agents/<id>`, so walking up two levels
+/// (`agents`, then `<home>`) recovers home — the shape the old inline
+/// `agent_dir.parent().and_then(|p| p.parent())` assumed everywhere. Ephemeral
+/// agents live one level deeper at `<home>/agents/.ephemeral/<id>`
+/// (`spawn_ephemeral`), so that same two-hop walk lands on `<home>/agents`
+/// instead of `<home>` — every signed identity token then embeds the wrong
+/// key root. This detects the `.ephemeral` directory name in the parent chain
+/// and peels one extra level for that case.
+///
+/// Falls back to `duduclaw_core::duduclaw_home()` when `agent_dir` is too
+/// shallow to have the expected ancestors (matches the previous inline
+/// fail-safe behaviour — never panics on a malformed path).
+fn derive_home_from_agent_dir(agent_dir: &Path) -> std::path::PathBuf {
+    let Some(parent) = agent_dir.parent() else {
+        return duduclaw_core::duduclaw_home();
+    };
+    let is_ephemeral = parent.file_name().and_then(|n| n.to_str()) == Some(".ephemeral");
+    let levels_up = if is_ephemeral { 3 } else { 2 };
+
+    let mut home = agent_dir.to_path_buf();
+    for _ in 0..levels_up {
+        match home.parent() {
+            Some(p) => home = p.to_path_buf(),
+            None => return duduclaw_core::duduclaw_home(),
+        }
+    }
+    home
+}
+
 /// Legacy per-agent `.mcp.json` fixup — kept for backwards compatibility.
 ///
 /// Prefer `ensure_global_mcp_server()` for new installations.
@@ -254,6 +286,11 @@ pub fn ensure_global_mcp_server() -> Result<bool, String> {
 /// call falls back to `config.toml [general] default_agent` and
 /// supervisor-relation authorization breaks for every agent except the
 /// global default.
+///
+/// WP21 debt ⑧: `DUDUCLAW_AGENT_TOKEN` — the MAC proving that id was issued by
+/// DuDuClaw rather than typed by the agent — is written alongside it whenever
+/// `<home>/identity.key` exists. No key ⇒ the env block is byte-identical to
+/// before, so this is inert on installs that have not enabled the feature.
 ///
 /// The `duduclaw` / `duduclaw-pro` server entries are the only ones
 /// touched; other servers (playwright, browserbase, …) are left alone.
@@ -269,7 +306,7 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
     }
 
     // Agent identity = directory name (matches the rest of the codebase,
-    // e.g. `check_supervisor_relation`, `is_valid_agent_id`).
+    // e.g. `can_delegate`, `is_valid_agent_id`).
     let agent_id = agent_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -282,13 +319,17 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
     // that lacks the gateway env). See `duduclaw_core::mcp_forward_env_vars`.
     let forward_env = duduclaw_core::mcp_forward_env_vars();
 
+    // Per-agent identity pair: id + (when enabled) its WP21 debt ⑧ token. The
+    // home is derived from `<home>/agents/<id>` rather than `duduclaw_home()`
+    // so a caller operating on an explicit agents root (tests, migrations,
+    // a second instance) signs with that root's key, not the ambient one.
+    let identity_env =
+        duduclaw_core::agent_identity_env_vars(&derive_home_from_agent_dir(agent_dir), &agent_id);
+
     // Case 1: No .mcp.json exists → create with duduclaw server entry
     if !path.exists() {
         let mut env = std::collections::HashMap::new();
-        env.insert(
-            duduclaw_core::ENV_AGENT_ID.to_string(),
-            agent_id.clone(),
-        );
+        env.extend(identity_env.iter().cloned());
         env.extend(forward_env.iter().cloned());
         let mut servers = std::collections::HashMap::new();
         servers.insert("duduclaw".to_string(), McpServerDef {
@@ -334,15 +375,16 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
             let wrong_command = !cmd_path.is_absolute()
                 || !cmd_path.exists()
                 || entry.command != abs_str;
-            let missing_agent_id = entry
-                .env
-                .get(duduclaw_core::ENV_AGENT_ID)
-                .map(|v| v != &agent_id)
-                .unwrap_or(true);
+            // Covers the identity token too: an install that enables
+            // `identity.key` after its agents were scaffolded shows up here as
+            // a missing pair and gets rewritten on the next startup sweep.
+            let missing_identity = identity_env
+                .iter()
+                .any(|(k, v)| entry.env.get(k) != Some(v));
             let missing_forward = forward_env
                 .iter()
                 .any(|(k, v)| entry.env.get(k) != Some(v));
-            wrong_command || missing_agent_id || missing_forward
+            wrong_command || missing_identity || missing_forward
         }
     };
 
@@ -355,19 +397,13 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
         .entry(target_key.clone())
         .and_modify(|e| {
             e.command = abs_str.clone();
-            // Preserve other env vars; upsert DUDUCLAW_AGENT_ID + forward set.
-            e.env.insert(
-                duduclaw_core::ENV_AGENT_ID.to_string(),
-                agent_id.clone(),
-            );
+            // Preserve other env vars; upsert the identity pair + forward set.
+            e.env.extend(identity_env.iter().cloned());
             e.env.extend(forward_env.iter().cloned());
         })
         .or_insert_with(|| {
             let mut env = std::collections::HashMap::new();
-            env.insert(
-                duduclaw_core::ENV_AGENT_ID.to_string(),
-                agent_id.clone(),
-            );
+            env.extend(identity_env.iter().cloned());
             env.extend(forward_env.iter().cloned());
             McpServerDef {
                 command: abs_str.clone(),
@@ -380,6 +416,7 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
         .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
     std::fs::write(&path, json)
         .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    duduclaw_core::platform::set_owner_only(&path).ok();
 
     info!(
         path = %path.display(),
@@ -744,6 +781,40 @@ mod tests {
         assert!(config.mcp_servers.contains_key("memory"));
     }
 
+    // ── Home derivation (T3 fix) ──────────────────────────────
+    //
+    // `derive_home_from_agent_dir` must recover the same DuDuClaw home for a
+    // normal agent (`<home>/agents/<id>`, two parents up) and an ephemeral
+    // one (`<home>/agents/.ephemeral/<id>`, three parents up) — the bug fixed
+    // here was that the naive two-parent walk landed on `<home>/agents`
+    // instead of `<home>` for the ephemeral shape, poisoning the derived
+    // identity token's key root.
+
+    #[test]
+    fn derive_home_normal_agent_path() {
+        let home = std::path::Path::new("/tmp/duduclaw-home");
+        let agent_dir = home.join("agents").join("sales-rep");
+        assert_eq!(derive_home_from_agent_dir(&agent_dir), home);
+    }
+
+    #[test]
+    fn derive_home_ephemeral_agent_path_matches_normal() {
+        let home = std::path::Path::new("/tmp/duduclaw-home");
+        let normal_dir = home.join("agents").join("sales-rep");
+        let ephemeral_dir = home.join("agents").join(".ephemeral").join("eph-abc123");
+
+        let normal_home = derive_home_from_agent_dir(&normal_dir);
+        let ephemeral_home = derive_home_from_agent_dir(&ephemeral_dir);
+
+        assert_eq!(normal_home, home);
+        assert_eq!(
+            ephemeral_home, home,
+            "ephemeral scaffold sits one level deeper than a normal agent dir; \
+             the derived home must still land on the same root"
+        );
+        assert_eq!(ephemeral_home, normal_home);
+    }
+
     // ── Agent-ID env migration tests ──────────────────────────
     //
     // Each test creates an agent directory named so `ensure_duduclaw_absolute_path`
@@ -951,5 +1022,67 @@ mod tests {
             !ensure_duduclaw_absolute_path(&agent_dir).unwrap(),
             "second call must not rewrite the file"
         );
+    }
+
+    /// WP21 debt ⑧ — with an `identity.key` under the home that owns this
+    /// agent dir, the written env block gains a `DUDUCLAW_AGENT_TOKEN` that
+    /// actually verifies for *this* agent id, and an already-migrated file
+    /// missing the token is detected and rewritten.
+    #[test]
+    fn mcp_json_carries_a_verifiable_identity_token_when_key_exists() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agent_dir = home.join("agents").join("sales-rep");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let key = duduclaw_core::ensure_identity_key(home).unwrap();
+
+        assert!(ensure_duduclaw_absolute_path(&agent_dir).unwrap());
+        let path = agent_dir.join(".mcp.json");
+        let env = read_mcp_json(&path)["mcpServers"]["duduclaw"]["env"].clone();
+        assert_eq!(env["DUDUCLAW_AGENT_ID"].as_str(), Some("sales-rep"));
+        let token = env["DUDUCLAW_AGENT_TOKEN"].as_str().expect("token written");
+        assert!(duduclaw_core::verify_identity_token(&key, "sales-rep", token));
+        // The token is bound to this id — it cannot be lifted into another
+        // agent's config to impersonate them.
+        assert!(!duduclaw_core::verify_identity_token(&key, "ceo", token));
+
+        // Idempotent once written.
+        assert!(!ensure_duduclaw_absolute_path(&agent_dir).unwrap());
+
+        // A file that predates the feature (id but no token) is repaired.
+        let mut stale = read_mcp_json(&path);
+        stale["mcpServers"]["duduclaw"]["env"]
+            .as_object_mut()
+            .unwrap()
+            .remove("DUDUCLAW_AGENT_TOKEN");
+        write_json(&path, &stale);
+        assert!(
+            ensure_duduclaw_absolute_path(&agent_dir).unwrap(),
+            "a missing token must be detected as needing an update"
+        );
+        assert_eq!(
+            read_mcp_json(&path)["mcpServers"]["duduclaw"]["env"]["DUDUCLAW_AGENT_TOKEN"].as_str(),
+            Some(token)
+        );
+    }
+
+    /// ...and with no key, the env block is byte-identical to pre-WP21.
+    #[test]
+    fn mcp_json_has_no_token_when_feature_is_disabled() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("agents").join("sales-rep");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        ensure_duduclaw_absolute_path(&agent_dir).unwrap();
+        let env = read_mcp_json(&agent_dir.join(".mcp.json"))["mcpServers"]["duduclaw"]["env"]
+            .clone();
+        assert_eq!(env["DUDUCLAW_AGENT_ID"].as_str(), Some("sales-rep"));
+        assert!(env.get("DUDUCLAW_AGENT_TOKEN").is_none());
     }
 }
