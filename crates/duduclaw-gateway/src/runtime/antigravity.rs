@@ -424,6 +424,9 @@ impl AntigravityRuntime {
         )
         .await
         .map_err(|e| e.to_string())?;
+        // Carries DUDUCLAW_AGENT_TOKEN in plaintext — restrict to the owning
+        // OS user (0600 on Unix; no-op on Windows).
+        duduclaw_core::platform::set_owner_only(&settings_path).ok();
         Ok(true)
     }
 

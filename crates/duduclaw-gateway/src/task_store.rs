@@ -19,7 +19,7 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      created_at, updated_at, completed_at, blocked_reason, parent_task_id, tags, message_id, \
      claimed_by, claimed_at, lease_expires_at, depends_on, retry_count, max_retries, \
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
-     source_channel, source_chat_id, revision_round, diminishing, agent_seconds";
+     source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json";
 
 // ── Task row ────────────────────────────────────────────────
 
@@ -117,6 +117,19 @@ pub struct TaskRow {
     /// clock; the "wall clock" half is `completed_at − created_at`.
     #[serde(default)]
     pub agent_seconds: i64,
+
+    // ── A1 StateAct self-report round-trip (arXiv:2410.02810, v1.53) ──
+    /// JSON snapshot of the agent's self-reported `pending_hypotheses`
+    /// (see `goal_state.rs::GoalStateSnapshot`), captured from the
+    /// `<state_update>` marker in `result_summary` while a goal-mode task
+    /// sits in `review` (before `DispatchEngine::review_goal_tasks` clears
+    /// `result_summary` on rejection). `None` until the first successful
+    /// capture. No dedicated free-form metadata/notes column existed on
+    /// this row prior to A1 — `tags` is comma-separated and user/dashboard
+    /// facing (unsuitable for a JSON blob) — so this is a purpose-built
+    /// column rather than repurposing an existing field.
+    #[serde(default)]
+    pub goal_state_json: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -169,6 +182,7 @@ impl TaskRow {
             revision_round: 0,
             diminishing: false,
             agent_seconds: 0,
+            goal_state_json: None,
         }
     }
 }
@@ -611,6 +625,8 @@ impl TaskStore {
             ("revision_round", "revision_round INTEGER NOT NULL DEFAULT 0"),
             ("diminishing", "diminishing INTEGER NOT NULL DEFAULT 0"),
             ("agent_seconds", "agent_seconds INTEGER NOT NULL DEFAULT 0"),
+            // A1 StateAct self-report round-trip (v1.53).
+            ("goal_state_json", "goal_state_json TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -865,6 +881,87 @@ impl TaskStore {
         }
 
         self.get_task(id).await
+    }
+
+    /// A1 (StateAct): persist the self-reported `pending_hypotheses`
+    /// snapshot for a goal-mode task so the next dispatch's `<state>` block
+    /// carries it forward. `None` clears the column. Deliberately a small
+    /// direct UPDATE rather than routing through [`Self::update_task`]'s
+    /// generic field whitelist — keeps this narrow, best-effort write path
+    /// isolated from that method's cycle-checking / dependency-rewrite
+    /// logic, which has nothing to do with this column.
+    pub async fn set_goal_state_json(
+        &self,
+        id: &str,
+        state_json: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE tasks SET goal_state_json = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, state_json, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("set goal_state_json: {e}"))?;
+        Ok(())
+    }
+
+    /// M7: read-merge-write update of `tasks.goal_state_json`, holding the
+    /// store's single connection `Mutex` across the whole read→mutate→write
+    /// sequence so two concurrent callers merging DIFFERENT keys into the
+    /// same task's snapshot cannot lose either other's write.
+    ///
+    /// The bug this fixes: `goal_state_json` is a single JSON blob shared by
+    /// multiple independent writers (`goal_loop.rs::capture_round_state`
+    /// writes `pending_hypotheses`; `dispatch_engine.rs`'s acceptance review
+    /// writes `confirmed_facts` — see [`Self::set_goal_state_json`]'s
+    /// callers). A writer that does read-then-`set_goal_state_json`-the-whole-blob
+    /// outside any lock can race another writer touching a DIFFERENT field:
+    /// whichever `UPDATE` lands second wins with a value it computed from a
+    /// stale read, silently discarding the other writer's field. Holding this
+    /// crate's single `conn` mutex across the read AND the write closes that
+    /// window for any two callers that both go through this method.
+    ///
+    /// `f` receives a mutable `serde_json::Value` — guaranteed to be a JSON
+    /// object — to edit in place; whatever it leaves behind is persisted.
+    /// Missing / malformed / non-object stored JSON degrades to an empty
+    /// `{}` object first (same "never fabricate, just start from nothing"
+    /// contract [`crate::goal_state::GoalStateSnapshot::from_json`] uses)
+    /// rather than failing the merge.
+    ///
+    /// Both writers go through this API: `capture_round_state`
+    /// (`pending_hypotheses`) and `DispatchEngine::persist_confirmed_facts`
+    /// (`confirmed_facts`) — each merge must touch only its own key so
+    /// concurrent merges from the two drivers cannot clobber each other.
+    pub async fn merge_goal_state_json(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT goal_state_json FROM tasks WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| format!("merge_goal_state_json read: {e}"))?
+            .flatten();
+        let mut value: serde_json::Value = current
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !value.is_object() {
+            value = serde_json::json!({});
+        }
+        f(&mut value);
+        let new_json = serde_json::to_string(&value)
+            .map_err(|e| format!("merge_goal_state_json serialize: {e}"))?;
+        conn.execute(
+            "UPDATE tasks SET goal_state_json = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, new_json, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("merge_goal_state_json write: {e}"))?;
+        Ok(())
     }
 
     pub async fn remove_task(&self, id: &str) -> Result<bool, String> {
@@ -2273,6 +2370,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         revision_round: row.get(28)?,
         diminishing: row.get::<_, i64>(29)? != 0,
         agent_seconds: row.get(30)?,
+        goal_state_json: row.get(31)?,
     })
 }
 
@@ -2925,6 +3023,90 @@ mod tests {
             .atomic_claim("t1", "worker-c", now, lease)
             .await
             .unwrap().is_claimed());
+    }
+
+    // ── M7: merge_goal_state_json read-merge-write ──────────
+
+    #[tokio::test]
+    async fn merge_goal_state_json_concurrent_merges_do_not_lose_either_write() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(TaskStore::open(dir.path()).expect("open"));
+        store.insert_task(&pending_task("g1")).await.expect("insert");
+
+        // Two concurrent merges, each touching a DIFFERENT key of the same
+        // JSON blob — before M7 a naive read-then-`set_goal_state_json`
+        // pattern would let whichever write lands second clobber the other's
+        // key with a stale read.
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let (r1, r2) = tokio::join!(
+            async move {
+                s1.merge_goal_state_json("g1", |v| {
+                    v["confirmed_facts"] = serde_json::json!(["fact one"]);
+                })
+                .await
+            },
+            async move {
+                s2.merge_goal_state_json("g1", |v| {
+                    v["pending_hypotheses"] = serde_json::json!(["hypothesis one"]);
+                })
+                .await
+            },
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        let t = store.get_task("g1").await.unwrap().unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(t.goal_state_json.as_deref().unwrap()).unwrap();
+        assert_eq!(value["confirmed_facts"], serde_json::json!(["fact one"]), "first writer's key must survive");
+        assert_eq!(
+            value["pending_hypotheses"],
+            serde_json::json!(["hypothesis one"]),
+            "second writer's key must survive too — neither merge may clobber the other"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_goal_state_json_degrades_malformed_existing_json_to_empty_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TaskStore::open(dir.path()).expect("open");
+        store.insert_task(&pending_task("g2")).await.expect("insert");
+        store.set_goal_state_json("g2", Some("not json at all")).await.unwrap();
+
+        store
+            .merge_goal_state_json("g2", |v| {
+                v["confirmed_facts"] = serde_json::json!(["a"]);
+            })
+            .await
+            .unwrap();
+
+        let t = store.get_task("g2").await.unwrap().unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(t.goal_state_json.as_deref().unwrap()).unwrap();
+        assert_eq!(value["confirmed_facts"], serde_json::json!(["a"]));
+    }
+
+    #[tokio::test]
+    async fn merge_goal_state_json_starts_from_empty_object_when_column_is_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TaskStore::open(dir.path()).expect("open");
+        store.insert_task(&pending_task("g3")).await.expect("insert");
+        // goal_state_json starts NULL for a freshly inserted task.
+        assert_eq!(store.get_task("g3").await.unwrap().unwrap().goal_state_json, None);
+
+        store
+            .merge_goal_state_json("g3", |v| {
+                v["pending_hypotheses"] = serde_json::json!(["h"]);
+            })
+            .await
+            .unwrap();
+
+        let t = store.get_task("g3").await.unwrap().unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(t.goal_state_json.as_deref().unwrap()).unwrap();
+        assert_eq!(value["pending_hypotheses"], serde_json::json!(["h"]));
     }
 
     #[tokio::test]

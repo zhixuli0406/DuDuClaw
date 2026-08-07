@@ -48,6 +48,18 @@
 //! `config.toml [goal_loop]` with serde defaults (absent / partial section ⇒
 //! built-in defaults; the section is parsed in isolation so it can never break
 //! deserialization of the rest of `config.toml`).
+//!
+//! ## A1/A2: predict-act-verify instead of generate-then-judge
+//!
+//! Every dispatch payload now carries a structured [`crate::goal_state`]
+//! `<state>` block (goal / confirmed facts / pending hypotheses / excluded
+//! approaches — StateAct, arXiv:2410.02810) that the harness programmatically
+//! fills and updates round to round, and every round is recorded into a
+//! [`crate::goal_visit_graph`] `(state_hash, action)` graph (Graph-Based
+//! Exploration, arXiv:2512.24156) that replaced the old two-round
+//! identical-feedback oscillation guard with structural loop detection. See
+//! those two modules' docs for the full design and the honesty/persistence
+//! trade-offs made.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -64,8 +76,17 @@ use tracing::{debug, info, warn};
 
 use crate::approval::{ApprovalBroker, ApprovalId, ApprovalStatus};
 use crate::dispatch_policy::DispatchPolicy;
+use crate::goal_state::{self, GoalStateSnapshot};
+use crate::goal_visit_graph::GoalVisitGraph;
 use crate::message_queue::{MessageQueue, MessageStatus, QueueMessage};
+use crate::prediction::task_forward::{GoalKind, RoundPhase, TaskStateKey};
+use crate::prediction::task_forward_store::TaskForwardModel;
 use crate::task_store::{parse_depends_on, ActivityRow, TaskRow, TaskStore};
+
+// `catch_unwind` for futures — same extension trait
+// `subagent_prediction::spawn_record` uses (design R5: forward-model
+// bookkeeping must never panic a hot path).
+use futures_util::FutureExt as _;
 
 /// TTL for a kickoff approval (Collaborator/Consultant autonomy gate). Expiry
 /// counts as a denial (ApprovalBroker fail-closed) ⇒ the goal is aborted.
@@ -148,6 +169,110 @@ enum KickoffGate {
     Waiting,
     /// Denied / expired — the task was aborted; skip it.
     Aborted,
+}
+
+/// WP-A9: derive a coarse [`GoalKind`] for the A3 `TaskStateKey` (design
+/// §2.2, §9 U3 "顆粒度取捨,可在 WP-A2 實作時用真實 goal 文字樣本試跑決定").
+///
+/// Zero-LLM, deterministic. Kept as its own small classifier here rather
+/// than reusing `prediction::outcome::detect_task_type` — that function
+/// classifies *conversational* turns from `SessionMessage` history (a
+/// different input shape and a different mission: "what kind of user
+/// request is this"), whereas this classifies one goal-loop task's
+/// title+description text once at dispatch time. `task_forward.rs`'s
+/// `ArtifactShape`/`GoalKind` doc comments explicitly deferred this
+/// derivation to WP-A9 (this module, at the call site) rather than baking a
+/// specific keyword table into the otherwise dependency-free
+/// `task_forward` module.
+const GOAL_KIND_OPS_KEYWORDS: [&str; 12] = [
+    "部署", "上線", "發佈", "發布", "通知", "寄信", "email", "傳送", "webhook", "deploy", "notify",
+    "send",
+];
+const GOAL_KIND_RESEARCH_KEYWORDS: [&str; 10] =
+    ["研究", "調查", "比較", "評估", "查詢", "research", "compare", "investigate", "分析", "評比"];
+const GOAL_KIND_PLANNING_KEYWORDS: [&str; 8] =
+    ["計畫", "規劃", "步驟", "方案", "plan", "roadmap", "strategy", "schedule"];
+const GOAL_KIND_CODING_KEYWORDS: [&str; 10] = [
+    "程式", "程式碼", "代碼", "寫程式", "bug", "測試", "重構", "code", "function", "implement",
+];
+
+/// L4: count DISTINCT topical signals in `lower` for one keyword list.
+///
+/// Two fixes over the old `list.iter().filter(|kw| lower.contains(*kw)).count()`:
+///
+/// 1. **Anchored matching** (project convention #2: no unanchored `contains`
+///    for a routing/classification decision) — uses
+///    [`duduclaw_core::word_contains_ci`] instead of raw `contains`, so e.g.
+///    the OPS keyword `"send"` no longer matches inside `"sender"`.
+/// 2. **Overlap de-duplication** — a single CJK phrase like `"寫程式碼"`
+///    contains THREE of [`GOAL_KIND_CODING_KEYWORDS`] as substrings
+///    (`"程式"`, `"程式碼"`, `"寫程式"`), all sharing the same characters.
+///    Counting each independently inflates the score to 3 for what is one
+///    coding-topic signal. This merges the first-occurrence byte span of
+///    every matched keyword and counts each resulting overlap CLUSTER once,
+///    not each keyword.
+fn count_distinct_hits(lower: &str, list: &[&str]) -> usize {
+    let mut spans: Vec<(usize, usize)> = list
+        .iter()
+        .filter(|kw| duduclaw_core::word_contains_ci(lower, kw))
+        .filter_map(|kw| lower.find(kw).map(|start| (start, start + kw.len())))
+        .collect();
+    if spans.is_empty() {
+        return 0;
+    }
+    spans.sort_unstable();
+    let mut clusters = 0usize;
+    let mut current_end: Option<usize> = None;
+    for (start, end) in spans.drain(..) {
+        match current_end {
+            Some(ce) if start < ce => current_end = Some(ce.max(end)),
+            _ => {
+                clusters += 1;
+                current_end = Some(end);
+            }
+        }
+    }
+    clusters
+}
+
+fn derive_goal_kind(text: &str) -> GoalKind {
+    let difficulty = crate::dispatch_engine::classify_goal_difficulty(text);
+    let lower = text.to_lowercase();
+
+    let hits = |list: &[&str]| count_distinct_hits(&lower, list);
+
+    let ops = hits(&GOAL_KIND_OPS_KEYWORDS);
+    let research = hits(&GOAL_KIND_RESEARCH_KEYWORDS);
+    let planning = hits(&GOAL_KIND_PLANNING_KEYWORDS);
+    let coding = hits(&GOAL_KIND_CODING_KEYWORDS);
+
+    // Ops/external signals dominate regardless of difficulty — an external
+    // side-effect changes the expected tool classes (Net/Exec) and artifact
+    // shape (ExternalEffect) more than length/complexity does.
+    if ops > 0 && ops >= research && ops >= planning && ops >= coding {
+        return GoalKind::OpsOrExternal;
+    }
+    if coding > 0 && coding >= research && coding >= planning {
+        return match difficulty {
+            crate::dispatch_engine::Difficulty::Simple => GoalKind::CodingSimple,
+            crate::dispatch_engine::Difficulty::Complex => GoalKind::CodingComplex,
+        };
+    }
+    if research > 0 && research >= planning {
+        return GoalKind::ResearchOrQa;
+    }
+    if planning > 0 {
+        return GoalKind::PlanningOrDoc;
+    }
+    // No topical keyword hit at all: fall back on the difficulty split alone
+    // (coding is the modal goal-loop workload — Complex without any other
+    // signal still gets the coarse Coding bucket rather than Unknown, which
+    // would leave GoalKind's statistics permanently unbucketed for the
+    // common case).
+    match difficulty {
+        crate::dispatch_engine::Difficulty::Simple => GoalKind::Unknown,
+        crate::dispatch_engine::Difficulty::Complex => GoalKind::CodingComplex,
+    }
 }
 
 /// Tuning for the goal loop driver. Read from `config.toml [goal_loop]`.
@@ -258,18 +383,6 @@ struct InFlight {
     /// `todo` / `pending` (i.e. `tasks_claim`). Flipped false once it moves to
     /// `in_progress` / `review`.
     awaiting_pickup: bool,
-    /// Normalized `judge_feedback` carried on the *previous* rejection re-dispatch
-    /// (lowercase + trim). Used to detect no-progress oscillation: two
-    /// consecutive rejections with identical feedback ⇒ the retry loop is not
-    /// converging (possible LoopTrap / stuck agent), so escalate to a human
-    /// instead of burning the iteration budget. `None` until the first rejection.
-    last_feedback: Option<String>,
-}
-
-/// Normalize judge feedback for oscillation comparison: lowercase + trim. Kept
-/// deliberately simple (the design calls for lowercase+trim, not fuzzy match).
-fn normalize_feedback(fb: &str) -> String {
-    fb.trim().to_lowercase()
 }
 
 /// The goal loop background driver.
@@ -324,7 +437,25 @@ pub struct GoalLoopDriver {
     /// Retry counter for a kickoff notification that failed transiently,
     /// keyed by task id.
     kickoff_retry: Mutex<HashMap<String, u32>>,
+    /// A2: the `(state_hash, action)` visit graph — always-on, in-memory,
+    /// scoped to this driver's lifetime (see `goal_visit_graph.rs` module
+    /// docs for the persistence rationale).
+    visit_graph: Arc<GoalVisitGraph>,
+    /// A1/A2: task ids for which this round's `<state>` capture
+    /// (self-reported hypotheses + visit-graph recording, see
+    /// [`Self::capture_round_state`]) has already run while the task sits in
+    /// `review` — pruned back to the live candidate set every tick so the
+    /// NEXT time a task re-enters `review` (a later round) it captures
+    /// again.
+    state_capture_seen: Mutex<HashSet<String>>,
     running: Arc<AtomicBool>,
+    /// WP-A9: A3 task-forward-model (design §4.1). `None` ⇒ the predict
+    /// hook is a complete no-op — same as before this field existed
+    /// (design §7.3's `enabled = false` default-off contract). Shared with
+    /// the `DispatchEngine`'s settle hook via the same `Arc` so the
+    /// in-memory statistical-bucket cache the two hooks read/write stays
+    /// coherent (see the caller-side wiring notes in `handlers.rs`).
+    forward_model: Option<Arc<TaskForwardModel>>,
 }
 
 /// Retry cap for a transient ([`crate::goal_notify::NotifyOutcome::SendFailed`])
@@ -351,13 +482,25 @@ impl GoalLoopDriver {
             needs_human_retry: Mutex::new(HashMap::new()),
             kickoff_notified: Mutex::new(HashSet::new()),
             kickoff_retry: Mutex::new(HashMap::new()),
+            visit_graph: Arc::new(GoalVisitGraph::new()),
+            state_capture_seen: Mutex::new(HashSet::new()),
             running: Arc::new(AtomicBool::new(false)),
+            forward_model: None,
         }
     }
 
     /// Set the DuDuClaw home dir (per-agent autonomy + channel push).
     pub fn with_home_dir(mut self, home_dir: PathBuf) -> Self {
         self.home_dir = home_dir;
+        self
+    }
+
+    /// WP-A9: wire the A3 task-forward-model predict hook. Omit (default
+    /// `None`) to keep the hook a no-op — the `[task_forward_model] enabled`
+    /// gate (design §7.3) is enforced by the caller deciding whether to
+    /// construct a `TaskForwardModel` at all, not by a flag read here.
+    pub fn with_forward_model(mut self, forward_model: Arc<TaskForwardModel>) -> Self {
+        self.forward_model = Some(forward_model);
         self
     }
 
@@ -461,6 +604,13 @@ impl GoalLoopDriver {
             let mut kr = self.kickoff_retry.lock().await;
             kr.retain(|id, _| candidate_ids.contains(id));
         }
+        // A1/A2: a task back in the candidate set is no longer "sitting in
+        // review" — clear its capture-done flag so the NEXT time it reaches
+        // `review` (a later round), `capture_round_state` runs again.
+        {
+            let mut seen = self.state_capture_seen.lock().await;
+            seen.retain(|id| !candidate_ids.contains(id));
+        }
 
         let mut inflight = self.inflight.lock().await;
 
@@ -485,12 +635,21 @@ impl GoalLoopDriver {
                         e.awaiting_pickup = false;
                     }
                 }
-                // Under acceptance review — push the "驗收中" progress once.
+                // Under acceptance review — push the "驗收中" progress once,
+                // and (A1/A2, once per review sitting) capture this round's
+                // state for the visit graph + any self-reported hypotheses.
                 "review" => {
                     if let Some(e) = inflight.get_mut(&id) {
                         e.awaiting_pickup = false;
                     }
                     if let Some(t) = &task_opt {
+                        let first_capture = {
+                            let mut seen = self.state_capture_seen.lock().await;
+                            seen.insert(id.clone())
+                        };
+                        if first_capture {
+                            self.capture_round_state(t).await;
+                        }
                         self.push_progress(t, "review", crate::goal_notify::GoalProgress::Reviewing)
                             .await;
                     }
@@ -515,6 +674,18 @@ impl GoalLoopDriver {
                         inflight.remove(&id);
                         self.progress_seen.lock().await.remove(&id);
                         self.clear_progress_retries(&id).await;
+                        // A2 lifecycle: task reached a terminal state — drop
+                        // its visit-graph tracking.
+                        self.visit_graph.clear_task(&id).await;
+                        // L3: `state_capture_seen` is pruned at the TOP of
+                        // `tick_once` by `retain(|id| !candidate_ids.contains(id))`
+                        // — which only clears an id when it RE-ENTERS the
+                        // candidate set (todo/pending/revising). A task that
+                        // goes review → done never becomes a candidate again,
+                        // so without this explicit removal its entry would
+                        // never be pruned and `state_capture_seen` would grow
+                        // unboundedly over a long-running gateway's lifetime.
+                        self.state_capture_seen.lock().await.remove(&id);
                     }
                 }
                 // Other terminal / escalated states (cancelled / failed /
@@ -523,6 +694,16 @@ impl GoalLoopDriver {
                 _ => {
                     inflight.remove(&id);
                     self.clear_progress_retries(&id).await;
+                    // A2 lifecycle: cleanup on terminal/escalated states too
+                    // (needs_human here may have come from DispatchEngine's
+                    // own judge-retry-budget path, not this driver's
+                    // `escalate()`, so it needs its own cleanup call).
+                    self.visit_graph.clear_task(&id).await;
+                    // L3: same leak as the `done` arm above — a task that
+                    // lands in cancelled/failed/needs_human never re-enters
+                    // the candidate set, so the top-of-tick prune never
+                    // reaches it either.
+                    self.state_capture_seen.lock().await.remove(&id);
                 }
             }
         }
@@ -724,39 +905,76 @@ impl GoalLoopDriver {
                 continue;
             }
 
-            // ── No-progress oscillation guard (LoopTrap arXiv:2605.05846) ──
-            // A *rejection* re-dispatch (task came back to `pending` with fresh
-            // judge_feedback, not merely a stalled pickup) whose feedback is
-            // identical to the previous rejection means the Generator-Verifier
-            // loop is not converging. Escalate to a human instead of spending the
-            // rest of the iteration budget on the same failure.
-            let current_fb_norm = task
-                .judge_feedback
-                .as_deref()
-                .map(normalize_feedback)
-                .filter(|s| !s.is_empty());
+            // ── A1: build this round's structured `<state>` block ──
+            // Computed once per candidate per tick (before any escalation
+            // decision) and reused both for the A2 loop-detection checks
+            // right below AND for the actual dispatch payload further down.
+            let iterations = self.store.list_iterations(&task.id).await?;
+            let goal_snapshot = GoalStateSnapshot::from_json(task.goal_state_json.as_deref());
+            let mut state_block = goal_state::build_state_block(task, &iterations, &goal_snapshot);
+            let state_hash = goal_state::state_hash(&state_block);
+
+            // ── A2 no-progress guard (Graph-Based Exploration arXiv:2512.24156) ──
+            // Replaces the old two-round identical-`judge_feedback`-text
+            // oscillation check. `state_hash` folds in the goal, any
+            // self-reported hypotheses, and the LATEST rejection reason
+            // (see `goal_state.rs::StateBlock::hash_input`), so "state
+            // unchanged" is a strictly stronger signal than "feedback text
+            // unchanged": a judge that rewords the same underlying problem
+            // still counts as unchanged, and genuinely new information
+            // (fresh rejection reason, or an updated self-reported
+            // hypothesis) always resets it. M3: escalates when this round
+            // WOULD be the 2nd consecutive dispatch with a byte-identical
+            // state — i.e. this round's rejection would repeat the exact
+            // same state the previous rejection already produced. Kept at
+            // n=2 (not n=3) to match the pre-A2 guard's timing exactly: that
+            // guard escalated the moment TWO consecutive judge rejections
+            // carried identical feedback text, before ever attempting a 3rd
+            // dispatch with the repeated information — an earlier n=3
+            // threshold here let one extra, provably-useless round dispatch
+            // before escalating.
+            // Gated on `is_rejection_redispatch` exactly like the guard it
+            // replaces: a stalled-pickup redispatch means the agent never
+            // engaged this round, which is not evidence of "no progress".
+            //
+            // External contract kept byte-identical on purpose — same
+            // activity `event_type` (`goal_loop.oscillation`) and same
+            // `judge_feedback` reason text as before A2 — because
+            // `topology_evolution.rs` (D5, out of scope for this change)
+            // queries that exact event-type string for its own analytics.
             let is_rejection_redispatch = matches!(&entry, Some(e) if !e.awaiting_pickup);
-            if is_rejection_redispatch
-                && let (Some(cur), Some(prev)) = (
-                    current_fb_norm.as_ref(),
-                    entry.as_ref().and_then(|e| e.last_feedback.as_ref()),
-                )
-                && cur == prev
-            {
-                self.post_activity(
-                    "goal_loop.oscillation",
-                    &task.assigned_to,
-                    Some(&task.id),
-                    &format!(
-                        "goal-loop 偵測到連續兩輪駁回且回饋雷同,無進展 — 轉人工 {}",
-                        task.title
-                    ),
-                )
-                .await;
-                self.escalate(&mut inflight, task, "goal-loop no-progress oscillation")
-                    .await?;
-                active = inflight.len();
-                continue;
+            if is_rejection_redispatch {
+                let would_be_streak = self.visit_graph.peek_streak(&task.id, &state_hash).await;
+                if would_be_streak >= 2 {
+                    self.post_activity(
+                        "goal_loop.oscillation",
+                        &task.assigned_to,
+                        Some(&task.id),
+                        &format!(
+                            "goal-loop 偵測到狀態連續 {would_be_streak} 輪未變(目標／已確認事實／待驗證假設／最新駁回理由皆相同),無進展 — 轉人工 {}",
+                            task.title
+                        ),
+                    )
+                    .await;
+                    self.escalate(&mut inflight, task, "goal-loop no-progress oscillation")
+                        .await?;
+                    active = inflight.len();
+                    continue;
+                }
+            }
+
+            // ── A2 repeated-action annotation ──
+            // Whenever this round's state already has SOME recorded action
+            // repeated ≥2 times (from any earlier round, not gated to
+            // rejection-redispatch), flag it explicitly in the dispatch
+            // prompt's excluded-approaches section — a softer signal than
+            // the escalate above: keep retrying, but stop repeating the
+            // specific thing that already failed twice from this exact
+            // state.
+            if self.visit_graph.has_repeated_action(&task.id, &state_hash).await {
+                state_block.loop_warning = Some(
+                    "此狀態下已重複嘗試相同做法且失敗,請勿重複,改用不同做法".to_string(),
+                );
             }
 
             // ── Iteration guard (difficulty-scaled cap, D4 item 3) ──
@@ -780,9 +998,122 @@ impl GoalLoopDriver {
                 continue;
             }
 
+            // ── WP-A9: A3 task-forward-model predict hook (design §4.1) ──
+            // `forward_model` is `None` unless `[task_forward_model] enabled
+            // = true` (see `handlers.rs`'s construction site) — with it
+            // `None`, this entire block is skipped and dispatch behavior is
+            // byte-identical to before A3 existed (design §7.3). Even when
+            // wired, a failure here is caught and logged, never allowed to
+            // block or fail a real dispatch (R5 — same
+            // `catch_unwind`-over-`AssertUnwindSafe` discipline as
+            // `subagent_prediction::spawn_record`).
+            if let Some(fm) = self.forward_model.clone() {
+                let phase = if is_rejection_redispatch {
+                    RoundPhase::Retry
+                } else if !is_new {
+                    RoundPhase::Restall
+                } else {
+                    RoundPhase::First
+                };
+                let goal_text = format!("{}\n{}", task.title, task.description);
+                let goal_kind = derive_goal_kind(&goal_text);
+                let has_outcome_spec = crate::outcome_spec::OutcomeSpec::from_tags(&task.tags)
+                    .map(|s| !matches!(s, crate::outcome_spec::OutcomeSpec::Text))
+                    .unwrap_or(false);
+                let state_key = TaskStateKey {
+                    agent_id: task.assigned_to.clone(),
+                    goal_kind,
+                    phase,
+                    has_outcome_spec,
+                };
+                let round = (task.revision_round as u32).saturating_add(1);
+                let task_id = task.id.clone();
+                let agent_id = task.assigned_to.clone();
+
+                let predict_and_log = async move {
+                    let prediction = fm.predict(&task_id, &agent_id, round, state_key).await;
+                    if let Err(e) = fm.log_prediction(&prediction).await {
+                        warn!(
+                            task = %task_id, round, error = %e,
+                            "A3 forward-model: predict log failed (non-fatal)"
+                        );
+                    }
+                };
+                if let Err(e) = std::panic::AssertUnwindSafe(predict_and_log)
+                    .catch_unwind()
+                    .await
+                {
+                    warn!(task = %task.id, "A3 forward-model predict hook panicked: {e:?}");
+                }
+            }
+
+            // ── WP-A4 rule injection (design §6.5 item 2) ──
+            // Independent of the A3 predict hook above (this queries
+            // already-induced task-layer rules; it doesn't need this
+            // round's fresh prediction) but gated on the SAME
+            // `forward_model` presence (A4 is a strict downstream of A3 —
+            // design §6.5) plus the `[task_forward_model] rule_induction`
+            // sub-switch. Records which rule ids were injected (via
+            // `fm.record_injected_task_rules`, an in-memory map on the SAME
+            // shared `Arc<TaskForwardModel>` the `DispatchEngine` settle
+            // hook reads from — see that field's doc comment in
+            // `task_forward_store.rs` for why no new cross-struct wiring is
+            // needed) so the settle step can credit/blame them next round.
+            // A failure here is caught and logged, never allowed to block
+            // or fail a real dispatch (same R5 discipline as the predict
+            // hook above).
+            let mut task_rule_section: Option<String> = None;
+            if let Some(fm) = self.forward_model.clone() {
+                let rule_induction_enabled = crate::prediction::task_forward_store::
+                    TaskForwardModelConfig::from_home(&self.home_dir)
+                    .rule_induction;
+                if rule_induction_enabled {
+                    let round = (task.revision_round as u32).saturating_add(1);
+                    let task_id = task.id.clone();
+                    let agent_id = task.assigned_to.clone();
+                    let db_path = self.home_dir.join("memory.db");
+
+                    let inject = async move {
+                        let engine = duduclaw_memory::SqliteMemoryEngine::new(&db_path).ok()?;
+                        let rules = crate::prediction::rule_lifecycle::select_task_rules(
+                            &engine,
+                            &agent_id,
+                            crate::prediction::rule_lifecycle::TASK_RULE_INJECTION_LIMIT,
+                        )
+                        .await;
+                        if rules.is_empty() {
+                            return None;
+                        }
+                        let ids: Vec<String> = rules.iter().map(|r| r.id.clone()).collect();
+                        fm.record_injected_task_rules(&task_id, round, ids).await;
+                        let body = rules
+                            .iter()
+                            .map(|r| format!("- {}", goal_state::xml_escape(&r.content)))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        Some(format!("## 任務經驗規則\n{body}"))
+                    };
+                    match std::panic::AssertUnwindSafe(inject).catch_unwind().await {
+                        Ok(section) => task_rule_section = section,
+                        Err(e) => warn!(task = %task.id, "A4 rule injection hook panicked: {e:?}"),
+                    }
+                }
+            }
+
             // ── Dispatch: enqueue a work message on the existing wake-up rail ──
             let next_iter = current_iter + 1;
-            self.enqueue_work(task, next_iter).await?;
+            let mut state_text = state_block.render();
+            if let Some(section) = &task_rule_section {
+                state_text.push_str("\n\n");
+                state_text.push_str(section);
+            }
+            self.enqueue_work(task, next_iter, &state_text).await?;
+            // A2: commit this round's state as the latest dispatched state
+            // for the unchanged-streak comparison the NEXT rejection
+            // re-dispatch will make (see the peek/commit split in the guard
+            // above — commit happens once the dispatch decision is final,
+            // mirroring the pre-A2 `last_feedback` commit timing).
+            self.visit_graph.commit_dispatch(&task.id, &state_hash).await;
             // Iterative Kanban: open this round in the iteration timeline. Round
             // is the judge-rejection counter + 1 (revision_round is bumped by
             // reject_review), idempotent per round so a stall re-dispatch of the
@@ -798,19 +1129,12 @@ impl GoalLoopDriver {
             if is_new {
                 active += 1;
             }
-            // Remember this round's feedback (only meaningful on a rejection
-            // re-dispatch) so the next rejection can be compared against it. On a
-            // fresh dispatch / stall re-dispatch this is either `None` or a
-            // carried-over value; the oscillation guard only fires on
-            // `is_rejection_redispatch`, so a stale carry cannot false-trigger.
-            let next_last_feedback = current_fb_norm.clone();
             inflight.insert(
                 task.id.clone(),
                 InFlight {
                     iter: next_iter,
                     enqueued_at: now,
                     awaiting_pickup: true,
-                    last_feedback: next_last_feedback,
                 },
             );
 
@@ -893,6 +1217,18 @@ impl GoalLoopDriver {
         self.revoke_task_grants(&task.id, crate::capability_grants::REVOKE_REASON_PHASE_END)
             .await;
         inflight.remove(&task.id);
+        // A2 lifecycle: this driver's own escalation is a terminal phase end
+        // — drop visit-graph tracking (the tracked-loop's terminal branches
+        // also clear it, for escalations DispatchEngine triggers directly;
+        // this call covers the driver-triggered path with no gap in
+        // between).
+        self.visit_graph.clear_task(&task.id).await;
+        // L3: same `state_capture_seen` leak fix as the reconcile loop's
+        // terminal branches — this driver's own escalation (iteration cap /
+        // deadline / A2 oscillation) is ALSO a terminal phase end that never
+        // re-enters the candidate set, so the top-of-tick prune alone would
+        // never clear it.
+        self.state_capture_seen.lock().await.remove(&task.id);
         self.post_activity(
             "goal_loop.needs_human",
             &task.assigned_to,
@@ -1263,7 +1599,7 @@ impl GoalLoopDriver {
     /// the heartbeat's task-board pull uses, so the existing dispatcher routes it
     /// to the agent unchanged. Carries `judge_feedback` (if any) so a rejected
     /// task is retried *with* the reviewer's feedback.
-    async fn enqueue_work(&self, task: &TaskRow, iter: u32) -> Result<(), String> {
+    async fn enqueue_work(&self, task: &TaskRow, iter: u32, state_text: &str) -> Result<(), String> {
         let marker = format!("[goal-loop task_id={} iter={iter}]", task.id);
         let feedback_block = match task.judge_feedback.as_deref() {
             Some(fb) if !fb.trim().is_empty() => format!(
@@ -1278,11 +1614,21 @@ impl GoalLoopDriver {
             }
             _ => String::new(),
         };
+        // A1 (StateAct): the structured state block + the self-report
+        // protocol instructions. Plain text, runtime-neutral — any CLI
+        // backend (Claude / Codex / Gemini / Antigravity / openai-compat)
+        // reads this the same way, and the self-report marker is parsed by
+        // `goal_state::parse_state_update` regardless of which runtime
+        // produced it.
         let payload = format!(
             "{marker} 你有一個自主目標任務要推進:\n\
              • Task ID: {}\n\
              • 標題: {}\n\
              • 說明: {}{criteria_block}\n\n\
+             {state_text}\n\n\
+             若你在推進過程中形成了新的『待驗證假設』,請在回覆最後附上下列標記(純文字,任何 \
+             AI 執行環境皆可產出;省略此標記則系統會沿用上一輪的假設清單,絕不自行臆測):\n\
+             <state_update>{{\"pending_hypotheses\": [\"假設一\", \"假設二\"]}}</state_update>\n\n\
              請使用 MCP 工具 `tasks_claim` 認領這項任務,執行後用 `tasks_complete` \
              回報結果(務必在 result_summary 寫清楚你做了什麼、產出在哪),\
              系統會由驗收判官檢核是否達成驗收標準。若受阻無法完成,使用 `tasks_block` \
@@ -1298,8 +1644,15 @@ impl GoalLoopDriver {
             status: MessageStatus::Pending,
             retry_count: 0,
             delegation_depth: 0,
-            origin_agent: None,
-            sender_agent: None,
+            // WP21 C1: the dispatcher's delegation gate judges `sender_agent`
+            // (falling back to `origin_agent`); leaving both `None` put every
+            // goal-loop dispatch through the v1.52 legacy-warn path instead of
+            // being judged like any other sender. Stamped consistently with
+            // the `sender` column above — this rail has exactly one sender
+            // identity, the goal-loop driver itself, which is already in
+            // `SYSTEM_SENDERS` and so always clears the gate.
+            origin_agent: Some("goal-loop-driver".to_string()),
+            sender_agent: Some("goal-loop-driver".to_string()),
             error: None,
             response: None,
             created_at: Utc::now().to_rfc3339(),
@@ -1370,6 +1723,101 @@ impl GoalLoopDriver {
         let prefix = format!("{task_id}::");
         let mut retries = self.progress_retry.lock().await;
         retries.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// A1/A2: capture one completed round's state, called exactly once per
+    /// review sitting (see the `"review"` reconcile branch's
+    /// `state_capture_seen` gate).
+    ///
+    /// Two things happen here, both best-effort (a failure logs and the
+    /// driver moves on — this is observability/quality-of-signal, never
+    /// control flow):
+    ///
+    /// 1. **A2 visit-graph recording**: hash the state that was ACTUALLY
+    ///    dispatched for this round (recomputed here from `task_iterations`
+    ///    + the snapshot as they stood BEFORE this round's self-report is
+    ///    persisted below — i.e. byte-identical to what was hashed at
+    ///    dispatch-commit time, since neither input has changed yet) paired
+    ///    with an [`crate::goal_visit_graph::action_digest`] of what the
+    ///    agent actually did this round.
+    /// 2. **A1 self-report persistence**: parse `<state_update>` out of
+    ///    `result_summary` and, on success, persist it as the new
+    ///    `goal_state_json` snapshot for the NEXT round's `<state>` block.
+    ///
+    /// ## The race this method accepts
+    ///
+    /// `DispatchEngine::review_goal_tasks` (out of scope for this change)
+    /// runs independently and, on rejection, wipes `result_summary` back to
+    /// `NULL`. If that judge pass completes before THIS driver's tick
+    /// observes the task sitting in `review`, this capture never runs for
+    /// that round — silently, by design: the next round's `<state>` block
+    /// simply falls back to whatever `goal_state_json` already held
+    /// (StateAct's "parse failure / miss ⇒ keep the previous round's value,
+    /// never fabricate" rule, applied to the whole capture, not just JSON
+    /// parsing). No error is raised because losing one round's self-report
+    /// to a race is an accepted degradation, not a fault.
+    async fn capture_round_state(&self, task: &TaskRow) {
+        let iterations = match self.store.list_iterations(&task.id).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(task = %task.id, error = %e, "goal loop: state capture list_iterations failed (non-fatal)");
+                Vec::new()
+            }
+        };
+        let snapshot = GoalStateSnapshot::from_json(task.goal_state_json.as_deref());
+        let state_block = goal_state::build_state_block(task, &iterations, &snapshot);
+        let state_hash = goal_state::state_hash(&state_block);
+
+        if self.has_real_home() {
+            let agent_id = task.claimed_by.clone().unwrap_or_else(|| task.assigned_to.clone());
+            let since = task.claimed_at.clone().unwrap_or_else(|| task.created_at.clone());
+            let until = Utc::now().to_rfc3339();
+            let result_text = task.result_summary.clone().unwrap_or_default();
+            let digest = crate::goal_visit_graph::action_digest(
+                &self.home_dir,
+                &agent_id,
+                &since,
+                &until,
+                &result_text,
+            );
+            self.visit_graph.record_round(&task.id, &state_hash, &digest).await;
+        }
+
+        if let Some(result_text) = task.result_summary.as_deref() {
+            match goal_state::parse_state_update(result_text) {
+                Some(hyps) => {
+                    // M7: `confirmed_facts` is written independently by
+                    // `dispatch_engine.rs`'s settle path (see
+                    // `goal_state.rs`'s "Honesty note"). The previous
+                    // read-then-`set_goal_state_json`-the-whole-blob pattern
+                    // here read `snapshot.confirmed_facts` at the TOP of
+                    // this method, then wrote a brand-new blob combining
+                    // that (possibly by-now-stale) value with the fresh
+                    // hypotheses — a concurrent `confirmed_facts` write
+                    // landing in between would be silently clobbered.
+                    // `merge_goal_state_json` holds the store's connection
+                    // lock across its own read-mutate-write, so it only
+                    // ever touches the `pending_hypotheses` key here and
+                    // leaves whatever `confirmed_facts` is ACTUALLY stored
+                    // at write time untouched, whichever writer got there
+                    // first.
+                    let hyps_value = serde_json::json!(hyps);
+                    if let Err(e) = self
+                        .store
+                        .merge_goal_state_json(&task.id, move |v| {
+                            v["pending_hypotheses"] = hyps_value;
+                        })
+                        .await
+                    {
+                        debug!(task = %task.id, error = %e, "goal loop: state_update persist failed (non-fatal, next round keeps prior snapshot)");
+                    }
+                }
+                // No marker / invalid JSON / wrong shape ⇒ degrade: leave
+                // `goal_state_json` untouched, the next round's snapshot
+                // read carries forward whatever was already stored.
+                None => {}
+            }
+        }
     }
 
     /// Best-effort append to the dashboard Activity Feed. A failure here must not
@@ -1599,7 +2047,8 @@ mod tests {
         assert!(pending[0].payload.contains("上一輪驗收未通過"));
     }
 
-    // ── P3 no-progress oscillation guard ────────────────────
+    // ── A2 no-progress guard (structural, replaces the old P3 two-round
+    //    identical-judge-feedback oscillation guard) ─────────
 
     /// Drive one full rejection round for a task already tracked in-flight and
     /// awaiting pickup: (1) agent moves it to `review` and a tick observes that
@@ -1625,13 +2074,27 @@ mod tests {
         store.reject_review(id, feedback, 99).await.unwrap();
     }
 
+    /// A2 semantics (M3: re-aligned to the pre-A2 guard's exact timing):
+    /// escalation fires the moment this round's `<state>` hash (goal +
+    /// confirmed facts + self-reported hypotheses + LATEST judge feedback —
+    /// `goal_state::StateBlock::hash_input`) would repeat for a 2nd
+    /// consecutive dispatch — i.e. two consecutive rejections already
+    /// carried the identical underlying state, so a 3rd dispatch would be
+    /// provably useless. This matches the pre-A2 guard byte-for-byte in
+    /// timing (it escalated the moment two consecutive judge rejections
+    /// carried identical feedback text, never attempting a 3rd dispatch
+    /// first) while keeping A2's stronger "state" comparison (goal +
+    /// confirmed facts + hypotheses + latest rejection, not just the raw
+    /// feedback string). Same external contract as before (event_type
+    /// `goal_loop.oscillation`, reason text `"goal-loop no-progress
+    /// oscillation"`).
     #[tokio::test]
     async fn identical_feedback_two_rounds_escalates_oscillation() {
         let dir = tempfile::tempdir().unwrap();
         let (store, queue) = open_stores(dir.path()).await;
 
-        // High iteration cap (both difficulty tiers) so ONLY the oscillation
-        // guard can escalate here — the test goal text classifies as Simple.
+        // High iteration cap (both difficulty tiers) so ONLY the A2 guard can
+        // escalate here — the test goal text classifies as Simple.
         let cfg = GoalLoopConfig { iteration_cap: 10, iteration_cap_simple: 10, ..small_cfg() };
         let mut t = goal_task("g1", "alice");
         t.max_retries = 100; // don't let reject_review self-escalate
@@ -1639,11 +2102,13 @@ mod tests {
 
         let d = driver(store.clone(), queue.clone(), cfg);
 
-        // Initial dispatch (iter 1, awaiting pickup).
+        // Initial dispatch (iter 1, awaiting pickup) — commits state_hash A
+        // (no rejection history yet).
         d.tick_once().await.unwrap();
 
         // Round 1: agent works, judge rejects "same". Next tick re-dispatches
-        // (first rejection — records the feedback, no oscillation yet).
+        // — state_hash changes A→B (∅ → "same reason" as the latest excluded
+        // entry), so the streak resets to 1: no escalation yet.
         agent_round_then_reject(&d, &store, "g1", "same reason").await;
         d.tick_once().await.unwrap();
         assert_ne!(
@@ -1652,7 +2117,9 @@ mod tests {
             "first rejection must not escalate"
         );
 
-        // Round 2: identical feedback again ⇒ oscillation on the next tick.
+        // Round 2: identical feedback again ⇒ state_hash stays B for what
+        // would be a 2nd consecutive dispatch of that exact state ⇒
+        // escalate now, WITHOUT ever attempting a 3rd dispatch.
         agent_round_then_reject(&d, &store, "g1", "same reason").await;
         d.tick_once().await.unwrap();
 
@@ -1660,13 +2127,19 @@ mod tests {
         assert_eq!(got.status, "needs_human");
         assert_eq!(
             got.judge_feedback.as_deref(),
-            Some("goal-loop no-progress oscillation")
+            Some("goal-loop no-progress oscillation"),
+            "external judge_feedback text kept byte-identical to the pre-A2 guard"
         );
+        // Exactly 2 work messages were ever enqueued (iter 1 and iter 2) — no
+        // 3rd dispatch happened before escalation, matching the pre-A2 timing.
+        let pending = queue.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 2, "no 3rd dispatch before the A2 guard fires");
 
         let (acts, _) = store.list_activity(None, None, 100, 0).await.unwrap();
         assert!(
             acts.iter().any(|a| a.event_type == "goal_loop.oscillation"),
-            "an oscillation activity must be recorded"
+            "an oscillation activity must be recorded under the same event_type \
+             topology_evolution.rs (D5) queries"
         );
     }
 
@@ -1730,25 +2203,31 @@ mod tests {
         assert_eq!(iters[0].round, 2, "revising re-dispatch opens round revision_round+1");
     }
 
-    /// Oscillation must win over the iteration cap when BOTH would fire on the
-    /// same tick: identical feedback for two rounds escalates as oscillation
-    /// (its guard runs before the cap check), locking the existing precedence.
+    /// The A2 no-progress guard must win over the iteration cap when BOTH
+    /// would fire on the very same tick (the guard runs before the cap
+    /// check in `tick_once`). M3 lowered the A2 threshold to a 2nd
+    /// consecutive identical-state dispatch, so `iteration_cap` is set to
+    /// exactly 2 so that, at the tick where that 2nd identical-state
+    /// dispatch is evaluated, `current_iter (2) >= cap (2)` is ALSO true —
+    /// a genuine simultaneous boundary, not merely "the cap happens to be
+    /// generous enough to never matter".
     #[tokio::test]
     async fn oscillation_takes_precedence_over_iteration_cap() {
         let dir = tempfile::tempdir().unwrap();
         let (store, queue) = open_stores(dir.path()).await;
 
-        // Cap = 2 (small_cfg). max_retries high so only the driver escalates.
+        let cfg = GoalLoopConfig { iteration_cap: 2, iteration_cap_simple: 2, ..small_cfg() };
         let mut t = goal_task("g1", "alice");
-        t.max_retries = 100;
+        t.max_retries = 100; // don't let reject_review self-escalate
         store.insert_task(&t).await.unwrap();
-        let d = driver(store.clone(), queue.clone(), small_cfg());
+        let d = driver(store.clone(), queue.clone(), cfg);
 
-        d.tick_once().await.unwrap(); // iter 1
+        d.tick_once().await.unwrap(); // dispatch #1 (iter 1, state_hash A)
         agent_round_then_reject(&d, &store, "g1", "same").await;
-        d.tick_once().await.unwrap(); // iter 2 (== cap), first rejection recorded
-        // Second identical rejection: iter would be at cap AND feedback repeats.
+        d.tick_once().await.unwrap(); // dispatch #2 (iter 2 == cap, state_hash B, streak 1)
         agent_round_then_reject(&d, &store, "g1", "same").await;
+        // This tick: current_iter (2) >= cap (2) AND the would-be streak (2)
+        // both hold — the A2 guard must fire first.
         d.tick_once().await.unwrap();
 
         let got = store.get_task("g1").await.unwrap().unwrap();
@@ -1756,7 +2235,7 @@ mod tests {
         assert_eq!(
             got.judge_feedback.as_deref(),
             Some("goal-loop no-progress oscillation"),
-            "oscillation reason wins over the iteration-cap reason"
+            "the A2 no-progress guard must win over the iteration-cap reason"
         );
     }
 
@@ -2054,5 +2533,187 @@ mod tests {
 
         assert_eq!(store.get_task("g1").await.unwrap().unwrap().assigned_to, "alice");
         assert_eq!(queue.pending_messages(10).await.unwrap()[0].target, "alice");
+    }
+
+    // ── L4: derive_goal_kind / count_distinct_hits ──────────
+
+    #[test]
+    fn count_distinct_hits_dedupes_overlapping_cjk_keywords() {
+        // "程式", "程式碼", "寫程式" are three separate entries of
+        // GOAL_KIND_CODING_KEYWORDS, but all three match inside "寫程式碼"
+        // and mutually overlap the same characters — must count as ONE
+        // cluster, not three.
+        let lower = "幫我寫程式碼".to_lowercase();
+        assert_eq!(count_distinct_hits(&lower, &GOAL_KIND_CODING_KEYWORDS), 1);
+    }
+
+    #[test]
+    fn count_distinct_hits_counts_non_overlapping_separately() {
+        let lower = "寫程式碼順便修一個 bug".to_lowercase();
+        // "寫程式碼" cluster (1) + separate "bug" (1) = 2, not 4 raw keyword
+        // matches (程式/程式碼/寫程式/bug).
+        assert_eq!(count_distinct_hits(&lower, &GOAL_KIND_CODING_KEYWORDS), 2);
+    }
+
+    #[test]
+    fn count_distinct_hits_is_anchored_not_substring() {
+        // Old `contains`-based counting matched "send" inside "sender" and
+        // "email" inside "emailed" — both false positives for an OPS signal.
+        let lower = "check the sender field, already emailed them".to_lowercase();
+        assert_eq!(
+            count_distinct_hits(&lower, &GOAL_KIND_OPS_KEYWORDS),
+            0,
+            "unanchored substrings inside sender/emailed must not count as OPS hits"
+        );
+        // A real word-boundary hit still counts.
+        let real_hit = "please send it now".to_lowercase();
+        assert_eq!(count_distinct_hits(&real_hit, &GOAL_KIND_OPS_KEYWORDS), 1);
+    }
+
+    #[test]
+    fn count_distinct_hits_empty_on_no_match() {
+        let lower = "just chatting, nothing special".to_lowercase();
+        assert_eq!(count_distinct_hits(&lower, &GOAL_KIND_CODING_KEYWORDS), 0);
+    }
+
+    #[test]
+    fn derive_goal_kind_classifies_coding_despite_overlapping_keywords() {
+        // Before L4 this text scored coding=3 (dominating trivially); after
+        // the dedup fix it scores coding=1 — still correctly the dominant
+        // (only) topical signal, still classified as a Coding variant.
+        let kind = derive_goal_kind("請幫我寫程式碼");
+        assert!(
+            matches!(kind, GoalKind::CodingSimple | GoalKind::CodingComplex),
+            "unexpected kind: {kind:?}"
+        );
+    }
+
+    #[test]
+    fn derive_goal_kind_ops_dominates_over_research() {
+        let kind = derive_goal_kind("請部署新版本並通知團隊");
+        assert_eq!(kind, GoalKind::OpsOrExternal);
+    }
+
+    #[test]
+    fn derive_goal_kind_no_signal_falls_back_on_difficulty() {
+        let kind = derive_goal_kind("哈囉");
+        assert_eq!(kind, GoalKind::Unknown, "short, no-keyword text ⇒ Simple ⇒ Unknown");
+    }
+
+    // ── L3: state_capture_seen must not leak across terminal states ──
+
+    #[tokio::test]
+    async fn state_capture_seen_is_cleared_when_task_reaches_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap(); // dispatch iter 1
+
+        // Agent moves it to review — the next tick's reconcile loop should
+        // record a first capture.
+        store
+            .update_task("g1", &serde_json::json!({ "status": "review" }))
+            .await
+            .unwrap();
+        d.tick_once().await.unwrap();
+        assert!(
+            d.state_capture_seen.lock().await.contains("g1"),
+            "review sitting must be recorded as captured"
+        );
+
+        // Task reaches a terminal state (done) without ever re-entering the
+        // candidate set (todo/pending/revising) — the top-of-tick prune
+        // alone can never clear it; the `done` branch's explicit removal
+        // must.
+        store
+            .update_task("g1", &serde_json::json!({ "status": "done" }))
+            .await
+            .unwrap();
+        d.tick_once().await.unwrap();
+
+        assert!(
+            !d.state_capture_seen.lock().await.contains("g1"),
+            "state_capture_seen must not leak once the task is terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_capture_seen_is_cleared_when_task_reaches_needs_human_directly() {
+        // Simulates DispatchEngine's own judge-retry-budget path setting
+        // needs_human directly (not via this driver's `escalate()`) — the
+        // reconcile loop's `_` catch-all branch must clear the flag too.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+
+        store
+            .update_task("g1", &serde_json::json!({ "status": "review" }))
+            .await
+            .unwrap();
+        d.tick_once().await.unwrap();
+        assert!(d.state_capture_seen.lock().await.contains("g1"));
+
+        store
+            .update_task("g1", &serde_json::json!({ "status": "needs_human" }))
+            .await
+            .unwrap();
+        d.tick_once().await.unwrap();
+
+        assert!(
+            !d.state_capture_seen.lock().await.contains("g1"),
+            "state_capture_seen must be cleared on a directly-set needs_human too"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_capture_seen_is_cleared_on_driver_escalate() {
+        // Exercises this driver's OWN `escalate()` path — here via the A2
+        // no-progress guard, the cheapest trigger to set up without
+        // fighting `update_task`'s field whitelist (which doesn't allow
+        // rewriting `created_at` post-insert for a deadline trigger). Note:
+        // under the current `tick_once` control flow the top-of-tick prune
+        // already clears a candidate task's entry before `escalate()` runs
+        // in the same tick (a task must be a candidate to reach
+        // `escalate()` at all, and the prune runs first) — so
+        // `escalate()`'s own removal is defense-in-depth for future call
+        // sites/orderings rather than the only thing keeping this specific
+        // scenario clean today. The end-to-end invariant asserted below (no
+        // leak once terminal) must hold either way.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap(); // dispatch iter 1 (commits state_hash A)
+
+        store
+            .update_task("g1", &serde_json::json!({ "status": "review" }))
+            .await
+            .unwrap();
+        d.tick_once().await.unwrap(); // captures review state
+        assert!(d.state_capture_seen.lock().await.contains("g1"));
+
+        // Return it to `pending` WITHOUT going through a real judge
+        // rejection (no new `judge_feedback`) — the recomputed `<state>`
+        // hash is therefore byte-identical to state_hash A, so the A2
+        // no-progress guard's `would_be_streak` reaches 2 on this very next
+        // tick and `escalate()` fires.
+        store
+            .update_task("g1", &serde_json::json!({ "status": "pending" }))
+            .await
+            .unwrap();
+        d.tick_once().await.unwrap();
+
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, "needs_human", "A2 guard must have escalated");
+        assert!(
+            !d.state_capture_seen.lock().await.contains("g1"),
+            "escalate() must clear state_capture_seen too"
+        );
     }
 }

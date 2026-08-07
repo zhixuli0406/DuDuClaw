@@ -388,7 +388,14 @@ impl PredictionEngine {
                 ON evolution_events(agent_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_evolution_type
                 ON evolution_events(event_type);"
-        ).map_err(|e| e.to_string())
+        ).map_err(|e| e.to_string())?;
+
+        // WP-A7 (design-task-forward-model-2026-08-06.md §5.1): task-layer
+        // forward-model tables, same `prediction.db` file. `prediction_log`
+        // above is untouched — task-layer predictions must never mix into
+        // MetaCognition's self-calibration or the SOUL.md 24h observation
+        // window (design §4.3, §5.2).
+        super::task_forward_store::init_task_tables(conn)
     }
 
     /// Log a structured evolution event to SQLite (Sutskever Day 1 principle).

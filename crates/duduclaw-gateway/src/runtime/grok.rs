@@ -415,7 +415,12 @@ impl AgentRuntime for GrokRuntime {
         // Forward the duduclaw MCP identity via spawn env so the MCP server child
         // (spawned by grok, inheriting this env) resolves the right agent even if
         // Grok doesn't pick up the per-agent project config (residual #2).
-        cmd.env(duduclaw_core::ENV_AGENT_ID, &context.agent_id);
+        // Identity pair, not just the id: an MCP child that inherits this env
+        // instead of the declared block must still be able to prove its claim
+        // under `[delegation] require_identity_token = true`.
+        for (k, v) in duduclaw_core::agent_identity_env_vars_default(&context.agent_id) {
+            cmd.env(k, v);
+        }
         for (k, v) in duduclaw_core::mcp_forward_env_vars() {
             cmd.env(k, v);
         }
@@ -606,10 +611,10 @@ impl GrokRuntime {
         if !api_key.is_empty() {
             env.insert("XAI_API_KEY".to_string(), api_key.to_string());
         }
-        env.insert(
-            duduclaw_core::ENV_AGENT_ID.to_string(),
-            context.agent_id.clone(),
-        );
+        // Identity pair (id + WP21 token when the install has an identity.key).
+        env.extend(duduclaw_core::agent_identity_env_vars_default(
+            &context.agent_id,
+        ));
         for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
             if let Ok(v) = std::env::var(var) {
                 if !v.trim().is_empty() {
@@ -734,6 +739,9 @@ impl GrokRuntime {
         tokio::fs::write(&config_path, rendered)
             .await
             .map_err(|e| e.to_string())?;
+        // Carries DUDUCLAW_AGENT_TOKEN in plaintext — restrict to the owning
+        // OS user (0600 on Unix; no-op on Windows).
+        duduclaw_core::platform::set_owner_only(&config_path).ok();
         Ok(true)
     }
 
@@ -748,10 +756,11 @@ impl GrokRuntime {
             return None;
         }
         let mut env = toml::map::Map::new();
-        env.insert(
-            duduclaw_core::ENV_AGENT_ID.to_string(),
-            toml::Value::String(agent_id.to_string()),
-        );
+        // Identity pair: id + (when `<home>/identity.key` exists) the WP21
+        // debt ⑧ `DUDUCLAW_AGENT_TOKEN` proving DuDuClaw issued that id.
+        for (k, v) in duduclaw_core::agent_identity_env_vars_default(agent_id) {
+            env.insert(k, toml::Value::String(v));
+        }
         // Shared forward set (home/port/instance + MCP auth). Grok spawns MCP
         // children with ONLY this declared env block — omitting
         // DUDUCLAW_MCP_API_KEY here was the root cause of "grok 查 odoo 不行":

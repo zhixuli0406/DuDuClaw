@@ -178,6 +178,32 @@ impl ExplorationState {
 // Skill extraction hook
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Exploration marker — the AEE strategy-mix trigger surface (WP2.3 §3.2.2)
+// ---------------------------------------------------------------------------
+
+/// Section header that marks a reflection as ε-floor **exploration** rather
+/// than a failure-driven repair.
+///
+/// AEE's intent selection needs to tell these two apart: an exploration round
+/// has no concrete failure behind it and is therefore the natural window for
+/// `Innovate`, whereas a Significant/Critical error round must consume the
+/// failure it was born from. Before this constant existed the two were
+/// indistinguishable — both arrived as `TriggerReflection { context }` — so
+/// every exploration round was being spent on repair work it had no material
+/// for. Kept as one constant used by both the writer and
+/// [`context_is_exploration`] so they cannot drift apart.
+pub const EXPLORATION_MARKER: &str = "## Epistemic Foraging";
+
+/// Classify a reflection context produced by [`route`].
+///
+/// Anchored to the start of a line (never a bare `contains`, per CLAUDE.md
+/// security convention #2) so a user message quoting the phrase cannot make
+/// an ordinary error round look like exploration.
+pub fn context_is_exploration(context: &str) -> bool {
+    context.lines().any(|l| l.trim_start().starts_with(EXPLORATION_MARKER))
+}
+
 /// Check if the current context warrants skill extraction alongside evolution.
 ///
 /// When the prediction engine triggers a Reflect or GVU loop, we also check
@@ -229,7 +255,7 @@ pub fn route(
             if exploration.should_explore() {
                 EvolutionAction::TriggerReflection {
                     context: format!(
-                        "## Epistemic Foraging (forced exploration, \u{03B5}={:.3})\n\
+                        "{EXPLORATION_MARKER} (forced exploration, \u{03B5}={:.3})\n\
                          Low prediction error but exploring to prevent dark-room convergence.\n\n{}",
                         exploration.epsilon(),
                         format_reflection_context(error),
@@ -333,4 +359,32 @@ fn format_reflection_context(error: &PredictionError) -> String {
     ));
 
     sections.join("\n\n")
+}
+
+#[cfg(test)]
+mod exploration_marker_tests {
+    use super::*;
+
+    #[test]
+    fn epsilon_reflection_context_is_classified_as_exploration() {
+        let ctx = format!("{EXPLORATION_MARKER} (forced exploration, \u{03B5}=0.050)\nbody");
+        assert!(context_is_exploration(&ctx));
+    }
+
+    #[test]
+    fn ordinary_error_context_is_not_exploration() {
+        assert!(!context_is_exploration(
+            "## Prediction Error Report\n- Composite error: 0.812 (category: Critical)"
+        ));
+    }
+
+    #[test]
+    fn a_quoted_marker_inside_prose_does_not_fake_exploration() {
+        // The marker must be a line header, not a substring anywhere — a user
+        // message echoed into the context must not be able to relabel the
+        // round.
+        assert!(!context_is_exploration(
+            "## Prediction Error Report\nThe user wrote: please read ## Epistemic Foraging docs"
+        ));
+    }
 }

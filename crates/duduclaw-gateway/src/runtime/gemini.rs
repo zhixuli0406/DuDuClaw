@@ -78,6 +78,181 @@ struct GeminiStats {
     output_tokens: u64,
 }
 
+/// Parse a complete `gemini -p --output-format stream-json` stdout buffer
+/// into `(content, input_tokens, output_tokens, chunks)`.
+///
+/// T10 (design commercial/docs/design-task-forward-model-2026-08-06.md
+/// §8.2/§9): the previously zero-constructor `RuntimeChunk::ToolUse` /
+/// `ToolResult` variants (`runtime/mod.rs`) are populated from the
+/// `tool_use` / `tool_result` event types this module's own header doc
+/// comment already documented as part of the stream (design §1 line 37
+/// flagged this: "gemini 模組註解甚至明列了 tool_use/tool_result 事件存
+/// 在"). Pairing (below, before the `RuntimeChunk` conversion) mirrors
+/// `claude_runner.rs`'s WP-A4 approach: match by an id field when present,
+/// else fall back to the most recently opened call — unlike codex's
+/// `command_execution`/`mcp_tool_call` (always emitted as one adjacent
+/// completed item), gemini's `tool_use`/`tool_result` are independent events
+/// that CAN arrive out of order across multiple outstanding calls, so this
+/// id-based resolution happens on the raw event stream FIRST; only the
+/// already-resolved `(name, success)` pairs are then emitted as adjacent
+/// `ToolUse`+`ToolResult` chunk pairs (in resolution order) —
+/// [`super::native_tool_events_from_chunks`]'s simple "next chunk pairs with
+/// this one" fold only needs to handle that already-normalized shape, not
+/// gemini's actual out-of-order wire behavior.
+///
+/// Exact field names (`tool_name`/`name`, `tool_id`/`id`, `status`) are
+/// grounded in a third-party `stream-json` event cheat sheet (no first-party
+/// field-level schema doc was found) — kept deliberately tolerant (checks
+/// both plausible field names) rather than committing to one unverified
+/// name; a call with neither field present degrades to tool_name
+/// `"unknown"` (still recorded — `ToolClass::classify` maps unknown names to
+/// `Other` rather than the caller silently losing the call count) instead
+/// of being dropped, since unlike codex's mcp_tool_call (which does have a
+/// clearly-documented `tool` field) there is no unambiguous "skip" signal
+/// here.
+///
+/// R1: `tool_use.parameters`/`input`/`args` (dual/triple-name tolerance,
+/// same convention as the name/id fields above) and
+/// `tool_result.output`/`content` are now carried through into the emitted
+/// `RuntimeChunk::ToolUse.input`/`ToolResult.output` — previously these were
+/// always `Value::Null`/`String::new()`, discarding whatever text the wire
+/// event actually had. Resolution (pairing a `tool_use` with its eventual
+/// `tool_result`, id-based, out-of-order tolerant) still happens on the raw
+/// event stream first, exactly as before; only the *payload* carried through
+/// the resolved tuple changed.
+fn parse_gemini_stdout(stdout: &str) -> (String, u64, u64, Vec<super::RuntimeChunk>) {
+    use super::RuntimeChunk;
+
+    let mut content = String::new();
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    // Each resolved tool call: (name, input, output, is_error). Provisional
+    // until a matching `tool_result` (if any) arrives.
+    let mut resolved: Vec<(String, serde_json::Value, String, bool)> = Vec::new();
+    // Outstanding (unresolved) tool calls, innermost last: (id-or-empty,
+    // index into `resolved`). Mirrors the WP-A4 claude_runner.rs pairing.
+    let mut open_native_calls: Vec<(String, usize)> = Vec::new();
+
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<GeminiEvent>(line) {
+            match event.event_type.as_str() {
+                "message" => {
+                    // Extract assistant message text
+                    if event.extra.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        if let Some(text) = event.extra.get("content").and_then(|c| c.as_str()) {
+                            content.push_str(text);
+                        }
+                    }
+                }
+                "result" => {
+                    // Final result: extract content and stats.
+                    // Only overwrite if non-empty — when the AI uses tools, the
+                    // result event may have empty content while the real answer
+                    // was accumulated from earlier "message" events.
+                    if let Some(text) = event.extra.get("content").and_then(|c| c.as_str()) {
+                        if !text.is_empty() {
+                            content = text.to_string();
+                        }
+                    }
+                    if let Some(stats) = event.extra.get("stats") {
+                        if let Ok(s) = serde_json::from_value::<GeminiStats>(stats.clone()) {
+                            input_tokens = s.input_tokens;
+                            output_tokens = s.output_tokens;
+                        }
+                    }
+                }
+                "tool_use" => {
+                    let name = event
+                        .extra
+                        .get("tool_name")
+                        .or_else(|| event.extra.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let id = event
+                        .extra
+                        .get("tool_id")
+                        .or_else(|| event.extra.get("id"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .unwrap_or_default();
+                    // R1: `parameters` is the field the cheat sheet documents
+                    // for this event; `input`/`args` tolerated as plausible
+                    // alternates (same tolerance style as name/id above).
+                    let input = event
+                        .extra
+                        .get("parameters")
+                        .or_else(|| event.extra.get("input"))
+                        .or_else(|| event.extra.get("args"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let idx = resolved.len();
+                    open_native_calls.push((id, idx));
+                    // Provisional success — corrected by a paired
+                    // `tool_result` below, if one arrives.
+                    resolved.push((name, input, String::new(), false));
+                }
+                "tool_result" => {
+                    let id = event
+                        .extra
+                        .get("tool_id")
+                        .or_else(|| event.extra.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let is_error = event
+                        .extra
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .map(|s| !s.eq_ignore_ascii_case("success"))
+                        .unwrap_or(false)
+                        || event.extra.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || event.extra.get("error").is_some();
+                    // R1: `output` is the field the cheat sheet documents for
+                    // this event; `content` tolerated as a plausible alternate
+                    // (mirrors the MCP/claude tool_result "content" naming).
+                    let output = event
+                        .extra
+                        .get("output")
+                        .or_else(|| event.extra.get("content"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let popped = if !id.is_empty() {
+                        open_native_calls
+                            .iter()
+                            .rposition(|(oid, _)| oid == id)
+                            .map(|pos| open_native_calls.remove(pos))
+                    } else {
+                        open_native_calls.pop()
+                    }
+                    .or_else(|| open_native_calls.pop());
+                    if let Some((_, idx)) = popped {
+                        if let Some(entry) = resolved.get_mut(idx) {
+                            entry.2 = output;
+                            entry.3 = is_error;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Convert the already id-resolved `resolved` tuples into adjacent
+    // ToolUse+ToolResult chunk pairs (see doc comment above for why the
+    // resolution must happen before this step).
+    let mut chunks = Vec::with_capacity(resolved.len() * 2);
+    for (name, input, output, is_error) in resolved {
+        chunks.push(RuntimeChunk::ToolUse { name, input });
+        chunks.push(RuntimeChunk::ToolResult { output, is_error });
+    }
+
+    (content, input_tokens, output_tokens, chunks)
+}
+
 // ── AgentRuntime impl ───────────────────────────────────────────
 
 #[async_trait]
@@ -227,45 +402,8 @@ impl AgentRuntime for GeminiRuntime {
 
         // Parse JSONL output
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut content = String::new();
-        let mut input_tokens: u64 = 0;
-        let mut output_tokens: u64 = 0;
-
-        for line in stdout.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(event) = serde_json::from_str::<GeminiEvent>(line) {
-                match event.event_type.as_str() {
-                    "message" => {
-                        // Extract assistant message text
-                        if event.extra.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                            if let Some(text) = event.extra.get("content").and_then(|c| c.as_str()) {
-                                content.push_str(text);
-                            }
-                        }
-                    }
-                    "result" => {
-                        // Final result: extract content and stats.
-                        // Only overwrite if non-empty — when the AI uses tools, the
-                        // result event may have empty content while the real answer
-                        // was accumulated from earlier "message" events.
-                        if let Some(text) = event.extra.get("content").and_then(|c| c.as_str()) {
-                            if !text.is_empty() {
-                                content = text.to_string();
-                            }
-                        }
-                        if let Some(stats) = event.extra.get("stats") {
-                            if let Ok(s) = serde_json::from_value::<GeminiStats>(stats.clone()) {
-                                input_tokens = s.input_tokens;
-                                output_tokens = s.output_tokens;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let (mut content, input_tokens, output_tokens, chunks) = parse_gemini_stdout(&stdout);
+        super::extend_native_tool_events(super::native_tool_events_from_chunks(&chunks));
 
         if content.is_empty() {
             // Fallback: use raw stdout
@@ -377,6 +515,9 @@ impl GeminiRuntime {
         )
         .await
         .map_err(|e| e.to_string())?;
+        // Carries DUDUCLAW_AGENT_TOKEN in plaintext — restrict to the owning
+        // OS user (0600 on Unix; no-op on Windows).
+        duduclaw_core::platform::set_owner_only(&settings_path).ok();
         Ok(true)
     }
 
@@ -417,6 +558,190 @@ mod tests {
         let event: GeminiEvent = serde_json::from_str(line).unwrap();
         assert_eq!(event.event_type, "message");
         assert_eq!(event.extra.get("role").unwrap().as_str().unwrap(), "assistant");
+    }
+
+    // ── T10: parse_gemini_stdout → RuntimeChunk → NativeToolEvent ───────
+
+    #[test]
+    fn parse_gemini_stdout_emits_tool_use_and_tool_result_chunks() {
+        // The literal T10 ask: `RuntimeChunk::ToolUse`/`ToolResult` must
+        // actually get constructed, not bypassed.
+        let stdout = concat!(
+            r#"{"type":"tool_use","tool_name":"run_shell_command","tool_id":"tool_1","parameters":{"command":"ls"}}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_id":"tool_1","status":"success","output":"docs\n"}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_gemini_stdout(stdout);
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(chunks[0], super::super::RuntimeChunk::ToolUse { .. }));
+        match &chunks[1] {
+            super::super::RuntimeChunk::ToolResult { is_error, .. } => assert!(!is_error),
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_gemini_stdout_collects_tool_use_paired_with_success_result() {
+        let stdout = concat!(
+            r#"{"type":"tool_use","tool_name":"run_shell_command","tool_id":"tool_1","parameters":{"command":"ls"}}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_id":"tool_1","status":"success","output":"docs\n"}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_gemini_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "run_shell_command");
+        assert!(events[0].success);
+    }
+
+    #[test]
+    fn parse_gemini_stdout_collects_tool_use_paired_with_error_result() {
+        let stdout = concat!(
+            r#"{"type":"tool_use","tool_name":"read_file","tool_id":"tool_2","parameters":{"path":"missing.txt"}}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_id":"tool_2","status":"error","output":"file not found"}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_gemini_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "read_file");
+        assert!(!events[0].success);
+    }
+
+    #[test]
+    fn parse_gemini_stdout_unpaired_tool_use_stays_provisionally_successful() {
+        // A tool_use with no matching tool_result (stream truncated, or the
+        // CLI omitted it) keeps its provisional success = true rather than
+        // being dropped — an attempted call is still evidence.
+        let stdout = concat!(
+            r#"{"type":"tool_use","tool_name":"write_file","tool_id":"tool_3","parameters":{}}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_gemini_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].success);
+    }
+
+    #[test]
+    fn parse_gemini_stdout_multiple_tool_calls_pair_by_id_not_just_order() {
+        // Two outstanding calls; the result for the FIRST arrives after the
+        // second tool_use — id-based pairing must still resolve correctly
+        // rather than assuming strict LIFO/FIFO order. This resolution
+        // happens INSIDE parse_gemini_stdout (on the raw event stream)
+        // before the result is re-expressed as adjacent RuntimeChunk pairs
+        // — see the function's doc comment.
+        let stdout = concat!(
+            r#"{"type":"tool_use","tool_name":"a","tool_id":"id-a","parameters":{}}"#,
+            "\n",
+            r#"{"type":"tool_use","tool_name":"b","tool_id":"id-b","parameters":{}}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_id":"id-a","status":"error","output":""}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_id":"id-b","status":"success","output":""}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_gemini_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].tool_name, "a");
+        assert!(!events[0].success);
+        assert_eq!(events[1].tool_name, "b");
+        assert!(events[1].success);
+    }
+
+    #[test]
+    fn parse_gemini_stdout_mixed_events_content_and_tools() {
+        let stdout = concat!(
+            r#"{"type":"tool_use","tool_name":"run_shell_command","tool_id":"tool_1","parameters":{}}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_id":"tool_1","status":"success","output":""}"#,
+            "\n",
+            r#"{"type":"result","content":"done","stats":{"inputTokens":12,"outputTokens":7}}"#,
+            "\n",
+        );
+        let (content, input_tokens, output_tokens, chunks) = parse_gemini_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(content, "done");
+        assert_eq!(input_tokens, 12);
+        assert_eq!(output_tokens, 7);
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn parse_gemini_stdout_no_tool_events_is_empty() {
+        let stdout = concat!(
+            r#"{"type":"result","content":"just text","stats":{"inputTokens":1,"outputTokens":1}}"#,
+            "\n",
+        );
+        let (content, _, _, chunks) = parse_gemini_stdout(stdout);
+        assert_eq!(content, "just text");
+        assert!(chunks.is_empty());
+    }
+
+    // ── R1: result_text / input_text capture ─────────────────────────────
+
+    #[test]
+    fn parse_gemini_stdout_captures_result_and_input_text() {
+        let stdout = concat!(
+            r#"{"type":"tool_use","tool_name":"run_shell_command","tool_id":"tool_1","parameters":{"command":"cat report.md"}}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_id":"tool_1","status":"success","output":"quarterly revenue: 1.2M"}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_gemini_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].result_text.as_deref(), Some("quarterly revenue: 1.2M"));
+        assert!(events[0].input_text.as_deref().unwrap().contains("cat report.md"));
+    }
+
+    #[test]
+    fn parse_gemini_stdout_output_field_alternate_content_name_is_read() {
+        // `content` is the tolerated alternate field name for the result
+        // text (mirrors `tool_name`/`name` and `tool_id`/`id` tolerance).
+        let stdout = concat!(
+            r#"{"type":"tool_use","tool_name":"read_file","tool_id":"tool_1","parameters":{}}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_id":"tool_1","status":"success","content":"file body text"}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_gemini_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert_eq!(events[0].result_text.as_deref(), Some("file body text"));
+    }
+
+    #[test]
+    fn parse_gemini_stdout_masks_secret_in_result_text() {
+        let stdout = concat!(
+            r#"{"type":"tool_use","tool_name":"run_shell_command","tool_id":"tool_1","parameters":{}}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_id":"tool_1","status":"success","output":"key: sk-ant-api03-verysecretvalue1234567890"}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_gemini_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        let result_text = events[0].result_text.as_deref().unwrap();
+        assert!(
+            !result_text.contains("sk-ant-api03-verysecretvalue1234567890"),
+            "secret leaked into result_text: {result_text}"
+        );
+    }
+
+    #[test]
+    fn parse_gemini_stdout_empty_output_stays_none() {
+        let stdout = concat!(
+            r#"{"type":"tool_use","tool_name":"run_shell_command","tool_id":"tool_1","parameters":{}}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_id":"tool_1","status":"success","output":""}"#,
+            "\n",
+        );
+        let (_, _, _, chunks) = parse_gemini_stdout(stdout);
+        let events = super::super::native_tool_events_from_chunks(&chunks);
+        assert!(events[0].result_text.is_none());
     }
 
     #[test]

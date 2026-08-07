@@ -1252,10 +1252,12 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
 /// the multi-instance overrides) so the API-path tool loop reaches the same MCP
 /// tools the CLI backends do.
 fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
-    let mut envs = vec![(
-        duduclaw_core::ENV_AGENT_ID.to_string(),
-        agent_id.to_string(),
-    )];
+    // Identity pair: id + (when `<home>/identity.key` exists) the WP21 debt ⑧
+    // `DUDUCLAW_AGENT_TOKEN`. Without the token this path is the one MCP
+    // spawn point that `[delegation] require_identity_token = true` would
+    // refuse to boot — API-mode agents would silently lose their whole tool
+    // surface the moment an operator enables strict mode.
+    let mut envs = duduclaw_core::agent_identity_env_vars_default(agent_id);
     // Shared forward set (home/port/instance + MCP auth) — see
     // `duduclaw_core::mcp_forward_env_vars`. The spawned mcp-server inherits
     // this process env too, but the explicit pairs keep the tool loop working
@@ -2496,6 +2498,125 @@ struct ClaudeResponse {
     usage: Option<crate::cost_telemetry::TokenUsage>,
 }
 
+/// WP-A4 (design commercial/docs/design-task-forward-model-2026-08-06.md
+/// §5.3/§9): pure per-event ingestion for the native-tool collector,
+/// extracted out of `call_claude_streaming`'s stream loop so it can be
+/// exercised with fixture stream-json lines without spawning a real `claude`
+/// subprocess. Handles ONE already-parsed stream-json event
+/// (`type: "assistant"` carrying `tool_use` blocks, `type: "user"` carrying
+/// `tool_result` blocks); any other event type is a no-op. Pairing mirrors
+/// `duduclaw-cli/src/eval/transcript.rs`'s tool_use/tool_result matching
+/// (match by block `id` when present, else fall back to the most recently
+/// opened call) — kept local rather than importing that CLI-crate module
+/// (this gateway crate does not depend on duduclaw-cli).
+fn ingest_stream_json_event_for_native_tools(
+    event: &serde_json::Value,
+    native_events: &mut Vec<crate::runtime::NativeToolEvent>,
+    open_native_calls: &mut Vec<(String, usize)>,
+) {
+    match event.get("type").and_then(|t| t.as_str()) {
+        Some("assistant") => {
+            let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) else {
+                return;
+            };
+            for block in content {
+                if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                    continue;
+                }
+                let name = block
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let id = block
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .map(String::from)
+                    .unwrap_or_default();
+                // R1: capture the call's own input (masked + capped) up
+                // front — the block carries it right now, unlike the result
+                // text which only arrives with the paired "user" event below.
+                let input_text = block
+                    .get("input")
+                    .and_then(crate::runtime::native_event_input_text_from_value);
+                let idx = native_events.len();
+                open_native_calls.push((id, idx));
+                // Provisional success — corrected by a paired `tool_result`
+                // ("user" event, below), if one arrives.
+                native_events.push(crate::runtime::NativeToolEvent {
+                    tool_name: name,
+                    success: true,
+                    result_text: None,
+                    input_text,
+                });
+            }
+        }
+        Some("user") => {
+            let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) else {
+                return;
+            };
+            for block in content {
+                if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                    continue;
+                }
+                let id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or_default();
+                let popped = if !id.is_empty() {
+                    open_native_calls
+                        .iter()
+                        .rposition(|(oid, _)| oid == id)
+                        .map(|pos| open_native_calls.remove(pos))
+                } else {
+                    open_native_calls.pop()
+                }
+                .or_else(|| open_native_calls.pop());
+                if let Some((_, idx)) = popped {
+                    if let Some(ev) = native_events.get_mut(idx) {
+                        ev.success = !block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                        // R1: the tool_result's `content` is either a bare
+                        // string, or (Claude's actual tool_result shape) an
+                        // array of content blocks — join every `text` block,
+                        // same convention as `duduclaw-cli/src/eval/transcript.rs`.
+                        if let Some(content_val) = block.get("content") {
+                            ev.result_text = claude_tool_result_content_text(content_val)
+                                .as_deref()
+                                .and_then(crate::runtime::native_event_result_text);
+                        }
+                    }
+                }
+                // No outstanding call to match — ignore; never panics on a
+                // reordered/malformed stream (same tolerance as
+                // `eval/transcript.rs`).
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract the plain-text form of a Claude `tool_result` block's `content`
+/// field — either a bare string, or an array of content blocks (only
+/// `{"type": "text", "text": ...}` blocks contribute; other block types,
+/// e.g. images, are skipped rather than guessed at). Multiple text blocks
+/// are newline-joined. `None` when there is nothing textual to extract
+/// (never fabricated).
+fn claude_tool_result_content_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Array(blocks) => {
+            let parts: Vec<&str> = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Spawn a `claude` CLI process with streaming output and read the result.
 ///
 /// Uses `--output-format stream-json --verbose`. No idle timeout — the process
@@ -2540,6 +2661,22 @@ async fn call_claude_streaming(
     let mut result_text = String::new();
     let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
     let mut last_tool_reported: Option<String> = None;
+
+    // WP-A4: runtime-neutral native-tool collector (design
+    // commercial/docs/design-task-forward-model-2026-08-06.md §5.3/§9). This
+    // is the dispatcher-side stream-json loop (goal loop dispatch), distinct
+    // from `channel_reply`'s own parser — design §1 "更正一之一" confirmed
+    // this path had zero native-tool capture before WP-A4. Pairing mirrors
+    // `duduclaw-cli/src/eval/transcript.rs`'s tool_use/tool_result matching
+    // (by block `id` when present, else the most recently opened call) —
+    // kept local rather than importing that CLI-crate module (this gateway
+    // crate does not depend on duduclaw-cli). Flushed into
+    // `crate::runtime::NATIVE_TOOL_COLLECTOR` best-effort right before a
+    // successful return; never affects the primary CLI response (a
+    // collector failure/missing scope is always silent — see
+    // `extend_native_tool_events`'s doc comment).
+    let mut native_events: Vec<crate::runtime::NativeToolEvent> = Vec::new();
+    let mut open_native_calls: Vec<(String, usize)> = Vec::new();
 
     // Keepalive timer (90s) — only meaningful when on_progress is Some
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(
@@ -2600,6 +2737,14 @@ async fn call_claude_streaming(
                                             "claude CLI assistant error: {err}"
                                         ));
                                     }
+                                    // WP-A4: record every tool_use block in this event
+                                    // into the native-tool collector, independent of
+                                    // the on_progress callback below (native or MCP —
+                                    // classification happens downstream in
+                                    // `ToolClass::classify`).
+                                    ingest_stream_json_event_for_native_tools(
+                                        &event, &mut native_events, &mut open_native_calls,
+                                    );
                                     if let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) {
                                         for block in content {
                                             let block_type = block.get("type").and_then(|t| t.as_str());
@@ -2610,6 +2755,16 @@ async fn call_claude_streaming(
                                                     }
                                                 }
                                                 Some("tool_use") => {
+                                                    // WP-A4 collector: handled once per
+                                                    // event (not per block) below via
+                                                    // `ingest_stream_json_event_for_native_tools`
+                                                    // — see the call right after the
+                                                    // envelope-error check above. Kept
+                                                    // separate from the on_progress
+                                                    // callback logic here so the
+                                                    // collector's tool_use/tool_result
+                                                    // pairing is independently
+                                                    // fixture-testable.
                                                     if let Some(cb) = on_progress {
                                                         let tool = block.get("name")
                                                             .and_then(|n| n.as_str())
@@ -2649,6 +2804,15 @@ async fn call_claude_streaming(
                                             token_usage = crate::cost_telemetry::TokenUsage::from_json(usage_val);
                                         }
                                     }
+                                }
+                                Some("user") => {
+                                    // WP-A4: pair `tool_result` blocks back to their
+                                    // `tool_use` via the same fixture-testable
+                                    // ingestion function used for "assistant" events
+                                    // above.
+                                    ingest_stream_json_event_for_native_tools(
+                                        &event, &mut native_events, &mut open_native_calls,
+                                    );
                                 }
                                 _ => {}
                             }
@@ -2705,6 +2869,12 @@ async fn call_claude_streaming(
         span.record(crate::otel::attrs::USAGE_INPUT_TOKENS, usage.input_tokens);
         span.record(crate::otel::attrs::USAGE_OUTPUT_TOKENS, usage.output_tokens);
     }
+
+    // WP-A4: best-effort flush of this call's native-tool collector. A
+    // missing scope (every non-goal-loop caller) or a poisoned mutex
+    // degrades to a silent no-op inside `extend_native_tool_events` — never
+    // affects the response above.
+    crate::runtime::extend_native_tool_events(native_events);
 
     Ok(ClaudeResponse {
         text: result_text,
@@ -2972,6 +3142,234 @@ async fn call_claude_with_env(
     crate::runtime::apply_native_sandbox(&mut cmd, capabilities, work_dir, "claude")?;
 
     call_claude_streaming(&mut cmd, None).await
+}
+
+// ---------------------------------------------------------------------------
+// Tests — WP-A4 native-tool collector (fixture stream-json lines)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod native_tool_collector_tests {
+    use super::*;
+
+    fn assistant_tool_use(id: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": id, "name": name, "input": {}}
+                ]
+            }
+        })
+    }
+
+    fn user_tool_result(id: &str, is_error: bool) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": id, "is_error": is_error, "content": "x"}
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn ingest_pairs_tool_use_with_success_result_by_id() {
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Bash"), &mut events, &mut open);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].success, "provisional success before pairing");
+        ingest_stream_json_event_for_native_tools(&user_tool_result("tu_1", false), &mut events, &mut open);
+        assert_eq!(events[0].tool_name, "Bash");
+        assert!(events[0].success);
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn ingest_pairs_tool_use_with_error_result() {
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Bash"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(&user_tool_result("tu_1", true), &mut events, &mut open);
+        assert!(!events[0].success);
+    }
+
+    #[test]
+    fn ingest_pairs_by_id_not_just_order() {
+        // Two outstanding calls; the result for the FIRST arrives after the
+        // second tool_use — id-based pairing must resolve correctly rather
+        // than assuming strict FIFO/LIFO order.
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        ingest_stream_json_event_for_native_tools(&assistant_tool_use("id-a", "Read"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(&assistant_tool_use("id-b", "Write"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(&user_tool_result("id-a", true), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(&user_tool_result("id-b", false), &mut events, &mut open);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].tool_name, "Read");
+        assert!(!events[0].success);
+        assert_eq!(events[1].tool_name, "Write");
+        assert!(events[1].success);
+    }
+
+    #[test]
+    fn ingest_unpaired_tool_use_stays_provisionally_successful() {
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Bash"), &mut events, &mut open);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].success);
+        assert_eq!(open.len(), 1, "still outstanding — no matching tool_result arrived");
+    }
+
+    #[test]
+    fn ingest_ignores_non_tool_use_blocks_and_other_event_types() {
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        let text_event = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "hello"}]}
+        });
+        ingest_stream_json_event_for_native_tools(&text_event, &mut events, &mut open);
+        assert!(events.is_empty());
+
+        let result_event = serde_json::json!({"type": "result", "result": "done"});
+        ingest_stream_json_event_for_native_tools(&result_event, &mut events, &mut open);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn ingest_unresolved_tool_result_id_is_ignored_not_panic() {
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        // A tool_result whose id matches nothing outstanding — must not
+        // panic, must not corrupt any other entry.
+        ingest_stream_json_event_for_native_tools(&user_tool_result("nonexistent", true), &mut events, &mut open);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn ingest_fallback_pairing_without_id_uses_most_recently_opened() {
+        let assistant_no_id = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]}
+        });
+        let user_no_id = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "is_error": true, "content": "x"}]}
+        });
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        ingest_stream_json_event_for_native_tools(&assistant_no_id, &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(&user_no_id, &mut events, &mut open);
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].success);
+    }
+
+    // ── R1: result_text / input_text capture ─────────────────────────────
+
+    fn assistant_tool_use_with_input(id: &str, name: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": id, "name": name, "input": input}
+                ]
+            }
+        })
+    }
+
+    fn user_tool_result_with_content(id: &str, is_error: bool, content: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": id, "is_error": is_error, "content": content}
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn ingest_captures_input_text_from_tool_use_block() {
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        ingest_stream_json_event_for_native_tools(
+            &assistant_tool_use_with_input("tu_1", "Bash", serde_json::json!({"command": "cat report.md"})),
+            &mut events,
+            &mut open,
+        );
+        assert!(events[0].input_text.as_deref().unwrap().contains("cat report.md"));
+    }
+
+    #[test]
+    fn ingest_captures_result_text_from_bare_string_content() {
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Read"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &user_tool_result_with_content("tu_1", false, serde_json::json!("quarterly revenue: 1.2M")),
+            &mut events,
+            &mut open,
+        );
+        assert_eq!(events[0].result_text.as_deref(), Some("quarterly revenue: 1.2M"));
+    }
+
+    #[test]
+    fn ingest_joins_multiple_text_blocks_in_result_content() {
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Read"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &user_tool_result_with_content(
+                "tu_1",
+                false,
+                serde_json::json!([
+                    {"type": "text", "text": "first line"},
+                    {"type": "text", "text": "second line"},
+                ]),
+            ),
+            &mut events,
+            &mut open,
+        );
+        assert_eq!(events[0].result_text.as_deref(), Some("first line\nsecond line"));
+    }
+
+    #[test]
+    fn ingest_masks_secret_in_result_text() {
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Bash"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &user_tool_result_with_content(
+                "tu_1",
+                false,
+                serde_json::json!("ANTHROPIC_API_KEY=sk-ant-api03-verysecretvalue1234567890"),
+            ),
+            &mut events,
+            &mut open,
+        );
+        let result_text = events[0].result_text.as_deref().unwrap();
+        assert!(
+            !result_text.contains("sk-ant-api03-verysecretvalue1234567890"),
+            "secret leaked into result_text: {result_text}"
+        );
+    }
+
+    #[test]
+    fn ingest_empty_input_object_yields_no_input_text() {
+        // `{}` from the fixture helper `assistant_tool_use` — an empty
+        // object still stringifies non-empty ("{}"), so this documents that
+        // "no meaningful input" and "no input at all" are not conflated at
+        // this layer; only a genuinely empty/whitespace string collapses to
+        // `None` (see `mask_and_cap`'s trim-then-empty-check).
+        let mut events = Vec::new();
+        let mut open = Vec::new();
+        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Bash"), &mut events, &mut open);
+        assert_eq!(events[0].input_text.as_deref(), Some("{}"));
+    }
 }
 
 // ---------------------------------------------------------------------------
