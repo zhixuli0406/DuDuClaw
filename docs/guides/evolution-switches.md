@@ -40,13 +40,139 @@ Under the master switch, each capability has its own flag. With the master on,
 
 | Toggle | Default | Controls |
 |---|---|---|
-| `gvu_enabled` | `true` | GVU generator→verifier→updater loop (SOUL.md rewrites) |
+| `gvu_enabled` | `false` | GVU generator→verifier→updater loop (SOUL.md rewrites) |
 | `skill_synthesis_enabled` | `false` | Synthesising new skills from repeated domain gaps |
 | `skill_graduation_enabled` | `false` | Promoting a proven skill to global scope |
 | `skill_recommendation_enabled` | `false` | Auto-activating recommended skills for new agents |
 | `curiosity_enabled` | `false` | Proactive exploration of underused domains |
 | `skill_auto_activate` | `false` | Activating suggested skills mid-conversation |
 | `skill_behavior_monitor_enabled` | `false` | Behavioural-drift detection after activation |
+
+**`gvu_enabled` defaults to `false` (fail-closed opt-in, changed 2026-08-06 —
+see `TODO-evolution-v3-2026-08.md` WP0.1).** Every scaffold/template that
+writes `agent.toml` writes the key explicitly, even when `false`, so the
+toggle is always visible rather than an absent key that silently means "off".
+Set `gvu_enabled = true` to opt an agent in.
+
+### GVU cooldown
+
+Independent of the toggle above, every GVU trigger path (channel-reply
+ε-exploration, silence-timer, sub-agent dispatch forced reflection) shares a
+single per-agent cooldown so a burst of triggers can't chain multiple
+multi-minute GVU cycles back to back:
+
+```toml
+[evolution]
+gvu_cooldown_minutes = 60   # default 60; 0 disables the cooldown
+```
+
+The cooldown starts counting the moment a trigger is let through the gate
+(not when the cycle finishes), and applies regardless of the outcome
+(applied/abandoned/deferred/timed_out/skipped) — the cost being throttled is
+LLM calls *attempted*, not just calls that succeeded. State is in-memory and
+resets on gateway restart.
+
+### Which engine runs: AEE (default) or the legacy SOUL path
+
+When `gvu_enabled = true`, the evolution engine that actually runs is **AEE**
+(the Agentic Evolution Engine). AEE evolves the agent's *playbook* — small,
+independently retirable behaviour rules, each linked to at least one eval case
+— and never writes `SOUL.md`. The persona file is operator-owned.
+
+The historical Generator→Verifier→Updater cycle that rewrote `SOUL.md` is still
+available as an escape hatch:
+
+```toml
+[evolution]
+legacy_soul_evolution = true   # default false → AEE
+```
+
+A missing or malformed `agent.toml` yields `false` (AEE) — deliberately the
+opposite fail-safe direction from the other keys on this page, because AEE is
+the path that *cannot* write `SOUL.md` at all, and a config typo must not
+silently re-open that write surface.
+
+Two things stay shared by both engines: the cooldown above, and the `SOUL.md`
+size-cap consolidation breaker (an over-cap persona file freezes the agent's
+prompt no matter which engine is driving).
+
+After a committed AEE round, the entries it added are observed before their
+verdict is settled:
+
+```toml
+[evolution]
+aee_settle_hours = 24   # default 24; the agent runs no new AEE round until it elapses
+```
+
+### Strategy mix (which intent AEE picks each round)
+
+Each AEE round deterministically picks one intent — `repair` (consume
+`MistakeNotebook` backlog), `optimize` (refine an existing low-`success_streak`
+entry), or `innovate` (propose a new entry) — from a per-agent mix, replacing
+the previous raw ε-exploration:
+
+```toml
+[evolution]
+strategy = "balanced"   # balanced (default) | innovate | harden | repair_only
+```
+
+| `strategy` | Repair | Optimize | Innovate |
+|---|---|---|---|
+| `balanced` | 5 | 3 | 2 |
+| `innovate` | 2 | 3 | 5 |
+| `harden` | 4 | 5 | 1 |
+| `repair_only` | 10 | 0 | 0 |
+
+An unrecognised value `warn!`s and falls back to `balanced` — a typo must not
+silently change evolution behaviour. `repair` is starved down to `optimize`
+when the mistake backlog is empty, regardless of the configured mix.
+
+The commit gate's per-dimension noise band (how close to the champion counts
+as a tie, i.e. "matches" under matches-or-improves) is also configurable —
+defaults are starting values pending empirical calibration, not tuned numbers:
+
+```toml
+[evolution.noise_band]
+cases = 0.05     # eval-case pass-rate dimension; hard-clamped to ≤ 0.10
+                 # (a wider band means the cases are noisy, not that the band should widen)
+judge = 0.15     # LLM judge score dimension (judges vary run to run)
+anti_sycophancy = 0.0   # deterministic — zero band
+novelty = 0.05
+relevance = 0.10
+```
+
+### Eval corpus location (AEE's measurement)
+
+AEE scores candidates by replaying the agent's eval suite. The suite for an
+agent is the directory named after it under the suites root:
+
+```toml
+# ~/.duduclaw/config.toml
+[evolution]
+eval_suites_root = "evals"        # default: <home>/evals; relative paths resolve against the home dir
+# eval_binary    = "/usr/local/bin/duduclaw"   # optional: which binary to spawn for `duduclaw eval`
+```
+
+`DUDUCLAW_EVAL_SUITES_ROOT` overrides `eval_suites_root` for one process.
+A developer checkout typically points it at the repo's `commercial/evals`.
+
+**Record the corpus once before the scores mean anything.** AEE measures in
+replay mode (offline, zero LLM cost), which reads a recorded transcript per
+case. A case with no `<stem>.transcript.jsonl` beside it cannot be replayed:
+
+```bash
+duduclaw eval ~/.duduclaw/evals/<agent-id> --record   # one live pass, then replay is free
+```
+
+Until that pass exists, the whole suite is treated as *unmeasured* rather than
+as failing — an unrecorded case is an infrastructure gap, not a quality signal,
+and scoring it 0.0 would enshrine a champion of zeroes nothing could improve on.
+
+**No suite, no problem.** An agent with no eval corpus (or an unrecorded one,
+or an unreachable eval binary) still evolves — the `cases` dimension is
+reported as *absent*, never as zero, and the commit gate compares the
+dimensions that do exist. The degradation is visible in the round's audit
+record (`case_dimension_available: false`) and in a `warn!` line, not silent.
 
 ## Autopilot is deliberately NOT governed by the master switch
 

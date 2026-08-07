@@ -1,8 +1,10 @@
 # 半自動拓撲演化（D5，human-gated）
 
-DuDuClaw 的 GVU / SOUL.md 自我演化只優化「節點」——每個 agent 的 prompt。多 agent
-之間的「邊」，也就是 `reports_to` 階層把某類任務路由給誰，一直是寫死的。D5 讓這條邊
-變成可演化的對象，但每一次改動都必須經過人工核准，機器只負責提案與證據收集。
+DuDuClaw 的自主進化（GVU / AEE，v3 起預設走 AEE playbook 條目，不再整份改寫
+SOUL.md——見 `docs/architecture/evolution-engine.md` 第十二章）只優化「節點」——
+每個 agent 的 prompt/行為規則。多 agent 之間的「邊」，也就是 `reports_to` 階層把
+某類任務路由給誰，一直是寫死的。D5 讓這條邊變成可演化的對象，但每一次改動都必須
+經過人工核准，機器只負責提案與證據收集。
 
 設計出處：GPTSwarm（arXiv:2402.16823，拓撲是可學習物件）、AFlow（2410.10762）、
 ADAS（2408.08435，全自動改寫控制流是 runaway 風險最高的能力，因此 D5 刻意不做全自動）。

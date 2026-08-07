@@ -1,8 +1,18 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
+import type { IntlShape } from 'react-intl';
 import { useIntl } from 'react-intl';
 import { useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
-import { api, type EvolutionVersion, type KeyFactEntry } from '@/lib/api';
+import {
+  api,
+  type EvolutionVersion,
+  type EvolutionStagnationSignal,
+  type EvolutionStagnationSnapshot,
+  type EvolutionTelemetrySummary,
+  type EvolutionConsolidation,
+  type PlaybookEntry,
+  type KeyFactEntry,
+} from '@/lib/api';
 import { timeAgo } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import { useSystemStore } from '@/stores/system-store';
@@ -13,9 +23,13 @@ import {
   CollectionPageHeader,
   CollectionPageState,
   Card,
+  CardHeader,
+  CardTitle,
+  CardAction,
   CardContent,
   Segmented,
   Badge,
+  Button,
   Input,
   Skeleton,
   ActorAvatar,
@@ -24,6 +38,11 @@ import {
   SelectValue,
   SelectContent,
   SelectItem,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
   type SegmentedOption,
 } from '@/components/mds';
 import {
@@ -34,6 +53,10 @@ import {
   CheckCircleIcon,
   XCircleIcon,
   LightbulbIcon,
+  AlertTriangleIcon,
+  BookOpenIcon,
+  DownloadIcon,
+  Trash2Icon,
 } from 'lucide-react';
 
 /**
@@ -117,9 +140,11 @@ export function MemoryPage() {
     return opts;
   }, [intl, isPersonal]);
 
-  // The wiki views bring their own agent picker; evolution and the shared wiki
-  // are not agent-scoped at all.
-  const showAgentPicker = view === 'memories' || view === 'insights';
+  // The wiki views bring their own agent picker; the shared wiki is not
+  // agent-scoped at all. Evolution's overview cards are all-agent, but the
+  // stagnation/telemetry/consolidations/playbook detail sections underneath
+  // need one agent selected — same picker, reused.
+  const showAgentPicker = view === 'memories' || view === 'insights' || view === 'evolution';
 
   return (
     <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
@@ -164,7 +189,7 @@ export function MemoryPage() {
         {view === 'wiki' && <KnowledgeHubPage embedded />}
         {view === 'shared' && <SharedWikiPage embedded />}
         {view === 'insights' && <InsightsView agentId={selectedAgent} />}
-        {view === 'evolution' && <EvolutionView />}
+        {view === 'evolution' && <EvolutionView selectedAgent={selectedAgent} />}
       </div>
     </div>
   );
@@ -294,7 +319,7 @@ interface EvolutionAgent {
   observation_period_hours: number;
 }
 
-function EvolutionView() {
+function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
   const intl = useIntl();
   const [agents, setAgents] = useState<EvolutionAgent[]>([]);
   const [mode, setMode] = useState('');
@@ -317,7 +342,9 @@ function EvolutionView() {
     };
     Promise.all([
       api.evolution.status().catch(onFailure),
-      api.evolution.history(undefined, 20).catch(onFailure),
+      // Superset of `.history` (adds the WP0.4 ExpiredNoData status + the
+      // low-data alert flag); same optional-agent/limit contract.
+      api.evolution.versions(undefined, 20).catch(onFailure),
     ]).then(([status, history]) => {
       setAgents(status?.agents ?? []);
       setMode(status?.mode ?? '');
@@ -392,6 +419,16 @@ function EvolutionView() {
         </div>
       )}
 
+      {/* Per-agent detail: stagnation watch + rejection distribution. Silent
+          when the agent has no signal to show (§ "Real-time without anxiety"
+          — a quiet dashboard is the healthy state, not a missing feature). */}
+      {selectedAgent && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <StagnationCard agentId={selectedAgent} />
+          <TelemetryCard agentId={selectedAgent} />
+        </div>
+      )}
+
       {agents.length > 0 && (
         <section className="space-y-2">
           <h2 className="flex items-center gap-2 text-sm font-medium text-foreground">
@@ -413,7 +450,409 @@ function EvolutionView() {
           )}
         </section>
       )}
+
+      {selectedAgent && (
+        <>
+          <ConsolidationsCard agentId={selectedAgent} />
+          <PlaybookCard agentId={selectedAgent} />
+        </>
+      )}
     </div>
+  );
+}
+
+// ── Stagnation watch (AVO §2.4) ──────────────────────────────
+
+function stagnationSignalLabel(intl: IntlShape, s: EvolutionStagnationSignal): string {
+  switch (s.kind) {
+    case 'consecutive_non_applied':
+      return intl.formatMessage(
+        { id: 'evolution.stagnation.signal.consecutive' },
+        { count: s.count ?? 0, threshold: s.threshold ?? 0 },
+      );
+    case 'zero_apply_window':
+      return intl.formatMessage(
+        { id: 'evolution.stagnation.signal.zeroApply' },
+        { days: s.days ?? 0, count: s.trigger_count ?? 0 },
+      );
+    case 'repeated_rejection_reason':
+      return intl.formatMessage(
+        { id: 'evolution.stagnation.signal.repeated' },
+        { occurrences: s.occurrences ?? 0, threshold: s.threshold ?? 0 },
+      );
+    default:
+      return s.kind;
+  }
+}
+
+function StagnationCard({ agentId }: { agentId: string }) {
+  const intl = useIntl();
+  const [snapshot, setSnapshot] = useState<EvolutionStagnationSnapshot | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    api.evolution.stagnation(agentId).then((res) => {
+      if (alive) setSnapshot(res?.snapshots?.[0] ?? null);
+    }).catch((e) => {
+      console.warn('[api]', e);
+      if (alive) setSnapshot(null);
+    }).finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [agentId]);
+
+  if (loading) return <Skeleton className="h-24 w-full" />;
+
+  const stagnant = snapshot?.is_stagnant ?? false;
+
+  return (
+    <Card data-size="sm" className={cn(stagnant && 'border-warning/40 bg-warning/5')}>
+      <CardContent className="space-y-2">
+        <div className="flex items-center gap-2">
+          {stagnant ? (
+            <AlertTriangleIcon className="size-4 shrink-0 text-warning" />
+          ) : (
+            <CheckCircleIcon className="size-4 shrink-0 text-success" />
+          )}
+          <h3 className="text-sm font-medium text-foreground">
+            {intl.formatMessage({ id: 'evolution.stagnation.title' })}
+          </h3>
+        </div>
+        {stagnant ? (
+          <ul className="space-y-1 pl-6 text-sm text-muted-foreground">
+            {(snapshot?.signals ?? []).map((s, i) => (
+              <li key={i} className="list-disc">{stagnationSignalLabel(intl, s)}</li>
+            ))}
+          </ul>
+        ) : (
+          <p className="pl-6 text-sm text-muted-foreground">
+            {intl.formatMessage({ id: 'evolution.stagnation.ok' })}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Rejection distribution (WP0.6) ───────────────────────────
+
+function TelemetryCard({ agentId }: { agentId: string }) {
+  const intl = useIntl();
+  const [days, setDays] = useState<'7' | '30'>('7');
+  const [summary, setSummary] = useState<EvolutionTelemetrySummary | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    api.evolution.telemetry(agentId, Number(days)).then((res) => {
+      if (alive) setSummary(res ?? null);
+    }).catch((e) => {
+      console.warn('[api]', e);
+      if (alive) setSummary(null);
+    }).finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [agentId, days]);
+
+  const rows = useMemo(() => {
+    if (!summary) return [];
+    const out: Array<{ stage: string; layer: string; count: number }> = [];
+    for (const [stage, layers] of Object.entries(summary.by_stage_layer)) {
+      for (const [layer, count] of Object.entries(layers)) {
+        out.push({ stage, layer, count });
+      }
+    }
+    return out.sort((a, b) => b.count - a.count).slice(0, 8);
+  }, [summary]);
+  const max = Math.max(1, ...rows.map((r) => r.count));
+
+  const rangeOptions: SegmentedOption<'7' | '30'>[] = [
+    { value: '7', label: intl.formatMessage({ id: 'evolution.telemetry.range.7d' }) },
+    { value: '30', label: intl.formatMessage({ id: 'evolution.telemetry.range.30d' }) },
+  ];
+
+  return (
+    <Card data-size="sm">
+      <CardHeader>
+        <CardTitle className="text-sm">{intl.formatMessage({ id: 'evolution.telemetry.title' })}</CardTitle>
+        <CardAction>
+          <Segmented value={days} onValueChange={setDays} options={rangeOptions} />
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        {loading ? (
+          <Skeleton className="h-20 w-full" />
+        ) : rows.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            {intl.formatMessage({ id: 'evolution.telemetry.empty' })}
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {rows.map((r) => (
+              <div key={`${r.stage}-${r.layer}`} className="flex items-center gap-2 text-xs">
+                <span className="w-36 shrink-0 truncate text-muted-foreground">
+                  {intl.formatMessage({ id: `evolution.telemetry.stage.${r.stage}`, defaultMessage: r.stage })}
+                  {' · '}
+                  <span className="font-mono">{r.layer}</span>
+                </span>
+                <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
+                  <div
+                    className="h-full rounded-full bg-chart-1"
+                    style={{ width: `${(r.count / max) * 100}%` }}
+                  />
+                </div>
+                <span className="w-8 shrink-0 text-right font-mono tabular-nums text-foreground">{r.count}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Consolidation audit trail (WP0.2) ────────────────────────
+
+function ConsolidationsCard({ agentId }: { agentId: string }) {
+  const intl = useIntl();
+  const [records, setRecords] = useState<ReadonlyArray<EvolutionConsolidation>>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    api.evolution.consolidations(agentId, 10).then((res) => {
+      if (alive) setRecords(res?.consolidations ?? []);
+    }).catch((e) => {
+      console.warn('[api]', e);
+      if (alive) setRecords([]);
+    }).finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [agentId]);
+
+  // Quiet when there is nothing to audit — no consolidation has ever been
+  // needed for this agent, which is the common (and healthy) case.
+  if (!loading && records.length === 0) return null;
+
+  const outcomeBadgeClass = (outcome: string) => {
+    if (outcome === 'applied') return 'bg-success/15 text-success';
+    if (outcome === 'attempted') return 'bg-info/15 text-info';
+    return 'bg-destructive/10 text-destructive';
+  };
+
+  return (
+    <section className="space-y-2">
+      <h2 className="text-sm font-medium text-foreground">
+        {intl.formatMessage({ id: 'evolution.consolidations.title' })}
+      </h2>
+      {loading ? (
+        <Skeleton className="h-16 w-full" />
+      ) : (
+        <div className="space-y-1.5">
+          {records.map((r) => (
+            <Card key={r.id} data-size="sm">
+              <CardContent className="flex flex-wrap items-center justify-between gap-2">
+                <Badge variant="secondary" className={outcomeBadgeClass(r.outcome)}>
+                  {intl.formatMessage({
+                    id: `evolution.consolidations.outcome.${r.outcome}`,
+                    defaultMessage: r.outcome,
+                  })}
+                </Badge>
+                <span className="font-mono text-xs tabular-nums text-muted-foreground">
+                  {r.from_bytes}B → {r.to_bytes ?? '—'}B
+                </span>
+                <span className="flex items-center gap-1 font-mono text-xs tabular-nums text-muted-foreground">
+                  <ClockIcon className="size-3" />
+                  {timeAgo(r.attempted_at)}
+                </span>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ── Playbook (WP1.2/1.3 gene-shaped experience entries) ──────
+
+const PLAYBOOK_CATEGORY_CLASS: Record<string, string> = {
+  repair: 'bg-destructive/10 text-destructive',
+  optimize: 'bg-info/15 text-info',
+  innovate: 'bg-brand/12 text-brand',
+  regulatory: 'bg-muted text-muted-foreground',
+  explore: 'bg-warning/15 text-warning',
+};
+
+const PLAYBOOK_STATE_CLASS: Record<string, string> = {
+  probation: 'bg-warning/15 text-warning',
+  active: 'bg-success/15 text-success',
+  stale: 'bg-muted text-muted-foreground',
+  retired: 'bg-muted text-muted-foreground/70',
+};
+
+function PlaybookEntryRow({ entry, onRetire }: { entry: PlaybookEntry; onRetire: () => void }) {
+  const intl = useIntl();
+  const retired = entry.state === 'retired';
+
+  return (
+    <Card data-size="sm">
+      <CardContent className="space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Badge variant="secondary" className={PLAYBOOK_CATEGORY_CLASS[entry.category]}>
+              {intl.formatMessage({ id: `playbook.category.${entry.category}` })}
+            </Badge>
+            <Badge variant="secondary" className={PLAYBOOK_STATE_CLASS[entry.state]}>
+              {intl.formatMessage({ id: `playbook.state.${entry.state}` })}
+            </Badge>
+          </div>
+          {!retired && (
+            <Button variant="ghost" size="icon-xs" onClick={onRetire} aria-label={intl.formatMessage({ id: 'playbook.retire.button' })} title={intl.formatMessage({ id: 'playbook.retire.button' })}>
+              <Trash2Icon />
+            </Button>
+          )}
+        </div>
+        <p className="whitespace-pre-wrap text-sm text-foreground">{entry.content}</p>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-surface-border pt-2 text-xs text-muted-foreground">
+          <span>
+            {intl.formatMessage({ id: 'playbook.stats' }, { helpful: entry.helpful, harmful: entry.harmful })}
+          </span>
+          {entry.success_streak > 0 && (
+            <span>{intl.formatMessage({ id: 'playbook.streak' }, { count: entry.success_streak })}</span>
+          )}
+          {entry.eval_cases.length > 0 && (
+            <span>{intl.formatMessage({ id: 'playbook.evalCases' }, { count: entry.eval_cases.length })}</span>
+          )}
+          {entry.signals_match.length > 0 && (
+            <span className="truncate font-mono">{entry.signals_match.join(', ')}</span>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function PlaybookCard({ agentId }: { agentId: string }) {
+  const intl = useIntl();
+  const [entries, setEntries] = useState<ReadonlyArray<PlaybookEntry>>([]);
+  const [loading, setLoading] = useState(true);
+  const [retireTarget, setRetireTarget] = useState<PlaybookEntry | null>(null);
+  const [reason, setReason] = useState('');
+  const [retiring, setRetiring] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api.playbook.list(agentId).then((res) => {
+      setEntries(res?.entries ?? []);
+    }).catch((e) => {
+      console.warn('[api]', e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      setEntries([]);
+    }).finally(() => setLoading(false));
+    // Run once per agent; `intl` is stable from context.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleExport = async () => {
+    try {
+      const res = await api.playbook.export(agentId);
+      const blob = new Blob([JSON.stringify(res, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${agentId}-playbook.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success(intl.formatMessage({ id: 'playbook.export.success' }));
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'playbook.export.error' }, { message: formatError(e) }));
+    }
+  };
+
+  const handleRetireConfirm = async () => {
+    if (!retireTarget) return;
+    setRetiring(true);
+    try {
+      const res = await api.playbook.retire(agentId, retireTarget.id, reason);
+      if (!res.retired) {
+        toast.error(intl.formatMessage({ id: 'playbook.retire.error' }, { message: res.reason ?? '' }));
+      } else {
+        toast.success(intl.formatMessage({ id: 'playbook.retire.success' }));
+      }
+      setRetireTarget(null);
+      setReason('');
+      load();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'playbook.retire.error' }, { message: formatError(e) }));
+    } finally {
+      setRetiring(false);
+    }
+  };
+
+  return (
+    <section className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-sm font-medium text-foreground">
+          {intl.formatMessage({ id: 'playbook.title' })}
+        </h2>
+        <Button variant="outline" size="xs" onClick={handleExport} disabled={loading || entries.length === 0}>
+          <DownloadIcon />
+          {intl.formatMessage({ id: 'playbook.export.button' })}
+        </Button>
+      </div>
+
+      {loading ? (
+        <Skeleton className="h-24 w-full" />
+      ) : entries.length === 0 ? (
+        <CollectionPageState
+          state="empty"
+          icon={BookOpenIcon}
+          title={intl.formatMessage({ id: 'playbook.empty' })}
+        />
+      ) : (
+        <div className="space-y-1.5">
+          {entries.map((entry) => (
+            <PlaybookEntryRow key={entry.id} entry={entry} onRetire={() => setRetireTarget(entry)} />
+          ))}
+        </div>
+      )}
+
+      <Dialog
+        open={retireTarget !== null}
+        onOpenChange={(o) => { if (!o) { setRetireTarget(null); setReason(''); } }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{intl.formatMessage({ id: 'playbook.retire.confirm.title' })}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <p className="text-sm text-muted-foreground">
+              {intl.formatMessage({ id: 'playbook.retire.confirm.desc' })}
+            </p>
+            <div className="space-y-1.5">
+              <label className="block text-sm font-medium text-foreground">
+                {intl.formatMessage({ id: 'playbook.retire.confirm.reasonLabel' })}
+              </label>
+              <Input value={reason} onChange={(e) => setReason(e.target.value)} />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => { setRetireTarget(null); setReason(''); }} disabled={retiring}>
+              {intl.formatMessage({ id: 'playbook.retire.confirm.cancel' })}
+            </Button>
+            <Button variant="destructive" onClick={handleRetireConfirm} disabled={retiring}>
+              {retiring
+                ? intl.formatMessage({ id: 'common.saving' })
+                : intl.formatMessage({ id: 'playbook.retire.confirm.confirm' })}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </section>
   );
 }
 
@@ -434,6 +873,10 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
       case 'Confirmed': return intl.formatMessage({ id: 'evolution.status.confirmed' });
       case 'RolledBack': return intl.formatMessage({ id: 'evolution.status.rolledBack' });
       case 'Observing': return intl.formatMessage({ id: 'evolution.status.observing' });
+      // WP0.4: the observation window closed without enough traffic to judge
+      // pass/fail — deliberately NOT phrased as pass or fail (user-facing
+      // copy, never the internal `ExpiredNoData` term).
+      case 'ExpiredNoData': return intl.formatMessage({ id: 'evolution.status.expiredNoData' });
       default: return version.status;
     }
   })();
@@ -441,6 +884,7 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
     Confirmed: 'bg-success/15 text-success',
     RolledBack: 'bg-destructive/10 text-destructive',
     Observing: 'bg-warning/15 text-warning',
+    ExpiredNoData: 'bg-muted text-muted-foreground',
   };
 
   const renderDelta = (pre: number, post: number | undefined, invert = false) => {
@@ -478,6 +922,11 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
         </div>
         {version.soul_summary && (
           <p className="whitespace-pre-wrap text-sm text-foreground">{version.soul_summary}</p>
+        )}
+        {version.status === 'ExpiredNoData' && version.low_data_alert_sent && (
+          <p className="text-xs text-muted-foreground">
+            {intl.formatMessage({ id: 'evolution.version.lowDataAlert' })}
+          </p>
         )}
         <div className="grid grid-cols-3 gap-2 border-t border-surface-border pt-2 text-xs">
           <div>

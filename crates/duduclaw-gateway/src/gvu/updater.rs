@@ -365,6 +365,22 @@ const SOUL_SCANNER_BLOCK_CUMULATIVE: u32 = 120;
 /// body or sanitized append) — not just the LLM narrative — so the structured
 /// patch payload cannot bypass these gates.
 fn scan_content_safety(agent_id: &str, payload: &str) -> Result<(), String> {
+    scan_payload_safety(agent_id, payload)?;
+    if contains_contract_override_token(payload) {
+        return Err("GVU proposal cannot modify behavioral contracts".to_string());
+    }
+    Ok(())
+}
+
+/// Gates (1) and (2) of [`scan_content_safety`] — prompt-injection scan and
+/// SOUL.md hidden-content scan.
+///
+/// Split out (WP0.2) so consolidate mode can reuse them verbatim while applying
+/// gate (3) — [`contains_contract_override_token`] — with different semantics.
+/// See [`super::consolidate::scan_consolidated_soul`] for why a whole-file
+/// rewrite must evaluate the contract-token rule relative to the pre-compression
+/// document instead of absolutely.
+pub(crate) fn scan_payload_safety(agent_id: &str, payload: &str) -> Result<(), String> {
     // (1) Prompt-injection scan.
     let scan = duduclaw_security::input_guard::scan_input(
         payload,
@@ -418,8 +434,14 @@ fn scan_content_safety(agent_id: &str, payload: &str) -> Result<(), String> {
         );
     }
 
-    // (3) Contract-override token check. NFKC-normalize and strip invisible
-    // characters first to prevent Unicode fullwidth/homoglyph bypass (R4-H2).
+    Ok(())
+}
+
+/// Gate (3) of [`scan_content_safety`] — the contract-override token check.
+///
+/// NFKC-normalizes and strips invisible characters first to prevent Unicode
+/// fullwidth/homoglyph bypass (R4-H2).
+pub(crate) fn contains_contract_override_token(payload: &str) -> bool {
     let normalized: String = payload.nfkc().collect();
     let clean: String = normalized
         .chars()
@@ -428,11 +450,68 @@ fn scan_content_safety(agent_id: &str, payload: &str) -> Result<(), String> {
         ))
         .collect();
     let lower = clean.to_lowercase();
-    if lower.contains("must_not") || lower.contains("must_always") || lower.contains("contract.toml") {
-        return Err("GVU proposal cannot modify behavioral contracts".to_string());
+    lower.contains("must_not") || lower.contains("must_always") || lower.contains("contract.toml")
+}
+
+/// Compute the SOUL.md document a proposal would produce, without writing it.
+///
+/// Returns `(new_document, applied_payload)` where `applied_payload` is the text
+/// this proposal actually introduces — the patch body, or the meta-stripped
+/// append. The content-safety gates run on the payload rather than on
+/// `proposal.content`, because the structured-patch path writes `patch.content`,
+/// which the early narrative scan never inspected (HS1).
+///
+/// Extracted from [`Updater::apply`] (WP0.2) so the caller can ask "would this
+/// proposal breach a hard cap?" *before* paying for the apply attempt, and route
+/// into consolidate mode instead of collecting another log-only rejection. It is
+/// deliberately the same function `apply` itself uses — a second, parallel
+/// projection would drift out of sync with the real write path, which is exactly
+/// how "the gate said X, the writer did Y" bugs happen.
+///
+/// Errors carry `(telemetry_gate_tag, message)` so `apply` keeps recording the
+/// same WP0.6 rejection tags it did before the extraction.
+pub(crate) fn project_applied_soul(
+    current_content: &str,
+    proposal: &EvolutionProposal,
+) -> Result<(String, String), (&'static str, String)> {
+    // Prefer the structured patch path when the Generator emitted one.
+    // The legacy free-form append remains as a fallback so older LLM outputs
+    // (and existing in-flight proposals) continue to apply.
+    if let Some(patch) = &proposal.patch {
+        let applied = apply_patch_to_soul(current_content, patch).map_err(|e| {
+            (
+                "structured_patch_invalid",
+                format!("Structured patch failed: {e}"),
+            )
+        })?;
+        return Ok((applied, patch.content.clone()));
     }
 
-    Ok(())
+    // Strip LLM proposal-meta sections (diagnosis, rationale, expected_improvement,
+    // wiki_proposals, etc.) before appending. Without this, every GVU cycle would
+    // append the model's full reasoning narrative — leading to the agnes/SOUL.md
+    // bloat (61 → 592 lines over 5 cycles) observed in production on 2026-05-17.
+    let sanitized = strip_proposal_meta(&proposal.content);
+    let sanitized_trimmed = sanitized.trim();
+    if sanitized_trimmed.is_empty() {
+        return Err((
+            "meta_only",
+            "GVU proposal contained only meta-discussion (diagnosis / rationale / \
+             expected_improvement) — no behavioral changes to apply"
+                .to_string(),
+        ));
+    }
+
+    // Build new SOUL.md content by appending the proposed changes.
+    // Always append rather than replace — this prevents a malicious or
+    // broken LLM output from wiping out the entire SOUL.md.
+    let merged = format!(
+        "{}\n\n<!-- Evolution update ({}) -->\n{}",
+        current_content,
+        Utc::now().format("%Y-%m-%d"),
+        sanitized_trimmed,
+    );
+    Ok((merged, sanitized_trimmed.to_string()))
 }
 
 /// Outcome of judging an observation period.
@@ -444,25 +523,77 @@ pub enum OutcomeVerdict {
     Rollback { reason: String },
     /// Not enough data — extend observation.
     ExtendObservation { extra_hours: f64 },
+    /// WP0.4 (R5): not enough data AND past the soft warn threshold
+    /// ([`Updater::MAX_OBSERVATION_HOURS_WITHOUT_DATA`]) but still under the
+    /// hard no-data ceiling. Still extends — identical effect to
+    /// `ExtendObservation` — but callers should raise a one-time alert
+    /// instead of silently continuing, since this is exactly the situation
+    /// that used to auto-confirm with zero evidence.
+    ExtendObservationLowDataWarn { extra_hours: f64 },
+    /// WP0.4 (R5): insufficient data persisted past the hard no-data ceiling
+    /// (default 14 days). Replaces the old unconditional-Confirm behavior —
+    /// SOUL.md content is left as-is (no rollback, no evidence either way)
+    /// but this version must NEVER be treated as a verified confirm.
+    ExpiredNoData,
 }
 
 /// Updater applies proposals and manages the observation lifecycle.
 pub struct Updater {
     version_store: VersionStore,
     observation_hours: f64,
+    /// WP0.4 (R5): hard ceiling, in hours, before an observation with
+    /// persistently insufficient data (`< 5` conversations) is given up on
+    /// and marked [`OutcomeVerdict::ExpiredNoData`] instead of extended
+    /// forever. Defaults to [`Self::DEFAULT_MAX_NO_DATA_HOURS`] (14 days).
+    /// Configurable via [`Self::with_max_no_data_hours`] — existing
+    /// `Updater::new(...)` call sites are unaffected.
+    max_no_data_hours: f64,
 }
 
 impl Updater {
+    /// WP0.4 (R5): default hard ceiling on how long an observation can sit
+    /// with insufficient data before being given up on. 14 days — long
+    /// enough that a genuinely low-traffic install still gets several
+    /// nightly cron cycles' worth of opportunity to accumulate 5
+    /// conversations, short enough that a version doesn't sit in limbo
+    /// forever.
+    pub const DEFAULT_MAX_NO_DATA_HOURS: f64 = 24.0 * 14.0;
+
     pub fn new(version_store: VersionStore, observation_hours: Option<f64>) -> Self {
         Self {
             version_store,
             observation_hours: observation_hours.unwrap_or(DEFAULT_OBSERVATION_HOURS),
+            max_no_data_hours: Self::DEFAULT_MAX_NO_DATA_HOURS,
         }
+    }
+
+    /// Override the no-data hard ceiling (WP0.4). Additive builder — does
+    /// not change `Updater::new`'s signature, so existing call sites are
+    /// unaffected.
+    pub fn with_max_no_data_hours(mut self, hours: f64) -> Self {
+        self.max_no_data_hours = hours;
+        self
     }
 
     /// Access the version store (for heartbeat observation checking).
     pub fn version_store(&self) -> &VersionStore {
         &self.version_store
+    }
+
+    /// WP0.6: record an Updater apply-skip to the rejection telemetry
+    /// sidecar (best-effort, zero decision impact — see gvu/telemetry.rs).
+    /// `gate` is a short machine-readable tag (e.g. `"cap_lines"`,
+    /// `"asi_critical"`) distinguishing which apply-time gate fired.
+    fn record_apply_skip(&self, proposal: &EvolutionProposal, gate: &str, reason: &str) {
+        super::telemetry::record_rejection_from_store(
+            &self.version_store,
+            &proposal.agent_id,
+            "apply",
+            gate,
+            reason,
+            &proposal.content,
+            proposal.generation,
+        );
     }
 
     /// Apply a verified proposal to SOUL.md.
@@ -481,64 +612,41 @@ impl Updater {
         // is NOT sufficient on its own (HS1) — `apply_patch_to_soul` writes
         // `patch.content`, not `proposal.content`, so the SAME gates are re-run
         // below against the actual `new_content` that lands in SOUL.md.
-        scan_content_safety(&proposal.agent_id, &proposal.content)?;
+        scan_content_safety(&proposal.agent_id, &proposal.content).map_err(|e| {
+            self.record_apply_skip(proposal, "content_safety_narrative", &e);
+            e
+        })?;
 
         // Read current SOUL.md (for rollback)
         let current_content = std::fs::read_to_string(&soul_path)
             .map_err(|e| format!("Failed to read SOUL.md: {e}"))?;
 
-        // Prefer the structured patch path when the Generator emitted one.
-        // The legacy free-form append remains as a fallback so older LLM outputs
-        // (and existing in-flight proposals) continue to apply.
-        //
-        // `applied_payload` is the text actually introduced into SOUL.md by this
-        // proposal (the patch body, or the sanitized append). The content-safety
-        // gates below run on it — NOT on `proposal.content` — because the patch
-        // path writes `patch.content`, which the early narrative scan never saw.
-        let (new_content, applied_payload): (String, String) = if let Some(patch) = &proposal.patch {
-            let applied = apply_patch_to_soul(&current_content, patch)
-                .map_err(|e| format!("Structured patch failed: {e}"))?;
-            (applied, patch.content.clone())
-        } else {
-            // Strip LLM proposal-meta sections (diagnosis, rationale, expected_improvement,
-            // wiki_proposals, etc.) before appending. Without this, every GVU cycle would
-            // append the model's full reasoning narrative — leading to the agnes/SOUL.md
-            // bloat (61 → 592 lines over 5 cycles) observed in production on 2026-05-17.
-            let sanitized = strip_proposal_meta(&proposal.content);
-            let sanitized_trimmed = sanitized.trim();
-            if sanitized_trimmed.is_empty() {
-                return Err(
-                    "GVU proposal contained only meta-discussion (diagnosis / rationale / \
-                     expected_improvement) — no behavioral changes to apply"
-                        .to_string(),
-                );
-            }
-
-            // Build new SOUL.md content by appending the proposed changes.
-            // Always append rather than replace — this prevents a malicious or
-            // broken LLM output from wiping out the entire SOUL.md.
-            let merged = format!(
-                "{}\n\n<!-- Evolution update ({}) -->\n{}",
-                current_content,
-                Utc::now().format("%Y-%m-%d"),
-                sanitized_trimmed,
-            );
-            (merged, sanitized_trimmed.to_string())
-        };
+        let (new_content, applied_payload) =
+            project_applied_soul(&current_content, proposal).map_err(|(gate, msg)| {
+                self.record_apply_skip(proposal, gate, &msg);
+                msg
+            })?;
 
         // HS1: re-run the content-safety gates against the payload that is
         // ACTUALLY written. A benign-looking `proposed_changes` narrative can
         // ship a `soul_patch` carrying hidden HTML-comment / zero-width
         // instructions or contract-override tokens that the early narrative
         // scan never inspected.
-        scan_content_safety(&proposal.agent_id, &applied_payload)?;
+        scan_content_safety(&proposal.agent_id, &applied_payload).map_err(|e| {
+            self.record_apply_skip(proposal, "content_safety_payload", &e);
+            e
+        })?;
 
         // Validate new content
         if new_content.trim().is_empty() {
-            return Err("Resulting SOUL.md would be empty".to_string());
+            let msg = "Resulting SOUL.md would be empty".to_string();
+            self.record_apply_skip(proposal, "empty_result", &msg);
+            return Err(msg);
         }
         if new_content.len() > 50_000 {
-            return Err("Resulting SOUL.md exceeds 50KB limit".to_string());
+            let msg = "Resulting SOUL.md exceeds 50KB limit".to_string();
+            self.record_apply_skip(proposal, "size_limit_50kb", &msg);
+            return Err(msg);
         }
 
         // Hard caps on growth — independent of the 50KB ceiling above and of ASI.
@@ -553,11 +661,13 @@ impl Updater {
                 cap = SOUL_MAX_LINES,
                 "GVU proposal rejected: SOUL.md line-count cap exceeded"
             );
-            return Err(format!(
+            let msg = format!(
                 "Applying this proposal would push SOUL.md to {projected_lines} lines, \
                  exceeding the {SOUL_MAX_LINES}-line cap. Manual review required — \
                  SOUL.md may have accumulated stale evolution increments and need consolidation."
-            ));
+            );
+            self.record_apply_skip(proposal, "cap_lines", &msg);
+            return Err(msg);
         }
         if new_content.len() > SOUL_MAX_BYTES {
             warn!(
@@ -566,11 +676,13 @@ impl Updater {
                 cap = SOUL_MAX_BYTES,
                 "GVU proposal rejected: SOUL.md byte-size cap exceeded"
             );
-            return Err(format!(
+            let msg = format!(
                 "Applying this proposal would push SOUL.md to {} bytes, exceeding the \
                  {SOUL_MAX_BYTES}-byte cap. Manual review required.",
                 new_content.len()
-            ));
+            );
+            self.record_apply_skip(proposal, "cap_bytes", &msg);
+            return Err(msg);
         }
 
         // Compute Agent Stability Index (ASI) — reject if drift is too extreme.
@@ -595,10 +707,12 @@ impl Updater {
                 summary = %asi.summary,
                 "GVU proposal rejected: ASI below critical threshold"
             );
-            return Err(format!(
+            let msg = format!(
                 "GVU proposal would cause critical identity drift (ASI={:.3}): {}",
                 asi.index, asi.summary,
-            ));
+            );
+            self.record_apply_skip(proposal, "asi_critical", &msg);
+            return Err(msg);
         }
         if asi.level == duduclaw_security::stability_index::AsiLevel::Warning {
             warn!(
@@ -683,25 +797,182 @@ impl Updater {
         Ok(version)
     }
 
+    /// WP0.2 (R2): apply a whole-file **consolidation** to SOUL.md.
+    ///
+    /// The one sanctioned whole-file write path. [`Self::apply`] is additive by
+    /// construction (patch or append), which is what turns the hard caps into a
+    /// permanent deadlock once SOUL.md crosses one. This method exists solely to
+    /// break that deadlock and is deliberately *not* reachable from the ordinary
+    /// proposal flow — the caller
+    /// ([`super::loop_::GvuLoop::run_consolidation`]) only reaches it after a
+    /// cap breach, a 7-day frequency check, the full Verifier Gate, and the
+    /// collapse guard.
+    ///
+    /// Re-runs the collapse guard here as defence in depth: this is the function
+    /// that actually overwrites the file, and per the project's fail-closed
+    /// convention the artifact that takes effect must be validated at the write
+    /// boundary, not only at the proposal boundary. `must_always` is not
+    /// available at this layer, so that one sub-check is a no-op here and is
+    /// enforced by the caller; the identity lock, structure lock, shrink rule
+    /// and anti-collapse floor all apply.
+    ///
+    /// **ASI is measured but not enforced for consolidation.** The Agent
+    /// Stability Index scores content-weighted drift, and a legitimate 30–40 %
+    /// compression scores as heavy drift by construction — gating on it would
+    /// leave the deadlock exactly where it was. The identity guarantee is
+    /// instead provided by the byte-for-byte identity-partition lock (a strictly
+    /// stronger statement than a similarity score), with the 24 h observation
+    /// window and its metric-based auto-rollback as the behavioural backstop.
+    /// The measured value is returned to the caller for the audit record.
+    pub fn apply_consolidation(
+        &self,
+        proposal: &EvolutionProposal,
+        agent_dir: &Path,
+        consolidated: &str,
+        pre_metrics: VersionMetrics,
+    ) -> Result<(SoulVersion, f64), String> {
+        let soul_path = agent_dir.join("SOUL.md");
+        let current_content = std::fs::read_to_string(&soul_path)
+            .map_err(|e| format!("Failed to read SOUL.md: {e}"))?;
+
+        // Collapse guard at the write boundary (see doc comment).
+        super::consolidate::verify_consolidation(&current_content, consolidated, &[]).map_err(
+            |e| {
+                let msg = format!("Consolidation rejected by collapse guard: {e}");
+                self.record_apply_skip(proposal, "consolidate_collapse_guard", &msg);
+                msg
+            },
+        )?;
+
+        // Content-safety gates on the artifact that actually lands on disk.
+        super::consolidate::scan_consolidated_soul(
+            &proposal.agent_id,
+            &current_content,
+            consolidated,
+        )
+        .map_err(|e| {
+            self.record_apply_skip(proposal, "consolidate_content_safety", &e);
+            e
+        })?;
+
+        // The whole point: the result must be back under BOTH hard caps.
+        if let Some(breach) = super::consolidate::detect_cap_breach(consolidated) {
+            let msg = format!(
+                "Consolidated SOUL.md is still over cap ({} lines / {} bytes)",
+                breach.lines, breach.bytes
+            );
+            self.record_apply_skip(proposal, "consolidate_still_over_cap", &msg);
+            return Err(msg);
+        }
+
+        let asi_config =
+            duduclaw_security::stability_index::AsiConfig::for_baseline_size(current_content.len());
+        let asi = duduclaw_security::stability_index::compute_asi(
+            &current_content,
+            consolidated,
+            &[],
+            &asi_config,
+        );
+        info!(
+            agent = %proposal.agent_id,
+            asi = asi.index,
+            level = ?asi.level,
+            summary = %asi.summary,
+            "Consolidation ASI measured (not enforced — identity lock is authoritative)"
+        );
+
+        // Atomic write, identical mechanics to `apply`.
+        let tmp_path = soul_path.with_extension("md.gvu_consolidate_tmp");
+        std::fs::write(&tmp_path, consolidated).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("Failed to write temp SOUL.md: {e}")
+        })?;
+
+        let hash_of = |s: &str| -> String {
+            use ring::digest;
+            let d = digest::digest(&digest::SHA256, s.as_bytes());
+            d.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+
+        let now = Utc::now();
+        let observation_end =
+            now + chrono::Duration::seconds((self.observation_hours * 3600.0) as i64);
+
+        let version = SoulVersion {
+            version_id: uuid::Uuid::new_v4().to_string(),
+            agent_id: proposal.agent_id.clone(),
+            soul_hash: hash_of(consolidated),
+            soul_summary: consolidated.chars().take(200).collect(),
+            applied_at: now,
+            observation_end,
+            status: VersionStatus::Observing,
+            pre_metrics,
+            post_metrics: None,
+            proposal_id: proposal.id.clone(),
+            rollback_diff_hash: Some(hash_of(&current_content)),
+            rollback_diff: current_content,
+        };
+
+        if let Err(e) = self.version_store.record_version(&version) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("Failed to record version: {e}"));
+        }
+
+        if let Err(e) = std::fs::rename(&tmp_path, &soul_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = self
+                .version_store
+                .mark_rolled_back(&version.version_id, "rename failed");
+            return Err(format!("Failed to rename SOUL.md: {e}"));
+        }
+
+        if let Err(e) =
+            duduclaw_security::soul_guard::accept_soul_change(&proposal.agent_id, agent_dir)
+        {
+            warn!(
+                agent = %proposal.agent_id,
+                "Failed to update soul hash after consolidation: {e} — soul_guard will detect drift on next heartbeat"
+            );
+        }
+
+        info!(
+            agent = %proposal.agent_id,
+            version = %version.version_id,
+            observation_end = %observation_end.to_rfc3339(),
+            "SOUL.md consolidated atomically, observation period started"
+        );
+
+        Ok((version, asi.index))
+    }
+
     /// After this much wall-clock time since `applied_at`, an observation
-    /// with `< 5` conversations is auto-confirmed instead of extended.
+    /// with `< 5` conversations crosses the SOFT warn threshold: it keeps
+    /// extending (never auto-confirms — see WP0.4 below) but the caller
+    /// should raise a one-time alert instead of silently continuing.
     ///
-    /// #10 (2026-05-11) — prevents the infinite-extend loop that would
-    /// otherwise pin a SOUL version in `observing` forever. Sub-agents
-    /// without their own channel (e.g. `duduclaw-tl`) only get traffic when
-    /// another agent spawns them. If nobody spawns one for a week, the
-    /// `< 5 conversations → extend` rule would keep cycling every 12 h
-    /// without progress — and crucially, every extend keeps the
+    /// #10 (2026-05-11) — originally existed to prevent the infinite-extend
+    /// loop that would otherwise pin a SOUL version in `observing` forever.
+    /// Sub-agents without their own channel (e.g. `duduclaw-tl`) only get
+    /// traffic when another agent spawns them. If nobody spawns one for a
+    /// week, the `< 5 conversations → extend` rule would keep cycling every
+    /// 12 h without progress — and crucially, every extend keeps the
     /// `already_observing` guard active, blocking the *next* GVU proposal
-    /// for that agent. Empirical evidence (5/11 12:33Z): duduclaw-tl
-    /// reached its 2nd extend with 0 conversations — without this cap it
-    /// was on track for an infinite loop.
+    /// for that agent. Empirical evidence (5/11 12:33Z): duduclaw-tl reached
+    /// its 2nd extend with 0 conversations.
     ///
-    /// 72 h is the chosen ceiling because:
-    /// - 24 h initial window + 2× 12 h extends = 48 h, comfortably under cap
-    /// - 72 h still gives a slow-burn cron task three nightly fires
-    /// - Auto-confirm is safe: the new version was already L1+L3 verified
-    ///   before applying, and "nobody used it" is not a signal it's bad.
+    /// **WP0.4 correction (R5, 2026-08-06):** the original fix for #10 was
+    /// "auto-confirm after this many hours with zero evidence". Production
+    /// audit of a real installation found this had auto-confirmed ~30
+    /// versions whose `post_metrics` were **all zero** — i.e. the safety
+    /// valve had become the dominant path to "confirmed", with literally no
+    /// evidence backing the confirmation. The infinite-loop problem #10 was
+    /// solving is now handled correctly: instead of pretending "no data"
+    /// means "success", crossing this threshold now (a) raises a one-time
+    /// alert so a human can see the version is stuck, and (b) still lets the
+    /// GVU loop proceed (extending does NOT hold the `already_observing`
+    /// guard past [`Self::max_no_data_hours`], see [`Self::judge_outcome_at`]
+    /// for the hard ceiling that eventually marks it `expired_no_data`
+    /// instead of `confirmed`).
     pub(crate) const MAX_OBSERVATION_HOURS_WITHOUT_DATA: i64 = 72;
 
     /// Judge whether an observation period passed or failed.
@@ -725,23 +996,34 @@ impl Updater {
         post_metrics: &VersionMetrics,
         now: chrono::DateTime<Utc>,
     ) -> OutcomeVerdict {
-        // Not enough data → extend, UNLESS we've been waiting too long.
+        // Not enough data → extend, with two escalating signals as the wait
+        // grows (WP0.4 / R5 — replaces the old "auto-confirm with zero
+        // evidence" behavior; see the doc comment on
+        // MAX_OBSERVATION_HOURS_WITHOUT_DATA for why).
         if post_metrics.conversations_count < 5 {
-            // #10 cap: a SOUL.md observation cannot stay in observing
-            // forever just because no traffic arrived. After
-            // MAX_OBSERVATION_HOURS_WITHOUT_DATA, auto-confirm so the
-            // GVU loop can run again on the next silence breaker.
             let elapsed_hours = (now - version.applied_at).num_hours();
-            if elapsed_hours >= Self::MAX_OBSERVATION_HOURS_WITHOUT_DATA {
+
+            // Hard ceiling: give up waiting, but do NOT pretend this was a
+            // verified confirm. SOUL.md content is left as-is (no evidence
+            // either way), and this version must never count toward
+            // "confirmed" statistics.
+            if (elapsed_hours as f64) >= self.max_no_data_hours {
                 info!(
                     agent = %version.agent_id,
                     version = %version.version_id,
                     elapsed_hours,
                     conversations = post_metrics.conversations_count,
-                    "Observation auto-confirmed: no-traffic timeout exceeded (#10)"
+                    "Observation expired without sufficient data — marking unverified, NOT confirmed (WP0.4)"
                 );
-                return OutcomeVerdict::Confirm;
+                return OutcomeVerdict::ExpiredNoData;
             }
+
+            // Soft warn threshold: still extending, but the caller should
+            // raise a one-time alert instead of silently continuing.
+            if elapsed_hours >= Self::MAX_OBSERVATION_HOURS_WITHOUT_DATA {
+                return OutcomeVerdict::ExtendObservationLowDataWarn { extra_hours: 12.0 };
+            }
+
             return OutcomeVerdict::ExtendObservation { extra_hours: 12.0 };
         }
 
@@ -943,5 +1225,120 @@ mod tests {
         };
         let verdict = updater.judge_outcome_at(&version, &post, Utc::now());
         assert!(matches!(verdict, OutcomeVerdict::Confirm));
+    }
+
+    // ── WP0.4 (R5): observation-window quality gate ─────────────────────────
+    //
+    // Replaces the old "auto-confirm after 72h with zero evidence" behavior.
+    // See the doc comment on `MAX_OBSERVATION_HOURS_WITHOUT_DATA` for the
+    // production audit finding that motivated this (confirmed versions whose
+    // post_metrics were all zero).
+
+    fn make_aged_version(hours_ago: i64) -> SoulVersion {
+        let mut v = make_version(VersionMetrics::default());
+        v.applied_at = Utc::now() - chrono::Duration::hours(hours_ago);
+        v.observation_end = v.applied_at + chrono::Duration::hours(24);
+        v
+    }
+
+    #[test]
+    fn wp04_no_data_under_warn_threshold_still_extends_plain() {
+        let updater = make_updater();
+        let version = make_aged_version(30); // under the 72h soft warn threshold
+        let post = VersionMetrics { conversations_count: 0, ..Default::default() };
+        let now = Utc::now();
+        assert!(matches!(
+            updater.judge_outcome_at(&version, &post, now),
+            OutcomeVerdict::ExtendObservation { .. }
+        ));
+    }
+
+    #[test]
+    fn wp04_no_data_past_warn_threshold_extends_with_alert_signal() {
+        // Past the old 72h "auto-confirm" cutoff but nowhere near the new
+        // 14-day hard ceiling — must extend (never confirm), and must be
+        // distinguishable from a plain extend so the caller can alert once.
+        let updater = make_updater();
+        let version = make_aged_version(80); // past 72h, well under 14 days
+        let post = VersionMetrics { conversations_count: 0, ..Default::default() };
+        let now = Utc::now();
+        let verdict = updater.judge_outcome_at(&version, &post, now);
+        assert!(
+            matches!(verdict, OutcomeVerdict::ExtendObservationLowDataWarn { .. }),
+            "expected ExtendObservationLowDataWarn, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn wp04_no_data_never_auto_confirms_regardless_of_age() {
+        // This is the core regression test for R5: no amount of elapsed time
+        // with insufficient data may produce Confirm. 1000h (~42 days) is
+        // well past both the old 72h cutoff and the new 14-day ceiling.
+        let updater = make_updater();
+        let version = make_aged_version(1000);
+        let post = VersionMetrics { conversations_count: 0, ..Default::default() };
+        let verdict = updater.judge_outcome(&version, &post);
+        assert!(
+            !matches!(verdict, OutcomeVerdict::Confirm),
+            "no-data observations must never auto-confirm (R5), got {verdict:?}"
+        );
+        assert!(
+            matches!(verdict, OutcomeVerdict::ExpiredNoData),
+            "past the hard ceiling, verdict must be ExpiredNoData, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn wp04_no_data_at_hard_ceiling_boundary_is_expired_not_confirmed() {
+        let updater = make_updater();
+        let version = make_aged_version(24 * 14); // exactly at the 14-day default ceiling
+        let post = VersionMetrics { conversations_count: 4, ..Default::default() };
+        let now = Utc::now();
+        assert!(matches!(
+            updater.judge_outcome_at(&version, &post, now),
+            OutcomeVerdict::ExpiredNoData
+        ));
+    }
+
+    #[test]
+    fn wp04_max_no_data_hours_is_configurable_via_builder() {
+        // A shorter custom ceiling must be honored without touching
+        // Updater::new's signature.
+        let tmp = std::env::temp_dir().join(format!("dudu_upd_{}.db", uuid::Uuid::new_v4()));
+        let updater = Updater::new(VersionStore::new(&tmp), Some(24.0))
+            .with_max_no_data_hours(48.0);
+        let version = make_aged_version(50); // past the custom 48h ceiling
+        let post = VersionMetrics { conversations_count: 0, ..Default::default() };
+        let now = Utc::now();
+        assert!(matches!(
+            updater.judge_outcome_at(&version, &post, now),
+            OutcomeVerdict::ExpiredNoData
+        ));
+    }
+
+    #[test]
+    fn wp04_sufficient_data_judged_normally_regardless_of_age() {
+        // With >= 5 conversations the quality gate is irrelevant — a
+        // 100h-old observation with real regression data must still
+        // roll back exactly as before WP0.4.
+        let updater = make_updater();
+        let pre = VersionMetrics {
+            positive_feedback_ratio: 0.8,
+            conversations_count: 20,
+            ..Default::default()
+        };
+        let mut version = make_version(pre);
+        version.applied_at = Utc::now() - chrono::Duration::hours(100);
+
+        let post = VersionMetrics {
+            positive_feedback_ratio: 0.5, // big regression
+            conversations_count: 15,
+            ..Default::default()
+        };
+        let now = Utc::now();
+        assert!(matches!(
+            updater.judge_outcome_at(&version, &post, now),
+            OutcomeVerdict::Rollback { .. }
+        ));
     }
 }

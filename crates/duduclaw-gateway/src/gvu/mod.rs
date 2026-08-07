@@ -39,3 +39,38 @@ pub mod version_store;
 
 #[cfg(test)]
 mod tests;
+
+// WP0.5 (TODO-evolution-v3-2026-08.md, 2026-08-06): stagnation detector —
+// appended at the end of this module list per task instructions (another
+// session is concurrently editing several sibling gvu/*.rs files).
+pub mod stagnation;
+
+// WP0.6 (TODO-evolution-v3-2026-08.md, 2026-08-06): Verifier/Updater
+// rejection telemetry — appended at the end for the same reason as above.
+pub mod reward_hack;
+pub mod telemetry;
+
+// WP0.2 (TODO-evolution-v3-2026-08.md, 2026-08-06): SOUL.md cap-deadlock
+// breaker (consolidate mode) — appended at the end for the same reason.
+pub mod consolidate;
+
+// ---------------------------------------------------------------------------
+// WP2.3 / WP2.4 / WP2.5 (2026-08-06) — AEE (Agentic Evolution Engine)
+// `commercial/docs/DESIGN-evolution-v3-aee.md` chapters 2 and 3.
+// ---------------------------------------------------------------------------
+
+/// WP2.4 §2.2 — deterministic, zero-LLM gates that keep their veto.
+pub mod verifier_gate;
+/// WP2.4 §2.3/§2.4 — score dimensions (no veto) + the matches-or-improves
+/// commit gate.
+pub mod verifier_measure;
+/// WP2.4 §2.4.1 — the reigning playbook snapshot a candidate is compared to.
+pub mod champion;
+/// WP2.3 §3 + WP2.5 — the agentic inner loop, strategy mix, prompt assembly
+/// and entry-level accept/rollback.
+pub mod aee;
+
+#[cfg(test)]
+mod tests_gate;
+#[cfg(test)]
+mod tests_measure;

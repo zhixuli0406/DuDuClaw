@@ -123,6 +123,22 @@ pub enum AuditEventType {
     /// "non_response", "correct_silence", "unknown", "fa_rate", "mn_rate",
     /// "lookback_secs"}`
     ProactiveQuadrant,
+
+    // ── Evolution v3 / AEE (WP2.3 §3.2.4) ────────────────────────────────────
+    /// One AEE round completed (or was skipped). Purely additive.
+    ///
+    /// `outcome`: `success` when the round committed, `failure` when the
+    /// commit gate rejected, `suppressed` when the round was skipped for lack
+    /// of material or a cooldown.
+    /// `metadata`: `crate::gvu::aee::AeeRoundRecord` — `{"intent", "strategy",
+    /// "trigger", "round_seq", "inner_rounds", "llm_calls", "deltas_proposed",
+    /// "deltas_applied", "gate_rejections", "verdict", "skipped", "exit",
+    /// "case_dimension_available"}`.
+    ///
+    /// Recording `intent` is the point: without it, a strategy-mix
+    /// misconfiguration is invisible in hindsight — the exact failure mode
+    /// that let root cause R3 sit unnoticed for three months.
+    AeeRound,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -151,6 +167,8 @@ impl std::fmt::Display for AuditEventType {
             Self::DurabilityDlqReplayed => "durability_dlq_replayed",
             // OS-native P2-3
             Self::ProactiveQuadrant => "proactive_quadrant",
+            // Evolution v3 / AEE
+            Self::AeeRound => "aee_round",
         };
         f.write_str(s)
     }

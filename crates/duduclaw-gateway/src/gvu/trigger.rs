@@ -42,6 +42,14 @@ pub enum TriggerSource {
     SubAgentDispatch,
     /// Heartbeat silence breaker fired and the agent has gvu_enabled.
     ForcedReflection,
+    /// WP0.5's stagnation detector fired (AVO P8). AEE overrides the round
+    /// intent to `Innovate` for this source: when the loop is stuck, the
+    /// answer is a change of direction, not another pass over the same spot.
+    Stagnation,
+    /// ε-floor forced exploration from `prediction::router` — no concrete
+    /// failure behind it, so it is an exploration window rather than a repair
+    /// job (WP2.3 §3.2.2 step 3).
+    Exploration,
 }
 
 impl TriggerSource {
@@ -50,6 +58,20 @@ impl TriggerSource {
             TriggerSource::ChannelReply => "channel_reply",
             TriggerSource::SubAgentDispatch => "subagent_dispatch",
             TriggerSource::ForcedReflection => "forced_reflection",
+            TriggerSource::Stagnation => "stagnation",
+            TriggerSource::Exploration => "exploration",
+        }
+    }
+
+    /// Project onto the AEE trigger taxonomy (WP2.3 §3.2.2).
+    pub fn as_aee(self) -> crate::gvu::aee::AeeTrigger {
+        use crate::gvu::aee::AeeTrigger as A;
+        match self {
+            TriggerSource::ChannelReply => A::ChannelReply,
+            TriggerSource::SubAgentDispatch => A::SubAgentDispatch,
+            TriggerSource::ForcedReflection => A::ForcedReflection,
+            TriggerSource::Stagnation => A::Stagnation,
+            TriggerSource::Exploration => A::Exploration,
         }
     }
 }
@@ -96,6 +118,39 @@ pub fn agent_gvu_enabled(agent_dir: &Path) -> bool {
         .and_then(|e| e.get("gvu_enabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+/// Read `[evolution] gvu_cooldown_minutes` from the agent's `agent.toml`.
+///
+/// WP0.3 (2026-08-06, fixes root cause R4): the channel-reply trigger path
+/// (ε-exploration + silence-timer driven, `channel_reply.rs`) could re-fire
+/// GVU with no throttling at all — a 2026-08-03 production window burned 6
+/// full GVU cycles (~4-5 min of LLM time each) inside 5 hours on the same
+/// agent. This cooldown is enforced centrally in
+/// [`crate::gvu::loop_::GvuLoop::run_with_context_and_retry`] so every
+/// caller (channel reply, dispatcher `maybe_run_gvu`, retries) is covered by
+/// construction, not by remembering to check at each call site.
+///
+/// Returns the default (60 minutes) for missing files / malformed TOML /
+/// absent key / non-positive values — same fail-safe posture as
+/// [`agent_gvu_enabled`]. `0` is honoured as "cooldown disabled" only when
+/// explicitly written; a *missing* key does NOT mean unthrottled.
+pub fn agent_gvu_cooldown_minutes(agent_dir: &Path) -> u64 {
+    const DEFAULT_COOLDOWN_MINUTES: u64 = 60;
+    let path = agent_dir.join("agent.toml");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return DEFAULT_COOLDOWN_MINUTES;
+    };
+    let Ok(value) = raw.parse::<toml::Value>() else {
+        return DEFAULT_COOLDOWN_MINUTES;
+    };
+    let Some(evo) = value.get("evolution") else {
+        return DEFAULT_COOLDOWN_MINUTES;
+    };
+    match evo.get("gvu_cooldown_minutes").and_then(|v| v.as_integer()) {
+        Some(v) if v >= 0 => v as u64,
+        _ => DEFAULT_COOLDOWN_MINUTES,
+    }
 }
 
 /// Run the GVU loop for `agent_id` if eligible. Pure helper — no event-bus
@@ -152,13 +207,8 @@ where
     let contract = duduclaw_agent::contract::load_contract(agent_dir);
     let pre_metrics = VersionMetrics::default();
 
-    let trigger_context = build_trigger_context(
-        agent_id,
-        composite_error,
-        category,
-        source,
-        extra_context,
-    );
+    let trigger_context =
+        build_trigger_context(agent_id, composite_error, category, source, extra_context);
 
     info!(
         agent = agent_id,
@@ -244,6 +294,16 @@ async fn record_outcome_to_metacognition(
             let mut meta = metacog.lock().await;
             meta.record_outcome(category, true);
         }
+        GvuOutcome::PlaybookEvolved { applied, verdict, .. } => {
+            info!(
+                agent = agent_id,
+                applied,
+                %verdict,
+                "AEE committed playbook deltas"
+            );
+            let mut meta = metacog.lock().await;
+            meta.record_outcome(category, true);
+        }
         GvuOutcome::Abandoned { last_gradient } => {
             warn!(
                 agent = agent_id,
@@ -263,14 +323,22 @@ async fn record_outcome_to_metacognition(
             // filter, leaving "trigger fired … then nothing" with no clue.
             info!(agent = agent_id, %reason, "GVU skipped");
             // Don't penalise the metacognition window for "observation
-            // already in progress" / "loop already running" — those are
-            // legitimate concurrency guards, not failed reflections.
-            if !reason.contains("observation") && !reason.contains("already running") {
+            // already in progress" / "loop already running" / "cooldown
+            // active" (WP0.3) — those are legitimate throttling/concurrency
+            // guards, not failed reflections.
+            if !reason.contains("observation")
+                && !reason.contains("already running")
+                && !reason.contains("cooldown")
+            {
                 let mut meta = metacog.lock().await;
                 meta.record_outcome(category, false);
             }
         }
-        GvuOutcome::Deferred { retry_count, retry_after_hours, .. } => {
+        GvuOutcome::Deferred {
+            retry_count,
+            retry_after_hours,
+            ..
+        } => {
             info!(
                 agent = agent_id,
                 retry_count,
@@ -279,7 +347,11 @@ async fn record_outcome_to_metacognition(
             );
             // Retry path will record the eventual outcome.
         }
-        GvuOutcome::TimedOut { elapsed, generations_completed, .. } => {
+        GvuOutcome::TimedOut {
+            elapsed,
+            generations_completed,
+            ..
+        } => {
             warn!(
                 agent = agent_id,
                 elapsed_secs = elapsed.as_secs(),
@@ -305,8 +377,7 @@ mod tests {
 
     #[test]
     fn agent_gvu_enabled_returns_false_when_agent_toml_missing() {
-        let tmp = std::env::temp_dir()
-            .join(format!("gvu-trig-no-toml-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("gvu-trig-no-toml-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         assert!(!agent_gvu_enabled(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -314,53 +385,95 @@ mod tests {
 
     #[test]
     fn agent_gvu_enabled_reads_evolution_section() {
-        let tmp = std::env::temp_dir()
-            .join(format!("gvu-trig-yes-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("gvu-trig-yes-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(
-            tmp.join("agent.toml"),
-            "[evolution]\ngvu_enabled = true\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.join("agent.toml"), "[evolution]\ngvu_enabled = true\n").unwrap();
         assert!(agent_gvu_enabled(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn agent_gvu_enabled_returns_false_when_explicitly_disabled() {
-        let tmp = std::env::temp_dir()
-            .join(format!("gvu-trig-no-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("gvu-trig-no-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(
-            tmp.join("agent.toml"),
-            "[evolution]\ngvu_enabled = false\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.join("agent.toml"), "[evolution]\ngvu_enabled = false\n").unwrap();
         assert!(!agent_gvu_enabled(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn agent_gvu_enabled_returns_false_when_evolution_section_missing() {
-        let tmp = std::env::temp_dir()
-            .join(format!("gvu-trig-no-section-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("gvu-trig-no-section-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(
-            tmp.join("agent.toml"),
-            "[agent]\nname = \"test\"\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.join("agent.toml"), "[agent]\nname = \"test\"\n").unwrap();
         assert!(!agent_gvu_enabled(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn agent_gvu_enabled_silent_on_malformed_toml() {
-        let tmp = std::env::temp_dir()
-            .join(format!("gvu-trig-bad-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("gvu-trig-bad-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("agent.toml"), "bad = [toml").unwrap();
         assert!(!agent_gvu_enabled(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn agent_gvu_cooldown_minutes_defaults_when_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "gvu-trig-cooldown-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(agent_gvu_cooldown_minutes(&tmp), 60);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn agent_gvu_cooldown_minutes_reads_explicit_value() {
+        let tmp = std::env::temp_dir().join(format!(
+            "gvu-trig-cooldown-explicit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("agent.toml"),
+            "[evolution]\ngvu_cooldown_minutes = 15\n",
+        )
+        .unwrap();
+        assert_eq!(agent_gvu_cooldown_minutes(&tmp), 15);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn agent_gvu_cooldown_minutes_zero_disables() {
+        let tmp =
+            std::env::temp_dir().join(format!("gvu-trig-cooldown-zero-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("agent.toml"),
+            "[evolution]\ngvu_cooldown_minutes = 0\n",
+        )
+        .unwrap();
+        assert_eq!(agent_gvu_cooldown_minutes(&tmp), 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn agent_gvu_cooldown_minutes_negative_falls_back_to_default() {
+        let tmp = std::env::temp_dir().join(format!(
+            "gvu-trig-cooldown-negative-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("agent.toml"),
+            "[evolution]\ngvu_cooldown_minutes = -5\n",
+        )
+        .unwrap();
+        assert_eq!(agent_gvu_cooldown_minutes(&tmp), 60);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

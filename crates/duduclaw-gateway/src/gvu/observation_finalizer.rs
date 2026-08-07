@@ -49,6 +49,10 @@ pub enum Decision {
     Confirmed,
     RolledBack { reason: String },
     Extended { extra_hours: f64 },
+    /// WP0.4 (R5): observation ran past the hard no-data ceiling. SOUL.md
+    /// content is untouched — this is NOT a confirm, just giving up on
+    /// waiting for evidence. See `VersionStatus::ExpiredNoData`.
+    ExpiredNoData,
     Failed { error: String },
 }
 
@@ -89,9 +93,63 @@ impl ObservationFinalizer {
         }
     }
 
+    /// The DuDuClaw home directory, derived from `agents_dir`
+    /// (`<home>/agents`). Used by the AEE settlement sweep to reach
+    /// `memory.db` / `config.toml` without a new constructor argument — every
+    /// existing construction site stays untouched.
+    fn home_dir(&self) -> PathBuf {
+        self.agents_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.agents_dir.clone())
+    }
+
+    /// WP2.5 — close every AEE settlement whose observation window has
+    /// elapsed.
+    ///
+    /// Deliberately a **separate** queue from the SOUL observation windows
+    /// swept below: an AEE round writes no `SoulVersion`, so there is nothing
+    /// in `soul_versions` for the existing sweep to find. The two coexist
+    /// without interference — an agent can have a legacy SOUL version under
+    /// observation and no AEE settlement, or the reverse, and neither sweep
+    /// reads the other's rows.
+    ///
+    /// Best-effort throughout: a settlement that cannot be judged (no eval
+    /// score reachable) leaves its entries exactly as they are and says so —
+    /// "we could not check" is never rendered as "checked and fine".
+    async fn sweep_aee_settlements(&self) -> usize {
+        let db_path = self.version_store.db_path_ref().to_path_buf();
+        let due = crate::gvu::aee::PendingSettlementStore::new(&db_path).due(Utc::now());
+        if due.is_empty() {
+            return 0;
+        }
+        let home = self.home_dir();
+        let scorer = crate::gvu::aee::EvalMeasureScorer::from_home(&home);
+        info!(
+            target: "observation_finalizer",
+            count = due.len(),
+            "Sweeping due AEE playbook settlements"
+        );
+        let mut settled = 0usize;
+        for pending in due {
+            if crate::gvu::aee::settle_pending(&pending, &db_path, &home, &scorer)
+                .await
+                .is_some()
+            {
+                settled += 1;
+            }
+        }
+        settled
+    }
+
     /// Run a single sweep — finalise every expired observation, returning a
     /// per-version decision log.
     pub async fn tick(&self) -> FinalizationReport {
+        // AEE settlements first: they are independent of the SOUL observation
+        // queue and must still run on a tick where no SOUL version expired
+        // (the early return below would otherwise skip them entirely).
+        self.sweep_aee_settlements().await;
+
         let expired = self.version_store.get_expired_observations();
         if expired.is_empty() {
             debug!(target: "observation_finalizer", "No expired observations");
@@ -207,6 +265,37 @@ impl ObservationFinalizer {
                     Decision::Extended { extra_hours }
                 }
             }
+            OutcomeVerdict::ExtendObservationLowDataWarn { extra_hours } => {
+                // Same effect as a plain extend, but this branch also raises
+                // a ONE-TIME alert (WP0.4/R5) — this is exactly the
+                // situation that used to silently auto-confirm.
+                if let Err(e) =
+                    self.extend_observation(&version.version_id, extra_hours)
+                {
+                    Decision::Failed {
+                        error: format!("extend_observation: {e}"),
+                    }
+                } else {
+                    self.maybe_raise_low_data_alert(version);
+                    Decision::Extended { extra_hours }
+                }
+            }
+            OutcomeVerdict::ExpiredNoData => {
+                match self.version_store.mark_expired_no_data(&version.version_id, &post) {
+                    Ok(()) => {
+                        warn!(
+                            target: "observation_finalizer",
+                            agent = %version.agent_id,
+                            version = %version.version_id,
+                            "Observation expired without sufficient data — marked unverified, NOT confirmed (WP0.4)"
+                        );
+                        Decision::ExpiredNoData
+                    }
+                    Err(e) => Decision::Failed {
+                        error: format!("mark_expired_no_data: {e}"),
+                    },
+                }
+            }
         };
 
         FinalizationDecision {
@@ -256,9 +345,21 @@ impl ObservationFinalizer {
             .unwrap_or(0);
         let correction_rate = if total > 0 { bad as f64 / total as f64 } else { 0.0 };
 
-        let positive_ratio =
+        // WP0.4 (R5): don't let a MISSING feedback.jsonl masquerade as
+        // "measured zero positive feedback" — the two are very different
+        // claims (audit found feedback.jsonl absent on multiple production
+        // installs while GVU nonetheless "confirmed" versions with 0.0
+        // ratios as if that were real evidence). `feedback_available` lets
+        // downstream consumers (judge_outcome's own logic is unchanged here
+        // — this is purely an honesty flag for dashboard/audit) distinguish
+        // the two.
+        let feedback_available = self.feedback_jsonl.exists();
+        let positive_ratio = if feedback_available {
             count_positive_feedback_ratio(&self.feedback_jsonl, agent_id, since)
-                .unwrap_or(0.0);
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
 
         Ok(VersionMetrics {
             positive_feedback_ratio: positive_ratio,
@@ -266,7 +367,47 @@ impl ObservationFinalizer {
             user_correction_rate: correction_rate,
             contract_violations: 0,
             conversations_count: total,
+            feedback_available,
         })
+    }
+
+    /// WP0.4 (R5): raise a one-time "insufficient observation data" alert
+    /// for a version that has crossed the soft warn threshold. Guarded by
+    /// `low_data_alert_sent` so a version stuck for weeks (extending every
+    /// 12h) produces exactly one alert, not one per tick.
+    fn maybe_raise_low_data_alert(&self, version: &SoulVersion) {
+        if self.version_store.low_data_alert_sent(&version.version_id) {
+            return; // Already alerted — not repeated.
+        }
+        if let Err(e) = self
+            .version_store
+            .mark_low_data_alert_sent(&version.version_id, &version.agent_id)
+        {
+            warn!(
+                target: "observation_finalizer",
+                agent = %version.agent_id,
+                version = %version.version_id,
+                "Failed to persist low-data alert marker: {e} — alert may repeat"
+            );
+        }
+        let elapsed_hours = (Utc::now() - version.applied_at).num_hours();
+        warn!(
+            target: "observation_finalizer",
+            agent = %version.agent_id,
+            version = %version.version_id,
+            elapsed_hours,
+            "GVU observation window has insufficient data past the quality-gate warn threshold \
+             — extending, NOT auto-confirming (WP0.4/R5)"
+        );
+        crate::evolution_events::emitter::EvolutionEventEmitter::global().emit_gvu_generation(
+            &version.agent_id,
+            crate::evolution_events::schema::Outcome::Warned,
+            "observation_low_data_warn",
+            serde_json::json!({
+                "version_id": version.version_id,
+                "elapsed_hours": elapsed_hours,
+            }),
+        );
     }
 
     /// Push observation_end further into the future without changing status.
@@ -543,5 +684,157 @@ mod tests {
         let (fin, _evo, _pred_db, _feedback) = make_finalizer(tmp.path(), None);
         let report = fin.tick().await;
         assert!(report.decisions.is_empty());
+    }
+
+    // ── WP0.4 (R5): observation-window quality gate ─────────────────────────
+
+    #[tokio::test]
+    async fn test_no_data_under_hard_ceiling_extends_never_confirms() {
+        // Applied 80h ago (past the old 72h "auto-confirm" cutoff, but well
+        // under the new 14-day hard ceiling) with zero conversations. This is
+        // the exact scenario that used to silently auto-confirm with no
+        // evidence (R5 production audit finding) — must now still extend.
+        let tmp = TempDir::new().unwrap();
+        let (fin, _evo, pred_db, _feedback) = make_finalizer(tmp.path(), None);
+
+        let now = Utc::now();
+        let pre = VersionMetrics::default();
+        seed_observing_version(
+            &fin.version_store,
+            &fin.agents_dir,
+            "agent-nodata",
+            now - ChronoDuration::hours(80),
+            now - ChronoDuration::hours(56), // observation_end already passed
+            pre,
+        );
+        // Table must exist (real installs always have it via the prediction
+        // engine) but genuinely zero traffic — no rows.
+        seed_prediction_db(&pred_db, "agent-nodata", &[]);
+
+        let report = fin.tick().await;
+        assert_eq!(report.decisions.len(), 1);
+        assert!(
+            !matches!(report.decisions[0].decision, Decision::Confirmed),
+            "R5 regression: no-data observation must never auto-confirm, got {:?}",
+            report.decisions[0].decision
+        );
+        assert!(
+            matches!(report.decisions[0].decision, Decision::Extended { .. }),
+            "expected Extended (with alert), got {:?}",
+            report.decisions[0].decision
+        );
+
+        // Status must remain 'observing' in the store.
+        let still = fin
+            .version_store
+            .get_observing_version("agent-nodata")
+            .expect("must still be observing");
+        assert_eq!(still.status, VersionStatus::Observing);
+
+        // One-time alert marker must now be set.
+        assert!(fin.version_store.low_data_alert_sent(&still.version_id));
+    }
+
+    #[tokio::test]
+    async fn test_low_data_alert_is_not_repeated_across_ticks() {
+        let tmp = TempDir::new().unwrap();
+        let (fin, _evo, pred_db, _feedback) = make_finalizer(tmp.path(), None);
+
+        let now = Utc::now();
+        seed_observing_version(
+            &fin.version_store,
+            &fin.agents_dir,
+            "agent-repeat",
+            now - ChronoDuration::hours(80),
+            now - ChronoDuration::hours(56),
+            VersionMetrics::default(),
+        );
+        seed_prediction_db(&pred_db, "agent-repeat", &[]);
+
+        // First tick sends the alert and extends observation_end into the future.
+        let _ = fin.tick().await;
+        let v1 = fin.version_store.get_observing_version("agent-repeat").unwrap();
+        assert!(fin.version_store.low_data_alert_sent(&v1.version_id));
+
+        // Force the (now extended) observation back into the past so a
+        // second tick would fire again if the guard didn't work, then verify
+        // the marker is still a single idempotent row (mark_low_data_alert_sent
+        // is INSERT OR IGNORE) rather than asserting on tick() output, since
+        // the version is no longer expired after the first extend.
+        assert!(
+            fin.version_store.mark_low_data_alert_sent(&v1.version_id, "agent-repeat").is_ok(),
+            "re-marking an already-sent alert must be idempotent, not error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_data_past_hard_ceiling_marks_expired_not_confirmed() {
+        // 15 days old, zero conversations — past the 14-day default hard
+        // ceiling. Must transition to `expired_no_data`, never `confirmed`.
+        let tmp = TempDir::new().unwrap();
+        let (fin, _evo, pred_db, _feedback) = make_finalizer(tmp.path(), None);
+
+        let now = Utc::now();
+        seed_observing_version(
+            &fin.version_store,
+            &fin.agents_dir,
+            "agent-expired",
+            now - ChronoDuration::days(15),
+            now - ChronoDuration::days(14) - ChronoDuration::hours(1),
+            VersionMetrics::default(),
+        );
+        seed_prediction_db(&pred_db, "agent-expired", &[]);
+
+        let report = fin.tick().await;
+        assert_eq!(report.decisions.len(), 1);
+        assert!(
+            matches!(report.decisions[0].decision, Decision::ExpiredNoData),
+            "expected ExpiredNoData, got {:?}",
+            report.decisions[0].decision
+        );
+
+        // No longer 'observing' — and specifically NOT 'confirmed'.
+        assert!(
+            fin.version_store.get_observing_version("agent-expired").is_none(),
+            "expired version must leave the observing state"
+        );
+        let history = fin.version_store.get_history("agent-expired", 10);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, VersionStatus::ExpiredNoData);
+    }
+
+    #[test]
+    fn test_compute_post_metrics_flags_missing_feedback_file() {
+        let tmp = TempDir::new().unwrap();
+        let (fin, _evo, pred_db, _feedback_path) = make_finalizer(tmp.path(), None);
+        // feedback.jsonl deliberately never written.
+        seed_prediction_db(&pred_db, "agent-nofeedback", &[(0.1, "Negligible", Utc::now())]);
+
+        let metrics = fin
+            .compute_post_metrics("agent-nofeedback", Utc::now() - ChronoDuration::hours(1))
+            .unwrap();
+        assert!(
+            !metrics.feedback_available,
+            "feedback_available must be false when feedback.jsonl does not exist"
+        );
+        assert_eq!(
+            metrics.positive_feedback_ratio, 0.0,
+            "ratio still reads 0.0, but feedback_available now distinguishes 'no evidence' from 'measured zero'"
+        );
+    }
+
+    #[test]
+    fn test_compute_post_metrics_flags_available_when_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let (fin, _evo, pred_db, feedback_path) = make_finalizer(tmp.path(), None);
+        seed_prediction_db(&pred_db, "agent-withfeedback", &[(0.1, "Negligible", Utc::now())]);
+        // An empty-but-present feedback.jsonl still counts as "available"
+        // (the distinction is file presence, not row count).
+        std::fs::write(&feedback_path, "").unwrap();
+
+        let metrics = fin
+            .compute_post_metrics("agent-withfeedback", Utc::now() - ChronoDuration::hours(1))
+            .unwrap();
+        assert!(metrics.feedback_available);
     }
 }

@@ -2,6 +2,16 @@
 
 > エージェントが自らパーソナリティを執筆・審査・改善——すべて自動、しかも2つのフィードバックループにまたがって。
 
+> **Evolution v3（2026-08-06）以降、本稿が説明するのは非デフォルトのレガシー
+> 経路です。** 以下の Generator→Verifier→Updater ループは、agent が
+> `agent.toml [evolution] legacy_soul_evolution = true` を明示的に選択した
+> 場合はそのまま動作しますが、デフォルトの進化対象は **playbook**（小さく
+> 独立して引退させられる行動ルール）に変わり、`SOUL.md` は agent に対して
+> デフォルトで読み取り専用になりました。現行デフォルトの解説は
+> [`docs/features/38-aee-playbook-evolution.md`](../38-aee-playbook-evolution.md)
+>（英語/繁体中文のみ）、技術詳細は
+> [`docs/architecture/evolution-engine.md`](../../architecture/evolution-engine.md) 第12章を参照。
+
 ---
 
 ## たとえ話：一人三役のライターズルーム——ディレクターズカット付き
