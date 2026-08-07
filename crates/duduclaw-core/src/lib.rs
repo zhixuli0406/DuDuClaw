@@ -3,13 +3,18 @@ pub mod agent_rename;
 pub mod autostart;
 pub mod config;
 pub mod cron_tz;
+pub mod delegation_policy;
 pub mod department;
 pub mod dispatch_guard;
 pub mod error;
 pub mod fs_lock;
+pub mod grounding;
+pub mod identity_token;
 pub mod keychain;
 pub mod match_utils;
 pub mod org;
+pub mod org_field_guard;
+pub mod org_store;
 pub mod platform;
 pub mod sensitivity;
 pub mod text_utils;
@@ -22,6 +27,15 @@ pub use agent_guard::{check_agent_file_write, check_bash_command, GuardDecision,
 pub use agent_rename::{rename_in_markdown, synced_trigger};
 pub use config::write_minimal_config;
 pub use cron_tz::{parse_timezone, should_fire_in_tz};
+pub use delegation_policy::{
+    can_delegate, can_delegate_ext, can_delegate_rules, can_delegate_rules_ext,
+    delegation_rules_from_home, is_ancestor as is_org_ancestor, is_reserved_agent_id,
+    is_system_sender,
+    policy_from_home as delegation_policy_from_home, require_identity_token_from_home,
+    resolve_allow_pairs, DelegationConfig,
+    DelegationDenied, DelegationPolicy, DelegationRules, DenyReason as DelegationDenyReason,
+    MapOrgView, OrgNode, OrgView, ACP_CLIENT_SENDER, MAX_ANCESTOR_HOPS, SYSTEM_SENDERS,
+};
 pub use department::{
     department_of_page, department_page_visible, is_valid_department,
     namespace_department_visible, top_level_namespace as wiki_top_level_namespace,
@@ -32,8 +46,28 @@ pub use dispatch_guard::{
 };
 pub use error::{DuDuClawError, Result};
 pub use fs_lock::with_file_lock;
+pub use grounding::{
+    check_grounded, is_self_echo_tool, matching_result_texts, shares_contiguous_run,
+    shares_contiguous_run_excluding_echo, tool_name_matches, GroundingOutcome,
+    SELF_ECHO_TOOL_NAMES, ToolEvidence,
+};
+pub use identity_token::{
+    agent_identity_env_vars, agent_identity_env_vars_default, ensure_key as ensure_identity_key,
+    identity_key_path, load_key as load_identity_key, mint_token as mint_identity_token,
+    verify_claim as verify_identity_claim, verify_env_identity, verify_token as verify_identity_token,
+    IdentityVerdict, ENV_AGENT_TOKEN, IDENTITY_KEY_FILE, UNTRUSTED_AGENT_ID,
+};
 pub use keychain::{resolve_master_key, KeychainError, MasterKeySource};
 pub use match_utils::{is_valid_egress_host, origin_host_matches, word_contains_ci};
+pub use org_field_guard::{
+    check_bash_protected_write, check_caller_scope, check_identity_surface_write,
+    check_own_soul_write, check_protected_toml_write, classify_identity_surface,
+    classify_protected_toml, HookCaller, ProtectedSurface, ProtectedTomlKind, AGENT_ORG_FIELDS,
+    CONFIG_PROTECTED_SECTIONS,
+};
+pub use org_store::{
+    OrgDrift, OrgEntry, OrgStore, OrgSyncChange, ORG_SEEDED_FILE, ORG_STORE_FILE, ORG_STORE_SCHEMA,
+};
 pub use platform::{duduclaw_home, duduclaw_instance, expand_tilde, home_dir, mcp_server_key};
 pub use sensitivity::{is_private_session, perception_source_sensitivity, Sensitivity};
 pub use text_utils::{truncate_bytes, truncate_chars};

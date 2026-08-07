@@ -47,6 +47,8 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/34-goal-loop.md](features/34-goal-loop.md) | Autonomous goal loop — /goal to completion with an MAV acceptance judge |
 | [features/35-photo-desktop-pet.md](features/35-photo-desktop-pet.md) | Photo → desktop pet — local pixel-art pipeline + wander engine |
 | [features/36-recording-to-skill.md](features/36-recording-to-skill.md) | Recording → skill — approval-gated skill drafts from browser/desktop recordings |
+| [features/37-delegation-isolation.md](features/37-delegation-isolation.md) | 部門與階級隔離（A2A 委派政策） — 三層政策 + 白名單配對 + 可見範圍過濾 |
+| [features/38-aee-playbook-evolution.md](features/38-aee-playbook-evolution.md) | 自主進化 v3：Agentic Evolution Engine + Playbook — SOUL.md 唯讀化、gene 形行為規則、條目級觀察窗 |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios (zh-TW) — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix (zh-TW) — sales-facing coverage table |
 
@@ -67,7 +69,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description | Status |
 |----------|-------------|--------|
 | [architecture/overview.md](architecture/overview.md) | System architecture overview | Current |
-| [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine v2 — Prediction + GVU² + Cognitive Memory | Current |
+| [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine — Prediction + GVU (legacy SOUL.md path) + AEE/Playbook (v3 default, ch.12) + Cognitive Memory | Current |
 
 ## Design Proposals (RFC / ADR)
 
@@ -112,7 +114,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/google-no-oauth-client.md](guides/google-no-oauth-client.md) | Google 兩條免自建 OAuth client 的路徑（服務帳號網域委派、Apps Script 橋接），含覆蓋度差異、安全性質與已排除方案的實測數據 | Current |
 | [guides/notion.md](guides/notion.md) | Native Notion integration (search / page read / page append, four MCP tools, OAuth setup, external-knowledge-source boundary) | Current |
 | [guides/github.md](guides/github.md) | Native GitHub integration (issue/PR search + read + comment, five MCP tools, OAuth App setup, public-comment safety) | Current |
-| [guides/evals.md](guides/evals.md) | Agent behavior evals / regression suite (`duduclaw eval`), CI gate, GVU yardstick | Current |
+| [guides/evals.md](guides/evals.md) | Agent behavior evals / regression suite (`duduclaw eval`), CI gate, GVU/AEE yardstick (`--case`/`--exclude-dir`/`--report`) | Current |
+| [guides/evolution-switches.md](guides/evolution-switches.md) | Evolution switches — master kill-switch, per-feature toggles, AEE vs legacy SOUL.md path, `strategy`/`noise_band`, freeze/unfreeze | Current |
 | [guides/docker.md](guides/docker.md) | Docker build & run | Current |
 | [guides/multi-instance.md](guides/multi-instance.md) | Running multiple instances on one machine (DUDUCLAW_HOME / PORT / INSTANCE) | Current |
 | [guides/observability.md](guides/observability.md) | OpenTelemetry GenAI tracing + OTLP export (`--features otel`, `[telemetry]` config) | Current |
@@ -139,7 +142,7 @@ docs/                                  # L1 PUBLIC — product & developer docum
 ├── README.md                          # This index
 ├── architecture/                      # System architecture & engine design
 │   ├── overview.md                    #   Architecture overview
-│   └── evolution-engine.md            #   Evolution Engine v2 spec
+│   └── evolution-engine.md            #   Evolution Engine spec (legacy GVU + v3 AEE/Playbook)
 ├── rfc/                               # Request-for-Comments design proposals
 │   ├── RFC-21-identity-credential-isolation.md
 │   ├── RFC-21-operator-guide.md

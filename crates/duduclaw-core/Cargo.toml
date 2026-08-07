@@ -17,6 +17,14 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 fs2 = "0.4"
 
+# WP21 debt ⑧ — MCP caller-identity token (src/identity_token.rs).
+# Pure-Rust RustCrypto stack: no build script, no C toolchain, and `Mac::verify_slice`
+# gives the constant-time tag comparison for free. `getrandom` is the OS CSPRNG used
+# once, to mint `~/.duduclaw/identity.key`.
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
+
 [features]
 default = []
 # Optional OS keychain storage for the master secret (see src/keychain.rs).
