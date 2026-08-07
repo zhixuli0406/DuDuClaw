@@ -588,7 +588,11 @@ impl FootprintTracker {
         let date_str = finalized.date.to_string();
         let res = tokio::task::spawn_blocking(move || {
             let db_path = home_dir.join("memory.db");
-            let engine = SqliteMemoryEngine::new(&db_path)?;
+            // R2: factory honors `[memory] novelty_gate` (footprint rows are
+            // (s,p,o) triples so the gate's supersession carve-out applies
+            // either way; routing through the factory keeps construction
+            // policy in one place).
+            let engine = crate::memory_factory::build_memory_engine(&db_path, &home_dir)?;
             let rt = tokio::runtime::Handle::current();
             rt.block_on(write_footprint_triples(&engine, &agent_owned, &finalized))
         })

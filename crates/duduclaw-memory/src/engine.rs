@@ -302,6 +302,18 @@ pub struct SqliteMemoryEngine {
     /// the crate never depends on `duduclaw-license`: the quota is a parameter,
     /// not a license lookup.
     memory_quota_bytes: u64,
+    /// B1 anti-false-surprise gate config (arXiv:2606.29182). See
+    /// `crate::novelty_gate`. Only has any effect on Semantic-layer writes,
+    /// and only when [`embedder`](Self::embedder) is attached — no embedder
+    /// ⇒ byte-identical to pre-gate behaviour, matching the rest of this
+    /// crate's "no signal ⇒ no-op" convention for optional retrieval
+    /// features.
+    pub novelty_gate: crate::novelty_gate::NoveltyGateConfig,
+    /// Count of writes rejected by the B1 novelty gate since this engine was
+    /// constructed (in-process only, not persisted). Exposed so a caller can
+    /// wire it into a metrics layer; see
+    /// [`novelty_gate_rejections`](Self::novelty_gate_rejections).
+    novelty_rejections: std::sync::atomic::AtomicU64,
 }
 
 /// Bytes per gigabyte (binary GiB, matching SQLite page-size arithmetic).
@@ -530,6 +542,8 @@ impl SqliteMemoryEngine {
             graph_cache: StdRwLock::new(HashMap::new()),
             embedder: None,
             memory_quota_bytes: 0,
+            novelty_gate: crate::novelty_gate::NoveltyGateConfig::default(),
+            novelty_rejections: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -546,6 +560,8 @@ impl SqliteMemoryEngine {
             graph_cache: StdRwLock::new(HashMap::new()),
             embedder: None,
             memory_quota_bytes: 0,
+            novelty_gate: crate::novelty_gate::NoveltyGateConfig::default(),
+            novelty_rejections: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -637,6 +653,79 @@ impl SqliteMemoryEngine {
     /// Whether a semantic embedder is attached (the `w_vec` signal is active).
     pub fn has_embedder(&self) -> bool {
         self.embedder.is_some()
+    }
+
+    /// Builder-style: override the B1 novelty gate config (default:
+    /// enabled, cosine threshold 0.92). See [`novelty_gate`](Self::novelty_gate).
+    pub fn with_novelty_gate_config(mut self, config: crate::novelty_gate::NoveltyGateConfig) -> Self {
+        self.novelty_gate = config;
+        self
+    }
+
+    /// Mutating form of [`with_novelty_gate_config`](Self::with_novelty_gate_config).
+    pub fn set_novelty_gate_config(&mut self, config: crate::novelty_gate::NoveltyGateConfig) {
+        self.novelty_gate = config;
+    }
+
+    /// Number of writes the B1 novelty gate has rejected since this engine
+    /// instance was constructed (in-process counter, not persisted — a
+    /// caller that needs durability should read the `tracing::warn!` audit
+    /// line this gate emits on every rejection, or wire this counter into a
+    /// process-wide metrics registry).
+    pub fn novelty_gate_rejections(&self) -> u64 {
+        self.novelty_rejections.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// B1 anti-false-surprise gate (arXiv:2606.29182), exposed for callers
+    /// that synthesize a memory entry themselves before deciding whether to
+    /// write it (e.g. `reflexion::consolidate_group`, which must reject a
+    /// near-duplicate consolidated rule BEFORE calling `store_temporal` —
+    /// `store_temporal` itself skips this gate whenever the caller supplies
+    /// an explicit `(subject, predicate)` triple, since that path is F1
+    /// temporal supersession, a legitimate update, not a "new discovery").
+    ///
+    /// Read-only: does not write anything. `None` when novel, when the gate
+    /// is disabled, or when no embedder is attached (fail-open, matching
+    /// this crate's "no signal ⇒ byte-identical" convention for optional
+    /// retrieval features) or when the candidate scan hit a DB error
+    /// (logged, never blocks the caller).
+    pub async fn check_novelty(
+        &self,
+        agent_id: &str,
+        layer: duduclaw_core::types::MemoryLayer,
+        content: &str,
+    ) -> Option<crate::novelty_gate::NoveltyRejection> {
+        let conn = self.conn.lock().await;
+        self.check_novelty_with_conn(&conn, agent_id, layer, content)
+    }
+
+    /// Synchronous variant used internally by write paths that already hold
+    /// the connection lock (`store` / `store_temporal`) — avoids a
+    /// self-deadlock on the same `tokio::sync::Mutex`.
+    fn check_novelty_with_conn(
+        &self,
+        conn: &Connection,
+        agent_id: &str,
+        layer: duduclaw_core::types::MemoryLayer,
+        content: &str,
+    ) -> Option<crate::novelty_gate::NoveltyRejection> {
+        let embedder = self.embedder.as_ref()?;
+        let now_rfc = Utc::now().to_rfc3339();
+        match crate::novelty_gate::check_novelty(
+            conn,
+            agent_id,
+            layer.as_str(),
+            content,
+            embedder.as_ref(),
+            &self.novelty_gate,
+            &now_rfc,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(agent_id, "B1 novelty gate scan failed (fail-open, write proceeds): {e}");
+                None
+            }
+        }
     }
 
     /// Embed any currently-valid rows for `agent_id` that lack an embedding
@@ -1347,6 +1436,39 @@ impl SqliteMemoryEngine {
         }
     }
 
+    /// Overwrite an entry's `content` text in place (ownership enforced).
+    ///
+    /// Used by the playbook `Revise` delta (WP1.2, `crate::playbook`) to
+    /// rewrite an entry's text while keeping its row id — the id is the
+    /// stable handle later `Link`/`Record`/`Retire` deltas target, so a
+    /// revision must not become a new row.
+    ///
+    /// Known limitation: this does NOT refresh the `memories_fts` index (the
+    /// FTS row keeps the pre-revision text), so a generic full-text
+    /// `search()`/`search_layer()` call may surface stale content for a
+    /// revised row until the next full re-index. Playbook selection never
+    /// goes through FTS (`list_valid_by_source_event` reads the `memories`
+    /// table directly), so this has no effect on playbook injection — it
+    /// only matters for an operator manually searching memory and finding an
+    /// outdated snippet for a revised entry. Returns `Ok(true)` when a row
+    /// was updated, `Ok(false)` when the id does not exist or belongs to
+    /// another agent.
+    pub async fn update_content(
+        &self,
+        agent_id: &str,
+        memory_id: &str,
+        content: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE memories SET content = ?1 WHERE id = ?2 AND agent_id = ?3",
+                params![content, memory_id, agent_id],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Ok(n > 0)
+    }
+
     /// Overwrite the metadata JSON blob for a single entry (ownership enforced).
     ///
     /// Returns `Ok(true)` when a row was updated, `Ok(false)` when the id does
@@ -1845,6 +1967,38 @@ impl SqliteMemoryEngine {
             }
         }
         } // end `if !meta.quarantined`
+
+        // B1 anti-false-surprise gate (arXiv:2606.29182): ONLY applies to a
+        // "plain" semantic write — one that carries no explicit
+        // `(subject, predicate)` triple. Whenever the caller supplies a
+        // triple, this write is F1 temporal supersession/reaffirm/history —
+        // a deliberate value update, not a "new discovery" — and the gate
+        // must not touch it (the reaffirm branch above already
+        // short-circuits with an early `return` before reaching here, and a
+        // fresh triple-driven insert legitimately replaces or historically
+        // slots in next to what came before). A quarantined write is
+        // likewise exempt: it never asserts a current belief.
+        if !meta.quarantined
+            && entry.layer == duduclaw_core::types::MemoryLayer::Semantic
+            && (meta.subject.is_none() || meta.predicate.is_none())
+        {
+            if let Some(rejection) =
+                self.check_novelty_with_conn(&conn, agent_id, entry.layer.clone(), &entry.content)
+            {
+                self.novelty_rejections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    agent_id,
+                    entry_id = %entry.id,
+                    matched_id = %rejection.matched_id,
+                    similarity = rejection.similarity,
+                    threshold = rejection.threshold,
+                    "B1 novelty gate rejected temporal write: {rejection}"
+                );
+                return Err(DuDuClawError::Memory(format!(
+                    "novelty gate rejected write: {rejection}"
+                )));
+            }
+        }
 
         let tags_json = serde_json::to_string(&entry.tags)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
@@ -3038,6 +3192,30 @@ impl MemoryEngine for SqliteMemoryEngine {
         // unlimited (quota 0). Runs before any write so a rejection loses nothing.
         self.enforce_quota(&conn)?;
 
+        // B1 anti-false-surprise gate (arXiv:2606.29182): only Semantic-layer
+        // writes are "beliefs" worth deduplicating — episodic conversation
+        // logs are expected to repeat (greetings, routine check-ins) and must
+        // never be blocked here. No-op (see `check_novelty_with_conn`) when
+        // no embedder is attached or the gate is disabled.
+        if entry.layer == duduclaw_core::types::MemoryLayer::Semantic {
+            if let Some(rejection) =
+                self.check_novelty_with_conn(&conn, agent_id, entry.layer.clone(), &entry.content)
+            {
+                self.novelty_rejections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    agent_id,
+                    entry_id = %entry.id,
+                    matched_id = %rejection.matched_id,
+                    similarity = rejection.similarity,
+                    threshold = rejection.threshold,
+                    "B1 novelty gate rejected write: {rejection}"
+                );
+                return Err(DuDuClawError::Memory(format!(
+                    "novelty gate rejected write: {rejection}"
+                )));
+            }
+        }
+
         let tags_json =
             serde_json::to_string(&entry.tags).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let timestamp_str = entry.timestamp.to_rfc3339();
@@ -4051,6 +4229,158 @@ mod tests {
         );
         // Idempotent: a second pass re-embeds nothing (same model id).
         assert_eq!(engine.backfill_embeddings(agent).await.unwrap(), 0);
+    }
+
+    // ── B1 anti-false-surprise gate (arXiv:2606.29182) ─────────────────────
+
+    /// `store()`: a near-duplicate Semantic write is rejected once an
+    /// embedder is attached.
+    #[tokio::test]
+    async fn store_rejects_near_duplicate_semantic_entry() {
+        use std::sync::Arc;
+        let agent = "b1-store";
+        let engine = SqliteMemoryEngine::in_memory()
+            .unwrap()
+            .with_embedder(Arc::new(crate::vector::NgramHashEmbedder::new()));
+
+        let mut first = make_entry(agent, "使用者偏好深色模式介面", vec![]);
+        first.layer = duduclaw_core::types::MemoryLayer::Semantic;
+        engine.store(agent, first).await.unwrap();
+
+        let mut dup = make_entry(agent, "使用者偏好深色模式介面", vec![]);
+        dup.layer = duduclaw_core::types::MemoryLayer::Semantic;
+        let err = engine.store(agent, dup).await.unwrap_err();
+        assert!(
+            err.to_string().contains("novelty gate"),
+            "rejection must be a clear error, not a silent drop: {err}"
+        );
+        assert_eq!(engine.novelty_gate_rejections(), 1);
+
+        // Confirm nothing was silently written: exactly one row.
+        let results = engine.search(agent, "深色", 5).await.unwrap();
+        assert_eq!(results.len(), 1, "the near-duplicate must not have been inserted");
+    }
+
+    /// The gate is Semantic-layer-only — Episodic writes (conversation logs,
+    /// which are expected to repeat) are never blocked.
+    #[tokio::test]
+    async fn store_never_gates_episodic_entries() {
+        use std::sync::Arc;
+        let agent = "b1-episodic";
+        let engine = SqliteMemoryEngine::in_memory()
+            .unwrap()
+            .with_embedder(Arc::new(crate::vector::NgramHashEmbedder::new()));
+
+        // Episodic (the `make_entry` default layer) — same content twice.
+        engine.store(agent, make_entry(agent, "早安", vec![])).await.unwrap();
+        engine
+            .store(agent, make_entry(agent, "早安", vec![]))
+            .await
+            .expect("episodic near-duplicates must never be gated");
+    }
+
+    /// Without an attached embedder, the gate is a total no-op (matches the
+    /// crate's "no signal ⇒ byte-identical" convention) — near-duplicate
+    /// Semantic writes succeed exactly as before this feature existed.
+    #[tokio::test]
+    async fn store_without_embedder_gate_is_a_no_op() {
+        let agent = "b1-no-embedder";
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        assert!(!engine.has_embedder());
+
+        let mut first = make_entry(agent, "user prefers dark mode", vec![]);
+        first.layer = duduclaw_core::types::MemoryLayer::Semantic;
+        engine.store(agent, first).await.unwrap();
+
+        let mut dup = make_entry(agent, "user prefers dark mode", vec![]);
+        dup.layer = duduclaw_core::types::MemoryLayer::Semantic;
+        engine
+            .store(agent, dup)
+            .await
+            .expect("no embedder attached ⇒ gate must be a no-op");
+        assert_eq!(engine.novelty_gate_rejections(), 0);
+    }
+
+    /// Disabling the gate via config allows a near-duplicate Semantic write
+    /// through even with an embedder attached.
+    #[tokio::test]
+    async fn store_gate_can_be_disabled() {
+        use std::sync::Arc;
+        let agent = "b1-disabled";
+        let mut engine = SqliteMemoryEngine::in_memory()
+            .unwrap()
+            .with_embedder(Arc::new(crate::vector::NgramHashEmbedder::new()));
+        engine.set_novelty_gate_config(crate::novelty_gate::NoveltyGateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+
+        let mut first = make_entry(agent, "user prefers dark mode", vec![]);
+        first.layer = duduclaw_core::types::MemoryLayer::Semantic;
+        engine.store(agent, first).await.unwrap();
+
+        let mut dup = make_entry(agent, "user prefers dark mode", vec![]);
+        dup.layer = duduclaw_core::types::MemoryLayer::Semantic;
+        engine
+            .store(agent, dup)
+            .await
+            .expect("disabled gate must never reject");
+    }
+
+    /// `store_temporal`'s F1 supersession path (explicit `(subject,
+    /// predicate)` triple) must NEVER be blocked by the B1 gate, even when
+    /// the new value's content is textually identical to a prior value for a
+    /// DIFFERENT triple slot (the legitimate-update carve-out is keyed on
+    /// "caller supplied a triple", not on content similarity).
+    #[tokio::test]
+    async fn store_temporal_triple_path_bypasses_the_gate() {
+        use std::sync::Arc;
+        let agent = "b1-temporal-triple";
+        let engine = SqliteMemoryEngine::in_memory()
+            .unwrap()
+            .with_embedder(Arc::new(crate::vector::NgramHashEmbedder::new()));
+
+        // First triple fact.
+        let e1 = make_entry(agent, "the deploy target is asia-east1", vec![]);
+        engine
+            .store_temporal(agent, e1, triple_meta("deploy", "target_is", "asia-east1"))
+            .await
+            .unwrap();
+
+        // A DIFFERENT triple slot, but textually identical content — must
+        // still be accepted (the gate never runs on a triple-carrying write).
+        let e2 = make_entry(agent, "the deploy target is asia-east1", vec![]);
+        engine
+            .store_temporal(agent, e2, triple_meta("backup", "target_is", "asia-east1"))
+            .await
+            .expect("a triple-carrying write must bypass the B1 gate entirely");
+        assert_eq!(engine.novelty_gate_rejections(), 0);
+    }
+
+    /// `store_temporal`'s "plain" path (no `(subject, predicate)` triple) IS
+    /// gated when the layer is Semantic.
+    #[tokio::test]
+    async fn store_temporal_plain_path_is_gated() {
+        use std::sync::Arc;
+        let agent = "b1-temporal-plain";
+        let engine = SqliteMemoryEngine::in_memory()
+            .unwrap()
+            .with_embedder(Arc::new(crate::vector::NgramHashEmbedder::new()));
+
+        let mut e1 = make_entry(agent, "always double-check the currency before quoting", vec![]);
+        e1.layer = duduclaw_core::types::MemoryLayer::Semantic;
+        engine
+            .store_temporal(agent, e1, TemporalMeta::default())
+            .await
+            .unwrap();
+
+        let mut e2 = make_entry(agent, "always double-check the currency before quoting", vec![]);
+        e2.layer = duduclaw_core::types::MemoryLayer::Semantic;
+        let err = engine
+            .store_temporal(agent, e2, TemporalMeta::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("novelty gate"));
     }
 
     #[tokio::test]

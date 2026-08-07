@@ -748,7 +748,9 @@ pub async fn run_induction_for_agent(
     let mut report = InductionReport::default();
     if !plan.is_empty() {
         let db_path = home_dir.join("memory.db");
-        let engine = SqliteMemoryEngine::new(&db_path)
+        // R2: factory honors `[memory] novelty_gate` for these semantic rule
+        // writes, matching reflexion/task_rule_induce.
+        let engine = crate::memory_factory::build_memory_engine(&db_path, home_dir)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         for r in &plan.revokes {
