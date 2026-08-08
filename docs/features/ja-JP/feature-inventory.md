@@ -1,10 +1,24 @@
 # DuDuClaw 全機能一覧
 
-> v1.24.0 コア + 2026-07 追加 | 最終更新：2026-07-29 (v1.46.0)
+> v1.24.0 コア + 2026-07/08 追加 | 最終更新：2026-08-08 (v1.53.0)
 >
-> 注記:以下の各セクションは v1.24.0 のベースラインです。直後の**「2026-07 追加」**ブロックが、それ以降に実装された機能をまとめています(正式な一覧は `CHANGELOG.md` `[Unreleased]` を参照)。本ファイルは英語版と 2026-07 まで同期済みです。
+> 注記:以下の各セクションは v1.24.0 のベースラインです。直後の**「追加」**ブロックが、それ以降に実装された機能をまとめています(正式な一覧は `CHANGELOG.md` を参照)。本ファイルは英語版と同期済みです。
 
 ---
+
+## 2026-08 追加(v1.53)
+
+| 機能 | 説明 |
+|------|------|
+| 進化システム v3:AEE + playbook | デフォルトの進化対象を「SOUL.md の全面書き換え」から遺伝子形 playbook 行動ルールへ変更——Gate/Measure 分離、champion + matches-or-improves コミットゲート、エントリ単位の観察ウィンドウ;SOUL.md はエージェントに対して読み取り専用([38-aee-playbook-evolution.md](../38-aee-playbook-evolution.md)) |
+| E1 エントリアサーション + 反 reward-hacking 監査 | 新規ルールは機械検証可能なアサーション必須。録画済み transcript に対し LLM ゼロで再生検証(`G-Assertions`);コミット前に評価問題の丸写し / 恒真表現 / 失敗隠蔽を決定論的にスクリーニング |
+| タスク層フォワードモデル | goal loop 上の predict-act-verify 世界モデル:4 段階退化の統計予測(コールドスタート LLM ゼロ)、観察証拠の忠実度分級(ネイティブツールイベント / 監査ログのみ / なし)、`<state>` ブロック + (状態, 行動) 訪問グラフによる振動検出、決定論的タスクルール帰納;`[task_forward_model]`、デフォルト off |
+| ディスパッチ証拠グラウンディング事前チェック | 受け入れ判定の前に LLM ゼロの証拠チェック——最終回答は実在する非エラーのツール結果と重なる必要がある;自己エコー除外リスト + 入力重複控除で自己証明を防止;`[dispatch] grounding_precheck_enabled`、デフォルト on |
+| メモリ新規性ゲート | 意味層のほぼ重複した書き込みを書き込み時に拒否しテレメトリ記録(0.92 文字 n-gram cosine)——偽サプライズの蓄積防止;時間的置換・再確認パスは除外;`[memory] novelty_gate`、デフォルト on |
+| 証拠必須のリフレクション | MistakeNotebook エントリはプログラム抽出の `TrajectoryEvidence` を保持;証拠のない自己申告ミスはルール統合に参加しない |
+| 行動前シミュレーション承認 | `needs_human` / 承認リクエストに 3 ステップのシミュレーション軌跡を添付(15 秒上限、タイムアウト時は劣化しブロックしない);wiki 参照は読み取り専用 namespace のみ;ダッシュボードでプレビュー表示 |
+| Eval 録画分離 + ブートストラップ CLI | `--record` は一時 `.mcp.json` コピーで実行(eval home + プレースホルダキー——本番への副作用ゼロ、キー漏洩なし);max-turns 暴走は `error_max_turns` として解析(評価可能な失敗ベースライン);`duduclaw eval-scaffold` は SOUL ルールから問題ドラフトを生成;`duduclaw playbook migrate-soul` は旧 SOUL ルールを playbook ドラフトへ移行 |
+| 監査ログの証拠ソース化 | `tool_calls.jsonl` にマスク済み `result_text`/`input_text` を記録(3 パスシークレットマスキング、16MB ローテーション、0600);システム送信者のディスパッチ(goal-loop/cron/heartbeat/autopilot)は実行エージェントに帰属 |
 
 ## 2026-07 中盤〜後半追加(v1.33 – v1.46)
 
@@ -117,17 +131,30 @@
 
 ## 進化システム
 
+> **進化システム v3（2026-08-06）**:デフォルトの進化対象は「`SOUL.md` の
+> 全面書き換え」から **playbook**（小粒度で個別に退役可能な遺伝子形ルール;
+> `SOUL.md` はデフォルトでエージェントに読み取り専用）へ移行しました。
+> 下表の GVU² 系の行（デュアルループ / 4+2 層検証 / SOUL.md バージョン管理）
+> は**非デフォルトの legacy パス**（`agent.toml [evolution]
+> legacy_soul_evolution = true`）の説明です。現行デフォルト（AEE、
+> Gate/Measure 分離、champion + matches-or-improves、エントリ単位観察
+> ウィンドウ）は [38-aee-playbook-evolution.md](../38-aee-playbook-evolution.md)
+> と [evolution-engine.md](../../architecture/evolution-engine.md) 第 12 章を参照。
+
 | 機能 | 説明 |
 |------|------|
 | 予測駆動エンジン | Active Inference + Dual Process Theory、約 90% LLM コストゼロ |
 | デュアルプロセスルーター | System 1（ルール）/ System 2（LLM リフレクション） |
-| GVU² デュアルループ | 外側ループ（Behavioral GVU — SOUL.md）+ 内側ループ（Task GVU — 即時再試行） |
-| 4+2 層検証 | L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety |
-| MistakeNotebook | ループ間エラー記憶 — 失敗パターン記録、退行防止 |
-| SOUL.md バージョン管理 | 24h 観察期間 + アトミックロールバック + SHA-256 フィンガープリント |
-| MetaCognition | 100 予測毎に誤差閾値を自己校正 |
+| AEE（v3 デフォルト） | Agentic Evolution Engine — Generator 内ループ（≤3 ラウンド）→ Gate（決定論的・拒否権あり）/ Measure（スコア・拒否権なし）分離 → champion + matches-or-improves コミットゲート → エントリごとにリンクされた eval case に対して confirm/rollback |
+| Playbook（v3 デフォルト） | 遺伝子形行動ルール（category/signals_match/eval_cases/success_streak）、既存 rule_lifecycle ストアの拡張、0.92 cosine 重複排除、容量 + 失効/アーカイブライフサイクル |
+| GVU² デュアルループ（legacy） | 外側ループ（Behavioral GVU — SOUL.md 書き換え）+ 内側ループ（Task GVU — 即時再試行）;`legacy_soul_evolution = true` でオプトイン |
+| 4+2 層検証（legacy） | L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety |
+| MistakeNotebook | ループ間エラー記憶 — 失敗パターン記録、退行防止;エントリは決定論的 `TrajectoryEvidence`（どのツール/アサーションが失敗したか）を保持し、証拠のない自己申告診断はリフレクション統合に参加しない（v3） |
+| SOUL.md バージョン管理（legacy） | 24h 観察期間 + アトミックロールバック + SHA-256 フィンガープリント — legacy GVU パスに適用;SOUL.md サイズ上限デッドロックはガード付き consolidate 書き換えで解除され、エージェントが凍結しなくなった（v3 Phase 0） |
+| MetaCognition | 100 予測毎に誤差閾値を自己校正、対称的な引き上げ規則を追加し閾値の一方向ドリフトを解消（v3 Phase 0） |
 | Adaptive Depth | MetaCognition 駆動の GVU 反復深度（3-7 ラウンド） |
-| Deferred GVU | 勾配累積 + 遅延再試行（最大 3 deferral、72h、9-21 実効ラウンド） |
+| Deferred GVU（legacy） | 勾配累積 + 遅延再試行（最大 3 deferral、72h、9-21 実効ラウンド） |
+| 停滞検出器（v3） | 30 分毎に `evolution.db` の連続拒否 / D 日間ゼロ適用 / 拒否理由反復シグナルをスキャンし、Activity Feed + ダッシュボードへ通知 |
 | ConversationOutcome | LLM ゼロの会話結果検出、zh-TW + en |
 | Agent-as-Evaluator | 独立 Evaluator Agent（Haiku コスト管理）による対抗的検証 |
 | Orchestrator テンプレート | 5 ステップ計画（Analyze → Decompose → Delegate → Evaluate → Synthesize）|

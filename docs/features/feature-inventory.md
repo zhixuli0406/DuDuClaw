@@ -1,13 +1,27 @@
 # DuDuClaw Complete Feature Inventory
 
-> v1.24.0 core + 2026-07 additions | Last updated: 2026-07-29 (v1.46.0)
+> v1.24.0 core + 2026-07/08 additions | Last updated: 2026-08-08 (v1.53.0)
 >
-> Note: the sections below describe the v1.24.0 baseline. The **2026-07
-> additions** block immediately after captures features shipped since (see
-> `CHANGELOG.md` `[Unreleased]` for the authoritative list). The `ja-JP/` and
-> `zh-TW/` mirrors are synced with the 2026-07 additions.
+> Note: the sections below describe the v1.24.0 baseline. The **additions**
+> blocks immediately after capture features shipped since (see `CHANGELOG.md`
+> for the authoritative list). The `ja-JP/` and `zh-TW/` mirrors are synced
+> with the additions blocks.
 
 ---
+
+## 2026-08 additions (v1.53)
+
+| Feature | Description |
+|---------|-------------|
+| Evolution v3: AEE + playbook | Default evolution target moved from SOUL.md rewrites to gene-shaped playbook rules — Gate/Measure split, champion + matches-or-improves commit gate, entry-level observation windows; SOUL.md is read-only for agents ([38-aee-playbook-evolution.md](38-aee-playbook-evolution.md)) |
+| E1 entry assertions + anti-reward-hacking audit | Every new playbook rule carries machine-checkable assertions replayed zero-LLM against recorded transcripts (`G-Assertions`); deterministic screening of candidate rules for eval-prompt leakage / tautology / failure-suppression before commit |
+| Task-level forward model | Predict-act-verify world model on the goal loop: 4-tier statistical prediction (zero LLM on cold start), fidelity-graded observation (native tool events / audit-only / none), `<state>` block + `(state, action)` visit-graph oscillation detection, deterministic task-rule induction; `[task_forward_model]`, default off |
+| Grounded dispatch precheck | Zero-LLM evidence check before the acceptance judge — the final answer must overlap a real non-error tool result; self-echo deny-list + input-overlap subtraction defeat self-certification; `[dispatch] grounding_precheck_enabled`, default on |
+| Memory novelty gate | Near-duplicate semantic-layer memory writes rejected with telemetry (0.92 char n-gram cosine) — anti fake-surprise; temporal supersession/reaffirmation exempt; `[memory] novelty_gate`, default on |
+| Verified-only reflexion | MistakeNotebook entries carry programmatic `TrajectoryEvidence`; evidence-less self-reported mistakes no longer consolidate into learned rules |
+| Simulate-before-act approvals | `needs_human` / approval requests attach a simulated three-step trajectory (15s cap, degrades to no-simulation rather than blocking); read-only wiki namespaces only; dashboard renders the preview |
+| Eval recording isolation + bootstrap CLI | `--record` runs against a temporary `.mcp.json` (eval home + placeholder key — zero production side effects, no key leakage); max-turns runaways parse as `error_max_turns` (assessable failure baseline); `duduclaw eval-scaffold` drafts cases from SOUL rules; `duduclaw playbook migrate-soul` migrates legacy SOUL rules into playbook drafts |
+| Audit log as evidence source | `tool_calls.jsonl` records masked `result_text`/`input_text` (3-pass secret masking, 16MB rotation, 0600); system-sender dispatches (goal-loop/cron/heartbeat/autopilot) attribute to the executing agent |
 
 ## 2026-07 mid/late additions (v1.33 – v1.46)
 

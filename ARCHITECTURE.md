@@ -41,6 +41,7 @@
 | API key 儲存 | **AES-256-GCM** | 對稱加密，base64 存於 config.toml |
 | 日誌推送 | **BroadcastLayer** tracing | 即時推播 log 到 WebSocket，零侵入 |
 | Evolution | **預測驅動 + AEE playbook 進化**（GVU 整份改寫 SOUL.md 降為選配逃生門） | 90% 零 LLM 成本，Significant/Critical 才觸發；`SOUL.md` 對 agent 唯讀 |
+| 任務驗收（v1.53） | **判官前確定性防線**：grounding 證據預檢 + outcome schema 校驗；任務層 forward model 選配（`[task_forward_model]` 預設關） | 證據不落地就不燒判官 LLM；世界模型用統計先行，冷啟動零 LLM（見 [docs/guides/goal-loop.md](docs/guides/goal-loop.md)） |
 | Token 計算 | **CJK-aware heuristic** | CJK 字元 ~1.5 chars/token，ASCII ~4 chars/token |
 
 ---

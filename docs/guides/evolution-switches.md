@@ -168,11 +168,33 @@ Until that pass exists, the whole suite is treated as *unmeasured* rather than
 as failing — an unrecorded case is an infrastructure gap, not a quality signal,
 and scoring it 0.0 would enshrine a champion of zeroes nothing could improve on.
 
-**No suite, no problem.** An agent with no eval corpus (or an unrecorded one,
-or an unreachable eval binary) still evolves — the `cases` dimension is
-reported as *absent*, never as zero, and the commit gate compares the
-dimensions that do exist. The degradation is visible in the round's audit
-record (`case_dimension_available: false`) and in a `warn!` line, not silent.
+**Measurement degrades gracefully without a suite.** An agent whose corpus is
+unrecorded (or whose eval binary is unreachable) is still measured — the
+`cases` dimension is reported as *absent*, never as zero, and the commit gate
+compares the dimensions that do exist. The degradation is visible in the
+round's audit record (`case_dimension_available: false`) and in a `warn!`
+line, not silent.
+
+**But new entries do require at least one eval case (v1.53, G6/E1).** Every
+playbook `Add` must link ≥1 eval case and carry machine-checkable assertions
+(`must_use_tools` / `output_contains` / …) — an agent with zero eval cases
+cannot accumulate *new* rules. To bootstrap a corpus from an agent's SOUL
+behaviour rules:
+
+```bash
+duduclaw eval-scaffold --agent <agent-id>   # drafts into evals-drafts/
+```
+
+Review the drafts, move the good ones into `evals/<agent-id>/`, then record
+them as above. Drafts are deliberately written to a separate `evals-drafts/`
+directory so unreviewed cases can never leak into the live corpus. Assertion
+replay against a case with no recorded transcript reports *Unverified*
+(advisory), never a silent pass.
+
+Recording is side-effect-free since v1.53: `--record` rewrites the agent's
+`.mcp.json` to a temporary copy whose `DUDUCLAW_HOME` points at the eval home
+(and a placeholder MCP key), so a recording run can't touch production state
+or leak real keys into transcripts.
 
 ## Autopilot is deliberately NOT governed by the master switch
 
@@ -216,3 +238,13 @@ flip it. To check:
 4. No observation window should open (no pending version in the version store).
 
 This mirrors the automated verification the project runs for this feature.
+
+## Related switches on other pages (v1.53)
+
+Not evolution toggles, but part of the same learn-and-verify surface:
+
+| Key | Default | Page |
+|---|---|---|
+| `config.toml [memory] novelty_gate` | `true` | [memory-and-knowledge.md](./memory-and-knowledge.md) — rejects near-duplicate semantic memories |
+| `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](./goal-loop.md) — zero-LLM evidence check before the acceptance judge |
+| `config.toml [task_forward_model] enabled` | `false` | [goal-loop.md](./goal-loop.md) — task-level predict-act-verify world model |

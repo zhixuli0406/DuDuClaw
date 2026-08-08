@@ -1007,6 +1007,19 @@ consolidate 路徑，與 AEE 迴圈正交，兩者只共用同一支 cooldown。
 順序也修正了：Gate 先跑（零成本），必死的候選不會再燒 judge 的 LLM 費用
 （B2 裁定，`DESIGN-evolution-v3-aee.md` §2.5.2）。
 
+v1.53 追加兩道同屬 Gate 家族的檢查：
+
+- **G-Assertions**（WP2.8，`inner_loop.rs` b2 步）：每個新增條目必附的
+  E1 斷言（`must_use_tools`／`must_not_use_tools`／`output_contains`／
+  `output_not_contains`，≤6 條、每條 ≤80 字元，schema 在
+  `playbook/entry.rs`，重放器在 `playbook/assertions.rs`）對已錄製的
+  eval transcript 做零 LLM 重放，違反即否決；找不到可重放的錄製時降級為
+  advisory——誠實標記「未驗證」，不假裝驗過。
+- **反 reward-hacking 稽核**（WP2.10／規劃書的 C4，`gvu/reward_hack.rs`）：
+  H1 題庫題面洩漏（n-gram 重疊 ≥0.6，等於背答案）、H2 恆真空話、H3 失敗
+  抑制三類簽名併入 `G-Contract` 否決家族（D11 拍板：不加新層）；H4 判官
+  取悅措辭只記 Measure 側遙測，不否決，避免誤殺正常條目。
+
 #### 12.5.3 Champion 與提交閘（matches-or-improves）
 
 `champion.rs`：champion 是**整份 playbook 快照**（所有 active/probation
@@ -1026,15 +1039,14 @@ confirm/rollback 由它自己連結的 eval case 裁定，觀察時長
 
 ### 12.6 尚未實作的部分（同一份規劃書的後續波次）
 
-`TODO-evolution-v3-2026-08.md` 規劃的 Phase 2 還有三項本輪**未**落地，
-不是被靜默捨棄，是排進後續波次：
+`TODO-evolution-v3-2026-08.md` 規劃的 Phase 2 還有兩項**未**落地，
+不是被靜默捨棄，是排進後續波次（原列於此的 C4 反 reward-hacking 稽核
+已於 v1.53 落地，見 §12.5.2）：
 
 - **C1 hypothesis 物件**：把每輪演化意圖顯式化成可證偽的假設（陳述/證據/
   信心/血緣），取代觀察窗的模糊統計判定。
 - **C3 refactor-toward-simplicity**：週期性把 playbook 往更簡潔抽象壓縮
   （拍板方向：只做確定性壓縮，不引入 LLM 整批重構）。
-- **C4 反 reward-hacking 手段稽核 gate**：稽核「達成手段」而非只看分數
-  （H1 題庫洩漏／H2 驗證器弱化／H3 失敗抑制／H4 判官取悅四類簽名）。
 
 ### 12.7 設定總覽
 
@@ -1060,8 +1072,15 @@ eval_binary = "/usr/local/bin/duduclaw"   # 選填，覆寫預設二進位路徑
 ```
 
 新 CLI：`duduclaw playbook export --agent <id> [--out <path>]`（GEP-gene
-形 JSON 匯出，本地檔案，不接任何外部 hub）；`duduclaw eval` 新增
-`--case`/`--exclude-dir`/`--report`（詳見 `docs/guides/evals.md`）。
+形 JSON 匯出，本地檔案，不接任何外部 hub）；`duduclaw playbook
+migrate-soul --agent <id> [--apply]`（WP1.4——舊 SOUL.md 行為規則抽成
+playbook 條目草稿，人審後 `--apply` 套用）；`duduclaw eval-scaffold
+--agent <id>`（從 SOUL 行為規則產生題目草稿到 `evals-drafts/`，免費層
+補足「條目必連結 eval case」硬要求的入口）；`duduclaw eval` 新增
+`--case`/`--exclude-dir`/`--report`，`--record` 錄製改走臨時 `.mcp.json`
+副本（`DUDUCLAW_HOME` 指向 eval home、`DUDUCLAW_MCP_API_KEY=eval-local`，
+錄製對生產環境零副作用、金鑰不入 transcript）（詳見
+`docs/guides/evals.md`）。
 
 Dashboard：記憶頁「自主學習」分頁——進化模式總覽、版本歷史、停滯偵測卡、
 拒絕遙測圖、整併紀錄、Playbook 條目卡片（匯出／手動 retire）。
@@ -1091,6 +1110,10 @@ Dashboard：記憶頁「自主學習」分頁——進化模式總覽、版本�
 | 停滯偵測器 | `crates/duduclaw-gateway/src/gvu/stagnation.rs` |
 | 拒絕遙測 | `crates/duduclaw-gateway/src/gvu/telemetry.rs` |
 | MistakeNotebook 軌跡證據 | `crates/duduclaw-gateway/src/gvu/mistake_notebook.rs`（`TrajectoryEvidence`） |
+| E1 斷言重放（G-Assertions） | `crates/duduclaw-gateway/src/playbook/assertions.rs` |
+| 反 reward-hacking 稽核 | `crates/duduclaw-gateway/src/gvu/reward_hack.rs` |
+| SOUL→playbook 遷移 CLI | `crates/duduclaw-cli/src/playbook_migrate.rs` |
+| eval 題目草稿 CLI | `crates/duduclaw-cli/src/eval_scaffold.rs` |
 | PLAYBOOK_EDITING_GUIDE | `crates/duduclaw-gateway/src/playbook/PLAYBOOK_EDITING_GUIDE.md` |
 
 ### 12.9 理論基礎（v3 增補）

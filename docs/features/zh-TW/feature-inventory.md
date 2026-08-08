@@ -1,10 +1,24 @@
 # DuDuClaw 完整功能清單
 
-> v1.24.0 核心 + 2026-07 新增 | 最後更新：2026-07-29（v1.46.0）
+> v1.24.0 核心 + 2026-07/08 新增 | 最後更新：2026-08-08（v1.53.0）
 >
-> 說明:以下各章為 v1.24.0 基準。緊接其後的**「2026-07 新增」**區塊涵蓋此後落地的功能(權威清單見 `CHANGELOG.md` `[Unreleased]`)。本檔已與英文版同步至 2026-07。
+> 說明:以下各章為 v1.24.0 基準。緊接其後的**「新增」**區塊涵蓋此後落地的功能(權威清單見 `CHANGELOG.md`)。本檔已與英文版同步。
 
 ---
+
+## 2026-08 新增(v1.53)
+
+| 功能 | 說明 |
+|------|------|
+| 進化系統 v3:AEE + playbook | 預設進化標的從「整份改寫 SOUL.md」改為基因形 playbook 行為規則——Gate/Measure 閘門分離、champion + matches-or-improves 提交閘、條目級觀察窗;SOUL.md 對 agent 唯讀([38-aee-playbook-evolution.md](../38-aee-playbook-evolution.md)) |
+| E1 條目斷言 + 反 reward-hacking 稽核 | 每條新規則必附可機器檢查的斷言,對錄製 transcript 做零 LLM 重放(`G-Assertions`);提案提交前確定性篩查題庫題面洩漏 / 恆真空話 / 失敗抑制 |
+| 任務層前瞻模型 | goal loop 上的 predict-act-verify 世界模型:四階退化統計預測(冷啟動零 LLM)、觀察證據保真度分級(原生工具事件 / 只有稽核日誌 / 無)、`<state>` 狀態區塊 + (狀態,行動) 訪問圖震盪偵測、確定性任務規則歸納;`[task_forward_model]`,預設關 |
+| 派工證據落地預檢 | 驗收判官之前的零 LLM 證據檢查——最終回覆必須與真實的非錯誤工具結果重疊;自我回音排除名單 + 輸入重疊扣除,防自我證明;`[dispatch] grounding_precheck_enabled`,預設開 |
+| 記憶新穎度閘門 | 語意層近重複寫入在落地前被擋下並記遙測(0.92 字元 n-gram cosine),防假驚訝累積;時間取代/再確認路徑豁免;`[memory] novelty_gate`,預設開 |
+| 有證據才歸納的反思 | MistakeNotebook 條目附程式化抽取的 `TrajectoryEvidence`;查無證據的自述錯誤不再參與規則歸納 |
+| 行動前模擬審批 | `needs_human` / 審批請求附三步模擬軌跡預覽(15 秒上限,逾時降級不阻塞);知識庫引用限唯讀 namespace;儀表板渲染預覽 |
+| Eval 錄製隔離 + 起步 CLI | `--record` 走臨時 `.mcp.json` 副本(eval home + 佔位金鑰——生產零副作用、金鑰不入 transcript);撞 max-turns 的失控 run 解析為 `error_max_turns`(可評測的失敗基線);`duduclaw eval-scaffold` 從 SOUL 規則產生題目草稿;`duduclaw playbook migrate-soul` 把舊 SOUL 規則遷成 playbook 草稿 |
+| 稽核日誌作為證據源 | `tool_calls.jsonl` 記錄遮罩後的 `result_text`/`input_text`(三段遮罩、16MB 輪替、0600);系統發送者派工(goal-loop/cron/heartbeat/autopilot)歸屬到實際執行的 agent |
 
 ## 2026-07 中後期新增(v1.33 – v1.46)
 
@@ -117,17 +131,29 @@
 
 ## 演化系統
 
+> **進化系統 v3（2026-08-06）**：預設進化標的從「整份改寫 `SOUL.md`」改為
+> **playbook**（小顆粒、可個別退休的基因形規則；`SOUL.md` 預設對 agent
+> 唯讀）。下表的 GVU²（雙迴圈 / 4+2 層驗證 / SOUL.md 版本控制）現在描述的
+> 是**非預設的 legacy 路徑**（`agent.toml [evolution] legacy_soul_evolution
+> = true`）。現行預設（AEE、Gate/Measure 分離、champion +
+> matches-or-improves、條目級觀察窗）見
+> [38-aee-playbook-evolution.md](../38-aee-playbook-evolution.md) 與
+> [evolution-engine.md](../../architecture/evolution-engine.md) 第十二章。
+
 | 功能 | 說明 |
 |------|------|
 | 預測驅動引擎 | Active Inference + Dual Process Theory，約 90% 零 LLM 成本 |
 | 雙系統路由器 | System 1（規則）/ System 2（LLM 反思）|
-| GVU² 雙迴圈 | 外迴圈（Behavioral GVU — SOUL.md）+ 內迴圈（Task GVU — 即時重試）|
-| 4+2 層驗證 | L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety |
-| MistakeNotebook | 跨迴圈錯誤記憶 — 記錄失敗模式、防止退化 |
-| SOUL.md 版本控制 | 24h 觀察期 + 原子回滾 + SHA-256 指紋 |
-| MetaCognition | 每 100 次預測自動校準誤差閾值 |
+| AEE（v3 預設） | Agentic Evolution Engine — Generator 內迴圈（≤3 輪）→ Gate（確定性、有否決權）/ Measure（分數、無否決權）分離 → champion + matches-or-improves 提交閘 → 條目對自己連結的 eval case 各自 confirm/rollback |
+| Playbook（v3 預設） | 基因形行為規則（category/signals_match/eval_cases/success_streak），擴建自既有 rule_lifecycle 儲存，0.92 cosine 去重，容量 + 過期/封存生命週期 |
+| GVU² 雙迴圈（legacy） | 外迴圈（Behavioral GVU — SOUL.md 改寫）+ 內迴圈（Task GVU — 即時重試）；經 `legacy_soul_evolution = true` 選入 |
+| 4+2 層驗證（legacy） | L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety |
+| MistakeNotebook | 跨迴圈錯誤記憶 — 記錄失敗模式、防止退化；條目現在附確定性 `TrajectoryEvidence`（哪個工具/斷言失敗），查無證據的自述診斷不再參與反思歸納（v3） |
+| SOUL.md 版本控制（legacy） | 24h 觀察期 + 原子回滾 + SHA-256 指紋 — 適用 legacy GVU 路徑；SOUL.md 超上限死鎖現在經受控 consolidate 重寫解除，不再凍住 agent（v3 Phase 0） |
+| MetaCognition | 每 100 次預測自動校準誤差閾值，新增對稱回升規則，閾值不再單向漂移（v3 Phase 0） |
 | Adaptive Depth | MetaCognition 驅動 GVU 迭代深度（3-7 輪）|
-| Deferred GVU | gradient 累積 + 延遲重試（最多 3 次 deferral、72h 跨度、9-21 輪有效迭代）|
+| Deferred GVU（legacy） | gradient 累積 + 延遲重試（最多 3 次 deferral、72h 跨度、9-21 輪有效迭代）|
+| 停滯偵測器（v3） | 每 30 分鐘掃描 `evolution.db` 的連續拒絕 / 連續 D 天零 apply / 重複拒絕原因訊號，發到 Activity Feed + 儀表板 |
 | ConversationOutcome | 零 LLM 對話結果偵測（TaskType / Satisfaction / Completion），zh-TW + en |
 | Agent-as-Evaluator | 獨立 Evaluator Agent（Haiku 成本控制）進行對抗式驗證 |
 | Orchestrator 模板 | 5 步規劃（Analyze → Decompose → Delegate → Evaluate → Synthesize）+ 複雜度路由 |
