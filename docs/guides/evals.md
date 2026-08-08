@@ -210,6 +210,12 @@ whose `DUDUCLAW_MCP_API_KEY` is a placeholder), so recording inside a sandbox
 home never writes tool side effects into — or leaks credentials from — your
 real deployment. The original file is never modified.
 
+Runaway runs are assessable, not fatal: a live run that dies because the agent
+hit the `max_turns` cap (an endless tool loop) records as `error_max_turns` —
+the transcript parses, assertions run against what the agent did produce, and
+the case counts as a behavioural failure baseline. Only infrastructure errors
+(spawn failure, credential errors, malformed stream) stay hard errors.
+
 ---
 
 ## Bootstrapping a suite from SOUL.md (`eval-scaffold`)
@@ -277,35 +283,38 @@ provisioned agent + `claude` login.
 
 ---
 
-## GVU integration: the external yardstick
+## Evolution integration: the external yardstick
 
-The evolution engine's GVU loop (Generator → Verifier → Updater) proposes
-`SOUL.md` rewrites and gates them with an *internal* 4‑layer verifier, then holds
-a **24‑hour observation window** before confirming or auto‑rolling‑back a version
-(`ObservationFinalizer` / `duduclaw evolution finalize`, which computes
-post‑metrics from `prediction.db` + `feedback.jsonl`).
+Evals are the **independent** counterpart to the evolution engine's internal
+verifier:
 
-Evals are the **independent** counterpart to that internal verifier:
-
-- The internal Verifier grades a proposal against the model's *own* judgment. It
-  can co‑drift with the behavior it grades.
+- The internal verifier grades a proposal against the model's *own* judgment.
+  It can co‑drift with the behavior it grades.
 - An eval suite grades the *running agent* against **human‑authored expected
-  behaviors** that don't move when `SOUL.md` does. If a GVU rewrite quietly drops
-  the "always cite the refund policy page" behavior, a `must_use_tools` /
-  `output_regex` case turns red — even though GVU's Verifier approved the change.
+  behaviors** that don't move when the agent's rules do. If a learned rule
+  quietly drops the "always cite the refund policy page" behavior, a
+  `must_use_tools` / `output_regex` case turns red — even though the internal
+  verifier approved the change.
 
-### Design hook (not wired this pass)
+Since v1.53 this wiring is live, and it is **entry‑level** (AEE, the default
+evolution engine — see
+[`docs/architecture/evolution-engine.md`](../architecture/evolution-engine.md)
+ch. 12):
 
-> **TODO (design‑only).** Feed the eval suite's pass‑rate into the `SOUL.md`
-> 24‑hour observation‑window **post‑metrics** so a version that regresses a golden
-> behavior is auto‑rolled‑back, not just confirmed on prediction‑error metrics.
-> Concretely: after a GVU version is applied, run
-> `duduclaw eval evals/<agent> --replay --report <tmp>.json`; treat the
-> `failed`/`total` ratio as an additional negative signal alongside the
-> `prediction.db` post‑metrics the `ObservationFinalizer` already reads. A drop in
-> eval pass‑rate across the observation window becomes a rollback trigger. This
-> wave ships the yardstick and the CLI; the finalizer wiring is intentionally left
-> for a follow‑up so the eval runner can stabilize as a standalone gate first.
+- Every playbook entry must link ≥1 eval case at creation (G6) and carries E1
+  assertions replayed zero‑LLM against recorded transcripts (`G-Assertions`
+  gate; no transcript → honest *Unverified*, never a silent pass).
+- AEE's Measure step scores candidates by spawning
+  `duduclaw eval … --replay --report` as a subprocess (runtime‑agnostic, never
+  in‑process) and reading the JSON report.
+- After a committed round, each entry settles (confirm/rollback) against **its
+  own linked case** after `aee_settle_hours` — a regression rolls back exactly
+  the entry that caused it.
+
+The legacy SOUL.md path (opt‑in via `[evolution] legacy_soul_evolution = true`)
+still uses the whole‑file 24‑hour observation window
+(`ObservationFinalizer` / `duduclaw evolution finalize`); its post‑metrics come
+from `prediction.db` + `feedback.jsonl`, without eval wiring.
 
 ---
 
