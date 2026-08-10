@@ -1447,6 +1447,16 @@ impl DispatchEngine {
                     let db_path = home.join("memory.db");
                     match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
                         Ok(engine) => {
+                            // WP-P3 + v1.54: read the held-out gate once, shared
+                            // by the injected-rule settle routing below AND the
+                            // shadow→promotion pass further down. Defaults ON
+                            // (v1.54); when off, the injected path runs the
+                            // unchanged `ErrorCategory`-credit lifecycle and the
+                            // shadow pass is skipped entirely (byte-identical).
+                            let held_out_gate_enabled =
+                                crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(home)
+                                    .held_out_gate_enabled;
+
                             if crate::prediction::transition::should_write_transition(&error) {
                                 if let Err(e) = crate::prediction::transition::write_transition(
                                     &engine,
@@ -1479,12 +1489,8 @@ impl DispatchEngine {
                                 // settlement routes through the numeric-oracle
                                 // gate (`settle_injected_rules_held_out`)
                                 // instead of the pure ErrorCategory-credit
-                                // lifecycle. `held_out_gate_enabled` defaults
-                                // false ⇒ the unchanged `settle_injected_rules`
-                                // runs, byte-identical to before this change.
-                                let held_out_gate_enabled =
-                                    crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(home)
-                                        .held_out_gate_enabled;
+                                // lifecycle. Gate off ⇒ the unchanged
+                                // `settle_injected_rules` runs, byte-identical.
                                 let retired = if held_out_gate_enabled {
                                     crate::prediction::rule_lifecycle::settle_injected_rules_held_out(
                                         &engine,
@@ -1514,6 +1520,59 @@ impl DispatchEngine {
                                     debug!(
                                         task = %task.id, round, retired = retired.len(),
                                         "A4 task-rule settle retired net-zero rules"
+                                    );
+                                }
+                            }
+
+                            // ── v1.54 shadow → promotion pass (DESIGN-lwm-
+                            // calibration §6). Scores the *other* population:
+                            // active shadow task-layer rules whose goal_kind
+                            // signal matches THIS round's situation. A shadow
+                            // rule's implicit prediction is "signal match ⇒
+                            // high-risk", so its out-of-sample hit is the round
+                            // actually being high-risk; when its record beats
+                            // the frozen climatology baseline it is promoted
+                            // out of shadow. Runs BEFORE the induce step below,
+                            // so a rule born THIS settle is never scored this
+                            // settle ("誕生於本次 settle 之前"). Gate off ⇒
+                            // skipped ⇒ byte-identical. Best-effort like every
+                            // other side-effect in this hook.
+                            if held_out_gate_enabled {
+                                // Frozen climatology baseline (fraction of this
+                                // agent's settled rounds that were high-risk).
+                                // Falls back to the domain-agnostic 0.5
+                                // coin-flip until enough history accumulates.
+                                let baseline = fm
+                                    .high_risk_base_rate(
+                                        &agent_id,
+                                        crate::prediction::rule_gate::MIN_HELD_OUT_SAMPLES,
+                                    )
+                                    .await
+                                    .unwrap_or(
+                                        crate::prediction::rule_gate::DEFAULT_BASELINE_HIT_RATE,
+                                    );
+                                let match_tag = crate::prediction::task_rule_induce::goal_kind_tag(
+                                    error.prediction.state_key.goal_kind,
+                                );
+                                let now_seq = Utc::now().timestamp().max(0) as u64;
+                                let pass =
+                                    crate::prediction::rule_lifecycle::score_shadow_candidates_for_task(
+                                        &engine,
+                                        &agent_id,
+                                        &match_tag,
+                                        error.category,
+                                        baseline,
+                                        now_seq,
+                                    )
+                                    .await;
+                                if pass.scored > 0 {
+                                    debug!(
+                                        task = %task.id, round,
+                                        scored = pass.scored,
+                                        promoted = pass.promoted.len(),
+                                        retired = pass.retired.len(),
+                                        baseline,
+                                        "v1.54 shadow→promotion pass"
                                     );
                                 }
                             }

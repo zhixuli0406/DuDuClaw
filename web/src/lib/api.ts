@@ -391,6 +391,16 @@ export interface DelegationSettings {
   warnings: string[];
 }
 
+/** v1.54 global `[task_forward_model]` switches (calibrated prediction + held-out learning gate). */
+export interface TaskForwardModelSettings {
+  /** Master switch — task-level prediction itself. */
+  enabled: boolean;
+  /** Score every prediction against the real outcome (Brier/RPS + Murphy). */
+  calibration_enabled: boolean;
+  /** Inductive lessons must earn adoption out-of-sample before injection. */
+  held_out_gate_enabled: boolean;
+}
+
 // ── Unified audit log (merges security, tool_call, channel_failure, feedback) ──
 export type UnifiedAuditSource = 'security' | 'tool_call' | 'channel_failure' | 'feedback';
 
@@ -3664,6 +3674,15 @@ export const api = {
         allow: Array<[string, string]>;
         applied: boolean;
       }>,
+  },
+  /** v1.54 校準式預測 + held-out 學習閘 全域開關 (admin only). */
+  taskForwardModel: {
+    get: () =>
+      client.call('task_forward_model.get') as Promise<TaskForwardModelSettings>,
+    set: (params: Partial<TaskForwardModelSettings>) =>
+      client.call('task_forward_model.set', params) as Promise<
+        TaskForwardModelSettings & { success: boolean; enabled_requires_restart: boolean }
+      >,
   },
   system: {
     status: () =>

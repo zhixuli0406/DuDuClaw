@@ -42,8 +42,12 @@ use duduclaw_memory::TemporalMeta;
 use tracing::debug;
 
 use super::engine::ErrorCategory;
-use super::rule_lifecycle::{RuleStats, PROBATION_RULE_TAG, TASK_RULE_SOURCE_EVENT, TASK_RULE_TAG};
-use super::task_forward::TaskPredictionError;
+use super::rule_gate::HeldOutStats;
+use super::rule_lifecycle::{
+    RuleStats, PROBATION_RULE_TAG, SHADOW_RULE_TAG, TASK_RULE_SOURCE_EVENT, TASK_RULE_TAG,
+};
+use super::task_forward::{GoalKind, TaskPredictionError};
+use super::task_forward_store::TaskForwardModelConfig;
 
 /// Importance assigned to a freshly induced task rule — same convention as
 /// `reflexion.rs`'s F2b consolidated rules (fresh rules start "important",
@@ -56,6 +60,17 @@ const FRESH_RULE_IMPORTANCE: f64 = 8.0;
 /// from >=2 independent mistake sessions via the GovMem promotion gate — a
 /// single settled round here has no equivalent independence check).
 const TASK_RULE_CONFIDENCE: f64 = 0.7;
+
+/// The `goal_kind:<kind>` tag a task-layer rule carries so a later
+/// task-situation pass can tell whether the rule's trigger matches the current
+/// round. Extracted into one function so the write path (this module) and the
+/// v1.54 shadow→promotion match path
+/// (`rule_lifecycle::score_shadow_candidates_for_task`, via `dispatch_engine`'s
+/// settle) share a single definition of the tag format instead of duplicating
+/// it — "signal 命中比對重用 task_rule_induce 的既有邏輯".
+pub fn goal_kind_tag(goal_kind: GoalKind) -> String {
+    format!("goal_kind:{}", goal_kind.as_str())
+}
 
 /// Deterministically synthesize a rule sentence from one settled diff's four
 /// dimensions (design §3.1: `tool_set_error` / `volume_error` /
@@ -195,19 +210,36 @@ pub async fn maybe_induce_task_rule(
         return Ok(None);
     }
 
+    // v1.54 (DESIGN-lwm-calibration §6): a task-induced rule is an inductive
+    // lesson generalized from a SINGLE settled diff — exactly the "outcome /
+    // N≈30 全雜訊候選, shadow-only, 禁注入" class. When the held-out gate is on
+    // it is therefore born as a **shadow candidate** (excluded from injection)
+    // and must earn adoption out-of-sample via
+    // `rule_lifecycle::score_shadow_candidates_for_task` before it can be
+    // injected. Additive: gate OFF ⇒ no shadow tag, no held-out record, so the
+    // pre-v1.54 born-probation behavior is byte-identical. `home_dir` is
+    // `memory_db_path.parent()` (same derivation the engine handle above uses),
+    // so this reuses the exact config location the caller already targets.
+    let held_out_gate_enabled = TaskForwardModelConfig::from_home(home_dir).held_out_gate_enabled;
+
+    let mut tags = vec![
+        TASK_RULE_TAG.to_string(),
+        // WP2 Janus (arXiv:2606.31121): same trial-period convention as
+        // `reflexion.rs` — every freshly induced task rule starts on
+        // probation, settled by the shared `rule_lifecycle` machinery.
+        PROBATION_RULE_TAG.to_string(),
+        goal_kind_tag(error.prediction.state_key.goal_kind),
+    ];
+    if held_out_gate_enabled {
+        tags.push(SHADOW_RULE_TAG.to_string());
+    }
+
     let entry = MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.to_string(),
         content: rule,
         timestamp: chrono::Utc::now(),
-        tags: vec![
-            TASK_RULE_TAG.to_string(),
-            // WP2 Janus (arXiv:2606.31121): same trial-period convention as
-            // `reflexion.rs` — every freshly induced task rule starts on
-            // probation, settled by the shared `rule_lifecycle` machinery.
-            PROBATION_RULE_TAG.to_string(),
-            format!("goal_kind:{}", error.prediction.state_key.goal_kind.as_str()),
-        ],
+        tags,
         embedding: None,
         layer: MemoryLayer::Semantic,
         importance: FRESH_RULE_IMPORTANCE,
@@ -216,11 +248,17 @@ pub async fn maybe_induce_task_rule(
         source_event: TASK_RULE_SOURCE_EVENT.to_string(),
     };
 
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "rule_stats": RuleStats::initial(),
         "source_task_id": error.prediction.task_id,
         "source_round": error.prediction.round,
     });
+    if held_out_gate_enabled {
+        // Seed the prequential birth cursor so the shadow→promotion pass never
+        // validates the rule against its own birth batch (train != test).
+        HeldOutStats::born(chrono::Utc::now().timestamp().max(0) as u64)
+            .merge_into(&mut metadata);
+    }
 
     let meta = TemporalMeta {
         // No `(subject, predicate)` triple — deliberately, same reasoning
@@ -531,5 +569,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2, "both distinct-deviation rules must remain valid");
+    }
+
+    // ── v1.54: shadow birth under the held-out gate ──
+
+    #[tokio::test]
+    async fn induce_gate_on_by_default_births_shadow_with_born_seq() {
+        // No config.toml ⇒ held_out_gate_enabled defaults ON (v1.54), so a
+        // task-induced (inductive) rule is born as a shadow candidate carrying
+        // a prequential birth cursor — it must earn adoption out-of-sample
+        // before it can be injected.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.db");
+        let pred = base_prediction(key());
+        let mut obs = base_observation(ObservationFidelity::Full);
+        obs.observed_tool_classes = BTreeSet::from([ToolClass::Exec, ToolClass::Net]);
+        obs.observed_outcome = ObservedOutcome::Rejected;
+        let error = computed(pred, obs);
+
+        let id = maybe_induce_task_rule(&db_path, &error).await.unwrap().unwrap();
+        let engine = SqliteMemoryEngine::new(&db_path).unwrap();
+        let entry = engine.get_by_id("agnes", &id).await.unwrap().unwrap();
+        assert!(entry.tags.iter().any(|t| t == SHADOW_RULE_TAG), "born shadow under the gate");
+        assert!(entry.tags.iter().any(|t| t == PROBATION_RULE_TAG), "still on the Janus probation");
+        assert!(
+            entry.tags.iter().any(|t| *t == goal_kind_tag(GoalKind::CodingSimple)),
+            "carries the goal_kind signal used for later shadow→promotion matching"
+        );
+        let meta = engine.get_metadata("agnes", &id).await.unwrap().unwrap();
+        let held = HeldOutStats::from_metadata(&meta);
+        assert!(held.born_seq > 0, "gate-on birth seeds a born_seq for the prequential split");
+
+        // Shadow ⇒ excluded from injection until promoted.
+        let sel = super::super::rule_lifecycle::select_task_rules(&engine, "agnes", 5).await;
+        assert!(sel.is_empty(), "a freshly born shadow rule is not injectable");
+    }
+
+    #[tokio::test]
+    async fn induce_gate_off_births_plain_probation_rule_byte_identical() {
+        // Explicit gate OFF ⇒ pre-v1.54 behavior: born probation (not shadow),
+        // no held-out record. select_task_rules injects it immediately.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[task_forward_model]\nheld_out_gate_enabled = false\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("memory.db");
+        let pred = base_prediction(key());
+        let mut obs = base_observation(ObservationFidelity::Full);
+        obs.observed_tool_classes = BTreeSet::from([ToolClass::Exec, ToolClass::Net]);
+        obs.observed_outcome = ObservedOutcome::Rejected;
+        let error = computed(pred, obs);
+
+        let id = maybe_induce_task_rule(&db_path, &error).await.unwrap().unwrap();
+        let engine = SqliteMemoryEngine::new(&db_path).unwrap();
+        let entry = engine.get_by_id("agnes", &id).await.unwrap().unwrap();
+        assert!(!entry.tags.iter().any(|t| t == SHADOW_RULE_TAG), "gate off never mints a shadow tag");
+        let meta = engine.get_metadata("agnes", &id).await.unwrap().unwrap();
+        assert!(
+            meta.get(HeldOutStats::METADATA_KEY).is_none(),
+            "gate off must not seed a held-out record (byte-identical metadata shape)"
+        );
+        let sel = super::super::rule_lifecycle::select_task_rules(&engine, "agnes", 5).await;
+        assert_eq!(sel.len(), 1, "a non-shadow task rule is immediately injectable");
     }
 }

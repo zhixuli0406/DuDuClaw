@@ -103,39 +103,56 @@ pub struct TaskForwardModelConfig {
     /// platform section): gates the calibrated-forward-model scoring path
     /// — proper-scoring (`prediction::calibration::brier_binary`) of every
     /// settled `TaskPrediction.confidence` against whether the round turned
-    /// out well. **Defaults `false`.** This is a strictly additive,
+    /// out well. **Defaults `true` (v1.54).** This is a strictly additive,
     /// domain-agnostic `(confidence, realized_outcome)` scorer — it never
     /// gates dispatch/accept behavior, only whether `brier_score` gets
     /// computed and persisted (a nullable column / nullable transition
-    /// fields). `false` ⇒ `settle_prediction` and `build_transition_write`
-    /// skip the calculation entirely, leaving those fields `NULL`/`None` —
-    /// byte-identical to the pre-calibration behavior.
+    /// fields). Nothing here runs unless the outer `enabled` master switch
+    /// (still default `false`) is on, so turning this default on cannot
+    /// change any agent's behavior until the forward model itself is enabled.
+    /// Set `false` to keep the forward model running while skipping the
+    /// calibration calculation entirely (leaving those fields `NULL`/`None`,
+    /// byte-identical to the pre-calibration behavior).
     pub calibration_enabled: bool,
-    /// WP-P3 (`commercial/docs/DESIGN-lwm-calibration-2026-08-10.md` §1.4,
-    /// §6): gates the held-out rule gate — the anti-overfitting adoption
-    /// authority that turns self-learning into "reflection PROPOSES a
-    /// candidate, an external numeric oracle DECIDES adoption". **Defaults
-    /// `false`.** When off, every wired call site (`reflexion::consolidate_group`
-    /// shadow-birth, `rule_lifecycle::select_*` shadow exclusion, the
-    /// `dispatch_engine` settle held-out promotion/keep-better path) is a
-    /// complete no-op — no shadow tags are ever minted and settlement runs the
-    /// unchanged `ErrorCategory`-credit lifecycle, so behavior is
-    /// byte-identical to before this change. See `prediction::rule_gate`.
+    /// WP-P3 + v1.54 shadow→promotion pass
+    /// (`commercial/docs/DESIGN-lwm-calibration-2026-08-10.md` §1.4, §6):
+    /// gates the held-out rule gate — the anti-overfitting adoption authority
+    /// that turns self-learning into "reflection PROPOSES a candidate, an
+    /// external numeric oracle DECIDES adoption". **Defaults `true`
+    /// (v1.54).** When on, inductive/task-layer lessons are born as shadow
+    /// candidates (`reflexion::consolidate_group`, `task_rule_induce`),
+    /// excluded from injection (`rule_lifecycle::select_*`), scored
+    /// out-of-sample every settle (`dispatch_engine`'s injected-rule held-out
+    /// path AND the shadow→promotion prequential pass), and promoted only
+    /// when their record beats the frozen climatology baseline. Nothing here
+    /// runs unless the outer `enabled` master switch (still default `false`)
+    /// is on. Set `false` to keep the forward model running while settlement
+    /// uses the unchanged `ErrorCategory`-credit lifecycle and no shadow tags
+    /// are ever minted (byte-identical to the pre-WP3 behavior). See
+    /// `prediction::rule_gate`.
     pub held_out_gate_enabled: bool,
 }
 
 impl Default for TaskForwardModelConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // v1.54: the calibrated forward model is a default-ON platform
+            // capability. The master switch is on so predict-act-verify,
+            // proper-scoring, and the held-out rule gate actually run for every
+            // agent out of the box. `cold_start_llm` stays off, so cold starts
+            // remain zero-LLM (statistical/prior degradation only). Operators
+            // opt out per-deployment via `config.toml [task_forward_model]` or
+            // the dashboard toggle.
+            enabled: true,
             cold_start_llm: false,
             min_samples: MIN_SAMPLES,
             mature_n: MATURE_N,
             foresight_tau: super::foresight_gate::DEFAULT_FORESIGHT_TAU,
             foresight_recent_k: super::foresight_gate::DEFAULT_FORESIGHT_RECENT_K,
             rule_induction: true,
-            calibration_enabled: false,
-            held_out_gate_enabled: false,
+            // calibrated forward model + held-out rule gate: on with the master.
+            calibration_enabled: true,
+            held_out_gate_enabled: true,
         }
     }
 }
@@ -143,7 +160,8 @@ impl Default for TaskForwardModelConfig {
 impl TaskForwardModelConfig {
     /// Load `[task_forward_model]` from `<home>/config.toml`. Absent /
     /// malformed section, or absent / malformed `config.toml` ⇒
-    /// [`Self::default`] (`enabled = false`).
+    /// [`Self::default`] (`enabled = true` as of v1.54 — the capability is
+    /// on out of the box; operators opt out explicitly).
     pub fn from_home(home_dir: &Path) -> Self {
         let path = home_dir.join("config.toml");
         let Ok(content) = std::fs::read_to_string(&path) else {
@@ -689,6 +707,55 @@ impl TaskForwardModel {
         .flatten()
     }
 
+    /// Frozen / slow-moving **climatology** estimate of this agent's
+    /// high-risk base rate: the fraction of its settled predictions whose
+    /// `category` is Significant/Critical, over ALL of the agent's settled
+    /// history in `task_prediction_log`.
+    ///
+    /// Used as the frozen baseline the held-out shadow→promotion gate must
+    /// beat (DESIGN-lwm-calibration-2026-08-10.md §1.3: the RPSS / gate
+    /// baseline must be frozen or slow-moving, else the denominator drifts and
+    /// the skill claim is unfalsifiable). This is a **climatology
+    /// approximation, not an exact frozen prior** — an all-history proportion
+    /// moves negligibly per new sample once N is large, which is the honest
+    /// "persistent count" fallback the design permits ("若無現成凍結基準,用
+    /// 簡單持久化累積比例,並在 doc 註明其為 climatology 近似").
+    ///
+    /// Returns `None` when fewer than `min_samples` settled rows exist (too
+    /// little history to trust a climatology; the caller falls back to the
+    /// domain-agnostic 0.5 coin-flip default). Never panics: a DB/read failure
+    /// degrades to `None`, same posture as [`Self::get_prediction`].
+    pub async fn high_risk_base_rate(&self, agent_id: &str, min_samples: u64) -> Option<f64> {
+        let db_path = self.db_path.clone();
+        let agent = agent_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).ok()?;
+            let (hi, total): (i64, i64) = conn
+                .query_row(
+                    "SELECT
+                       SUM(CASE WHEN category IN ('significant','critical') THEN 1 ELSE 0 END),
+                       COUNT(*)
+                     FROM task_prediction_log
+                     WHERE agent_id = ?1 AND settled_at IS NOT NULL AND category IS NOT NULL",
+                    params![agent],
+                    |row| {
+                        // SUM(...) is NULL when zero rows match — coalesce to 0.
+                        let hi = row.get::<_, Option<i64>>(0)?.unwrap_or(0);
+                        let total: i64 = row.get(1)?;
+                        Ok((hi, total))
+                    },
+                )
+                .ok()?;
+            if total <= 0 || (total as u64) < min_samples {
+                return None;
+            }
+            Some(hi as f64 / total as f64)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Append an unsettled prediction row (`observation_json = NULL`).
     /// Idempotent on `(task_id, round)` via `INSERT OR REPLACE` semantics
     /// through the unique index — a re-dispatch of the same round
@@ -1105,10 +1172,11 @@ mod tests {
     // ── WP-A9: TaskForwardModelConfig ──
 
     #[test]
-    fn task_forward_model_config_defaults_to_disabled() {
+    fn task_forward_model_config_defaults_to_enabled() {
+        // v1.54: the forward model is a default-ON platform capability.
         let dir = tempfile::tempdir().unwrap();
         let cfg = TaskForwardModelConfig::from_home(dir.path());
-        assert!(!cfg.enabled, "no config.toml ⇒ enabled defaults to false");
+        assert!(cfg.enabled, "no config.toml ⇒ enabled defaults to true (v1.54)");
         assert_eq!(cfg, TaskForwardModelConfig::default());
     }
 
@@ -1162,11 +1230,20 @@ mod tests {
         assert!(!cfg.rule_induction);
     }
 
-    // ── WP-P2: calibration_enabled sub-switch ──
+    // ── WP-P2 / v1.54: calibration_enabled + held_out_gate_enabled default ON ──
 
     #[test]
-    fn task_forward_model_config_calibration_defaults_to_disabled() {
-        assert!(!TaskForwardModelConfig::default().calibration_enabled);
+    fn task_forward_model_config_calibration_and_held_out_default_on() {
+        // v1.54: the whole capability is default ON — master switch plus both
+        // learning gates — so predict-act-verify, proper-scoring, and the
+        // held-out rule gate run for every agent out of the box.
+        let d = TaskForwardModelConfig::default();
+        assert!(d.calibration_enabled, "v1.54: calibration_enabled defaults ON");
+        assert!(d.held_out_gate_enabled, "v1.54: held_out_gate_enabled defaults ON");
+        assert!(d.enabled, "v1.54: the master switch defaults ON too");
+
+        // A config.toml with the section present but these keys unset inherits
+        // the ON default (serde default) — absent == ON, per the v1.54 design.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
@@ -1174,23 +1251,34 @@ mod tests {
         )
         .unwrap();
         let cfg = TaskForwardModelConfig::from_home(dir.path());
-        assert!(
-            !cfg.calibration_enabled,
-            "calibration_enabled must stay false unless explicitly set"
-        );
+        assert!(cfg.calibration_enabled, "unset calibration key inherits the ON default");
+        assert!(cfg.held_out_gate_enabled, "unset held-out key inherits the ON default");
     }
 
     #[test]
-    fn task_forward_model_config_calibration_can_be_enabled() {
+    fn task_forward_model_config_calibration_and_held_out_can_be_disabled() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
-            "[task_forward_model]\nenabled = true\ncalibration_enabled = true\n",
+            "[task_forward_model]\nenabled = true\ncalibration_enabled = false\n\
+             held_out_gate_enabled = false\n",
         )
         .unwrap();
         let cfg = TaskForwardModelConfig::from_home(dir.path());
         assert!(cfg.enabled);
+        assert!(!cfg.calibration_enabled, "explicit off is honored");
+        assert!(!cfg.held_out_gate_enabled, "explicit off is honored");
+    }
+
+    #[test]
+    fn task_forward_model_absent_config_file_defaults_on() {
+        // No config.toml at all ⇒ Self::default() ⇒ whole capability ON (v1.54):
+        // master switch and both learning gates. "absent == ON".
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TaskForwardModelConfig::from_home(dir.path());
         assert!(cfg.calibration_enabled);
+        assert!(cfg.held_out_gate_enabled);
+        assert!(cfg.enabled);
     }
 
     // ── WP-P2: settle_prediction brier_score persistence ──
