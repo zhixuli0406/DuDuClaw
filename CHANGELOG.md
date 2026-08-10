@@ -16,11 +16,16 @@
   Bonferroni 校正）贏過凍結基準才轉正，轉正後表現退步會自動降級或退休（keep-better，
   歷史保留不刪除）。系統只給三種誠實結論：`SUPPORTED` / `CANDIDATE` /
   `INDISTINGUISHABLE_FROM_LUCK`。樣本不夠時「還不知道」是合法輸出，不會為了顯得
-  有用硬給模糊的「初步驗證」。三層設定皆預設關閉、逐層獨立開啟，全數為 opt-in、
-  無破壞性變更：`config.toml`/`agent.toml [task_forward_model] enabled` /
-  `calibration_enabled` / `held_out_gate_enabled`。能力與具體業務無關，任何 AI
-  員工（客服、coding、操盤等）皆可啟用。見
+  有用硬給模糊的「初步驗證」。shadow 候選的樣本外晉升閉環已接通：每次任務結算對
+  觸發命中的 shadow 候選記一筆樣本外命中，打贏凍結的高風險基準率就自動轉正注入。
+  這套能力 **v1.54 起預設開啟**（`enabled` / `calibration_enabled` /
+  `held_out_gate_enabled` 三層皆預設 `true`，冷啟動零 LLM），每個 AI 員工開箱即用；
+  可在 dashboard「進階設定 → 預測校準」或 `config.toml [task_forward_model]` 逐層關掉，
+  關掉那一層即回到與本功能之前 byte-identical 的行為。能力與具體業務無關，任何 AI
+  員工（客服、coding、操盤等）皆適用。見
   [`docs/features/39-calibrated-forward-model.md`](docs/features/39-calibrated-forward-model.md)。
+- Dashboard「進階設定 → 預測校準」分頁：admin 可即時切換上述三個開關（`task_forward_model.get`
+  / `.set` RPC，部分更新保留 `config.toml` 其他區段；`enabled` 變更需重啟 gateway 生效）。
 
 ## [1.53.0] - 2026-08-07 — 任務層世界模型與 AEE 進化引擎
 

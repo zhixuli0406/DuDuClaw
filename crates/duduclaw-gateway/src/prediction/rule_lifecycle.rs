@@ -473,6 +473,173 @@ pub async fn settle_injected_rules_held_out(
     retired
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// v1.54 debt — shadow → promotion prequential scoring pass
+// (DESIGN-lwm-calibration-2026-08-10.md §6). This is the OTHER half of the
+// held-out loop: `settle_injected_rules_held_out` above scores rules that were
+// *injected* (a hit there = a GOOD outcome, because an injected rule is
+// credited when the turn went well). This pass scores rules that are still
+// *shadow* candidates — never injected, so they cannot be validated as helpers;
+// instead they are validated as **risk predictors**. A shadow rule carries the
+// implicit, falsifiable prediction "when my signal matches the situation, this
+// is a HIGH-RISK situation", so its out-of-sample hit polarity is the OPPOSITE
+// of the injected path's.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Out-of-sample hit polarity for a **shadow** candidate rule.
+///
+/// A shadow rule predicts "high-risk when my signal matches". So the settled
+/// outcome is a **hit** when the round actually turned out high-risk
+/// (`Significant`/`Critical`) — the trigger correctly flagged risk — and a
+/// **miss** otherwise (`Negligible`/`Moderate`, i.e. a false alarm).
+///
+/// This is deliberately the mirror image of [`settle_injected_rules_held_out`]'s
+/// hit rule (`Negligible`/`Moderate` ⇒ hit there): an injected rule is a helper
+/// scored on whether the turn went well; a shadow rule is a risk predictor
+/// scored on whether the predicted risk materialized. Pure — deterministic
+/// mapping, no LLM, no I/O.
+pub fn score_shadow_candidate(category: ErrorCategory) -> bool {
+    matches!(category, ErrorCategory::Significant | ErrorCategory::Critical)
+}
+
+/// Fold one out-of-sample observation into a shadow candidate's
+/// [`HeldOutStats`] and run the numeric gate, returning the updated record and
+/// the [`GateDecision`]. Near-pure: no I/O, no LLM — the caller persists the
+/// returned stats.
+///
+/// Prequential time split (design §6 item 2): the observation is only counted
+/// when `now_seq > stats.born_seq`, so a candidate's own birth batch never
+/// validates it (train != test). The gate decision is still computed on the
+/// (possibly unchanged) record so a same-instant birth-batch call cleanly
+/// resolves to [`GateDecision::Shadow`] via the `n < MIN` branch rather than a
+/// special case here.
+pub fn update_held_out_and_gate(
+    mut stats: HeldOutStats,
+    category: ErrorCategory,
+    now_seq: u64,
+    k_concurrent_candidates: usize,
+    baseline_hit_rate: f64,
+) -> (HeldOutStats, GateDecision) {
+    if now_seq > stats.born_seq {
+        stats.record(score_shadow_candidate(category));
+    }
+    let decision = evaluate_rule_gate(&stats, k_concurrent_candidates, baseline_hit_rate);
+    (stats, decision)
+}
+
+/// Result of one [`score_shadow_candidates_for_task`] pass — telemetry for the
+/// caller to log; carries no control-flow authority of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadowScoreOutcome {
+    /// How many shadow candidates were signal-matched and scored this pass.
+    pub scored: usize,
+    /// Ids promoted out of shadow this pass ([`SHADOW_RULE_TAG`] removed).
+    pub promoted: Vec<String>,
+    /// Ids retired this pass ([`RETIRED_RULE_TAG`] + low importance).
+    pub retired: Vec<String>,
+}
+
+/// v1.54 shadow → promotion pass. Reached only when
+/// `[task_forward_model] held_out_gate_enabled = true` (the caller branches on
+/// that flag; gate-off never calls this, so the gate-off settle path is
+/// byte-identical).
+///
+/// For every **active shadow** task-layer rule ([`TASK_RULE_SOURCE_EVENT`],
+/// carrying [`SHADOW_RULE_TAG`], not [`RETIRED_RULE_TAG`]) whose signal matches
+/// the current task situation — the `match_tag` is the current round's
+/// `goal_kind:<kind>` tag, built by
+/// [`task_rule_induce::goal_kind_tag`](super::task_rule_induce::goal_kind_tag),
+/// the SAME convention the rule was born with (no duplicated format) — record
+/// one out-of-sample observation ([`score_shadow_candidate`] polarity), persist
+/// the updated [`HeldOutStats`], and act on the gate:
+/// - [`GateDecision::Inject`] → **promote**: remove [`SHADOW_RULE_TAG`] so
+///   `select_task_rules` starts injecting it (its record beat the frozen
+///   baseline out-of-sample).
+/// - [`GateDecision::Retire`] → retire (spent risk predictor: even the
+///   optimistic upper bound is below baseline).
+/// - [`GateDecision::Demote`] / [`GateDecision::Shadow`] → leave it shadow
+///   (not promotable / not yet decidable — it is already un-injected, so
+///   keep-better "stop injecting" is a no-op here).
+///
+/// `k` for the Bonferroni correction is the count of active shadow candidates
+/// in this family — more candidates trialed at once makes promotion strictly
+/// harder. Every failure path logs and continues; scoring a shadow candidate
+/// is an enhancement, never a settle blocker.
+pub async fn score_shadow_candidates_for_task(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    match_tag: &str,
+    category: ErrorCategory,
+    baseline_hit_rate: f64,
+    now_seq: u64,
+) -> ShadowScoreOutcome {
+    let rows = match engine
+        .list_valid_by_source_event(agent_id, TASK_RULE_SOURCE_EVENT, CANDIDATE_SCAN_CAP)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(agent = %agent_id, "shadow-scoring: list task rules failed: {e}");
+            return ShadowScoreOutcome::default();
+        }
+    };
+
+    // Active shadow candidates: the concurrent trial family for Bonferroni.
+    let shadow: Vec<(String, Vec<String>, serde_json::Value)> = rows
+        .into_iter()
+        .filter(|(entry, _)| {
+            entry.tags.iter().any(|t| t == SHADOW_RULE_TAG)
+                && !entry.tags.iter().any(|t| t == RETIRED_RULE_TAG)
+        })
+        .map(|(entry, meta)| (entry.id, entry.tags, meta))
+        .collect();
+    let k = shadow.len().max(1);
+
+    let mut out = ShadowScoreOutcome::default();
+    for (id, tags, mut metadata) in shadow {
+        // Signal match: only score a shadow rule whose trigger matches this
+        // round's task situation (goal_kind tag equality — the reused
+        // task_rule_induce convention).
+        if !tags.iter().any(|t| t == match_tag) {
+            continue;
+        }
+
+        let stats = HeldOutStats::from_metadata(&metadata);
+        let (updated, decision) =
+            update_held_out_and_gate(stats, category, now_seq, k, baseline_hit_rate);
+        updated.merge_into(&mut metadata);
+        if let Err(e) = engine.update_metadata(agent_id, &id, &metadata).await {
+            warn!(agent = %agent_id, rule = %id, "shadow-scoring: write metadata failed: {e}");
+            continue;
+        }
+        out.scored += 1;
+
+        match decision {
+            GateDecision::Inject => match engine.remove_tag(agent_id, &id, SHADOW_RULE_TAG).await {
+                Ok(true) => out.promoted.push(id.clone()),
+                Ok(false) => {}
+                Err(e) => warn!(agent = %agent_id, rule = %id, "shadow-scoring: promote failed: {e}"),
+            },
+            GateDecision::Retire => {
+                match engine
+                    .set_importance_and_add_tag(agent_id, &id, RETIRED_IMPORTANCE, RETIRED_RULE_TAG)
+                    .await
+                {
+                    Ok(true) => out.retired.push(id.clone()),
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(agent = %agent_id, rule = %id, "shadow-scoring: retire failed: {e}")
+                    }
+                }
+            }
+            // Already un-injected: nothing to stop injecting (Demote), and
+            // Shadow means "not decidable yet" — leave the row as-is.
+            GateDecision::Demote | GateDecision::Shadow => {}
+        }
+    }
+    out
+}
+
 /// Fire-and-forget settlement used by the channel-reply outcome path.
 ///
 /// Detached so it never delays reply delivery; failures only log.
@@ -976,5 +1143,234 @@ mod tests {
             &engine.get_metadata(agent, &id).await.unwrap().unwrap(),
         );
         assert_eq!(held.oos_hits, 1, "an out-of-sample observation (now_seq > born_seq) counts");
+    }
+
+    // ── v1.54: shadow → promotion prequential scoring pass ────────────────
+
+    /// Score-polarity of a shadow (risk-predictor) candidate is the mirror of
+    /// the injected (helper) path.
+    #[test]
+    fn score_shadow_candidate_hits_on_high_risk_only() {
+        assert!(score_shadow_candidate(ErrorCategory::Significant));
+        assert!(score_shadow_candidate(ErrorCategory::Critical));
+        assert!(!score_shadow_candidate(ErrorCategory::Negligible));
+        assert!(!score_shadow_candidate(ErrorCategory::Moderate));
+    }
+
+    #[test]
+    fn update_held_out_and_gate_skips_birth_batch_but_still_evaluates() {
+        let born = HeldOutStats::born(1000);
+        // now_seq == born_seq → not recorded; n = 0 → Shadow.
+        let (s, d) = update_held_out_and_gate(born, ErrorCategory::Critical, 1000, 1, 0.3);
+        assert_eq!(s.total(), 0, "birth-batch observation not counted");
+        assert_eq!(d, GateDecision::Shadow);
+    }
+
+    /// Store a shadow task-layer rule carrying a `goal_kind` tag and a
+    /// pre-seeded held-out record — the fixture the shadow→promotion pass
+    /// consumes.
+    async fn store_shadow_task_rule(
+        engine: &SqliteMemoryEngine,
+        agent: &str,
+        goal_kind_tag: &str,
+        held: HeldOutStats,
+    ) -> String {
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: format!("shadow risk rule for {goal_kind_tag}"),
+            timestamp: chrono::Utc::now(),
+            tags: vec![
+                TASK_RULE_TAG.to_string(),
+                SHADOW_RULE_TAG.to_string(),
+                goal_kind_tag.to_string(),
+            ],
+            embedding: None,
+            layer: MemoryLayer::Semantic,
+            importance: 8.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: TASK_RULE_SOURCE_EVENT.to_string(),
+        };
+        let mut metadata = serde_json::json!({ "rule_stats": RuleStats::initial() });
+        held.merge_into(&mut metadata);
+        let meta = TemporalMeta {
+            metadata: Some(metadata),
+            ..Default::default()
+        };
+        engine.store_temporal(agent, entry, meta).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn shadow_pass_promotes_after_enough_high_risk_hits() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-shadow-promote";
+        let tag = "goal_kind:coding_simple";
+        // Born at 100; every settle below is at now=200 (strictly after) so it
+        // counts as out-of-sample.
+        let id = store_shadow_task_rule(&engine, agent, tag, HeldOutStats::born(100)).await;
+
+        // Frozen baseline 0.3; 10 high-risk (Critical) settles → the rule's
+        // trigger keeps correctly flagging risk → its Wilson lower bound clears
+        // the baseline and it is promoted out of shadow.
+        for _ in 0..10 {
+            score_shadow_candidates_for_task(&engine, agent, tag, ErrorCategory::Critical, 0.3, 200)
+                .await;
+        }
+
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(
+            !entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
+            "a strong out-of-sample risk-prediction record is promoted out of shadow"
+        );
+        assert!(
+            !entry.tags.iter().any(|t| t == RETIRED_RULE_TAG),
+            "promotion is not retirement"
+        );
+        // Now selectable for injection.
+        let sel = select_task_rules(&engine, agent, TASK_RULE_INJECTION_LIMIT).await;
+        assert!(sel.iter().any(|r| r.id == id), "promoted rule becomes injectable");
+    }
+
+    #[tokio::test]
+    async fn shadow_pass_undetermined_record_stays_shadow() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-shadow-undetermined";
+        let tag = "goal_kind:research_or_qa";
+        let id = store_shadow_task_rule(&engine, agent, tag, HeldOutStats::born(0)).await;
+
+        // 5 hits + 5 misses at baseline 0.5 → CI straddles the baseline →
+        // not decidable → stays a shadow candidate (neither promoted nor
+        // retired).
+        for _ in 0..5 {
+            score_shadow_candidates_for_task(&engine, agent, tag, ErrorCategory::Critical, 0.5, 10)
+                .await;
+        }
+        for _ in 0..5 {
+            score_shadow_candidates_for_task(
+                &engine, agent, tag, ErrorCategory::Negligible, 0.5, 10,
+            )
+            .await;
+        }
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(entry.tags.iter().any(|t| t == SHADOW_RULE_TAG), "still shadow");
+        assert!(!entry.tags.iter().any(|t| t == RETIRED_RULE_TAG), "not retired");
+    }
+
+    #[tokio::test]
+    async fn shadow_pass_retires_persistent_false_alarm() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-shadow-retire";
+        let tag = "goal_kind:coding_simple";
+        let id = store_shadow_task_rule(&engine, agent, tag, HeldOutStats::born(0)).await;
+
+        // Baseline 0.5; 16 low-risk (Negligible) settles = 16 false alarms →
+        // even the optimistic upper bound falls below baseline → retire.
+        for _ in 0..16 {
+            score_shadow_candidates_for_task(
+                &engine, agent, tag, ErrorCategory::Negligible, 0.5, 10,
+            )
+            .await;
+        }
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(
+            entry.tags.iter().any(|t| t == RETIRED_RULE_TAG),
+            "a spent false-alarm risk predictor is retired"
+        );
+        assert!(entry.importance < 2.0, "importance demoted on retirement");
+    }
+
+    #[tokio::test]
+    async fn shadow_pass_skips_birth_batch() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-shadow-birth";
+        let tag = "goal_kind:coding_simple";
+        let id = store_shadow_task_rule(&engine, agent, tag, HeldOutStats::born(500)).await;
+
+        // now_seq == born_seq → birth batch, not counted.
+        score_shadow_candidates_for_task(&engine, agent, tag, ErrorCategory::Critical, 0.3, 500)
+            .await;
+        let held =
+            HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
+        assert_eq!(held.total(), 0, "birth-batch settle (now_seq <= born_seq) must not count");
+
+        // A strictly later settle IS counted.
+        score_shadow_candidates_for_task(&engine, agent, tag, ErrorCategory::Critical, 0.3, 501)
+            .await;
+        let held =
+            HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
+        assert_eq!(held.oos_hits, 1, "an out-of-sample settle (now_seq > born_seq) counts");
+    }
+
+    #[tokio::test]
+    async fn shadow_pass_larger_k_makes_promotion_harder() {
+        // A borderline 9/1 record promotes at k=1 but not once the concurrent
+        // shadow-candidate family is large (Bonferroni). born_seq is set above
+        // now_seq so the pass's own observation is a birth-batch skip, leaving
+        // the pre-seeded 9/1 record intact — the gate is then evaluated on
+        // exactly 9/1 in both cases, isolating the effect of k.
+        let strong = HeldOutStats {
+            oos_hits: 9,
+            oos_misses: 1,
+            born_seq: 1000,
+            recent: vec![true; 8],
+        };
+        let tag = "goal_kind:coding_simple";
+
+        // k = 1: only the target shadow rule exists → promoted.
+        let e1 = SqliteMemoryEngine::in_memory().unwrap();
+        let a1 = "agent-k1";
+        let t1 = store_shadow_task_rule(&e1, a1, tag, strong.clone()).await;
+        score_shadow_candidates_for_task(&e1, a1, tag, ErrorCategory::Critical, 0.5, 500).await;
+        let entry = e1.get_by_id(a1, &t1).await.unwrap().unwrap();
+        assert!(
+            !entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
+            "at k=1 the 9/1 record promotes"
+        );
+
+        // k = 20: 19 extra active shadow candidates widen the Bonferroni z →
+        // the SAME 9/1 record no longer clears the baseline → stays shadow.
+        let e2 = SqliteMemoryEngine::in_memory().unwrap();
+        let a2 = "agent-k20";
+        let t2 = store_shadow_task_rule(&e2, a2, tag, strong).await;
+        for _ in 0..19 {
+            store_shadow_task_rule(&e2, a2, tag, HeldOutStats::born(0)).await;
+        }
+        score_shadow_candidates_for_task(&e2, a2, tag, ErrorCategory::Critical, 0.5, 500).await;
+        let entry = e2.get_by_id(a2, &t2).await.unwrap().unwrap();
+        assert!(
+            entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
+            "a large concurrent-candidate family must block a promotion that passed at k=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_pass_ignores_non_matching_signal() {
+        // A shadow rule whose goal_kind tag does NOT match the current task
+        // situation is left completely untouched — no held-out record is
+        // written, so it can never be promoted or retired by an unrelated
+        // situation.
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-shadow-nomatch";
+        let id =
+            store_shadow_task_rule(&engine, agent, "goal_kind:coding_simple", HeldOutStats::born(0))
+                .await;
+
+        let out = score_shadow_candidates_for_task(
+            &engine,
+            agent,
+            "goal_kind:ops_or_external", // different situation
+            ErrorCategory::Critical,
+            0.3,
+            10,
+        )
+        .await;
+        assert_eq!(out.scored, 0, "a non-matching shadow rule is not scored");
+
+        let held =
+            HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
+        assert_eq!(held.total(), 0, "no out-of-sample record written for a non-match");
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(entry.tags.iter().any(|t| t == SHADOW_RULE_TAG), "still shadow, untouched");
     }
 }

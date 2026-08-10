@@ -10,8 +10,9 @@ DuDuClaw 1.54 起，任何一位 AI 員工都可以在動手之前，先對「�
 
 以前 AI 員工「學到教訓」靠的是自己反省、自己判斷有沒有道理；現在多了
 一道關卡：教訓要嘛有工具紀錄或稽核可查證，可以直接採用；要嘛先當候選，
-用之後真實發生的案例記命中率，命中率打贏基準才准轉正。全部功能預設
-關閉，開啟前 AI 員工行為完全不變。
+用之後真實發生的案例記命中率，命中率打贏基準才准轉正。v1.54 起這套能力
+預設開啟，每個 AI 員工開箱即用；不想要的人可以在設定裡整套或逐層關掉，
+關掉那一層的行為就跟沒有這個功能之前完全一樣。
 
 ## 這解決三個問題
 
@@ -78,17 +79,17 @@ AI 員工自己講的結果）當裁判，計算 Brier score（二元判斷）�
 三個開關都在 `[task_forward_model]` 底下，逐層打開：
 
 ```toml
-# config.toml（全域）或 agent.toml（單一 AI 員工）
+# config.toml（全域）。也可在 dashboard →「進階設定 → 預測校準」直接切換。
 [task_forward_model]
-enabled = true                # 總開關：任務層預測本身，預設 false
-calibration_enabled = true    # 打分：Brier/RPS + Murphy 分解，預設 false
-held_out_gate_enabled = true  # 學習閘：反思候選要先過樣本外驗證，預設 false
+enabled = true                # 總開關：任務層預測本身，v1.54 預設 true
+calibration_enabled = true    # 打分：Brier/RPS + Murphy 分解，v1.54 預設 true
+held_out_gate_enabled = true  # 學習閘：反思候選要先過樣本外驗證，v1.54 預設 true
 ```
 
-三層獨立疊加，不強制一起開。只開 `enabled` 就只是單純做預測記錄；
-加開 `calibration_enabled` 才會開始打分、產生誠實標籤；再加開
-`held_out_gate_enabled` 才會影響自我學習的教訓能不能被注入。任何一層
-維持 `false`，那一層的行為跟沒有這個功能之前完全一樣（byte-identical）。
+三層獨立疊加。`enabled` 做預測記錄；`calibration_enabled` 開始打分、產生
+誠實標籤；`held_out_gate_enabled` 影響自我學習的教訓能不能被注入。三層
+v1.54 都預設開;把任何一層改成 `false`，那一層的行為就跟沒有這個功能之前
+完全一樣（byte-identical），方便逐層關掉。
 
 ## 舉個例子：不限於某一種 AI 員工
 

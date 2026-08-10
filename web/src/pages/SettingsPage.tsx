@@ -16,6 +16,7 @@ import {
   KeyRound,
   Bot,
   Share2,
+  Gauge,
 } from 'lucide-react';
 import {
   SettingsShell,
@@ -37,12 +38,13 @@ import { DoctorTab } from '@/components/settings/sections/DoctorTab';
 import { BrowserTab } from '@/components/settings/sections/BrowserTab';
 import { AutomationTab } from '@/components/settings/sections/AutomationTab';
 import { DelegationTab } from '@/components/settings/sections/DelegationTab';
+import { CalibrationTab } from '@/components/settings/sections/CalibrationTab';
 
 /** Settings sub-tab whitelist (spec §5.3 式3). `?tab=` is validated against this
  *  set; unknown values fall back to `general`. */
 const VALID_TABS = [
   'general', 'account', 'system', 'container', 'heartbeat', 'voice',
-  'proactive', 'automation', 'delegation', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser',
+  'proactive', 'automation', 'delegation', 'calibration', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser',
 ] as const;
 type TabId = (typeof VALID_TABS)[number];
 
@@ -79,8 +81,9 @@ export function SettingsPage() {
   // gates `delegation.get/set` too — this is the courtesy layer.
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
 
+  const ADMIN_ONLY_TABS = ['delegation', 'calibration'];
   const tabAllowed = (tab: string) =>
-    (VALID_TABS as readonly string[]).includes(tab) && (tab !== 'delegation' || isAdmin);
+    (VALID_TABS as readonly string[]).includes(tab) && (!ADMIN_ONLY_TABS.includes(tab) || isAdmin);
   const activeTab: TabId = tabAllowed(tabParam ?? '') ? (tabParam as TabId) : 'general';
   const setTab = (next: string) => {
     const nextParams = new URLSearchParams(searchParams);
@@ -111,7 +114,10 @@ export function SettingsPage() {
         { value: 'heartbeat', label: t('settings.heartbeat'), icon: HeartPulse },
         { value: 'automation', label: t('settings.automation.tab'), icon: Bot },
         ...(isAdmin
-          ? [{ value: 'delegation', label: t('settings.delegation'), icon: Share2 }]
+          ? [
+              { value: 'delegation', label: t('settings.delegation'), icon: Share2 },
+              { value: 'calibration', label: t('settings.calibration'), icon: Gauge },
+            ]
           : []),
         { value: 'autopilot', label: t('settings.autopilot'), icon: Workflow },
         { value: 'skillSynthesis', label: t('settings.skillSynthesis'), icon: Sparkles },
@@ -156,6 +162,15 @@ export function SettingsPage() {
             description={t('settings.delegation.desc')}
           >
             <DelegationTab />
+          </SettingsTab>
+        )}
+        {isAdmin && (
+          <SettingsTab
+            value="calibration"
+            title={t('settings.calibration')}
+            description={t('settings.calibration.desc')}
+          >
+            <CalibrationTab />
           </SettingsTab>
         )}
         <SettingsTab value="autopilot" title={t('settings.autopilot')} description={t('settings.autopilot.desc')}>

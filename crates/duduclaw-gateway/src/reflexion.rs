@@ -897,10 +897,17 @@ mod tests {
 
     #[tokio::test]
     async fn held_out_gate_off_is_byte_identical_no_shadow_no_held_out_record() {
-        // No config.toml → gate off → the consolidation metadata/tags must be
-        // exactly what the pre-WP3 code produced (no shadow tag, no
-        // held_out_stats key).
+        // Explicit gate OFF → the consolidation metadata/tags must be exactly
+        // what the pre-WP3 code produced (no shadow tag, no held_out_stats
+        // key). v1.54 flipped the held_out_gate default to ON, so a test that
+        // wants the OFF path must now say so explicitly rather than relying on
+        // an absent config (absent == ON since v1.54).
         let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[task_forward_model]\nheld_out_gate_enabled = false\n",
+        )
+        .unwrap();
         let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
         let mem_path = dir.path().join("memory.db");
         record_n(&nb, "agent-off", MistakeCategory::Capability, 3, "");
