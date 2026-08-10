@@ -218,19 +218,45 @@ async fn consolidate_group(
         return Ok(None);
     }
 
+    // WP-P3 held-out rule gate (design §1.4, §6): read once from
+    // `<home>/config.toml`. Defaults `false` ⇒ everything below is
+    // byte-identical to the pre-WP3 behavior (no shadow tag, no held-out
+    // record seeded). `consolidate_group` already receives `home_dir`, so no
+    // signature change to `maybe_consolidate` or its callers is needed.
+    let held_out_gate_enabled =
+        crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(home_dir)
+            .held_out_gate_enabled;
+    // Domain-agnostic process/outcome classification (rule_gate::classify_lesson):
+    // a lesson grounded in programmatic evidence (tool error / assertion) is
+    // Verified and injects on the normal path; an evidence-less inductive
+    // lesson is born as a shadow candidate and must earn adoption out-of-sample
+    // through the held-out gate. In the current F2b pipeline `maybe_consolidate`
+    // has already filtered to evidence-backed (verified) mistakes, so this is
+    // Verified today — the shadow branch is the correct, defensive wiring for
+    // any future evidence-less consolidation source (design §6 item 1).
+    let has_evidence = mistakes.iter().any(|m| m.evidence.is_some());
+    let born_as_shadow = held_out_gate_enabled
+        && crate::prediction::rule_gate::classify_lesson(has_evidence)
+            == crate::prediction::rule_gate::LessonKind::Inductive;
+
+    let mut tags = vec![
+        "reflexion".to_string(),
+        "consolidated".to_string(),
+        format!("category:{}", category.as_str()),
+        // WP2 Janus (arXiv:2606.31121): every freshly consolidated rule
+        // starts on a trial period — see `prediction::rule_lifecycle`.
+        PROBATION_RULE_TAG.to_string(),
+    ];
+    if born_as_shadow {
+        tags.push(crate::prediction::rule_lifecycle::SHADOW_RULE_TAG.to_string());
+    }
+
     let entry = MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.to_string(),
         content: rule.clone(),
         timestamp: chrono::Utc::now(),
-        tags: vec![
-            "reflexion".to_string(),
-            "consolidated".to_string(),
-            format!("category:{}", category.as_str()),
-            // WP2 Janus (arXiv:2606.31121): every freshly consolidated rule
-            // starts on a trial period — see `prediction::rule_lifecycle`.
-            PROBATION_RULE_TAG.to_string(),
-        ],
+        tags,
         embedding: None,
         layer: MemoryLayer::Semantic,
         importance: 8.0,
@@ -275,6 +301,15 @@ async fn consolidate_group(
         "rule_stats": crate::prediction::rule_lifecycle::RuleStats::initial(),
     });
     playbook_meta.merge_into(&mut metadata_blob);
+
+    // WP-P3: when the held-out gate is on, seed the rule's out-of-sample
+    // record with its birth cursor so the prequential time split
+    // (`settle_injected_rules_held_out`) never validates the rule against its
+    // own birth batch. No-op when the gate is off (byte-identical).
+    if held_out_gate_enabled {
+        crate::prediction::rule_gate::HeldOutStats::born(chrono::Utc::now().timestamp().max(0) as u64)
+            .merge_into(&mut metadata_blob);
+    }
 
     // Triple ties successive consolidations of the same category into a
     // supersession chain (newer rule supersedes the older one automatically).
@@ -817,5 +852,78 @@ mod tests {
             .unwrap();
         assert!(r2.is_some(), "a genuinely novel lesson must still consolidate");
         assert_ne!(r1, r2, "the two consolidations produced different semantic ids");
+    }
+
+    // ── WP-P3: held-out rule gate wiring at consolidation ─────────────────
+
+    #[tokio::test]
+    async fn held_out_gate_on_verified_rule_injects_normally_and_seeds_held_out_record() {
+        // record_n attaches TrajectoryEvidence, so the consolidated group is
+        // Verified — even with the gate ON it must inject on the normal path
+        // (no shadow tag), and the gate seeds a held-out record with a birth
+        // cursor for the prequential split.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[task_forward_model]\nheld_out_gate_enabled = true\n",
+        )
+        .unwrap();
+        let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
+        let mem_path = dir.path().join("memory.db");
+        record_n(&nb, "agent-hog", MistakeCategory::Capability, 3, "");
+
+        let sid =
+            maybe_consolidate(&nb, &mem_path, dir.path(), "agent-hog", MistakeCategory::Capability, 3)
+                .await
+                .unwrap()
+                .expect("verified group must consolidate");
+
+        let engine = SqliteMemoryEngine::new(&mem_path).unwrap();
+        let entry = engine.get_by_id("agent-hog", &sid).await.unwrap().unwrap();
+        assert!(
+            !entry
+                .tags
+                .iter()
+                .any(|t| t == crate::prediction::rule_lifecycle::SHADOW_RULE_TAG),
+            "an evidence-backed (Verified) consolidation must NOT be born as a shadow candidate"
+        );
+        let meta = engine.get_metadata("agent-hog", &sid).await.unwrap().unwrap();
+        let held = crate::prediction::rule_gate::HeldOutStats::from_metadata(&meta);
+        assert!(
+            held.born_seq > 0,
+            "gate-on consolidation seeds a born_seq for the prequential time split"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_out_gate_off_is_byte_identical_no_shadow_no_held_out_record() {
+        // No config.toml → gate off → the consolidation metadata/tags must be
+        // exactly what the pre-WP3 code produced (no shadow tag, no
+        // held_out_stats key).
+        let dir = TempDir::new().unwrap();
+        let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
+        let mem_path = dir.path().join("memory.db");
+        record_n(&nb, "agent-off", MistakeCategory::Capability, 3, "");
+
+        let sid =
+            maybe_consolidate(&nb, &mem_path, dir.path(), "agent-off", MistakeCategory::Capability, 3)
+                .await
+                .unwrap()
+                .expect("must consolidate");
+
+        let engine = SqliteMemoryEngine::new(&mem_path).unwrap();
+        let entry = engine.get_by_id("agent-off", &sid).await.unwrap().unwrap();
+        assert!(
+            !entry
+                .tags
+                .iter()
+                .any(|t| t == crate::prediction::rule_lifecycle::SHADOW_RULE_TAG),
+            "gate off must never mint a shadow tag"
+        );
+        let meta = engine.get_metadata("agent-off", &sid).await.unwrap().unwrap();
+        assert!(
+            meta.get(crate::prediction::rule_gate::HeldOutStats::METADATA_KEY).is_none(),
+            "gate off must not seed a held-out record (byte-identical metadata shape)"
+        );
     }
 }

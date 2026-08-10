@@ -15,7 +15,7 @@ use duduclaw_memory::SqliteMemoryEngine;
 use super::entry::{PlaybookCategory, PlaybookMeta, PlaybookState, LEGACY_RULE_SOURCE_EVENT, PLAYBOOK_SOURCE_EVENT};
 use super::signals::{self, TurnSignals};
 use super::store::CANDIDATE_SCAN_CAP;
-use crate::prediction::rule_lifecycle::{RuleStats, PROBATION_RULE_TAG, RETIRED_RULE_TAG};
+use crate::prediction::rule_lifecycle::{RuleStats, PROBATION_RULE_TAG, RETIRED_RULE_TAG, SHADOW_RULE_TAG};
 
 /// Section header — deliberately dropped the old "(from past mistakes)"
 /// suffix since entries can now originate from signal-matched playbook
@@ -99,7 +99,15 @@ pub async fn select_playbook(
             if !seen.insert(mem_entry.id.clone()) {
                 continue;
             }
-            if mem_entry.tags.iter().any(|t| t == RETIRED_RULE_TAG) {
+            // WP-P3: retired OR shadow-candidate rules are excluded from
+            // injection. Shadow tags are only minted when the held-out gate is
+            // on, so the `SHADOW_RULE_TAG` arm is a no-op (byte-identical) when
+            // the gate is off.
+            if mem_entry
+                .tags
+                .iter()
+                .any(|t| t == RETIRED_RULE_TAG || t == SHADOW_RULE_TAG)
+            {
                 continue;
             }
             let meta = PlaybookMeta::from_metadata(&metadata)

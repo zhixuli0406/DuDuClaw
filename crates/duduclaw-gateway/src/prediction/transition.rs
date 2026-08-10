@@ -85,6 +85,17 @@ pub struct TransitionOutcome {
     /// CJK-safe, ≤ [`FEEDBACK_DIGEST_CHAR_CAP`] chars.
     pub feedback_digest: Option<String>,
     pub composite_error: Option<f64>,
+    /// WP-P2 (`commercial/docs/DESIGN-lwm-calibration-2026-08-10.md` §4):
+    /// `error.prediction.confidence` at settle time, only populated when
+    /// `[task_forward_model] calibration_enabled = true`. `#[serde(default)]`
+    /// so a transition row written before this field existed still
+    /// deserializes — it reads back as `None`, not a parse error.
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    /// `task_forward::calibration_brier_score(error)` for this settled
+    /// prediction, same gating and backward-compat behavior as `confidence`.
+    #[serde(default)]
+    pub calibration_score: Option<f64>,
 }
 
 /// sha8: first 8 hex chars of SHA-256(input). Deterministic identifier for
@@ -110,10 +121,16 @@ pub fn should_write_transition(error: &TaskPredictionError) -> bool {
 /// Caller is responsible for actually calling `store_temporal` (WP-B2) —
 /// kept as a pure builder so it's testable without a live
 /// `SqliteMemoryEngine`.
+///
+/// `calibration_enabled` (WP-P2, design §4) gates `TransitionOutcome`'s
+/// `confidence`/`calibration_score` fields: `true` populates both from
+/// `error.prediction.confidence` / `task_forward::calibration_brier_score`;
+/// `false` leaves them `None` — byte-identical to pre-calibration behavior.
 pub fn build_transition_write(
     agent_id: &str,
     error: &TaskPredictionError,
     judge_feedback: Option<&str>,
+    calibration_enabled: bool,
 ) -> Option<(MemoryEntry, TemporalMeta)> {
     if !should_write_transition(error) {
         return None;
@@ -136,11 +153,22 @@ pub fn build_transition_write(
         artifact: format!("{:?}", error.observation.observed_artifact).to_lowercase(),
     };
 
+    let (confidence, calibration_score) = if calibration_enabled {
+        (
+            Some(error.prediction.confidence),
+            Some(super::task_forward::calibration_brier_score(error)),
+        )
+    } else {
+        (None, None)
+    };
+
     let outcome = TransitionOutcome {
         verdict: error.observation.observed_outcome.as_str().to_string(),
         feedback_digest: judge_feedback
             .map(|f| duduclaw_core::truncate_chars(f, FEEDBACK_DIGEST_CHAR_CAP)),
         composite_error: Some(error.composite_error),
+        confidence,
+        calibration_score,
     };
 
     let fidelity_str = match error.fidelity {
@@ -216,14 +244,18 @@ pub fn build_transition_write(
 /// memory. No-op (returns `Ok(None)`) when [`should_write_transition`]
 /// rejects it. `judge_feedback` is the human-readable rejection/acceptance
 /// note (when the caller has one) — optional, purely for the D-series
-/// narrative use case.
+/// narrative use case. `calibration_enabled` — see
+/// [`build_transition_write`]'s doc comment.
 pub async fn write_transition(
     engine: &SqliteMemoryEngine,
     agent_id: &str,
     error: &TaskPredictionError,
     judge_feedback: Option<&str>,
+    calibration_enabled: bool,
 ) -> Result<Option<String>, String> {
-    let Some((entry, meta)) = build_transition_write(agent_id, error, judge_feedback) else {
+    let Some((entry, meta)) =
+        build_transition_write(agent_id, error, judge_feedback, calibration_enabled)
+    else {
         return Ok(None);
     };
     engine
@@ -351,7 +383,7 @@ mod tests {
     #[test]
     fn build_transition_write_leaves_subject_predicate_object_none() {
         let error = sample_error("t1", 1, ObservationFidelity::McpOnly);
-        let (_, meta) = build_transition_write("agnes", &error, None).unwrap();
+        let (_, meta) = build_transition_write("agnes", &error, None, false).unwrap();
         assert!(meta.subject.is_none(), "subject must stay None — see module docs trap warning");
         assert!(meta.predicate.is_none());
         assert!(meta.object.is_none());
@@ -360,7 +392,8 @@ mod tests {
     #[test]
     fn build_transition_write_content_is_capped_and_fidelity_stamped() {
         let error = sample_error("t1", 1, ObservationFidelity::McpOnly);
-        let (entry, temporal_meta) = build_transition_write("agnes", &error, Some("looked fine")).unwrap();
+        let (entry, temporal_meta) =
+            build_transition_write("agnes", &error, Some("looked fine"), false).unwrap();
         assert!(entry.content.chars().count() <= CONTENT_CHAR_CAP);
         let transition: TransitionMeta = serde_json::from_value(
             temporal_meta.metadata.as_ref().unwrap().get("transition").unwrap().clone(),
@@ -369,6 +402,52 @@ mod tests {
         assert_eq!(transition.fidelity, "mcp_only");
         assert_eq!(entry.source_event, TRANSITION_SOURCE_EVENT);
         assert_eq!(entry.layer, duduclaw_core::types::MemoryLayer::Episodic);
+    }
+
+    // ── WP-P2: calibration_enabled gating ──
+
+    #[test]
+    fn build_transition_write_calibration_disabled_leaves_fields_none() {
+        let error = sample_error("t1", 1, ObservationFidelity::McpOnly);
+        let (_, temporal_meta) = build_transition_write("agnes", &error, None, false).unwrap();
+        let transition: TransitionMeta = serde_json::from_value(
+            temporal_meta.metadata.as_ref().unwrap().get("transition").unwrap().clone(),
+        )
+        .unwrap();
+        assert!(transition.outcome.confidence.is_none());
+        assert!(transition.outcome.calibration_score.is_none());
+    }
+
+    #[test]
+    fn build_transition_write_calibration_enabled_fills_confidence_and_score() {
+        let error = sample_error("t1", 1, ObservationFidelity::Full);
+        let (_, temporal_meta) = build_transition_write("agnes", &error, None, true).unwrap();
+        let transition: TransitionMeta = serde_json::from_value(
+            temporal_meta.metadata.as_ref().unwrap().get("transition").unwrap().clone(),
+        )
+        .unwrap();
+        assert_eq!(transition.outcome.confidence, Some(error.prediction.confidence));
+        assert_eq!(
+            transition.outcome.calibration_score,
+            Some(crate::prediction::task_forward::calibration_brier_score(&error))
+        );
+    }
+
+    #[test]
+    fn transition_outcome_serde_defaults_missing_calibration_fields_to_none() {
+        // A transition row written before this WP-P2 change had no
+        // `confidence`/`calibration_score` keys at all — the `#[serde(default)]`
+        // attribute must let old rows deserialize instead of erroring out.
+        let old_json = serde_json::json!({
+            "verdict": "accepted",
+            "feedback_digest": null,
+            "composite_error": 0.1
+        });
+        let outcome: TransitionOutcome = serde_json::from_value(old_json).unwrap();
+        assert_eq!(outcome.verdict, "accepted");
+        assert_eq!(outcome.composite_error, Some(0.1));
+        assert!(outcome.confidence.is_none());
+        assert!(outcome.calibration_score.is_none());
     }
 
     #[tokio::test]
@@ -391,8 +470,8 @@ mod tests {
             "fixture sanity: both samples must share a state_key for this regression to be meaningful"
         );
 
-        let id1 = write_transition(&engine, "agnes", &error1, None).await.unwrap();
-        let id2 = write_transition(&engine, "agnes", &error2, None).await.unwrap();
+        let id1 = write_transition(&engine, "agnes", &error1, None, false).await.unwrap();
+        let id2 = write_transition(&engine, "agnes", &error2, None, false).await.unwrap();
         assert!(id1.is_some());
         assert!(id2.is_some());
         assert_ne!(id1, id2);
@@ -431,11 +510,11 @@ mod tests {
         let engine = SqliteMemoryEngine::new(&db_path).unwrap();
 
         let error_a = sample_error("task-a", 1, ObservationFidelity::McpOnly);
-        write_transition(&engine, "agnes", &error_a, None).await.unwrap();
+        write_transition(&engine, "agnes", &error_a, None, false).await.unwrap();
 
         // A different agent's transitions must not leak in.
         let error_b = sample_error("task-b", 1, ObservationFidelity::McpOnly);
-        write_transition(&engine, "other-agent", &error_b, None).await.unwrap();
+        write_transition(&engine, "other-agent", &error_b, None, false).await.unwrap();
 
         let state_key = error_a.prediction.state_key.canonical();
         let samples = read_transitions_for_state(&engine, "agnes", &state_key, 10)

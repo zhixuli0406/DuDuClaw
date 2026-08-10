@@ -1420,13 +1420,27 @@ impl DispatchEngine {
             native_evidence,
         );
 
+        // WP-P2 (commercial/docs/DESIGN-lwm-calibration-2026-08-10.md §4):
+        // loaded fresh here — same convention as `rule_induction_enabled`
+        // below — rather than threaded through `TaskForwardModel`'s
+        // constructor, since this is the one place both the settle-time
+        // score and the transition-write score are needed. `home_dir`
+        // absent (never happens in production, but tests construct this
+        // struct without one) ⇒ config default ⇒ `false`.
+        let calibration_enabled = self
+            .home_dir
+            .as_deref()
+            .map(crate::prediction::task_forward_store::TaskForwardModelConfig::from_home)
+            .unwrap_or_default()
+            .calibration_enabled;
+
         let thresholds = crate::prediction::metacognition::AdaptiveThresholds::default();
         match crate::prediction::task_forward::diff(prediction, observation, &thresholds) {
             crate::prediction::task_forward::DiffOutcome::Unobservable { reason } => {
                 debug!(task = %task.id, round, reason, "A3 settle: unobservable this round");
             }
             crate::prediction::task_forward::DiffOutcome::Computed(error) => {
-                if let Err(e) = fm.settle_prediction(&error).await {
+                if let Err(e) = fm.settle_prediction(&error, calibration_enabled).await {
                     warn!(task = %task.id, round, error = %e, "A3 settle_prediction failed (non-fatal)");
                 }
                 if let Some(home) = &self.home_dir {
@@ -1439,6 +1453,7 @@ impl DispatchEngine {
                                     &agent_id,
                                     &error,
                                     judge_feedback,
+                                    calibration_enabled,
                                 )
                                 .await
                                 {
@@ -1460,13 +1475,41 @@ impl DispatchEngine {
                             // existed) — the settle call is then a no-op.
                             let injected_ids = fm.take_injected_task_rules(&task.id, round).await;
                             if !injected_ids.is_empty() {
-                                let retired = crate::prediction::rule_lifecycle::settle_injected_rules(
-                                    &engine,
-                                    &agent_id,
-                                    &injected_ids,
-                                    error.category,
-                                )
-                                .await;
+                                // WP-P3: when the held-out rule gate is on,
+                                // settlement routes through the numeric-oracle
+                                // gate (`settle_injected_rules_held_out`)
+                                // instead of the pure ErrorCategory-credit
+                                // lifecycle. `held_out_gate_enabled` defaults
+                                // false ⇒ the unchanged `settle_injected_rules`
+                                // runs, byte-identical to before this change.
+                                let held_out_gate_enabled =
+                                    crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(home)
+                                        .held_out_gate_enabled;
+                                let retired = if held_out_gate_enabled {
+                                    crate::prediction::rule_lifecycle::settle_injected_rules_held_out(
+                                        &engine,
+                                        &agent_id,
+                                        &injected_ids,
+                                        error.category,
+                                        // Family size for the Bonferroni
+                                        // correction: the batch of rules
+                                        // trialed together this round (a
+                                        // conservative proxy for the concurrent
+                                        // candidate family).
+                                        injected_ids.len(),
+                                        crate::prediction::rule_gate::DEFAULT_BASELINE_HIT_RATE,
+                                        Utc::now().timestamp().max(0) as u64,
+                                    )
+                                    .await
+                                } else {
+                                    crate::prediction::rule_lifecycle::settle_injected_rules(
+                                        &engine,
+                                        &agent_id,
+                                        &injected_ids,
+                                        error.category,
+                                    )
+                                    .await
+                                };
                                 if !retired.is_empty() {
                                     debug!(
                                         task = %task.id, round, retired = retired.len(),

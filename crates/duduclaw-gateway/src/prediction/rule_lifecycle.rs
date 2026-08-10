@@ -36,6 +36,7 @@ use tracing::{info, warn};
 use duduclaw_memory::SqliteMemoryEngine;
 
 use super::engine::ErrorCategory;
+use super::rule_gate::{evaluate_rule_gate, GateDecision, HeldOutStats};
 
 /// `source_event` written by `reflexion::maybe_consolidate` (F2b).
 pub const RULE_SOURCE_EVENT: &str = "reflexion_consolidation";
@@ -57,6 +58,14 @@ pub const TASK_RULE_SOURCE_EVENT: &str = "task_forward_induction";
 pub const TASK_RULE_TAG: &str = "task-rule";
 /// Tag appended on retirement; F2a selection excludes entries carrying it.
 pub const RETIRED_RULE_TAG: &str = "retired-rule";
+/// WP-P3 (held-out rule gate): marks a rule as a **shadow candidate** — it is
+/// scored out-of-sample but never injected into a prompt. Selection excludes
+/// entries carrying it exactly like [`RETIRED_RULE_TAG`]. The tag is only ever
+/// minted when `[task_forward_model] held_out_gate_enabled = true` (a newly
+/// born inductive lesson, or a keep-better demotion), so excluding it
+/// unconditionally in selection is **byte-identical** when the gate is off —
+/// no rule can carry the tag then. See `prediction::rule_gate`.
+pub const SHADOW_RULE_TAG: &str = "shadow-rule";
 /// Tag appended to a freshly consolidated rule (WP2 Janus trial period).
 /// Removed on graduation (`helpful >= PROBATION_GRADUATE_HELPFUL` with no
 /// harmful strikes yet); any harmful strike while present retires the rule
@@ -213,7 +222,12 @@ async fn select_rules_by_source_event(
 
     let mut rules: Vec<InjectedRule> = rows
         .into_iter()
-        .filter(|(entry, _)| !entry.tags.iter().any(|t| t == RETIRED_RULE_TAG))
+        .filter(|(entry, _)| {
+            // WP-P3: shadow candidates are scored out-of-sample but never
+            // injected. No-op when the held-out gate is off (no rule carries
+            // the tag then) — byte-identical to the pre-WP3 retired-only filter.
+            !entry.tags.iter().any(|t| t == RETIRED_RULE_TAG || t == SHADOW_RULE_TAG)
+        })
         .map(|(entry, metadata)| InjectedRule {
             net: RuleStats::from_metadata(&metadata).net(),
             probation: entry.tags.iter().any(|t| t == PROBATION_RULE_TAG),
@@ -337,6 +351,122 @@ pub async fn settle_injected_rules(
                 Err(e) => {
                     warn!(agent = %agent_id, rule = %id, "rule lifecycle: retire failed: {e}");
                 }
+            }
+        }
+    }
+    retired
+}
+
+/// WP-P3 held-out-gated settlement — reached only when
+/// `[task_forward_model] held_out_gate_enabled = true` (the caller branches on
+/// that flag; when off it calls the unchanged [`settle_injected_rules`], so the
+/// gate-off path is byte-identical).
+///
+/// For each injected rule this records the turn's out-of-sample outcome — a
+/// deterministic hit (Negligible/Moderate) or miss (Significant/Critical),
+/// **never an LLM self-assessment** — into the rule's [`HeldOutStats`], then
+/// hands the fate decision to [`evaluate_rule_gate`], which reads only that
+/// numeric record. This replaces the pure `ErrorCategory`-credit retirement of
+/// [`settle_injected_rules`] for a gate-on deployment:
+/// - [`GateDecision::Retire`] → [`RETIRED_RULE_TAG`] + low importance (returned
+///   in the retired list).
+/// - [`GateDecision::Demote`] → [`SHADOW_RULE_TAG`] (keep-better: stop
+///   injecting, keep the row + its history; a regime shift can be reverted, not
+///   deleted).
+/// - [`GateDecision::Inject`] → remove [`SHADOW_RULE_TAG`] if present (promote /
+///   stay active).
+/// - [`GateDecision::Shadow`] → leave tags untouched (not yet decidable).
+///
+/// `now_seq` is the current prequential cursor (e.g. unix seconds). An outcome
+/// is counted only when `now_seq > born_seq` so a candidate's own birth batch
+/// never validates it (train != test; design §6 item 2). `RuleStats` counters
+/// are still updated for telemetry/continuity but no longer drive retirement on
+/// this path.
+#[allow(clippy::too_many_arguments)]
+pub async fn settle_injected_rules_held_out(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    rule_ids: &[String],
+    category: ErrorCategory,
+    k_concurrent_candidates: usize,
+    baseline_hit_rate: f64,
+    now_seq: u64,
+) -> Vec<String> {
+    let is_hit = matches!(category, ErrorCategory::Negligible | ErrorCategory::Moderate);
+    let mut retired = Vec::new();
+    for id in rule_ids {
+        let mut metadata = match engine.get_metadata(agent_id, id).await {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(agent = %agent_id, rule = %id, "held-out gate: read metadata failed: {e}");
+                continue;
+            }
+        };
+        let entry = match engine.get_by_id(agent_id, id).await {
+            Ok(Some(e)) => e,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(agent = %agent_id, rule = %id, "held-out gate: read entry failed: {e}");
+                continue;
+            }
+        };
+
+        // Telemetry-only rule_stats update (kept for continuity; no longer the
+        // retirement authority on this path).
+        let mut stats = RuleStats::from_metadata(&metadata);
+        stats.record(category);
+        stats.merge_into(&mut metadata);
+
+        // Held-out numeric record. Prequential guard: never count the birth
+        // batch against the candidate that produced it.
+        let mut held = HeldOutStats::from_metadata(&metadata);
+        if now_seq > held.born_seq {
+            held.record(is_hit);
+        }
+        held.merge_into(&mut metadata);
+
+        if let Err(e) = engine.update_metadata(agent_id, id, &metadata).await {
+            warn!(agent = %agent_id, rule = %id, "held-out gate: write metadata failed: {e}");
+            continue;
+        }
+
+        let is_shadow = entry.tags.iter().any(|t| t == SHADOW_RULE_TAG);
+        match evaluate_rule_gate(&held, k_concurrent_candidates, baseline_hit_rate) {
+            GateDecision::Retire => {
+                match engine
+                    .set_importance_and_add_tag(agent_id, id, RETIRED_IMPORTANCE, RETIRED_RULE_TAG)
+                    .await
+                {
+                    Ok(true) => retired.push(id.clone()),
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(agent = %agent_id, rule = %id, "held-out gate: retire failed: {e}");
+                    }
+                }
+            }
+            GateDecision::Demote => {
+                // Keep-better: add the shadow tag (stop injecting) while
+                // preserving the row's current importance and full history.
+                if !is_shadow {
+                    if let Err(e) = engine
+                        .set_importance_and_add_tag(agent_id, id, entry.importance, SHADOW_RULE_TAG)
+                        .await
+                    {
+                        warn!(agent = %agent_id, rule = %id, "held-out gate: demote failed: {e}");
+                    }
+                }
+            }
+            GateDecision::Inject => {
+                // Promotion / continued eligibility: clear any shadow tag.
+                if is_shadow {
+                    if let Err(e) = engine.remove_tag(agent_id, id, SHADOW_RULE_TAG).await {
+                        warn!(agent = %agent_id, rule = %id, "held-out gate: promote failed: {e}");
+                    }
+                }
+            }
+            GateDecision::Shadow => {
+                // Not yet decidable — leave the rule exactly as it is.
             }
         }
     }
@@ -691,5 +821,160 @@ mod tests {
         let after = select_task_rules(&engine, agent, INJECTION_LIMIT).await;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, low);
+    }
+
+    // ── WP-P3: held-out rule gate wiring ──────────────────────────────────
+
+    #[tokio::test]
+    async fn select_excludes_shadow_tagged_rules() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-shadow-select";
+        let normal =
+            store_rule(&engine, agent, "normal", RuleStats { helpful: 5, harmful: 0 }, 0, false)
+                .await;
+        // A shadow-tagged rule with an even higher net score must still be
+        // excluded — shadow candidates are scored, never injected.
+        let shadow = store_rule_with_source(
+            &engine,
+            agent,
+            "shadow",
+            RuleStats { helpful: 9, harmful: 0 },
+            RULE_SOURCE_EVENT,
+            vec![SHADOW_RULE_TAG.to_string()],
+        )
+        .await;
+
+        let selected = select_rules(&engine, agent, INJECTION_LIMIT).await;
+        let ids: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&normal.as_str()), "non-shadow rule is selectable");
+        assert!(
+            !ids.contains(&shadow.as_str()),
+            "shadow-tagged rule must be excluded even with a higher net score"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_out_gate_injects_strong_record_then_keep_better_demotes() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-heldout";
+        // born_seq 0 (default) so every settle counts as out-of-sample.
+        let id = store_rule(&engine, agent, "rule H", RuleStats::initial(), 0, false).await;
+        let ids = vec![id.clone()];
+        let now = 1_000_000u64;
+
+        // 20 out-of-sample hits → strong cumulative record; the gate keeps it
+        // injectable (no shadow tag).
+        for _ in 0..20 {
+            settle_injected_rules_held_out(
+                &engine, agent, &ids, ErrorCategory::Negligible, 1, 0.5, now,
+            )
+            .await;
+        }
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(
+            !entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
+            "a strong out-of-sample record stays injectable (Inject)"
+        );
+        // The held-out counters are populated from the numeric outcomes.
+        let held = HeldOutStats::from_metadata(
+            &engine.get_metadata(agent, &id).await.unwrap().unwrap(),
+        );
+        assert_eq!(held.oos_hits, 20);
+        assert_eq!(held.oos_misses, 0);
+
+        // 8 misses collapse the recent rolling window → keep-better demotion:
+        // shadow-tagged (stop injecting) but NOT retired (row + history kept).
+        for _ in 0..8 {
+            settle_injected_rules_held_out(
+                &engine, agent, &ids, ErrorCategory::Critical, 1, 0.5, now,
+            )
+            .await;
+        }
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(
+            entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
+            "recent-window regression demotes to shadow (keep-better)"
+        );
+        assert!(
+            !entry.tags.iter().any(|t| t == RETIRED_RULE_TAG),
+            "keep-better never deletes/retires on a recoverable regression"
+        );
+
+        // Once demoted the rule is excluded from injection selection.
+        let ok = store_rule(
+            &engine, agent, "rule OK", RuleStats { helpful: 5, harmful: 0 }, 0, false,
+        )
+        .await;
+        let selected = select_rules(&engine, agent, INJECTION_LIMIT).await;
+        let sel: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
+        assert!(sel.contains(&ok.as_str()));
+        assert!(!sel.contains(&id.as_str()), "demoted (shadow) rule is not injected");
+    }
+
+    #[tokio::test]
+    async fn held_out_gate_retires_spent_candidate() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-heldout-retire";
+        let id = store_rule(&engine, agent, "rule bad", RuleStats::initial(), 0, false).await;
+        let ids = vec![id.clone()];
+        let now = 2_000_000u64;
+
+        // 1 hit + 15 misses: even the optimistic Wilson upper bound falls
+        // below baseline → the candidate is spent → retire.
+        settle_injected_rules_held_out(&engine, agent, &ids, ErrorCategory::Negligible, 1, 0.5, now)
+            .await;
+        for _ in 0..15 {
+            settle_injected_rules_held_out(
+                &engine, agent, &ids, ErrorCategory::Critical, 1, 0.5, now,
+            )
+            .await;
+        }
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(
+            entry.tags.iter().any(|t| t == RETIRED_RULE_TAG),
+            "spent candidate (upper bound below baseline) is retired"
+        );
+        assert!(entry.importance < 2.0, "importance demoted on retirement");
+    }
+
+    #[tokio::test]
+    async fn held_out_gate_prequential_split_skips_birth_batch_observation() {
+        // An outcome whose sequence is at/below born_seq is the birth batch and
+        // must not be counted (train != test).
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-prequential";
+        let id = store_rule_with_source(
+            &engine,
+            agent,
+            "rule seq",
+            RuleStats::initial(),
+            RULE_SOURCE_EVENT,
+            vec![],
+        )
+        .await;
+        // Seed a birth cursor of 500.
+        let mut meta = engine.get_metadata(agent, &id).await.unwrap().unwrap();
+        HeldOutStats::born(500).merge_into(&mut meta);
+        engine.update_metadata(agent, &id, &meta).await.unwrap();
+
+        // Settle with now_seq == born_seq → not counted.
+        settle_injected_rules_held_out(
+            &engine, agent, &[id.clone()], ErrorCategory::Negligible, 1, 0.5, 500,
+        )
+        .await;
+        let held = HeldOutStats::from_metadata(
+            &engine.get_metadata(agent, &id).await.unwrap().unwrap(),
+        );
+        assert_eq!(held.total(), 0, "birth-batch observation (now_seq <= born_seq) must not count");
+
+        // A later observation IS counted.
+        settle_injected_rules_held_out(
+            &engine, agent, &[id.clone()], ErrorCategory::Negligible, 1, 0.5, 501,
+        )
+        .await;
+        let held = HeldOutStats::from_metadata(
+            &engine.get_metadata(agent, &id).await.unwrap().unwrap(),
+        );
+        assert_eq!(held.oos_hits, 1, "an out-of-sample observation (now_seq > born_seq) counts");
     }
 }
