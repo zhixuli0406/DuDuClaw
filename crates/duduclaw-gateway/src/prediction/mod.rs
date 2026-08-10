@@ -8,6 +8,7 @@
 //! 90% of conversations complete via the System 1 path (zero LLM cost).
 //! Only genuine prediction errors trigger expensive LLM reflections.
 
+pub mod calibration;
 pub mod engine;
 pub mod feedback_bus;
 pub mod forced_reflection;
@@ -30,6 +31,7 @@ pub mod task_forward_store;
 pub mod task_observe;
 pub mod transition;
 pub mod foresight_gate;
+pub mod rule_gate;
 // ── A4 rule induce/update/prune (design §6.5) ──
 pub mod task_rule_induce;
 

@@ -99,6 +99,29 @@ pub struct TaskForwardModelConfig {
     /// prediction/observation/diff machinery running while suppressing rule
     /// writes and injection entirely.
     pub rule_induction: bool,
+    /// WP-P2 (`commercial/docs/DESIGN-lwm-calibration-2026-08-10.md` §4
+    /// platform section): gates the calibrated-forward-model scoring path
+    /// — proper-scoring (`prediction::calibration::brier_binary`) of every
+    /// settled `TaskPrediction.confidence` against whether the round turned
+    /// out well. **Defaults `false`.** This is a strictly additive,
+    /// domain-agnostic `(confidence, realized_outcome)` scorer — it never
+    /// gates dispatch/accept behavior, only whether `brier_score` gets
+    /// computed and persisted (a nullable column / nullable transition
+    /// fields). `false` ⇒ `settle_prediction` and `build_transition_write`
+    /// skip the calculation entirely, leaving those fields `NULL`/`None` —
+    /// byte-identical to the pre-calibration behavior.
+    pub calibration_enabled: bool,
+    /// WP-P3 (`commercial/docs/DESIGN-lwm-calibration-2026-08-10.md` §1.4,
+    /// §6): gates the held-out rule gate — the anti-overfitting adoption
+    /// authority that turns self-learning into "reflection PROPOSES a
+    /// candidate, an external numeric oracle DECIDES adoption". **Defaults
+    /// `false`.** When off, every wired call site (`reflexion::consolidate_group`
+    /// shadow-birth, `rule_lifecycle::select_*` shadow exclusion, the
+    /// `dispatch_engine` settle held-out promotion/keep-better path) is a
+    /// complete no-op — no shadow tags are ever minted and settlement runs the
+    /// unchanged `ErrorCategory`-credit lifecycle, so behavior is
+    /// byte-identical to before this change. See `prediction::rule_gate`.
+    pub held_out_gate_enabled: bool,
 }
 
 impl Default for TaskForwardModelConfig {
@@ -111,6 +134,8 @@ impl Default for TaskForwardModelConfig {
             foresight_tau: super::foresight_gate::DEFAULT_FORESIGHT_TAU,
             foresight_recent_k: super::foresight_gate::DEFAULT_FORESIGHT_RECENT_K,
             rule_induction: true,
+            calibration_enabled: false,
+            held_out_gate_enabled: false,
         }
     }
 }
@@ -426,6 +451,16 @@ fn prediction_from_bucket(
 /// tests (which open a throwaway temp DB and never construct a
 /// `PredictionEngine`).
 pub(crate) fn init_task_tables(conn: &Connection) -> Result<(), String> {
+    // WP-P2 (DESIGN-lwm-calibration-2026-08-10.md §4): best-effort column
+    // migration for pre-calibration DBs. Run BEFORE the `CREATE TABLE IF
+    // NOT EXISTS` below (same ordering as `trust_store.rs::ensure_schema`)
+    // — a fresh DB has no `task_prediction_log` table yet so this is a
+    // harmless no-op error, then the CREATE TABLE below brings the column
+    // in directly; an existing pre-calibration DB gets the column added
+    // here, and the CREATE TABLE below is then itself a no-op. Either way
+    // idempotent — "duplicate column" errors are deliberately swallowed.
+    let _ = conn.execute("ALTER TABLE task_prediction_log ADD COLUMN brier_score REAL", []);
+
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS task_prediction_log (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -442,7 +477,8 @@ pub(crate) fn init_task_tables(conn: &Connection) -> Result<(), String> {
             composite_error REAL,
             category        TEXT,
             created_at      TEXT NOT NULL,
-            settled_at      TEXT
+            settled_at      TEXT,
+            brier_score     REAL
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_tpl_task_round
             ON task_prediction_log(task_id, round);
@@ -693,7 +729,18 @@ impl TaskForwardModel {
     /// in-memory bucket and persists it. `fidelity == None` never reaches
     /// here — `task_forward::diff` never produces a `TaskPredictionError`
     /// for it.
-    pub async fn settle_prediction(&self, error: &TaskPredictionError) -> Result<(), String> {
+    ///
+    /// `calibration_enabled` (WP-P2, design §4/§7 platform section) gates
+    /// the `brier_score` column: `true` scores
+    /// `error.prediction.confidence` via `calibration::brier_binary` against
+    /// `task_forward::task_prediction_correct(error)` (`Negligible` /
+    /// `Moderate` category ⇒ correct) and persists it; `false` leaves the
+    /// column untouched (`NULL`), matching pre-calibration behavior exactly.
+    pub async fn settle_prediction(
+        &self,
+        error: &TaskPredictionError,
+        calibration_enabled: bool,
+    ) -> Result<(), String> {
         let db_path = self.db_path.clone();
         let prediction_id = error.prediction.prediction_id.clone();
         let observation_json = serde_json::to_string(&error.observation).map_err(|e| e.to_string())?;
@@ -701,15 +748,23 @@ impl TaskForwardModel {
         let composite_error = error.composite_error;
         let category = format!("{:?}", error.category).to_lowercase();
         let settled_at = Utc::now().to_rfc3339();
+        let brier_score: Option<f64> = if calibration_enabled {
+            Some(super::task_forward::calibration_brier_score(error))
+        } else {
+            None
+        };
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
             conn.execute(
                 "UPDATE task_prediction_log
                  SET observation_json = ?1, fidelity = ?2, composite_error = ?3,
-                     category = ?4, settled_at = ?5
-                 WHERE prediction_id = ?6",
-                params![observation_json, fidelity, composite_error, category, settled_at, prediction_id],
+                     category = ?4, settled_at = ?5, brier_score = ?6
+                 WHERE prediction_id = ?7",
+                params![
+                    observation_json, fidelity, composite_error, category, settled_at,
+                    brier_score, prediction_id
+                ],
             )
             .map_err(|e| e.to_string())?;
             Ok::<(), String>(())
@@ -812,6 +867,7 @@ mod tests {
     use super::super::task_forward::{
         DiffOutcome, ObservationFidelity, RoundPhase, TaskObservation, diff,
     };
+    use crate::prediction::engine::ErrorCategory;
     use crate::prediction::metacognition::AdaptiveThresholds;
 
     fn key(agent: &str, kind: GoalKind, phase: RoundPhase, has_spec: bool) -> TaskStateKey {
@@ -927,7 +983,7 @@ mod tests {
             model.log_prediction(&pred).await.unwrap();
             let obs = base_observation(ObservationFidelity::Full);
             if let DiffOutcome::Computed(err) = diff(pred, obs, &thresholds) {
-                model.settle_prediction(&err).await.unwrap();
+                model.settle_prediction(&err, false).await.unwrap();
             } else {
                 panic!("should compute");
             }
@@ -951,7 +1007,7 @@ mod tests {
             model.log_prediction(&pred).await.unwrap();
             let obs = base_observation(ObservationFidelity::Full);
             if let DiffOutcome::Computed(err) = diff(pred, obs, &thresholds) {
-                model.settle_prediction(&err).await.unwrap();
+                model.settle_prediction(&err, false).await.unwrap();
             }
         }
         // Query a RETRY-phase key for the same agent/goal_kind — canonical
@@ -975,7 +1031,7 @@ mod tests {
                 model.log_prediction(&pred).await.unwrap();
                 let obs = base_observation(ObservationFidelity::Full);
                 if let DiffOutcome::Computed(err) = diff(pred, obs, &thresholds) {
-                    model.settle_prediction(&err).await.unwrap();
+                    model.settle_prediction(&err, false).await.unwrap();
                 }
             }
             model.flush_all().await;
@@ -998,7 +1054,7 @@ mod tests {
             obs.observed_outcome = ObservedOutcome::Unknown; // ineligible
             if let DiffOutcome::Computed(err) = diff(pred, obs, &thresholds) {
                 assert!(!err.eligible_for_stats);
-                model.settle_prediction(&err).await.unwrap();
+                model.settle_prediction(&err, false).await.unwrap();
             }
         }
         // Bucket should still be cold — ineligible settles never fed it.
@@ -1104,6 +1160,98 @@ mod tests {
         let cfg = TaskForwardModelConfig::from_home(dir.path());
         assert!(cfg.enabled);
         assert!(!cfg.rule_induction);
+    }
+
+    // ── WP-P2: calibration_enabled sub-switch ──
+
+    #[test]
+    fn task_forward_model_config_calibration_defaults_to_disabled() {
+        assert!(!TaskForwardModelConfig::default().calibration_enabled);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[task_forward_model]\nenabled = true\n",
+        )
+        .unwrap();
+        let cfg = TaskForwardModelConfig::from_home(dir.path());
+        assert!(
+            !cfg.calibration_enabled,
+            "calibration_enabled must stay false unless explicitly set"
+        );
+    }
+
+    #[test]
+    fn task_forward_model_config_calibration_can_be_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[task_forward_model]\nenabled = true\ncalibration_enabled = true\n",
+        )
+        .unwrap();
+        let cfg = TaskForwardModelConfig::from_home(dir.path());
+        assert!(cfg.enabled);
+        assert!(cfg.calibration_enabled);
+    }
+
+    // ── WP-P2: settle_prediction brier_score persistence ──
+
+    /// Read back the `brier_score` column directly — there's no public
+    /// getter (the column is an internal scoring artifact, not part of
+    /// `TaskForwardModel`'s public surface), so tests reach into the DB the
+    /// same way `settle_prediction_persists_across_reload` above reaches in
+    /// via `TaskForwardModel::new` reopening — a raw read is the simplest
+    /// honest check here.
+    fn read_brier_score(db_path: &std::path::Path, prediction_id: &str) -> Option<f64> {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT brier_score FROM task_prediction_log WHERE prediction_id = ?1",
+            params![prediction_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn settle_prediction_calibration_disabled_leaves_brier_score_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("prediction.db");
+        let model = TaskForwardModel::new(db_path.clone());
+        let thresholds = AdaptiveThresholds::default();
+        let sk = key("agnes", GoalKind::CodingSimple, RoundPhase::First, false);
+        let pred = model.predict("t1", "agnes", 1, sk).await;
+        model.log_prediction(&pred).await.unwrap();
+        let prediction_id = pred.prediction_id.clone();
+        let obs = base_observation(ObservationFidelity::Full);
+        let DiffOutcome::Computed(err) = diff(pred, obs, &thresholds) else {
+            panic!("should compute");
+        };
+        model.settle_prediction(&err, false).await.unwrap();
+        assert_eq!(read_brier_score(&db_path, &prediction_id), None);
+    }
+
+    #[tokio::test]
+    async fn settle_prediction_calibration_enabled_writes_brier_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("prediction.db");
+        let model = TaskForwardModel::new(db_path.clone());
+        let thresholds = AdaptiveThresholds::default();
+        let sk = key("agnes", GoalKind::CodingSimple, RoundPhase::First, false);
+        let pred = model.predict("t1", "agnes", 1, sk).await;
+        // Cold-start prior prediction always has confidence 0.0; force a
+        // non-trivial confidence so the Brier score isn't the degenerate
+        // conf=0.0 case.
+        let mut pred = pred;
+        pred.confidence = 0.65;
+        model.log_prediction(&pred).await.unwrap();
+        let prediction_id = pred.prediction_id.clone();
+        let obs = base_observation(ObservationFidelity::Full);
+        let DiffOutcome::Computed(err) = diff(pred, obs, &thresholds) else {
+            panic!("should compute");
+        };
+        assert_eq!(err.category, ErrorCategory::Negligible, "perfect-match fixture stays Negligible");
+        model.settle_prediction(&err, true).await.unwrap();
+        let expected = super::super::calibration::brier_binary(0.65, true);
+        assert_eq!(read_brier_score(&db_path, &prediction_id), Some(expected));
     }
 
     // ── WP-A4: injected_task_rules bookkeeping round-trip ──

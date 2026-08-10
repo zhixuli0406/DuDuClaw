@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::calibration;
 use super::engine::ErrorCategory;
 use super::metacognition::AdaptiveThresholds;
 use super::tool_class::ToolClass;
@@ -330,6 +331,30 @@ pub struct TaskPredictionError {
     pub eligible_for_stats: bool,
     pub prediction: TaskPrediction,
     pub observation: TaskObservation,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// WP-P2 — calibration scoring (design DESIGN-lwm-calibration-2026-08-10.md
+// §2/§4 platform section)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Domain-agnostic "was this prediction correct" verdict for calibration
+/// scoring: `Negligible`/`Moderate` composite-error categories count as
+/// correct, `Significant`/`Critical` do not. This is the `(confidence,
+/// realized_outcome)` abstraction the design mandates — it reuses the
+/// existing dual-process-router category (§4 platform integration point),
+/// not a new domain-specific correctness notion.
+pub fn task_prediction_correct(error: &TaskPredictionError) -> bool {
+    matches!(error.category, ErrorCategory::Negligible | ErrorCategory::Moderate)
+}
+
+/// Brier calibration score for one settled prediction: scores
+/// `error.prediction.confidence` against [`task_prediction_correct`] via
+/// [`calibration::brier_binary`]. Pure, zero I/O — callers (`settle_prediction`,
+/// `transition::build_transition_write`) gate this behind `[task_forward_model]
+/// calibration_enabled` (default `false`).
+pub fn calibration_brier_score(error: &TaskPredictionError) -> f64 {
+    calibration::brier_binary(error.prediction.confidence, task_prediction_correct(error))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -695,6 +720,95 @@ mod tests {
             }
             DiffOutcome::Unobservable { .. } => panic!("should compute"),
         }
+    }
+
+    // ── WP-P2: calibration scoring ──
+
+    #[test]
+    fn task_prediction_correct_maps_negligible_and_moderate_to_true() {
+        let sk = key("agnes", GoalKind::CodingSimple, RoundPhase::First, false);
+        let mut pred = base_prediction(sk);
+        pred.confidence = 0.8;
+        let obs = base_observation(ObservationFidelity::Full);
+        let thresholds = AdaptiveThresholds::default();
+        // Perfect match ⇒ Negligible category ⇒ correct == true.
+        match diff(pred, obs, &thresholds) {
+            DiffOutcome::Computed(err) => {
+                assert_eq!(err.category, ErrorCategory::Negligible);
+                assert!(task_prediction_correct(&err));
+            }
+            DiffOutcome::Unobservable { .. } => panic!("should compute"),
+        }
+    }
+
+    #[test]
+    fn task_prediction_correct_maps_significant_and_critical_to_false() {
+        // Force a maximal mismatch on every dimension so category lands in
+        // Significant/Critical territory.
+        let sk = key("agnes", GoalKind::CodingSimple, RoundPhase::First, false);
+        let mut pred = base_prediction(sk);
+        pred.expected_tool_classes = BTreeSet::from([ToolClass::Read]);
+        pred.expected_call_band = (1, 2);
+        pred.expected_outcome = ExpectedOutcome::Reject;
+        pred.expected_artifact = ArtifactShape::TextOnly;
+        let mut obs = base_observation(ObservationFidelity::Full);
+        obs.observed_tool_classes = BTreeSet::from([ToolClass::Exec, ToolClass::Net]);
+        obs.observed_calls = 1000;
+        obs.observed_outcome = ObservedOutcome::Accepted;
+        obs.observed_artifact = ArtifactShape::ExternalEffect;
+        let thresholds = AdaptiveThresholds::default();
+        match diff(pred, obs, &thresholds) {
+            DiffOutcome::Computed(err) => {
+                assert!(
+                    matches!(err.category, ErrorCategory::Significant | ErrorCategory::Critical),
+                    "fixture must land in Significant/Critical, got {:?}",
+                    err.category
+                );
+                assert!(!task_prediction_correct(&err));
+            }
+            DiffOutcome::Unobservable { .. } => panic!("should compute"),
+        }
+    }
+
+    #[test]
+    fn calibration_brier_score_matches_calibration_brier_binary() {
+        let sk = key("agnes", GoalKind::CodingSimple, RoundPhase::First, false);
+        // Negligible case: confidence + correct=true.
+        let mut pred_ok = base_prediction(sk.clone());
+        pred_ok.confidence = 0.73;
+        let obs_ok = base_observation(ObservationFidelity::Full);
+        let thresholds = AdaptiveThresholds::default();
+        let err_ok = match diff(pred_ok, obs_ok, &thresholds) {
+            DiffOutcome::Computed(e) => e,
+            DiffOutcome::Unobservable { .. } => panic!("should compute"),
+        };
+        assert_eq!(err_ok.category, ErrorCategory::Negligible);
+        assert_eq!(
+            calibration_brier_score(&err_ok),
+            calibration::brier_binary(0.73, true)
+        );
+
+        // Critical case: confidence + correct=false.
+        let mut pred_bad = base_prediction(sk);
+        pred_bad.confidence = 0.9;
+        pred_bad.expected_tool_classes = BTreeSet::from([ToolClass::Read]);
+        pred_bad.expected_call_band = (1, 2);
+        pred_bad.expected_outcome = ExpectedOutcome::Reject;
+        pred_bad.expected_artifact = ArtifactShape::TextOnly;
+        let mut obs_bad = base_observation(ObservationFidelity::Full);
+        obs_bad.observed_tool_classes = BTreeSet::from([ToolClass::Exec, ToolClass::Net]);
+        obs_bad.observed_calls = 1000;
+        obs_bad.observed_outcome = ObservedOutcome::Accepted;
+        obs_bad.observed_artifact = ArtifactShape::ExternalEffect;
+        let err_bad = match diff(pred_bad, obs_bad, &thresholds) {
+            DiffOutcome::Computed(e) => e,
+            DiffOutcome::Unobservable { .. } => panic!("should compute"),
+        };
+        assert!(matches!(err_bad.category, ErrorCategory::Significant | ErrorCategory::Critical));
+        assert_eq!(
+            calibration_brier_score(&err_bad),
+            calibration::brier_binary(0.9, false)
+        );
     }
 
     #[test]

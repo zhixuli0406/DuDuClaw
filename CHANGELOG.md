@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Added
+- **校準式 forward model + held-out 學習閘**（v1.54）：任何 AI 員工行動前先對「這一步
+  會不會成功」落檔一個機率預測（`TaskPrediction.confidence`），事後用工具實際回傳的
+  結果（外部證據，不是 AI 員工自我陳述）計算 proper-score（Brier / RPS，有界分數，
+  拒用小樣本下不穩定的 log score），並做 Murphy 分解（reliability / resolution /
+  uncertainty）。只有鑑別力（resolution）隨時間上升才算真的學到預測模式，可靠度
+  單獨變好只代表學會了保守報均值。自我反省產生的候選教訓不再自己判斷是否可信：
+  有工具紀錄／稽核可查證的教訓照舊直接採用，沒有程式化證據的歸納型教訓先進
+  shadow（不注入提示詞），累積樣本外命中紀錄、用 Wilson 信賴區間下界（多候選時
+  Bonferroni 校正）贏過凍結基準才轉正，轉正後表現退步會自動降級或退休（keep-better，
+  歷史保留不刪除）。系統只給三種誠實結論：`SUPPORTED` / `CANDIDATE` /
+  `INDISTINGUISHABLE_FROM_LUCK`。樣本不夠時「還不知道」是合法輸出，不會為了顯得
+  有用硬給模糊的「初步驗證」。三層設定皆預設關閉、逐層獨立開啟，全數為 opt-in、
+  無破壞性變更：`config.toml`/`agent.toml [task_forward_model] enabled` /
+  `calibration_enabled` / `held_out_gate_enabled`。能力與具體業務無關，任何 AI
+  員工（客服、coding、操盤等）皆可啟用。見
+  [`docs/features/39-calibrated-forward-model.md`](docs/features/39-calibrated-forward-model.md)。
+
 ## [1.53.0] - 2026-08-07 — 任務層世界模型與 AEE 進化引擎
 
 ### Added

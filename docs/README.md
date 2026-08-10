@@ -49,6 +49,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/36-recording-to-skill.md](features/36-recording-to-skill.md) | Recording → skill — approval-gated skill drafts from browser/desktop recordings |
 | [features/37-delegation-isolation.md](features/37-delegation-isolation.md) | 部門與階級隔離（A2A 委派政策） — 三層政策 + 白名單配對 + 可見範圍過濾 |
 | [features/38-aee-playbook-evolution.md](features/38-aee-playbook-evolution.md) | 自主進化 v3：Agentic Evolution Engine + Playbook — SOUL.md 唯讀化、gene 形行為規則、條目級觀察窗 |
+| [features/39-calibrated-forward-model.md](features/39-calibrated-forward-model.md) | 校準式預測 + held-out 學習閘 — 任意 AI 員工的 predict-score-gate 迴圈，Brier/RPS 校準 + Murphy 分解 + honest-luck 標籤 |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios (zh-TW) — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix (zh-TW) — sales-facing coverage table |
 
