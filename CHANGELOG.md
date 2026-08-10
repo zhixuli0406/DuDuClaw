@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.54.0] - 2026-08-10 — 校準式 forward model + held-out 學習閘
+
 ### Added
 - **校準式 forward model + held-out 學習閘**（v1.54）：任何 AI 員工行動前先對「這一步
   會不會成功」落檔一個機率預測（`TaskPrediction.confidence`），事後用工具實際回傳的
