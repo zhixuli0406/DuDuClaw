@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { Routes, Route } from 'react-router';
+import { IntlProvider } from 'react-intl';
+import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router';
+import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { TaskBoardPage } from './TaskBoardPage';
@@ -97,6 +99,81 @@ describe('TaskBoardPage', () => {
     await user.click(await screen.findByRole('button', { name: 'Ship the release' }));
     await waitFor(() => {
       expect(screen.getByText('detail-probe')).toBeInTheDocument();
+    });
+  });
+});
+
+// ── W3-3: state-as-URL (Stripe pattern B4) — the agent/priority filters are
+// bookmarkable/shareable, matching the existing `?new=1` / `?assignee=` deep
+// links this page already supports.
+
+/** Shows the current query string, for asserting an outbound URL mirror. */
+function SearchParamsProbe() {
+  const [params] = useSearchParams();
+  return <div data-testid="search-probe">{params.toString()}</div>;
+}
+
+/** `renderWithProviders`'s router has no way to seed a starting location/query
+ *  string — same limitation InboxPage's own deep-link tests work around. */
+function renderAt(path: string) {
+  return render(
+    <IntlProvider messages={en} locale="en" defaultLocale="en">
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route
+            path="/tasks"
+            element={
+              <>
+                <TaskBoardPage />
+                <SearchParamsProbe />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    </IntlProvider>,
+  );
+}
+
+describe('TaskBoardPage — filters as URL (W3-3)', () => {
+  it('seeds the agent/priority filters from ?agent=/?priority= on load', async () => {
+    renderAt('/tasks?agent=nova&priority=high');
+    await waitFor(() => {
+      expect(useTasksStore.getState().filterAgent).toBe('nova');
+      expect(useTasksStore.getState().filterPriority).toBe('high');
+    });
+  });
+
+  it('ignores an unrecognized ?priority= value rather than coercing it', async () => {
+    renderAt('/tasks?priority=not-a-real-priority');
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Task Board' })).toBeInTheDocument();
+    });
+    expect(useTasksStore.getState().filterPriority).toBeNull();
+  });
+
+  it('mirrors an in-app filter change back into the URL', async () => {
+    const user = userEvent.setup();
+    renderAt('/tasks');
+
+    await user.click(screen.getByRole('button', { name: /Filter/ }));
+    await user.click(await screen.findByRole('menuitem', { name: /Nova/ }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('search-probe')).toHaveTextContent('agent=nova');
+    });
+  });
+
+  it('does not carry a bookmarked filter forward once cleared (no stale param)', async () => {
+    const user = userEvent.setup();
+    renderAt('/tasks?agent=nova');
+    await waitFor(() => expect(useTasksStore.getState().filterAgent).toBe('nova'));
+
+    await user.click(screen.getByRole('button', { name: /Filter/ }));
+    await user.click(await screen.findByRole('menuitem', { name: 'Clear filters' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('search-probe')).not.toHaveTextContent('agent=nova');
     });
   });
 });

@@ -11,9 +11,11 @@ import {
   type EvolutionTelemetrySummary,
   type EvolutionConsolidation,
   type PlaybookEntry,
+  type RuleStatusKey,
   type KeyFactEntry,
 } from '@/lib/api';
 import { timeAgo } from '@/lib/format';
+import { withParam } from '@/lib/url-params';
 import { toast, formatError } from '@/lib/toast';
 import { useSystemStore } from '@/stores/system-store';
 import { MemoryBrowser } from '@/components/memory/MemoryBrowser';
@@ -94,13 +96,21 @@ export function MemoryPage() {
   const view = parseView(params.get('tab'), !isPersonal);
   const [agents, setAgents] = useState<ReadonlyArray<{ name: string; display_name: string }>>([]);
   const [selectedAgent, setSelectedAgent] = useState('');
-  const [query, setQuery] = useState('');
+  // W3-3 (state-as-URL): the memories search term starts from `?q=` so a
+  // bookmarked/shared search opens with the same query already typed.
+  const [query, setQuery] = useState(() => params.get('q') ?? '');
 
   const setView = (id: ViewId) => {
     const next = new URLSearchParams(params);
     next.set('tab', id);
     setParams(next, { replace: true });
   };
+
+  // Mirror the search term back into the URL (W3-3). Functional update so it
+  // never clobbers `tab` (or MemoryBrowser's own `cat` param below).
+  useEffect(() => {
+    setParams((prev) => withParam(prev, 'q', query), { replace: true });
+  }, [query, setParams]);
 
   useEffect(() => {
     api.agents.list().then((res) => {
@@ -692,9 +702,24 @@ const PLAYBOOK_STATE_CLASS: Record<string, string> = {
   retired: 'bg-muted text-muted-foreground/70',
 };
 
+/**
+ * W3-2 (§C.9) — status badge colours keyed by the *outward* vocabulary the
+ * gateway derives, not by the raw stored state. `observing` and `trial` are
+ * separate colours on purpose: 「觀察中(尚未生效)」 means the rule is not
+ * steering anything yet, which reads very differently from 「試用中」.
+ */
+const RULE_STATUS_CLASS: Record<RuleStatusKey, string> = {
+  observing: 'bg-info/15 text-info',
+  trial: 'bg-warning/15 text-warning',
+  active: 'bg-success/15 text-success',
+  dormant: 'bg-muted text-muted-foreground',
+  retired: 'bg-muted text-muted-foreground/70',
+};
+
 function PlaybookEntryRow({ entry, onRetire }: { entry: PlaybookEntry; onRetire: () => void }) {
   const intl = useIntl();
   const retired = entry.state === 'retired';
+  const h = entry.humanized;
 
   return (
     <Card data-size="sm">
@@ -704,9 +729,15 @@ function PlaybookEntryRow({ entry, onRetire }: { entry: PlaybookEntry; onRetire:
             <Badge variant="secondary" className={PLAYBOOK_CATEGORY_CLASS[entry.category]}>
               {intl.formatMessage({ id: `playbook.category.${entry.category}` })}
             </Badge>
-            <Badge variant="secondary" className={PLAYBOOK_STATE_CLASS[entry.state]}>
-              {intl.formatMessage({ id: `playbook.state.${entry.state}` })}
-            </Badge>
+            {h ? (
+              <Badge variant="secondary" className={RULE_STATUS_CLASS[h.status_key]}>
+                {intl.formatMessage({ id: `playbook.status.${h.status_key}` })}
+              </Badge>
+            ) : (
+              <Badge variant="secondary" className={PLAYBOOK_STATE_CLASS[entry.state]}>
+                {intl.formatMessage({ id: `playbook.state.${entry.state}` })}
+              </Badge>
+            )}
           </div>
           {!retired && (
             <Button variant="ghost" size="icon-xs" onClick={onRetire} aria-label={intl.formatMessage({ id: 'playbook.retire.button' })} title={intl.formatMessage({ id: 'playbook.retire.button' })}>
@@ -714,7 +745,44 @@ function PlaybookEntryRow({ entry, onRetire }: { entry: PlaybookEntry; onRetire:
             </Button>
           )}
         </div>
-        <p className="whitespace-pre-wrap text-sm text-foreground">{entry.content}</p>
+
+        {/* Plain language leads; the model-facing text is one click away. An
+            older gateway sends no `humanized`, so the raw content stays the
+            primary text there rather than the card rendering empty. */}
+        {h && !h.fallback ? (
+          <p className="whitespace-pre-wrap text-sm text-foreground">{h.sentence}</p>
+        ) : (
+          <>
+            {h?.fallback && (
+              <p className="text-xs text-muted-foreground">
+                {intl.formatMessage({ id: 'playbook.humanize.fallback' })}
+              </p>
+            )}
+            <p className="whitespace-pre-wrap text-sm text-foreground">{entry.content}</p>
+          </>
+        )}
+
+        {h && (
+          <p className="text-xs text-muted-foreground">
+            <span className="font-medium text-foreground/80">
+              {intl.formatMessage({ id: 'playbook.why.label' })}
+            </span>
+            {' '}
+            {h.why}
+          </p>
+        )}
+
+        {h && !h.fallback && (
+          <details className="group">
+            <summary className="cursor-pointer list-none rounded text-xs text-muted-foreground underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+              {intl.formatMessage({ id: 'playbook.raw.toggle' })}
+            </summary>
+            <p className="mt-1.5 whitespace-pre-wrap rounded-md bg-muted/40 p-2 font-mono text-xs text-muted-foreground">
+              {entry.content}
+            </p>
+          </details>
+        )}
+
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-surface-border pt-2 text-xs text-muted-foreground">
           <span>
             {intl.formatMessage({ id: 'playbook.stats' }, { helpful: entry.helpful, harmful: entry.harmful })}
@@ -725,8 +793,13 @@ function PlaybookEntryRow({ entry, onRetire }: { entry: PlaybookEntry; onRetire:
           {entry.eval_cases.length > 0 && (
             <span>{intl.formatMessage({ id: 'playbook.evalCases' }, { count: entry.eval_cases.length })}</span>
           )}
-          {entry.signals_match.length > 0 && (
-            <span className="truncate font-mono">{entry.signals_match.join(', ')}</span>
+          {(h?.evidence.failure_notes ?? 0) > 0 && (
+            <span>
+              {intl.formatMessage(
+                { id: 'playbook.failureNotes' },
+                { count: h?.evidence.failure_notes ?? 0 },
+              )}
+            </span>
           )}
         </div>
       </CardContent>

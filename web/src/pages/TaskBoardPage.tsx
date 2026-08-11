@@ -38,6 +38,7 @@ import {
 import { CreateTaskModal, TaskDoneBurst, celebrateTaskDone } from '@/components/task';
 import { toStatusKey, toBackendStatus } from '@/lib/task-status';
 import { timeAgo } from '@/lib/format';
+import { withParam, parseEnumParam } from '@/lib/url-params';
 import { api, type TaskInfo, type TaskStatus, type TaskPriority, type TaskCreateParams, type FlowMetrics } from '@/lib/api';
 import {
   Plus,
@@ -139,6 +140,9 @@ function isStale(task: TaskInfo, now: number): boolean {
 }
 
 const PRIORITY_RANK: Record<TaskPriority, number> = { urgent: 0, high: 1, medium: 2, low: 3 };
+/** The full `TaskPriority` set, in filter-menu order — shared by the filter
+ *  menu items and the `?priority=` URL param parser (W3-3). */
+const TASK_PRIORITIES: readonly TaskPriority[] = ['low', 'medium', 'high', 'urgent'];
 
 /** Order rows within a group by the active ordering preference (pure). */
 function orderRows(rows: ReadonlyArray<TaskInfo>, order: OrderMode): TaskInfo[] {
@@ -714,6 +718,32 @@ export function TaskBoardPage() {
 
   // `?assignee=<id>` (employee-detail "交辦" button) preselects the assignee.
   const defaultAssignee = searchParams.get('assignee') || undefined;
+
+  // W3-3 (state-as-URL, Stripe pattern B4): seed the agent/priority filters
+  // from the URL once on mount so a bookmarked/shared `/tasks?agent=…` link
+  // opens with the same view. Absent params leave whatever the store already
+  // carries untouched — this must not change default (no-param) behaviour.
+  const urlFiltersSeededRef = useRef(false);
+  useEffect(() => {
+    if (urlFiltersSeededRef.current) return;
+    urlFiltersSeededRef.current = true;
+    const agentParam = searchParams.get('agent');
+    const priorityParam = parseEnumParam(searchParams.get('priority'), TASK_PRIORITIES);
+    if (agentParam) setFilterAgent(agentParam);
+    if (priorityParam) setFilterPriority(priorityParam);
+    // Runs once; `searchParams`/setters are read at mount time only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Mirror the active filters back into the URL so the current view is
+  // bookmarkable/shareable (W3-3). Functional update to avoid clobbering
+  // `new`/`assignee` set by the effects above / `closeCreate` below.
+  useEffect(() => {
+    setSearchParams(
+      (prev) => withParam(withParam(prev, 'agent', filterAgent), 'priority', filterPriority),
+      { replace: true },
+    );
+  }, [filterAgent, filterPriority, setSearchParams]);
 
   const setViewPref = (v: ViewMode) => {
     setView(v);

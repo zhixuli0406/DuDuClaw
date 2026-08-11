@@ -18,10 +18,11 @@ const KIND_LABEL_KEYS: Record<TickSourceStatus['kind'], string> = {
   http_poll: 'autopilot.monitor.kind.http_poll',
   command: 'autopilot.monitor.kind.command',
   file_tail: 'autopilot.monitor.kind.file_tail',
+  websocket: 'autopilot.monitor.kind.websocket',
 };
 
 function droppedTotal(d: TickSourceStatus['dropped']): number {
-  return d.rate_cap + d.unchanged + d.oversize + d.fetch_error;
+  return d.rate_cap + d.unchanged + d.oversize + d.fetch_error + d.non_text;
 }
 
 /** Compact `key=value` rendering of one buffered observation. */
@@ -78,7 +79,13 @@ function SourceRow({ source }: { source: TickSourceStatus }) {
                   id: source.enabled ? 'autopilot.monitor.status.enabled' : 'autopilot.monitor.status.disabled',
                 })}
               </Badge>
-              <Badge variant="outline">{intl.formatMessage({ id: KIND_LABEL_KEYS[source.kind] })}</Badge>
+              <Badge variant="outline">
+                {/* A kind this build has no label for (older dashboard, newer
+                    gateway) falls back to the raw id instead of throwing. */}
+                {KIND_LABEL_KEYS[source.kind]
+                  ? intl.formatMessage({ id: KIND_LABEL_KEYS[source.kind] })
+                  : source.kind}
+              </Badge>
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
               {source.last_tick_ts

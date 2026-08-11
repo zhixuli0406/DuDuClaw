@@ -463,6 +463,33 @@ export interface UnifiedAuditResponse {
   total: number;
 }
 
+// ── W3-1 human takeover (read-only) — `takeover.list`. Surfaced in the W3-4
+// developer panel's 系統 tab so a manager watching the fleet can see who is
+// currently holding a conversation without leaving the page they're on. No
+// write twin by design (see the gateway dispatch comment on `takeover.list`) —
+// starting/extending/ending a takeover is a channel-side act.
+export interface TakeoverRecord {
+  /** Channel session key — the same shape `chat.sessions.list` uses. */
+  conversation: string;
+  channel: string;
+  /** Human-readable channel name (already localized server-side). */
+  channel_label: string;
+  chat_id: string;
+  agent_id: string;
+  /** Display name only — `holder_user_id` is deliberately never sent here. */
+  holder_display: string;
+  started_at: string;
+  until: string;
+  /** Whole minutes left, floored at 0 (never negative). */
+  minutes_left: number;
+  claimed_task_ids: string[];
+}
+
+export interface TakeoverListResponse {
+  count: number;
+  items: TakeoverRecord[];
+}
+
 export interface SkillIndexEntry {
   name: string;
   description: string;
@@ -848,11 +875,13 @@ export interface TickDroppedCounts {
   unchanged: number;
   oversize: number;
   fetch_error: number;
+  /** websocket sources only — binary frames the text-only pipeline refuses. */
+  non_text: number;
 }
 
 export interface TickSourceStatus {
   id: string;
-  kind: 'http_poll' | 'command' | 'file_tail';
+  kind: 'http_poll' | 'command' | 'file_tail' | 'websocket';
   enabled: boolean;
   interval_secs: number;
   max_events_per_minute: number;
@@ -993,6 +1022,37 @@ export interface EvolutionConsolidation {
   detail: string | null;
 }
 
+/** §C.9 outward status vocabulary for an experience rule (經驗法則). */
+export type RuleStatusKey = 'observing' | 'trial' | 'active' | 'dormant' | 'retired';
+
+/**
+ * W3-2 — the gateway's zero-LLM plain-language rewrite of a rule.
+ *
+ * `sentence` is ready-to-show zh-TW; the `*_key` fields are stable machine
+ * keys so the UI localizes rather than echoing the server's zh-TW label.
+ * `fallback === true` means the templates could not produce a sentence and
+ * `sentence` is the raw stored text — render it as such, never as a rewrite.
+ */
+export interface HumanizedRule {
+  sentence: string;
+  condition: string;
+  action: string;
+  purpose: string;
+  purpose_key: PlaybookEntry['category'];
+  status: string;
+  status_key: RuleStatusKey;
+  why: string;
+  fallback: boolean;
+  evidence: {
+    eval_cases: number;
+    failure_notes: number;
+    applications: number;
+    helpful: number;
+    harmful: number;
+    success_streak: number;
+  };
+}
+
 export interface PlaybookEntry {
   id: string;
   content: string;
@@ -1007,6 +1067,8 @@ export interface PlaybookEntry {
   net_score: number;
   origin: string;
   created_at: string;
+  /** Optional so an older gateway (pre-W3-2) still type-checks. */
+  humanized?: HumanizedRule;
 }
 
 export interface BrowserAuditEntry {
@@ -4232,6 +4294,11 @@ export const api = {
         id: string;
         decided: 'approved' | 'denied';
       }>,
+  },
+  // W3-1 — read-only: conversations a human currently holds. See
+  // `TakeoverListResponse` above for why there's no write twin.
+  takeover: {
+    list: () => client.call('takeover.list') as Promise<TakeoverListResponse>,
   },
   // WP14-T14.6 — budget incident console (manager-gated read).
   budget: {

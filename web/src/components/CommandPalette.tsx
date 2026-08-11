@@ -13,11 +13,14 @@ import {
   LogOut,
   Bot,
   ClipboardList,
+  Loader2,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
 import { fuzzyMatch, highlightSegments } from '@/lib/fuzzy';
+import { api } from '@/lib/api';
+import { looksLikeIdQuery, findIdMatch, idMatchRoute } from '@/lib/id-lookup';
 import {
   allManageNav,
   conversationsEntry,
@@ -40,6 +43,10 @@ import { useTasksStore } from '@/stores/tasks-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useThemeStore } from '@/stores/theme-store';
 import { useLocaleStore, localeNames } from '@/i18n';
+
+/** How long to let the user keep typing/pasting before spending the id-lookup
+ *  RPC round-trip (debounce for `IdDirectJump`). */
+const ID_LOOKUP_DEBOUNCE_MS = 200;
 
 interface Command {
   readonly id: string;
@@ -262,6 +269,71 @@ export function CommandPalette() {
     setActiveIndex((i) => (i >= results.length ? Math.max(0, results.length - 1) : i));
   }, [results.length]);
 
+  // ── ID direct-jump (W3-3, Stripe pattern B4): pasting any object id — task
+  // / approval / install / agent / conversation — jumps straight to its
+  // detail view. Local nav + entity commands above already cover the common
+  // case (agents/tasks already loaded into their stores render as exact
+  // fuzzy hits), so this only spends the RPC round-trip when every local
+  // command already missed AND the query is shaped like a pasted id, not a
+  // search phrase (`looksLikeIdQuery`). Queries every object-kind list RPC in
+  // parallel and jumps on the first — and only ever — hit; an all-miss shows
+  // "not found" instead of the generic empty state.
+  const [idLookup, setIdLookup] = useState<'idle' | 'searching' | 'notFound'>('idle');
+  useEffect(() => {
+    if (!open || !looksLikeIdQuery(query) || results.length > 0) {
+      setIdLookup('idle');
+      return;
+    }
+    let cancelled = false;
+    setIdLookup('searching');
+    const q = query.trim();
+    const timer = setTimeout(() => {
+      Promise.all([
+        api.tasks.list().catch(() => null),
+        api.approvals.list().catch(() => null),
+        api.installRequests.list().catch(() => null),
+        useConversationsStore
+          .getState()
+          .fetch()
+          .then(() => useConversationsStore.getState().sessions)
+          .catch(() => []),
+      ]).then(([tasksRes, approvalsRes, installRes, conversations]) => {
+        if (cancelled) return;
+        const match = findIdMatch(q, {
+          tasks: tasksRes?.tasks,
+          approvals: approvalsRes?.approvals,
+          installs: installRes?.requests,
+          agents,
+          conversations,
+        });
+        if (!match) {
+          setIdLookup('notFound');
+          return;
+        }
+        setIdLookup('idle');
+        closePalette();
+        if (match.kind === 'conversation') {
+          const session = conversations.find((c) => c.session_id === match.id);
+          if (session) {
+            void useConversationsStore
+              .getState()
+              .resume(session)
+              .then((ok) => {
+                if (ok) navigate('/chat');
+              });
+          }
+          return;
+        }
+        const route = idMatchRoute(match);
+        if (route) navigate(route);
+      });
+    }, ID_LOOKUP_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [open, query, results.length, agents, navigate, closePalette]);
+
   // Group results for section headers while preserving flat index for keyboard nav.
   const grouped = useMemo(() => {
     const order: string[] = [];
@@ -367,8 +439,17 @@ export function CommandPalette() {
           className="max-h-[min(400px,50vh)] overflow-y-auto overscroll-contain p-2"
         >
           {results.length === 0 ? (
-            <div className="px-3 py-10 text-center text-sm text-muted-foreground">
-              {t('cmdk.empty')}
+            <div className="flex flex-col items-center gap-2 px-3 py-10 text-center text-sm text-muted-foreground">
+              {idLookup === 'searching' ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                  {t('cmdk.idLookup.searching')}
+                </>
+              ) : idLookup === 'notFound' ? (
+                intl.formatMessage({ id: 'cmdk.idLookup.notFound' }, { query })
+              ) : (
+                t('cmdk.empty')
+              )}
             </div>
           ) : (
             grouped.map((group) => (
