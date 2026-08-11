@@ -1303,13 +1303,18 @@ impl GoalLoopDriver {
                 use crate::goal_notify::NotifyOutcome;
                 let outcome = crate::goal_notify::notify_goal_needs_human(&self.home_dir, task).await;
                 match outcome {
-                    NotifyOutcome::Sent | NotifyOutcome::NoTarget => {
+                    // `Deferred` cannot occur here in practice — needs_human
+                    // is L3 and quiet hours never hold it back — but it is
+                    // handled explicitly rather than by a wildcard so that a
+                    // future re-classification is a compile-time decision, not
+                    // a silently-swallowed notification.
+                    NotifyOutcome::Sent | NotifyOutcome::NoTarget | NotifyOutcome::Deferred => {
                         self.push_progress(
                             task, "needs_human", crate::goal_notify::GoalProgress::NeedsHuman,
                         )
                         .await;
                         self.needs_human_retry.lock().await.remove(&task.id);
-                        let sent = outcome == NotifyOutcome::Sent;
+                        let sent = outcome != NotifyOutcome::NoTarget;
                         self.post_activity(
                             "goal_loop.needs_human_notified",
                             &task.assigned_to,
@@ -1465,7 +1470,9 @@ impl GoalLoopDriver {
             crate::goal_notify::notify_goal_kickoff(&self.home_dir, &task.assigned_to, approval_id, summary)
                 .await;
         match outcome {
-            NotifyOutcome::Sent => {
+            // `Deferred` = the kickoff card is queued behind quiet hours (it
+            // is L2). Handled, not lost: retrying would queue a duplicate.
+            NotifyOutcome::Sent | NotifyOutcome::Deferred => {
                 self.kickoff_notified.lock().await.insert(task.id.clone());
                 self.kickoff_retry.lock().await.remove(&task.id);
             }

@@ -717,6 +717,29 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!("Channel-outage alert monitor scheduled — 2 min interval");
     }
 
+    // ── Notification governance (W2-4) ──────────────────────────────────
+    // Quiet hours defer L1/L2 notifications into `notify_queue.jsonl`
+    // (`crate::notify_governance`). Nothing else would ever take them out
+    // again: the push that queued a notice at 23:00 has no reason to run at
+    // 08:00, so the drainer is the only thing that closes the loop. Runs
+    // unconditionally and costs one `exists()` per minute when no agent has
+    // quiet hours configured (the default).
+    {
+        let drainer = Arc::new(crate::notify_governance::DeferredNotifyDrainer::new(home_dir.clone()));
+        tokio::spawn(drainer.run(std::time::Duration::from_secs(60)));
+        info!("Deferred-notification drainer scheduled — 1 min interval");
+    }
+
+    // Daily digest (C8). Self-gating: the scheduler reads
+    // `config.toml [notify] daily_digest` on every tick and returns
+    // immediately when it is off (the default), so a deployment that never
+    // opts in pays one file read per minute and sends nothing.
+    {
+        let digest = Arc::new(crate::notify_digest::DailyDigestScheduler::new(home_dir.clone()));
+        tokio::spawn(digest.run(std::time::Duration::from_secs(60)));
+        info!("Daily-digest scheduler scheduled — 1 min interval (off unless [notify] daily_digest = true)");
+    }
+
     // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
     let (event_tx, _) = broadcast::channel::<String>(64);
     handler.set_event_tx(event_tx.clone()).await;
@@ -1180,7 +1203,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // `config.toml [rule_induction] enabled` (default off — deny-safe;
         // see `RuleInductionConfig::from_home`), re-checked every tick. No-op
         // when `events.db` failed to open (nothing to scan).
-        if let Some(bus) = events_bus {
+        // (`.clone()`d rather than moved — the resident-sensing tick sources
+        // below reuse the SAME `Arc<EventBusStore>` handle for their opt-in
+        // `persist_every_n` audit trail.)
+        if let Some(bus) = events_bus.clone() {
             bg_handles.push(crate::rule_induction::spawn_induction_loop(
                 home_dir.clone(),
                 bus,
@@ -1247,6 +1273,36 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             ap_tx.clone(),
         ));
 
+        // ── Resident sensing: external data streams → autopilot bus ─────
+        // One poll task per `config.toml [[tick.sources]]` entry, feeding
+        // `AutopilotEvent::Tick` onto the SAME broadcast bus the engine and
+        // the CEP matcher above consume, so a tick is matched by the exact
+        // same deterministic rule machinery as every other event. Default
+        // OFF (`[tick] enabled = false`): with no `[tick]` section
+        // `active_sources()` is empty and not a single task is spawned.
+        // The hub (recent-tick ring buffer) is created regardless so the
+        // engine's wake-up context injection has a stable handle.
+        let tick_hub = Arc::new(crate::tick_source::TickHub::new());
+        // WP4: hand the dashboard/MCP handler the SAME hub the poll tasks
+        // and the engine write into, so `ticks.sources`/`ticks.recent` read
+        // live counters rather than a second, never-updated copy.
+        handler.set_tick_hub(tick_hub.clone()).await;
+        {
+            let tick_cfg = crate::tick_config::TickConfig::from_home(&home_dir);
+            let handles = crate::tick_source::spawn_tick_sources(
+                &tick_cfg,
+                ap_tx.clone(),
+                tick_hub.clone(),
+                events_bus.clone(),
+            );
+            if handles.is_empty() {
+                info!("Resident sensing disabled (no active [tick] sources)");
+            } else {
+                info!(sources = handles.len(), "Resident sensing tick sources started");
+            }
+            bg_handles.extend(handles);
+        }
+
         // Spawn the engine loop
         let engine = crate::autopilot_engine::AutopilotEngine::new(
             home_dir.clone(),
@@ -1255,7 +1311,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             mq_for_autopilot,
             ap_rx,
         )
-        .with_proactive_gate(proactive_gate);
+        .with_proactive_gate(proactive_gate)
+        .with_tick_hub(tick_hub);
         bg_handles.push(tokio::spawn(async move { engine.run().await }));
         info!("Autopilot trigger engine started");
     } else {

@@ -322,7 +322,17 @@ async fn notify_breaker_transition(
     } else {
         format!("✅ {name} 已恢復工作：預算額度已回復。{link}")
     };
-    let outcome = crate::goal_notify::notify_agent_plain(home_dir, agent_id, &text).await;
+    // Stopping work is L3 — the agent is dead in the water until someone
+    // raises the budget, and "found out at 08:00" costs a whole night's
+    // throughput. Coming back online is L1: welcome news nobody has to act on.
+    let level = if is_open {
+        crate::notify_governance::NotifyLevel::Act
+    } else {
+        crate::notify_governance::NotifyLevel::Fyi
+    };
+    let outcome =
+        crate::goal_notify::notify_agent_plain(home_dir, agent_id, level, "budget.breaker", &text)
+            .await;
     if matches!(outcome, crate::goal_notify::NotifyOutcome::SendFailed) {
         tracing::debug!(agent_id, is_open, "budget: breaker-transition push failed (non-fatal)");
     }

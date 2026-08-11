@@ -27,15 +27,34 @@
 //! future writer that stamps a `channel` field on its record is picked up
 //! automatically, no code change needed here.
 //!
-//! Only records carrying a non-empty `channel` field count as a per-channel
-//! send failure. Today that is exclusively [`crate::telegram`]'s
-//! `record_send_failure` (`telegram_send_failed`); every other existing
-//! writer (`channel_reply_silent`, `runtime_fallback_substitution`,
+//! Only records whose `event` is in [`SEND_FAILURE_EVENTS`] **and** which
+//! carry a non-empty `channel` count as a per-channel send failure. Every
+//! other writer (`channel_reply_silent`, `runtime_fallback_substitution`,
 //! `channel_reply_fallback`, `pty_pool_fallback`, `trajectory_anomaly`,
 //! `foresight_alarm`) describes an agent/runtime condition rather than "this
 //! channel can't deliver", and is deliberately excluded — alerting on those
 //! would conflate a channel outage with an LLM/runtime failure the operator
 //! would investigate completely differently.
+//!
+//! **The event allowlist is load-bearing, not belt-and-braces.** Until W2-4
+//! this module keyed purely off "has a non-empty `channel` field", which was
+//! safe only because exactly one writer stamped one. W2-4 gave every
+//! session-aware writer a `channel` field (so the dashboard can attribute a
+//! failure to a platform), which under the old rule would have turned every
+//! LLM timeout and every trajectory anomaly into a channel-outage page.
+//! Widening this list is therefore a deliberate act: a new entry must be an
+//! event that genuinely means "this channel could not deliver a message".
+//!
+//! ## Recovery (`channel_recovered`)
+//!
+//! When a channel drops back under threshold this module appends a
+//! `channel_recovered` record to the same JSONL. The failure rows themselves
+//! are never rewritten — an audit log is append-only — so a consumer decides
+//! "is this outage still current?" by looking for a later `channel_recovered`
+//! for the same channel, exactly as it would for any other event-sourced
+//! state. Both a `resolved: true` flag and a `resolves` field naming the
+//! failure event are carried, so the row is self-describing without needing
+//! this module's source to interpret.
 //!
 //! ## Threshold & de-duplication
 //!
@@ -86,12 +105,27 @@ const TAIL_BYTES: u64 = 256 * 1024;
 /// system-level rows).
 const ACTIVITY_AGENT_ID: &str = "channel_alert";
 
+/// `event` values that mean "this channel could not deliver a message".
+///
+/// See the module docs: this list, not the mere presence of a `channel`
+/// field, is what makes a record count toward an outage.
+pub const SEND_FAILURE_EVENTS: &[&str] = &["telegram_send_failed"];
+
+/// The `event` written when a channel comes back.
+pub const RECOVERED_EVENT: &str = "channel_recovered";
+
+/// Action-rate stats bucket for the outage alert.
+const NOTIFY_TYPE: &str = "channel.outage";
+
 // ── Parsing ──────────────────────────────────────────────────────────────
 
 /// One parsed channel-level send-failure record.
 #[derive(Debug, Clone, PartialEq)]
 struct ChannelFailure {
     channel: String,
+    /// The `event` token, carried so a recovery record can name what it
+    /// resolves.
+    event: String,
     /// The AI employee whose message failed to send, when the record
     /// carries one — used as a hint for token resolution when pushing the
     /// alert (an agent's own `agent.toml [channels.<x>]` config may resolve
@@ -103,12 +137,18 @@ struct ChannelFailure {
 }
 
 /// Parse one `channel_failures.jsonl` line into a [`ChannelFailure`].
-/// `None` when the line isn't valid JSON, has no non-empty `channel` field
-/// (not a per-channel send failure — see module docs), or has no parseable
-/// `timestamp`. A record we can't window is treated conservatively as "not
-/// counted" rather than risking a false trigger from malformed data.
+///
+/// `None` when the line isn't valid JSON, its `event` is not in
+/// [`SEND_FAILURE_EVENTS`], it has no non-empty `channel`, or it has no
+/// parseable `timestamp`. A record we can't classify or can't window is
+/// treated conservatively as "not counted" rather than risking a false
+/// trigger from malformed data.
 fn parse_failure_line(line: &str) -> Option<ChannelFailure> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let event = v.get("event").and_then(|e| e.as_str())?.trim();
+    if !SEND_FAILURE_EVENTS.contains(&event) {
+        return None;
+    }
     let channel = v.get("channel").and_then(|c| c.as_str())?.trim();
     if channel.is_empty() {
         return None;
@@ -127,6 +167,7 @@ fn parse_failure_line(line: &str) -> Option<ChannelFailure> {
         .map(str::to_string);
     Some(ChannelFailure {
         channel: channel.to_string(),
+        event: event.to_string(),
         agent,
         reason,
         timestamp,
@@ -210,7 +251,12 @@ fn alert_body(channel_label: &str, count: usize, link: Option<&str>) -> String {
 /// reusing `channel_reply::channel_display_name` — that function is private
 /// to a file this change does not touch; duplicating a ten-entry display
 /// table is cheaper than widening that file's surface for it.
-fn channel_label(channel: &str) -> &str {
+///
+/// `pub(crate)`: `handlers.rs`'s unified-log renderer (W2-8) reuses this so a
+/// `channel_recovered` row reads with the exact same label as the Activity
+/// Feed row this module writes alongside it — one lookup table, not two that
+/// could drift.
+pub(crate) fn channel_label(channel: &str) -> &str {
     match channel {
         "telegram" => "Telegram",
         "line" => "LINE",
@@ -306,9 +352,12 @@ impl ChannelAlertMonitor {
             .map(|(ch, _)| ch.clone())
             .collect();
 
-        let to_alert: Vec<String> = {
+        let (to_alert, recovered): (Vec<String>, Vec<String>) = {
             let alerted = self.alerted.lock().await;
-            currently_failing.difference(&alerted).cloned().collect()
+            (
+                currently_failing.difference(&alerted).cloned().collect(),
+                alerted.difference(&currently_failing).cloned().collect(),
+            )
         };
 
         for channel in &to_alert {
@@ -316,8 +365,17 @@ impl ChannelAlertMonitor {
             self.raise_alert(channel, count, &failures).await;
         }
 
+        // W2-4: recovery is now an explicit event, not just the absence of a
+        // signal. Consumers of the unified log could previously see "telegram
+        // failed 3 times" forever with no way to know it had been fine for a
+        // week; a `channel_recovered` row makes "is this still current?"
+        // answerable without re-deriving the window.
+        for channel in &recovered {
+            self.record_recovery(channel, &failures).await;
+        }
+
         // Whole-set replace: channels no longer over threshold drop out
-        // (their streak "recovered" — see module docs), channels still over
+        // (their streak recovered — recorded above), channels still over
         // threshold keep their marker (no re-send), and newly-crossed
         // channels were just alerted above.
         *self.alerted.lock().await = currently_failing.clone();
@@ -357,10 +415,68 @@ impl ChannelAlertMonitor {
                 channel,
                 "channel-alert: no reachable destination for this alert — degrading to log + Activity Feed only"
             );
+        } else {
+            // L3 (W2-4): a channel that can't deliver is a real outage — it
+            // is never held back by quiet hours, and it is counted so P4-5
+            // can tell whether operators actually act on these.
+            crate::notify_stats::record_push(
+                &self.home_dir,
+                NOTIFY_TYPE,
+                crate::notify_governance::NotifyLevel::Act,
+                None,
+            );
         }
 
         self.post_activity(channel, count, delivered.as_deref(), latest.and_then(|f| f.reason.as_deref()))
             .await;
+    }
+
+    /// Record that a channel stopped failing: one `channel_recovered` row in
+    /// `channel_failures.jsonl` plus one Activity Feed row.
+    ///
+    /// Deliberately does **not** push a message. A channel coming back is L1
+    /// (nobody has to do anything) and the operator was already told when it
+    /// broke; "it's fine again" at 03:00 is precisely the notification P4-1's
+    /// actionability rule exists to suppress.
+    async fn record_recovery(&self, channel: &str, failures: &[ChannelFailure]) {
+        let resolves = latest_for_channel(failures, channel)
+            .map(|f| f.event.clone())
+            .unwrap_or_else(|| SEND_FAILURE_EVENTS[0].to_string());
+        let rec = serde_json::json!({
+            "event": RECOVERED_EVENT,
+            "channel": channel,
+            // The unified-log RPC renders `channel.{reason}`, so this is what
+            // the dashboard shows as the event type.
+            "reason": "recovered",
+            "resolved": true,
+            "resolves": resolves,
+            "timestamp": Utc::now().to_rfc3339(),
+        });
+        if let Err(e) = crate::trajectory_guard::append_anomaly(&self.home_dir, &rec) {
+            debug!(error = %e, "channel-alert: 寫入 channel_recovered 失敗（非致命）");
+        }
+
+        let store = match TaskStore::open(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(error = %e, "channel-alert: failed to open task store for recovery row (non-fatal)");
+                return;
+            }
+        };
+        let row = ActivityRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: "channel_recovered".to_string(),
+            agent_id: ACTIVITY_AGENT_ID.to_string(),
+            task_id: None,
+            summary: format!("通道「{}」已恢復正常發送", channel_label(channel)),
+            timestamp: Utc::now().to_rfc3339(),
+            metadata: Some(
+                serde_json::json!({ "channel": channel, "resolves": resolves }).to_string(),
+            ),
+        };
+        if let Err(e) = store.append_activity(&row).await {
+            debug!(error = %e, "channel-alert: recovery activity append failed (non-fatal)");
+        }
     }
 
     /// Best-effort Activity Feed append (telemetry, never control flow — a
@@ -416,6 +532,7 @@ mod tests {
     fn failure(channel: &str, ts: DateTime<Utc>) -> ChannelFailure {
         ChannelFailure {
             channel: channel.to_string(),
+            event: "telegram_send_failed".to_string(),
             agent: None,
             reason: None,
             timestamp: ts,
@@ -435,31 +552,60 @@ mod tests {
 
     #[test]
     fn parses_agent_field_when_present() {
-        let line = r#"{"event":"channel_reply_fallback","agent":"sales-bot","channel":"slack","timestamp":"2026-08-11T10:00:00Z"}"#;
+        let line = r#"{"event":"telegram_send_failed","agent":"sales-bot","channel":"telegram","timestamp":"2026-08-11T10:00:00Z"}"#;
         let rec = parse_failure_line(line).unwrap();
         assert_eq!(rec.agent.as_deref(), Some("sales-bot"));
+        assert_eq!(rec.event, "telegram_send_failed");
     }
 
     #[test]
     fn rejects_records_without_a_channel_field() {
-        // Every existing non-telegram writer (trajectory anomaly, foresight
-        // alarm, channel_reply_fallback's agent-only shape, …) — these must
-        // never count toward a channel-outage alert.
-        let line = r#"{"event":"trajectory_anomaly","agent":"a","session_id":"s","timestamp":"2026-08-11T10:00:00Z"}"#;
+        let line = r#"{"event":"telegram_send_failed","agent":"a","timestamp":"2026-08-11T10:00:00Z"}"#;
+        assert_eq!(parse_failure_line(line), None);
+    }
+
+    #[test]
+    fn agent_and_runtime_events_never_count_even_with_a_channel_field() {
+        // W2-4 stamped `channel` on every session-aware writer so the
+        // dashboard can attribute failures to a platform. Under the old
+        // "any record with a channel" rule, each of these would have started
+        // paging as a channel outage. The event allowlist is what stops that.
+        for line in [
+            r#"{"event":"trajectory_anomaly","agent":"a","channel":"telegram","timestamp":"2026-08-11T10:00:00Z"}"#,
+            r#"{"event":"foresight_alarm","agent":"a","channel":"telegram","timestamp":"2026-08-11T10:00:00Z"}"#,
+            r#"{"event":"channel_reply_fallback","agent":"a","channel":"telegram","timestamp":"2026-08-11T10:00:00Z"}"#,
+            r#"{"event":"channel_reply_silent","channel":"telegram","timestamp":"2026-08-11T10:00:00Z"}"#,
+            r#"{"event":"runtime_fallback_substitution","channel":"slack","timestamp":"2026-08-11T10:00:00Z"}"#,
+            r#"{"event":"pty_pool_fallback","channel":"telegram","timestamp":"2026-08-11T10:00:00Z"}"#,
+            // A recovery row must never itself count as a failure.
+            r#"{"event":"channel_recovered","channel":"telegram","resolved":true,"timestamp":"2026-08-11T10:00:00Z"}"#,
+        ] {
+            assert_eq!(parse_failure_line(line), None, "must not count: {line}");
+        }
+    }
+
+    #[test]
+    fn rejects_records_without_an_event_field() {
+        let line = r#"{"channel":"telegram","timestamp":"2026-08-11T10:00:00Z"}"#;
         assert_eq!(parse_failure_line(line), None);
     }
 
     #[test]
     fn rejects_blank_channel() {
-        let line = r#"{"channel":"   ","timestamp":"2026-08-11T10:00:00Z"}"#;
+        let line = r#"{"event":"telegram_send_failed","channel":"   ","timestamp":"2026-08-11T10:00:00Z"}"#;
         assert_eq!(parse_failure_line(line), None);
     }
 
     #[test]
     fn rejects_missing_or_bad_timestamp() {
-        assert_eq!(parse_failure_line(r#"{"channel":"telegram"}"#), None);
         assert_eq!(
-            parse_failure_line(r#"{"channel":"telegram","timestamp":"not-a-date"}"#),
+            parse_failure_line(r#"{"event":"telegram_send_failed","channel":"telegram"}"#),
+            None
+        );
+        assert_eq!(
+            parse_failure_line(
+                r#"{"event":"telegram_send_failed","channel":"telegram","timestamp":"not-a-date"}"#
+            ),
             None
         );
     }
@@ -682,6 +828,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 2, "one row for the first streak, one for the relapse");
+    }
+
+    #[tokio::test]
+    async fn recovery_writes_a_channel_recovered_event_and_activity_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        write_failures(
+            dir.path(),
+            &[
+                failure_line("telegram", now - chrono::Duration::minutes(1)),
+                failure_line("telegram", now - chrono::Duration::minutes(2)),
+                failure_line("telegram", now - chrono::Duration::minutes(3)),
+            ],
+        );
+        let monitor = ChannelAlertMonitor::new(dir.path().to_path_buf());
+        let _ = monitor.tick().await;
+
+        // Age the failures out of the window ⇒ recovery.
+        write_failures(
+            dir.path(),
+            &[failure_line("telegram", now - chrono::Duration::minutes(30))],
+        );
+        let _ = monitor.tick().await;
+
+        let body = std::fs::read_to_string(dir.path().join("channel_failures.jsonl")).unwrap();
+        let recovered: Vec<serde_json::Value> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some(RECOVERED_EVENT))
+            .collect();
+        assert_eq!(recovered.len(), 1, "exactly one recovery row: {body}");
+        assert_eq!(recovered[0]["channel"], "telegram");
+        assert_eq!(recovered[0]["resolved"], true);
+        assert_eq!(recovered[0]["resolves"], "telegram_send_failed");
+        // The dashboard's unified log renders `channel.{reason}`.
+        assert_eq!(recovered[0]["reason"], "recovered");
+
+        let store = TaskStore::open(dir.path()).unwrap();
+        let (rows, total) = store
+            .list_activity(None, Some("channel_recovered"), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert!(rows[0].summary.contains("已恢復"));
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_never_alerted_never_reports_recovery() {
+        // Below threshold the whole time ⇒ nothing broke ⇒ nothing recovered.
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        write_failures(dir.path(), &[failure_line("telegram", now)]);
+        let monitor = ChannelAlertMonitor::new(dir.path().to_path_buf());
+        let _ = monitor.tick().await;
+        write_failures(dir.path(), &[failure_line("telegram", now - chrono::Duration::hours(1))]);
+        let _ = monitor.tick().await;
+
+        let body = std::fs::read_to_string(dir.path().join("channel_failures.jsonl")).unwrap();
+        assert!(!body.contains(RECOVERED_EVENT), "{body}");
     }
 
     #[tokio::test]

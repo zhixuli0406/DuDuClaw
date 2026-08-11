@@ -38,6 +38,46 @@ use duduclaw_auth::models::{UserRole, UserStatus};
 use duduclaw_auth::UserDb;
 
 use crate::decision_action::{DecisionAct, DecisionAction, DecisionSource};
+use crate::notify_governance::NotifyLevel;
+
+// ── Escalation level (W2-4, P4-1) ───────────────────────────────
+
+/// Where each decision source sits on the escalation ladder.
+///
+/// The rule from `02-ux-methodology.md` P4-1 is "urgent AND important AND
+/// actionable AND real ⇒ L3". Applied honestly, that splits the five sources
+/// two ways:
+///
+/// - **L3 (never suppressed)** — `Goal` (an autonomous run has stopped dead
+///   waiting for a person), `Approval` (a high-risk, often irreversible
+///   action is being held), `Install` (a two-stage sign-off gating software
+///   entering the deployment). Each blocks something with a real cost to
+///   waiting, and each is exactly the "would you rather be woken than find
+///   out eight hours later" case.
+/// - **L2 (deferrable)** — `Kickoff` (a goal has not *started*; the cost of
+///   starting at 08:00 instead of 03:00 is one night) and `Autopilot` (a rule
+///   already stopped itself; the breaker is the safety, the message is the
+///   notice).
+pub fn notify_level(source: DecisionSource) -> NotifyLevel {
+    match source {
+        DecisionSource::Goal | DecisionSource::Approval | DecisionSource::Install => NotifyLevel::Act,
+        DecisionSource::Kickoff | DecisionSource::Autopilot => NotifyLevel::Confirm,
+    }
+}
+
+/// The action-rate stats bucket for a decision source
+/// ([`crate::notify_stats`]). One bucket per source, so P4-5's "is this type
+/// of notification worth sending" question is answerable per source rather
+/// than for "decisions" as an undifferentiated lump.
+pub fn notify_type(source: DecisionSource) -> &'static str {
+    match source {
+        DecisionSource::Goal => "decision.goal",
+        DecisionSource::Kickoff => "decision.kickoff",
+        DecisionSource::Approval => "decision.approval",
+        DecisionSource::Install => "decision.install",
+        DecisionSource::Autopilot => "decision.autopilot",
+    }
+}
 
 /// External channels a pending decision may be pushed to. A session id like
 /// `webchat:<conn>#agent:…` names a transport with no bot-push API, so it must
@@ -297,14 +337,112 @@ pub(crate) struct DecisionCard<'a> {
     pub no_button_hint: &'a str,
 }
 
-/// Push one decision card to one destination, recording where it landed so a
-/// later settle can retire it in place.
+/// Push one decision card to one destination, **through the notification
+/// governance layer** ([`crate::notify_governance`]).
 ///
-/// Returns whether delivery succeeded. Capturing the message identity is
-/// best-effort on top of that: a platform response that doesn't yield one
-/// (LINE always, or an unexpected body) still counts as delivered — it only
-/// costs a later append instead of an in-place edit.
+/// [`NotifyLevel::Act`] cards (goal `needs_human`, high-risk approvals,
+/// install sign-offs) go out immediately whatever the hour. [`NotifyLevel::Confirm`]
+/// cards (kickoff gates, a paused autopilot rule) are queued during quiet
+/// hours and re-rendered — buttons and all — when the window ends.
+///
+/// Returns `true` when the card was delivered **or** queued; both mean "the
+/// caller's job here is done". `false` means neither happened.
 pub(crate) async fn deliver(
+    home_dir: &Path,
+    http: &reqwest::Client,
+    channel: &str,
+    token: &str,
+    chat_id: &str,
+    card: &DecisionCard<'_>,
+) -> bool {
+    !matches!(
+        deliver_outcome(home_dir, http, channel, token, chat_id, card).await,
+        DeliverOutcome::Failed
+    )
+}
+
+/// What [`deliver_outcome`] did with a card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliverOutcome {
+    /// Pushed to the channel now.
+    Sent,
+    /// Held back by quiet hours and queued. Not a failure, and NOT worth
+    /// retrying — a retry would enqueue a duplicate.
+    Deferred,
+    /// Neither happened.
+    Failed,
+}
+
+/// [`deliver`] with the deferral distinguishable from a real send. Callers
+/// that surface an outcome to a retry loop (the goal loop) use this; callers
+/// that only need "did the caller's job get done" use [`deliver`].
+pub(crate) async fn deliver_outcome(
+    home_dir: &Path,
+    http: &reqwest::Client,
+    channel: &str,
+    token: &str,
+    chat_id: &str,
+    card: &DecisionCard<'_>,
+) -> DeliverOutcome {
+    let level = notify_level(card.source);
+    // Cards addressed to a specific agent would ideally use that agent's
+    // quiet hours; a `DecisionCard` carries no agent id, so the deployment
+    // fallback (`config.toml [notify] quiet_hours`) is what applies. Stated
+    // rather than silently approximated — per-agent windows for decision
+    // cards need an agent id threaded through five call sites, which is a
+    // separate change.
+    let policy = crate::notify_governance::QuietPolicy {
+        window: crate::notify_governance::load_global_window(home_dir),
+        tz: crate::notify_governance::NotifyTz::System,
+    };
+    if let Some(until) = policy.decide(level, chrono::Utc::now()) {
+        let queued = crate::notify_governance::enqueue(
+            home_dir,
+            crate::notify_governance::DeferredNotice {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: String::new(),
+                channel: channel.to_string(),
+                chat_id: chat_id.to_string(),
+                level: level.as_str().to_string(),
+                notify_type: notify_type(card.source).to_string(),
+                queued_at: chrono::Utc::now().to_rfc3339(),
+                deliver_after: until.to_rfc3339(),
+                kind: crate::notify_governance::NoticeKind::Decision,
+                text: card.body.to_string(),
+                link: card.link.map(str::to_string),
+                no_button_hint: Some(card.no_button_hint.to_string()),
+                decision_source: Some(card.source.token().to_string()),
+                decision_id: Some(card.decision_id.to_string()),
+            },
+        );
+        return if queued {
+            DeliverOutcome::Deferred
+        } else {
+            DeliverOutcome::Failed
+        };
+    }
+    if deliver_now(home_dir, http, channel, token, chat_id, card).await {
+        crate::notify_stats::record_push(
+            home_dir,
+            notify_type(card.source),
+            level,
+            Some(card.decision_id),
+        );
+        DeliverOutcome::Sent
+    } else {
+        DeliverOutcome::Failed
+    }
+}
+
+/// The un-gated push. Called by [`deliver`] when the card may go out now, and
+/// by the deferred-queue drainer when a held-back card's window has ended.
+///
+/// Records where the card landed so a later settle can retire it in place.
+/// Capturing the message identity is best-effort on top of delivery: a
+/// platform response that doesn't yield one (LINE always, or an unexpected
+/// body) still counts as delivered — it only costs a later append instead of
+/// an in-place edit.
+pub(crate) async fn deliver_now(
     home_dir: &Path,
     http: &reqwest::Client,
     channel: &str,
@@ -378,7 +516,24 @@ pub async fn route_press(
 }
 
 /// Apply an already-decoded decision against its owning store.
+///
+/// A **successful** apply is what gets recorded as an action for the
+/// action-rate metric (P4-5) — a refused or stale press is a failed
+/// interaction, not evidence the notification was worth sending.
 pub(crate) async fn dispatch(
+    home_dir: &Path,
+    channel: &str,
+    channel_user_id: &str,
+    action: &DecisionAction,
+) -> Result<String, String> {
+    let outcome = dispatch_inner(home_dir, channel, channel_user_id, action).await;
+    if outcome.is_ok() {
+        crate::notify_stats::record_action(home_dir, notify_type(action.source), &action.id);
+    }
+    outcome
+}
+
+async fn dispatch_inner(
     home_dir: &Path,
     channel: &str,
     channel_user_id: &str,
@@ -644,7 +799,122 @@ mod tests {
         assert_eq!(reason_prefix(DecisionSource::Autopilot), "🔁 自動規則已暫停");
     }
 
+    // ── escalation level (W2-4) ────────────────────────────
+
+    #[test]
+    fn every_decision_source_has_a_level_and_the_split_is_the_documented_one() {
+        use crate::notify_governance::NotifyLevel;
+        assert_eq!(notify_level(DecisionSource::Goal), NotifyLevel::Act);
+        assert_eq!(notify_level(DecisionSource::Approval), NotifyLevel::Act);
+        assert_eq!(notify_level(DecisionSource::Install), NotifyLevel::Act);
+        assert_eq!(notify_level(DecisionSource::Kickoff), NotifyLevel::Confirm);
+        assert_eq!(notify_level(DecisionSource::Autopilot), NotifyLevel::Confirm);
+    }
+
+    #[test]
+    fn l3_decision_sources_can_never_be_held_by_quiet_hours() {
+        for s in [DecisionSource::Goal, DecisionSource::Approval, DecisionSource::Install] {
+            assert!(
+                !notify_level(s).is_suppressible(),
+                "{s:?} blocks work until a person answers; it must never be deferred"
+            );
+        }
+    }
+
+    #[test]
+    fn notify_types_are_distinct_and_namespaced_per_source() {
+        let all = [
+            DecisionSource::Goal,
+            DecisionSource::Kickoff,
+            DecisionSource::Approval,
+            DecisionSource::Install,
+            DecisionSource::Autopilot,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for s in all {
+            let t = notify_type(s);
+            assert!(t.starts_with("decision."), "stats buckets are namespaced: {t}");
+            assert!(seen.insert(t), "one bucket per source, so P4-5 is answerable per source: {t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_l2_card_inside_quiet_hours_is_queued_with_its_buttons_recoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let window = crate::notify_governance::tests::window_covering_now();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!("[notify]\nquiet_hours = \"{window}\"\n"),
+        )
+        .unwrap();
+
+        let card = DecisionCard {
+            source: DecisionSource::Kickoff,
+            decision_id: "apv-123",
+            body: "🚀 新任務要開工",
+            link: Some("http://localhost:18789/inbox?item=apv-123"),
+            no_button_hint: "請至儀表板同意或拒絕。",
+        };
+        let http = reqwest::Client::new();
+        let outcome =
+            deliver_outcome(dir.path(), &http, "telegram", "tok", "555", &card).await;
+        assert_eq!(outcome, DeliverOutcome::Deferred);
+
+        let queued = crate::notify_governance::take_due(
+            dir.path(),
+            chrono::Utc::now() + chrono::Duration::hours(2),
+        );
+        assert_eq!(queued.len(), 1);
+        let n = &queued[0];
+        assert_eq!(n.kind, crate::notify_governance::NoticeKind::Decision);
+        // Everything the drainer needs to re-render the card with its buttons.
+        assert_eq!(n.decision_source.as_deref(), Some("kick"));
+        assert_eq!(n.decision_id.as_deref(), Some("apv-123"));
+        assert_eq!(n.text, "🚀 新任務要開工");
+        assert_eq!(n.link.as_deref(), Some("http://localhost:18789/inbox?item=apv-123"));
+        assert_eq!(n.no_button_hint.as_deref(), Some("請至儀表板同意或拒絕。"));
+        assert_eq!(
+            DecisionSource::from_token(n.decision_source.as_deref().unwrap()),
+            Some(DecisionSource::Kickoff)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_quiet_window_means_no_card_is_ever_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = DecisionCard {
+            source: DecisionSource::Kickoff,
+            decision_id: "apv-1",
+            body: "x",
+            link: None,
+            no_button_hint: "y",
+        };
+        let http = reqwest::Client::new();
+        // No config.toml ⇒ no window ⇒ it takes the send path (which fails
+        // against a bogus token, and that is fine — the assertion is that
+        // nothing was queued).
+        let _ = deliver_outcome(dir.path(), &http, "line", "tok", "U1", &card).await;
+        assert!(crate::notify_governance::take_due(
+            dir.path(),
+            chrono::Utc::now() + chrono::Duration::hours(2)
+        )
+        .is_empty());
+    }
+
     // ── inbound routing ────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_successful_press_records_an_action_and_a_refused_one_does_not() {
+        // Action rate must count decisions people actually settled, not
+        // presses that bounced off a fail-closed store.
+        let dir = tempfile::tempdir().unwrap();
+        let out = route_press(dir.path(), "telegram", "u1", "duduclaw:decide:apv:ok:missing").await;
+        assert!(out.unwrap().is_err(), "a missing row must refuse");
+        assert!(
+            crate::notify_stats::stats(dir.path(), 30).is_empty(),
+            "a refused press is a failed interaction, not evidence the notification worked"
+        );
+    }
 
     #[tokio::test]
     async fn route_press_ignores_non_decision_actions() {

@@ -1238,6 +1238,11 @@ async fn handle_message_create(
     let channel_id = data["channel_id"].as_str().unwrap_or("");
     let guild_id = data["guild_id"].as_str().unwrap_or(""); // empty for DMs
     let message_id = data["id"].as_str().unwrap_or("");
+
+    // W2-7: cache channel->guild before any filtering below returns early —
+    // maximizes the chance the mapping is already known by the time a
+    // same-channel `/goal` command or approval fan-out needs it.
+    record_channel_guild(&ctx.home_dir, channel_id, guild_id);
     let author_name = author.and_then(|a| a["username"].as_str()).unwrap_or("someone");
     let user_id = author_id;
 
@@ -2335,6 +2340,141 @@ async fn edit_interaction_response(
         }
         Err(e) => error!("Discord edit interaction error: {e}"),
         _ => {}
+    }
+}
+
+// ── Channel → guild id persistence (W2-7 deep-link coords) ──
+//
+// `channel_link.rs`'s Discord deep link (`discord.com/channels/<guild>/...`)
+// needs the guild id, but the gateway only sees it transiently on inbound
+// Gateway events (`MESSAGE_CREATE`'s `guild_id` field) — nothing durable
+// remembered a channel's guild anywhere a later `/goal` task creation or
+// decision-card push could read it back from. Every inbound guild message
+// (not DMs — `guild_id` is empty there) upserts `channel_id -> guild_id`
+// here; callers snapshot it onto their own record (`TaskRow.
+// source_discord_guild_id`, `decision_message_store::CardEntry`) at write
+// time rather than re-reading this cache live, so a link keeps resolving
+// even after the bot leaves the guild or this cache is pruned/reset.
+
+const CHANNEL_GUILD_STORE_FILE: &str = "discord_channel_guilds.json";
+/// Hard cap on distinct channels remembered. No per-entry timestamp is
+/// tracked (this is a small best-effort cache, not an audit log), so once
+/// full, unseen channels are simply not recorded until the file is pruned by
+/// an operator — degrading to "no link" for the newest channels only, never
+/// panicking or growing the file unbounded.
+const CHANNEL_GUILD_STORE_CAP: usize = 1_000;
+
+fn channel_guild_store_path(home_dir: &Path) -> std::path::PathBuf {
+    home_dir.join(CHANNEL_GUILD_STORE_FILE)
+}
+
+fn load_channel_guild_store(home_dir: &Path) -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(channel_guild_store_path(home_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Record `channel_id -> guild_id`. Best-effort and non-fatal: a write
+/// failure only means a later deep link degrades to `None`, never blocks
+/// message handling. No-ops for DMs (`guild_id` empty) and for a mapping
+/// that's already up to date (skips a disk write on every single message in
+/// a hot channel).
+pub(crate) fn record_channel_guild(home_dir: &Path, channel_id: &str, guild_id: &str) {
+    if channel_id.is_empty() || guild_id.is_empty() {
+        return;
+    }
+    let path = channel_guild_store_path(home_dir);
+    let channel_id = channel_id.to_string();
+    let guild_id = guild_id.to_string();
+    let result = duduclaw_core::with_file_lock(&path, || {
+        let mut store = load_channel_guild_store(home_dir);
+        if store.get(&channel_id).map(String::as_str) == Some(guild_id.as_str()) {
+            return Ok(()); // already current — skip the write
+        }
+        if !store.contains_key(&channel_id) && store.len() >= CHANNEL_GUILD_STORE_CAP {
+            return Ok(()); // full; degrade rather than grow unbounded
+        }
+        store.insert(channel_id.clone(), guild_id.clone());
+        let bytes = serde_json::to_vec(&store).map_err(std::io::Error::other)?;
+        // Atomic replace (temp + rename), matching decision_message_store's
+        // pattern for the same class of small durable JSON state.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &path)
+    });
+    if let Err(e) = result {
+        tracing::debug!(%channel_id, error = %e, "discord: failed to persist channel->guild mapping (non-fatal)");
+    }
+}
+
+/// Look up a previously-recorded guild id for a Discord channel. `None` when
+/// never seen (DM, or no message from that channel has reached this gateway
+/// yet) — the caller (task/decision-card creation) must treat this as an
+/// honest gap, not fabricate a value.
+pub fn guild_id_for_channel(home_dir: &Path, channel_id: &str) -> Option<String> {
+    if channel_id.is_empty() {
+        return None;
+    }
+    load_channel_guild_store(home_dir).get(channel_id).cloned()
+}
+
+#[cfg(test)]
+mod channel_guild_tests {
+    use super::{guild_id_for_channel, record_channel_guild, CHANNEL_GUILD_STORE_CAP};
+
+    #[test]
+    fn round_trip_write_then_read() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(guild_id_for_channel(dir.path(), "chan-1"), None);
+        record_channel_guild(dir.path(), "chan-1", "guild-1");
+        assert_eq!(guild_id_for_channel(dir.path(), "chan-1"), Some("guild-1".to_string()));
+    }
+
+    #[test]
+    fn dm_messages_are_never_recorded() {
+        // MESSAGE_CREATE's guild_id is empty for DMs — must not pollute the
+        // store with a channel->"" mapping.
+        let dir = tempfile::tempdir().unwrap();
+        record_channel_guild(dir.path(), "dm-chan", "");
+        assert_eq!(guild_id_for_channel(dir.path(), "dm-chan"), None);
+    }
+
+    #[test]
+    fn blank_channel_id_is_never_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        record_channel_guild(dir.path(), "", "guild-1");
+        assert_eq!(guild_id_for_channel(dir.path(), ""), None);
+    }
+
+    #[test]
+    fn lookup_unknown_channel_is_none_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(guild_id_for_channel(dir.path(), "never-seen"), None);
+    }
+
+    #[test]
+    fn guild_can_change_for_the_same_channel_id() {
+        // Exceedingly unlikely on real Discord (snowflakes don't get
+        // reused across guilds) but the store must not get stuck on a
+        // stale value if it ever did.
+        let dir = tempfile::tempdir().unwrap();
+        record_channel_guild(dir.path(), "chan-1", "guild-1");
+        record_channel_guild(dir.path(), "chan-1", "guild-2");
+        assert_eq!(guild_id_for_channel(dir.path(), "chan-1"), Some("guild-2".to_string()));
+    }
+
+    #[test]
+    fn store_does_not_grow_past_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..(CHANNEL_GUILD_STORE_CAP + 5) {
+            record_channel_guild(dir.path(), &format!("chan-{i}"), "guild-x");
+        }
+        let store = super::load_channel_guild_store(dir.path());
+        assert!(store.len() <= CHANNEL_GUILD_STORE_CAP);
+        // The first CAP channels seen must still be present (fail-safe:
+        // degrade for the newest unseen channels, not evict known-good data).
+        assert_eq!(store.get("chan-0"), Some(&"guild-x".to_string()));
     }
 }
 

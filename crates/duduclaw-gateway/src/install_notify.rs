@@ -75,6 +75,52 @@ pub fn approvers_for(users: &[User], req: &InstallRequest) -> Vec<User> {
         .collect()
 }
 
+/// Resolve the "open in channel" target for an install request — the E8
+/// reverse-handoff button on `InstallDetailPanel`, extending the pattern
+/// already wired for tasks/approvals to the one object type it was missing
+/// from (04-orca doc §4.1: E8 covers task/approval, not install). Not one of
+/// `07-unified-decision-design.md` §6's lettered hand-off items (H1-H5) —
+/// those are a distinct list; naming it "H3" would collide with that
+/// document's own H3 (install ack wording). `InstallRequest` itself carries no
+/// `notify_channel`/`notify_chat_id` columns (unlike `ApprovalRecord`/
+/// `TaskRow`), so this checks, in order:
+///
+/// 1. **`decision_message_store`'s `install` namespace** — the exact
+///    conversation a decision card was actually pushed to and (if any) the
+///    message id, letting the deep link jump to that specific message.
+/// 2. **The current stage's first approver with a verified channel
+///    identity** (`approvers_for`) — falls back to *a* reachable approver
+///    conversation when no card was ever recorded (e.g. filed before any
+///    approver had linked a channel, or the record predates this feature).
+///
+/// Returns `(channel, chat_id, message_id)`, or `None` when neither resolves
+/// — the caller must render no button rather than guess (fail closed / fail
+/// quiet, same posture as `channel_link.rs`).
+pub async fn resolve_channel_target(
+    home_dir: &Path,
+    db: &UserDb,
+    req: &InstallRequest,
+) -> Option<(String, String, Option<String>)> {
+    let cards = crate::decision_message_store::list_card_messages(
+        home_dir,
+        DecisionSource::Install.namespace(),
+        &req.id,
+    );
+    if let Some(card) = cards.into_iter().next() {
+        return Some((card.channel, card.chat_id, Some(card.pushed.message_id)));
+    }
+
+    let users = db.list_users().ok()?;
+    for approver in approvers_for(&users, req) {
+        if let Ok(channels) = db.verified_channels_for_user(&approver.id) {
+            if let Some(ident) = channels.into_iter().next() {
+                return Some((ident.channel, ident.channel_user_id, None));
+            }
+        }
+    }
+    None
+}
+
 /// Render the zh-TW notification body for a request. The dashboard deep link
 /// and the "this channel has no buttons" hint are appended by the shared
 /// delivery path, so this is purely the description of what is being asked.
@@ -685,6 +731,53 @@ mod tests {
         let got = approvers_for(&users, &req("manager", None, None));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, "a1");
+    }
+
+    // ── E8: resolve_channel_target (InstallDetailPanel reverse handoff) ──
+
+    #[tokio::test]
+    async fn resolve_channel_target_prefers_a_recorded_card_over_approver_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&dir.path().join("auth.db")).unwrap();
+        let admin = db.create_user("admin@x", "Admin", "pw", UserRole::Admin).unwrap();
+        // The approver has a linked channel too — the recorded card must still win.
+        db.bind_channel_identity(&admin.id, "telegram", "999", true).unwrap();
+
+        let request = req("manager", None, None);
+        crate::decision_message_store::record_card_message(
+            dir.path(),
+            DecisionSource::Install.namespace(),
+            &request.id,
+            "slack",
+            "C123",
+            &crate::decision_card::PushedMessage { edit_chat_id: "C123".into(), message_id: "m1".into() },
+        );
+
+        let target = resolve_channel_target(dir.path(), &db, &request).await;
+        assert_eq!(target, Some(("slack".to_string(), "C123".to_string(), Some("m1".to_string()))));
+    }
+
+    #[tokio::test]
+    async fn resolve_channel_target_falls_back_to_first_approver_channel_when_no_card_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&dir.path().join("auth.db")).unwrap();
+        let admin = db.create_user("admin@x", "Admin", "pw", UserRole::Admin).unwrap();
+        db.bind_channel_identity(&admin.id, "telegram", "555", true).unwrap();
+
+        let request = req("manager", None, None);
+        let target = resolve_channel_target(dir.path(), &db, &request).await;
+        assert_eq!(target, Some(("telegram".to_string(), "555".to_string(), None)));
+    }
+
+    #[tokio::test]
+    async fn resolve_channel_target_none_when_no_card_and_no_approver_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&dir.path().join("auth.db")).unwrap();
+        // Admin exists (so `approvers_for` isn't empty) but never linked a channel.
+        db.create_user("admin@x", "Admin", "pw", UserRole::Admin).unwrap();
+
+        let request = req("manager", None, None);
+        assert_eq!(resolve_channel_target(dir.path(), &db, &request).await, None);
     }
 
     // ── H1: dashboard collapse summary (`spawn_dashboard_collapse`,

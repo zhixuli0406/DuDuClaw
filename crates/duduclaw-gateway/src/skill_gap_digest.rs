@@ -245,25 +245,32 @@ pub async fn maybe_send_daily_digest(home_dir: &Path) {
         return;
     };
 
-    // Push to the default agent's notify destination (same `[proactive]`
-    // convention + reports_to token cascade the goal loop uses).
-    let Some((channel, chat_id)) = crate::goal_notify::agent_notify_target(home_dir, &agent_id)
-    else {
-        info!(
+    // Push to the default agent's notify destination via the shared governed
+    // path (W2-4): same `[proactive]` convention + reports_to token cascade
+    // the goal loop uses, plus quiet-hours deferral and action-rate telemetry.
+    // L1 — a list of capability gaps is a reading item, never a page.
+    let outcome = crate::goal_notify::notify_agent_plain(
+        home_dir,
+        &agent_id,
+        crate::notify_governance::NotifyLevel::Fyi,
+        "skill_gap.digest",
+        &message,
+    )
+    .await;
+    match outcome {
+        crate::goal_notify::NotifyOutcome::Sent => {
+            info!(agent = %agent_id, gaps = items.len(), "skill-gap digest sent")
+        }
+        crate::goal_notify::NotifyOutcome::Deferred => {
+            info!(agent = %agent_id, gaps = items.len(), "skill-gap digest queued until quiet hours end")
+        }
+        crate::goal_notify::NotifyOutcome::NoTarget => info!(
             agent = %agent_id,
-            "skill-gap digest: agent has no [proactive] notify destination; skipping push"
-        );
-        return;
-    };
-    let Some(token) = crate::goal_notify::channel_token(home_dir, &agent_id, &channel).await else {
-        info!(%channel, "skill-gap digest: no bot token; skipping push");
-        return;
-    };
-    let http = reqwest::Client::new();
-    if crate::goal_notify::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &message).await {
-        info!(agent = %agent_id, %channel, gaps = items.len(), "skill-gap digest sent");
-    } else {
-        warn!(agent = %agent_id, %channel, "skill-gap digest send failed (will retry tomorrow)");
+            "skill-gap digest: agent has no [proactive] notify destination or bot token; skipping push"
+        ),
+        crate::goal_notify::NotifyOutcome::SendFailed => {
+            warn!(agent = %agent_id, "skill-gap digest send failed (will retry tomorrow)")
+        }
     }
 }
 

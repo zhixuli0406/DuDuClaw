@@ -2059,7 +2059,14 @@ static INFERENCE_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Get or create the inference engine singleton.
-async fn get_inference_engine(
+///
+/// `pub(crate)`: also the entry point for `autopilot_screen::InferenceScreener`
+/// (resident sensing WP3), which must share THIS singleton rather than build a
+/// second engine — two engines would mean two GGUF loads and the OOM risk the
+/// init mutex below exists to prevent. Nothing here reaches a cloud API; the
+/// confidence router's cloud tier lives in `try_local_inference`, not in the
+/// engine itself.
+pub(crate) async fn get_inference_engine(
     home_dir: &std::path::Path,
 ) -> Option<std::sync::Arc<duduclaw_inference::InferenceEngine>> {
     // Negative-cache fast path: a previous init attempt already failed

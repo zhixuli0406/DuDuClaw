@@ -75,7 +75,7 @@ impl DecisionSource {
         }
     }
 
-    fn from_token(s: &str) -> Option<Self> {
+    pub(crate) fn from_token(s: &str) -> Option<Self> {
         match s {
             "goal" => Some(Self::Goal),
             "kick" => Some(Self::Kickoff),
@@ -137,7 +137,7 @@ impl DecisionAct {
         }
     }
 
-    fn from_token(s: &str) -> Option<Self> {
+    pub(crate) fn from_token(s: &str) -> Option<Self> {
         match s {
             "retry" => Some(Self::Retry),
             "done" => Some(Self::Done),

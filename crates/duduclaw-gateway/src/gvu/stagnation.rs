@@ -508,9 +508,16 @@ impl StagnationMonitor {
         // before a human noticed, from a manual DB inspection. De-duplicated
         // by the fingerprint check above, so a persistently stagnant agent
         // produces exactly one push per state change, not one per tick.
-        let outcome =
-            crate::goal_notify::notify_agent_plain(&self.home_dir, &snapshot.agent_id, &summary)
-                .await;
+        // L1: a stalled evolution loop is a real finding, but nothing about
+        // it is fixable at 03:00 and nothing degrades further by waiting.
+        let outcome = crate::goal_notify::notify_agent_plain(
+            &self.home_dir,
+            &snapshot.agent_id,
+            crate::notify_governance::NotifyLevel::Fyi,
+            "evolution.stagnation",
+            &summary,
+        )
+        .await;
         if matches!(outcome, crate::goal_notify::NotifyOutcome::SendFailed) {
             debug!(agent = %snapshot.agent_id, "stagnation monitor: channel push failed (non-fatal)");
         }

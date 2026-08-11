@@ -146,6 +146,22 @@ pub struct ConversationRef {
     pub bot_account: serde_json::Value,
     pub user_account: serde_json::Value,
     pub updated_at: u64,
+
+    // ── W2-7 deep-link coordinates ──────────────────────────
+    // Teams' `/l/channel/...` deep link needs the Team's Office 365 group id
+    // and the channel's display name, neither of which every activity
+    // carries — `channelData` reliably includes `team.aadGroupId` /
+    // `tenant.id` for channel messages but Teams does not consistently send
+    // the channel's display name on every activity. `#[serde(default)]` so
+    // every reference persisted before this field existed (and every 1:1
+    // chat, which has no team/channel at all) deserializes to `None` rather
+    // than failing — honest gap, never fabricated (see `channel_link.rs`).
+    #[serde(default)]
+    pub teams_group_id: Option<String>,
+    #[serde(default)]
+    pub teams_channel_name: Option<String>,
+    #[serde(default)]
+    pub teams_tenant_id: Option<String>,
 }
 
 fn conv_store_path(home_dir: &Path) -> std::path::PathBuf {
@@ -213,6 +229,24 @@ fn save_conversation_ref(home_dir: &Path, conversation_id: &str, conv: Conversat
 /// Look up a stored conversation reference by conversation id.
 pub fn lookup_conversation_ref(home_dir: &Path, conversation_id: &str) -> Option<ConversationRef> {
     load_conv_store(home_dir).get(conversation_id).cloned()
+}
+
+/// W2-7: best-effort extraction of Teams deep-link coordinates from an
+/// inbound activity's `channelData`. Channel messages reliably carry
+/// `team.aadGroupId` (the O365 group id the deep link's `groupId=` param
+/// needs) and `tenant.id`; the channel's own display name is NOT
+/// consistently present on every activity (Teams only sometimes includes
+/// it), and 1:1 chat activities carry no `team`/`channel` block at all — a
+/// missing field maps to `None` here, never guessed at.
+fn extract_teams_coords(activity: &serde_json::Value) -> (Option<String>, Option<String>, Option<String>) {
+    let non_empty = |v: &serde_json::Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    let group_id = activity.pointer("/channelData/team/aadGroupId").and_then(non_empty);
+    let channel_name = activity.pointer("/channelData/channel/name").and_then(non_empty);
+    let tenant_id = activity
+        .pointer("/channelData/tenant/id")
+        .or_else(|| activity.pointer("/conversation/tenantId"))
+        .and_then(non_empty);
+    (group_id, channel_name, tenant_id)
 }
 
 /// Send markdown text to a previously-seen conversation (proactive /
@@ -440,6 +474,18 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         user_account,
     };
 
+    // W2-7: best-effort deep-link coordinates from this activity's
+    // `channelData`. Merged against whatever was already stored so a later
+    // activity that doesn't carry `channelData` (a bare follow-up message,
+    // or Teams simply not sending it that time) never regresses an
+    // already-known coordinate back to `None`.
+    let (mut teams_group_id, mut teams_channel_name, mut teams_tenant_id) = extract_teams_coords(activity);
+    if let Some(existing) = lookup_conversation_ref(&state.ctx.home_dir, &target.conversation_id) {
+        teams_group_id = teams_group_id.or(existing.teams_group_id);
+        teams_channel_name = teams_channel_name.or(existing.teams_channel_name);
+        teams_tenant_id = teams_tenant_id.or(existing.teams_tenant_id);
+    }
+
     // Persist the conversation reference so proactive sends (delegation
     // forwarding, Computer Use) can reach this conversation later.
     save_conversation_ref(
@@ -453,6 +499,9 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            teams_group_id,
+            teams_channel_name,
+            teams_tenant_id,
         },
     );
 
@@ -710,6 +759,51 @@ async fn delete_activity(creds: &TeamsCreds, target: &TeamsTarget, activity_id: 
 mod tests {
     use super::*;
 
+    // ── W2-7: extract_teams_coords ───────────────────────────
+
+    #[test]
+    fn extract_teams_coords_reads_channel_message_channel_data() {
+        let activity = serde_json::json!({
+            "channelData": {
+                "team": { "id": "19:xxxx@thread.tacv2", "aadGroupId": "grp-1" },
+                "channel": { "id": "19:xxxx@thread.tacv2", "name": "General" },
+                "tenant": { "id": "tenant-1" }
+            }
+        });
+        assert_eq!(
+            extract_teams_coords(&activity),
+            (Some("grp-1".to_string()), Some("General".to_string()), Some("tenant-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_teams_coords_falls_back_to_conversation_tenant_id() {
+        let activity = serde_json::json!({
+            "conversation": { "id": "conv-1", "tenantId": "tenant-2" }
+        });
+        assert_eq!(extract_teams_coords(&activity), (None, None, Some("tenant-2".to_string())));
+    }
+
+    #[test]
+    fn extract_teams_coords_missing_channel_data_is_all_none() {
+        // A 1:1 chat activity — no `team`/`channel` block at all. Must not
+        // fabricate anything.
+        let activity = serde_json::json!({ "conversation": { "id": "a:1abc" } });
+        assert_eq!(extract_teams_coords(&activity), (None, None, None));
+    }
+
+    #[test]
+    fn extract_teams_coords_treats_empty_strings_as_absent() {
+        let activity = serde_json::json!({
+            "channelData": {
+                "team": { "aadGroupId": "" },
+                "channel": { "name": "" },
+                "tenant": { "id": "" }
+            }
+        });
+        assert_eq!(extract_teams_coords(&activity), (None, None, None));
+    }
+
     #[test]
     fn conversation_ref_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -723,6 +817,9 @@ mod tests {
                 bot_account: serde_json::json!({"id": "28:bot"}),
                 user_account: serde_json::json!({"id": "29:user"}),
                 updated_at: 100,
+                teams_group_id: None,
+                teams_channel_name: None,
+                teams_tenant_id: None,
             },
         );
         let got = lookup_conversation_ref(home, "a:1abc").expect("stored ref");
@@ -743,6 +840,9 @@ mod tests {
                     bot_account: serde_json::json!({}),
                     user_account: serde_json::json!({}),
                     updated_at: i as u64,
+                    teams_group_id: None,
+                    teams_channel_name: None,
+                    teams_tenant_id: None,
                 },
             );
         }
@@ -772,6 +872,9 @@ mod tests {
                 bot_account: serde_json::json!({"id": "28:bot"}),
                 user_account: serde_json::json!({"id": "29:user"}),
                 updated_at: 1,
+                teams_group_id: None,
+                teams_channel_name: None,
+                teams_tenant_id: None,
             },
         );
         let mode = std::fs::metadata(&store).unwrap().permissions().mode() & 0o777;

@@ -62,6 +62,12 @@ pub mod decision_capture;
 pub mod decision_card;
 pub mod decision_message_store;
 pub mod decision_notify;
+// W2-4 notification governance: the gate every outbound notification passes
+// through (levels + quiet hours + deferred queue), its action-rate telemetry,
+// and the scheduled daily digest.
+pub mod notify_digest;
+pub mod notify_governance;
+pub mod notify_stats;
 pub mod cron_scheduler;
 pub mod cron_store;
 pub mod cron_templates;
@@ -77,10 +83,14 @@ pub mod license_seed;
 pub mod autopilot_store;
 pub mod autopilot_engine;
 pub mod autopilot_notify;
+pub mod autopilot_screen;
 pub mod cep_matcher;
+pub mod tick_config;
+pub mod tick_source;
 pub mod rule_induction;
 pub mod approval;
 pub mod approval_notify;
+pub mod channel_link;
 pub mod deep_link;
 pub mod expert_admin;
 pub mod expert_generate;
