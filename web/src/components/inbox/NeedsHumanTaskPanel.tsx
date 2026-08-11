@@ -7,6 +7,7 @@ import { toast, formatError } from '@/lib/toast';
 import { Button } from '@/components/mds';
 import { DetailShell } from './DetailShell';
 import { TYPE_META } from './meta';
+import { OpenInChannelButton } from './OpenInChannelButton';
 
 type ResolveAction = 'retry' | 'done' | 'abort';
 
@@ -94,10 +95,14 @@ export function NeedsHumanTaskPanel({
         </Button>
       </div>
 
-      <Button variant="ghost" onClick={() => navigate(`/tasks/${task.id}`)}>
-        <ExternalLink />
-        {t('inbox.detail.viewTask')}
-      </Button>
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="ghost" onClick={() => navigate(`/tasks/${task.id}`)}>
+          <ExternalLink />
+          {t('inbox.detail.viewTask')}
+        </Button>
+        {/* W2-3 reverse handoff (E8): jump back to the /goal conversation. */}
+        <OpenInChannelButton channel={task.channel} link={task.channel_link} variant="ghost" />
+      </div>
     </DetailShell>
   );
 }

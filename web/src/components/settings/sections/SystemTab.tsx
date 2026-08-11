@@ -63,6 +63,10 @@ export function SystemTab() {
   const [originDraft, setOriginDraft] = useState('');
   // [memory] novelty_gate — B1 write-time memory dedup gate (default: on).
   const [noveltyGate, setNoveltyGate] = useState(true);
+  // [notify] daily_digest / daily_digest_at — W2-8 daily-digest toggle
+  // (default: off, matching `notify_digest::DigestConfig::default()`).
+  const [dailyDigest, setDailyDigest] = useState(false);
+  const [dailyDigestAt, setDailyDigestAt] = useState('09:00');
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -107,6 +111,9 @@ export function SystemTab() {
       setOrigins(Array.isArray(ao) ? (ao.filter((v) => typeof v === 'string') as string[]) : []);
       // novelty_gate_enabled comes back structured too (not parsed from TOML).
       setNoveltyGate(res.novelty_gate_enabled ?? true);
+      // daily_digest_enabled / daily_digest_at come back structured too.
+      setDailyDigest(res.daily_digest_enabled ?? false);
+      setDailyDigestAt(res.daily_digest_at ?? '09:00');
     }).catch((e) => {
       console.warn('[api]', e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
@@ -154,6 +161,10 @@ export function SystemTab() {
       // Empty array = loopback-only (the default). Hot-applied server-side.
       payload.allowed_origins = origins;
       payload.novelty_gate_enabled = noveltyGate;
+      payload.daily_digest = dailyDigest;
+      // An empty native time input must not be sent as "" — the gateway
+      // rejects an unparseable daily_digest_at outright (fail-closed).
+      payload.daily_digest_at = dailyDigestAt.trim() !== '' ? dailyDigestAt : '09:00';
 
       await api.system.updateConfig(payload);
       setAuthToken('');
@@ -371,6 +382,37 @@ export function SystemTab() {
             checked={noveltyGate}
             onChange={setNoveltyGate}
           />
+        </SettingsCard>
+      </SettingsSection>
+
+      {/* Daily digest — W2-8, the second of the two notification channels
+          (event-driven pushes above, a scheduled roll-up here). Off by
+          default; "無事不寄" — a quiet day sends nothing at all. */}
+      <SettingsSection
+        title={intl.formatMessage({ id: 'settings.system.dailyDigest' })}
+        description={intl.formatMessage({ id: 'settings.system.dailyDigest.desc' })}
+      >
+        <SettingsCard>
+          <RowSwitch
+            label={intl.formatMessage({ id: 'settings.system.dailyDigest.enabled' })}
+            description={intl.formatMessage({ id: 'settings.system.dailyDigest.enabled.help' })}
+            checked={dailyDigest}
+            onChange={setDailyDigest}
+          />
+          {dailyDigest && (
+            <SettingsRow
+              label={intl.formatMessage({ id: 'settings.system.dailyDigest.at' })}
+              description={intl.formatMessage({ id: 'settings.system.dailyDigest.at.help' })}
+              tier="select"
+            >
+              <Input
+                type="time"
+                value={dailyDigestAt}
+                onChange={(e) => setDailyDigestAt(e.target.value)}
+                aria-label={intl.formatMessage({ id: 'settings.system.dailyDigest.at' })}
+              />
+            </SettingsRow>
+          )}
         </SettingsCard>
       </SettingsSection>
 

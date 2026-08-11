@@ -27,6 +27,7 @@ import { ConfirmDialog } from '@/components/settings/controls';
 import { FieldBlock } from '@/pages/agent-form/form-rows';
 import { Plus, Clock, XCircle, Workflow } from 'lucide-react';
 import { glyphText } from '@/lib/agent-glyph';
+import { TickSourcesCard } from './TickSourcesCard';
 
 // ── Autopilot Tab ───────────────────────────────────────────
 
@@ -117,6 +118,8 @@ export function AutopilotTab() {
 
   return (
     <div className="space-y-6">
+      <TickSourcesCard />
+
       <div className="flex items-center justify-between gap-2">
         <p className="text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'autopilot.subtitle' })}

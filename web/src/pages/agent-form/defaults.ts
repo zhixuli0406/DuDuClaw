@@ -194,6 +194,11 @@ export const DEFAULT_ADVANCED: {
   proactive_notify_channel: string;
   proactive_notify_chat_id: string;
   proactive_notify_thread_id: string;
+  /** W2-8 — [proactive] quiet_hours (`HH:MM-HH:MM`), empty = not set.
+   *  Prefilled from `agents.inspect`'s `proactive.quiet_hours_own` (the
+   *  agent's OWN raw value, never the fallen-back effective one — see
+   *  `ProactiveSettings.quiet_hours_own` in `lib/api.ts`). */
+  proactive_quiet_hours: string;
   stagnation_enabled: boolean;
   stagnation_window_seconds: number;
   stagnation_trigger_threshold: number;
@@ -212,6 +217,7 @@ export const DEFAULT_ADVANCED: {
   proactive_notify_channel: '',
   proactive_notify_chat_id: '',
   proactive_notify_thread_id: '',
+  proactive_quiet_hours: '',
   stagnation_enabled: false,
   stagnation_window_seconds: 3600,
   stagnation_trigger_threshold: 3,

@@ -119,13 +119,35 @@ export interface VoiceSettings {
 export interface ProactiveSettings {
   enabled: boolean;
   check_interval: string;
+  /** @deprecated Legacy numeric pair — deliberately NOT read by the W2-4
+   *  notification gate (`notify_governance.rs`); kept only because the
+   *  typed `ProactiveConfig` struct still round-trips it. Use `quiet_hours`
+   *  (the `HH:MM-HH:MM` string below) for anything suppression-related. */
   quiet_hours_start: number;
+  /** @deprecated see `quiet_hours_start`. */
   quiet_hours_end: number;
   max_messages_per_hour: number;
   notify_channel: string;
   notify_chat_id: string;
   /** Optional thread/topic ID within the chat (Discord thread / TG topic). */
   notify_thread_id?: string;
+  /** W2-8 — the agent's OWN raw `[proactive] quiet_hours` value
+   *  (`HH:MM-HH:MM`), empty when unset. This — NOT `quiet_hours` below — is
+   *  what an edit form must read/write: prefilling from the effective
+   *  (fallen-back) value and saving it unchanged would silently pin the
+   *  deployment-wide default into this one agent's config. Write via
+   *  `agents.update` `proactive.quiet_hours`; empty string clears it. */
+  quiet_hours_own?: string;
+  /** Effective quiet-hours window (`HH:MM-HH:MM`) after the agent → global
+   *  `config.toml [notify] quiet_hours` fallback (W2-4), or `null` when
+   *  nothing is ever held back. Display-only — do not write this field
+   *  back, see `quiet_hours_own`. */
+  quiet_hours?: string | null;
+  /** zh-TW sentence stating exactly what is deferred vs. delivered
+   *  immediately during `quiet_hours` above (F10: a suppression rule the
+   *  UI cannot state is a silent failure). Display-only, `null` when no
+   *  window is in force. */
+  quiet_hours_note?: string | null;
 }
 
 export interface ChannelStatus {
@@ -133,6 +155,27 @@ export interface ChannelStatus {
   connected: boolean;
   last_connected?: string;
   error?: string;
+}
+
+/** W2-2 (E1) — a channel's behavior settings (`channels.config_get/set`). */
+export interface ChannelConfigSettings {
+  mention_only: boolean;
+  auto_thread: boolean;
+  allowed_channels: string[];
+  allowed_guilds: string[];
+  agent_override: string;
+  response_mode: 'embed' | 'plain' | 'auto';
+  /** Stored as a string ("60"|"1440"|"4320"|"10080"); `null` = never set. */
+  thread_archive_minutes: string | null;
+}
+
+/** W2-2 (E2) — a channel's access-control settings (`channels.access_get/set`). */
+export interface ChannelAccessSettings {
+  require_pairing: boolean;
+  allowed_users: string[];
+  blocked_users: string[];
+  /** Who may run admin-gated chat commands (`!STOP` / `!STOP ALL` / `!RESUME`). */
+  admin_users: string[];
 }
 
 export interface CliCredentialInfo {
@@ -495,6 +538,15 @@ export interface TaskInfo {
   agent_seconds?: number;
   /** Lease deadline (RFC3339); a past value with an in_progress task = stale. */
   lease_expires_at?: string;
+  // ── W2-3 reverse handoff (E8) ─────────────────────────────
+  /** Originating channel of a `/goal` command (e.g. `telegram`), when known.
+   *  `null`/absent for tasks not launched from a channel conversation. */
+  channel?: string | null;
+  /** Server-resolved "open in `channel`" URL, or `null` when nothing could
+   *  be constructed for this platform (never a raw chat/message id — see
+   *  `channel_link.rs`). Render the button ONLY when this is a non-empty
+   *  string. */
+  channel_link?: string | null;
 }
 
 /** One judge-review round of a goal-mode task (Iterative Kanban timeline). */
@@ -630,7 +682,13 @@ export type ActivityType =
   | 'evolution_triggered'
   | 'autopilot_triggered'
   | 'autopilot_lag'
-  | 'error';
+  | 'error'
+  // W2-8 — `channel_alerts.rs` (W2-4) writes these two Activity Feed rows
+  // (a channel outage crossing the alert threshold, and its later
+  // resolution). Both existed on the wire before this type declared them —
+  // they rendered with the generic fallback icon until now.
+  | 'channel_send_failure_alert'
+  | 'channel_recovered';
 
 export interface ActivityEvent {
   id: string;
@@ -779,6 +837,53 @@ export interface AutopilotHistoryEntry {
   triggered_at: string;
   result: 'success' | 'failure';
   details?: string;
+}
+
+// ── Resident sensing observability (WP4) ────────────────────
+// Backend: `ticks.sources` / `ticks.recent` RPCs (handlers.rs). Field names
+// intentionally mirror the wire shape 1:1 — no dashboard-side renaming.
+
+export interface TickDroppedCounts {
+  rate_cap: number;
+  unchanged: number;
+  oversize: number;
+  fetch_error: number;
+}
+
+export interface TickSourceStatus {
+  id: string;
+  kind: 'http_poll' | 'command' | 'file_tail';
+  enabled: boolean;
+  interval_secs: number;
+  max_events_per_minute: number;
+  last_tick_ts: string | null;
+  events_per_minute_approx: number;
+  events_emitted_total: number;
+  dropped: TickDroppedCounts;
+}
+
+export interface TickScreenCounts {
+  pass: number;
+  drop: number;
+  unavailable: number;
+}
+
+export interface TicksSourcesResult {
+  enabled: boolean;
+  allow_command_sources: boolean;
+  sources: TickSourceStatus[];
+  screen: TickScreenCounts;
+}
+
+export interface TickRecordEntry {
+  ts: string;
+  fields: Record<string, unknown>;
+  raw: string | null;
+}
+
+export interface TicksRecentResult {
+  source: string;
+  records: TickRecordEntry[];
 }
 
 // ── Skill Sharing types ─────────────────────────────────────
@@ -1261,6 +1366,17 @@ export interface InstallRequestInfo {
   /** Unix epoch (seconds) this request auto-expires at. `null` on an
    *  unparseable `created_at` — treat as "no countdown available". */
   expires_at?: number | null;
+  // ── E8 reverse handoff, extended to install requests ─────────
+  /** Originating/reachable channel for this request's sign-off
+   *  conversation (e.g. `telegram`), when one could be resolved. `null`/
+   *  absent when no card was ever recorded and no current-stage approver
+   *  has a linked channel. */
+  channel?: string | null;
+  /** Server-resolved "open in `channel`" URL, or `null` when nothing could
+   *  be constructed for this platform (never a raw chat/message id — see
+   *  `channel_link.rs`). Render the button ONLY when this is a non-empty
+   *  string. */
+  channel_link?: string | null;
 }
 
 export interface InstallRequestFiled {
@@ -2377,6 +2493,38 @@ export interface CostRecentResult {
   records: CostRecentRow[];
 }
 
+// ── NOTIFY: notification governance action-rate telemetry (`notify.stats`, W2-4/W2-8) ──
+
+/** One notification type's scorecard over the queried window (`notify_stats.rs`
+ *  `NotifyTypeStat`). `notify_type` is a free-form `<family>.<what>` bucket
+ *  (e.g. `decision.approval`, `evolution.stagnation`) — there is no fixed
+ *  enum, new subsystems add new buckets over time. */
+export interface NotifyTypeStat {
+  type: string;
+  /** Distinct pushes in the window. */
+  pushed: number;
+  /** Pushes that carried something to press — 0 for a plain FYI line, which
+   *  by definition has nothing to act on. */
+  actionable: number;
+  /** Actionable pushes a person actually settled. */
+  acted: number;
+  /** `acted / actionable`, 0.0–1.0 (0 when nothing was actionable). */
+  action_rate: number;
+  /** The SRE 50% rule (P4-5): enough actionable samples (`min_sample`) AND
+   *  fewer than half acted on. Never `true` for an all-FYI type — see
+   *  `actionable`. */
+  broken: boolean;
+}
+
+export interface NotifyStatsResponse {
+  days: number;
+  /** The action-rate threshold below which a type is flagged `broken` (0.5). */
+  broken_threshold: number;
+  /** Minimum actionable-push sample size before `broken` can ever be `true`. */
+  min_sample: number;
+  types: NotifyTypeStat[];
+}
+
 // ── MEM: temporal history / supersession chain (`memory.history/at`) ──
 
 /** One version in a fact's supersession chain (`memory.history`). */
@@ -2646,6 +2794,14 @@ export interface ApprovalItem {
   expires_at?: number | null;
   /** Absent on older/other approval kinds — render nothing, not a placeholder. */
   simulation?: ApprovalSimulation | null;
+  // ── W2-3 reverse handoff (E8) ─────────────────────────────
+  /** The channel this approval's decision card was pushed to, when known. */
+  channel?: string | null;
+  /** Server-resolved "open in `channel`" URL, or `null` when nothing could
+   *  be constructed for this platform (never a raw chat/message id — see
+   *  `channel_link.rs`). Render the button ONLY when this is a non-empty
+   *  string. */
+  channel_link?: string | null;
 }
 
 // ── BUD: budget incident console (WP14-T14.6) ──────────────────
@@ -3367,6 +3523,59 @@ export const api = {
         expires_in_minutes: number;
         max_uses: number;
       }>,
+    // W2-2 (E1) — behavior settings ("行為" tab). Reads/writes the same
+    // `ChannelSettingsManager` the `channel_config` MCP tool uses.
+    configGet: (channel: string, scopeId?: string) =>
+      client.call('channels.config_get', {
+        channel,
+        ...(scopeId ? { scope_id: scopeId } : {}),
+      }) as Promise<{
+        success: boolean;
+        channel: string;
+        scope_id: string;
+        settings: ChannelConfigSettings;
+        /** Other known scopes (e.g. Discord guild ids) for this channel type. */
+        scopes: string[];
+      }>,
+    configSet: (channel: string, settings: Partial<ChannelConfigSettings>, scopeId?: string) =>
+      client.call('channels.config_set', {
+        channel,
+        ...(scopeId ? { scope_id: scopeId } : {}),
+        settings,
+      }) as Promise<{
+        success: boolean;
+        channel: string;
+        scope_id: string;
+        changes: Array<{ key: string; value: unknown }>;
+      }>,
+    // W2-2 (E2) — access-control settings ("存取" tab). Always the "global"
+    // scope (the only scope the gateway's access gate actually reads).
+    accessGet: (channel: string) =>
+      client.call('channels.access_get', { channel }) as Promise<{
+        success: boolean;
+        channel: string;
+        settings: ChannelAccessSettings;
+      }>,
+    accessSet: (channel: string, settings: Partial<ChannelAccessSettings>) =>
+      client.call('channels.access_set', { channel, settings }) as Promise<{
+        success: boolean;
+        channel: string;
+        scope_id: string;
+        changes: Array<{ key: string; value: unknown }>;
+      }>,
+    // Approved pairing subjects (`/pair <code>` redemptions) — shared across
+    // channel types, mirroring the `pairing_manage` MCP tool's storage.
+    pairingList: () =>
+      client.call('channels.pairing_list', {}) as Promise<{
+        success: boolean;
+        approved: string[];
+      }>,
+    pairingRevoke: (subject: string) =>
+      client.call('channels.pairing_revoke', { subject }) as Promise<{
+        success: boolean;
+        subject: string;
+        revoked: boolean;
+      }>,
   },
   // Interactive CLI login ("Dashboard 一鍵登入") — drives a CLI's native login
   // in a PTY on the gateway and streams it back via `auth.cli_login.*` events.
@@ -3749,6 +3958,10 @@ export const api = {
         // Structured [memory] novelty_gate for the memory-dedup-gate toggle
         // (absent ⇒ true, matching the gateway's fail-closed default).
         novelty_gate_enabled?: boolean;
+        // Structured [notify] daily_digest for the daily-digest toggle
+        // (W2-8; absent ⇒ false/"09:00", matching `DigestConfig::default()`).
+        daily_digest_enabled?: boolean;
+        daily_digest_at?: string;
       }>,
     updateConfig: (fields: Record<string, unknown>) =>
       client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean; hot_reloaded?: string[] }>,
@@ -3985,6 +4198,12 @@ export const api = {
       client.call('cost.agents', { hours }) as Promise<CostAgentsResult>,
     recent: (limit = 20) =>
       client.call('cost.recent', { limit }) as Promise<CostRecentResult>,
+  },
+  // Notification governance action-rate telemetry (W2-4/W2-8). Manager+
+  // (aggregates across every agent) — same gate as `/reports` itself.
+  notify: {
+    stats: (days = 30) =>
+      client.call('notify.stats', { days }) as Promise<NotifyStatsResponse>,
   },
   billing: {
     usage: () =>
@@ -4298,6 +4517,14 @@ export const api = {
       client.call('autopilot.remove', { rule_id: ruleId }) as Promise<{ success: boolean }>,
     history: (ruleId?: string, limit = 20) =>
       client.call('autopilot.history', { rule_id: ruleId, limit }) as Promise<{ entries: AutopilotHistoryEntry[] }>,
+  },
+  // Resident sensing observability (WP4) — read-only status for the
+  // `[[tick.sources]]` config-driven ingest layer + its WP3 local screening.
+  ticks: {
+    sources: () =>
+      client.call('ticks.sources') as Promise<TicksSourcesResult>,
+    recent: (source: string, limit = 50) =>
+      client.call('ticks.recent', { source, limit }) as Promise<TicksRecentResult>,
   },
   // RFC-26 Live Run Forking — read fork state from the cross-process ForkStore.
   fork: {

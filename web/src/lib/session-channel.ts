@@ -39,6 +39,17 @@ export function sessionChannel(sessionId: string): SessionChannel | null {
   return label ? { key, label } : null;
 }
 
+/**
+ * Human-readable brand label for a bare channel key (e.g. `telegram` →
+ * `Telegram`), as opposed to {@link sessionChannel} which parses it out of a
+ * full session id. Falls back to the raw key when unknown — channel keys
+ * are locale-independent brand identifiers, never internal implementation
+ * details (unlike a chat/message id), so showing the raw key is safe.
+ */
+export function channelLabel(key: string): string {
+  return CHANNEL_LABELS[key.toLowerCase()] ?? key;
+}
+
 /** True when the session is a user conversation on a known channel. */
 export function isConversationSession(sessionId: string): boolean {
   return sessionChannel(sessionId) !== null;

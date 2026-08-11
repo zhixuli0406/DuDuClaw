@@ -40,6 +40,7 @@ import {
 import { decideApproval } from '@/lib/api-custom-skills';
 import { parseSkillCreatePayload, type SkillCreatePayload } from '@/components/skills/skill-create-payload';
 import { formatTimeSaved } from '@/components/skills/status-meta';
+import { OpenInChannelButton } from './OpenInChannelButton';
 
 // ── Local mds-token property primitives (replace the Calm Glass PropertyRow) ──
 
@@ -260,6 +261,10 @@ function GenericApprovalView({
           )}
         </div>
       </Section>
+
+      {/* W2-3 reverse handoff (E8): jump back to where this decision card
+          was actually pushed. Renders nothing when unresolvable. */}
+      <OpenInChannelButton channel={approval.channel} link={approval.channel_link} />
 
       {/* ── Near-expiry warning — only shown in the last third of the
           TTL window, so it signals urgency instead of adding noise to every

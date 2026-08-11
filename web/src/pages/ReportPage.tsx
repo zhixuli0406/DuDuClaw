@@ -8,6 +8,7 @@ import {
   type CostAgentRow,
   type CostRecentRow,
   type CacheHealth,
+  type NotifyTypeStat,
 } from '@/lib/api';
 import { formatMillicents, formatTokens } from '@/lib/format';
 import {
@@ -20,6 +21,7 @@ import {
   Coins,
   Database,
   TriangleAlert,
+  BellRing,
 } from 'lucide-react';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -332,8 +334,152 @@ export function ReportPage() {
             </div>
           )}
         </ReportCard>
+
+        {/* Notification effectiveness (W2-8, notify.stats). */}
+        <NotifyEffectivenessSection />
       </div>
     </div>
+  );
+}
+
+/**
+ * NotifyEffectivenessSection (W2-8) — per-type notification action rate over
+ * the last 30 days (`notify.stats`, P4-5's SRE 50% rule). Same ranking-row
+ * visual language as the cache-efficiency section above (name + horizontal
+ * bar + counts) so the report reads as one system, not two chart styles.
+ * `broken` types (≥ `min_sample` actionable pushes, action rate below
+ * `broken_threshold`) are never flagged by color alone — the bar turns
+ * destructive-red AND carries an icon AND a stated reason, so the finding
+ * survives a colorblind or grayscale read.
+ */
+function NotifyEffectivenessSection() {
+  const intl = useIntl();
+  const connectionState = useConnectionStore((s) => s.state);
+  const [types, setTypes] = useState<readonly NotifyTypeStat[]>([]);
+  const [brokenRate, setBrokenRate] = useState(0.5);
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (connectionState !== 'authenticated') return;
+    let cancelled = false;
+    setLoading(true);
+    setFailed(false);
+    api.notify
+      .stats(30)
+      .then((res) => {
+        if (cancelled) return;
+        setTypes(res?.types ?? []);
+        setBrokenRate(res?.broken_threshold ?? 0.5);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        console.warn('[api]', e);
+        setFailed(true);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionState]);
+
+  const title = intl.formatMessage({ id: 'reports.notify.title' });
+
+  if (loading) {
+    return (
+      <ReportCard title={title}>
+        <div className="py-10 text-center text-sm text-muted-foreground">
+          {intl.formatMessage({ id: 'common.loading' })}
+        </div>
+      </ReportCard>
+    );
+  }
+
+  if (failed) {
+    return (
+      <ReportCard title={title}>
+        <div className="py-8 text-center text-sm text-muted-foreground">
+          {intl.formatMessage({ id: 'reports.notify.loadError' })}
+        </div>
+      </ReportCard>
+    );
+  }
+
+  if (types.length === 0) {
+    return (
+      <ReportCard title={title} className="min-h-[160px]">
+        <Empty
+          icon={BellRing}
+          title={intl.formatMessage({ id: 'reports.notify.empty.title' })}
+          description={intl.formatMessage({ id: 'reports.notify.empty.desc' })}
+        />
+      </ReportCard>
+    );
+  }
+
+  return (
+    <ReportCard
+      title={title}
+      action={
+        <span className="text-xs text-muted-foreground">
+          {intl.formatMessage({ id: 'reports.notify.subtitle' }, { threshold: Math.round(brokenRate * 100) })}
+        </span>
+      }
+    >
+      <div className="divide-y divide-surface-border">
+        {types.map((t) => {
+          const pct = Math.round(t.action_rate * 100);
+          return (
+            <div key={t.type} className="py-3 first:pt-0 last:pb-0">
+              <div className="flex items-center gap-2">
+                {t.broken && <TriangleAlert className="size-3.5 shrink-0 text-destructive" aria-hidden />}
+                <span className="min-w-0 flex-1 truncate font-mono text-sm text-foreground" title={t.type}>
+                  {t.type}
+                </span>
+                {t.actionable > 0 ? (
+                  <span className={cn('shrink-0 font-mono text-xs tabular-nums', t.broken ? 'text-destructive' : 'text-muted-foreground')}>
+                    {pct}%
+                  </span>
+                ) : (
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {intl.formatMessage({ id: 'reports.notify.fyiOnly' })}
+                  </span>
+                )}
+              </div>
+              {t.actionable > 0 && (
+                <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-muted">
+                  <div
+                    className={cn('h-full rounded-full', t.broken ? 'bg-destructive' : 'bg-chart-1')}
+                    style={{ width: `${Math.max(4, pct)}%` }}
+                  />
+                </div>
+              )}
+              <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+                <span>
+                  {intl.formatMessage({ id: 'reports.notify.col.pushed' })}:{' '}
+                  <span className="font-mono tabular-nums">{t.pushed.toLocaleString()}</span>
+                </span>
+                {t.actionable > 0 && (
+                  <span>
+                    {intl.formatMessage({ id: 'reports.notify.col.acted' })}:{' '}
+                    <span className="font-mono tabular-nums">{t.acted.toLocaleString()}</span>
+                    {' / '}
+                    <span className="font-mono tabular-nums">{t.actionable.toLocaleString()}</span>
+                  </span>
+                )}
+              </div>
+              {t.broken && (
+                <p className="mt-1 text-xs text-destructive">
+                  {intl.formatMessage({ id: 'reports.notify.brokenHint' })}
+                </p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </ReportCard>
   );
 }
 

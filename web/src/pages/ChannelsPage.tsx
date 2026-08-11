@@ -2,7 +2,13 @@ import { useEffect, useState, useCallback, useRef, useMemo, type ReactNode } fro
 import { useIntl } from 'react-intl';
 import qrcode from 'qrcode-generator';
 import { cn } from '@/lib/utils';
-import { api, type ChannelStatus, type AgentInfo } from '@/lib/api';
+import {
+  api,
+  type ChannelStatus,
+  type AgentInfo,
+  type ChannelConfigSettings,
+  type ChannelAccessSettings,
+} from '@/lib/api';
 import { client } from '@/lib/ws-client';
 import { toast, formatError } from '@/lib/toast';
 import { useConnectionStore } from '@/stores/connection-store';
@@ -27,6 +33,17 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   Empty,
+  Badge,
+  Switch,
+  Tabs,
+  TabsList,
+  TabsTab,
+  TabsPanel,
+  SettingsSection,
+  SettingsCard,
+  SettingsRow,
+  SettingsSaveState,
+  Spinner,
 } from '@/components/mds';
 import {
   Radio,
@@ -42,6 +59,8 @@ import {
   Copy,
   Check,
   MoreHorizontal,
+  SlidersHorizontal,
+  ShieldCheck,
 } from 'lucide-react';
 
 const channelMeta: Record<
@@ -147,6 +166,10 @@ export function ChannelsPage() {
   const [showBindDialog, setShowBindDialog] = useState(false);
   const [editChannel, setEditChannel] = useState<string | null>(null);
   const [removeTarget, setRemoveTarget] = useState<string | null>(null);
+  // W2-2 (E1/E2) — 行為 + 存取 detail dialog, keyed by channel row name
+  // (e.g. "discord" or "discord:sam" — the dialog resolves it to the base
+  // platform, since behavior/access settings are per-platform, not per-agent).
+  const [detailChannel, setDetailChannel] = useState<string | null>(null);
   const [removing, setRemoving] = useState(false);
   // 'warning' covers the honest "credential_only" degrade — a test that
   // could not actually send a message must never read as a green success.
@@ -308,6 +331,7 @@ export function ChannelsPage() {
               onTest={() => handleTest(channel.name)}
               onEdit={() => setEditChannel(channel.name)}
               onRemove={() => setRemoveTarget(channel.name)}
+              onDetail={() => setDetailChannel(channel.name)}
             />
           ))}
         </div>
@@ -344,6 +368,13 @@ export function ChannelsPage() {
         confirmLabel={intl.formatMessage({ id: 'channels.remove' })}
         busy={removing}
       />
+
+      {/* W2-2 (E1/E2) — 行為 / 存取 detail dialog */}
+      <ChannelDetailDialog
+        channelName={detailChannel}
+        open={detailChannel !== null}
+        onClose={() => setDetailChannel(null)}
+      />
     </div>
   );
 }
@@ -354,11 +385,13 @@ function ChannelRow({
   onTest,
   onEdit,
   onRemove,
+  onDetail,
 }: {
   channel: ChannelStatus;
   onTest: () => void;
   onEdit: () => void;
   onRemove: () => void;
+  onDetail: () => void;
 }) {
   const intl = useIntl();
   const style = getChannelStyle(channel.name);
@@ -408,6 +441,10 @@ function ChannelRow({
               <MoreHorizontal />
             </DropdownMenuTrigger>
             <DropdownMenuContent>
+              <DropdownMenuItem onClick={onDetail}>
+                <SlidersHorizontal />
+                {intl.formatMessage({ id: 'channels.detail.action' })}
+              </DropdownMenuItem>
               <DropdownMenuItem onClick={onTest}>
                 <TestTube />
                 {intl.formatMessage({ id: 'channels.test' })}
@@ -949,5 +986,509 @@ function TelegramBindDialog({ open, onClose }: { open: boolean; onClose: () => v
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+// ── W2-2 (E1/E2) — 行為 / 存取 detail dialog ─────────────────────────────
+//
+// `channels.config_get/set` (行為) and `channels.access_get/set` +
+// `channels.pairing_list/revoke` (存取) close the biggest gap between what
+// ChannelsPage shows and what a channel's admin/agent could already change
+// via chat commands + MCP tools (`channel_config`/`pairing_manage`) — see
+// `commercial/docs/ux-redesign-2026-08/01-current-state-map.md` breakpoint #3.
+// Both tabs write through the same `ChannelSettingsManager`/`AccessController`
+// the MCP tools use, so a change made from a chat and a change made here
+// converge on one state (`dashboard_feedback.rs` pushes `channel_config.changed`
+// either way — no manual refresh needed to see the other side's edit).
+
+/** Discord-only behavior keys — currently only `discord.rs` reads them
+ * (guild allowlist / auto-thread / response embed style / archive timer).
+ * Shown conditionally so a Telegram/LINE admin never sees dead controls. */
+const DISCORD_ONLY_BEHAVIOR = true;
+
+const THREAD_ARCHIVE_MINUTES: ReadonlyArray<string> = ['60', '1440', '4320', '10080'];
+
+function channelDisplayLabel(platform: string): string {
+  return CHANNEL_TYPES.find((c) => c.value === platform)?.label ?? platform;
+}
+
+function ChannelDetailDialog({
+  channelName,
+  open,
+  onClose,
+}: {
+  channelName: string | null;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const intl = useIntl();
+  const t = (id: string) => intl.formatMessage({ id });
+  const platform = channelName ? getChannelPlatform(channelName) : '';
+  const [tab, setTab] = useState<'behavior' | 'access'>('behavior');
+
+  useEffect(() => {
+    if (open) setTab('behavior');
+  }, [open]);
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => { if (!o) onClose(); }}>
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>
+            {intl.formatMessage({ id: 'channels.detail.title' }, { name: channelDisplayLabel(platform) })}
+          </DialogTitle>
+        </DialogHeader>
+
+        {platform && (
+          <Tabs value={tab} onValueChange={(v) => setTab(v as 'behavior' | 'access')}>
+            <TabsList>
+              <TabsTab value="behavior">
+                <SlidersHorizontal />
+                {t('channels.detail.tab.behavior')}
+              </TabsTab>
+              <TabsTab value="access">
+                <ShieldCheck />
+                {t('channels.detail.tab.access')}
+              </TabsTab>
+            </TabsList>
+            <div className="max-h-[60vh] overflow-y-auto pt-4">
+              <TabsPanel value="behavior">
+                <ChannelBehaviorTab platform={platform} active={open && tab === 'behavior'} />
+              </TabsPanel>
+              <TabsPanel value="access">
+                <ChannelAccessTab platform={platform} active={open && tab === 'access'} />
+              </TabsPanel>
+            </div>
+          </Tabs>
+        )}
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            {t('common.close')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** Add/remove chip list editor for `allowed_*`/`blocked_*`/`admin_users`
+ * fields. Enter or the + button adds the current draft; duplicates are
+ * silently ignored rather than erroring (the same value re-added is a no-op,
+ * not a mistake worth interrupting the admin over). */
+function TagListEditor({
+  label,
+  help,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  help?: string;
+  value: string[];
+  onChange: (next: string[]) => void;
+  placeholder?: string;
+}) {
+  const intl = useIntl();
+  const [draft, setDraft] = useState('');
+
+  const add = () => {
+    const v = draft.trim();
+    if (!v) return;
+    if (!value.includes(v)) onChange([...value, v]);
+    setDraft('');
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <label className="text-sm font-medium text-foreground">{label}</label>
+      <div className="flex gap-2">
+        <Input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder={placeholder}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              add();
+            }
+          }}
+        />
+        <Button type="button" variant="outline" size="sm" onClick={add} disabled={!draft.trim()}>
+          <Plus />
+          {intl.formatMessage({ id: 'common.add' })}
+        </Button>
+      </div>
+      {value.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 pt-0.5">
+          {value.map((v) => (
+            <Badge key={v} variant="secondary" className="gap-1 pr-1">
+              <span className="font-mono">{v}</span>
+              <button
+                type="button"
+                className="rounded p-0.5 opacity-60 transition-opacity hover:opacity-100"
+                onClick={() => onChange(value.filter((x) => x !== v))}
+                aria-label={intl.formatMessage({ id: 'common.remove' })}
+              >
+                <X className="size-3" />
+              </button>
+            </Badge>
+          ))}
+        </div>
+      )}
+      {help && <p className="text-xs text-muted-foreground">{help}</p>}
+    </div>
+  );
+}
+
+/** 行為 tab (E1) — `channels.config_get`/`channels.config_set`. */
+function ChannelBehaviorTab({ platform, active }: { platform: string; active: boolean }) {
+  const intl = useIntl();
+  const t = (id: string) => intl.formatMessage({ id });
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [settings, setSettings] = useState<ChannelConfigSettings | null>(null);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    api.channels.configGet(platform)
+      .then((r) => { if (!cancelled) setSettings(r.settings); })
+      .catch((e) => { if (!cancelled) setLoadError(formatError(e)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [active, platform]);
+
+  const update = <K extends keyof ChannelConfigSettings>(key: K, value: ChannelConfigSettings[K]) => {
+    setSettings((prev) => (prev ? { ...prev, [key]: value } : prev));
+  };
+
+  const handleSave = async () => {
+    if (!settings) return;
+    setSaveState('saving');
+    try {
+      await api.channels.configSet(platform, settings);
+      setSaveState('saved');
+      toast.success(t('channels.detail.saved'));
+      setTimeout(() => setSaveState('idle'), 2000);
+    } catch (e) {
+      setSaveState('error');
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Spinner className="size-5 text-muted-foreground" />
+      </div>
+    );
+  }
+  if (loadError || !settings) {
+    return (
+      <div className="flex items-start gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">
+        <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+        <span>{loadError ?? t('channels.detail.loadFailed')}</span>
+      </div>
+    );
+  }
+
+  const isDiscord = DISCORD_ONLY_BEHAVIOR && platform === 'discord';
+
+  return (
+    <div className="space-y-5">
+      <SettingsSection>
+        <SettingsCard>
+          <SettingsRow
+            label={t('channels.detail.behavior.mentionOnly')}
+            description={t('channels.detail.behavior.mentionOnly.help')}
+          >
+            <Switch
+              checked={settings.mention_only}
+              onCheckedChange={(v) => update('mention_only', Boolean(v))}
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t('channels.detail.behavior.agentOverride')}
+            description={t('channels.detail.behavior.agentOverride.help')}
+            tier="text"
+          >
+            <Input
+              value={settings.agent_override}
+              onChange={(e) => update('agent_override', e.target.value)}
+              placeholder={t('channels.detail.behavior.agentOverride.placeholder')}
+            />
+          </SettingsRow>
+          {isDiscord && (
+            <SettingsRow
+              label={t('channels.detail.behavior.autoThread')}
+              description={t('channels.detail.behavior.autoThread.help')}
+            >
+              <Switch
+                checked={settings.auto_thread}
+                onCheckedChange={(v) => update('auto_thread', Boolean(v))}
+              />
+            </SettingsRow>
+          )}
+          {isDiscord && (
+            <SettingsRow label={t('channels.detail.behavior.responseMode')} tier="select">
+              <Select
+                value={settings.response_mode}
+                onValueChange={(v) => update('response_mode', String(v) as ChannelConfigSettings['response_mode'])}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue>{t(`channels.detail.behavior.responseMode.${settings.response_mode}`)}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">{t('channels.detail.behavior.responseMode.auto')}</SelectItem>
+                  <SelectItem value="embed">{t('channels.detail.behavior.responseMode.embed')}</SelectItem>
+                  <SelectItem value="plain">{t('channels.detail.behavior.responseMode.plain')}</SelectItem>
+                </SelectContent>
+              </Select>
+            </SettingsRow>
+          )}
+          {isDiscord && (
+            <SettingsRow label={t('channels.detail.behavior.threadArchive')} tier="select">
+              <Select
+                value={settings.thread_archive_minutes ?? '__unset'}
+                onValueChange={(v) => update('thread_archive_minutes', String(v) === '__unset' ? null : String(v))}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue>
+                    {settings.thread_archive_minutes
+                      ? t(`channels.detail.behavior.threadArchive.${settings.thread_archive_minutes}`)
+                      : t('channels.detail.behavior.threadArchive.unset')}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__unset">{t('channels.detail.behavior.threadArchive.unset')}</SelectItem>
+                  {THREAD_ARCHIVE_MINUTES.map((minutes) => (
+                    <SelectItem key={minutes} value={minutes}>
+                      {t(`channels.detail.behavior.threadArchive.${minutes}`)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </SettingsRow>
+          )}
+        </SettingsCard>
+      </SettingsSection>
+
+      <TagListEditor
+        label={t('channels.detail.behavior.allowedChannels')}
+        help={t('channels.detail.behavior.allowedChannels.help')}
+        value={settings.allowed_channels}
+        onChange={(v) => update('allowed_channels', v)}
+        placeholder={t('channels.detail.behavior.allowedChannels.placeholder')}
+      />
+      {isDiscord && (
+        <TagListEditor
+          label={t('channels.detail.behavior.allowedGuilds')}
+          help={t('channels.detail.behavior.allowedGuilds.help')}
+          value={settings.allowed_guilds}
+          onChange={(v) => update('allowed_guilds', v)}
+          placeholder={t('channels.detail.behavior.allowedGuilds.placeholder')}
+        />
+      )}
+
+      <div className="flex items-center justify-end gap-3 pt-1">
+        <SettingsSaveState
+          status={saveState}
+          savingLabel={t('common.saving')}
+          savedLabel={t('channels.detail.saved.inline')}
+          errorLabel={t('common.saveError')}
+        />
+        <Button variant="brand" size="sm" onClick={handleSave} disabled={saveState === 'saving'}>
+          {t('common.save')}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/** 存取 tab (E2) — `channels.access_get`/`channels.access_set` +
+ * `channels.pairing_list`/`channels.pairing_revoke`. */
+function ChannelAccessTab({ platform, active }: { platform: string; active: boolean }) {
+  const intl = useIntl();
+  const t = (id: string) => intl.formatMessage({ id });
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [settings, setSettings] = useState<ChannelAccessSettings | null>(null);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+
+  const [approved, setApproved] = useState<string[]>([]);
+  const [pairingLoading, setPairingLoading] = useState(true);
+  const [revoking, setRevoking] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    api.channels.accessGet(platform)
+      .then((r) => { if (!cancelled) setSettings(r.settings); })
+      .catch((e) => { if (!cancelled) setLoadError(formatError(e)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [active, platform]);
+
+  const loadPairing = useCallback(() => {
+    setPairingLoading(true);
+    api.channels.pairingList()
+      .then((r) => setApproved(r.approved ?? []))
+      .catch((e) => toast.error(formatError(e)))
+      .finally(() => setPairingLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (active) loadPairing();
+  }, [active, loadPairing]);
+
+  // Live-refresh when the same store changes from the other write path (a
+  // channel `/pair` approval, or another dashboard tab) — closes the E1/E2
+  // sync gap called out in the task brief.
+  useEffect(() => {
+    const unsubscribe = client.subscribe('channel_config.changed', () => {
+      if (active) loadPairing();
+    });
+    return unsubscribe;
+  }, [active, loadPairing]);
+
+  const update = <K extends keyof ChannelAccessSettings>(key: K, value: ChannelAccessSettings[K]) => {
+    setSettings((prev) => (prev ? { ...prev, [key]: value } : prev));
+  };
+
+  const handleSave = async () => {
+    if (!settings) return;
+    setSaveState('saving');
+    try {
+      await api.channels.accessSet(platform, settings);
+      setSaveState('saved');
+      toast.success(t('channels.detail.saved'));
+      setTimeout(() => setSaveState('idle'), 2000);
+    } catch (e) {
+      setSaveState('error');
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    }
+  };
+
+  const handleRevoke = async (subject: string) => {
+    setRevoking(subject);
+    try {
+      await api.channels.pairingRevoke(subject);
+      setApproved((prev) => prev.filter((s) => s !== subject));
+      toast.success(intl.formatMessage({ id: 'channels.detail.access.pairing.revoked' }, { subject }));
+    } catch (e) {
+      toast.error(formatError(e));
+    } finally {
+      setRevoking(null);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Spinner className="size-5 text-muted-foreground" />
+      </div>
+    );
+  }
+  if (loadError || !settings) {
+    return (
+      <div className="flex items-start gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">
+        <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+        <span>{loadError ?? t('channels.detail.loadFailed')}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      <SettingsSection>
+        <SettingsCard>
+          <SettingsRow
+            label={t('channels.detail.access.requirePairing')}
+            description={t('channels.detail.access.requirePairing.help')}
+          >
+            <Switch
+              checked={settings.require_pairing}
+              onCheckedChange={(v) => update('require_pairing', Boolean(v))}
+            />
+          </SettingsRow>
+        </SettingsCard>
+      </SettingsSection>
+
+      <TagListEditor
+        label={t('channels.detail.access.allowedUsers')}
+        help={t('channels.detail.access.allowedUsers.help')}
+        value={settings.allowed_users}
+        onChange={(v) => update('allowed_users', v)}
+        placeholder={t('channels.detail.access.allowedUsers.placeholder')}
+      />
+      <TagListEditor
+        label={t('channels.detail.access.blockedUsers')}
+        help={t('channels.detail.access.blockedUsers.help')}
+        value={settings.blocked_users}
+        onChange={(v) => update('blocked_users', v)}
+        placeholder={t('channels.detail.access.blockedUsers.placeholder')}
+      />
+      <TagListEditor
+        label={t('channels.detail.access.adminUsers')}
+        help={t('channels.detail.access.adminUsers.help')}
+        value={settings.admin_users}
+        onChange={(v) => update('admin_users', v)}
+        placeholder={t('channels.detail.access.adminUsers.placeholder')}
+      />
+
+      <div className="flex items-center justify-end gap-3 pt-1">
+        <SettingsSaveState
+          status={saveState}
+          savingLabel={t('common.saving')}
+          savedLabel={t('channels.detail.saved.inline')}
+          errorLabel={t('common.saveError')}
+        />
+        <Button variant="brand" size="sm" onClick={handleSave} disabled={saveState === 'saving'}>
+          {t('common.save')}
+        </Button>
+      </div>
+
+      {/* Approved pairing subjects — shared across every channel type, so
+          this list looks the same regardless of which platform tab it's
+          opened from (see channels.pairing_list — no per-channel dimension
+          exists server-side). */}
+      <SettingsSection
+        title={t('channels.detail.access.pairing.title')}
+        description={t('channels.detail.access.pairing.desc')}
+      >
+        <SettingsCard>
+          {pairingLoading ? (
+            <div className="flex items-center justify-center py-8">
+              <Spinner className="size-4 text-muted-foreground" />
+            </div>
+          ) : approved.length === 0 ? (
+            <p className="px-4 py-4 text-center text-xs text-muted-foreground">
+              {t('channels.detail.access.pairing.empty')}
+            </p>
+          ) : (
+            approved.map((subject) => (
+              <div key={subject} className="flex items-center justify-between gap-3 px-4 py-2.5">
+                <span className="truncate font-mono text-xs text-foreground">{subject}</span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={revoking === subject}
+                  onClick={() => handleRevoke(subject)}
+                >
+                  <X className="size-3.5" />
+                  {t('channels.detail.access.pairing.revoke')}
+                </Button>
+              </div>
+            ))
+          )}
+        </SettingsCard>
+      </SettingsSection>
+    </div>
   );
 }
