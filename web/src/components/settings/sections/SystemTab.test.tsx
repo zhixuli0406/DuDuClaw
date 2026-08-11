@@ -114,3 +114,43 @@ describe('<SystemTab> memory dedup gate ([memory] novelty_gate)', () => {
     expect(lastCall[0].novelty_gate_enabled).toBe(false);
   });
 });
+
+describe('<SystemTab> daily digest ([notify] daily_digest)', () => {
+  it('defaults the toggle to off and hides the time field when absent from system.config', async () => {
+    renderWithProviders(<SystemTab />);
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Enable daily digest' })).not.toBeChecked());
+    expect(screen.queryByLabelText('Send time')).not.toBeInTheDocument();
+  });
+
+  it('reflects a saved on state + time from system.config', async () => {
+    configMock.mockResolvedValue({
+      config: '',
+      allowed_origins: [],
+      daily_digest_enabled: true,
+      daily_digest_at: '07:30',
+    });
+    renderWithProviders(<SystemTab />);
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Enable daily digest' })).toBeChecked());
+    expect(screen.getByDisplayValue('07:30')).toBeInTheDocument();
+  });
+
+  it('sends the toggled flag and time in the update_config payload on save', async () => {
+    renderWithProviders(<SystemTab />);
+    await waitFor(() => expect(screen.getByText('dash.example.com')).toBeInTheDocument());
+
+    const toggle = screen.getByRole('switch', { name: 'Enable daily digest' });
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+
+    const timeInput = screen.getByLabelText('Send time') as HTMLInputElement;
+    fireEvent.change(timeInput, { target: { value: '20:15' } });
+
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalled());
+    const lastCall = updateConfigMock.mock.calls.at(-1) as [{ daily_digest: boolean; daily_digest_at: string }];
+    expect(lastCall[0].daily_digest).toBe(true);
+    expect(lastCall[0].daily_digest_at).toBe('20:15');
+  });
+});

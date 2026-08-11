@@ -31,6 +31,7 @@ import {
   TaskDoneBurst,
   celebrateTaskDone,
 } from '@/components/task';
+import { OpenInChannelButton } from '@/components/inbox/OpenInChannelButton';
 import { toStatusKey } from '@/lib/task-status';
 import { timeAgo } from '@/lib/format';
 import { api, type TaskInfo, type TaskStatus, type TaskPriority, type TaskIteration } from '@/lib/api';
@@ -327,6 +328,8 @@ export function TaskDetailPage() {
                 <span className="text-xs text-muted-foreground">{assigneeAgent.display_name}</span>
               </span>
             )}
+            {/* W2-3 reverse handoff (E8): jump back to the /goal conversation. */}
+            <OpenInChannelButton channel={task.channel} link={task.channel_link} className="ml-auto" />
           </div>
         </div>
 

@@ -20,6 +20,7 @@ import { Badge, Button } from '@/components/mds';
 import { timeAgo, timeRemaining } from '@/lib/format';
 import { expiryState } from '@/lib/inbox-model';
 import { useNowTick } from '@/hooks/useNowTick';
+import { OpenInChannelButton } from './OpenInChannelButton';
 
 const SEVERITY_COLOR: Record<string, string> = {
   critical: 'text-destructive',
@@ -189,6 +190,11 @@ export function InstallDetailPanel({
           {request.manager_by && <span className="ml-2">{t('install.request.managerSigned')}</span>}
         </div>
       </div>
+
+      {/* E8 reverse handoff: jump to the sign-off conversation this
+          request's decision card is (or was) parked in on the resolved
+          channel. Renders nothing when the backend couldn't resolve a link. */}
+      <OpenInChannelButton channel={request.channel} link={request.channel_link} variant="outline" />
 
       {/* Decision */}
       {decided ? (

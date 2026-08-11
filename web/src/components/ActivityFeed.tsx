@@ -19,6 +19,7 @@ import {
   Eye,
   EyeOff,
   Layers,
+  RadioTower,
 } from 'lucide-react';
 
 type TypeConfig = {
@@ -99,6 +100,19 @@ const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
     color: 'text-destructive',
     bgColor: 'bg-destructive/10',
   },
+  // W2-8 — a channel outage crossing the alert threshold (warning) and its
+  // later resolution (success), so the two are visually distinguishable at a
+  // glance instead of sharing the generic gray fallback icon.
+  channel_send_failure_alert: {
+    icon: RadioTower,
+    color: 'text-warning',
+    bgColor: 'bg-warning/10',
+  },
+  channel_recovered: {
+    icon: CheckCircle2,
+    color: 'text-success',
+    bgColor: 'bg-success/10',
+  },
 };
 
 /**
@@ -116,6 +130,11 @@ const TIER: Record<ActivityType, Tier> = {
   task_blocked: 1,
   error: 1,
   skill_learned: 1,
+  // W2-8 — a channel outage and its resolution are headline events (the
+  // owner needs to know a delivery path broke, and when it's fine again),
+  // not routine chatter to fold behind "show all".
+  channel_send_failure_alert: 1,
+  channel_recovered: 1,
   task_assigned: 2,
   evolution_triggered: 2,
   autopilot_triggered: 2,

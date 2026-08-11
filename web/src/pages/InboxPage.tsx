@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
-import { useNavigate } from 'react-router';
+import { useNavigate, useSearchParams } from 'react-router';
 import {
   Inbox as InboxIcon,
   SlidersHorizontal,
@@ -13,6 +13,7 @@ import {
 import { api, type ApprovalItem, type TaskInfo, type DecisionInfo, type InstallRequestInfo } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useApprovalsStore } from '@/stores/approvals-store';
+import { excludeRecoveredChannelFailures, channelFailureChannel } from '@/lib/home-overview';
 import { toast, formatError } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import {
@@ -36,6 +37,7 @@ import { ApprovalDetailPanel } from '@/components/inbox/ApprovalDetailPanel';
 import { InstallDetailPanel } from '@/components/inbox/InstallDetailPanel';
 import { NeedsHumanTaskPanel } from '@/components/inbox/NeedsHumanTaskPanel';
 import { DetailShell } from '@/components/inbox/DetailShell';
+import { OpenInChannelButton } from '@/components/inbox/OpenInChannelButton';
 import { TYPE_META } from '@/components/inbox/meta';
 import type { InboxRowLabels } from '@/components/inbox/InboxRow';
 import {
@@ -111,6 +113,13 @@ export function InboxPage() {
   const isMobile = useIsMobile();
   const connectionState = useConnectionStore((s) => s.state);
   const setPendingCount = useApprovalsStore((s) => s.setPendingCount);
+
+  // H5 deep link: `?item=<id>` selects + scrolls to a specific row on load
+  // (captured once at mount — the effect below resolves it against the
+  // loaded entries and never re-reads the URL after that).
+  const [searchParams, setSearchParams] = useSearchParams();
+  const deepLinkItemRef = useRef(searchParams.get('item'));
+  const deepLinkAppliedRef = useRef(false);
 
   const [entries, setEntries] = useState<RawEntry[]>([]);
   const [agentNames, setAgentNames] = useState<Record<string, string>>({});
@@ -237,8 +246,10 @@ export function InboxPage() {
       });
     }
 
-    for (const ev of failedRes?.events ?? []) {
-      const ch = typeof ev.details?.channel === 'string' ? (ev.details.channel as string) : undefined;
+    // W2-8: `channel_recovered` resolution rows must never appear as a
+    // "沒送出去" item, and a failure a later recovery already resolved for
+    // the same channel is dropped too (see `lib/home-overview.ts`).
+    for (const ev of excludeRecoveredChannelFailures(failedRes?.events ?? [])) {
       merged.push({
         raw: ev,
         item: {
@@ -246,7 +257,7 @@ export function InboxPage() {
           type: 'failed_run',
           title: ev.summary || intl.formatMessage({ id: 'inbox.failedRun.title' }, { agent: nameMap[ev.agent_id] ?? ev.agent_id }),
           agentId: ev.agent_id || undefined,
-          channel: ch,
+          channel: channelFailureChannel(ev),
           timestamp: ev.timestamp,
           urgency: TYPE_URGENCY.failed_run,
           actionable: false,
@@ -412,6 +423,40 @@ export function InboxPage() {
     [markRead],
   );
 
+  // H5 deep link resolution: once the first aggregate load settles, try to
+  // match `?item=<id>` against the loaded entries and open it — same as
+  // clicking the row. Matched with a suffix fallback (`endsWith(':' + id)`)
+  // because a gateway-side push (`deep_link.rs`) only ever has the bare
+  // `ApprovalRecord`/`InstallRequest` id, not the frontend's type-prefixed
+  // `approval:<id>`/`install:<id>` form — a dashboard-originated link (e.g.
+  // `NeedsAttentionList`) already passes the prefixed id, which matches
+  // exactly. Runs at most once (`deepLinkAppliedRef`): a miss on the first
+  // (aggregate) paint is not retried once the deferred decisions poll lands,
+  // so it never fights a manual selection made in between.
+  useEffect(() => {
+    if (loading || deepLinkAppliedRef.current) return;
+    deepLinkAppliedRef.current = true;
+    const param = deepLinkItemRef.current;
+    if (!param) return;
+    const match = entries.find((e) => e.item.id === param || e.item.id.endsWith(`:${param}`));
+    if (match) select(match.item);
+  }, [loading, entries, select]);
+
+  // Mirror the open item back into the URL so the current view is
+  // bookmarkable/shareable (H5). `replace: true` avoids stacking a history
+  // entry per row click.
+  useEffect(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (selectedId) next.set('item', selectedId);
+        else next.delete('item');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [selectedId, setSearchParams]);
+
   const markAllRead = useCallback(() => {
     setRead((prev) => {
       let next = prev;
@@ -535,10 +580,20 @@ export function InboxPage() {
 
   const canArchive = prefs.tab === 'mine';
 
-  // Keep the selection valid as the visible set changes.
+  // Keep the selection valid as the loaded set changes. Checked against
+  // `nonArchived` (tab-independent), not the current tab's filtered `sorted`
+  // list: the detail pane already renders off `entries` regardless of the
+  // active tab (`findEntry` below), so clearing the selection just because
+  // the current tab's filter excludes it would fight that — most sharply for
+  // the H5 deep-link flow, where `select()` marks the item read as a side
+  // effect and could otherwise immediately fall out of an `unread`-tab view
+  // and get its own just-applied selection wiped. Also gated on `!loading`
+  // so the deep-link resolution above has a chance to run before this ever
+  // sees an (still-empty) entry set and clears it.
   useEffect(() => {
-    if (selectedId && !sorted.some((it) => it.id === selectedId)) setSelectedId(null);
-  }, [sorted, selectedId]);
+    if (loading) return;
+    if (selectedId && !nonArchived.some((it) => it.id === selectedId)) setSelectedId(null);
+  }, [loading, nonArchived, selectedId]);
 
   const selectedEntry = selectedId ? findEntry(selectedId) : undefined;
 
@@ -596,10 +651,14 @@ export function InboxPage() {
             {task.blocked_reason && (
               <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{task.blocked_reason}</p>
             )}
-            <Button variant="brand" onClick={() => navigate(`/tasks/${task.id}`)}>
-              <ExternalLink />
-              {t('inbox.detail.viewTask')}
-            </Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="brand" onClick={() => navigate(`/tasks/${task.id}`)}>
+                <ExternalLink />
+                {t('inbox.detail.viewTask')}
+              </Button>
+              {/* W2-3 reverse handoff (E8): jump back to the /goal conversation. */}
+              <OpenInChannelButton channel={task.channel} link={task.channel_link} variant="outline" />
+            </div>
           </DetailShell>
         );
       }

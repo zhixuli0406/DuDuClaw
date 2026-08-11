@@ -74,6 +74,28 @@ import {
 import { ToolPolicyEditor, MountTable, KvTable, EnvTable } from './editors';
 import { RowText, RowNumber, RowSwitch, RowSelect, FieldBlock } from './form-rows';
 
+/**
+ * W2-8 — client-side mirror of the gateway's `notify_governance::QuietWindow::
+ * parse`: same `H:MM-H:MM`/`HH:MM-HH:MM` shape, same range check, same
+ * degenerate-window (`start == end`) rejection. Kept intentionally narrower
+ * than the backend's fail-open reader (which treats a malformed value as "no
+ * quiet hours") — here an invalid-but-non-empty value should surface as a
+ * visible inline error, not silently behave as if the field were blank.
+ * Empty string is valid (means "not set").
+ */
+function isValidQuietHoursFormat(raw: string): boolean {
+  const s = raw.trim();
+  if (s === '') return true;
+  const m = s.match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/);
+  if (!m) return false;
+  const h1 = Number(m[1]);
+  const min1 = Number(m[2]);
+  const h2 = Number(m[3]);
+  const min2 = Number(m[4]);
+  if (h1 > 23 || min1 > 59 || h2 > 23 || min2 > 59) return false;
+  return !(h1 === h2 && min1 === min2);
+}
+
 /** Settings sub-tab whitelist (spec §5.3 式2/式3). `?tab=` is validated against
  *  this set; unknown values fall back to `general`. */
 const SUBTABS = [
@@ -373,6 +395,11 @@ export function EditAgentPage() {
         proactive_notify_channel: agent.proactive?.notify_channel ?? '',
         proactive_notify_chat_id: agent.proactive?.notify_chat_id ?? '',
         proactive_notify_thread_id: agent.proactive?.notify_thread_id ?? '',
+        // W2-8 — the agent's OWN raw value, never `agent.proactive.quiet_hours`
+        // (which is the effective, possibly-fallen-back window — see
+        // `ProactiveSettings.quiet_hours_own` for why saving THAT unchanged
+        // would silently pin the deployment-wide default into this agent).
+        proactive_quiet_hours: agent.proactive?.quiet_hours_own ?? '',
       });
       setAdvDirty(false);
     }
@@ -683,6 +710,11 @@ export function EditAgentPage() {
           notify_channel: adv.proactive_notify_channel,
           notify_chat_id: adv.proactive_notify_chat_id.trim(),
           notify_thread_id: adv.proactive_notify_thread_id.trim(),
+          // W2-8 — quiet_hours. Prefilled from the agent's own raw value
+          // (never the effective/fallen-back one), so writing it back
+          // unchanged is safe; empty clears it. The gateway re-validates
+          // the same `HH:MM-HH:MM` format server-side (fail-closed).
+          quiet_hours: adv.proactive_quiet_hours.trim(),
         };
         // UI.3 — stagnation detection.
         submitForm.stagnation_enabled = adv.stagnation_enabled;
@@ -1359,6 +1391,29 @@ export function EditAgentPage() {
               <RowText label={t('agents.adv.notifyChatId')} description={t('agents.adv.notifyChatId.help')} value={adv.proactive_notify_chat_id} placeholder="123456789" onChange={(v) => updateAdv('proactive_notify_chat_id', v)} />
               <RowText label={t('agents.adv.notifyThreadId')} description={t('agents.adv.notifyThreadId.help')} value={adv.proactive_notify_thread_id} placeholder="" onChange={(v) => updateAdv('proactive_notify_thread_id', v)} />
             </SettingsCard>
+          </SettingsSection>
+
+          {/* W2-8 — quiet hours (F10: a suppression rule the UI cannot state
+              is a silent failure). The field edits the agent's OWN raw value;
+              the note beneath renders the backend's zh-TW sentence stating
+              exactly what quiet hours defer and what still gets through. */}
+          <SettingsSection title={t('agents.adv.quietHours')} description={t('agents.adv.quietHours.desc')}>
+            <SettingsCard>
+              <RowText
+                label={t('agents.adv.quietHours.window')}
+                description={t('agents.adv.quietHours.help')}
+                tier="select-wide"
+                value={adv.proactive_quiet_hours}
+                placeholder="22:00-08:00"
+                onChange={(v) => updateAdv('proactive_quiet_hours', v)}
+              />
+            </SettingsCard>
+            {adv.proactive_quiet_hours.trim() !== '' && !isValidQuietHoursFormat(adv.proactive_quiet_hours) && (
+              <p className="px-1 text-xs text-destructive">{t('agents.adv.quietHours.invalid')}</p>
+            )}
+            {agent.proactive?.quiet_hours_note && (
+              <p className="px-1 text-xs text-muted-foreground">{agent.proactive.quiet_hours_note}</p>
+            )}
           </SettingsSection>
 
           <SettingsSection title={t('agents.evo.desc')}>

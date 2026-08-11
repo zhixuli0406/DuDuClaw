@@ -20,17 +20,16 @@ import {
   DropdownMenuItem,
 } from '@/components/mds';
 import { ActivityFeed } from '@/components/ActivityFeed';
-import {
-  type InboxItem,
-  sortInbox,
-  TYPE_URGENCY,
-} from '@/lib/inbox-model';
+import { type InboxItem, TYPE_URGENCY } from '@/lib/inbox-model';
+import { excludeRecoveredChannelFailures, channelFailureChannel } from '@/lib/home-overview';
 import { NeedsMeRow } from '@/components/home/NeedsMeRow';
 import { LiveCards } from '@/components/home/LiveCards';
 import { RecentTasks } from '@/components/home/RecentTasks';
 import { ChannelHealthCard } from '@/components/home/ChannelHealthCard';
 import { UsageSummary } from '@/components/home/UsageSummary';
 import { CustomWidgetFrame } from '@/components/home/CustomWidgetFrame';
+import { HealthOverview } from '@/components/home/HealthOverview';
+import { SinceLastVisit } from '@/components/home/SinceLastVisit';
 import {
   LayoutGrid,
   ArrowUp,
@@ -91,11 +90,19 @@ export function greetingName(
 }
 
 /**
- * HomePage (`/`) — Multica-style work overview (WP1.5). A reading-type container
- * (§5.2): a plain greeting line, the fixed 用量摘要 KPI strip (§5.5), then the
- * per-user widget list (server-persisted order + visibility, catalog role-filtered
- * fail-closed by the gateway). The PixiJS world stage lives on its own `/world`
- * page now — the home canvas stays calm and report-shaped.
+ * HomePage (`/`) — Multica-style work overview (WP1.5), overview-first since
+ * W2-1 (05-ux-redesign-proposal.md Wave 2, 憲章 8 "首頁 overview first"). A
+ * reading-type container (§5.2): a plain greeting line, then the FIXED
+ * health-summary + "需要你處理" list (`HealthOverview`) and the
+ * since-last-visit recap (`SinceLastVisit`) — the first-screen content a
+ * returning visitor needs to answer "is anything wrong, and which thing"
+ * within a few seconds. Everything else (用量摘要 KPI strip, the per-user
+ * customizable widget list — server-persisted order + visibility, catalog
+ * role-filtered fail-closed by the gateway) follows below, i.e. "details on
+ * demand" (Shneiderman). Both fixed sections are hidden in view-as mode
+ * (they read the *viewer's* own pending items, not the impersonated user's —
+ * see `HealthOverview`'s docstring). The PixiJS world stage lives on its own
+ * `/world` page now — the home canvas stays calm and report-shaped.
  */
 export function HomePage() {
   const intl = useIntl();
@@ -225,28 +232,38 @@ export function HomePage() {
       return a?.display_name || id;
     };
 
-    // "需要我" merged stream — four cheap sources (approvals / blocked / budget /
-    // failed run). Each is best-effort: a manager-gated source that errors for
-    // this viewer contributes nothing (fail-safe, not fail-loud).
+    // "需要我" merged stream — five cheap sources (approvals / blocked /
+    // needs_human / budget / failed run). Each is best-effort: a
+    // manager-gated source that errors for this viewer contributes nothing
+    // (fail-safe, not fail-loud).
+    //
+    // W2-5: `blocked` and `needs_human` are two DISTINCT `TaskInfo.status`
+    // values (`task_store.rs`) — a goal-loop task escalated to `needs_human`
+    // never carries `status: 'blocked'`, so it was silently absent from this
+    // widget even though it is exactly the kind of "等你決定" item the strip
+    // exists for (the same gap `InboxPage`/`HealthOverview` already close via
+    // their own `needs_human` fetch).
     Promise.all([
       api.approvals.list().catch(() => null),
       api.budget.incidents().catch(() => null),
       api.tasks.list({ status: 'blocked' }).catch(() => null),
+      api.tasks.list({ status: 'needs_human' }).catch(() => null),
       api.audit.unifiedLog({ sources: ['channel_failure'], limit: 20 }).catch(() => null),
-    ]).then(([approvals, budget, blocked, failed]) => {
+    ]).then(([approvals, budget, blocked, needsHuman, failed]) => {
       const items: InboxItem[] = [];
       for (const a of approvals?.approvals ?? []) {
         items.push({ id: `approval:${a.id}`, type: 'approval', title: a.summary, agentId: a.agent_id, timestamp: a.created_at, urgency: TYPE_URGENCY.approval, actionable: true, status: 'pending' });
       }
-      for (const t of blocked?.tasks ?? []) {
+      for (const t of [...(blocked?.tasks ?? []), ...(needsHuman?.tasks ?? [])]) {
         items.push({ id: `blocked:${t.id}`, type: 'blocked', title: t.title, agentId: t.assigned_to || undefined, timestamp: t.updated_at, urgency: TYPE_URGENCY.blocked, actionable: true, status: t.status });
       }
       for (const inc of budget?.incidents ?? []) {
         items.push({ id: `budget:${inc.agent_id}:${inc.ts}`, type: 'budget', title: intl.formatMessage({ id: 'inbox.budget.title' }, { agent: nameOf(inc.agent_id), scope: inc.scope }), agentId: inc.agent_id, timestamp: inc.ts, urgency: TYPE_URGENCY.budget, actionable: true, status: inc.event });
       }
-      for (const ev of failed?.events ?? []) {
-        const ch = typeof ev.details?.channel === 'string' ? (ev.details.channel as string) : undefined;
-        items.push({ id: `failed_run:${ev.agent_id}:${ev.timestamp}`, type: 'failed_run', title: ev.summary || intl.formatMessage({ id: 'inbox.failedRun.title' }, { agent: nameOf(ev.agent_id) }), agentId: ev.agent_id || undefined, channel: ch, timestamp: ev.timestamp, urgency: TYPE_URGENCY.failed_run, actionable: false, status: ev.severity });
+      // W2-8: exclude `channel_recovered` rows and any failure a later
+      // recovery already resolved for the same channel (`lib/home-overview.ts`).
+      for (const ev of excludeRecoveredChannelFailures(failed?.events ?? [])) {
+        items.push({ id: `failed_run:${ev.agent_id}:${ev.timestamp}`, type: 'failed_run', title: ev.summary || intl.formatMessage({ id: 'inbox.failedRun.title' }, { agent: nameOf(ev.agent_id) }), agentId: ev.agent_id || undefined, channel: channelFailureChannel(ev), timestamp: ev.timestamp, urgency: TYPE_URGENCY.failed_run, actionable: false, status: ev.severity });
       }
       setNeedsMe(items);
     }).catch(() => { /* silent — an empty strip is honest */ });
@@ -255,7 +272,6 @@ export function HomePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authed, fetchAgents, intl]);
 
-  const previewTop = useMemo(() => sortInbox(needsMe, 'urgency').slice(0, 4), [needsMe]);
 
   // ── edit actions ──
   const move = (id: string, dir: -1 | 1) => {
@@ -294,7 +310,7 @@ export function HomePage() {
   const renderWidget = (id: string): ReactNode => {
     switch (id) {
       case 'needs_me':
-        return <NeedsMeRow items={previewTop} total={needsMe.length} />;
+        return <NeedsMeRow total={needsMe.length} />;
       case 'my_agents':
         return <LiveCards agents={scopedAgents} enabled={authed} />;
       case 'recent_activity':
@@ -391,7 +407,18 @@ export function HomePage() {
         </p>
       </div>
 
-      {/* Fixed 用量摘要 KPI strip (§5.5). */}
+      {/* Overview-first fixed section (W2-1, 憲章 8) — hidden in view-as
+          mode: both read the current VIEWER's own pending items / activity,
+          not the impersonated user's, so showing them while "looking at
+          someone else's dashboard" would be misleading. */}
+      {!viewing && (
+        <>
+          <HealthOverview agents={agents} enabled={authed} />
+          <SinceLastVisit enabled={authed} />
+        </>
+      )}
+
+      {/* Fixed 用量摘要 KPI strip (§5.5) — details-on-demand, below the fold. */}
       <UsageSummary enabled={authed} />
 
       {/* Read-only view-as banner (§view-as: look, never touch). */}
