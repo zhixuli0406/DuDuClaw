@@ -77,6 +77,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         message: input.message,
         durationMs,
         dismissible,
+        action: input.action,
         createdAt,
       };
 
@@ -220,9 +221,21 @@ function ToastItem({ toast, onDismiss }: ToastItemProps) {
       className={`${baseClasses} ${variantClasses} ${motionClasses}`.trim()}
     >
       <ToastIcon variant={toast.variant} />
-      <p className="min-w-0 flex-1 whitespace-pre-line break-words text-sm leading-relaxed">
-        {toast.message}
-      </p>
+      <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+        <p className="whitespace-pre-line break-words text-sm leading-relaxed">{toast.message}</p>
+        {toast.action && (
+          <button
+            type="button"
+            onClick={() => {
+              toast.action?.onClick();
+              onDismiss(toast.id);
+            }}
+            className="self-start rounded-md text-sm font-medium underline decoration-current/40 underline-offset-2 hover:decoration-current focus:outline-none focus:ring-2 focus:ring-current/40"
+          >
+            {toast.action.label}
+          </button>
+        )}
+      </div>
       {toast.dismissible && (
         <button
           type="button"

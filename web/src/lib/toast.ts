@@ -13,6 +13,14 @@
 
 export type ToastVariant = 'success' | 'error' | 'info';
 
+/** An optional clickable action rendered alongside a toast's message (e.g.
+ * "前往查看" for a navigation that was suppressed because the user has
+ * unsaved edits in a form — see `lib/dashboard-navigate.ts`). */
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 export interface Toast {
   id: string;
   variant: ToastVariant;
@@ -21,6 +29,8 @@ export interface Toast {
   durationMs?: number;
   /** Whether the user can close via the X button. Default true. */
   dismissible?: boolean;
+  /** Optional clickable action button. */
+  action?: ToastAction;
   createdAt: number;
 }
 

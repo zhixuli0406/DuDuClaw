@@ -7,6 +7,7 @@ import { TourPrompt } from '@/components/tour/TourPrompt';
 import { SoftLimitBanner } from '@/components/SoftLimitBanner';
 import { LicenseExpiryBanner } from '@/components/LicenseExpiryBanner';
 import { CommandPalette } from '@/components/CommandPalette';
+import { DevPanel } from '@/components/devpanel';
 import { GrowthMount } from '@/components/growth/GrowthMount';
 import { PanelProvider, PropertiesPanel, CelebrationLayer, usePanel } from '@/components/ui';
 import {
@@ -166,6 +167,9 @@ function AppShell() {
       <TourPrompt />
       <GuidedTour />
       <CommandPalette />
+      {/* W3-4 developer panel (Stripe Workbench pattern E1/E2) — `~`-summoned,
+          manager+ only (gated inside the component itself). */}
+      <DevPanel />
       {/* Zone A quick access on small screens (§4.3) */}
       <MobileBottomNav />
       {/* Global celebration portal (§6.5). Reduced-motion → calm toast. */}

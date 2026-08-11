@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor, within, act } from '@testing-library/react';
+import { render, screen, waitFor, within, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { IntlProvider } from 'react-intl';
+import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router';
+import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { useConnectionStore } from '@/stores/connection-store';
@@ -409,6 +412,78 @@ describe('MemoryBrowser', () => {
     await waitFor(() => {
       const after = mockWsClient.call.mock.calls.filter((c) => c[0] === 'memory.browse').length;
       expect(after).toBeGreaterThan(before);
+    });
+  });
+});
+
+// ── W3-3: state-as-URL (Stripe pattern B4) — the category rail is
+// bookmarkable/shareable via `?cat=`.
+
+function SearchParamsProbe() {
+  const [params] = useSearchParams();
+  return <div data-testid="search-probe">{params.toString()}</div>;
+}
+
+/** `renderWithProviders`'s router has no way to seed a starting query string. */
+function renderAt(path: string) {
+  return render(
+    <IntlProvider messages={en} locale="en" defaultLocale="en">
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route
+            path="/memory"
+            element={
+              <>
+                <MemoryBrowser agentId="agnes" query="" />
+                <SearchParamsProbe />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    </IntlProvider>,
+  );
+}
+
+describe('MemoryBrowser — category rail as URL (W3-3)', () => {
+  it('seeds the selected category from ?cat= on load', async () => {
+    renderAt('/memory?cat=business');
+
+    expect(await screen.findByText('客戶的合約報價是三萬元')).toBeInTheDocument();
+    // The other categories' entries are filtered out by the seeded selection.
+    expect(screen.queryByText('老闆喜歡簡短的回覆語氣')).not.toBeInTheDocument();
+  });
+
+  it('ignores an unrecognized ?cat= value and falls back to "all"', async () => {
+    renderAt('/memory?cat=not-a-real-category');
+
+    // All three seeded entries are visible — the bad param never narrowed anything.
+    expect(await screen.findByText('客戶的合約報價是三萬元')).toBeInTheDocument();
+    expect(screen.getByText('老闆喜歡簡短的回覆語氣')).toBeInTheDocument();
+  });
+
+  it('mirrors an in-app category click back into the URL', async () => {
+    const user = userEvent.setup();
+    renderAt('/memory');
+
+    await user.click(await screen.findByRole('button', { name: /Customers & deals\s*1/ }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('search-probe')).toHaveTextContent('cat=business');
+    });
+  });
+
+  it('clears the "cat" param when the rail returns to "All"', async () => {
+    const user = userEvent.setup();
+    renderAt('/memory?cat=business');
+    await waitFor(() => {
+      expect(screen.getByTestId('search-probe')).toHaveTextContent('cat=business');
+    });
+
+    await user.click(screen.getByRole('button', { name: /^All\s*3/ }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('search-probe')).not.toHaveTextContent('cat=');
     });
   });
 });

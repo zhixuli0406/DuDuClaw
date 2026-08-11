@@ -1,6 +1,9 @@
 import { useEffect, lazy, Suspense } from 'react';
 import { Routes, Route, Navigate, useNavigate } from 'react-router';
 import { onPetOpenStudio } from './lib/pet';
+import { client } from './lib/ws-client';
+import { handleDashboardNavigate } from './lib/dashboard-navigate';
+import { toast } from './lib/toast';
 import { MainLayout } from './components/layout/MainLayout';
 import { ManageShell } from './components/layout/ManageShell';
 import { AuthGuard, RoleGuard } from './components/AuthGuard';
@@ -115,6 +118,17 @@ export function App() {
       alive = false;
       unlisten();
     };
+  }, [navigate]);
+
+  // B5: server-initiated dashboard navigation (`dashboard.navigate` WS event
+  // — see `lib/dashboard-navigate.ts` for the cooldown + mid-edit-form guard).
+  // Subscribed once, globally, so every page benefits without per-page wiring.
+  useEffect(() => {
+    return client.subscribe('dashboard.navigate', (payload) => {
+      handleDashboardNavigate(payload, navigate, (message, action) =>
+        toast.info(message, { action }),
+      );
+    });
   }, [navigate]);
 
   // Connect WS after auth is resolved; disconnect on logout.

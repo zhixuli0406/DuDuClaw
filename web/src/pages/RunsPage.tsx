@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { useSearchParams } from 'react-router';
 import {
   ArrowLeft,
   CheckCircle2,
@@ -12,6 +13,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { withParam } from '@/lib/url-params';
 import {
   cardsForEvents,
   isRunLive,
@@ -103,8 +105,11 @@ export function RunsPage() {
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const scope = useDataScope();
   const visibleAgents = useVisibleAgents();
+  const [searchParams, setSearchParams] = useSearchParams();
 
-  const [agentFilter, setAgentFilter] = useState('');
+  // W3-3 (state-as-URL): the agent filter starts from `?agent=<id>` when the
+  // page is opened via a bookmarked/shared link, same as any other visit.
+  const [agentFilter, setAgentFilter] = useState(() => searchParams.get('agent') ?? '');
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [listError, setListError] = useState<string | null>(null);
   const [listLoaded, setListLoaded] = useState(false);
@@ -117,6 +122,14 @@ export function RunsPage() {
   // an agent_id) — default to the first AI staff member the viewer can see.
   const effectiveAgent =
     agentFilter || (scope !== 'all' ? (visibleAgents[0]?.name ?? '') : '');
+
+  // Mirror the explicit filter (not the scope fallback above) back into the
+  // URL so the current view is bookmarkable/shareable (W3-3). Only the
+  // user's own choice is written — the non-admin default scope is derived,
+  // not a filter the user picked, so it stays out of the URL.
+  useEffect(() => {
+    setSearchParams((prev) => withParam(prev, 'agent', agentFilter), { replace: true });
+  }, [agentFilter, setSearchParams]);
 
   const agentName = useCallback(
     (id: string) => agents.find((a) => a.name === id)?.display_name || id,

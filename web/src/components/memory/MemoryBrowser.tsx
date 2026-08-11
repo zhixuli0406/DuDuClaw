@@ -1,5 +1,6 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useIntl } from 'react-intl';
+import { useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import {
   api,
@@ -20,10 +21,12 @@ import {
 } from '@/lib/memory-format';
 import {
   groupByCategory,
+  MEMORY_CATEGORIES,
   type MemoryCategoryId,
   type CategoryBucket,
 } from '@/lib/memory-category';
 import { timeAgo } from '@/lib/format';
+import { withParam, parseEnumParam } from '@/lib/url-params';
 import { toast, formatError } from '@/lib/toast';
 import {
   CollectionPageState,
@@ -113,6 +116,9 @@ function byRecency(a: MemoryEntry, b: MemoryEntry): number {
   return tb - ta;
 }
 
+/** Every selectable category rail id, for validating the `?cat=` URL param. */
+const CATEGORY_IDS: readonly MemoryCategoryId[] = MEMORY_CATEGORIES.map((c) => c.id);
+
 export function MemoryBrowser({ agentId, query }: { agentId: string; query: string }) {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
@@ -120,7 +126,17 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
   /** WP15 — platform learning telemetry, kept out of the list above. */
   const [signals, setSignals] = useState<ReadonlyArray<MemoryEntry>>([]);
   const [loading, setLoading] = useState(false);
-  const [selected, setSelected] = useState<MemoryCategoryId | 'all'>('all');
+  // W3-3 (state-as-URL): the category rail starts from `?cat=` so a
+  // bookmarked/shared filtered view opens on the same category.
+  const [params, setParams] = useSearchParams();
+  const [selected, setSelected] = useState<MemoryCategoryId | 'all'>(
+    () => parseEnumParam(params.get('cat'), CATEGORY_IDS) ?? 'all',
+  );
+  /** Tracks whether the reset-on-agent-change effect below has already seen
+   *  one agent — the very first run is the initial mount (must honour the
+   *  URL-seeded category above), only later transitions are a real agent
+   *  switch that should snap the rail back to "all". */
+  const mountedAgentRef = useRef<string | null>(null);
 
   /** Refetch this agent's memories. `showSpinner` is false for background
    *  refreshes (WP6 live push) so an incoming memory doesn't blank the list
@@ -154,9 +170,20 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
   useEffect(() => {
     if (!agentId) return;
     if (connectionState !== 'authenticated') return;
-    setSelected('all');
+    // Only reset the category rail on an actual agent switch — the initial
+    // mount must keep whatever `?cat=` seeded above (W3-3).
+    if (mountedAgentRef.current !== null && mountedAgentRef.current !== agentId) {
+      setSelected('all');
+    }
+    mountedAgentRef.current = agentId;
     void browse(true);
   }, [agentId, browse, connectionState]);
+
+  // Mirror the category rail selection back into the URL (W3-3). Functional
+  // update so it never clobbers MemoryPage's own `tab`/`q` params.
+  useEffect(() => {
+    setParams((prev) => withParam(prev, 'cat', selected === 'all' ? null : selected), { replace: true });
+  }, [selected, setParams]);
 
   // WP6 — data the agent collected or distilled during a channel conversation
   // used to sit in `memory.db` unseen until reload ("看不到的東西使用者會認為
