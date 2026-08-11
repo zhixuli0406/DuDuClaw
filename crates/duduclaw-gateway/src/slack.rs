@@ -463,9 +463,10 @@ async fn handle_event(
             // Real per-channel admin status (fail-closed) — never hardcoded.
             let is_admin =
                 crate::channel_reply::is_channel_admin(ctx, "slack", &[user, &session_id]).await;
-            let reply =
-                crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id, is_admin)
-                    .await;
+            let reply = crate::chat_commands::handle_command(
+                &cmd, ctx, &session_id, &agent_id, is_admin, user,
+            )
+            .await;
             send_message(http, bot_token, channel, &reply, thread_ts.as_deref().or(Some(ts))).await;
             remove_reaction_add_done(http, bot_token, channel, ts).await;
             return;
@@ -718,6 +719,29 @@ async fn handle_slash_command_envelope(
             // Management subcommands (status/new/usage/help/...) route through
             // chat_commands and stay ephemeral.
             let cmd_text = if text.is_empty() { "/help".to_string() } else { format!("/{text}") };
+            // W3-1: Slack swallows unregistered slash commands client-side, so
+            // a bare `/takeover` never reaches us the way it does on Telegram
+            // or Discord. `/duduclaw takeover …` is the working form here.
+            // Handled before `parse_command` (which deliberately does not know
+            // this command) and with the sender's account id, which the shared
+            // `handle_command` signature does not carry.
+            if let Some(tk) = crate::chat_commands::parse_takeover(&cmd_text) {
+                if let Some(gate_reply) = crate::channel_reply::check_user_access_gate(
+                    ctx, &session_id, user_id, &cmd_text,
+                )
+                .await
+                {
+                    if !gate_reply.is_empty() {
+                        respond_via_response_url(http, response_url, "ephemeral", &gate_reply)
+                            .await;
+                    }
+                    return;
+                }
+                let reply =
+                    crate::chat_commands::handle_takeover(ctx, &session_id, user_id, &tk).await;
+                respond_via_response_url(http, response_url, "ephemeral", &reply).await;
+                return;
+            }
             if let Some(cmd) = crate::chat_commands::parse_command(&cmd_text, None) {
                 // Central access gate — slash commands must not bypass the
                 // pairing/allowlist/blocklist enforcement the AI path applies.
@@ -746,16 +770,17 @@ async fn handle_slash_command_envelope(
                     &[user_id, &session_id],
                 )
                 .await;
-                let reply =
-                    crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id, is_admin)
-                        .await;
+                let reply = crate::chat_commands::handle_command(
+                    &cmd, ctx, &session_id, &agent_id, is_admin, user_id,
+                )
+                .await;
                 respond_via_response_url(http, response_url, "ephemeral", &reply).await;
             } else {
                 respond_via_response_url(
                     http,
                     response_url,
                     "ephemeral",
-                    "未知的子指令。可用：status / new / usage / help（或用 /ask 提問）",
+                    "未知的子指令。可用：status / new / usage / help / takeover（或用 /ask 提問）",
                 ).await;
             }
         }

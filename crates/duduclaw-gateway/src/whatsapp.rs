@@ -324,7 +324,7 @@ async fn receive_webhook(
                                     .unwrap_or_default()
                             };
                             let reply = crate::chat_commands::handle_command(
-                                &cmd, &state.ctx, &session_id, &agent_id, true,
+                                &cmd, &state.ctx, &session_id, &agent_id, true, sender,
                             ).await;
                             send_text(&state.http, &state.access_token, &phone_id, sender, &reply).await;
                             continue;

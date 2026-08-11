@@ -746,6 +746,17 @@ impl ApprovalBroker {
         // strictly better than a reminder storm.
         match self.store.claim_reminder(&rec.id, &now.to_rfc3339()).await {
             Ok(true) => {
+                // B5: an admin who already has the dashboard open in a
+                // browser tab gets routed straight to the inbox row at the
+                // exact instant the channel nudge fires below — no reason
+                // to make them separately notice a channel ping when the tab
+                // is already open. Independent of the channel push outcome:
+                // same-origin dashboard navigation is free and does not need
+                // a reachable channel destination (unlike `notify_reminder`,
+                // which may find none — see `push_new_request`'s
+                // "dashboard-only" warning case).
+                crate::dashboard_navigate::push_dashboard_navigate(&reminder_navigate_path(&rec.id));
+
                 let fut = crate::approval_notify::notify_reminder(&home, rec);
                 match tokio::time::timeout(NOTIFY_TIMEOUT, fut).await {
                     // The reminder is also the retry: when the FIRST push found
@@ -962,6 +973,14 @@ impl ApprovalBroker {
 /// authorize no one.
 pub(crate) fn notify_target_changed(rec: &ApprovalRecord, channel: &str, chat_id: &str) -> bool {
     rec.notify_channel.as_deref() != Some(channel) || rec.notify_chat_id.as_deref() != Some(chat_id)
+}
+
+/// B5: the dashboard route a "⅔-TTL about to auto-deny" push routes an open
+/// tab to — the exact `/inbox?item=<id>` H5 deep-link contract `InboxPage`
+/// already reads (see `deep_link.rs`'s `DeepLinkKind::Approval` for the
+/// external-URL twin of this same route, used by the channel-side push).
+fn reminder_navigate_path(id: &ApprovalId) -> String {
+    format!("/inbox?item={}", id.as_str())
 }
 
 // ── Decision source: agent.toml [capabilities] ──────────────
@@ -2270,6 +2289,14 @@ mod tests {
         // At the floor and above, the nudge is worth sending.
         assert!(aged(90, 120, false).reminder_due(now));
         assert_eq!(REMIND_MIN_TTL_SECONDS, 120);
+    }
+
+    // ── B5: dashboard navigate wired to the same ⅔-TTL reminder point ──
+
+    #[test]
+    fn reminder_navigate_path_matches_the_inbox_deep_link_contract() {
+        let id = ApprovalId::from("ap-abc123".to_string());
+        assert_eq!(reminder_navigate_path(&id), "/inbox?item=ap-abc123");
     }
 
     #[test]

@@ -2711,6 +2711,26 @@ async fn forward_to_channel(
         validate_channel_id(channel_type, tid)?;
     }
 
+    // W3-1 D5: a delegation callback is the classic "the AI's old message
+    // suddenly appears" case — a sub-agent finishes work started before the
+    // handover and reports back into a conversation a human is now running.
+    // Dropped, not queued: the report is already durable in `message_queue`
+    // (and re-forwardable via `duduclaw dispatcher reforward`), so a human who
+    // wants it can pull it; pushing it late would be exactly the ManyChat
+    // failure. Checked on both the thread and the parent chat id.
+    let takeover_target = thread_id.filter(|t| !t.is_empty()).unwrap_or(channel_id);
+    if crate::takeover::is_target_paused(home_dir, channel_type, takeover_target)
+        || crate::takeover::is_target_paused(home_dir, channel_type, channel_id)
+    {
+        crate::takeover::log_skip(
+            "dispatcher.forward",
+            channel_type,
+            takeover_target,
+            responder_agent,
+        );
+        return Ok(());
+    }
+
     // Read config for channel token
     let config_path = home_dir.join("config.toml");
     let config_str = tokio::fs::read_to_string(&config_path)
@@ -4446,5 +4466,73 @@ bot_token = "{token}"
             r#"{"type":"proactive_notification","agent_id":"","channel":"discord","chat_id":"1","message":"m"}"#
         )
         .is_none());
+    }
+
+    // ── W3-1 (D5): a delegation callback must not surface in a conversation
+    //    a human has taken over — the canonical "the AI's old message
+    //    suddenly appears" failure. ──
+
+    fn begin_takeover(home: &Path, channel: &str, chat_id: &str) {
+        duduclaw_core::takeover_state::begin(
+            home,
+            &duduclaw_core::takeover_state::BeginRequest {
+                conversation: format!("{channel}:{chat_id}"),
+                agent_id: "alice".into(),
+                holder_user_id: "555".into(),
+                holder_display: "王小明".into(),
+            },
+            &duduclaw_core::takeover_state::TakeoverConfig::default(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn forward_to_channel_is_skipped_while_a_human_holds_the_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Control: with no config.toml the forward fails loudly, proving the
+        // test actually reaches the send path.
+        let control = forward_to_channel(
+            dir.path(), "telegram", "12345", None, "回報", "bob", "alice", None,
+        )
+        .await;
+        assert!(control.is_err(), "control: unconfigured forward must error");
+
+        begin_takeover(dir.path(), "telegram", "12345");
+        assert!(
+            forward_to_channel(
+                dir.path(), "telegram", "12345", None, "回報", "bob", "alice", None,
+            )
+            .await
+            .is_ok(),
+            "a held conversation short-circuits before any send attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_to_channel_takeover_covers_the_thread_and_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Holding the parent chat also holds forwards addressed at a thread
+        // inside it — the safe direction is silence.
+        begin_takeover(dir.path(), "telegram", "12345");
+        assert!(forward_to_channel(
+            dir.path(), "telegram", "12345", Some("77"), "回報", "bob", "alice", None,
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn forward_to_channel_to_another_conversation_is_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        begin_takeover(dir.path(), "telegram", "12345");
+        assert!(
+            forward_to_channel(
+                dir.path(), "telegram", "99999", None, "回報", "bob", "alice", None,
+            )
+            .await
+            .is_err(),
+            "a takeover must not mute unrelated conversations"
+        );
     }
 }

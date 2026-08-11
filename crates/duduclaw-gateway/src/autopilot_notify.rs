@@ -178,21 +178,44 @@ pub async fn notify_circuit_open(
         );
         return;
     };
+    let body = circuit_open_body(&rule.name, max_fires, cooldown_secs);
+    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Autopilot, &rule.id);
+    const CIRCUIT_OPEN_NO_BUTTON_HINT: &str = "如需暫停此規則，請至儀表板的自動規則頁操作。";
+    // W3-1 (D5): an "a rule tripped" card is a needs-to-know, not a
+    // needs-to-know-*now* — deferred to the handback (buttons intact) rather
+    // than interrupting a human mid-conversation.
+    if crate::goal_notify::takeover_defer(
+        home_dir,
+        &agent_id,
+        &channel,
+        &chat_id,
+        crate::notify_governance::NotifyLevel::Confirm,
+        "autopilot.circuit_open",
+        &body,
+        Some((
+            DecisionSource::Autopilot,
+            rule.id.as_str(),
+            link.as_deref(),
+            CIRCUIT_OPEN_NO_BUTTON_HINT,
+        )),
+    )
+    .is_some()
+    {
+        return;
+    }
     let Some(token) = crate::goal_notify::channel_token(home_dir, &agent_id, &channel).await
     else {
         info!(rule = %rule.name, %channel, "autopilot-notify: no bot token — skipping circuit-open push");
         return;
     };
 
-    let body = circuit_open_body(&rule.name, max_fires, cooldown_secs);
-    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Autopilot, &rule.id);
     let http = reqwest::Client::new();
     let card = DecisionCard {
         source: DecisionSource::Autopilot,
         decision_id: &rule.id,
         body: &body,
         link: link.as_deref(),
-        no_button_hint: "如需暫停此規則，請至儀表板的自動規則頁操作。",
+        no_button_hint: CIRCUIT_OPEN_NO_BUTTON_HINT,
     };
     crate::decision_notify::deliver(home_dir, &http, &channel, &token, &chat_id, &card).await;
 }

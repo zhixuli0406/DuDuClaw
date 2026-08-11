@@ -1386,9 +1386,10 @@ async fn handle_message_create(
                 &[user_id, &session_id],
             )
             .await;
-            let reply =
-                crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id, is_admin)
-                    .await;
+            let reply = crate::chat_commands::handle_command(
+                &cmd, ctx, &session_id, &agent_id, is_admin, user_id,
+            )
+            .await;
             let _ = send_discord_message(http, token, channel_id, json!({ "content": reply }))
                 .await;
             return;

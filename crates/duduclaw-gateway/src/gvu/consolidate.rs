@@ -558,6 +558,51 @@ pub struct GvuAlertSink {
 }
 
 impl GvuAlertSink {
+    /// W3-2 — record an evolution outcome **without** paging anyone.
+    ///
+    /// [`Self::alert`] is for things a human should look at now, so it also
+    /// pushes to the agent's channel. A committed set of experience rules is
+    /// not that: D.14 classes 「試行結果通知(採用/回退)」 as L1 FYI — it belongs in
+    /// the daily digest, not in a per-event push. Without this row, though, a
+    /// rule adoption left no Activity Feed trace at all, so the digest's
+    /// 「學習事件」 line could never see it (`notify_digest::LEARNING_PREFIXES`
+    /// matches on `playbook_`, which until now had zero producers).
+    ///
+    /// Best-effort throughout, exactly like `alert`.
+    pub async fn record_activity(&self, agent_id: &str, event_type: &str, summary: &str) {
+        debug!(agent = %agent_id, event = event_type, "{summary}");
+
+        self.prediction_engine.log_evolution_event(
+            event_type,
+            agent_id,
+            None,
+            None,
+            Some(summary),
+            None,
+            None,
+        );
+
+        let store = match crate::task_store::TaskStore::open(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(error = %e, "evolution activity: failed to open task store (non-fatal)");
+                return;
+            }
+        };
+        let row = crate::task_store::ActivityRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: event_type.to_string(),
+            agent_id: agent_id.to_string(),
+            task_id: None,
+            summary: summary.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            metadata: None,
+        };
+        if let Err(e) = store.append_activity(&row).await {
+            debug!(error = %e, "evolution activity: append failed (non-fatal)");
+        }
+    }
+
     /// Raise a consolidate-mode alert: `tracing::warn!` + evolution event +
     /// dashboard Activity Feed row. Mirrors
     /// [`super::stagnation::StagnationMonitor`]'s alerting so the two WP0.2/WP0.5

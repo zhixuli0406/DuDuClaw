@@ -949,6 +949,21 @@ async fn resolve_agent_for_restore(ctx: &ReplyContext, session_id: &str) -> Stri
         .to_string()
 }
 
+/// Public alias of [`resolve_agent_for_restore`] for callers outside the reply
+/// pipeline that need "which AI employee owns this conversation" — currently
+/// [`crate::takeover`], which must attribute an Activity Feed row and a
+/// session write without duplicating the resolution order.
+pub async fn resolve_agent_for_session(ctx: &ReplyContext, session_id: &str) -> String {
+    resolve_agent_for_restore(ctx, session_id).await
+}
+
+/// CJK-aware token estimate, exposed for the takeover path which appends a
+/// turn to the session without running the AI and must cost it the same way
+/// the normal path does.
+pub fn estimate_tokens_public(text: &str) -> u32 {
+    estimate_tokens(text)
+}
+
 /// Build a reply with progress streaming.
 ///
 /// `on_progress` callback receives real-time progress events (keepalive,
@@ -1267,6 +1282,33 @@ async fn build_reply_with_session_inner(
     // None unless the operator configured access settings for this channel.
     if let Some(early_reply) = check_user_access_gate(ctx, session_id, user_id, text).await {
         return early_reply;
+    }
+
+    // ── W3-1 `/takeover` lifecycle command (D3) ──
+    // Handled before the typing-takeover gate below so that an explicit
+    // command always works — including `/takeover end` typed while the
+    // conversation is paused, which must not be swallowed as "a manager
+    // spoke, refresh the window". Zero LLM cost: it returns before any agent
+    // is resolved. Lives here rather than in each channel's command
+    // interceptor because it is the only place that carries BOTH the
+    // conversation and the sender's channel account id.
+    if let Some(tk) = crate::chat_commands::parse_takeover(text) {
+        return crate::chat_commands::handle_takeover(ctx, session_id, user_id, &tk).await;
+    }
+
+    // ── W3-1 human takeover (D1/D2/D5) ──
+    // Placed immediately after the access gate and before any agent
+    // resolution / LLM work: a manager typing into this conversation IS the
+    // takeover declaration, and while somebody holds the conversation the AI
+    // must not merely stop *starting* work — it must not produce a reply at
+    // all. `Silent` returns an empty string, which every channel already
+    // treats as "send nothing" (the same contract the blocked-user and
+    // circuit-breaker paths use); the inbound turn is still recorded in the
+    // session so the AI resumes with full context.
+    match crate::takeover::intercept(ctx, session_id, user_id, text).await {
+        Some(crate::takeover::Intercepted::Announce(msg)) => return msg,
+        Some(crate::takeover::Intercepted::Silent) => return String::new(),
+        None => {}
     }
 
     // BLOCKER fix (review B1): use a fresh per-turn ID for citation tracking

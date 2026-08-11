@@ -591,6 +591,16 @@ async fn deliver_cron_result(
         _ => chat_id.to_string(),
     };
 
+    // W3-1 D5: a scheduled result must not land in a conversation a human is
+    // running. Dropped rather than deferred: a routine's output is tied to the
+    // moment it ran (「今天的待辦」at 09:00), and the next occurrence supersedes
+    // it — replaying stale routine output an hour later is noise, not recovery.
+    // The run itself already recorded its result, so nothing is lost.
+    if crate::takeover::is_target_paused(home_dir, channel, &effective_chat_id) {
+        crate::takeover::log_skip("cron.deliver", channel, &effective_chat_id, &task.id);
+        return Ok(());
+    }
+
     // WeCom / DingTalk have no single `<channel>_bot_token` — their senders
     // resolve corp/app credentials from global config at send time, so a
     // token-cascade miss must not block delivery. We only verify the channel
@@ -1065,5 +1075,61 @@ mod tests {
             cron_reply_channel_string(&task).as_deref(),
             Some("telegram:12345:6789"),
         );
+    }
+
+    // ── W3-1 (D5): a routine's result must not land in a conversation a
+    //    human has taken over. ──
+
+    fn begin_takeover(home: &Path, channel: &str, chat_id: &str) {
+        duduclaw_core::takeover_state::begin(
+            home,
+            &duduclaw_core::takeover_state::BeginRequest {
+                conversation: format!("{channel}:{chat_id}"),
+                agent_id: "agnes".into(),
+                holder_user_id: "555".into(),
+                holder_display: "王小明".into(),
+            },
+            &duduclaw_core::takeover_state::TakeoverConfig::default(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cron_delivery_is_skipped_while_a_human_holds_the_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = task_with_notify(Some("telegram"), Some("12345"), None);
+
+        // Baseline: with no takeover and no configured token, delivery fails
+        // loudly — that is the signal we are actually reaching the send path.
+        let err = deliver_cron_result(dir.path(), &task, "結果").await;
+        assert!(err.is_err(), "control: unconfigured delivery must error");
+
+        begin_takeover(dir.path(), "telegram", "12345");
+        assert!(
+            deliver_cron_result(dir.path(), &task, "結果").await.is_ok(),
+            "a held conversation short-circuits before any send attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_delivery_to_another_conversation_is_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        begin_takeover(dir.path(), "telegram", "12345");
+        let other = task_with_notify(Some("telegram"), Some("99999"), None);
+        assert!(
+            deliver_cron_result(dir.path(), &other, "結果").await.is_err(),
+            "a takeover must not mute unrelated conversations"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_discord_thread_delivery_respects_a_thread_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        // Discord threads are addressed by the thread id, so the takeover is
+        // keyed on it — not on the parent channel.
+        begin_takeover(dir.path(), "discord", "thread-42");
+        let task = task_with_notify(Some("discord"), Some("parent"), Some("thread-42"));
+        assert!(deliver_cron_result(dir.path(), &task, "結果").await.is_ok());
     }
 }

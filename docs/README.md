@@ -51,7 +51,8 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/38-aee-playbook-evolution.md](features/38-aee-playbook-evolution.md) | 自主進化 v3：Agentic Evolution Engine + Playbook — SOUL.md 唯讀化、gene 形行為規則、條目級觀察窗 |
 | [features/39-calibrated-forward-model.md](features/39-calibrated-forward-model.md) | 校準式預測 + held-out 學習閘 — 任意 AI 員工的 predict-score-gate 迴圈，Brier/RPS 校準 + Murphy 分解 + honest-luck 標籤 |
 | [features/40-notification-governance.md](features/40-notification-governance.md) | 通知治理 — 四級 escalation ladder、勿擾時段延後佇列、每日摘要、行動率量測（SRE 50% 判準） |
-| [features/41-resident-sensing.md](features/41-resident-sensing.md) | 常駐感知＋訊號喚醒（Resident Sensing）— 外部資料流（http_poll/command/file_tail）進 autopilot 匯流排、deterministic delta 衍生欄位、本地模型初篩、ticks.sources/ticks.recent 觀測 RPC |
+| [features/41-resident-sensing.md](features/41-resident-sensing.md) | 常駐感知＋訊號喚醒（Resident Sensing）— 外部資料流（http_poll/command/file_tail/websocket）進 autopilot 匯流排、deterministic delta 衍生欄位、本地模型初篩、ticks.sources/ticks.recent 觀測 RPC |
+| [features/42-human-takeover.md](features/42-human-takeover.md) | 真人接手對話 — 管理者發言即接手、暫停+接手工作+活動流三合一、每條派發路徑逐一擋住、`/takeover` 生命週期 |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios (zh-TW) — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix (zh-TW) — sales-facing coverage table |
 

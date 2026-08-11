@@ -119,6 +119,22 @@ pub async fn notify_agent_plain(
         return NotifyOutcome::NoTarget;
     };
 
+    // W3-1 D5: a human holding this conversation outranks quiet hours — the
+    // window is shorter and the harm of talking over somebody mid-conversation
+    // is larger than the harm of a late notice. Checked first for that reason.
+    if let Some(out) = takeover_defer(
+        home_dir,
+        agent_id,
+        &channel,
+        &chat_id,
+        level,
+        notify_type,
+        text,
+        None,
+    ) {
+        return out;
+    }
+
     // Quiet hours are evaluated BEFORE the token lookup: a deferred notice is
     // re-resolved at delivery time, so a token that is missing right now
     // (mid-rotation, say) must not turn a suppressible push into `NoTarget`.
@@ -227,6 +243,82 @@ pub enum GoalProgress {
 /// Resolve the SOURCE conversation of a goal task — the `source_channel` /
 /// `source_chat_id` stamped by the `/goal` entry point. `None` when the task was
 /// not launched from a channel command (callers then fall back to `[proactive]`).
+/// W3-1 (D5): hold a push back while a human holds the destination
+/// conversation.
+///
+/// Returns `Some(NotifyOutcome::Deferred)` when the message must NOT go out
+/// now — it has been queued on the existing quiet-hours queue with
+/// `deliver_after` set to the moment the human hands back, so
+/// [`crate::notify_governance::DeferredNotifyDrainer`] delivers it (merged
+/// with anything else that piled up) instead of it appearing mid-conversation
+/// or being lost. `None` ⇒ nothing is holding this destination; push normally.
+///
+/// Deferral, not deletion, is the deliberate choice: ManyChat's documented
+/// failure is delayed automation surfacing *after* the human finishes, which
+/// is what makes an unbounded in-flight queue dangerous. A bounded queue whose
+/// release point is exactly the handback has the opposite property — the human
+/// is done by construction before anything lands.
+///
+/// `pub(crate)`: the other push families that address an agent's `[proactive]`
+/// destination (currently `autopilot_notify`) defer through the same helper,
+/// so there is one queue-shape and one log line for the whole behaviour rather
+/// than a copy per module.
+pub(crate) fn takeover_defer(
+    home_dir: &Path,
+    agent_id: &str,
+    channel: &str,
+    chat_id: &str,
+    level: NotifyLevel,
+    notify_type: &str,
+    text: &str,
+    decision: Option<(DecisionSource, &str, Option<&str>, &str)>,
+) -> Option<NotifyOutcome> {
+    let rec = crate::takeover::target_record(home_dir, channel, chat_id)?;
+    crate::takeover::log_skip("goal_notify", channel, chat_id, notify_type);
+    let (kind, decision_source, decision_id, link, hint) = match decision {
+        Some((source, id, link, hint)) => (
+            crate::notify_governance::NoticeKind::Decision,
+            Some(source.token().to_string()),
+            Some(id.to_string()),
+            link.map(str::to_string),
+            Some(hint.to_string()),
+        ),
+        None => (
+            crate::notify_governance::NoticeKind::Plain,
+            None,
+            None,
+            None,
+            None,
+        ),
+    };
+    let queued = crate::notify_governance::enqueue(
+        home_dir,
+        crate::notify_governance::DeferredNotice {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent_id.to_string(),
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            level: level.as_str().to_string(),
+            notify_type: notify_type.to_string(),
+            queued_at: chrono::Utc::now().to_rfc3339(),
+            deliver_after: rec.until.to_rfc3339(),
+            kind,
+            text: text.to_string(),
+            link,
+            no_button_hint: hint,
+            decision_source,
+            decision_id,
+        },
+    );
+    // A failed queue write is reported as a send failure so the caller's own
+    // retry logic still applies — never as "handled", which would drop it.
+    Some(if queued {
+        NotifyOutcome::Deferred
+    } else {
+        NotifyOutcome::SendFailed
+    })
+}
+
 fn task_source_target(task: &TaskRow) -> Option<(String, String)> {
     let channel = task
         .source_channel
@@ -304,11 +396,24 @@ pub async fn notify_goal_progress(
         // No source and no [proactive] destination — Activity-only, silent.
         return NotifyOutcome::NoTarget;
     };
+    let text = progress_body(task, &progress);
+    // W3-1 D5: never narrate progress into a conversation a human is running.
+    if let Some(out) = takeover_defer(
+        home_dir,
+        &task.assigned_to,
+        &channel,
+        &chat_id,
+        NotifyLevel::Fyi,
+        "goal.progress",
+        &text,
+        None,
+    ) {
+        return out;
+    }
     let Some(token) = channel_token(home_dir, &task.assigned_to, &channel).await else {
         info!(task = %task.id, %channel, "goal-progress: no bot token; skipping push");
         return NotifyOutcome::NoTarget;
     };
-    let text = progress_body(task, &progress);
     let http = reqwest::Client::new();
     if send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await {
         NotifyOutcome::Sent
@@ -548,6 +653,32 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
               "goal-notify: agent has no [proactive] notify destination; skipping push");
         return NotifyOutcome::NoTarget;
     };
+    // W3-1 D5: checked BEFORE the trajectory LLM call — a card that is going
+    // to be held back must not also cost a model call to render.
+    const NEEDS_HUMAN_NO_BUTTON_HINT: &str =
+        "此通道無法顯示按鈕，請至儀表板的待辦決定頁處理這件事。";
+    if crate::takeover::is_target_paused(home_dir, &channel, &chat_id) {
+        let body = needs_human_body(task, None, &channel);
+        let link =
+            crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
+        if let Some(out) = takeover_defer(
+            home_dir,
+            &task.assigned_to,
+            &channel,
+            &chat_id,
+            NotifyLevel::Act,
+            "goal.needs_human",
+            &body,
+            Some((
+                DecisionSource::Goal,
+                task.id.as_str(),
+                link.as_deref(),
+                NEEDS_HUMAN_NO_BUTTON_HINT,
+            )),
+        ) {
+            return out;
+        }
+    }
     let Some(token) = channel_token(home_dir, &task.assigned_to, &channel).await else {
         info!(task = %task.id, %channel, "goal-notify: no bot token; skipping push");
         return NotifyOutcome::NoTarget;
@@ -566,7 +697,7 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
         decision_id: &task.id,
         body: &body,
         link: link.as_deref(),
-        no_button_hint: "此通道無法顯示按鈕，請至儀表板的待辦決定頁處理這件事。",
+        no_button_hint: NEEDS_HUMAN_NO_BUTTON_HINT,
     };
     match crate::decision_notify::deliver_outcome(home_dir, &http, &channel, &token, &chat_id, &card)
         .await
@@ -581,9 +712,6 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
 /// autonomy, where the loop does not wait for a human. Best-effort.
 pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &str) -> bool {
     let Some((channel, chat_id)) = agent_notify_target(home_dir, &task.assigned_to) else {
-        return false;
-    };
-    let Some(token) = channel_token(home_dir, &task.assigned_to, &channel).await else {
         return false;
     };
     let reason = task
@@ -602,6 +730,23 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
         reason = duduclaw_core::truncate_chars(reason, 300),
         id = task.id,
     );
+    // W3-1 D5: same family as the other two goal pushes — deferred to the
+    // handback rather than landing while a human runs the conversation.
+    if let Some(out) = takeover_defer(
+        home_dir,
+        &task.assigned_to,
+        &channel,
+        &chat_id,
+        NotifyLevel::Fyi,
+        "goal.observer",
+        &text,
+        None,
+    ) {
+        return out != NotifyOutcome::SendFailed;
+    }
+    let Some(token) = channel_token(home_dir, &task.assigned_to, &channel).await else {
+        return false;
+    };
     let http = reqwest::Client::new();
     send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await
 }
@@ -2106,5 +2251,150 @@ mod tests {
                 NotifyOutcome::NoTarget
             );
         }
+    }
+
+    // ── W3-1 (D5/D4): pushes into a taken-over conversation are deferred to
+    //    the handback, not dropped and not delivered mid-conversation. ──
+
+    fn begin_takeover(home: &std::path::Path, channel: &str, chat_id: &str) {
+        duduclaw_core::takeover_state::begin(
+            home,
+            &duduclaw_core::takeover_state::BeginRequest {
+                conversation: format!("{channel}:{chat_id}"),
+                agent_id: "alice".into(),
+                holder_user_id: "555".into(),
+                holder_display: "王小明".into(),
+            },
+            &duduclaw_core::takeover_state::TakeoverConfig::default(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    }
+
+    fn goal_task_from(chat_id: &str) -> TaskRow {
+        let mut t = TaskRow::new(
+            "g1".into(),
+            "跑月報".into(),
+            "把這個月的營收整理成報表".into(),
+            "medium".into(),
+            "alice".into(),
+            "test".into(),
+        );
+        t.goal_mode = true;
+        t.source_channel = Some("telegram".into());
+        t.source_chat_id = Some(chat_id.to_string());
+        t
+    }
+
+    #[tokio::test]
+    async fn goal_progress_is_deferred_to_the_handback_not_pushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        begin_takeover(home, "telegram", "12345");
+        let task = goal_task_from("12345");
+
+        let out = notify_goal_progress(
+            home,
+            &task,
+            GoalProgress::Dispatched { iter: 1, cap: 8, retry: false },
+        )
+        .await;
+        assert_eq!(out, NotifyOutcome::Deferred);
+
+        // Nothing is due right now …
+        let now = chrono::Utc::now();
+        assert!(crate::notify_governance::take_due(home, now).is_empty());
+        // … and everything is due once the human hands back.
+        let after = now + chrono::Duration::minutes(
+            duduclaw_core::takeover_state::DEFAULT_DURATION_MINUTES + 1,
+        );
+        let due = crate::notify_governance::take_due(home, after);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].chat_id, "12345");
+        assert_eq!(due[0].kind, crate::notify_governance::NoticeKind::Plain);
+    }
+
+    #[tokio::test]
+    async fn goal_progress_for_another_conversation_is_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        begin_takeover(home, "telegram", "12345");
+        let task = goal_task_from("99999");
+        // No bot token configured ⇒ NoTarget, i.e. it went down the normal
+        // push path rather than being deferred.
+        assert_eq!(
+            notify_goal_progress(home, &task, GoalProgress::Reviewing).await,
+            NotifyOutcome::NoTarget
+        );
+        assert!(crate::notify_governance::take_due(
+            home,
+            chrono::Utc::now() + chrono::Duration::days(1)
+        )
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn needs_human_card_is_deferred_with_its_buttons_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // needs_human pushes to the agent's [proactive] destination.
+        let agent_dir = home.join("agents").join("alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[proactive]\nnotify_channel = \"telegram\"\nnotify_chat_id = \"12345\"\n",
+        )
+        .unwrap();
+        begin_takeover(home, "telegram", "12345");
+
+        let mut task = goal_task_from("12345");
+        task.status = "needs_human".into();
+        task.judge_feedback = Some("卡住了".into());
+        assert_eq!(notify_goal_needs_human(home, &task).await, NotifyOutcome::Deferred);
+
+        let due = crate::notify_governance::take_due(
+            home,
+            chrono::Utc::now()
+                + chrono::Duration::minutes(
+                    duduclaw_core::takeover_state::DEFAULT_DURATION_MINUTES + 1,
+                ),
+        );
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].kind, crate::notify_governance::NoticeKind::Decision);
+        assert_eq!(due[0].decision_id.as_deref(), Some("g1"));
+        assert_eq!(
+            due[0].decision_source.as_deref(),
+            Some(DecisionSource::Goal.token()),
+            "the re-rendered card must carry its source so the buttons still work"
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_result_is_deferred_to_the_handback() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent_dir = home.join("agents").join("alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[proactive]\nnotify_channel = \"telegram\"\nnotify_chat_id = \"12345\"\n",
+        )
+        .unwrap();
+        begin_takeover(home, "telegram", "12345");
+
+        let task = goal_task_from("12345");
+        assert!(
+            notify_goal_observer(home, &task, "已放棄").await,
+            "a deferred push is handled, not a failure"
+        );
+        let due = crate::notify_governance::take_due(
+            home,
+            chrono::Utc::now()
+                + chrono::Duration::minutes(
+                    duduclaw_core::takeover_state::DEFAULT_DURATION_MINUTES + 1,
+                ),
+        );
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].kind, crate::notify_governance::NoticeKind::Plain);
     }
 }

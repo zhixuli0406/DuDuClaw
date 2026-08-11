@@ -9,6 +9,7 @@ use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 mod acp;
+mod docs_cmd;              // Stripe-style `duduclaw docs [<topic>]` (E12) — GitHub doc links, browser hand-off
 mod eval;                 // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
 mod playbook_export;      // WP2.2/B4 batch: gene JSON export CLI (`duduclaw playbook export`)
 mod eval_scaffold;        // WP2.1: free-tier eval draft bootstrap (`duduclaw eval-scaffold`)
@@ -771,6 +772,22 @@ enum Commands {
 
     /// Print version information
     Version,
+
+    /// 查看 DuDuClaw 文件主題（features/guides），或直接開啟指定主題的說明文件。
+    ///
+    /// 這個工具以單一執行檔發行，`docs/` 底下的說明文件不會被打包進發行版，
+    /// 所以主題一律連到 GitHub 上的最新文件（不是本機檔案）。不帶參數列出全
+    /// 部主題；帶關鍵字則印出連結並嘗試用預設瀏覽器開啟（無圖形介面的伺服
+    /// 器環境會自動略過開啟，只印連結）。
+    ///
+    /// Examples:
+    ///     duduclaw docs
+    ///     duduclaw docs evals
+    ///     duduclaw docs playbook
+    Docs {
+        /// 主題關鍵字（大小寫不拘，比對檔名或文件說明）。留空列出全部主題。
+        topic: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1659,6 +1676,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             println!("duduclaw {}", duduclaw_gateway::updater::current_version());
             Ok(())
         }
+        Commands::Docs { topic } => docs_cmd::run(topic).await,
     }
 }
 

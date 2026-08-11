@@ -665,9 +665,24 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
     let agent = agent_id.to_string();
     let tasks_path = tasks_db.clone();
     let queue_path = queue_db.clone();
+    let home = home_dir.to_path_buf();
 
     // All sqlite I/O on a blocking thread — rusqlite is sync.
     tokio::task::spawn_blocking(move || -> Result<(), String> {
+        // W3-1 (D5): a task whose conversation a human has taken over must not
+        // generate a wake-up. The wake-up itself is internal, but the agent it
+        // wakes answers into that same conversation — which is exactly the
+        // "the AI suddenly speaks up again" failure. Skipped, never queued:
+        // the row stays on the board and the next tick after the handback
+        // nudges it unchanged.
+        let paused = |channel: Option<String>, chat: Option<String>| -> bool {
+            match (channel, chat) {
+                (Some(ch), Some(cid)) => {
+                    duduclaw_core::takeover_state::is_target_paused(&home, &ch, &cid)
+                }
+                _ => false,
+            }
+        };
         let tdb = rusqlite::Connection::open(&tasks_path)
             .map_err(|e| format!("open tasks.db: {e}"))?;
         tdb.busy_timeout(std::time::Duration::from_secs(5))
@@ -683,7 +698,7 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
         // heartbeat pull remains the fallback wake-up for ordinary tasks.
         let todo: Option<(String, String, String)> = tdb
             .query_row(
-                "SELECT id, title, priority FROM tasks
+                "SELECT id, title, priority, source_channel, source_chat_id FROM tasks
                  WHERE assigned_to = ?1 AND status IN ('todo', 'pending')
                    AND COALESCE(goal_mode, 0) = 0
                  ORDER BY CASE priority
@@ -700,26 +715,51 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
             .optional()
-            .map_err(|e| format!("query todo: {e}"))?;
+            .map_err(|e| format!("query todo: {e}"))?
+            .and_then(|(id, title, priority, ch, cid)| {
+                if paused(ch, cid) {
+                    info!(agent = %agent, task_id = %id, "Heartbeat: todo wake-up skipped — a human is handling this conversation");
+                    None
+                } else {
+                    Some((id, title, priority))
+                }
+            });
 
         // Stalled in_progress: updated_at > 30 minutes ago.
         let stall_cutoff = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
         let stalled: Option<(String, String)> = tdb
             .query_row(
-                "SELECT id, title FROM tasks
+                "SELECT id, title, source_channel, source_chat_id FROM tasks
                  WHERE assigned_to = ?1 AND status = 'in_progress'
                    AND updated_at < ?2
                  ORDER BY updated_at ASC
                  LIMIT 1",
                 rusqlite::params![&agent, stall_cutoff],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
             )
             .optional()
-            .map_err(|e| format!("query stalled: {e}"))?;
+            .map_err(|e| format!("query stalled: {e}"))?
+            .and_then(|(id, title, ch, cid)| {
+                if paused(ch, cid) {
+                    info!(agent = %agent, task_id = %id, "Heartbeat: stall wake-up skipped — a human is handling this conversation");
+                    None
+                } else {
+                    Some((id, title))
+                }
+            });
         drop(tdb);
 
         if todo.is_none() && stalled.is_none() {
@@ -1058,6 +1098,20 @@ async fn execute_proactive_check(
                 fallback
             };
             if let Some((channel, chat_id)) = target {
+                // W3-1 (D5): a proactive nudge is unsolicited by definition —
+                // the single worst thing to drop into a conversation a human
+                // has taken over. Discarded rather than queued: "你已經連續
+                // 工作兩小時了" delivered an hour late is not a late reminder,
+                // it is a wrong one.
+                if duduclaw_core::takeover_state::is_target_paused(home_dir, &channel, &chat_id) {
+                    info!(
+                        agent = agent_id,
+                        %channel,
+                        %chat_id,
+                        "Proactive notification skipped: a human is handling this conversation"
+                    );
+                    return;
+                }
                 let bus_entry = serde_json::json!({
                     "type": "proactive_notification",
                     "agent_id": agent_id,
@@ -1367,14 +1421,16 @@ mod tests {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch(
             "CREATE TABLE tasks (
-                 id          TEXT PRIMARY KEY,
-                 title       TEXT NOT NULL,
-                 status      TEXT NOT NULL,
-                 priority    TEXT NOT NULL DEFAULT 'medium',
-                 assigned_to TEXT NOT NULL,
-                 goal_mode   INTEGER,
-                 created_at  TEXT NOT NULL,
-                 updated_at  TEXT NOT NULL
+                 id             TEXT PRIMARY KEY,
+                 title          TEXT NOT NULL,
+                 status         TEXT NOT NULL,
+                 priority       TEXT NOT NULL DEFAULT 'medium',
+                 assigned_to    TEXT NOT NULL,
+                 goal_mode      INTEGER,
+                 source_channel TEXT,
+                 source_chat_id TEXT,
+                 created_at     TEXT NOT NULL,
+                 updated_at     TEXT NOT NULL
              );",
         )
         .unwrap();
@@ -1482,5 +1538,126 @@ mod tests {
 
         assert_eq!(sender_agent.as_deref(), Some("heartbeat"));
         assert_eq!(origin_agent.as_deref(), Some("heartbeat"));
+    }
+
+    // ── W3-1 (D5): the task-board pull is one of the dispatch points a
+    //    human takeover must silence. Without this, a manager who takes over
+    //    a conversation still gets the agent woken up an hour later and
+    //    answering into the same chat. ──
+
+    fn begin_takeover_for(home: &Path, channel: &str, chat_id: &str) {
+        duduclaw_core::takeover_state::begin(
+            home,
+            &duduclaw_core::takeover_state::BeginRequest {
+                conversation: format!("{channel}:{chat_id}"),
+                agent_id: "worker".into(),
+                holder_user_id: "555".into(),
+                holder_display: "王小明".into(),
+            },
+            &duduclaw_core::takeover_state::TakeoverConfig::default(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    }
+
+    fn queued_count(queue_path: &Path) -> i64 {
+        rusqlite::Connection::open(queue_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM message_queue WHERE target = 'worker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn poll_assigned_tasks_skips_a_taken_over_conversation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let tasks_path = home.join("tasks.db");
+        let queue_path = home.join("message_queue.db");
+        init_test_tasks_db(&tasks_path);
+        init_test_queue_db(&queue_path);
+
+        let now = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = rusqlite::Connection::open(&tasks_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, priority, assigned_to, goal_mode, \
+                 source_channel, source_chat_id, created_at, updated_at) \
+                 VALUES ('t1', '待辦任務', 'todo', 'high', 'worker', 0, 'telegram', '1', ?1, ?1)",
+                rusqlite::params![&now],
+            )
+            .unwrap();
+        }
+
+        begin_takeover_for(home, "telegram", "1");
+        poll_assigned_tasks(home, "worker").await.unwrap();
+        assert_eq!(
+            queued_count(&queue_path),
+            0,
+            "no wake-up may be queued for a conversation a human is handling"
+        );
+
+        // Handing back resumes the pull unchanged.
+        duduclaw_core::takeover_state::end(home, "telegram:1", chrono::Utc::now()).unwrap();
+        poll_assigned_tasks(home, "worker").await.unwrap();
+        assert_eq!(queued_count(&queue_path), 1, "the task is nudged after handback");
+    }
+
+    #[tokio::test]
+    async fn poll_assigned_tasks_takeover_is_scoped_to_the_matching_conversation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let tasks_path = home.join("tasks.db");
+        let queue_path = home.join("message_queue.db");
+        init_test_tasks_db(&tasks_path);
+        init_test_queue_db(&queue_path);
+
+        let now = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = rusqlite::Connection::open(&tasks_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, priority, assigned_to, goal_mode, \
+                 source_channel, source_chat_id, created_at, updated_at) \
+                 VALUES ('t1', '別的對話', 'todo', 'high', 'worker', 0, 'telegram', '2', ?1, ?1)",
+                rusqlite::params![&now],
+            )
+            .unwrap();
+        }
+
+        begin_takeover_for(home, "telegram", "1");
+        poll_assigned_tasks(home, "worker").await.unwrap();
+        assert_eq!(
+            queued_count(&queue_path),
+            1,
+            "a takeover on one conversation must not mute the whole agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_assigned_tasks_without_a_source_conversation_is_unaffected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let tasks_path = home.join("tasks.db");
+        let queue_path = home.join("message_queue.db");
+        init_test_tasks_db(&tasks_path);
+        init_test_queue_db(&queue_path);
+
+        let now = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = rusqlite::Connection::open(&tasks_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, priority, assigned_to, goal_mode, created_at, updated_at) \
+                 VALUES ('t1', '無來源對話', 'todo', 'high', 'worker', 0, ?1, ?1)",
+                rusqlite::params![&now],
+            )
+            .unwrap();
+        }
+
+        begin_takeover_for(home, "telegram", "1");
+        poll_assigned_tasks(home, "worker").await.unwrap();
+        assert_eq!(queued_count(&queue_path), 1);
     }
 }

@@ -64,6 +64,23 @@ const LEARNING_PREFIXES: &[&str] = &["gvu_", "playbook_", "soul_", "evolution_"]
 /// The Activity Feed event the channel-outage monitor writes.
 const CHANNEL_ALERT_EVENT: &str = "channel_send_failure_alert";
 
+/// W3-2 (D.14 「試行結果通知(採用/回退)」, L1 = digest, never its own push).
+///
+/// 「學習事件 N 則」 alone answers "did anything happen" but not "did it go
+/// well" — the single number reads identically whether every trial was adopted
+/// or every one was rolled back. These three sets break that number down into
+/// the outcome the reader actually cares about. Exact names, not prefixes:
+/// unlike [`LEARNING_PREFIXES`] (which must stay permissive so a new event type
+/// is still *counted*), mis-classifying an outcome would report a rollback as
+/// an adoption, so an unknown event stays in the undifferentiated remainder.
+const RULE_ADOPTED_EVENTS: &[&str] = &["gvu_observation_confirmed", "playbook_rules_updated"];
+/// Trials that were reverted after the observation window measured a regression.
+const RULE_REVERTED_EVENTS: &[&str] = &["gvu_observation_rolled_back"];
+/// Trials that expired without enough evidence to judge either way (§C.9
+/// 「證據不足,未採用」) — deliberately NOT counted as a rollback: nothing was
+/// shown to be wrong, there just was not enough traffic to tell.
+const RULE_NO_EVIDENCE_EVENTS: &[&str] = &["gvu_observation_expired_no_data"];
+
 // ── Config ───────────────────────────────────────────────────────────────
 
 /// `config.toml [notify]`, digest half.
@@ -151,6 +168,16 @@ pub struct DigestStats {
     pub pending_decisions: usize,
     /// Evolution / learning Activity Feed rows in the window.
     pub learning_events: usize,
+    /// W3-2 breakdown of `learning_events`: experience rules whose trial ended
+    /// in adoption. Always `<= learning_events` (a strict subset of the same
+    /// rows), which is why none of the three participate in [`Self::is_empty`]
+    /// — `learning_events` already covers them and double-counting would let a
+    /// day be "non-empty" twice for one event.
+    pub rules_adopted: usize,
+    /// Trials reverted after measuring a regression.
+    pub rules_reverted: usize,
+    /// Trials that expired without enough evidence to judge (§C.9).
+    pub rules_no_evidence: usize,
     /// Spend over the window, in millicents.
     pub cost_millicents: u64,
     /// Channel-outage alerts raised in the window.
@@ -194,6 +221,9 @@ pub fn render(stats: &DigestStats, link: Option<&str>) -> Option<String> {
     }
     if stats.learning_events > 0 {
         lines.push(format!("・學習事件 {} 則", stats.learning_events));
+        if let Some(breakdown) = render_rule_trials(stats) {
+            lines.push(format!("  ↳ 經驗法則試行結果：{breakdown}"));
+        }
     }
     if stats.cost_millicents > 0 {
         lines.push(format!("・花費 {}", format_millicents(stats.cost_millicents)));
@@ -211,6 +241,27 @@ pub fn render(stats: &DigestStats, link: Option<&str>) -> Option<String> {
         lines.push(format!("👉 {url}"));
     }
     Some(lines.join("\n"))
+}
+
+/// W3-2 — the 「採用 X 條、回退 Y 條、證據不足 Z 條」 sub-line, or `None` when
+/// no trial settled in the window (a learning-events day made entirely of
+/// other evolution activity says nothing about trials, and inventing a
+/// 「採用 0 條」 line would read as a failure report).
+///
+/// Uses only the §C.9 outward vocabulary — 「採用」/「回退」/「證據不足」 —
+/// never the internal state names.
+fn render_rule_trials(stats: &DigestStats) -> Option<String> {
+    let mut parts = Vec::new();
+    if stats.rules_adopted > 0 {
+        parts.push(format!("採用 {} 條", stats.rules_adopted));
+    }
+    if stats.rules_reverted > 0 {
+        parts.push(format!("回退 {} 條", stats.rules_reverted));
+    }
+    if stats.rules_no_evidence > 0 {
+        parts.push(format!("證據不足 {} 條", stats.rules_no_evidence));
+    }
+    (!parts.is_empty()).then(|| parts.join("、"))
 }
 
 /// Millicents → a human amount. 100_000 millicents = US$1.00.
@@ -252,6 +303,14 @@ pub async fn collect(home_dir: &Path, since: DateTime<Utc>, now: DateTime<Utc>) 
                     }
                     if is_learning_event(&r.event_type) {
                         stats.learning_events += 1;
+                        let ev = r.event_type.as_str();
+                        if RULE_ADOPTED_EVENTS.contains(&ev) {
+                            stats.rules_adopted += 1;
+                        } else if RULE_REVERTED_EVENTS.contains(&ev) {
+                            stats.rules_reverted += 1;
+                        } else if RULE_NO_EVIDENCE_EVENTS.contains(&ev) {
+                            stats.rules_no_evidence += 1;
+                        }
                     } else if r.event_type == CHANNEL_ALERT_EVENT {
                         stats.channel_alerts += 1;
                     }
@@ -580,11 +639,16 @@ mod tests {
             cost_millicents: 0,
             channel_alerts: 0,
             broken_notify_types: vec![],
+            ..Default::default()
         };
         let body = render(&stats, None).unwrap();
         assert!(body.starts_with("📊 昨日摘要"));
         assert!(body.contains("完成任務 3 件"));
         assert!(body.contains("學習事件 2 則"));
+        assert!(
+            !body.contains("試行結果"),
+            "no trial settled ⇒ no breakdown line: {body}"
+        );
         assert!(!body.contains("待你決定"), "zero counters must not appear: {body}");
         assert!(!body.contains("花費"));
     }
@@ -596,6 +660,42 @@ mod tests {
         assert!(body.ends_with("👉 http://localhost:18789/tasks"));
         // No link ⇒ text reads exactly as it would without the feature.
         assert!(!render(&stats, None).unwrap().contains("👉"));
+    }
+
+    #[test]
+    fn render_breaks_learning_events_down_into_trial_outcomes() {
+        let stats = DigestStats {
+            learning_events: 5,
+            rules_adopted: 2,
+            rules_reverted: 1,
+            rules_no_evidence: 1,
+            ..Default::default()
+        };
+        let body = render(&stats, None).unwrap();
+        assert!(body.contains("學習事件 5 則"), "{body}");
+        assert!(body.contains("經驗法則試行結果：採用 2 條、回退 1 條、證據不足 1 條"), "{body}");
+        // §C.9 wording only — no internal artifact names in a user-facing push.
+        for internal in ["playbook", "shadow", "probation", "GVU", "SOUL"] {
+            assert!(!body.contains(internal), "leaked `{internal}`: {body}");
+        }
+    }
+
+    #[test]
+    fn trial_breakdown_omits_the_outcomes_that_did_not_happen() {
+        let stats = DigestStats { learning_events: 3, rules_adopted: 1, ..Default::default() };
+        let body = render(&stats, None).unwrap();
+        assert!(body.contains("試行結果：採用 1 條"), "{body}");
+        assert!(!body.contains("回退"), "a zero must not read as a failure report: {body}");
+        assert!(!body.contains("證據不足"), "{body}");
+    }
+
+    #[test]
+    fn trial_counters_alone_never_make_an_otherwise_empty_day_worth_sending() {
+        // They are a strict subset of `learning_events`; counting them again
+        // in `is_empty` would let one event make the day non-empty twice.
+        let stats = DigestStats { rules_adopted: 2, ..Default::default() };
+        assert!(stats.is_empty(), "{stats:?}");
+        assert_eq!(render(&stats, None), None);
     }
 
     #[test]
@@ -708,6 +808,53 @@ mod tests {
         let now = Utc::now();
         let stats = collect(dir.path(), now - chrono::Duration::hours(24), now).await;
         assert!(stats.is_empty(), "{stats:?}");
+    }
+
+    #[tokio::test]
+    async fn collect_classifies_rule_trial_outcomes_inside_the_learning_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let store = crate::task_store::TaskStore::open(dir.path()).unwrap();
+
+        // One of each outcome, plus an undifferentiated learning event and a
+        // stale row outside the window.
+        for (i, (ev, ts)) in [
+            ("gvu_observation_confirmed", now - chrono::Duration::hours(1)),
+            ("playbook_rules_updated", now - chrono::Duration::hours(2)),
+            ("gvu_observation_rolled_back", now - chrono::Duration::hours(3)),
+            ("gvu_observation_expired_no_data", now - chrono::Duration::hours(4)),
+            ("gvu_consolidated", now - chrono::Duration::hours(5)),
+            ("gvu_observation_confirmed", now - chrono::Duration::days(3)),
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .append_activity(&crate::task_store::ActivityRow {
+                    id: format!("trial-{i}"),
+                    event_type: (*ev).into(),
+                    agent_id: "kiki".into(),
+                    task_id: None,
+                    summary: "x".into(),
+                    timestamp: ts.to_rfc3339(),
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let stats = collect(dir.path(), now - chrono::Duration::hours(24), now).await;
+        assert_eq!(stats.learning_events, 5, "the 3-day-old row is out of window");
+        assert_eq!(stats.rules_adopted, 2, "confirmed observation + committed rules");
+        assert_eq!(stats.rules_reverted, 1);
+        assert_eq!(stats.rules_no_evidence, 1);
+        // The breakdown never exceeds the total it decomposes.
+        assert!(
+            stats.rules_adopted + stats.rules_reverted + stats.rules_no_evidence
+                <= stats.learning_events
+        );
+        let body = render(&stats, None).unwrap();
+        assert!(body.contains("採用 2 條、回退 1 條、證據不足 1 條"), "{body}");
     }
 
     #[tokio::test]

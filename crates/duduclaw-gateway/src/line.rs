@@ -458,7 +458,7 @@ async fn line_webhook_handler(
                     )
                     .await;
                     let reply = crate::chat_commands::handle_command(
-                        &cmd, &state.ctx, &session_id, &agent_id, is_admin,
+                        &cmd, &state.ctx, &session_id, &agent_id, is_admin, sender,
                     )
                     .await;
                     let messages = vec![serde_json::json!({ "type": "text", "text": reply })];
