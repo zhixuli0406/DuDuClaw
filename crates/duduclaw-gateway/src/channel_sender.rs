@@ -43,6 +43,69 @@ impl std::fmt::Display for ChannelSendError {
 
 impl std::error::Error for ChannelSendError {}
 
+/// Inspect an HTTP status for platform-level rejection that a bare
+/// `Result<Response, reqwest::Error>` transport check would miss — a revoked
+/// token, an unknown chat id, or a bot that was kicked from a channel still
+/// completes the HTTP round-trip (status 4xx/5xx), so callers that only
+/// `map_err` the `.send()` future and ignore the response report every one of
+/// these as a successful delivery (the exact false-positive `channels.test`
+/// exists to close — W0-2). Returns the response body text on success (some
+/// callers need it for further platform-specific validation, e.g. Slack/
+/// Feishu embed their real `ok`/`code` failure signal in a 200 body).
+async fn require_api_success(
+    label: &str,
+    resp: reqwest::Response,
+) -> Result<String, ChannelSendError> {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err(ChannelSendError(format!(
+            "{label} API error {status}: {}",
+            duduclaw_core::truncate_chars(&body, 300)
+        )))
+    }
+}
+
+/// Slack's HTTP layer returns 200 even on failure — the real success signal
+/// is the JSON body's `ok` field (revoked token, `channel_not_found`,
+/// `not_in_channel`, … all come back as HTTP 200). Fail-open (`Ok`) when the
+/// body doesn't parse as the expected shape rather than mask a 2xx as a
+/// failure on a response format change.
+fn require_slack_ok(body: &str) -> Result<(), ChannelSendError> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Ok(());
+    };
+    if parsed.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        let err = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown_error");
+        return Err(ChannelSendError(format!("Slack API error: {err}")));
+    }
+    Ok(())
+}
+
+/// Feishu embeds its real result in the body's `code` field (0 = success)
+/// even on an HTTP 200. Fail-open when the body doesn't parse or carries no
+/// `code` at all.
+fn require_feishu_code_zero(body: &str) -> Result<(), ChannelSendError> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Ok(());
+    };
+    if let Some(code) = parsed.get("code").and_then(|v| v.as_i64()) {
+        if code != 0 {
+            let msg = parsed
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            return Err(ChannelSendError(format!("Feishu API error {code}: {msg}")));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Confirmation reply system
 // ---------------------------------------------------------------------------
@@ -341,7 +404,7 @@ pub struct TelegramSender {
 impl ChannelSender for TelegramSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
-        self.http
+        let resp = self.http
             .post(&url)
             .json(&serde_json::json!({
                 "chat_id": self.chat_id,
@@ -351,6 +414,7 @@ impl ChannelSender for TelegramSender {
             .send()
             .await
             .map_err(|e| ChannelSendError(format!("Telegram sendMessage: {}", crate::secret_redact::redact_secrets(&e.to_string()))))?;
+        require_api_success("Telegram", resp).await?;
         Ok(())
     }
 
@@ -418,7 +482,7 @@ pub struct LineSender {
 #[async_trait]
 impl ChannelSender for LineSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
-        self.http
+        let resp = self.http
             .post("https://api.line.me/v2/bot/message/push")
             .bearer_auth(&self.access_token)
             .json(&serde_json::json!({
@@ -428,6 +492,7 @@ impl ChannelSender for LineSender {
             .send()
             .await
             .map_err(|e| ChannelSendError(format!("LINE push: {e}")))?;
+        require_api_success("LINE", resp).await?;
         Ok(())
     }
 
@@ -540,13 +605,14 @@ pub struct DiscordSender {
 impl ChannelSender for DiscordSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
         let url = format!("https://discord.com/api/v10/channels/{}/messages", self.channel_id);
-        self.http
+        let resp = self.http
             .post(&url)
             .header("Authorization", format!("Bot {}", self.bot_token))
             .json(&serde_json::json!({"content": text}))
             .send()
             .await
             .map_err(|e| ChannelSendError(format!("Discord send: {e}")))?;
+        require_api_success("Discord", resp).await?;
         Ok(())
     }
 
@@ -627,7 +693,7 @@ pub struct SlackSender {
 #[async_trait]
 impl ChannelSender for SlackSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
-        self.http
+        let resp = self.http
             .post("https://slack.com/api/chat.postMessage")
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .json(&serde_json::json!({
@@ -637,6 +703,8 @@ impl ChannelSender for SlackSender {
             .send()
             .await
             .map_err(|e| ChannelSendError(format!("Slack postMessage: {e}")))?;
+        let body = require_api_success("Slack", resp).await?;
+        require_slack_ok(&body)?;
         Ok(())
     }
 
@@ -775,7 +843,7 @@ impl ChannelSender for WhatsAppSender {
             "https://graph.facebook.com/v20.0/{}/messages",
             self.phone_number_id
         );
-        self.http
+        let resp = self.http
             .post(&url)
             .bearer_auth(&self.access_token)
             .json(&serde_json::json!({
@@ -787,6 +855,7 @@ impl ChannelSender for WhatsAppSender {
             .send()
             .await
             .map_err(|e| ChannelSendError(format!("WhatsApp send: {e}")))?;
+        require_api_success("WhatsApp", resp).await?;
         Ok(())
     }
 
@@ -921,7 +990,7 @@ pub struct FeishuSender {
 #[async_trait]
 impl ChannelSender for FeishuSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
-        self.http
+        let resp = self.http
             .post("https://open.feishu.cn/open-apis/im/v1/messages")
             .bearer_auth(&self.access_token)
             .query(&[("receive_id_type", "chat_id")])
@@ -933,6 +1002,8 @@ impl ChannelSender for FeishuSender {
             .send()
             .await
             .map_err(|e| ChannelSendError(format!("Feishu send: {e}")))?;
+        let body = require_api_success("Feishu", resp).await?;
+        require_feishu_code_zero(&body)?;
         Ok(())
     }
 
@@ -1629,6 +1700,44 @@ mod tests {
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
         let sender = create_webchat_sender("session-42".into(), tx);
         assert_eq!(sender.channel_type(), "webchat");
+    }
+
+    // -- W0-2: platform-level (not just transport-level) failure detection --
+
+    #[test]
+    fn slack_ok_true_passes() {
+        assert!(super::require_slack_ok(r#"{"ok":true,"ts":"123"}"#).is_ok());
+    }
+
+    #[test]
+    fn slack_ok_false_is_rejected_with_the_platform_error() {
+        let err = super::require_slack_ok(r#"{"ok":false,"error":"channel_not_found"}"#)
+            .unwrap_err();
+        assert!(err.0.contains("channel_not_found"), "{}", err.0);
+    }
+
+    #[test]
+    fn slack_unparsable_body_fails_open() {
+        // A response-shape change must not turn every send into a false
+        // failure — only an explicit `ok:false` is treated as rejection.
+        assert!(super::require_slack_ok("not json").is_ok());
+    }
+
+    #[test]
+    fn feishu_code_zero_passes() {
+        assert!(super::require_feishu_code_zero(r#"{"code":0,"msg":"success"}"#).is_ok());
+    }
+
+    #[test]
+    fn feishu_nonzero_code_is_rejected_with_the_platform_error() {
+        let err = super::require_feishu_code_zero(r#"{"code":230002,"msg":"chat not found"}"#)
+            .unwrap_err();
+        assert!(err.0.contains("230002") && err.0.contains("chat not found"), "{}", err.0);
+    }
+
+    #[test]
+    fn feishu_missing_code_fails_open() {
+        assert!(super::require_feishu_code_zero(r#"{"unexpected":true}"#).is_ok());
     }
 
     #[test]

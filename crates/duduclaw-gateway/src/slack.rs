@@ -639,33 +639,6 @@ async fn respond_via_response_url(
     }
 }
 
-/// Replace the ORIGINAL message (the one carrying the buttons) via the
-/// interaction's `response_url` — used once an install decision lands, so the
-/// spent approve/deny buttons disappear instead of inviting a second click.
-async fn replace_original_via_response_url(
-    http: &reqwest::Client,
-    response_url: &str,
-    text: &str,
-) {
-    if !is_valid_slack_response_url(response_url) {
-        warn!("Slack: rejecting suspicious response_url");
-        return;
-    }
-    let body = json!({
-        "replace_original": true,
-        "text": text,
-        // A single section block REPLACES the original blocks (including the
-        // actions block with the buttons); an empty blocks array is rejected
-        // by some Slack API surfaces, so always send a valid one.
-        "blocks": [
-            { "type": "section", "text": { "type": "mrkdwn", "text": text } }
-        ],
-    });
-    if let Err(e) = http.post(response_url).json(&body).send().await {
-        error!("Slack response_url replace error: {e}");
-    }
-}
-
 /// Handle a `slash_commands` Socket-Mode envelope (native slash commands).
 ///
 /// Note: Slack slash commands are declared in the app manifest (there is no
@@ -769,6 +742,21 @@ async fn handle_slash_command_envelope(
     }
 }
 
+/// Slack overflow menus (W1-5's secondary-actions tier — see
+/// `channel_format::slack_goal_buttons`) report the chosen option in
+/// `selected_option.value`; the element's own `action_id` stays fixed to the
+/// menu itself and is never a decodable decision id. Every other interactive
+/// element (a plain button) carries its payload directly in `action_id`.
+/// Pulled out as a pure function so the branch is unit-testable without a
+/// live Socket-Mode envelope.
+fn slack_action_payload(action: &serde_json::Value) -> &str {
+    if action["type"].as_str() == Some("overflow") {
+        action["selected_option"]["value"].as_str().unwrap_or("")
+    } else {
+        action["action_id"].as_str().unwrap_or("")
+    }
+}
+
 /// Handle an `interactive` Socket-Mode envelope (`block_actions` button presses).
 /// `action_id` mirrors the Discord custom_id convention (`duduclaw:{action}`);
 /// the session id travels in the button `value`.
@@ -791,70 +779,27 @@ async fn handle_interactive_envelope(
         return;
     }
 
-    // Install-approval buttons (Feature D): map the clicking Slack account to
-    // a dashboard user, authorize, and decide. `None` → not an install action,
-    // fall through to the other handlers below.
+    // Decision buttons — every "a human must decide this" card, whichever
+    // store backs it. `None` ⇒ not a decision button, fall through below.
+    // `slack_action_payload` resolves an overflow menu's selection instead of
+    // its fixed `action_id` — everything else is unaffected (payload ==
+    // action_id for a plain button).
+    let action_data = slack_action_payload(action);
     let slack_uid = payload["user"]["id"].as_str().unwrap_or("");
     if !slack_uid.is_empty() {
-        if let Some(result) = crate::install_notify::decide_from_channel(
-            &ctx.home_dir, "slack", slack_uid, action_id,
-        )
-        .await
+        if let Some(result) =
+            crate::decision_notify::route_press(&ctx.home_dir, "slack", slack_uid, action_data).await
         {
-            match result {
-                // Decision landed → replace the button message with the
-                // outcome so the spent buttons disappear.
-                Ok(m) => {
-                    let original = payload["message"]["text"].as_str().unwrap_or("");
-                    let text =
-                        if original.is_empty() { m } else { format!("{original}\n\n{m}") };
-                    replace_original_via_response_url(http, response_url, &text).await;
-                }
-                // Unauthorized / already handled → quiet ephemeral note; the
-                // message stays for whoever IS allowed to act on it.
-                Err(m) => {
-                    respond_via_response_url(http, response_url, "ephemeral", &format!("⚠️ {m}"))
-                        .await;
-                }
-            }
-            return;
-        }
-    }
-
-    // Generic ApprovalBroker buttons (WP20): every `approvals.db` gate.
-    if !slack_uid.is_empty() {
-        if let Some(result) = crate::approval_notify::decide_from_channel(
-            &ctx.home_dir, "slack", slack_uid, action_id,
-        )
-        .await
-        {
+            // Retiring the card (clearing its buttons) happens inside the
+            // decide path via `chat.update` — a detached best-effort edit
+            // independent of this `response_url`, which is single-use and
+            // would conflict with it (see `decision_card::collapse_all`).
+            // This only sends the light ephemeral ack; an unauthorized or
+            // already-settled press leaves the message for whoever IS
+            // allowed to act on it.
             match result {
                 Ok(m) => {
-                    let original = payload["message"]["text"].as_str().unwrap_or("");
-                    let text = if original.is_empty() { m } else { format!("{original}\n\n{m}") };
-                    replace_original_via_response_url(http, response_url, &text).await;
-                }
-                Err(m) => {
-                    respond_via_response_url(http, response_url, "ephemeral", &format!("⚠️ {m}"))
-                        .await;
-                }
-            }
-            return;
-        }
-    }
-
-    // Goal-loop buttons (P2a): needs_human retry/done/abort + autonomy kickoff.
-    if !slack_uid.is_empty() {
-        if let Some(result) = crate::goal_notify::decide_from_channel(
-            &ctx.home_dir, "slack", slack_uid, action_id,
-        )
-        .await
-        {
-            match result {
-                Ok(m) => {
-                    let original = payload["message"]["text"].as_str().unwrap_or("");
-                    let text = if original.is_empty() { m } else { format!("{original}\n\n{m}") };
-                    replace_original_via_response_url(http, response_url, &text).await;
+                    respond_via_response_url(http, response_url, "ephemeral", &m).await;
                 }
                 Err(m) => {
                     respond_via_response_url(http, response_url, "ephemeral", &format!("⚠️ {m}"))
@@ -1201,5 +1146,39 @@ mod tests {
         assert_eq!(env.envelope_type, "interactive");
         let p = env.payload.unwrap();
         assert_eq!(p["actions"][0]["action_id"], "duduclaw:new_session");
+    }
+
+    // ── W1-5: overflow menu payload resolution ──────────────────────────
+
+    #[test]
+    fn slack_action_payload_reads_overflow_selected_value() {
+        let action = serde_json::json!({
+            "type": "overflow",
+            "action_id": "duduclaw:goal_more:t1",
+            "selected_option": {
+                "text": { "type": "plain_text", "text": "👤 交給我" },
+                "value": "duduclaw:decide:goal:take:t1"
+            }
+        });
+        assert_eq!(slack_action_payload(&action), "duduclaw:decide:goal:take:t1");
+    }
+
+    #[test]
+    fn slack_action_payload_reads_button_action_id_directly() {
+        let action = serde_json::json!({
+            "type": "button",
+            "action_id": "duduclaw:decide:goal:retry:t1",
+            "value": "t1"
+        });
+        assert_eq!(slack_action_payload(&action), "duduclaw:decide:goal:retry:t1");
+    }
+
+    #[test]
+    fn slack_action_payload_degrades_to_empty_on_a_malformed_overflow() {
+        // An overflow entry missing `selected_option` (should never happen on
+        // a real Slack payload) must not panic — empty string, which
+        // `decision_notify::route_press` then fails closed on.
+        let action = serde_json::json!({ "type": "overflow", "action_id": "duduclaw:goal_more:t1" });
+        assert_eq!(slack_action_payload(&action), "");
     }
 }

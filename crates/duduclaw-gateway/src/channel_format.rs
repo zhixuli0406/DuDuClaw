@@ -639,58 +639,85 @@ pub fn line_quick_reply() -> Value {
     })
 }
 
-// ── Install-approval buttons (approve / deny an install request) ──
+// ── Decision buttons (the one "a human must decide this" button family) ──
 //
-// Action id convention (extends the `duduclaw:{action}` scheme):
-//   duduclaw:install_approve:{request_id}
-//   duduclaw:install_deny:{request_id}
-// Parsed by `parse_install_approval_action`; the per-channel inbound
-// dispatchers pass the raw id to `install_notify::decide_from_channel`.
+// Every pending-decision card — install sign-off, goal-loop needs_human, the
+// goal-loop kickoff gate, a generic `ApprovalBroker` row, an autopilot
+// circuit-breaker trip — carries buttons whose action id is produced by
+// `decision_action::encode` and decoded by `decision_action::parse`. This
+// module only owns the per-platform *shape* (Telegram inline keyboard /
+// Discord action row / Slack Block Kit actions / LINE quickReply); the wire
+// format, its legacy-compatible parser and the legal verb set live in
+// `decision_action`.
+//
+// Button labels follow the settled-state vocabulary the collapsed card uses
+// (`decision_card::DecisionVerb`), so "同意" leads to "已同意" and "婉拒"
+// leads to "已婉拒" — the verb a person pressed is the verb they are told
+// afterwards.
 
-/// Build the callback/action id for an install-approval button.
-pub fn install_approval_action_id(approve: bool, request_id: &str) -> String {
-    let verb = if approve { "install_approve" } else { "install_deny" };
-    format!("duduclaw:{verb}:{request_id}")
+use crate::decision_action::{encode, DecisionAct, DecisionSource};
+
+/// Per-platform button markup for a pending decision, or `None` for a channel
+/// with no inline-button support (the caller then degrades to plain text plus
+/// a dashboard deep link).
+pub fn decision_markup(channel: &str, source: DecisionSource, id: &str) -> Option<Value> {
+    let markup = match (channel, source) {
+        ("telegram", DecisionSource::Install) => telegram_approval_buttons(id),
+        ("discord", DecisionSource::Install) => discord_approval_buttons(id),
+        ("slack", DecisionSource::Install) => slack_approval_buttons(id),
+        ("line", DecisionSource::Install) => line_approval_quick_reply(id),
+
+        ("telegram", DecisionSource::Goal) => telegram_goal_buttons(id),
+        ("discord", DecisionSource::Goal) => discord_goal_buttons(id),
+        ("slack", DecisionSource::Goal) => slack_goal_buttons(id),
+        ("line", DecisionSource::Goal) => line_goal_quick_reply(id),
+
+        ("telegram", DecisionSource::Kickoff) => telegram_goal_kickoff_buttons(id),
+        ("discord", DecisionSource::Kickoff) => discord_goal_kickoff_buttons(id),
+        ("slack", DecisionSource::Kickoff) => slack_goal_kickoff_buttons(id),
+        ("line", DecisionSource::Kickoff) => line_goal_kickoff_quick_reply(id),
+
+        ("telegram", DecisionSource::Approval) => telegram_broker_approval_buttons(id),
+        ("discord", DecisionSource::Approval) => discord_broker_approval_buttons(id),
+        ("slack", DecisionSource::Approval) => slack_broker_approval_buttons(id),
+        ("line", DecisionSource::Approval) => line_broker_approval_quick_reply(id),
+
+        ("telegram", DecisionSource::Autopilot) => telegram_autopilot_pause_buttons(id),
+        ("discord", DecisionSource::Autopilot) => discord_autopilot_pause_buttons(id),
+        ("slack", DecisionSource::Autopilot) => slack_autopilot_pause_buttons(id),
+        ("line", DecisionSource::Autopilot) => line_autopilot_pause_quick_reply(id),
+
+        _ => return None,
+    };
+    Some(markup)
 }
 
-/// Parse an install-approval action id → `(request_id, approve)`.
-/// Returns `None` for any id that is not an install-approval action.
-pub fn parse_install_approval_action(data: &str) -> Option<(String, bool)> {
-    if let Some(id) = data.strip_prefix("duduclaw:install_approve:") {
-        if !id.is_empty() {
-            return Some((id.to_string(), true));
-        }
-    }
-    if let Some(id) = data.strip_prefix("duduclaw:install_deny:") {
-        if !id.is_empty() {
-            return Some((id.to_string(), false));
-        }
-    }
-    None
-}
+// ── Install sign-off (two-stage manager → admin gate) ──
 
-/// Telegram inline keyboard with approve / deny buttons for a request.
+/// Telegram inline keyboard with approve / decline buttons for a request.
 pub fn telegram_approval_buttons(request_id: &str) -> Value {
     json!({
         "inline_keyboard": [[
-            { "text": "✅ 核准", "callback_data": install_approval_action_id(true, request_id) },
-            { "text": "❌ 退回", "callback_data": install_approval_action_id(false, request_id) }
+            { "text": "✅ 同意", "callback_data": encode(DecisionSource::Install, DecisionAct::Approve, request_id) },
+            { "text": "🙅 婉拒", "callback_data": encode(DecisionSource::Install, DecisionAct::Deny, request_id) }
         ]]
     })
 }
 
-/// Discord action row with approve / deny buttons (custom_id carries the id).
+/// Discord action row with approve / decline buttons (custom_id carries the id).
 pub fn discord_approval_buttons(request_id: &str) -> Value {
     json!({
         "type": 1,
         "components": [
-            { "type": 2, "style": 3, "label": "✅ 核准", "custom_id": install_approval_action_id(true, request_id) },
-            { "type": 2, "style": 4, "label": "❌ 退回", "custom_id": install_approval_action_id(false, request_id) }
+            { "type": 2, "style": 3, "label": "✅ 同意",
+              "custom_id": encode(DecisionSource::Install, DecisionAct::Approve, request_id) },
+            { "type": 2, "style": 4, "label": "🙅 婉拒",
+              "custom_id": encode(DecisionSource::Install, DecisionAct::Deny, request_id) }
         ]
     })
 }
 
-/// Slack Block Kit actions block with approve / deny buttons. The request id
+/// Slack Block Kit actions block with approve / decline buttons. The request id
 /// travels in both `action_id` and `value` (Slack truncates neither here).
 pub fn slack_approval_buttons(request_id: &str) -> Value {
     json!({
@@ -698,98 +725,67 @@ pub fn slack_approval_buttons(request_id: &str) -> Value {
         "elements": [
             {
                 "type": "button", "style": "primary",
-                "text": { "type": "plain_text", "text": "✅ 核准" },
-                "action_id": install_approval_action_id(true, request_id),
+                "text": { "type": "plain_text", "text": "✅ 同意" },
+                "action_id": encode(DecisionSource::Install, DecisionAct::Approve, request_id),
                 "value": request_id
             },
             {
                 "type": "button", "style": "danger",
-                "text": { "type": "plain_text", "text": "❌ 退回" },
-                "action_id": install_approval_action_id(false, request_id),
+                "text": { "type": "plain_text", "text": "🙅 婉拒" },
+                "action_id": encode(DecisionSource::Install, DecisionAct::Deny, request_id),
                 "value": request_id
             }
         ]
     })
 }
 
-/// LINE quickReply with approve / deny postback actions for a request.
+/// LINE quickReply with approve / decline postback actions for a request.
 pub fn line_approval_quick_reply(request_id: &str) -> Value {
     json!({
         "items": [
             {
                 "type": "action",
-                "action": { "type": "postback", "label": "✅ 核准",
-                    "data": install_approval_action_id(true, request_id), "displayText": "核准安裝申請" }
+                "action": { "type": "postback", "label": "✅ 同意",
+                    "data": encode(DecisionSource::Install, DecisionAct::Approve, request_id),
+                    "displayText": "同意這項安裝申請" }
             },
             {
                 "type": "action",
-                "action": { "type": "postback", "label": "❌ 退回",
-                    "data": install_approval_action_id(false, request_id), "displayText": "退回安裝申請" }
+                "action": { "type": "postback", "label": "🙅 婉拒",
+                    "data": encode(DecisionSource::Install, DecisionAct::Deny, request_id),
+                    "displayText": "婉拒這項安裝申請" }
             }
         ]
     })
 }
 
-// ── Goal-loop approval buttons (P2a needs_human exit + kickoff gate) ──
+// ── Goal loop: needs_human exit + kickoff gate ──
 //
-// Action id convention (extends the `duduclaw:{action}` scheme, same inbound
-// dispatchers as install-approval):
-//   needs_human exit (carries a task id):
-//     duduclaw:goal_retry:{task_id}   — retry (return to pending, re-dispatch)
-//     duduclaw:goal_done:{task_id}    — accept as done
-//     duduclaw:goal_abort:{task_id}   — give up (cancelled)
-//   kickoff gate (carries an ApprovalBroker approval id):
-//     duduclaw:goal_kickoff_ok:{approval_id}  — approve, start dispatching
-//     duduclaw:goal_kickoff_no:{approval_id}  — deny, abort the goal
-// Parsed by `parse_goal_action`; `goal_notify::decide_from_channel` applies it.
+// A needs_human card offers FOUR actions (retry / mark-done / abandon / take
+// over), one more than the "≤3 primary actions + 更多" budget (05 doc, one
+// message's primary actions capped at 3). Retry/mark-done stay primary
+// (the two everyday, low-friction exits); abandon/take-over collapse into
+// each platform's own secondary affordance (03b capability survey):
+// Telegram gets a second inline-keyboard row, Discord a second action row,
+// Slack an `overflow` menu sharing the same actions block, and LINE — which
+// has no secondary-menu affordance at all — drops them from the quick reply
+// entirely and lists them as plain text in the body instead (see
+// `goal_notify::needs_human_body`).
 
-/// A decoded goal-loop button action.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GoalAction {
-    /// needs_human: retry the task (carries the task id).
-    Retry(String),
-    /// needs_human: mark the task done (carries the task id).
-    Done(String),
-    /// needs_human: abandon the task (carries the task id).
-    Abort(String),
-    /// kickoff gate approve/deny (carries the approval id, `true` = approve).
-    Kickoff(String, bool),
-}
-
-/// Parse a goal-loop action id. Returns `None` for anything that is not a
-/// well-formed goal action (fail-closed: unrecognised buttons are ignored).
-pub fn parse_goal_action(data: &str) -> Option<GoalAction> {
-    let non_empty = |id: &str| (!id.is_empty()).then(|| id.to_string());
-    if let Some(id) = data.strip_prefix("duduclaw:goal_retry:") {
-        return non_empty(id).map(GoalAction::Retry);
-    }
-    if let Some(id) = data.strip_prefix("duduclaw:goal_done:") {
-        return non_empty(id).map(GoalAction::Done);
-    }
-    if let Some(id) = data.strip_prefix("duduclaw:goal_abort:") {
-        return non_empty(id).map(GoalAction::Abort);
-    }
-    if let Some(id) = data.strip_prefix("duduclaw:goal_kickoff_ok:") {
-        return non_empty(id).map(|i| GoalAction::Kickoff(i, true));
-    }
-    if let Some(id) = data.strip_prefix("duduclaw:goal_kickoff_no:") {
-        return non_empty(id).map(|i| GoalAction::Kickoff(i, false));
-    }
-    None
-}
-
-fn goal_action_id(verb: &str, id: &str) -> String {
-    format!("duduclaw:{verb}:{id}")
-}
-
-/// Telegram inline keyboard: retry / done / abort for a needs_human goal task.
+/// Telegram inline keyboard: retry / done primary; abort / take-over on a
+/// second row (secondary tier — see the module doc above).
 pub fn telegram_goal_buttons(task_id: &str) -> Value {
     json!({
-        "inline_keyboard": [[
-            { "text": "🔄 重試", "callback_data": goal_action_id("goal_retry", task_id) },
-            { "text": "✅ 標記完成", "callback_data": goal_action_id("goal_done", task_id) },
-            { "text": "🗑 放棄", "callback_data": goal_action_id("goal_abort", task_id) }
-        ]]
+        "inline_keyboard": [
+            [
+                { "text": "🔄 重試", "callback_data": encode(DecisionSource::Goal, DecisionAct::Retry, task_id) },
+                { "text": "✅ 標記完成", "callback_data": encode(DecisionSource::Goal, DecisionAct::Done, task_id) }
+            ],
+            [
+                { "text": "🗑 放棄", "callback_data": encode(DecisionSource::Goal, DecisionAct::Abort, task_id) },
+                { "text": "👤 交給我", "callback_data": encode(DecisionSource::Goal, DecisionAct::Takeover, task_id) }
+            ]
+        ]
     })
 }
 
@@ -797,22 +793,38 @@ pub fn telegram_goal_buttons(task_id: &str) -> Value {
 pub fn telegram_goal_kickoff_buttons(approval_id: &str) -> Value {
     json!({
         "inline_keyboard": [[
-            { "text": "▶️ 開始", "callback_data": goal_action_id("goal_kickoff_ok", approval_id) },
-            { "text": "❌ 拒絕", "callback_data": goal_action_id("goal_kickoff_no", approval_id) }
+            { "text": "▶️ 同意開始", "callback_data": encode(DecisionSource::Kickoff, DecisionAct::Approve, approval_id) },
+            { "text": "❌ 拒絕", "callback_data": encode(DecisionSource::Kickoff, DecisionAct::Deny, approval_id) }
         ]]
     })
 }
 
-/// Discord action row: retry / done / abort for a needs_human goal task.
+/// Discord action rows: retry / done primary; abort / take-over on a second
+/// row (secondary tier). Unlike every other `decision_markup` shape this
+/// returns an ARRAY of action rows, not a single one — `send_with_markup`'s
+/// discord branch treats an array markup as the full `components` list
+/// rather than wrapping it in one more.
 pub fn discord_goal_buttons(task_id: &str) -> Value {
-    json!({
-        "type": 1,
-        "components": [
-            { "type": 2, "style": 1, "label": "🔄 重試", "custom_id": goal_action_id("goal_retry", task_id) },
-            { "type": 2, "style": 3, "label": "✅ 標記完成", "custom_id": goal_action_id("goal_done", task_id) },
-            { "type": 2, "style": 4, "label": "🗑 放棄", "custom_id": goal_action_id("goal_abort", task_id) }
-        ]
-    })
+    json!([
+        {
+            "type": 1,
+            "components": [
+                { "type": 2, "style": 1, "label": "🔄 重試",
+                  "custom_id": encode(DecisionSource::Goal, DecisionAct::Retry, task_id) },
+                { "type": 2, "style": 3, "label": "✅ 標記完成",
+                  "custom_id": encode(DecisionSource::Goal, DecisionAct::Done, task_id) }
+            ]
+        },
+        {
+            "type": 1,
+            "components": [
+                { "type": 2, "style": 4, "label": "🗑 放棄",
+                  "custom_id": encode(DecisionSource::Goal, DecisionAct::Abort, task_id) },
+                { "type": 2, "style": 2, "label": "👤 交給我",
+                  "custom_id": encode(DecisionSource::Goal, DecisionAct::Takeover, task_id) }
+            ]
+        }
+    ])
 }
 
 /// Discord action row: approve / deny a kickoff approval (autonomy gate).
@@ -820,23 +832,38 @@ pub fn discord_goal_kickoff_buttons(approval_id: &str) -> Value {
     json!({
         "type": 1,
         "components": [
-            { "type": 2, "style": 3, "label": "▶️ 開始", "custom_id": goal_action_id("goal_kickoff_ok", approval_id) },
-            { "type": 2, "style": 4, "label": "❌ 拒絕", "custom_id": goal_action_id("goal_kickoff_no", approval_id) }
+            { "type": 2, "style": 3, "label": "▶️ 同意開始",
+              "custom_id": encode(DecisionSource::Kickoff, DecisionAct::Approve, approval_id) },
+            { "type": 2, "style": 4, "label": "❌ 拒絕",
+              "custom_id": encode(DecisionSource::Kickoff, DecisionAct::Deny, approval_id) }
         ]
     })
 }
 
-/// Slack actions block: retry / done / abort for a needs_human goal task.
+/// Slack actions block: retry / done as buttons (primary); abort / take-over
+/// folded into a native `overflow` menu (Slack's own secondary-action
+/// affordance) sharing the same block. The overflow's own `action_id` is
+/// never decoded — Slack reports the chosen option in
+/// `selected_option.value`, which is what carries the real decision id (see
+/// `slack::slack_action_payload`).
 pub fn slack_goal_buttons(task_id: &str) -> Value {
     json!({
         "type": "actions",
         "elements": [
             { "type": "button", "text": { "type": "plain_text", "text": "🔄 重試" },
-              "action_id": goal_action_id("goal_retry", task_id), "value": task_id },
+              "action_id": encode(DecisionSource::Goal, DecisionAct::Retry, task_id), "value": task_id },
             { "type": "button", "style": "primary", "text": { "type": "plain_text", "text": "✅ 標記完成" },
-              "action_id": goal_action_id("goal_done", task_id), "value": task_id },
-            { "type": "button", "style": "danger", "text": { "type": "plain_text", "text": "🗑 放棄" },
-              "action_id": goal_action_id("goal_abort", task_id), "value": task_id }
+              "action_id": encode(DecisionSource::Goal, DecisionAct::Done, task_id), "value": task_id },
+            {
+                "type": "overflow",
+                "action_id": format!("duduclaw:goal_more:{task_id}"),
+                "options": [
+                    { "text": { "type": "plain_text", "text": "🗑 放棄" },
+                      "value": encode(DecisionSource::Goal, DecisionAct::Abort, task_id) },
+                    { "text": { "type": "plain_text", "text": "👤 交給我" },
+                      "value": encode(DecisionSource::Goal, DecisionAct::Takeover, task_id) }
+                ]
+            }
         ]
     })
 }
@@ -846,24 +873,26 @@ pub fn slack_goal_kickoff_buttons(approval_id: &str) -> Value {
     json!({
         "type": "actions",
         "elements": [
-            { "type": "button", "style": "primary", "text": { "type": "plain_text", "text": "▶️ 開始" },
-              "action_id": goal_action_id("goal_kickoff_ok", approval_id), "value": approval_id },
+            { "type": "button", "style": "primary", "text": { "type": "plain_text", "text": "▶️ 同意開始" },
+              "action_id": encode(DecisionSource::Kickoff, DecisionAct::Approve, approval_id), "value": approval_id },
             { "type": "button", "style": "danger", "text": { "type": "plain_text", "text": "❌ 拒絕" },
-              "action_id": goal_action_id("goal_kickoff_no", approval_id), "value": approval_id }
+              "action_id": encode(DecisionSource::Kickoff, DecisionAct::Deny, approval_id), "value": approval_id }
         ]
     })
 }
 
-/// LINE quickReply: retry / done / abort postbacks for a needs_human goal task.
+/// LINE quickReply: retry / done postbacks only (primary tier). LINE has no
+/// secondary-menu affordance (03b survey: Quick Reply/Template/Flex all lack
+/// an overflow-equivalent), so abort/take-over are deliberately NOT offered
+/// as buttons here — `goal_notify::needs_human_body` lists them as plain
+/// text with a link to the dashboard instead of silently dropping them.
 pub fn line_goal_quick_reply(task_id: &str) -> Value {
     json!({
         "items": [
             { "type": "action", "action": { "type": "postback", "label": "🔄 重試",
-                "data": goal_action_id("goal_retry", task_id), "displayText": "重試目標任務" } },
+                "data": encode(DecisionSource::Goal, DecisionAct::Retry, task_id), "displayText": "重試目標任務" } },
             { "type": "action", "action": { "type": "postback", "label": "✅ 標記完成",
-                "data": goal_action_id("goal_done", task_id), "displayText": "標記目標完成" } },
-            { "type": "action", "action": { "type": "postback", "label": "🗑 放棄",
-                "data": goal_action_id("goal_abort", task_id), "displayText": "放棄目標任務" } }
+                "data": encode(DecisionSource::Goal, DecisionAct::Done, task_id), "displayText": "標記目標完成" } }
         ]
     })
 }
@@ -872,61 +901,22 @@ pub fn line_goal_quick_reply(task_id: &str) -> Value {
 pub fn line_goal_kickoff_quick_reply(approval_id: &str) -> Value {
     json!({
         "items": [
-            { "type": "action", "action": { "type": "postback", "label": "▶️ 開始",
-                "data": goal_action_id("goal_kickoff_ok", approval_id), "displayText": "核准開始目標" } },
+            { "type": "action", "action": { "type": "postback", "label": "▶️ 同意開始",
+                "data": encode(DecisionSource::Kickoff, DecisionAct::Approve, approval_id), "displayText": "同意開始目標" } },
             { "type": "action", "action": { "type": "postback", "label": "❌ 拒絕",
-                "data": goal_action_id("goal_kickoff_no", approval_id), "displayText": "拒絕目標" } }
+                "data": encode(DecisionSource::Kickoff, DecisionAct::Deny, approval_id), "displayText": "拒絕目標" } }
         ]
     })
 }
 
-// ── Generic ApprovalBroker buttons (WP20) ────────────────────────
-//
-// The install-approval buttons above decide an `install_requests` row (the
-// dashboard 安裝簽核 workflow); the goal buttons decide a task / kickoff. NEITHER
-// covers the **generic `ApprovalBroker`** (`approvals.db`) — the store every
-// MCP install-class gate, capability grant, skill activation and knowledge
-// quarantine actually blocks on. This third family is that missing codec.
-//
-// Action id convention (same `duduclaw:{action}:{id}` scheme, same inbound
-// dispatchers):
-//   duduclaw:approval_ok:{approval_id}  — approve (broker.decide(.., true))
-//   duduclaw:approval_no:{approval_id}  — deny    (broker.decide(.., false))
-//
-// The prefixes are deliberately distinct from `install_approve` / `goal_*` so
-// the three parsers never claim each other's presses (each dispatcher tries
-// them in order and falls through on `None`).
-
-/// Build the callback/action id for a generic ApprovalBroker button.
-pub fn approval_action_id(approve: bool, approval_id: &str) -> String {
-    let verb = if approve { "approval_ok" } else { "approval_no" };
-    format!("duduclaw:{verb}:{approval_id}")
-}
-
-/// Parse a generic approval action id → `(approval_id, approve)`.
-/// Returns `None` for anything that is not a well-formed approval action
-/// (fail-closed: an unrecognised or id-less button is ignored, never treated
-/// as an approve).
-pub fn parse_approval_action(data: &str) -> Option<(String, bool)> {
-    if let Some(id) = data.strip_prefix("duduclaw:approval_ok:") {
-        if !id.is_empty() {
-            return Some((id.to_string(), true));
-        }
-    }
-    if let Some(id) = data.strip_prefix("duduclaw:approval_no:") {
-        if !id.is_empty() {
-            return Some((id.to_string(), false));
-        }
-    }
-    None
-}
+// ── Generic ApprovalBroker (approvals.db) ──
 
 /// Telegram inline keyboard: approve / deny a broker approval.
 pub fn telegram_broker_approval_buttons(approval_id: &str) -> Value {
     json!({
         "inline_keyboard": [[
-            { "text": "✅ 同意", "callback_data": approval_action_id(true, approval_id) },
-            { "text": "❌ 拒絕", "callback_data": approval_action_id(false, approval_id) }
+            { "text": "✅ 同意", "callback_data": encode(DecisionSource::Approval, DecisionAct::Approve, approval_id) },
+            { "text": "❌ 拒絕", "callback_data": encode(DecisionSource::Approval, DecisionAct::Deny, approval_id) }
         ]]
     })
 }
@@ -936,8 +926,10 @@ pub fn discord_broker_approval_buttons(approval_id: &str) -> Value {
     json!({
         "type": 1,
         "components": [
-            { "type": 2, "style": 3, "label": "✅ 同意", "custom_id": approval_action_id(true, approval_id) },
-            { "type": 2, "style": 4, "label": "❌ 拒絕", "custom_id": approval_action_id(false, approval_id) }
+            { "type": 2, "style": 3, "label": "✅ 同意",
+              "custom_id": encode(DecisionSource::Approval, DecisionAct::Approve, approval_id) },
+            { "type": 2, "style": 4, "label": "❌ 拒絕",
+              "custom_id": encode(DecisionSource::Approval, DecisionAct::Deny, approval_id) }
         ]
     })
 }
@@ -950,13 +942,13 @@ pub fn slack_broker_approval_buttons(approval_id: &str) -> Value {
             {
                 "type": "button", "style": "primary",
                 "text": { "type": "plain_text", "text": "✅ 同意" },
-                "action_id": approval_action_id(true, approval_id),
+                "action_id": encode(DecisionSource::Approval, DecisionAct::Approve, approval_id),
                 "value": approval_id
             },
             {
                 "type": "button", "style": "danger",
                 "text": { "type": "plain_text", "text": "❌ 拒絕" },
-                "action_id": approval_action_id(false, approval_id),
+                "action_id": encode(DecisionSource::Approval, DecisionAct::Deny, approval_id),
                 "value": approval_id
             }
         ]
@@ -968,9 +960,63 @@ pub fn line_broker_approval_quick_reply(approval_id: &str) -> Value {
     json!({
         "items": [
             { "type": "action", "action": { "type": "postback", "label": "✅ 同意",
-                "data": approval_action_id(true, approval_id), "displayText": "同意此項核可" } },
+                "data": encode(DecisionSource::Approval, DecisionAct::Approve, approval_id),
+                "displayText": "同意此項核可" } },
             { "type": "action", "action": { "type": "postback", "label": "❌ 拒絕",
-                "data": approval_action_id(false, approval_id), "displayText": "拒絕此項核可" } }
+                "data": encode(DecisionSource::Approval, DecisionAct::Deny, approval_id),
+                "displayText": "拒絕此項核可" } }
+        ]
+    })
+}
+
+// ── Autopilot circuit-breaker pause ──
+//
+// A tripped rule offers a single action — whether to disable the rule — so
+// there is no approve/deny pair here.
+
+/// Telegram inline keyboard: pause this rule.
+pub fn telegram_autopilot_pause_buttons(rule_id: &str) -> Value {
+    json!({
+        "inline_keyboard": [[
+            { "text": "⏸ 暫停這條規則",
+              "callback_data": encode(DecisionSource::Autopilot, DecisionAct::Pause, rule_id) }
+        ]]
+    })
+}
+
+/// Discord action row: pause this rule.
+pub fn discord_autopilot_pause_buttons(rule_id: &str) -> Value {
+    json!({
+        "type": 1,
+        "components": [
+            { "type": 2, "style": 4, "label": "⏸ 暫停這條規則",
+              "custom_id": encode(DecisionSource::Autopilot, DecisionAct::Pause, rule_id) }
+        ]
+    })
+}
+
+/// Slack actions block: pause this rule.
+pub fn slack_autopilot_pause_buttons(rule_id: &str) -> Value {
+    json!({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button", "style": "danger",
+                "text": { "type": "plain_text", "text": "⏸ 暫停這條規則" },
+                "action_id": encode(DecisionSource::Autopilot, DecisionAct::Pause, rule_id),
+                "value": rule_id
+            }
+        ]
+    })
+}
+
+/// LINE quickReply: pause this rule.
+pub fn line_autopilot_pause_quick_reply(rule_id: &str) -> Value {
+    json!({
+        "items": [
+            { "type": "action", "action": { "type": "postback", "label": "⏸ 暫停規則",
+                "data": encode(DecisionSource::Autopilot, DecisionAct::Pause, rule_id),
+                "displayText": "暫停這條自動規則" } }
         ]
     })
 }
@@ -982,53 +1028,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_goal_action_roundtrip() {
-        assert_eq!(
-            parse_goal_action("duduclaw:goal_retry:t-1"),
-            Some(GoalAction::Retry("t-1".into()))
-        );
-        assert_eq!(
-            parse_goal_action("duduclaw:goal_done:t-1"),
-            Some(GoalAction::Done("t-1".into()))
-        );
-        assert_eq!(
-            parse_goal_action("duduclaw:goal_abort:t-1"),
-            Some(GoalAction::Abort("t-1".into()))
-        );
-        assert_eq!(
-            parse_goal_action("duduclaw:goal_kickoff_ok:ap-9"),
-            Some(GoalAction::Kickoff("ap-9".into(), true))
-        );
-        assert_eq!(
-            parse_goal_action("duduclaw:goal_kickoff_no:ap-9"),
-            Some(GoalAction::Kickoff("ap-9".into(), false))
-        );
-        // Fail-closed: empty id, install actions, and garbage all → None.
-        assert_eq!(parse_goal_action("duduclaw:goal_retry:"), None);
-        assert_eq!(parse_goal_action("duduclaw:install_approve:x"), None);
-        assert_eq!(parse_goal_action("garbage"), None);
-    }
-
-    #[test]
-    fn test_install_approval_action_roundtrip() {
-        let approve = install_approval_action_id(true, "req-123");
-        let deny = install_approval_action_id(false, "req-123");
-        assert_eq!(approve, "duduclaw:install_approve:req-123");
-        assert_eq!(deny, "duduclaw:install_deny:req-123");
-        assert_eq!(parse_install_approval_action(&approve), Some(("req-123".into(), true)));
-        assert_eq!(parse_install_approval_action(&deny), Some(("req-123".into(), false)));
-        // Non-install actions and malformed ids → None (dispatcher falls through)
-        assert_eq!(parse_install_approval_action("duduclaw:new_session"), None);
-        assert_eq!(parse_install_approval_action("duduclaw:install_approve:"), None);
-        assert_eq!(parse_install_approval_action("garbage"), None);
-    }
-
-    #[test]
-    fn test_telegram_approval_buttons_shape() {
-        let kb = telegram_approval_buttons("r1");
+    fn install_buttons_carry_the_unified_decision_id() {
+        let kb = telegram_approval_buttons("req-123");
         let row = &kb["inline_keyboard"][0];
-        assert_eq!(row[0]["callback_data"], "duduclaw:install_approve:r1");
-        assert_eq!(row[1]["callback_data"], "duduclaw:install_deny:r1");
+        assert_eq!(row[0]["callback_data"], "duduclaw:decide:inst:ok:req-123");
+        assert_eq!(row[1]["callback_data"], "duduclaw:decide:inst:no:req-123");
     }
 
     #[test]
@@ -1239,70 +1243,216 @@ mod tests {
         assert_eq!(qr["items"][0]["action"]["data"], "duduclaw:new_session");
     }
 
-    // ── WP20: generic ApprovalBroker button codec ──────────────
+    // ── Decision buttons: every source × every button-capable channel ──
 
-    #[test]
-    fn approval_action_roundtrip() {
-        let ok = approval_action_id(true, "ap-1");
-        let no = approval_action_id(false, "ap-1");
-        assert_eq!(ok, "duduclaw:approval_ok:ap-1");
-        assert_eq!(no, "duduclaw:approval_no:ap-1");
-        assert_eq!(parse_approval_action(&ok), Some(("ap-1".into(), true)));
-        assert_eq!(parse_approval_action(&no), Some(("ap-1".into(), false)));
-    }
+    use crate::decision_action::{parse, DecisionAct, DecisionSource};
 
-    #[test]
-    fn approval_action_rejects_malformed_and_foreign() {
-        // No id ⇒ None (fail-closed, never an implicit approve).
-        assert_eq!(parse_approval_action("duduclaw:approval_ok:"), None);
-        assert_eq!(parse_approval_action("duduclaw:approval_no:"), None);
-        assert_eq!(parse_approval_action("garbage"), None);
-        // The three button families never claim each other's presses.
-        assert_eq!(parse_approval_action("duduclaw:install_approve:r1"), None);
-        assert_eq!(parse_approval_action("duduclaw:goal_kickoff_ok:a1"), None);
-        assert_eq!(parse_install_approval_action("duduclaw:approval_ok:a1"), None);
-        assert_eq!(parse_goal_action("duduclaw:approval_ok:a1"), None);
-    }
-
-    #[test]
-    fn approval_button_markup_carries_the_id_on_all_four_channels() {
-        let tg = telegram_broker_approval_buttons("a9");
-        assert_eq!(
-            tg["inline_keyboard"][0][0]["callback_data"],
-            "duduclaw:approval_ok:a9"
-        );
-        assert_eq!(
-            tg["inline_keyboard"][0][1]["callback_data"],
-            "duduclaw:approval_no:a9"
-        );
-
-        let dc = discord_broker_approval_buttons("a9");
-        assert_eq!(dc["components"][0]["custom_id"], "duduclaw:approval_ok:a9");
-        // Discord dispatchers split custom_id on ':' — the verb must be segment 2.
-        let cid = dc["components"][1]["custom_id"].as_str().unwrap();
-        assert_eq!(cid.splitn(3, ':').nth(1), Some("approval_no"));
-
-        let sl = slack_broker_approval_buttons("a9");
-        assert_eq!(sl["elements"][0]["action_id"], "duduclaw:approval_ok:a9");
-        assert_eq!(sl["elements"][0]["value"], "a9");
-
-        let ln = line_broker_approval_quick_reply("a9");
-        assert_eq!(ln["items"][0]["action"]["data"], "duduclaw:approval_ok:a9");
-        assert_eq!(ln["items"][1]["action"]["data"], "duduclaw:approval_no:a9");
-    }
-
-    #[test]
-    fn approval_callback_data_fits_telegram_64_byte_limit() {
-        // Approval ids are UUIDv4 (36 chars). Telegram silently rejects a
-        // callback_data over 64 bytes — the buttons would render and then do
-        // nothing, which is exactly the failure mode WP20 exists to remove.
-        let uuid = "123e4567-e89b-12d3-a456-426614174000";
-        assert_eq!(uuid.len(), 36);
-        for approve in [true, false] {
-            let id = approval_action_id(approve, uuid);
-            assert!(id.len() <= 64, "callback_data too long ({}): {id}", id.len());
-            // …and it still round-trips at that length.
-            assert_eq!(parse_approval_action(&id), Some((uuid.to_string(), approve)));
+    /// Pull the action id(s) out of whatever shape a platform uses for them.
+    /// Telegram/Discord may spread buttons across MULTIPLE rows (the goal
+    /// needs_human card's primary+secondary tiers, W1-5) — flattened across
+    /// all of them. Slack's `overflow` element reports its choices in
+    /// `options[].value`, not `action_id` (mirrors `slack.rs`'s
+    /// `slack_action_payload` runtime handling of the same shape).
+    fn action_ids(channel: &str, markup: &Value) -> Vec<String> {
+        match channel {
+            "telegram" => markup["inline_keyboard"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|row| row.as_array().unwrap().iter())
+                .map(|b| b["callback_data"].as_str().unwrap().to_string())
+                .collect(),
+            "discord" => {
+                // A single action-row object, OR an array of them (goal's
+                // two-row layout) — normalize to "a list of rows" either way.
+                let rows: Vec<&Value> = if markup.is_array() {
+                    markup.as_array().unwrap().iter().collect()
+                } else {
+                    vec![markup]
+                };
+                rows.into_iter()
+                    .flat_map(|row| row["components"].as_array().unwrap().iter())
+                    .map(|b| b["custom_id"].as_str().unwrap().to_string())
+                    .collect()
+            }
+            "slack" => markup["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|el| -> Vec<String> {
+                    if el["type"] == "overflow" {
+                        el["options"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|o| o["value"].as_str().unwrap().to_string())
+                            .collect()
+                    } else {
+                        vec![el["action_id"].as_str().unwrap().to_string()]
+                    }
+                })
+                .collect(),
+            "line" => markup["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["action"]["data"].as_str().unwrap().to_string())
+                .collect(),
+            other => panic!("no action-id shape for {other}"),
         }
+    }
+
+    #[test]
+    fn every_source_renders_decodable_buttons_on_all_four_channels() {
+        // Goal is deliberately excluded here — its per-channel button count
+        // differs (primary+secondary tiers, LINE drops the secondary pair
+        // entirely) and gets its own dedicated tests below.
+        let cases = [
+            (DecisionSource::Install, vec![DecisionAct::Approve, DecisionAct::Deny]),
+            (DecisionSource::Kickoff, vec![DecisionAct::Approve, DecisionAct::Deny]),
+            (DecisionSource::Approval, vec![DecisionAct::Approve, DecisionAct::Deny]),
+            (DecisionSource::Autopilot, vec![DecisionAct::Pause]),
+        ];
+        for (source, acts) in cases {
+            for channel in ["telegram", "discord", "slack", "line"] {
+                let markup = decision_markup(channel, source, "id-9").expect("markup must exist");
+                let ids = action_ids(channel, &markup);
+                assert_eq!(ids.len(), acts.len(), "{channel}/{:?} button count", source.token());
+                for (raw, act) in ids.iter().zip(acts.iter()) {
+                    let decoded = parse(raw).unwrap_or_else(|| panic!("undecodable: {raw}"));
+                    assert_eq!(decoded.source, source);
+                    assert_eq!(decoded.act, *act);
+                    assert_eq!(decoded.id, "id-9");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decision_markup_has_no_shape_for_button_less_channels() {
+        for channel in ["whatsapp", "feishu", "googlechat", "teams", "webchat", ""] {
+            assert!(decision_markup(channel, DecisionSource::Approval, "a1").is_none());
+        }
+    }
+
+    // ── Goal needs_human: primary (≤3) + secondary tier (W1-5) ──────────
+
+    #[test]
+    fn goal_buttons_primary_pair_is_retry_and_done_everywhere() {
+        for channel in ["telegram", "discord", "slack", "line"] {
+            let markup = decision_markup(channel, DecisionSource::Goal, "t9").unwrap();
+            let ids = action_ids(channel, &markup);
+            assert!(ids.len() >= 2, "{channel}: expected at least the two primary actions");
+            let first_two: Vec<DecisionAct> =
+                ids[..2].iter().map(|raw| parse(raw).unwrap().act).collect();
+            assert_eq!(
+                first_two,
+                vec![DecisionAct::Retry, DecisionAct::Done],
+                "{channel}: primary tier must be retry+done"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_buttons_telegram_discord_slack_reach_all_four_acts() {
+        for channel in ["telegram", "discord", "slack"] {
+            let markup = decision_markup(channel, DecisionSource::Goal, "t9").unwrap();
+            let ids = action_ids(channel, &markup);
+            let acts: std::collections::HashSet<DecisionAct> =
+                ids.iter().map(|raw| parse(raw).unwrap().act).collect();
+            assert_eq!(
+                acts,
+                std::collections::HashSet::from([
+                    DecisionAct::Retry,
+                    DecisionAct::Done,
+                    DecisionAct::Abort,
+                    DecisionAct::Takeover,
+                ]),
+                "{channel}: all four goal actions must be reachable (primary or secondary tier)"
+            );
+            for raw in &ids {
+                let decoded = parse(raw).unwrap();
+                assert_eq!(decoded.source, DecisionSource::Goal);
+                assert_eq!(decoded.id, "t9");
+            }
+        }
+    }
+
+    #[test]
+    fn goal_buttons_line_only_offers_the_primary_pair() {
+        // LINE has no secondary-menu affordance at all (03b survey) — abort /
+        // take-over are deliberately not offered as quick-reply buttons;
+        // `goal_notify::needs_human_body` lists them as plain text instead.
+        let markup = decision_markup("line", DecisionSource::Goal, "t9").unwrap();
+        let ids = action_ids("line", &markup);
+        let acts: Vec<DecisionAct> = ids.iter().map(|raw| parse(raw).unwrap().act).collect();
+        assert_eq!(acts, vec![DecisionAct::Retry, DecisionAct::Done]);
+    }
+
+    #[test]
+    fn goal_buttons_telegram_secondary_tier_is_a_second_row() {
+        let markup = telegram_goal_buttons("t9");
+        let rows = markup["inline_keyboard"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "primary row + secondary row");
+        assert_eq!(rows[0].as_array().unwrap().len(), 2);
+        assert_eq!(rows[1].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn goal_buttons_discord_secondary_tier_is_a_second_action_row() {
+        let markup = discord_goal_buttons("t9");
+        let rows = markup.as_array().expect("discord goal markup is an array of rows");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row["type"], 1);
+            assert_eq!(row["components"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn goal_buttons_slack_secondary_tier_rides_an_overflow_menu() {
+        let markup = slack_goal_buttons("t9");
+        let elements = markup["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 3, "2 primary buttons + 1 overflow");
+        assert_eq!(elements[0]["type"], "button");
+        assert_eq!(elements[1]["type"], "button");
+        assert_eq!(elements[2]["type"], "overflow");
+        let options = elements[2]["options"].as_array().unwrap();
+        assert_eq!(options.len(), 2);
+    }
+
+    #[test]
+    fn discord_custom_id_keeps_the_verb_in_the_dispatcher_visible_segment() {
+        // The Discord dispatcher splits custom_id at most 3 times; the second
+        // segment is what it routes on, so it must be the unified marker.
+        let dc = decision_markup("discord", DecisionSource::Approval, "a9").unwrap();
+        let cid = dc["components"][0]["custom_id"].as_str().unwrap();
+        assert_eq!(cid.splitn(3, ':').nth(1), Some("decide"));
+    }
+
+    #[test]
+    fn slack_buttons_keep_the_bare_id_in_value() {
+        for (source, markup_id) in [
+            (DecisionSource::Install, "r1"),
+            (DecisionSource::Approval, "a9"),
+            (DecisionSource::Autopilot, "r9"),
+            (DecisionSource::Goal, "t1"),
+        ] {
+            let sl = decision_markup("slack", source, markup_id).unwrap();
+            assert_eq!(sl["elements"][0]["value"], markup_id);
+        }
+    }
+
+    #[test]
+    fn button_labels_use_the_settled_state_vocabulary() {
+        // The verb a person presses must be the verb they are told
+        // afterwards: install declines read "婉拒" (softer), high-risk
+        // declines read "拒絕".
+        let inst = telegram_approval_buttons("r1");
+        assert_eq!(inst["inline_keyboard"][0][0]["text"], "✅ 同意");
+        assert_eq!(inst["inline_keyboard"][0][1]["text"], "🙅 婉拒");
+        let apv = telegram_broker_approval_buttons("a1");
+        assert_eq!(apv["inline_keyboard"][0][0]["text"], "✅ 同意");
+        assert_eq!(apv["inline_keyboard"][0][1]["text"], "❌ 拒絕");
     }
 }

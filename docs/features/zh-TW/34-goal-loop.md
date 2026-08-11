@@ -54,7 +54,11 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 ## needs_human 升級
 
-任務停在 `needs_human` 時,`goal_notify.rs` 往來源對話推送一則帶三顆 inline 按鈕的審批訊息——**重試 / 標記完成 / 中止**(fallback 到該 agent 的 `[proactive]` 控制通道)。按鈕在 Telegram、Slack、Discord、LINE 原生渲染;其他通道用文字 fallback,儀表板也有一欄 needs_human 看板。決策具冪等性且 fail-closed:只從 `needs_human` 狀態轉出,所以過期或重複按下都是 no-op。
+任務停在 `needs_human` 時,`goal_notify.rs` 往來源對話推送一則帶四個動作的審批訊息——**重試 / 標記完成 / 中止 / 交給我**(fallback 到該 agent 的 `[proactive]` 控制通道)。一則訊息主要動作上限 3 個,因此重試/標記完成留在主要層,中止/交給我收進各平台自己的次要層:Telegram、Discord 各是第二排按鈕,Slack 是原生 `overflow` 選單;LINE 沒有對應的次要選單機制,這兩個動作不會出現在 LINE 的快速回覆裡,改以文字說明並附儀表板連結。其他無按鈕通道用文字 fallback,儀表板也有一欄 needs_human 看板。
+
+**交給我**只認領任務(`claimed_by`),不解決它——任務仍留在 `needs_human`,而驅動器的派工候選查詢本就不看這個狀態,所以不需要額外的狀態轉換就已經停止自動重試。這是目前實作的第一層(停止自動迴圈＋標記＋收斂卡片);把整段對話控制權轉交給人是後續階段的功能,尚未實作。
+
+決策具冪等性且 fail-closed:重試/標記完成/中止只從 `needs_human` 狀態轉出,所以過期或重複按下都是 no-op;交給我沒有終態可比對,重複按(甚至換另一位有權限的人按)就是重新認領,不會報錯。
 
 ## 自主等級
 

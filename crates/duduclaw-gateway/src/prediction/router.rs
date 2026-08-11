@@ -267,16 +267,7 @@ pub fn route(
         }
 
         ErrorCategory::Moderate => {
-            let content = format!(
-                "Prediction deviation: expected satisfaction {:.2}, inferred {:.2} (delta {:.2}). \
-                 Topic surprise: {:.2}. Corrections: {}. Follow-ups: {}.",
-                error.prediction.expected_satisfaction,
-                error.prediction.expected_satisfaction - error.delta_satisfaction,
-                error.delta_satisfaction,
-                error.topic_surprise,
-                if error.unexpected_correction { "yes" } else { "no" },
-                if error.unexpected_follow_up { "yes" } else { "no" },
-            );
+            let content = format_moderate_telemetry(error);
             // Importance scales with composite error (range 4.0 - 10.0; ~5.2-7.0 for default Moderate thresholds)
             let importance = 4.0 + error.composite_error * 6.0;
             EvolutionAction::StoreEpisodic { content, importance }
@@ -298,6 +289,45 @@ pub fn route(
             EvolutionAction::TriggerEmergencyEvolution { context }
         }
     }
+}
+
+/// Format the episodic-memory telemetry string stored for a Moderate error.
+///
+/// The base line is pure numeric telemetry (deviation, surprise, correction/
+/// follow-up flags) — useless to a human reading the Memory page without
+/// knowing *what conversation* it came from. This appends the conversation's
+/// extracted topics (already short keywords/CJK bigrams from `extract_keywords`,
+/// so no truncation is needed) when available, so the "learning signal" card
+/// can show what the agent was actually learning about.
+///
+/// `web/src/lib/memory-format.ts`'s `PREDICTION_RE` mirrors this exact format —
+/// keep the two in sync when changing either the base line or the optional
+/// trailing sections.
+fn format_moderate_telemetry(error: &PredictionError) -> String {
+    let mut content = format!(
+        "Prediction deviation: expected satisfaction {:.2}, inferred {:.2} (delta {:.2}). \
+         Topic surprise: {:.2}. Corrections: {}. Follow-ups: {}.",
+        error.prediction.expected_satisfaction,
+        error.prediction.expected_satisfaction - error.delta_satisfaction,
+        error.delta_satisfaction,
+        error.topic_surprise,
+        if error.unexpected_correction { "yes" } else { "no" },
+        if error.unexpected_follow_up { "yes" } else { "no" },
+    );
+
+    if !error.actual.extracted_topics.is_empty() {
+        let topics = error.actual.extracted_topics.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+        content.push_str(&format!(" Topics: {topics}."));
+    }
+
+    if let Some(expected) = &error.prediction.expected_topic {
+        let already_covered = error.actual.extracted_topics.iter().any(|t| t == expected);
+        if !already_covered {
+            content.push_str(&format!(" Expected topic: {expected}."));
+        }
+    }
+
+    content
 }
 
 /// Format a detailed context string for LLM reflection.

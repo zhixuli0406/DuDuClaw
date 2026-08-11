@@ -25,6 +25,7 @@
 //! cost control, not a security gate (contrast the fail-closed MCP auth). The
 //! choice is logged so it is never silent.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::cost_telemetry::{get_telemetry, init_telemetry, CostTelemetry};
@@ -80,6 +81,11 @@ impl BudgetVerdict {
 
     /// A user-facing zh-TW message for a denial (empty for Allow). Deliberately
     /// no internal paths/agent-ids — just the budget fact the end user needs.
+    /// Wording matches the platform's external-facing state vocabulary
+    /// ("已停工（花費達上限）") and — since [`check_agent_budget`] now pushes
+    /// an admin alert on the same transition — truthfully tells the person
+    /// talking to the agent that the admin already knows, instead of leaving
+    /// them to wonder why the agent went quiet.
     pub fn user_message(&self) -> String {
         match self {
             BudgetVerdict::Allow => String::new(),
@@ -90,9 +96,8 @@ impl BudgetVerdict {
             } => {
                 let window = if *scope == "daily" { "今日" } else { "本月" };
                 format!(
-                    "⚠️ 已達{window}預算上限（已使用 US${:.2} / 上限 US${:.2}），\
-                     暫停回應以避免超支。額度會在時間窗滑動後自動恢復，\
-                     或請調整 agent.toml 的 [budget] 設定。",
+                    "⚠️ 已停工（花費達上限）。我目前因為花費達到上限暫停工作，已通知管理員。\
+                     （{window}已使用 US${:.2} / 上限 US${:.2}，額度會在時間窗滑動後自動恢復）",
                     *spent_cents as f64 / 100.0,
                     *cap_cents as f64 / 100.0,
                 )
@@ -256,22 +261,136 @@ pub async fn check_agent_budget(
         return BudgetVerdict::Allow;
     };
     let verdict = evaluate_budget(tel, agent_id, &limits).await;
-    if let BudgetVerdict::Deny {
-        scope,
-        spent_cents,
-        cap_cents,
-    } = &verdict
-    {
-        tracing::warn!(
-            agent_id,
+    match &verdict {
+        BudgetVerdict::Deny {
             scope,
             spent_cents,
             cap_cents,
-            "budget circuit breaker OPEN — blocking LLM call"
-        );
-        append_budget_event(home_dir, agent_id, scope, *spent_cents, *cap_cents);
+        } => {
+            tracing::warn!(
+                agent_id,
+                scope,
+                spent_cents,
+                cap_cents,
+                "budget circuit breaker OPEN — blocking LLM call"
+            );
+            append_budget_event(home_dir, agent_id, scope, *spent_cents, *cap_cents);
+            notify_breaker_transition(home_dir, agent_dir, agent_id, true).await;
+        }
+        // Only reached once `limits.is_inert()` was already false above, i.e.
+        // enforcement genuinely ran — an Allow here is a real "still/again
+        // under budget" result, worth checking for an OPEN→CLOSED recovery,
+        // not the earlier short-circuit for agents with no cap configured.
+        BudgetVerdict::Allow => {
+            notify_breaker_transition(home_dir, agent_dir, agent_id, false).await;
+        }
     }
     verdict
+}
+
+/// Admin-facing push on a genuine CLOSED→OPEN or OPEN→CLOSED breaker
+/// transition — de-duplicated so a breaker that stays open across many
+/// dispatch attempts (every subsequent LLM call re-runs this same check)
+/// pushes exactly one alert per state, not one per attempt. Mirrors
+/// `StagnationMonitor`'s fingerprint de-dup (`gvu/stagnation.rs`), but that
+/// monitor is a long-lived struct that keeps its last-alerted map in memory
+/// across periodic ticks in one process; `check_agent_budget` has no such
+/// home — it is a plain fn re-entered from scratch on every dispatch call,
+/// possibly from a different process across a gateway restart — so the
+/// de-dup memory has to be file-backed instead of an in-memory `HashMap`.
+///
+/// Best-effort: any failure (state file unreadable/unwritable, no `[proactive]`
+/// destination, no bot token) degrades to a skipped push, never blocks or
+/// panics the budget gate — the gate's own fail-open posture (module docs)
+/// extends to this notification path too.
+async fn notify_breaker_transition(
+    home_dir: &Path,
+    agent_dir: Option<&Path>,
+    agent_id: &str,
+    is_open: bool,
+) {
+    let new_state = if is_open { "open" } else { "closed" };
+    if !record_breaker_transition(home_dir, agent_id, new_state) {
+        return; // already alerted on this state (or was never open) — stay quiet
+    }
+    let name = agent_display_name(agent_dir, agent_id);
+    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Billing, agent_id)
+        .map(|url| format!("\n👉 {url}"))
+        .unwrap_or_default();
+    let text = if is_open {
+        format!("⚠️ {name} 已停工：花費達上限。{link}")
+    } else {
+        format!("✅ {name} 已恢復工作：預算額度已回復。{link}")
+    };
+    let outcome = crate::goal_notify::notify_agent_plain(home_dir, agent_id, &text).await;
+    if matches!(outcome, crate::goal_notify::NotifyOutcome::SendFailed) {
+        tracing::debug!(agent_id, is_open, "budget: breaker-transition push failed (non-fatal)");
+    }
+}
+
+/// Compare-and-set the on-disk last-known breaker state for `agent_id`.
+/// Returns `true` only when the stored state actually changed (a genuine
+/// transition worth alerting on) — `false` for "already in that state" (the
+/// common case: a breaker that stays open across many dispatch attempts) and
+/// for any read/write failure (fail-open: an unwritable state file must
+/// never crash the gate, worst case is a missed or duplicated push).
+fn record_breaker_transition(home_dir: &Path, agent_id: &str, new_state: &'static str) -> bool {
+    let path = breaker_state_path(home_dir);
+    duduclaw_core::with_file_lock(&path, || {
+        let mut states = read_breaker_states(&path);
+        if states.get(agent_id).map(String::as_str) == Some(new_state) {
+            return Ok(false);
+        }
+        states.insert(agent_id.to_string(), new_state.to_string());
+        let json = serde_json::to_string_pretty(&states)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&path, json)?;
+        Ok(true)
+    })
+    .unwrap_or(false)
+}
+
+fn breaker_state_path(home_dir: &Path) -> std::path::PathBuf {
+    home_dir.join("budget_breaker_state.json")
+}
+
+fn read_breaker_states(path: &Path) -> HashMap<String, String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Resolve a human-readable agent name for the admin push — `agent.toml
+/// [agent] display_name`, falling back to `name`, falling back to the raw
+/// `agent_id` when neither is readable. Lightweight manual TOML parse,
+/// mirroring [`load_budget_limits`], rather than depending on the full
+/// `AgentRegistry` (this module has no registry handle, only a dir + id).
+fn agent_display_name(agent_dir: Option<&Path>, agent_id: &str) -> String {
+    let Some(dir) = agent_dir else {
+        return agent_id.to_string();
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("agent.toml")) else {
+        return agent_id.to_string();
+    };
+    let Ok(table) = text.parse::<toml::Value>() else {
+        return agent_id.to_string();
+    };
+    let Some(a) = table.get("agent").and_then(|v| v.as_table()) else {
+        return agent_id.to_string();
+    };
+    a.get("display_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            a.get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or(agent_id)
+        .to_string()
 }
 
 /// Append a denial to `budget_events.jsonl` for dashboard surfacing. Best-effort
@@ -425,5 +544,106 @@ mod tests {
         };
         let m = v.user_message();
         assert!(m.contains("今日") && m.contains("2.50") && m.contains("2.00"));
+    }
+
+    #[test]
+    fn deny_message_uses_stopped_working_wording_and_says_admin_notified() {
+        let v = BudgetVerdict::Deny {
+            scope: "monthly",
+            spent_cents: 100,
+            cap_cents: 100,
+        };
+        let m = v.user_message();
+        assert!(m.contains("已停工"), "must use the platform's external state wording: {m}");
+        assert!(m.contains("花費達上限"));
+        assert!(m.contains("已通知管理員"), "must truthfully tell the user the admin was alerted: {m}");
+    }
+
+    // ── record_breaker_transition: the admin-push de-dup ─────────────────
+
+    #[test]
+    fn first_open_transition_fires_repeat_does_not() {
+        let dir = tempdir().unwrap();
+        assert!(
+            record_breaker_transition(dir.path(), "a1", "open"),
+            "CLOSED→OPEN (first time) must report a real transition"
+        );
+        assert!(
+            !record_breaker_transition(dir.path(), "a1", "open"),
+            "repeated OPEN while already OPEN must be a no-op — breaker re-tripping every \
+             dispatch attempt must not re-fire the admin push"
+        );
+        assert!(
+            !record_breaker_transition(dir.path(), "a1", "open"),
+            "third consecutive OPEN check must still be deduped"
+        );
+    }
+
+    #[test]
+    fn open_then_close_then_reopen_each_fire_once() {
+        let dir = tempdir().unwrap();
+        assert!(record_breaker_transition(dir.path(), "a1", "open"));
+        assert!(!record_breaker_transition(dir.path(), "a1", "open"));
+
+        assert!(
+            record_breaker_transition(dir.path(), "a1", "closed"),
+            "OPEN→CLOSED recovery must report a real transition"
+        );
+        assert!(
+            !record_breaker_transition(dir.path(), "a1", "closed"),
+            "repeated CLOSED (e.g. every subsequent Allow check) must be deduped"
+        );
+
+        // Relapse into OPEN again after having recovered must re-fire.
+        assert!(
+            record_breaker_transition(dir.path(), "a1", "open"),
+            "a relapse after recovery must fire again, not stay silenced forever"
+        );
+    }
+
+    #[test]
+    fn distinct_agents_do_not_share_dedup_state() {
+        let dir = tempdir().unwrap();
+        assert!(record_breaker_transition(dir.path(), "a1", "open"));
+        assert!(
+            record_breaker_transition(dir.path(), "a2", "open"),
+            "agent a2's first OPEN must fire even though a1 is already OPEN"
+        );
+        assert!(!record_breaker_transition(dir.path(), "a1", "open"));
+        assert!(!record_breaker_transition(dir.path(), "a2", "open"));
+    }
+
+    #[test]
+    fn breaker_state_persists_across_reads() {
+        let dir = tempdir().unwrap();
+        assert!(record_breaker_transition(dir.path(), "a1", "open"));
+        // A fresh read (simulating a new process / a later dispatch call)
+        // must see the persisted state, not re-fire.
+        let states = read_breaker_states(&breaker_state_path(dir.path()));
+        assert_eq!(states.get("a1").map(String::as_str), Some("open"));
+    }
+
+    // ── agent_display_name ────────────────────────────────────────────────
+
+    #[test]
+    fn display_name_prefers_display_name_field() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[agent]\nname = \"assistant\"\ndisplay_name = \"嘟嘟\"\n",
+        )
+        .unwrap();
+        assert_eq!(agent_display_name(Some(dir.path()), "assistant"), "嘟嘟");
+    }
+
+    #[test]
+    fn display_name_falls_back_to_name_then_agent_id() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), "[agent]\nname = \"assistant\"\n").unwrap();
+        assert_eq!(agent_display_name(Some(dir.path()), "assistant"), "assistant");
+
+        let empty_dir = tempdir().unwrap();
+        assert_eq!(agent_display_name(Some(empty_dir.path()), "fallback-id"), "fallback-id");
+        assert_eq!(agent_display_name(None, "no-dir-id"), "no-dir-id");
     }
 }

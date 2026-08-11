@@ -927,92 +927,27 @@ async fn handle_callback_query(
 
     info!("🔘 Telegram [{sender}] pressed: {data}");
 
-    // Install-approval buttons (Feature D): map the clicking Telegram account
-    // to a dashboard user, authorize, and decide. Falls through to the other
-    // actions when the data isn't an install-approval action.
+    // Decision buttons — every "a human must decide this" card, whichever
+    // store backs it. `None` ⇒ not a decision button, fall through to this
+    // dispatcher's own actions below.
+    //
+    // Only the pressing USER id is passed: authorization is by dashboard
+    // role, or (deployments with no approver identity at all) by an exact
+    // match against the individual account the card was delivered to — never
+    // by "was in the same chat".
     if let Some(tg_uid) = cb.from.as_ref().map(|u| u.id.to_string()) {
-        if let Some(result) = crate::install_notify::decide_from_channel(
-            &ctx.home_dir, "telegram", &tg_uid, data,
-        )
-        .await
+        if let Some(result) =
+            crate::decision_notify::route_press(&ctx.home_dir, "telegram", &tg_uid, data).await
         {
-            let decided = result.is_ok();
+            // The persistent card (this same message) is retired in place by
+            // the decide path itself — a detached best-effort edit that
+            // clears the buttons and rewrites the card to a one-line result,
+            // independent of this toast. See `decision_card::collapse_all`.
             let text = match result {
                 Ok(msg) => msg,
                 Err(msg) => format!("⚠️ {msg}"),
             };
             answer_callback_query(client, api_base, &cb.id, &text).await;
-            // The decision landed → the buttons are spent. Strip the inline
-            // keyboard and append the outcome so the message tells the story
-            // instead of inviting a second (futile) click.
-            if decided && let Some(mid) = msg.message_id {
-                let original = msg.text.as_deref().unwrap_or("");
-                let body = json!({
-                    "chat_id": chat_id,
-                    "message_id": mid,
-                    "text": format!("{original}\n\n{text}"),
-                });
-                let _ = client.post(format!("{api_base}/editMessageText")).json(&body).send().await;
-            }
-            return;
-        }
-    }
-
-    // Generic ApprovalBroker buttons (WP20): every `approvals.db` gate — MCP
-    // install-class, capability grants, skill activation, knowledge quarantine.
-    // Same fall-through contract as install-approval. Only the pressing USER id
-    // is passed: authorization is by dashboard role, or (solo deployments) by
-    // an exact match against the individual account the approval was delivered
-    // to — never by "was in the same chat".
-    if let Some(tg_uid) = cb.from.as_ref().map(|u| u.id.to_string()) {
-        if let Some(result) = crate::approval_notify::decide_from_channel(
-            &ctx.home_dir, "telegram", &tg_uid, data,
-        )
-        .await
-        {
-            let decided = result.is_ok();
-            let text = match result {
-                Ok(msg) => msg,
-                Err(msg) => format!("⚠️ {msg}"),
-            };
-            answer_callback_query(client, api_base, &cb.id, &text).await;
-            if decided && let Some(mid) = msg.message_id {
-                let original = msg.text.as_deref().unwrap_or("");
-                let body = json!({
-                    "chat_id": chat_id,
-                    "message_id": mid,
-                    "text": format!("{original}\n\n{text}"),
-                });
-                let _ = client.post(format!("{api_base}/editMessageText")).json(&body).send().await;
-            }
-            return;
-        }
-    }
-
-    // Goal-loop buttons (P2a): needs_human retry/done/abort + autonomy kickoff.
-    // Same fall-through contract as install-approval — `None` ⇒ not a goal
-    // action, continue to the other handlers.
-    if let Some(tg_uid) = cb.from.as_ref().map(|u| u.id.to_string()) {
-        if let Some(result) = crate::goal_notify::decide_from_channel(
-            &ctx.home_dir, "telegram", &tg_uid, data,
-        )
-        .await
-        {
-            let decided = result.is_ok();
-            let text = match result {
-                Ok(msg) => msg,
-                Err(msg) => format!("⚠️ {msg}"),
-            };
-            answer_callback_query(client, api_base, &cb.id, &text).await;
-            if decided && let Some(mid) = msg.message_id {
-                let original = msg.text.as_deref().unwrap_or("");
-                let body = json!({
-                    "chat_id": chat_id,
-                    "message_id": mid,
-                    "text": format!("{original}\n\n{text}"),
-                });
-                let _ = client.post(format!("{api_base}/editMessageText")).json(&body).send().await;
-            }
             return;
         }
     }

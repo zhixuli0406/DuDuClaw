@@ -1503,6 +1503,43 @@ impl TaskStore {
         Ok(n == 1)
     }
 
+    /// W1-5: mark a `needs_human` goal task as claimed by a human decider —
+    /// the "Take over" half of the Submit/Take over pair (D6, Intercom
+    /// `Loop in teammate`). Deliberately does NOT change `status`: a task
+    /// sitting in `needs_human` is already excluded from
+    /// `GoalLoopDriver::tick_once`'s dispatch-candidate query (only
+    /// `todo`/`pending`/`revising` are ever picked up), so no further state
+    /// is needed to stop the automatic loop from retrying it — the "stop
+    /// auto-retry" half of takeover is a side effect of the task already
+    /// being parked, not something this method has to enforce.
+    ///
+    /// Reuses the existing `claimed_by` column (the one worker-lease claims
+    /// use elsewhere): safe to share because a `needs_human` row is never
+    /// itself a claim/lease candidate (`claim_task` only matches
+    /// `pending`/`revising`), so the two meanings never collide. Idempotent
+    /// and repeatable — unlike [`Self::resolve_needs_human`] there is no
+    /// terminal state to race against, so a second (or a different
+    /// authorized decider's) take-over press simply re-stamps `claimed_by`.
+    ///
+    /// This is the scoped-down half of takeover: it stops the loop and
+    /// records who is now handling the task by hand. Actually transferring
+    /// the conversation itself (redirecting inbound channel messages to the
+    /// human instead of the agent) is a separate, larger change deferred to
+    /// a later phase — seeing this task stay `needs_human` is the signal a
+    /// caller uses to know full conversation handoff has NOT happened yet.
+    pub async fn claim_needs_human(&self, id: &str, decider: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let n = conn
+            .execute(
+                "UPDATE tasks SET claimed_by = ?2, updated_at = ?3
+                  WHERE id = ?1 AND status = 'needs_human'",
+                params![id, decider, now],
+            )
+            .map_err(|e| format!("claim needs_human: {e}"))?;
+        Ok(n == 1)
+    }
+
     /// P2a: cancel a task that has not reached a terminal state. Used by the
     /// goal-loop kickoff gate when a human denies (or lets the approval expire)
     /// before the first dispatch. Idempotent: a task already
@@ -3901,6 +3938,65 @@ mod tests {
         assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "needs_human");
         let iters = store.list_iterations("g1").await.unwrap();
         assert_eq!(iters[0].verdict.as_deref(), Some("escalated"));
+    }
+
+    // ── W1-5: claim_needs_human (take over) ─────────────────────────────
+
+    #[tokio::test]
+    async fn claim_needs_human_stamps_claimed_by_without_changing_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.status = "needs_human".into();
+        store.insert_task(&t).await.unwrap();
+
+        let changed = store.claim_needs_human("g1", "channel:telegram:555").await.unwrap();
+        assert!(changed);
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        // Status stays `needs_human` — GoalLoopDriver's candidate query never
+        // reads this status, so the loop is already stopped without a
+        // dedicated status transition.
+        assert_eq!(got.status, "needs_human");
+        assert_eq!(got.claimed_by.as_deref(), Some("channel:telegram:555"));
+    }
+
+    #[tokio::test]
+    async fn claim_needs_human_is_idempotent_and_repeatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.status = "needs_human".into();
+        store.insert_task(&t).await.unwrap();
+
+        assert!(store.claim_needs_human("g1", "channel:telegram:1").await.unwrap());
+        // A second (even different) decider re-stamps rather than failing —
+        // unlike `resolve_needs_human` there is no terminal state to guard.
+        assert!(store.claim_needs_human("g1", "channel:slack:2").await.unwrap());
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.claimed_by.as_deref(), Some("channel:slack:2"));
+        assert_eq!(got.status, "needs_human");
+    }
+
+    #[tokio::test]
+    async fn claim_needs_human_fails_closed_off_needs_human() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.status = "pending".into();
+        store.insert_task(&t).await.unwrap();
+
+        let changed = store.claim_needs_human("g1", "channel:telegram:1").await.unwrap();
+        assert!(!changed, "a task not in needs_human must not be claimable");
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert!(got.claimed_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_needs_human_on_missing_task_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let changed = store.claim_needs_human("ghost", "channel:telegram:1").await.unwrap();
+        assert!(!changed);
     }
 
     #[tokio::test]

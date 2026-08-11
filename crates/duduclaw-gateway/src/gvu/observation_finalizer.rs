@@ -19,7 +19,13 @@
 //! 4. Call `execute_confirm` / `execute_rollback` accordingly.
 //!
 //! Every decision is logged as a structured `info!` event so behaviour is
-//! auditable from the gateway log.
+//! auditable from the gateway log. Confirm / rollback / the 72h low-data
+//! warning / the 14-day hard expiry additionally post a zh-TW row to the
+//! dashboard Activity Feed and an evolution event — previously these
+//! terminal outcomes were only visible in the log file or by querying
+//! `evolution.db` by hand. Deliberately does NOT also push a channel
+//! notification: this class of result is FYI-level, routed through the
+//! (separately scoped) daily digest rather than a real-time push.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -60,6 +66,47 @@ pub enum Decision {
 #[derive(Debug, Default, Clone)]
 pub struct FinalizationReport {
     pub decisions: Vec<FinalizationDecision>,
+}
+
+// ── Dashboard-facing copy (Activity Feed) ───────────────────────────────────
+
+/// zh-TW Activity Feed copy for a terminal observation-window decision.
+///
+/// Follows the dashboard state-vocabulary contract
+/// (`04-orca-object-model-cta-matrix.md` §C.9): only "行為調整" / "試行"
+/// surface to the reader — internal names (SOUL.md, "observation window",
+/// GVU) never leak into user-facing text. Returns `(event_type, summary)`;
+/// `event_type` is an internal Activity Feed / evolution-event key, not
+/// shown to the reader.
+fn confirmed_copy(agent_id: &str) -> (&'static str, String) {
+    (
+        "gvu_observation_confirmed",
+        format!("{agent_id} 的行為調整已通過試行，正式生效"),
+    )
+}
+
+fn rolled_back_copy() -> (&'static str, String) {
+    (
+        "gvu_observation_rolled_back",
+        "試行未達標，已回退".to_string(),
+    )
+}
+
+fn expired_no_data_copy() -> (&'static str, String) {
+    (
+        "gvu_observation_expired_no_data",
+        "證據不足，未採用".to_string(),
+    )
+}
+
+/// Copy for the 72h soft-warn branch (`OutcomeVerdict::ExtendObservationLowDataWarn`)
+/// — the observation kept running but crossed the quality-gate warn
+/// threshold with too little evidence to judge either way.
+fn low_data_warn_copy(agent_id: &str) -> (&'static str, String) {
+    (
+        "gvu_observation_low_data_warn",
+        format!("{agent_id} 的行為調整仍在試行中，證據不足，已延長試行期"),
+    )
 }
 
 // ── ObservationFinalizer ──────────────────────────────────────────────────────
@@ -225,6 +272,16 @@ impl ObservationFinalizer {
                         post_pos = format!("{:.2}", post.positive_feedback_ratio),
                         "Observation confirmed"
                     );
+                    let (event_type, summary) = confirmed_copy(&version.agent_id);
+                    crate::evolution_events::emitter::EvolutionEventEmitter::global()
+                        .emit_gvu_generation(
+                            &version.agent_id,
+                            crate::evolution_events::schema::Outcome::Success,
+                            event_type,
+                            serde_json::json!({ "version_id": &version.version_id }),
+                        );
+                    self.post_activity(&version.agent_id, event_type, &summary, &version.version_id)
+                        .await;
                     Decision::Confirmed
                 }
                 Err(e) => Decision::Failed { error: format!("execute_confirm: {e}") },
@@ -239,6 +296,19 @@ impl ObservationFinalizer {
                             reason = %reason,
                             "Observation rolled back"
                         );
+                        let (event_type, summary) = rolled_back_copy();
+                        crate::evolution_events::emitter::EvolutionEventEmitter::global()
+                            .emit_gvu_generation(
+                                &version.agent_id,
+                                crate::evolution_events::schema::Outcome::Failure,
+                                event_type,
+                                serde_json::json!({
+                                    "version_id": &version.version_id,
+                                    "reason": &reason,
+                                }),
+                            );
+                        self.post_activity(&version.agent_id, event_type, &summary, &version.version_id)
+                            .await;
                         Decision::RolledBack { reason }
                     }
                     Err(e) => Decision::Failed {
@@ -276,7 +346,7 @@ impl ObservationFinalizer {
                         error: format!("extend_observation: {e}"),
                     }
                 } else {
-                    self.maybe_raise_low_data_alert(version);
+                    self.maybe_raise_low_data_alert(version).await;
                     Decision::Extended { extra_hours }
                 }
             }
@@ -289,6 +359,16 @@ impl ObservationFinalizer {
                             version = %version.version_id,
                             "Observation expired without sufficient data — marked unverified, NOT confirmed (WP0.4)"
                         );
+                        let (event_type, summary) = expired_no_data_copy();
+                        crate::evolution_events::emitter::EvolutionEventEmitter::global()
+                            .emit_gvu_generation(
+                                &version.agent_id,
+                                crate::evolution_events::schema::Outcome::Warned,
+                                event_type,
+                                serde_json::json!({ "version_id": &version.version_id }),
+                            );
+                        self.post_activity(&version.agent_id, event_type, &summary, &version.version_id)
+                            .await;
                         Decision::ExpiredNoData
                     }
                     Err(e) => Decision::Failed {
@@ -374,8 +454,9 @@ impl ObservationFinalizer {
     /// WP0.4 (R5): raise a one-time "insufficient observation data" alert
     /// for a version that has crossed the soft warn threshold. Guarded by
     /// `low_data_alert_sent` so a version stuck for weeks (extending every
-    /// 12h) produces exactly one alert, not one per tick.
-    fn maybe_raise_low_data_alert(&self, version: &SoulVersion) {
+    /// 12h) produces exactly one alert, not one per tick — which also caps
+    /// the Activity Feed row below at exactly one per version.
+    async fn maybe_raise_low_data_alert(&self, version: &SoulVersion) {
         if self.version_store.low_data_alert_sent(&version.version_id) {
             return; // Already alerted — not repeated.
         }
@@ -408,6 +489,44 @@ impl ObservationFinalizer {
                 "elapsed_hours": elapsed_hours,
             }),
         );
+        let (event_type, summary) = low_data_warn_copy(&version.agent_id);
+        self.post_activity(&version.agent_id, event_type, &summary, &version.version_id)
+            .await;
+    }
+
+    /// Best-effort append to the dashboard Activity Feed. Mirrors
+    /// `StagnationMonitor::post_activity` / `GvuAlertSink::alert` — telemetry,
+    /// not control flow: a failure here must never affect the already-committed
+    /// confirm/rollback/expire decision. Unlike those two siblings this does
+    /// NOT also push a channel notification (see module doc).
+    async fn post_activity(&self, agent_id: &str, event_type: &str, summary: &str, version_id: &str) {
+        let store = match crate::task_store::TaskStore::open(&self.home_dir()) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(
+                    target: "observation_finalizer",
+                    error = %e,
+                    "failed to open task store for Activity Feed (non-fatal)"
+                );
+                return;
+            }
+        };
+        let row = crate::task_store::ActivityRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: event_type.to_string(),
+            agent_id: agent_id.to_string(),
+            task_id: None,
+            summary: summary.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            metadata: serde_json::to_string(&serde_json::json!({ "version_id": version_id })).ok(),
+        };
+        if let Err(e) = store.append_activity(&row).await {
+            debug!(
+                target: "observation_finalizer",
+                error = %e,
+                "Activity Feed append failed (non-fatal)"
+            );
+        }
     }
 
     /// Push observation_end further into the future without changing status.
@@ -836,5 +955,200 @@ mod tests {
             .compute_post_metrics("agent-withfeedback", Utc::now() - ChronoDuration::hours(1))
             .unwrap();
         assert!(metrics.feedback_available);
+    }
+
+    // ── Activity Feed copy (dashboard-facing text) ───────────────────────
+
+    /// Internal names must never leak into the copy shown to a reader —
+    /// this is the concrete regression test for the module-doc claim.
+    fn assert_no_internal_vocabulary(summary: &str) {
+        for banned in ["SOUL", "soul", "observation window", "GVU"] {
+            assert!(
+                !summary.contains(banned),
+                "Activity Feed copy leaked internal vocabulary {banned:?}: {summary:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_copy_matches_spec_wording() {
+        let (event_type, summary) = confirmed_copy("ceo-assistant");
+        assert_eq!(event_type, "gvu_observation_confirmed");
+        assert_eq!(summary, "ceo-assistant 的行為調整已通過試行，正式生效");
+        assert_no_internal_vocabulary(&summary);
+    }
+
+    #[test]
+    fn rolled_back_copy_matches_spec_wording() {
+        let (event_type, summary) = rolled_back_copy();
+        assert_eq!(event_type, "gvu_observation_rolled_back");
+        assert_eq!(summary, "試行未達標，已回退");
+        assert_no_internal_vocabulary(&summary);
+    }
+
+    #[test]
+    fn expired_no_data_copy_matches_spec_wording() {
+        let (event_type, summary) = expired_no_data_copy();
+        assert_eq!(event_type, "gvu_observation_expired_no_data");
+        assert_eq!(summary, "證據不足，未採用");
+        assert_no_internal_vocabulary(&summary);
+    }
+
+    #[test]
+    fn low_data_warn_copy_is_distinct_and_clean() {
+        let (event_type, summary) = low_data_warn_copy("ceo-assistant");
+        assert_eq!(event_type, "gvu_observation_low_data_warn");
+        assert!(summary.contains("ceo-assistant"));
+        assert!(summary.contains("試行"));
+        assert_no_internal_vocabulary(&summary);
+    }
+
+    // ── Activity Feed wiring (real TaskStore round trip) ─────────────────
+
+    async fn activity_rows_for(fin: &ObservationFinalizer, agent_id: &str) -> Vec<crate::task_store::ActivityRow> {
+        let store = crate::task_store::TaskStore::open(&fin.home_dir()).unwrap();
+        store
+            .list_activity(Some(agent_id), None, 50, 0)
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn test_confirm_posts_activity_feed_row() {
+        let tmp = TempDir::new().unwrap();
+        let (fin, _evo, pred_db, _feedback) = make_finalizer(tmp.path(), None);
+
+        let now = Utc::now();
+        let pre = VersionMetrics {
+            avg_prediction_error: 0.30,
+            positive_feedback_ratio: 0.0,
+            ..Default::default()
+        };
+        seed_observing_version(
+            &fin.version_store,
+            &fin.agents_dir,
+            "agent-activity-confirm",
+            now - ChronoDuration::hours(48),
+            now - ChronoDuration::hours(24),
+            pre,
+        );
+        let rows: Vec<_> = (0..5)
+            .map(|i| (0.05_f64, "Negligible", now - ChronoDuration::hours(40 - i)))
+            .collect();
+        seed_prediction_db(&pred_db, "agent-activity-confirm", &rows);
+
+        let report = fin.tick().await;
+        assert!(matches!(report.decisions[0].decision, Decision::Confirmed));
+
+        let activity = activity_rows_for(&fin, "agent-activity-confirm").await;
+        assert_eq!(activity.len(), 1, "expected exactly one Activity Feed row");
+        assert_eq!(activity[0].event_type, "gvu_observation_confirmed");
+        assert!(activity[0].summary.contains("正式生效"));
+        assert_no_internal_vocabulary(&activity[0].summary);
+    }
+
+    #[tokio::test]
+    async fn test_rollback_posts_activity_feed_row() {
+        let tmp = TempDir::new().unwrap();
+        let (fin, _evo, pred_db, _feedback) = make_finalizer(tmp.path(), None);
+
+        let now = Utc::now();
+        let pre = VersionMetrics {
+            avg_prediction_error: 0.10,
+            positive_feedback_ratio: 0.0,
+            ..Default::default()
+        };
+        seed_observing_version(
+            &fin.version_store,
+            &fin.agents_dir,
+            "agent-activity-rollback",
+            now - ChronoDuration::hours(48),
+            now - ChronoDuration::hours(24),
+            pre,
+        );
+        let rows: Vec<_> = (0..6)
+            .map(|i| (0.60_f64, "Significant", now - ChronoDuration::hours(40 - i)))
+            .collect();
+        seed_prediction_db(&pred_db, "agent-activity-rollback", &rows);
+
+        let report = fin.tick().await;
+        assert!(matches!(report.decisions[0].decision, Decision::RolledBack { .. }));
+
+        let activity = activity_rows_for(&fin, "agent-activity-rollback").await;
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].event_type, "gvu_observation_rolled_back");
+        assert!(activity[0].summary.contains("已回退"));
+        assert_no_internal_vocabulary(&activity[0].summary);
+    }
+
+    #[tokio::test]
+    async fn test_expired_no_data_posts_activity_feed_row() {
+        let tmp = TempDir::new().unwrap();
+        let (fin, _evo, pred_db, _feedback) = make_finalizer(tmp.path(), None);
+
+        let now = Utc::now();
+        seed_observing_version(
+            &fin.version_store,
+            &fin.agents_dir,
+            "agent-activity-expired",
+            now - ChronoDuration::days(15),
+            now - ChronoDuration::days(14) - ChronoDuration::hours(1),
+            VersionMetrics::default(),
+        );
+        seed_prediction_db(&pred_db, "agent-activity-expired", &[]);
+
+        let report = fin.tick().await;
+        assert!(matches!(report.decisions[0].decision, Decision::ExpiredNoData));
+
+        let activity = activity_rows_for(&fin, "agent-activity-expired").await;
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].event_type, "gvu_observation_expired_no_data");
+        assert!(activity[0].summary.contains("未採用"));
+        assert_no_internal_vocabulary(&activity[0].summary);
+    }
+
+    #[tokio::test]
+    async fn test_low_data_warn_posts_exactly_one_activity_row_across_ticks() {
+        // Mirrors test_low_data_alert_is_not_repeated_across_ticks — the
+        // Activity Feed row must share the same one-time guard as the
+        // evolution-event alert, not fire again on every tick.
+        let tmp = TempDir::new().unwrap();
+        let (fin, _evo, pred_db, _feedback) = make_finalizer(tmp.path(), None);
+
+        let now = Utc::now();
+        seed_observing_version(
+            &fin.version_store,
+            &fin.agents_dir,
+            "agent-activity-warn",
+            now - ChronoDuration::hours(80),
+            now - ChronoDuration::hours(56),
+            VersionMetrics::default(),
+        );
+        seed_prediction_db(&pred_db, "agent-activity-warn", &[]);
+
+        let _ = fin.tick().await;
+        let activity_after_first = activity_rows_for(&fin, "agent-activity-warn").await;
+        assert_eq!(activity_after_first.len(), 1);
+        assert_eq!(activity_after_first[0].event_type, "gvu_observation_low_data_warn");
+        assert_no_internal_vocabulary(&activity_after_first[0].summary);
+
+        // Force the (now extended) observation back into the past and tick
+        // again — the guard must suppress a second row.
+        let v1 = fin.version_store.get_observing_version("agent-activity-warn").unwrap();
+        let conn = Connection::open(fin.version_store.db_path_ref()).unwrap();
+        conn.execute(
+            "UPDATE soul_versions SET observation_end = ?1 WHERE version_id = ?2",
+            params![(now - ChronoDuration::hours(1)).to_rfc3339(), v1.version_id],
+        )
+        .unwrap();
+
+        let _ = fin.tick().await;
+        let activity_after_second = activity_rows_for(&fin, "agent-activity-warn").await;
+        assert_eq!(
+            activity_after_second.len(),
+            1,
+            "low-data-warn Activity Feed row must not repeat across ticks"
+        );
     }
 }

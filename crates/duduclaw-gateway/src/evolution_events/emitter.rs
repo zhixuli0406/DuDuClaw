@@ -23,9 +23,11 @@
 //!   so the JSONL schema is exercised end-to-end, but the stagnation-detection *condition*
 //!   (when to call this) lives in P1.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 
 use serde_json::Value as Json;
+use tokio::task::JoinHandle;
 
 use super::{
     logger::EvolutionEventLogger,
@@ -34,19 +36,50 @@ use super::{
 
 // ── Emitter ───────────────────────────────────────────────────────────────────
 
+/// Default bound for [`EvolutionEventEmitter::wait_pending_default`] — long
+/// enough for a cold-start `create_dir_all` + file open on a healthy
+/// filesystem, short enough that a genuinely stuck write can't hang a CLI
+/// command's shutdown indefinitely.
+const DEFAULT_WAIT_PENDING_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Non-blocking emitter of [`AuditEvent`] records.
 ///
 /// Wraps an [`EvolutionEventLogger`] and exposes typed helpers for each of the
 /// five `event_type` variants.  Every emit call spawns a detached Tokio task so
 /// the caller is never blocked by I/O.
+///
+/// ## B3 — one-shot CLI shutdown race
+/// `emit_*` calls are fire-and-forget: they never block the caller, which is
+/// exactly right for the long-running gateway (the process — and its Tokio
+/// `Runtime` — stays alive for the write's whole lifetime). It is **not**
+/// safe for a one-shot CLI command (`duduclaw evolution finalize` and
+/// similar): `#[tokio::main]` drops the `Runtime` as soon as `main()`
+/// returns, which can abort an in-flight `tokio::spawn`'d write mid
+/// `create_dir_all`/`open`. The aborted `spawn_blocking` join surfaces as
+/// `io::Error::new(Other, "background task failed")`, logged by
+/// [`EvolutionEventLogger::log`] as `Failed to open audit log file: ...` even
+/// though nothing is actually broken — the directory/file get created fine
+/// on a second run because there's no race the second time. One-shot callers
+/// must call [`Self::wait_pending`] (or [`Self::wait_pending_default`])
+/// after their last `emit_*` call and before returning, so the spawned write
+/// tasks are joined instead of racing process exit.
 pub struct EvolutionEventEmitter {
     logger: Arc<EvolutionEventLogger>,
+    /// In-flight audit-write tasks spawned by [`Self::spawn`], tracked solely
+    /// so [`Self::wait_pending`] has something to join. Opportunistically
+    /// pruned of already-finished handles on every `spawn()` call so a
+    /// long-lived process (the gateway, which never calls `wait_pending`)
+    /// doesn't accumulate an unbounded `Vec`.
+    inflight: Arc<StdMutex<Vec<JoinHandle<()>>>>,
 }
 
 impl EvolutionEventEmitter {
     /// Create an emitter backed by the provided logger.
     pub fn new(logger: Arc<EvolutionEventLogger>) -> Self {
-        Self { logger }
+        Self {
+            logger,
+            inflight: Arc::new(StdMutex::new(Vec::new())),
+        }
     }
 
     /// Create an emitter using the environment-configured logger.
@@ -404,17 +437,65 @@ impl EvolutionEventEmitter {
         );
     }
 
+    // ── B3: one-shot CLI shutdown synchronisation ────────────────────────────
+
+    /// Wait (bounded by `timeout`) for every audit-write task spawned so far
+    /// to finish, then return.
+    ///
+    /// One-shot CLI commands must call this after their last `emit_*` call
+    /// and before returning — see the "B3" note on [`EvolutionEventEmitter`]
+    /// for why. The long-running gateway never needs to call this.
+    ///
+    /// On timeout, any still-running tasks are left to finish in the
+    /// background on a best-effort basis (they are simply no longer
+    /// tracked) rather than hanging CLI shutdown forever.
+    pub async fn wait_pending(&self, timeout: Duration) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut guard = match self.inflight.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *guard)
+        };
+        if handles.is_empty() {
+            return;
+        }
+        let join_all = async {
+            for h in handles {
+                // A join error here means the write task panicked — nothing
+                // more to do; the panic itself would already have been
+                // reported by the default Tokio panic hook.
+                let _ = h.await;
+            }
+        };
+        let _ = tokio::time::timeout(timeout, join_all).await;
+    }
+
+    /// [`Self::wait_pending`] with the crate-default timeout
+    /// ([`DEFAULT_WAIT_PENDING_TIMEOUT`]). Convenience for the common
+    /// one-shot-CLI-shutdown call site.
+    pub async fn wait_pending_default(&self) {
+        self.wait_pending(DEFAULT_WAIT_PENDING_TIMEOUT).await;
+    }
+
     // ── Internal ──────────────────────────────────────────────────────────────
 
     /// Fire-and-forget: log `event` via [`tokio::spawn`].
     ///
     /// The spawned task holds a clone of the logger `Arc` and runs to completion
-    /// independently of the caller.  Write errors degrade to `stderr`.
+    /// independently of the caller.  Write errors degrade to `stderr`. The
+    /// `JoinHandle` is tracked in `inflight` so [`Self::wait_pending`] can
+    /// synchronise on it later (B3); already-finished handles are pruned on
+    /// every call so long-lived processes don't leak memory here.
     fn spawn(&self, event: AuditEvent) {
         let logger = Arc::clone(&self.logger);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             logger.log(event).await;
         });
+        if let Ok(mut guard) = self.inflight.lock() {
+            guard.retain(|h| !h.is_finished());
+            guard.push(handle);
+        }
     }
 }
 
@@ -775,6 +856,95 @@ mod tests {
                 ev_type(line)
             );
         }
+    }
+
+    // ── B3: cold-directory race + wait_pending synchronisation ────────────────
+
+    /// Regression test for the "first `duduclaw evolution finalize` run
+    /// prints an ERROR" bug: emitting into a directory that does not exist
+    /// yet, then immediately (no `sleep` compensation) awaiting
+    /// `wait_pending`, must leave the event durably written. Before the B3
+    /// fix there was no way to synchronise on the detached `tokio::spawn`
+    /// task at all, so a caller that didn't sleep an arbitrary amount of
+    /// time could observe the write mid-flight — and in the real one-shot
+    /// CLI, the process's Runtime could be dropped before the write ever
+    /// completed.
+    #[tokio::test]
+    async fn test_wait_pending_flushes_cold_directory_emit() {
+        let tmp = TempDir::new().unwrap();
+        // Deliberately nested + not pre-created: this is the "first ever
+        // run" shape, where `~/.duduclaw/evolution/events` doesn't exist.
+        let cold_dir = tmp.path().join("brand-new-agent-home/evolution/events");
+        assert!(!cold_dir.exists(), "precondition: directory must not exist yet");
+        let emitter = make_emitter(&cold_dir);
+
+        emitter.emit_skill_activate("agent-cold", "python-patterns", "prediction_error_diagnosis");
+        // No `sleep()` here — `wait_pending` itself must be the
+        // synchronisation point, not luck-based timing.
+        emitter.wait_pending(Duration::from_secs(2)).await;
+
+        let lines = read_lines(&cold_dir).await;
+        assert_eq!(lines.len(), 1, "cold-directory emit must be durably written after wait_pending");
+        assert_eq!(lines[0]["event_type"], "skill_activate");
+        assert_eq!(lines[0]["agent_id"], "agent-cold");
+    }
+
+    /// Same as above but for multiple concurrent emits into a cold
+    /// directory — simulates `ObservationFinalizer::tick()` firing one
+    /// `emit_gvu_generation` per expired version before the one-shot CLI
+    /// returns.
+    #[tokio::test]
+    async fn test_wait_pending_flushes_multiple_cold_directory_emits() {
+        let tmp = TempDir::new().unwrap();
+        let cold_dir = tmp.path().join("cold/evolution/events");
+        let emitter = make_emitter(&cold_dir);
+
+        for i in 0..5 {
+            emitter.emit_gvu_generation(
+                &format!("agent-{i}"),
+                Outcome::Success,
+                "gvu_trigger",
+                serde_json::json!({"version_id": format!("v{i}")}),
+            );
+        }
+        emitter.wait_pending(Duration::from_secs(2)).await;
+
+        let lines = read_lines(&cold_dir).await;
+        assert_eq!(
+            lines.len(),
+            5,
+            "all emits into the cold directory must land before wait_pending returns"
+        );
+    }
+
+    /// `wait_pending` on an emitter with nothing in flight must return
+    /// immediately (fast path) rather than waiting out the timeout.
+    #[tokio::test]
+    async fn test_wait_pending_with_no_pending_tasks_returns_immediately() {
+        let tmp = TempDir::new().unwrap();
+        let emitter = make_emitter(tmp.path());
+
+        let started = std::time::Instant::now();
+        emitter.wait_pending(Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "wait_pending with nothing in flight must not block for anywhere near the timeout"
+        );
+    }
+
+    /// `wait_pending_default` (the convenience one-shot-CLI-shutdown call)
+    /// must behave like `wait_pending` with the crate's default timeout.
+    #[tokio::test]
+    async fn test_wait_pending_default_flushes_cold_directory_emit() {
+        let tmp = TempDir::new().unwrap();
+        let cold_dir = tmp.path().join("cold2/evolution/events");
+        let emitter = make_emitter(&cold_dir);
+
+        emitter.emit_skill_activate("agent-default", "s", "t");
+        emitter.wait_pending_default().await;
+
+        let lines = read_lines(&cold_dir).await;
+        assert_eq!(lines.len(), 1);
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────

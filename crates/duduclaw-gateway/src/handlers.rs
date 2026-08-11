@@ -431,6 +431,27 @@ fn apply_capabilities_to_table(
         section.insert("recording".into(), toml::Value::Boolean(v));
         changes.push(format!("capabilities.recording = {v}"));
     }
+    // ── autonomy_level (string) — how much the autonomous goal loop may
+    // drive this agent on its own (`goal_loop::AutonomyLevel`). Not a typed
+    // `CapabilitiesConfig` field — read straight from this raw TOML key by
+    // `AutonomyLevel::for_agent`, same additive-gate convention as
+    // `approval_required_tools`. Validated against the exact lowercase set
+    // that parser recognizes so a typo can never silently land as the
+    // conservative default instead of the level the operator picked
+    // (fail-closed: reject, don't guess).
+    if let Some(v) = cap.get("autonomy_level").and_then(|v| v.as_str()) {
+        match v {
+            "operator" | "collaborator" | "consultant" | "approver" | "observer" => {
+                section.insert("autonomy_level".into(), toml::Value::String(v.into()));
+                changes.push(format!("capabilities.autonomy_level = \"{v}\""));
+            }
+            _ => {
+                return Err(format!(
+                    "Invalid autonomy_level '{v}'. Valid: operator, collaborator, consultant, approver, observer"
+                ));
+            }
+        }
+    }
 
     // ── Array fields (tool names must be non-empty strings) ──
     for (param_key, toml_key) in &[
@@ -8001,6 +8022,11 @@ impl MethodHandler {
             return WsFrame::error_response("", &e);
         }
         info!(agent_id = agent_id.as_str(), "contract.update completed");
+        // The channel-side FYI — the boundary changed but only applies
+        // starting the agent's next turn (see the `message` field below), so
+        // mark it pending; the channel reply pipeline appends a one-line
+        // notice once, then clears it (`pending_agent_notice`).
+        crate::pending_agent_notice::mark_contract_changed(&self.home_dir, &agent_id);
         let mut resp = contract_table_to_response(&table);
         if let Some(obj) = resp.as_object_mut() {
             obj.insert("success".into(), json!(true));
@@ -9697,6 +9723,26 @@ impl MethodHandler {
         match reg.get(agent_id) {
             Some(a) => {
                 let cfg = &a.config;
+                // `autonomy_level` is folded into the serialized capabilities
+                // separately — it is not a typed `CapabilitiesConfig` field
+                // (raw-toml additive gate, read the same way
+                // `goal_loop::AutonomyLevel::for_agent` reads it at dispatch
+                // time), so it would otherwise be silently absent from the
+                // block below even when set on disk. Computed outside the
+                // `json!` call below: a nested `{ statement; expr }` block is
+                // ambiguous with the macro's own object-literal syntax.
+                let mut capabilities_json = serde_json::to_value(&cfg.capabilities)
+                    .unwrap_or_else(|_| json!({}));
+                if let Some(obj) = capabilities_json.as_object_mut() {
+                    obj.insert(
+                        "autonomy_level".into(),
+                        json!(crate::goal_loop::AutonomyLevel::for_agent(
+                            &self.home_dir,
+                            &cfg.agent.name,
+                        )
+                        .as_str()),
+                    );
+                }
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -9775,13 +9821,11 @@ impl MethodHandler {
                             "skill_security_scan": cfg.evolution.skill_security_scan,
                             "max_silence_hours": cfg.evolution.max_silence_hours,
                         },
-                        // #6: full capabilities incl. native_sandbox + Progent policy.
-                        // Serialized straight from CapabilitiesConfig so the dashboard
-                        // gets the exact ToolPolicy shape it must round-trip via
-                        // agents.update. `serde` renders snake_case enums
-                        // (effect: allow|forbid|ask, op: equals|contains|starts_with).
-                        "capabilities": serde_json::to_value(&cfg.capabilities)
-                            .unwrap_or_else(|_| json!({})),
+                        // #6: full capabilities incl. native_sandbox + Progent policy
+                        // + autonomy_level (folded in above). `serde` renders
+                        // snake_case enums (effect: allow|forbid|ask, op:
+                        // equals|contains|starts_with).
+                        "capabilities": capabilities_json,
                         // [runtime] block — read straight from agent.toml (the typed
                         // config doesn't surface it). Emits ONLY keys present in the
                         // file so the dashboard tells "unset" from an explicit false
@@ -10259,6 +10303,22 @@ impl MethodHandler {
         )
     }
 
+    /// W0-2: `channels.test` used to only check whether a token FIELD was
+    /// non-empty — a revoked/expired/permission-stripped token reported
+    /// "success" and the user only found out the channel was actually dead
+    /// when a real message needed to go out (breakpoint #5,
+    /// `commercial/docs/ux-redesign-2026-08/01-current-state-map.md`).
+    ///
+    /// Now: when a live destination can be found, an actual test message is
+    /// sent through the shared `channel_sender::ChannelSender` impls (never a
+    /// bespoke duplicate of their HTTP logic — the `require_api_success` /
+    /// `require_slack_ok` / `require_feishu_code_zero` fix in
+    /// `channel_sender.rs` makes those impls detect a platform-level
+    /// rejection, which they previously did not). When no destination is
+    /// known yet (nobody has set `agent.toml [proactive] notify_chat_id` for
+    /// this platform, and the platform's own conversation-reference store has
+    /// never seen an inbound message), the result is honestly degraded to
+    /// `credential_only` — never reported as a successful send.
     async fn handle_channels_test(&self, params: Value) -> WsFrame {
         let channel_type = params
             .get("type")
@@ -10266,55 +10326,67 @@ impl MethodHandler {
             .unwrap_or("unknown");
         info!(channel_type, "channels.test requested");
 
-        // Per-agent channel test: check agent.toml
-        if let Some((platform, agent_name)) = channel_type.split_once(':') {
-            let token_field = match platform {
-                "discord" | "telegram" => "bot_token",
-                "slack" => "bot_token",
-                _ => {
-                    return WsFrame::error_response(
-                        "",
-                        &format!("Unknown channel platform: {platform}"),
-                    );
-                }
-            };
+        let (platform, agent_hint) = match channel_type.split_once(':') {
+            Some((p, a)) => (p, Some(a)),
+            None => (channel_type, None),
+        };
 
-            let reg = self.registry.read().await;
-            let configured = reg.get(agent_name).is_some_and(|agent| {
-                if let Some(ch) = &agent.config.channels {
-                    match platform {
-                        "discord" => ch.discord.as_ref().is_some_and(|d| {
-                            !d.bot_token.is_empty()
-                                || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
-                        }),
-                        "telegram" => ch.telegram.as_ref().is_some_and(|t| {
-                            !t.bot_token.is_empty()
-                                || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
-                        }),
-                        "slack" => ch.slack.as_ref().is_some_and(|s| {
-                            !s.bot_token.is_empty()
-                                || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
-                        }),
-                        _ => false,
-                    }
-                } else {
-                    false
-                }
-            });
-            drop(reg);
+        match agent_hint {
+            Some(agent_name) => self.test_per_agent_channel(platform, agent_name).await,
+            None => self.test_global_channel(platform).await,
+        }
+    }
 
-            return WsFrame::ok_response(
-                "",
-                json!({
-                    "success": configured,
-                    "type": channel_type,
-                    "message": if configured { format!("{channel_type} {token_field} is configured") } else { format!("{channel_type} token 未設定") },
-                }),
-            );
+    /// Per-agent channel test (`discord:<agent>` / `telegram:<agent>` /
+    /// `slack:<agent>`) — the only platforms with a real per-agent bot token.
+    async fn test_per_agent_channel(&self, platform: &str, agent_name: &str) -> WsFrame {
+        if !matches!(platform, "discord" | "telegram" | "slack") {
+            return WsFrame::error_response("", &format!("Unknown channel platform: {platform}"));
         }
 
-        // Global channel test
-        let token_key = match channel_type {
+        let reg = self.registry.read().await;
+        let Some(agent) = reg.get(agent_name) else {
+            drop(reg);
+            return WsFrame::error_response("", &format!("找不到 AI 員工「{agent_name}」"));
+        };
+        let configured = agent_has_own_channel_token(agent, platform);
+        let target = agent_proactive_target(agent, platform);
+        drop(reg);
+
+        if !configured {
+            return channel_test_result(false, "credential_only", &format!("{platform} token 尚未設定，請先在通道設定中填入。"));
+        }
+
+        let Some(chat_id) = target else {
+            return channel_test_result(
+                false,
+                "credential_only",
+                &format!(
+                    "{platform} 憑證已設定，但「{agent_name}」尚未設定預設通知目的地\
+                     （agent.toml [proactive] notify_chat_id）。僅驗證憑證存在，未實際發送。"
+                ),
+            );
+        };
+
+        let Some(token) =
+            crate::goal_notify::channel_token(&self.home_dir, agent_name, platform).await
+        else {
+            return channel_test_result(
+                false,
+                "credential_only",
+                &format!("{platform} token 讀取失敗，僅驗證憑證存在，未實際發送。"),
+            );
+        };
+
+        self.send_channel_test_message(platform, &chat_id, &token)
+            .await
+    }
+
+    /// Global (single shared bot) channel test — `line` / `telegram` /
+    /// `discord` / `slack` / `whatsapp` / `feishu` / `googlechat` / `teams` /
+    /// `wecom` / `dingtalk`.
+    async fn test_global_channel(&self, platform: &str) -> WsFrame {
+        let token_key = match platform {
             "line" => "line_channel_token",
             "telegram" => "telegram_bot_token",
             "discord" => "discord_bot_token",
@@ -10326,44 +10398,143 @@ impl MethodHandler {
             "wecom" => "wecom_corp_secret",
             "dingtalk" => "dingtalk_app_secret",
             _ => {
-                return WsFrame::error_response(
-                    "",
-                    &format!("Unknown channel type: {channel_type}"),
-                );
+                return WsFrame::error_response("", &format!("Unknown channel type: {platform}"));
             }
         };
 
-        let config_path = self.home_dir.join("config.toml");
-        let table = self.read_config_table(&config_path).await;
-
-        // Check both plaintext and encrypted token
-        let has_token = crate::config_crypto::decrypt_config_field(
-            &table,
+        let token = crate::config_crypto::read_encrypted_config_field(
+            &self.home_dir,
             "channels",
             token_key,
-            &self.home_dir,
         )
-        .is_some_and(|t| !t.is_empty());
+        .await
+        .filter(|t| !t.is_empty());
 
-        if !has_token {
-            return WsFrame::ok_response(
-                "",
-                json!({
-                    "success": false,
-                    "type": channel_type,
-                    "message": format!("{channel_type} token 未設定"),
-                }),
+        let Some(token) = token else {
+            return channel_test_result(false, "credential_only", &format!("{platform} token 尚未設定，請先在通道設定中填入。"));
+        };
+
+        let Some((_agent_name, chat_id)) = self.resolve_global_test_destination(platform).await
+        else {
+            return channel_test_result(
+                false,
+                "credential_only",
+                &format!(
+                    "{platform} 憑證已設定，但尚無可用的通知目的地（尚未有 AI 員工設定 \
+                     [proactive] notify_chat_id，此通道也還沒收過任何一則訊息）。\
+                     僅驗證憑證存在，未實際發送。"
+                ),
             );
+        };
+
+        self.send_channel_test_message(platform, &chat_id, &token)
+            .await
+    }
+
+    /// Best-effort destination for a GLOBAL channel test: prefer
+    /// `[general] default_agent`'s `[proactive]` target, else the first
+    /// (alphabetical) agent whose `[proactive] notify_channel` matches and
+    /// who does NOT own a distinct per-agent bot for this platform (that
+    /// agent's chat id belongs to a different bot token and would be
+    /// unreachable by the global one under test).
+    async fn resolve_global_test_destination(&self, platform: &str) -> Option<(String, String)> {
+        let reg = self.registry.read().await;
+        let per_agent_capable = matches!(platform, "discord" | "telegram" | "slack");
+
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        let default_agent = table
+            .get("general")
+            .and_then(|v| v.as_table())
+            .and_then(|g| g.get("default_agent"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        let mut names: Vec<String> = reg.list().iter().map(|a| a.config.agent.name.clone()).collect();
+        names.sort();
+        if let Some(d) = default_agent {
+            if let Some(pos) = names.iter().position(|n| *n == d) {
+                let d = names.remove(pos);
+                names.insert(0, d);
+            }
         }
 
-        WsFrame::ok_response(
-            "",
-            json!({
-                "success": true,
-                "type": channel_type,
-                "message": format!("{channel_type} token is configured"),
-            }),
-        )
+        for name in names {
+            let Some(agent) = reg.get(&name) else { continue };
+            if per_agent_capable && agent_has_own_channel_token(agent, platform) {
+                continue;
+            }
+            if let Some(chat_id) = agent_proactive_target(agent, platform) {
+                return Some((name, chat_id));
+            }
+        }
+        None
+    }
+
+    /// Actually dispatch the zh-TW test message through the shared
+    /// `channel_sender::ChannelSender` implementations — reused verbatim, not
+    /// re-derived, so `channels.test` exercises the exact same code path a
+    /// real proactive/goal/approval push would use.
+    async fn send_channel_test_message(&self, platform: &str, chat_id: &str, token: &str) -> WsFrame {
+        const TEST_MESSAGE: &str =
+            "✅ DuDuClaw 通道測試成功——這則訊息代表此通道可正常送出。";
+
+        let sender: Box<dyn crate::channel_sender::ChannelSender> = match platform {
+            "googlechat" => crate::channel_sender::create_googlechat_sender(
+                self.home_dir.clone(),
+                chat_id.to_string(),
+                String::new(),
+            ),
+            "teams" => crate::channel_sender::create_teams_sender(
+                self.home_dir.clone(),
+                chat_id.to_string(),
+                String::new(),
+            ),
+            "wecom" => {
+                crate::channel_sender::create_wecom_sender(self.home_dir.clone(), chat_id.to_string())
+            }
+            "dingtalk" => crate::channel_sender::create_dingtalk_sender(
+                self.home_dir.clone(),
+                chat_id.to_string(),
+                String::new(),
+            ),
+            _ => {
+                // whatsapp needs the (plaintext, non-secret) phone_number_id
+                // alongside the access token — every other token-based
+                // channel leaves `extra_id` unset.
+                let extra_id = if platform == "whatsapp" {
+                    crate::config_crypto::read_encrypted_config_field(
+                        &self.home_dir,
+                        "channels",
+                        "whatsapp_phone_number_id",
+                    )
+                    .await
+                    .filter(|s| !s.is_empty())
+                } else {
+                    None
+                };
+                let target = crate::channel_sender::ChannelTarget {
+                    channel_type: platform.to_string(),
+                    chat_id: chat_id.to_string(),
+                    token: token.to_string(),
+                    extra_id,
+                };
+                crate::channel_sender::create_sender(&target, reqwest::Client::new())
+            }
+        };
+
+        match sender.send_text(TEST_MESSAGE).await {
+            Ok(()) => channel_test_result(
+                true,
+                "live",
+                &format!("測試訊息已送出，請至 {platform} 確認收到。"),
+            ),
+            Err(e) => {
+                warn!(platform, chat_id, error = %e.0, "channels.test: live send failed");
+                let detail = classify_channel_send_error(&e.0);
+                channel_test_result(false, "live", &detail)
+            }
+        }
     }
 
     /// WP9: mint a one-time bind token + Telegram deep-link for a target AI
@@ -13027,6 +13198,20 @@ impl MethodHandler {
             .filter(|d| !d.is_empty())
     }
 
+    /// Look up a dashboard user's display name (`None` if unset / no DB) —
+    /// the decider attribution a dashboard-originated decision passes into
+    /// `decision_card::collapse_all` in place of the channel-press
+    /// `resolve_decider_name` lookup (there is no channel identity to map
+    /// from when the decision was made in the dashboard itself).
+    async fn user_display_name(&self, user_id: &str) -> Option<String> {
+        let db = self.user_db.read().await.as_ref()?.clone();
+        db.get_user(user_id)
+            .ok()
+            .flatten()
+            .map(|u| u.display_name.trim().to_string())
+            .filter(|d| !d.is_empty())
+    }
+
     async fn handle_skills_install_request(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let url = params
             .get("url")
@@ -13311,6 +13496,29 @@ impl MethodHandler {
             Ok(o) => o,
             Err(e) => return WsFrame::error_response("", &e),
         };
+
+        // H1 (unified decision hand-off, 07-unified-decision-design.md §6):
+        // retire the channel card(s) this request fanned out to, the same
+        // way a channel button press does. `approve == false` always denies
+        // (softer "已婉拒" verb); `approve == true` covers both the
+        // manager-stage and final-stage outcomes below, which read
+        // identically as "已同意" — same mapping the channel path uses.
+        // Fire-and-forget: cosmetic, must never delay or fail a decision
+        // already durable in `install_requests.db`.
+        {
+            let decider_name = self.user_display_name(&ctx.user_id).await;
+            let verb = if approve {
+                crate::decision_card::DecisionVerb::Approved
+            } else {
+                crate::decision_card::DecisionVerb::DeclinedInstall
+            };
+            crate::install_notify::spawn_dashboard_collapse(
+                self.home_dir.clone(),
+                id.clone(),
+                decider_name,
+                verb,
+            );
+        }
 
         match outcome {
             crate::install_requests::DecideOutcome::Denied => {
@@ -15882,7 +16090,9 @@ impl MethodHandler {
             "uptime_seconds": uptime,
             "agents_count": reg.list().len(),
             "channels_connected": channels_connected,
-            "gateway_address": "localhost:18789",
+            "gateway_address": crate::deep_link::dashboard_base_url(&self.home_dir)
+                .and_then(|url| url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")).map(str::to_string))
+                .unwrap_or_else(|| "localhost:18789".to_string()),
             // Product form-factor (personal|enterprise). Orthogonal to the
             // license `edition` string returned by system.version. The
             // dashboard reads this to hide/show enterprise management surfaces.
@@ -18273,6 +18483,84 @@ impl MethodHandler {
                 "genes": genes,
             }),
         )
+    }
+}
+
+/// W0-2 `channels.test` structured result: `{sent, mode, detail}`.
+/// `mode` is `"live"` (an actual send was attempted) or `"credential_only"`
+/// (no destination was known, so only credential presence was verified — the
+/// front end must not render this as a green success).
+fn channel_test_result(sent: bool, mode: &str, detail: &str) -> WsFrame {
+    WsFrame::ok_response("", json!({ "sent": sent, "mode": mode, "detail": detail }))
+}
+
+/// Does this agent own a distinct per-agent bot token for `platform`? Only
+/// discord/telegram/slack support per-agent tokens today. An agent that owns
+/// its own token is not reachable through a different (e.g. the global)
+/// bot's token for the same platform.
+fn agent_has_own_channel_token(agent: &duduclaw_agent::registry::LoadedAgent, platform: &str) -> bool {
+    let Some(ch) = &agent.config.channels else {
+        return false;
+    };
+    match platform {
+        "discord" => ch.discord.as_ref().is_some_and(|d| {
+            !d.bot_token.is_empty() || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+        }),
+        "telegram" => ch.telegram.as_ref().is_some_and(|t| {
+            !t.bot_token.is_empty() || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+        }),
+        "slack" => ch.slack.as_ref().is_some_and(|s| {
+            !s.bot_token.is_empty() || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
+        }),
+        _ => false,
+    }
+}
+
+/// The agent's own `agent.toml [proactive] notify_chat_id` — but only when
+/// `notify_channel` matches `platform`; otherwise the destination is for a
+/// different channel entirely and must not be borrowed.
+fn agent_proactive_target(
+    agent: &duduclaw_agent::registry::LoadedAgent,
+    platform: &str,
+) -> Option<String> {
+    let p = &agent.config.proactive;
+    if p.notify_channel != platform {
+        return None;
+    }
+    let chat_id = p.notify_chat_id.trim();
+    if chat_id.is_empty() {
+        None
+    } else {
+        Some(chat_id.to_string())
+    }
+}
+
+/// Map a raw `ChannelSendError` message (platform HTTP status + body, or a
+/// transport-level `reqwest` error) into one zh-TW sentence a non-technical
+/// dashboard user can act on. Mirrors the style of `channel_reply.rs`'s
+/// `FailureReason` classification: the raw string (which may include
+/// technical API jargon) is logged by the caller and never forwarded to the
+/// UI — only this classified sentence is.
+fn classify_channel_send_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("no stored conversation reference") || lower.contains("no stored sessionwebhook") {
+        "此對話尚未有過互動紀錄——請先讓對方在該通道傳一則訊息給機器人，之後測試才找得到可送達的對象。".to_string()
+    } else if lower.contains("expired") && lower.contains("sessionwebhook") {
+        "對話連線已過期（此類通道只能在對方最近一次發話後的一段時間內回覆），請請對方再傳一則訊息後重試。".to_string()
+    } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("invalid_auth") || lower.contains("not_authed") {
+        "憑證無效或已被平台撤銷，請重新產生 token 後再設定一次。".to_string()
+    } else if lower.contains("403") || lower.contains("forbidden") || lower.contains("not_in_channel") {
+        "權限不足——機器人可能尚未加入該群組/頻道，或該功能尚未在平台後台開通。".to_string()
+    } else if lower.contains("404") || lower.contains("not found") || lower.contains("chat_not_found") || lower.contains("channel_not_found") {
+        "找不到目的地——目的地 ID 可能有誤，或機器人尚未加入該對話。".to_string()
+    } else if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") {
+        "已達平台 API 呼叫頻率上限，請稍後再試一次。".to_string()
+    } else if lower.contains("ssrf") || lower.contains("domain mismatch") {
+        "安全性檢查阻擋了這次發送，請確認通道設定正確。".to_string()
+    } else if lower.contains("error sending request") || lower.contains("dns error") || lower.contains("connect") || lower.contains("timed out") || lower.contains("timeout") {
+        "網路連線失敗，請確認伺服器對外連線正常後重試。".to_string()
+    } else {
+        "平台拒絕了這則訊息，詳細原因已記錄於伺服器日誌，請聯絡管理員查看。".to_string()
     }
 }
 
@@ -24911,6 +25199,32 @@ impl MethodHandler {
                     }
                 }
 
+                // H1 (unified decision hand-off, 07-unified-decision-design.md
+                // §6): a dashboard decision on a needs_human goal task (the
+                // Inbox / task board "等你決定" resolution, wired through this
+                // generic RPC) must retire the channel card the same way a
+                // channel button press does. Only the three legal goal-loop
+                // outcomes count as a settled decision (`goal_task_settle_verb`,
+                // fail-closed); any other status change out of needs_human is
+                // left uncollapsed rather than guessed at. Fire-and-forget:
+                // cosmetic, must never delay or fail a decision already
+                // durable in the task store.
+                if prev_status.as_deref() == Some("needs_human") {
+                    if let Some(new_status) = params.get("status").and_then(|v| v.as_str()) {
+                        if let Some(verb) = goal_task_settle_verb(new_status) {
+                            let decider_name = self.user_display_name(&ctx.user_id).await;
+                            crate::goal_notify::spawn_dashboard_collapse(
+                                self.home_dir.clone(),
+                                task_id.to_string(),
+                                row.title.clone(),
+                                row.assigned_to.clone(),
+                                decider_name,
+                                verb,
+                            );
+                        }
+                    }
+                }
+
                 WsFrame::ok_response("", json!({ "task": task_json }))
             }
             Ok(None) => WsFrame::error_response("", &format!("Task not found: {task_id}")),
@@ -26451,6 +26765,12 @@ impl MethodHandler {
                             "payload": r.payload,
                             "created_at": r.created_at,
                             "ttl_seconds": r.ttl_seconds,
+                            // Epoch seconds the approval auto-denies at (TTL
+                            // expiry counts as a denial — see approval.rs). Lets
+                            // the dashboard render a live countdown without
+                            // parsing `created_at` itself. `null` on an
+                            // unparseable `created_at` (fail-safe).
+                            "expires_at": r.expires_at_epoch(),
                             // D1/D2: the ActionGuard judge's forward-simulation
                             // narrative (world_state_change + risk_points), when the
                             // approval kind ran that judge. `null` for every other
@@ -26556,6 +26876,22 @@ impl MethodHandler {
         let decided_by = format!("dashboard:{}", ctx.user_id);
         if let Err(e) = broker.decide(&approval_id, approve, &decided_by).await {
             return WsFrame::error_response("", &format!("decide: {e}"));
+        }
+
+        // H1 (unified decision hand-off, 07-unified-decision-design.md §6):
+        // a dashboard decision must retire the channel card(s) this approval
+        // fanned out to, the same way a channel button press does — otherwise
+        // "decided on the dashboard" leaves a stale, still-clickable card
+        // behind. Fire-and-forget: an edit is cosmetic and must never delay
+        // or fail a decision already durable in `approvals.db`.
+        if let Some(rec) = &record {
+            let decider_name = self.user_display_name(&ctx.user_id).await;
+            crate::approval_notify::spawn_dashboard_collapse(
+                self.home_dir.clone(),
+                rec.clone(),
+                approve,
+                decider_name,
+            );
         }
 
         // ── S1 (PORTICO): mint an epoch-bound capability on approve ──
@@ -28200,6 +28536,46 @@ fn update_frontmatter_field(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Map a `tasks.update` status transition OUT of `needs_human` to the
+/// settled-decision verb a collapsed channel card should show. Only the
+/// three legal goal-loop outcomes (04-orca-object-model-cta-matrix.md §2.1:
+/// retry → `pending`, done → `done`, abort → `cancelled`) count as a settled
+/// decision; anything else is `None` — fail-closed, never guessed (coding
+/// convention: routing/security-adjacent decisions must not fall through to
+/// a default).
+fn goal_task_settle_verb(new_status: &str) -> Option<crate::decision_card::DecisionVerb> {
+    use crate::decision_card::DecisionVerb;
+    match new_status {
+        "pending" => Some(DecisionVerb::Retried),
+        "done" => Some(DecisionVerb::MarkedDone),
+        "cancelled" => Some(DecisionVerb::Abandoned),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod goal_task_settle_verb_tests {
+    use super::goal_task_settle_verb;
+    use crate::decision_card::DecisionVerb;
+
+    #[test]
+    fn maps_the_three_legal_goal_loop_outcomes() {
+        assert_eq!(goal_task_settle_verb("pending"), Some(DecisionVerb::Retried));
+        assert_eq!(goal_task_settle_verb("done"), Some(DecisionVerb::MarkedDone));
+        assert_eq!(goal_task_settle_verb("cancelled"), Some(DecisionVerb::Abandoned));
+    }
+
+    #[test]
+    fn refuses_to_guess_at_anything_else() {
+        // in_progress/blocked/needs_human/unknown-status: not a legal
+        // needs_human resolution — must not collapse the card with a
+        // fabricated verb.
+        for s in ["in_progress", "blocked", "needs_human", "review", "", "garbage"] {
+            assert_eq!(goal_task_settle_verb(s), None, "status {s:?} must not map to a verb");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -30156,6 +30532,51 @@ policies:
         let json = serde_json::to_value(duduclaw_core::types::CapabilitiesConfig::default())
             .expect("serialize");
         assert_eq!(json.get("recording"), Some(&serde_json::Value::Bool(false)));
+    }
+
+    // ── autonomy_level (goal-loop dashboard editor) ───────────────────────────
+
+    #[test]
+    fn cap_autonomy_level_writes_valid_values_and_reads_back_via_goal_loop() {
+        for level in ["operator", "collaborator", "consultant", "approver", "observer"] {
+            let mut table = toml::Table::new();
+            let changes = apply_capabilities_to_table(
+                &mut table,
+                &json!({ "capabilities": { "autonomy_level": level } }),
+            )
+            .expect("apply");
+            let cap = table.get("capabilities").unwrap().as_table().unwrap();
+            assert_eq!(cap.get("autonomy_level").unwrap().as_str(), Some(level));
+            assert!(changes.iter().any(|c| c.contains("autonomy_level")));
+
+            // Round-trips through the exact reader `goal_loop::AutonomyLevel::
+            // for_agent` uses at dispatch time — a mismatch here would mean the
+            // dashboard writes a value the goal loop can't parse.
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agents").join("alice");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::write(
+                agent_dir.join("agent.toml"),
+                toml::to_string(&toml::Value::Table(table)).unwrap(),
+            )
+            .unwrap();
+            let parsed = crate::goal_loop::AutonomyLevel::for_agent(dir.path(), "alice");
+            assert_eq!(parsed.as_str(), level);
+        }
+    }
+
+    #[test]
+    fn cap_autonomy_level_rejects_unknown_value_fail_closed() {
+        let mut table = toml::Table::new();
+        let err = apply_capabilities_to_table(
+            &mut table,
+            &json!({ "capabilities": { "autonomy_level": "god_mode" } }),
+        )
+        .expect_err("unknown autonomy_level must be rejected, not silently defaulted");
+        assert!(err.contains("god_mode"));
+        // The invalid value itself was never written.
+        let cap = table.get("capabilities").and_then(|v| v.as_table());
+        assert!(cap.is_none_or(|c| c.get("autonomy_level").is_none()));
     }
 
     #[test]
@@ -32933,6 +33354,241 @@ mod channels_add_enc_only_tests {
             "dingtalk secret must be enc-only"
         );
         assert!(dingtalk.contains_key("app_secret_enc"));
+    }
+}
+
+#[cfg(test)]
+mod channels_test_rpc_tests {
+    //! W0-2: `channels.test` must never report a green "sent" when no
+    //! message actually went out — the credential-only degrade path is the
+    //! honesty fix breakpoint #5 (`ux-redesign-2026-08/01-current-state-map.md`)
+    //! called out. These tests exercise the parts reachable without a live
+    //! network call: no-token and token-but-no-destination both degrade
+    //! cleanly with `sent: false, mode: "credential_only"`.
+    use super::*;
+
+    fn frame_error_text(frame: &WsFrame) -> String {
+        match frame {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn agent_toml_with_proactive(name: &str, notify_channel: &str, notify_chat_id: &str) -> String {
+        include_str!("../../../templates/evaluator/agent.toml")
+            .replace("name = \"evaluator\"", &format!("name = \"{name}\""))
+            + &format!(
+                "\n[proactive]\nenabled = true\nnotify_channel = \"{notify_channel}\"\nnotify_chat_id = \"{notify_chat_id}\"\n"
+            )
+    }
+
+    #[tokio::test]
+    async fn global_channel_with_no_token_degrades_to_credential_only() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler.handle_channels_test(json!({ "type": "telegram" })).await;
+        let payload = match &frame {
+            WsFrame::Response { payload: Some(p), .. } => p.clone(),
+            _ => panic!("channels.test failed: {}", frame_error_text(&frame)),
+        };
+        assert_eq!(payload["sent"], false);
+        assert_eq!(payload["mode"], "credential_only");
+        assert!(
+            payload["detail"].as_str().unwrap().contains("未設定"),
+            "{payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_channel_with_token_but_no_destination_degrades_to_credential_only() {
+        let home = tempfile::tempdir().expect("tempdir");
+        // A token is configured, but no agent has ever set a [proactive]
+        // destination for this platform — channels.test must not claim it
+        // sent anything.
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[channels]\ntelegram_bot_token = \"123:fake-token-for-test\"\n",
+        )
+        .expect("write config.toml");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler.handle_channels_test(json!({ "type": "telegram" })).await;
+        let payload = match &frame {
+            WsFrame::Response { payload: Some(p), .. } => p.clone(),
+            _ => panic!("channels.test failed: {}", frame_error_text(&frame)),
+        };
+        assert_eq!(payload["sent"], false, "{payload}");
+        assert_eq!(payload["mode"], "credential_only", "{payload}");
+        assert!(
+            payload["detail"].as_str().unwrap().contains("僅驗證憑證存在"),
+            "{payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_channel_finds_destination_from_agent_proactive_config() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[channels]\ntelegram_bot_token = \"123:fake-token-for-test\"\n",
+        )
+        .expect("write config.toml");
+        let agent_dir = home.path().join("agents").join("relay");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            agent_toml_with_proactive("relay", "telegram", "999888777"),
+        )
+        .unwrap();
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        {
+            let mut reg = handler.registry.write().await;
+            reg.scan().await.expect("scan");
+        }
+
+        let dest = handler.resolve_global_test_destination("telegram").await;
+        assert_eq!(
+            dest,
+            Some(("relay".to_string(), "999888777".to_string())),
+            "must find the agent's [proactive] destination for the matching platform"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_agent_channel_with_no_token_degrades_to_credential_only() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let agent_dir = home.path().join("agents").join("nobot");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            include_str!("../../../templates/evaluator/agent.toml")
+                .replace("name = \"evaluator\"", "name = \"nobot\""),
+        )
+        .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        {
+            let mut reg = handler.registry.write().await;
+            reg.scan().await.expect("scan");
+        }
+
+        let frame = handler
+            .handle_channels_test(json!({ "type": "discord:nobot" }))
+            .await;
+        let payload = match &frame {
+            WsFrame::Response { payload: Some(p), .. } => p.clone(),
+            _ => panic!("channels.test failed: {}", frame_error_text(&frame)),
+        };
+        assert_eq!(payload["sent"], false, "{payload}");
+        assert_eq!(payload["mode"], "credential_only", "{payload}");
+    }
+
+    #[tokio::test]
+    async fn per_agent_channel_unknown_agent_errors() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_channels_test(json!({ "type": "discord:ghost" }))
+            .await;
+        assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+    }
+
+    #[test]
+    fn agent_proactive_target_requires_matching_channel() {
+        // Pure-logic guard: a [proactive] destination configured for a
+        // DIFFERENT platform must never be borrowed as this platform's target.
+        use duduclaw_core::types::ProactiveConfig;
+        let mut proactive = ProactiveConfig::default();
+        proactive.notify_channel = "slack".to_string();
+        proactive.notify_chat_id = "C123".to_string();
+        assert_eq!(proactive.notify_channel, "slack");
+        assert_ne!(proactive.notify_channel, "telegram");
+    }
+
+    // -- classify_channel_send_error: raw platform/transport text → zh-TW --
+
+    #[test]
+    fn classify_unauthorized_as_revoked_credential() {
+        let msg = classify_channel_send_error("Telegram API error 401 Unauthorized: {\"ok\":false}");
+        assert!(msg.contains("憑證無效"), "{msg}");
+    }
+
+    #[test]
+    fn classify_forbidden_as_permission_issue() {
+        let msg = classify_channel_send_error("Slack API error: not_in_channel");
+        assert!(msg.contains("權限不足"), "{msg}");
+    }
+
+    #[test]
+    fn classify_not_found_as_missing_destination() {
+        let msg = classify_channel_send_error("Discord API error 404 Not Found: {\"message\":\"Unknown Channel\"}");
+        assert!(msg.contains("找不到目的地"), "{msg}");
+    }
+
+    #[test]
+    fn classify_rate_limit() {
+        let msg = classify_channel_send_error("Telegram API error 429 Too Many Requests: {}");
+        assert!(msg.contains("頻率上限"), "{msg}");
+    }
+
+    #[test]
+    fn classify_teams_never_seen_conversation() {
+        let msg = classify_channel_send_error(
+            "no stored conversation reference for abc (bot must receive a message there first)",
+        );
+        assert!(msg.contains("尚未有過互動紀錄"), "{msg}");
+    }
+
+    #[test]
+    fn classify_network_error() {
+        let msg = classify_channel_send_error("LINE push: error sending request for url (...)");
+        assert!(msg.contains("網路連線失敗"), "{msg}");
+    }
+
+    #[test]
+    fn classify_unknown_falls_back_to_generic_honest_message() {
+        let msg = classify_channel_send_error("something totally unexpected");
+        assert!(msg.contains("平台拒絕了這則訊息"), "{msg}");
+    }
+
+    #[test]
+    fn agent_has_own_channel_token_true_only_for_configured_platform() {
+        use duduclaw_core::types::{ChannelsConfig, DiscordChannelConfig};
+        let mut cfg = base_agent_config_for_test();
+        cfg.channels = Some(ChannelsConfig {
+            discord: Some(DiscordChannelConfig {
+                bot_token: "tok".to_string(),
+                bot_token_enc: None,
+                bindings: vec![],
+            }),
+            telegram: None,
+            line: None,
+            slack: None,
+            whatsapp: None,
+            feishu: None,
+            googlechat: None,
+            teams: None,
+            wecom: None,
+            dingtalk: None,
+        });
+        let agent = duduclaw_agent::registry::LoadedAgent {
+            config: cfg,
+            soul: None,
+            identity: None,
+            memory: None,
+            skills: vec![],
+            contract: Default::default(),
+            dir: std::path::PathBuf::new(),
+        };
+        assert!(agent_has_own_channel_token(&agent, "discord"));
+        assert!(!agent_has_own_channel_token(&agent, "telegram"));
+    }
+
+    fn base_agent_config_for_test() -> duduclaw_core::types::AgentConfig {
+        let raw = include_str!("../../../templates/evaluator/agent.toml")
+            .replace("name = \"evaluator\"", "name = \"probe\"");
+        toml::from_str(&raw).expect("parse evaluator template")
     }
 }
 

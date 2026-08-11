@@ -683,8 +683,13 @@ impl AutopilotEngine {
             CircuitState::HalfOpen { probed_at } => {
                 if now.duration_since(*probed_at) < CIRCUIT_HALF_OPEN_PROBE_WINDOW {
                     // Any fire within the probe window → re-trip to Open.
+                    // Tagged distinctly from a fresh Closed→Open trip
+                    // ("open_retrip", not "open") so the circuit-open
+                    // notification can dedup: a probe re-trip continues the
+                    // SAME open episode and must never push a second notice
+                    // for it — see `autopilot_notify` module docs.
                     *state = CircuitState::Open { opened_at: now };
-                    (false, Some("open"))
+                    (false, Some("open_retrip"))
                 } else {
                     // Probe window elapsed without re-trip → reset to Closed
                     // and count this fire as the first of a fresh window.
@@ -838,6 +843,13 @@ impl AutopilotEngine {
                         CIRCUIT_OPEN_COOLDOWN.as_secs()
                     ),
                 ),
+                "open_retrip" => (
+                    "circuit_open",
+                    format!(
+                        "circuit breaker RE-TRIPPED during half-open probe — rule blocked for {}s",
+                        CIRCUIT_OPEN_COOLDOWN.as_secs()
+                    ),
+                ),
                 "half_open" => (
                     "circuit_half_open",
                     format!(
@@ -855,6 +867,28 @@ impl AutopilotEngine {
                 result: result_tag.into(),
                 details: Some(details),
             }).await;
+
+            // Push a symptom notice + "暫停這條規則" button — ONLY on
+            // a fresh Closed→Open trip ("open"), never on a HalfOpen probe
+            // re-trip of the SAME open episode ("open_retrip" — see
+            // `autopilot_notify` module docs for the dedup rationale). Fully
+            // detached: the breaker's own block (the `!allowed` early return
+            // right below) has already taken effect regardless of whether
+            // this push ever lands, so a slow/unreachable channel can never
+            // weaken the protection itself.
+            if new_state == "open" {
+                let home = self.home_dir.clone();
+                let rule_snapshot = rule.clone();
+                tokio::spawn(async move {
+                    crate::autopilot_notify::notify_circuit_open(
+                        &home,
+                        &rule_snapshot,
+                        CIRCUIT_MAX_FIRES,
+                        CIRCUIT_OPEN_COOLDOWN.as_secs(),
+                    )
+                    .await;
+                });
+            }
         }
         if !allowed {
             return;
@@ -2373,10 +2407,12 @@ mod tests {
                 },
             );
         }
-        // Any fire within the probe window → re-trip to Open
+        // Any fire within the probe window → re-trip to Open. Tagged
+        // "open_retrip" (not "open") — see the circuit-open notify dedup
+        // note above `circuit_check`'s HalfOpen arm.
         let (allowed, transition) = engine.circuit_check("rule-w").await;
         assert!(!allowed);
-        assert_eq!(transition, Some("open"));
+        assert_eq!(transition, Some("open_retrip"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

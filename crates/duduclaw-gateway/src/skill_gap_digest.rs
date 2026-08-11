@@ -260,7 +260,7 @@ pub async fn maybe_send_daily_digest(home_dir: &Path) {
         return;
     };
     let http = reqwest::Client::new();
-    if crate::goal_notify::send_plain_text(&http, &channel, &token, &chat_id, &message).await {
+    if crate::goal_notify::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &message).await {
         info!(agent = %agent_id, %channel, gaps = items.len(), "skill-gap digest sent");
     } else {
         warn!(agent = %agent_id, %channel, "skill-gap digest send failed (will retry tomorrow)");

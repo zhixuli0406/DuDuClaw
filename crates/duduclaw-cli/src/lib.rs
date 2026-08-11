@@ -1732,6 +1732,22 @@ async fn cmd_evolution(
             );
             let report = finalizer.tick().await;
 
+            // B3: `tick()` fires one evolution-events audit write per decision
+            // via a detached `tokio::spawn` (EvolutionEventEmitter::global()
+            // .emit_gvu_generation, see gvu/observation_finalizer.rs). That's
+            // safe inside the long-running gateway (its Runtime outlives the
+            // write), but `evolution finalize` is a one-shot CLI command:
+            // once this function returns, `entry_point()`'s `#[tokio::main]`
+            // Runtime is dropped, which can abort an in-flight write
+            // mid-`create_dir_all`/`open` — surfacing a spurious "Failed to
+            // open audit log file: background task failed" ERROR on the
+            // first-ever run (before `~/.duduclaw/evolution/events` exists).
+            // Join those writes here, before doing anything else with the
+            // report, so the process never exits mid-write.
+            duduclaw_gateway::evolution_events::emitter::EvolutionEventEmitter::global()
+                .wait_pending_default()
+                .await;
+
             if report.decisions.is_empty() {
                 println!("No expired observations.");
                 return Ok(());

@@ -271,6 +271,68 @@ mod router_tests {
         assert!(matches!(route(&error, 0, &mut exploration, &consistency), EvolutionAction::StoreEpisodic { .. }));
     }
 
+    /// `make_error`'s default `extracted_topics: vec![]` — the pre-fix
+    /// telemetry-only shape must still be produced (old records with no topic
+    /// data are not fabricated a "Topics:" section).
+    #[test]
+    fn moderate_without_topics_has_no_topics_section() {
+        let error = make_error(0.35, ErrorCategory::Moderate);
+        let mut exploration = no_exploration();
+        let consistency = ConsistencyTracker::new(50);
+        let EvolutionAction::StoreEpisodic { content, .. } = route(&error, 0, &mut exploration, &consistency) else {
+            panic!("expected StoreEpisodic");
+        };
+        assert!(!content.contains("Topics:"));
+        assert!(!content.contains("Expected topic:"));
+        assert!(content.starts_with("Prediction deviation: expected satisfaction 0.70, inferred 0.70 (delta 0.00). \
+             Topic surprise: 0.00. Corrections: no. Follow-ups: no."));
+    }
+
+    /// With extracted topics present, the stored content must carry them so
+    /// the Memory page can show what the conversation was actually about.
+    #[test]
+    fn moderate_with_topics_appends_topics_section() {
+        let mut error = make_error(0.35, ErrorCategory::Moderate);
+        error.actual.extracted_topics =
+            vec!["報價".to_string(), "合約".to_string(), "交期".to_string(), "extra".to_string()];
+        let mut exploration = no_exploration();
+        let consistency = ConsistencyTracker::new(50);
+        let EvolutionAction::StoreEpisodic { content, .. } = route(&error, 0, &mut exploration, &consistency) else {
+            panic!("expected StoreEpisodic");
+        };
+        // Capped at 3 topics, comma-separated, trailing period.
+        assert!(content.contains("Topics: 報價, 合約, 交期."));
+        assert!(!content.contains("extra"));
+    }
+
+    /// `expected_topic` is only appended when it adds information beyond the
+    /// extracted topics already shown (avoids a redundant duplicate mention).
+    #[test]
+    fn moderate_appends_expected_topic_when_not_already_covered() {
+        let mut error = make_error(0.35, ErrorCategory::Moderate);
+        error.prediction.expected_topic = Some("退貨".to_string());
+        error.actual.extracted_topics = vec!["報價".to_string()];
+        let mut exploration = no_exploration();
+        let consistency = ConsistencyTracker::new(50);
+        let EvolutionAction::StoreEpisodic { content, .. } = route(&error, 0, &mut exploration, &consistency) else {
+            panic!("expected StoreEpisodic");
+        };
+        assert!(content.contains("Expected topic: 退貨."));
+
+        // When the expected topic is already among the extracted topics, it
+        // must not be repeated.
+        let mut error2 = make_error(0.35, ErrorCategory::Moderate);
+        error2.prediction.expected_topic = Some("報價".to_string());
+        error2.actual.extracted_topics = vec!["報價".to_string()];
+        let mut exploration2 = no_exploration();
+        let EvolutionAction::StoreEpisodic { content: content2, .. } =
+            route(&error2, 0, &mut exploration2, &consistency)
+        else {
+            panic!("expected StoreEpisodic");
+        };
+        assert!(!content2.contains("Expected topic:"));
+    }
+
     #[test]
     fn significant_routes_to_reflection() {
         let error = make_error(0.6, ErrorCategory::Significant);
