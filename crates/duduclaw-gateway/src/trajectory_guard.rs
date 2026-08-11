@@ -576,6 +576,42 @@ impl TrajectoryGuard {
     }
 }
 
+/// Platform prefixes a session id may carry. Anchored exact match against
+/// this list, never a substring test (project convention 2) — `webchatty:1`
+/// must not resolve to `webchat`.
+const SESSION_CHANNELS: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "line",
+    "whatsapp",
+    "feishu",
+    "googlechat",
+    "teams",
+    "webchat",
+    "wecom",
+    "dingtalk",
+];
+
+/// The platform a session id belongs to, for the `channel` field of a
+/// `channel_failures.jsonl` record (W2-4).
+///
+/// Session ids are `<platform>:<id>[:<thread>]`, with WebChat's composed form
+/// (`webchat:<conn>#agent:…#conv:…`) sharing the same prefix rule. Internal
+/// sessions ("default", cron/bus/heartbeat ids) belong to no platform and
+/// yield `None` — the record is then written without a `channel` field, which
+/// is the honest answer and the shape every pre-W2-4 consumer already handles.
+///
+/// This exists so that the dashboard's unified log can answer "which platform
+/// was affected" for every failure class, not just the one writer
+/// (`telegram_send_failed`) that hard-coded a literal. Note that stamping the
+/// field does **not** make a record count as a channel outage — see
+/// [`crate::channel_alerts::SEND_FAILURE_EVENTS`].
+pub fn channel_from_session_id(session_id: &str) -> Option<&'static str> {
+    let prefix = session_id.trim().split(':').next()?.trim();
+    SESSION_CHANNELS.iter().copied().find(|c| *c == prefix)
+}
+
 /// Build the structured `channel_failures.jsonl` record for an anomaly signal.
 /// Pure — the caller performs the (locked) append.
 pub fn anomaly_record(
@@ -594,6 +630,10 @@ pub fn anomaly_record(
         "event": "trajectory_anomaly",
         "agent": agent,
         "session_id": session_id,
+        // W2-4: `null` when the session belongs to no platform (cron, bus,
+        // heartbeat) — an absent/`null` field is what every consumer written
+        // before W2-4 already tolerates.
+        "channel": channel_from_session_id(session_id),
         "anomaly": signal.kind.as_str(),
         "severity": signal.severity.as_str(),
         "evidence": duduclaw_core::truncate_chars(&signal.evidence, 300),
@@ -624,6 +664,59 @@ pub fn append_anomaly(home_dir: &Path, record: &serde_json::Value) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── channel_from_session_id (W2-4 schema helper) ────────────
+
+    #[test]
+    fn session_ids_resolve_to_their_platform() {
+        assert_eq!(channel_from_session_id("telegram:12345"), Some("telegram"));
+        assert_eq!(channel_from_session_id("telegram:12345:678"), Some("telegram"));
+        assert_eq!(channel_from_session_id("discord:thread:999"), Some("discord"));
+        assert_eq!(channel_from_session_id("line:U9"), Some("line"));
+        assert_eq!(channel_from_session_id("slack:C1"), Some("slack"));
+        assert_eq!(channel_from_session_id("teams:conv"), Some("teams"));
+        assert_eq!(channel_from_session_id("googlechat:spaces/AAA"), Some("googlechat"));
+        // WebChat's composed id shares the prefix rule.
+        assert_eq!(
+            channel_from_session_id("webchat:conn-1#agent:kiki#conv:nonce"),
+            Some("webchat")
+        );
+        assert_eq!(channel_from_session_id("  telegram:1  "), Some("telegram"));
+    }
+
+    #[test]
+    fn non_channel_sessions_have_no_platform() {
+        // Internal sessions belong to no platform; omitting the field is the
+        // honest answer, and it is the shape every pre-W2-4 consumer handles.
+        for s in ["default", "cron:job-1", "bus:task-9", "heartbeat", "", "   ", ":", "dashboard:alice"] {
+            assert_eq!(channel_from_session_id(s), None, "must not attribute {s:?}");
+        }
+    }
+
+    #[test]
+    fn prefix_matching_is_anchored_not_a_substring_test() {
+        // Project convention 2: an unanchored `starts_with`/`contains` here
+        // would attribute a lookalike prefix to a real platform.
+        assert_eq!(channel_from_session_id("webchatty:1"), None);
+        assert_eq!(channel_from_session_id("nottelegram:1"), None);
+        assert_eq!(channel_from_session_id("telegramx:1"), None);
+        assert_eq!(channel_from_session_id("my-slack:1"), None);
+    }
+
+    #[test]
+    fn anomaly_records_carry_the_channel_when_the_session_names_one() {
+        let signal = AnomalySignal {
+            kind: AnomalyKind::RepeatedToolLoop,
+            severity: Severity::High,
+            evidence: "x".into(),
+        };
+        let rec = anomaly_record("kiki", "telegram:555", &signal, false);
+        assert_eq!(rec["channel"], "telegram");
+        // A non-channel session yields an explicit null, not a fabricated
+        // platform — consumers already tolerate the field being absent/null.
+        let rec = anomaly_record("kiki", "cron:nightly", &signal, false);
+        assert!(rec["channel"].is_null());
+    }
 
     fn start(tool: &str, summary: Option<&str>, depth: usize) -> ToolStep {
         ToolStep {

@@ -1727,6 +1727,29 @@ fn scp_namespace_mode(table: &toml::Table, namespace: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// W2-5: strict `.scope.toml` parse for the `wiki_scope.get`/`wiki_scope.update`
+/// RPC pair. Blank/absent content is the canonical "no policy configured"
+/// state (→ empty table, unchanged behavior); non-blank content that fails to
+/// parse is `Err` and MUST NOT be written back over.
+///
+/// This exists because the generic `read_config_table` (shared by every other
+/// RPC in this file) silently downgrades a parse failure to an empty table —
+/// exactly the wrong behavior for `wiki_scope.update` specifically: that
+/// handler previously called `read_config_table`, got back an "empty" table
+/// for a merely-malformed file (e.g. one unbalanced quote from a manual edit),
+/// applied the requested change to that empty table, and wrote it back —
+/// silently erasing every OTHER operator namespace declaration the file
+/// actually still held. Fail-closed here means refusing the write entirely
+/// and leaving the on-disk file untouched (CLAUDE.md convention 4).
+fn parse_scp_table_strict(content: &str) -> Result<toml::Table, String> {
+    if content.trim().is_empty() {
+        return Ok(toml::Table::new());
+    }
+    content
+        .parse::<toml::Table>()
+        .map_err(|e| format!(".scope.toml is malformed and was left untouched: {e}"))
+}
+
 /// Render the compact, auto-injectable Odoo schema summary (wiki `context`
 /// layer). Lists custom (`x_`) models in full and caps the business-model roll
 /// so the auto-injected prompt stays small.
@@ -3327,6 +3350,107 @@ fn killswitch_table_to_response(table: &toml::Table) -> Value {
     })
 }
 
+// ── W2-2 (E1/E2): channel behavior/access settings ⇄ JSON ───────────────
+//
+// `ChannelSettingsManager::get_all` returns raw `(key, value)` string pairs
+// (its on-disk encoding); the dashboard form needs typed JSON. These two
+// converters are the read-side counterpart of `json_value_to_setting_string`
+// below and share its key list, so a key present in one and not the other
+// would be caught immediately by the round-trip unit tests.
+
+/// Render a channel's `CONFIG_KEYS` rows as typed JSON, applying the same
+/// defaults the live reply path uses when a key was never set (`mention_only`
+/// / `auto_thread` default `false`, `response_mode` defaults `"auto"` —
+/// mirrors `channel_reply.rs`/`discord.rs` `get_bool`/`get_with_fallback`
+/// call sites). `thread_archive_minutes` and `agent_override` have no forced
+/// default (`null` / `""`) — "unset" is a meaningful, distinct state for
+/// both (fall back to per-message default; no override respectively).
+fn config_settings_to_json(all: &[(String, String)]) -> Value {
+    let get = |k: &str| all.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    let json_array = |k: &str| -> Value {
+        get(k)
+            .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+            .unwrap_or_default()
+            .into()
+    };
+    json!({
+        "mention_only": get(crate::channel_settings::keys::MENTION_ONLY).as_deref() == Some("true"),
+        "auto_thread": get(crate::channel_settings::keys::AUTO_THREAD).as_deref() == Some("true"),
+        "allowed_channels": json_array(crate::channel_settings::keys::ALLOWED_CHANNELS),
+        "allowed_guilds": json_array(crate::channel_settings::keys::ALLOWED_GUILDS),
+        "agent_override": get(crate::channel_settings::keys::AGENT_OVERRIDE).unwrap_or_default(),
+        "response_mode": get(crate::channel_settings::keys::RESPONSE_MODE).unwrap_or_else(|| "auto".to_string()),
+        "thread_archive_minutes": get(crate::channel_settings::keys::THREAD_ARCHIVE_MINUTES),
+    })
+}
+
+/// Render a channel's `DASHBOARD_ACCESS_KEYS` rows as typed JSON. All four
+/// default to the fully-open state (`require_pairing: false`, empty lists) —
+/// matching `check_user_access_gate`'s documented "defaults are fully open"
+/// contract in `channel_reply.rs`, so a never-configured channel reads the
+/// same way the dashboard is about to render it.
+fn access_settings_to_json(all: &[(String, String)]) -> Value {
+    let get = |k: &str| all.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    let json_array = |k: &str| -> Value {
+        get(k)
+            .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+            .unwrap_or_default()
+            .into()
+    };
+    json!({
+        "require_pairing": get(crate::channel_settings::keys::REQUIRE_PAIRING).as_deref() == Some("true"),
+        "allowed_users": json_array(crate::channel_settings::keys::ALLOWED_USERS),
+        "blocked_users": json_array(crate::channel_settings::keys::BLOCKED_USERS),
+        "admin_users": json_array(crate::channel_settings::keys::ADMIN_USERS),
+    })
+}
+
+/// Convert one dashboard-form JSON value to the string encoding
+/// `ChannelSettingsManager` stores (and `validate_setting_value` checks).
+/// The write-side counterpart of `config_settings_to_json`/
+/// `access_settings_to_json` above.
+fn json_value_to_setting_string(key: &str, value: &Value) -> std::result::Result<String, String> {
+    use crate::channel_settings::keys;
+    match key {
+        k if k == keys::MENTION_ONLY || k == keys::AUTO_THREAD || k == keys::REQUIRE_PAIRING => value
+            .as_bool()
+            .map(|b| b.to_string())
+            .ok_or_else(|| format!("{key} must be a boolean")),
+        k if k == keys::ALLOWED_CHANNELS
+            || k == keys::ALLOWED_GUILDS
+            || k == keys::ALLOWED_USERS
+            || k == keys::BLOCKED_USERS
+            || k == keys::ADMIN_USERS =>
+        {
+            let arr = value
+                .as_array()
+                .ok_or_else(|| format!("{key} must be an array of strings"))?;
+            let strs: std::result::Result<Vec<String>, String> = arr
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("{key} must be an array of strings"))
+                })
+                .collect();
+            serde_json::to_string(&strs?).map_err(|e| e.to_string())
+        }
+        k if k == keys::THREAD_ARCHIVE_MINUTES => {
+            if let Some(n) = value.as_u64() {
+                Ok(n.to_string())
+            } else if let Some(s) = value.as_str() {
+                Ok(s.to_string())
+            } else {
+                Err(format!("{key} must be a number or a numeric string"))
+            }
+        }
+        _ => value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("{key} must be a string")),
+    }
+}
+
 /// Redact URLs and credential-like tokens from a free-form error string before
 /// it is forwarded to a client (M19).
 ///
@@ -3497,6 +3621,14 @@ pub struct MethodHandler {
     /// §7.3 — this field is never constructed at all when disabled, not
     /// merely inert).
     forward_model: RwLock<Option<Arc<crate::prediction::task_forward_store::TaskForwardModel>>>,
+    /// Resident sensing (WP4): shared tick-observation state — the SAME
+    /// `Arc<TickHub>` the `tick_source` poll tasks and `AutopilotEngine`
+    /// write into (`server.rs` injects it via `set_tick_hub` once, right
+    /// after constructing it). `None` until injected, and permanently
+    /// `None` when the autopilot engine block never ran (no task/autopilot
+    /// store) — `ticks.sources`/`ticks.recent` treat that identically to
+    /// "feature never started": zero counts, empty records, never an error.
+    tick_hub: RwLock<Option<Arc<crate::tick_source::TickHub>>>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -3598,6 +3730,7 @@ impl MethodHandler {
                 std::collections::HashSet::new(),
             ),
             forward_model: RwLock::new(None),
+            tick_hub: RwLock::new(None),
         }
     }
 
@@ -3732,6 +3865,14 @@ impl MethodHandler {
         &self,
     ) -> Option<Arc<crate::prediction::task_forward_store::TaskForwardModel>> {
         self.forward_model.read().await.clone()
+    }
+
+    /// Resident sensing (WP4): inject the shared tick-observation hub
+    /// (called once after gateway start, only when the autopilot engine —
+    /// and therefore the tick-source runtime — was started; see
+    /// `server.rs`).
+    pub async fn set_tick_hub(&self, hub: Arc<crate::tick_source::TickHub>) {
+        *self.tick_hub.write().await = Some(hub);
     }
 
     /// Inject the event broadcast sender for task/activity real-time events.
@@ -4358,6 +4499,37 @@ impl MethodHandler {
             "channels.telegram_bind_token" => {
                 require_admin!();
                 self.handle_telegram_bind_token(params).await
+            }
+
+            // ── W2-2 (E1/E2, D-C1): behavior settings + access control ──
+            // Read/write the same `ChannelSettingsManager`/`AccessController`
+            // the `channel_config`/`pairing_manage` MCP tools use — one access
+            // layer, two front doors. Admin-only, matching every other
+            // `channels.*` method (these are security-relevant settings:
+            // `admin_users` decides who can press `!STOP` in-channel).
+            "channels.config_get" => {
+                require_admin!();
+                self.handle_channels_config_get(params).await
+            }
+            "channels.config_set" => {
+                require_admin!();
+                self.handle_channels_config_set(params, ctx).await
+            }
+            "channels.access_get" => {
+                require_admin!();
+                self.handle_channels_access_get(params).await
+            }
+            "channels.access_set" => {
+                require_admin!();
+                self.handle_channels_access_set(params, ctx).await
+            }
+            "channels.pairing_list" => {
+                require_admin!();
+                self.handle_channels_pairing_list().await
+            }
+            "channels.pairing_revoke" => {
+                require_admin!();
+                self.handle_channels_pairing_revoke(params, ctx).await
             }
 
             // ── Account methods (admin only) ─────────────────
@@ -5145,6 +5317,16 @@ impl MethodHandler {
                 self.handle_canvas_get(params).await
             }
 
+            // ── Notification governance (W2-4) ──────────────
+            // Read-only telemetry about the notification system itself: how
+            // many of each type went out, and how many led a person to
+            // actually decide something (P4-5 / C12). Manager+ because it
+            // aggregates across every agent in the deployment.
+            "notify.stats" => {
+                require_manager!();
+                self.handle_notify_stats(params)
+            }
+
             // ── Live Run Forking (RFC-26) ───────────────────
             "fork.list" => self.handle_fork_list(params),
             "fork.inspect" => self.handle_fork_inspect(params),
@@ -5220,6 +5402,16 @@ impl MethodHandler {
             "autopilot.history" => {
                 require_admin!();
                 self.handle_autopilot_history(params).await
+            }
+
+            // ── Resident sensing observability (WP4, admin only) ──
+            "ticks.sources" => {
+                require_admin!();
+                self.handle_ticks_sources().await
+            }
+            "ticks.recent" => {
+                require_admin!();
+                self.handle_ticks_recent(params).await
             }
 
             // ── OS-native page (P4-3, admin management surface) ─
@@ -5549,6 +5741,12 @@ impl MethodHandler {
                     { "name": "channels.add", "description": "Add a channel" },
                     { "name": "channels.test", "description": "Test a channel" },
                     { "name": "channels.remove", "description": "Remove a channel" },
+                    { "name": "channels.config_get", "description": "Read a channel's behavior settings" },
+                    { "name": "channels.config_set", "description": "Write a channel's behavior settings" },
+                    { "name": "channels.access_get", "description": "Read a channel's access-control settings" },
+                    { "name": "channels.access_set", "description": "Write a channel's access-control settings" },
+                    { "name": "channels.pairing_list", "description": "List approved channel pairing subjects" },
+                    { "name": "channels.pairing_revoke", "description": "Revoke an approved channel pairing subject" },
                     { "name": "accounts.list", "description": "List accounts" },
                     { "name": "accounts.budget_summary", "description": "Budget overview" },
                     { "name": "accounts.rotate", "description": "Rotate account key" },
@@ -7266,6 +7464,25 @@ impl MethodHandler {
                         pt.insert("notify_thread_id".into(), toml::Value::String(v.into()));
                         changes.push(format!("proactive.notify_thread_id = \"{v}\""));
                     }
+                    // ── quiet_hours (W2-8 — dashboard-editable suppression
+                    // window read by `notify_governance::load_agent_policy`).
+                    // Validated with the SAME parser the runtime gate uses
+                    // (`QuietWindow::parse`) so a malformed value is rejected
+                    // at write time here rather than silently landing as "no
+                    // quiet hours" days later when the gate fails open on it.
+                    // Empty string clears it (readers treat blank as unset).
+                    if let Some(v) = p.get("quiet_hours").and_then(|v| v.as_str()) {
+                        let trimmed = v.trim();
+                        if !trimmed.is_empty()
+                            && crate::notify_governance::QuietWindow::parse(trimmed).is_none()
+                        {
+                            return Err(format!(
+                                "Invalid proactive quiet_hours '{v}' (need \"HH:MM-HH:MM\", e.g. \"22:00-08:00\")"
+                            ));
+                        }
+                        pt.insert("quiet_hours".into(), toml::Value::String(trimmed.into()));
+                        changes.push(format!("proactive.quiet_hours = \"{trimmed}\""));
+                    }
                 }
             }
 
@@ -8957,22 +9174,44 @@ impl MethodHandler {
     //
     // Path: `<home>/shared/wiki/.scope.toml` (mirrors duduclaw-cli::wiki_scope).
 
+    /// Read `.scope.toml` for the SCP handlers via [`parse_scp_table_strict`]:
+    /// absent file → empty table (unchanged default), malformed existing file
+    /// → `Err` that the caller MUST surface instead of writing anything.
+    async fn read_scp_table(&self, path: &Path) -> Result<toml::Table, String> {
+        match tokio::fs::read_to_string(path).await {
+            Ok(content) => parse_scp_table_strict(&content),
+            Err(_) => Ok(toml::Table::new()),
+        }
+    }
+
     /// `wiki_scope.get` — read the shared wiki `.scope.toml`. Response:
     /// `{ namespaces: [{ namespace, mode, synced_from }] }`. Absent file → `[]`.
+    /// A malformed file is an error (not a silent `[]`) — the admin needs to
+    /// know the on-disk policy couldn't be read, not see an empty list that
+    /// looks like "nothing configured".
     async fn handle_wiki_scope_get(&self) -> WsFrame {
         let path = self
             .home_dir
             .join("shared")
             .join("wiki")
             .join(".scope.toml");
-        let table = self.read_config_table(&path).await;
-        WsFrame::ok_response("", scp_table_to_response(&table))
+        match self.read_scp_table(&path).await {
+            Ok(table) => WsFrame::ok_response("", scp_table_to_response(&table)),
+            Err(e) => WsFrame::error_response("", &e),
+        }
     }
 
     /// `wiki_scope.update` — set (or clear) a single namespace's policy. Params:
     /// `{ namespace, mode: agent_writable|read_only|operator_only, synced_from?,
     /// remove? }`. `remove=true` deletes the entry (reverts to agent_writable
     /// default). Atomic write. Response: `{ success, change }`.
+    ///
+    /// Fail-closed on a malformed existing file: read happens through
+    /// [`Self::read_scp_table`], which returns `Err` instead of silently
+    /// treating unparseable content as empty — so this handler bails out
+    /// BEFORE calling `scp_apply_namespace`/`atomic_write_toml`, and the
+    /// broken file on disk is never touched (previously it would have been
+    /// clobbered with a table containing only the one namespace just set).
     async fn handle_wiki_scope_update(&self, params: Value) -> WsFrame {
         let namespace = match params
             .get("namespace")
@@ -8997,7 +9236,10 @@ impl MethodHandler {
             .join("shared")
             .join("wiki")
             .join(".scope.toml");
-        let mut table = self.read_config_table(&path).await;
+        let mut table = match self.read_scp_table(&path).await {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         let change = match scp_apply_namespace(&mut table, &namespace, mode, synced_from, remove) {
             Ok(c) => c,
             Err(e) => return WsFrame::error_response("", &e),
@@ -9743,6 +9985,8 @@ impl MethodHandler {
                         .as_str()),
                     );
                 }
+                let notify_policy =
+                    crate::notify_governance::load_agent_policy(&self.home_dir, &cfg.agent.name);
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -9795,6 +10039,26 @@ impl MethodHandler {
                             "notify_channel": cfg.proactive.notify_channel,
                             "notify_chat_id": cfg.proactive.notify_chat_id,
                             "notify_thread_id": cfg.proactive.notify_thread_id,
+                            // W2-4 notification governance (F10: a suppression
+                            // rule the UI cannot state is a silent failure).
+                            // `quiet_hours` is the effective `HH:MM-HH:MM`
+                            // window after the agent → global fallback, or
+                            // null when nothing is ever held back;
+                            // `quiet_hours_note` is the zh-TW sentence saying
+                            // exactly what is deferred and what still gets
+                            // through, ready to render as-is.
+                            "quiet_hours": notify_policy.window.map(|w| w.to_display()),
+                            "quiet_hours_note": notify_policy.suppression_note_zh(),
+                            // W2-8 — the agent's OWN raw value (never the
+                            // fallen-back one above), for the edit form's
+                            // initial value. See `agent_raw_quiet_hours` doc:
+                            // prefilling from the effective `quiet_hours`
+                            // instead would pin the global default into this
+                            // agent's own config on the next unrelated save.
+                            "quiet_hours_own": crate::notify_governance::agent_raw_quiet_hours(
+                                &self.home_dir,
+                                &cfg.agent.name,
+                            ),
                         },
                         "permissions": {
                             "can_create_agents": cfg.permissions.can_create_agents,
@@ -10625,6 +10889,335 @@ impl MethodHandler {
                 "max_uses": effective_uses,
             }),
         )
+    }
+
+    // ── W2-2 (E1/E2, D-C1): channel behavior + access control ────────────
+    //
+    // Reads/writes go through the exact same `ChannelSettingsManager` the
+    // `channel_config`/`channel_config_list` MCP tools use
+    // (`duduclaw-cli::mcp::handle_channel_config`) — a fresh instance is
+    // opened per call (as the MCP handlers already do; the underlying SQLite
+    // file, not the in-process cache, is the single state authority) so a
+    // channel-side `/pair`-adjacent change and a dashboard edit are never two
+    // different stores. Validation (`CONFIG_KEYS`/`DASHBOARD_ACCESS_KEYS`/
+    // `validate_scope_id`/`validate_setting_value`) is centralized in
+    // `crate::channel_settings` for the same reason.
+
+    /// Open a fresh `ChannelSettingsManager` against the shared session DB.
+    fn open_channel_settings(&self) -> Result<crate::channel_settings::ChannelSettingsManager, String> {
+        crate::channel_settings::ChannelSettingsManager::from_session_db(
+            &self.home_dir.join("sessions.db"),
+        )
+    }
+
+    /// Validate `{ channel, scope_id? }` params shared by all six methods.
+    /// `force_global`: access-control keys only ever take effect at the
+    /// `"global"` scope (`channel_reply::check_user_access_gate`/
+    /// `is_channel_admin` both hardcode `"global"`) — accepting a different
+    /// scope_id for `access_get`/`access_set` would silently write settings
+    /// nothing ever reads, so those two force it instead of trusting input.
+    fn parse_channel_scope(
+        &self,
+        params: &Value,
+        force_global: bool,
+    ) -> std::result::Result<(String, String), WsFrame> {
+        let channel = match params.get("channel").and_then(|v| v.as_str()) {
+            Some(c) if !c.is_empty() => c.to_string(),
+            _ => return Err(WsFrame::error_response("", "Missing required parameter: channel")),
+        };
+        if !crate::channel_settings::VALID_CHANNEL_TYPES.contains(&channel.as_str()) {
+            return Err(WsFrame::error_response(
+                "",
+                &format!("Invalid channel type: {channel}"),
+            ));
+        }
+        let scope_id = if force_global {
+            "global".to_string()
+        } else {
+            params
+                .get("scope_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("global")
+                .to_string()
+        };
+        if let Err(e) = crate::channel_settings::validate_scope_id(&scope_id) {
+            return Err(WsFrame::error_response("", &format!("Invalid scope_id: {e}")));
+        }
+        Ok((channel, scope_id))
+    }
+
+    /// `channels.config_get` — read a channel's behavior settings (E1).
+    /// Params: `{ channel, scope_id? }` (scope_id defaults to "global").
+    /// Response: `{ success, channel, scope_id, settings{}, scopes[] }` —
+    /// `scopes` lists other known scopes (e.g. Discord guild ids) for that
+    /// channel type so the caller can offer a per-scope override, without
+    /// this task committing to a full per-scope editor UI.
+    async fn handle_channels_config_get(&self, params: Value) -> WsFrame {
+        let (channel, scope_id) = match self.parse_channel_scope(&params, false) {
+            Ok(v) => v,
+            Err(frame) => return frame,
+        };
+        let mgr = match self.open_channel_settings() {
+            Ok(m) => m,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open settings store: {e}")),
+        };
+        let all = mgr.get_all(&channel, &scope_id).await;
+        let scopes = mgr.list_scopes(&channel).await;
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "channel": channel,
+                "scope_id": scope_id,
+                "settings": config_settings_to_json(&all),
+                "scopes": scopes,
+            }),
+        )
+    }
+
+    /// `channels.config_set` — write a channel's behavior settings (E1).
+    /// Params: `{ channel, scope_id?, settings: { <CONFIG_KEYS field>: value, ... } }`.
+    /// Partial update: only the fields present in `settings` change; a field
+    /// set to JSON `null` clears the override for that scope (falls back to
+    /// global / the hardcoded default). Fail-closed: any key outside
+    /// `CONFIG_KEYS` rejects the whole call before writing anything.
+    /// Response: `{ success, channel, scope_id, changes[] }`.
+    async fn handle_channels_config_set(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let (channel, scope_id) = match self.parse_channel_scope(&params, false) {
+            Ok(v) => v,
+            Err(frame) => return frame,
+        };
+        let settings_obj = match params.get("settings").and_then(|v| v.as_object()) {
+            Some(o) if !o.is_empty() => o,
+            Some(_) => return WsFrame::error_response("", "settings object is empty"),
+            None => return WsFrame::error_response("", "Missing required parameter: settings (object)"),
+        };
+        for key in settings_obj.keys() {
+            if !crate::channel_settings::CONFIG_KEYS.contains(&key.as_str()) {
+                return WsFrame::error_response("", &format!("Unknown setting key: {key}"));
+            }
+        }
+        let mgr = match self.open_channel_settings() {
+            Ok(m) => m,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open settings store: {e}")),
+        };
+        let changes = match self
+            .apply_channel_settings(&mgr, &channel, &scope_id, settings_obj)
+            .await
+        {
+            Ok(c) => c,
+            Err(frame) => return frame,
+        };
+
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "channel_config_set",
+                &channel,
+                duduclaw_security::audit::Severity::Info,
+                json!({
+                    "scope_id": scope_id,
+                    "changes": changes,
+                    "actor": ctx.user_id,
+                    "source": "dashboard",
+                }),
+            ),
+        );
+        crate::dashboard_feedback::emit(
+            &self.home_dir,
+            crate::dashboard_feedback::EV_CHANNEL_CONFIG_CHANGED,
+            json!({ "action": "config_set", "channel": channel, "scope_id": scope_id }),
+        )
+        .await;
+
+        info!(channel = channel.as_str(), scope_id = scope_id.as_str(), "channels.config_set completed");
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "channel": channel, "scope_id": scope_id, "changes": changes }),
+        )
+    }
+
+    /// `channels.access_get` — read a channel's access-control settings (E2):
+    /// `require_pairing` / `allowed_users` / `blocked_users` / `admin_users`.
+    /// Always the `"global"` scope (see `parse_channel_scope`). Params:
+    /// `{ channel }`. Response: `{ success, channel, settings{} }`.
+    async fn handle_channels_access_get(&self, params: Value) -> WsFrame {
+        let (channel, scope_id) = match self.parse_channel_scope(&params, true) {
+            Ok(v) => v,
+            Err(frame) => return frame,
+        };
+        let mgr = match self.open_channel_settings() {
+            Ok(m) => m,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open settings store: {e}")),
+        };
+        let all = mgr.get_all(&channel, &scope_id).await;
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "channel": channel, "settings": access_settings_to_json(&all) }),
+        )
+    }
+
+    /// `channels.access_set` — write a channel's access-control settings (E2).
+    /// Params: `{ channel, settings: { <DASHBOARD_ACCESS_KEYS field>: value, ... } }`.
+    /// Dashboard-only write path for `admin_users` (who may press `!STOP`
+    /// in-channel) — the `channel_config` MCP tool refuses that key by design
+    /// (`MCP_ACCESS_KEYS` excludes it), so an agent can never self-grant admin.
+    /// Fail-closed on unknown keys, same partial-update / `null`-clears
+    /// semantics as `config_set`. Response: `{ success, channel, changes[] }`.
+    async fn handle_channels_access_set(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let (channel, scope_id) = match self.parse_channel_scope(&params, true) {
+            Ok(v) => v,
+            Err(frame) => return frame,
+        };
+        let settings_obj = match params.get("settings").and_then(|v| v.as_object()) {
+            Some(o) if !o.is_empty() => o,
+            Some(_) => return WsFrame::error_response("", "settings object is empty"),
+            None => return WsFrame::error_response("", "Missing required parameter: settings (object)"),
+        };
+        for key in settings_obj.keys() {
+            if !crate::channel_settings::DASHBOARD_ACCESS_KEYS.contains(&key.as_str()) {
+                return WsFrame::error_response("", &format!("Unknown setting key: {key}"));
+            }
+        }
+        let mgr = match self.open_channel_settings() {
+            Ok(m) => m,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open settings store: {e}")),
+        };
+        let changes = match self
+            .apply_channel_settings(&mgr, &channel, &scope_id, settings_obj)
+            .await
+        {
+            Ok(c) => c,
+            Err(frame) => return frame,
+        };
+
+        // `admin_users` controls `!STOP` — always Warning severity regardless
+        // of which other keys were touched in the same call.
+        let severity = if settings_obj.contains_key(crate::channel_settings::keys::ADMIN_USERS) {
+            duduclaw_security::audit::Severity::Warning
+        } else {
+            duduclaw_security::audit::Severity::Info
+        };
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "channel_access_set",
+                &channel,
+                severity,
+                json!({
+                    "scope_id": scope_id,
+                    "changes": changes,
+                    "actor": ctx.user_id,
+                    "source": "dashboard",
+                }),
+            ),
+        );
+        crate::dashboard_feedback::emit(
+            &self.home_dir,
+            crate::dashboard_feedback::EV_CHANNEL_CONFIG_CHANGED,
+            json!({ "action": "access_set", "channel": channel, "scope_id": scope_id }),
+        )
+        .await;
+
+        info!(channel = channel.as_str(), "channels.access_set completed");
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "channel": channel, "scope_id": scope_id, "changes": changes }),
+        )
+    }
+
+    /// Shared partial-update loop for `config_set`/`access_set`: validates
+    /// every value before writing anything (so a bad field in a multi-field
+    /// call can't leave a half-applied setting), converts to the store's
+    /// string encoding, and returns the applied changes for the audit event.
+    async fn apply_channel_settings(
+        &self,
+        mgr: &crate::channel_settings::ChannelSettingsManager,
+        channel: &str,
+        scope_id: &str,
+        settings_obj: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Vec<Value>, WsFrame> {
+        // Validate-then-write: reject the whole call on the first bad value
+        // instead of applying a valid prefix and erroring on the rest.
+        let mut encoded: Vec<(&str, Option<String>)> = Vec::with_capacity(settings_obj.len());
+        for (key, value) in settings_obj {
+            if value.is_null() {
+                encoded.push((key.as_str(), None));
+                continue;
+            }
+            let value_str = match json_value_to_setting_string(key, value) {
+                Ok(s) => s,
+                Err(e) => return Err(WsFrame::error_response("", &e)),
+            };
+            if let Err(e) = crate::channel_settings::validate_setting_value(key, &value_str) {
+                return Err(WsFrame::error_response("", &format!("Invalid value for {key}: {e}")));
+            }
+            encoded.push((key.as_str(), Some(value_str)));
+        }
+
+        let mut changes = Vec::with_capacity(encoded.len());
+        for (key, value_str) in encoded {
+            match &value_str {
+                None => {
+                    if let Err(e) = mgr.delete(channel, scope_id, key).await {
+                        return Err(WsFrame::error_response("", &format!("Failed to clear {key}: {e}")));
+                    }
+                }
+                Some(v) => {
+                    if let Err(e) = mgr.set(channel, scope_id, key, v).await {
+                        return Err(WsFrame::error_response("", &format!("Failed to set {key}: {e}")));
+                    }
+                }
+            }
+            changes.push(json!({ "key": key, "value": value_str }));
+        }
+        Ok(changes)
+    }
+
+    /// `channels.pairing_list` — list approved pairing subjects (E2). This
+    /// list is shared across channel types (`AccessController`'s persisted
+    /// `approved` set carries no channel dimension — matching the
+    /// `pairing_manage action=list` MCP tool exactly), so unlike the other
+    /// five methods it takes no `channel` param.
+    /// Response: `{ success, approved: string[] }`.
+    async fn handle_channels_pairing_list(&self) -> WsFrame {
+        let ctrl = crate::access_control::AccessController::with_persistence(
+            self.home_dir.join("access_control.json"),
+        );
+        let approved = ctrl.runtime_approved_users().await;
+        WsFrame::ok_response("", json!({ "success": true, "approved": approved }))
+    }
+
+    /// `channels.pairing_revoke` — revoke an approved pairing subject (E2).
+    /// Params: `{ subject }`. Response: `{ success, subject, revoked }`.
+    async fn handle_channels_pairing_revoke(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let subject = match params.get("subject").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing required parameter: subject"),
+        };
+        let ctrl = crate::access_control::AccessController::with_persistence(
+            self.home_dir.join("access_control.json"),
+        );
+        ctrl.revoke_user(&subject).await;
+
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "channel_pairing_revoke",
+                &subject,
+                duduclaw_security::audit::Severity::Warning,
+                json!({ "actor": ctx.user_id, "source": "dashboard" }),
+            ),
+        );
+        crate::dashboard_feedback::emit(
+            &self.home_dir,
+            crate::dashboard_feedback::EV_CHANNEL_CONFIG_CHANGED,
+            json!({ "action": "pairing_revoke", "subject": subject }),
+        )
+        .await;
+
+        info!(subject = subject.as_str(), "channels.pairing_revoke completed");
+        WsFrame::ok_response("", json!({ "success": true, "subject": subject, "revoked": true }))
     }
 
     async fn handle_channels_remove(&self, params: Value) -> WsFrame {
@@ -13423,8 +14016,8 @@ impl MethodHandler {
         } else {
             self.user_department(&ctx.user_id).await
         };
-        let actionable: Vec<Value> = pending
-            .iter()
+        let actionable: Vec<_> = pending
+            .into_iter()
             .filter(|r| {
                 if is_admin {
                     true
@@ -13436,12 +14029,9 @@ impl MethodHandler {
                         && r.manager_may_sign(mgr_dept.as_deref())
                 }
             })
-            .map(|r| r.to_json())
             .collect();
-        WsFrame::ok_response(
-            "",
-            json!({ "requests": actionable, "count": actionable.len() }),
-        )
+        let items = self.install_requests_with_channel_link(&actionable).await;
+        WsFrame::ok_response("", json!({ "requests": items, "count": items.len() }))
     }
 
     /// The caller's own install requests (any authenticated user).
@@ -13452,11 +14042,59 @@ impl MethodHandler {
         };
         match store.list_for_requester(&ctx.user_id).await {
             Ok(rows) => {
-                let items: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
+                let items = self.install_requests_with_channel_link(&rows).await;
                 WsFrame::ok_response("", json!({ "requests": items, "count": items.len() }))
             }
             Err(e) => WsFrame::error_response("", &format!("list mine: {e}")),
         }
+    }
+
+    /// E8 extension: enrich each install request's JSON with the same "open in
+    /// `channel`" reverse-handoff pair (`channel` / `channel_link`) tasks and
+    /// approvals already carry (E8). Resolution goes through
+    /// `install_notify::resolve_channel_target` (recorded decision card, else
+    /// the current stage's first reachable approver — see that function's
+    /// docs) and then `channel_link::resolve_conversation_link` to turn
+    /// `(channel, chat_id, message_id)` into an actual URL. Best-effort: no
+    /// user DB, no resolvable target, or no constructible link for the
+    /// platform all degrade to `null` — never a raw chat/message id crosses
+    /// to the frontend (project convention: internal identifiers don't leak
+    /// to the UI), and a resolution failure never blocks the list itself.
+    async fn install_requests_with_channel_link(
+        &self,
+        rows: &[crate::install_requests::InstallRequest],
+    ) -> Vec<Value> {
+        let db = self.user_db.read().await.as_ref().cloned();
+        let mut items = Vec::with_capacity(rows.len());
+        for r in rows {
+            let mut v = r.to_json();
+            let resolved = match &db {
+                Some(db) => crate::install_notify::resolve_channel_target(&self.home_dir, db, r).await,
+                None => None,
+            };
+            let channel_link = match resolved {
+                Some((channel, chat_id, message_id)) => {
+                    // W2-7: install-request targets don't snapshot a Discord
+                    // guild id anywhere today, so this passes `None` — same
+                    // honest gap as before this parameter existed, not a
+                    // regression (see `channel_link.rs` module docs).
+                    crate::channel_link::resolve_conversation_link(
+                        &self.home_dir,
+                        &channel,
+                        &chat_id,
+                        message_id.as_deref(),
+                        None,
+                    )
+                    .await
+                    .map(|link| (channel, link))
+                }
+                None => None,
+            };
+            v["channel"] = json!(channel_link.as_ref().map(|(c, _)| c.clone()));
+            v["channel_link"] = json!(channel_link.as_ref().map(|(_, l)| l.clone()));
+            items.push(v);
+        }
+        items
     }
 
     /// Decide an install request (manager+). On final approval the install is
@@ -16724,6 +17362,13 @@ impl MethodHandler {
                 .unwrap_or(true)
         };
 
+        // Structured [notify] daily_digest so the dashboard Settings toggle +
+        // time field show the saved values (W2-8). Reuses `DigestConfig`'s
+        // own fail-open parser rather than re-implementing it — same
+        // "absent/malformed ⇒ default (off, 09:00)" posture every other
+        // structured field on this response follows.
+        let digest_cfg = crate::notify_digest::DigestConfig::from_home(&self.home_dir);
+
         match tokio::fs::read_to_string(&config_path).await {
             Ok(content) => {
                 // Mask sensitive fields
@@ -16740,6 +17385,8 @@ impl MethodHandler {
                                 "allowed_origins": allowed_origins,
                                 "gap_digest_enabled": gap_digest_enabled,
                                 "novelty_gate_enabled": novelty_gate_enabled,
+                                "daily_digest_enabled": digest_cfg.enabled,
+                                "daily_digest_at": digest_cfg.at.format("%H:%M").to_string(),
                             }),
                         )
                     }
@@ -17230,7 +17877,31 @@ impl MethodHandler {
                 let error_msg = row.get("error").and_then(|v| v.as_str()).unwrap_or("");
 
                 let event_type = format!("channel.{reason}");
-                let summary = truncate_bytes(error_msg, SUMMARY_MAX_BYTES).to_string();
+                // W2-8: `channel_alerts::record_recovery` appends a
+                // `channel_recovered` row to this SAME file (see its module
+                // docs) so a consumer can tell "is this outage still
+                // current?" without re-deriving the failure window. That row
+                // carries no `error` field — it isn't a failure — so without
+                // this branch it rendered here with a blank summary next to
+                // the same amber "warning" border as an actual outage: a
+                // recovery silently looking like an unexplained warning.
+                let is_recovery = row.get("event").and_then(|v| v.as_str())
+                    == Some(crate::channel_alerts::RECOVERED_EVENT);
+                let (severity, summary) = if is_recovery {
+                    let channel_name = row.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                    (
+                        "info",
+                        format!(
+                            "通道「{}」已恢復正常發送",
+                            crate::channel_alerts::channel_label(channel_name)
+                        ),
+                    )
+                } else {
+                    (
+                        "warning",
+                        truncate_bytes(error_msg, SUMMARY_MAX_BYTES).to_string(),
+                    )
+                };
 
                 if let Some(af) = &agent_id_filter
                     && &agent_id != af
@@ -17243,7 +17914,7 @@ impl MethodHandler {
                     "source": "channel_failure",
                     "event_type": event_type,
                     "agent_id": agent_id,
-                    "severity": "warning",
+                    "severity": severity,
                     "summary": summary,
                     "details": { "channel_failure": row },
                 }));
@@ -19314,6 +19985,45 @@ impl MethodHandler {
                 changes.push(format!("memory.novelty_gate = {v} (applies to new sessions)"));
             } else {
                 return WsFrame::error_response("", "Invalid [memory] section in config.toml");
+            }
+        }
+
+        // ── W2-8 [notify] daily_digest / daily_digest_at (dashboard toggle) ──
+        // Re-read from config.toml on every `DailyDigestScheduler` tick
+        // (`notify_digest.rs::DigestConfig::from_home`), so persisting is
+        // enough — no restart, no hot-reload plumbing (same posture as
+        // gap_digest_enabled above). `daily_digest_at` is validated with the
+        // SAME parser the scheduler itself uses (`notify_digest::parse_clock`)
+        // so a malformed time is rejected here rather than silently falling
+        // back to 09:00 hours later when the scheduler's own fail-open read
+        // path hits it.
+        {
+            let has_notify = ["daily_digest", "daily_digest_at"]
+                .iter()
+                .any(|k| params.get(*k).is_some());
+            if has_notify {
+                let notify = table
+                    .entry("notify")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut();
+                let Some(notify) = notify else {
+                    return WsFrame::error_response("", "Invalid [notify] section in config.toml");
+                };
+                if let Some(v) = params.get("daily_digest").and_then(|v| v.as_bool()) {
+                    notify.insert("daily_digest".into(), toml::Value::Boolean(v));
+                    changes.push(format!("notify.daily_digest = {v}"));
+                }
+                if let Some(v) = params.get("daily_digest_at").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if crate::notify_digest::parse_clock(v).is_none() {
+                        return WsFrame::error_response(
+                            "",
+                            &format!("Invalid notify.daily_digest_at '{v}' (need \"HH:MM\", e.g. \"09:00\")"),
+                        );
+                    }
+                    notify.insert("daily_digest_at".into(), toml::Value::String(v.into()));
+                    changes.push(format!("notify.daily_digest_at = \"{v}\""));
+                }
             }
         }
 
@@ -24939,7 +25649,40 @@ impl MethodHandler {
         let priority = params.get("priority").and_then(|v| v.as_str());
         match store.list_tasks(status, agent_id, priority).await {
             Ok(rows) => {
-                let tasks: Vec<Value> = rows.iter().map(|r| task_row_to_json(r)).collect();
+                // E8 reverse handoff: "在 <通道> 中開啟" — resolve from the
+                // `/goal` entry point's stamped source conversation
+                // (`source_channel`/`source_chat_id`, P5 write-back). No
+                // message id is stamped at goal-creation time today (see
+                // `channel_link.rs` module docs for the platforms this
+                // still reaches without one), so this is always a
+                // conversation-level link, never message-level. Only the
+                // resolved URL (or nothing) crosses to the frontend — the
+                // raw `chat_id` never does (project convention: internal
+                // identifiers don't leak to the UI).
+                let mut tasks: Vec<Value> = Vec::with_capacity(rows.len());
+                for r in &rows {
+                    let mut v = task_row_to_json(r);
+                    let channel_link = match (r.source_channel.as_deref(), r.source_chat_id.as_deref()) {
+                        (Some(channel), Some(chat_id)) if !channel.is_empty() && !chat_id.is_empty() => {
+                            // W2-7: Discord's guild id was snapshotted onto
+                            // this row at `/goal` creation time (see
+                            // `channel_link.rs` module docs) — pass it
+                            // through rather than re-resolving it live.
+                            crate::channel_link::resolve_conversation_link(
+                                &self.home_dir,
+                                channel,
+                                chat_id,
+                                None,
+                                r.source_discord_guild_id.as_deref(),
+                            )
+                            .await
+                        }
+                        _ => None,
+                    };
+                    v["channel"] = json!(r.source_channel);
+                    v["channel_link"] = json!(channel_link);
+                    tasks.push(v);
+                }
                 WsFrame::ok_response("", json!({ "tasks": tasks }))
             }
             Err(e) => WsFrame::error_response("", &format!("list tasks: {e}")),
@@ -26504,6 +27247,43 @@ impl MethodHandler {
             .map_err(|e| WsFrame::error_response("", &format!("open fork store: {e}")))
     }
 
+    /// `notify.stats` — per-type notification action rate over the last
+    /// `days` days (default 30, clamped 1–365 by the data layer).
+    ///
+    /// The SRE 50% rule (P4-5) is applied server-side: `broken: true` means
+    /// "this notification type has enough actionable samples and fewer than
+    /// half of them made anyone do anything". Types with nothing to press
+    /// (plain FYI lines) report `actionable: 0` and are never flagged —
+    /// see [`crate::notify_stats`] for why that would be a tautology.
+    fn handle_notify_stats(&self, params: Value) -> WsFrame {
+        let days = params.get("days").and_then(|v| v.as_i64()).unwrap_or(30);
+        let rows = crate::notify_stats::stats(&self.home_dir, days);
+        let types: Vec<Value> = rows
+            .iter()
+            .map(|s| {
+                json!({
+                    "type": s.notify_type,
+                    "pushed": s.pushed,
+                    "actionable": s.actionable,
+                    "acted": s.acted,
+                    // Two decimals is all a percentage bar needs, and it
+                    // keeps the payload from carrying float noise.
+                    "action_rate": (s.action_rate * 100.0).round() / 100.0,
+                    "broken": s.broken,
+                })
+            })
+            .collect();
+        WsFrame::ok_response(
+            "",
+            json!({
+                "days": days.clamp(1, 365),
+                "broken_threshold": crate::notify_stats::BROKEN_RATE,
+                "min_sample": crate::notify_stats::MIN_SAMPLE,
+                "types": types,
+            }),
+        )
+    }
+
     fn handle_fork_list(&self, params: Value) -> WsFrame {
         // No fork has ever been created yet → the store file doesn't exist.
         // That's an empty list, not an error: return [] so the dashboard shows
@@ -26752,34 +27532,84 @@ impl MethodHandler {
         };
         match broker.list_pending(agent_filter).await {
             Ok(rows) => {
-                let items: Vec<Value> = rows
-                    .iter()
-                    .filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k))
-                    .map(|r| {
-                        let kind = crate::governance::ApprovalKind::parse(&r.action_kind);
-                        json!({
-                            "id": r.id.as_str(),
-                            "agent_id": r.agent_id,
-                            "kind": kind.as_str(),
-                            "summary": r.summary,
-                            "payload": r.payload,
-                            "created_at": r.created_at,
-                            "ttl_seconds": r.ttl_seconds,
-                            // Epoch seconds the approval auto-denies at (TTL
-                            // expiry counts as a denial — see approval.rs). Lets
-                            // the dashboard render a live countdown without
-                            // parsing `created_at` itself. `null` on an
-                            // unparseable `created_at` (fail-safe).
-                            "expires_at": r.expires_at_epoch(),
-                            // D1/D2: the ActionGuard judge's forward-simulation
-                            // narrative (world_state_change + risk_points), when the
-                            // approval kind ran that judge. `null` for every other
-                            // kind (the overwhelming majority) — the dashboard
-                            // renders nothing when this is absent, purely additive.
-                            "simulation": r.simulation,
-                        })
-                    })
-                    .collect();
+                let mut items: Vec<Value> = Vec::with_capacity(rows.len());
+                for r in rows.iter().filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k)) {
+                    let kind = crate::governance::ApprovalKind::parse(&r.action_kind);
+                    // E8 reverse handoff: "在 <通道> 中開啟" — the WP20
+                    // `notify_channel`/`notify_chat_id` columns already record
+                    // where this approval's decision card was actually pushed
+                    // (the conversation to jump back to); `decision_message_store`
+                    // has the exact message id for it when a card was recorded
+                    // there. A goal-kickoff approval (`action_kind ==
+                    // "goal_kickoff"`) files its card under the `goal_kickoff`
+                    // namespace instead of `approval` (`goal_notify::notify_goal_kickoff`
+                    // is self-notifying — see `SELF_NOTIFYING_KINDS` in
+                    // `approval.rs`), so the namespace must match. Only the
+                    // resolved URL (or nothing) crosses to the frontend — the raw
+                    // `chat_id` never does.
+                    let namespace = if r.action_kind == "goal_kickoff" {
+                        crate::decision_action::DecisionSource::Kickoff.namespace()
+                    } else {
+                        crate::decision_action::DecisionSource::Approval.namespace()
+                    };
+                    let channel_link = match (r.notify_channel.as_deref(), r.notify_chat_id.as_deref()) {
+                        (Some(channel), Some(chat_id)) if !channel.is_empty() && !chat_id.is_empty() => {
+                            let message_id = crate::decision_message_store::lookup_card_message(
+                                &self.home_dir,
+                                namespace,
+                                r.id.as_str(),
+                                channel,
+                                chat_id,
+                            )
+                            .map(|p| p.message_id);
+                            // W2-7: Discord's guild id was snapshotted onto
+                            // this card's entry at push time — pass it
+                            // through rather than re-resolving it live.
+                            let discord_guild_id = crate::decision_message_store::lookup_card_discord_guild_id(
+                                &self.home_dir,
+                                namespace,
+                                r.id.as_str(),
+                                channel,
+                                chat_id,
+                            );
+                            crate::channel_link::resolve_conversation_link(
+                                &self.home_dir,
+                                channel,
+                                chat_id,
+                                message_id.as_deref(),
+                                discord_guild_id.as_deref(),
+                            )
+                            .await
+                        }
+                        _ => None,
+                    };
+                    items.push(json!({
+                        "id": r.id.as_str(),
+                        "agent_id": r.agent_id,
+                        "kind": kind.as_str(),
+                        "summary": r.summary,
+                        "payload": r.payload,
+                        "created_at": r.created_at,
+                        "ttl_seconds": r.ttl_seconds,
+                        // Epoch seconds the approval auto-denies at (TTL
+                        // expiry counts as a denial — see approval.rs). Lets
+                        // the dashboard render a live countdown without
+                        // parsing `created_at` itself. `null` on an
+                        // unparseable `created_at` (fail-safe).
+                        "expires_at": r.expires_at_epoch(),
+                        // D1/D2: the ActionGuard judge's forward-simulation
+                        // narrative (world_state_change + risk_points), when the
+                        // approval kind ran that judge. `null` for every other
+                        // kind (the overwhelming majority) — the dashboard
+                        // renders nothing when this is absent, purely additive.
+                        "simulation": r.simulation,
+                        // E8: platform name (safe to expose — no internal id)
+                        // + a fully-resolved "open in channel" URL, or `null`
+                        // when nothing could be constructed.
+                        "channel": r.notify_channel,
+                        "channel_link": channel_link,
+                    }));
+                }
                 WsFrame::ok_response("", json!({ "approvals": items, "count": items.len() }))
             }
             Err(e) => WsFrame::error_response("", &format!("list approvals: {e}")),
@@ -27611,6 +28441,98 @@ impl MethodHandler {
         }
     }
 
+    // ── Resident sensing observability (WP4) ────────────────
+
+    /// `ticks.sources` — every configured `[[tick.sources]]` entry (whether
+    /// currently active or not — the master `[tick] enabled` switch and each
+    /// source's own `enabled` flag are both surfaced so the dashboard can
+    /// tell "off" from "never emitted"), joined with its live counters from
+    /// the shared `TickHub`. Zero counts and `null` timestamps, never an
+    /// error, when the hub was never wired (feature not started this boot).
+    async fn handle_ticks_sources(&self) -> WsFrame {
+        let cfg = crate::tick_config::TickConfig::from_home(&self.home_dir);
+        let hub = self.tick_hub.read().await.clone();
+
+        let mut sources = Vec::with_capacity(cfg.sources.len());
+        for s in &cfg.sources {
+            let (counters, events_per_minute_approx) = match &hub {
+                Some(hub) => (
+                    hub.counters_snapshot(&s.id).await,
+                    hub.events_per_minute_approx(&s.id).await,
+                ),
+                None => (crate::tick_source::SourceCountersSnapshot::default(), 0.0),
+            };
+            sources.push(json!({
+                "id": s.id,
+                "kind": s.kind.as_str(),
+                "enabled": s.enabled,
+                "interval_secs": s.interval_secs,
+                "max_events_per_minute": s.max_events_per_minute,
+                "last_tick_ts": counters.last_tick_ts,
+                "events_per_minute_approx": events_per_minute_approx,
+                "events_emitted_total": counters.events_emitted,
+                "dropped": {
+                    "rate_cap": counters.dropped_rate_cap,
+                    "unchanged": counters.dropped_unchanged,
+                    "oversize": counters.dropped_oversize,
+                    "fetch_error": counters.dropped_fetch_error,
+                },
+            }));
+        }
+
+        let screen = match &hub {
+            Some(hub) => {
+                let (pass, drop, unavailable) = hub.screen_counts();
+                json!({ "pass": pass, "drop": drop, "unavailable": unavailable })
+            }
+            None => json!({ "pass": 0, "drop": 0, "unavailable": 0 }),
+        };
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "enabled": cfg.enabled,
+                "allow_command_sources": cfg.allow_command_sources,
+                "sources": sources,
+                "screen": screen,
+            }),
+        )
+    }
+
+    /// `ticks.recent` — up to [`crate::tick_source::TICK_RECENT_RPC_LIMIT`]
+    /// (50) most recent buffered observations for one source, oldest first.
+    /// An unknown source, or the hub never having been wired, both resolve
+    /// to an empty `records` array — a source with no history yet is not an
+    /// error.
+    async fn handle_ticks_recent(&self, params: Value) -> WsFrame {
+        let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        if source.is_empty() {
+            return WsFrame::error_response("", "source is required");
+        }
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).min(crate::tick_source::TICK_RECENT_RPC_LIMIT))
+            .unwrap_or(crate::tick_source::TICK_RECENT_RPC_LIMIT);
+
+        let hub = self.tick_hub.read().await.clone();
+        let records = match &hub {
+            Some(hub) => hub.recent(source, limit).await,
+            None => Vec::new(),
+        };
+        let entries: Vec<Value> = records
+            .iter()
+            .map(|r| {
+                json!({
+                    "ts": r.ts,
+                    "fields": Value::Object(r.fields.clone()),
+                    "raw": r.raw,
+                })
+            })
+            .collect();
+        WsFrame::ok_response("", json!({ "source": source, "records": entries }))
+    }
+
     // ── OS-native page RPCs (P4-3) ──────────────────────────
 
     /// `os.status` — whole-fleet OS-native snapshot for the dashboard OS page.
@@ -28428,6 +29350,10 @@ pub(crate) fn validate_autopilot_trigger_event(ev: &str) -> Result<(), String> {
         // could never subscribe to either (2026-07-23 P3-4 audit follow-up).
         "os_file",
         "os_frontmost",
+        // Resident sensing (WP2) — `autopilot_engine::AutopilotEvent::Tick`.
+        // Without this entry a dashboard-authored rule could never subscribe
+        // to a configured `[[tick.sources]]` feed at all.
+        "tick",
     ];
     if KNOWN.iter().any(|k| *k == ev) {
         Ok(())
@@ -28482,13 +29408,27 @@ pub(crate) fn validate_autopilot_action(action: &Value) -> Result<(), String> {
         }
         other => return Err(format!("unknown action.type '{other}'")),
     }
+
+    // Resident sensing WP3: the optional local-model screening layer. Same
+    // write-time contract as everything above — a typo'd `mode`, an
+    // over-long prompt, or an out-of-range `timeout_secs` is refused here
+    // rather than surfacing as a degraded fire much later.
+    if let Some(screen) = obj.get("screen") {
+        if !screen.is_null() {
+            crate::autopilot_screen::validate_screen_spec(screen)?;
+        }
+    }
     Ok(())
 }
 
 /// WP9: resolve a Telegram bot's `@username` from its token via getMe.
 /// Returns `None` on any network/parse error or a non-ok Telegram response —
 /// the caller then fails closed (no deep-link minted).
-async fn fetch_telegram_bot_username(token: &str) -> Option<String> {
+///
+/// `pub(crate)`: also reused by `channel_link::cached_telegram_bot_username`
+/// (E8 reverse handoff) — same "resolve live from the configured token"
+/// contract, just cached with a TTL there instead of called fresh per bind.
+pub(crate) async fn fetch_telegram_bot_username(token: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -29528,6 +30468,23 @@ mod autopilot_validation_tests {
     }
 
     #[test]
+    fn trigger_event_accepts_resident_sensing_tick() {
+        // WP2: without this a `[[tick.sources]]` feed could be configured but
+        // never subscribed to from the dashboard.
+        assert!(validate_autopilot_trigger_event("tick").is_ok());
+        // The engine's own spelling is the contract — keep them in lockstep.
+        assert_eq!(
+            crate::autopilot_engine::AutopilotEvent::Tick {
+                source: "s1".into(),
+                ts: "2026-08-11T09:00:00+00:00".into(),
+                fields: serde_json::Value::Null,
+            }
+            .event_name(),
+            "tick"
+        );
+    }
+
+    #[test]
     fn trigger_event_rejects_typos() {
         assert!(validate_autopilot_trigger_event("task.created").is_err());
         assert!(validate_autopilot_trigger_event("").is_err());
@@ -29574,6 +30531,72 @@ mod autopilot_validation_tests {
     fn action_rejects_non_object() {
         assert!(validate_autopilot_action(&Value::Null).is_err());
         assert!(validate_autopilot_action(&json!("delegate")).is_err());
+    }
+
+    // ── WP3: `action.screen` structural validation ────────────────
+
+    fn delegate_with_screen(screen: Value) -> Value {
+        json!({
+            "type": "delegate",
+            "target_agent": "trader",
+            "prompt": "p",
+            "screen": screen,
+        })
+    }
+
+    #[test]
+    fn action_accepts_a_well_formed_screen() {
+        assert!(
+            validate_autopilot_action(&delegate_with_screen(json!({
+                "mode": "local",
+                "prompt": "只有真的異常才回 YES",
+                "on_unavailable": "drop",
+                "timeout_secs": 15,
+            })))
+            .is_ok()
+        );
+        // Minimal form (defaults fill the rest).
+        assert!(
+            validate_autopilot_action(&delegate_with_screen(
+                json!({ "mode": "local", "prompt": "p" })
+            ))
+            .is_ok()
+        );
+        // Absent / explicit null keeps every pre-WP3 rule valid.
+        assert!(
+            validate_autopilot_action(&json!({
+                "type": "delegate", "target_agent": "t", "prompt": "p"
+            }))
+            .is_ok()
+        );
+        assert!(validate_autopilot_action(&delegate_with_screen(Value::Null)).is_ok());
+    }
+
+    #[test]
+    fn action_rejects_a_malformed_screen_at_write_time() {
+        // Unknown mode (including a near-miss that a substring check would
+        // have let through), missing/empty prompt, over-long prompt, unknown
+        // policy, out-of-range timeout, non-object.
+        let over_long = "x".repeat(crate::autopilot_screen::MAX_SCREEN_RULE_PROMPT_BYTES + 1);
+        for bad in [
+            json!({ "mode": "cloud", "prompt": "p" }),
+            json!({ "mode": "local2", "prompt": "p" }),
+            json!({ "prompt": "p" }),
+            json!({ "mode": "local" }),
+            json!({ "mode": "local", "prompt": "  " }),
+            json!({ "mode": "local", "prompt": over_long }),
+            json!({ "mode": "local", "prompt": "p", "on_unavailable": "ignore" }),
+            json!({ "mode": "local", "prompt": "p", "timeout_secs": 0 }),
+            json!({ "mode": "local", "prompt": "p", "timeout_secs": 600 }),
+            json!({ "mode": "local", "prompt": "p", "timeout_secs": "10" }),
+            json!("local"),
+            json!([]),
+        ] {
+            assert!(
+                validate_autopilot_action(&delegate_with_screen(bad.clone())).is_err(),
+                "screen {bad} must be refused"
+            );
+        }
     }
 }
 
@@ -30935,6 +31958,36 @@ policies:
         let arr = resp["namespaces"].as_array().unwrap();
         assert_eq!(arr[0]["namespace"].as_str(), Some("alpha"));
         assert_eq!(arr[1]["namespace"].as_str(), Some("zeta"));
+    }
+
+    // ── W2-5: parse_scp_table_strict fail-closed on malformed .scope.toml ────
+
+    #[test]
+    fn scp_strict_parse_blank_or_absent_is_empty_table() {
+        assert!(parse_scp_table_strict("").unwrap().is_empty());
+        assert!(parse_scp_table_strict("   \n\t  ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn scp_strict_parse_malformed_content_is_err_not_silently_empty() {
+        // The exact bug this closes: `read_config_table` would have returned
+        // an empty table here (via `unwrap_or_default()`), which
+        // `handle_wiki_scope_update` then happily wrote back — erasing
+        // whatever the malformed file actually still held on disk.
+        let err = parse_scp_table_strict("this is :: not = valid = toml ===").unwrap_err();
+        assert!(err.contains("malformed"), "got: {err}");
+    }
+
+    #[test]
+    fn scp_strict_parse_valid_content_round_trips_into_the_same_shape_as_apply() {
+        let t = parse_scp_table_strict(
+            "[namespaces.identity]\nmode = \"read_only\"\nsynced_from = \"identity-provider\"\n",
+        )
+        .unwrap();
+        assert_eq!(scp_namespace_mode(&t, "identity").as_deref(), Some("read_only"));
+        let resp = scp_table_to_response(&t);
+        assert_eq!(resp["namespaces"][0]["namespace"].as_str(), Some("identity"));
+        assert_eq!(resp["namespaces"][0]["synced_from"].as_str(), Some("identity-provider"));
     }
 
     // ── XC.3: phone_number_id is NOT encrypted (alignment) ───────────────────
@@ -32644,6 +33697,73 @@ mod d6_curation_tests {
         );
     }
 
+    /// [notify] daily_digest / daily_digest_at round-trip (W2-8): persists,
+    /// `DigestConfig::from_home` reads the same shape back, and
+    /// `system.config` exposes both structured fields for the dashboard.
+    #[tokio::test]
+    async fn system_update_config_daily_digest_round_trip() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Absent config ⇒ fail-closed default (off, 09:00).
+        std::fs::write(home.path().join("config.toml"), "").unwrap();
+        let frame = handler.handle_system_config().await;
+        assert!(frame_ok(&frame));
+        let data = frame_data(&frame);
+        assert_eq!(data.get("daily_digest_enabled").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(data.get("daily_digest_at").and_then(|v| v.as_str()), Some("09:00"));
+
+        let frame = handler
+            .handle_system_update_config(json!({ "daily_digest": true, "daily_digest_at": "07:30" }))
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let cfg: toml::Table = raw.parse().unwrap();
+        assert_eq!(cfg["notify"]["daily_digest"].as_bool(), Some(true));
+        assert_eq!(cfg["notify"]["daily_digest_at"].as_str(), Some("07:30"));
+        // The scheduler's own reader parses the exact same shape.
+        let digest_cfg = crate::notify_digest::DigestConfig::from_toml_str(&raw);
+        assert!(digest_cfg.enabled);
+        assert_eq!(digest_cfg.at, chrono::NaiveTime::from_hms_opt(7, 30, 0).unwrap());
+
+        // system.config surfaces both structured fields for the dashboard.
+        let frame = handler.handle_system_config().await;
+        assert!(frame_ok(&frame));
+        let data = frame_data(&frame);
+        assert_eq!(data.get("daily_digest_enabled").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(data.get("daily_digest_at").and_then(|v| v.as_str()), Some("07:30"));
+
+        // Turning it back off round-trips too.
+        let frame = handler
+            .handle_system_update_config(json!({ "daily_digest": false }))
+            .await;
+        assert!(frame_ok(&frame));
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let cfg: toml::Table = raw.parse().unwrap();
+        assert_eq!(cfg["notify"]["daily_digest"].as_bool(), Some(false));
+        // The time set earlier is untouched by an update that only sent the flag.
+        assert_eq!(cfg["notify"]["daily_digest_at"].as_str(), Some("07:30"));
+    }
+
+    /// A malformed `daily_digest_at` is rejected at write time — fail-closed,
+    /// not silently accepted then blanked to 09:00 by the scheduler's own
+    /// fail-open read path hours later.
+    #[tokio::test]
+    async fn system_update_config_rejects_malformed_daily_digest_at() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_system_update_config(json!({ "daily_digest_at": "早上九點" }))
+            .await;
+        assert!(!frame_ok(&frame), "malformed daily_digest_at must be rejected");
+
+        // Nothing was written.
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap_or_default();
+        assert!(!raw.contains("daily_digest_at"));
+    }
+
     #[tokio::test]
     async fn system_update_config_rejects_bad_dispatch_policy_and_cap() {
         let home = tempfile::tempdir().unwrap();
@@ -33592,6 +34712,383 @@ mod channels_test_rpc_tests {
     }
 }
 
+/// W2-2 (E1/E2) — `channels.config_*` / `channels.access_*` /
+/// `channels.pairing_*` RPCs. These share `ChannelSettingsManager` /
+/// `AccessController` with the `channel_config`/`pairing_manage` MCP tools
+/// (`duduclaw-cli::mcp`), so a round-trip here also exercises the exact
+/// storage format the MCP side reads.
+#[cfg(test)]
+mod channels_config_access_rpc_tests {
+    use super::*;
+
+    fn admin_ctx() -> UserContext {
+        UserContext::admin_fallback()
+    }
+
+    fn manager_ctx() -> UserContext {
+        UserContext {
+            user_id: "m1".to_string(),
+            email: "m1@test.local".to_string(),
+            role: UserRole::Manager,
+            agent_access: std::collections::HashMap::new(),
+        }
+    }
+
+    fn frame_ok(f: &WsFrame) -> bool {
+        matches!(f, WsFrame::Response { ok: true, .. })
+    }
+
+    fn frame_data(f: &WsFrame) -> Value {
+        match f {
+            WsFrame::Response { payload, .. } => payload.clone().unwrap_or(Value::Null),
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    // ── config_get / config_set round trip ─────────────────────────────
+
+    #[tokio::test]
+    async fn config_get_defaults_on_a_never_configured_channel() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle("channels.config_get", json!({ "channel": "discord" }), &admin_ctx())
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        let data = frame_data(&frame);
+        assert_eq!(data["channel"], "discord");
+        assert_eq!(data["scope_id"], "global");
+        assert_eq!(data["settings"]["mention_only"], false);
+        assert_eq!(data["settings"]["auto_thread"], false);
+        assert_eq!(data["settings"]["response_mode"], "auto");
+        assert_eq!(data["settings"]["agent_override"], "");
+        assert_eq!(data["settings"]["allowed_channels"], json!([]));
+        assert!(data["settings"]["thread_archive_minutes"].is_null());
+    }
+
+    #[tokio::test]
+    async fn config_set_then_get_round_trips_every_field() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let set_frame = handler
+            .handle(
+                "channels.config_set",
+                json!({
+                    "channel": "discord",
+                    "settings": {
+                        "mention_only": true,
+                        "auto_thread": true,
+                        "allowed_channels": ["c1", "c2"],
+                        "allowed_guilds": ["g1"],
+                        "agent_override": "sam",
+                        "response_mode": "embed",
+                        "thread_archive_minutes": 1440,
+                    },
+                }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(frame_ok(&set_frame), "{set_frame:?}");
+        assert_eq!(frame_data(&set_frame)["changes"].as_array().unwrap().len(), 7);
+
+        let get_frame = handler
+            .handle("channels.config_get", json!({ "channel": "discord" }), &admin_ctx())
+            .await;
+        let data = frame_data(&get_frame);
+        assert_eq!(data["settings"]["mention_only"], true);
+        assert_eq!(data["settings"]["auto_thread"], true);
+        assert_eq!(data["settings"]["allowed_channels"], json!(["c1", "c2"]));
+        assert_eq!(data["settings"]["allowed_guilds"], json!(["g1"]));
+        assert_eq!(data["settings"]["agent_override"], "sam");
+        assert_eq!(data["settings"]["response_mode"], "embed");
+        // thread_archive_minutes round-trips as its string encoding.
+        assert_eq!(data["settings"]["thread_archive_minutes"], "1440");
+    }
+
+    #[tokio::test]
+    async fn config_set_null_clears_a_previously_set_field() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        handler
+            .handle(
+                "channels.config_set",
+                json!({ "channel": "telegram", "settings": { "agent_override": "sam" } }),
+                &admin_ctx(),
+            )
+            .await;
+        let cleared = handler
+            .handle(
+                "channels.config_set",
+                json!({ "channel": "telegram", "settings": { "agent_override": null } }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(frame_ok(&cleared), "{cleared:?}");
+        let get_frame = handler
+            .handle("channels.config_get", json!({ "channel": "telegram" }), &admin_ctx())
+            .await;
+        assert_eq!(frame_data(&get_frame)["settings"]["agent_override"], "");
+    }
+
+    // ── access_get / access_set round trip ──────────────────────────────
+
+    #[tokio::test]
+    async fn access_set_then_get_round_trips_admin_users() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let set_frame = handler
+            .handle(
+                "channels.access_set",
+                json!({
+                    "channel": "line",
+                    "settings": {
+                        "require_pairing": true,
+                        "allowed_users": ["u1"],
+                        "blocked_users": ["u2"],
+                        "admin_users": ["u1"],
+                    },
+                }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(frame_ok(&set_frame), "{set_frame:?}");
+
+        let get_frame = handler
+            .handle("channels.access_get", json!({ "channel": "line" }), &admin_ctx())
+            .await;
+        let data = frame_data(&get_frame);
+        assert_eq!(data["settings"]["require_pairing"], true);
+        assert_eq!(data["settings"]["allowed_users"], json!(["u1"]));
+        assert_eq!(data["settings"]["blocked_users"], json!(["u2"]));
+        assert_eq!(data["settings"]["admin_users"], json!(["u1"]));
+
+        // Audit log recorded the write with Warning severity (admin_users touched).
+        let audit_raw = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit_raw.contains("channel_access_set"));
+        assert!(audit_raw.contains("\"warning\""));
+    }
+
+    /// `access_set` always writes at the "global" scope even if a caller
+    /// passes a different `scope_id` — access-control keys are only ever
+    /// read at global scope in production (`channel_reply::check_user_access_gate`).
+    #[tokio::test]
+    async fn access_set_ignores_a_non_global_scope_id() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle(
+                "channels.access_set",
+                json!({
+                    "channel": "discord",
+                    "scope_id": "guild123",
+                    "settings": { "require_pairing": true },
+                }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        assert_eq!(frame_data(&frame)["scope_id"], "global");
+    }
+
+    // ── permission denial ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn non_admin_is_denied_on_every_method() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = manager_ctx();
+        for (method, params) in [
+            ("channels.config_get", json!({ "channel": "discord" })),
+            (
+                "channels.config_set",
+                json!({ "channel": "discord", "settings": { "mention_only": true } }),
+            ),
+            ("channels.access_get", json!({ "channel": "discord" })),
+            (
+                "channels.access_set",
+                json!({ "channel": "discord", "settings": { "require_pairing": true } }),
+            ),
+            ("channels.pairing_list", json!({})),
+            ("channels.pairing_revoke", json!({ "subject": "u1" })),
+        ] {
+            let frame = handler.handle(method, params, &ctx).await;
+            assert!(!frame_ok(&frame), "{method} must deny a manager: {frame:?}");
+        }
+
+        // The denied `channels.config_set`/`access_set` calls above must not
+        // have written anything — an admin reading the same channel back
+        // still sees the untouched defaults.
+        let get_frame = handler
+            .handle("channels.config_get", json!({ "channel": "discord" }), &admin_ctx())
+            .await;
+        assert_eq!(frame_data(&get_frame)["settings"]["mention_only"], false);
+        let access_frame = handler
+            .handle("channels.access_get", json!({ "channel": "discord" }), &admin_ctx())
+            .await;
+        assert_eq!(frame_data(&access_frame)["settings"]["require_pairing"], false);
+    }
+
+    // ── unknown-field / invalid-value rejection (fail-closed) ───────────
+
+    #[tokio::test]
+    async fn config_set_rejects_unknown_key() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle(
+                "channels.config_set",
+                // admin_users is a valid key elsewhere, but not through
+                // config_set (it's access-control, not behavior).
+                json!({ "channel": "discord", "settings": { "admin_users": ["u1"] } }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(!frame_ok(&frame), "{frame:?}");
+        let get_frame = handler
+            .handle("channels.config_get", json!({ "channel": "discord" }), &admin_ctx())
+            .await;
+        assert_eq!(
+            frame_data(&get_frame)["settings"]["admin_users"],
+            Value::Null,
+            "a rejected call must not have written anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_set_rejects_unknown_key() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle(
+                "channels.access_set",
+                // mention_only is a valid key elsewhere, but not through
+                // access_set (it's behavior, not access-control).
+                json!({ "channel": "discord", "settings": { "mention_only": true } }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(!frame_ok(&frame), "{frame:?}");
+    }
+
+    #[tokio::test]
+    async fn config_set_rejects_invalid_channel_type() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle(
+                "channels.config_set",
+                json!({ "channel": "myspace", "settings": { "mention_only": true } }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(!frame_ok(&frame), "{frame:?}");
+    }
+
+    #[tokio::test]
+    async fn config_set_rejects_wrong_value_type_and_writes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle(
+                "channels.config_set",
+                // mention_only must be a bool, not a string — and this must
+                // fail before the (valid) auto_thread field is written, so a
+                // multi-field call cannot partially apply.
+                json!({
+                    "channel": "discord",
+                    "settings": { "mention_only": "true", "auto_thread": true },
+                }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(!frame_ok(&frame), "{frame:?}");
+        let get_frame = handler
+            .handle("channels.config_get", json!({ "channel": "discord" }), &admin_ctx())
+            .await;
+        assert_eq!(
+            frame_data(&get_frame)["settings"]["auto_thread"],
+            false,
+            "validate-before-write: the whole call must reject, not partially apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_rejects_invalid_scope_id() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle(
+                "channels.config_set",
+                json!({
+                    "channel": "discord",
+                    "scope_id": "guild;drop table",
+                    "settings": { "mention_only": true },
+                }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(!frame_ok(&frame), "{frame:?}");
+    }
+
+    // ── pairing_list / pairing_revoke ────────────────────────────────────
+
+    #[tokio::test]
+    async fn pairing_list_and_revoke_share_the_access_control_store() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // Simulate what `/pair <code>` (or the MCP `pairing_manage
+        // action=approve` tool) already persisted — the same
+        // ~/.duduclaw/access_control.json the RPC reads.
+        let ctrl = crate::access_control::AccessController::with_persistence(
+            home.path().join("access_control.json"),
+        );
+        ctrl.approve_user("u-alice").await;
+        ctrl.approve_user("u-bob").await;
+
+        let list_frame = handler.handle("channels.pairing_list", json!({}), &admin_ctx()).await;
+        assert!(frame_ok(&list_frame), "{list_frame:?}");
+        let approved = frame_data(&list_frame)["approved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(approved.contains(&"u-alice".to_string()));
+        assert!(approved.contains(&"u-bob".to_string()));
+
+        let revoke_frame = handler
+            .handle("channels.pairing_revoke", json!({ "subject": "u-alice" }), &admin_ctx())
+            .await;
+        assert!(frame_ok(&revoke_frame), "{revoke_frame:?}");
+
+        let list_frame2 = handler.handle("channels.pairing_list", json!({}), &admin_ctx()).await;
+        let approved2 = frame_data(&list_frame2)["approved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(!approved2.contains(&"u-alice".to_string()), "revoked subject must be gone");
+        assert!(approved2.contains(&"u-bob".to_string()), "other subjects must be unaffected");
+
+        let audit_raw = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit_raw.contains("channel_pairing_revoke"));
+    }
+
+    #[tokio::test]
+    async fn pairing_revoke_requires_subject() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle("channels.pairing_revoke", json!({}), &admin_ctx())
+            .await;
+        assert!(!frame_ok(&frame), "{frame:?}");
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Live Canvas handlers (G15)
 // ═══════════════════════════════════════════════════════════════
@@ -34449,6 +35946,177 @@ skill_security_scan = true
         // And it deserializes into the typed config (agents.inspect prefill).
         let cfg: duduclaw_core::types::ProactiveConfig = p.clone().try_into().unwrap();
         assert_eq!(cfg.notify_thread_id, "42");
+    }
+
+    // ── quiet_hours (W2-8 dashboard editor) ───────────────────────────────
+
+    /// `agents.update` persists a valid `[proactive] quiet_hours` window, and
+    /// `agents.inspect` reads it back both as the raw own-value the edit form
+    /// prefills (`quiet_hours_own`) and the effective note (`quiet_hours_note`)
+    /// the runtime gate would apply.
+    #[tokio::test]
+    async fn agents_update_writes_and_validates_quiet_hours() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "alpha", false);
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_agents_update(json!({
+                "agent_id": "alpha",
+                "proactive": { "quiet_hours": "22:00-08:00" },
+            }))
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+
+        let raw =
+            std::fs::read_to_string(home.path().join("agents").join("alpha").join("agent.toml"))
+                .unwrap();
+        let table: toml::Table = raw.parse().unwrap();
+        assert_eq!(
+            table["proactive"]["quiet_hours"].as_str(),
+            Some("22:00-08:00")
+        );
+
+        let inspect = handler
+            .handle_agents_inspect(json!({ "agent_id": "alpha" }))
+            .await;
+        let payload = match inspect {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => p,
+            other => panic!("expected ok, got {other:?}"),
+        };
+        assert_eq!(
+            payload["proactive"]["quiet_hours_own"].as_str(),
+            Some("22:00-08:00")
+        );
+        assert_eq!(
+            payload["proactive"]["quiet_hours"].as_str(),
+            Some("22:00-08:00")
+        );
+        let note = payload["proactive"]["quiet_hours_note"].as_str().unwrap();
+        assert!(note.contains("22:00-08:00"), "{note}");
+
+        // Round-trips through the exact reader the runtime gate uses.
+        let policy = crate::notify_governance::load_agent_policy(home.path(), "alpha");
+        assert_eq!(
+            policy.window,
+            crate::notify_governance::QuietWindow::parse("22:00-08:00")
+        );
+    }
+
+    /// A malformed window is rejected at write time — fail-closed, not
+    /// silently accepted-then-ignored by the gate.
+    #[tokio::test]
+    async fn agents_update_rejects_malformed_quiet_hours() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "alpha", false);
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_agents_update(json!({
+                "agent_id": "alpha",
+                "proactive": { "quiet_hours": "not-a-window" },
+            }))
+            .await;
+        assert!(!frame_ok(&frame), "malformed quiet_hours must be rejected");
+
+        // The write must NOT have happened.
+        let raw =
+            std::fs::read_to_string(home.path().join("agents").join("alpha").join("agent.toml"))
+                .unwrap();
+        assert!(!raw.contains("quiet_hours"));
+    }
+
+    /// Empty string clears a previously-set window (readers treat blank as
+    /// unset — matches every other `[proactive]` string field's convention).
+    #[tokio::test]
+    async fn agents_update_clears_quiet_hours_with_empty_string() {
+        let home = tempfile::tempdir().unwrap();
+        seed_agent(home.path(), "alpha", false);
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        handler
+            .handle_agents_update(json!({
+                "agent_id": "alpha",
+                "proactive": { "quiet_hours": "22:00-08:00" },
+            }))
+            .await;
+        let frame = handler
+            .handle_agents_update(json!({
+                "agent_id": "alpha",
+                "proactive": { "quiet_hours": "" },
+            }))
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+
+        let raw =
+            std::fs::read_to_string(home.path().join("agents").join("alpha").join("agent.toml"))
+                .unwrap();
+        let table: toml::Table = raw.parse().unwrap();
+        assert_eq!(table["proactive"]["quiet_hours"].as_str(), Some(""));
+        assert_eq!(
+            crate::notify_governance::agent_raw_quiet_hours(home.path(), "alpha"),
+            ""
+        );
+    }
+
+    // ── channel_recovered in the unified log (W2-8) ───────────────────────
+
+    /// `channel_alerts::record_recovery` appends a `channel_recovered` row
+    /// with no `error` field to `channel_failures.jsonl`. `audit.unified_log`
+    /// must render it as an informational "已恢復" line, not an empty
+    /// "warning" row indistinguishable from a blank/corrupt record.
+    #[tokio::test]
+    async fn unified_log_renders_channel_recovered_as_an_info_row_not_a_blank_warning() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("channel_failures.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "event": "telegram_send_failed",
+                    "channel": "telegram",
+                    "agent": "alpha",
+                    "reason": "telegram_send_failed",
+                    "error": "401 Unauthorized",
+                    "timestamp": "2026-08-11T09:00:00Z",
+                }),
+                json!({
+                    "event": crate::channel_alerts::RECOVERED_EVENT,
+                    "channel": "telegram",
+                    "reason": "recovered",
+                    "resolved": true,
+                    "resolves": "telegram_send_failed",
+                    "timestamp": "2026-08-11T09:30:00Z",
+                }),
+            ),
+        )
+        .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_audit_unified_log(json!({ "sources": ["channel_failure"] }))
+            .await;
+        let payload = match frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => p,
+            other => panic!("expected ok, got {other:?}"),
+        };
+        let events = payload["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+
+        let failure = events
+            .iter()
+            .find(|e| e["event_type"] == "channel.telegram_send_failed")
+            .expect("failure row present");
+        assert_eq!(failure["severity"], "warning");
+        assert_eq!(failure["summary"], "401 Unauthorized");
+
+        let recovered = events
+            .iter()
+            .find(|e| e["event_type"] == "channel.recovered")
+            .expect("recovery row present");
+        assert_eq!(recovered["severity"], "info", "a recovery is good news, not a warning");
+        assert_eq!(recovered["summary"], "通道「Telegram」已恢復正常發送");
+        assert_ne!(recovered["summary"], "", "must never render blank (F10)");
     }
 
     #[tokio::test]
@@ -35958,5 +37626,193 @@ keep = \"me\"
             .handle_task_forward_model_set(json!({ "enabled": true }), &ctx)
             .await;
         assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+    }
+}
+
+#[cfg(test)]
+mod resident_sensing_dashboard_tests {
+    //! WP4 dashboard RPCs: `ticks.sources` / `ticks.recent`. Mirrors the
+    //! `MethodHandler::new(root).await` + `handler.handle_xxx(...).await`
+    //! harness used throughout this file (see `evolution_v3_dashboard_tests`).
+    use super::*;
+
+    fn payload(frame: &WsFrame) -> Value {
+        match frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => p.clone(),
+            WsFrame::Response { ok: false, error, .. } => {
+                panic!("RPC returned an error frame: {error:?}")
+            }
+            other => panic!("unexpected frame shape: {other:?}"),
+        }
+    }
+
+    // ── ticks.sources ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sources_with_no_config_and_no_hub_is_an_empty_not_missing_list() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let p = payload(&handler.handle_ticks_sources().await);
+        assert_eq!(p["enabled"], false);
+        assert!(p["sources"].as_array().unwrap().is_empty());
+        assert_eq!(p["screen"]["pass"], 0);
+        assert_eq!(p["screen"]["drop"], 0);
+        assert_eq!(p["screen"]["unavailable"], 0);
+    }
+
+    #[tokio::test]
+    async fn sources_lists_configured_sources_with_live_counters() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "twse-2330"
+            kind = "http_poll"
+            enabled = true
+            interval_secs = 10
+            url = "https://example.com/quote"
+            "#,
+        )
+        .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let hub = Arc::new(crate::tick_source::TickHub::new());
+        hub.record_emit("twse-2330").await;
+        hub.record_emit("twse-2330").await;
+        hub.record_drop("twse-2330", crate::tick_source::DropReason::RateCap)
+            .await;
+        hub.record_screen_outcome("pass");
+        hub.record_screen_outcome("drop");
+        handler.set_tick_hub(hub).await;
+
+        let p = payload(&handler.handle_ticks_sources().await);
+        assert_eq!(p["enabled"], true);
+        let sources = p["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        let s0 = &sources[0];
+        assert_eq!(s0["id"], "twse-2330");
+        assert_eq!(s0["kind"], "http_poll");
+        assert_eq!(s0["enabled"], true);
+        assert_eq!(s0["events_emitted_total"], 2);
+        assert_eq!(s0["dropped"]["rate_cap"], 1);
+        assert_eq!(s0["dropped"]["unchanged"], 0);
+        assert!(s0["last_tick_ts"].is_string());
+        assert_eq!(p["screen"]["pass"], 1);
+        assert_eq!(p["screen"]["drop"], 1);
+        assert_eq!(p["screen"]["unavailable"], 0);
+    }
+
+    #[tokio::test]
+    async fn sources_shows_a_disabled_source_with_zero_counts() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"
+            [tick]
+            enabled = false
+            [[tick.sources]]
+            id = "quiet"
+            kind = "http_poll"
+            enabled = false
+            url = "https://example.com/quote"
+            "#,
+        )
+        .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let p = payload(&handler.handle_ticks_sources().await);
+        assert_eq!(p["enabled"], false, "master switch reflected");
+        let sources = p["sources"].as_array().unwrap();
+        assert_eq!(
+            sources.len(),
+            1,
+            "a configured-but-inactive source is still listed, not hidden"
+        );
+        assert_eq!(sources[0]["enabled"], false);
+        assert_eq!(sources[0]["events_emitted_total"], 0);
+        assert!(sources[0]["last_tick_ts"].is_null());
+    }
+
+    // ── ticks.recent ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn recent_requires_a_source_param() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler.handle_ticks_recent(json!({})).await;
+        assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+    }
+
+    #[tokio::test]
+    async fn recent_returns_empty_records_when_the_hub_was_never_wired() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let p = payload(
+            &handler
+                .handle_ticks_recent(json!({ "source": "twse-2330" }))
+                .await,
+        );
+        assert_eq!(p["source"], "twse-2330");
+        assert!(p["records"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recent_returns_buffered_records_oldest_first() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let hub = Arc::new(crate::tick_source::TickHub::new());
+        for i in 0..5 {
+            hub.push(
+                "twse-2330",
+                crate::tick_source::TickRecord {
+                    ts: format!("t{i}"),
+                    fields: json!({ "price": 100 + i }).as_object().cloned().unwrap(),
+                    raw: None,
+                },
+            )
+            .await;
+        }
+        handler.set_tick_hub(hub).await;
+
+        let p = payload(
+            &handler
+                .handle_ticks_recent(json!({ "source": "twse-2330", "limit": 3 }))
+                .await,
+        );
+        let records = p["records"].as_array().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["ts"], "t2", "oldest of the last 3");
+        assert_eq!(records[2]["ts"], "t4", "newest last");
+        assert_eq!(records[2]["fields"]["price"], 104);
+    }
+
+    #[tokio::test]
+    async fn recent_limit_is_capped_even_if_the_caller_asks_for_more() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let hub = Arc::new(crate::tick_source::TickHub::new());
+        for i in 0..80 {
+            hub.push(
+                "s1",
+                crate::tick_source::TickRecord {
+                    ts: format!("t{i}"),
+                    fields: serde_json::Map::new(),
+                    raw: None,
+                },
+            )
+            .await;
+        }
+        handler.set_tick_hub(hub).await;
+        let p = payload(
+            &handler
+                .handle_ticks_recent(json!({ "source": "s1", "limit": 500 }))
+                .await,
+        );
+        assert_eq!(
+            p["records"].as_array().unwrap().len(),
+            crate::tick_source::TICK_RECENT_RPC_LIMIT
+        );
     }
 }

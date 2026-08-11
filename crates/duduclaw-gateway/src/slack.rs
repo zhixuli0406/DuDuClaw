@@ -204,6 +204,15 @@ async fn run_socket_mode(
     {
         Ok(resp) => {
             if let Ok(data) = resp.json::<serde_json::Value>().await {
+                // W2-7: `auth.test`'s `url` field is `https://<workspace>.
+                // slack.com/` — the coordinate `channel_link.rs`'s "在 Slack
+                // 中開啟" permalink needs and that nothing else in the
+                // gateway ever captures. Persisted on every (re)connect so
+                // it's always fresh for whichever workspace this bot token
+                // currently belongs to.
+                if let Some(domain) = slack_workspace_domain_from_url(data["url"].as_str().unwrap_or("")) {
+                    crate::channel_link::record_slack_workspace_domain(&ctx.home_dir, &domain);
+                }
                 data["user_id"].as_str().unwrap_or("").to_string()
             } else {
                 String::new()
@@ -308,6 +317,20 @@ async fn run_socket_mode(
 
     set_channel_connected(&ctx.channel_status, label, false, None, Some(&ctx.event_tx)).await;
     Ok(())
+}
+
+// ── W2-7: workspace domain extraction ────────────────────────────
+//
+// Pure function so the `<workspace>.slack.com` parsing can be pinned with a
+// plain unit test independent of the live `auth.test` call.
+
+/// Extract the `<workspace>` subdomain from Slack `auth.test`'s `url` field
+/// (`https://<workspace>.slack.com/`). `None` for a missing/malformed URL or
+/// a host that isn't a `*.slack.com` domain — never guesses.
+fn slack_workspace_domain_from_url(url: &str) -> Option<String> {
+    let host = url::Url::parse(url).ok()?.host_str()?.to_string();
+    let domain = host.strip_suffix(".slack.com")?;
+    (!domain.is_empty()).then(|| domain.to_string())
 }
 
 // ── Text helpers ───────────────────────────────────────────────
@@ -1050,6 +1073,48 @@ mod tests {
     fn test_to_slack_mrkdwn() {
         assert_eq!(to_slack_mrkdwn("**bold**"), "*bold*");
         assert_eq!(to_slack_mrkdwn("normal text"), "normal text");
+    }
+
+    // ── W2-7: slack_workspace_domain_from_url ────────────────
+
+    #[test]
+    fn workspace_domain_extracted_from_auth_test_url() {
+        assert_eq!(
+            slack_workspace_domain_from_url("https://acme.slack.com/"),
+            Some("acme".to_string())
+        );
+        // auth.test's `url` field is not guaranteed to carry a trailing
+        // slash across API versions.
+        assert_eq!(slack_workspace_domain_from_url("https://acme.slack.com"), Some("acme".to_string()));
+    }
+
+    #[test]
+    fn workspace_domain_rejects_non_slack_hosts() {
+        assert_eq!(slack_workspace_domain_from_url("https://evil.example.com/"), None);
+        assert_eq!(slack_workspace_domain_from_url("not a url"), None);
+        assert_eq!(slack_workspace_domain_from_url(""), None);
+    }
+
+    #[test]
+    fn workspace_domain_rejects_bare_slack_com() {
+        // `https://slack.com/` has no workspace subdomain — must not treat
+        // the empty prefix as a valid domain.
+        assert_eq!(slack_workspace_domain_from_url("https://slack.com/"), None);
+    }
+
+    // ── W2-7: record + read round trip (integration-level, real files) ──
+
+    #[test]
+    fn slack_workspace_domain_round_trips_through_persisted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::channel_link::record_slack_workspace_domain(dir.path(), "acme");
+        // Re-derive the same "在 Slack 中開啟" URL channel_link.rs would
+        // build for a channel, proving the file this function writes is the
+        // exact shape channel_link.rs's reader expects.
+        let stored =
+            std::fs::read_to_string(dir.path().join(crate::channel_link::SLACK_WORKSPACE_STORE_FILE)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(value["domain"], "acme");
     }
 
     #[test]

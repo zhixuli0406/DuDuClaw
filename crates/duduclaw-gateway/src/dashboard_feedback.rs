@@ -65,6 +65,20 @@ pub const EV_SKILL_CHANGED: &str = "skill.changed";
 /// the user sees which agents changed and why.
 pub const EV_RUNTIME_MIGRATED: &str = "runtime.migrated";
 
+/// A channel's behavior settings (`channels.config_set` / `channel_config`
+/// MCP tool) or access-control list (`channels.access_set` / a pairing
+/// subject approved or revoked) changed. Payload:
+/// `{ action, channel?, scope_id?, key?, subject? }`.
+///
+/// W2-2 (E1/E2, D-C1): both write paths for these settings — the dashboard
+/// RPCs in `handlers.rs` and the in-channel `channel_config`/`pairing_manage`
+/// MCP tools, which share the same `ChannelSettingsManager`/`AccessController`
+/// storage — emit this so every connected dashboard session (and the
+/// ChannelsPage 行為/存取 tabs specifically) reflect the other write path's
+/// change without a manual refresh, closing the "dashboard has zero
+/// visibility into channel_config/pairing_manage" gap.
+pub const EV_CHANNEL_CONFIG_CHANGED: &str = "channel_config.changed";
+
 /// Every event name this module forwards to the dashboard WebSocket.
 ///
 /// Keep this list closed: the `events.db` tail carries autopilot triggers and
@@ -76,6 +90,7 @@ pub const DASHBOARD_EVENTS: &[&str] = &[
     EV_MEMORY_CHANGED,
     EV_SKILL_CHANGED,
     EV_RUNTIME_MIGRATED,
+    EV_CHANNEL_CONFIG_CHANGED,
 ];
 
 /// Serialize one `events.db` row into a dashboard `WsFrame::Event` JSON string,
@@ -252,6 +267,35 @@ pub fn tool_feedback_event(
             }),
         )),
 
+        // ── Channel settings (W2-2, E1/E2) ─────────────────────────────────
+        // `channel_config` is one MCP tool for both read and write — a `value`
+        // argument present means "set"; omitted means "get" and must stay
+        // silent (a refetch storm on every read would defeat the purpose of
+        // a targeted feedback signal).
+        "channel_config" if args.get("value").and_then(|v| v.as_str()).is_some() => Some((
+            EV_CHANNEL_CONFIG_CHANGED,
+            json!({
+                "action": "config_set",
+                "channel": s("channel"),
+                "scope_id": s("scope_id"),
+                "key": s("key"),
+            }),
+        )),
+        // Only `approve`/`revoke` mutate the approved-subject list that
+        // `channels.pairing_list` surfaces; `generate` only creates an
+        // ephemeral pending code and `list` is read-only.
+        "pairing_manage"
+            if matches!(s("action").as_deref(), Some("approve") | Some("revoke")) =>
+        {
+            Some((
+                EV_CHANNEL_CONFIG_CHANGED,
+                json!({
+                    "action": format!("pairing_{}", s("action").unwrap_or_default()),
+                    "subject": s("subject"),
+                }),
+            ))
+        }
+
         _ => None,
     }
 }
@@ -286,6 +330,7 @@ mod tests {
         assert!(dashboard_push_frame(EV_MEMORY_CHANGED, "{}").is_some());
         assert!(dashboard_push_frame(EV_SKILL_CHANGED, "{}").is_some());
         assert!(dashboard_push_frame(EV_RUNTIME_MIGRATED, "{}").is_some());
+        assert!(dashboard_push_frame(EV_CHANNEL_CONFIG_CHANGED, "{}").is_some());
 
         assert!(dashboard_push_frame("os_file", r#"{"path":"/secret"}"#).is_none());
         assert!(dashboard_push_frame("task.created", "{}").is_none());
@@ -429,6 +474,68 @@ mod tests {
         let (_, payload) =
             tool_feedback_event("memory_improve", &json!({}), &json!({}), "  ").unwrap();
         assert!(payload["agent_id"].is_null());
+    }
+
+    /// `channel_config` only feeds back when it actually wrote a value; a
+    /// read (`value` omitted) must stay silent (W2-2).
+    #[test]
+    fn channel_config_set_feeds_back_but_get_does_not() {
+        let (ev, payload) = tool_feedback_event(
+            "channel_config",
+            &json!({ "channel": "discord", "scope_id": "global", "key": "mention_only", "value": "true" }),
+            &json!({}),
+            "",
+        )
+        .unwrap();
+        assert_eq!(ev, EV_CHANNEL_CONFIG_CHANGED);
+        assert_eq!(payload["action"], "config_set");
+        assert_eq!(payload["channel"], "discord");
+        assert_eq!(payload["key"], "mention_only");
+
+        assert!(tool_feedback_event(
+            "channel_config",
+            &json!({ "channel": "discord", "scope_id": "global", "key": "mention_only" }),
+            &json!({}),
+            "",
+        )
+        .is_none());
+    }
+
+    /// `pairing_manage` only feeds back on `approve`/`revoke` (the
+    /// approved-subject list `channels.pairing_list` reads); `generate` and
+    /// `list` must stay silent (W2-2).
+    #[test]
+    fn pairing_manage_approve_revoke_feed_back_generate_list_do_not() {
+        let (ev, payload) = tool_feedback_event(
+            "pairing_manage",
+            &json!({ "action": "revoke", "subject": "u1" }),
+            &json!({}),
+            "",
+        )
+        .unwrap();
+        assert_eq!(ev, EV_CHANNEL_CONFIG_CHANGED);
+        assert_eq!(payload["action"], "pairing_revoke");
+        assert_eq!(payload["subject"], "u1");
+
+        let (ev, payload) = tool_feedback_event(
+            "pairing_manage",
+            &json!({ "action": "approve", "subject": "u2" }),
+            &json!({}),
+            "",
+        )
+        .unwrap();
+        assert_eq!(ev, EV_CHANNEL_CONFIG_CHANGED);
+        assert_eq!(payload["action"], "pairing_approve");
+
+        for action in ["generate", "list"] {
+            assert!(tool_feedback_event(
+                "pairing_manage",
+                &json!({ "action": action, "subject": "u3" }),
+                &json!({}),
+                "",
+            )
+            .is_none());
+        }
     }
 
     /// A failed tool persisted nothing — announcing a change would make the

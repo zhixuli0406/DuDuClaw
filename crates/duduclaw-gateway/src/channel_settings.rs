@@ -52,6 +52,100 @@ pub mod keys {
     pub const SHARED_BOT_BINDING: &str = "shared_bot_binding";
 }
 
+/// Channel types recognized by the settings store and its RPC/MCP surfaces.
+/// Centralized so the MCP `channel_config` tool (`duduclaw-cli::mcp`) and the
+/// dashboard `channels.config_*`/`access_*` RPCs (`duduclaw-gateway::handlers`)
+/// can never drift into accepting different channel-type strings — one write
+/// path validating "discord" while the other silently accepts "Discord" would
+/// split the settings store into two unreachable halves.
+pub const VALID_CHANNEL_TYPES: &[&str] = &[
+    "discord", "telegram", "slack", "line", "whatsapp", "feishu", "wecom", "dingtalk",
+];
+
+/// "Behavior" setting keys — response shape / routing, not access control.
+/// Exposed to both the `channel_config` MCP tool and the dashboard
+/// `channels.config_get`/`channels.config_set` RPC (E1).
+pub const CONFIG_KEYS: &[&str] = &[
+    keys::MENTION_ONLY,
+    keys::AUTO_THREAD,
+    keys::ALLOWED_CHANNELS,
+    keys::ALLOWED_GUILDS,
+    keys::AGENT_OVERRIDE,
+    keys::RESPONSE_MODE,
+    keys::THREAD_ARCHIVE_MINUTES,
+];
+
+/// Access-control keys an in-channel agent may read/write via the
+/// `channel_config` MCP tool. Deliberately excludes [`keys::ADMIN_USERS`] — an
+/// agent must never be able to grant itself (or anyone else) `!STOP`
+/// authority over channel automation from inside a chat.
+pub const MCP_ACCESS_KEYS: &[&str] = &[keys::REQUIRE_PAIRING, keys::ALLOWED_USERS, keys::BLOCKED_USERS];
+
+/// Access-control keys the dashboard (admin-only, human-operated GUI) may
+/// read/write (E2). Superset of [`MCP_ACCESS_KEYS`]: `admin_users` decides who
+/// can press `!STOP` in-channel — a GUI-only write per the D-C1 "channel-side
+/// read-only for org-wide settings" decision. No MCP tool may set it.
+pub const DASHBOARD_ACCESS_KEYS: &[&str] = &[
+    keys::REQUIRE_PAIRING,
+    keys::ALLOWED_USERS,
+    keys::BLOCKED_USERS,
+    keys::ADMIN_USERS,
+];
+
+/// Validate a `scope_id`: max 64 chars, alphanumeric + underscore/hyphen
+/// (also matches the literal "global"/"dm" scopes). Shared by the MCP
+/// `channel_config` tool and the dashboard `channels.config_*`/`access_*` RPCs
+/// so both write paths reject the same malformed input.
+pub fn validate_scope_id(scope_id: &str) -> Result<(), String> {
+    if scope_id.len() > 64 {
+        return Err("scope_id too long (max 64 chars)".into());
+    }
+    if scope_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        Ok(())
+    } else {
+        Err("scope_id contains invalid characters".into())
+    }
+}
+
+/// Validate a setting value against its key's expected shape. Shared by the
+/// MCP `channel_config` tool and the dashboard `channels.config_set`/
+/// `access_set` RPCs — one validator, so a value illegal from the dashboard
+/// can't sneak in from MCP or vice versa. Unrecognized keys are fail-closed
+/// at the call site (not here) by checking membership in [`CONFIG_KEYS`] /
+/// [`MCP_ACCESS_KEYS`] / [`DASHBOARD_ACCESS_KEYS`] first.
+pub fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
+    match key {
+        keys::MENTION_ONLY | keys::AUTO_THREAD | keys::REQUIRE_PAIRING => {
+            if value != "true" && value != "false" {
+                return Err(format!("{key} must be 'true' or 'false'"));
+            }
+        }
+        keys::ALLOWED_CHANNELS | keys::ALLOWED_GUILDS | keys::ALLOWED_USERS | keys::BLOCKED_USERS
+        | keys::ADMIN_USERS => {
+            if serde_json::from_str::<Vec<String>>(value).is_err() {
+                return Err(format!(
+                    "{key} must be a JSON array of strings, e.g. [\"id1\",\"id2\"]"
+                ));
+            }
+        }
+        keys::RESPONSE_MODE => {
+            if !["embed", "plain", "auto"].contains(&value) {
+                return Err("response_mode must be 'embed', 'plain', or 'auto'".into());
+            }
+        }
+        keys::THREAD_ARCHIVE_MINUTES => {
+            if !["60", "1440", "4320", "10080"].contains(&value) {
+                return Err("thread_archive_minutes must be 60, 1440, 4320, or 10080".into());
+            }
+        }
+        _ => {} // agent_override: any string is valid (checked against registry at use time)
+    }
+    Ok(())
+}
+
 /// Cache key: (channel_type, scope_id, key)
 type CacheKey = (String, String, String);
 
@@ -445,6 +539,71 @@ mod tests {
         let (_tmp, mgr) = temp_db();
         mgr.set("discord", "global", keys::ALLOWED_GUILDS, "not json").await.unwrap();
         assert!(mgr.is_guild_allowed("discord", "g1").await);
+    }
+
+    // ── Shared validator tests (moved from duduclaw-cli mcp.rs, W2-2) ──────
+
+    #[test]
+    fn validate_scope_id_accepts_alphanumeric_and_hyphen_underscore() {
+        assert!(validate_scope_id("global").is_ok());
+        assert!(validate_scope_id("guild_123-abc").is_ok());
+        assert!(validate_scope_id(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn validate_scope_id_rejects_too_long() {
+        assert!(validate_scope_id(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn validate_scope_id_rejects_invalid_chars() {
+        assert!(validate_scope_id("guild;drop table").is_err());
+        assert!(validate_scope_id("guild/../etc").is_err());
+    }
+
+    #[test]
+    fn validate_setting_value_bool_keys() {
+        assert!(validate_setting_value(keys::MENTION_ONLY, "true").is_ok());
+        assert!(validate_setting_value(keys::MENTION_ONLY, "false").is_ok());
+        assert!(validate_setting_value(keys::MENTION_ONLY, "yes").is_err());
+        assert!(validate_setting_value(keys::REQUIRE_PAIRING, "1").is_err());
+    }
+
+    #[test]
+    fn validate_setting_value_json_array_keys() {
+        assert!(validate_setting_value(keys::ALLOWED_USERS, r#"["u1","u2"]"#).is_ok());
+        assert!(validate_setting_value(keys::BLOCKED_USERS, "[]").is_ok());
+        assert!(validate_setting_value(keys::ADMIN_USERS, r#"["u1"]"#).is_ok());
+        assert!(validate_setting_value(keys::ALLOWED_USERS, "not json").is_err());
+        assert!(validate_setting_value(keys::ALLOWED_USERS, r#"[1,2]"#).is_err());
+    }
+
+    #[test]
+    fn validate_setting_value_response_mode() {
+        assert!(validate_setting_value(keys::RESPONSE_MODE, "embed").is_ok());
+        assert!(validate_setting_value(keys::RESPONSE_MODE, "plain").is_ok());
+        assert!(validate_setting_value(keys::RESPONSE_MODE, "auto").is_ok());
+        assert!(validate_setting_value(keys::RESPONSE_MODE, "bogus").is_err());
+    }
+
+    #[test]
+    fn validate_setting_value_thread_archive_minutes() {
+        assert!(validate_setting_value(keys::THREAD_ARCHIVE_MINUTES, "60").is_ok());
+        assert!(validate_setting_value(keys::THREAD_ARCHIVE_MINUTES, "10080").is_ok());
+        assert!(validate_setting_value(keys::THREAD_ARCHIVE_MINUTES, "30").is_err());
+    }
+
+    #[test]
+    fn validate_setting_value_agent_override_any_string() {
+        assert!(validate_setting_value(keys::AGENT_OVERRIDE, "any-string-goes").is_ok());
+    }
+
+    #[test]
+    fn mcp_access_keys_excludes_admin_users() {
+        // Security boundary (E2): an in-channel agent must never grant itself
+        // `!STOP` authority via the channel_config MCP tool.
+        assert!(!MCP_ACCESS_KEYS.contains(&keys::ADMIN_USERS));
+        assert!(DASHBOARD_ACCESS_KEYS.contains(&keys::ADMIN_USERS));
     }
 
     #[tokio::test]

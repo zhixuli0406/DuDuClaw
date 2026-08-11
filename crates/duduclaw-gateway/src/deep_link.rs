@@ -30,27 +30,33 @@
 //!
 //! Routes are taken from the actual React Router table in `web/src/App.tsx`,
 //! not invented: `tasks/:id` (`TaskDetailPage`) is a real per-object detail
-//! route, so a task deep link lands exactly there. `InboxPage` (`/inbox`) has
-//! no per-item hash/query focus support today (verified: no `useSearchParams`/
-//! `location.hash` read in `InboxPage.tsx`), so an approval/install/kickoff
-//! deep link lands on the unified inbox list — still the page that shows the
-//! object, just not scrolled to it. `/manage/channels`, `/manage/billing` and
+//! route, so a task deep link lands exactly there. `InboxPage` (`/inbox`)
+//! reads `?item=<id>` (W2-5 H5 hand-off from `07-unified-decision-design.md`
+//! §6) to select the matching row and scroll it into view on load, so an
+//! approval/install/kickoff deep link lands on the unified inbox with the
+//! object already open — `id` is passed through verbatim (whatever the
+//! caller already had: a bare broker/install-request id), and `InboxPage`
+//! resolves it against its own type-prefixed item ids (`approval:<id>` /
+//! `install:<id>` / ...) with a suffix match, so this module does not need to
+//! know which of the three `DeepLinkKind::Approval` callers (kickoff/approval
+//! broker/install) is asking. `/manage/channels`, `/manage/billing` and
 //! `/manage/logs` (`LogsPage`) are existing `ManageShell` routes.
 
 use std::path::Path;
 
-/// The kind of object a deep link points at. `id` is only meaningful for
-/// [`DeepLinkKind::Task`] today ([`InboxPage`] has no per-item focus yet — see
-/// module docs); it is still threaded through the other kinds so call sites
-/// don't need to special-case the signature once the frontend gains focus
-/// support, and so a caller can log/attribute which object triggered the link.
+/// The kind of object a deep link points at. `id` is meaningful for
+/// [`DeepLinkKind::Task`] (`/tasks/<id>`) and [`DeepLinkKind::Approval`]
+/// (`/inbox?item=<id>`, H5); it is still threaded through the other kinds so
+/// call sites don't need to special-case the signature if they gain per-item
+/// focus later, and so a caller can log/attribute which object triggered the
+/// link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeepLinkKind {
     /// A task (goal-loop or manually assigned) — `/tasks/<id>`.
     Task,
     /// Anything surfaced in the unified HITL inbox: `ApprovalBroker` rows
     /// (generic approvals, goal-loop kickoff gates) and `install_requests`
-    /// rows — `/inbox`.
+    /// rows — `/inbox?item=<id>` (H5).
     Approval,
     /// Channel configuration/status — `/manage/channels`.
     Channels,
@@ -104,7 +110,11 @@ pub fn deep_link(home_dir: &Path, kind: DeepLinkKind, id: &str) -> Option<String
     let base = dashboard_base_url(home_dir)?;
     let path: String = match kind {
         DeepLinkKind::Task => format!("/tasks/{id}"),
-        DeepLinkKind::Approval => "/inbox".to_string(),
+        // H5: per-item anchor. `id` here is whatever the caller already had
+        // (a bare `ApprovalRecord`/`InstallRequest` id, no `approval:`/
+        // `install:` prefix) — `InboxPage` resolves it with a suffix match
+        // against its own prefixed item ids, so no prefix is added here.
+        DeepLinkKind::Approval => format!("/inbox?item={id}"),
         DeepLinkKind::Channels => "/manage/channels".to_string(),
         DeepLinkKind::Billing => "/manage/billing".to_string(),
         DeepLinkKind::System => "/manage/logs".to_string(),
@@ -199,12 +209,12 @@ mod tests {
     }
 
     #[test]
-    fn deep_link_approval_lands_on_inbox() {
+    fn deep_link_approval_lands_on_inbox_with_item_query() {
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path(), "[gateway]\nport = 18789\n");
         assert_eq!(
             deep_link(dir.path(), DeepLinkKind::Approval, "ap-1"),
-            Some("http://localhost:18789/inbox".to_string())
+            Some("http://localhost:18789/inbox?item=ap-1".to_string())
         );
     }
 

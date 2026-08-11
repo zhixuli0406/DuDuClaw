@@ -107,6 +107,11 @@ pub const KNOWN_EVENT_NAMES: &[&str] = &[
     "run_at_risk",
     "os_file",
     "os_frontmost",
+    // Resident sensing (WP2): external data-stream observations. Legal on
+    // both sides of a sequence — "price crossed the threshold, then no
+    // confirmation tick within 60s" is exactly the temporal shape this
+    // matcher exists for, and it stays 100% deterministic.
+    "tick",
 ];
 
 /// Bounds on `within_secs` — floor rejects a degenerate always-false-window

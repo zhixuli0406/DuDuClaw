@@ -851,10 +851,18 @@ async fn handle_goal_create(
     if let Some(tag) = &outcome_tag {
         task.tags = tag.clone();
     }
+    // W2-7: snapshot the Discord guild id (if known) onto the task at
+    // creation time — see `discord::guild_id_for_channel` module docs for
+    // why this is captured now rather than looked up live at list time.
+    // Borrow before the two moves below consume `channel`/`chat_id`.
+    let source_discord_guild_id = (channel == "discord")
+        .then(|| crate::discord::guild_id_for_channel(&ctx.home_dir, &chat_id))
+        .flatten();
     if !channel.is_empty() {
         task.source_channel = Some(channel);
     }
     task.source_chat_id = Some(chat_id);
+    task.source_discord_guild_id = source_discord_guild_id;
 
     if let Err(e) = store.insert_task(&task).await {
         warn!(error = %e, "goal: insert task failed");
@@ -925,7 +933,7 @@ async fn try_decompose_goal(
     }
 
     let source_channel = (!channel.is_empty()).then_some(channel);
-    let rows = plan_to_tasks(
+    let mut rows = plan_to_tasks(
         &plan,
         agent_id,
         &format!("goal:{channel}"),
@@ -933,6 +941,16 @@ async fn try_decompose_goal(
         source_channel,
         Some(chat_id),
     );
+    // W2-7: same snapshot-at-creation-time coordinate as the single-task
+    // path (`handle_goal_create`) — every sub-task of a decomposed goal
+    // shares the same source Discord channel/guild.
+    if channel == "discord" {
+        if let Some(guild) = crate::discord::guild_id_for_channel(home_dir, chat_id) {
+            for row in &mut rows {
+                row.source_discord_guild_id = Some(guild.clone());
+            }
+        }
+    }
     for row in &rows {
         if let Err(e) = store.insert_task(row).await {
             warn!(error = %e, task = %row.id, "goal planner: subtask insert failed — single-task fallback");

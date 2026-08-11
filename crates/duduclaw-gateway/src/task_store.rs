@@ -19,7 +19,8 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      created_at, updated_at, completed_at, blocked_reason, parent_task_id, tags, message_id, \
      claimed_by, claimed_at, lease_expires_at, depends_on, retry_count, max_retries, \
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
-     source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json";
+     source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
+     source_discord_guild_id";
 
 // ── Task row ────────────────────────────────────────────────
 
@@ -130,6 +131,20 @@ pub struct TaskRow {
     /// column rather than repurposing an existing field.
     #[serde(default)]
     pub goal_state_json: Option<String>,
+
+    // ── W2-7 deep-link coordinate persistence (v1.55) ───────────
+    /// Discord guild id the `/goal` command's source channel belonged to at
+    /// task-creation time, when known (`discord.rs` caches `channel_id ->
+    /// guild_id` from inbound Gateway events; see
+    /// [`crate::discord::guild_id_for_channel`]). `None` for non-Discord
+    /// tasks and for Discord tasks created before any message from that
+    /// channel reached this gateway (fail-safe: the "在通道中開啟" link
+    /// just doesn't render — see `channel_link.rs`). Snapshotted at
+    /// creation time rather than looked up live at list time so the link
+    /// still resolves after the bot leaves the guild or the cache is
+    /// pruned.
+    #[serde(default)]
+    pub source_discord_guild_id: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -183,6 +198,7 @@ impl TaskRow {
             diminishing: false,
             agent_seconds: 0,
             goal_state_json: None,
+            source_discord_guild_id: None,
         }
     }
 }
@@ -627,6 +643,8 @@ impl TaskStore {
             ("agent_seconds", "agent_seconds INTEGER NOT NULL DEFAULT 0"),
             // A1 StateAct self-report round-trip (v1.53).
             ("goal_state_json", "goal_state_json TEXT"),
+            // W2-7 deep-link coordinate persistence (v1.55).
+            ("source_discord_guild_id", "source_discord_guild_id TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -700,10 +718,10 @@ impl TaskStore {
                  claimed_by, claimed_at, lease_expires_at, depends_on, retry_count,
                  max_retries, goal_mode, acceptance_criteria, result_summary, judge_feedback,
                  goal_id, lease_renewed_at, source_channel, source_chat_id,
-                 revision_round, diminishing, agent_seconds)
+                 revision_round, diminishing, agent_seconds, source_discord_guild_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                     ?29, ?30, ?31)",
+                     ?29, ?30, ?31, ?32)",
             params![
                 row.id,
                 row.title,
@@ -736,6 +754,7 @@ impl TaskStore {
                 row.revision_round,
                 row.diminishing as i64,
                 row.agent_seconds,
+                row.source_discord_guild_id,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -2408,6 +2427,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         diminishing: row.get::<_, i64>(29)? != 0,
         agent_seconds: row.get(30)?,
         goal_state_json: row.get(31)?,
+        source_discord_guild_id: row.get(32)?,
     })
 }
 
@@ -2855,6 +2875,50 @@ mod tests {
             body: body.into(),
             created_at: at.into(),
         }
+    }
+
+    // ── W2-7: source_discord_guild_id column round trip ──────
+
+    #[tokio::test]
+    async fn source_discord_guild_id_round_trips_through_insert_and_get() {
+        let (store, _dir) = temp_store();
+        let mut task = TaskRow::new(
+            "t-discord".into(),
+            "Goal from Discord".into(),
+            String::new(),
+            "medium".into(),
+            "bot".into(),
+            "goal:discord".into(),
+        );
+        task.source_channel = Some("discord".into());
+        task.source_chat_id = Some("chan-1".into());
+        task.source_discord_guild_id = Some("guild-1".into());
+        store.insert_task(&task).await.expect("insert task");
+
+        let got = store.get_task("t-discord").await.expect("get task").expect("row exists");
+        assert_eq!(got.source_discord_guild_id.as_deref(), Some("guild-1"));
+
+        let listed = store.list_tasks(None, None, None).await.expect("list tasks");
+        let row = listed.iter().find(|t| t.id == "t-discord").expect("row in list");
+        assert_eq!(row.source_discord_guild_id.as_deref(), Some("guild-1"));
+    }
+
+    #[tokio::test]
+    async fn source_discord_guild_id_defaults_to_none() {
+        let (store, _dir) = temp_store();
+        // A non-Discord (or Discord-but-unknown-guild) task never fabricates
+        // a value — the column stays NULL / None.
+        let task = TaskRow::new(
+            "t-telegram".into(),
+            "Goal from Telegram".into(),
+            String::new(),
+            "medium".into(),
+            "bot".into(),
+            "goal:telegram".into(),
+        );
+        store.insert_task(&task).await.expect("insert task");
+        let got = store.get_task("t-telegram").await.expect("get task").expect("row exists");
+        assert_eq!(got.source_discord_guild_id, None);
     }
 
     #[tokio::test]

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 ### Added
+- **通知治理**：所有主動推播（決定卡、預算斷路器、演化停滯／整併、技能缺口摘要、通道故障）改走同一層治理。每個推播點標上四級 `NotifyLevel`（L1 週知／L2 待確認／L3 須處理），級別是必填參數而非預設值。新增 `agent.toml [proactive] quiet_hours = "22:00-08:00"`（可選，另有 `config.toml [notify] quiet_hours` 全域退路；時區吃 `[proactive] timezone`，無法解析時用系統時區）：勿擾時段內 L1/L2 通知延後排隊、時段結束後**同一收件目的地合併成一則**投遞；L3（需人工決定、高風險審批、安裝簽核、預算停工、通道故障）照發不擋。格式解析失敗一律 fail-open 視為未設定並記 `warn`——設定寫錯的代價是照常收到通知，不是整晚靜音。既有的 `quiet_hours_start`/`quiet_hours_end` 數字欄位刻意不接管（其預設 23–8 套用在每個員工身上，接管等於讓所有既有安裝無聲靜音一整晚），維持原本「排程主動檢查」的職責。被延後的通知寫入 `notify_queue.jsonl`（檔案鎖），佇列上限 500 則／36 小時，逾限丟棄一定寫 `warn`。`agent.get` 回傳 `proactive.quiet_hours` 與 `proactive.quiet_hours_note`（可直接渲染的繁中說明，明寫哪些延後、哪些照常）供 UI 呈現。見 [docs/features/40-notification-governance.md](docs/features/40-notification-governance.md)。
+- **每日摘要**（`config.toml [notify] daily_digest`，**預設關閉**；`daily_digest_at` 預設 09:00 本地時間）：每天一則彙整前 24 小時的完成任務數、待你決定件數、學習事件、花費、通道異常次數，推到 `[general] default_agent` 的 `[proactive]` 目的地。**無事不寄**——全部歸零的一天不發訊息，而不是發一則「今日無事」。硬性上限一則／日（狀態檔記錄本地日期，重啟不補送）；gateway 在設定時間沒開機的話，開機後當天仍會補送一次。
+- **通知行動率量測**：推播與「決定真的被處理」各記一筆到 `notify_events.jsonl`，新增 `notify.stats` RPC（Manager+）回傳近 N 天每類通知的推送數／可行動數／行動數／行動率，並依 Google SRE 的「準確率低於 50% 的告警就是壞掉的告警」判準標記 `broken`（需 ≥10 筆可行動樣本）。同一張卡按兩次只算一次行動；被拒絕的按壓不算行動；純週知類（沒有按鈕）永遠不會被標 broken。儀表板圖表下期。
 - **通道推播的儀表板深連結**：新增 `duduclaw-gateway::deep_link` 模組——依 `config.toml [dashboard] public_url`（優先）或 `[gateway] port`（退化為 `http://localhost:<port>`）組出落在物件詳情頁的可點連結（任務 → `/tasks/<id>`、審批/安裝簽核 → `/inbox`、通道 → `/manage/channels`、花費 → `/manage/billing`、系統日誌 → `/manage/logs`、自動規則 → `/manage/system?tab=autopilot`）。三個通道推播模組（goal/approval/install）的「請至儀表板」純文字提示全部改附此連結；有按鈕的通道也在卡片尾附同一連結作為按鈕失效時的 fallback；未設定時維持原文字不變。見 [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md)。
 - **決定卡就地收斂**：通道上的審批/需人工卡片在按下按鈕後就地改寫成一行結果（例「✅ 已同意（由 王小明 於 14:32）」）並移除按鈕，不再留下可點但已失效的殘卡。新增 `decision_card`（Telegram `editMessageText`／Slack `chat.update`／Discord `PATCH`，bot-token 直呼不依賴會過期的互動 token）與 `decision_message_store` 兩模組；LINE 無編輯 API，維持「回覆即結果」；編輯失敗誠實降級為追加一行文字，決定本身不受影響。
 - **花費斷路器雙向通知**：AI 員工因花費達上限被停下時，管理員的通知通道會收到一則推播（附帳務深連結，恢復時亦通知，同一次觸發只推一次）；正在對話的使用者則收到白話說明（「已停工（花費達上限），已通知管理員」），不再無聲已讀不回。
@@ -19,11 +22,22 @@
 - **統一收件匣**：收件匣現在自行處理全部三類決定——安裝簽核詳情不再跳轉舊審批頁；自主任務「等你決定」的重試/標記完成/放棄可直接在收件匣操作（先前這類任務甚至不會出現在收件匣）；新增「已處理」個人整理標記（處理完的沉底，不消失）。舊審批頁保留書籤相容並加導流橫幅。
 - **儀表板決定同步收斂通道卡片**：在儀表板按同意/婉拒/重試後，先前推到通訊軟體的對應卡片也會就地改寫成結果、移除按鈕。
 - **學習訊號帶話題脈絡**：記憶頁的系統學習紀錄現在會記下該次學習關於哪些話題（列表列與卡片顯示「話題：…」）；既往紀錄寫入時未存話題，維持原狀不假造。
+- **常駐感知＋訊號喚醒（Resident Sensing）**：外部資料流（行情輪詢、日誌檔追蹤、任意指令輸出）現在可以常駐接進 autopilot 事件匯流排——新增 `tick` 事件與 `config.toml [tick]` / `[[tick.sources]]`（`http_poll`／`command`／`file_tail` 三種來源，**預設關閉**）。每筆數值型觀測欄位自動衍生 `prev_<f>`／`delta_<f>`／`pct_<f>` 三個比對欄位，規則不用學新運算子就能寫「漲跌幅 gt 2」。deterministic 規則（含既有 CEP 時序判斷）命中後，可選掛一道**本地模型初篩**（`action.screen`，只走本地推理、絕不外呼雲端）擋掉不值得喚醒 AI 員工的雜訊；初篩逾時／不可用／回覆解析不出 YES/NO 一律依 `on_unavailable` 政策處理（預設放行，可設為攔截）。tick 事件預設不落 `events.db`（近期歷史留在記憶體環形緩衝，256 筆／來源，可選 `persist_every_n` 稽核）；喚醒 `delegate` 的提示詞可附最近觀測窗口（`context_ticks`，預設 10、上限 50）。`command` 來源需全域 `allow_command_sources = true` 才會執行（fail-closed）。儀表板 Autopilot 分頁新增「即時監控來源」唯讀卡片（`ticks.sources`／`ticks.recent` RPC），另新增 `tick_events_total`／`tick_dropped_total`／`tick_screen_total`／`tick_wakes_total` 四個 Prometheus 指標。見 [docs/features/41-resident-sensing.md](docs/features/41-resident-sensing.md)。
+
+### Wave 2 — 雙模深化
+- **首頁 overview-first**:頂部一行健康摘要(N 位待命/M 件等你決定/K 件沒送出去)+「需要你處理」清單(點擊直達收件匣對應項)+「你不在的時候」聚合區塊(以上次訪問為錨,聚合成事件類型而非逐筆 log);全綠時顯示安心態。
+- **通道「行為與存取」設定進儀表板**:只在被 @ 回、自動開討論串、允許/封鎖名單、配對要求、`admin_users`(誰能下停止指令)終於在通道頁可見可管;與通道端既有工具共用同一驗證與儲存層;`admin_users` 僅限儀表板寫入(AI 員工不能自我授權),全部寫入過稽核。
+- **「在通道中開啟」反向直達**:任務/待辦決定/安裝申請詳情頁一鍵跳回產生它的那則對話——Telegram(私聊+群組訊息級)、WhatsApp 立即可用;Discord/Slack/Teams 座標開始持久化(收訊即記錄,建任務時快照),LINE/飛書/Google Chat 平台無此能力則誠實不顯示按鈕。
+- **通知治理**:勿擾時段(`quiet_hours`,FYI/需確認級延後合併投遞,需操作級照發)、每日摘要(預設關,有事才發)、每類通知的行動率量測(`notify.stats` RPC,低於 50% 即視為 broken 的判準內建);通道故障記錄補平台欄位與恢復事件。
+- **收件匣單筆直達**:`/inbox?item=<id>` 深連結落在該筆並捲動到位;通道推播與首頁清單全部帶單筆座標。
+- **修復**:`wiki_scope.update` 對格式錯誤的政策檔先前會靜默清空其他 namespace 的宣告(fail-open),已改為拒絕寫入;首頁「等我處理」小工具漏算等你決定類任務。
 
 ### 語彙統一
 - 全站狀態詞依同一張語彙表對齊（通道與儀表板逐字相同）：「需人工」→「等你決定」、「受阻」→「卡住了」、「失敗」→「沒做完」、「核准/退回」→「同意/拒絕」（安裝申請用「婉拒」）、「審核中」→「驗收中」，三語（zh-TW/en/ja-JP）同步。
 
 ### Changed
+- **通道故障記錄補平台欄位＋恢復事件**：`channel_failures.jsonl` 的所有寫入點只要能從 session id 推出平台，就補上 `channel` 欄位（`channel_reply_silent` / `channel_reply_fallback` / `runtime_fallback_substitution` / `trajectory_anomaly` / `foresight_alarm`）；推不出平台的（cron / bus / heartbeat 等內部 session，以及只拿得到工作目錄的 PTY fallback）寫 `null` 或省略，不假造歸屬。通道從告警狀態恢復時寫一筆 `{"event":"channel_recovered","channel":…,"resolved":true,"resolves":…}`；舊的失敗行不改寫（append-only 稽核檔），儀表板靠「同一 channel 有沒有更晚的恢復事件」判斷故障是否仍相關。舊行沒有 `channel` 欄位照常解析。
+  - ⚠️ 連帶修正：通道故障告警的判定條件從「有 `channel` 欄位」改為「`event` 在送出失敗白名單內 **且** 有 `channel` 欄位」。少了這步，上述補欄位會讓每次 LLM 逾時、每次軌跡異常都被誤判為通道斷線而告警。白名單目前只有 `telegram_send_failed`。
 - **「待辦決定」收斂為單一介面**：安裝簽核、自主任務卡關、自主任務啟動核准、高風險動作核可、自動規則跳閘這五種「要你點頭才會繼續」的事，先前各有一套按鈕編碼、各一套授權規則、各一段通道路由。現在共用同一套：
   - **授權統一**：自主任務的按鈕先前完全不驗證按的人是誰（任何看得到卡片的人都能重試／標記完成／放棄別人的任務），現已套用與核可按鈕相同的規則——已綁定儀表板身分者依角色（管理員／主管），未建立任何身分系統的單人部署則只認收到卡片的那個帳號本人。群組收到的卡片不會讓群組成員自動取得決定權。
   - **文案統一**：按鈕與結果沿用同一組詞（已同意／已拒絕／已婉拒／已重試／已標記完成／已放棄／已暫停）。安裝申請的退回改稱「婉拒」（語氣較軟）、啟動核准的「已核准」改稱「已同意」、逾時改稱「逾時未決，已自動拒絕」。

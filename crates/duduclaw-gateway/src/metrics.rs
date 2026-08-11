@@ -94,6 +94,28 @@ pub struct MetricsRegistry {
     /// efficiency cratered right after a previously-healthy row for the
     /// same agent.
     pub prompt_compression_cache_break_suspect_total: AtomicU64,
+
+    // ── Resident sensing (WP4 observability) ──────────────────────────
+    /// Tick events successfully emitted, by source id. Source ids are
+    /// validated against `^[a-z0-9][a-z0-9-]{0,63}$` at `[tick]` config load
+    /// time (`tick_config::is_valid_source_id`), so this label is safe to
+    /// interpolate without further escaping.
+    pub tick_events: RwLock<std::collections::HashMap<String, u64>>,
+    /// Tick payloads refused before becoming an event, by `(source, reason)`.
+    /// `reason` is one of the fixed [`crate::tick_source::DropReason`]
+    /// strings.
+    pub tick_dropped: RwLock<std::collections::HashMap<(String, String), u64>>,
+    /// WP3 local-model screening verdicts. Global rather than per-source or
+    /// per-rule: `screen` is a rule-level feature usable on any
+    /// `trigger_event`, so there is no single source to attribute a verdict
+    /// to (see `autopilot_screen` module doc).
+    pub tick_screen_pass_total: AtomicU64,
+    pub tick_screen_drop_total: AtomicU64,
+    pub tick_screen_unavailable_total: AtomicU64,
+    /// Rules whose action actually dispatched after a `tick`-triggered fire,
+    /// keyed by `rule_id` — never `rule_name`, which is operator-authored
+    /// free text and must not become an unescaped Prometheus label.
+    pub tick_wakes: RwLock<std::collections::HashMap<String, u64>>,
 }
 
 const DURATION_BOUNDS_MS: [u64; 7] = [100, 250, 500, 1000, 2500, 5000, 10000];
@@ -163,6 +185,13 @@ impl MetricsRegistry {
             prompt_compression_runs: RwLock::new(std::collections::HashMap::new()),
             prompt_compression_skipped_cache_guard_total: AtomicU64::new(0),
             prompt_compression_cache_break_suspect_total: AtomicU64::new(0),
+
+            tick_events: RwLock::new(std::collections::HashMap::new()),
+            tick_dropped: RwLock::new(std::collections::HashMap::new()),
+            tick_screen_pass_total: AtomicU64::new(0),
+            tick_screen_drop_total: AtomicU64::new(0),
+            tick_screen_unavailable_total: AtomicU64::new(0),
+            tick_wakes: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -202,6 +231,39 @@ impl MetricsRegistry {
     pub fn prompt_compression_cache_break_suspect(&self) {
         self.prompt_compression_cache_break_suspect_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Resident sensing helpers (WP4 observability) ──────────────────
+
+    /// Record one tick event emitted by `source`.
+    pub async fn tick_event(&self, source: &str) {
+        let mut map = self.tick_events.write().await;
+        *map.entry(source.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record one tick payload refused before becoming an event.
+    pub async fn tick_dropped(&self, source: &str, reason: &str) {
+        let mut map = self.tick_dropped.write().await;
+        *map.entry((source.to_string(), reason.to_string())).or_insert(0) += 1;
+    }
+
+    /// Record one WP3 screening verdict. `outcome` must be `"pass"` /
+    /// `"drop"` / `"unavailable"`; anything else folds into `unavailable`
+    /// (fail-closed observability — an unrecognized outcome must never
+    /// vanish from the totals).
+    pub fn tick_screen(&self, outcome: &str) {
+        let counter = match outcome {
+            "pass" => &self.tick_screen_pass_total,
+            "drop" => &self.tick_screen_drop_total,
+            _ => &self.tick_screen_unavailable_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one rule action dispatching after a `tick`-triggered fire.
+    pub async fn tick_wake(&self, rule_id: &str) {
+        let mut map = self.tick_wakes.write().await;
+        *map.entry(rule_id.to_string()).or_insert(0) += 1;
     }
 
     // ── PTY pool helpers (Phase 8 production-rollout observability) ───
@@ -619,6 +681,43 @@ impl MetricsRegistry {
             self.prompt_compression_cache_break_suspect_total.load(Ordering::Relaxed)
         ));
 
+        // ── Resident sensing (WP4 observability) ──
+        out.push_str("# HELP tick_events_total Tick events emitted, by source.\n");
+        out.push_str("# TYPE tick_events_total counter\n");
+        for (source, count) in self.tick_events.read().await.iter() {
+            out.push_str(&format!("tick_events_total{{source=\"{source}\"}} {count}\n"));
+        }
+        out.push_str(
+            "# HELP tick_dropped_total Tick payloads refused before becoming an event, by source and reason.\n",
+        );
+        out.push_str("# TYPE tick_dropped_total counter\n");
+        for ((source, reason), count) in self.tick_dropped.read().await.iter() {
+            out.push_str(&format!(
+                "tick_dropped_total{{source=\"{source}\",reason=\"{reason}\"}} {count}\n"
+            ));
+        }
+        out.push_str("# HELP tick_screen_total Local-model screening verdicts, by outcome.\n");
+        out.push_str("# TYPE tick_screen_total counter\n");
+        out.push_str(&format!(
+            "tick_screen_total{{outcome=\"pass\"}} {}\n",
+            self.tick_screen_pass_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "tick_screen_total{{outcome=\"drop\"}} {}\n",
+            self.tick_screen_drop_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "tick_screen_total{{outcome=\"unavailable\"}} {}\n",
+            self.tick_screen_unavailable_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP tick_wakes_total Rule actions dispatched after a tick-triggered fire, by rule id.\n",
+        );
+        out.push_str("# TYPE tick_wakes_total counter\n");
+        for (rule_id, count) in self.tick_wakes.read().await.iter() {
+            out.push_str(&format!("tick_wakes_total{{rule=\"{rule_id}\"}} {count}\n"));
+        }
+
         out
     }
 }
@@ -932,5 +1031,75 @@ mod tests {
         assert!(output.contains("prompt_compression_runs_total{stage=\"turn_trim\"} 1"));
         assert!(output.contains("prompt_compression_skipped_cache_guard_total 1"));
         assert!(output.contains("prompt_compression_cache_break_suspect_total 1"));
+    }
+
+    // ── Resident sensing (WP4 observability) ──────────────────────────
+
+    #[tokio::test]
+    async fn tick_event_counts_by_source() {
+        let r = MetricsRegistry::new();
+        r.tick_event("twse-2330").await;
+        r.tick_event("twse-2330").await;
+        r.tick_event("other-source").await;
+        let map = r.tick_events.read().await;
+        assert_eq!(map.get("twse-2330"), Some(&2));
+        assert_eq!(map.get("other-source"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn tick_dropped_counts_by_source_and_reason() {
+        let r = MetricsRegistry::new();
+        r.tick_dropped("twse-2330", "rate_cap").await;
+        r.tick_dropped("twse-2330", "rate_cap").await;
+        r.tick_dropped("twse-2330", "oversize").await;
+        r.tick_dropped("other-source", "fetch_error").await;
+        let map = r.tick_dropped.read().await;
+        assert_eq!(map.get(&("twse-2330".to_string(), "rate_cap".to_string())), Some(&2));
+        assert_eq!(map.get(&("twse-2330".to_string(), "oversize".to_string())), Some(&1));
+        assert_eq!(
+            map.get(&("other-source".to_string(), "fetch_error".to_string())),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn tick_screen_routes_to_the_right_counter_and_folds_unknown_to_unavailable() {
+        let r = MetricsRegistry::new();
+        r.tick_screen("pass");
+        r.tick_screen("pass");
+        r.tick_screen("drop");
+        r.tick_screen("unavailable");
+        r.tick_screen("something_unexpected");
+        assert_eq!(r.tick_screen_pass_total.load(Ordering::Relaxed), 2);
+        assert_eq!(r.tick_screen_drop_total.load(Ordering::Relaxed), 1);
+        // "unavailable" + the unrecognized outcome both fold here.
+        assert_eq!(r.tick_screen_unavailable_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn tick_wake_counts_by_rule_id() {
+        let r = MetricsRegistry::new();
+        r.tick_wake("rule-1").await;
+        r.tick_wake("rule-1").await;
+        r.tick_wake("rule-2").await;
+        let map = r.tick_wakes.read().await;
+        assert_eq!(map.get("rule-1"), Some(&2));
+        assert_eq!(map.get("rule-2"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn render_emits_resident_sensing_metric_labels() {
+        let r = MetricsRegistry::new();
+        r.tick_event("twse-2330").await;
+        r.tick_dropped("twse-2330", "rate_cap").await;
+        r.tick_screen("pass");
+        r.tick_wake("rule-1").await;
+
+        let output = r.render().await;
+        assert!(output.contains("tick_events_total{source=\"twse-2330\"} 1"));
+        assert!(output.contains("tick_dropped_total{source=\"twse-2330\",reason=\"rate_cap\"} 1"));
+        assert!(output.contains("tick_screen_total{outcome=\"pass\"} 1"));
+        assert!(output.contains("tick_screen_total{outcome=\"drop\"} 0"));
+        assert!(output.contains("tick_wakes_total{rule=\"rule-1\"} 1"));
     }
 }

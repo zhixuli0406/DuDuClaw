@@ -10367,54 +10367,37 @@ async fn handle_synthesize_speech(args: &Value) -> Value {
 }
 
 // ── Channel settings tool handlers ──────────────────────────────
+//
+// Channel-type list, key allowlists, and value validation are centralized in
+// `duduclaw_gateway::channel_settings` (W2-2) so this MCP tool and the
+// dashboard `channels.config_*`/`access_*` RPCs can never drift into
+// accepting different input — one shared `ChannelSettingsManager` access
+// layer, one validator. `VALID_KEYS` here intentionally excludes
+// `admin_users`: an in-channel agent must never grant itself `!STOP`
+// authority (dashboard-only via `channels.access_set`, see handlers.rs).
 
-const VALID_CHANNELS: &[&str] = &[
-    "discord", "telegram", "slack", "line", "whatsapp", "feishu", "wecom", "dingtalk",
-];
-const VALID_KEYS: &[&str] = &[
-    "mention_only", "auto_thread", "allowed_channels", "allowed_guilds",
-    "agent_override", "response_mode", "thread_archive_minutes",
-    "allowed_users", "blocked_users", "require_pairing",
-];
+const VALID_CHANNELS: &[&str] = duduclaw_gateway::channel_settings::VALID_CHANNEL_TYPES;
 
-/// Validate scope_id: max 64 chars, alphanumeric + underscore/hyphen or "global"/"dm".
-fn validate_scope_id(scope_id: &str) -> std::result::Result<(), String> {
-    if scope_id.len() > 64 {
-        return Err("scope_id too long (max 64 chars)".into());
-    }
-    if scope_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        Ok(())
-    } else {
-        Err("scope_id contains invalid characters".into())
-    }
+fn valid_config_key(key: &str) -> bool {
+    duduclaw_gateway::channel_settings::CONFIG_KEYS.contains(&key)
+        || duduclaw_gateway::channel_settings::MCP_ACCESS_KEYS.contains(&key)
 }
 
-/// Validate value based on key type.
+fn valid_keys_help() -> String {
+    duduclaw_gateway::channel_settings::CONFIG_KEYS
+        .iter()
+        .chain(duduclaw_gateway::channel_settings::MCP_ACCESS_KEYS.iter())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn validate_scope_id(scope_id: &str) -> std::result::Result<(), String> {
+    duduclaw_gateway::channel_settings::validate_scope_id(scope_id)
+}
+
 fn validate_value(key: &str, value: &str) -> std::result::Result<(), String> {
-    match key {
-        "mention_only" | "auto_thread" | "require_pairing" => {
-            if value != "true" && value != "false" {
-                return Err(format!("{key} must be 'true' or 'false'"));
-            }
-        }
-        "allowed_channels" | "allowed_guilds" | "allowed_users" | "blocked_users" => {
-            if serde_json::from_str::<Vec<String>>(value).is_err() {
-                return Err(format!("{key} must be a JSON array of strings, e.g. [\"id1\",\"id2\"]"));
-            }
-        }
-        "response_mode" => {
-            if !["embed", "plain", "auto"].contains(&value) {
-                return Err("response_mode must be 'embed', 'plain', or 'auto'".into());
-            }
-        }
-        "thread_archive_minutes" => {
-            if !["60", "1440", "4320", "10080"].contains(&value) {
-                return Err("thread_archive_minutes must be 60, 1440, 4320, or 10080".into());
-            }
-        }
-        _ => {} // agent_override: any string is valid (checked against registry at use time)
-    }
-    Ok(())
+    duduclaw_gateway::channel_settings::validate_setting_value(key, value)
 }
 
 async fn handle_channel_config(args: &Value, home_dir: &Path) -> Value {
@@ -10434,8 +10417,8 @@ async fn handle_channel_config(args: &Value, home_dir: &Path) -> Value {
     if !VALID_CHANNELS.contains(&channel) {
         return tool_error(&format!("Invalid channel type: {channel}"));
     }
-    if !VALID_KEYS.contains(&key) {
-        return tool_error(&format!("Invalid key: {key}. Valid keys: {}", VALID_KEYS.join(", ")));
+    if !valid_config_key(key) {
+        return tool_error(&format!("Invalid key: {key}. Valid keys: {}", valid_keys_help()));
     }
     if let Err(e) = validate_scope_id(scope_id) {
         return tool_error(&format!("Invalid scope_id: {e}"));

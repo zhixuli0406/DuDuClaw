@@ -44,6 +44,7 @@ use crate::decision_notify::{
     authorize_press, destination_matches_any, identity_system_active, mapped_role, refusal_text,
     DecisionCard, PressAuth,
 };
+use crate::notify_governance::NotifyLevel;
 use crate::task_store::{ActivityRow, TaskRow, TaskStore};
 
 /// The agent's default notification destination — `agent.toml [proactive]
@@ -87,7 +88,8 @@ pub(crate) async fn channel_token(home_dir: &Path, agent_id: &str, channel: &str
         .filter(|t| !t.is_empty())
 }
 
-/// Push one plain-text line to an agent's own control channel.
+/// Push one plain-text line to an agent's own control channel, **through the
+/// notification governance layer** ([`crate::notify_governance`]).
 ///
 /// The generic version of the `[proactive]` destination + `reports_to` token
 /// cascade the goal loop already uses, exposed for the evolution-side alerts
@@ -96,23 +98,67 @@ pub(crate) async fn channel_token(home_dir: &Path, agent_id: &str, channel: &str
 /// consolidated SOUL.md or a frozen evolution loop is exactly the kind of
 /// thing the operator should hear about where they already are.
 ///
+/// `level` is the caller's [`NotifyLevel`] classification (W2-4 P4-1) — it is
+/// a required argument rather than a default so that adding a new push site
+/// forces a decision about whether it may wake someone up.
+/// `notify_type` is the action-rate stats bucket
+/// (see [`crate::notify_stats`]); use a stable `<family>.<what>` token.
+///
 /// Best-effort by construction: no `[proactive]` destination or no bot token
-/// is [`NotifyOutcome::NoTarget`], not an error. Callers keep their Activity
-/// Feed row either way.
+/// is [`NotifyOutcome::NoTarget`], not an error. A push held back by quiet
+/// hours is [`NotifyOutcome::Deferred`] — queued, never dropped. Callers keep
+/// their Activity Feed row either way.
 pub async fn notify_agent_plain(
     home_dir: &Path,
     agent_id: &str,
+    level: NotifyLevel,
+    notify_type: &str,
     text: &str,
 ) -> NotifyOutcome {
     let Some((channel, chat_id)) = agent_notify_target(home_dir, agent_id) else {
         return NotifyOutcome::NoTarget;
     };
+
+    // Quiet hours are evaluated BEFORE the token lookup: a deferred notice is
+    // re-resolved at delivery time, so a token that is missing right now
+    // (mid-rotation, say) must not turn a suppressible push into `NoTarget`.
+    let policy = crate::notify_governance::load_agent_policy(home_dir, agent_id);
+    if let Some(until) = policy.decide(level, chrono::Utc::now()) {
+        let queued = crate::notify_governance::enqueue(
+            home_dir,
+            crate::notify_governance::DeferredNotice {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: agent_id.to_string(),
+                channel,
+                chat_id,
+                level: level.as_str().to_string(),
+                notify_type: notify_type.to_string(),
+                queued_at: chrono::Utc::now().to_rfc3339(),
+                deliver_after: until.to_rfc3339(),
+                kind: crate::notify_governance::NoticeKind::Plain,
+                text: text.to_string(),
+                link: None,
+                no_button_hint: None,
+                decision_source: None,
+                decision_id: None,
+            },
+        );
+        return if queued {
+            NotifyOutcome::Deferred
+        } else {
+            // The queue write failed and was logged; report it as a send
+            // failure so the caller's own retry logic (if any) still applies.
+            NotifyOutcome::SendFailed
+        };
+    }
+
     let Some(token) = channel_token(home_dir, agent_id, &channel).await else {
         info!(agent = %agent_id, %channel, "agent-notify: no bot token; skipping push");
         return NotifyOutcome::NoTarget;
     };
     let http = reqwest::Client::new();
     if send_plain_text(home_dir, &http, &channel, &token, &chat_id, text).await {
+        crate::notify_stats::record_push(home_dir, notify_type, level, None);
         NotifyOutcome::Sent
     } else {
         NotifyOutcome::SendFailed
@@ -137,6 +183,10 @@ pub enum NotifyOutcome {
     NoTarget,
     /// A destination existed but the HTTP send failed. Worth retrying.
     SendFailed,
+    /// Quiet hours held the message back ([`crate::notify_governance`]). It is
+    /// queued and will be delivered when the window ends — handled, not lost,
+    /// and NOT worth retrying (a retry would queue a duplicate).
+    Deferred,
 }
 
 impl NotifyOutcome {
@@ -518,10 +568,12 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
         link: link.as_deref(),
         no_button_hint: "此通道無法顯示按鈕，請至儀表板的待辦決定頁處理這件事。",
     };
-    if crate::decision_notify::deliver(home_dir, &http, &channel, &token, &chat_id, &card).await {
-        NotifyOutcome::Sent
-    } else {
-        NotifyOutcome::SendFailed
+    match crate::decision_notify::deliver_outcome(home_dir, &http, &channel, &token, &chat_id, &card)
+        .await
+    {
+        crate::decision_notify::DeliverOutcome::Sent => NotifyOutcome::Sent,
+        crate::decision_notify::DeliverOutcome::Deferred => NotifyOutcome::Deferred,
+        crate::decision_notify::DeliverOutcome::Failed => NotifyOutcome::SendFailed,
     }
 }
 
@@ -704,10 +756,12 @@ pub async fn notify_goal_kickoff(
         link: link.as_deref(),
         no_button_hint: "此通道無法顯示按鈕，請至儀表板的待辦決定頁同意或拒絕。",
     };
-    if crate::decision_notify::deliver(home_dir, &http, &channel, &token, &chat_id, &card).await {
-        NotifyOutcome::Sent
-    } else {
-        NotifyOutcome::SendFailed
+    match crate::decision_notify::deliver_outcome(home_dir, &http, &channel, &token, &chat_id, &card)
+        .await
+    {
+        crate::decision_notify::DeliverOutcome::Sent => NotifyOutcome::Sent,
+        crate::decision_notify::DeliverOutcome::Deferred => NotifyOutcome::Deferred,
+        crate::decision_notify::DeliverOutcome::Failed => NotifyOutcome::SendFailed,
     }
 }
 
@@ -1955,5 +2009,102 @@ mod tests {
         )
         .await;
         assert_eq!(out, None);
+    }
+
+    // ── W2-4: governed plain pushes ──────────────────────────────
+
+    /// Give `agent` a `[proactive]` destination plus a quiet window that
+    /// certainly contains the current local time.
+    fn seed_quiet_target(home: &std::path::Path, agent: &str, quiet_hours: &str) {
+        let dir = home.join("agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!(
+                "[proactive]\nnotify_channel = \"telegram\"\nnotify_chat_id = \"555\"\nquiet_hours = \"{quiet_hours}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_suppressible_push_inside_quiet_hours_is_queued_not_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let window = crate::notify_governance::tests::window_covering_now();
+        seed_quiet_target(dir.path(), "kiki", &window);
+
+        let outcome = notify_agent_plain(
+            dir.path(),
+            "kiki",
+            NotifyLevel::Fyi,
+            "evolution.stagnation",
+            "演化迴圈停滯",
+        )
+        .await;
+        assert_eq!(outcome, NotifyOutcome::Deferred);
+        assert!(outcome.is_final(), "a queued notice must not be retried into a duplicate");
+
+        // It is in the queue, addressed correctly, and carries its body.
+        let queued = crate::notify_governance::take_due(
+            dir.path(),
+            chrono::Utc::now() + chrono::Duration::hours(2),
+        );
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].agent_id, "kiki");
+        assert_eq!(queued[0].channel, "telegram");
+        assert_eq!(queued[0].chat_id, "555");
+        assert_eq!(queued[0].level, "L1");
+        assert_eq!(queued[0].notify_type, "evolution.stagnation");
+        assert_eq!(queued[0].text, "演化迴圈停滯");
+        assert_eq!(queued[0].kind, crate::notify_governance::NoticeKind::Plain);
+
+        // Nothing was recorded as pushed — the stats bucket counts delivery,
+        // not intent (the drainer records it when it actually goes out).
+        assert!(crate::notify_stats::stats(dir.path(), 30).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_l3_push_inside_quiet_hours_is_never_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let window = crate::notify_governance::tests::window_covering_now();
+        seed_quiet_target(dir.path(), "kiki", &window);
+
+        // No bot token in this temp home ⇒ `NoTarget`. The point is that it
+        // reached the token lookup at all, i.e. it was NOT deferred.
+        let outcome = notify_agent_plain(
+            dir.path(),
+            "kiki",
+            NotifyLevel::Act,
+            "budget.breaker",
+            "已停工：花費達上限",
+        )
+        .await;
+        assert_eq!(outcome, NotifyOutcome::NoTarget);
+        assert!(crate::notify_governance::take_due(
+            dir.path(),
+            chrono::Utc::now() + chrono::Duration::hours(2)
+        )
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_agent_without_quiet_hours_is_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_notify_target(dir.path(), "kiki", "telegram", "555");
+        // No token ⇒ NoTarget, but crucially never Deferred.
+        let outcome =
+            notify_agent_plain(dir.path(), "kiki", NotifyLevel::Fyi, "evolution.consolidate", "x").await;
+        assert_eq!(outcome, NotifyOutcome::NoTarget);
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_destination_is_no_target_regardless_of_level() {
+        let dir = tempfile::tempdir().unwrap();
+        for lvl in [NotifyLevel::Fyi, NotifyLevel::Confirm, NotifyLevel::Act] {
+            assert_eq!(
+                notify_agent_plain(dir.path(), "ghost", lvl, "x.y", "hi").await,
+                NotifyOutcome::NoTarget
+            );
+        }
     }
 }

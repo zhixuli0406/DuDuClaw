@@ -1060,6 +1060,9 @@ pub(crate) fn record_silent_reply(
     let rec = serde_json::json!({
         "event": "channel_reply_silent",
         "session_id": session_id,
+        // W2-4: which platform the person was silenced on. `null` for
+        // non-channel sessions.
+        "channel": crate::trajectory_guard::channel_from_session_id(session_id),
         "user_id": user_id,
         "reason": reason,
         "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -2459,6 +2462,8 @@ async fn build_reply_with_session_inner(
                     "event": "runtime_fallback_substitution",
                     "agent": hb_agent_id,
                     "session_id": hb_session_id,
+                    // W2-4: platform attribution; `null` off-channel.
+                    "channel": crate::trajectory_guard::channel_from_session_id(hb_session_id),
                     "requested": provider.as_str(),
                     "actual": resp.runtime_name,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -4293,6 +4298,9 @@ async fn build_reply_with_session_inner(
         "event": "channel_reply_fallback",
         "agent": name,
         "session_id": session_id,
+        // W2-4: which platform the user got the fallback message on; `null`
+        // for non-channel sessions.
+        "channel": crate::trajectory_guard::channel_from_session_id(session_id),
         "reason": reason_token,
         "error": err_str.chars().take(300).collect::<String>(),
         "mast": mast.as_str(),
@@ -8743,6 +8751,11 @@ fn record_pty_pool_fallback(
     reason: &str,
     mid_task: bool,
 ) {
+    // No `channel` field (W2-4): this path is reached from the CLI-runtime
+    // layer, which is handed a work dir and no session id. Guessing a
+    // platform from the agent's config would be a fabricated attribution;
+    // omitting the field is the honest answer and consumers already tolerate
+    // its absence.
     let record = serde_json::json!({
         "event": "pty_pool_fallback",
         "agent": agent_id_from_work_dir(work_dir),

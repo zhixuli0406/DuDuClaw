@@ -543,6 +543,9 @@ pub fn alarm_record(agent: &str, session_id: &str, alarm: &ForesightAlarm) -> Va
         "event": "foresight_alarm",
         "agent": agent,
         "session_id": session_id,
+        // W2-4: platform attribution for the dashboard's unified log; `null`
+        // for non-channel sessions (cron / bus / heartbeat).
+        "channel": crate::trajectory_guard::channel_from_session_id(session_id),
         "level": alarm.level.as_str(),
         "score": (alarm.score * 10.0).round() / 10.0,
         "reasons": alarm.reasons,

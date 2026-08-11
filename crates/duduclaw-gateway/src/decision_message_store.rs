@@ -49,6 +49,14 @@ struct CardEntry {
     /// [`CardEntry::channel`].
     #[serde(default)]
     chat_id: String,
+    /// W2-7: the Discord guild this card's destination channel belonged to,
+    /// snapshotted at push time from `discord::guild_id_for_channel` when
+    /// `channel == "discord"`. `#[serde(default)]` so every entry written
+    /// before this field existed (and every entry for a non-Discord
+    /// destination) deserializes to `None` rather than failing — this store's
+    /// documented failure posture is "degrade, never error".
+    #[serde(default)]
+    discord_guild_id: Option<String>,
 }
 
 type State = HashMap<String, CardEntry>;
@@ -115,12 +123,18 @@ pub fn record_card_message(
     let path = store_path(home_dir);
     let key = card_key(namespace, decision_id, channel, chat_id);
     let now_ms = chrono::Utc::now().timestamp_millis();
+    // W2-7: snapshot the Discord guild id at push time (same rationale as
+    // `TaskRow::source_discord_guild_id`) — `None` for every other platform
+    // and for a Discord channel this gateway hasn't seen a message from yet.
+    let discord_guild_id =
+        (channel == "discord").then(|| crate::discord::guild_id_for_channel(home_dir, chat_id)).flatten();
     let entry = CardEntry {
         edit_chat_id: pushed.edit_chat_id.clone(),
         message_id: pushed.message_id.clone(),
         stored_at_ms: now_ms,
         channel: channel.to_string(),
         chat_id: chat_id.to_string(),
+        discord_guild_id,
     };
     let result = duduclaw_core::with_file_lock(&path, || {
         let mut state = load_state(&path);
@@ -148,6 +162,22 @@ pub fn lookup_card_message(
         edit_chat_id: e.edit_chat_id.clone(),
         message_id: e.message_id.clone(),
     })
+}
+
+/// W2-7: the Discord guild id snapshotted for a decision card's destination,
+/// when its channel was `"discord"` and the guild was known at push time.
+/// `None` for every other platform, for a lookup miss, or for a Discord
+/// card pushed before this field existed — never fabricated.
+pub fn lookup_card_discord_guild_id(
+    home_dir: &Path,
+    namespace: &str,
+    decision_id: &str,
+    channel: &str,
+    chat_id: &str,
+) -> Option<String> {
+    let path = store_path(home_dir);
+    let key = card_key(namespace, decision_id, channel, chat_id);
+    load_state(&path).get(&key).and_then(|e| e.discord_guild_id.clone())
 }
 
 /// One card of a decision, as delivered to a specific destination.
@@ -232,6 +262,48 @@ mod tests {
     fn lookup_miss_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(lookup_card_message(dir.path(), "approval", "does-not-exist", "telegram", "555"), None);
+    }
+
+    // ── W2-7: Discord guild id snapshot on push ──────────────
+
+    #[test]
+    fn discord_card_snapshots_guild_id_recorded_by_discord_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Simulates discord.rs having already seen a message from this
+        // channel before the approval card was pushed to it.
+        crate::discord::record_channel_guild(dir.path(), "chan-1", "guild-1");
+        let pushed = PushedMessage { edit_chat_id: "chan-1".into(), message_id: "m1".into() };
+        record_card_message(dir.path(), "approval", "ap-1", "discord", "chan-1", &pushed);
+
+        assert_eq!(
+            lookup_card_discord_guild_id(dir.path(), "approval", "ap-1", "discord", "chan-1"),
+            Some("guild-1".to_string())
+        );
+    }
+
+    #[test]
+    fn discord_card_unknown_channel_has_no_guild_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let pushed = PushedMessage { edit_chat_id: "chan-9".into(), message_id: "m1".into() };
+        record_card_message(dir.path(), "approval", "ap-2", "discord", "chan-9", &pushed);
+        assert_eq!(
+            lookup_card_discord_guild_id(dir.path(), "approval", "ap-2", "discord", "chan-9"),
+            None
+        );
+    }
+
+    #[test]
+    fn non_discord_card_never_carries_a_guild_id() {
+        let dir = tempfile::tempdir().unwrap();
+        // Even if (hypothetically) some data existed under the same chat_id
+        // for Discord, a Telegram-channel card must never pick it up.
+        crate::discord::record_channel_guild(dir.path(), "555", "guild-x");
+        let pushed = PushedMessage { edit_chat_id: "555".into(), message_id: "m1".into() };
+        record_card_message(dir.path(), "approval", "ap-3", "telegram", "555", &pushed);
+        assert_eq!(
+            lookup_card_discord_guild_id(dir.path(), "approval", "ap-3", "telegram", "555"),
+            None
+        );
     }
 
     #[test]
@@ -350,6 +422,7 @@ mod tests {
                 stored_at_ms: 0,
                 channel: "telegram".into(),
                 chat_id: "1".into(),
+                discord_guild_id: None,
             },
         );
         std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();

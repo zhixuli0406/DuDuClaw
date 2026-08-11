@@ -602,8 +602,16 @@ impl GvuAlertSink {
         // row above — visible solely to whoever happened to open the
         // dashboard. Best-effort: no configured destination just means the
         // Activity Feed stays the only record.
-        let outcome =
-            crate::goal_notify::notify_agent_plain(&self.home_dir, agent_id, summary).await;
+        // L1: a consolidated SOUL.md / cap-blocked loop is worth telling
+        // someone about, but it is a report, not a page.
+        let outcome = crate::goal_notify::notify_agent_plain(
+            &self.home_dir,
+            agent_id,
+            crate::notify_governance::NotifyLevel::Fyi,
+            "evolution.consolidate",
+            summary,
+        )
+        .await;
         if matches!(outcome, crate::goal_notify::NotifyOutcome::SendFailed) {
             debug!(agent = %agent_id, event = event_type, "consolidate alert: channel push failed (non-fatal)");
         }
