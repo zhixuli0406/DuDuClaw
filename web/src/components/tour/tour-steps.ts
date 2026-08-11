@@ -29,6 +29,9 @@ const STEPS: ReadonlyArray<TourStep> = [
   { route: '/skills', target: '[data-tour="nav:/skills"]', titleKey: 'tour.step.skills.title', bodyKey: 'tour.step.skills.body' },
   { route: '/growth', target: '[data-tour="nav:/growth"]', titleKey: 'tour.step.growth.title', bodyKey: 'tour.step.growth.body' },
   { route: '/manage', target: '[data-tour="nav:/manage"]', titleKey: 'tour.step.manage.title', bodyKey: 'tour.step.manage.body', minRole: 'manager' },
+  // minRole must stay in sync with the /manage/channels gate in nav-model —
+  // the tour must never walk a viewer to a page their RoleGuard hides.
+  { route: '/manage/channels', target: '[data-tour="nav:/manage/channels"]', titleKey: 'tour.step.channels.title', bodyKey: 'tour.step.channels.body', minRole: 'admin' },
 ] as const;
 
 /** The tour stops the given role can actually reach, in order. */

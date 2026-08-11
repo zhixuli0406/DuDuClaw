@@ -4,10 +4,15 @@
  * The prediction engine (System 1.5, Moderate errors) stores episodic memories
  * as a fixed English telemetry string — e.g.
  *   "Prediction deviation: expected satisfaction 0.75, inferred 0.61
- *    (delta 0.14). Topic surprise: 1.00. Corrections: yes. Follow-ups: no."
+ *    (delta 0.14). Topic surprise: 1.00. Corrections: yes. Follow-ups: no.
+ *    Topics: 報價, 合約."
  * Shown verbatim this is meaningless to end users, so the Memory page parses it
  * into structured fields and renders a localized "learning signal" card instead.
  * Non-matching content is left untouched.
+ *
+ * The trailing `Topics: …` / `Expected topic: …` sentences are both optional —
+ * older entries were written before the conversation's topics were recorded,
+ * so `topics` is simply empty for them (never fabricated).
  */
 
 export interface PredictionMemory {
@@ -23,11 +28,19 @@ export interface PredictionMemory {
   corrected: boolean;
   /** The user followed up unexpectedly. */
   followUp: boolean;
+  /**
+   * What the conversation was actually about — up to 3 keywords extracted
+   * from the user's messages, plus the model's predicted topic when that
+   * differs from all of them. Empty when the entry predates topic tracking
+   * (nothing to show; never fabricated).
+   */
+  topics: string[];
 }
 
-// Mirrors the exact `format!` in crates/duduclaw-gateway/src/prediction/router.rs.
+// Mirrors the exact `format!` in crates/duduclaw-gateway/src/prediction/router.rs
+// (see `format_moderate_telemetry`) — keep the two in sync.
 const PREDICTION_RE =
-  /^Prediction deviation: expected satisfaction (\d+(?:\.\d+)?), inferred (\d+(?:\.\d+)?) \(delta (-?\d+(?:\.\d+)?)\)\. Topic surprise: (\d+(?:\.\d+)?)\. Corrections: (yes|no)\. Follow-ups: (yes|no)\.?$/;
+  /^Prediction deviation: expected satisfaction (\d+(?:\.\d+)?), inferred (\d+(?:\.\d+)?) \(delta (-?\d+(?:\.\d+)?)\)\. Topic surprise: (\d+(?:\.\d+)?)\. Corrections: (yes|no)\. Follow-ups: (yes|no)\.?(?: Topics: ([^.]+)\.?)?(?: Expected topic: ([^.]+)\.?)?$/;
 
 /**
  * Parse a prediction-deviation episodic memory into structured fields, or
@@ -41,6 +54,19 @@ export function parsePredictionMemory(content: string): PredictionMemory | null 
   const delta = Number(m[3]);
   const surprise = Number(m[4]);
   if ([expected, inferred, delta, surprise].some((n) => Number.isNaN(n))) return null;
+
+  const extractedTopics = m[7]
+    ? m[7]
+        .split(',')
+        .map((t) => t.trim())
+        .filter((t) => t.length > 0)
+    : [];
+  const expectedTopic = m[8]?.trim();
+  const topics =
+    expectedTopic && !extractedTopics.includes(expectedTopic)
+      ? [...extractedTopics, expectedTopic]
+      : extractedTopics;
+
   return {
     expected,
     inferred,
@@ -48,6 +74,7 @@ export function parsePredictionMemory(content: string): PredictionMemory | null 
     surprise,
     corrected: m[5] === 'yes',
     followUp: m[6] === 'yes',
+    topics,
   };
 }
 

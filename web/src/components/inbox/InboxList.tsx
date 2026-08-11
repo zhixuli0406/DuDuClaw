@@ -22,6 +22,8 @@ interface InboxListProps {
   selectedId: string | null;
   /** Per-item unread flag (renders the leading dot). */
   isUnread: (item: InboxItem) => boolean;
+  /** Per-item processed flag (§C6 — dims the row + shows a checkmark). */
+  isProcessed: (item: InboxItem) => boolean;
   emptyState: ReactNode;
   /** Select a row → the page opens it in the detail pane + marks it read. */
   onSelect: (item: InboxItem) => void;
@@ -79,7 +81,7 @@ function GroupHeaderRow({
  * via `selectedId` so the split's detail pane stays in sync.
  */
 export function InboxList(props: InboxListProps) {
-  const { groups, canArchive, agentName, labels, selectedId, isUnread, emptyState } = props;
+  const { groups, canArchive, agentName, labels, selectedId, isUnread, isProcessed, emptyState } = props;
   const rowRefs = useRef(new Map<string, HTMLElement>());
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
 
@@ -213,6 +215,7 @@ export function InboxList(props: InboxListProps) {
               item={entry.item}
               selected={entry.item.id === selectedId}
               unread={isUnread(entry.item)}
+              processed={isProcessed(entry.item)}
               canArchive={canArchive}
               agentName={agentName(entry.item.agentId ?? '')}
               labels={labels}

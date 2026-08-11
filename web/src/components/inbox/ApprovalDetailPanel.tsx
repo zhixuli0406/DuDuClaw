@@ -9,6 +9,7 @@ import {
   ChevronDown,
   AlertTriangle,
   Compass,
+  Hourglass,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
@@ -24,9 +25,11 @@ import {
   DialogFooter,
   DialogClose,
 } from '@/components/mds';
-import { timeAgo } from '@/lib/format';
+import { timeAgo, timeRemaining } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import type { ApprovalItem, ApprovalSimulation } from '@/lib/api';
+import { expiryState } from '@/lib/inbox-model';
+import { useNowTick } from '@/hooks/useNowTick';
 import {
   approvalRisk,
   riskNeedsConfirm,
@@ -218,9 +221,18 @@ function GenericApprovalView({
   const described = DESCRIBED_KINDS.has(approval.kind);
   const kindDesc = described ? t(`approval.plan.kind.${approval.kind}`) : t('approval.plan.kind.unknown');
 
-  const ttlAt = approval.created_at
-    ? new Date(Date.parse(approval.created_at) + approval.ttl_seconds * 1000).toISOString()
-    : undefined;
+  // TTL countdown. Prefers the server-computed `expires_at` epoch;
+  // falls back to `created_at + ttl_seconds` for older cached responses that
+  // predate that field. Ticks only while there is a deadline to track.
+  const expiresAtEpoch =
+    approval.expires_at ?? (approval.created_at
+      ? Math.round(Date.parse(approval.created_at) / 1000) + approval.ttl_seconds
+      : null);
+  const tracksExpiry = expiresAtEpoch != null && !!approval.created_at;
+  const now = useNowTick(tracksExpiry);
+  const expiry = tracksExpiry
+    ? expiryState({ timestamp: approval.created_at, expiresAt: expiresAtEpoch }, now)
+    : null;
   const payload =
     typeof approval.payload === 'string' ? approval.payload : JSON.stringify(approval.payload, null, 2);
 
@@ -248,6 +260,19 @@ function GenericApprovalView({
           )}
         </div>
       </Section>
+
+      {/* ── Near-expiry warning — only shown in the last third of the
+          TTL window, so it signals urgency instead of adding noise to every
+          approval. Timing out is an auto-rejection, not a no-op — say so. ── */}
+      {expiry?.nearExpiry && (
+        <p className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-foreground">
+          <Hourglass className="mt-0.5 size-3.5 shrink-0 text-warning" aria-hidden="true" />
+          {intl.formatMessage(
+            { id: 'inbox.approval.nearExpiryBanner' },
+            { time: timeRemaining(expiry.remainingMs) },
+          )}
+        </p>
+      )}
 
       {/* ── D1/D2: forward-simulation narrative, when the judge ran it ── */}
       {hasSimulation(approval.simulation) && (
@@ -309,7 +334,13 @@ function GenericApprovalView({
                 <Mono>{approval.kind}</Mono>
               </Row>
               <Row label={t('inbox.approval.created')}>{timeAgo(approval.created_at)}</Row>
-              {ttlAt && <Row label={t('inbox.approval.ttl')}>{timeAgo(ttlAt)}</Row>}
+              {expiry && (
+                <Row label={t('inbox.approval.ttl')}>
+                  <span className={cn('tabular-nums', expiry.nearExpiry && 'font-medium text-warning')}>
+                    {timeRemaining(expiry.remainingMs)}
+                  </span>
+                </Row>
+              )}
             </div>
             <pre className="max-h-64 overflow-auto rounded-lg bg-muted p-2 text-[11px] leading-relaxed text-muted-foreground">
               {payload}

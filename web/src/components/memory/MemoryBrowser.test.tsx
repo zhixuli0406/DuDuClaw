@@ -18,7 +18,8 @@ function mockCalls(entries: unknown[], signals: unknown[] = []) {
   });
 }
 
-/** One prediction-deviation row, exactly as the router writes it. */
+/** One prediction-deviation row, exactly as the router writes it — legacy
+ *  shape, written before the fix, with no conversation context at all. */
 const SIGNAL = {
   id: 'p1',
   agent_id: 'agnes',
@@ -28,6 +29,13 @@ const SIGNAL = {
   tags: [],
   layer: 'episodic',
   source_event: 'prediction_episodic',
+};
+
+/** Same telemetry, current backend shape: carries the conversation's topics. */
+const SIGNAL_WITH_TOPICS = {
+  ...SIGNAL,
+  id: 'p3',
+  content: `${SIGNAL.content} Topics: 報價, 合約.`,
 };
 
 const ENTRIES = [
@@ -256,6 +264,52 @@ describe('MemoryBrowser', () => {
     expect(within(list).getByText('客戶的合約報價是三萬元')).toBeInTheDocument();
     expect(within(list).queryByText(/Learning signal/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /System learning log\s*1/ })).toBeInTheDocument();
+  });
+
+  // ── Bug fix: the learning-signal card carries no conversation context ──
+
+  it('appends the first topic to the row summary when the signal carries one', async () => {
+    const user = userEvent.setup();
+    mockCalls(ENTRIES, [SIGNAL_WITH_TOPICS]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    const toggle = await screen.findByRole('button', { name: /System learning log\s*1/ });
+    await user.click(toggle);
+    expect(screen.getByText(/Learning signal · 70% → 52% · 報價/)).toBeInTheDocument();
+  });
+
+  it('does not append a topic to the row summary for a legacy signal with none', async () => {
+    const user = userEvent.setup();
+    mockCalls(ENTRIES, [SIGNAL]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    const toggle = await screen.findByRole('button', { name: /System learning log\s*1/ });
+    await user.click(toggle);
+    expect(screen.getByText('Learning signal · 70% → 52%')).toBeInTheDocument();
+  });
+
+  it('shows the topics badge in the expanded detail card', async () => {
+    const user = userEvent.setup();
+    mockCalls(ENTRIES, [SIGNAL_WITH_TOPICS]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    const toggle = await screen.findByRole('button', { name: /System learning log\s*1/ });
+    await user.click(toggle);
+    await user.click(screen.getByText(/Learning signal · 70% → 52% · 報價/));
+
+    expect(screen.getByText('Topics: 報價, 合約')).toBeInTheDocument();
+  });
+
+  it('renders no topics badge for a legacy signal with none', async () => {
+    const user = userEvent.setup();
+    mockCalls(ENTRIES, [SIGNAL]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    const toggle = await screen.findByRole('button', { name: /System learning log\s*1/ });
+    await user.click(toggle);
+    await user.click(screen.getByText('Learning signal · 70% → 52%'));
+
+    expect(screen.queryByText(/^Topics:/)).not.toBeInTheDocument();
   });
 
   it('hides the section entirely when there are no signals', async () => {

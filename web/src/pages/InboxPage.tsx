@@ -18,10 +18,8 @@ import { cn } from '@/lib/utils';
 import {
   PageHeader,
   Button,
-  Badge,
   Empty,
   Skeleton,
-  ActorAvatar,
   ResizablePanelGroup,
   ResizablePanel,
   ResizableHandle,
@@ -35,6 +33,9 @@ import {
 } from '@/components/mds';
 import { InboxList, type InboxGroup } from '@/components/inbox/InboxList';
 import { ApprovalDetailPanel } from '@/components/inbox/ApprovalDetailPanel';
+import { InstallDetailPanel } from '@/components/inbox/InstallDetailPanel';
+import { NeedsHumanTaskPanel } from '@/components/inbox/NeedsHumanTaskPanel';
+import { DetailShell } from '@/components/inbox/DetailShell';
 import { TYPE_META } from '@/components/inbox/meta';
 import type { InboxRowLabels } from '@/components/inbox/InboxRow';
 import {
@@ -55,6 +56,7 @@ import {
   INBOX_TABS,
   TYPE_URGENCY,
   BLOCKED_BUCKET_ORDER,
+  ACTION_QUEUE_TABS,
   blockedBucket,
   groupKeyOf,
   filterByTab,
@@ -62,6 +64,9 @@ import {
   filterByStatus,
   distinctStatuses,
   excludeArchived,
+  excludeProcessed,
+  sinkProcessed,
+  statusLabelKey,
   sortInbox,
   withId,
   withoutId,
@@ -71,6 +76,7 @@ import {
   persistPrefs,
   READ_KEY,
   ARCHIVED_KEY,
+  PROCESSED_KEY,
 } from '@/lib/inbox-model';
 
 /** How many agents to poll for open decisions (best-effort, capped). */
@@ -112,6 +118,10 @@ export function InboxPage() {
   const [prefs, setPrefs] = useState<InboxPrefs>(loadPrefs);
   const [read, setRead] = useState<ReadonlySet<string>>(() => loadIdSet(READ_KEY));
   const [archived, setArchived] = useState<ReadonlySet<string>>(() => loadIdSet(ARCHIVED_KEY));
+  // §C6: a second, independent triage axis from `read` — has the user
+  // actually resolved this item? Never hides it (that's `archived`); it
+  // sinks to the bottom and dims instead.
+  const [processed, setProcessed] = useState<ReadonlySet<string>>(() => loadIdSet(PROCESSED_KEY));
   const [undoStack, setUndoStack] = useState<RawEntry[]>([]);
   // The open item in the detail pane (split layout).
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -135,10 +145,15 @@ export function InboxPage() {
   // fail-safe, not fail-loud). Splitting the decisions poll out of the initial
   // burst keeps the Inbox from firing ~17 RPCs the moment it opens (Bug#2).
   const load = useCallback(async () => {
-    const [approvalsRes, budgetRes, tasksRes, agentsRes, failedRes, installRes] = await Promise.all([
+    const [approvalsRes, budgetRes, tasksRes, needsHumanRes, agentsRes, failedRes, installRes] = await Promise.all([
       api.approvals.list().catch(() => null),
       api.budget.incidents().catch(() => null),
       api.tasks.list({ status: 'blocked' }).catch(() => null),
+      // W1-2: a goal-loop task escalated to needs_human is a distinct status
+      // from plain `blocked` (task_store.rs) — the Inbox previously never
+      // fetched it at all, so it never appeared here despite being exactly
+      // the kind of "等你決定" item this page exists for (04 doc §D.6).
+      api.tasks.list({ status: 'needs_human' }).catch(() => null),
       api.agents.list().catch(() => null),
       api.audit.unifiedLog({ sources: ['channel_failure'], limit: FAILED_RUN_CAP }).catch(() => null),
       // Install approval requests actionable by this viewer (manager/admin).
@@ -165,6 +180,7 @@ export function InboxPage() {
           actionable: true,
           status: 'pending',
           risk: approvalRisk(a.kind, a.payload),
+          expiresAt: a.expires_at,
         },
       });
     }
@@ -180,11 +196,16 @@ export function InboxPage() {
           urgency: TYPE_URGENCY.install,
           actionable: true,
           status: req.stage,
+          // W0-9 parity: install requests carry the same TTL countdown shape
+          // as approvals — surface it so the row's near-expiry marker (which
+          // already exists, don't regress it) also fires for install rows.
+          expiresAt: req.expires_at,
         },
       });
     }
 
-    for (const task of tasksRes?.tasks ?? []) {
+    const blockedTasks = [...(tasksRes?.tasks ?? []), ...(needsHumanRes?.tasks ?? [])];
+    for (const task of blockedTasks) {
       merged.push({
         raw: task,
         item: {
@@ -285,10 +306,11 @@ export function InboxPage() {
   const items = useMemo(() => entries.map((e) => e.item), [entries]);
   const nonArchived = useMemo(() => excludeArchived(items, archived), [items, archived]);
 
-  // Pending badge = actionable, non-archived items.
+  // Pending badge = actionable, non-archived, not-yet-processed items — a
+  // decided approval shouldn't keep inflating the "needs you" count (§C6).
   useEffect(() => {
-    setPendingCount(nonArchived.filter((i) => i.actionable).length);
-  }, [nonArchived, setPendingCount]);
+    setPendingCount(nonArchived.filter((i) => i.actionable && !processed.has(i.id)).length);
+  }, [nonArchived, processed, setPendingCount]);
 
   const findEntry = useCallback((id: string) => entries.find((e) => e.item.id === id), [entries]);
 
@@ -345,13 +367,16 @@ export function InboxPage() {
     });
   }, []);
 
-  // Remove a decided approval from the queue and close its detail. Archiving (vs.
-  // deleting) keeps the id out of every tab; undo deliberately can't cheaply
-  // resurrect a server-decided item.
-  const markDecided = useCallback((id: string) => {
-    setArchived((prev) => {
+  // Mark a resolved item processed (§C6) and close its detail. Unlike
+  // `archive`, this does NOT hide the row outright — it graduates out of the
+  // action-required tabs (`ACTION_QUEUE_TABS`) but stays visible, sunk to the
+  // bottom, everywhere else. There is no undo: a server-decided item can't be
+  // cheaply un-decided, so this axis has no undo stack (unlike `archive`'s).
+  const markProcessed = useCallback((id: string) => {
+    setProcessed((prev) => {
+      if (prev.has(id)) return prev;
       const next = withId(prev, id);
-      persistIdSet(ARCHIVED_KEY, next);
+      persistIdSet(PROCESSED_KEY, next);
       return next;
     });
     setSelectedId((cur) => (cur === id ? null : cur));
@@ -370,12 +395,12 @@ export function InboxPage() {
             ? intl.formatMessage({ id: 'approvals.approvedToast' }, { summary: a.summary })
             : t('inbox.approval.rejectedToast'),
         );
-        markDecided(item.id);
+        markProcessed(item.id);
       } catch (e) {
         toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
       }
     },
-    [findEntry, intl, t, markDecided],
+    [findEntry, intl, t, markProcessed],
   );
 
   // Open a row in the detail pane (marks it read).
@@ -397,18 +422,25 @@ export function InboxPage() {
   }, [nonArchived]);
 
   const isUnread = useCallback((item: InboxItem) => !read.has(item.id), [read]);
+  const isProcessed = useCallback((item: InboxItem) => processed.has(item.id), [processed]);
 
   // ── Tab population + grouping ────────────────────────────────────────────────
-  const tabItems = useMemo(
-    () => filterByTab(nonArchived, prefs.tab, { readIds: read }),
-    [nonArchived, prefs.tab, read],
-  );
+  // §C6 / 04 doc §E11: the action-required tabs ("我的"/"受阻") graduate a
+  // processed item out entirely; every other tab keeps it (sunk to the
+  // bottom via `sinkProcessed` below) rather than hiding it outright.
+  const tabItems = useMemo(() => {
+    const base = filterByTab(nonArchived, prefs.tab, { readIds: read });
+    return ACTION_QUEUE_TABS.includes(prefs.tab) ? excludeProcessed(base, processed) : base;
+  }, [nonArchived, prefs.tab, read, processed]);
   const filtered = useMemo(() => {
     if (prefs.tab !== 'all') return tabItems;
     return filterByStatus(filterByCategory(tabItems, prefs.categoryFilter), prefs.statusFilter);
   }, [tabItems, prefs.tab, prefs.categoryFilter, prefs.statusFilter]);
   const statuses = useMemo(() => distinctStatuses(tabItems), [tabItems]);
-  const sorted = useMemo(() => sortInbox(filtered, prefs.sortBy), [filtered, prefs.sortBy]);
+  const sorted = useMemo(
+    () => sinkProcessed(sortInbox(filtered, prefs.sortBy), processed),
+    [filtered, prefs.sortBy, processed],
+  );
 
   const groupLabel = useCallback(
     (key: string, by: InboxGroupBy, sample: InboxItem): string => {
@@ -450,9 +482,19 @@ export function InboxPage() {
 
   const rowLabels: InboxRowLabels = useMemo(
     () => ({
-      typeLabel: (item) => t(TYPE_META[item.type].labelKey),
+      // §C.3: a needs_human task shares "等你決定" with an approval's
+      // `pending` status — show that instead of the generic "受阻" category
+      // label, the single biggest vocabulary payoff of the object-model
+      // convergence (04 doc §C.3).
+      typeLabel: (item) =>
+        item.type === 'blocked' && item.status === 'needs_human'
+          ? t('inbox.status.pending')
+          : t(TYPE_META[item.type].labelKey),
       riskLabel: (level: RiskLevel) => t(`approval.risk.${level}`),
       archive: t('inbox.action.archive'),
+      nearExpiry: t('inbox.approval.nearExpiry'),
+      nearExpiryTooltip: t('inbox.approval.nearExpiryTooltip'),
+      processedTooltip: t('inbox.processed.tooltip'),
     }),
     [t],
   );
@@ -472,9 +514,23 @@ export function InboxPage() {
     [t],
   );
 
+  // §C.2/§C.3: never print a raw internal status token in the "全部" tab's
+  // status filter — fall back to the raw token only when there's no vocab
+  // mapping (open-ended values like a failed-run severity).
+  const statusFilterLabel = useCallback(
+    (status: string) => {
+      const key = statusLabelKey(status);
+      return key ? t(key) : status;
+    },
+    [t],
+  );
+
   const tabItemsFor = useCallback(
-    (tab: InboxTab) => filterByTab(nonArchived, tab, { readIds: read }),
-    [nonArchived, read],
+    (tab: InboxTab) => {
+      const base = filterByTab(nonArchived, tab, { readIds: read });
+      return ACTION_QUEUE_TABS.includes(tab) ? excludeProcessed(base, processed) : base;
+    },
+    [nonArchived, read, processed],
   );
 
   const canArchive = prefs.tab === 'mine';
@@ -490,7 +546,12 @@ export function InboxPage() {
   const detailBody = useMemo<ReactNode>(() => {
     if (!selectedEntry) return null;
     const { item, raw } = selectedEntry;
-    const typeLabel = t(TYPE_META[item.type].labelKey);
+    // §C.3: mirrors `rowLabels.typeLabel` — a needs_human task's detail panel
+    // must say the same "等你決定" the row does, not the generic "受阻".
+    const typeLabel =
+      item.type === 'blocked' && item.status === 'needs_human'
+        ? t('inbox.status.pending')
+        : t(TYPE_META[item.type].labelKey);
     switch (item.type) {
       case 'approval':
         return (
@@ -499,31 +560,39 @@ export function InboxPage() {
             agentName={agentName((raw as ApprovalItem).agent_id)}
             onApprove={() => decide(item, true)}
             onReject={() => decide(item, false)}
-            onDecided={() => markDecided(item.id)}
+            onDecided={() => markProcessed(item.id)}
           />
         );
       case 'install': {
         const req = raw as InstallRequestInfo;
-        return (
-          <DetailShell item={item} typeLabel={typeLabel}>
-            <div className="space-y-1 text-sm text-muted-foreground">
-              <p>{intl.formatMessage({ id: 'inbox.install.requester' }, { email: req.requester_email })}</p>
-              {req.requester_department && (
-                <p>{intl.formatMessage({ id: 'inbox.install.dept' }, { dept: req.requester_department })}</p>
-              )}
-              {req.description && <p className="text-foreground">{req.description}</p>}
-            </div>
-            <Button variant="brand" onClick={() => navigate('/approvals')}>
-              <ExternalLink />
-              {t('inbox.detail.reviewInstall')}
-            </Button>
-          </DetailShell>
-        );
+        // W1-2 / 04 doc §E17: self-contained in the Inbox — no more bouncing
+        // to `/approvals` just to see (or act on) an install request's detail.
+        return <InstallDetailPanel request={req} onDecided={() => markProcessed(item.id)} />;
       }
       case 'blocked': {
         const task = raw as TaskInfo;
+        // A needs_human task gets the full "等你決定" treatment (retry/mark
+        // complete/abandon) — a plain blocked task (no goal-loop escalation)
+        // keeps the lighter read-only view; there is no defined resolution
+        // protocol for it here.
+        if (task.status === 'needs_human') {
+          return (
+            <NeedsHumanTaskPanel
+              task={task}
+              typeLabel={typeLabel}
+              agentName={item.agentId ? agentName(item.agentId) : undefined}
+              onResolved={() => markProcessed(item.id)}
+            />
+          );
+        }
         return (
-          <DetailShell item={item} typeLabel={typeLabel} agentName={item.agentId ? agentName(item.agentId) : undefined}>
+          <DetailShell
+            icon={TYPE_META.blocked.icon}
+            title={item.title}
+            typeLabel={typeLabel}
+            agentId={item.agentId}
+            agentName={item.agentId ? agentName(item.agentId) : undefined}
+          >
             {task.blocked_reason && (
               <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{task.blocked_reason}</p>
             )}
@@ -536,7 +605,13 @@ export function InboxPage() {
       }
       case 'budget':
         return (
-          <DetailShell item={item} typeLabel={typeLabel} agentName={item.agentId ? agentName(item.agentId) : undefined}>
+          <DetailShell
+            icon={TYPE_META.budget.icon}
+            title={item.title}
+            typeLabel={typeLabel}
+            agentId={item.agentId}
+            agentName={item.agentId ? agentName(item.agentId) : undefined}
+          >
             <Button variant="brand" onClick={() => navigate('/manage/billing')}>
               <ExternalLink />
               {t('inbox.detail.viewBilling')}
@@ -545,7 +620,13 @@ export function InboxPage() {
         );
       case 'decision':
         return (
-          <DetailShell item={item} typeLabel={typeLabel} agentName={item.agentId ? agentName(item.agentId) : undefined}>
+          <DetailShell
+            icon={TYPE_META.decision.icon}
+            title={item.title}
+            typeLabel={typeLabel}
+            agentId={item.agentId}
+            agentName={item.agentId ? agentName(item.agentId) : undefined}
+          >
             <div className="flex flex-wrap items-center gap-2">
               <Button variant="brand" onClick={() => navigate('/agents')}>
                 <ExternalLink />
@@ -560,14 +641,20 @@ export function InboxPage() {
         );
       case 'failed_run':
         return (
-          <DetailShell item={item} typeLabel={typeLabel} agentName={item.agentId ? agentName(item.agentId) : undefined}>
+          <DetailShell
+            icon={TYPE_META.failed_run.icon}
+            title={item.title}
+            typeLabel={typeLabel}
+            agentId={item.agentId}
+            agentName={item.agentId ? agentName(item.agentId) : undefined}
+          >
             <pre className="max-h-96 overflow-auto rounded-lg bg-muted p-2 text-[11px] leading-relaxed text-muted-foreground">
               {JSON.stringify(raw, null, 2)}
             </pre>
           </DetailShell>
         );
     }
-  }, [selectedEntry, agentName, decide, markDecided, navigate, archive, t, intl]);
+  }, [selectedEntry, agentName, decide, markProcessed, navigate, archive, t]);
 
   // ── Left column: header + tabs + list ────────────────────────────────────────
   const listColumn = (
@@ -648,7 +735,7 @@ export function InboxPage() {
                           onClick={() => updatePrefs({ statusFilter: s })}
                           className={cn(prefs.statusFilter === s && 'font-medium text-foreground')}
                         >
-                          <span className="flex-1 truncate">{s}</span>
+                          <span className="flex-1 truncate">{statusFilterLabel(s)}</span>
                           {prefs.statusFilter === s && <Check className="size-3.5 text-brand" />}
                         </DropdownMenuItem>
                       ))}
@@ -717,6 +804,7 @@ export function InboxPage() {
             labels={rowLabels}
             selectedId={selectedId}
             isUnread={isUnread}
+            isProcessed={isProcessed}
             onSelect={select}
             onArchive={archive}
             onUnread={(item) => markUnread(item.id)}
@@ -779,43 +867,6 @@ export function InboxPage() {
           <ResizablePanel minSize="40">{detailColumn}</ResizablePanel>
         </ResizablePanelGroup>
       )}
-    </div>
-  );
-}
-
-/** Shared detail scaffold for the non-approval item types. */
-function DetailShell({
-  item,
-  typeLabel,
-  agentName,
-  children,
-}: {
-  item: InboxItem;
-  typeLabel: string;
-  agentName?: string;
-  children: ReactNode;
-}) {
-  const meta = TYPE_META[item.type];
-  const Icon = meta.icon;
-  return (
-    <div className="space-y-4">
-      <div className="flex items-start gap-3">
-        {item.agentId ? (
-          <ActorAvatar actorType="agent" size="lg" name={agentName ?? item.agentId} />
-        ) : (
-          <span className="grid size-8 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground ring-1 ring-surface-border">
-            <Icon className="size-4" />
-          </span>
-        )}
-        <div className="min-w-0 flex-1 space-y-1">
-          <div className="flex items-center gap-2">
-            <Badge variant="secondary">{typeLabel}</Badge>
-            {agentName && <span className="truncate text-xs text-muted-foreground">{agentName}</span>}
-          </div>
-          <h2 className="text-lg font-medium text-foreground">{item.title}</h2>
-        </div>
-      </div>
-      {children}
     </div>
   );
 }

@@ -153,3 +153,29 @@ describe('<ApprovalDetailPanel> D1/D2 simulation trajectory', () => {
     expect(screen.getByText('Amount miscalculation is hard to reverse')).toBeInTheDocument();
   });
 });
+
+describe('<ApprovalDetailPanel> TTL countdown', () => {
+  it('does not show the near-expiry banner well inside the TTL window', () => {
+    const now = Date.now();
+    const approval = genericApproval({
+      created_at: new Date(now - 10_000).toISOString(),
+      ttl_seconds: 300,
+      expires_at: Math.floor(now / 1000) + 290,
+    });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByText(/Expiring soon/)).not.toBeInTheDocument();
+  });
+
+  it('shows the near-expiry banner once the last third of the TTL window is reached', () => {
+    const now = Date.now();
+    const approval = genericApproval({
+      created_at: new Date(now - 280_000).toISOString(),
+      ttl_seconds: 300,
+      expires_at: Math.floor(now / 1000) + 20,
+    });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    // The banner explains that timing out counts as an automatic rejection.
+    expect(screen.getByText(/Expiring soon/)).toBeInTheDocument();
+    expect(screen.getByText(/auto-rejected/)).toBeInTheDocument();
+  });
+});

@@ -1,8 +1,9 @@
-import { Archive } from 'lucide-react';
+import { Archive, CheckCircle2, Hourglass } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ActorAvatar } from '@/components/mds';
-import { timeAgo } from '@/lib/format';
-import type { InboxItem } from '@/lib/inbox-model';
+import { timeAgo, timeRemaining } from '@/lib/format';
+import { expiryState, type InboxItem } from '@/lib/inbox-model';
+import { useNowTick } from '@/hooks/useNowTick';
 import type { RiskLevel } from '@/lib/approval-risk';
 import { TYPE_META } from './meta';
 
@@ -11,6 +12,16 @@ export interface InboxRowLabels {
   /** Whole-action risk band → short label ("低/中/高"). */
   riskLabel: (level: RiskLevel) => string;
   archive: string;
+  /** Short amber-marker label shown once an approval's TTL has burned
+   *  through two-thirds of its window ("即將逾時"). */
+  nearExpiry: string;
+  /** Full explanation of what happens at the deadline, rendered as the
+   *  countdown's hover tooltip ("逾時未決，將自動拒絕"). */
+  nearExpiryTooltip: string;
+  /** aria-label / tooltip for the "已處理" checkmark badge (§C6 — a second,
+   *  independent axis from read/unread; a processed row is never hidden
+   *  outright, only dimmed and sunk). */
+  processedTooltip: string;
 }
 
 export interface InboxRowProps {
@@ -18,6 +29,9 @@ export interface InboxRowProps {
   selected: boolean;
   /** Renders the leading unread dot + heavier title weight. */
   unread: boolean;
+  /** §C6: the user has already resolved this item. Dims the row and shows a
+   *  checkmark badge — never hides it (that's `archived`, a separate axis). */
+  processed: boolean;
   /** Hover archive button only on the "我的" tab. */
   canArchive: boolean;
   /** Display name for the leading avatar. */
@@ -39,9 +53,16 @@ function riskDot(level: RiskLevel): string {
  * selecting a row opens it there. Archive is a hover-only affordance.
  */
 export function InboxRow(props: InboxRowProps) {
-  const { item, selected, unread, canArchive, agentName, labels } = props;
+  const { item, selected, unread, processed, canArchive, agentName, labels } = props;
   const meta = TYPE_META[item.type];
   const Icon = meta.icon;
+
+  // Live TTL countdown (approvals + installs — both are two-stage-signable
+  // decisions with a server-computed deadline) — ticks only while this row
+  // actually has a deadline to track, so every other row costs nothing.
+  const tracksExpiry = (item.type === 'approval' || item.type === 'install') && item.expiresAt != null;
+  const now = useNowTick(tracksExpiry);
+  const expiry = tracksExpiry ? expiryState(item, now) : null;
 
   return (
     <div
@@ -52,6 +73,8 @@ export function InboxRow(props: InboxRowProps) {
       className={cn(
         'group/row flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 transition-colors',
         selected ? 'bg-surface-selected' : 'hover:bg-surface-hover',
+        // Sunk + dimmed, never hidden — the row stays reachable (§C6).
+        processed && !selected && 'opacity-55',
       )}
     >
       {/* Leading: originating staff avatar, or the type glyph when unowned. */}
@@ -87,8 +110,30 @@ export function InboxRow(props: InboxRowProps) {
               {labels.riskLabel(item.risk)}
             </span>
           )}
+          {/* TTL countdown — always shown once an approval carries an expiry;
+              the amber "即將逾時" marker + tint join in once under a third of
+              the window remains. Tooltip spells out that timing out counts
+              as an automatic rejection (never a silent no-op). */}
+          {expiry && (
+            <span
+              title={labels.nearExpiryTooltip}
+              className={cn(
+                'inline-flex shrink-0 items-center gap-1 tabular-nums',
+                expiry.nearExpiry && 'rounded bg-warning/15 px-1 py-0.5 font-medium text-warning',
+              )}
+            >
+              <Hourglass className="size-2.5 shrink-0" aria-hidden="true" />
+              {expiry.nearExpiry && <span>{labels.nearExpiry}</span>}
+              <span>{timeRemaining(expiry.remainingMs)}</span>
+            </span>
+          )}
           {item.channel && (
             <span className="truncate rounded bg-muted px-1 text-[10px] font-medium">{item.channel}</span>
+          )}
+          {processed && (
+            <span title={labels.processedTooltip} aria-label={labels.processedTooltip} className="inline-flex shrink-0">
+              <CheckCircle2 className="size-3 shrink-0 text-success" aria-hidden="true" />
+            </span>
           )}
         </div>
       </div>

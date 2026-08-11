@@ -6,6 +6,10 @@ import {
   filterByStatus,
   distinctStatuses,
   excludeArchived,
+  excludeProcessed,
+  sinkProcessed,
+  statusLabelKey,
+  ACTION_QUEUE_TABS,
   blockedBucket,
   groupKeyOf,
   withId,
@@ -14,6 +18,7 @@ import {
   persistIdSet,
   loadPrefs,
   persistPrefs,
+  expiryState,
   DEFAULT_PREFS,
   RECENT_WINDOW_MS,
   READ_KEY,
@@ -106,6 +111,10 @@ describe('inbox-model blocked tri-bucket', () => {
     expect(blockedBucket(mk({ type: 'blocked', agentId: 'sam' }))).toBe('input');
     expect(blockedBucket(mk({ type: 'blocked', agentId: undefined }))).toBe('attention');
   });
+  it('a needs_human task → decide, even when assigned (it is a decision, not an input request)', () => {
+    expect(blockedBucket(mk({ type: 'blocked', agentId: 'sam', status: 'needs_human' }))).toBe('decide');
+    expect(blockedBucket(mk({ type: 'blocked', agentId: undefined, status: 'needs_human' }))).toBe('decide');
+  });
   it('budget & failed_run → attention', () => {
     expect(blockedBucket(mk({ type: 'budget' }))).toBe('attention');
     expect(blockedBucket(mk({ type: 'failed_run' }))).toBe('attention');
@@ -161,6 +170,54 @@ describe('inbox-model archive exclusion + id sets', () => {
   });
 });
 
+// ── "已讀" vs "處理完" (§C6) ─────────────────────────────────────────────────
+
+describe('inbox-model processed axis (§C6)', () => {
+  it('excludeProcessed drops processed ids, keeps the rest', () => {
+    const items = [mk({ id: '1' }), mk({ id: '2' }), mk({ id: '3' })];
+    expect(excludeProcessed(items, new Set(['2'])).map((i) => i.id)).toEqual(['1', '3']);
+    expect(excludeProcessed(items, new Set())).toHaveLength(3);
+    // Empty-set fast path still returns a fresh array, not the same ref.
+    expect(excludeProcessed(items, new Set())).not.toBe(items);
+  });
+
+  it('sinkProcessed moves processed items to the end, preserving relative order within each partition', () => {
+    const items = [mk({ id: 'a' }), mk({ id: 'b' }), mk({ id: 'c' }), mk({ id: 'd' })];
+    expect(sinkProcessed(items, new Set(['b', 'd'])).map((i) => i.id)).toEqual(['a', 'c', 'b', 'd']);
+  });
+
+  it('sinkProcessed never drops an item — only reorders', () => {
+    const items = [mk({ id: 'a' }), mk({ id: 'b' })];
+    expect(sinkProcessed(items, new Set(['a', 'b']))).toHaveLength(2);
+  });
+
+  it('sinkProcessed with an empty set is a no-op copy', () => {
+    const items = [mk({ id: 'a' }), mk({ id: 'b' })];
+    const out = sinkProcessed(items, new Set());
+    expect(out).toEqual(items);
+    expect(out).not.toBe(items);
+  });
+
+  it('ACTION_QUEUE_TABS is exactly the actionable queues, not the time-ordered views', () => {
+    expect([...ACTION_QUEUE_TABS].sort()).toEqual(['blocked', 'mine']);
+  });
+});
+
+describe('inbox-model statusLabelKey (§C.2/§C.3)', () => {
+  it('pending and needs_human share one message id — the object-model convergence payoff', () => {
+    expect(statusLabelKey('pending')).toBe(statusLabelKey('needs_human'));
+    expect(statusLabelKey('pending')).toBe('inbox.status.pending');
+  });
+  it('maps the install two-stage tokens', () => {
+    expect(statusLabelKey('awaiting_manager')).toBe('inbox.status.awaitingManager');
+    expect(statusLabelKey('awaiting_admin')).toBe('inbox.status.awaitingAdmin');
+  });
+  it('unmapped tokens (open-ended business values) return null — caller falls back to the raw string', () => {
+    expect(statusLabelKey('critical')).toBeNull();
+    expect(statusLabelKey('some_future_status')).toBeNull();
+  });
+});
+
 describe('inbox-model persistence', () => {
   beforeEach(() => localStorage.clear());
 
@@ -187,5 +244,56 @@ describe('inbox-model persistence', () => {
     const p = loadPrefs();
     expect(p.tab).toBe(DEFAULT_PREFS.tab);
     expect(p.sortBy).toBe(DEFAULT_PREFS.sortBy);
+  });
+});
+
+// ── approval TTL countdown ───────────────────────────────────────────────────
+
+describe('expiryState', () => {
+  const created = '2026-01-01T00:00:00Z';
+  const createdMs = Date.parse(created);
+
+  it('is null when there is no expiresAt (every non-approval type)', () => {
+    expect(expiryState({ timestamp: created, expiresAt: undefined }, createdMs)).toBeNull();
+    expect(expiryState({ timestamp: created, expiresAt: null }, createdMs)).toBeNull();
+  });
+
+  it('is null when the timestamp is missing or unparseable', () => {
+    const expiresAt = createdMs / 1000 + 300;
+    expect(expiryState({ expiresAt }, createdMs)).toBeNull();
+    expect(expiryState({ timestamp: 'not-a-date', expiresAt }, createdMs)).toBeNull();
+  });
+
+  it('is null on a non-positive window (expiresAt at/before timestamp)', () => {
+    expect(expiryState({ timestamp: created, expiresAt: createdMs / 1000 }, createdMs)).toBeNull();
+    expect(expiryState({ timestamp: created, expiresAt: createdMs / 1000 - 10 }, createdMs)).toBeNull();
+  });
+
+  it('reports remainingMs and nearExpiry=false well inside the window', () => {
+    // 300s TTL, 10s elapsed ⇒ 290s left, nowhere near the last third.
+    const expiresAt = createdMs / 1000 + 300;
+    const state = expiryState({ timestamp: created, expiresAt }, createdMs + 10_000);
+    expect(state).not.toBeNull();
+    expect(state!.remainingMs).toBe(290_000);
+    expect(state!.nearExpiry).toBe(false);
+    expect(state!.expired).toBe(false);
+  });
+
+  it('flips nearExpiry once at most a third of the window remains', () => {
+    // 300s TTL ⇒ last third starts at 200s elapsed (100s left).
+    const expiresAt = createdMs / 1000 + 300;
+    const justBefore = expiryState({ timestamp: created, expiresAt }, createdMs + 199_000);
+    const atThreshold = expiryState({ timestamp: created, expiresAt }, createdMs + 200_000);
+    expect(justBefore!.nearExpiry).toBe(false);
+    expect(atThreshold!.nearExpiry).toBe(true);
+    expect(atThreshold!.remainingMs).toBe(100_000);
+  });
+
+  it('clamps remainingMs to 0 and reports expired=true past the deadline', () => {
+    const expiresAt = createdMs / 1000 + 300;
+    const state = expiryState({ timestamp: created, expiresAt }, createdMs + 999_000);
+    expect(state!.remainingMs).toBe(0);
+    expect(state!.expired).toBe(true);
+    expect(state!.nearExpiry).toBe(false);
   });
 });

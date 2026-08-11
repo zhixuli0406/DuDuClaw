@@ -34,6 +34,7 @@ function RailRow({
   return (
     <NavLink
       to={item.to}
+      data-tour={`nav:${item.to}`}
       className={({ isActive }) => railLink(isActive || forceActive, indent)}
     >
       <item.icon className="size-4 shrink-0" />

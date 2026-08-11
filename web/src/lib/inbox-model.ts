@@ -33,6 +33,10 @@ export interface InboxItem {
   readonly status?: string;
   /** Whole-action risk band (approvals only) — drives the row's risk badge (U2). */
   readonly risk?: RiskLevel;
+  /** Unix epoch (seconds) this item auto-denies at (approvals only — a
+   *  server-computed TTL deadline). `undefined`/`null` on every other type,
+   *  and on an approval whose `created_at` was unparseable server-side. */
+  readonly expiresAt?: number | null;
 }
 
 /** The five inbox lenses (§5.2). */
@@ -130,9 +134,65 @@ export function filterByTab(items: readonly InboxItem[], tab: InboxTab, ctx: Inb
 /** Classify an item into the blocked-tab tri-bucket. */
 export function blockedBucket(item: InboxItem): BlockedBucket {
   if (item.type === 'approval' || item.type === 'install' || item.type === 'decision') return 'decide';
-  if (item.type === 'blocked') return item.agentId ? 'input' : 'attention';
+  if (item.type === 'blocked') {
+    // A goal-loop task escalated to `needs_human` IS a decision point — the
+    // agent is not waiting on input, it is waiting on a yes/no/give-up call
+    // (§C.2 `needs_human` → "等你決定", the same word approvals use). A task
+    // merely `blocked` (no escalation) keeps the input/attention split.
+    if (item.status === 'needs_human') return 'decide';
+    return item.agentId ? 'input' : 'attention';
+  }
   // budget / failed_run — nothing to decide, just needs eyes.
   return 'attention';
+}
+
+// ── Expiry countdown (approvals) ────────────────────────────────────────────
+
+/** Structural subset of [`InboxItem`] `expiryState` needs — lets the raw
+ *  `ApprovalItem` API shape (`created_at` / `expires_at`) feed the same
+ *  computation via an inline object literal, without importing `InboxItem`
+ *  into `api.ts` consumers just to reuse this one function. */
+export interface ExpiryInput {
+  /** ISO instant the countdown window started from. */
+  timestamp?: string | null;
+  /** Unix epoch (seconds) the countdown ends at. */
+  expiresAt?: number | null;
+}
+
+export interface ExpiryState {
+  /** Time left until the deadline, in ms. Never negative (clamped at 0). */
+  remainingMs: number;
+  /** True once at most a third of the original window remains — the "⏳ 即將
+   *  逾時" amber-marker threshold. */
+  nearExpiry: boolean;
+  /** True once the deadline has passed. */
+  expired: boolean;
+}
+
+/**
+ * Countdown state for an approval-type item's TTL deadline. Pure — takes
+ * `nowMs` as a parameter rather than reading the clock itself — so it is
+ * unit-testable without a ticking timer; callers supply a live `Date.now()`
+ * from a small ticking hook (`useNowTick`).
+ *
+ * `null` when there isn't enough data to compute a window: no `expiresAt`
+ * (every non-approval type, and an approval whose `created_at` was
+ * unparseable server-side), no/unparseable `timestamp`, or a non-positive
+ * window (`expiresAt` at or before `timestamp` — a malformed pair that must
+ * not be guessed at).
+ */
+export function expiryState(item: ExpiryInput, nowMs: number): ExpiryState | null {
+  if (item.expiresAt == null || !item.timestamp) return null;
+  const createdMs = Date.parse(item.timestamp);
+  if (!Number.isFinite(createdMs)) return null;
+  const expiresAtMs = item.expiresAt * 1000;
+  const totalMs = expiresAtMs - createdMs;
+  if (totalMs <= 0) return null;
+  return {
+    remainingMs: Math.max(0, expiresAtMs - nowMs),
+    nearExpiry: expiresAtMs > nowMs && expiresAtMs - nowMs <= totalMs / 3,
+    expired: expiresAtMs <= nowMs,
+  };
 }
 
 // ── Grouping ─────────────────────────────────────────────────────────────────
@@ -176,6 +236,82 @@ export function excludeArchived(items: readonly InboxItem[], archived: ReadonlyS
   return items.filter((i) => !archived.has(i.id));
 }
 
+// ── "已讀" vs "處理完" — two independent triage axes (03 doc §C6, GitHub inbox:
+// Read/Unread on one axis, Done/Saved on another). `read` above is axis one.
+// `processed` below is axis two: has the user actually resolved this item
+// (approved/rejected/retried/completed/abandoned an install or a needs_human
+// task)? Unlike `archived` (an explicit, permanent "get this out of my
+// sight"), a processed item is never hidden outright — it sinks to the
+// bottom of the ordered list and dims, staying browsable in the time-ordered
+// tabs, while graduating out of the action-required tabs (04 doc §E11: "GUI:
+// 移出待辦"). Front-end-only, localStorage-backed — no backend schema change.
+
+/** Tabs that represent "things still needing me" — the actionable queue.
+ *  Processed items are excluded from these (§E11) but remain visible,
+ *  sunk to the bottom, in every other tab (§C6). */
+export const ACTION_QUEUE_TABS: readonly InboxTab[] = ['mine', 'blocked'];
+
+/** Drop processed ids from an item list — used only for the action-required
+ *  tabs (`ACTION_QUEUE_TABS`); every other tab keeps processed items visible
+ *  via `sinkProcessed` instead. */
+export function excludeProcessed(items: readonly InboxItem[], processed: ReadonlySet<string>): InboxItem[] {
+  if (processed.size === 0) return [...items];
+  return items.filter((i) => !processed.has(i.id));
+}
+
+/** Stable-partition: processed items move to the end of an already-ordered
+ *  list, each partition keeping its relative order. "摺疊到底部", never
+ *  removed — the opposite of `excludeArchived`/`excludeProcessed`. */
+export function sinkProcessed(items: readonly InboxItem[], processed: ReadonlySet<string>): InboxItem[] {
+  if (processed.size === 0) return [...items];
+  const head: InboxItem[] = [];
+  const tail: InboxItem[] = [];
+  for (const it of items) (processed.has(it.id) ? tail : head).push(it);
+  return [...head, ...tail];
+}
+
+// ── Status vocabulary (§C.2/§C.3) ───────────────────────────────────────────
+
+/**
+ * Raw backend status token → its §C.2/§C.3-aligned i18n message id. Exists so
+ * surfaces that would otherwise print an internal state-machine token
+ * verbatim (the "全部" tab's status filter pulls `item.status` straight off
+ * `TaskInfo.status` / `InstallRequestInfo.stage` / `ApprovalItem`'s implicit
+ * `pending`) show the shared, human status vocabulary instead — rule 2's
+ * "不外洩內部詞" applied to a filter control, not just prose.
+ *
+ * `pending` and `needs_human` deliberately share one id: the single biggest
+ * vocabulary payoff of converging tasks/approvals into one "待辦決定" object
+ * is that both say "等你決定" (§C.3).
+ *
+ * Deliberately NOT exhaustive: open-ended business values (a failed-run
+ * severity, an unrecognized future status) have no entry — callers fall back
+ * to the raw token for those rather than guess at a translation.
+ */
+export const STATUS_LABEL_KEYS: Readonly<Record<string, string>> = {
+  pending: 'inbox.status.pending',
+  needs_human: 'inbox.status.pending',
+  approved: 'inbox.status.approved',
+  denied: 'inbox.status.denied',
+  expired: 'inbox.status.expired',
+  awaiting_manager: 'inbox.status.awaitingManager',
+  awaiting_admin: 'inbox.status.awaitingAdmin',
+  blocked: 'inbox.status.blocked',
+  done: 'inbox.status.done',
+  cancelled: 'inbox.status.cancelled',
+  failed: 'inbox.status.failed',
+  in_progress: 'inbox.status.inProgress',
+  review: 'inbox.status.review',
+  revising: 'inbox.status.inProgress',
+  budget_breaker_open: 'inbox.status.budgetBreakerOpen',
+};
+
+/** i18n message id for a raw status token, or `null` when there is no
+ *  §C-aligned mapping — the caller should fall back to the raw token. */
+export function statusLabelKey(status: string): string | null {
+  return STATUS_LABEL_KEYS[status] ?? null;
+}
+
 // ── Immutable id-set helpers (read / archived membership) ──────────────────────
 
 export function withId(set: ReadonlySet<string>, id: string): Set<string> {
@@ -194,6 +330,8 @@ export function withoutId(set: ReadonlySet<string>, id: string): Set<string> {
 
 export const READ_KEY = 'duduclaw:inbox:read';
 export const ARCHIVED_KEY = 'duduclaw:inbox:archived';
+/** Axis two of §C6's triage model — see the "已讀 vs 處理完" block above. */
+export const PROCESSED_KEY = 'duduclaw:inbox:processed';
 export const PREFS_KEY = 'duduclaw:inbox:prefs';
 
 /** Cap on how many ids we retain per set, newest-wins, to bound storage growth. */

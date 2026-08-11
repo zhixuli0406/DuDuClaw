@@ -528,10 +528,12 @@ function MemoryRow({
   const [open, setOpen] = useState(false);
   const prediction = parsePredictionMemory(entry.content);
   // Prediction telemetry is a fixed English string; never show it raw.
+  // Appending the first topic (when the entry carries one) turns "learning
+  // signal 70% → 52%" into something that hints at *what* was learned.
   const summary = prediction
     ? `${intl.formatMessage({ id: 'memory.prediction.label' })} · ${toPercent(
         prediction.expected,
-      )}% → ${toPercent(prediction.inferred)}%`
+      )}% → ${toPercent(prediction.inferred)}%${prediction.topics[0] ? ` · ${prediction.topics[0]}` : ''}`
     : summarizeMemory(entry.content);
   const layerId = memoryLayerMessageId(entry.layer);
 
@@ -685,6 +687,13 @@ function PredictionDetail({ data }: { data: PredictionMemory }) {
           {actualPct}%
         </span>
       </p>
+      {data.topics.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          <Badge variant="secondary">
+            {intl.formatMessage({ id: 'memory.prediction.topics' }, { topics: data.topics.join(', ') })}
+          </Badge>
+        </div>
+      )}
       <div className="flex flex-wrap gap-1.5">
         <Badge variant="secondary">
           {intl.formatMessage({ id: 'memory.prediction.surprise' }, { value: toPercent(data.surprise) })}
