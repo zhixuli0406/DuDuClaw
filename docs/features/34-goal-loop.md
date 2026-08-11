@@ -54,7 +54,11 @@ All under `[goal_loop]` / `[dispatch_guard]` in `config.toml`, with built-in def
 
 ## needs_human Escalation
 
-When a task parks as `needs_human`, `goal_notify.rs` pushes an approval message with three inline buttons — **retry / mark done / abort** — to the source conversation (falling back to the agent's `[proactive]` control channel). Buttons render natively on Telegram, Slack, Discord, and LINE; other channels get a text fallback, and the dashboard shows a needs_human board column. Decisions are idempotent and fail-closed: they only transition *from* `needs_human`, so a stale or double press is a no-op.
+When a task parks as `needs_human`, `goal_notify.rs` pushes an approval message with four inline actions — **retry / mark done / abort / take over** — to the source conversation (falling back to the agent's `[proactive]` control channel). A message caps at 3 primary actions, so retry/mark-done stay primary and abort/take-over collapse into each platform's secondary affordance: a second row on Telegram and Discord, a native `overflow` menu on Slack; LINE has no secondary-menu affordance at all, so those two are dropped from its quick reply and listed as plain text with a dashboard link instead. Other non-button channels get a text fallback, and the dashboard shows a needs_human board column.
+
+**Take over** claims the task (`claimed_by`) without resolving it — the task stays `needs_human`, which is already outside the driver's dispatch-candidate query, so automatic retries are already stopped without a status change. This is the scoped first layer of takeover (stop the loop + mark + collapse the card); transferring the conversation itself to the human is a later-phase feature, not yet implemented.
+
+Decisions are idempotent and fail-closed: retry/mark-done/abort only transition *from* `needs_human`, so a stale or double press is a no-op; take-over has no terminal state to compare against, so a repeat press (even by a different authorized decider) simply re-claims it.
 
 ## Autonomy Levels
 

@@ -17,30 +17,34 @@
 //!   decision (task-store transition for needs_human, ApprovalBroker decide for
 //!   kickoff) and records it on the Activity Feed.
 //!
-//! ## Authorization posture (honest scope note)
+//! ## Authorization posture
 //!
-//! Unlike install-approval — which maps the clicking account to a dashboard
-//! user + role — a goal task has **no owner/source column** on `TaskRow` yet
-//! (that arrives with the P5 `/goal` entry point). So the push goes to the
-//! agent's own control channel and the decision is *not* bound to a specific
-//! presser. The fail-closed guards that remain are: (a) the action id must
-//! decode cleanly, (b) `resolve_needs_human` only transitions FROM
-//! `needs_human` (a stale / double press is a no-op), and (c) the ApprovalBroker
-//! refuses to change a terminal state. Everything is best-effort and fail-soft:
-//! a missing token / unconfigured destination is logged, never panics.
+//! Presses are authorized by the same matrix as every other decision source
+//! ([`crate::decision_notify::authorize_press`]): a mapped, Active dashboard
+//! user decides by role; where no channel-reachable approver identity exists
+//! at all, only a press from the exact account the card was delivered to is
+//! honoured. Goal cards go to the assigned agent's `[proactive]` destination,
+//! so that destination is re-derived at press time — a `TaskRow` has no
+//! delivery-record column to persist it in, the same situation
+//! `autopilot_notify` is in.
+//!
+//! Layered on top, unchanged: the action id must decode cleanly,
+//! `resolve_needs_human` only transitions FROM `needs_human` (a stale or
+//! double press is a no-op), and the `ApprovalBroker` refuses to change a
+//! terminal state. Everything is best-effort and fail-soft: a missing token
+//! or unconfigured destination is logged, never panics.
 
 use std::path::Path;
 
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::channel_format;
+use crate::decision_action::{DecisionAct, DecisionSource};
+use crate::decision_notify::{
+    authorize_press, destination_matches_any, identity_system_active, mapped_role, refusal_text,
+    DecisionCard, PressAuth,
+};
 use crate::task_store::{ActivityRow, TaskRow, TaskStore};
-
-/// Channels that can render inline goal buttons today (same four as install).
-fn channel_supports_buttons(channel: &str) -> bool {
-    matches!(channel, "telegram" | "slack" | "discord" | "line")
-}
 
 /// The agent's default notification destination — `agent.toml [proactive]
 /// notify_channel` + `notify_chat_id`. Returns `None` when either is unset
@@ -108,7 +112,7 @@ pub async fn notify_agent_plain(
         return NotifyOutcome::NoTarget;
     };
     let http = reqwest::Client::new();
-    if send_plain_text(&http, &channel, &token, &chat_id, text).await {
+    if send_plain_text(home_dir, &http, &channel, &token, &chat_id, text).await {
         NotifyOutcome::Sent
     } else {
         NotifyOutcome::SendFailed
@@ -256,18 +260,31 @@ pub async fn notify_goal_progress(
     };
     let text = progress_body(task, &progress);
     let http = reqwest::Client::new();
-    if send_plain_text(&http, &channel, &token, &chat_id, &text).await {
+    if send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await {
         NotifyOutcome::Sent
     } else {
         NotifyOutcome::SendFailed
     }
 }
 
+/// LINE has no secondary-menu affordance (03b capability survey), so the
+/// abort/take-over pair — which every other button-capable channel offers as
+/// a second row/overflow menu — is dropped from the LINE quick reply
+/// entirely (see [`crate::channel_format::line_goal_quick_reply`]) and named
+/// here as plain text instead, pointing at the dashboard deep link the
+/// shared delivery path already appends after this body.
+const LINE_SECONDARY_ACTIONS_HINT: &str =
+    "（放棄／交給我：此通道無法顯示這兩個按鈕，請至下方連結的儀表板頁面處理。）";
+
 /// Render the zh-TW needs_human approval body for a goal task. `trajectory`
 /// is the optional D2 forward-trajectory line (see
 /// [`build_needs_human_trajectory`]) — rendered above the "請選擇" line
 /// (i.e. above the buttons, since the buttons attach to this same message).
-fn needs_human_body(task: &TaskRow, trajectory: Option<&str>) -> String {
+/// `channel` selects the LINE-specific plain-text degrade for the secondary
+/// action pair (W1-5) — every other channel gets the full four-way choice
+/// line since those actions are still reachable via a second row/overflow
+/// menu there.
+fn needs_human_body(task: &TaskRow, trajectory: Option<&str>, channel: &str) -> String {
     let reason = task
         .judge_feedback
         .as_deref()
@@ -277,14 +294,21 @@ fn needs_human_body(task: &TaskRow, trajectory: Option<&str>) -> String {
     let trajectory_block = trajectory
         .map(|t| format!("\n{t}\n"))
         .unwrap_or_default();
+    let choices = if channel == "line" {
+        format!("請選擇：重試 / 標記完成。\n{LINE_SECONDARY_ACTIONS_HINT}")
+    } else {
+        "請選擇：重試 / 標記完成 / 放棄 / 交給我。".to_string()
+    };
     format!(
-        "🧭 自主目標任務卡住，需要您的決定\n\
+        "{prefix}\n\
+         🧭 自主目標任務卡住，需要您的決定\n\
          任務：{title}\n\
          目標：{goal}\n\
          卡住原因：{reason}\n\
          編號：{id}\n\
          {trajectory_block}\n\
-         請選擇：重試 / 標記完成 / 放棄。",
+         {choices}",
+        prefix = crate::decision_notify::reason_prefix(DecisionSource::Goal),
         title = task.title,
         goal = duduclaw_core::truncate_chars(&task.description, 200),
         reason = duduclaw_core::truncate_chars(reason, 300),
@@ -480,23 +504,24 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
     };
     let http = reqwest::Client::new();
     let trajectory = build_needs_human_trajectory(home_dir, task).await;
-    let body = needs_human_body(task, trajectory.as_deref());
-    if channel_supports_buttons(&channel) {
-        let markup = goal_button_markup(&channel, &task.id);
-        match send_with_markup(&http, &channel, &token, &chat_id, &body, markup).await {
-            Ok(()) => NotifyOutcome::Sent,
-            Err(e) => {
-                warn!(task = %task.id, %channel, error = %e, "goal-notify: button push failed");
-                NotifyOutcome::SendFailed
-            }
-        }
+    let body = needs_human_body(task, trajectory.as_deref(), &channel);
+    // A clickable deep link straight to this task's detail page — the
+    // page that actually shows it (`/tasks/<id>`), never the homepage. `None`
+    // when no dashboard base URL is configured/derivable — the message text
+    // then stays exactly as it was before this feature (never
+    // emit a dangling/empty link).
+    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
+    let card = DecisionCard {
+        source: DecisionSource::Goal,
+        decision_id: &task.id,
+        body: &body,
+        link: link.as_deref(),
+        no_button_hint: "此通道無法顯示按鈕，請至儀表板的待辦決定頁處理這件事。",
+    };
+    if crate::decision_notify::deliver(home_dir, &http, &channel, &token, &chat_id, &card).await {
+        NotifyOutcome::Sent
     } else {
-        let text = format!("{body}\n\n請至儀表板任務看板處理此「需人工」任務。");
-        if send_plain_text(&http, &channel, &token, &chat_id, &text).await {
-            NotifyOutcome::Sent
-        } else {
-            NotifyOutcome::SendFailed
-        }
+        NotifyOutcome::SendFailed
     }
 }
 
@@ -526,7 +551,7 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
         id = task.id,
     );
     let http = reqwest::Client::new();
-    send_plain_text(&http, &channel, &token, &chat_id, &text).await
+    send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await
 }
 
 /// Render the zh-TW kickoff approval body. `trajectory` is the optional D2
@@ -538,10 +563,12 @@ fn kickoff_body(summary: &str, trajectory: Option<&str>) -> String {
         .map(|t| format!("\n{t}\n"))
         .unwrap_or_default();
     format!(
-        "🚀 自主目標啟動前需要您的核准\n\
+        "{prefix}\n\
+         🚀 自主目標啟動前需要您的核准\n\
          {summary}\n\
          {trajectory_block}\n\
-         請選擇：開始 / 拒絕。"
+         請選擇：開始 / 拒絕。",
+        prefix = crate::decision_notify::reason_prefix(DecisionSource::Kickoff),
     )
 }
 
@@ -665,55 +692,42 @@ pub async fn notify_goal_kickoff(
     let trajectory = build_kickoff_trajectory(home_dir, approval_id).await;
     let body = kickoff_body(summary, trajectory.as_deref());
     let http = reqwest::Client::new();
-    if channel_supports_buttons(&channel) {
-        let markup = kickoff_button_markup(&channel, approval_id);
-        match send_with_markup(&http, &channel, &token, &chat_id, &body, markup).await {
-            Ok(()) => NotifyOutcome::Sent,
-            Err(e) => {
-                warn!(agent = %agent_id, %channel, error = %e, "goal-notify: kickoff push failed");
-                NotifyOutcome::SendFailed
-            }
-        }
+    // Kickoff is gated through the shared `ApprovalBroker`, so the
+    // object the link should land on is the unified inbox, same as
+    // `approval_notify`/`install_notify` — not `/tasks/<id>` (the task hasn't
+    // started yet and this function only has `approval_id`, not the task row).
+    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Approval, approval_id);
+    let card = DecisionCard {
+        source: DecisionSource::Kickoff,
+        decision_id: approval_id,
+        body: &body,
+        link: link.as_deref(),
+        no_button_hint: "此通道無法顯示按鈕，請至儀表板的待辦決定頁同意或拒絕。",
+    };
+    if crate::decision_notify::deliver(home_dir, &http, &channel, &token, &chat_id, &card).await {
+        NotifyOutcome::Sent
     } else {
-        let text = format!("{body}\n\n（此通道無按鈕，請至儀表板核准。）");
-        if send_plain_text(&http, &channel, &token, &chat_id, &text).await {
-            NotifyOutcome::Sent
-        } else {
-            NotifyOutcome::SendFailed
-        }
-    }
-}
-
-/// Per-channel button markup for a needs_human goal task.
-fn goal_button_markup(channel: &str, task_id: &str) -> serde_json::Value {
-    match channel {
-        "telegram" => channel_format::telegram_goal_buttons(task_id),
-        "discord" => channel_format::discord_goal_buttons(task_id),
-        "slack" => channel_format::slack_goal_buttons(task_id),
-        "line" => channel_format::line_goal_quick_reply(task_id),
-        _ => json!({}),
-    }
-}
-
-/// Per-channel button markup for a kickoff approval.
-fn kickoff_button_markup(channel: &str, approval_id: &str) -> serde_json::Value {
-    match channel {
-        "telegram" => channel_format::telegram_goal_kickoff_buttons(approval_id),
-        "discord" => channel_format::discord_goal_kickoff_buttons(approval_id),
-        "slack" => channel_format::slack_goal_kickoff_buttons(approval_id),
-        "line" => channel_format::line_goal_kickoff_quick_reply(approval_id),
-        _ => json!({}),
+        NotifyOutcome::SendFailed
     }
 }
 
 /// Send a message carrying inline buttons on one of the four button-capable
 /// channels. `markup` is the platform-native structure from
-/// [`goal_button_markup`] / [`kickoff_button_markup`].
+/// [`crate::channel_format::decision_markup`].
 ///
-/// `pub(crate)`: also the button sender for `approval_notify` (WP20), which
-/// pushes generic `ApprovalBroker` approvals to the same four channels — one
-/// tested implementation of the Discord DM-open dance / Slack block shape /
-/// LINE push envelope rather than a third copy.
+/// `pub(crate)`: also the button sender for `approval_notify` (WP20) and
+/// `install_notify`, which push their own button shapes to the same four
+/// channels — one tested implementation of the Discord DM-open dance / Slack
+/// block shape / LINE push envelope rather than three copies.
+///
+/// Returns the pushed message's identity ([`crate::decision_card::PushedMessage`])
+/// when the platform's response makes one available — `None` on LINE (no
+/// stable editable message id, and LINE cannot edit messages regardless, see
+/// `decision_card`) or when the response body doesn't parse as expected
+/// (never treated as a send failure — capturing the id is a best-effort
+/// extra, not required for delivery). Callers persist it via
+/// `decision_message_store::record_card_message` so a later decide can edit
+/// this exact card in place.
 pub(crate) async fn send_with_markup(
     http: &reqwest::Client,
     channel: &str,
@@ -721,7 +735,7 @@ pub(crate) async fn send_with_markup(
     chat_id: &str,
     text: &str,
     markup: serde_json::Value,
-) -> Result<(), String> {
+) -> Result<Option<crate::decision_card::PushedMessage>, String> {
     match channel {
         "telegram" => {
             let url = format!("https://api.telegram.org/bot{token}/sendMessage");
@@ -736,7 +750,12 @@ pub(crate) async fn send_with_markup(
             if !resp.status().is_success() {
                 return Err(format!("telegram HTTP {}", resp.status()));
             }
-            Ok(())
+            let data: serde_json::Value = resp.json().await.unwrap_or_default();
+            let mid = data.get("result").and_then(|r| r.get("message_id")).and_then(|v| v.as_i64());
+            Ok(mid.map(|m| crate::decision_card::PushedMessage {
+                edit_chat_id: chat_id.to_string(),
+                message_id: m.to_string(),
+            }))
         }
         "slack" => {
             let body = json!({
@@ -761,7 +780,11 @@ pub(crate) async fn send_with_markup(
                     data.get("error").and_then(|v| v.as_str()).unwrap_or("unknown")
                 ));
             }
-            Ok(())
+            let ts = data.get("ts").and_then(|v| v.as_str()).map(str::to_string);
+            Ok(ts.map(|t| crate::decision_card::PushedMessage {
+                edit_chat_id: chat_id.to_string(),
+                message_id: t,
+            }))
         }
         "discord" => {
             // The linked id is the USER id — open (or reuse) the bot↔user DM
@@ -782,7 +805,13 @@ pub(crate) async fn send_with_markup(
                 _ => chat_id.to_string(),
             };
             let url = format!("https://discord.com/api/v10/channels/{dm_channel}/messages");
-            let body = json!({ "content": text, "components": [markup] });
+            // W1-5: `decision_markup` returns EITHER one action-row object
+            // (every source but goal) or an array of them (goal's
+            // primary+secondary two-row layout, `discord_goal_buttons`) — an
+            // array is already shaped as Discord's `components` list, an
+            // object needs wrapping in one.
+            let components = if markup.is_array() { markup } else { json!([markup]) };
+            let body = json!({ "content": text, "components": components });
             let resp = http
                 .post(&url)
                 .header("Authorization", format!("Bot {token}"))
@@ -793,7 +822,12 @@ pub(crate) async fn send_with_markup(
             if !resp.status().is_success() {
                 return Err(format!("discord HTTP {}", resp.status()));
             }
-            Ok(())
+            let data: serde_json::Value = resp.json().await.unwrap_or_default();
+            let mid = data.get("id").and_then(|v| v.as_str()).map(str::to_string);
+            Ok(mid.map(|m| crate::decision_card::PushedMessage {
+                edit_chat_id: dm_channel.clone(),
+                message_id: m,
+            }))
         }
         "line" => {
             let body = json!({
@@ -810,7 +844,9 @@ pub(crate) async fn send_with_markup(
             if !resp.status().is_success() {
                 return Err(format!("line HTTP {}", resp.status()));
             }
-            Ok(())
+            // LINE has no editable message id worth capturing — see
+            // `decision_card::channel_editable`.
+            Ok(None)
         }
         other => Err(format!("channel {other} has no button sender")),
     }
@@ -821,20 +857,45 @@ pub(crate) async fn send_with_markup(
 ///
 /// `pub(crate)`: also reused by `skill_gap_digest` (WP2.6 P1) for its daily
 /// recommendation push.
+///
+/// `channel_sender::create_sender`'s generic factory has no branch for
+/// `googlechat`/`teams` (their credentials live in global/home-dir config,
+/// not on a `ChannelTarget`) and falls through to `NullSender`, whose
+/// `send_text` always returns `Ok(())` — a message that was never sent looks
+/// identical to one that was. Dispatch those two through their dedicated
+/// constructors instead, mirroring `handlers.rs::send_channel_test_message`
+/// (the same factory-gap fix, already shipped for the `channels.test`
+/// button). `token` is unused on those two branches — `GoogleChatSender` /
+/// `TeamsSender` resolve their own credentials from `home_dir`.
 pub(crate) async fn send_plain_text(
+    home_dir: &Path,
     http: &reqwest::Client,
     channel: &str,
     token: &str,
     chat_id: &str,
     text: &str,
 ) -> bool {
-    let target = crate::channel_sender::ChannelTarget {
-        channel_type: channel.to_string(),
-        chat_id: chat_id.to_string(),
-        token: token.to_string(),
-        extra_id: None,
+    let sender: Box<dyn crate::channel_sender::ChannelSender> = match channel {
+        "googlechat" => crate::channel_sender::create_googlechat_sender(
+            home_dir.to_path_buf(),
+            chat_id.to_string(),
+            String::new(),
+        ),
+        "teams" => crate::channel_sender::create_teams_sender(
+            home_dir.to_path_buf(),
+            chat_id.to_string(),
+            String::new(),
+        ),
+        _ => {
+            let target = crate::channel_sender::ChannelTarget {
+                channel_type: channel.to_string(),
+                chat_id: chat_id.to_string(),
+                token: token.to_string(),
+                extra_id: None,
+            };
+            crate::channel_sender::create_sender(&target, http.clone())
+        }
     };
-    let sender = crate::channel_sender::create_sender(&target, http.clone());
     match sender.send_text(text).await {
         Ok(()) => true,
         Err(e) => {
@@ -844,48 +905,134 @@ pub(crate) async fn send_plain_text(
     }
 }
 
+/// The destinations a goal decision's card was pushed to — the assigned
+/// agent's `[proactive]` control channel.
+///
+/// Re-derived rather than persisted: a `TaskRow` has no delivery-record
+/// column, and the `[proactive]` destination changing between push and press
+/// is vanishingly rare. `autopilot_notify` resolves its own the same way.
+fn delivered_targets(home_dir: &Path, agent_id: &str) -> Vec<(String, String)> {
+    agent_notify_target(home_dir, agent_id).into_iter().collect()
+}
+
+/// Authorize a press against the goal card's delivery destination, or return
+/// the zh-TW refusal to show. `subject` names the action for the message.
+fn authorize_goal_press(
+    home_dir: &Path,
+    agent_id: &str,
+    channel: &str,
+    channel_user_id: &str,
+    subject: &str,
+) -> Result<(), String> {
+    let auth = authorize_press(
+        mapped_role(home_dir, channel, channel_user_id),
+        identity_system_active(home_dir),
+        destination_matches_any(&delivered_targets(home_dir, agent_id), channel, channel_user_id),
+    );
+    if auth == PressAuth::Allow {
+        Ok(())
+    } else {
+        Err(refusal_text(auth, subject))
+    }
+}
+
 /// Handle a goal-loop button action from a channel.
 ///
 /// Returns:
 /// - `None` — `action_data` is not a goal action (the dispatcher falls through).
 /// - `Some(Ok(msg))` — decision handled; `msg` is the zh-TW ack to show.
-/// - `Some(Err(msg))` — an error to show the presser.
+/// - `Some(Err(msg))` — an error or refusal to show the presser.
 pub async fn decide_from_channel(
     home_dir: &Path,
     channel: &str,
     channel_user_id: &str,
     action_data: &str,
 ) -> Option<Result<String, String>> {
-    let action = channel_format::parse_goal_action(action_data)?;
-    match action {
-        channel_format::GoalAction::Retry(task_id) => {
-            Some(resolve_needs_human(home_dir, channel, channel_user_id, &task_id, "retry").await)
+    let action = crate::decision_action::parse(action_data)?;
+    Some(match action.source {
+        DecisionSource::Goal => {
+            apply_needs_human(home_dir, channel, channel_user_id, &action.id, action.act).await
         }
-        channel_format::GoalAction::Done(task_id) => {
-            Some(resolve_needs_human(home_dir, channel, channel_user_id, &task_id, "done").await)
+        DecisionSource::Kickoff => {
+            apply_kickoff(home_dir, channel, channel_user_id, &action.id, action.approve()).await
         }
-        channel_format::GoalAction::Abort(task_id) => {
-            Some(resolve_needs_human(home_dir, channel, channel_user_id, &task_id, "abort").await)
-        }
-        channel_format::GoalAction::Kickoff(approval_id, approve) => {
-            Some(decide_kickoff(home_dir, channel, channel_user_id, &approval_id, approve).await)
-        }
-    }
+        _ => return None,
+    })
 }
 
 /// Apply a needs_human decision to the task store + record it on the Activity
 /// Feed. The store transition is fail-closed (only acts from `needs_human`).
-async fn resolve_needs_human(
+///
+/// `pub(crate)`: also the unified inbound router's entry point for this source.
+pub(crate) async fn apply_needs_human(
     home_dir: &Path,
     channel: &str,
     channel_user_id: &str,
     task_id: &str,
-    decision: &str,
+    act: DecisionAct,
 ) -> Result<String, String> {
+    let verb = crate::decision_notify::settled_verb(DecisionSource::Goal, act);
     let store = TaskStore::open(home_dir).map_err(|e| format!("開啟任務資料庫失敗：{e}"))?;
     let task = store.get_task(task_id).await.map_err(|e| e.to_string())?;
     let Some(task) = task else {
         return Err("找不到此任務".into());
+    };
+
+    // The same authorization matrix as every other decision source. Until
+    // this gate existed, anyone who could see the card could retry, close or
+    // abandon someone else's autonomous task.
+    authorize_goal_press(home_dir, &task.assigned_to, channel, channel_user_id, "決定這件事")?;
+
+    // W1-5: "take over" claims the task by hand rather than resolving it out
+    // of needs_human — it stays `needs_human` (already outside
+    // `GoalLoopDriver::tick_once`'s dispatch-candidate query, so the loop is
+    // already stopped) and goes through a separate store call, never
+    // `resolve_needs_human`'s retry/done/abort match below.
+    if act == DecisionAct::Takeover {
+        let decider_id = format!("channel:{channel}:{channel_user_id}");
+        let changed = store
+            .claim_needs_human(task_id, &decider_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !changed {
+            return Ok("此任務已不在待人工決定狀態（可能已由他人決定）。".into());
+        }
+        let summary = format!(
+            "人工接手目標任務「{}」（來自 {channel}:{channel_user_id}）",
+            task.title
+        );
+        append_activity(
+            &store,
+            "goal_loop.human_decision.takeover",
+            &task.assigned_to,
+            Some(task_id),
+            &summary,
+        )
+        .await;
+        // Best-effort, detached card collapse — same rationale as every
+        // other settled decision (see `spawn_goal_task_collapse`'s doc
+        // comment): an edit is cosmetic and must not delay or fail a
+        // decision already durable in the task store.
+        spawn_goal_task_collapse(
+            home_dir.to_path_buf(),
+            task_id.to_string(),
+            task.title.clone(),
+            task.assigned_to.clone(),
+            channel.to_string(),
+            channel_user_id.to_string(),
+            verb,
+        );
+        return Ok("已接手此目標任務，我會停止自動重試；請自行跟進處理。".into());
+    }
+
+    let decision = match act {
+        DecisionAct::Retry => "retry",
+        DecisionAct::Done => "done",
+        DecisionAct::Abort => "abort",
+        // The codec refuses every other pair for `Goal`, so this is
+        // unreachable in practice; refusing rather than guessing keeps it
+        // that way.
+        _ => return Err("不支援的動作".into()),
     };
     let changed = store
         .resolve_needs_human(task_id, decision, "")
@@ -894,23 +1041,122 @@ async fn resolve_needs_human(
     if !changed {
         return Ok("此任務已被處理過（可能已由他人決定或狀態已改變）。".into());
     }
-    let (verb_zh, event) = match decision {
-        "retry" => ("重試", "goal_loop.human_decision.retry"),
-        "done" => ("標記完成", "goal_loop.human_decision.done"),
-        "abort" => ("放棄", "goal_loop.human_decision.abort"),
-        _ => ("處理", "goal_loop.human_decision"),
+    let event = match act {
+        DecisionAct::Retry => "goal_loop.human_decision.retry",
+        DecisionAct::Done => "goal_loop.human_decision.done",
+        _ => "goal_loop.human_decision.abort",
     };
     let summary = format!(
-        "人工決定「{verb_zh}」目標任務「{}」（來自 {channel}:{channel_user_id}）",
+        "人工{}目標任務「{}」（來自 {channel}:{channel_user_id}）",
+        verb.label(),
         task.title
     );
     append_activity(&store, event, &task.assigned_to, Some(task_id), &summary).await;
-    Ok(format!("已{verb_zh}此目標任務。"))
+
+    // Best-effort, detached: retire the channel cards that carried the
+    // buttons. Never awaited by the caller — an edit is cosmetic and must
+    // not delay or fail a decision that is already durable in the task store.
+    spawn_goal_task_collapse(
+        home_dir.to_path_buf(),
+        task_id.to_string(),
+        task.title.clone(),
+        task.assigned_to.clone(),
+        channel.to_string(),
+        channel_user_id.to_string(),
+        verb,
+    );
+
+    Ok(format!("{}此目標任務。", verb.label()))
+}
+
+/// Spawn a best-effort, fire-and-forget attempt to retire a settled
+/// needs_human task's channel cards. Detached so a slow or unreachable
+/// channel API can never delay or fail the decision that already landed.
+fn spawn_goal_task_collapse(
+    home_dir: std::path::PathBuf,
+    task_id: String,
+    task_title: String,
+    agent_id: String,
+    channel: String,
+    channel_user_id: String,
+    verb: crate::decision_card::DecisionVerb,
+) {
+    tokio::spawn(async move {
+        let Some((notify_channel, chat_id)) = agent_notify_target(&home_dir, &agent_id) else {
+            return;
+        };
+        let http = reqwest::Client::new();
+        let decider = crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
+        let summary = format!("🐾 目標任務：{}", duduclaw_core::truncate_chars(&task_title, 60));
+        let home = home_dir.clone();
+        let agent = agent_id.clone();
+        crate::decision_card::collapse_all(
+            &home_dir,
+            &http,
+            DecisionSource::Goal.namespace(),
+            &task_id,
+            &summary,
+            verb,
+            decider.as_deref(),
+            move |ch: String| {
+                let home = home.clone();
+                let agent = agent.clone();
+                async move { channel_token(&home, &agent, &ch).await }
+            },
+            Some((notify_channel.as_str(), chat_id.as_str())),
+        )
+        .await;
+    });
+}
+
+/// Spawn a best-effort, fire-and-forget attempt to retire a settled
+/// needs_human task's channel cards after a **dashboard** decision
+/// (`handlers.rs`'s `tasks.update` RPC — H1 of the unified-decision
+/// hand-off, 07 §6). Mirrors [`spawn_goal_task_collapse`] but the decider is
+/// a resolved dashboard display name rather than a channel identity — the
+/// fallback destination is still the agent's own `[proactive]` channel (the
+/// same place a channel-originated decision would fall back to), since a
+/// dashboard decision offers no channel destination of its own.
+pub(crate) fn spawn_dashboard_collapse(
+    home_dir: std::path::PathBuf,
+    task_id: String,
+    task_title: String,
+    agent_id: String,
+    decider_name: Option<String>,
+    verb: crate::decision_card::DecisionVerb,
+) {
+    tokio::spawn(async move {
+        let Some((notify_channel, chat_id)) = agent_notify_target(&home_dir, &agent_id) else {
+            return;
+        };
+        let http = reqwest::Client::new();
+        let summary = format!("🐾 目標任務：{}", duduclaw_core::truncate_chars(&task_title, 60));
+        let home = home_dir.clone();
+        let agent = agent_id.clone();
+        crate::decision_card::collapse_all(
+            &home_dir,
+            &http,
+            DecisionSource::Goal.namespace(),
+            &task_id,
+            &summary,
+            verb,
+            decider_name.as_deref(),
+            move |ch: String| {
+                let home = home.clone();
+                let agent = agent.clone();
+                async move { channel_token(&home, &agent, &ch).await }
+            },
+            Some((notify_channel.as_str(), chat_id.as_str())),
+        )
+        .await;
+    });
 }
 
 /// Approve/deny a kickoff approval through the ApprovalBroker. The goal-loop
 /// driver polls the approval and starts (or aborts) dispatch on its next tick.
-async fn decide_kickoff(
+///
+/// `pub(crate)`: also the unified inbound router's entry point for this source.
+pub(crate) async fn apply_kickoff(
     home_dir: &Path,
     channel: &str,
     channel_user_id: &str,
@@ -920,18 +1166,27 @@ async fn decide_kickoff(
     let broker = crate::approval::ApprovalBroker::open(home_dir)
         .map_err(|e| format!("開啟審批資料庫失敗：{e}"))?;
     let id = crate::approval::ApprovalId::from(approval_id.to_string());
+
+    // Read the row BEFORE deciding: the agent it belongs to is what the
+    // authorization matrix needs, and a press that turns out to be
+    // unauthorized must leave the approval untouched.
+    let record = broker.get(&id).await.ok().flatten();
+    let agent = record.as_ref().map(|r| r.agent_id.clone()).unwrap_or_default();
+    if agent.is_empty() {
+        return Err("找不到這筆核可（可能已過期並被清除）".into());
+    }
+    authorize_goal_press(home_dir, &agent, channel, channel_user_id, "核准")?;
+
+    let card_verb = crate::decision_notify::settled_verb(
+        DecisionSource::Kickoff,
+        if approve { DecisionAct::Approve } else { DecisionAct::Deny },
+    );
     let decided_by = format!("channel:{channel}:{channel_user_id}");
     broker.decide(&id, approve, &decided_by).await?;
+
     // Record on the Activity Feed against the approval's agent, best-effort.
     if let Ok(store) = TaskStore::open(home_dir) {
-        let agent = broker
-            .get(&id)
-            .await
-            .ok()
-            .flatten()
-            .map(|r| r.agent_id)
-            .unwrap_or_default();
-        let verb = if approve { "核准啟動" } else { "拒絕啟動" };
+        let verb = if approve { "同意啟動" } else { "拒絕啟動" };
         append_activity(
             &store,
             "goal_loop.kickoff_decision",
@@ -941,11 +1196,77 @@ async fn decide_kickoff(
         )
         .await;
     }
+
+    // Best-effort, detached card collapse — see `spawn_goal_task_collapse`'s
+    // doc comment for why this is never awaited by the caller.
+    let task_id = record
+        .as_ref()
+        .and_then(|r| r.payload.get("task_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    spawn_kickoff_collapse(
+        home_dir.to_path_buf(),
+        agent,
+        approval_id.to_string(),
+        task_id,
+        channel.to_string(),
+        channel_user_id.to_string(),
+        card_verb,
+    );
+
     Ok(if approve {
-        "已核准，目標將開始自主執行。".into()
+        "已同意，目標將開始自主執行。".into()
     } else {
         "已拒絕，目標不會啟動。".into()
     })
+}
+
+/// Spawn a best-effort, fire-and-forget attempt to retire a settled kickoff
+/// approval's channel cards. `task_id` (from the approval's own payload) is
+/// used to look up the task title for the collapsed summary line — a lookup
+/// miss degrades to a generic summary, never blocks.
+fn spawn_kickoff_collapse(
+    home_dir: std::path::PathBuf,
+    agent_id: String,
+    approval_id: String,
+    task_id: Option<String>,
+    channel: String,
+    channel_user_id: String,
+    verb: crate::decision_card::DecisionVerb,
+) {
+    tokio::spawn(async move {
+        let Some((notify_channel, chat_id)) = agent_notify_target(&home_dir, &agent_id) else {
+            return;
+        };
+        let http = reqwest::Client::new();
+        let decider = crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
+        let mut summary = "🚀 自主目標啟動核准".to_string();
+        if let Some(tid) = &task_id {
+            if let Ok(store) = TaskStore::open(&home_dir) {
+                if let Ok(Some(t)) = store.get_task(tid).await {
+                    summary = format!("🚀 目標啟動核准：{}", duduclaw_core::truncate_chars(&t.title, 60));
+                }
+            }
+        }
+        let home = home_dir.clone();
+        let agent = agent_id.clone();
+        crate::decision_card::collapse_all(
+            &home_dir,
+            &http,
+            DecisionSource::Kickoff.namespace(),
+            &approval_id,
+            &summary,
+            verb,
+            decider.as_deref(),
+            move |ch: String| {
+                let home = home.clone();
+                let agent = agent.clone();
+                async move { channel_token(&home, &agent, &ch).await }
+            },
+            Some((notify_channel.as_str(), chat_id.as_str())),
+        )
+        .await;
+    });
 }
 
 /// Best-effort Activity Feed append (telemetry, never control flow).
@@ -1033,6 +1354,35 @@ mod tests {
         assert!(done.contains("已完成月報並寄出"));
     }
 
+    /// Give `agent` a `[proactive]` destination, which is both where its goal
+    /// cards are pushed and — with no dashboard identities configured — the
+    /// only account authorized to press them.
+    fn seed_notify_target(home: &std::path::Path, agent: &str, channel: &str, chat_id: &str) {
+        let dir = home.join("agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!("[proactive]\nnotify_channel = \"{channel}\"\nnotify_chat_id = \"{chat_id}\"\n"),
+        )
+        .unwrap();
+    }
+
+    async fn seed_needs_human_task(home: &std::path::Path, id: &str, agent: &str) -> TaskStore {
+        let store = TaskStore::open(home).unwrap();
+        let mut t = TaskRow::new(
+            id.into(),
+            format!("goal {id}"),
+            "do it".into(),
+            "medium".into(),
+            agent.into(),
+            "system".into(),
+        );
+        t.status = "needs_human".into();
+        t.goal_mode = true;
+        store.insert_task(&t).await.unwrap();
+        store
+    }
+
     #[tokio::test]
     async fn decide_from_channel_ignores_non_goal_actions() {
         let dir = tempfile::tempdir().unwrap();
@@ -1044,32 +1394,28 @@ mod tests {
                 .await
                 .is_none()
         );
+        assert!(
+            decide_from_channel(dir.path(), "telegram", "u1", "duduclaw:autopilot_pause:r1")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn retry_transitions_needs_human_task() {
         let dir = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(dir.path()).unwrap();
-        let mut t = TaskRow::new(
-            "g1".into(),
-            "goal g1".into(),
-            "do it".into(),
-            "medium".into(),
-            "alice".into(),
-            "system".into(),
-        );
-        t.status = "needs_human".into();
-        t.goal_mode = true;
-        store.insert_task(&t).await.unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let store = seed_needs_human_task(dir.path(), "g1", "alice").await;
 
-        let out = decide_from_channel(dir.path(), "telegram", "u1", "duduclaw:goal_retry:g1")
+        let action = crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Retry, "g1");
+        let out = decide_from_channel(dir.path(), "telegram", "555", &action)
             .await
             .unwrap();
         assert!(out.is_ok(), "retry ack: {out:?}");
         assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "pending");
 
         // A second press is a no-op (already left needs_human) — fail-closed.
-        let again = decide_from_channel(dir.path(), "telegram", "u1", "duduclaw:goal_retry:g1")
+        let again = decide_from_channel(dir.path(), "telegram", "555", &action)
             .await
             .unwrap();
         assert!(again.unwrap().contains("已被處理過"));
@@ -1078,23 +1424,220 @@ mod tests {
     #[tokio::test]
     async fn abort_marks_cancelled() {
         let dir = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(dir.path()).unwrap();
-        let mut t = TaskRow::new(
-            "g2".into(),
-            "goal g2".into(),
-            "do it".into(),
-            "medium".into(),
-            "alice".into(),
-            "system".into(),
-        );
-        t.status = "needs_human".into();
-        store.insert_task(&t).await.unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let store = seed_needs_human_task(dir.path(), "g2", "alice").await;
 
-        let out = decide_from_channel(dir.path(), "telegram", "u1", "duduclaw:goal_abort:g2")
-            .await
-            .unwrap();
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "555",
+            &crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Abort, "g2"),
+        )
+        .await
+        .unwrap();
         assert!(out.is_ok());
         assert_eq!(store.get_task("g2").await.unwrap().unwrap().status, "cancelled");
+    }
+
+    // ── W1-5: take over (D6 Submit/Take over) ───────────────────────────
+
+    #[tokio::test]
+    async fn takeover_claims_the_task_without_leaving_needs_human() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let store = seed_needs_human_task(dir.path(), "g8", "alice").await;
+
+        let action = crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Takeover, "g8");
+        let out = decide_from_channel(dir.path(), "telegram", "555", &action)
+            .await
+            .unwrap();
+        assert!(out.is_ok(), "takeover ack: {out:?}");
+        assert!(out.unwrap().contains("已接手"));
+
+        let t = store.get_task("g8").await.unwrap().unwrap();
+        // Deliberately still `needs_human` — GoalLoopDriver's dispatch
+        // candidate query never reads this status, so the auto-loop is
+        // already stopped without a status transition (see
+        // `TaskStore::claim_needs_human`'s doc comment for the scope call).
+        assert_eq!(t.status, "needs_human");
+        assert_eq!(t.claimed_by.as_deref(), Some("channel:telegram:555"));
+    }
+
+    #[tokio::test]
+    async fn takeover_is_repeatable_by_the_same_authorized_account() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let store = seed_needs_human_task(dir.path(), "g9", "alice").await;
+        let action = crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Takeover, "g9");
+
+        for _ in 0..2 {
+            let out = decide_from_channel(dir.path(), "telegram", "555", &action)
+                .await
+                .unwrap();
+            assert!(out.is_ok(), "repeated takeover must stay a no-op success: {out:?}");
+        }
+        assert_eq!(store.get_task("g9").await.unwrap().unwrap().status, "needs_human");
+    }
+
+    #[tokio::test]
+    async fn takeover_from_an_unrelated_account_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let store = seed_needs_human_task(dir.path(), "g10", "alice").await;
+
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "999",
+            &crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Takeover, "g10"),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_err(), "an unrelated account must not take over someone else's task: {out:?}");
+        let t = store.get_task("g10").await.unwrap().unwrap();
+        assert_eq!(t.status, "needs_human");
+        assert!(t.claimed_by.is_none(), "a refused press must not claim the task");
+    }
+
+    #[tokio::test]
+    async fn takeover_after_the_task_already_left_needs_human_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let store = seed_needs_human_task(dir.path(), "g11", "alice").await;
+        // Resolved via `done` first (e.g. from the dashboard) — a takeover
+        // press that lands after that must not resurrect or reclaim it.
+        store.resolve_needs_human("g11", "done", "").await.unwrap();
+
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "555",
+            &crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Takeover, "g11"),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_ok(), "a settled task's takeover press must ack, not error: {out:?}");
+        assert!(out.unwrap().contains("已不在待人工決定狀態"));
+        assert_eq!(store.get_task("g11").await.unwrap().unwrap().status, "done");
+    }
+
+    #[tokio::test]
+    async fn a_card_pushed_before_the_encoding_change_still_decides() {
+        // Cards already sitting in a channel carry the pre-unification
+        // encoding; they must keep working through the rotation.
+        let dir = tempfile::tempdir().unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let store = seed_needs_human_task(dir.path(), "g3", "alice").await;
+
+        let out = decide_from_channel(dir.path(), "telegram", "555", "duduclaw:goal_done:g3")
+            .await
+            .unwrap();
+        assert!(out.is_ok(), "legacy encoding must still decide: {out:?}");
+        assert_eq!(store.get_task("g3").await.unwrap().unwrap().status, "done");
+    }
+
+    #[tokio::test]
+    async fn press_from_an_unrelated_account_cannot_decide_someone_elses_goal() {
+        // The gap this closes: before authorization, anyone who could see the
+        // card could retry, close or abandon another person's autonomous task.
+        let dir = tempfile::tempdir().unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let store = seed_needs_human_task(dir.path(), "g4", "alice").await;
+
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "999",
+            &crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Abort, "g4"),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_err(), "an unrelated account must not decide: {out:?}");
+        // Fail-closed: the task is untouched.
+        assert_eq!(store.get_task("g4").await.unwrap().unwrap().status, "needs_human");
+    }
+
+    #[tokio::test]
+    async fn press_is_refused_when_the_agent_has_no_delivery_destination() {
+        // No `[proactive]` destination ⇒ no card was ever pushed ⇒ there is no
+        // destination authority to fall back on, and no dashboard identity
+        // either. Fail-closed.
+        let dir = tempfile::tempdir().unwrap();
+        let store = seed_needs_human_task(dir.path(), "g5", "alice").await;
+
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "555",
+            &crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Done, "g5"),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_err(), "no destination proof ⇒ must refuse: {out:?}");
+        assert_eq!(store.get_task("g5").await.unwrap().unwrap().status, "needs_human");
+    }
+
+    #[tokio::test]
+    async fn kickoff_press_from_an_unrelated_account_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let t = mk_task("g6");
+        let approval_id = seed_kickoff_approval(dir.path(), &t).await;
+
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "999",
+            &crate::decision_action::encode(DecisionSource::Kickoff, DecisionAct::Approve, &approval_id),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_err(), "an unrelated account must not start a goal: {out:?}");
+
+        let broker = crate::approval::ApprovalBroker::open(dir.path()).unwrap();
+        let id = crate::approval::ApprovalId::from(approval_id.clone());
+        assert_eq!(
+            broker.poll(&id).await.unwrap(),
+            crate::approval::ApprovalStatus::Pending,
+            "a refused press must leave the approval untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn kickoff_press_from_the_delivery_destination_approves() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let t = mk_task("g7");
+        let approval_id = seed_kickoff_approval(dir.path(), &t).await;
+
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "555",
+            &crate::decision_action::encode(DecisionSource::Kickoff, DecisionAct::Approve, &approval_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(out.contains("已同意"), "unexpected ack: {out}");
+
+        let broker = crate::approval::ApprovalBroker::open(dir.path()).unwrap();
+        let id = crate::approval::ApprovalId::from(approval_id);
+        assert_eq!(broker.poll(&id).await.unwrap(), crate::approval::ApprovalStatus::Approved);
+    }
+
+    #[tokio::test]
+    async fn kickoff_press_on_a_missing_approval_is_reported_not_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "555",
+            &crate::decision_action::encode(DecisionSource::Kickoff, DecisionAct::Approve, "nope"),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_err());
     }
 
     // ── D2: needs_human forward trajectory ──────────────────────────────
@@ -1102,17 +1645,40 @@ mod tests {
     #[test]
     fn needs_human_body_without_trajectory_matches_prior_shape() {
         let t = mk_task("g1");
-        let body = needs_human_body(&t, None);
+        let body = needs_human_body(&t, None, "telegram");
         assert!(body.contains("自主目標任務卡住"));
-        assert!(body.contains("請選擇：重試 / 標記完成 / 放棄。"));
+        // W1-5: the four-way choice line (retry/done/abort/take-over) — all
+        // reachable via buttons on a channel with a secondary tier.
+        assert!(body.contains("請選擇：重試 / 標記完成 / 放棄 / 交給我。"));
         assert!(!body.contains("若核准，接下來預計"));
+    }
+
+    #[test]
+    fn needs_human_body_starts_with_the_reason_prefix() {
+        // W1-6: the very first line is the canonical reason vocabulary, the
+        // same phrase for every goal needs_human card regardless of channel.
+        let t = mk_task("g1");
+        let body = needs_human_body(&t, None, "telegram");
+        assert!(body.starts_with("🤔 自主任務等你決定\n"));
+    }
+
+    #[test]
+    fn needs_human_body_on_line_degrades_secondary_actions_to_plain_text() {
+        // W1-5: LINE has no secondary-menu affordance, so abort/take-over are
+        // dropped from the quick reply and named in the body as plain text
+        // instead of a clickable choice.
+        let t = mk_task("g1");
+        let body = needs_human_body(&t, None, "line");
+        assert!(body.contains("請選擇：重試 / 標記完成。"));
+        assert!(!body.contains("請選擇：重試 / 標記完成 / 放棄 / 交給我。"));
+        assert!(body.contains("放棄／交給我"));
     }
 
     #[test]
     fn needs_human_body_with_trajectory_renders_above_choices() {
         let t = mk_task("g1");
         let traj = "若核准，接下來預計：\n1) 整理客戶資料\n2) 產出月報\n3) 寄出通知";
-        let body = needs_human_body(&t, Some(traj));
+        let body = needs_human_body(&t, Some(traj), "telegram");
         assert!(body.contains(traj));
         let traj_pos = body.find("若核准，接下來預計").unwrap();
         let choices_pos = body.find("請選擇：重試").unwrap();
@@ -1199,6 +1765,15 @@ mod tests {
         assert!(body.contains("目標:整理客戶月報"));
         assert!(body.contains("請選擇：開始 / 拒絕。"));
         assert!(!body.contains("接下來預計"));
+    }
+
+    #[test]
+    fn kickoff_body_starts_with_the_reason_prefix() {
+        // W1-6: distinct reason from the needs_human card's — "新任務要開工"
+        // vs. "自主任務等你決定" — so a person scanning line 1 can tell them
+        // apart without reading further.
+        let body = kickoff_body("目標:整理客戶月報 — 最多 8 輪自主嘗試", None);
+        assert!(body.starts_with("🚀 新任務要開工\n"));
     }
 
     #[test]

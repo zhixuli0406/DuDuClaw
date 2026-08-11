@@ -266,6 +266,14 @@ impl ApprovalRecord {
         self.expires_at().map(|t| t.to_rfc3339())
     }
 
+    /// The instant this approval expires, as a Unix epoch (seconds). Lets a
+    /// dashboard client compute a live countdown with plain arithmetic instead
+    /// of parsing RFC3339 client-side. `None` on an unparseable timestamp
+    /// (mirrors [`Self::deadline_rfc3339`]).
+    pub fn expires_at_epoch(&self) -> Option<i64> {
+        self.expires_at().map(|t| t.timestamp())
+    }
+
     /// WP20: true when the pending approval has burned through
     /// [`REMIND_AT_FRACTION`] of its TTL and has not been reminded yet — the
     /// "about to auto-deny" nudge is due.
@@ -2369,5 +2377,29 @@ mod tests {
     fn status_from_db_fails_closed_on_unknown() {
         assert_eq!(ApprovalStatus::from_db("garbage"), ApprovalStatus::Denied);
         assert!(!ApprovalStatus::from_db("garbage").is_granted());
+    }
+
+    // ── expires_at_epoch (dashboard countdown) ────────────────────────────────
+
+    #[test]
+    fn expires_at_epoch_matches_created_at_plus_ttl() {
+        let rec = aged(0, 300, false);
+        let created = DateTime::parse_from_rfc3339(&rec.created_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(rec.expires_at_epoch(), Some((created.timestamp()) + 300));
+        // Matches the RFC3339 sibling accessor exactly (same underlying instant).
+        assert_eq!(
+            rec.expires_at_epoch(),
+            rec.deadline_rfc3339()
+                .map(|s| DateTime::parse_from_rfc3339(&s).unwrap().timestamp())
+        );
+    }
+
+    #[test]
+    fn expires_at_epoch_none_on_unparseable_created_at() {
+        let mut rec = aged(0, 300, false);
+        rec.created_at = "not-a-timestamp".into();
+        assert_eq!(rec.expires_at_epoch(), None);
     }
 }

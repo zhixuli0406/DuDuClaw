@@ -97,6 +97,11 @@ where
         .get(agent_id)
         .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
     let agent_toml_path = agent.dir.join("agent.toml");
+    // `agent.dir` is `<home_dir>/agents/<agent_id>` (see `AgentRegistry::new`
+    // callers) — walk up two levels rather than threading a separate
+    // `home_dir` parameter through every caller of this already-widely-used
+    // function just for the model-switch FYI below.
+    let home_dir = agent.dir.parent().and_then(Path::parent).map(Path::to_path_buf);
     drop(reg);
 
     let content = tokio::fs::read_to_string(&agent_toml_path)
@@ -107,7 +112,10 @@ where
         .parse()
         .map_err(|e| format!("Failed to parse agent.toml: {e}"))?;
 
+    let model_before = read_model_preferred(&table);
     mutate(&mut table)?;
+    let model_changed = read_model_preferred(&table)
+        .is_some_and(|after| Some(after.as_str()) != model_before.as_deref());
 
     let new_content = toml::to_string_pretty(&table)
         .map_err(|e| format!("Failed to serialise agent.toml: {e}"))?;
@@ -151,6 +159,16 @@ where
         // Nudge live WebChat sockets to re-send their session_info frame
         // so open dashboard tabs reflect the change without a reconnect.
         let _ = agent_config_events().send(agent_id.to_string());
+        // The channel-side FYI: only when `[model].preferred` actually
+        // changed value (not merely re-written), and only once the change is
+        // truly live (hot_reloaded) — a rescan failure below leaves the old
+        // model answering, so announcing a switch that hasn't landed yet
+        // would be a lie.
+        if model_changed {
+            if let Some(home_dir) = &home_dir {
+                crate::pending_agent_notice::mark_model_changed(home_dir, agent_id);
+            }
+        }
     } else {
         warn!(
             agent_id,
@@ -159,6 +177,18 @@ where
     }
 
     Ok(hot_reloaded)
+}
+
+/// Read `[model].preferred` out of a parsed `agent.toml` table, if present.
+/// Used by [`update_agent_toml_with`] to detect an actual model switch
+/// (before-vs-after comparison), never to drive dispatch itself.
+fn read_model_preferred(table: &toml::Table) -> Option<String> {
+    table
+        .get("model")
+        .and_then(|v| v.as_table())
+        .and_then(|m| m.get("preferred"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 /// Shared channel status map, accessible by both channel bots and the RPC handler.
@@ -954,7 +984,8 @@ pub async fn build_reply_for_agent(
     .await;
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
     let restored = restore_for_channel(raw, ctx, agent_name, session_id).await;
-    enforce_contract(restored, &ctx.home_dir, agent_name).await
+    let enforced = enforce_contract(restored, &ctx.home_dir, agent_name).await;
+    append_pending_agent_notice(enforced, &ctx.home_dir, agent_name)
 }
 
 /// Build a reply with session tracking and optional progress streaming.
@@ -978,7 +1009,24 @@ pub async fn build_reply_with_session(
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
     let agent_id = resolve_agent_for_restore(ctx, session_id).await;
     let restored = restore_for_channel(raw, ctx, &agent_id, session_id).await;
-    enforce_contract(restored, &ctx.home_dir, &agent_id).await
+    let enforced = enforce_contract(restored, &ctx.home_dir, &agent_id).await;
+    append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id)
+}
+
+/// Append any pending "rules changed" / "model switched" FYI line(s) — see
+/// `pending_agent_notice` — to an outgoing reply, then clear the flag(s) so
+/// the same change is never announced twice. A reply that is already empty
+/// (silent-by-design drops: circuit-breaker denial, blocked/unpaired user,
+/// injection-scan block) is left untouched — turning a deliberate silence
+/// into a visible message would defeat the gate that produced it.
+fn append_pending_agent_notice(reply: String, home_dir: &std::path::Path, agent_id: &str) -> String {
+    if reply.is_empty() {
+        return reply;
+    }
+    match crate::pending_agent_notice::take_pending_notice_suffix(home_dir, agent_id) {
+        Some(suffix) => format!("{reply}\n\n{suffix}"),
+        None => reply,
+    }
 }
 
 /// Channel session-id prefixes subject to the user access gate. Internal
@@ -4233,6 +4281,14 @@ async fn build_reply_with_session_inner(
         error_text: Some(&err_str),
         ..Default::default()
     });
+    // Stripe error-object pattern: attach "where to go look" alongside the
+    // classification itself — console_url is the dashboard deep link (same
+    // one the message text below surfaces), doc_url is the public docs page
+    // when one actually exists (`failure_doc_url` never invents a URL).
+    // `json!` serializes `Option<String>`/`Option<&str>` as `null` when
+    // `None`, so this stays fail-quiet the same way `deep_link` itself does.
+    let console_url = failure_console_url(&ctx.home_dir, reason);
+    let doc_url = failure_doc_url(reason);
     let audit = serde_json::json!({
         "event": "channel_reply_fallback",
         "agent": name,
@@ -4241,6 +4297,8 @@ async fn build_reply_with_session_inner(
         "error": err_str.chars().take(300).collect::<String>(),
         "mast": mast.as_str(),
         "mast_category": mast.category_str(),
+        "console_url": console_url,
+        "doc_url": doc_url,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
     if let Ok(line) = serde_json::to_string(&audit) {
@@ -4256,7 +4314,7 @@ async fn build_reply_with_session_inner(
         }
     }
 
-    format_fallback_message(&name, reason)
+    format_fallback_message(&name, reason, &ctx.home_dir)
 }
 
 /// True when a non-Claude reply's actual answering runtime differs from the
@@ -4359,7 +4417,7 @@ mod runtime_substitution_tests {
 /// Drives the user-facing fallback message so we tell the user *why*
 /// it actually failed (rate limit, timeout, etc.) rather than always
 /// suggesting they re-run `claude auth status`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureReason {
     /// `claude` binary was not found on the filesystem.
     BinaryMissing,
@@ -4666,12 +4724,86 @@ pub(crate) fn retry_hint_for(err: &str) -> Option<String> {
     }
 }
 
+/// Which dashboard page a classified failure should point the user at
+/// (Stripe error-object pattern: every failure carries "where to go look").
+///
+/// Two groups: failures where the fix is an account/quota action already
+/// surfaced on the billing page (rate limit, billing exhaustion, no/cooling
+/// accounts) land on [`DeepLinkKind::Billing`]; everything else — a CLI-side
+/// problem the user can't self-serve from an account page — lands on
+/// [`DeepLinkKind::System`], the same debug-log destination the message text
+/// already tells people to check by hand.
+fn failure_console_link_kind(reason: FailureReason) -> crate::deep_link::DeepLinkKind {
+    use crate::deep_link::DeepLinkKind;
+    match reason {
+        FailureReason::RateLimited
+        | FailureReason::Billing
+        | FailureReason::NoAccounts
+        | FailureReason::AccountsCoolingDownLong
+        | FailureReason::AccountsCoolingDownShort
+        | FailureReason::AccountsCoolingDownUnknown => DeepLinkKind::Billing,
+        FailureReason::BinaryMissing
+        | FailureReason::AuthFailed
+        | FailureReason::Timeout
+        | FailureReason::SpawnError
+        | FailureReason::EmptyResponse
+        | FailureReason::Unknown => DeepLinkKind::System,
+    }
+}
+
+/// Resolve the dashboard "console" deep link for a classified failure, or
+/// `None` when no dashboard base URL is resolvable (`deep_link`'s fail-quiet
+/// contract — see `deep_link.rs` module docs). `id` is irrelevant to both
+/// `DeepLinkKind::Billing` and `DeepLinkKind::System` (neither is a per-object
+/// route today), so an empty string is passed, matching the existing
+/// `Channels`/`Billing` call sites in `channel_alerts.rs`/`budget.rs`.
+fn failure_console_url(home_dir: &Path, reason: FailureReason) -> Option<String> {
+    crate::deep_link::deep_link(home_dir, failure_console_link_kind(reason), "")
+}
+
+/// Public documentation URL for a classified failure, or `None` when no
+/// matching page exists in `docs/` — never a guessed/invented URL (project
+/// convention). Only the account-rotation family of failures has a real
+/// on-topic doc today (`docs/features/zh-TW/07-account-rotation.md` covers
+/// OAuth/API-key rotation, health tracking and cooldown horizons — exactly
+/// what `RateLimited`/`Billing`/`NoAccounts`/`AccountsCoolingDown*` are
+/// about); the CLI-side failures (`BinaryMissing`/`AuthFailed`/`Timeout`/
+/// `SpawnError`/`EmptyResponse`/`Unknown`) have no dedicated troubleshooting
+/// doc in the public tree, so this deliberately returns `None` for them
+/// rather than pointing at a loosely-related guide.
+fn failure_doc_url(reason: FailureReason) -> Option<&'static str> {
+    match reason {
+        FailureReason::RateLimited
+        | FailureReason::Billing
+        | FailureReason::NoAccounts
+        | FailureReason::AccountsCoolingDownLong
+        | FailureReason::AccountsCoolingDownShort
+        | FailureReason::AccountsCoolingDownUnknown => Some(
+            "https://github.com/zhixuli0406/DuDuClaw/blob/main/docs/features/zh-TW/07-account-rotation.md",
+        ),
+        FailureReason::BinaryMissing
+        | FailureReason::AuthFailed
+        | FailureReason::Timeout
+        | FailureReason::SpawnError
+        | FailureReason::EmptyResponse
+        | FailureReason::Unknown => None,
+    }
+}
+
 /// Build a zh-TW user-facing message for a classified failure.
 ///
 /// Messages directly tell the user *why* CLI failed (rate limit, billing, etc.)
-/// and whether a local model fallback was used.
-pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -> String {
-    match reason {
+/// and whether a local model fallback was used. When a dashboard deep link is
+/// resolvable (`[dashboard] public_url` or `[gateway] port` in
+/// `config.toml` — see `deep_link.rs`), a single "🔎 詳情：<url>" line is
+/// appended so the failure carries a concrete "go look here" destination
+/// (Stripe error-object pattern), not just a category label. Fail-quiet: no
+/// resolvable base URL means no link line, never a dangling/placeholder one.
+/// Only the console link is surfaced here — the doc link is dashboard-side
+/// (`channel_failures.jsonl`'s `doc_url` field), keeping the channel message
+/// to at most one URL.
+pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason, home_dir: &Path) -> String {
+    let body = match reason {
         FailureReason::BinaryMissing => format!(
             "{agent_name} 暫時無法回應：系統找不到 Claude Code CLI。\n\
              請確認已安裝，並執行：\n\
@@ -4729,6 +4861,10 @@ pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -
             "{agent_name} 暫時無法回應。\n\
              請稍後再試，或查看 ~/.duduclaw/debug.log 取得詳細原因。"
         ),
+    };
+    match failure_console_url(home_dir, reason) {
+        Some(url) => format!("{body}\n🔎 詳情：{url}"),
+        None => body,
     }
 }
 
@@ -5151,7 +5287,7 @@ mod fallback_tests {
 
     #[test]
     fn message_auth_failed_tells_user_to_login() {
-        let msg = format_fallback_message("Agnes", FailureReason::AuthFailed);
+        let msg = format_fallback_message("Agnes", FailureReason::AuthFailed, Path::new("/nonexistent-duduclaw-test-home"));
         assert!(msg.contains("Agnes"));
         assert!(msg.contains("未登入") || msg.contains("認證失效"));
         assert!(msg.contains("/login"));
@@ -5162,7 +5298,7 @@ mod fallback_tests {
 
     #[test]
     fn message_rate_limited_contains_busy_string_not_auth_status() {
-        let msg = format_fallback_message("Agnes", FailureReason::RateLimited);
+        let msg = format_fallback_message("Agnes", FailureReason::RateLimited, Path::new("/nonexistent-duduclaw-test-home"));
         assert!(msg.contains("Agnes"));
         assert!(msg.contains("忙線中"));
         assert!(!msg.contains("auth status"));
@@ -5170,15 +5306,165 @@ mod fallback_tests {
 
     #[test]
     fn message_binary_missing_keeps_auth_status_hint() {
-        let msg = format_fallback_message("Agnes", FailureReason::BinaryMissing);
+        let msg = format_fallback_message("Agnes", FailureReason::BinaryMissing, Path::new("/nonexistent-duduclaw-test-home"));
         assert!(msg.contains("找不到 Claude Code"));
         assert!(msg.contains("auth status"));
     }
 
     #[test]
     fn message_timeout_mentions_30_min() {
-        let msg = format_fallback_message("Agnes", FailureReason::Timeout);
+        let msg = format_fallback_message("Agnes", FailureReason::Timeout, Path::new("/nonexistent-duduclaw-test-home"));
         assert!(msg.contains("30 分鐘"));
+    }
+
+    // ── W0-12: console_url / doc_url mapping (Stripe error-object pattern) ──
+
+    #[test]
+    fn account_and_quota_failures_link_to_billing() {
+        use crate::deep_link::DeepLinkKind;
+        for reason in [
+            FailureReason::RateLimited,
+            FailureReason::Billing,
+            FailureReason::NoAccounts,
+            FailureReason::AccountsCoolingDownLong,
+            FailureReason::AccountsCoolingDownShort,
+            FailureReason::AccountsCoolingDownUnknown,
+        ] {
+            assert_eq!(
+                failure_console_link_kind(reason),
+                DeepLinkKind::Billing,
+                "{reason:?} should land on the billing/account page"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_side_failures_link_to_system() {
+        use crate::deep_link::DeepLinkKind;
+        for reason in [
+            FailureReason::BinaryMissing,
+            FailureReason::AuthFailed,
+            FailureReason::Timeout,
+            FailureReason::SpawnError,
+            FailureReason::EmptyResponse,
+            FailureReason::Unknown,
+        ] {
+            assert_eq!(
+                failure_console_link_kind(reason),
+                DeepLinkKind::System,
+                "{reason:?} should land on the system/logs page"
+            );
+        }
+    }
+
+    #[test]
+    fn every_failure_reason_has_a_console_link_kind_assigned() {
+        // Exhaustiveness guard: if a new FailureReason variant is added
+        // without updating failure_console_link_kind, this test's match
+        // (mirroring the classify_cli_failure_hint exhaustive match style)
+        // would fail to compile — but since failure_console_link_kind
+        // already matches exhaustively without a wildcard arm, the compiler
+        // itself enforces this. This test instead locks the total count so
+        // silently narrowing the match (accidentally merging two variants
+        // into a wildcard) would be caught.
+        let all = [
+            FailureReason::BinaryMissing,
+            FailureReason::RateLimited,
+            FailureReason::Billing,
+            FailureReason::AuthFailed,
+            FailureReason::Timeout,
+            FailureReason::SpawnError,
+            FailureReason::EmptyResponse,
+            FailureReason::NoAccounts,
+            FailureReason::AccountsCoolingDownLong,
+            FailureReason::AccountsCoolingDownShort,
+            FailureReason::AccountsCoolingDownUnknown,
+            FailureReason::Unknown,
+        ];
+        assert_eq!(all.len(), 12, "update this list when FailureReason grows");
+        for reason in all {
+            let _ = failure_console_link_kind(reason); // must not panic for any variant
+        }
+    }
+
+    #[test]
+    fn only_account_rotation_failures_carry_a_doc_url() {
+        for reason in [
+            FailureReason::RateLimited,
+            FailureReason::Billing,
+            FailureReason::NoAccounts,
+            FailureReason::AccountsCoolingDownLong,
+            FailureReason::AccountsCoolingDownShort,
+            FailureReason::AccountsCoolingDownUnknown,
+        ] {
+            let doc = failure_doc_url(reason);
+            assert!(doc.is_some(), "{reason:?} should have a doc_url");
+            let doc = doc.unwrap();
+            assert!(
+                doc.starts_with("https://github.com/zhixuli0406/DuDuClaw/blob/main/docs/"),
+                "doc_url must point at a real repo doc path, got: {doc}"
+            );
+        }
+        for reason in [
+            FailureReason::BinaryMissing,
+            FailureReason::AuthFailed,
+            FailureReason::Timeout,
+            FailureReason::SpawnError,
+            FailureReason::EmptyResponse,
+            FailureReason::Unknown,
+        ] {
+            assert_eq!(
+                failure_doc_url(reason),
+                None,
+                "{reason:?} has no matching public doc — must not invent a URL"
+            );
+        }
+    }
+
+    #[test]
+    fn console_url_is_none_without_a_resolvable_dashboard_base() {
+        // Fail-quiet contract inherited from deep_link: no config.toml at
+        // the given home ⇒ no base URL ⇒ None, never a dangling link.
+        let home = Path::new("/nonexistent-duduclaw-test-home");
+        for reason in [FailureReason::Billing, FailureReason::Timeout] {
+            assert_eq!(failure_console_url(home, reason), None);
+        }
+    }
+
+    #[test]
+    fn format_fallback_message_appends_console_link_when_dashboard_resolvable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[gateway]\nport = 18789\n").unwrap();
+
+        let billing_msg = format_fallback_message("Agnes", FailureReason::RateLimited, dir.path());
+        assert!(
+            billing_msg.contains("🔎 詳情：http://localhost:18789/manage/billing"),
+            "billing-group failure must link to /manage/billing: {billing_msg}"
+        );
+
+        let system_msg = format_fallback_message("Agnes", FailureReason::Timeout, dir.path());
+        assert!(
+            system_msg.contains("🔎 詳情：http://localhost:18789/manage/logs"),
+            "CLI-side failure must link to /manage/logs: {system_msg}"
+        );
+
+        // Exactly one link line — doc_url must never leak into the channel
+        // message (it's dashboard-side only, via channel_failures.jsonl).
+        assert_eq!(billing_msg.matches("🔎").count(), 1);
+        assert!(!billing_msg.contains("github.com"));
+    }
+
+    #[test]
+    fn format_fallback_message_omits_link_line_when_dashboard_base_unresolvable() {
+        let msg = format_fallback_message(
+            "Agnes",
+            FailureReason::RateLimited,
+            Path::new("/nonexistent-duduclaw-test-home"),
+        );
+        assert!(
+            !msg.contains('🔎'),
+            "no resolvable dashboard base ⇒ no link line: {msg}"
+        );
     }
 }
 
@@ -5532,7 +5818,7 @@ mod rotation_tests {
         );
         // And the zh-TW surface must explain the wait, not only "go set up an
         // account" — the user HAS an account.
-        let msg = format_fallback_message("小助手", FailureReason::AccountsCoolingDownUnknown);
+        let msg = format_fallback_message("小助手", FailureReason::AccountsCoolingDownUnknown, Path::new("/nonexistent-duduclaw-test-home"));
         assert!(
             msg.contains("冷卻") || msg.contains("恢復"),
             "message should explain the wait: {msg}"
@@ -5561,7 +5847,7 @@ mod rotation_tests {
             classify_cli_failure(&err),
             FailureReason::AccountsCoolingDownLong
         );
-        let msg = format_fallback_message("小助手", FailureReason::AccountsCoolingDownLong);
+        let msg = format_fallback_message("小助手", FailureReason::AccountsCoolingDownLong, Path::new("/nonexistent-duduclaw-test-home"));
         assert!(msg.contains("24"), "long horizon must be stated: {msg}");
         assert!(!msg.contains("幾分鐘"), "must not promise minutes: {msg}");
     }
@@ -5587,7 +5873,7 @@ mod rotation_tests {
             classify_cli_failure(&err),
             FailureReason::AccountsCoolingDownShort
         );
-        let msg = format_fallback_message("小助手", FailureReason::AccountsCoolingDownShort);
+        let msg = format_fallback_message("小助手", FailureReason::AccountsCoolingDownShort, Path::new("/nonexistent-duduclaw-test-home"));
         assert!(
             msg.contains("幾分鐘"),
             "short horizon must be stated: {msg}"
@@ -5691,7 +5977,7 @@ mod rotation_tests {
         let reason = classify_cli_failure(&err);
         assert_eq!(reason, FailureReason::RateLimited);
 
-        let user_msg = format_fallback_message("Agnes", reason);
+        let user_msg = format_fallback_message("Agnes", reason, Path::new("/nonexistent-duduclaw-test-home"));
         assert!(user_msg.contains("Agnes"));
         assert!(user_msg.contains("忙線中"), "must say busy: {user_msg}");
         assert!(
@@ -5736,7 +6022,7 @@ mod rotation_tests {
         let reason = classify_cli_failure(&err);
         assert_eq!(reason, FailureReason::AuthFailed);
 
-        let msg = format_fallback_message("Agnes", reason);
+        let msg = format_fallback_message("Agnes", reason, Path::new("/nonexistent-duduclaw-test-home"));
         assert!(msg.contains("Agnes"));
         assert!(msg.contains("/login"));
         assert!(

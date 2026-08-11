@@ -703,6 +703,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!("GVU stagnation detector scheduled — 30 min interval");
     }
 
+    // ── Channel-outage alerting ─────────────────────────────────────────
+    // `channel_failures.jsonl` previously had no reverse notification path —
+    // a channel that stayed connectable but stopped actually delivering
+    // messages was only ever discoverable by an operator opening the
+    // dashboard. Sweeps for the same-channel/threshold/window signal on a
+    // tighter cadence than the 30-min GVU checks above: the alert window
+    // itself is only 10 minutes, so a 30-min tick would routinely miss (or
+    // badly delay) the very condition it exists to catch.
+    {
+        let monitor = Arc::new(crate::channel_alerts::ChannelAlertMonitor::new(home_dir.clone()));
+        tokio::spawn(monitor.run(std::time::Duration::from_secs(120)));
+        info!("Channel-outage alert monitor scheduled — 2 min interval");
+    }
+
     // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
     let (event_tx, _) = broadcast::channel::<String>(64);
     handler.set_event_tx(event_tx.clone()).await;

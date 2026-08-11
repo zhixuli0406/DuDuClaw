@@ -27,13 +27,9 @@ use tracing::{info, warn};
 use duduclaw_auth::models::{User, UserRole, UserStatus};
 use duduclaw_auth::UserDb;
 
+use crate::decision_action::DecisionSource;
+use crate::decision_notify::DecisionCard;
 use crate::install_requests::{DecideOutcome, InstallRequest, InstallRequestStore};
-
-/// Channels that can render inline approve/deny buttons today. All four have
-/// their inbound dispatchers wired to [`decide_from_channel`].
-fn channel_supports_buttons(channel: &str) -> bool {
-    matches!(channel, "telegram" | "slack" | "discord" | "line")
-}
 
 /// The approver users for a request's CURRENT stage.
 ///
@@ -79,31 +75,32 @@ pub fn approvers_for(users: &[User], req: &InstallRequest) -> Vec<User> {
         .collect()
 }
 
-/// Render the zh-TW notification body for a request.
-fn notify_body(req: &InstallRequest, needs_button_hint: bool) -> String {
+/// Render the zh-TW notification body for a request. The dashboard deep link
+/// and the "this channel has no buttons" hint are appended by the shared
+/// delivery path, so this is purely the description of what is being asked.
+fn notify_body(req: &InstallRequest) -> String {
     let kind = if req.kind == "skill" { "Skill" } else { "MCP" };
     let findings = req.scan.as_array().map(|a| a.len()).unwrap_or(0);
-    let mut body = format!(
-        "🔔 安裝簽核申請\n\
+    format!(
+        "{prefix}\n🔔 安裝簽核申請\n\
          類型：{kind}\n\
          項目：{title}\n\
          申請人：{who}（{role}）\n\
          功能：{desc}\n\
          安全審查：風險 {risk}，{findings} 項發現\n\
          編號：{id}",
+        prefix = crate::decision_notify::reason_prefix(DecisionSource::Install),
         title = req.title,
         who = if req.requester_email.is_empty() { &req.requester_id } else { &req.requester_email },
         role = zh_role(&req.requester_role),
         desc = duduclaw_core::truncate_chars(&req.description, 200),
         risk = req.risk_level,
         id = req.id,
-    );
-    if needs_button_hint {
-        // Channels without inline buttons: point the approver at the dashboard.
-        body.push_str("\n\n請至儀表板「安裝簽核申請」頁核准或退回。");
-    }
-    body
+    )
 }
+
+/// What to tell an approver whose channel cannot render inline buttons.
+const NO_BUTTON_HINT: &str = "此通道無法顯示按鈕，請至儀表板的待辦決定頁同意或婉拒。";
 
 fn zh_role(role: &str) -> &str {
     match role {
@@ -131,6 +128,17 @@ pub async fn notify_install_approvers(home_dir: &Path, db: &UserDb, req: &Instal
     }
 
     let http = reqwest::Client::new();
+    // A clickable deep link to the unified inbox — `None` when no
+    // dashboard base URL is configured/derivable.
+    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Approval, &req.id);
+    let body = notify_body(req);
+    let card = DecisionCard {
+        source: DecisionSource::Install,
+        decision_id: &req.id,
+        body: &body,
+        link: link.as_deref(),
+        no_button_hint: NO_BUTTON_HINT,
+    };
     for approver in &approvers {
         let channels = match db.verified_channels_for_user(&approver.id) {
             Ok(c) => c,
@@ -144,28 +152,15 @@ pub async fn notify_install_approvers(home_dir: &Path, db: &UserDb, req: &Instal
                 info!(channel = %ident.channel, "install-notify: no bot token configured; skipping");
                 continue;
             };
-            let has_buttons = channel_supports_buttons(&ident.channel);
-            if has_buttons {
-                let body = notify_body(req, false);
-                if let Err(e) = send_with_buttons(
-                    &http,
-                    &ident.channel,
-                    &token,
-                    &ident.channel_user_id,
-                    &body,
-                    &req.id,
-                )
-                .await
-                {
-                    warn!(user = %approver.id, channel = %ident.channel, error = %e,
-                          "install-notify: button send failed");
-                }
-            } else {
-                // No inline buttons on this channel → text + dashboard hint.
-                let body = notify_body(req, true);
-                send_plain_text(home_dir, &http, &ident.channel, &ident.channel_user_id, &body)
-                    .await;
-            }
+            crate::decision_notify::deliver(
+                home_dir,
+                &http,
+                &ident.channel,
+                &token,
+                &ident.channel_user_id,
+                &card,
+            )
+            .await;
         }
     }
 }
@@ -186,8 +181,14 @@ pub async fn notify_requester(home_dir: &Path, db: &UserDb, req: &InstallRequest
     }
 }
 
-/// Send plain text to one linked channel identity via the shared sender
-/// factory. Logs and swallows errors (best-effort notification path).
+/// Send plain text to one linked channel identity. Logs and swallows errors
+/// (best-effort notification path).
+///
+/// Delegates to the shared sender so Google Chat and Teams keep working: the
+/// generic `channel_sender` factory has no branch for those two (their
+/// credentials live in home-dir config, not on a `ChannelTarget`) and falls
+/// through to `NullSender`, whose `send_text` always returns `Ok(())` — a
+/// message that was never sent would look identical to one that was.
 async fn send_plain_text(
     home_dir: &Path,
     http: &reqwest::Client,
@@ -199,15 +200,8 @@ async fn send_plain_text(
         info!(channel = %channel, "install-notify: no bot token configured; skipping");
         return;
     };
-    let target = crate::channel_sender::ChannelTarget {
-        channel_type: channel.to_string(),
-        chat_id: chat_id.to_string(),
-        token,
-        extra_id: None,
-    };
-    let sender = crate::channel_sender::create_sender(&target, http.clone());
-    if let Err(e) = sender.send_text(text).await {
-        warn!(channel = %channel, error = %e, "install-notify: send failed");
+    if !crate::goal_notify::send_plain_text(home_dir, http, channel, &token, chat_id, text).await {
+        warn!(channel = %channel, "install-notify: send failed");
     }
 }
 
@@ -220,123 +214,6 @@ async fn global_channel_token(home_dir: &Path, channel: &str) -> Option<String> 
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", field)
         .await
         .filter(|t| !t.is_empty())
-}
-
-/// Send the notification with inline approve/deny buttons on one of the four
-/// button-capable channels.
-async fn send_with_buttons(
-    http: &reqwest::Client,
-    channel: &str,
-    token: &str,
-    chat_id: &str,
-    text: &str,
-    request_id: &str,
-) -> Result<(), String> {
-    match channel {
-        "telegram" => {
-            let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-            let body = json!({
-                "chat_id": chat_id,
-                "text": text,
-                "reply_markup": crate::channel_format::telegram_approval_buttons(request_id),
-            });
-            let resp = http
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                // WP12: reqwest's Display embeds the URL, which carries the bot token.
-                .map_err(|e| crate::secret_redact::redact_secrets(&e.to_string()).into_owned())?;
-            if !resp.status().is_success() {
-                return Err(format!("telegram HTTP {}", resp.status()));
-            }
-            Ok(())
-        }
-        "slack" => {
-            // chat.postMessage to the linked user id opens/reuses the bot DM.
-            let body = json!({
-                "channel": chat_id,
-                "text": text,
-                "blocks": [
-                    { "type": "section", "text": { "type": "mrkdwn", "text": text } },
-                    crate::channel_format::slack_approval_buttons(request_id),
-                ],
-            });
-            let resp = http
-                .post("https://slack.com/api/chat.postMessage")
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                return Err(format!(
-                    "slack chat.postMessage: {}",
-                    data.get("error").and_then(|v| v.as_str()).unwrap_or("unknown")
-                ));
-            }
-            Ok(())
-        }
-        "discord" => {
-            // The linked id is the USER id — open (or reuse) the bot↔user DM
-            // channel first. If the call fails, fall back to treating the id
-            // as a channel id directly (older bindings may store one).
-            let dm_channel = match http
-                .post("https://discord.com/api/v10/users/@me/channels")
-                .header("Authorization", format!("Bot {token}"))
-                .json(&json!({ "recipient_id": chat_id }))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
-                    .unwrap_or_else(|| chat_id.to_string()),
-                _ => chat_id.to_string(),
-            };
-            let url = format!("https://discord.com/api/v10/channels/{dm_channel}/messages");
-            let body = json!({
-                "content": text,
-                "components": [crate::channel_format::discord_approval_buttons(request_id)],
-            });
-            let resp = http
-                .post(&url)
-                .header("Authorization", format!("Bot {token}"))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("discord HTTP {}", resp.status()));
-            }
-            Ok(())
-        }
-        "line" => {
-            let body = json!({
-                "to": chat_id,
-                "messages": [{
-                    "type": "text",
-                    "text": text,
-                    "quickReply": crate::channel_format::line_approval_quick_reply(request_id),
-                }],
-            });
-            let resp = http
-                .post("https://api.line.me/v2/bot/message/push")
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("line HTTP {}", resp.status()));
-            }
-            Ok(())
-        }
-        other => Err(format!("channel {other} has no button sender")),
-    }
 }
 
 /// Handle an install-approval action from a channel.
@@ -352,12 +229,37 @@ pub async fn decide_from_channel(
     channel_user_id: &str,
     action_data: &str,
 ) -> Option<Result<String, String>> {
-    let (request_id, approve) = crate::channel_format::parse_install_approval_action(action_data)?;
+    let action = crate::decision_action::parse(action_data)?;
+    if action.source != DecisionSource::Install {
+        return None;
+    }
+    Some(apply_decision(home_dir, channel, channel_user_id, &action.id, action.approve()).await)
+}
 
-    // Open the user DB from the home dir (channel dispatchers don't carry one).
-    let db = match UserDb::new(&home_dir.join("users.db")) {
-        Ok(d) => d,
-        Err(e) => return Some(Err(format!("開啟使用者資料庫失敗：{e}"))),
+/// Apply an already-decoded sign-off to `install_requests`. Called by the
+/// unified inbound router as well as this module's own thin wrapper.
+///
+/// Authorization here is strictly identity-based: an install sign-off must map
+/// to a verified dashboard user with a Manager/Admin role, and the store
+/// re-checks role + department for the current stage. There is deliberately no
+/// "solo operator decides from the delivered destination" fallback — a
+/// two-stage sign-off whose stages nobody is identified for has no meaning.
+pub(crate) async fn apply_decision(
+    home_dir: &Path,
+    channel: &str,
+    channel_user_id: &str,
+    request_id: &str,
+    approve: bool,
+) -> Result<String, String> {
+    // Open the user DB from the home dir (channel dispatchers don't carry
+    // one). Existing file only — filing a decision must never conjure an auth
+    // database as a side effect; an absent one simply means nobody is
+    // identified, which is the same refusal an unmapped account gets.
+    let Some(db) = crate::decision_notify::open_user_db(home_dir) else {
+        return Err(crate::decision_notify::refusal_text(
+            crate::decision_notify::PressAuth::DenyUnknown,
+            "核准",
+        ));
     };
 
     // Map the clicking channel account → a dashboard user. VERIFIED links only:
@@ -370,85 +272,211 @@ pub async fn decide_from_channel(
     let user_id = match db.find_verified_user_id_by_channel(channel, channel_user_id) {
         Ok(Some(uid)) => uid,
         Ok(None) => {
-            return Some(Err(
-                "此帳號尚未連結儀表板身分，無法核准。請先於儀表板以此通道登入綁定。".into(),
+            return Err(crate::decision_notify::refusal_text(
+                crate::decision_notify::PressAuth::DenyUnknown,
+                "核准",
             ))
         }
-        Err(e) => return Some(Err(format!("查詢身分失敗：{e}"))),
+        Err(e) => return Err(format!("查詢身分失敗：{e}")),
     };
     let user = match db.get_user(&user_id) {
         Ok(Some(u)) if u.status == UserStatus::Active => u,
-        _ => return Some(Err("找不到有效的使用者身分".into())),
+        _ => return Err("找不到有效的使用者身分".into()),
     };
     if !matches!(user.role, UserRole::Manager | UserRole::Admin) {
-        return Some(Err("您沒有核准權限".into()));
+        return Err(crate::decision_notify::refusal_text(
+            crate::decision_notify::PressAuth::DenyNotApprover,
+            "核准",
+        ));
     }
 
     let store = match InstallRequestStore::open(home_dir) {
         Ok(s) => s,
-        Err(e) => return Some(Err(format!("開啟申請資料庫失敗：{e}"))),
+        Err(e) => return Err(format!("開啟申請資料庫失敗：{e}")),
     };
     let decider = format!("{}:{}", user.role, user.id);
     let dept = user.department.as_deref();
     let outcome = match store
-        .decide(&request_id, &decider, &user.role.to_string(), dept, approve, "")
+        .decide(request_id, &decider, &user.role.to_string(), dept, approve, "")
         .await
     {
         Ok(o) => o,
-        Err(e) => return Some(Err(e)),
+        Err(e) => return Err(e),
     };
 
     match outcome {
         DecideOutcome::Denied => {
-            if let Ok(Some(req)) = store.get(&request_id).await {
+            if let Ok(Some(req)) = store.get(request_id).await {
                 notify_requester(
                     home_dir,
                     &db,
                     &req,
-                    &format!("❌ 您的安裝申請「{}」已被退回。", req.title),
+                    &format!("🙅 您的安裝申請「{}」已婉拒。", req.title),
                 )
                 .await;
             }
-            Some(Ok("已退回此安裝申請。".into()))
+            spawn_install_collapse(
+                home_dir.to_path_buf(),
+                request_id.to_string(),
+                channel.to_string(),
+                channel_user_id.to_string(),
+                user.display_name.clone(),
+                crate::decision_card::DecisionVerb::DeclinedInstall,
+            );
+            Ok("已婉拒此安裝申請。".into())
         }
         DecideOutcome::AdvancedToAdmin => {
             // Notify the next stage's approvers (admins).
-            if let Ok(Some(req)) = store.get(&request_id).await {
+            if let Ok(Some(req)) = store.get(request_id).await {
                 notify_install_approvers(home_dir, &db, &req).await;
             }
-            Some(Ok("已核准（主管關卡），已轉交管理員做最終核准。".into()))
+            spawn_install_collapse(
+                home_dir.to_path_buf(),
+                request_id.to_string(),
+                channel.to_string(),
+                channel_user_id.to_string(),
+                user.display_name.clone(),
+                crate::decision_card::DecisionVerb::Approved,
+            );
+            Ok("已同意（主管關卡），現在等管理員同意。".into())
         }
         DecideOutcome::ReadyToExecute => {
-            let req = match store.get(&request_id).await {
+            let req = match store.get(request_id).await {
                 Ok(Some(r)) => r,
-                _ => return Some(Err("已核准，但讀取申請失敗，安裝未執行".into())),
+                _ => return Err("已同意，但讀取申請失敗，安裝未執行".into()),
             };
+            spawn_install_collapse(
+                home_dir.to_path_buf(),
+                request_id.to_string(),
+                channel.to_string(),
+                channel_user_id.to_string(),
+                user.display_name.clone(),
+                crate::decision_card::DecisionVerb::Approved,
+            );
             match apply_install_request(home_dir, &req).await {
                 Ok(_) => {
-                    let _ = store.mark_executed(&request_id, true, None).await;
+                    let _ = store.mark_executed(request_id, true, None).await;
                     notify_requester(
                         home_dir,
                         &db,
                         &req,
-                        &format!("✅ 您的安裝申請「{}」已核准並完成安裝。", req.title),
+                        &format!("✅ 您的安裝申請「{}」已同意並完成安裝。", req.title),
                     )
                     .await;
-                    Some(Ok(format!("已核准並安裝：{}", req.title)))
+                    Ok(format!("已同意並完成安裝：{}", req.title))
                 }
                 Err(e) => {
-                    let _ = store.mark_executed(&request_id, false, Some(&e)).await;
+                    let _ = store.mark_executed(request_id, false, Some(&e)).await;
                     notify_requester(
                         home_dir,
                         &db,
                         &req,
-                        &format!("⚠️ 您的安裝申請「{}」已核准，但安裝執行失敗：{e}", req.title),
+                        &format!("⚠️ 您的安裝申請「{}」已同意，但安裝執行失敗：{e}", req.title),
                     )
                     .await;
-                    Some(Ok(format!("已完成簽核，但安裝執行失敗：{e}")))
+                    Ok(format!("已完成簽核，但安裝執行失敗：{e}"))
                 }
             }
         }
     }
+}
+
+/// The one-line identifying summary regenerated fresh from the request
+/// record — shared by every collapse path (channel press and dashboard
+/// decision alike) rather than persisting/parsing the original push text.
+async fn install_collapse_summary(home_dir: &Path, request_id: &str) -> String {
+    match InstallRequestStore::open(home_dir).ok() {
+        Some(s) => match s.get(request_id).await.ok().flatten() {
+            Some(req) => format!(
+                "🔔 安裝簽核：{}",
+                duduclaw_core::truncate_chars(&req.title, 60)
+            ),
+            None => "🔔 安裝簽核申請".to_string(),
+        },
+        None => "🔔 安裝簽核申請".to_string(),
+    }
+}
+
+/// Spawn a best-effort, fire-and-forget attempt to retire this request's
+/// channel cards. Detached so a slow or unreachable channel API can never
+/// delay or fail a decision that already landed.
+///
+/// An install sign-off is pushed to every eligible approver's every linked
+/// channel, so a settled request routinely leaves several cards behind — all
+/// of them are retired, not just the presser's copy.
+fn spawn_install_collapse(
+    home_dir: std::path::PathBuf,
+    request_id: String,
+    channel: String,
+    channel_user_id: String,
+    decider_name: String,
+    verb: crate::decision_card::DecisionVerb,
+) {
+    tokio::spawn(async move {
+        let http = reqwest::Client::new();
+        let decider = (!decider_name.trim().is_empty()).then_some(decider_name.as_str());
+        let summary = install_collapse_summary(&home_dir, &request_id).await;
+        // Install pushes go out on the global bot for each channel (they
+        // address an approver's own linked account, not an agent's control
+        // channel), so the token lookup is the global one.
+        let home = home_dir.clone();
+        crate::decision_card::collapse_all(
+            &home_dir,
+            &http,
+            DecisionSource::Install.namespace(),
+            &request_id,
+            &summary,
+            verb,
+            decider,
+            move |ch: String| {
+                let home = home.clone();
+                async move { global_channel_token(&home, &ch).await }
+            },
+            Some((channel.as_str(), channel_user_id.as_str())),
+        )
+        .await;
+    });
+}
+
+/// Spawn a best-effort, fire-and-forget attempt to retire this request's
+/// channel cards after a **dashboard** decision (`handlers.rs`'s
+/// `install_requests.decide` RPC — H1 of the unified-decision hand-off, 07
+/// §6). Mirrors [`spawn_install_collapse`] but the decider is a resolved
+/// dashboard display name rather than a channel identity, and there is no
+/// channel destination to fall back to on a total collapse miss — the
+/// dashboard RPC already carries its own acknowledgement, so a miss stays
+/// silent rather than pushing a new message anywhere.
+///
+/// `verb` is the caller's to compute: `approve == false` always denies
+/// (`DeclinedInstall`); `approve == true` covers both the manager-stage and
+/// final-stage outcomes, which read identically as `Approved` — same mapping
+/// [`apply_decision`] uses for the channel path.
+pub(crate) fn spawn_dashboard_collapse(
+    home_dir: std::path::PathBuf,
+    request_id: String,
+    decider_name: Option<String>,
+    verb: crate::decision_card::DecisionVerb,
+) {
+    tokio::spawn(async move {
+        let http = reqwest::Client::new();
+        let summary = install_collapse_summary(&home_dir, &request_id).await;
+        let home = home_dir.clone();
+        crate::decision_card::collapse_all(
+            &home_dir,
+            &http,
+            DecisionSource::Install.namespace(),
+            &request_id,
+            &summary,
+            verb,
+            decider_name.as_deref(),
+            move |ch: String| {
+                let home = home.clone();
+                async move { global_channel_token(&home, &ch).await }
+            },
+            None,
+        )
+        .await;
+    });
 }
 
 /// Reduce an attacker-influenced name to a safe temp-file stem: keep only
@@ -606,6 +634,14 @@ mod tests {
     }
 
     #[test]
+    fn notify_body_starts_with_the_reason_prefix() {
+        // W1-6: line 1 is the canonical install-request reason.
+        let body = notify_body(&req("employee", None, None));
+        assert!(body.starts_with("📦 安裝申請\n"));
+        assert!(body.contains("安裝簽核申請"));
+    }
+
+    #[test]
     fn employee_no_dept_routes_to_all_managers() {
         let users = vec![
             user("m1", UserRole::Manager, Some("sales")),
@@ -651,6 +687,30 @@ mod tests {
         assert_eq!(got[0].id, "a1");
     }
 
+    // ── H1: dashboard collapse summary (`spawn_dashboard_collapse`,
+    // `handlers.rs`'s `install_requests.decide` RPC) ────────────
+
+    #[tokio::test]
+    async fn install_collapse_summary_regenerates_from_the_request_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstallRequestStore::open(dir.path()).unwrap();
+        let id = store
+            .create("skill", "客戶名單整理", "d", "emp", "emp@x", "employee", None, "Low", &json!([]), &json!({}), 3600)
+            .await
+            .unwrap();
+        let summary = install_collapse_summary(dir.path(), &id).await;
+        assert!(summary.contains("客戶名單整理"));
+    }
+
+    #[tokio::test]
+    async fn install_collapse_summary_degrades_to_a_generic_phrase_when_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        // Never filed: `open()` still succeeds (creates an empty db), `get()`
+        // returns None — must degrade, not panic or return an empty string.
+        let summary = install_collapse_summary(dir.path(), "does-not-exist").await;
+        assert_eq!(summary, "🔔 安裝簽核申請");
+    }
+
     #[test]
     fn tmp_file_stem_never_traverses() {
         assert_eq!(sanitize_tmp_file_stem("my-skill"), "my-skill");
@@ -660,6 +720,38 @@ mod tests {
         assert_eq!(sanitize_tmp_file_stem(""), "skill");
         assert_eq!(sanitize_tmp_file_stem("危險名稱"), "skill");
         assert!(sanitize_tmp_file_stem(&"x".repeat(200)).len() <= 64);
+    }
+
+    #[tokio::test]
+    async fn only_claims_install_presses_and_accepts_the_legacy_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        // Other sources' buttons fall through so their handler sees them.
+        for data in [
+            "garbage",
+            "duduclaw:approval_ok:a1",
+            "duduclaw:goal_retry:t1",
+            "duduclaw:autopilot_pause:r1",
+            "duduclaw:decide:apv:ok:a1",
+            "duduclaw:install_approve:", // id-less ⇒ fail-closed
+        ] {
+            assert!(
+                decide_from_channel(dir.path(), "telegram", "u1", data).await.is_none(),
+                "should not claim {data}"
+            );
+        }
+        // Both encodings of an install press are claimed. With no users.db the
+        // answer is a refusal, which is the point: an unidentified account
+        // cannot sign off an install.
+        for data in [
+            "duduclaw:install_approve:r1".to_string(),
+            crate::decision_action::encode(DecisionSource::Install, crate::decision_action::DecisionAct::Approve, "r1"),
+        ] {
+            let out = decide_from_channel(dir.path(), "telegram", "u1", &data).await;
+            assert!(out.is_some(), "must claim {data}");
+            assert!(out.unwrap().is_err(), "unidentified account must be refused: {data}");
+        }
+        // …and no auth database was conjured as a side effect.
+        assert!(!dir.path().join("users.db").exists());
     }
 
     #[test]

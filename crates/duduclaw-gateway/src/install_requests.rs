@@ -155,6 +155,14 @@ impl InstallRequest {
         Some(created.with_timezone(&Utc) + chrono::Duration::seconds(self.ttl_seconds))
     }
 
+    /// The instant this request expires, as a Unix epoch (seconds) — lets a
+    /// dashboard client render a live countdown without parsing RFC3339
+    /// itself. `None` on an unparseable `created_at` (fail-safe, mirrors
+    /// [`Self::is_stale`]'s treatment of the same case).
+    fn expires_at_epoch(&self) -> Option<i64> {
+        self.expires_at().map(|t| t.timestamp())
+    }
+
     fn is_stale(&self, now: DateTime<Utc>) -> bool {
         if self.status != RequestStatus::Pending {
             return false;
@@ -189,6 +197,7 @@ impl InstallRequest {
             "execute_error": self.execute_error,
             "created_at": self.created_at,
             "ttl_seconds": self.ttl_seconds,
+            "expires_at": self.expires_at_epoch(),
         })
     }
 }
@@ -673,6 +682,39 @@ mod tests {
         // admin (no department) still clears an out-of-department request
         let o = s.decide(&id, "adm", "admin", None, true, "").await.unwrap();
         assert_eq!(o, DecideOutcome::ReadyToExecute);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expires_at_epoch_matches_created_at_plus_ttl_and_reaches_to_json() {
+        let s = store();
+        let id = make(&s, "employee").await;
+        let r = s.get(&id).await.unwrap().unwrap();
+        assert_eq!(r.ttl_seconds, 3600);
+        let created = DateTime::parse_from_rfc3339(&r.created_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(r.expires_at_epoch(), Some(created.timestamp() + 3600));
+        // The dashboard-facing JSON carries the same value.
+        assert_eq!(
+            r.to_json().get("expires_at").and_then(|v| v.as_i64()),
+            r.expires_at_epoch(),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expires_at_epoch_none_on_unparseable_created_at() {
+        let s = store();
+        {
+            let conn = s.conn.lock().await;
+            conn.execute(
+                "INSERT INTO install_requests (id,kind,title,description,requester_id,requester_email,requester_role,risk_level,scan,payload,status,created_at,ttl_seconds)
+                 VALUES ('bad-ts','skill','t','','u','e','employee','Low','[]','{}','pending','not-a-timestamp',3600)",
+                [],
+            ).unwrap();
+        }
+        let r = s.get("bad-ts").await.unwrap().unwrap();
+        assert_eq!(r.expires_at_epoch(), None);
+        assert!(r.to_json().get("expires_at").unwrap().is_null());
     }
 
     #[test]

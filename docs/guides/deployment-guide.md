@@ -203,6 +203,25 @@ DUDUCLAW_ALLOWED_ORIGINS="duduclaw.yourdomain.com,box.your-tailnet.ts.net"
 - 也可直接在 dashboard **設定 → 系統 → 遠端存取網址**新增／刪除，不必手改 config.toml；
   **存檔即時生效，不用重開 gateway**（環境變數提供的項目仍會保留）。
 
+### 通道推播的儀表板深連結（`[dashboard] public_url`）
+
+當 AI 員工在 LINE／Telegram／Slack 等通道推播「請至儀表板處理」的訊息時，會附上一個
+可直接點擊的連結，直達該任務／審批的詳情頁（不是首頁）。這個連結怎麼組出來：
+
+1. 優先讀 `config.toml` 的 `[dashboard] public_url`（你對外的網域，例如透過反向代理
+   或 tailnet 開放時使用）；
+2. 沒有設定時，退化為 `http://localhost:<[gateway] port>`——僅在使用者跟 gateway
+   在同一台機器時才會真的打得開；
+3. 兩者都沒有 → 不附連結，訊息文字維持原樣（不會出現空連結）。
+
+透過反向代理或 tailnet 對外開放 dashboard 時，建議設定 `public_url`：
+
+```toml
+# ~/.duduclaw/config.toml
+[dashboard]
+public_url = "https://duduclaw.yourdomain.com"
+```
+
 ---
 
 ## 6. Docker Compose

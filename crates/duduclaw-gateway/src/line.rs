@@ -581,6 +581,13 @@ async fn line_webhook_handler(
 
 /// Handle a `postback` event (quick-reply button press).
 /// `data` format mirrors the Discord custom_id convention: `duduclaw:{action}`.
+///
+/// LINE has no message-edit API a postback can target (confirmed against the
+/// Messaging API — no editable message id is ever exposed to a bot), so it
+/// never had a persistent card to collapse in the first place: this reply IS
+/// already the "append a one-line result" fallback the other channels only
+/// fall back to on an edit miss/failure. `decision_card::channel_editable`
+/// excludes "line" for the same reason — see its module doc.
 async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
     let data = event
         .postback
@@ -596,52 +603,12 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
 
     info!("🔘 LINE [{sender}] postback: {data}");
 
-    // Install-approval buttons (Feature D): map the clicking LINE account to a
-    // dashboard user, authorize, and decide. `None` → not an install action,
-    // fall through to the other postback actions below.
+    // Decision buttons — every "a human must decide this" card, whichever
+    // store backs it. `None` ⇒ not a decision button, fall through to the
+    // other postback actions below.
     if sender != "unknown" {
-        if let Some(result) = crate::install_notify::decide_from_channel(
-            &state.ctx.home_dir, "line", sender, data,
-        )
-        .await
-        {
-            let answer = match result {
-                Ok(msg) => msg,
-                Err(msg) => format!("⚠️ {msg}"),
-            };
-            let messages = vec![serde_json::json!({ "type": "text", "text": answer })];
-            if !send_reply_rich(&state.http, token, reply_token, messages.clone()).await {
-                push_message_rich(&state.http, token, sender, messages).await;
-            }
-            return;
-        }
-    }
-
-    // Generic ApprovalBroker buttons (WP20): every `approvals.db` gate.
-    if sender != "unknown" {
-        if let Some(result) = crate::approval_notify::decide_from_channel(
-            &state.ctx.home_dir, "line", sender, data,
-        )
-        .await
-        {
-            let answer = match result {
-                Ok(msg) => msg,
-                Err(msg) => format!("⚠️ {msg}"),
-            };
-            let messages = vec![serde_json::json!({ "type": "text", "text": answer })];
-            if !send_reply_rich(&state.http, token, reply_token, messages.clone()).await {
-                push_message_rich(&state.http, token, sender, messages).await;
-            }
-            return;
-        }
-    }
-
-    // Goal-loop buttons (P2a): needs_human retry/done/abort + autonomy kickoff.
-    if sender != "unknown" {
-        if let Some(result) = crate::goal_notify::decide_from_channel(
-            &state.ctx.home_dir, "line", sender, data,
-        )
-        .await
+        if let Some(result) =
+            crate::decision_notify::route_press(&state.ctx.home_dir, "line", sender, data).await
         {
             let answer = match result {
                 Ok(msg) => msg,

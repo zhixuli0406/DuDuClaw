@@ -1,4 +1,4 @@
-//! WP20 — channel push + inline decision for the generic [`ApprovalBroker`].
+//! Channel push + inline decision for the generic [`ApprovalBroker`].
 //!
 //! ## The gap this closes
 //!
@@ -21,169 +21,35 @@
 //! `mcp_install` row in `approvals.db`, no message anywhere, and an automatic
 //! denial 5 minutes later. This module is the missing wire.
 //!
-//! ## Shape (mirrors `goal_notify`)
+//! ## Shape
 //!
 //! - **Outbound** [`notify_new_approval`] — called from
 //!   [`ApprovalBroker::request`] itself, so every action kind is covered by
 //!   construction rather than by remembering to call it at each site.
-//!   [`notify_reminder`] sends the ⅔-TTL "about to auto-deny" nudge.
-//! - **Inbound** [`decide_from_channel`] — a `duduclaw:approval_ok|no:{id}`
-//!   press is authorized ([`authorize_press`]) and applied via
-//!   `ApprovalBroker::decide`.
+//!   [`notify_reminder`] sends the ⅔-TTL "about to auto-deny" nudge. Both go
+//!   out through the shared [`crate::decision_notify::deliver`] path.
+//! - **Inbound** [`apply_decision`] — reached from the unified router
+//!   ([`crate::decision_notify::route_press`]), authorized by the shared
+//!   matrix and applied via `ApprovalBroker::decide`.
 //!
 //! Everything is best-effort and fail-soft: a missing token / unreachable
 //! destination is logged, never panics, and never blocks the approval itself.
 
 use std::path::Path;
 
-use serde_json::json;
-use tracing::{info, warn};
-
-use duduclaw_auth::models::{UserRole, UserStatus};
-use duduclaw_auth::UserDb;
+use tracing::info;
 
 use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus, SimulationNarrative};
-use crate::channel_format;
+use crate::decision_action::{DecisionAct, DecisionSource};
+use crate::decision_notify::{
+    approver_links, authorize_press, destination_matches_any, identity_system_active, mapped_role,
+    origin_target, refusal_text, resolve_targets, DecisionCard, PressAuth,
+};
 use crate::task_store::{ActivityRow, TaskStore};
 
 /// Max chars of the (partly external) summary rendered into a channel message.
 /// CJK-safe via `truncate_chars` — never a raw byte slice (convention #1).
 const SUMMARY_MAX_CHARS: usize = 300;
-
-/// Channels that can render inline approve/deny buttons today — the same four
-/// whose inbound dispatchers are wired to [`decide_from_channel`].
-fn channel_supports_buttons(channel: &str) -> bool {
-    matches!(channel, "telegram" | "slack" | "discord" | "line")
-}
-
-/// External channels a pending approval may be pushed to. A session id like
-/// `webchat:<conn>#agent:…` names a transport with no bot-push API, so it must
-/// never be mistaken for a destination.
-fn is_pushable_channel(channel: &str) -> bool {
-    matches!(
-        channel,
-        "telegram" | "slack" | "discord" | "line" | "whatsapp" | "feishu" | "googlechat" | "teams"
-    )
-}
-
-// ── Destination resolution ──────────────────────────────────────
-
-/// Parse a `DUDUCLAW_REPLY_CHANNEL`-style session id into a pushable
-/// `(channel, chat_id)` destination.
-///
-/// Grammar matches `dispatcher::parse_reply_channel`: `<type>:<id>[:<thread>]`,
-/// with the `<type>:thread:<id>` marker collapsing to `<id>`. Returns `None`
-/// for a malformed value or a non-pushable transport (webchat, dashboard, …) —
-/// the caller then falls through to the next link in the chain.
-pub(crate) fn parse_origin(reply_channel: &str) -> Option<(String, String)> {
-    let rc = reply_channel.trim();
-    let parts: Vec<&str> = rc.splitn(3, ':').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let channel = parts[0].trim();
-    if !is_pushable_channel(channel) {
-        return None;
-    }
-    let chat_id = if parts.len() == 3 && parts[1] == "thread" {
-        parts[2]
-    } else {
-        parts[1]
-    };
-    let chat_id = chat_id.trim();
-    // A composed WebChat-style id (`…#agent:…`) is not a chat id.
-    if chat_id.is_empty() || chat_id.contains('#') {
-        return None;
-    }
-    Some((channel.to_string(), chat_id.to_string()))
-}
-
-/// The conversation the approval was raised from, if any.
-///
-/// Two lookups, in order: the in-process `REPLY_CHANNEL` task-local (gateway
-/// callers — autopilot, wiki ingest, skill activation) and the
-/// `DUDUCLAW_REPLY_CHANNEL` env var (the `duduclaw mcp-server` child process,
-/// which inherits it from the CLI spawn). This is why no new plumbing is
-/// needed for the customer's case: the MCP server that files the `mcp_install`
-/// approval already knows it was reached from `telegram:<chat_id>`.
-fn origin_target() -> Option<(String, String)> {
-    if let Ok(rc) = crate::claude_runner::REPLY_CHANNEL.try_with(|ch| ch.clone()) {
-        if let Some(t) = parse_origin(&rc) {
-            return Some(t);
-        }
-    }
-    let rc = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL).ok()?;
-    parse_origin(&rc)
-}
-
-/// Pure destination chain: **origin conversation → the agent's own control
-/// channel → the linked channels of everyone who may decide**.
-///
-/// Rationale for the order: pushing back into the conversation that triggered
-/// the action is the only destination guaranteed to be watched by the person
-/// who is waiting on it. `[proactive]` is the agent-level fallback every other
-/// proactive push already uses. The admin fan-out is the last resort so an
-/// approval raised by a cron/autopilot path still reaches a human.
-///
-/// Duplicate destinations are collapsed (an admin whose linked chat IS the
-/// origin must not be messaged twice).
-pub(crate) fn resolve_targets(
-    origin: Option<(String, String)>,
-    agent_default: Option<(String, String)>,
-    approver_links: Vec<(String, String)>,
-) -> Vec<(String, String)> {
-    let chosen = match (origin, agent_default) {
-        (Some(o), _) => vec![o],
-        (None, Some(a)) => vec![a],
-        (None, None) => approver_links,
-    };
-    let mut out: Vec<(String, String)> = Vec::new();
-    for t in chosen {
-        if t.0.trim().is_empty() || t.1.trim().is_empty() || !is_pushable_channel(&t.0) {
-            continue;
-        }
-        if !out.contains(&t) {
-            out.push(t);
-        }
-    }
-    out
-}
-
-/// Verified channel identities of every Active Admin/Manager — the humans the
-/// dashboard would let decide this. Empty when `users.db` does not exist (a
-/// solo deployment that never onboarded dashboard users).
-fn approver_links(home_dir: &Path) -> Vec<(String, String)> {
-    let Some(db) = open_user_db(home_dir) else {
-        return Vec::new();
-    };
-    let Ok(users) = db.list_users() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for u in users {
-        if u.status != UserStatus::Active || !matches!(u.role, UserRole::Admin | UserRole::Manager)
-        {
-            continue;
-        }
-        if let Ok(idents) = db.verified_channels_for_user(&u.id) {
-            for i in idents {
-                out.push((i.channel, i.channel_user_id));
-            }
-        }
-    }
-    out
-}
-
-/// Open `users.db` ONLY if it already exists. `UserDb::new` would create the
-/// file; the MCP-server child process must not conjure an auth database as a
-/// side effect of filing an approval.
-fn open_user_db(home_dir: &Path) -> Option<UserDb> {
-    let path = home_dir.join("users.db");
-    if !path.exists() {
-        return None;
-    }
-    UserDb::new(&path).ok()
-}
 
 // ── Message rendering ───────────────────────────────────────────
 
@@ -258,12 +124,13 @@ pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
         "🔔 需要您的確認"
     };
     format!(
-        "{head}\n\
+        "{prefix}\n{head}\n\
          AI 員工：{agent}\n\
          想做的事：{kind}\n\
          內容：{summary}{trajectory}\n\
          期限：{deadline}未回覆將自動拒絕\n\
          編號：{id}",
+        prefix = crate::decision_notify::reason_prefix(DecisionSource::Approval),
         agent = crate::goal_state::xml_escape(&rec.agent_id),
         kind = zh_action_kind(&rec.action_kind),
         summary = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.summary, SUMMARY_MAX_CHARS)),
@@ -271,17 +138,6 @@ pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
         deadline = deadline_phrase(rec),
         id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
     )
-}
-
-/// Per-channel button markup for a generic approval.
-fn approval_markup(channel: &str, approval_id: &str) -> serde_json::Value {
-    match channel {
-        "telegram" => channel_format::telegram_broker_approval_buttons(approval_id),
-        "discord" => channel_format::discord_broker_approval_buttons(approval_id),
-        "slack" => channel_format::slack_broker_approval_buttons(approval_id),
-        "line" => channel_format::line_broker_approval_quick_reply(approval_id),
-        _ => json!({}),
-    }
 }
 
 // ── Outbound ────────────────────────────────────────────────────
@@ -326,6 +182,18 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
 
     let http = reqwest::Client::new();
     let body = approval_body(rec, reminder);
+    // A clickable deep link to the unified inbox — `None` when no dashboard
+    // base URL is configured/derivable, in which case the rendered text stays
+    // exactly as it reads without this feature.
+    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Approval, rec.id.as_str());
+    let card = DecisionCard {
+        source: DecisionSource::Approval,
+        decision_id: rec.id.as_str(),
+        body: &body,
+        link: link.as_deref(),
+        no_button_hint: "此通道無法顯示按鈕，請至儀表板的待辦決定頁同意或拒絕，\
+                         或改用 Telegram／Slack／Discord／LINE 直接按按鈕。",
+    };
     let mut delivered: Option<(String, String)> = None;
 
     for (channel, chat_id) in targets {
@@ -335,28 +203,7 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
             info!(approval_id = %rec.id, %channel, "approval push: no bot token; skipping");
             continue;
         };
-        let ok = if channel_supports_buttons(&channel) {
-            let markup = approval_markup(&channel, rec.id.as_str());
-            match crate::goal_notify::send_with_markup(
-                &http, &channel, &token, &chat_id, &body, markup,
-            )
-            .await
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    warn!(approval_id = %rec.id, %channel, error = %e, "approval push failed");
-                    false
-                }
-            }
-        } else {
-            // No inline buttons on this transport — degrade to text plus the
-            // two ways a human can still act.
-            let text = format!(
-                "{body}\n\n此通道無法顯示按鈕，請至儀表板「審批」頁核准或拒絕，\
-                 或改用 Telegram／Slack／Discord／LINE 直接按按鈕。"
-            );
-            crate::goal_notify::send_plain_text(&http, &channel, &token, &chat_id, &text).await
-        };
+        let ok = crate::decision_notify::deliver(home_dir, &http, &channel, &token, &chat_id, &card).await;
         if ok && delivered.is_none() {
             delivered = Some((channel, chat_id));
         }
@@ -366,76 +213,19 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
 
 // ── Inbound ─────────────────────────────────────────────────────
 
-/// The authorization verdict for one button press.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PressAuth {
-    Allow,
-    /// The presser maps to a dashboard user without approval rights.
-    DenyNotApprover,
-    /// The presser has no usable identity and did not press from the
-    /// destination this approval was delivered to.
-    DenyUnknown,
-}
-
-/// Pure authorization for an approval button press. Fail-closed: anything not
-/// explicitly allowed is a denial.
+/// The destinations this approval was (or would have been) delivered to, for
+/// the destination branch of [`authorize_press`].
 ///
-/// - A mapped, Active dashboard user decides by **role** — Admin/Manager may
-///   approve, everyone else may not. This keeps the enterprise
-///   separation-of-duties identical to the install-request path (an employee
-///   never signs off their own request).
-/// - When the deployment has **no channel-approver identity at all**
-///   (`identity_system_active == false` — nobody Active with Admin/Manager role
-///   has linked a channel), the only authority available is the destination the
-///   operator configured (or the conversation that raised the request), so a
-///   press from that exact destination is honoured. Without this, a solo
-///   operator who never created dashboard users can never approve anything from
-///   a phone — which is precisely the failure being fixed. It does NOT loosen a
-///   configured deployment: as soon as one approver links a channel, role rules
-///   apply to everyone.
-pub(crate) fn authorize_press(
-    mapped_role: Option<UserRole>,
-    identity_system_active: bool,
-    destination_match: bool,
-) -> PressAuth {
-    match mapped_role {
-        Some(UserRole::Admin) | Some(UserRole::Manager) => PressAuth::Allow,
-        Some(_) => PressAuth::DenyNotApprover,
-        None => {
-            if !identity_system_active && destination_match {
-                PressAuth::Allow
-            } else {
-                PressAuth::DenyUnknown
-            }
+/// The broker persists the destination a successful push landed on, so unlike
+/// the sources that re-derive it, this is an actual delivery record. `None`
+/// before any push has succeeded ⇒ no destination authority exists yet.
+fn delivered_targets(rec: &ApprovalRecord) -> Vec<(String, String)> {
+    match (rec.notify_channel.as_deref(), rec.notify_chat_id.as_deref()) {
+        (Some(ch), Some(id)) if !ch.is_empty() && !id.is_empty() => {
+            vec![(ch.to_string(), id.to_string())]
         }
+        _ => Vec::new(),
     }
-}
-
-/// True when the press came from the **individual account** this approval was
-/// delivered to.
-///
-/// Deliberately matches `channel_user_id` ONLY, never the chat/conversation id.
-/// Matching the conversation would mean that when an approval lands in a group,
-/// *every member of that group* satisfies the solo-operator branch of
-/// [`authorize_press`] — a group back-door where any colleague (or anyone
-/// invited to the chat) can approve a skill install. Telegram / Discord / LINE
-/// report `channel_user_id == chat_id` for a 1:1 DM, which is the destination
-/// this branch actually exists to serve, so DMs are unaffected.
-///
-/// Consequence, stated plainly: an approval delivered to a **group** cannot be
-/// decided through the solo-operator branch at all. That deployment must bind a
-/// dashboard identity (role-based authorization) or decide from the dashboard —
-/// which is the correct answer for a shared conversation.
-fn destination_matches(rec: &ApprovalRecord, channel: &str, channel_user_id: &str) -> bool {
-    let Some(dest_ch) = rec.notify_channel.as_deref() else {
-        return false;
-    };
-    let Some(dest_id) = rec.notify_chat_id.as_deref() else {
-        return false;
-    };
-    // Exact equality only — no `contains`/`starts_with` for a routing or
-    // security decision (project convention #2).
-    dest_ch == channel && dest_id == channel_user_id
 }
 
 /// Handle an approval button press from a channel.
@@ -451,11 +241,16 @@ pub async fn decide_from_channel(
     channel_user_id: &str,
     action_data: &str,
 ) -> Option<Result<String, String>> {
-    let (approval_id, approve) = channel_format::parse_approval_action(action_data)?;
-    Some(apply_decision(home_dir, channel, channel_user_id, &approval_id, approve).await)
+    let action = crate::decision_action::parse(action_data)?;
+    if action.source != DecisionSource::Approval {
+        return None;
+    }
+    Some(apply_decision(home_dir, channel, channel_user_id, &action.id, action.approve()).await)
 }
 
-async fn apply_decision(
+/// Apply an already-decoded approve/deny to `approvals.db`. Called by the
+/// unified inbound router as well as this module's own thin wrapper.
+pub(crate) async fn apply_decision(
     home_dir: &Path,
     channel: &str,
     channel_user_id: &str,
@@ -469,33 +264,24 @@ async fn apply_decision(
     };
     if rec.status.is_terminal() {
         return Ok(match rec.status {
-            ApprovalStatus::Approved => "這項要求先前已被同意。".into(),
-            ApprovalStatus::Denied => "這項要求先前已被拒絕。".into(),
-            _ => "這項要求已逾時自動拒絕，請重新發起。".to_string(),
+            ApprovalStatus::Approved => "這項要求先前已同意。".into(),
+            ApprovalStatus::Denied => "這項要求先前已拒絕。".into(),
+            _ => "這項要求逾時未決，已自動拒絕，請重新發起。".to_string(),
         });
     }
 
     // ── authorization ───────────────────────────────────────
-    let db = open_user_db(home_dir);
-    // VERIFIED bindings only: an unverified `channel_identities` row is just an
-    // unconfirmed claim typed into the binding form, never proof of identity.
-    let mapped_role = db.as_ref().and_then(|db| {
-        let uid = db
-            .find_verified_user_id_by_channel(channel, channel_user_id)
-            .ok()
-            .flatten()?;
-        let u = db.get_user(&uid).ok().flatten()?;
-        (u.status == UserStatus::Active).then_some(u.role)
-    });
-    let identity_system_active = !approver_links(home_dir).is_empty();
-    let dest_match = destination_matches(&rec, channel, channel_user_id);
-
-    match authorize_press(mapped_role, identity_system_active, dest_match) {
-        PressAuth::Allow => {}
-        PressAuth::DenyNotApprover => return Err("您沒有核准權限".into()),
-        PressAuth::DenyUnknown => {
-            return Err("此帳號尚未連結儀表板身分，無法核准。請先於儀表板以此通道登入綁定。".into())
-        }
+    // One matrix for every decision source (see `decision_notify`): a mapped
+    // Active dashboard user decides by role; with no identity system
+    // configured at all, only a press from the exact account the approval was
+    // delivered to is honoured. Fail-closed everywhere else.
+    let auth = authorize_press(
+        mapped_role(home_dir, channel, channel_user_id),
+        identity_system_active(home_dir),
+        destination_matches_any(&delivered_targets(&rec), channel, channel_user_id),
+    );
+    if auth != PressAuth::Allow {
+        return Err(refusal_text(auth, "核准"));
     }
 
     // ── decide ──────────────────────────────────────────────
@@ -523,11 +309,126 @@ async fn apply_decision(
         }
     }
 
-    Ok(if approve {
-        format!("✅ 已同意：{}", zh_action_kind(&rec.action_kind))
+    // Best-effort, detached card collapse — an edit is cosmetic and must not
+    // delay or fail a decision that is already durable in `approvals.db` by
+    // this point (see `goal_notify::spawn_goal_task_collapse`'s doc comment
+    // for the same rationale).
+    //
+    // An install-class refusal reads softer ("已婉拒") than a high-risk one
+    // ("已拒絕"); the acknowledgement and the collapsed card take that verb
+    // from the same place, so a person is told the same word twice.
+    let card_verb = settled_verb_for(&rec, approve);
+    spawn_approval_collapse(home_dir.to_path_buf(), rec.clone(), channel.to_string(), channel_user_id.to_string(), card_verb);
+
+    Ok(format!(
+        "{} {}：{}",
+        card_verb.emoji(),
+        card_verb.label(),
+        zh_action_kind(&rec.action_kind)
+    ))
+}
+
+/// The settled verb for this approval. Install-class rows carry the softer
+/// refusal wording; everything else is the generic high-risk pair.
+fn settled_verb_for(rec: &ApprovalRecord, approve: bool) -> crate::decision_card::DecisionVerb {
+    let source = if rec.action_kind == "mcp_install" {
+        DecisionSource::Install
     } else {
-        format!("❌ 已拒絕：{}", zh_action_kind(&rec.action_kind))
-    })
+        DecisionSource::Approval
+    };
+    let act = if approve { DecisionAct::Approve } else { DecisionAct::Deny };
+    crate::decision_notify::settled_verb(source, act)
+}
+
+/// The one-line identifying summary regenerated fresh from an approval
+/// record — shared by every collapse path (channel press and dashboard
+/// decision alike) so the collapsed card always reads the same regardless of
+/// where the decision was made.
+fn approval_collapse_summary(rec: &ApprovalRecord) -> String {
+    format!(
+        "🔔 {}：{}",
+        zh_action_kind(&rec.action_kind),
+        duduclaw_core::truncate_chars(&rec.summary, SUMMARY_MAX_CHARS),
+    )
+}
+
+/// Spawn a best-effort, fire-and-forget attempt to retire this approval's
+/// channel cards. Detached so a slow or unreachable channel API can never
+/// delay a decision that is already durable in `approvals.db`.
+///
+/// Retires EVERY card, not just the presser's: an approval with no
+/// originating conversation fans out to all approvers, and leaving the other
+/// copies showing live buttons is the stale-card problem in-place collapse
+/// exists to remove.
+fn spawn_approval_collapse(
+    home_dir: std::path::PathBuf,
+    rec: ApprovalRecord,
+    channel: String,
+    channel_user_id: String,
+    verb: crate::decision_card::DecisionVerb,
+) {
+    tokio::spawn(async move {
+        let http = reqwest::Client::new();
+        let decider = crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
+        let summary = approval_collapse_summary(&rec);
+        let home = home_dir.clone();
+        let agent = rec.agent_id.clone();
+        crate::decision_card::collapse_all(
+            &home_dir,
+            &http,
+            DecisionSource::Approval.namespace(),
+            rec.id.as_str(),
+            &summary,
+            verb,
+            decider.as_deref(),
+            move |ch: String| {
+                let home = home.clone();
+                let agent = agent.clone();
+                async move { crate::goal_notify::channel_token(&home, &agent, &ch).await }
+            },
+            Some((channel.as_str(), channel_user_id.as_str())),
+        )
+        .await;
+    });
+}
+
+/// Spawn a best-effort, fire-and-forget attempt to retire this approval's
+/// channel cards after a **dashboard** decision (`handlers.rs`'s
+/// `approvals.decide` RPC — H1 of the unified-decision hand-off, 07
+/// §6). Mirrors [`spawn_approval_collapse`] but the decider is a resolved
+/// dashboard display name rather than a channel identity, and there is no
+/// channel destination to fall back to on a total collapse miss — the
+/// dashboard RPC already carries its own acknowledgement, so a miss stays
+/// silent rather than pushing a new message anywhere.
+pub(crate) fn spawn_dashboard_collapse(
+    home_dir: std::path::PathBuf,
+    rec: ApprovalRecord,
+    approve: bool,
+    decider_name: Option<String>,
+) {
+    tokio::spawn(async move {
+        let http = reqwest::Client::new();
+        let verb = settled_verb_for(&rec, approve);
+        let summary = approval_collapse_summary(&rec);
+        let home = home_dir.clone();
+        let agent = rec.agent_id.clone();
+        crate::decision_card::collapse_all(
+            &home_dir,
+            &http,
+            DecisionSource::Approval.namespace(),
+            rec.id.as_str(),
+            &summary,
+            verb,
+            decider_name.as_deref(),
+            move |ch: String| {
+                let home = home.clone();
+                let agent = agent.clone();
+                async move { crate::goal_notify::channel_token(&home, &agent, &ch).await }
+            },
+            None,
+        )
+        .await;
+    });
 }
 
 #[cfg(test)]
@@ -556,183 +457,33 @@ mod tests {
         }
     }
 
-    // ── destination resolution ─────────────────────────────
+    // NOTE: destination resolution (`parse_origin`/`resolve_targets`) and the
+    // authorization matrix (`authorize_press`/destination matching) are shared
+    // by every decision source and are tested in `decision_notify`. What stays
+    // here is what is specific to `approvals.db`.
+
+    // ── H1: settled verb + summary feeding both collapse paths ─────
+    // (channel press's `spawn_approval_collapse` and the dashboard's
+    // `spawn_dashboard_collapse`, `handlers.rs`'s `approvals.decide` RPC)
 
     #[test]
-    fn parse_origin_accepts_channel_sessions() {
-        assert_eq!(
-            parse_origin("telegram:12345"),
-            Some(("telegram".into(), "12345".into()))
-        );
-        // thread-scoped session → chat id, thread dropped
-        assert_eq!(
-            parse_origin("telegram:12345:678"),
-            Some(("telegram".into(), "12345".into()))
-        );
-        // the `<type>:thread:<id>` marker collapses to <id>
-        assert_eq!(
-            parse_origin("discord:thread:999"),
-            Some(("discord".into(), "999".into()))
-        );
+    fn settled_verb_for_install_deny_reads_softer_than_generic_deny() {
+        assert_eq!(settled_verb_for(&rec("mcp_install"), false), crate::decision_card::DecisionVerb::DeclinedInstall);
+        assert_eq!(settled_verb_for(&rec("mcp_call"), false), crate::decision_card::DecisionVerb::Denied);
     }
 
     #[test]
-    fn parse_origin_rejects_non_pushable_and_malformed() {
-        // WebChat has no bot-push API — never a destination.
-        assert_eq!(parse_origin("webchat:conn-1"), None);
-        assert_eq!(parse_origin("webchat:conn#agent:a#conv:n"), None);
-        assert_eq!(parse_origin("dashboard:alice"), None);
-        assert_eq!(parse_origin("telegram"), None);
-        assert_eq!(parse_origin("telegram:"), None);
-        assert_eq!(parse_origin(""), None);
+    fn settled_verb_for_approve_is_always_approved_regardless_of_kind() {
+        assert_eq!(settled_verb_for(&rec("mcp_install"), true), crate::decision_card::DecisionVerb::Approved);
+        assert_eq!(settled_verb_for(&rec("mcp_call"), true), crate::decision_card::DecisionVerb::Approved);
     }
 
     #[test]
-    fn targets_prefer_the_origin_conversation() {
-        // The customer's case: install triggered from Telegram → the approval
-        // goes back to THAT chat, even though the agent has another default
-        // and admins are linked elsewhere.
-        let got = resolve_targets(
-            Some(("telegram".into(), "555".into())),
-            Some(("slack".into(), "C1".into())),
-            vec![("discord".into(), "D1".into())],
-        );
-        assert_eq!(got, vec![("telegram".to_string(), "555".to_string())]);
-    }
-
-    #[test]
-    fn targets_fall_back_to_agent_default_then_approvers() {
-        let agent_only = resolve_targets(
-            None,
-            Some(("slack".into(), "C1".into())),
-            vec![("discord".into(), "D1".into())],
-        );
-        assert_eq!(agent_only, vec![("slack".to_string(), "C1".to_string())]);
-
-        let approvers = resolve_targets(
-            None,
-            None,
-            vec![
-                ("discord".into(), "D1".into()),
-                ("line".into(), "U9".into()),
-            ],
-        );
-        assert_eq!(approvers.len(), 2);
-
-        // Nothing anywhere ⇒ no destination (caller logs the config gap).
-        assert!(resolve_targets(None, None, vec![]).is_empty());
-    }
-
-    #[test]
-    fn targets_drop_blank_and_unpushable_and_dedupe() {
-        let got = resolve_targets(
-            None,
-            None,
-            vec![
-                ("telegram".into(), "1".into()),
-                ("telegram".into(), "1".into()), // duplicate admin link
-                ("webchat".into(), "x".into()),  // not pushable
-                ("telegram".into(), "  ".into()), // blank id
-                ("".into(), "1".into()),
-            ],
-        );
-        assert_eq!(got, vec![("telegram".to_string(), "1".to_string())]);
-    }
-
-    // ── authorization ──────────────────────────────────────
-
-    #[test]
-    fn approvers_are_allowed_by_role() {
-        assert_eq!(
-            authorize_press(Some(UserRole::Admin), true, false),
-            PressAuth::Allow
-        );
-        assert_eq!(
-            authorize_press(Some(UserRole::Manager), true, false),
-            PressAuth::Allow
-        );
-    }
-
-    #[test]
-    fn employee_press_is_refused_even_from_the_destination() {
-        // Separation of duties: a mapped non-approver never approves, not even
-        // in the chat the approval was delivered to.
-        assert_eq!(
-            authorize_press(Some(UserRole::Employee), true, true),
-            PressAuth::DenyNotApprover
-        );
-        assert_eq!(
-            authorize_press(Some(UserRole::Employee), false, true),
-            PressAuth::DenyNotApprover
-        );
-    }
-
-    #[test]
-    fn unmapped_press_is_refused_when_approvers_exist() {
-        // A configured deployment stays strict: a random chat member cannot
-        // approve just because the message landed in their chat.
-        assert_eq!(authorize_press(None, true, true), PressAuth::DenyUnknown);
-        assert_eq!(authorize_press(None, true, false), PressAuth::DenyUnknown);
-    }
-
-    #[test]
-    fn solo_operator_may_decide_from_the_delivered_destination() {
-        // No dashboard approver identities exist at all → the operator-configured
-        // (or originating) conversation is the only authority available.
-        assert_eq!(authorize_press(None, false, true), PressAuth::Allow);
-        // …but only from THAT conversation.
-        assert_eq!(authorize_press(None, false, false), PressAuth::DenyUnknown);
-    }
-
-    #[test]
-    fn destination_match_requires_exact_channel_and_user() {
-        let mut r = rec("mcp_install");
-        assert!(
-            !destination_matches(&r, "telegram", "555"),
-            "never delivered ⇒ no match"
-        );
-        r.notify_channel = Some("telegram".into());
-        r.notify_chat_id = Some("555".into());
-        // 1:1 DM — the account the approval was delivered to.
-        assert!(destination_matches(&r, "telegram", "555"));
-        // wrong channel / wrong account
-        assert!(!destination_matches(&r, "slack", "555"));
-        assert!(!destination_matches(&r, "telegram", "666"));
-        // no substring shortcuts (convention #2)
-        assert!(!destination_matches(&r, "telegram", "5555"));
-    }
-
-    #[test]
-    fn group_delivery_is_not_a_back_door_for_its_members() {
-        // Approval delivered to a GROUP chat (id 555). A member of that group
-        // presses; their own account id is 999. Matching the *conversation*
-        // would let every member of the group approve — it must not.
-        let mut r = rec("mcp_install");
-        r.notify_channel = Some("telegram".into());
-        r.notify_chat_id = Some("555".into()); // group chat id
-        assert!(
-            !destination_matches(&r, "telegram", "999"),
-            "a group member must not satisfy the solo-operator branch"
-        );
-        // …and that refusal is what the authorization layer sees.
-        assert_eq!(
-            authorize_press(None, false, destination_matches(&r, "telegram", "999")),
-            PressAuth::DenyUnknown
-        );
-    }
-
-    #[test]
-    fn dm_delivery_still_authorizes_the_owner() {
-        // The DM case this branch exists for: TG/Discord/LINE report
-        // channel_user_id == chat_id for a 1:1, so the owner still gets through.
-        let mut r = rec("mcp_install");
-        r.notify_channel = Some("telegram".into());
-        r.notify_chat_id = Some("555".into()); // == the owner's user id in a DM
-        assert!(destination_matches(&r, "telegram", "555"));
-        assert_eq!(
-            authorize_press(None, false, destination_matches(&r, "telegram", "555")),
-            PressAuth::Allow
-        );
+    fn approval_collapse_summary_hides_internal_action_kind() {
+        let summary = approval_collapse_summary(&rec("mcp_install"));
+        assert!(summary.contains("安裝新技能"));
+        assert!(summary.contains("客戶名單整理"));
+        assert!(!summary.contains("mcp_install"));
     }
 
     // ── rendering ──────────────────────────────────────────
@@ -749,6 +500,16 @@ mod tests {
         // Reminder variant announces the deadline instead.
         let nudge = approval_body(&rec("mcp_install"), true);
         assert!(nudge.contains("快到期"));
+    }
+
+    #[test]
+    fn body_starts_with_the_reason_prefix() {
+        // W1-6: line 1 is the canonical high-risk-action reason, distinct
+        // from every other decision source, regardless of the reminder flag.
+        let body = approval_body(&rec("mcp_install"), false);
+        assert!(body.starts_with("⚠️ 高風險動作需要你同意\n"));
+        let nudge = approval_body(&rec("mcp_install"), true);
+        assert!(nudge.starts_with("⚠️ 高風險動作需要你同意\n"));
     }
 
     #[test]
@@ -891,7 +652,7 @@ mod tests {
             dir.path(),
             "telegram",
             "555",
-            &channel_format::approval_action_id(true, id.as_str()),
+            &crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Approve, id.as_str()),
         )
         .await
         .unwrap();
@@ -917,7 +678,7 @@ mod tests {
             dir.path(),
             "telegram",
             "999",
-            &channel_format::approval_action_id(true, id.as_str()),
+            &crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Approve, id.as_str()),
         )
         .await
         .unwrap();
@@ -938,7 +699,7 @@ mod tests {
             .await
             .unwrap();
 
-        let deny = channel_format::approval_action_id(false, id.as_str());
+        let deny = crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Deny, id.as_str());
         let first = decide_from_channel(dir.path(), "telegram", "42", &deny)
             .await
             .unwrap();
@@ -950,7 +711,65 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(second.contains("先前已被拒絕"), "unexpected: {second}");
+        assert!(second.contains("先前已拒絕"), "unexpected: {second}");
+    }
+
+    #[tokio::test]
+    async fn a_card_pushed_before_the_encoding_change_still_decides() {
+        // Cards already sitting in a channel carry the pre-unification
+        // encoding; they must keep working through the rotation.
+        let dir = tempfile::tempdir().unwrap();
+        let disk = ApprovalBroker::open(dir.path()).unwrap();
+        let id = disk
+            .request("sales-bot", "mcp_install", "安裝 skill", json!({}), 300)
+            .await
+            .unwrap();
+        disk.set_notify_target_for_test(&id, "telegram", "555").await.unwrap();
+
+        let legacy = format!("duduclaw:approval_ok:{}", id.as_str());
+        let out = decide_from_channel(dir.path(), "telegram", "555", &legacy)
+            .await
+            .unwrap();
+        assert!(out.is_ok(), "legacy encoding must still decide: {out:?}");
+        assert_eq!(disk.poll(&id).await.unwrap(), ApprovalStatus::Approved);
+    }
+
+    #[tokio::test]
+    async fn install_class_refusal_reads_softer_than_a_high_risk_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = ApprovalBroker::open(dir.path()).unwrap();
+
+        let install = disk
+            .request("a", "mcp_install", "安裝 skill", json!({}), 300)
+            .await
+            .unwrap();
+        disk.set_notify_target_for_test(&install, "telegram", "1").await.unwrap();
+        let msg = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "1",
+            &crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Deny, install.as_str()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(msg.contains("已婉拒"), "unexpected: {msg}");
+
+        let risky = disk
+            .request("a", "mcp_call", "刪除資料", json!({}), 300)
+            .await
+            .unwrap();
+        disk.set_notify_target_for_test(&risky, "telegram", "1").await.unwrap();
+        let msg = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "1",
+            &crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Deny, risky.as_str()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(msg.contains("已拒絕"), "unexpected: {msg}");
     }
 
     #[tokio::test]
