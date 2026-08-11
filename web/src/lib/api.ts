@@ -1258,6 +1258,9 @@ export interface InstallRequestInfo {
   execute_error: string | null;
   created_at: string;
   ttl_seconds: number;
+  /** Unix epoch (seconds) this request auto-expires at. `null` on an
+   *  unparseable `created_at` — treat as "no countdown available". */
+  expires_at?: number | null;
 }
 
 export interface InstallRequestFiled {
@@ -1861,6 +1864,16 @@ export interface ToolPolicyRule {
   when?: ToolPolicyWhen[];
 }
 
+/** How much the autonomous goal loop may drive an agent on its own
+ *  (`agent.toml [capabilities] autonomy_level`, parsed by
+ *  `goal_loop::AutonomyLevel`). From most human-driven to most autonomous:
+ *  `operator` (the loop never touches this agent) → `collaborator` /
+ *  `consultant` (a human must approve before the loop kicks a goal off) →
+ *  `approver` (no kickoff gate; the default — pauses and waits when stuck) →
+ *  `observer` (fully autonomous; a stuck task is just reported, never
+ *  waited on). An unrecognized string fails closed to `approver` server-side. */
+export type AutonomyLevel = 'operator' | 'collaborator' | 'consultant' | 'approver' | 'observer';
+
 /** The `capabilities` object accepted by `agents.update`. All fields optional —
  *  the backend only writes fields that are present (partial update). */
 export interface AgentCapabilities {
@@ -1879,6 +1892,8 @@ export interface AgentCapabilities {
   os_native?: boolean;
   /** WP3.3 — opt-in recording-to-skill capture (browser/desktop recording). */
   recording?: boolean;
+  /** How much the autonomous goal loop may drive this agent on its own. */
+  autonomy_level?: AutonomyLevel;
 }
 
 /** v1.39 — top-level `[os_watch]` table (gated by `capabilities.os_native`).
@@ -2625,6 +2640,10 @@ export interface ApprovalItem {
   payload: unknown;
   created_at: string;
   ttl_seconds: number;
+  /** Unix epoch (seconds) this approval auto-denies at (`created_at +
+   *  ttl_seconds`, computed server-side). `null` on an unparseable
+   *  `created_at` — treat as "no countdown available", not "never expires". */
+  expires_at?: number | null;
   /** Absent on older/other approval kinds — render nothing, not a placeholder. */
   simulation?: ApprovalSimulation | null;
 }
@@ -3325,8 +3344,16 @@ export const api = {
       client.call('channels.status') as Promise<{ channels: ChannelStatus[] }>,
     add: (type: string, config: Record<string, string>, agent?: string) =>
       client.call('channels.add', { type, config, ...(agent ? { agent } : {}) }),
+    // W0-2: the gateway actually sends a test message when it can find a
+    // destination (`mode: "live"`); when no destination is known yet it
+    // honestly degrades to `mode: "credential_only"` (only verified the
+    // token exists — never reported as a successful send).
     test: (type: string) =>
-      client.call('channels.test', { type }) as Promise<{ success: boolean; message: string }>,
+      client.call('channels.test', { type }) as Promise<{
+        sent: boolean;
+        mode: 'live' | 'credential_only';
+        detail: string;
+      }>,
     remove: (type: string) =>
       client.call('channels.remove', { type }),
     // WP9: mint a one-time Telegram deep-link/QR bind token so an employee can

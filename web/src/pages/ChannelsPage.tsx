@@ -36,6 +36,7 @@ import {
   CheckCircle,
   Pencil,
   AlertTriangle,
+  Info,
   X,
   Link2,
   Copy,
@@ -147,13 +148,15 @@ export function ChannelsPage() {
   const [editChannel, setEditChannel] = useState<string | null>(null);
   const [removeTarget, setRemoveTarget] = useState<string | null>(null);
   const [removing, setRemoving] = useState(false);
-  const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  // 'warning' covers the honest "credential_only" degrade — a test that
+  // could not actually send a message must never read as a green success.
+  const [toast, setToast] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null);
 
   const toastTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
-  const showToast = useCallback((type: 'success' | 'error', message: string) => {
+  const showToast = useCallback((type: 'success' | 'warning' | 'error', message: string) => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setToast({ type, message });
-    toastTimerRef.current = setTimeout(() => setToast(null), type === 'error' ? 8000 : 4000);
+    toastTimerRef.current = setTimeout(() => setToast(null), type === 'success' ? 4000 : 8000);
   }, []);
   const dismissToast = useCallback(() => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -216,8 +219,13 @@ export function ChannelsPage() {
 
   const handleTest = async (type: string) => {
     try {
-      const result = await api.channels.test(type) as { success: boolean; message: string };
-      showToast(result.success ? 'success' : 'error', result.message);
+      const result = await api.channels.test(type);
+      // `sent` is the only signal that a message actually left the server —
+      // `mode: "credential_only"` means only the token was checked, so it
+      // must never render as a success (that was breakpoint #5: a revoked
+      // token used to show a green "測試成功").
+      const toastType = result.sent ? 'success' : result.mode === 'credential_only' ? 'warning' : 'error';
+      showToast(toastType, result.detail);
       await fetchChannels();
     } catch {
       showToast('error', intl.formatMessage({ id: 'channels.testFailed' }));
@@ -267,10 +275,14 @@ export function ChannelsPage() {
           'flex items-start gap-3 rounded-lg px-4 py-3 text-sm transition-all',
           toast.type === 'success'
             ? 'bg-success/10 text-success'
-            : 'bg-destructive/10 text-destructive'
+            : toast.type === 'warning'
+              ? 'bg-warning/10 text-warning'
+              : 'bg-destructive/10 text-destructive'
         )}>
           {toast.type === 'success' ? (
             <CheckCircle className="mt-0.5 size-4 shrink-0" />
+          ) : toast.type === 'warning' ? (
+            <Info className="mt-0.5 size-4 shrink-0" />
           ) : (
             <AlertTriangle className="mt-0.5 size-4 shrink-0" />
           )}

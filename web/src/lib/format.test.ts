@@ -4,6 +4,7 @@ import {
   formatTokens,
   formatId,
   timeAgo,
+  timeRemaining,
   formatXp,
   formatCoins,
   formatDurationSaved,
@@ -43,6 +44,16 @@ describe('format helpers (dashboard-redesign §8)', () => {
     expect(timeAgo(new Date(now - 3 * 86_400_000), now)).toBe('3d');
     expect(timeAgo(null)).toBe('—');
     expect(timeAgo('not-a-date')).toBe('—');
+  });
+
+  it('timeRemaining returns compact unit tokens counting down', () => {
+    expect(timeRemaining(45_000)).toBe('45s');
+    expect(timeRemaining(5 * 60_000)).toBe('5m');
+    expect(timeRemaining(2 * 3600_000)).toBe('2h');
+    expect(timeRemaining(3 * 86_400_000)).toBe('3d');
+    // Never negative — clamps to 0s once the deadline has passed.
+    expect(timeRemaining(-500)).toBe('0s');
+    expect(timeRemaining(0)).toBe('0s');
   });
 
   it('formatXp groups thousands then M-suffixes', () => {

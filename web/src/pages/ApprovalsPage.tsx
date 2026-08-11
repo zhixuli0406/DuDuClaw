@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { Link } from 'react-router';
 import {
   ClipboardCheck,
   Globe,
@@ -13,6 +14,8 @@ import {
   X,
   Clock,
   Compass,
+  Inbox as InboxIcon,
+  ArrowRight,
 } from 'lucide-react';
 import { api, type ApprovalItem, type ApprovalKind } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
@@ -111,6 +114,22 @@ export function ApprovalsPage() {
 
   return (
     <div className="space-y-6">
+      {/* W1-2 / 04 doc §E17: this page is downgraded to a legacy bookmark
+          alias — the unified Inbox now self-handles every HITL source
+          (approvals, install requests, needs_human tasks). Keep the route
+          working (bookmarks), point everyone forward. */}
+      <Link
+        to="/inbox"
+        className="flex items-center gap-2.5 rounded-xl border border-brand/30 bg-brand/5 px-4 py-3 text-sm text-foreground transition-colors hover:bg-brand/10 focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+      >
+        <InboxIcon className="size-4 shrink-0 text-brand" aria-hidden="true" />
+        <span className="min-w-0 flex-1">{intl.formatMessage({ id: 'approvals.legacyBanner.text' })}</span>
+        <span className="flex shrink-0 items-center gap-1 font-medium text-brand">
+          {intl.formatMessage({ id: 'approvals.legacyBanner.cta' })}
+          <ArrowRight className="size-3.5" aria-hidden="true" />
+        </span>
+      </Link>
+
       {/* Slim page header (spec §5.2). */}
       <div className="flex items-center gap-2">
         <ClipboardCheck className="size-5 text-muted-foreground" />

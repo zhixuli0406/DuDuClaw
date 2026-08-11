@@ -62,6 +62,7 @@ import {
   type KvRow,
   RUNTIME_PROVIDERS,
   AGENT_ROLES,
+  AUTONOMY_LEVELS,
   DEFAULT_RUNTIME,
   DEFAULT_EVOLUTION_ADVANCED,
   DEFAULT_CONTAINER_ADVANCED,
@@ -579,6 +580,7 @@ export function EditAgentPage() {
           policy: caps.policy,
           os_native: caps.os_native,
           recording: caps.recording,
+          autonomy_level: caps.autonomy_level,
           computer_use_config: { ...caps.computer_use_config },
         };
       }
@@ -993,6 +995,38 @@ export function EditAgentPage() {
             <SettingsCard>
               <RowSwitch label={t('agents.edit.canSendCrossAgent')} description={t('agents.edit.canSendCrossAgent.help')} checked={form.can_send_cross_agent ?? true} onChange={(v) => updateField('can_send_cross_agent', v)} />
               <RowSwitch label={t('agents.edit.canScheduleTasks')} description={t('agents.edit.canScheduleTasks.help')} checked={form.can_schedule_tasks ?? false} onChange={(v) => updateField('can_schedule_tasks', v)} />
+            </SettingsCard>
+          </SettingsSection>
+
+          {/* 自主等級 — how much the autonomous goal loop may drive this agent
+              on its own (`agent.toml [capabilities] autonomy_level`, read by
+              `goal_loop::AutonomyLevel`). A single-select radio group (not a
+              dropdown) so every level's plain-language consequence is visible
+              at once, mirroring the 委派模式 pattern in DelegationTab. */}
+          <SettingsSection title={t('agents.autonomy.title')} description={t('agents.autonomy.desc')}>
+            <SettingsCard>
+              {AUTONOMY_LEVELS.map((level) => (
+                <label
+                  key={level}
+                  className="flex cursor-pointer items-start gap-3 px-4 py-3.5 transition-colors hover:bg-surface-hover"
+                >
+                  <input
+                    type="radio"
+                    name="autonomy-level"
+                    className="mt-1 accent-primary"
+                    checked={caps.autonomy_level === level}
+                    onChange={() => updateCap('autonomy_level', level)}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium text-foreground">
+                      {t(`agents.autonomy.${level}`)}
+                    </span>
+                    <span className="mt-0.5 block text-xs text-muted-foreground">
+                      {t(`agents.autonomy.${level}.help`)}
+                    </span>
+                  </span>
+                </label>
+              ))}
             </SettingsCard>
           </SettingsSection>
 

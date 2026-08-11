@@ -28,6 +28,7 @@ import {
   Cpu,
   Terminal,
   RefreshCw,
+  Radio,
 } from 'lucide-react';
 
 // ---------------------------------------------------------------------------
@@ -644,9 +645,18 @@ export function WelcomePage() {
             {intl.formatMessage({ id: 'welcome.success.moreRoles' })}
           </p>
         )}
-        <Button variant="brand" size="lg" className="mt-4" onClick={() => navigate('/')}>
-          {intl.formatMessage({ id: 'welcome.goToDashboard' })}
-        </Button>
+        <p className="max-w-sm text-sm text-muted-foreground">
+          {intl.formatMessage({ id: 'welcome.success.channelsHint' })}
+        </p>
+        <div className="mt-2 flex flex-col items-center gap-2">
+          <Button variant="brand" size="lg" onClick={() => navigate('/manage/channels')}>
+            <Radio />
+            {intl.formatMessage({ id: 'welcome.success.channelsCta' })}
+          </Button>
+          <Button variant="ghost" onClick={() => navigate('/')}>
+            {intl.formatMessage({ id: 'welcome.goToDashboard' })}
+          </Button>
+        </div>
       </div>
     );
   }

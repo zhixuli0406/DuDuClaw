@@ -91,6 +91,25 @@ export function timeAgo(input: string | number | Date | null | undefined, nowMs?
   return `${y}-${m}-${day}`;
 }
 
+/**
+ * Compact countdown token — the "time left" sibling of {@link timeAgo}, for
+ * an approval TTL deadline. Takes a remaining duration in ms directly
+ * (rather than a target timestamp) since callers already derive it from
+ * `inbox-model`'s `expiryState`. Same locale-neutral unit vocabulary as
+ * `timeAgo` (`45s`, `12m`, `3h`, `2d`); clamped to `0s` rather than ever
+ * showing a negative token.
+ */
+export function timeRemaining(remainingMs: number): string {
+  const diffSec = Math.max(0, Math.round(remainingMs / 1000));
+  if (diffSec < 60) return `${diffSec}s`;
+  const mins = Math.round(diffSec / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.round(hours / 24);
+  return `${days}d`;
+}
+
 /* ───────────────── Soft Play v2 gamification formatters (T0.4) ─────────────
    Same locale-neutral, Mono-friendly discipline as above: these return compact
    tokens; surrounding i18n copy supplies the label/unit sentence. */

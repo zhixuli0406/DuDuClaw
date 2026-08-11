@@ -58,7 +58,9 @@ export function IncidentBanner({ approvalsCount = 0 }: { approvalsCount?: number
       key: 'approvals',
       icon: ClipboardCheck,
       label: intl.formatMessage({ id: 'dashboard.incident.approvals' }, { count: approvalsCount }),
-      to: '/approvals',
+      // W1-2: the unified Inbox is the one entry point now — `/approvals`
+      // stays reachable as a legacy bookmark alias, but new links point here.
+      to: '/inbox',
     });
   }
 

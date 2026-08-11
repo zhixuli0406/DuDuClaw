@@ -8,7 +8,10 @@ import {
 } from './memory-format';
 
 describe('parsePredictionMemory', () => {
-  it('parses the prediction-deviation telemetry format', () => {
+  // Legacy shape (written before topic tracking existed) — no `Topics:` /
+  // `Expected topic:` tail. Must still parse, with `topics` honestly empty
+  // rather than fabricated.
+  it('parses the legacy telemetry format with no topic data', () => {
     const raw =
       'Prediction deviation: expected satisfaction 0.75, inferred 0.61 (delta 0.14). ' +
       'Topic surprise: 1.00. Corrections: yes. Follow-ups: no.';
@@ -19,6 +22,7 @@ describe('parsePredictionMemory', () => {
       surprise: 1.0,
       corrected: true,
       followUp: false,
+      topics: [],
     });
   });
 
@@ -30,6 +34,7 @@ describe('parsePredictionMemory', () => {
     expect(p?.delta).toBe(-0.17);
     expect(p?.corrected).toBe(false);
     expect(p?.followUp).toBe(false);
+    expect(p?.topics).toEqual([]);
   });
 
   it('tolerates surrounding whitespace and a missing trailing period', () => {
@@ -43,6 +48,41 @@ describe('parsePredictionMemory', () => {
     expect(parsePredictionMemory('使用者偏好用繁體中文回覆。')).toBeNull();
     expect(parsePredictionMemory('Prediction deviation: malformed')).toBeNull();
     expect(parsePredictionMemory('')).toBeNull();
+  });
+
+  // Current backend format (crates/duduclaw-gateway/src/prediction/router.rs
+  // `format_moderate_telemetry`) — the fix under test: the stored content now
+  // carries what the conversation was about.
+  it('parses the current format with a Topics tail', () => {
+    const raw =
+      'Prediction deviation: expected satisfaction 0.70, inferred 0.52 (delta 0.18). ' +
+      'Topic surprise: 1.00. Corrections: yes. Follow-ups: no. Topics: 報價, 合約, 交期.';
+    const p = parsePredictionMemory(raw);
+    expect(p).not.toBeNull();
+    expect(p?.topics).toEqual(['報價', '合約', '交期']);
+    expect(p?.expected).toBe(0.7);
+    expect(p?.inferred).toBe(0.52);
+  });
+
+  it('appends Expected topic when present and distinct from the extracted topics', () => {
+    const raw =
+      'Prediction deviation: expected satisfaction 0.70, inferred 0.52 (delta 0.18). ' +
+      'Topic surprise: 1.00. Corrections: yes. Follow-ups: no. Topics: 報價. Expected topic: 退貨.';
+    expect(parsePredictionMemory(raw)?.topics).toEqual(['報價', '退貨']);
+  });
+
+  it('does not duplicate the expected topic when it is already among the extracted topics', () => {
+    const raw =
+      'Prediction deviation: expected satisfaction 0.70, inferred 0.52 (delta 0.18). ' +
+      'Topic surprise: 1.00. Corrections: yes. Follow-ups: no. Topics: 報價. Expected topic: 報價.';
+    expect(parsePredictionMemory(raw)?.topics).toEqual(['報價']);
+  });
+
+  it('parses an Expected topic tail with no Topics section at all', () => {
+    const raw =
+      'Prediction deviation: expected satisfaction 0.70, inferred 0.52 (delta 0.18). ' +
+      'Topic surprise: 1.00. Corrections: yes. Follow-ups: no. Expected topic: 退貨.';
+    expect(parsePredictionMemory(raw)?.topics).toEqual(['退貨']);
   });
 });
 

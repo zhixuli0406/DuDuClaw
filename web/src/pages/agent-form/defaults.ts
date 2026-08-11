@@ -2,6 +2,7 @@ import type {
   AgentCapabilities,
   AgentEvolutionAdvanced,
   AgentRuntime,
+  AutonomyLevel,
   ComputerUseConfig,
   ContainerEnvVar,
   ContainerMount,
@@ -28,6 +29,17 @@ export type AdvGroup = 'run' | 'access' | 'integration' | 'evo';
 export const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = ['claude', 'codex', 'gemini', 'grok', 'openai_compat'];
 
 export const AGENT_ROLES: ReadonlyArray<string> = ['main', 'specialist', 'worker', 'developer', 'qa', 'planner'];
+
+/** Presentation order for the 自主等級 radio group — from the most
+ *  human-driven to the most autonomous (mirrors `goal_loop::AutonomyLevel`'s
+ *  declaration order, which is itself ordered least→most autonomous). */
+export const AUTONOMY_LEVELS: ReadonlyArray<AutonomyLevel> = [
+  'operator',
+  'collaborator',
+  'consultant',
+  'approver',
+  'observer',
+];
 
 /** RT — runtime form defaults. `agents.inspect` now returns the `[runtime]`
  *  block (only keys present in agent.toml), so the Edit page prefills these
@@ -114,6 +126,11 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
   policy: [],
   os_native: false,
   recording: false,
+  // Conservative default — mirrors the gateway's fail-safe fallback
+  // (`goal_loop::AutonomyLevel::for_agent`: missing/unparseable ⇒ Approver),
+  // so an agent this form has never touched behaves the same before and
+  // after the operator opens the 工具與權限 tab.
+  autonomy_level: 'approver',
   computer_use_config: {
     allowed_apps: [],
     blocked_actions: [],

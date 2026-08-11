@@ -63,6 +63,15 @@ const ICONS: Record<TaskStatusKey, LucideIcon> = {
   cancelled: XCircle,
 };
 
+// §C.2: the fallback English used when no catalog entry is loaded (e.g. in
+// tests). Kept word-for-word in sync with `taskStatus.*` in `src/i18n/*.json`
+// — `blocked`/`needs_human`/`failed` share their vocabulary with the unified
+// "待辦決定" object's `inbox.status.*` set (04-orca §C.2/§C.3) rather than a
+// literal translation, so the same state reads identically everywhere.
+// `revising` deliberately keeps its own label (unlike the Inbox, which folds
+// it into "in progress") — the Iterative Kanban board shows it as its own
+// column precisely to distinguish a judge-rejected retry round, and echoing
+// "in progress" here would contradict that column's own header.
 const DEFAULT_LABELS: Record<TaskStatusKey, string> = {
   backlog: 'Backlog',
   todo: 'To do',
@@ -70,9 +79,9 @@ const DEFAULT_LABELS: Record<TaskStatusKey, string> = {
   in_review: 'In review',
   revising: 'Revising',
   done: 'Done',
-  blocked: 'Blocked',
-  needs_human: 'Needs human',
-  failed: 'Failed',
+  blocked: 'Stuck',
+  needs_human: 'Needs your decision',
+  failed: "Didn't finish",
   cancelled: 'Cancelled',
 };
 
