@@ -13,7 +13,7 @@
 //!
 //! [[tick.sources]]
 //! id = "twse-2330"
-//! kind = "http_poll"              # http_poll | command | file_tail
+//! kind = "http_poll"              # http_poll | command | file_tail | websocket
 //! enabled = true
 //! interval_secs = 10
 //! url = "https://example.invalid/quote"
@@ -36,6 +36,7 @@
 //!   load of the other sources and never blocks gateway boot.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -52,6 +53,12 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 10;
 pub const DEFAULT_MAX_EVENTS_PER_MINUTE: u32 = 120;
 /// Upper bound on `id` / extracted-field-name length.
 const MAX_ID_LEN: usize = 64;
+/// D5-W — how many `subscribe` frames a `websocket` source may send after
+/// connecting. A subscription handshake is a handful of frames; anything
+/// longer is a configuration mistake, not a feed.
+pub const MAX_SUBSCRIBE_FRAMES: usize = 8;
+/// D5-W — byte ceiling on one `subscribe` frame.
+pub const MAX_SUBSCRIBE_FRAME_BYTES: usize = 4096;
 
 /// D7 — field names an extraction may not claim, because
 /// [`crate::autopilot_engine::AutopilotEvent::Tick`]'s `to_fields()` owns
@@ -62,9 +69,7 @@ pub const RESERVED_FIELD_NAMES: &[&str] = &["event", "source", "ts", "kind"];
 /// `prev_<f>` / `delta_<f>` / `pct_<f>`).
 pub const RESERVED_FIELD_PREFIXES: &[&str] = &["prev_", "delta_", "pct_"];
 
-/// How a source produces its payload (D5). WebSocket is deliberately absent —
-/// a streaming feed is reachable today by pointing `command` at a CLI/curl
-/// that prints one JSON line per event.
+/// How a source produces its payload (D5, D5-W).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TickKind {
@@ -76,6 +81,10 @@ pub enum TickKind {
     Command,
     /// Poll a file's length, read newly-appended lines; one line = one tick.
     FileTail,
+    /// D5-W — a long-lived WebSocket connection; every **text** frame is one
+    /// payload, pushed rather than polled. `interval_secs` stops meaning
+    /// "poll period" here and becomes the reconnect-backoff starting point.
+    Websocket,
 }
 
 impl TickKind {
@@ -84,6 +93,7 @@ impl TickKind {
             Self::HttpPoll => "http_poll",
             Self::Command => "command",
             Self::FileTail => "file_tail",
+            Self::Websocket => "websocket",
         }
     }
 }
@@ -98,9 +108,13 @@ pub struct TickSourceConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Clamped to at least [`MIN_INTERVAL_SECS`] by [`validate_source`].
+    ///
+    /// For `websocket` sources this is **not** a poll period (nothing is
+    /// polled) — it is the reconnect backoff's starting delay (D5-W).
     #[serde(default = "default_interval_secs")]
     pub interval_secs: u64,
-    /// `http_poll` only.
+    /// `http_poll` (http/https) and `websocket` (ws/wss) — validated by the
+    /// scheme-appropriate gate in [`validate_source`].
     #[serde(default)]
     pub url: Option<String>,
     /// `command` only — argv, executed directly (no shell).
@@ -110,6 +124,13 @@ pub struct TickSourceConfig {
     /// [`validate_source`].
     #[serde(default)]
     pub path: Option<PathBuf>,
+    /// `websocket` only (D5-W) — verbatim frames sent, in order, right after
+    /// the connection opens (a quote feed's subscribe handshake). No
+    /// templating: what is written here is what is sent. Capped at
+    /// [`MAX_SUBSCRIBE_FRAMES`] × [`MAX_SUBSCRIBE_FRAME_BYTES`], and cleared
+    /// for every other kind.
+    #[serde(default)]
+    pub subscribe: Vec<String>,
     /// `field name → JSON pointer` (RFC 6901). A pointer that doesn't resolve
     /// leaves the field **absent**, never zero — an absent field satisfies no
     /// condition (`autopilot_engine::apply_op`), which is exactly the
@@ -280,6 +301,10 @@ pub fn validate_source(
     let mut url = raw.url.clone();
     let mut command = raw.command.clone();
     let mut path = raw.path.clone();
+    // `subscribe` is meaningful only for `websocket`; every other kind gets an
+    // empty vector so a stray entry can never be silently carried around (and
+    // can never be mistaken for an active handshake later).
+    let mut subscribe: Vec<String> = Vec::new();
 
     match raw.kind {
         TickKind::HttpPoll => {
@@ -330,6 +355,16 @@ pub fn validate_source(
             }
             path = Some(canonical);
         }
+        TickKind::Websocket => {
+            command = None;
+            path = None;
+            let u = url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| "kind = \"websocket\" requires `url`".to_string())?;
+            validate_ws_url(u)?;
+            subscribe = validate_subscribe_frames(&raw.subscribe)?;
+        }
     }
 
     Ok(TickSourceConfig {
@@ -340,11 +375,94 @@ pub fn validate_source(
         url,
         command,
         path,
+        subscribe,
         json_fields: raw.json_fields,
         emit_unchanged: raw.emit_unchanged,
         max_events_per_minute,
         persist_every_n: raw.persist_every_n,
     })
+}
+
+/// D5-W — validate a `websocket` source's URL.
+///
+/// Two gates, in this order:
+///
+/// 1. **Scheme**: only `ws://` / `wss://`. Anything else (including a plain
+///    `https://` typo) is refused rather than coerced.
+/// 2. **Host**: a loopback host is the one place plaintext `ws://` is allowed
+///    — the traffic never leaves the machine, and it is what a local relay
+///    process (the documented way to bridge an exotic feed) actually offers.
+///    Every other host must be `wss://`, and is then handed to the SAME SSRF
+///    validator every other outbound fetch path uses, with the scheme mapped
+///    `wss → https` so private ranges, link-local and cloud-metadata hosts are
+///    refused by exactly one implementation instead of a second copy here.
+///
+/// Host comparison is exact (`==` on the lowercased host / a parsed `IpAddr`),
+/// never `contains`/`starts_with` — `ws://localhost.evil.example` is a public
+/// host and must not inherit the loopback carve-out.
+pub fn validate_ws_url(url: &str) -> Result<(), String> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| format!("url rejected: invalid URL: {e}"))?;
+
+    let scheme = parsed.scheme();
+    if scheme != "ws" && scheme != "wss" {
+        return Err(format!(
+            "kind = \"websocket\" requires a ws:// or wss:// url (got {scheme}://)"
+        ));
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "url rejected: missing host".to_string())?;
+    let host_lower = host.to_ascii_lowercase();
+    // `host_str()` returns IPv6 literals bracketed (`[::1]`).
+    let bare = host_lower.trim_start_matches('[').trim_end_matches(']');
+    let is_loopback = bare == "localhost"
+        || bare
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+
+    if is_loopback {
+        return Ok(());
+    }
+
+    if scheme != "wss" {
+        return Err(format!(
+            "plaintext ws:// is only allowed for loopback hosts \
+             (127.0.0.1 / localhost / ::1); use wss:// for {host_lower}"
+        ));
+    }
+
+    let mut mapped = parsed.clone();
+    mapped
+        .set_scheme("https")
+        .map_err(|_| "url rejected: could not normalize wss:// for validation".to_string())?;
+    crate::web_fetch::validate_url(mapped.as_str()).map_err(|e| format!("url rejected: {e}"))?;
+    Ok(())
+}
+
+/// D5-W — bound the post-connect subscribe handshake. Returns a **new** vector
+/// (the project's immutability convention) rather than trimming in place.
+fn validate_subscribe_frames(frames: &[String]) -> Result<Vec<String>, String> {
+    if frames.len() > MAX_SUBSCRIBE_FRAMES {
+        return Err(format!(
+            "`subscribe` has {} frames — the maximum is {MAX_SUBSCRIBE_FRAMES}",
+            frames.len()
+        ));
+    }
+    for (index, frame) in frames.iter().enumerate() {
+        if frame.trim().is_empty() {
+            return Err(format!("`subscribe[{index}]` is empty"));
+        }
+        if frame.len() > MAX_SUBSCRIBE_FRAME_BYTES {
+            return Err(format!(
+                "`subscribe[{index}]` is {} bytes — the maximum is {MAX_SUBSCRIBE_FRAME_BYTES}",
+                frame.len()
+            ));
+        }
+    }
+    Ok(frames.to_vec())
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,63}$`, hand-rolled (the project does not carry a
@@ -747,6 +865,191 @@ mod tests {
             dir.path().join("nope.jsonl").display()
         ));
         assert!(missing.sources.is_empty(), "missing path is fail-closed");
+    }
+
+    // ── D5-W websocket ───────────────────────────────────────
+
+    fn websocket(url: &str, extra: &str) -> TickConfig {
+        parse(&format!(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "feed"
+            kind = "websocket"
+            url = "{url}"
+            {extra}
+            "#
+        ))
+    }
+
+    #[test]
+    fn websocket_source_parses_with_defaults() {
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "quotes"
+            kind = "websocket"
+            url = "wss://example.com/stream"
+            json_fields = { price = "/p" }
+            "#,
+        );
+        assert_eq!(s.kind, TickKind::Websocket);
+        assert_eq!(s.kind.as_str(), "websocket");
+        assert!(s.subscribe.is_empty(), "subscribe is optional");
+        // `interval_secs` keeps its default; for websocket it is the backoff
+        // starting point, not a poll period.
+        assert_eq!(s.interval_secs, DEFAULT_INTERVAL_SECS);
+        assert!(s.command.is_none() && s.path.is_none());
+    }
+
+    #[test]
+    fn websocket_rejects_non_ws_schemes() {
+        for url in [
+            "https://example.com/stream",
+            "http://example.com/stream",
+            "file:///etc/passwd",
+            "wsss://example.com/stream",
+        ] {
+            assert!(
+                websocket(url, "").sources.is_empty(),
+                "{url} must be refused — only ws:// / wss://"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_refuses_plaintext_ws_to_a_non_loopback_host() {
+        for url in [
+            "ws://example.com/stream",
+            // A host that merely *contains* a loopback name is a public host.
+            "ws://localhost.evil.example/stream",
+            "ws://127.0.0.1.evil.example/stream",
+            "ws://8.8.8.8/stream",
+        ] {
+            assert!(
+                websocket(url, "").sources.is_empty(),
+                "{url} must be refused — plaintext ws:// is loopback-only"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_allows_plaintext_ws_on_loopback() {
+        for url in [
+            "ws://127.0.0.1:8765/stream",
+            "ws://localhost:8765/stream",
+            "ws://[::1]:8765/stream",
+            "ws://LocalHost:8765/stream",
+            "wss://127.0.0.1:8765/stream",
+        ] {
+            let cfg = websocket(url, "");
+            assert_eq!(cfg.sources.len(), 1, "{url} must be allowed (loopback)");
+        }
+    }
+
+    #[test]
+    fn websocket_wss_reuses_the_shared_ssrf_gate() {
+        // Public host over TLS — allowed.
+        assert_eq!(
+            websocket("wss://example.com/stream", "").sources.len(),
+            1,
+            "a public wss:// endpoint is the normal case"
+        );
+        // Everything the http_poll gate refuses is refused here too, because
+        // it IS the same validator (wss → https before the check).
+        for url in [
+            "wss://192.168.1.10/stream",
+            "wss://10.0.0.5/stream",
+            "wss://169.254.169.254/stream",
+            "wss://metadata.google.internal/stream",
+            "wss://0.0.0.0/stream",
+        ] {
+            assert!(
+                websocket(url, "").sources.is_empty(),
+                "{url} must be refused by the shared SSRF gate"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_without_url_is_refused() {
+        let cfg = parse(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "feed"
+            kind = "websocket"
+            "#,
+        );
+        assert!(cfg.sources.is_empty());
+    }
+
+    #[test]
+    fn websocket_subscribe_frames_are_capped() {
+        let eight: Vec<String> = (0..MAX_SUBSCRIBE_FRAMES)
+            .map(|i| format!("\"sub{i}\""))
+            .collect();
+        let ok = websocket(
+            "wss://example.com/stream",
+            &format!("subscribe = [{}]", eight.join(", ")),
+        );
+        assert_eq!(ok.sources.len(), 1, "exactly the cap is allowed");
+        assert_eq!(ok.sources[0].subscribe.len(), MAX_SUBSCRIBE_FRAMES);
+        assert_eq!(ok.sources[0].subscribe[0], "sub0");
+
+        let nine: Vec<String> = (0..=MAX_SUBSCRIBE_FRAMES)
+            .map(|i| format!("\"sub{i}\""))
+            .collect();
+        assert!(
+            websocket(
+                "wss://example.com/stream",
+                &format!("subscribe = [{}]", nine.join(", "))
+            )
+            .sources
+            .is_empty(),
+            "one over the frame cap disables the source"
+        );
+
+        let huge = "x".repeat(MAX_SUBSCRIBE_FRAME_BYTES + 1);
+        assert!(
+            websocket(
+                "wss://example.com/stream",
+                &format!("subscribe = [\"{huge}\"]")
+            )
+            .sources
+            .is_empty(),
+            "one over-size frame disables the source"
+        );
+
+        assert!(
+            websocket("wss://example.com/stream", "subscribe = [\"  \"]")
+                .sources
+                .is_empty(),
+            "an empty frame is a configuration mistake, not a handshake"
+        );
+    }
+
+    #[test]
+    fn subscribe_is_cleared_for_non_websocket_kinds() {
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "poller"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            subscribe = ["{\"op\":\"sub\"}"]
+            "#,
+        );
+        assert!(
+            s.subscribe.is_empty(),
+            "subscribe only means anything for websocket sources"
+        );
     }
 
     // ── active_sources gating ────────────────────────────────

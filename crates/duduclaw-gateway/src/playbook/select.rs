@@ -22,6 +22,24 @@ use crate::prediction::rule_lifecycle::{RuleStats, PROBATION_RULE_TAG, RETIRED_R
 /// `Add`s, not only mistake consolidation.
 pub const SECTION_HEADER: &str = "## Learned Rules";
 
+/// W3-2 — one line telling the model these rules are quotable.
+///
+/// Without it the section is a silent behavioral constraint: the model obeys
+/// the rules but has no licence to say *why*, so 「你為什麼這樣做?」 gets an
+/// invented rationalization instead of the actual rule. Paired with the
+/// `[法則 N]` labels below (which give each rule a stable handle to point at),
+/// this is the whole cost of making the loop explainable — no pipeline change,
+/// no extra call. Deliberately phrased as permission, not instruction: a rule
+/// citation on every turn would be noise.
+pub const SECTION_GUIDANCE: &str =
+    "（這些是你從過去經驗歸納出的法則。回答時可自然引用，例如「因為我學過：…」；\
+使用者問「你為什麼這樣做？」時，請指出你實際依據的那一條。）";
+
+/// Prefix stamped on each rendered rule so the model can cite a specific one.
+fn rule_label(n: usize) -> String {
+    format!("[法則 {n}] ")
+}
+
 /// One candidate entry ready for rendering into the prompt section.
 #[derive(Debug, Clone)]
 pub struct SelectedEntry {
@@ -158,26 +176,30 @@ pub async fn select_playbook(
 /// injected_ids)`; `None` when nothing was selected (matches the old
 /// `build_rules_section_blocking` "no active rules" contract).
 pub fn render_section(entries: &[SelectedEntry], budget: &InjectionBudget) -> Option<(String, Vec<String>)> {
-    let mut body_parts: Vec<&str> = Vec::new();
+    let mut body_parts: Vec<String> = Vec::new();
     let mut ids: Vec<String> = Vec::new();
-    let header_len = SECTION_HEADER.chars().count() + 1; // + newline
+    // Header + newline + guidance line + newline (W3-2). Both are charged to
+    // the same `max_chars` budget the rules are, so an agent with a tiny
+    // budget renders fewer rules rather than silently overflowing.
+    let prefix_len = SECTION_HEADER.chars().count() + 1 + SECTION_GUIDANCE.chars().count() + 1;
 
     for e in entries {
         if ids.len() >= budget.max_entries {
             break;
         }
+        let labeled = format!("{}{}", rule_label(ids.len() + 1), e.content);
         // Recompute the actual joined length directly (simplest correct way
         // to know if appending this entry stays within `max_chars`).
         let would_be_body = if body_parts.is_empty() {
-            e.content.clone()
+            labeled.clone()
         } else {
-            format!("{}\n\n{}", body_parts.join("\n\n"), e.content)
+            format!("{}\n\n{}", body_parts.join("\n\n"), labeled)
         };
-        let actual_len = header_len + would_be_body.chars().count();
+        let actual_len = prefix_len + would_be_body.chars().count();
         if actual_len > budget.max_chars {
             break;
         }
-        body_parts.push(&e.content);
+        body_parts.push(labeled);
         ids.push(e.id.clone());
     }
 
@@ -185,7 +207,7 @@ pub fn render_section(entries: &[SelectedEntry], budget: &InjectionBudget) -> Op
         return None;
     }
     let body = body_parts.join("\n\n");
-    Some((format!("{SECTION_HEADER}\n{body}"), ids))
+    Some((format!("{SECTION_HEADER}\n{SECTION_GUIDANCE}\n{body}"), ids))
 }
 
 /// Blocking helper for the channel-reply prompt-assembly path
@@ -310,10 +332,14 @@ mod tests {
             SelectedEntry { id: "1".into(), content: "a".repeat(50), category: PlaybookCategory::Repair, net: 5, success_streak: 0, probation: false, signal_matched: true },
             SelectedEntry { id: "2".into(), content: "b".repeat(50), category: PlaybookCategory::Repair, net: 4, success_streak: 0, probation: false, signal_matched: true },
         ];
-        // Header (18 chars incl. newline) + one 50-char entry = 68 chars;
-        // two entries would need 18 + 50 + 2 + 50 = 120. 100 fits exactly
-        // one, never a truncated second.
-        let budget = InjectionBudget { max_entries: 10, max_chars: 100 };
+        // Prefix (header + W3-2 guidance line, both newline-terminated) plus
+        // one labeled 50-char entry, with a little slack. A second entry
+        // needs another blank line + label + 50 chars, which does not fit —
+        // so it must be dropped whole, never truncated mid-content.
+        let budget = InjectionBudget {
+            max_entries: 10,
+            max_chars: prefix_chars() + rule_label(1).chars().count() + 50 + 10,
+        };
         let (section, ids) = render_section(&entries, &budget).unwrap();
         assert_eq!(ids, vec!["1".to_string()], "second entry dropped whole, never truncated mid-content");
         assert!(section.contains(&"a".repeat(50)));
@@ -349,11 +375,48 @@ mod tests {
             probation: false,
             signal_matched: false,
         }];
-        // 30 chars + header (~19 chars) well under a byte-sized-but-char-tight budget.
-        let budget = InjectionBudget { max_entries: 10, max_chars: 60 };
+        // 30 chars + prefix + label, with slack — a byte-based budget would
+        // have blown past this three times over.
+        let max_chars = prefix_chars() + rule_label(1).chars().count() + 30 + 5;
+        let budget = InjectionBudget { max_entries: 10, max_chars };
         let (section, ids) = render_section(&entries, &budget).unwrap();
         assert_eq!(ids.len(), 1);
-        assert!(section.chars().count() <= 60);
+        assert!(section.chars().count() <= max_chars);
+        assert!(section.len() > max_chars, "content is multi-byte; a byte budget would differ");
+    }
+
+    /// Chars consumed by everything that is not a rule: the header line plus
+    /// the W3-2 guidance line, each newline-terminated.
+    fn prefix_chars() -> usize {
+        SECTION_HEADER.chars().count() + 1 + SECTION_GUIDANCE.chars().count() + 1
+    }
+
+    #[test]
+    fn rendered_rules_carry_citable_labels_and_the_quotation_guidance() {
+        let entries: Vec<SelectedEntry> = (0..3)
+            .map(|i| SelectedEntry {
+                id: format!("id-{i}"),
+                content: format!("rule body {i}"),
+                category: PlaybookCategory::Repair,
+                net: 0,
+                success_streak: 0,
+                probation: false,
+                signal_matched: false,
+            })
+            .collect();
+        let (section, ids) = render_section(&entries, &InjectionBudget::default_budget()).unwrap();
+        assert!(section.starts_with(SECTION_HEADER));
+        assert!(section.contains(SECTION_GUIDANCE), "agent has no licence to cite: {section}");
+        // Labels are 1-based and in the same order as the returned ids, so a
+        // model citing 「法則 2」 points at `ids[1]`.
+        assert_eq!(ids.len(), 3);
+        for (i, _) in ids.iter().enumerate() {
+            assert!(section.contains(&format!("[法則 {}] rule body {i}", i + 1)), "{section}");
+        }
+        // Internal vocabulary must not reach the prompt's user-visible copy.
+        for internal in ["playbook", "shadow", "probation", "GVU"] {
+            assert!(!SECTION_GUIDANCE.contains(internal), "guidance leaks `{internal}`");
+        }
     }
 
     #[test]

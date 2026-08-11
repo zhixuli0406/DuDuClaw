@@ -730,6 +730,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!("Deferred-notification drainer scheduled — 1 min interval");
     }
 
+    // ── Human-takeover handback sweeper (W3-1, pattern D10) ─────────────
+    // The pause itself expires at read time — every consumer compares `until`
+    // against now — so this task exists purely to tell the conversation the
+    // AI is back. Costs one `exists()` per minute when nobody has taken
+    // anything over (the overwhelmingly common case).
+    {
+        let sweeper = crate::takeover::TakeoverSweeper::new(home_dir.clone());
+        tokio::spawn(sweeper.run(std::time::Duration::from_secs(60)));
+        info!("Human-takeover handback sweeper scheduled — 1 min interval");
+    }
+
     // Daily digest (C8). Self-gating: the scheduler reads
     // `config.toml [notify] daily_digest` on every tick and returns
     // immediately when it is off (the default), so a deployment that never
@@ -743,6 +754,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
     let (event_tx, _) = broadcast::channel::<String>(64);
     handler.set_event_tx(event_tx.clone()).await;
+    // B5: give `dashboard_navigate::push_dashboard_navigate` a handle to the
+    // SAME sender every `/ws` connection subscribes to, so any code path in
+    // the gateway process (no `Handler`/`ReplyContext` needed) can route an
+    // open dashboard tab to a specific page.
+    crate::dashboard_navigate::init(event_tx.clone());
 
     // WP0.8 (R8, 2026-08-06): the MistakeNotebook Arc is built HERE — before
     // `reply_ctx` — rather than at its historical construction site further

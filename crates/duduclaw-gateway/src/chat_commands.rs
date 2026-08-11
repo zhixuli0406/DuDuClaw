@@ -60,6 +60,13 @@ pub enum ChatCommand {
     SafetyStatus,
     /// `/goal ...` — autonomous goal loop entry point (P5).
     Goal(GoalCommand),
+    /// `/rules` — 經驗法則 (W3-2). `all=false, off=None` = the top 3
+    /// currently-in-effect rules; `all=true` (`/rules all`) = the full list.
+    /// `off=Some(n)` (`/rules off <n>`, W3-5) = disable the rule at position
+    /// `n` in the same numbering `/rules all` shows — admin/manager-gated,
+    /// see [`handle_rules_off`] for the authorization predicate. Zero LLM
+    /// cost either way.
+    Rules { all: bool, off: Option<u32> },
 }
 
 /// The three shapes a `/goal` command can take.
@@ -273,20 +280,57 @@ pub fn parse_command(
         }
         "rollback" => Some(ChatCommand::Rollback),
         "goal" => Some(ChatCommand::Goal(parse_goal_args(args))),
+        // W3-2 經驗法則 (+ W3-5 `off <n>`). Anything other than `all`/`off <n>`
+        // in the tail is ignored rather than rejected (same laxity as
+        // `/replay`) — a mistyped argument should still show the summary,
+        // not an error. `off` with a missing/non-numeric/zero index still
+        // produces `Rules { off: Some(0) }` rather than falling back to the
+        // summary — [`handle_rules_off`] reports "no such rule number"
+        // instead of silently showing the listing, since a person who typed
+        // `/rules off` deserves to know the command was recognized but
+        // needs a number, not a bare summary that looks like `off` was
+        // ignored.
+        "rules" => {
+            let tail = args.map(str::trim).unwrap_or("");
+            let mut words = tail.split_whitespace();
+            let off = match words.next() {
+                Some(w) if w.eq_ignore_ascii_case("off") => {
+                    Some(words.next().and_then(|n| n.parse::<u32>().ok()).unwrap_or(0))
+                }
+                _ => None,
+            };
+            Some(ChatCommand::Rules {
+                all: off.is_none() && tail.eq_ignore_ascii_case("all"),
+                off,
+            })
+        }
         _ => None,
     }
 }
 
 /// Execute a chat command and return the response text.
 ///
-/// `is_admin` indicates whether the user has admin/owner privileges.
+/// `is_admin` indicates whether the user has admin/owner privileges (the
+/// per-channel `admin_users` allowlist — `channel_reply::is_channel_admin`).
 /// Safety words that modify agent state (`!STOP`, `!RESUME`) require admin.
+///
+/// `channel_user_id` is the sender's raw channel account id (the identifier
+/// a dashboard "bind this channel account" flow would key on — e.g. a
+/// Telegram numeric id, a Slack `U…` id). It is unused by every command
+/// except `/rules off <n>` (W3-5), which needs the STRONGER
+/// identity-verified [`crate::takeover::manager_display_name`] predicate
+/// takeover.rs already established, not the looser `admin_users` list —
+/// disabling a rule is a persistent write to the agent's playbook, not a
+/// read. Pass `""` for a channel with no addressable per-sender identity
+/// (e.g. an anonymous WebChat connection); [`handle_rules_off`] then
+/// correctly refuses with "no verified identity" rather than guessing.
 pub async fn handle_command(
     cmd: &ChatCommand,
     ctx: &ReplyContext,
     session_id: &str,
     agent_id: &str,
     is_admin: bool,
+    channel_user_id: &str,
 ) -> String {
     // Enforce admin requirement for destructive safety commands.
     // Fail-closed: callers must compute real admin status per channel
@@ -336,6 +380,10 @@ pub async fn handle_command(
         ChatCommand::SafetyResume => handle_safety_resume(ctx, session_id).await,
         ChatCommand::SafetyStatus => handle_safety_status(ctx, session_id).await,
         ChatCommand::Goal(goal) => handle_goal(ctx, session_id, agent_id, goal).await,
+        ChatCommand::Rules { all, off: None } => handle_rules(ctx, agent_id, *all).await,
+        ChatCommand::Rules { off: Some(n), .. } => {
+            handle_rules_off(ctx, session_id, channel_user_id, agent_id, *n).await
+        }
     }
 }
 
@@ -432,7 +480,9 @@ fn handle_help() -> String {
      `/handoff <頻道>` — 將對話轉移到其他頻道\n\
      `/undo [次數]` — 撤銷最近 N 輪對話（預設 1，最多 20）\n\
      `/rollback` — 回退到最近一次檢查點（僅回退對話，不還原檔案）\n\
-     `/goal <目標>` — 交付一個自主目標，AI 自主做到完成、卡住問你（`/goal status` 看進度）\n\n\
+     `/goal <目標>` — 交付一個自主目標，AI 自主做到完成、卡住問你（`/goal status` 看進度）\n\
+     `/rules` — 看目前生效中的經驗法則（`/rules all` 看全部、`/rules off <編號>` 停用一條，限管理員／主管）\n\
+     `/takeover` — 看目前是誰在回覆（管理員直接發言即接手；`+30m` 延長、`end` 交還）\n\n\
      *Safety Words*\n\
      `!STOP` / `!停止` — Stop current agent\n\
      `!STOP ALL` / `!全部停止` — Emergency stop all\n\
@@ -1138,6 +1188,162 @@ async fn handle_replay(ctx: &ReplyContext, agent_id: &str, limit: u32) -> String
     }
 }
 
+// ── /takeover — human takeover lifecycle (W3-1, pattern D3) ─────
+//
+// Deliberately parsed and dispatched separately from [`ChatCommand`]: every
+// other chat command is intercepted per-channel *before* the reply pipeline,
+// where the sender's channel account id is not carried (see `handle_pair`'s
+// note). `/takeover` is an identity-bearing command — only a verified manager
+// may extend or end a takeover — so it is handled at the one place that has
+// both the conversation and the sender:
+// `channel_reply::build_reply_with_session_inner`. That is also the only
+// choke point that is guaranteed to be reached on every channel, including
+// the ones whose per-channel interception drops unknown slash commands.
+
+/// The three shapes `/takeover` takes (LINE OA's four-piece contract minus
+/// "start", which needs no command — speaking is the start; see
+/// [`crate::takeover`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeoverCommand {
+    /// `/takeover` — who holds this conversation and until when.
+    Status,
+    /// `/takeover +30m` — push the deadline out by N minutes.
+    Extend(i64),
+    /// `/takeover end` — hand back to the AI now.
+    End,
+}
+
+/// Parse `/takeover [...]`. Returns `None` for anything that is not this
+/// command, so the caller falls through to its normal handling.
+///
+/// Accepted tails (case-insensitive, `＋`/`ｍ` full-width forms included since
+/// the target users type on zh-TW IMEs):
+/// - empty ⇒ [`TakeoverCommand::Status`]
+/// - `end` / `結束` / `stop` ⇒ [`TakeoverCommand::End`]
+/// - `+30m`, `+30`, `30m`, `30` ⇒ [`TakeoverCommand::Extend`]
+/// - anything else ⇒ `Status` (which prints usage), never a silent no-op.
+pub fn parse_takeover(text: &str) -> Option<TakeoverCommand> {
+    let trimmed = text.trim();
+    let rest = trimmed
+        .strip_prefix('/')
+        .or_else(|| trimmed.strip_prefix('／'))?;
+    let (cmd, args) = match rest.find(char::is_whitespace) {
+        Some(pos) => (&rest[..pos], rest[pos..].trim()),
+        None => (rest, ""),
+    };
+    // Strip a Telegram-style `@BotName` suffix so `/takeover@bot end` works.
+    let cmd = cmd.split('@').next().unwrap_or(cmd);
+    if !cmd.eq_ignore_ascii_case("takeover") {
+        return None;
+    }
+    if args.is_empty() {
+        return Some(TakeoverCommand::Status);
+    }
+    let lowered = args.to_ascii_lowercase();
+    if matches!(lowered.as_str(), "end" | "stop" | "off") || args == "結束" || args == "交還" {
+        return Some(TakeoverCommand::End);
+    }
+    // `+30m` / `30m` / `30`, tolerating full-width plus and `m`.
+    let digits: String = lowered
+        .replace('＋', "+")
+        .replace('ｍ', "m")
+        .trim_start_matches('+')
+        .trim_end_matches("min")
+        .trim_end_matches('m')
+        .trim()
+        .to_string();
+    match digits.parse::<i64>() {
+        Ok(n) if n > 0 => Some(TakeoverCommand::Extend(n)),
+        _ => Some(TakeoverCommand::Status),
+    }
+}
+
+/// Execute a `/takeover` command. Every reply is end-user zh-TW; internal
+/// vocabulary (conversation keys, agent ids, task ids) never appears.
+///
+/// Authorization is the same predicate typing-takeover uses
+/// ([`crate::takeover::manager_display_name`]): an Active dashboard
+/// Admin/Manager reached through a verified channel binding. A non-manager
+/// gets a refusal, not a silent no-op — a person who typed a command deserves
+/// to know why nothing happened.
+pub async fn handle_takeover(
+    ctx: &ReplyContext,
+    session_id: &str,
+    user_id: &str,
+    cmd: &TakeoverCommand,
+) -> String {
+    use duduclaw_core::takeover_state::{self, TakeoverConfig};
+
+    let home = ctx.home_dir.as_path();
+    let cfg = TakeoverConfig::from_home(home);
+    if !cfg.enabled {
+        return "此系統未啟用真人接手功能。".to_string();
+    }
+    let Some((channel, _)) = takeover_state::conversation_target(session_id) else {
+        return "這個對話無法使用接手功能。".to_string();
+    };
+    let now = chrono::Utc::now();
+    let holding = takeover_state::active_at(home, session_id, now);
+
+    // Status is readable by anyone in the conversation: "is a human handling
+    // this right now" is not privileged information, and hiding it would
+    // recreate the black box this feature exists to open.
+    if matches!(cmd, TakeoverCommand::Status) {
+        return match holding {
+            Some(rec) => format!(
+                "👤 目前由 {} 接手中，還有約 {} 分鐘。\n輸入 `/takeover +30m` 延長、`/takeover end` 交還 AI。",
+                rec.holder_display,
+                rec.minutes_left(now).max(1)
+            ),
+            None => {
+                let how = if crate::takeover::identity_available(home) {
+                    "管理員只要在這個對話裡直接發言，就會自動接手。"
+                } else {
+                    "尚未有任何管理員在儀表板綁定此通道帳號，因此無法自動辨識接手者。"
+                };
+                format!("🤖 目前由 AI 回覆中，沒有人接手。\n{how}")
+            }
+        };
+    }
+
+    // Extend / end are writes — verified manager only.
+    if crate::takeover::manager_display_name(home, &channel, user_id).is_none() {
+        return "您沒有變更接手狀態的權限。請先於儀表板以此通道帳號完成綁定。".to_string();
+    }
+    let Some(rec) = holding else {
+        return "目前沒有人接手這個對話，無需變更。".to_string();
+    };
+
+    match cmd {
+        TakeoverCommand::Status => unreachable!("handled above"),
+        TakeoverCommand::Extend(minutes) => {
+            match takeover_state::extend(home, session_id, *minutes, &cfg, now) {
+                Ok(Some(updated)) => format!(
+                    "👤 已延長接手時間，還有約 {} 分鐘。",
+                    updated.minutes_left(now).max(1)
+                ),
+                Ok(None) => "目前沒有人接手這個對話，無需變更。".to_string(),
+                Err(e) => {
+                    warn!(session_id, error = %e, "takeover: extend failed");
+                    "⚠️ 延長失敗，請稍後再試。".to_string()
+                }
+            }
+        }
+        TakeoverCommand::End => match crate::takeover::end_takeover(home, session_id).await {
+            Ok(Some(_)) => format!(
+                "{}\n（{} 已結束接手）",
+                crate::takeover::announce_resumed(),
+                rec.holder_display
+            ),
+            Ok(None) => "目前沒有人接手這個對話，無需變更。".to_string(),
+            Err(e) => {
+                warn!(session_id, error = %e, "takeover: end failed");
+                "⚠️ 結束接手失敗，請稍後再試。".to_string()
+            }
+        },
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1451,5 +1657,584 @@ mod model_switch_tests {
     fn validate_model_name_rejects_an_over_long_value() {
         assert!(validate_model_name(&"a".repeat(65)).is_err());
         assert!(validate_model_name(&"a".repeat(64)).is_ok());
+    }
+}
+
+// ── /rules — 經驗法則 (W3-2, D-O3 = A) ───────────────────────────────
+//
+// Self-evolution is this product's headline claim, and until now the rules an
+// AI employee had learned were visible only in the dashboard. `/rules` puts
+// them where the user already is, at zero LLM cost (the whole command is a
+// SQLite read plus `playbook::humanize` template assembly).
+//
+// Everything below is deliberately at the file tail to keep the merge surface
+// with other in-flight command work down to the three one-line hooks above.
+
+/// Default channel summary size (D.14: 通道前 3 條摘要).
+const RULES_SUMMARY_LIMIT: usize = 3;
+/// `/rules all` hard cap — a channel message is not a dashboard; past this we
+/// say how many were withheld rather than flooding the chat.
+const RULES_FULL_LIMIT: usize = 15;
+
+/// Status keys shown by the bare `/rules` summary: the rules that are actually
+/// steering behaviour right now.
+const RULES_IN_EFFECT: &[&str] = &["active", "trial"];
+/// Additional status keys `/rules all` surfaces. `retired` (已淘汰) is
+/// deliberately absent from both — a dead rule is dashboard history, not news.
+const RULES_ALL_EXTRA: &[&str] = &["observing", "dormant"];
+
+/// One rule prepared for channel rendering.
+struct RuleLine {
+    status: String,
+    sentence: String,
+    streak: u32,
+    helpful: u32,
+    harmful: u32,
+    applications: usize,
+}
+
+/// Deterministic, zero-LLM channel rendering of an agent's experience rules.
+///
+/// Pure over its input so the wording is unit-testable without a database;
+/// [`handle_rules`] is only the I/O around it.
+fn render_rules_message(lines: &[RuleLine], total_in_effect: usize, all: bool) -> String {
+    if lines.is_empty() {
+        return if all {
+            "📘 這位 AI 員工還沒有累積任何經驗法則。等它做過幾次任務、從結果裡歸納出原則後，這裡就會有內容。"
+                .to_string()
+        } else {
+            "📘 目前沒有生效中的經驗法則。輸入 `/rules all` 可以看還在觀察中的項目。".to_string()
+        };
+    }
+
+    let header = if all {
+        format!("📘 *經驗法則*（共 {} 條）", lines.len())
+    } else {
+        format!(
+            "📘 *經驗法則*（生效中 {total_in_effect} 條，以下列出前 {}）",
+            lines.len()
+        )
+    };
+
+    let mut out = vec![header, String::new()];
+    for (i, l) in lines.iter().enumerate() {
+        out.push(format!("{}. 〔{}〕{}", i + 1, l.status, l.sentence));
+        let used = l.applications.max((l.helpful + l.harmful) as usize);
+        let mut tail = if used == 0 {
+            "還沒有實際使用紀錄".to_string()
+        } else {
+            format!("用過 {used} 次，{} 次有幫助、{} 次幫倒忙", l.helpful, l.harmful)
+        };
+        if l.streak > 0 {
+            tail.push_str(&format!("；連續 {} 次沒出問題", l.streak));
+        }
+        out.push(format!("   ↳ {tail}"));
+    }
+
+    out.push(String::new());
+    if all {
+        out.push(
+            "要停用某一條，輸入 `/rules off <上面的編號>`（限管理員／主管）；或到 儀表板 → 記憶 → 自主進化。"
+                .to_string(),
+        );
+    } else {
+        out.push(
+            "輸入 `/rules all` 看全部＋編號；要停用某一條，先看 `/rules all` 的編號再輸入 `/rules off <編號>`（限管理員／主管）。"
+                .to_string(),
+        );
+    }
+    out.join("\n")
+}
+
+/// Result of [`ranked_rule_lines`]: entries already filtered, sorted, and
+/// truncated the way `/rules`/`/rules all` render them, plus the counts
+/// needed for the header/footer text.
+struct RankedRules {
+    /// `(playbook entry id, rendered line)`, in display order — position `i`
+    /// here is exactly "line `i + 1`" in the rendered message, and exactly
+    /// what `/rules off <n>` (W3-5) resolves `n` against (see
+    /// [`handle_rules_off`]). Carrying the id alongside the line means the
+    /// two commands share one query/sort instead of risking two independent
+    /// ones silently drifting apart.
+    entries: Vec<(String, RuleLine)>,
+    in_effect: usize,
+    /// Count before the display limit was applied — `entries.len()` alone
+    /// can't tell the caller whether anything was truncated.
+    total: usize,
+}
+
+/// Rank + filter an agent's playbook entries exactly the way `/rules`
+/// renders them: `all=false` → only the top [`RULES_SUMMARY_LIMIT`]
+/// currently-in-effect entries; `all=true` → up to [`RULES_FULL_LIMIT`]
+/// entries across the wider `RULES_IN_EFFECT ∪ RULES_ALL_EXTRA` visibility
+/// set. Sorted by (net score, then streak) — the same order the injection
+/// path ranks by, so what the user reads first is what the model actually
+/// sees first.
+async fn ranked_rule_lines(
+    engine: &duduclaw_memory::SqliteMemoryEngine,
+    agent_id: &str,
+    all: bool,
+) -> RankedRules {
+    let mut prepared: Vec<(i64, u32, String, RuleLine)> = Vec::new();
+    let mut in_effect = 0usize;
+    for (mem, meta, stats) in crate::playbook::list_active(engine, agent_id).await {
+        let h = crate::playbook::humanize(&mem.content, &meta, &stats, &mem.tags);
+        let visible = RULES_IN_EFFECT.contains(&h.status_key)
+            || (all && RULES_ALL_EXTRA.contains(&h.status_key));
+        if RULES_IN_EFFECT.contains(&h.status_key) {
+            in_effect += 1;
+        }
+        if !visible {
+            continue;
+        }
+        prepared.push((
+            stats.net(),
+            meta.success_streak,
+            mem.id.clone(),
+            RuleLine {
+                status: h.status.clone(),
+                sentence: h.sentence.clone(),
+                streak: h.evidence.success_streak,
+                helpful: h.evidence.helpful,
+                harmful: h.evidence.harmful,
+                applications: h.evidence.applications,
+            },
+        ));
+    }
+
+    prepared.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let limit = if all { RULES_FULL_LIMIT } else { RULES_SUMMARY_LIMIT };
+    let total = prepared.len();
+    let entries = prepared.into_iter().take(limit).map(|(_, _, id, l)| (id, l)).collect();
+    RankedRules { entries, in_effect, total }
+}
+
+async fn handle_rules(ctx: &ReplyContext, agent_id: &str, all: bool) -> String {
+    let Some(db_path) = ctx.memory_db_path.clone() else {
+        return "📘 這位 AI 員工還沒有開啟記憶功能，所以還不會累積經驗法則。".to_string();
+    };
+    if !db_path.exists() {
+        return "📘 這位 AI 員工還沒有累積任何經驗法則。".to_string();
+    }
+    let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(agent = agent_id, error = %e, "/rules: failed to open memory db");
+            return "⚠️ 暫時讀不到經驗法則，請稍後再試。".to_string();
+        }
+    };
+
+    let ranked = ranked_rule_lines(&engine, agent_id, all).await;
+    let shown = ranked.entries.len();
+    let lines: Vec<RuleLine> = ranked.entries.into_iter().map(|(_, l)| l).collect();
+
+    let mut msg = render_rules_message(&lines, ranked.in_effect, all);
+    if all && ranked.total > shown {
+        msg.push_str(&format!("\n（另有 {} 條未列出，完整清單請看儀表板。）", ranked.total - shown));
+    }
+    msg
+}
+
+/// `/rules off <n>` (W3-5): disable the rule at position `n` in the SAME
+/// numbering `/rules all` shows ([`ranked_rule_lines`] with `all=true` — one
+/// shared query/sort, so the two commands can never disagree about what
+/// "#n" means). Retires through the existing manual-retire path
+/// (`playbook::PlaybookDelta::Retire` + `apply_deltas`, the same one
+/// `handlers.rs`'s `playbook.retire` dashboard RPC uses), so an in-channel
+/// disable is auditable exactly like a dashboard one, and records one
+/// Activity Feed row (`playbook_rule_retired`, matching the dashboard path's
+/// event shape).
+///
+/// ## Authorization
+///
+/// Reuses [`crate::takeover::manager_display_name`] — the SAME
+/// identity-verified Admin/Manager predicate typing-takeover (W3-1) and
+/// `/takeover` use — NOT the looser per-channel `admin_users` list every
+/// other command's `is_admin` gates on. Disabling a rule is a persistent
+/// write to the agent's playbook (it stops steering every future turn), not
+/// a read; a deployment/channel with no dashboard identity bound to the
+/// sender's account refuses outright and points at the dashboard, rather
+/// than silently falling back to the weaker gate.
+async fn handle_rules_off(
+    ctx: &ReplyContext,
+    session_id: &str,
+    channel_user_id: &str,
+    agent_id: &str,
+    n: u32,
+) -> String {
+    let home = ctx.home_dir.as_path();
+
+    if !crate::takeover::identity_available(home) {
+        return "⚠️ 這個部署還沒有設定任何管理員身分綁定，無法在通道內停用經驗法則。請改用 儀表板 → 記憶 → 自主進化。"
+            .to_string();
+    }
+    let Some((channel, _)) = duduclaw_core::takeover_state::conversation_target(session_id) else {
+        return "⚠️ 這個對話無法使用此指令。".to_string();
+    };
+    if crate::takeover::manager_display_name(home, &channel, channel_user_id).is_none() {
+        return "⚠️ 您沒有停用經驗法則的權限，請先於儀表板以此通道帳號完成管理員／主管綁定。".to_string();
+    }
+
+    let Some(db_path) = ctx.memory_db_path.clone() else {
+        return "📘 這位 AI 員工還沒有開啟記憶功能，沒有經驗法則可以停用。".to_string();
+    };
+    if !db_path.exists() {
+        return "📘 這位 AI 員工還沒有累積任何經驗法則。".to_string();
+    }
+    let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(agent = agent_id, error = %e, "/rules off: failed to open memory db");
+            return "⚠️ 暫時讀不到經驗法則，請稍後再試。".to_string();
+        }
+    };
+
+    let ranked = ranked_rule_lines(&engine, agent_id, true).await;
+    let Some((entry_id, line)) = resolve_rule_ordinal(&ranked.entries, n) else {
+        return format!(
+            "⚠️ 找不到編號 {n} 的規則。請先輸入 `/rules all` 確認目前的編號（目前共 {} 條）。",
+            ranked.entries.len()
+        );
+    };
+
+    let eval_cases_root = home.join("agents").join(agent_id).join("evals");
+    let delta = crate::playbook::PlaybookDelta::Retire {
+        id: entry_id.clone(),
+        reason: format!("channel /rules off (by {channel_user_id})"),
+    };
+    let outcome = crate::playbook::apply_deltas(
+        &engine,
+        agent_id,
+        vec![delta],
+        &[],
+        &eval_cases_root,
+        chrono::Utc::now(),
+    )
+    .await;
+
+    if let Some((_, reason)) = outcome.rejected.first() {
+        warn!(agent_id, n, reason, "/rules off: retire rejected");
+        return "⚠️ 停用失敗，請稍後再試或改用儀表板。".to_string();
+    }
+    let retired = outcome
+        .applied
+        .iter()
+        .any(|op| matches!(op, crate::playbook::AppliedOp::Retired { .. }));
+    if !retired {
+        return "這條規則似乎已經停用了，無需重複操作。".to_string();
+    }
+
+    // Activity Feed — same event shape `playbook.retire`'s dashboard RPC
+    // uses, so an in-channel disable shows up next to a dashboard one rather
+    // than being invisible outside this one chat.
+    if let Ok(store) = crate::task_store::TaskStore::open(home) {
+        let row = crate::task_store::ActivityRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: "playbook_rule_retired".to_string(),
+            agent_id: agent_id.to_string(),
+            task_id: None,
+            summary: format!("管理者透過通道停用了 AI 員工「{agent_id}」的一條經驗法則"),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            metadata: None,
+        };
+        if let Err(e) = store.append_activity(&row).await {
+            tracing::debug!(error = %e, "/rules off: activity append failed (non-fatal)");
+        }
+    }
+
+    format!("✅ 已停用第 {n} 條規則：{}", line.sentence)
+}
+
+/// Resolve a 1-based `/rules off <n>` ordinal against the SAME slice
+/// `/rules all` rendered, or `None` for `0` / out of range. Pure so the
+/// off-by-one/bounds edge cases are unit-testable without a database.
+fn resolve_rule_ordinal(entries: &[(String, RuleLine)], n: u32) -> Option<&(String, RuleLine)> {
+    let idx = usize::try_from(n).ok()?.checked_sub(1)?;
+    entries.get(idx)
+}
+
+#[cfg(test)]
+mod rules_command_tests {
+    use super::*;
+
+    fn line(status: &str, sentence: &str, helpful: u32, harmful: u32, streak: u32) -> RuleLine {
+        RuleLine {
+            status: status.to_string(),
+            sentence: sentence.to_string(),
+            streak,
+            helpful,
+            harmful,
+            applications: (helpful + harmful) as usize,
+        }
+    }
+
+    #[test]
+    fn parses_bare_and_all_forms() {
+        assert_eq!(parse_command("/rules", None), Some(ChatCommand::Rules { all: false, off: None }));
+        assert_eq!(parse_command("/rules all", None), Some(ChatCommand::Rules { all: true, off: None }));
+        assert_eq!(parse_command("/RULES ALL", None), Some(ChatCommand::Rules { all: true, off: None }));
+        // A mistyped tail degrades to the summary rather than erroring out.
+        assert_eq!(
+            parse_command("/rules everything", None),
+            Some(ChatCommand::Rules { all: false, off: None })
+        );
+    }
+
+    #[test]
+    fn parses_off_forms() {
+        assert_eq!(
+            parse_command("/rules off 3", None),
+            Some(ChatCommand::Rules { all: false, off: Some(3) })
+        );
+        assert_eq!(
+            parse_command("/rules OFF 12", None),
+            Some(ChatCommand::Rules { all: false, off: Some(12) })
+        );
+        // Extra whitespace tolerated.
+        assert_eq!(
+            parse_command("/rules   off   3  ", None),
+            Some(ChatCommand::Rules { all: false, off: Some(3) })
+        );
+    }
+
+    #[test]
+    fn off_with_a_missing_or_non_numeric_index_is_recognized_not_silently_ignored() {
+        // `off` alone or with garbage still parses as an `off` command (with
+        // a deliberately out-of-range 0) rather than falling back to the
+        // bare/all summary — a person who typed `/rules off` deserves
+        // "which number?", not a listing that looks like `off` vanished.
+        assert_eq!(parse_command("/rules off", None), Some(ChatCommand::Rules { all: false, off: Some(0) }));
+        assert_eq!(
+            parse_command("/rules off abc", None),
+            Some(ChatCommand::Rules { all: false, off: Some(0) })
+        );
+    }
+
+    #[test]
+    fn rules_is_readonly_so_it_never_demands_the_weak_admin_gate() {
+        // `requires_admin()` gates the looser per-channel `admin_users`
+        // check; `/rules off` uses the STRONGER identity-verified
+        // `takeover::manager_display_name` predicate instead (enforced
+        // inside `handle_rules_off`), so it must stay `false` here too —
+        // otherwise a channel with no admin_users configured at all would
+        // refuse the command before ever reaching the real gate.
+        assert!(!ChatCommand::Rules { all: false, off: None }.requires_admin());
+        assert!(!ChatCommand::Rules { all: true, off: None }.requires_admin());
+        assert!(!ChatCommand::Rules { all: false, off: Some(1) }.requires_admin());
+    }
+
+    #[test]
+    fn empty_state_differs_between_summary_and_full_list() {
+        let summary = render_rules_message(&[], 0, false);
+        assert!(summary.contains("/rules all"), "{summary}");
+        let full = render_rules_message(&[], 0, true);
+        assert!(!full.contains("/rules all"), "{full}");
+        assert!(full.contains("還沒有累積"), "{full}");
+    }
+
+    #[test]
+    fn summary_numbers_rules_and_reports_the_in_effect_total() {
+        let lines = vec![
+            line("生效中", "當提到「訂單」時，我會先查資料庫再回覆。", 4, 0, 4),
+            line("試用中", "當明顯出錯時，我會先說明原因。", 1, 0, 1),
+        ];
+        let msg = render_rules_message(&lines, 5, false);
+        assert!(msg.contains("生效中 5 條"), "{msg}");
+        assert!(msg.contains("1. 〔生效中〕"), "{msg}");
+        assert!(msg.contains("2. 〔試用中〕"), "{msg}");
+        assert!(msg.contains("用過 4 次，4 次有幫助、0 次幫倒忙"), "{msg}");
+        assert!(msg.contains("連續 4 次沒出問題"), "{msg}");
+    }
+
+    #[test]
+    fn an_unused_rule_says_so_instead_of_printing_a_fake_zero_record() {
+        let msg = render_rules_message(&[line("試用中", "我會先問清楚。", 0, 0, 0)], 1, false);
+        assert!(msg.contains("還沒有實際使用紀錄"), "{msg}");
+        assert!(!msg.contains("用過 0 次"), "{msg}");
+    }
+
+    #[test]
+    fn channel_copy_never_leaks_internal_vocabulary() {
+        let msg = render_rules_message(
+            &[line("觀察中（尚未生效）", "當踩到安全界線時，我會先徵求同意。", 0, 0, 0)],
+            0,
+            true,
+        );
+        for internal in ["playbook", "Playbook", "shadow", "probation", "GVU", "AEE", "SOUL"] {
+            assert!(!msg.contains(internal), "leaked `{internal}`: {msg}");
+        }
+        // And the empty states too.
+        for msg in [render_rules_message(&[], 0, false), render_rules_message(&[], 0, true)] {
+            for internal in ["playbook", "shadow", "probation", "GVU"] {
+                assert!(!msg.contains(internal), "leaked `{internal}`: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn help_advertises_the_command() {
+        let help = handle_help();
+        assert!(help.contains("/rules"), "{help}");
+        assert!(help.contains("經驗法則"), "{help}");
+    }
+
+    // ── W3-5 `/rules off <n>` — id/ordinal pairing correctness ─────────
+    // The property that actually matters for "不會停錯條": whatever
+    // `ranked_rule_lines` renders as line `n` is the exact entry
+    // `resolve_rule_ordinal(_, n)` returns, and retiring that id touches
+    // only that one row.
+
+    fn temp_rules_eval_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let suite = dir.path().join("s");
+        std::fs::create_dir(&suite).unwrap();
+        std::fs::write(
+            suite.join("c.toml"),
+            "[case]\nname = \"c\"\nagent = \"a\"\nprompt = \"hi\"\n[judge]\nrubric = \"r\"\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn rule_add_delta(content: &str) -> crate::playbook::PlaybookDelta {
+        crate::playbook::PlaybookDelta::Add {
+            assertions: crate::playbook::entry::EntryAssertions {
+                output_contains: vec!["ok".to_string()],
+                ..Default::default()
+            },
+            content: content.to_string(),
+            category: crate::playbook::PlaybookCategory::Repair,
+            signals_match: vec!["*".to_string()],
+            eval_cases: vec![crate::playbook::EvalCaseRef("s/c".to_string())],
+            strategy: Vec::new(),
+            rationale: "test".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ranked_rule_lines_gives_every_entry_a_distinct_id() {
+        let engine = duduclaw_memory::SqliteMemoryEngine::in_memory().unwrap();
+        let evals = temp_rules_eval_root();
+        let agent = "agent-rules-off";
+        let now = chrono::Utc::now();
+
+        let deltas = vec![rule_add_delta("rule about refunds"), rule_add_delta("rule about discord")];
+        let outcome =
+            crate::playbook::apply_deltas(&engine, agent, deltas, &[], evals.path(), now).await;
+        assert_eq!(outcome.applied.len(), 2, "{outcome:?}");
+
+        let ranked = ranked_rule_lines(&engine, agent, true).await;
+        assert_eq!(ranked.entries.len(), 2);
+        assert_eq!(ranked.total, 2);
+        let ids: std::collections::HashSet<&str> =
+            ranked.entries.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "ids must not collide");
+    }
+
+    #[tokio::test]
+    async fn retiring_the_ordinal_resolved_id_touches_only_that_entry() {
+        let engine = duduclaw_memory::SqliteMemoryEngine::in_memory().unwrap();
+        let evals = temp_rules_eval_root();
+        let agent = "agent-rules-off-2";
+        let now = chrono::Utc::now();
+
+        let deltas = vec![rule_add_delta("keep me"), rule_add_delta("retire me")];
+        crate::playbook::apply_deltas(&engine, agent, deltas, &[], evals.path(), now).await;
+
+        let before = ranked_rule_lines(&engine, agent, true).await;
+        assert_eq!(before.entries.len(), 2);
+        let (target_id, _) = resolve_rule_ordinal(&before.entries, 2).expect("ordinal 2 must resolve");
+
+        let retire = crate::playbook::PlaybookDelta::Retire { id: target_id.clone(), reason: "test".into() };
+        let outcome =
+            crate::playbook::apply_deltas(&engine, agent, vec![retire], &[], evals.path(), now).await;
+        assert!(outcome.rejected.is_empty(), "{outcome:?}");
+
+        let after = ranked_rule_lines(&engine, agent, true).await;
+        assert_eq!(after.entries.len(), 1, "only the resolved id should be gone");
+        assert!(
+            after.entries.iter().all(|(id, _)| id != target_id),
+            "the retired id must not resurface"
+        );
+    }
+
+    #[test]
+    fn resolve_rule_ordinal_rejects_zero_and_out_of_range() {
+        let entries = vec![
+            ("id-1".to_string(), line("生效中", "first", 0, 0, 0)),
+            ("id-2".to_string(), line("生效中", "second", 0, 0, 0)),
+        ];
+        assert!(resolve_rule_ordinal(&entries, 0).is_none());
+        assert_eq!(resolve_rule_ordinal(&entries, 1).unwrap().0, "id-1");
+        assert_eq!(resolve_rule_ordinal(&entries, 2).unwrap().0, "id-2");
+        assert!(resolve_rule_ordinal(&entries, 3).is_none());
+        assert!(resolve_rule_ordinal(&entries, u32::MAX).is_none());
+    }
+}
+
+#[cfg(test)]
+mod takeover_command_tests {
+    use super::*;
+
+    // ── W3-1 `/takeover` (D3) ───────────────────────────────────
+
+    #[test]
+    fn takeover_parses_its_three_shapes() {
+        use TakeoverCommand::*;
+        assert_eq!(parse_takeover("/takeover"), Some(Status));
+        assert_eq!(parse_takeover("  /takeover  "), Some(Status));
+        assert_eq!(parse_takeover("/TAKEOVER"), Some(Status));
+        assert_eq!(parse_takeover("/takeover@DuDuBot"), Some(Status));
+
+        assert_eq!(parse_takeover("/takeover end"), Some(End));
+        assert_eq!(parse_takeover("/takeover END"), Some(End));
+        assert_eq!(parse_takeover("/takeover 結束"), Some(End));
+        assert_eq!(parse_takeover("/takeover@DuDuBot end"), Some(End));
+
+        assert_eq!(parse_takeover("/takeover +30m"), Some(Extend(30)));
+        assert_eq!(parse_takeover("/takeover +30"), Some(Extend(30)));
+        assert_eq!(parse_takeover("/takeover 30m"), Some(Extend(30)));
+        assert_eq!(parse_takeover("/takeover +45min"), Some(Extend(45)));
+        // Full-width plus / m from a zh-TW IME.
+        assert_eq!(parse_takeover("/takeover ＋30ｍ"), Some(Extend(30)));
+    }
+
+    #[test]
+    fn takeover_never_silently_ignores_a_malformed_tail() {
+        // Anything unparseable falls back to Status, which prints usage —
+        // a person who typed a command must never get silence.
+        assert_eq!(parse_takeover("/takeover wat"), Some(TakeoverCommand::Status));
+        assert_eq!(parse_takeover("/takeover -5"), Some(TakeoverCommand::Status));
+        assert_eq!(parse_takeover("/takeover +0m"), Some(TakeoverCommand::Status));
+    }
+
+    #[test]
+    fn takeover_does_not_capture_other_input() {
+        assert_eq!(parse_takeover("/status"), None);
+        assert_eq!(parse_takeover("/take over"), None);
+        assert_eq!(parse_takeover("takeover"), None);
+        assert_eq!(parse_takeover("我要 /takeover"), None);
+        assert_eq!(parse_takeover(""), None);
+        // `/takeovers` must not match a prefix.
+        assert_eq!(parse_takeover("/takeovers"), None);
+    }
+
+    #[test]
+    fn takeover_is_not_a_legacy_chat_command() {
+        // It is dispatched from the reply pipeline, not the per-channel
+        // interceptor — `parse_command` must leave it alone so channels that
+        // fall through on an unknown slash command reach that pipeline.
+        assert_eq!(parse_command("/takeover", None), None);
+        assert_eq!(parse_command("/takeover end", None), None);
+    }
+
+    #[test]
+    fn help_advertises_takeover() {
+        let help = handle_help();
+        assert!(help.contains("/takeover"), "{help}");
+        // No internal vocabulary in a user-facing help screen.
+        for internal in ["takeover_state", "claimed_by", "session_id", "needs_human"] {
+            assert!(!help.contains(internal), "leaked `{internal}`: {help}");
+        }
     }
 }

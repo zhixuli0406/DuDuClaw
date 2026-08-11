@@ -571,6 +571,7 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
                 &session_id,
                 &agent_id,
                 true,
+                &from_user,
             )
             .await;
             if !reply.trim().is_empty() {

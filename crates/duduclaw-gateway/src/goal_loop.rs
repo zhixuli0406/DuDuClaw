@@ -738,6 +738,23 @@ impl GoalLoopDriver {
         };
 
         for task in &candidates {
+            // ── W3-1 D5: a human holds this task's conversation ──
+            // Freeze, do not escalate: the person who took over IS the human
+            // an escalation would page, and parking the task `needs_human`
+            // would fire a card at them mid-conversation. The task simply
+            // waits; the next tick after the window closes picks it up
+            // unchanged. Checked before the deadline guard so a long takeover
+            // cannot silently burn a task's wall clock into an escalation.
+            if let (Some(ch), Some(cid)) = (
+                task.source_channel.as_deref(),
+                task.source_chat_id.as_deref(),
+            ) {
+                if crate::takeover::is_target_paused(&self.home_dir, ch, cid) {
+                    crate::takeover::log_skip("goal_loop.dispatch", ch, cid, &task.id);
+                    continue;
+                }
+            }
+
             // ── Wall-clock guard (from created_at) ──
             if self.deadline_exceeded(&task.created_at, now) {
                 self.escalate(&mut inflight, task, "goal-loop deadline").await?;
@@ -2721,6 +2738,94 @@ mod tests {
         assert!(
             !d.state_capture_seen.lock().await.contains("g1"),
             "escalate() must clear state_capture_seen too"
+        );
+    }
+
+    // ── W3-1 (D5): the goal loop is the highest-volume dispatch path into a
+    //    conversation. A human who takes over must freeze it — and only it. ──
+
+    fn begin_takeover(home: &Path, channel: &str, chat_id: &str) {
+        duduclaw_core::takeover_state::begin(
+            home,
+            &duduclaw_core::takeover_state::BeginRequest {
+                conversation: format!("{channel}:{chat_id}"),
+                agent_id: "alice".into(),
+                holder_user_id: "555".into(),
+                holder_display: "王小明".into(),
+            },
+            &duduclaw_core::takeover_state::TakeoverConfig::default(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    }
+
+    fn goal_task_from_chat(id: &str, chat_id: &str) -> TaskRow {
+        let mut t = goal_task(id, "alice");
+        t.source_channel = Some("telegram".into());
+        t.source_chat_id = Some(chat_id.to_string());
+        t
+    }
+
+    #[tokio::test]
+    async fn goal_dispatch_freezes_while_a_human_holds_the_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store
+            .insert_task(&goal_task_from_chat("g1", "12345"))
+            .await
+            .unwrap();
+        begin_takeover(dir.path(), "telegram", "12345");
+
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf());
+        d.tick_once().await.unwrap();
+        assert!(
+            queue.pending_messages(10).await.unwrap().is_empty(),
+            "no dispatch into a conversation a human is running"
+        );
+
+        // Frozen, not escalated: parking it `needs_human` would page the very
+        // person who is already handling it.
+        let t = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(t.status, "todo");
+
+        // Handback resumes the loop unchanged.
+        duduclaw_core::takeover_state::end(dir.path(), "telegram:12345", chrono::Utc::now())
+            .unwrap();
+        d.tick_once().await.unwrap();
+        assert_eq!(
+            queue.pending_messages(10).await.unwrap().len(),
+            1,
+            "the goal is dispatched once the human hands back"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_dispatch_takeover_is_scoped_to_the_held_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store
+            .insert_task(&goal_task_from_chat("g-other", "99999"))
+            .await
+            .unwrap();
+        store.insert_task(&goal_task("g-nosource", "alice")).await.unwrap();
+        begin_takeover(dir.path(), "telegram", "12345");
+
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf());
+        d.tick_once().await.unwrap();
+
+        let dispatched: Vec<String> = queue
+            .pending_messages(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.target)
+            .collect();
+        assert_eq!(
+            dispatched.len(),
+            2,
+            "a takeover on one conversation must not freeze the whole board"
         );
     }
 }

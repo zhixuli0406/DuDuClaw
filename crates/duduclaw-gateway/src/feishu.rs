@@ -338,7 +338,10 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command(&cmd, &state.ctx, &session_id, &agent_id, true).await;
+            let reply = crate::chat_commands::handle_command(
+                &cmd, &state.ctx, &session_id, &agent_id, true, sender,
+            )
+            .await;
             if !reply.trim().is_empty() {
                 send_message(state, chat_id, &reply).await;
             }

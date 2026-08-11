@@ -1164,6 +1164,33 @@ async fn handle_command(
             } else {
                 format!("{cmd} {args}")
             };
+            // W3-1: `/takeover` is handled inside the reply pipeline (it needs
+            // the sender's account id, which this interceptor does not carry).
+            // Every other channel reaches that pipeline by falling through on
+            // an unrecognised slash command; Telegram is the one that drops
+            // them (see the "legacy behavior" note below), so route it
+            // explicitly rather than letting the command vanish.
+            if crate::chat_commands::parse_takeover(&normalized).is_some() {
+                let session_id = match thread_id {
+                    Some(tid) => format!("telegram:{chat_id}:{tid}"),
+                    None => format!("telegram:{chat_id}"),
+                };
+                let sender = from_user_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| scope_id.to_string());
+                let reply = crate::channel_reply::build_reply_with_session(
+                    &normalized,
+                    ctx,
+                    &session_id,
+                    &sender,
+                    None,
+                )
+                .await;
+                if !reply.trim().is_empty() {
+                    send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
+                }
+                return;
+            }
             if let Some(parsed) = crate::chat_commands::parse_command(&normalized, None) {
                 let session_id = if let Some(tid) = thread_id {
                     format!("telegram:{chat_id}:{tid}")
@@ -1189,8 +1216,12 @@ async fn handle_command(
                 }
                 let is_admin =
                     crate::channel_reply::is_channel_admin(ctx, "telegram", &identities).await;
+                // The sender's own account id (not `scope_id`, which may be a
+                // group/chat id) — the identity `/rules off`'s mapped_role
+                // gate resolves against.
+                let channel_user_id = from_id_str.as_deref().unwrap_or(scope_id);
                 let reply = crate::chat_commands::handle_command(
-                    &parsed, ctx, &session_id, &agent_id, is_admin,
+                    &parsed, ctx, &session_id, &agent_id, is_admin, channel_user_id,
                 )
                 .await;
                 send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;

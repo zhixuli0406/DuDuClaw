@@ -416,8 +416,10 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
                 let reg = state.ctx.registry.read().await;
                 reg.main_agent().map(|a| a.config.agent.name.clone()).unwrap_or_default()
             };
-            let reply =
-                crate::chat_commands::handle_command(&cmd, &state.ctx, &session_id, &agent_id, true).await;
+            let reply = crate::chat_commands::handle_command(
+                &cmd, &state.ctx, &session_id, &agent_id, true, &sender_id,
+            )
+            .await;
             deliver_reply(&state.creds, &space, thread.as_deref(), placeholder.as_deref(), &reply).await;
             return;
         }

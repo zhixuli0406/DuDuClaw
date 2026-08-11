@@ -5365,6 +5365,19 @@ impl MethodHandler {
                 self.handle_topology_list().await
             }
 
+            // ── W3-1 human takeover: READ-ONLY surface ──────
+            // Deliberately the only takeover RPC. Starting / extending /
+            // ending a takeover is a channel-side act (speaking, or
+            // `/takeover` in the conversation) — mirroring it as a dashboard
+            // write would create a second authorization model for the same
+            // state and let somebody "take over" a conversation they are not
+            // actually in. The dashboard's job here is to show that a human
+            // is on it; a UI consumer is a follow-up.
+            "takeover.list" => {
+                require_manager!();
+                self.handle_takeover_list()
+            }
+
             // Install approval requests (Skill / MCP two-stage signature chain)
             "install_requests.list" => {
                 require_manager!();
@@ -19024,6 +19037,12 @@ impl MethodHandler {
         let entries: Vec<Value> = active
             .into_iter()
             .map(|(mem, meta, stats)| {
+                // W3-2: the stored `content` is written for the model. Every
+                // read surface also gets the zero-LLM zh-TW rewrite so the UI
+                // can lead with plain language and keep the raw text folded
+                // away. `tags` carry the shadow/probation signal the metadata
+                // blob alone cannot express (see `humanize::status_of`).
+                let h = playbook::humanize(&mem.content, &meta, &stats, &mem.tags);
                 json!({
                     "id": mem.id,
                     "content": mem.content,
@@ -19038,6 +19057,25 @@ impl MethodHandler {
                     "net_score": stats.net(),
                     "origin": meta.origin,
                     "created_at": mem.timestamp.to_rfc3339(),
+                    "humanized": {
+                        "sentence": h.sentence,
+                        "condition": h.condition,
+                        "action": h.action,
+                        "purpose": h.purpose,
+                        "purpose_key": h.purpose_key,
+                        "status": h.status,
+                        "status_key": h.status_key,
+                        "why": h.why,
+                        "fallback": h.fallback,
+                        "evidence": {
+                            "eval_cases": h.evidence.eval_cases,
+                            "failure_notes": h.evidence.failure_notes,
+                            "applications": h.evidence.applications,
+                            "helpful": h.evidence.helpful,
+                            "harmful": h.evidence.harmful,
+                            "success_streak": h.evidence.success_streak,
+                        },
+                    },
                 })
             })
             .collect();
@@ -19107,6 +19145,24 @@ impl MethodHandler {
                     "reason": "entry not found (already retired or unknown id)",
                 }),
             );
+        }
+        // W3-2: a human switching a rule off is a learning event too — record
+        // it so the daily digest and the Activity Feed show it next to the
+        // automatic adoptions/rollbacks. Best-effort: the retire already
+        // succeeded, so a feed failure must not turn into an RPC error.
+        if let Some(store) = self.task_store.read().await.clone() {
+            let row = ActivityRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_type: "playbook_rule_retired".to_string(),
+                agent_id: agent_id.to_string(),
+                task_id: None,
+                summary: format!("管理者停用了 AI 員工「{agent_id}」的一條經驗法則"),
+                timestamp: Utc::now().to_rfc3339(),
+                metadata: None,
+            };
+            if let Err(e) = store.append_activity(&row).await {
+                tracing::debug!(error = %e, "playbook.retire: activity append failed (non-fatal)");
+            }
         }
         WsFrame::ok_response("", json!({ "success": true, "retired": true, "id": entry_id }))
     }
@@ -27667,6 +27723,34 @@ impl MethodHandler {
         )
     }
 
+    /// W3-1: conversations a human has currently taken over (read-only).
+    ///
+    /// No write twin by design — see the `takeover.list` dispatch note.
+    /// `holder_user_id` is deliberately omitted: the dashboard needs to show
+    /// *who*, and the display name does that without exposing a channel
+    /// account id to every manager who opens the page.
+    fn handle_takeover_list(&self) -> WsFrame {
+        let now = chrono::Utc::now();
+        let items: Vec<Value> = duduclaw_core::takeover_state::list_active(&self.home_dir)
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "conversation": r.conversation,
+                    "channel": r.channel,
+                    "channel_label": crate::takeover::channel_label(&r.channel),
+                    "chat_id": r.chat_id,
+                    "agent_id": r.agent_id,
+                    "holder_display": r.holder_display,
+                    "started_at": r.started_at.to_rfc3339(),
+                    "until": r.until.to_rfc3339(),
+                    "minutes_left": r.minutes_left(now),
+                    "claimed_task_ids": r.claimed_task_ids,
+                })
+            })
+            .collect();
+        WsFrame::ok_response("", json!({ "count": items.len(), "items": items }))
+    }
+
     /// WP14-T14.7: decide a pending approval from the dashboard ("就地同意/退回").
     /// Board-only kinds (WP17 StrategicPlan/AgentHire) require admin — the
     /// dashboard's fail-closed stand-in for board rights until a board-user model
@@ -28476,6 +28560,10 @@ impl MethodHandler {
                     "unchanged": counters.dropped_unchanged,
                     "oversize": counters.dropped_oversize,
                     "fetch_error": counters.dropped_fetch_error,
+                    // D5-W — websocket-only: binary frames the text pipeline
+                    // refuses. Always present (0 for the polling kinds) so the
+                    // dashboard's dropped total never has to guess a key.
+                    "non_text": counters.dropped_non_text,
                 },
             }));
         }
@@ -37699,6 +37787,9 @@ mod resident_sensing_dashboard_tests {
         assert_eq!(s0["events_emitted_total"], 2);
         assert_eq!(s0["dropped"]["rate_cap"], 1);
         assert_eq!(s0["dropped"]["unchanged"], 0);
+        // D5-W — the websocket-only reason is still reported (as 0) for a
+        // polling source, so the dashboard can sum a fixed set of keys.
+        assert_eq!(s0["dropped"]["non_text"], 0);
         assert!(s0["last_tick_ts"].is_string());
         assert_eq!(p["screen"]["pass"], 1);
         assert_eq!(p["screen"]["drop"], 1);

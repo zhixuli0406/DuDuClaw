@@ -1540,12 +1540,13 @@ impl TaskStore {
     /// terminal state to race against, so a second (or a different
     /// authorized decider's) take-over press simply re-stamps `claimed_by`.
     ///
-    /// This is the scoped-down half of takeover: it stops the loop and
-    /// records who is now handling the task by hand. Actually transferring
-    /// the conversation itself (redirecting inbound channel messages to the
-    /// human instead of the agent) is a separate, larger change deferred to
-    /// a later phase — seeing this task stay `needs_human` is the signal a
-    /// caller uses to know full conversation handoff has NOT happened yet.
+    /// This is the button-driven half of takeover: it stops the loop for one
+    /// parked task and records who is handling it by hand. Taking over the
+    /// **conversation** — pausing inbound AI replies and every scheduled
+    /// dispatch aimed at it — is W3-1's
+    /// [`crate::takeover`] / [`duduclaw_core::takeover_state`], which claims
+    /// the conversation's live goal tasks through
+    /// [`Self::claim_conversation_tasks`] instead.
     pub async fn claim_needs_human(&self, id: &str, decider: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let now = Utc::now().to_rfc3339();
@@ -1557,6 +1558,60 @@ impl TaskStore {
             )
             .map_err(|e| format!("claim needs_human: {e}"))?;
         Ok(n == 1)
+    }
+
+    /// W3-1 (D4): stamp `claimed_by` on every live goal task that came from
+    /// one channel conversation, and return the ids that were stamped.
+    ///
+    /// This is step 2 of the atomic three-in-one a takeover performs (pause
+    /// the conversation, claim its work, post to the Activity Feed). Without
+    /// it, a human who takes over a conversation still shows up on the board
+    /// as "the AI is on it", and the next person to look at the task has no
+    /// way to know somebody is already handling it by hand.
+    ///
+    /// Scope is deliberately narrow:
+    /// - **goal tasks only** (`goal_mode = 1`) — an ordinary board task is not
+    ///   driven by this conversation and must not be silently reassigned.
+    /// - **non-terminal only** — a finished task's `claimed_by` is history.
+    /// - **unclaimed or already this decider's** — one human taking over must
+    ///   not steal a row another worker holds a lease on
+    ///   ([`Self::claim_task`]'s meaning of the same column).
+    pub async fn claim_conversation_tasks(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        decider: &str,
+    ) -> Result<Vec<String>, String> {
+        if channel.trim().is_empty() || chat_id.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM tasks
+                  WHERE COALESCE(goal_mode, 0) = 1
+                    AND source_channel = ?1 AND source_chat_id = ?2
+                    AND status NOT IN ('done', 'cancelled', 'failed')
+                    AND (claimed_by IS NULL OR claimed_by = ?3)",
+            )
+            .map_err(|e| format!("claim conversation tasks (prepare): {e}"))?;
+        let ids: Vec<String> = stmt
+            .query_map(params![channel.trim(), chat_id.trim(), decider], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|e| format!("claim conversation tasks (query): {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        for id in &ids {
+            conn.execute(
+                "UPDATE tasks SET claimed_by = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, decider, now],
+            )
+            .map_err(|e| format!("claim conversation tasks (update {id}): {e}"))?;
+        }
+        Ok(ids)
     }
 
     /// P2a: cancel a task that has not reached a terminal state. Used by the

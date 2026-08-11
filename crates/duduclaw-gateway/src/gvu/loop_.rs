@@ -254,6 +254,16 @@ impl GvuLoop {
         }
     }
 
+    /// W3-2 — FYI-grade evolution record (Activity Feed + evolution event, no
+    /// channel push). See `GvuAlertSink::record_activity` for why this is
+    /// deliberately not [`Self::raise_alert`].
+    async fn record_activity(&self, agent_id: &str, event_type: &str, summary: &str) {
+        match &self.alert_sink {
+            Some(sink) => sink.record_activity(agent_id, event_type, summary).await,
+            None => debug!(agent = %agent_id, event = event_type, "{summary}"),
+        }
+    }
+
     /// Run the full GVU loop for an agent.
     ///
     /// `call_llm` is an async closure that calls Claude and returns the response text.
@@ -516,6 +526,16 @@ impl GvuLoop {
 
             return match result.verdict {
                 super::aee::AeeVerdict::Committed { applied, entry_ids, verdict } => {
+                    // W3-2: a committed round is the 「採用」 half of D.14's
+                    // 試行結果通知. Recorded (not pushed) so the daily digest
+                    // can count it — the user-facing wording is 經驗法則,
+                    // never the internal artifact name.
+                    self.record_activity(
+                        agent_id,
+                        "playbook_rules_updated",
+                        &format!("AI 員工「{agent_id}」更新了 {applied} 條經驗法則"),
+                    )
+                    .await;
                     GvuOutcome::PlaybookEvolved { applied, entry_ids, verdict }
                 }
                 super::aee::AeeVerdict::NotCommitted { gradient, .. } => {

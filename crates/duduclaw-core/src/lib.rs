@@ -17,6 +17,7 @@ pub mod org_field_guard;
 pub mod org_store;
 pub mod platform;
 pub mod sensitivity;
+pub mod takeover_state;
 pub mod text_utils;
 pub mod tool_catalog;
 pub mod traits;
@@ -70,6 +71,10 @@ pub use org_store::{
 };
 pub use platform::{duduclaw_home, duduclaw_instance, expand_tilde, home_dir, mcp_server_key};
 pub use sensitivity::{is_private_session, perception_source_sensitivity, Sensitivity};
+pub use takeover_state::{
+    BeginOutcome as TakeoverBeginOutcome, BeginRequest as TakeoverBeginRequest, TakeoverConfig,
+    TakeoverRecord,
+};
 pub use text_utils::{truncate_bytes, truncate_chars};
 pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
 pub use traits::{Channel, ContainerRuntime, MemoryEngine};

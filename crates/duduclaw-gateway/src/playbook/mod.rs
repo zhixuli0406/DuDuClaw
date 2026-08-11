@@ -10,6 +10,8 @@
 //!
 //! Module map:
 //! - [`entry`] — the `PlaybookMeta` schema + constants (§1.2)
+//! - [`humanize`] — W3-2 zero-LLM zh-TW rewrite layer turning a stored entry
+//!   into 「經驗法則」 copy for the dashboard, `/rules`, and the daily digest
 //! - [`signals`] — the `signals_match` vocabulary, `TurnSignals` assembly,
 //!   and matching (§1.3)
 //! - [`gene`] — lossless GEP-gene-shaped JSON export/import (§1.4, D5=B)
@@ -32,6 +34,7 @@ pub mod dedup;
 pub mod delta;
 pub mod entry;
 pub mod gene;
+pub mod humanize;
 pub mod select;
 pub mod signals;
 pub mod store;
@@ -47,6 +50,7 @@ pub use entry::{
     PLAYBOOK_SOURCE_EVENT, SIGNALS_MAX, WILDCARD_QUOTA,
 };
 pub use gene::{from_gene, to_gene, EvalCaseRef};
+pub use humanize::{humanize, HumanizedRule, RuleEvidence};
 pub use select::{build_playbook_section_blocking, render_section, select_playbook, InjectionBudget, SelectedEntry};
 pub use signals::TurnSignals;
 pub use store::{apply_deltas, list_active};

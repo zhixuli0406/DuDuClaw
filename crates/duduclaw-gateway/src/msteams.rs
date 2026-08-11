@@ -576,8 +576,10 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
                 let reg = state.ctx.registry.read().await;
                 reg.main_agent().map(|a| a.config.agent.name.clone()).unwrap_or_default()
             };
-            let reply =
-                crate::chat_commands::handle_command(&cmd, &state.ctx, &session_id, &agent_id, true).await;
+            let reply = crate::chat_commands::handle_command(
+                &cmd, &state.ctx, &session_id, &agent_id, true, &sender_id,
+            )
+            .await;
             drop(typing_guard);
             deliver_reply(&state.creds, &target, &reply).await;
             return;

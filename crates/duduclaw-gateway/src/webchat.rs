@@ -689,8 +689,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // Check for chat commands first
                                 if crate::chat_commands::is_command(&content) {
                                     if let Some(cmd) = crate::chat_commands::parse_command(&content, None) {
+                                        // WebChat carries no addressable per-sender channel
+                                        // identity (no `agent_binding`-style account to bind
+                                        // in the dashboard), so `/rules off` can never resolve
+                                        // a verified Admin/Manager here — `handle_rules_off`
+                                        // correctly refuses with "use the dashboard" rather
+                                        // than guessing at an identity.
                                         let reply = crate::chat_commands::handle_command(
-                                            &cmd, &state.ctx, sid, effective_agent_id, true,
+                                            &cmd, &state.ctx, sid, effective_agent_id, true, "",
                                         ).await;
                                         let done = ChatMessage::AssistantDone {
                                             content: reply,

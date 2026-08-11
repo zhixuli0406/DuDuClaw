@@ -351,6 +351,7 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
                 &session_id,
                 &agent_id,
                 true,
+                &sender,
             )
             .await;
             if !reply.trim().is_empty() {
