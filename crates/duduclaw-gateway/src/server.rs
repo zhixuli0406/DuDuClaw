@@ -1883,6 +1883,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // (home_dir) + 64 KiB body cap, like the federation route above.
     app = app.merge(crate::license_serve::router(home_dir.clone()));
 
+    // ── Telegram Mini App (D-S1 spike) ────────────────────────────
+    // Always mounted; every handler self-gates on `config.toml [miniapp]
+    // enabled` (default false) and 404s while off, so a stock install exposes
+    // nothing. Public by construction — the caller proves identity with
+    // Telegram-signed `initData`, not a dashboard JWT, and decisions are
+    // routed through the same `decision_notify::route_press` a button press
+    // uses. Own state (home_dir) + its own body cap, like the routes above.
+    app = app.merge(crate::miniapp::router(home_dir.clone()));
+
     // ── .well-known endpoints for protocol discovery ──────────────
     app = app
         .route(
@@ -4946,7 +4955,15 @@ fn build_agent_card() -> serde_json::Value {
     serde_json::json!({
         "name": "DuDuClaw Agent",
         "description": "AI agent with channel routing, memory, and self-evolution",
-        "url": format!("http://localhost:{}", std::env::var("DUDUCLAW_PORT").unwrap_or_else(|_| "3000".to_string())),
+        // Same shared resolver `duduclaw run` uses (env > config.toml
+        // [gateway] port > default) — this used to read `DUDUCLAW_PORT` only
+        // and default to a stale 3000 (the gateway's actual default is
+        // 18789), so an unconfigured A2A client following this card's `url`
+        // with no env var set landed on a dead port.
+        "url": format!(
+            "http://localhost:{}",
+            duduclaw_core::gateway_port_for_home(&duduclaw_core::duduclaw_home()).0
+        ),
         "version": crate::updater::current_version(),
         "capabilities": {
             "streaming": true,

@@ -2079,7 +2079,7 @@
   "agents.adv.notifyThreadId": "スレッド ID（任意）",
   "agents.adv.notifyThreadId.help": "チャット内のスレッドやトピックを指定します。空欄の場合はチャット本体に投稿します。",
   "agents.adv.quietHours": "通知しない時間帯",
-  "agents.adv.quietHours.desc": "この時間帯は「お知らせ」や「要確認」の通知をまとめて時間帯終了後にまとめて送信します。即座の判断が必要な通知（承認、予算停止、通道障害）は対象外で、通常どおり即時に届きます。",
+  "agents.adv.quietHours.desc": "この時間帯は「お知らせ」や「要確認」の通知をまとめて時間帯終了後にまとめて送信します。即座の判断が必要な通知（承認、予算停止、通道障害）は対象外で、通常どおり即時に届きます。注意：承認や要人手対応など、あなたの判断が必要なカードはこの設定の影響を受けません。システム全体の「通知しない時間帯」のみで管理されます。",
   "agents.adv.quietHours.window": "時間帯",
   "agents.adv.quietHours.help": "形式は HH:MM-HH:MM（例:22:00-08:00、日をまたいでも可）。空欄の場合は設定なし。",
   "agents.adv.quietHours.invalid": "形式が正しくありません。HH:MM-HH:MM（例:22:00-08:00）で入力してください。",

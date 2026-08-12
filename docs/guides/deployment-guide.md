@@ -222,11 +222,27 @@ DUDUCLAW_ALLOWED_ORIGINS="duduclaw.yourdomain.com,box.your-tailnet.ts.net"
 public_url = "https://duduclaw.yourdomain.com"
 ```
 
+### Telegram 內的審批詳情卡（`[miniapp] enabled`，試作，預設關閉）
+
+`public_url` 是 **https** 時，可以再打開一個試作功能：Telegram 的高風險動作核可卡片
+多一顆「🔎 查看詳情」，在對話裡直接展開完整說明、模擬後果與到期倒數，看完就地按同意
+或拒絕，不用切到瀏覽器。
+
+```toml
+# ~/.duduclaw/config.toml
+[miniapp]
+enabled = true
+```
+
+`public_url` 不是 https、或卡片送到群組（Telegram 規定這種按鈕只能在私訊出現）時，
+不會附這顆按鈕，卡片與沒開這個功能時完全相同。完整說明與安全模型見
+[docs/features/43-telegram-miniapp.md](../features/43-telegram-miniapp.md)。
+
 ---
 
 ## 6. Docker Compose
 
-> **→ 詳細版：** [docs/guides/docker.md](./guides/docker.md) — 包含三大 CLI 認證設定、port 詳解、volume 備份、watchtower、疑難排解。
+> **→ 詳細版：** [docs/guides/docker.md](./docker.md) — 包含三大 CLI 認證設定、port 詳解、volume 備份、watchtower、疑難排解。
 
 ```bash
 cd /path/to/DuDuClaw

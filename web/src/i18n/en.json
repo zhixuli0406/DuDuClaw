@@ -2079,7 +2079,7 @@
   "agents.adv.notifyThreadId": "Thread ID (optional)",
   "agents.adv.notifyThreadId.help": "A thread or topic inside the chat; leave empty to post to the chat itself.",
   "agents.adv.quietHours": "Quiet hours",
-  "agents.adv.quietHours.desc": "During this window, FYI and needs-a-tap notifications are held and delivered together once it ends. Notifications that need an immediate decision (approvals, budget stop-work, channel outages) are unaffected and still deliver right away.",
+  "agents.adv.quietHours.desc": "During this window, FYI and needs-a-tap notifications are held and delivered together once it ends. Notifications that need an immediate decision (approvals, budget stop-work, channel outages) are unaffected and still deliver right away. Note: cards that need your decision (approvals / needs-human) are not affected by this per-agent setting — they're governed only by the system-level quiet hours.",
   "agents.adv.quietHours.window": "Window",
   "agents.adv.quietHours.help": "Format HH:MM-HH:MM, e.g. 22:00-08:00 (may wrap past midnight); leave empty for none.",
   "agents.adv.quietHours.invalid": "Invalid format — use HH:MM-HH:MM, e.g. 22:00-08:00.",

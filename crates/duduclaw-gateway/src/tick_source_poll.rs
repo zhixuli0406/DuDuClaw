@@ -10,9 +10,11 @@
 //!
 //! Three answers live here, one per pollable kind:
 //!
-//! - **`http_poll`** — a GET through a shared, redirect-refusing client, with
-//!   the SSRF gate re-checked against the URL actually dialed and the body
-//!   accumulated under a hard byte cap.
+//! - **`http_poll`** — a GET through a redirect-refusing client pinned to a
+//!   freshly re-resolved, freshly screened address set (D5-W2 DNS re-pin),
+//!   with the SSRF gate re-checked against the URL actually dialed, the
+//!   operator's custom headers attached, and the body accumulated under a hard
+//!   byte cap.
 //! - **`command`** — an argv vector executed directly (never through a
 //!   shell), stdout taken as the payload, bounded by a timeout.
 //! - **`file_tail`** — newly-appended complete lines since a byte cursor that
@@ -21,10 +23,12 @@
 //! The push-based `websocket` kind is [`crate::tick_source_ws`]; it never
 //! reaches [`poll_once`].
 
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::Duration;
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, warn};
 
@@ -38,20 +42,96 @@ use crate::tick_source::{MAX_TICK_PAYLOAD_BYTES, SourceState};
 /// can never queue overlapping fetches.
 const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Shared HTTP client for `http_poll` sources — one warm connection pool
-/// instead of a fresh TCP+TLS handshake per poll (same rationale as
-/// `autopilot_engine::notify_http_client`). Redirects are refused outright:
-/// a validated, non-internal URL that 302s elsewhere is exactly the SSRF
-/// bypass the initial check is meant to stop.
-fn tick_http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(2)
-            .build()
-            .expect("reqwest client build (tick sources)")
-    })
+/// One source's HTTP client, pinned to the address set it was built for
+/// (D5-W2 DNS re-pin).
+///
+/// Why per-source and not one shared client: pinning is a *client-level*
+/// setting in reqwest (`resolve_to_addrs`), so a process-wide singleton cannot
+/// carry a per-request pin. Rebuilding a client per poll would be correct but
+/// would also throw away the connection pool — a fresh TCP+TLS handshake every
+/// second for a 1 s source. So the client is cached against the exact address
+/// set it was pinned to: DNS is still re-resolved and re-screened on **every**
+/// poll, and the client is rebuilt only when that answer actually changes.
+pub(crate) struct PinnedHttpClient {
+    addrs: Vec<SocketAddr>,
+    client: reqwest::Client,
+}
+
+/// Resolve + screen this poll's DNS answer and hand back a client pinned to it.
+///
+/// The resolution happens on every call — that is the point of a re-pin — but
+/// the client behind it survives as long as the answer is stable.
+async fn pinned_client_for(
+    state: &mut SourceState,
+    host: &str,
+    port: u16,
+) -> Result<reqwest::Client, String> {
+    let mut addrs = crate::web_fetch::resolve_public_addrs(host, port)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Sorted so a round-robin resolver returning the same addresses in a
+    // different order counts as "unchanged" and keeps the warm pool.
+    addrs.sort();
+
+    if let Some(existing) = &state.http_client {
+        if existing.addrs == addrs {
+            return Ok(existing.client.clone());
+        }
+    }
+
+    // Redirects are refused outright: a validated, non-internal URL that 302s
+    // elsewhere is exactly the SSRF bypass the initial check is meant to stop
+    // — and a followed redirect would leave the pinned address behind.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(2)
+        .resolve_to_addrs(host, &addrs)
+        .build()
+        .map_err(|e| format!("client build failed: {e}"))?;
+    state.http_client = Some(PinnedHttpClient {
+        addrs,
+        client: client.clone(),
+    });
+    Ok(client)
+}
+
+/// D5-W2 — the header map for one `http_poll` request.
+///
+/// Precedence, tightest last:
+///
+/// 1. Operator-declared `headers` (already validated by
+///    `tick_config::validate_headers`, so both conversions below are
+///    infallible in practice).
+/// 2. `User-Agent`, only if the operator did not set their own.
+/// 3. `Metadata-Flavor: none`, **always** — it is a security defence (it stops
+///    a GCP metadata server that only answers header-less requests), not a
+///    convenience, so a custom header may not displace it.
+///
+/// Nothing here logs a value. A header value is a credential.
+pub(crate) fn build_header_map(custom: &BTreeMap<String, String>) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (name, value) in custom {
+        match (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            (Ok(n), Ok(v)) => {
+                map.insert(n, v);
+            }
+            // Unreachable given config validation; refusing to send a header
+            // we cannot represent (rather than sending something else) keeps
+            // the failure loud at the endpoint instead of subtle here.
+            _ => warn!(header = %name, "tick http_poll: header could not be encoded — omitted"),
+        }
+    }
+    if !map.contains_key(reqwest::header::USER_AGENT) {
+        map.insert(
+            reqwest::header::USER_AGENT,
+            HeaderValue::from_static("DuDuClaw/1.0"),
+        );
+    }
+    map.insert("metadata-flavor", HeaderValue::from_static("none"));
+    map
 }
 
 /// Where the next `file_tail` read should start, given the current cursor and
@@ -78,14 +158,22 @@ pub(crate) async fn poll_once(
             // Fail-closed re-check on the URL actually dialed — the config was
             // validated at load time, but re-validating here keeps the gate
             // adjacent to the request (same convention as the Odoo connector).
-            crate::web_fetch::validate_url(url).map_err(|e| format!("url rejected: {e}"))?;
-            let mut response = tick_http_client()
+            let parsed =
+                crate::web_fetch::validate_url(url).map_err(|e| format!("url rejected: {e}"))?;
+            // D5-W2 DNS re-pin — resolve the host at request time, refuse the
+            // whole answer if any address is internal, and dial only the
+            // addresses just validated. Without this, a hostname that passed
+            // the pattern check at config load could re-resolve to
+            // 169.254.169.254 before the TCP handshake.
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| "url rejected: missing host".to_string())?;
+            let port = parsed.port_or_known_default().unwrap_or(443);
+            let client = pinned_client_for(state, host, port).await?;
+            let mut response = client
                 .get(url)
                 .timeout(timeout)
-                .header("User-Agent", "DuDuClaw/1.0")
-                // Refuses a GCP metadata server that only answers requests
-                // without this header (same defence as `web_fetch`).
-                .header("Metadata-Flavor", "none")
+                .headers(build_header_map(&cfg.headers))
                 .send()
                 .await
                 .map_err(|e| format!("request failed: {e}"))?;
@@ -238,6 +326,72 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::broadcast;
 
+    // ── D5-W2: custom headers on the request ─────────────────
+
+    fn headers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn header_value(map: &HeaderMap, name: &str) -> Option<String> {
+        map.get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    }
+
+    #[test]
+    fn configured_headers_reach_the_request() {
+        let map = build_header_map(&headers(&[
+            ("X-API-Key", "secret-value"),
+            ("Accept", "application/json"),
+        ]));
+        assert_eq!(
+            header_value(&map, "x-api-key").as_deref(),
+            Some("secret-value")
+        );
+        assert_eq!(
+            header_value(&map, "accept").as_deref(),
+            Some("application/json")
+        );
+        // Exactly one value per name — `insert`, not `append`, so a repeated
+        // declaration can never become a doubled header.
+        assert_eq!(map.get_all("x-api-key").iter().count(), 1);
+    }
+
+    #[test]
+    fn built_in_headers_are_present_by_default() {
+        let map = build_header_map(&BTreeMap::new());
+        assert_eq!(
+            header_value(&map, "user-agent").as_deref(),
+            Some("DuDuClaw/1.0")
+        );
+        assert_eq!(
+            header_value(&map, "metadata-flavor").as_deref(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn a_custom_user_agent_wins_but_the_metadata_defence_does_not_budge() {
+        let map = build_header_map(&headers(&[
+            ("User-Agent", "my-feed-client/2"),
+            ("Metadata-Flavor", "Google"),
+        ]));
+        assert_eq!(
+            header_value(&map, "user-agent").as_deref(),
+            Some("my-feed-client/2"),
+            "the operator may identify their own client"
+        );
+        assert_eq!(
+            header_value(&map, "metadata-flavor").as_deref(),
+            Some("none"),
+            "a custom header must not disable the GCP metadata defence"
+        );
+        assert_eq!(map.get_all("metadata-flavor").iter().count(), 1);
+    }
+
     // ── file_tail rotation ───────────────────────────────────
 
     #[test]
@@ -368,6 +522,9 @@ mod tests {
             command: Some(vec!["sh".into(), "-c".into(), "exit 1".into()]),
             path: None,
             subscribe: Vec::new(),
+            headers: BTreeMap::new(),
+            ping_interval_secs: 0,
+            idle_timeout_secs: 0,
             json_fields: BTreeMap::new(),
             emit_unchanged: false,
             max_events_per_minute: 120,

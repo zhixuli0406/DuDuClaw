@@ -3857,17 +3857,20 @@ max_active_skills = 5
 async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
 
-    // Resolve bind/port first — they have no dependency on config.toml and the
-    // first-run bootstrap below needs to persist them into the minimal config.
-    let bind = std::env::var("DUDUCLAW_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    // Resolve bind/port with priority: env var > config.toml [gateway] >
+    // default. The priority-order logic and its `#[cfg(test)]` coverage live
+    // in `duduclaw_core::config` (see `resolve_gateway_bind`/
+    // `resolve_gateway_port` doc comments there for the bug this fixes —
+    // `config.toml [gateway] port`, written on first boot, was never read
+    // back on subsequent runs) so this and `duduclaw-gateway::mcp_oauth`'s
+    // OAuth redirect URI (which must predict the same port) share one
+    // resolver and can never disagree.
+    let (bind, bind_source) = duduclaw_core::gateway_bind_for_home(&home);
     if bind.parse::<std::net::IpAddr>().is_err() {
         eprintln!("ERROR: Invalid bind address '{bind}'. Must be a valid IP (e.g. 127.0.0.1 or 0.0.0.0)");
         std::process::exit(1);
     }
-    let port: u16 = std::env::var("DUDUCLAW_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(18789);
+    let (port, port_source) = duduclaw_core::gateway_port_for_home(&home);
     if port == 0 {
         eprintln!("ERROR: Port 0 is not valid for a server. Use a port between 1024-65535.");
         std::process::exit(1);
@@ -3892,6 +3895,11 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     println!("🐾 DuDuClaw Server Starting...");
     println!("   Gateway: http://{bind}:{port}");
     println!("   Dashboard: http://localhost:{port}");
+    println!(
+        "   (bind source: {}, port source: {})",
+        bind_source.label(),
+        port_source.label()
+    );
     println!("   Press Ctrl+C to stop\n");
 
     // Read auth token from env, config.toml, or leave None for local-only mode
@@ -3984,6 +3992,38 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     };
 
     duduclaw_gateway::start_gateway(config).await
+}
+
+#[cfg(test)]
+mod gateway_settings_resolution_tests {
+    //! `cmd_run_server` delegates its bind/port priority resolution to
+    //! `duduclaw_core::gateway_bind_for_home`/`gateway_port_for_home` — the
+    //! exhaustive priority-order unit tests (env > config.toml [gateway] >
+    //! default) live there (`crates/duduclaw-core/src/config.rs`) so this
+    //! crate and `duduclaw-gateway::mcp_oauth` (whose OAuth redirect URI must
+    //! predict the same port) share one resolver and can never disagree.
+    //! This is a thin smoke test confirming the CLI actually wires the
+    //! shared resolver up end-to-end against a real config.toml on disk.
+
+    #[test]
+    fn cli_honors_config_toml_port_via_shared_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[gateway]\nbind = \"0.0.0.0\"\nport = 9100\n",
+        )
+        .unwrap();
+        // No env override in this test process (would require ENV_LOCK
+        // serialization — the exhaustive env-vs-config matrix is already
+        // covered in duduclaw-core, so this only needs to prove the wiring).
+        if std::env::var("DUDUCLAW_BIND").is_ok() || std::env::var("DUDUCLAW_PORT").is_ok() {
+            return;
+        }
+        let (bind, _) = duduclaw_core::gateway_bind_for_home(dir.path());
+        let (port, _) = duduclaw_core::gateway_port_for_home(dir.path());
+        assert_eq!(bind, "0.0.0.0");
+        assert_eq!(port, 9100);
+    }
 }
 
 /// Read `users.db` and report (user_count, has_default_admin) without

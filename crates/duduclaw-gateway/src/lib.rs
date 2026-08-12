@@ -95,6 +95,7 @@ pub mod approval;
 pub mod approval_notify;
 pub mod channel_link;
 pub mod deep_link;
+pub mod miniapp;
 pub mod expert_admin;
 pub mod expert_generate;
 pub mod capability;
