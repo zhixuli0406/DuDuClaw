@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+- **Docker 映像編譯失敗（v1.55.0 GHCR 映像因此延後補發）**：v1.55.0 新增的 `duduclaw docs` 指令在編譯期 `include_str!` 內嵌 `docs/README.md`，但 `container/Dockerfile.server` 與 `Dockerfile.edition-smoke` 的建置階段只 COPY `crates/`＋`templates/`，容器內缺檔導致 cargo 編譯中止（本機與 CI 的非容器建置不受影響）。兩個 Dockerfile 補上 `COPY docs/README.md`。
 
 ## [1.55.0] - 2026-08-12 — UX 重設計 Wave 0–3+常駐感知+真人接手
 ### Added

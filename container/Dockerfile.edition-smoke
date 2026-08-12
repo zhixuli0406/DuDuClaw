@@ -9,8 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-# duduclaw-memory/-cli use include_str! against templates/wiki/*
+# duduclaw-memory/-cli use include_str! against templates/wiki/* and docs/README.md
 COPY templates/ templates/
+COPY docs/README.md docs/README.md
 # No default features → skip the embedded dashboard (no frontend build needed).
 RUN cargo build --release --no-default-features -p duduclaw-cli
 
