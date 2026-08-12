@@ -67,3 +67,5 @@ python/duduclaw/memory_eval/data/longmemeval_v2/full.jsonl
 python/duduclaw/memory_eval/data/longmemeval_v2/*.raw.jsonl
 python/duduclaw/memory_eval/data/personamem_v2/full.jsonl
 python/duduclaw/memory_eval/data/personamem_v2/*.raw.jsonl
+# Broker-client runtime logs (SolPY writes ./log wherever it runs)
+/log/
