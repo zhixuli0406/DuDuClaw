@@ -14,6 +14,22 @@ pub mod limits {
     pub const LINE_MESSAGE: usize = 5000;
 }
 
+/// Byte budget for a quoted-reply excerpt prepended to the agent input
+/// (inbound direction). CJK-safe truncation via `truncate_bytes`.
+pub const QUOTED_CONTEXT_MAX_BYTES: usize = 2000;
+
+/// Inbound quoted-reply block: when a user replies to (quotes) an earlier
+/// message, every channel prepends this same block ahead of the user's new
+/// text so the agent sees what was quoted. One format across all channels.
+pub fn format_quoted_context(who: &str, excerpt: &str) -> String {
+    let excerpt = duduclaw_core::truncate_bytes(excerpt.trim(), QUOTED_CONTEXT_MAX_BYTES);
+    format!("〔引用訊息｜{who}〕\n{excerpt}\n〔引用結束〕")
+}
+
+/// Label for a quoted message the bot itself sent — the primary reply-quote
+/// scenario is "user quotes the bot's notification and asks a follow-up".
+pub const QUOTED_SELF_LABEL: &str = "你（bot）先前發送的訊息";
+
 /// A rich message component that can be rendered to any platform.
 #[derive(Debug, Clone)]
 pub enum RichComponent {

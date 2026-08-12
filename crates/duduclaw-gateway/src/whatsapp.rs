@@ -65,6 +65,23 @@ struct WaMessage {
     document: Option<WaDocument>,
     #[allow(dead_code)]
     timestamp: String,
+    /// Reply/forward context. Present when the user replied to (quoted) an
+    /// earlier message or forwarded one. Cloud API sends only the quoted
+    /// message's wamid — never its body — so this can annotate but not
+    /// reconstruct the quoted text.
+    context: Option<WaContext>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaContext {
+    /// wamid of the message the user replied to.
+    id: Option<String>,
+    #[allow(dead_code)]
+    from: Option<String>,
+    #[serde(default)]
+    forwarded: bool,
+    #[serde(default)]
+    frequently_forwarded: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,6 +314,30 @@ async fn receive_webhook(
                             Err(e) => warn!("Failed to download WhatsApp document: {e}"),
                         }
                     }
+
+                    // ── Reply/forward annotation ──
+                    // Cloud API never includes the quoted message body, so the
+                    // best available signal is an explicit annotation — without
+                    // it the agent has no idea the user was replying at all.
+                    let mut context_lines: Vec<String> = Vec::new();
+                    // Never prefix a chat command — the command parser matches
+                    // on the leading slash of the whole input.
+                    if let Some(wa_ctx) = msg.context.as_ref().filter(|_| !base_text.trim_start().starts_with('/')) {
+                        if wa_ctx.forwarded || wa_ctx.frequently_forwarded {
+                            context_lines.push("〔此訊息為使用者轉發的內容，非使用者本人所寫〕".to_string());
+                        }
+                        if wa_ctx.id.is_some() && !wa_ctx.forwarded && !wa_ctx.frequently_forwarded {
+                            context_lines.push(
+                                "〔使用者以「回覆」引用了一則先前訊息；WhatsApp 未附引用原文，請從近期對話推斷所指內容〕"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    let base_text = if context_lines.is_empty() {
+                        base_text
+                    } else {
+                        format!("{}\n{base_text}", context_lines.join("\n"))
+                    };
 
                     // Combine text + attachments
                     let input_text = if attachment_lines.is_empty() {

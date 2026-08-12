@@ -348,6 +348,46 @@ fn strip_bot_mention(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Quoted/shared-message context from a Slack message event. "Share message"
+/// (and pasted archive links) deliver the quoted content as legacy
+/// `attachments` entries with `text` + `author_name` — separate from `files`
+/// and previously dropped, so the agent never saw what was being quoted.
+/// Entries without a share/author signal are skipped (plain link unfurls).
+fn slack_quoted_context(event: &serde_json::Value, bot_user_id: &str) -> Option<String> {
+    let arr = event.get("attachments")?.as_array()?;
+    let mut blocks: Vec<String> = Vec::new();
+    for a in arr.iter() {
+        let is_share = a.get("is_share").and_then(|v| v.as_bool()).unwrap_or(false);
+        let author_id = a.get("author_id").and_then(|v| v.as_str());
+        let author_name = a.get("author_name").and_then(|v| v.as_str());
+        if !is_share && author_id.is_none() && author_name.is_none() {
+            continue;
+        }
+        let quoted_text = a
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                a.get("fallback")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            });
+        let Some(quoted_text) = quoted_text else { continue };
+        let who = if !bot_user_id.is_empty() && author_id == Some(bot_user_id) {
+            channel_format::QUOTED_SELF_LABEL
+        } else {
+            author_name.unwrap_or("對方")
+        };
+        blocks.push(channel_format::format_quoted_context(who, quoted_text));
+        if blocks.len() >= 3 {
+            break;
+        }
+    }
+    if blocks.is_empty() { None } else { Some(blocks.join("\n")) }
+}
+
 /// Convert standard markdown to Slack mrkdwn format.
 /// Slack uses *bold*, _italic_, `code`, ```code block``` — mostly compatible.
 fn to_slack_mrkdwn(text: &str) -> String {
@@ -386,13 +426,15 @@ async fn handle_event(
     let text = strip_bot_mention(raw_text);
     let text = text.as_str();
     // WP1.3: a message may carry only file attachments (no text) — still
-    // process it. Genuinely empty messages (no text, no files) are ignored.
+    // process it. A shared (quoted) message with no added comment is also
+    // non-empty. Genuinely empty messages are ignored.
     let has_files = event
         .get("files")
         .and_then(|v| v.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
-    if text.is_empty() && !has_files {
+    let has_shared_message = slack_quoted_context(event, bot_user_id).is_some();
+    if text.is_empty() && !has_files && !has_shared_message {
         return;
     }
 
@@ -574,12 +616,18 @@ async fn handle_event(
             }
         }
     }
+    // ── Quoted/shared-message context ──
+    let base_text = match slack_quoted_context(event, bot_user_id) {
+        Some(quote_block) if text.is_empty() => quote_block,
+        Some(quote_block) => format!("{quote_block}\n{text}"),
+        None => text.to_string(),
+    };
     let input_text = if attachment_lines.is_empty() {
-        text.to_string()
-    } else if text.is_empty() {
+        base_text
+    } else if base_text.is_empty() {
         attachment_lines.join("\n")
     } else {
-        format!("{text}\n\n{}", attachment_lines.join("\n"))
+        format!("{base_text}\n\n{}", attachment_lines.join("\n"))
     };
 
     let reply = if let Some(agent) = agent_name {
@@ -1270,5 +1318,45 @@ mod tests {
         // `decision_notify::route_press` then fails closed on.
         let action = serde_json::json!({ "type": "overflow", "action_id": "duduclaw:goal_more:t1" });
         assert_eq!(slack_action_payload(&action), "");
+    }
+}
+
+#[cfg(test)]
+mod quoted_context_tests {
+    use super::*;
+
+    #[test]
+    fn shared_message_attachment_builds_quote_block() {
+        let event = serde_json::json!({
+            "text": "這段是什麼意思",
+            "attachments": [{
+                "is_share": true,
+                "author_id": "U123",
+                "author_name": "Amy",
+                "text": "季報顯示毛利率提升 2 個百分點"
+            }]
+        });
+        let block = slack_quoted_context(&event, "UBOT").expect("quote block");
+        assert!(block.contains("毛利率"));
+        assert!(block.contains("Amy"));
+    }
+
+    #[test]
+    fn bot_authored_share_is_labeled_self() {
+        let event = serde_json::json!({
+            "attachments": [{ "is_share": true, "author_id": "UBOT", "text": "已完成部署" }]
+        });
+        let block = slack_quoted_context(&event, "UBOT").expect("quote block");
+        assert!(block.contains(channel_format::QUOTED_SELF_LABEL));
+    }
+
+    #[test]
+    fn plain_link_unfurl_without_share_signal_is_ignored() {
+        let event = serde_json::json!({
+            "text": "看看這個",
+            "attachments": [{ "title": "Some page", "text": "preview text", "service_name": "web" }]
+        });
+        assert!(slack_quoted_context(&event, "UBOT").is_none());
+        assert!(slack_quoted_context(&serde_json::json!({"text": "x"}), "UBOT").is_none());
     }
 }

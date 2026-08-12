@@ -1175,6 +1175,37 @@ async fn gateway_loop(
 
 // ── Message handling ────────────────────────────────────────
 
+/// Quoted-reply context from a MESSAGE_CREATE payload. Discord embeds the
+/// full `referenced_message` object (including content) when the message is
+/// a reply — no extra API call needed. `None` when the message is not a
+/// reply, or the referenced message was deleted (Discord sends `null`).
+fn discord_reply_context(data: &Value, bot_id: &str) -> Option<String> {
+    let referenced = data.get("referenced_message")?;
+    if referenced.is_null() {
+        return None;
+    }
+    let ref_author = referenced.get("author");
+    let who = if ref_author.and_then(|a| a["id"].as_str()) == Some(bot_id) {
+        channel_format::QUOTED_SELF_LABEL.to_string()
+    } else {
+        ref_author
+            .and_then(|a| a["username"].as_str())
+            .unwrap_or("對方")
+            .to_string()
+    };
+    let ref_content = referenced["content"].as_str().unwrap_or("").trim();
+    let excerpt = if !ref_content.is_empty() {
+        ref_content.to_string()
+    } else if referenced["attachments"].as_array().is_some_and(|a| !a.is_empty()) {
+        "（附件訊息，無文字）".to_string()
+    } else if referenced["embeds"].as_array().is_some_and(|a| !a.is_empty()) {
+        "（嵌入內容訊息，無文字）".to_string()
+    } else {
+        return None;
+    };
+    Some(channel_format::format_quoted_context(&who, &excerpt))
+}
+
 async fn handle_message_create(
     data: &Value,
     bot_id: &str,
@@ -1252,6 +1283,15 @@ async fn handle_message_create(
         .map(|arr| arr.iter().any(|m| m["id"].as_str() == Some(bot_id)))
         .unwrap_or(false);
 
+    // Replying to the bot's own message addresses the bot like an @mention —
+    // Discord omits the author from `mentions` when the replier turns the
+    // ping off, so the reference itself is the reliable signal.
+    let replied_to_bot = data
+        .get("referenced_message")
+        .and_then(|m| m.get("author"))
+        .and_then(|a| a["id"].as_str())
+        == Some(bot_id);
+
     let settings = &ctx.channel_settings;
     let scope_id = if guild_id.is_empty() { "dm" } else { guild_id };
 
@@ -1260,7 +1300,7 @@ async fn handle_message_create(
     // in the same server from responding to every message.
     let default_mention_only = agent_name.is_some();
     let mention_only = settings.get_bool("discord", scope_id, keys::MENTION_ONLY, default_mention_only).await;
-    if mention_only && !guild_id.is_empty() && !bot_mentioned {
+    if mention_only && !guild_id.is_empty() && !bot_mentioned && !replied_to_bot {
         return; // In guild, mention_only enabled, but bot not mentioned → skip
     }
 
@@ -1278,13 +1318,20 @@ async fn handle_message_create(
     let stripped = strip_bot_mention(content, bot_id);
     let stripped = stripped.trim();
 
+    // ── Quoted-reply context ──
+    let combined = match discord_reply_context(data, bot_id) {
+        Some(quote_block) if stripped.is_empty() => quote_block,
+        Some(quote_block) => format!("{quote_block}\n{stripped}"),
+        None => stripped.to_string(),
+    };
+
     // Combine text content with attachment references
     let combined = if attachment_lines.is_empty() {
-        stripped.to_string()
-    } else if stripped.is_empty() {
+        combined
+    } else if combined.is_empty() {
         attachment_lines.join("\n")
     } else {
-        format!("{stripped}\n\n{}", attachment_lines.join("\n"))
+        format!("{combined}\n\n{}", attachment_lines.join("\n"))
     };
     let clean_content = combined.trim();
 
@@ -2547,5 +2594,48 @@ mod invalid_session_tests {
             seen.insert(invalid_session_jitter_ms(nanos));
         }
         assert!(seen.len() > 100, "jitter looks clipped: only {} values", seen.len());
+    }
+}
+
+#[cfg(test)]
+mod reply_context_tests {
+    use super::*;
+
+    #[test]
+    fn referenced_message_builds_quote_block() {
+        let data = serde_json::json!({
+            "content": "這是你發的嗎",
+            "referenced_message": {
+                "author": { "id": "BOT1", "username": "trader" },
+                "content": "已送出委託 2317 8 股 @264"
+            }
+        });
+        let block = discord_reply_context(&data, "BOT1").expect("quote block");
+        assert!(block.contains("2317"));
+        assert!(block.contains(channel_format::QUOTED_SELF_LABEL));
+    }
+
+    #[test]
+    fn non_reply_and_deleted_reference_yield_none() {
+        let plain = serde_json::json!({ "content": "hello" });
+        assert!(discord_reply_context(&plain, "BOT1").is_none());
+        // Discord sends an explicit null when the referenced message was deleted.
+        let deleted = serde_json::json!({ "content": "hi", "referenced_message": null });
+        assert!(discord_reply_context(&deleted, "BOT1").is_none());
+    }
+
+    #[test]
+    fn attachment_only_reference_gets_placeholder() {
+        let data = serde_json::json!({
+            "content": "這個檔案是什麼",
+            "referenced_message": {
+                "author": { "id": "U2", "username": "amy" },
+                "content": "",
+                "attachments": [ { "id": "1" } ]
+            }
+        });
+        let block = discord_reply_context(&data, "BOT1").expect("quote block");
+        assert!(block.contains("附件訊息"));
+        assert!(block.contains("amy"));
     }
 }
