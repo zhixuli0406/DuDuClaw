@@ -33,6 +33,14 @@ interface AuthStore {
   otpRequest: (email: string) => Promise<{ challenge_id: string; hint?: string }>;
   /** Passwordless login step 2: verify the code and establish the session. */
   otpVerify: (challengeId: string, code: string) => Promise<void>;
+  /**
+   * Personal edition, loopback caller: ask the gateway to issue a session
+   * without a password (WP-F1 / design §2, D3-A). Resolves `true` when a
+   * session was established. Never throws and never surfaces an error — on
+   * every other kind of install this is expected to be refused, and a refusal
+   * simply means "show the login form".
+   */
+  tryLocalSession: () => Promise<boolean>;
   /** First-run onboarding: is this instance unclaimed (needs an admin password)? */
   firstRunStatus: () => Promise<boolean>;
   /** First-run onboarding: set the initial admin password, then establish the
@@ -205,6 +213,23 @@ async function apiGet<T>(path: string, jwt: string): Promise<T> {
 // H8 fix: in-flight lock for refresh to prevent concurrent refresh calls
 let refreshPromise: Promise<void> | null = null;
 
+// WP-F1: the local-session probe runs at most once per page load. A refusal is
+// a property of the install (not Personal / switch off / behind a proxy /
+// remote peer), not a transient failure, so it cannot become true while the
+// tab is open — retrying on every AuthGuard re-mount would be pure noise
+// against an endpoint that answers 403.
+let localSessionTried = false;
+
+/** Test seam: forget the one-shot probe result. */
+export function resetLocalSessionProbe(): void {
+  localSessionTried = false;
+}
+
+/** Custom header required by `POST /api/session/local`. Its purpose is not
+ *  authentication — it makes the request non-simple so a malicious page cannot
+ *  fire it without a CORS preflight the gateway will not answer (design §2.4.3). */
+const LOCAL_SESSION_HEADER = 'X-DuDuClaw-Local';
+
 export const useAuthStore = create<AuthStore>((set, get) => ({
   user: null,
   jwt: null,
@@ -283,6 +308,44 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     } catch (e) {
       set({ loading: false });
       throw e;
+    }
+  },
+
+  tryLocalSession: async () => {
+    if (localSessionTried) return false;
+    localSessionTried = true;
+    try {
+      const res = await fetch('/api/session/local', {
+        method: 'POST',
+        headers: { [LOCAL_SESSION_HEADER]: '1' },
+      });
+      if (!res.ok) return false; // 403 on every non-eligible install — stay quiet
+      const data = (await res.json()) as {
+        access_token?: string;
+        refresh_token?: string;
+      };
+      if (!data.access_token || !data.refresh_token) return false;
+
+      refreshTokenStorage.set(data.refresh_token);
+      // Same shape as `login`: the endpoint returns tokens, `/api/me` returns
+      // the authoritative user + bindings.
+      const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
+        '/api/me',
+        data.access_token,
+      );
+      set({
+        user: me.user,
+        jwt: data.access_token,
+        refreshToken: data.refresh_token,
+        isAuthenticated: true,
+        initialized: true,
+        bindings: me.bindings,
+        loading: false,
+      });
+      startRefreshTimer(get().refresh);
+      return true;
+    } catch {
+      return false; // network/parse failure → login form, never an error toast
     }
   },
 
@@ -382,6 +445,10 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
 
     const refreshToken = refreshTokenStorage.get();
     if (!refreshToken) {
+      // WP-F1: no stored session. On a Personal install reached over loopback
+      // the gateway issues one here and the operator never sees a password
+      // prompt; everywhere else this is refused and we fall through to /login.
+      if (await get().tryLocalSession()) return true;
       set({ initialized: true });
       return false;
     }
@@ -413,8 +480,10 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         return true;
       } catch (err) {
         if (!isRetryableAuthError(err)) {
-          // 401/403: the refresh token is genuinely invalid — re-login.
+          // 401/403: the refresh token is genuinely invalid — re-login. On a
+          // Personal loopback install "re-login" is passwordless.
           refreshTokenStorage.clear();
+          if (await get().tryLocalSession()) return true;
           set({ initialized: true });
           return false;
         }
@@ -428,6 +497,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     // Retries exhausted (persistent 429/network). Preserve the token so the
     // next reload re-establishes the session without a fresh login; surface
     // login for now but never wipe the credential.
+    if (await get().tryLocalSession()) return true;
     set({ initialized: true });
     return false;
   },

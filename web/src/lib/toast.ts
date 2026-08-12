@@ -71,13 +71,85 @@ export const toast = {
     toastBus.emit({ variant: 'info', message, ...opts }),
 };
 
-/** Normalize any thrown value into a human-readable string. */
-export function formatError(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === 'string') return err;
+
+// ── formatError: the P05 root fix ────────────────────────────────────────────
+//
+// `formatError` used to return `err.message` verbatim, which is how strings
+// like "Request timeout: system.config" or a raw HTML error page ended up in
+// front of end users — the shared root cause behind the 21 P05 blockers in the
+// 2026-08 UX audit (§0.5 point 2).
+//
+// It now runs the same classification `ErrorState` uses (`lib/error-message`),
+// so a failure reads identically wherever it surfaces, and returns a SHORT
+// plain-language clause suited to being interpolated into a toast template
+// ("儲存失敗：{message}"). The long "what you can do" sentence and the raw
+// technical string stay where there is room for them: `ErrorState`'s body and
+// its collapsed details disclosure (`formatErrorDetail`).
+//
+// The catalogue is a plain JSON map, so this non-React module can resolve a
+// message id directly — callers outside the React tree keep working.
+
+import { messages, useLocaleStore } from '@/i18n';
+import { classifyError, sanitizeErrorDetail } from './error-message';
+
+/** Short clause key for a classified error (`errorState.manage.short.*`). */
+export function errorShortKey(err: unknown): string {
+  return `errorState.manage.short.${classifyError(err)}`;
+}
+
+/** Resolve an i18n id against the active catalogue, outside a React context. */
+export function lookupMessage(id: string): string {
+  let locale = 'zh-TW';
   try {
-    return JSON.stringify(err);
+    locale = useLocaleStore.getState().locale;
   } catch {
-    return String(err);
+    // Store not constructible (no DOM) — fall through to the source catalogue.
   }
+  return messages[locale]?.[id] ?? messages['zh-TW']?.[id] ?? id;
+}
+
+/**
+ * A server message written for humans is worth more than a category label, so
+ * short CJK sentences from the gateway pass through (sanitized). Anything
+ * longer, or in the shape of a stack trace, is technical.
+ */
+const CJK_RE = /[぀-ヿ㐀-䶿一-鿿豈-﫿]/;
+const PASSTHROUGH_MAX_CHARS = 120;
+
+function humanReadablePassthrough(err: unknown): string | null {
+  const detail = sanitizeErrorDetail(err, PASSTHROUGH_MAX_CHARS);
+  if (!detail) return null;
+  if (!CJK_RE.test(detail)) return null;
+  if (detail.endsWith('…')) return null; // truncated ⇒ it was a dump, not a sentence
+  if (/\bat \w+ \(|https?:\/\/|\{|\}/.test(detail)) return null;
+  return detail;
+}
+
+/** How much sanitized technical text a toast-sized string may carry. */
+const TOAST_DETAIL_MAX_CHARS = 120;
+
+/**
+ * Plain-language one-liner for a thrown value.
+ *
+ * Shape: `<classified clause>（<sanitized detail>）`. The clause comes first so
+ * the sentence is readable by someone who does not know what a WebSocket is;
+ * the detail is masked, single-line and length-capped, and is what makes a
+ * support conversation possible. A raw, unbounded `err.message` — the audit
+ * finding — is never returned. Surfaces with room for structure (`ErrorState`)
+ * should use the classification directly and keep the detail collapsed.
+ */
+export function formatError(err: unknown): string {
+  const passthrough = humanReadablePassthrough(err);
+  if (passthrough) return passthrough;
+  const clause = lookupMessage(errorShortKey(err));
+  const detail = sanitizeErrorDetail(err, TOAST_DETAIL_MAX_CHARS);
+  if (!detail) return clause;
+  return lookupMessage('errorState.manage.withDetail')
+    .replace('{reason}', clause)
+    .replace('{detail}', detail);
+}
+
+/** Masked, single-line, length-capped technical text. Keep it collapsed. */
+export function formatErrorDetail(err: unknown): string {
+  return sanitizeErrorDetail(err);
 }

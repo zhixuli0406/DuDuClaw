@@ -269,6 +269,55 @@ export interface MemoryEntry {
   importance?: number;
   /** How many times this entry has been retrieved. */
   access_count?: number;
+  /** RFC-3339 timestamp of the last recall, or null if never recalled. */
+  last_accessed?: string | null;
+  /**
+   * 0–1 — how likely this memory is to still be retrievable right now. The
+   * gateway computes it from the very same curve the archival job scores
+   * against, so the freshness the page shows and the archival decision can
+   * never disagree. Shown to users as a plain-language state, never as a number.
+   */
+  retrievability?: number;
+  /**
+   * How many days of silence it takes for this memory to fade to about a third
+   * of its strength. Grows every time the memory is recalled.
+   */
+  stability_days?: number;
+}
+
+/** One band of the freshness histogram in `memory.decay_overview`. */
+export interface MemoryFreshnessBucket {
+  /** Stable wire key: `fresh` | `stable` | `fading` | `archiving`. */
+  key: string;
+  count: number;
+  /** Inclusive lower bound of the band, for the legend. */
+  min_retrievability: number;
+}
+
+/** One day of the memory-accumulation trend. */
+export interface MemoryTrendPoint {
+  /** `YYYY-MM-DD`. */
+  date: string;
+  /** Memories recorded that day. */
+  added: number;
+  /** Running pile size at the end of that day. */
+  total: number;
+}
+
+export interface MemoryDecayOverview {
+  total: number;
+  scanned: number;
+  /** True when the scan cap bound — the numbers describe a recent slice only. */
+  truncated: boolean;
+  buckets: MemoryFreshnessBucket[];
+  /** Faintest first — the memories closest to being filed away. */
+  fading_soon: MemoryEntry[];
+  /** Most-recalled first; entries never recalled are excluded. */
+  most_recalled: MemoryEntry[];
+  trend: MemoryTrendPoint[];
+  window_days: number;
+  /** Retrievability at which the archival job files a memory away. */
+  archive_threshold: number;
 }
 
 export interface KeyFactEntry {
@@ -3743,6 +3792,18 @@ export const api = {
         agent_id: agentId,
         limit,
       }) as Promise<{ entries: KeyFactEntry[] }>,
+    /**
+     * Read-only aggregate behind the memory-health view: how fresh this
+     * agent's memories are overall, which ones are closest to being filed
+     * away, which ones keep getting recalled, and how the pile has grown over
+     * `days`. Derived from the same decay curve as the archival job.
+     */
+    decayOverview: (agentId: string, days = 30, topN = 5) =>
+      client.call('memory.decay_overview', {
+        agent_id: agentId,
+        days,
+        top_n: topN,
+      }) as Promise<MemoryDecayOverview>,
     /** Supersession chain for a fact — by (subject, predicate) or memory_id. */
     history: (agentId: string, query: MemoryHistoryQuery) =>
       client.call('memory.history', {

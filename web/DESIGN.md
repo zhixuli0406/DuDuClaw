@@ -109,8 +109,9 @@ App Shell 是浮島式（inset）：sidebar 與內容區各自 `rounded-xl`，�
 | `Switch` / `Checkbox` / `Separator` / `Skeleton` | 基礎控制與骨架 |
 | `Sheet` 家族 | 行動抽屜 / 右側面板 |
 | `Empty` | 空 / 錯誤狀態（圓底 icon + title + 說明 + 選配 action） |
-| `Spinner` | braille 等寬 spinner |
+| `Spinner` | braille 等寬 spinner（列表/表格內小型 loading） |
 | `SubmitButton` | ArrowUp / Square / Loader2 三態送出鈕（對話輸入） |
+| `ThinkingOrb` | 大顆「思考中」Canvas 圓點動畫，`thinking-orb.tsx`/`thinking-orb-engine.ts` 兩檔（vendored 重寫，非 npm 依賴，見檔頭授權聲明）；6 態（working/searching/solving/listening/composing/shaping）× 2 尺寸（64/20），JS 端 `prefers-reduced-motion` gate 降級為靜態圖示，墨色吃 `--foreground` token。`components/chat/ThinkingOrbIndicator` 是其領域語彙 + i18n 包裝層 |
 
 ### 2.2 版型件（layout layer）
 
@@ -210,10 +211,39 @@ Badge variant：`default`（bg-primary）/ `secondary` / `destructive`（`bg-des
 
 - Root：`SidebarProvider` 容器 `h-svh bg-app-shell` + 左 `Sidebar variant="inset"`（浮島，`p-2`）+ 右 `SidebarInset`（`bg-page-canvas m-2 rounded-xl ring-1 ring-surface-border shadow`）。**無全域 topbar，每頁自帶 `PageHeader`。**
 - Sidebar 寬 256（可拖 200–360，存 localStorage），可折疊 icon 模式，行動版轉 Sheet 抽屜。
-- 導航分組（單一來源 `layout/nav-model.ts`）：**個人**（儀表板 / 收件匣 / 新對話）→ **對話紀錄**（最近 15 則，新的在上，`ConversationsZone` 動態產生，icon 模式不顯示）→ **工作**（任務 / 計畫 / 執行紀錄 / 畫布 / 例行 / 時間軸 / 用量 / 並行分身）→ **公司**（員工 / 團隊 / 世界 / 記憶 / 技能庫 / Widget / 知識庫 / 成長）→ **設定**（管理 / 關於）。非管理者整組依可見性規則隱藏。
+- 導航分組（單一來源 `layout/nav-model.ts`）：企業版由上而下是**每日**（新對話 / 儀表板，無組標題）→ **工作** → **LIVE AI 員工**（讀 agents store 動態產生）→ **公司** → **對話紀錄**（最近 15 則，新的在上，`ConversationsZone` 動態產生，icon 模式不顯示）→ **設定**（管理 / 關於）；個人版是每日 + 主區六列（例行工作 / 技能庫 / 記憶 / AI 員工 / 世界 / 桌寵）→ 對話紀錄 → 設定（預設摺疊）→ 進階（預設摺疊）。收件匣自 2026-08-04 起不佔導航列，入口改為 footer 鈴鐺（有待辦才亮）。非管理者整組依可見性規則隱藏。
 - 導航項可帶兩個修飾：`crumb` 讓側邊欄用動作口吻（新對話）而麵包屑保留名詞（對話）；`action: 'newConversation'` 在導航前先清空對話檢視，側邊欄與 ⌘K 走同一條路徑。
 - Menu item：`rounded-md p-2 h-8 text-sm`，未選 `text-muted-foreground`，hover `bg-sidebar-accent/70`，active `bg-sidebar-accent text-sidebar-accent-foreground font-medium`。active 判定 `pathname === href || startsWith(href + "/")`。
 - Sidebar footer 承載：主題切換、Edition / 升級卡、成本 / XP 摘要（原 header HUD 內容遷入）；語言 / 登出在公司下拉。⌘K 開 Command Palette。
+
+### 4.1 導航分層：一般層 / 進階層
+
+導航**只有兩層揭露**（IA 稽核指出四層是「找不到東西」的根因）。`nav-model.ts` 是唯一來源，任何新頁面先決定它落在哪一層。
+
+| 層 | 內容 | 排序法則 |
+|---|---|---|
+| **一般層**（預設展開） | 每日 rail + 工作 + 公司 | 頻率由高到低；用詞白話，機器語彙不進這一層 |
+| **進階層**（摺疊收納） | 管理 → 進階設定（`manageAdvancedNav`）＋個人版的「進階」組 | 低頻高重要在前（錢 → 存取與安全），低頻低重要在後（日誌 / 可靠性 / 模型用量 / 資料搬家），catch-all「設定」最後 |
+
+兩條排序鐵律高於上述法則，改版時一律先滿足：
+
+1. **客戶日常序（2026-08-04，兩版一致）**：新對話 → 例行工作 → 技能庫 → 記憶 → AI 員工 → 世界；任務看板刻意降級（個人版收進「進階」，企業版放 `工作` 組最後一列）。
+2. **客戶金錢序（`manageAdvancedNav`）**：帳務 → 授權 → 經銷，排在所有維運列之前；「設定」永遠最後。
+
+低頻列**不刪、只下沉**：企業版沒有「進階」組，所以「排在群組尾端」就是它的降級形式（`/forks`、`/os`）。降級是有代價的決定——把一項收進進階層，等於決定 95% 的使用者永遠用它的預設值，所以每次下沉都要順手複核該頁的預設值是否合理。
+
+### 4.2 三條全站 IA 規範
+
+以下三條適用每一頁，違反視同該頁未完成（Phase 4 rubric 驗收項）。
+
+**R-EDIT-SOURCE — 唯讀鏡像旁必須有編輯來源連結。**
+IA 稽核 14 組分散功能中至少 8 組是同一個形狀：A 頁可以編輯，B 頁只能看且不連回 A。凡是把別頁資料鏡像過來顯示的欄位 / 卡片，旁邊必須有「在〔X〕編輯 →」連結，讓任何設定值到它的來源頁 ≤2 跳。例：可靠性頁的退回率卡片連到模型用量頁的路由閾值、安全頁的 RBAC 區塊連到治理頁、預算摘要連到帳號頁。
+
+**R-SINGLE-WRITER — 一個設定只有一個寫入點。**
+代理層級設定的唯一寫入點是 `EditAgentPage`；主題頁（OS / Odoo / 設定頁的通知分頁）一律唯讀總覽 + 連結，不得再刻一份可編輯的表單。同一個值有兩個能存檔的地方，就會產生「以為改好了、其實改到另一份」的故障，而不只是重複的程式碼。
+
+**R-PLAIN-WORDS — 對使用者說白話。**
+使用者多為非技術人員，基調定在「高中程度、無工程背景可懂」。§5.2 的「內部術語不外洩」升級為**主動白話**：技術詞要有白話同義詞才能上畫面（retrievability → 新鮮度、consolidation → 整理歸納、needs_human → 等你決定、agent → AI 員工、session → 對話、cron → 例行工作）。數值優先用狀態詞呈現（新鮮 / 穩固 / 逐漸淡忘 / 即將歸檔），原始數字放 tooltip 或進階層。技術詞外洩的驗收嚴重度下限為 Major。
 
 ---
 
@@ -243,9 +273,10 @@ Badge variant：`default`（bg-primary）/ `secondary` / `destructive`（`bg-des
 2. 選定 §3 的版型範式，套上 `PageHeader` / `CollectionPageHeader` / `BreadcrumbHeader` / `SettingsShell` 骨架。
 3. 用 mds 原語取代 ad-hoc；AI 員工名字處掛 `ActorAvatar`；機器值用 `font-mono tabular-nums`；空資料用 `Empty` / `CollectionPageState`。
 4. i18n：字串走 `intl.formatMessage`，新 key 同 commit 進三語。
-5. 屬性 / 詳情走右欄 panel 或 split（§3.2 / §3.5）。
-6. Verify：`npm run build` + `npx vitest run` 綠；心中跑 a11y / 對比 / overflow / 鍵盤 / reduced-motion 一遍。
-7. 不動 store / api signature；規格變更同步改測試。
+5. 過 §4.2 三條規範：唯讀鏡像有「在〔X〕編輯」連結、頁面沒有變成第二個寫入點、每句文案通過白話測試；若新增導航項，先決定它落在一般層或進階層（§4.1）並照該層排序法則插入 `nav-model.ts`。
+6. 屬性 / 詳情走右欄 panel 或 split（§3.2 / §3.5）。
+7. Verify：`npm run build` + `npx vitest run` 綠；心中跑 a11y / 對比 / overflow / 鍵盤 / reduced-motion 一遍。
+8. 不動 store / api signature；規格變更同步改測試。
 
 ---
 

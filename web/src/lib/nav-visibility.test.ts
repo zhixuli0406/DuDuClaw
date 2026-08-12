@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isVisible, filterVisible, type Gated } from './nav-visibility';
+import { isVisible, filterVisible, ORG_CHART_MIN_AGENTS, type Gated } from './nav-visibility';
 
 describe('nav-visibility (dashboard-redesign WP11-T11.1)', () => {
   it('role gating: minRole is honoured', () => {
@@ -29,6 +29,20 @@ describe('nav-visibility (dashboard-redesign WP11-T11.1)', () => {
     expect(isVisible(op, 'admin', false, { hasOperatorAccess: false })).toBe(false);
     // Proven operator access → visible.
     expect(isVisible(op, 'admin', false, { hasOperatorAccess: true })).toBe(true);
+  });
+
+  // D6 (09-edition-split-features.md §4) — the org chart's progressive
+  // disclosure gate, same mechanism as `/forks`'s `requiresData: 'forks'`.
+  it('requiresData "org" fails closed below ORG_CHART_MIN_AGENTS, on every edition', () => {
+    const org: Gated = { requiresData: 'org' };
+    expect(isVisible(org, 'admin', false)).toBe(false); // no ctx at all
+    expect(isVisible(org, 'admin', false, { agentCount: 0 })).toBe(false);
+    expect(isVisible(org, 'admin', false, { agentCount: ORG_CHART_MIN_AGENTS - 1 })).toBe(false);
+    expect(isVisible(org, 'admin', false, { agentCount: ORG_CHART_MIN_AGENTS })).toBe(true);
+    expect(isVisible(org, 'admin', false, { agentCount: ORG_CHART_MIN_AGENTS + 5 })).toBe(true);
+    // Personal is gated by the same threshold, not by edition.
+    expect(isVisible(org, 'admin', true, { agentCount: ORG_CHART_MIN_AGENTS })).toBe(true);
+    expect(isVisible(org, 'admin', true, { agentCount: 1 })).toBe(false);
   });
 
   it('filterVisible applies every gate together', () => {

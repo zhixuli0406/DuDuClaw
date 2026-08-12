@@ -22,7 +22,14 @@ interface PlansStore {
   /** Steps keyed by plan id, in display order. */
   readonly steps: Readonly<Record<string, ReadonlyArray<PlanStep>>>;
   readonly loading: boolean;
-  readonly error: string | null;
+  /**
+   * The raw thrown value, kept unsanitized on purpose: the consuming page
+   * runs it through `ErrorState` / `useErrorMessage`, which classify it into
+   * plain language and hide the technical string behind a disclosure. Storing
+   * a pre-flattened `err.message` here is what let raw strings reach the UI.
+   */
+  readonly error: unknown;
+  clearError: () => void;
   fetchPlans: (filters?: { agent_id?: string; status?: PlanStatus }) => Promise<void>;
   fetchPlan: (planId: string) => Promise<void>;
   createPlan: (params: PlanCreateParams) => Promise<PlanInfo | null>;
@@ -57,13 +64,15 @@ export const usePlansStore = create<PlansStore>((set, get) => {
     loading: false,
     error: null,
 
+    clearError: () => set({ error: null }),
+
     fetchPlans: async (filters) => {
       set({ loading: true });
       try {
         const { plans } = await api.plans.list(filters);
         set({ plans, loading: false, error: null });
       } catch (e) {
-        set({ loading: false, error: e instanceof Error ? e.message : String(e) });
+        set({ loading: false, error: e });
       }
     },
 
@@ -78,7 +87,7 @@ export const usePlansStore = create<PlansStore>((set, get) => {
           error: null,
         });
       } catch (e) {
-        set({ error: e instanceof Error ? e.message : String(e) });
+        set({ error: e });
       }
     },
 
@@ -89,7 +98,7 @@ export const usePlansStore = create<PlansStore>((set, get) => {
         await get().fetchPlan(plan.id);
         return plan;
       } catch (e) {
-        set({ error: e instanceof Error ? e.message : String(e) });
+        set({ error: e });
         return null;
       }
     },
@@ -99,7 +108,7 @@ export const usePlansStore = create<PlansStore>((set, get) => {
         await api.plans.update(planId, fields);
         await refreshAfterMutation(planId);
       } catch (e) {
-        set({ error: e instanceof Error ? e.message : String(e) });
+        set({ error: e });
       }
     },
 
@@ -110,7 +119,7 @@ export const usePlansStore = create<PlansStore>((set, get) => {
         set({ steps: rest, plans: get().plans.filter((p) => p.id !== planId) });
         await get().fetchPlans();
       } catch (e) {
-        set({ error: e instanceof Error ? e.message : String(e) });
+        set({ error: e });
       }
     },
 
@@ -119,7 +128,7 @@ export const usePlansStore = create<PlansStore>((set, get) => {
         await api.plans.addStep(planId, params);
         await refreshAfterMutation(planId);
       } catch (e) {
-        set({ error: e instanceof Error ? e.message : String(e) });
+        set({ error: e });
       }
     },
 
@@ -128,7 +137,7 @@ export const usePlansStore = create<PlansStore>((set, get) => {
         await api.plans.updateStep(stepId, fields);
         await refreshAfterMutation(planId);
       } catch (e) {
-        set({ error: e instanceof Error ? e.message : String(e) });
+        set({ error: e });
       }
     },
 
@@ -137,7 +146,7 @@ export const usePlansStore = create<PlansStore>((set, get) => {
         await api.plans.removeStep(stepId);
         await refreshAfterMutation(planId);
       } catch (e) {
-        set({ error: e instanceof Error ? e.message : String(e) });
+        set({ error: e });
       }
     },
   };
