@@ -59,6 +59,8 @@ struct TgChat {
     id: i64,
     #[serde(rename = "type")]
     chat_type: Option<String>,
+    /// Group/channel title — used to label forward provenance.
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +135,28 @@ struct TgMessage {
     forum_topic_closed: Option<serde_json::Value>,
     /// Service message: a forum topic was created (session is created lazily).
     forum_topic_created: Option<serde_json::Value>,
+    /// The message this one replies to (user long-pressed → reply). Boxed:
+    /// the type is recursive. Telegram sends the full quoted message here;
+    /// without this field serde silently dropped the quoted content.
+    reply_to_message: Option<Box<TgMessage>>,
+    /// Origin of a forwarded message (Bot API 7.0+ `MessageOrigin`).
+    forward_origin: Option<TgForwardOrigin>,
+}
+
+/// Bot API 7.0+ `MessageOrigin` — only the fields needed to label who the
+/// forwarded content originally came from.
+#[derive(Debug, Deserialize)]
+struct TgForwardOrigin {
+    #[serde(rename = "type")]
+    origin_type: String,
+    /// `type == "user"`
+    sender_user: Option<TgUser>,
+    /// `type == "hidden_user"` (sender hid their account link)
+    sender_user_name: Option<String>,
+    /// `type == "chat"` (sent on behalf of a group)
+    sender_chat: Option<TgChat>,
+    /// `type == "channel"`
+    chat: Option<TgChat>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -580,10 +604,21 @@ async fn poll_loop(
                 let text_content = msg.text.as_deref().unwrap_or("");
                 let bot_mentioned = is_bot_mentioned(text_content, &msg.entities, &bot_username);
 
+                // Replying to the bot's own message addresses the bot just
+                // like an @mention does — without this, mention-only groups
+                // silently ignore the natural "reply to the bot" gesture.
+                let replied_to_bot = !bot_username.is_empty()
+                    && msg
+                        .reply_to_message
+                        .as_deref()
+                        .and_then(|q| q.from.as_ref())
+                        .and_then(|u| u.username.as_deref())
+                        .is_some_and(|u| u.eq_ignore_ascii_case(&bot_username));
+
                 // Check for bot commands (always process, even in mention-only mode)
                 let is_command = text_content.starts_with('/');
 
-                if is_group && mention_only && !bot_mentioned && !is_command {
+                if is_group && mention_only && !bot_mentioned && !is_command && !replied_to_bot {
                     continue;
                 }
 
@@ -632,6 +667,12 @@ async fn poll_loop(
                 } else {
                     // No text/voice/audio — use caption as base text (or empty)
                     caption_text.to_string()
+                };
+
+                // ── Quoted-reply / forward provenance ──
+                let input_text = match build_quoted_context(&msg, &bot_username) {
+                    Some(context_block) => format!("{context_block}\n{input_text}"),
+                    None => input_text,
                 };
 
                 // ── Attachment handling: photo/document/video/sticker ──
@@ -1376,6 +1417,105 @@ fn strip_bot_mention(text: &str, bot_username: &str) -> String {
         .to_string()
 }
 
+/// Display text of a replied-to message: `text` first, then `caption`.
+/// Media-only messages fall back to a kind placeholder so the agent still
+/// knows *something* was quoted. Returns `None` only for service messages
+/// with no representable content.
+fn quoted_message_excerpt(quoted: &TgMessage) -> Option<String> {
+    let body = quoted
+        .text
+        .as_deref()
+        .or(quoted.caption.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(body) = body {
+        return Some(body.to_string());
+    }
+    if quoted.photo.is_some() {
+        return Some("（圖片訊息，無文字）".to_string());
+    }
+    if quoted.video.is_some() {
+        return Some("（影片訊息，無文字）".to_string());
+    }
+    if quoted.voice.is_some() || quoted.audio.is_some() {
+        return Some("（語音訊息，未轉錄）".to_string());
+    }
+    if quoted.document.is_some() {
+        return Some("（檔案訊息，無文字）".to_string());
+    }
+    if quoted.sticker.is_some() {
+        return Some("（貼圖訊息）".to_string());
+    }
+    None
+}
+
+/// Label who a forwarded message originally came from.
+fn forward_origin_label(origin: &TgForwardOrigin) -> String {
+    match origin.origin_type.as_str() {
+        "user" => origin
+            .sender_user
+            .as_ref()
+            .and_then(|u| u.first_name.clone().or_else(|| u.username.clone()))
+            .unwrap_or_else(|| "某使用者".to_string()),
+        "hidden_user" => origin
+            .sender_user_name
+            .clone()
+            .unwrap_or_else(|| "某使用者".to_string()),
+        "chat" => origin
+            .sender_chat
+            .as_ref()
+            .and_then(|c| c.title.clone())
+            .unwrap_or_else(|| "某群組".to_string()),
+        "channel" => origin
+            .chat
+            .as_ref()
+            .and_then(|c| c.title.clone())
+            .unwrap_or_else(|| "某頻道".to_string()),
+        _ => "未知來源".to_string(),
+    }
+}
+
+/// Context block prepended to the agent input when the user replied to
+/// (quoted) an earlier message and/or forwarded one. `None` when the message
+/// carries neither — the input then stays byte-identical to prior behavior.
+///
+/// The quoted sender is labeled; when it is the bot itself the label says so
+/// explicitly — "user quotes the bot's own notification and asks a follow-up"
+/// is the primary scenario this exists for.
+fn build_quoted_context(msg: &TgMessage, bot_username: &str) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(origin) = &msg.forward_origin {
+        lines.push(format!(
+            "〔以下訊息由使用者轉發，原始來源：{}〕",
+            forward_origin_label(origin)
+        ));
+    }
+
+    if let Some(quoted) = &msg.reply_to_message
+        && let Some(excerpt) = quoted_message_excerpt(quoted)
+    {
+        let is_self = !bot_username.is_empty()
+            && quoted
+                .from
+                .as_ref()
+                .and_then(|u| u.username.as_deref())
+                .is_some_and(|u| u.eq_ignore_ascii_case(bot_username));
+        let who = if is_self {
+            channel_format::QUOTED_SELF_LABEL.to_string()
+        } else {
+            quoted
+                .from
+                .as_ref()
+                .and_then(|u| u.first_name.clone().or_else(|| u.username.clone()))
+                .unwrap_or_else(|| "對方".to_string())
+        };
+        lines.push(channel_format::format_quoted_context(&who, &excerpt));
+    }
+
+    if lines.is_empty() { None } else { Some(lines.join("\n")) }
+}
+
 /// Maximum audio download size (20MB, Telegram voice limit).
 const MAX_TELEGRAM_AUDIO_BYTES: usize = 20 * 1024 * 1024;
 
@@ -1819,6 +1959,114 @@ mod callback_tests {
         let update: TgUpdate = serde_json::from_str(json).unwrap();
         assert!(update.callback_query.is_none());
         assert!(update.message.is_some());
+    }
+}
+
+#[cfg(test)]
+mod reply_context_tests {
+    use super::*;
+
+    #[test]
+    fn parses_reply_to_message_and_builds_quote_block() {
+        let json = r#"{
+            "update_id": 7,
+            "message": {
+                "message_id": 100,
+                "chat": { "id": 5, "type": "private" },
+                "from": { "id": 9, "first_name": "Louis" },
+                "text": "這筆 2317 是你下的嗎",
+                "reply_to_message": {
+                    "message_id": 99,
+                    "chat": { "id": 5, "type": "private" },
+                    "from": { "id": 1, "username": "trader_bot", "first_name": "Trader" },
+                    "text": "主計畫：鴻海 2317 買進 8 股 @264"
+                }
+            }
+        }"#;
+        let update: TgUpdate = serde_json::from_str(json).unwrap();
+        let msg = update.message.unwrap();
+        let quoted = msg.reply_to_message.as_deref().expect("reply parsed");
+        assert_eq!(quoted.text.as_deref(), Some("主計畫：鴻海 2317 買進 8 股 @264"));
+
+        let block = build_quoted_context(&msg, "trader_bot").expect("quote block");
+        assert!(block.contains("鴻海 2317"));
+        // Quoting the bot's own notification must be labeled as such.
+        assert!(block.contains(channel_format::QUOTED_SELF_LABEL));
+        assert!(block.contains("〔引用結束〕"));
+    }
+
+    #[test]
+    fn no_reply_no_forward_yields_none() {
+        let json = r#"{
+            "message_id": 1,
+            "chat": { "id": 5, "type": "private" },
+            "text": "hello"
+        }"#;
+        let msg: TgMessage = serde_json::from_str(json).unwrap();
+        assert!(build_quoted_context(&msg, "trader_bot").is_none());
+    }
+
+    #[test]
+    fn quoted_cjk_text_truncates_without_panic() {
+        let long = "鴻海台積電".repeat(300);
+        let json = format!(
+            r#"{{
+                "message_id": 2,
+                "chat": {{ "id": 5, "type": "private" }},
+                "text": "追問",
+                "reply_to_message": {{
+                    "message_id": 1,
+                    "chat": {{ "id": 5, "type": "private" }},
+                    "from": {{ "id": 3, "first_name": "Amy" }},
+                    "text": "{long}"
+                }}
+            }}"#
+        );
+        let msg: TgMessage = serde_json::from_str(&json).unwrap();
+        let block = build_quoted_context(&msg, "trader_bot").expect("quote block");
+        assert!(block.len() < long.len());
+        assert!(block.contains("Amy"));
+    }
+
+    #[test]
+    fn media_only_quote_gets_placeholder() {
+        let json = r#"{
+            "message_id": 2,
+            "chat": { "id": 5, "type": "private" },
+            "text": "這張圖是什麼",
+            "reply_to_message": {
+                "message_id": 1,
+                "chat": { "id": 5, "type": "private" },
+                "photo": [ { "file_id": "abc" } ]
+            }
+        }"#;
+        let msg: TgMessage = serde_json::from_str(json).unwrap();
+        let block = build_quoted_context(&msg, "trader_bot").expect("quote block");
+        assert!(block.contains("圖片訊息"));
+    }
+
+    #[test]
+    fn forward_origin_variants_are_labeled() {
+        let json = r#"{
+            "message_id": 3,
+            "chat": { "id": 5, "type": "private" },
+            "text": "轉貼的內容本文",
+            "forward_origin": { "type": "channel", "chat": { "id": -100, "type": "channel", "title": "財經頻道" } }
+        }"#;
+        let msg: TgMessage = serde_json::from_str(json).unwrap();
+        let block = build_quoted_context(&msg, "trader_bot").expect("forward label");
+        assert!(block.contains("轉發"));
+        assert!(block.contains("財經頻道"));
+
+        let hidden = r#"{
+            "message_id": 4,
+            "chat": { "id": 5, "type": "private" },
+            "text": "x",
+            "forward_origin": { "type": "hidden_user", "sender_user_name": "王小明" }
+        }"#;
+        let msg: TgMessage = serde_json::from_str(hidden).unwrap();
+        let block = build_quoted_context(&msg, "trader_bot").expect("forward label");
+        assert!(block.contains("王小明"));
     }
 }
 

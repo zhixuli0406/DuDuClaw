@@ -407,6 +407,61 @@ fn strip_mention_tags(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// Strip HTML tags and decode the handful of entities Teams emits, keeping
+/// text content only. Tag boundaries become spaces so adjacent block elements
+/// don't glue words together.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+                out.push(' ');
+            }
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let decoded = out
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Quoted-reply context from a Teams message activity. When a user quotes a
+/// message, Teams delivers the quoted content inside an `attachments` item
+/// with `contentType == "text/html"` as a `<blockquote>` — `activity.text`
+/// carries only the user's new words. Without this the quote is silently
+/// dropped.
+fn teams_quoted_context(activity: &serde_json::Value) -> Option<String> {
+    let arr = activity.get("attachments")?.as_array()?;
+    for a in arr {
+        let ctype = a.get("contentType").and_then(|v| v.as_str()).unwrap_or("");
+        if ctype != "text/html" {
+            continue;
+        }
+        let html = a.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(open) = html.find("<blockquote") else { continue };
+        let Some(tag_end) = html[open..].find('>') else { continue };
+        let body_start = open + tag_end + 1;
+        let Some(body_len) = html[body_start..].find("</blockquote>") else { continue };
+        let quote = html_to_text(&html[body_start..body_start + body_len]);
+        if !quote.is_empty() {
+            return Some(crate::channel_format::format_quoted_context(
+                "對話中先前的訊息",
+                &quote,
+            ));
+        }
+    }
+    None
+}
+
 async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
     let raw_text = activity.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let text = strip_mention_tags(raw_text);
@@ -607,6 +662,13 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
             }
         }
     }
+    // ── Quoted-reply context ──
+    let text = match teams_quoted_context(activity) {
+        Some(quote_block) if text.is_empty() => quote_block,
+        Some(quote_block) => format!("{quote_block}\n{text}"),
+        None => text,
+    };
+
     let input_text = if attachment_lines.is_empty() {
         text.clone()
     } else if text.is_empty() {
@@ -904,5 +966,40 @@ mod tests {
         assert_eq!(m["textFormat"], "markdown");
         assert_eq!(m["replyToId"], "42");
         assert_eq!(m["conversation"]["id"], "a:1");
+    }
+}
+
+#[cfg(test)]
+mod quoted_context_tests {
+    use super::*;
+
+    #[test]
+    fn blockquote_in_html_attachment_is_extracted() {
+        let activity = serde_json::json!({
+            "text": "那這件事處理了嗎",
+            "attachments": [{
+                "contentType": "text/html",
+                "content": "<div><blockquote itemtype=\"http://schema.skype.com/Reply\"><strong>Amy</strong><p>請記得下午三點前回覆客戶&nbsp;A</p></blockquote><p>那這件事處理了嗎</p></div>"
+            }]
+        });
+        let block = teams_quoted_context(&activity).expect("quote block");
+        assert!(block.contains("回覆客戶 A"));
+        assert!(block.contains("〔引用訊息"));
+    }
+
+    #[test]
+    fn html_without_blockquote_yields_none() {
+        let activity = serde_json::json!({
+            "text": "hi",
+            "attachments": [{ "contentType": "text/html", "content": "<p>hi</p>" }]
+        });
+        assert!(teams_quoted_context(&activity).is_none());
+        assert!(teams_quoted_context(&serde_json::json!({"text": "x"})).is_none());
+    }
+
+    #[test]
+    fn html_to_text_strips_tags_and_decodes_entities() {
+        assert_eq!(html_to_text("<p>a&nbsp;&amp;&nbsp;b</p>"), "a & b");
+        assert_eq!(html_to_text("<strong>粗體</strong>文字"), "粗體 文字");
     }
 }

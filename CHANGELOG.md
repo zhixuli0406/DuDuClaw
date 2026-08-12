@@ -61,6 +61,9 @@
 - **儀表板改設定後通道端有感**：行為邊界（CONTRACT）或模型變更後，該員工下一輪回覆末尾附一行「（行為規則已於 X 更新）」/「（已切換至新模型）」，只提示一次。
 
 ### Fixed
+- **五個通道的「回覆／引用訊息」內容靜默遺失**：使用者長按一則訊息選「回覆」再追問時，被引用的內容先前完全沒有帶進 AI 的輸入——AI 只收到新打的那句話，誠實地回「我沒看到你說的那段」，體感像裝傻。全通道掃描後確認這是系統性缺口（11 個通道的接收路徑全數未解析引用上下文），本次修復 payload 內已含引用內容、零額外 API 呼叫的五個：**Telegram**（`TgMessage` 補宣告 `reply_to_message`，serde 先前對未宣告欄位靜默丟棄；被引用者是 bot 自己時明確標示「你（bot）先前發送的訊息」——使用者引用 bot 通知來追問正是最常見情境；純媒體引用給型別占位說明）、**Discord**（`referenced_message` 內嵌完整內容，先前整個被忽略；已刪除的引用來源誠實跳過）、**Slack**（「分享訊息」的 `attachments[].text`＋作者標示；純連結展開預覽不誤判為引用；分享而未加註解的訊息先前會被當空訊息整則丟棄，一併修正）、**Teams**（引用內容藏在 `text/html` 附件的 `<blockquote>`，現擷取並去標籤）、**WhatsApp**（`context` 物件先前未宣告——平台只給被引用訊息的 id 不給原文，故標註「使用者引用了一則先前訊息」並標示轉發訊息，不假造引用內容）。五通道共用同一個引用區塊格式（`channel_format::format_quoted_context`，CJK 安全截斷 2000 bytes）。見 [docs/todo/TODO-telegram-reply-context.md](docs/todo/TODO-telegram-reply-context.md)。
+- **群組「只在被 @ 時回覆」模式忽略對 bot 訊息的直接回覆**：Telegram／Discord 群組開 mention-only 時，使用者對 bot 的訊息按「回覆」追問（最自然的對話手勢、不會另打 @）先前被靜默略過。現在回覆 bot 的訊息視同提及。
+- **Telegram 轉發訊息來源遺失**：`forward_origin` 先前未解析——轉貼進來的內容無法與使用者本人發言區分。現在標注「由使用者轉發，原始來源：〈使用者／頻道／群組名〉」。
 - **一人決定後其他人的卡片沒收斂**：安裝簽核會同時推給多位簽核人的多個通道，先前只收斂按鍵者自己那一張，其餘卡片仍顯示可按的按鈕（按下去只得到「已被處理過」）。現在一次決定會回收該筆決定的**所有**卡片。
 - **任務類自動規則跳閘後推播無處可去**：`task_created`／`task_updated` 事件只提供 `task` 欄位，因此以 `task.assigned_to` 篩選的規則（最自然的寫法）在跳閘時解析不到通知對象，保護通知被靜默略過。現在也接受 `task.assigned_to` 作為規則的目標 AI 員工。
 - **六個平台 sender 誤報成功**：Telegram/LINE/Discord/Slack/WhatsApp/Feishu 的發送實作先前只檢查傳輸層結果、從不檢查 HTTP 狀態與回應體——被平台撤銷的 token 或 `channel_not_found` 都會回報成功。現在逐平台檢查（Slack/Feishu 的失敗訊號在 JSON body，HTTP 200 也可能是失敗）。

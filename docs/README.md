@@ -98,6 +98,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [todo/TODO-agent-honesty.md](todo/TODO-agent-honesty.md) | Agent honesty / anti-hallucination tasks |
 | [todo/TODO-rfc24-decision-continuity.md](todo/TODO-rfc24-decision-continuity.md) | RFC-24 decision-continuity implementation tracking |
 | [todo/TODO-rfc26-live-forking.md](todo/TODO-rfc26-live-forking.md) | RFC-26 live-forking implementation tracking |
+| [todo/TODO-telegram-reply-context.md](todo/TODO-telegram-reply-context.md) | Telegram 回覆/引用訊息內容遺失（reply_to_message 未解析）修復 |
+| [todo/TODO-channel-quote-context-remaining.md](todo/TODO-channel-quote-context-remaining.md) | 其餘通道引用/回覆上下文缺口（全通道掃描結果）追蹤 |
 
 ## User & Developer Guides
 
