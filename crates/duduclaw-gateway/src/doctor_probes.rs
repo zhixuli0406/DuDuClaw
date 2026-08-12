@@ -154,6 +154,58 @@ fn classify_mcp_cold_start(
     }
 }
 
+// ── Local auto-login exposure (G8 residual-risk finding) ──────────
+//
+// Personal edition's passwordless local-login switch (`[dashboard]`/
+// `[gateway] local_auto_login`, WP-F1, see `local_session.rs`) is only safe
+// because its own per-request gate independently re-checks the TCP peer
+// address (`ConnectInfo`, never a header) and refuses outright whenever a
+// proxy-class header is present. That defence has one blind spot by design:
+// a *bare* reverse proxy in front of the gateway (nginx/Caddy configured
+// with zero `X-Forwarded-*` forwarding) makes every remote peer look like
+// `127.0.0.1` to `ConnectInfo` without ever sending a proxy header — so
+// condition 3 (loopback peer) is defeated without ever tripping condition 4
+// (proxy header present). This probe is a second, static line of defence:
+// a config combination doctor can flag before any request ever arrives —
+// the switch left on while `[gateway] bind` is not itself loopback. Pure
+// function (no I/O beyond the two existing config reads it delegates to),
+// unit-testable, shared by both the CLI `duduclaw doctor` printout and the
+// dashboard `system.doctor` RPC per this module's stated single-source
+// convention.
+
+/// Returns `Some(zh-TW warning message)` when local auto-login is enabled
+/// AND the gateway bind is not loopback; `None` when either half of that is
+/// false (nothing to warn about).
+pub fn local_auto_login_exposure(home: &Path) -> Option<String> {
+    if !crate::local_session::auto_login_enabled(home) {
+        return None;
+    }
+    let (bind, _) = duduclaw_core::gateway_bind_for_home(home);
+    if bind_is_loopback(&bind) {
+        return None;
+    }
+    Some(format!(
+        "你開了本機自動登入（local_auto_login），但服務綁在非本機位址「{bind}」—— \
+         任何能連到這台機器的人都可能免密碼以 admin 身分進入。請確認前面沒有會覆寫來源位址的\
+         反向代理（例如裸 nginx／Caddy 未轉發 X-Forwarded-For 等標頭），否則就關閉自動登入\
+         （`config.toml [dashboard] local_auto_login = false`）改用密碼登入。"
+    ))
+}
+
+/// Loopback-ish bind strings doctor treats as safe. Mirrors the ad-hoc check
+/// `duduclaw run` already prints (`bind == "127.0.0.1" || "::1" ||
+/// "localhost"`), generalized via `IpAddr::is_loopback()` so any literal
+/// loopback address (e.g. `127.0.0.5`) also counts, not just the canonical
+/// one.
+fn bind_is_loopback(bind: &str) -> bool {
+    if bind.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    bind.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 // ── Grok CLI ────────────────────────────────────────────────────
 
 /// Outcome of the live `grok -p "ping"` run.
@@ -288,5 +340,66 @@ mod tests {
             }
             other => panic!("expected Abnormal, got {other:?}"),
         }
+    }
+
+    // ── local_auto_login_exposure ──────────────────────────────
+
+    #[test]
+    fn bind_is_loopback_recognizes_all_accepted_forms() {
+        assert!(bind_is_loopback("127.0.0.1"));
+        assert!(bind_is_loopback("127.0.0.5"));
+        assert!(bind_is_loopback("::1"));
+        assert!(bind_is_loopback("localhost"));
+        assert!(bind_is_loopback("LOCALHOST"));
+        assert!(!bind_is_loopback("0.0.0.0"));
+        assert!(!bind_is_loopback("192.168.1.10"));
+        assert!(!bind_is_loopback("::"));
+        // Unparseable strings fail closed to "not loopback" — never silently
+        // treated as safe.
+        assert!(!bind_is_loopback("not-an-ip"));
+    }
+
+    #[test]
+    fn warns_when_auto_login_on_and_bind_is_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[dashboard]\nlocal_auto_login = true\n\n[gateway]\nbind = \"0.0.0.0\"\n",
+        )
+        .unwrap();
+        let msg = local_auto_login_exposure(dir.path()).expect("should warn");
+        assert!(msg.contains("0.0.0.0"), "{msg}");
+        assert!(msg.contains("local_auto_login"), "{msg}");
+    }
+
+    #[test]
+    fn silent_when_bind_is_loopback_even_with_auto_login_on() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[dashboard]\nlocal_auto_login = true\n\n[gateway]\nbind = \"127.0.0.1\"\n",
+        )
+        .unwrap();
+        assert_eq!(local_auto_login_exposure(dir.path()), None);
+    }
+
+    #[test]
+    fn silent_when_auto_login_is_off_even_on_a_remote_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[dashboard]\nlocal_auto_login = false\n\n[gateway]\nbind = \"0.0.0.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(local_auto_login_exposure(dir.path()), None);
+    }
+
+    #[test]
+    fn default_bind_is_loopback_so_a_fresh_install_with_no_config_is_silent() {
+        // No config.toml at all: auto_login_enabled defaults to true, but
+        // gateway_bind_for_home also defaults to loopback — nothing to warn
+        // about on a brand-new install.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(local_auto_login_exposure(dir.path()), None);
     }
 }

@@ -3748,7 +3748,7 @@ icon = "🐾"
 [model]
 preferred = "claude-sonnet-4-6"
 fallback = "claude-haiku-4-5"
-account_pool = ["main"]
+account_pool = []
 api_mode = "{api_mode}"
 {model_local_section}
 [container]
@@ -4597,6 +4597,15 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
     // Check 2b (WP22 T1): organisational authority + mirror drift.
     checks.push(org_authority_check(&home));
 
+    // Check 2c (G8 residual-risk finding): local auto-login left on while
+    // the gateway bind is not loopback. Shared probe with the dashboard
+    // `system.doctor` RPC — see `duduclaw_gateway::doctor_probes` for the
+    // full threat write-up (bare reverse proxy makes a remote peer look
+    // loopback without ever sending a proxy header).
+    if let Some(message) = duduclaw_gateway::doctor_probes::local_auto_login_exposure(&home) {
+        checks.push(("本機自動登入曝險".into(), CheckStatus::Warn, message));
+    }
+
     // Check 3: Claude Code CLI
     match duduclaw_core::which_claude() {
         Some(path) => {
@@ -5069,7 +5078,7 @@ icon = "{icon}"
 [model]
 preferred = "{preferred}"
 fallback = "claude-haiku-4-5"
-account_pool = ["main"]
+account_pool = []
 api_mode = "auto"
 
 [container]

@@ -64,12 +64,24 @@ pub enum Promotion {
 ///
 /// [`TrajectoryEvidence`]: crate::gvu::mistake_notebook::TrajectoryEvidence
 pub fn assess_promotion(mistakes: &[MistakeEntry]) -> Promotion {
+    let (sessions, lessons) = promotion_counts(mistakes);
+    if sessions >= 2 && lessons >= 2 {
+        Promotion::Promote
+    } else {
+        Promotion::NeedsMoreEvidence
+    }
+}
+
+/// The two independence axes GovMem's promotion gate checks, over the VERIFIED
+/// subset only (B2: an unverified self-report contributes nothing toward
+/// independence): `(distinct_session_count, distinct_normalized_lesson_count)`.
+/// Shared by [`assess_promotion`] (the gate) and the G6 consolidation-failure
+/// telemetry (so a `NeedsMoreEvidence` record can report *why* the evidence
+/// was judged correlated). Pure — no I/O, no LLM.
+pub fn promotion_counts(mistakes: &[MistakeEntry]) -> (usize, usize) {
     let mut sessions: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut lessons: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in mistakes {
-        // B2: an unverified self-report contributes nothing toward
-        // independence — it is not evidence, so it cannot help establish
-        // that the evidence is independent.
         if m.evidence.is_none() {
             continue;
         }
@@ -79,11 +91,7 @@ pub fn assess_promotion(mistakes: &[MistakeEntry]) -> Promotion {
             lessons.insert(normalized);
         }
     }
-    if sessions.len() >= 2 && lessons.len() >= 2 {
-        Promotion::Promote
-    } else {
-        Promotion::NeedsMoreEvidence
-    }
+    (sessions.len(), lessons.len())
 }
 
 /// Normalize `what_went_wrong` for de-duplication: trim, lowercase, collapse
@@ -142,6 +150,11 @@ pub async fn maybe_consolidate(
     }
 
     for group in groups.into_values() {
+        // Captured before the group is consumed by the evidence filter — used
+        // by the G6 consolidation-failure telemetry below.
+        let source_kind = group.first().map(|m| m.source_kind.clone()).unwrap_or_default();
+        let raw_len = group.len();
+
         // B2 (Honest Lying, arXiv:2605.29463): an unverified mistake — no
         // `TrajectoryEvidence`, i.e. a pure LLM self-report — does not count
         // toward the consolidation threshold at all. This is the
@@ -154,9 +167,48 @@ pub async fn maybe_consolidate(
         let verified: Vec<MistakeEntry> =
             group.into_iter().filter(|m| m.evidence.is_some()).collect();
         if (verified.len() as u32) < threshold {
+            // G6/#7: only a *failure* worth surfacing when the raw group DID
+            // reach the threshold but the B2 evidence filter knocked it below
+            // — a genuine "these mistakes weren't merged because too few were
+            // verified". A group that never reached the threshold is normal
+            // accumulation, not a failure, and is deliberately NOT recorded.
+            if raw_len as u32 >= threshold {
+                crate::consolidation_failures::record_failure(
+                    home_dir,
+                    &crate::consolidation_failures::ConsolidationFailure::new(
+                        agent_id,
+                        category.as_str(),
+                        &source_kind,
+                        crate::consolidation_failures::FailureReason::InsufficientVerifiedEvidence,
+                        serde_json::json!({
+                            "raw": raw_len,
+                            "verified": verified.len(),
+                            "threshold": threshold,
+                        }),
+                    ),
+                );
+            }
             continue;
         }
         if assess_promotion(&verified) != Promotion::Promote {
+            // G6/#7: enough verified mistakes, but GovMem judged them
+            // correlated (too few distinct sessions and/or lessons). Record
+            // the two independence counts so the drill-down shows *why*.
+            let (distinct_sessions, distinct_lessons) = promotion_counts(&verified);
+            crate::consolidation_failures::record_failure(
+                home_dir,
+                &crate::consolidation_failures::ConsolidationFailure::new(
+                    agent_id,
+                    category.as_str(),
+                    &source_kind,
+                    crate::consolidation_failures::FailureReason::NeedsMoreEvidence,
+                    serde_json::json!({
+                        "verified": verified.len(),
+                        "distinct_sessions": distinct_sessions,
+                        "distinct_lessons": distinct_lessons,
+                    }),
+                ),
+            );
             continue;
         }
         return consolidate_group(notebook, memory_db_path, home_dir, agent_id, category, verified)
@@ -208,6 +260,23 @@ async fn consolidate_group(
             similarity = rejection.similarity,
             threshold = rejection.threshold,
             "B1 novelty gate rejected reflexion consolidation: {rejection}"
+        );
+        // G6/#7: surface the "why not merged" — the synthesized rule was a
+        // near-duplicate of an already-known rule.
+        let source_kind = mistakes.first().map(|m| m.source_kind.as_str()).unwrap_or("");
+        crate::consolidation_failures::record_failure(
+            home_dir,
+            &crate::consolidation_failures::ConsolidationFailure::new(
+                agent_id,
+                category.as_str(),
+                source_kind,
+                crate::consolidation_failures::FailureReason::NoveltyRejected,
+                serde_json::json!({
+                    "matched_id": rejection.matched_id,
+                    "similarity": rejection.similarity,
+                    "threshold": rejection.threshold,
+                }),
+            ),
         );
         // Leave source mistakes unresolved — same conservative posture as
         // `Promotion::NeedsMoreEvidence` above: this group's lesson is
@@ -301,6 +370,16 @@ async fn consolidate_group(
         "rule_stats": crate::prediction::rule_lifecycle::RuleStats::initial(),
     });
     playbook_meta.merge_into(&mut metadata_blob);
+
+    // G6 (Hindsight #6 parity): record the F1 memory-fact ids this rule was
+    // derived from so a later supersession of any of them flags the rule
+    // source-stale (`prediction::rule_staleness`). Reflexion consolidates from
+    // MistakeNotebook entries, NOT F1 temporal facts, so there is genuinely no
+    // fact source to record here — the call is made with an empty list (a
+    // no-op that writes no key), keeping the rule fail-open (never wrongly
+    // flagged stale). The wiring is explicit so a future consolidation source
+    // that DOES read F1 facts only has to pass their ids here.
+    crate::prediction::rule_staleness::record_source_facts(&mut metadata_blob, &[]);
 
     // WP-P3: when the held-out gate is on, seed the rule's out-of-sample
     // record with its birth cursor so the prequential time split
@@ -932,5 +1011,116 @@ mod tests {
             meta.get(crate::prediction::rule_gate::HeldOutStats::METADATA_KEY).is_none(),
             "gate off must not seed a held-out record (byte-identical metadata shape)"
         );
+    }
+
+    // ── G6/#7: consolidation-failure telemetry ────────────────────────────
+
+    #[tokio::test]
+    async fn needs_more_evidence_records_a_consolidation_failure() {
+        use crate::consolidation_failures::{list_failures, FailureReason};
+
+        let dir = TempDir::new().unwrap();
+        let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
+        let mem_path = dir.path().join("memory.db");
+        // 3 same-session verified mistakes → GovMem NeedsMoreEvidence.
+        record_same_session_n(&nb, "agent-nme", MistakeCategory::Capability, 3, "");
+
+        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-nme", MistakeCategory::Capability, 3)
+            .await
+            .unwrap();
+        assert!(r.is_none());
+
+        let fails = list_failures(dir.path(), Some("agent-nme"), 10);
+        assert_eq!(fails.len(), 1, "the GovMem rejection must be recorded");
+        assert_eq!(fails[0].reason, FailureReason::NeedsMoreEvidence);
+        assert_eq!(fails[0].category, "capability");
+        assert_eq!(fails[0].detail["distinct_sessions"], serde_json::json!(1));
+        assert_eq!(fails[0].detail["distinct_lessons"], serde_json::json!(3));
+    }
+
+    #[tokio::test]
+    async fn insufficient_verified_evidence_is_recorded_when_raw_reaches_threshold() {
+        use crate::consolidation_failures::{list_failures, FailureReason};
+
+        let dir = TempDir::new().unwrap();
+        let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
+        let mem_path = dir.path().join("memory.db");
+
+        // 2 verified + 3 unverified = raw 5 (>= threshold 3), verified 2 (< 3).
+        for i in 0..2 {
+            let e = build_mistake_entry(
+                "agent-ive", &format!("v-{i}"), MistakeCategory::Capability,
+                "u", "a", &format!("verified issue {i}"), None, "",
+            )
+            .with_evidence(TrajectoryEvidence::from_tool_error("bash", "boom"));
+            nb.record(&e).unwrap();
+        }
+        for i in 0..3 {
+            let e = build_mistake_entry(
+                "agent-ive", &format!("u-{i}"), MistakeCategory::Capability,
+                "u", "a", &format!("unverified issue {i}"), None, "",
+            );
+            nb.record(&e).unwrap();
+        }
+
+        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-ive", MistakeCategory::Capability, 3)
+            .await
+            .unwrap();
+        assert!(r.is_none());
+
+        let fails = list_failures(dir.path(), Some("agent-ive"), 10);
+        assert_eq!(fails.len(), 1);
+        assert_eq!(fails[0].reason, FailureReason::InsufficientVerifiedEvidence);
+        assert_eq!(fails[0].detail["raw"], serde_json::json!(5));
+        assert_eq!(fails[0].detail["verified"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn below_threshold_accumulation_is_not_recorded_as_failure() {
+        use crate::consolidation_failures::list_failures;
+
+        let dir = TempDir::new().unwrap();
+        let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
+        let mem_path = dir.path().join("memory.db");
+        // Only 2 verified mistakes — normal accumulation, NOT a failure.
+        record_n(&nb, "agent-acc", MistakeCategory::Capability, 2, "");
+
+        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-acc", MistakeCategory::Capability, 3)
+            .await
+            .unwrap();
+        assert!(r.is_none());
+        assert!(
+            list_failures(dir.path(), None, 10).is_empty(),
+            "below-threshold accumulation must not be logged as a consolidation failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn novelty_rejected_records_a_consolidation_failure() {
+        use crate::consolidation_failures::{list_failures, FailureReason};
+
+        let dir = TempDir::new().unwrap();
+        let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
+        let mem_path = dir.path().join("memory.db");
+
+        // Round 1 consolidates cleanly (no failure).
+        record_n(&nb, "agent-nov", MistakeCategory::Capability, 3, "");
+        assert!(maybe_consolidate(&nb, &mem_path, dir.path(), "agent-nov", MistakeCategory::Capability, 3)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(list_failures(dir.path(), None, 10).is_empty());
+
+        // Round 2: byte-identical synthesized rule → B1 novelty gate rejects.
+        record_n(&nb, "agent-nov", MistakeCategory::Capability, 3, "");
+        assert!(maybe_consolidate(&nb, &mem_path, dir.path(), "agent-nov", MistakeCategory::Capability, 3)
+            .await
+            .unwrap()
+            .is_none());
+
+        let fails = list_failures(dir.path(), Some("agent-nov"), 10);
+        assert_eq!(fails.len(), 1, "the B1 novelty rejection must be recorded");
+        assert_eq!(fails[0].reason, FailureReason::NoveltyRejected);
+        assert!(fails[0].detail["matched_id"].is_string());
     }
 }

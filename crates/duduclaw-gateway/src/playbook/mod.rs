@@ -51,7 +51,10 @@ pub use entry::{
 };
 pub use gene::{from_gene, to_gene, EvalCaseRef};
 pub use humanize::{humanize, HumanizedRule, RuleEvidence};
-pub use select::{build_playbook_section_blocking, render_section, select_playbook, InjectionBudget, SelectedEntry};
+pub use select::{
+    build_playbook_section_blocking, collect_armed_shadow, collect_armed_shadow_blocking,
+    render_section, select_playbook, ArmedShadow, InjectionBudget, SelectedEntry,
+};
 pub use signals::TurnSignals;
 pub use store::{apply_deltas, list_active};
 pub use sweep::{run_playbook_sweep, spawn_playbook_sweep_loop};

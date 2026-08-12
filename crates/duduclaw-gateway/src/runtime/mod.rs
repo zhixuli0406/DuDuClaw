@@ -67,6 +67,16 @@ pub struct RuntimeContext {
     /// CLI cannot fully honor them. `None` (agent-less utility calls) keeps
     /// each runtime's legacy behavior.
     pub capabilities: Option<duduclaw_core::types::CapabilitiesConfig>,
+    /// Agent account pool (`agent.toml [model] account_pool`).
+    ///
+    /// Narrows the [`AccountRotator`] candidate set for runtimes that rotate
+    /// DuDuClaw-managed accounts (today: the Claude CLI runtime). Empty for
+    /// agent-less utility calls and for agents that declare no pool — rotation
+    /// is then unchanged. Runtimes whose credentials do not come from the
+    /// rotator (codex / gemini / antigravity host logins) ignore it.
+    ///
+    /// [`AccountRotator`]: duduclaw_agent::account_rotator::AccountRotator
+    pub account_pool: Vec<String>,
 }
 
 /// Streaming chunk from a runtime execution.
@@ -431,6 +441,38 @@ pub fn load_agent_capabilities(
         },
     };
     Some(caps)
+}
+
+/// Read an agent's `[model] account_pool` from `agent.toml`.
+///
+/// Sibling of [`load_agent_capabilities`] — deliberately a lightweight direct
+/// read rather than a full `AgentConfig` parse, because the choke-point runs on
+/// paths that never loaded the registry. Missing file / unreadable / malformed
+/// section ⇒ empty pool ⇒ rotation unchanged (fail-open, matching the
+/// rotator's own stale-pool semantics).
+pub fn load_agent_account_pool(agent_dir: &Path) -> Vec<String> {
+    let path = agent_dir.join("agent.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = text.parse::<toml::Value>() else {
+        warn!(
+            agent_dir = %agent_dir.display(),
+            "agent.toml parse failed — ignoring [model] account_pool (full account set)"
+        );
+        return Vec::new();
+    };
+    parsed
+        .get("model")
+        .and_then(|m| m.get("account_pool"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Build the `duduclaw` MCP server definition for a non-Claude CLI's native

@@ -383,6 +383,11 @@ struct InFlight {
     /// `todo` / `pending` (i.e. `tasks_claim`). Flipped false once it moves to
     /// `in_progress` / `review`.
     awaiting_pickup: bool,
+    /// RFC-27: the edition concurrency-gate lease this task holds while
+    /// in-flight. `None` when the gate does not apply (unlimited edition, or
+    /// the gate is unwired in tests) — carried forward across re-dispatch,
+    /// renewed each tick, released when the task reaches a terminal state.
+    lease: Option<duduclaw_core::ConcurrencyLease>,
 }
 
 /// The goal loop background driver.
@@ -456,6 +461,16 @@ pub struct GoalLoopDriver {
     /// in-memory statistical-bucket cache the two hooks read/write stays
     /// coherent (see the caller-side wiring notes in `handlers.rs`).
     forward_model: Option<Arc<TaskForwardModel>>,
+    /// RFC-27: resolved effective edition concurrency limit for goal dispatch.
+    /// `None` ⇒ the gate is a complete no-op (unlimited edition, or unwired in
+    /// tests) — byte-identical to before this field existed. `Some(cap)` ⇒ a
+    /// NEW admission first acquires a cross-process lease and defers when the
+    /// class is at `cap`. Resolved at driver (re)spawn from the active edition
+    /// (see `handlers.rs::respawn_goal_loop_driver`).
+    concurrency_limit: Option<u32>,
+    /// RFC-27: crash-recovery TTL (seconds) for concurrency leases, renewed for
+    /// every held lease each tick.
+    concurrency_ttl_secs: u64,
 }
 
 /// Retry cap for a transient ([`crate::goal_notify::NotifyOutcome::SendFailed`])
@@ -463,6 +478,10 @@ pub struct GoalLoopDriver {
 /// it does not retry forever. Applies uniformly to the progress board,
 /// needs_human approval, and kickoff approval pushes.
 const NOTIFY_PUSH_MAX_RETRIES: u32 = 3;
+
+/// RFC-27: concurrency-gate class label for goal dispatch. Scopes the in-flight
+/// lease budget so a future second consumer cannot starve the goal budget.
+const CONCURRENCY_CLASS_GOAL: &str = "goal";
 
 impl GoalLoopDriver {
     pub fn new(store: Arc<TaskStore>, queue: Arc<MessageQueue>, config: GoalLoopConfig) -> Self {
@@ -486,12 +505,29 @@ impl GoalLoopDriver {
             state_capture_seen: Mutex::new(HashSet::new()),
             running: Arc::new(AtomicBool::new(false)),
             forward_model: None,
+            // RFC-27: gate disabled by default (None) — production wires the
+            // resolved edition limit via `with_concurrency_limit`. Tests and the
+            // 3-arg constructor stay on the untouched, unlimited path.
+            concurrency_limit: None,
+            concurrency_ttl_secs: duduclaw_core::ConcurrencyGateConfig::default()
+                .concurrency_lease_ttl_secs,
         }
     }
 
     /// Set the DuDuClaw home dir (per-agent autonomy + channel push).
     pub fn with_home_dir(mut self, home_dir: PathBuf) -> Self {
         self.home_dir = home_dir;
+        self
+    }
+
+    /// RFC-27: wire the resolved edition concurrency limit + lease TTL. `limit`
+    /// is `None` for an unlimited edition (Enterprise, or a Personal cap of 0),
+    /// in which case the gate stays a no-op. Called from
+    /// `handlers.rs::respawn_goal_loop_driver` with the edition resolved via the
+    /// existing `resolve_edition_profile()` chain.
+    pub fn with_concurrency_limit(mut self, limit: Option<u32>, ttl_secs: u64) -> Self {
+        self.concurrency_limit = limit;
+        self.concurrency_ttl_secs = ttl_secs;
         self
     }
 
@@ -671,7 +707,9 @@ impl GoalLoopDriver {
                         None => true,
                     };
                     if handled {
-                        inflight.remove(&id);
+                        if let Some(removed) = inflight.remove(&id) {
+                            self.release_lease(&removed); // RFC-27: free the slot
+                        }
                         self.progress_seen.lock().await.remove(&id);
                         self.clear_progress_retries(&id).await;
                         // A2 lifecycle: task reached a terminal state — drop
@@ -692,7 +730,9 @@ impl GoalLoopDriver {
                 // needs_human) — no longer the driver's dispatch concern.
                 // needs_human progress is pushed by reconcile_needs_human.
                 _ => {
-                    inflight.remove(&id);
+                    if let Some(removed) = inflight.remove(&id) {
+                        self.release_lease(&removed); // RFC-27: free the slot
+                    }
                     self.clear_progress_retries(&id).await;
                     // A2 lifecycle: cleanup on terminal/escalated states too
                     // (needs_human here may have come from DispatchEngine's
@@ -710,6 +750,23 @@ impl GoalLoopDriver {
 
         // In-flight goal tasks currently tracked (drives the concurrency admission gate).
         let mut active = inflight.len();
+
+        // ── RFC-27: renew the edition concurrency lease of every still-tracked
+        //    task so a live long-running goal never loses its slot to the
+        //    crash-recovery TTL. Runs after the reconcile loop above (terminal
+        //    tasks already released their leases), so only survivors are
+        //    renewed. No-op when the gate is unwired or a lease is unguarded. ──
+        if self.concurrency_limit.is_some() {
+            for entry in inflight.values() {
+                if let Some(lease) = &entry.lease {
+                    duduclaw_core::concurrency_renew(
+                        &self.home_dir,
+                        lease,
+                        self.concurrency_ttl_secs,
+                    );
+                }
+            }
+        }
 
         // ── D4 item 1: dependency-status map (LLMCompiler DAG) ──
         // Only built when some candidate actually carries dependencies, so the
@@ -1015,6 +1072,42 @@ impl GoalLoopDriver {
                 continue;
             }
 
+            // ── RFC-27 edition concurrency gate (cross-process, edition-aware) ──
+            // Checked AFTER the cheap in-memory guard above so a candidate that
+            // guard already deferred never touches the lease file. A NEW
+            // admission takes a cross-process lease; `AtCapacity` defers (queue
+            // semantics — a durable goal is a throughput throttle away from
+            // running, never dropped). `None` limit ⇒ the whole block is a
+            // no-op. A re-dispatch reuses the existing lease (set at the insert
+            // site) and is never re-counted.
+            let mut acquired_lease: Option<duduclaw_core::ConcurrencyLease> = None;
+            if is_new {
+                if let Some(limit) = self.concurrency_limit {
+                    match duduclaw_core::concurrency_try_acquire(
+                        &self.home_dir,
+                        CONCURRENCY_CLASS_GOAL,
+                        Some(limit),
+                        self.concurrency_ttl_secs,
+                    ) {
+                        duduclaw_core::ConcurrencyAcquireOutcome::Admitted(lease) => {
+                            acquired_lease = Some(lease);
+                        }
+                        duduclaw_core::ConcurrencyAcquireOutcome::AtCapacity {
+                            active: gate_active,
+                            limit: cap,
+                        } => {
+                            debug!(
+                                task = %task.id,
+                                active = gate_active,
+                                cap,
+                                "goal loop: edition concurrency cap reached, deferring new goal task"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // ── WP-A9: A3 task-forward-model predict hook (design §4.1) ──
             // `forward_model` is `None` unless `[task_forward_model] enabled
             // = true` (see `handlers.rs`'s construction site) — with it
@@ -1146,12 +1239,21 @@ impl GoalLoopDriver {
             if is_new {
                 active += 1;
             }
+            // RFC-27: a NEW admission carries the lease just acquired; a
+            // re-dispatch carries forward the lease the tracked entry already
+            // holds (never re-acquired, never double-counted).
+            let lease = if is_new {
+                acquired_lease.take()
+            } else {
+                inflight.get(&task.id).and_then(|e| e.lease.clone())
+            };
             inflight.insert(
                 task.id.clone(),
                 InFlight {
                     iter: next_iter,
                     enqueued_at: now,
                     awaiting_pickup: true,
+                    lease,
                 },
             );
 
@@ -1220,6 +1322,15 @@ impl GoalLoopDriver {
         }
     }
 
+    /// RFC-27: release the edition concurrency lease a terminal task held.
+    /// No-op when the gate did not apply (unguarded / `None`). Best-effort — the
+    /// lease TTL reclaims the slot even if the file write fails.
+    fn release_lease(&self, entry: &InFlight) {
+        if let Some(lease) = &entry.lease {
+            duduclaw_core::concurrency_release(&self.home_dir, lease);
+        }
+    }
+
     /// Park a task for a human and drop its in-flight tracking.
     async fn escalate(
         &self,
@@ -1233,7 +1344,9 @@ impl GoalLoopDriver {
         // needs_human revocation for the goal-loop-side escalation path.
         self.revoke_task_grants(&task.id, crate::capability_grants::REVOKE_REASON_PHASE_END)
             .await;
-        inflight.remove(&task.id);
+        if let Some(removed) = inflight.remove(&task.id) {
+            self.release_lease(&removed); // RFC-27: free the slot on escalation
+        }
         // A2 lifecycle: this driver's own escalation is a terminal phase end
         // — drop visit-graph tracking (the tracked-loop's terminal branches
         // also clear it, for escalations DispatchEngine triggers directly;
@@ -2045,6 +2158,93 @@ mod tests {
         // Only 2 of the 5 goal tasks admitted this tick.
         let pending = queue.pending_messages(10).await.unwrap();
         assert_eq!(pending.len(), 2, "concurrency cap admits at most 2 new tasks");
+    }
+
+    // ── RFC-27: edition concurrency gate (cross-process in-flight cap) ──
+
+    #[tokio::test]
+    async fn edition_concurrency_gate_defers_new_goals_then_frees_slot_on_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        for i in 0..3 {
+            store
+                .insert_task(&goal_task(&format!("g{i}"), "alice"))
+                .await
+                .unwrap();
+        }
+
+        // In-process guard set high (3) so ONLY the edition gate (cap 1) bites —
+        // this isolates the new gate from the pre-existing `max_concurrent` one.
+        let cfg = GoalLoopConfig {
+            max_concurrent: 3,
+            ..small_cfg()
+        };
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), cfg)
+            .with_home_dir(dir.path().to_path_buf())
+            .with_concurrency_limit(Some(1), 1800);
+
+        // Tick 1: edition cap 1 admits exactly one of the three new goals; the
+        // other two defer (queue semantics — not dropped).
+        d.tick_once().await.unwrap();
+        assert_eq!(
+            queue.pending_messages(10).await.unwrap().len(),
+            1,
+            "edition cap 1 admits at most one new goal per tick"
+        );
+        assert_eq!(
+            duduclaw_core::concurrency_active_count(dir.path(), CONCURRENCY_CLASS_GOAL),
+            1,
+            "exactly one cross-process lease is held"
+        );
+
+        // The admitted task reaches a terminal state → its lease is released.
+        let held: Vec<String> = d.inflight.lock().await.keys().cloned().collect();
+        assert_eq!(held.len(), 1);
+        store
+            .update_task(&held[0], &serde_json::json!({ "status": "done" }))
+            .await
+            .unwrap();
+
+        // Tick 2: reconcile releases the finished task's lease, then a deferred
+        // goal is admitted into the freed slot (still capped at 1).
+        d.tick_once().await.unwrap();
+        assert_eq!(
+            duduclaw_core::concurrency_active_count(dir.path(), CONCURRENCY_CLASS_GOAL),
+            1,
+            "the freed slot is taken by exactly one previously-deferred goal"
+        );
+        assert_eq!(
+            queue.pending_messages(10).await.unwrap().len(),
+            2,
+            "one more goal dispatched after the first released its slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn edition_concurrency_unlimited_is_byte_identical() {
+        // `None` limit ⇒ the gate is a complete no-op: all three admit under the
+        // in-process cap of 3, and the lease file is never even created.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        for i in 0..3 {
+            store
+                .insert_task(&goal_task(&format!("g{i}"), "alice"))
+                .await
+                .unwrap();
+        }
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf())
+            .with_concurrency_limit(None, 1800);
+        d.tick_once().await.unwrap();
+        assert_eq!(
+            queue.pending_messages(10).await.unwrap().len(),
+            3,
+            "unlimited edition dispatches all three under the in-process cap"
+        );
+        assert!(
+            !dir.path().join("concurrency_leases.json").exists(),
+            "the unlimited path must never touch the lease file"
+        );
     }
 
     #[tokio::test]

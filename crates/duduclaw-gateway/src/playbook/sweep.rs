@@ -52,6 +52,10 @@ pub struct SweepReport {
     pub staled: Vec<String>,
     pub retired: Vec<String>,
     pub evicted: Vec<String>,
+    /// G6: rule ids flagged source-stale this pass (a recorded source fact was
+    /// superseded). Distinct from `staled` above (Ebbinghaus decay) — this is
+    /// content-freshness, not recency.
+    pub source_staled: Vec<String>,
 }
 
 /// §1.7.2: pure retrievability check, no I/O.
@@ -99,6 +103,13 @@ pub fn gdi_score(
 pub async fn run_playbook_sweep(engine: &SqliteMemoryEngine, agent_id: &str, now: DateTime<Utc>) -> SweepReport {
     let weights = RetrievalWeights::default();
     let mut report = SweepReport::default();
+
+    // G6: propagate fact-layer supersession up to the rule layer. Runs first
+    // (before the Ebbinghaus stale/eviction passes below) and independently —
+    // rules with no recorded source facts are untouched (fail-open). Marks the
+    // `SOURCE_STALE_RULE_TAG` used by the injection downweight/marker.
+    report.source_staled =
+        crate::prediction::rule_staleness::refresh_rule_source_staleness(engine, agent_id).await;
 
     // Pass 1: Active→Stale, Stale→Retired.
     let mut still_active_probation: Vec<(String, i64, u32, u32, Option<DateTime<Utc>>, DateTime<Utc>, f64)> = Vec::new();
@@ -245,12 +256,17 @@ pub fn spawn_playbook_sweep_loop(
                 }
                 let report = run_playbook_sweep(&engine, &agent_id, now).await;
                 last_swept.insert(agent_id.clone(), now);
-                if !report.staled.is_empty() || !report.retired.is_empty() || !report.evicted.is_empty() {
+                if !report.staled.is_empty()
+                    || !report.retired.is_empty()
+                    || !report.evicted.is_empty()
+                    || !report.source_staled.is_empty()
+                {
                     tracing::info!(
                         agent = %agent_id,
                         staled = report.staled.len(),
                         retired = report.retired.len(),
                         evicted = report.evicted.len(),
+                        source_staled = report.source_staled.len(),
                         "playbook sweep: state transitions"
                     );
                 }
@@ -372,6 +388,120 @@ mod tests {
         assert_eq!(PlaybookMeta::from_metadata(&meta).unwrap().state, PlaybookState::Stale);
         let still_readable = engine.get_by_id(agent, evicted_id).await.unwrap();
         assert!(still_readable.is_some(), "eviction never deletes the row");
+    }
+
+    #[tokio::test]
+    async fn sweep_flags_rule_whose_source_fact_was_superseded() {
+        use crate::prediction::rule_staleness::{record_source_facts, SOURCE_STALE_RULE_TAG};
+
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-sweep-source-stale";
+        let now = Utc::now();
+
+        // A source fact the rule depends on.
+        let fact_entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: "price is 100".to_string(),
+            timestamp: now,
+            tags: vec![],
+            embedding: None,
+            layer: MemoryLayer::Semantic,
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: "fact".to_string(),
+        };
+        let fact_id = engine
+            .store_temporal(
+                agent,
+                fact_entry,
+                TemporalMeta {
+                    subject: Some("product:price".into()),
+                    predicate: Some("is".into()),
+                    object: Some("100".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // A fresh (non-decayed) playbook rule recording that source fact.
+        let mut meta = PlaybookMeta {
+            schema_version: crate::playbook::entry::PLAYBOOK_SCHEMA_VERSION,
+            category: PlaybookCategory::Repair,
+            signals_match: vec!["*".to_string()],
+            strategy: Vec::new(),
+            failure_history: Vec::new(),
+            eval_cases: vec![crate::playbook::gene::EvalCaseRef("s/c".to_string())],
+            applications: Vec::new(),
+            success_streak: 0,
+            state: PlaybookState::Active,
+            revision: 0,
+            dedup_key: "0".repeat(16),
+            embed_model: None,
+            origin: "agent_derived".to_string(),
+            derived_from: Vec::new(),
+            assertions: Default::default(),
+        };
+        let rule_entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: "when asked price answer 100".to_string(),
+            timestamp: now,
+            tags: vec!["playbook".to_string()],
+            embedding: None,
+            layer: MemoryLayer::Semantic,
+            importance: 8.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: PLAYBOOK_SOURCE_EVENT.to_string(),
+        };
+        let mut blob = serde_json::json!({"rule_stats": {"helpful": 1, "harmful": 0}});
+        record_source_facts(&mut blob, &[fact_id.clone()]);
+        meta.merge_into(&mut blob);
+        let rule_id = engine
+            .store_temporal(agent, rule_entry, TemporalMeta { metadata: Some(blob), ..Default::default() })
+            .await
+            .unwrap();
+
+        // Before supersession: sweep does not flag it.
+        let report = run_playbook_sweep(&engine, agent, now).await;
+        assert!(!report.source_staled.contains(&rule_id));
+
+        // Supersede the source fact with a newer value.
+        let newer = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: "price is 120".to_string(),
+            timestamp: now,
+            tags: vec![],
+            embedding: None,
+            layer: MemoryLayer::Semantic,
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: "fact".to_string(),
+        };
+        engine
+            .store_temporal(
+                agent,
+                newer,
+                TemporalMeta {
+                    subject: Some("product:price".into()),
+                    predicate: Some("is".into()),
+                    object: Some("120".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Now the sweep propagates the supersession up to the rule.
+        let report = run_playbook_sweep(&engine, agent, now).await;
+        assert!(report.source_staled.contains(&rule_id), "rule flagged after its source was superseded");
+        let stored = engine.get_by_id(agent, &rule_id).await.unwrap().unwrap();
+        assert!(stored.tags.iter().any(|t| t == SOURCE_STALE_RULE_TAG));
     }
 
     #[test]

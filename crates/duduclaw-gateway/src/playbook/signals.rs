@@ -148,6 +148,27 @@ pub fn matches(entry_signals: &[String], turn: &TurnSignals) -> bool {
     entry_signals.iter().any(|s| s == "*" || turn.contains(s))
 }
 
+/// Does the entry carry at least one discriminating (non-wildcard) trigger
+/// token? A wildcard-only signal set fires on every turn, which makes the
+/// entry unfalsifiable as a shadow risk predictor: armed on every
+/// observation, its hit rate converges to the baseline itself, so the
+/// Wilson CI straddles the baseline forever — unpromotable AND unretirable.
+/// The arming scan (`select::collect_armed_shadow`) uses this to keep such
+/// entries out of the trial family entirely.
+pub fn has_discriminating_signal(entry_signals: &[String]) -> bool {
+    entry_signals.iter().any(|s| s != "*")
+}
+
+/// [`matches`] restricted to discriminating tokens — the wildcard is
+/// ignored, so an entry only "arms" on a turn its specific trigger actually
+/// fired on. This keeps a mixed signal set (`["*", "mistake:capability"]`)
+/// falsifiable: as an ACTIVE entry it still wildcard-matches for injection
+/// ranking ([`matches`]), but as a shadow candidate it is only scored on the
+/// turns its non-wildcard token selected.
+pub fn matches_ignoring_wildcard(entry_signals: &[String], turn: &TurnSignals) -> bool {
+    entry_signals.iter().any(|s| s != "*" && turn.contains(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +183,29 @@ mod tests {
     fn empty_signals_never_match() {
         let turn = TurnSignals::new().with_channel("telegram");
         assert!(!matches(&[], &turn));
+    }
+
+    #[test]
+    fn discriminating_signal_detection_ignores_wildcard() {
+        assert!(!has_discriminating_signal(&[]));
+        assert!(!has_discriminating_signal(&["*".to_string()]));
+        assert!(has_discriminating_signal(&["*".to_string(), "kw:refund".to_string()]));
+        assert!(has_discriminating_signal(&["mistake:capability".to_string()]));
+    }
+
+    #[test]
+    fn matches_ignoring_wildcard_requires_a_real_token_hit() {
+        let turn = TurnSignals::new().with_mistake_category("capability");
+        // Wildcard alone never arms.
+        assert!(!matches_ignoring_wildcard(&["*".to_string()], &turn));
+        // Mixed set arms only through its discriminating token…
+        let mixed = vec!["*".to_string(), "mistake:capability".to_string()];
+        assert!(matches_ignoring_wildcard(&mixed, &turn));
+        // …and not on a turn where that token is absent (plain `matches`
+        // would say yes via the wildcard — that asymmetry is the point).
+        let other = TurnSignals::new().with_channel("telegram");
+        assert!(!matches_ignoring_wildcard(&mixed, &other));
+        assert!(matches(&mixed, &other));
     }
 
     #[test]

@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{Datelike, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_auth::acl;
 use duduclaw_auth::models::{AccessLevel, UserRole};
@@ -791,6 +792,295 @@ fn os_native_quota_reject_frame(limit: u32) -> WsFrame {
             "code": OS_NATIVE_QUOTA_ERROR_CODE,
             "message": message,
         })),
+    }
+}
+
+/// Machine-readable code returned when a Personal-edition caller reaches an
+/// RPC that only exists for the multi-person (Enterprise) form factor.
+/// Stable string — the dashboard may key upgrade copy off it.
+pub const ENTERPRISE_ONLY_ERROR_CODE: &str = "enterprise_edition_required";
+
+/// Is `method` part of the Enterprise-only RPC surface?
+///
+/// # Why this exists (G2)
+///
+/// The dashboard's `EditionGuard` / `nav-visibility` flags are **UX only** —
+/// the frontend says so itself. A Personal-edition user who edits the URL, hits
+/// a legacy route alias, or speaks WebSocket JSON-RPC directly still reached
+/// every enterprise management surface. This function is the server-side twin,
+/// enforced once at the [`MethodHandler::dispatch`] chokepoint.
+///
+/// # Source of truth
+///
+/// `commercial/docs/ux-redesign-2026-08/09-edition-split-features.md` §1 — the
+/// 89-unit inventory. Exactly the units marked ➖ (Personal-hidden) that have a
+/// dashboard RPC of their own are listed here. The dividing axis is **"needs a
+/// second natural person" / "sells to someone else's customers"**, never
+/// complexity: approvals, audit logs, autopilot, kill switch, delegation
+/// policy, shared wiki and the org chart are all cross-*agent*, not cross-
+/// *person*, and stay fully open in Personal.
+///
+/// # Matching discipline
+///
+/// Whole-family entries compare the **first dot-separated segment for exact
+/// equality** (never `starts_with`, per coding convention #2 — an unanchored
+/// prefix would also swallow a hypothetical `users_export.run`). Exact-equality
+/// on the segment is also fail-closed for *future* members: a new
+/// `departments.rename` is Enterprise-gated the day it is added, without anyone
+/// remembering to update this table.
+///
+/// Mixed families (`wiki.*`, `audit.*` — most of whose members are Personal-open)
+/// cannot use that rule, so their Enterprise members are enumerated one by one.
+/// **Any new `wiki.trust_*` or fleet-reliability RPC must be added below.**
+///
+/// # Deliberate exclusions (documented so they are not "fixed" back in)
+///
+/// - `users.me` / `users.change_password` — self-service only (both resolve the
+///   target from `ctx.user_id`, never from params). §1.6 keeps the 帳號與密碼
+///   tab open in Personal, and it is the *only* password path there.
+/// - `license.*` — 授權管理 is `personalHidden` in the UI, but `license.activate`
+///   / `license.redeem` are the upgrade path itself. Blocking them in Personal
+///   would make Enterprise unreachable (edition is derived from license tier).
+/// - `delegation.get` / `delegation.set` — §1.6 marks 委派權限 ✅ Personal:
+///   it governs which *agent* may hand work to which agent, not which person.
+/// - `billing.usage` — one RPC serves both the Personal 預算與超支 view (✅) and
+///   the Enterprise 方案用量 KPI (➖); the split is a section-level render
+///   decision inside `BillingPage`, not an RPC boundary.
+/// - `security.*` / `killswitch.*` / `audit.unified_log` / `audit.evolution_query`
+///   — D9 keeps kill switch + logs in Personal; the RBAC / vault / mount-guard
+///   cards are hidden by conditional rendering, not by RPC.
+/// - `topology.*` (組織架構) — D6 turned it into progressive disclosure
+///   (`requiresData`), visible in **both** editions once ≥3 agents exist.
+pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
+    // ── Self-service carve-outs inside an otherwise Enterprise family ──────
+    // Checked first so the family rule below cannot swallow them.
+    if matches!(method, "users.me" | "users.change_password") {
+        return false;
+    }
+
+    // ── Whole Enterprise families (exact first-segment equality) ───────────
+    let family = method.split('.').next().unwrap_or("");
+    if matches!(
+        family,
+        // 成員（使用者管理）— §1.5「跨人第一名」
+        "users"
+        // 部門 — 人的組織分群
+        | "departments"
+        // 治理政策 — permission policy 是跨人
+        | "governance"
+        // 經銷商管理／發授權／白牌品牌 — 賣給別人的客戶
+        | "distributor"
+        // 夥伴入口（經銷 CRM）— 客戶數／抽成
+        | "partner"
+        // 身分解析 — 把不同通道上的「人」對到同一身分
+        | "identity"
+    ) {
+        return true;
+    }
+
+    // ── Individual members of mixed families ───────────────────────────────
+    matches!(
+        method,
+        // Wiki Trust 稽核 — 治理級知識稽核（`wiki.*` 其餘成員皆為個人版開放）
+        "wiki.trust_audit" | "wiki.trust_history" | "wiki.trust_override"
+        // 可靠性報告 — SRE 式機隊指標（`audit.unified_log` / `audit.evolution_query`
+        // 為個人版開放的日誌與演化查詢，不在此列）
+        | "audit.reliability_summary"
+    )
+}
+
+/// Structured refusal for a Personal-edition caller hitting an Enterprise-only
+/// RPC. End-user zh-TW copy — no method names, route paths or other internal
+/// terms leak into it. Pure so code + message stay unit-testable.
+fn enterprise_only_reject_frame() -> WsFrame {
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(json!({
+            "code": ENTERPRISE_ONLY_ERROR_CODE,
+            "message": "此功能屬多人團隊版，個人版沒有開放。\
+                        升級後可解鎖成員、部門、治理政策與身分解析等多人協作功能：\
+                        https://duduclaw.dudustudio.monster#pricing",
+        })),
+    }
+}
+
+/// G2 — the Enterprise-only RPC table, tested as a pure function (no env, no
+/// tempdir, no races with the tests that mutate `DUDUCLAW_EDITION`). The
+/// end-to-end behaviour through `dispatch` lives in
+/// `tests/edition_rpc_gate_test.rs`, which runs in its own process.
+#[cfg(test)]
+mod edition_rpc_gate_table_tests {
+    use super::*;
+
+    /// Every ➖ (Personal-hidden) unit in 09-edition-split-features.md §1 that
+    /// owns a dashboard RPC is gated.
+    #[test]
+    fn enterprise_surfaces_are_listed() {
+        for method in [
+            // 成員（使用者管理）
+            "users.list",
+            "users.create",
+            "users.update",
+            "users.remove",
+            "users.bind_agent",
+            "users.unbind_agent",
+            "users.offboard",
+            "users.subordinates",
+            "users.audit_log",
+            // 部門
+            "departments.list",
+            "departments.create",
+            "departments.remove",
+            // 治理政策
+            "governance.list",
+            "governance.upsert",
+            "governance.remove",
+            // 經銷商管理／發授權／白牌品牌
+            "distributor.status",
+            "distributor.list",
+            "distributor.add",
+            "distributor.update",
+            "distributor.remove",
+            "distributor.issue",
+            "distributor.revoke",
+            "distributor.upgrade",
+            "distributor.bundle.sign",
+            // 夥伴入口（經銷 CRM）
+            "partner.profile",
+            "partner.profile.update",
+            "partner.stats",
+            "partner.customers",
+            "partner.customer.add",
+            "partner.customer.update",
+            "partner.customer.delete",
+            // 身分解析
+            "identity.config_get",
+            "identity.config_set",
+            "identity.resolve",
+            // Wiki Trust 稽核
+            "wiki.trust_audit",
+            "wiki.trust_history",
+            "wiki.trust_override",
+            // 可靠性報告
+            "audit.reliability_summary",
+        ] {
+            assert!(
+                is_enterprise_only_method(method),
+                "{method} must be Enterprise-only"
+            );
+        }
+    }
+
+    /// The far more dangerous direction: anything a single-person install
+    /// legitimately uses must NOT be caught. A false positive here is a
+    /// regression that silently breaks the free edition.
+    #[test]
+    fn personal_surfaces_are_untouched() {
+        for method in [
+            // Self-service account management (§1.6 帳號與密碼 ✅)
+            "users.me",
+            "users.change_password",
+            // 委派權限 — 跨 agent 不是跨人 (§1.6)
+            "delegation.get",
+            "delegation.set",
+            // 授權：升級路徑本身，擋掉就再也升不了級
+            "license.status",
+            "license.fingerprint",
+            "license.activate",
+            "license.redeem",
+            // 審批 / 稽核 / 日誌 / kill switch (D9)
+            "approvals.list",
+            "approvals.decide",
+            "audit.unified_log",
+            "audit.evolution_query",
+            "security.status",
+            "security.audit_log",
+            "killswitch.get",
+            "killswitch.update",
+            // 帳務：同一 RPC 服務個人版預算檢視，分區隱藏在前端
+            "billing.usage",
+            // 共享知識庫 / namespace 政策 (D5)
+            "wiki.pages",
+            "wiki.read",
+            "wiki.search",
+            "wiki.share",
+            "wiki.stats",
+            "wiki.lint",
+            "wiki.promote",
+            "wiki.archive",
+            "wiki.auto_pages",
+            "wiki_scope.get",
+            "wiki_scope.update",
+            // 組織架構 — D6 改為漸進揭露，兩版皆可讀
+            "topology.list",
+            // 日常主軌
+            "agents.list",
+            "agents.create",
+            "agents.update",
+            "tasks.list",
+            "plans.list",
+            "evolution.status",
+            "autopilot.list",
+            "channels.add",
+            "system.status",
+            "connect",
+            "ping",
+        ] {
+            assert!(
+                !is_enterprise_only_method(method),
+                "{method} must stay open in the Personal edition"
+            );
+        }
+    }
+
+    /// Family matching is exact first-segment equality, not `starts_with`
+    /// (coding convention #2). A method that merely *begins* with the letters
+    /// of a gated family is a different method and must not be captured.
+    #[test]
+    fn family_match_is_anchored_on_the_whole_segment() {
+        for method in [
+            "users_export.run",
+            "identityx.resolve",
+            "partnership.list",
+            "departmental.list",
+            "distributors_legacy.list",
+            "governancex.list",
+        ] {
+            assert!(
+                !is_enterprise_only_method(method),
+                "{method} shares only a prefix — must not be gated"
+            );
+        }
+        // …while a genuinely new member of a gated family is fail-closed
+        // (Enterprise) without anyone editing the table.
+        assert!(is_enterprise_only_method("departments.rename"));
+        assert!(is_enterprise_only_method("users.reset_password_for"));
+    }
+
+    /// The refusal is machine-readable and its copy is end-user-facing: no
+    /// method name, route path or other internal term leaks into the UI.
+    #[test]
+    fn reject_frame_is_coded_and_leak_free() {
+        match enterprise_only_reject_frame() {
+            WsFrame::Response {
+                ok: false,
+                error: Some(err),
+                ..
+            } => {
+                assert_eq!(
+                    err.get("code").and_then(|v| v.as_str()),
+                    Some(ENTERPRISE_ONLY_ERROR_CODE)
+                );
+                let msg = err.get("message").and_then(|v| v.as_str()).unwrap();
+                assert!(msg.contains("多人團隊版"), "plain-language copy: {msg}");
+                for leak in ["users.", "RPC", "edition", "enterprise", "/manage/"] {
+                    assert!(!msg.contains(leak), "internal term leaked: {leak}");
+                }
+            }
+            other => panic!("expected structured error response, got {other:?}"),
+        }
     }
 }
 
@@ -2924,7 +3214,17 @@ fn redaction_table_to_response(table: &toml::Table) -> Value {
 /// dashboard classifies an entry deterministically from its origin before it
 /// falls back to content keywords, so a `footprint_distill` entry never lands
 /// in the same bucket as a user-stated preference.
-fn memory_entry_row(e: &duduclaw_core::types::MemoryEntry) -> Value {
+/// The decay figures ride along on every row (`retrievability` / `stability_days`)
+/// so the memory page can show a freshness state per entry without a second
+/// round-trip. Both are derived from `duduclaw_memory::engine`'s own functions —
+/// the ones `decay::run_decay` scores against — so what the dashboard shows and
+/// what the archival job acts on can never drift apart.
+fn memory_entry_row(
+    e: &duduclaw_core::types::MemoryEntry,
+    w: &duduclaw_memory::engine::RetrievalWeights,
+    now: DateTime<Utc>,
+) -> Value {
+    let (retrievability, stability_days) = memory_decay_figures(e, w, now);
     json!({
         "id": e.id,
         "agent_id": e.agent_id,
@@ -2935,8 +3235,80 @@ fn memory_entry_row(e: &duduclaw_core::types::MemoryEntry) -> Value {
         "source_event": e.source_event,
         "importance": e.importance,
         "access_count": e.access_count,
+        "last_accessed": e.last_accessed.map(|t| t.to_rfc3339()),
+        "retrievability": round_to(retrievability, 4),
+        "stability_days": round_to(stability_days, 2),
     })
 }
+
+/// `(retrievability, stability_days)` for one entry at `now`.
+///
+/// The elapsed-time anchor is `last_accessed`, falling back to `timestamp` for a
+/// never-recalled entry — byte-identical to the anchor `decay::run_decay` picks,
+/// which is the whole point of factoring it out here.
+fn memory_decay_figures(
+    e: &duduclaw_core::types::MemoryEntry,
+    w: &duduclaw_memory::engine::RetrievalWeights,
+    now: DateTime<Utc>,
+) -> (f64, f64) {
+    let anchor = e.last_accessed.unwrap_or(e.timestamp);
+    let days = (now - anchor).num_seconds().max(0) as f64 / 86_400.0;
+    (
+        duduclaw_memory::engine::ebbinghaus_retrievability(days, e.access_count, e.importance, w),
+        duduclaw_memory::engine::ebbinghaus_stability_days(e.access_count, e.importance, w),
+    )
+}
+
+/// Round to `decimals` places for the wire. Keeps the JSON readable and stops a
+/// float artefact (`0.30000000000000004`) from reaching a chart axis.
+fn round_to(value: f64, decimals: u32) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    let factor = 10f64.powi(decimals as i32);
+    (value * factor).round() / factor
+}
+
+/// Freshness bands used by the memory page's decay visualisation, ordered
+/// freshest → faintest. `(key, lower_bound_inclusive)`; the last band is the
+/// remainder down to 0. The keys are stable wire values — the dashboard maps
+/// them to plain-language labels, never the other way round.
+const MEMORY_FRESHNESS_BANDS: &[(&str, f64)] = &[
+    ("fresh", 0.7),
+    ("stable", 0.4),
+    ("fading", 0.15),
+    ("archiving", 0.0),
+];
+
+/// Classify a retrievability value into one of [`MEMORY_FRESHNESS_BANDS`].
+fn memory_freshness_band(retrievability: f64) -> &'static str {
+    MEMORY_FRESHNESS_BANDS
+        .iter()
+        .find(|(_, lower)| retrievability >= *lower)
+        .map(|(key, _)| *key)
+        .unwrap_or("archiving")
+}
+
+/// Render the freshness histogram in band order, including bands with a zero
+/// count — a distribution chart with a silently-missing category reads as if
+/// that state does not exist.
+fn memory_freshness_bucket_rows(counts: &HashMap<&'static str, u64>) -> Vec<Value> {
+    MEMORY_FRESHNESS_BANDS
+        .iter()
+        .map(|(key, lower)| {
+            json!({
+                "key": key,
+                "count": counts.get(key).copied().unwrap_or(0),
+                "min_retrievability": lower,
+            })
+        })
+        .collect()
+}
+
+/// Upper bound on rows `memory.decay_overview` scans (newest first). A dashboard
+/// aggregate must not turn into an unbounded table scan; the response flags
+/// `truncated` when the cap actually binds.
+const MEMORY_DECAY_SCAN_CAP: usize = 5000;
 
 /// D3 wiring — fold `config.toml [memory]` graph-seed knobs into
 /// [`RetrievalWeights`]. Pure so it is unit-testable. Starts from engine
@@ -3981,8 +4353,23 @@ impl MethodHandler {
         };
 
         let cfg = crate::goal_loop::GoalLoopConfig::from_home(&self.home_dir);
-        let mut driver =
-            crate::goal_loop::GoalLoopDriver::new(ts, mq, cfg).with_home_dir(self.home_dir.clone());
+        // RFC-27: resolve the edition concurrency limit from the active edition
+        // via the SAME `resolve_edition_profile()` chain every other edition
+        // gate uses (no second source of truth — 鐵律 4). Personal → a small
+        // default cap; Enterprise → `None` (the gate is a no-op). Resolved at
+        // (re)spawn, so an edition/license change takes effect on the next
+        // config reload — the same cadence at which `[goal_loop]` is re-read.
+        let concurrency_cfg = duduclaw_core::ConcurrencyGateConfig::from_home(&self.home_dir);
+        let concurrency_limit = duduclaw_core::concurrency_effective_limit(
+            self.resolve_edition_profile().await,
+            &concurrency_cfg,
+        );
+        let mut driver = crate::goal_loop::GoalLoopDriver::new(ts, mq, cfg)
+            .with_home_dir(self.home_dir.clone())
+            .with_concurrency_limit(
+                concurrency_limit,
+                concurrency_cfg.concurrency_lease_ttl_secs,
+            );
         // WP-A9: wire the SAME forward-model `Arc` the `DispatchEngine`
         // settle hook uses (constructed once in `server.rs`, gated on
         // `[task_forward_model] enabled`). `None` ⇒ predict hook stays a
@@ -4207,6 +4594,18 @@ impl MethodHandler {
 
     /// Internal dispatch — returns a WsFrame with placeholder id (overwritten by caller).
     async fn dispatch(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+        // ── Edition gate (G2) ────────────────────────────────
+        // The single server-side chokepoint for the Enterprise-only RPC
+        // surface. It runs BEFORE the extension dispatch and before the method
+        // match, so no plugin, legacy route alias or hand-written WebSocket
+        // client can reach a multi-person management surface from a Personal
+        // install. `is_enterprise_only_method` carries the list + rationale;
+        // the (cheap, allocation-free) string test comes first so the ordinary
+        // RPC path never pays for edition resolution.
+        if is_enterprise_only_method(method) && self.resolve_edition_profile().await.is_personal() {
+            return enterprise_only_reject_frame();
+        }
+
         // ── Plugin extension dispatch ──────
         // Try extension first; if it returns Some, the method is handled.
         if let Some(frame) = self
@@ -4630,6 +5029,13 @@ impl MethodHandler {
             "memory.key_facts" => {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_memory_key_facts(params).await
+            }
+            // Freshness histogram + top-N + accumulation trend for the memory
+            // page's decay visualisation. Read-only aggregate over the same
+            // rows `memory.browse` lists.
+            "memory.decay_overview" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_memory_decay_overview(params).await
             }
             // F1 Temporal Memory (v1.19.0): supersession chain + point-in-time.
             "memory.history" => {
@@ -5767,6 +6173,7 @@ impl MethodHandler {
                     { "name": "memory.search", "description": "Search agent memory" },
                     { "name": "memory.browse", "description": "Browse recent memory entries" },
                     { "name": "memory.key_facts", "description": "List extracted key insights (P2 Key-Fact Accumulator)" },
+                    { "name": "memory.decay_overview", "description": "Memory freshness distribution, fading/most-recalled top-N and accumulation trend" },
                     { "name": "memory.history", "description": "Fact supersession chain (F1 Temporal Memory)" },
                     { "name": "memory.at", "description": "Point-in-time fact lookup (F1 Temporal Memory)" },
                     { "name": "memory.get_at", "description": "Point-in-time fact lookup (D6 alias of memory.at)" },
@@ -6177,7 +6584,7 @@ impl MethodHandler {
             [model]
             preferred = "claude-sonnet-4-6"
             fallback = "claude-haiku-4-5"
-            account_pool = ["main"]
+            account_pool = []
 
             [container]
             timeout_ms = 1800000
@@ -11764,11 +12171,12 @@ impl MethodHandler {
                 let (signals, results): (Vec<_>, Vec<_>) = entries
                     .iter()
                     .partition(|e| is_system_signal(&e.source_event, &e.content));
+                let (weights, now) = (engine.retrieval_weights.clone(), Utc::now());
                 WsFrame::ok_response(
                     "",
                     json!({
-                        "entries": results.into_iter().map(memory_entry_row).collect::<Vec<_>>(),
-                        "signals": signals.into_iter().map(memory_entry_row).collect::<Vec<_>>(),
+                        "entries": results.into_iter().map(|e| memory_entry_row(e, &weights, now)).collect::<Vec<_>>(),
+                        "signals": signals.into_iter().map(|e| memory_entry_row(e, &weights, now)).collect::<Vec<_>>(),
                     }),
                 )
             }
@@ -11809,12 +12217,168 @@ impl MethodHandler {
         // letting it bury (and, via the shared LIMIT, evict) real memories.
         match engine.list_recent_split(agent_id, limit).await {
             Ok((memories, signals)) => {
-                let rows: Vec<Value> = memories.iter().map(memory_entry_row).collect();
-                let signal_rows: Vec<Value> = signals.iter().map(memory_entry_row).collect();
+                let (weights, now) = (engine.retrieval_weights.clone(), Utc::now());
+                let rows: Vec<Value> = memories
+                    .iter()
+                    .map(|e| memory_entry_row(e, &weights, now))
+                    .collect();
+                let signal_rows: Vec<Value> = signals
+                    .iter()
+                    .map(|e| memory_entry_row(e, &weights, now))
+                    .collect();
                 WsFrame::ok_response("", json!({ "entries": rows, "signals": signal_rows }))
             }
             Err(e) => WsFrame::error_response("", &format!("Memory browse failed: {e}")),
         }
+    }
+
+    /// Aggregate view behind the memory page's decay visualisation: how fresh
+    /// this agent's memories are as a whole, which ones are about to fade, which
+    /// ones keep getting recalled, and how the pile has grown.
+    ///
+    /// Read-only — it opens the same db `memory.browse` does and derives every
+    /// number from `duduclaw_memory::engine`'s own Ebbinghaus functions. It
+    /// scans at most [`MEMORY_DECAY_SCAN_CAP`] entries (newest first) and says
+    /// so via `truncated`, rather than silently reporting a partial pile as the
+    /// whole one.
+    async fn handle_memory_decay_overview(&self, params: Value) -> WsFrame {
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+        let window_days = params
+            .get("days")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30)
+            .clamp(7, 90) as i64;
+        let top_n = params
+            .get("top_n")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 20) as usize;
+
+        let archive_threshold = duduclaw_memory::decay::MemoryDecayPolicy::default().min_retrievability;
+        let empty = || {
+            json!({
+                "total": 0,
+                "scanned": 0,
+                "truncated": false,
+                "buckets": memory_freshness_bucket_rows(&HashMap::new()),
+                "fading_soon": [],
+                "most_recalled": [],
+                "trend": [],
+                "window_days": window_days,
+                "archive_threshold": archive_threshold,
+            })
+        };
+
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::ok_response("", empty());
+        }
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"));
+            }
+        };
+
+        // Same list `memory.browse` shows — the overview must describe exactly
+        // the pile the user can scroll through, telemetry signals excluded.
+        let entries = match engine
+            .list_recent_split(agent_id, MEMORY_DECAY_SCAN_CAP)
+            .await
+        {
+            Ok((memories, _signals)) => memories,
+            Err(e) => {
+                return WsFrame::error_response("", &format!("Memory decay overview failed: {e}"));
+            }
+        };
+        if entries.is_empty() {
+            return WsFrame::ok_response("", empty());
+        }
+
+        let weights = engine.retrieval_weights.clone();
+        let now = Utc::now();
+
+        // One pass: freshness histogram + the decay figure per entry, kept
+        // alongside its entry so the two top-N lists never recompute it.
+        let mut counts: HashMap<&'static str, u64> = HashMap::new();
+        let mut scored: Vec<(&duduclaw_core::types::MemoryEntry, f64)> = Vec::with_capacity(entries.len());
+        for e in &entries {
+            let (r, _) = memory_decay_figures(e, &weights, now);
+            *counts.entry(memory_freshness_band(r)).or_insert(0) += 1;
+            scored.push((e, r));
+        }
+
+        // Faintest first — the ones a user would want to reinforce or let go.
+        let mut fading = scored.clone();
+        fading.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let fading_soon: Vec<Value> = fading
+            .iter()
+            .take(top_n)
+            .map(|(e, _)| memory_entry_row(e, &weights, now))
+            .collect();
+
+        // Most-recalled: access_count desc, freshest first on a tie so the list
+        // is deterministic instead of depending on scan order.
+        let mut recalled: Vec<_> = scored.clone();
+        recalled.sort_by(|a, b| {
+            b.0.access_count
+                .cmp(&a.0.access_count)
+                .then(b.1.total_cmp(&a.1))
+        });
+        let most_recalled: Vec<Value> = recalled
+            .iter()
+            .filter(|(e, _)| e.access_count > 0)
+            .take(top_n)
+            .map(|(e, _)| memory_entry_row(e, &weights, now))
+            .collect();
+
+        // Daily accumulation over the window. `added` is that day's new
+        // memories; `total` is the running pile size at the end of the day,
+        // seeded from everything older than the window.
+        let window_start = (now - ChronoDuration::days(window_days - 1)).date_naive();
+        let mut added_by_day: HashMap<chrono::NaiveDate, u64> = HashMap::new();
+        let mut baseline: u64 = 0;
+        for e in &entries {
+            let day = e.timestamp.date_naive();
+            if day < window_start {
+                baseline += 1;
+            } else {
+                *added_by_day.entry(day).or_insert(0) += 1;
+            }
+        }
+        let mut running = baseline;
+        let mut trend = Vec::with_capacity(window_days as usize);
+        for offset in 0..window_days {
+            let day = window_start + ChronoDuration::days(offset);
+            let added = added_by_day.get(&day).copied().unwrap_or(0);
+            running += added;
+            trend.push(json!({
+                "date": day.format("%Y-%m-%d").to_string(),
+                "added": added,
+                "total": running,
+            }));
+        }
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "total": entries.len(),
+                "scanned": entries.len(),
+                "truncated": entries.len() >= MEMORY_DECAY_SCAN_CAP,
+                "buckets": memory_freshness_bucket_rows(&counts),
+                "fading_soon": fading_soon,
+                "most_recalled": most_recalled,
+                "trend": trend,
+                "window_days": window_days,
+                "archive_threshold": archive_threshold,
+            }),
+        )
     }
 
     /// Forget one memory entry (2026-07-30 client feedback: per-row delete in
@@ -17101,6 +17665,8 @@ impl MethodHandler {
             Some(&caps),
             None,
             &[],
+            // System-level utility call, not an agent turn — no account pool.
+            &[],
         )
         .await
         {
@@ -21437,6 +22003,20 @@ impl MethodHandler {
             }));
         }
 
+        // Local auto-login exposure (G8 residual-risk finding): passwordless
+        // local login is only safe on a loopback bind — flag the dangerous
+        // combination before any request ever proves it in production.
+        if let Some(message) =
+            crate::doctor_probes::local_auto_login_exposure(&self.home_dir)
+        {
+            checks.push(json!({
+                "name": "local_auto_login_exposure",
+                "status": "warn",
+                "message": message,
+                "can_repair": false,
+            }));
+        }
+
         checks
     }
 
@@ -23388,6 +23968,8 @@ impl MethodHandler {
             None,
             Some(&caps),
             None,
+            &[],
+            // System-level utility call, not an agent turn — no account pool.
             &[],
         )
         .await
@@ -36921,6 +37503,274 @@ mod wp15_memory_split_tests {
         );
         assert_eq!(entries, vec![MEMORY.to_string()]);
         assert_eq!(signals, vec![TELEMETRY.to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod memory_decay_viz_tests {
+    //! Memory decay visualisation (R1, 2026-08-12): every browse/search row
+    //! carries its Ebbinghaus figures, and `memory.decay_overview` aggregates
+    //! them. The invariant these tests defend is that the dashboard and
+    //! `duduclaw_memory::decay::run_decay` read the *same* curve — a memory the
+    //! archival job is about to take must not look "fresh" on the page.
+    use super::*;
+    use duduclaw_memory::engine::RetrievalWeights;
+
+    fn payload(frame: WsFrame) -> Value {
+        match frame {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(d),
+                ..
+            } => d,
+            other => panic!("expected an ok response, got {other:?}"),
+        }
+    }
+
+    fn entry(
+        agent: &str,
+        content: &str,
+        age_days: i64,
+        access_count: u32,
+        importance: f64,
+    ) -> duduclaw_core::types::MemoryEntry {
+        let when = Utc::now() - ChronoDuration::days(age_days);
+        duduclaw_core::types::MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: content.to_string(),
+            timestamp: when,
+            tags: vec![],
+            embedding: None,
+            layer: Default::default(),
+            importance,
+            access_count,
+            last_accessed: None,
+            source_event: "conversation_summary".to_string(),
+        }
+    }
+
+    async fn seed(
+        home: &std::path::Path,
+        agent: &str,
+        entries: Vec<duduclaw_core::types::MemoryEntry>,
+    ) {
+        let db = home.join("agents").join(agent).join("memory.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        for e in entries {
+            engine.store(agent, e).await.unwrap();
+        }
+    }
+
+    #[test]
+    fn freshness_bands_are_ordered_and_total_the_whole_range() {
+        // Ordered freshest → faintest, strictly descending, bottoming out at 0
+        // so no retrievability value can fall through unclassified.
+        let mut previous = f64::INFINITY;
+        for (_, lower) in MEMORY_FRESHNESS_BANDS {
+            assert!(*lower < previous, "bands must strictly descend");
+            previous = *lower;
+        }
+        assert_eq!(MEMORY_FRESHNESS_BANDS.last().unwrap().1, 0.0);
+
+        assert_eq!(memory_freshness_band(1.0), "fresh");
+        assert_eq!(memory_freshness_band(0.7), "fresh");
+        assert_eq!(memory_freshness_band(0.69), "stable");
+        assert_eq!(memory_freshness_band(0.4), "stable");
+        assert_eq!(memory_freshness_band(0.39), "fading");
+        assert_eq!(memory_freshness_band(0.15), "fading");
+        assert_eq!(memory_freshness_band(0.14), "archiving");
+        assert_eq!(memory_freshness_band(0.0), "archiving");
+    }
+
+    #[test]
+    fn decay_figures_match_the_engine_and_use_the_recall_anchor() {
+        let w = RetrievalWeights::default();
+        let now = Utc::now();
+        let mut e = entry("a", "x", 30, 3, 5.0);
+
+        // Never recalled → the anchor is the creation time.
+        let (r, s) = memory_decay_figures(&e, &w, now);
+        let expect_s = duduclaw_memory::engine::ebbinghaus_stability_days(3, 5.0, &w);
+        assert!((s - expect_s).abs() < 1e-9);
+        assert!(
+            (r - duduclaw_memory::engine::ebbinghaus_retrievability(30.0, 3, 5.0, &w)).abs() < 1e-6
+        );
+
+        // Recalled yesterday → the same entry is far fresher, which is the
+        // whole "被回想會讓記憶更持久" story the UI tells.
+        e.last_accessed = Some(now - ChronoDuration::days(1));
+        let (r_recent, _) = memory_decay_figures(&e, &w, now);
+        assert!(r_recent > r, "a recent recall must raise retrievability");
+    }
+
+    #[tokio::test]
+    async fn browse_rows_carry_retrievability_and_stability() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = "decay-browse";
+        seed(
+            home.path(),
+            agent,
+            vec![entry(agent, "fresh memory", 0, 0, 5.0)],
+        )
+        .await;
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let body = payload(
+            handler
+                .handle_memory_browse(json!({ "agent_id": agent, "limit": 50 }))
+                .await,
+        );
+        let row = &body["entries"][0];
+        let r = row["retrievability"].as_f64().expect("retrievability");
+        let s = row["stability_days"].as_f64().expect("stability_days");
+        assert!((0.0..=1.0).contains(&r), "R must be a 0–1 probability, got {r}");
+        assert!(r > 0.9, "a just-written memory must read as fresh, got {r}");
+        assert!(s > 0.0, "stability must be positive, got {s}");
+        // `last_accessed` rides along so the detail sheet can explain *why* the
+        // curve sits where it does.
+        assert!(row.get("last_accessed").is_some());
+    }
+
+    #[tokio::test]
+    async fn decay_overview_buckets_top_lists_and_trend() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = "decay-overview";
+        seed(
+            home.path(),
+            agent,
+            vec![
+                entry(agent, "written today", 0, 0, 5.0),
+                // Same age as "drifting" below, but recalled 40 times and more
+                // important — reinforcement is exactly what keeps it fresh.
+                entry(agent, "recalled often", 20, 40, 8.0),
+                entry(agent, "drifting", 20, 0, 5.0),
+                entry(agent, "nearly gone", 300, 0, 1.0),
+            ],
+        )
+        .await;
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let body = payload(
+            handler
+                .handle_memory_decay_overview(json!({ "agent_id": agent, "days": 30, "top_n": 2 }))
+                .await,
+        );
+
+        assert_eq!(body["total"], json!(4));
+        assert_eq!(body["truncated"], json!(false));
+        assert_eq!(body["window_days"], json!(30));
+        // The archive line the curve draws is the archival job's own threshold.
+        assert_eq!(
+            body["archive_threshold"].as_f64().unwrap(),
+            duduclaw_memory::decay::MemoryDecayPolicy::default().min_retrievability
+        );
+
+        // All four bands are always present, even at zero, so the distribution
+        // chart never silently drops a category.
+        let buckets = body["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), MEMORY_FRESHNESS_BANDS.len());
+        let keys: Vec<&str> = buckets.iter().map(|b| b["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["fresh", "stable", "fading", "archiving"]);
+        let total: u64 = buckets.iter().map(|b| b["count"].as_u64().unwrap()).sum();
+        assert_eq!(total, 4, "every scanned entry lands in exactly one band");
+        let bucket = |key: &str| -> u64 {
+            buckets
+                .iter()
+                .find(|b| b["key"] == key)
+                .unwrap()["count"]
+                .as_u64()
+                .unwrap()
+        };
+        // Today's entry plus the reinforced one: repeated recall is what keeps
+        // a 20-day-old memory in the same band as one written this morning,
+        // while its never-recalled twin has already slipped two bands down.
+        assert_eq!(bucket("fresh"), 2);
+        assert_eq!(bucket("fading"), 1, "the never-recalled 20-day-old drifts");
+        assert_eq!(bucket("archiving"), 1, "the 300-day-old one is about to go");
+
+        // Faintest first, capped at top_n.
+        let fading = body["fading_soon"].as_array().unwrap();
+        assert_eq!(fading.len(), 2);
+        assert_eq!(fading[0]["content"], json!("nearly gone"));
+        assert!(
+            fading[0]["retrievability"].as_f64().unwrap()
+                <= fading[1]["retrievability"].as_f64().unwrap()
+        );
+
+        // Only entries actually recalled at least once appear here.
+        let recalled = body["most_recalled"].as_array().unwrap();
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0]["content"], json!("recalled often"));
+
+        // 30 daily points, cumulative and non-decreasing, ending at the total.
+        let trend = body["trend"].as_array().unwrap();
+        assert_eq!(trend.len(), 30);
+        let mut previous = 0u64;
+        for point in trend {
+            let value = point["total"].as_u64().unwrap();
+            assert!(value >= previous, "cumulative trend must never fall");
+            previous = value;
+            assert!(point["date"].as_str().unwrap().len() == 10);
+        }
+        assert_eq!(previous, 4, "the trend must end at the full pile");
+        // Day one of the window carries only the baseline: the 300-day-old
+        // entry predates the window, so it seeds the running total instead of
+        // showing up as an addition (which would misread as a burst of
+        // learning on the window's first day).
+        assert_eq!(trend[0]["total"].as_u64().unwrap(), 1);
+        assert_eq!(trend[0]["added"].as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn decay_overview_is_full_shaped_when_there_is_no_db() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let body = payload(
+            handler
+                .handle_memory_decay_overview(json!({ "agent_id": "nobody" }))
+                .await,
+        );
+        // Missing db is "nothing learned yet", not an error — and the caller
+        // must never have to special-case an absent key.
+        assert_eq!(body["total"], json!(0));
+        assert_eq!(body["buckets"].as_array().unwrap().len(), 4);
+        assert_eq!(body["fading_soon"], json!([]));
+        assert_eq!(body["most_recalled"], json!([]));
+        assert_eq!(body["trend"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn decay_overview_rejects_a_bad_agent_id() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_memory_decay_overview(json!({ "agent_id": "../etc" }))
+            .await;
+        assert!(
+            matches!(frame, WsFrame::Response { ok: false, .. }),
+            "path-traversal ids must be refused: {frame:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decay_overview_clamps_the_window() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = "decay-clamp";
+        seed(home.path(), agent, vec![entry(agent, "one", 0, 0, 5.0)]).await;
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        for (asked, expected) in [(0u64, 7i64), (1000, 90), (14, 14)] {
+            let body = payload(
+                handler
+                    .handle_memory_decay_overview(json!({ "agent_id": agent, "days": asked }))
+                    .await,
+            );
+            assert_eq!(body["window_days"], json!(expected), "days={asked}");
+            assert_eq!(body["trend"].as_array().unwrap().len(), expected as usize);
+        }
     }
 }
 

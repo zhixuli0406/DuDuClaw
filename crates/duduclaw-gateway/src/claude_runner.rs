@@ -497,6 +497,9 @@ async fn call_claude_for_agent_impl(
     // can wrap subprocess invocations in a `BARE_MODE` scope and
     // know to filter the rotator to API-key accounts.
     let cli_bare_mode = agent.config.prompt.cli_bare_mode;
+    // G1: the agent's `[model] account_pool` — threaded into every rotation
+    // path below (fresh-spawn `call_with_rotation` + the PTY short-circuit).
+    let account_pool = agent.config.model.account_pool.clone();
     // The agent's on-disk directory. For registry agents this equals
     // `<home>/agents/<id>`; for preloaded (ephemeral) agents it is the
     // scaffold dir under `<home>/agents/.ephemeral/<id>` — every downstream
@@ -732,6 +735,7 @@ async fn call_claude_for_agent_impl(
                 Ok(rotator) if rotator.count().await > 0 => {
                     let out = crate::channel_reply::rotate_cli_spawn(
                         &rotator,
+                        &account_pool,
                         move |env_vars, _retry_hint| {
                             let account_id =
                                 crate::channel_reply::account_id_from_env_vars(&env_vars);
@@ -827,6 +831,7 @@ async fn call_claude_for_agent_impl(
                 Some(&capabilities),
                 wd.as_deref(),
                 cli_bare_mode,
+                &account_pool,
             )
             .await;
             return match primary_result {
@@ -853,6 +858,7 @@ async fn call_claude_for_agent_impl(
                         Some(&capabilities),
                         wd.as_deref(),
                         cli_bare_mode,
+                        &account_pool,
                     )
                     .await
                     .map_err(|fe| {
@@ -944,6 +950,7 @@ async fn call_claude_for_agent_impl(
             Some(&capabilities),
             wd.as_deref(),
             cli_bare_mode,
+            &account_pool,
         )
         .await
         {
@@ -978,6 +985,7 @@ async fn call_claude_for_agent_impl(
                         Some(&capabilities),
                         wd.as_deref(),
                         cli_bare_mode,
+                        &account_pool,
                     )
                     .await
                     .map_err(|fe| {
@@ -2345,6 +2353,7 @@ pub fn spawn_health_probe(home_dir: PathBuf, interval_secs: u64) {
 /// Call Claude CLI with account rotation — tries next account on failure.
 ///
 /// Records token usage telemetry when available.
+#[allow(clippy::too_many_arguments)] // one extra pass-through param (account_pool)
 async fn call_with_rotation(
     home_dir: &Path,
     agent_id: &str,
@@ -2355,6 +2364,9 @@ async fn call_with_rotation(
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     work_dir: Option<&Path>,
     bare_mode: bool,
+    // The dispatched agent's `agent.toml [model] account_pool`. Narrows the
+    // rotator candidate set (fail-open); empty ⇒ rotation unchanged.
+    account_pool: &[String],
 ) -> Result<String, String> {
     // HIGH-A defence-in-depth: a `moa:` virtual model can never be served by
     // a CLI spawn. Reject BEFORE the rotator is even constructed so a
@@ -2408,7 +2420,7 @@ async fn call_with_rotation(
     let mut last_error = String::new();
 
     for attempt in 0..max_attempts {
-        let selected = match rotator.select().await {
+        let selected = match rotator.select_with_pool(account_pool).await {
             Some(s) => s,
             None => break,
         };
@@ -3467,6 +3479,7 @@ mod direct_api_routing_tests {
             None,
             None,
             false,
+            &[],
         )
         .await
         .expect_err("moa id must be rejected on the CLI-rotation path");

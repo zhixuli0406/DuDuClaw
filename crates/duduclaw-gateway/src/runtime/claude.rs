@@ -44,7 +44,10 @@ impl AgentRuntime for ClaudeRuntime {
             // dropped on the dispatch path — a silent enforcement gap).
             context.capabilities.as_ref(),
             None, // session_id (history folded into prompt)
-            &[],                          // conversation_history (threaded by caller for now)
+            &[],  // conversation_history (threaded by caller for now)
+            // G1: agent's `[model] account_pool` — narrows the rotator
+            // candidate set (fail-open; empty ⇒ full set).
+            &context.account_pool,
         )
         .await?;
 
