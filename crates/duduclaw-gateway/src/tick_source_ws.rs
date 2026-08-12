@@ -288,6 +288,7 @@ fn jitter_seed() -> u32 {
 async fn connect_source(
     cfg: &TickSourceConfig,
     url: &str,
+    dns: &mut crate::tick_source::DnsCache,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("url rejected: invalid URL: {e}"))?;
     let host = parsed
@@ -335,9 +336,18 @@ async fn connect_source(
             .await
             .map_err(|e| format!("tcp connect failed: {e}"))?
     } else {
-        let addrs = crate::web_fetch::resolve_public_addrs(host, port)
-            .await
-            .map_err(|e| e.to_string())?;
+        // R2 — a reconnect inside the DNS TTL redials the addresses already
+        // screened for this host instead of paying for (and waiting on) a
+        // fresh lookup on every backoff cycle.
+        let key = format!("{host}:{port}");
+        let owned_host = host.to_string();
+        let addrs =
+            crate::tick_source::resolve_with_cache(dns, &key, Instant::now(), || async move {
+                crate::web_fetch::resolve_public_addrs(&owned_host, port)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await?;
         TcpStream::connect(&addrs[..])
             .await
             .map_err(|e| format!("tcp connect failed: {e}"))?
@@ -366,7 +376,7 @@ async fn stream_websocket(
     // call is the same convention `poll_once` follows for `http_poll`.
     crate::tick_config::validate_ws_url(url)?;
 
-    let stream = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_source(cfg, url))
+    let stream = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_source(cfg, url, &mut state.dns))
         .await
         .map_err(|_| format!("connect timed out after {}s", WS_CONNECT_TIMEOUT.as_secs()))??;
 
@@ -517,6 +527,8 @@ mod tests {
             emit_unchanged: false,
             max_events_per_minute: 120,
             persist_every_n: 0,
+            baseline_max_age_secs: crate::tick_config::DEFAULT_BASELINE_MAX_AGE_SECS,
+            dns_ttl_secs: 0,
         }
     }
 
@@ -935,6 +947,8 @@ mod tests {
             emit_unchanged: false,
             max_events_per_minute: 120,
             persist_every_n: 0,
+            baseline_max_age_secs: crate::tick_config::DEFAULT_BASELINE_MAX_AGE_SECS,
+            dns_ttl_secs: 0,
         };
         let source = tokio::spawn(run_source(cfg, tx, hub.clone(), None));
 

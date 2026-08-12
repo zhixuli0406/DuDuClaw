@@ -80,6 +80,22 @@ pub const MIN_PING_INTERVAL_SECS: u64 = 5;
 /// a source asking for a 1-second watchdog has misunderstood the setting, and
 /// silently rewriting it to 30 would hide that.
 pub const MIN_IDLE_TIMEOUT_SECS: u64 = 30;
+/// R1 — default lifetime of a per-field delta baseline (1 hour).
+pub const DEFAULT_BASELINE_MAX_AGE_SECS: u64 = 3600;
+/// R1 — a non-zero baseline lifetime under this many seconds is *warned*
+/// about, not refused.
+///
+/// There is no floor here, unlike the watchdog clocks, because the failure
+/// modes are different in kind: a too-small `idle_timeout_secs` produces an
+/// unbounded reconnect loop (a runaway), whereas a too-small
+/// `baseline_max_age_secs` merely means the delta trio is almost always
+/// absent. That is a *loss of function*, and a legitimate one for a
+/// sub-second feed — refusing it would be inventing a policy. But it is also
+/// exactly the silent no-delta symptom two live-fire rounds were spent
+/// removing, so it does not get to happen quietly.
+pub const BASELINE_AGE_WARN_BELOW_SECS: u64 = 60;
+/// R2 — default reuse window for a screened DNS answer.
+pub const DEFAULT_DNS_TTL_SECS: u64 = 60;
 
 /// D5-W2 — header names the transport owns. An operator-supplied value for any
 /// of these would either corrupt the HTTP/WS framing or forge the handshake, so
@@ -212,6 +228,28 @@ pub struct TickSourceConfig {
     /// positive `n` persists every nth emitted tick for audit trails.
     #[serde(default)]
     pub persist_every_n: u32,
+    /// R1 — how long a field's delta baseline stays usable, in seconds.
+    /// `0` disables expiry (the pre-R1 behavior: a baseline lives forever).
+    ///
+    /// The F1 baseline is per-field last-seen, which is right for a feed that
+    /// interleaves partial frames but wrong across a long gap: a field that
+    /// stopped being reported yesterday would, on its next appearance, produce
+    /// a delta against a day-old value — a huge, entirely fictional move,
+    /// delivered to a rule as if it had just happened. Past this age the
+    /// baseline is discarded and the next observation re-establishes it, which
+    /// reads exactly like a first tick (no `prev_`/`delta_`/`pct_` at all).
+    #[serde(default = "default_baseline_max_age_secs")]
+    pub baseline_max_age_secs: u64,
+    /// R2 — seconds a screened DNS answer may be reused before the host is
+    /// re-resolved. `0` re-resolves on every request/dial.
+    ///
+    /// **Not read from the per-source table**: this is the global
+    /// `[tick] dns_ttl_secs`, copied onto each source by
+    /// [`TickConfig::from_section`] so a source task carries everything it
+    /// needs. A `dns_ttl_secs` key written inside `[[tick.sources]]` has no
+    /// effect.
+    #[serde(skip)]
+    pub dns_ttl_secs: u64,
 }
 
 impl std::fmt::Debug for TickSourceConfig {
@@ -234,6 +272,8 @@ impl std::fmt::Debug for TickSourceConfig {
             .field("emit_unchanged", &self.emit_unchanged)
             .field("max_events_per_minute", &self.max_events_per_minute)
             .field("persist_every_n", &self.persist_every_n)
+            .field("baseline_max_age_secs", &self.baseline_max_age_secs)
+            .field("dns_ttl_secs", &self.dns_ttl_secs)
             .finish()
     }
 }
@@ -253,6 +293,9 @@ fn default_ping_interval_secs() -> u64 {
 fn default_idle_timeout_secs() -> u64 {
     DEFAULT_IDLE_TIMEOUT_SECS
 }
+fn default_baseline_max_age_secs() -> u64 {
+    DEFAULT_BASELINE_MAX_AGE_SECS
+}
 
 /// The `[tick]` section. `enabled = false` by default — with it unset, no
 /// source task is ever spawned and nothing about the gateway changes.
@@ -263,6 +306,12 @@ pub struct TickConfig {
     /// global switch (fail-closed: a source-level `kind = "command"` is not
     /// sufficient authority to execute a binary).
     pub allow_command_sources: bool,
+    /// R2 — seconds a screened DNS answer may be reused before the host is
+    /// re-resolved. `0` re-resolves on every request/dial. Global, not
+    /// per-source: it is a property of how aggressively this install trusts
+    /// its resolver, not of one feed. Copied onto every source by
+    /// [`Self::from_section`].
+    pub dns_ttl_secs: u64,
     /// Only entries that parsed AND validated. Invalid entries were warned
     /// about and dropped at load time.
     pub sources: Vec<TickSourceConfig>,
@@ -273,6 +322,7 @@ impl Default for TickConfig {
         Self {
             enabled: false,
             allow_command_sources: false,
+            dns_ttl_secs: DEFAULT_DNS_TTL_SECS,
             sources: Vec::new(),
         }
     }
@@ -316,6 +366,14 @@ impl TickConfig {
             .get("allow_command_sources")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // R2 — a malformed / absent value falls back to the default rather
+        // than to `0`: silently switching every source to per-request
+        // resolution would be a performance cliff nobody asked for.
+        let dns_ttl_secs = section
+            .get("dns_ttl_secs")
+            .and_then(|v| v.as_integer())
+            .and_then(|n| u64::try_from(n).ok())
+            .unwrap_or(DEFAULT_DNS_TTL_SECS);
 
         let mut sources: Vec<TickSourceConfig> = Vec::new();
         if let Some(arr) = section.get("sources").and_then(|v| v.as_array()) {
@@ -340,7 +398,9 @@ impl TickConfig {
                     continue;
                 }
                 match validate_source(raw, allow_command_sources) {
-                    Ok(s) => sources.push(s),
+                    // R2 — the global TTL is stamped onto the source here, so
+                    // a task never has to reach back for section-level config.
+                    Ok(s) => sources.push(TickSourceConfig { dns_ttl_secs, ..s }),
                     Err(e) => warn!(
                         source = %id,
                         error = %e,
@@ -353,6 +413,7 @@ impl TickConfig {
         Self {
             enabled,
             allow_command_sources,
+            dns_ttl_secs,
             sources,
         }
     }
@@ -392,6 +453,30 @@ pub fn validate_source(
     // allowed (a `0` cap would silently mute the source forever).
     let interval_secs = raw.interval_secs.max(MIN_INTERVAL_SECS);
     let max_events_per_minute = raw.max_events_per_minute.max(1);
+
+    // R1 — advisory, never fatal: see `BASELINE_AGE_WARN_BELOW_SECS`.
+    if raw.baseline_max_age_secs > 0 && raw.baseline_max_age_secs < BASELINE_AGE_WARN_BELOW_SECS {
+        warn!(
+            source = %raw.id,
+            baseline_max_age_secs = raw.baseline_max_age_secs,
+            "[tick] baseline_max_age_secs is very short — prev_/delta_/pct_ fields \
+             will be absent from most ticks; set 0 to disable expiry entirely"
+        );
+    }
+    // R1 — the specific combination that guarantees the above rather than
+    // merely risking it. Also advisory: a slow source with a short baseline is
+    // a coherent thing to write down, it just cannot ever produce a delta.
+    if baseline_expires_between_polls(raw.kind, raw.baseline_max_age_secs, interval_secs) {
+        warn!(
+            source = %raw.id,
+            baseline_max_age_secs = raw.baseline_max_age_secs,
+            interval_secs,
+            "[tick] baseline_max_age_secs is shorter than interval_secs — every \
+             baseline expires before the next poll, so prev_/delta_/pct_ will be \
+             absent from EVERY tick; raise it above the poll interval, or set 0 \
+             to disable expiry"
+        );
+    }
 
     let mut url = raw.url.clone();
     let mut command = raw.command.clone();
@@ -521,7 +606,35 @@ pub fn validate_source(
         emit_unchanged: raw.emit_unchanged,
         max_events_per_minute,
         persist_every_n: raw.persist_every_n,
+        baseline_max_age_secs: raw.baseline_max_age_secs,
+        // Overwritten from the global `[tick] dns_ttl_secs` by
+        // `TickConfig::from_section`; a per-source key never reaches here.
+        dns_ttl_secs: raw.dns_ttl_secs,
     })
+}
+
+/// R1 — does this source's delta baseline expire before its next observation
+/// can possibly arrive?
+///
+/// True when expiry is on and the lifetime is shorter than the poll interval:
+/// the baseline recorded by one poll is already stale when the next one lands,
+/// so `prev_`/`delta_`/`pct_` are absent from *every* tick. Pure, so the
+/// decision is testable without capturing log output.
+///
+/// **`websocket` is excluded.** For a push source `interval_secs` is the
+/// reconnect-backoff starting point, not a tick spacing (D5-W) — frames can
+/// arrive hundreds of times a second on a source whose `interval_secs` is 10.
+/// Comparing the two there would fire on a perfectly healthy configuration,
+/// and a warning that cries wolf is worse than no warning.
+pub fn baseline_expires_between_polls(
+    kind: TickKind,
+    baseline_max_age_secs: u64,
+    interval_secs: u64,
+) -> bool {
+    if matches!(kind, TickKind::Websocket) {
+        return false;
+    }
+    baseline_max_age_secs > 0 && baseline_max_age_secs < interval_secs
 }
 
 /// D5-W — validate a `websocket` source's URL.
@@ -1398,12 +1511,300 @@ mod tests {
                 emit_unchanged: false,
                 max_events_per_minute: 120,
                 persist_every_n: 0,
+                baseline_max_age_secs: DEFAULT_BASELINE_MAX_AGE_SECS,
+                dns_ttl_secs: 0,
             },
             false,
         )
         .expect_err("a 1-second watchdog must be refused");
         assert!(err.contains("idle_timeout_secs"), "{err}");
         assert!(err.contains("30"), "the floor is stated: {err}");
+    }
+
+    // ── R1: baseline lifetime ────────────────────────────────
+
+    #[test]
+    fn baseline_max_age_defaults_to_an_hour_and_parses_per_source() {
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "s1"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            "#,
+        );
+        assert_eq!(s.baseline_max_age_secs, DEFAULT_BASELINE_MAX_AGE_SECS);
+        assert_eq!(DEFAULT_BASELINE_MAX_AGE_SECS, 3600);
+
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "s1"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            baseline_max_age_secs = 300
+            "#,
+        );
+        assert_eq!(s.baseline_max_age_secs, 300);
+    }
+
+    #[test]
+    fn a_very_short_baseline_lifetime_is_warned_about_not_refused() {
+        // Deliberately NOT a floor: unlike the watchdog clocks this cannot run
+        // away, and a sub-minute baseline is legitimate for a fast feed. It is
+        // warned about at load because "no deltas, ever" is otherwise silent.
+        for secs in [1, 5, BASELINE_AGE_WARN_BELOW_SECS - 1] {
+            let s = source(&format!(
+                r#"
+                [tick]
+                enabled = true
+                [[tick.sources]]
+                id = "s1"
+                kind = "http_poll"
+                url = "https://example.com/x"
+                baseline_max_age_secs = {secs}
+                "#
+            ));
+            assert_eq!(s.baseline_max_age_secs, secs, "kept as written");
+        }
+        // `0` is the explicit "never expires" escape hatch and is not short.
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "s1"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            baseline_max_age_secs = 0
+            "#,
+        );
+        assert_eq!(s.baseline_max_age_secs, 0);
+    }
+
+    #[test]
+    fn a_baseline_shorter_than_the_poll_interval_is_flagged() {
+        // The guaranteed-no-delta combination: the baseline written by one
+        // poll is already stale when the next poll lands.
+        assert!(baseline_expires_between_polls(TickKind::HttpPoll, 30, 60));
+        assert!(baseline_expires_between_polls(TickKind::Command, 1, 2));
+        assert!(baseline_expires_between_polls(
+            TickKind::FileTail,
+            3599,
+            86_400
+        ));
+
+        // Equal is fine: the baseline is checked with `>=`, so a baseline
+        // written at t and read at t+interval is exactly on the boundary and
+        // the operator's intent ("one interval of memory") is honoured.
+        assert!(!baseline_expires_between_polls(TickKind::HttpPoll, 60, 60));
+        assert!(!baseline_expires_between_polls(
+            TickKind::HttpPoll,
+            3600,
+            10
+        ));
+
+        // `0` means "never expires" — the opposite of the problem.
+        assert!(!baseline_expires_between_polls(
+            TickKind::HttpPoll,
+            0,
+            86_400
+        ));
+
+        // websocket is exempt: `interval_secs` is its reconnect backoff, not a
+        // tick spacing, so this comparison is meaningless there.
+        assert!(!baseline_expires_between_polls(
+            TickKind::Websocket,
+            5,
+            3600
+        ));
+    }
+
+    #[test]
+    fn a_baseline_shorter_than_the_interval_warns_but_still_loads() {
+        // Advisory, exactly like the sub-minute warning: the source is kept
+        // verbatim, both values intact.
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "slow"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            interval_secs = 86400
+            baseline_max_age_secs = 3600
+            "#,
+        );
+        assert_eq!(s.interval_secs, 86_400);
+        assert_eq!(s.baseline_max_age_secs, 3600);
+        assert!(baseline_expires_between_polls(
+            s.kind,
+            s.baseline_max_age_secs,
+            s.interval_secs
+        ));
+
+        // The documented fixes both silence it, and neither is refused.
+        let raised = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "slow"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            interval_secs = 86400
+            baseline_max_age_secs = 172800
+            "#,
+        );
+        assert!(!baseline_expires_between_polls(
+            raised.kind,
+            raised.baseline_max_age_secs,
+            raised.interval_secs
+        ));
+        let disabled = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "slow"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            interval_secs = 86400
+            baseline_max_age_secs = 0
+            "#,
+        );
+        assert!(!baseline_expires_between_polls(
+            disabled.kind,
+            disabled.baseline_max_age_secs,
+            disabled.interval_secs
+        ));
+    }
+
+    #[test]
+    fn the_interval_warning_uses_the_floored_interval() {
+        // `interval_secs = 0` is floored to 1 (D6); the advisory must compare
+        // against what will actually be used, not the raw value.
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "fast"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            interval_secs = 0
+            baseline_max_age_secs = 1
+            "#,
+        );
+        assert_eq!(s.interval_secs, MIN_INTERVAL_SECS);
+        assert!(
+            !baseline_expires_between_polls(s.kind, s.baseline_max_age_secs, s.interval_secs),
+            "1s baseline against the 1s floor is not a mismatch"
+        );
+    }
+
+    // ── R2: DNS TTL ──────────────────────────────────────────
+
+    #[test]
+    fn dns_ttl_is_global_defaulted_and_stamped_onto_every_source() {
+        let cfg = parse(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "a"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            [[tick.sources]]
+            id = "b"
+            kind = "websocket"
+            url = "wss://example.com/stream"
+            "#,
+        );
+        assert_eq!(cfg.dns_ttl_secs, DEFAULT_DNS_TTL_SECS);
+        assert_eq!(DEFAULT_DNS_TTL_SECS, 60);
+        for s in &cfg.sources {
+            assert_eq!(
+                s.dns_ttl_secs, DEFAULT_DNS_TTL_SECS,
+                "every source task carries the global TTL: {}",
+                s.id
+            );
+        }
+
+        let cfg = parse(
+            r#"
+            [tick]
+            enabled = true
+            dns_ttl_secs = 5
+            [[tick.sources]]
+            id = "a"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            "#,
+        );
+        assert_eq!(cfg.dns_ttl_secs, 5);
+        assert_eq!(cfg.sources[0].dns_ttl_secs, 5);
+    }
+
+    #[test]
+    fn a_zero_dns_ttl_is_honoured_but_a_malformed_one_falls_back() {
+        let zero = parse(
+            r#"
+            [tick]
+            enabled = true
+            dns_ttl_secs = 0
+            [[tick.sources]]
+            id = "a"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            "#,
+        );
+        assert_eq!(zero.dns_ttl_secs, 0, "0 = resolve every request");
+        assert_eq!(zero.sources[0].dns_ttl_secs, 0);
+
+        // A negative / non-integer value must not silently become `0` — that
+        // would flip every source to per-request resolution.
+        for bad in ["-1", "\"soon\"", "true"] {
+            let cfg = parse(&format!(
+                r#"
+                [tick]
+                enabled = true
+                dns_ttl_secs = {bad}
+                [[tick.sources]]
+                id = "a"
+                kind = "http_poll"
+                url = "https://example.com/x"
+                "#
+            ));
+            assert_eq!(
+                cfg.dns_ttl_secs, DEFAULT_DNS_TTL_SECS,
+                "malformed {bad} falls back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn a_per_source_dns_ttl_key_has_no_effect() {
+        // The TTL is a property of the install, not of one feed. A key written
+        // in the wrong place must not appear to work.
+        let cfg = parse(
+            r#"
+            [tick]
+            enabled = true
+            dns_ttl_secs = 30
+            [[tick.sources]]
+            id = "a"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            dns_ttl_secs = 999
+            "#,
+        );
+        assert_eq!(cfg.sources[0].dns_ttl_secs, 30, "the global wins");
     }
 
     // ── D5-W2: custom headers ────────────────────────────────
@@ -1606,6 +2007,7 @@ mod tests {
         let cfg = TickConfig {
             enabled: true,
             allow_command_sources: false,
+            dns_ttl_secs: DEFAULT_DNS_TTL_SECS,
             sources: vec![s],
         };
         assert!(!format!("{cfg:?}").contains("sk-live"));

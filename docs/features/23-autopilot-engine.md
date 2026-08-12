@@ -157,7 +157,7 @@ A rule is persisted in SQLite with a name, an enabled flag, a `trigger_event`, a
     ]
   },
   "action": {
-    "kind": "delegate",
+    "type": "delegate",
     "target_agent": "oncall",
     "prompt": "An urgent incident task was just created. Triage it."
   }
@@ -175,7 +175,7 @@ A `notify` rule that pings a channel when an agent goes idle too long:
     "all": [ { "field": "idle_minutes", "op": "gt", "value": 30 } ]
   },
   "action": {
-    "kind": "notify",
+    "type": "notify",
     "channel": "telegram",
     "chat_id": "12345",
     "text": "An agent has been idle for over 30 minutes."

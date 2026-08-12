@@ -20,9 +20,14 @@
 //! 2. Refuse oversized payloads (> [`MAX_TICK_PAYLOAD_BYTES`]) — counted, not
 //!    silently dropped.
 //! 3. Skip unchanged payloads unless `emit_unchanged = true`.
-//! 4. Apply the per-source rate cap (D6) — over-cap ticks are counted.
-//! 5. Extract `json_fields` (JSON pointers), then derive the deterministic
-//!    delta trio (D2). A non-JSON payload yields only `raw_len`.
+//! 4. Extract `json_fields` (JSON pointers, with numeric strings coerced to
+//!    numbers — F2). A source that declares `json_fields` and resolves none of
+//!    them produced a control frame, not an observation: counted as
+//!    [`DropReason::NoFields`] and dropped (F3). A non-JSON payload yields
+//!    only `raw_len`.
+//! 5. Apply the per-source rate cap (D6) — over-cap ticks are counted — then
+//!    derive the deterministic delta trio (D2) against the per-field
+//!    last-seen baseline (F1).
 //! 6. Push into the in-memory ring buffer ([`TickHub`], D1 — ticks do **not**
 //!    land in `events.db` unless the source opts into `persist_every_n`) and
 //!    broadcast the event.
@@ -41,7 +46,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use duduclaw_core::truncate_bytes;
 
@@ -105,6 +110,20 @@ pub enum DropReason {
     /// is what keeps "your feed is binary and nothing is coming through"
     /// diagnosable instead of silent.
     NonText,
+    /// F3 (third live-fire round) — the source declares `json_fields`, the
+    /// payload parsed as JSON, and **not one** configured pointer resolved.
+    ///
+    /// This is the shape of a control frame on a real feed: Kraken's
+    /// `{"channel":"heartbeat"}` arrives between quotes and carries no price.
+    /// Emitting it produced a field-less tick that woke rules on nothing,
+    /// occupied a ring slot, and polluted the wake-up window. Counting it (and
+    /// nothing else) keeps "my feed is 90% heartbeats" visible without turning
+    /// each heartbeat into an event.
+    ///
+    /// A source with **no** `json_fields` is unaffected — its payloads are
+    /// meant to arrive whole (`raw_len` + excerpt), so there is nothing to
+    /// fail to extract.
+    NoFields,
 }
 
 impl DropReason {
@@ -115,6 +134,7 @@ impl DropReason {
             Self::Oversize => "oversize",
             Self::FetchError => "fetch_error",
             Self::NonText => "non_text",
+            Self::NoFields => "no_fields",
         }
     }
 }
@@ -131,6 +151,7 @@ pub struct SourceCounters {
     pub dropped_oversize: AtomicU64,
     pub dropped_fetch_error: AtomicU64,
     pub dropped_non_text: AtomicU64,
+    pub dropped_no_fields: AtomicU64,
     /// Milliseconds since the Unix epoch of the most recent emitted tick.
     /// `0` (never set) reads back as "never emitted" — see
     /// [`epoch_ms_to_rfc3339`] — which is unambiguous for a feature that
@@ -151,6 +172,7 @@ pub struct SourceCountersSnapshot {
     pub dropped_oversize: u64,
     pub dropped_fetch_error: u64,
     pub dropped_non_text: u64,
+    pub dropped_no_fields: u64,
     pub last_tick_ts: Option<String>,
 }
 
@@ -261,6 +283,7 @@ impl TickHub {
             DropReason::Oversize => &c.dropped_oversize,
             DropReason::FetchError => &c.dropped_fetch_error,
             DropReason::NonText => &c.dropped_non_text,
+            DropReason::NoFields => &c.dropped_no_fields,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -277,6 +300,7 @@ impl TickHub {
                 dropped_oversize: c.dropped_oversize.load(Ordering::Relaxed),
                 dropped_fetch_error: c.dropped_fetch_error.load(Ordering::Relaxed),
                 dropped_non_text: c.dropped_non_text.load(Ordering::Relaxed),
+                dropped_no_fields: c.dropped_no_fields.load(Ordering::Relaxed),
                 last_tick_ts: epoch_ms_to_rfc3339(c.last_tick_epoch_ms.load(Ordering::Relaxed)),
             },
             None => SourceCountersSnapshot::default(),
@@ -361,6 +385,11 @@ impl TickHub {
 /// never `null`. `autopilot_engine::apply_op` refuses to match an absent
 /// field with any operator, so "the feed didn't report a price" can never be
 /// mistaken for "the price is zero".
+///
+/// F2 (third live-fire round) — a string that is cleanly a number is stored as
+/// a JSON **number**: see [`coerce_numeric_string`]. Every mainstream quote
+/// feed (Kraken, Binance) ships prices as strings, and without this both `gt`
+/// comparisons and the whole D2 delta trio silently did nothing.
 pub fn extract_fields(
     payload: &Value,
     json_fields: &std::collections::BTreeMap<String, String>,
@@ -368,20 +397,83 @@ pub fn extract_fields(
     let mut out = serde_json::Map::new();
     for (name, pointer) in json_fields {
         if let Some(found) = payload.pointer(pointer) {
-            out.insert(name.clone(), found.clone());
+            let value = match found {
+                Value::String(s) => coerce_numeric_string(s).unwrap_or_else(|| found.clone()),
+                other => other.clone(),
+            };
+            out.insert(name.clone(), value);
         }
     }
     out
 }
 
+/// F2 — a quote feed's `"63669.60000"` is a number; a product code's `"007"`
+/// is not. Returns `Some(number)` only when the string is *unambiguously*
+/// numeric, so coercion can never quietly destroy an identifier.
+///
+/// Accepted: the **whole** trimmed string parses as a finite `f64`. An integer
+/// that fits `i64` is stored as an integer, so `eq 200` still matches (a float
+/// `200.0` would compare unequal to the integer literal).
+///
+/// Refused, deliberately:
+/// - **Leading zeros** (`"007"`, `"-007"`, `"00.5"`) — the classic
+///   zero-padded identifier. `"0"` and `"0.5"` have a one-digit integer part
+///   and stay numbers.
+/// - **A leading `+`** (`"+5"`) — not how a feed writes a price, and it is how
+///   some feeds write a *signed change label*.
+/// - **Non-finite** (`"inf"`, `"NaN"`), which `f64::from_str` otherwise
+///   accepts, and which would poison every downstream comparison.
+/// - Anything with stray characters (`"12 USD"`, `"1_000"`, `"0x10"`), because
+///   the parse must consume the entire string.
+pub fn coerce_numeric_string(raw: &str) -> Option<Value> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let unsigned = s.strip_prefix('-').unwrap_or(s);
+    // A leading `+` never survives; a `-` is fine but only once (`"--1"` has an
+    // unsigned part starting with `-`, which the digit check below refuses).
+    if s.starts_with('+') {
+        return None;
+    }
+    // Integer part = everything before the fraction/exponent marker.
+    let int_part = unsigned.split(['.', 'e', 'E']).next().unwrap_or(unsigned);
+    if int_part.is_empty() || !int_part.chars().all(|c| c.is_ascii_digit()) {
+        // Catches `"inf"` / `"NaN"` / `"--1"` / `".5"` before the leading-zero
+        // rule can be fooled by a missing or non-digit first character.
+        return None;
+    }
+    if int_part.len() > 1 && int_part.starts_with('0') {
+        return None;
+    }
+
+    let parsed = s.parse::<f64>().ok()?;
+    if !parsed.is_finite() {
+        return None;
+    }
+    // Integers keep integer identity; everything else (including a value too
+    // large for i64) is a float.
+    if let Ok(i) = s.parse::<i64>() {
+        return Some(Value::Number(i.into()));
+    }
+    serde_json::Number::from_f64(parsed).map(Value::Number)
+}
+
 /// D2 — deterministic delta derivation.
 ///
-/// For every numeric field present in BOTH the current and previous tick, add
-/// `prev_<f>`, `delta_<f>` and `pct_<f>`. Rule authors get "漲跌幅 gt 2"
+/// For every numeric field present in BOTH the current tick and the baseline,
+/// add `prev_<f>`, `delta_<f>` and `pct_<f>`. Rule authors get "漲跌幅 gt 2"
 /// without a new condition operator.
 ///
+/// F1 — `prev` is a **per-field last-seen map**, not the previous tick's field
+/// set: `prev_price` is the last price that was actually reported, however
+/// many field-less or partial frames arrived in between.
+///
+/// Both **derived** values are rounded to 6 decimals; `prev_<f>` is passed
+/// through untouched because it is a reported value, not a computed one.
+///
 /// Deliberate absences:
-/// - No previous tick ⇒ none of the three fields exist (an absent field
+/// - Field never seen before ⇒ none of the three fields exist (an absent field
 ///   matches nothing, which is the correct "can't compare yet" semantics).
 /// - `prev == 0` ⇒ `pct_<f>` is absent (division by zero is not `0%`).
 /// - Integer inputs stay integers, so `eq 200` still matches `delta_vol`
@@ -401,8 +493,27 @@ pub fn with_delta_fields(
             continue;
         };
         let integral = cur_value.is_i64() && prev.get(name).map(|v| v.is_i64()).unwrap_or(false);
+        // `prev_` is the reported value, verbatim — rounding a feed's own
+        // number would be lying about what it sent.
         insert_number(&mut out, format!("prev_{name}"), before, integral);
-        insert_number(&mut out, format!("delta_{name}"), cur - before, integral);
+        // FINDING-7 — `delta_` is rounded for the same reason `pct_` always
+        // was. Float subtraction of two decimal prices leaves noise
+        // (63724.8 − 63724.7 = -0.10000000000582077), and once F2 turned
+        // string prices into real numbers that noise reached rule comparisons
+        // and wake-up prompts directly: `delta_price gt 0.1` flips meaning on
+        // the last bit.
+        //
+        // The integral case is deliberately NOT routed through `round6`: an
+        // integer subtraction has no noise to remove, and `round6` scales by
+        // 1e6, which stops being exact past ~9×10⁹ — rounding there could only
+        // ever *introduce* the error it exists to remove.
+        let difference = cur - before;
+        let difference = if integral {
+            difference
+        } else {
+            round6(difference)
+        };
+        insert_number(&mut out, format!("delta_{name}"), difference, integral);
         if before != 0.0 {
             // Rounded to 6 decimals so a clean 2% move reads as `2.0` rather
             // than `2.0000000000000004` in both rule comparisons and the UI.
@@ -557,13 +668,162 @@ pub fn format_tick_window(source: &str, records: &[TickRecord]) -> String {
 // Runtime
 // ═══════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════
+// Delta baselines (F1 + R1) and the DNS cache (R2)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// F1 + R1 — the per-field delta baseline: for each extracted field, the last
+/// value that appeared in an **emitted** tick, and when that was.
+///
+/// F1 is the per-field part (a partial frame must not erase other fields'
+/// baselines); R1 is the age stamp (a baseline that is old enough is worse
+/// than none, because it manufactures an enormous delta out of a reporting
+/// gap).
+#[derive(Debug, Default)]
+pub(crate) struct Baselines {
+    values: serde_json::Map<String, Value>,
+    seen_at: HashMap<String, Instant>,
+}
+
+impl Baselines {
+    /// R1 — forget every field whose baseline is at least `max_age` old.
+    /// `None` disables expiry (`baseline_max_age_secs = 0`).
+    ///
+    /// Forgetting rather than merely ignoring matters twice over: the next
+    /// observation of that field reads as a first tick (no delta trio), and
+    /// the map cannot accumulate fields a feed stopped reporting long ago.
+    pub(crate) fn expire(&mut self, max_age: Option<Duration>, now: Instant) {
+        let Some(max_age) = max_age else { return };
+        let stale: Vec<String> = self
+            .seen_at
+            .iter()
+            .filter(|(_, at)| now.saturating_duration_since(**at) >= max_age)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in stale {
+            self.values.remove(&name);
+            self.seen_at.remove(&name);
+        }
+    }
+
+    /// The still-valid baseline values, for [`with_delta_fields`].
+    pub(crate) fn values(&self) -> &serde_json::Map<String, Value> {
+        &self.values
+    }
+
+    /// Record an emitted tick's fields as the new baseline for exactly the
+    /// fields it carried.
+    pub(crate) fn record(&mut self, fields: &serde_json::Map<String, Value>, now: Instant) {
+        for (name, value) in fields {
+            self.values.insert(name.clone(), value.clone());
+            self.seen_at.insert(name.clone(), now);
+        }
+    }
+}
+
+/// R2 — a source task's single-entry DNS cache: one `host:port` → the vetted,
+/// all-public address set that [`crate::web_fetch::resolve_public_addrs`]
+/// returned, plus when it was resolved.
+///
+/// Task-local and therefore lock-free: each source dials exactly one host, and
+/// nothing outside its own task ever reads this.
+///
+/// **This does not weaken the rebinding defence.** What is cached is an
+/// address set that already passed the internal-IP screen; a rebinding attack
+/// needs a *fresh* resolution to flip the answer, and the cache serves fewer
+/// of those, not more. The worst case is connecting to an address the host has
+/// since moved off — which fails, and the next attempt re-resolves.
+#[derive(Debug)]
+pub(crate) struct DnsCache {
+    ttl: Option<Duration>,
+    entry: Option<(String, Vec<std::net::SocketAddr>, Instant)>,
+}
+
+impl DnsCache {
+    pub(crate) fn new(ttl_secs: u64) -> Self {
+        Self {
+            ttl: (ttl_secs > 0).then(|| Duration::from_secs(ttl_secs)),
+            entry: None,
+        }
+    }
+
+    /// The cached address set for `key`, if it is still within the TTL.
+    pub(crate) fn get(&self, key: &str, now: Instant) -> Option<&[std::net::SocketAddr]> {
+        let ttl = self.ttl?;
+        let (cached_key, addrs, at) = self.entry.as_ref()?;
+        if cached_key != key || now.saturating_duration_since(*at) >= ttl {
+            return None;
+        }
+        Some(addrs)
+    }
+
+    pub(crate) fn put(&mut self, key: String, addrs: Vec<std::net::SocketAddr>, now: Instant) {
+        if self.ttl.is_some() {
+            self.entry = Some((key, addrs, now));
+        }
+    }
+
+    /// Seconds left before this entry goes stale — for the cache-hit log line,
+    /// so an operator can see the TTL counting down rather than infer it.
+    /// `0` when there is nothing cached for `key`.
+    pub(crate) fn remaining_ttl_secs(&self, key: &str, now: Instant) -> u64 {
+        let Some(ttl) = self.ttl else { return 0 };
+        let Some((cached_key, _, at)) = self.entry.as_ref() else {
+            return 0;
+        };
+        if cached_key != key {
+            return 0;
+        }
+        ttl.saturating_sub(now.saturating_duration_since(*at))
+            .as_secs()
+    }
+}
+
+/// R2 — resolve `key` (a `host:port` string) through the cache.
+///
+/// `resolve` is injected so the caching decision is testable without a
+/// resolver; production passes a closure over
+/// [`crate::web_fetch::resolve_public_addrs`].
+pub(crate) async fn resolve_with_cache<F, Fut>(
+    cache: &mut DnsCache,
+    key: &str,
+    now: Instant,
+    resolve: F,
+) -> Result<Vec<std::net::SocketAddr>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<std::net::SocketAddr>, String>>,
+{
+    if let Some(hit) = cache.get(key, now) {
+        // The only external signal that the TTL is doing anything: a live-fire
+        // round could confirm the cache's *logic* from unit tests but had no
+        // way to see it working in a running gateway.
+        debug!(
+            host = %key,
+            remaining_ttl_secs = cache.remaining_ttl_secs(key, now),
+            addrs = hit.len(),
+            "tick dns cache hit — reusing the screened address set"
+        );
+        return Ok(hit.to_vec());
+    }
+    let addrs = resolve().await?;
+    debug!(
+        host = %key,
+        addrs = addrs.len(),
+        "tick dns resolved — address set screened and cached"
+    );
+    cache.put(key.to_string(), addrs.clone(), now);
+    Ok(addrs)
+}
+
 /// Per-source mutable state. Owned by that source's task, so no locking.
 /// Visible to the two kind modules: [`crate::tick_source_poll`] advances
 /// `file_offset` from it, and [`crate::tick_source_ws`]'s connection loop owns
 /// one for the lifetime of the source (so dedup, deltas and the rate window
 /// survive a reconnect). Neither constructs one — `run_source` does.
 pub(crate) struct SourceState {
-    pub(crate) prev_fields: Option<serde_json::Map<String, Value>>,
+    /// F1 + R1 — per-field last-seen delta baseline. See [`Baselines`].
+    pub(crate) baselines: Baselines,
     pub(crate) last_fingerprint: Option<u64>,
     pub(crate) rate: RateWindow,
     pub(crate) emitted: u64,
@@ -574,18 +834,27 @@ pub(crate) struct SourceState {
     /// pin is a client-level setting: see
     /// [`crate::tick_source_poll::PinnedHttpClient`].
     pub(crate) http_client: Option<crate::tick_source_poll::PinnedHttpClient>,
+    /// R2 — this task's DNS cache. Used by `http_poll` before every request
+    /// and by `websocket` before every dial.
+    pub(crate) dns: DnsCache,
+}
+
+/// R1 — `baseline_max_age_secs` as a duration; `0` means "never expires".
+pub(crate) fn baseline_max_age(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 impl SourceState {
     pub(crate) fn new(cfg: &TickSourceConfig) -> Self {
         Self {
-            prev_fields: None,
+            baselines: Baselines::default(),
             last_fingerprint: None,
             rate: RateWindow::new(cfg.max_events_per_minute),
             emitted: 0,
             failures: 0,
             file_offset: 0,
             http_client: None,
+            dns: DnsCache::new(cfg.dns_ttl_secs),
         }
     }
 }
@@ -658,8 +927,7 @@ pub(crate) async fn run_source(
     loop {
         tokio::time::sleep(interval).await;
 
-        let payloads = match crate::tick_source_poll::poll_once(&cfg, &mut state, interval).await
-        {
+        let payloads = match crate::tick_source_poll::poll_once(&cfg, &mut state, interval).await {
             Ok(p) => p,
             Err(e) => {
                 state.failures += 1;
@@ -688,7 +956,6 @@ pub(crate) async fn run_source(
         }
     }
 }
-
 
 /// Apply the payload filters, derive fields, buffer, broadcast.
 ///
@@ -726,6 +993,21 @@ pub(crate) async fn emit_payload(
     }
     state.last_fingerprint = Some(fingerprint);
 
+    let (extracted, raw) = fields_for_payload(payload, &cfg.json_fields);
+
+    // F3 — a configured extraction that resolved nothing is a control frame,
+    // not an observation. Refused *before* the rate cap on purpose: a stream of
+    // heartbeats must not eat the emission budget that the data frames need.
+    // The fingerprint above is already updated, matching the rate-cap path —
+    // the payload was seen, it just produced no tick.
+    if !cfg.json_fields.is_empty() && extracted.is_empty() {
+        hub.record_drop(&cfg.id, DropReason::NoFields).await;
+        crate::metrics::global_metrics()
+            .tick_dropped(&cfg.id, DropReason::NoFields.as_str())
+            .await;
+        return;
+    }
+
     if !state.rate.allow(Instant::now()) {
         // Logged on the first refusal of each burst only — the counter keeps
         // the total honest without one log line per dropped tick.
@@ -744,9 +1026,21 @@ pub(crate) async fn emit_payload(
         return;
     }
 
-    let (extracted, raw) = fields_for_payload(payload, &cfg.json_fields);
-    let fields = with_delta_fields(&extracted, state.prev_fields.as_ref());
-    state.prev_fields = Some(extracted);
+    // F1 — the delta baseline is per FIELD, not per tick: `prev_<f>` compares
+    // against the last value of `f` that actually appeared in an emitted tick.
+    // Wholesale-replacing the map (the pre-F1 behavior) meant any frame that
+    // carried a subset of the fields erased the baseline for the rest —
+    // measured at 90% of Kraken ticks producing no delta at all.
+    //
+    // R1 — but a baseline also goes stale: expire it first, so a field that
+    // stopped being reported long ago starts over instead of manufacturing a
+    // giant delta out of the gap.
+    let now = Instant::now();
+    state
+        .baselines
+        .expire(baseline_max_age(cfg.baseline_max_age_secs), now);
+    let fields = with_delta_fields(&extracted, Some(state.baselines.values()));
+    state.baselines.record(&extracted, now);
 
     let ts = chrono::Utc::now().to_rfc3339();
     hub.push(
@@ -900,6 +1194,89 @@ mod tests {
             &serde_json::json!({ "field": "delta_vol", "op": "eq", "value": 200 }),
             &out
         ));
+    }
+
+    /// FINDING-7 — float subtraction of two decimal prices leaves noise in the
+    /// last bits. `pct_` was always rounded; `delta_` was not, so once F2
+    /// started producing real numbers from string prices the noise went
+    /// straight into rule comparisons and wake-up prompts.
+    #[test]
+    fn float_delta_is_rounded_so_rule_thresholds_do_not_flip() {
+        // The exact pair observed on the live Kraken feed. Unrounded this is
+        // -0.10000000000582077.
+        let prev = map(serde_json::json!({ "price": 63724.8 }));
+        let current = map(serde_json::json!({ "price": 63724.7 }));
+        let out = with_delta_fields(&current, Some(&prev));
+        assert_eq!(
+            out["delta_price"].as_f64(),
+            Some(-0.1),
+            "delta must be exactly -0.1, got {:?}",
+            out["delta_price"]
+        );
+
+        // …and the same move upward.
+        let prev = map(serde_json::json!({ "price": 63724.7 }));
+        let current = map(serde_json::json!({ "price": 63724.8 }));
+        let out = with_delta_fields(&current, Some(&prev));
+        assert_eq!(out["delta_price"].as_f64(), Some(0.1));
+
+        // The operator-visible consequence: `delta_price gt 0.1` must be
+        // false for a move of exactly 0.1. Unrounded, the noise made it true.
+        assert!(
+            !crate::autopilot_engine::evaluate(
+                &serde_json::json!({ "field": "delta_price", "op": "gt", "value": 0.1 }),
+                &out
+            ),
+            "a 0.1 move must not satisfy `gt 0.1`: {:?}",
+            out["delta_price"]
+        );
+        // A genuinely larger move still fires.
+        let prev = map(serde_json::json!({ "price": 63724.7 }));
+        let current = map(serde_json::json!({ "price": 63724.95 }));
+        let out = with_delta_fields(&current, Some(&prev));
+        assert_eq!(out["delta_price"].as_f64(), Some(0.25));
+        assert!(crate::autopilot_engine::evaluate(
+            &serde_json::json!({ "field": "delta_price", "op": "gt", "value": 0.1 }),
+            &out
+        ));
+
+        // `prev_` is a reported value, not a derived one — it is passed
+        // through verbatim rather than rounded.
+        assert_eq!(out["prev_price"].as_f64(), Some(63724.7));
+    }
+
+    #[test]
+    fn rounding_the_delta_does_not_disturb_integer_deltas() {
+        // Integers never had float noise, and `round6` scales by 1e6, which
+        // stops being exact past ~9e9 — so the integral path must not be
+        // routed through it.
+        let big = 4_000_000_000_000i64; // 4e12: `* 1e6` would exceed f64's
+        let prev = map(serde_json::json!({ "vol": big }));
+        let current = map(serde_json::json!({ "vol": big + 7 })); // exact-integer range.
+        let out = with_delta_fields(&current, Some(&prev));
+        assert_eq!(
+            out["delta_vol"],
+            Value::Number(7.into()),
+            "a large integer delta must stay exact: {:?}",
+            out["delta_vol"]
+        );
+        assert!(out["delta_vol"].is_i64(), "and stay an integer");
+
+        // Negative and zero integer deltas too.
+        let prev = map(serde_json::json!({ "vol": 500 }));
+        let current = map(serde_json::json!({ "vol": 380 }));
+        let out = with_delta_fields(&current, Some(&prev));
+        assert_eq!(out["delta_vol"], Value::Number((-120).into()));
+    }
+
+    #[test]
+    fn rounding_keeps_six_decimals_of_real_signal() {
+        // The rounding must not flatten genuinely small moves — 6 decimals is
+        // the same budget `pct_` has always used.
+        let prev = map(serde_json::json!({ "p": 1.0 }));
+        let current = map(serde_json::json!({ "p": 1.000002 }));
+        let out = with_delta_fields(&current, Some(&prev));
+        assert_eq!(out["delta_p"].as_f64(), Some(0.000002));
     }
 
     #[test]
@@ -1058,6 +1435,7 @@ mod tests {
         assert_eq!(DropReason::Oversize.as_str(), "oversize");
         assert_eq!(DropReason::FetchError.as_str(), "fetch_error");
         assert_eq!(DropReason::NonText.as_str(), "non_text");
+        assert_eq!(DropReason::NoFields.as_str(), "no_fields");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1106,7 +1484,10 @@ mod tests {
         let (pass, drop, unavailable) = hub.screen_counts();
         assert_eq!(pass, 2);
         assert_eq!(drop, 1);
-        assert_eq!(unavailable, 2, "unavailable + the unrecognized outcome both fold here");
+        assert_eq!(
+            unavailable, 2,
+            "unavailable + the unrecognized outcome both fold here"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1143,6 +1524,8 @@ mod tests {
             emit_unchanged: false,
             max_events_per_minute: 2,
             persist_every_n: 0,
+            baseline_max_age_secs: crate::tick_config::DEFAULT_BASELINE_MAX_AGE_SECS,
+            dns_ttl_secs: 0,
         };
         let mut state = SourceState::new(&cfg);
 
@@ -1171,6 +1554,728 @@ mod tests {
         let snap = hub.counters_snapshot("s1").await;
         assert_eq!(snap.events_emitted, 2, "exactly cap-many payloads emitted");
         assert_eq!(snap.dropped_rate_cap, 1);
+    }
+
+    // ── F1: per-field last-seen delta baseline ───────────────
+
+    /// Config shaped like a real quote feed: a price pointer, no rate-cap
+    /// pressure, dedup on.
+    fn feed_cfg(id: &str, json_fields: BTreeMap<String, String>) -> TickSourceConfig {
+        TickSourceConfig {
+            id: id.into(),
+            kind: TickKind::Websocket,
+            enabled: true,
+            interval_secs: 1,
+            url: Some("wss://example.com/stream".into()),
+            command: None,
+            path: None,
+            subscribe: Vec::new(),
+            headers: BTreeMap::new(),
+            ping_interval_secs: 0,
+            idle_timeout_secs: 0,
+            json_fields,
+            emit_unchanged: false,
+            max_events_per_minute: 1000,
+            persist_every_n: 0,
+            baseline_max_age_secs: crate::tick_config::DEFAULT_BASELINE_MAX_AGE_SECS,
+            dns_ttl_secs: 0,
+        }
+    }
+
+    /// The regression that started this round: Kraken interleaves
+    /// `{"channel":"heartbeat"}` between quotes. Pre-F1 the heartbeat replaced
+    /// the whole baseline map, so the *next* quote had nothing to diff against
+    /// — measured at ~90% of ticks carrying no delta.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heartbeat_between_quotes_does_not_erase_the_delta_baseline() {
+        let hub = Arc::new(TickHub::new());
+        let (tx, _rx) = broadcast::channel(64);
+        let cfg = feed_cfg("kraken", pointers(&[("price", "/data/0/last")]));
+        let mut state = SourceState::new(&cfg);
+
+        emit_payload(
+            &cfg,
+            &mut state,
+            r#"{"channel":"ticker","data":[{"last":"100.0"}]}"#,
+            &tx,
+            &hub,
+            None,
+        )
+        .await;
+        // Two control frames in a row, neither carrying a price.
+        emit_payload(
+            &cfg,
+            &mut state,
+            r#"{"channel":"heartbeat"}"#,
+            &tx,
+            &hub,
+            None,
+        )
+        .await;
+        emit_payload(
+            &cfg,
+            &mut state,
+            r#"{"channel":"status","data":[{"system":"online"}]}"#,
+            &tx,
+            &hub,
+            None,
+        )
+        .await;
+        emit_payload(
+            &cfg,
+            &mut state,
+            r#"{"channel":"ticker","data":[{"last":"102.0"}]}"#,
+            &tx,
+            &hub,
+            None,
+        )
+        .await;
+
+        let records = hub.recent("kraken", 10).await;
+        assert_eq!(records.len(), 2, "only the two quotes became ticks");
+        let latest = &records[1];
+        assert_eq!(latest.fields["price"].as_f64(), Some(102.0));
+        assert_eq!(
+            latest.fields["prev_price"].as_f64(),
+            Some(100.0),
+            "the baseline survived the interleaved control frames: {:?}",
+            latest.fields
+        );
+        assert_eq!(latest.fields["delta_price"].as_f64(), Some(2.0));
+        assert_eq!(latest.fields["pct_price"].as_f64(), Some(2.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_partial_frame_only_updates_the_fields_it_carries() {
+        let hub = Arc::new(TickHub::new());
+        let (tx, _rx) = broadcast::channel(64);
+        let cfg = feed_cfg("partial", pointers(&[("price", "/price"), ("vol", "/vol")]));
+        let mut state = SourceState::new(&cfg);
+
+        // Both fields present.
+        emit_payload(
+            &cfg,
+            &mut state,
+            r#"{"price":10,"vol":100}"#,
+            &tx,
+            &hub,
+            None,
+        )
+        .await;
+        // Price-only frame: `vol`'s baseline must be left alone, not dropped.
+        emit_payload(&cfg, &mut state, r#"{"price":12}"#, &tx, &hub, None).await;
+        // Vol-only frame, several frames after the last `vol`.
+        emit_payload(&cfg, &mut state, r#"{"vol":140}"#, &tx, &hub, None).await;
+
+        let records = hub.recent("partial", 10).await;
+        assert_eq!(records.len(), 3);
+
+        // Frame 2 diffs price against frame 1, and says nothing about vol.
+        assert_eq!(records[1].fields["delta_price"].as_i64(), Some(2));
+        assert!(
+            !records[1].fields.contains_key("prev_vol"),
+            "a field the frame did not carry gets no delta trio: {:?}",
+            records[1].fields
+        );
+
+        // Frame 3 diffs vol against frame 1 — two frames back — because that
+        // is where `vol` was last actually reported.
+        assert_eq!(records[2].fields["prev_vol"].as_i64(), Some(100));
+        assert_eq!(records[2].fields["delta_vol"].as_i64(), Some(40));
+        assert!(!records[2].fields.contains_key("prev_price"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_baseline_is_the_last_emitted_value_not_the_last_seen_payload() {
+        let hub = Arc::new(TickHub::new());
+        let (tx, _rx) = broadcast::channel(64);
+        let cfg = feed_cfg("chain", pointers(&[("p", "/p")]));
+        let mut state = SourceState::new(&cfg);
+
+        for value in [10, 20, 35] {
+            emit_payload(
+                &cfg,
+                &mut state,
+                &format!(r#"{{"p":{value}}}"#),
+                &tx,
+                &hub,
+                None,
+            )
+            .await;
+        }
+        let records = hub.recent("chain", 10).await;
+        assert_eq!(records.len(), 3);
+        assert!(!records[0].fields.contains_key("prev_p"), "first tick");
+        assert_eq!(records[1].fields["prev_p"].as_i64(), Some(10));
+        assert_eq!(records[2].fields["prev_p"].as_i64(), Some(20));
+        assert_eq!(records[2].fields["delta_p"].as_i64(), Some(15));
+    }
+
+    // ── R1: baseline expiry ──────────────────────────────────
+
+    #[test]
+    fn baseline_max_age_treats_zero_as_never_expires() {
+        assert_eq!(baseline_max_age(0), None, "0 disables expiry");
+        assert_eq!(baseline_max_age(3600), Some(Duration::from_secs(3600)));
+        assert_eq!(baseline_max_age(1), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn baselines_forget_only_the_fields_that_aged_out() {
+        let mut baselines = Baselines::default();
+        let t0 = Instant::now();
+        baselines.record(&map(serde_json::json!({ "price": 100, "vol": 5 })), t0);
+        // `vol` is refreshed 50s later; `price` is not.
+        baselines.record(
+            &map(serde_json::json!({ "vol": 9 })),
+            t0 + Duration::from_secs(50),
+        );
+
+        // At t0+70 with a 60s lifetime: `price` (70s old) is gone, `vol`
+        // (20s old) survives. Expiry is per field, exactly like the baseline.
+        baselines.expire(Some(Duration::from_secs(60)), t0 + Duration::from_secs(70));
+        assert!(
+            !baselines.values().contains_key("price"),
+            "a 70s-old baseline must be forgotten: {:?}",
+            baselines.values()
+        );
+        assert_eq!(baselines.values()["vol"].as_i64(), Some(9));
+    }
+
+    #[test]
+    fn baselines_never_expire_when_the_lifetime_is_disabled() {
+        let mut baselines = Baselines::default();
+        let t0 = Instant::now();
+        baselines.record(&map(serde_json::json!({ "price": 100 })), t0);
+        // A day later, with expiry off, the baseline is still there — this is
+        // the pre-R1 behavior, preserved verbatim by `baseline_max_age_secs = 0`.
+        baselines.expire(None, t0 + Duration::from_secs(86_400));
+        assert_eq!(baselines.values()["price"].as_i64(), Some(100));
+    }
+
+    #[test]
+    fn an_expired_baseline_reads_as_a_first_tick_not_a_giant_move() {
+        let mut baselines = Baselines::default();
+        let t0 = Instant::now();
+        baselines.record(&map(serde_json::json!({ "price": 100.0 })), t0);
+
+        // The field goes unreported for an hour, then comes back at a very
+        // different level. Without expiry this produces `delta_price = 900`,
+        // a fictional move a rule would treat as real.
+        let later = t0 + Duration::from_secs(3601);
+        baselines.expire(Some(Duration::from_secs(3600)), later);
+        let current = map(serde_json::json!({ "price": 1000.0 }));
+        let out = with_delta_fields(&current, Some(baselines.values()));
+        for key in ["prev_price", "delta_price", "pct_price"] {
+            assert!(
+                !out.contains_key(key),
+                "{key} must be absent after the baseline aged out: {out:?}"
+            );
+        }
+
+        // …and the observation re-establishes the baseline, so the NEXT tick
+        // diffs against 1000, not against the hour-old 100.
+        baselines.record(&current, later);
+        let next = map(serde_json::json!({ "price": 1002.0 }));
+        let out = with_delta_fields(&next, Some(baselines.values()));
+        assert_eq!(out["prev_price"].as_f64(), Some(1000.0));
+        assert_eq!(out["delta_price"].as_f64(), Some(2.0));
+    }
+
+    /// The unit tests above drive `Baselines` with synthetic instants; this one
+    /// proves the expiry is actually wired into the emit path (which reads the
+    /// real clock).
+    #[tokio::test(flavor = "current_thread")]
+    async fn baseline_expiry_is_wired_into_emit_payload() {
+        let hub = Arc::new(TickHub::new());
+        let (tx, _rx) = broadcast::channel(64);
+        let mut cfg = feed_cfg("aging", pointers(&[("p", "/p")]));
+        cfg.baseline_max_age_secs = 1;
+        let mut state = SourceState::new(&cfg);
+
+        emit_payload(&cfg, &mut state, r#"{"p":10}"#, &tx, &hub, None).await;
+        // Real time — this crate's tests do not use the tokio `test-util`
+        // clock (see `run_source_counts_a_fetch_failure`).
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        emit_payload(&cfg, &mut state, r#"{"p":20}"#, &tx, &hub, None).await;
+        // Immediately after, so this one is well inside the lifetime.
+        emit_payload(&cfg, &mut state, r#"{"p":25}"#, &tx, &hub, None).await;
+
+        let records = hub.recent("aging", 10).await;
+        assert_eq!(records.len(), 3);
+        assert!(
+            !records[1].fields.contains_key("delta_p"),
+            "the 1s baseline had aged out: {:?}",
+            records[1].fields
+        );
+        assert_eq!(
+            records[2].fields["prev_p"].as_i64(),
+            Some(20),
+            "the aged-out baseline was re-established from the observation \
+             that found it missing: {:?}",
+            records[2].fields
+        );
+        assert_eq!(records[2].fields["delta_p"].as_i64(), Some(5));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_disabled_baseline_lifetime_keeps_the_f1_behavior() {
+        let hub = Arc::new(TickHub::new());
+        let (tx, _rx) = broadcast::channel(64);
+        let mut cfg = feed_cfg("forever", pointers(&[("p", "/p")]));
+        cfg.baseline_max_age_secs = 0;
+        let mut state = SourceState::new(&cfg);
+
+        emit_payload(&cfg, &mut state, r#"{"p":10}"#, &tx, &hub, None).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        emit_payload(&cfg, &mut state, r#"{"p":20}"#, &tx, &hub, None).await;
+
+        let records = hub.recent("forever", 10).await;
+        assert_eq!(
+            records[1].fields["delta_p"].as_i64(),
+            Some(10),
+            "with expiry off the baseline survives any gap: {:?}",
+            records[1].fields
+        );
+    }
+
+    // ── R2: DNS TTL cache ────────────────────────────────────
+
+    fn sock(s: &str) -> std::net::SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dns_answers_are_reused_inside_the_ttl_and_re_resolved_after() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let mut cache = DnsCache::new(60);
+        let t0 = Instant::now();
+        let first = vec![sock("93.184.216.34:443")];
+        let second = vec![sock("93.184.216.35:443")];
+
+        let got = resolve_with_cache(&mut cache, "example.com:443", t0, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(first.clone())
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Inside the TTL: served from cache, resolver never touched.
+        for offset in [0, 1, 59] {
+            let got = resolve_with_cache(
+                &mut cache,
+                "example.com:443",
+                t0 + Duration::from_secs(offset),
+                || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(second.clone())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(got, first, "cached answer at +{offset}s");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no re-resolution inside the TTL"
+        );
+
+        // At exactly the TTL the entry is stale — and the NEW answer is the
+        // one that comes back, so a host that genuinely moved is picked up.
+        let got = resolve_with_cache(
+            &mut cache,
+            "example.com:443",
+            t0 + Duration::from_secs(60),
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(second.clone())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, second, "the refreshed answer replaces the stale one");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_resolves_every_single_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let mut cache = DnsCache::new(0);
+        let t0 = Instant::now();
+        let addrs = vec![sock("93.184.216.34:443")];
+
+        for _ in 0..3 {
+            let got = resolve_with_cache(&mut cache, "example.com:443", t0, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(addrs.clone())
+            })
+            .await
+            .unwrap();
+            assert_eq!(got, addrs);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "dns_ttl_secs = 0 is the pre-R2 behavior: resolve per request"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_different_host_port_never_hits_another_hosts_cache_entry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let mut cache = DnsCache::new(60);
+        let t0 = Instant::now();
+
+        let a = vec![sock("93.184.216.34:443")];
+        let b = vec![sock("93.184.216.99:8443")];
+        resolve_with_cache(&mut cache, "example.com:443", t0, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(a.clone())
+        })
+        .await
+        .unwrap();
+
+        // Same host, different port ⇒ a different key ⇒ a real resolution.
+        let got = resolve_with_cache(&mut cache, "example.com:8443", t0, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(b.clone())
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, b);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_resolution_is_not_cached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let mut cache = DnsCache::new(60);
+        let t0 = Instant::now();
+
+        let err = resolve_with_cache(&mut cache, "nx.invalid:443", t0, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("DNS resolution failed".to_string())
+        })
+        .await;
+        assert!(err.is_err());
+
+        // A failure must not poison the cache into serving nothing — the very
+        // next attempt tries again.
+        let got = resolve_with_cache(&mut cache, "nx.invalid:443", t0, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![sock("93.184.216.34:443")])
+        })
+        .await
+        .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ── F2: numeric-string coercion ──────────────────────────
+
+    #[test]
+    fn numeric_strings_become_numbers() {
+        // Kraken/Binance ship prices as strings; these must become numbers or
+        // every `gt` and every delta silently does nothing.
+        assert_eq!(
+            coerce_numeric_string("63669.60000").and_then(|v| v.as_f64()),
+            Some(63669.6)
+        );
+        assert_eq!(
+            coerce_numeric_string("42").and_then(|v| v.as_i64()),
+            Some(42)
+        );
+        assert_eq!(
+            coerce_numeric_string("  7.5  ").and_then(|v| v.as_f64()),
+            Some(7.5),
+            "surrounding whitespace is trimmed"
+        );
+        assert_eq!(
+            coerce_numeric_string("-3").and_then(|v| v.as_i64()),
+            Some(-3)
+        );
+        assert_eq!(
+            coerce_numeric_string("-0.25").and_then(|v| v.as_f64()),
+            Some(-0.25)
+        );
+        assert_eq!(coerce_numeric_string("0").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(
+            coerce_numeric_string("0.5").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "a single leading zero before the point is a number, not padding"
+        );
+        assert_eq!(
+            coerce_numeric_string("1e3").and_then(|v| v.as_f64()),
+            Some(1000.0)
+        );
+
+        // An integer keeps integer identity so `eq 42` still matches.
+        assert!(coerce_numeric_string("42").unwrap().is_i64());
+        assert!(!coerce_numeric_string("42.0").unwrap().is_i64());
+    }
+
+    #[test]
+    fn ambiguous_or_non_numeric_strings_stay_strings() {
+        for raw in [
+            "007",      // zero-padded identifier
+            "-007",     // …with a sign
+            "00.5",     // …with a fraction
+            "00",       //
+            "+5",       // leading plus
+            "+5.5",     //
+            "inf",      // f64::from_str accepts these; we must not
+            "-inf",     //
+            "infinity", //
+            "NaN",      //
+            "1e400",    // parses, but overflows to infinity
+            "",         //
+            "   ",      //
+            "12 USD",   // trailing unit
+            "1_000",    // separator
+            "0x10",     // hex
+            ".5",       // no integer part
+            "--1",      //
+            "1,000.5",  // thousands separator
+            "台積電",   // CJK
+        ] {
+            assert!(
+                coerce_numeric_string(raw).is_none(),
+                "{raw:?} must NOT be coerced to a number"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_boundaries_pick_the_right_json_number_type() {
+        let max = i64::MAX.to_string();
+        assert_eq!(
+            coerce_numeric_string(&max).and_then(|v| v.as_i64()),
+            Some(i64::MAX)
+        );
+        let min = i64::MIN.to_string();
+        assert_eq!(
+            coerce_numeric_string(&min).and_then(|v| v.as_i64()),
+            Some(i64::MIN)
+        );
+        // One past i64::MAX no longer fits an integer — it degrades to a
+        // float rather than being refused outright.
+        let over = "9223372036854775808";
+        let coerced = coerce_numeric_string(over).expect("still a finite number");
+        assert!(!coerced.is_i64(), "must not wrap into an i64");
+        assert!(coerced.as_f64().is_some());
+    }
+
+    #[test]
+    fn string_prices_flow_through_extraction_into_rules_and_deltas() {
+        let payload = serde_json::json!({
+            "data": [{ "last": "63669.60000", "symbol": "BTC/USD", "seq": "007" }]
+        });
+        let fields = extract_fields(
+            &payload,
+            &pointers(&[
+                ("price", "/data/0/last"),
+                ("symbol", "/data/0/symbol"),
+                ("seq", "/data/0/seq"),
+            ]),
+        );
+        assert_eq!(fields["price"].as_f64(), Some(63669.6));
+        assert_eq!(fields["symbol"], Value::String("BTC/USD".into()));
+        assert_eq!(
+            fields["seq"],
+            Value::String("007".into()),
+            "a zero-padded id must survive as a string"
+        );
+
+        // The whole point: a rule can now compare it.
+        assert!(crate::autopilot_engine::evaluate(
+            &serde_json::json!({ "field": "price", "op": "gt", "value": 60000 }),
+            &fields
+        ));
+        assert!(!crate::autopilot_engine::evaluate(
+            &serde_json::json!({ "field": "price", "op": "gt", "value": 70000 }),
+            &fields
+        ));
+
+        // …and so can the delta trio.
+        let prev = map(serde_json::json!({ "price": 63000.0 }));
+        let with_delta = with_delta_fields(&fields, Some(&prev));
+        let delta = with_delta["delta_price"].as_f64().expect("delta derived");
+        assert!(
+            (delta - 669.6).abs() < 1e-6,
+            "delta_price was {delta}, expected ≈669.6"
+        );
+        assert!(with_delta["pct_price"].as_f64().unwrap() > 1.0);
+    }
+
+    #[test]
+    fn native_json_numbers_are_untouched_by_the_string_path() {
+        // Regression guard: F2 must not disturb feeds that already ship
+        // numbers, nor turn a real string field into something else.
+        let payload = serde_json::json!({
+            "price": 595.0, "vol": 12000, "name": "台積電", "flag": true, "none": null
+        });
+        let fields = extract_fields(
+            &payload,
+            &pointers(&[
+                ("price", "/price"),
+                ("vol", "/vol"),
+                ("name", "/name"),
+                ("flag", "/flag"),
+                ("none", "/none"),
+            ]),
+        );
+        assert_eq!(fields["price"].as_f64(), Some(595.0));
+        assert_eq!(fields["vol"].as_i64(), Some(12000));
+        assert!(fields["vol"].is_i64(), "integers stay integers");
+        assert_eq!(fields["name"], Value::String("台積電".into()));
+        assert_eq!(fields["flag"], Value::Bool(true));
+        assert_eq!(fields["none"], Value::Null);
+    }
+
+    // ── F3: field-less frames are not observations ───────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_resolving_no_configured_field_is_dropped_and_counted() {
+        let hub = Arc::new(TickHub::new());
+        let (tx, mut rx) = broadcast::channel(64);
+        let cfg = feed_cfg("heartbeats", pointers(&[("price", "/data/0/last")]));
+        let mut state = SourceState::new(&cfg);
+
+        emit_payload(
+            &cfg,
+            &mut state,
+            r#"{"channel":"heartbeat"}"#,
+            &tx,
+            &hub,
+            None,
+        )
+        .await;
+        emit_payload(&cfg, &mut state, r#"{"channel":"status"}"#, &tx, &hub, None).await;
+
+        let snap = hub.counters_snapshot("heartbeats").await;
+        assert_eq!(snap.dropped_no_fields, 2);
+        assert_eq!(snap.events_emitted, 0);
+        assert_eq!(
+            hub.len("heartbeats").await,
+            0,
+            "a control frame must not occupy a ring slot"
+        );
+        assert!(rx.try_recv().is_err(), "and must not reach the bus");
+
+        // A real quote still gets through untouched.
+        emit_payload(
+            &cfg,
+            &mut state,
+            r#"{"channel":"ticker","data":[{"last":"100.0"}]}"#,
+            &tx,
+            &hub,
+            None,
+        )
+        .await;
+        let snap = hub.counters_snapshot("heartbeats").await;
+        assert_eq!(snap.events_emitted, 1);
+        assert_eq!(snap.dropped_no_fields, 2, "unchanged by the good frame");
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn field_less_frames_do_not_consume_the_rate_cap() {
+        // The cap bounds *emitted events*; a frame that can never become one
+        // must not starve the data frames behind it.
+        let hub = Arc::new(TickHub::new());
+        let (tx, _rx) = broadcast::channel(64);
+        let mut cfg = feed_cfg("capped", pointers(&[("p", "/p")]));
+        cfg.max_events_per_minute = 2;
+        let mut state = SourceState::new(&cfg);
+
+        for i in 0..5 {
+            emit_payload(
+                &cfg,
+                &mut state,
+                &format!(r#"{{"heartbeat":{i}}}"#),
+                &tx,
+                &hub,
+                None,
+            )
+            .await;
+        }
+        emit_payload(&cfg, &mut state, r#"{"p":1}"#, &tx, &hub, None).await;
+        emit_payload(&cfg, &mut state, r#"{"p":2}"#, &tx, &hub, None).await;
+
+        let snap = hub.counters_snapshot("capped").await;
+        assert_eq!(snap.dropped_no_fields, 5);
+        assert_eq!(
+            snap.events_emitted, 2,
+            "both quotes fit the cap despite five heartbeats first"
+        );
+        assert_eq!(snap.dropped_rate_cap, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_source_without_json_fields_keeps_the_raw_len_behavior() {
+        let hub = Arc::new(TickHub::new());
+        let (tx, _rx) = broadcast::channel(64);
+        let cfg = feed_cfg("raw", BTreeMap::new());
+        let mut state = SourceState::new(&cfg);
+
+        // Non-JSON payload → raw_len + excerpt, exactly as before F3.
+        emit_payload(&cfg, &mut state, "plain text line", &tx, &hub, None).await;
+        // JSON payload with nothing configured to extract → still an event.
+        emit_payload(
+            &cfg,
+            &mut state,
+            r#"{"channel":"heartbeat"}"#,
+            &tx,
+            &hub,
+            None,
+        )
+        .await;
+
+        let snap = hub.counters_snapshot("raw").await;
+        assert_eq!(snap.dropped_no_fields, 0, "F3 only guards configured feeds");
+        assert_eq!(snap.events_emitted, 2);
+        let records = hub.recent("raw", 10).await;
+        assert_eq!(records[0].fields["raw_len"].as_u64(), Some(15));
+        assert_eq!(records[0].raw.as_deref(), Some("plain text line"));
+        assert!(records[1].fields.is_empty());
+    }
+
+    /// A non-JSON payload from a source that *does* declare `json_fields`
+    /// keeps its `raw_len` diagnostic instead of vanishing into the counter —
+    /// "your feed stopped being JSON" must stay visible in the ring buffer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_non_json_payload_still_reports_raw_len_even_with_fields_configured() {
+        let hub = Arc::new(TickHub::new());
+        let (tx, _rx) = broadcast::channel(64);
+        let cfg = feed_cfg("broken", pointers(&[("p", "/p")]));
+        let mut state = SourceState::new(&cfg);
+
+        emit_payload(
+            &cfg,
+            &mut state,
+            "<html>502 Bad Gateway</html>",
+            &tx,
+            &hub,
+            None,
+        )
+        .await;
+
+        let snap = hub.counters_snapshot("broken").await;
+        assert_eq!(snap.events_emitted, 1);
+        assert_eq!(snap.dropped_no_fields, 0);
+        let records = hub.recent("broken", 10).await;
+        assert!(records[0].raw.as_deref().unwrap().contains("502"));
     }
 
     // ── wake-up context window ───────────────────────────────
