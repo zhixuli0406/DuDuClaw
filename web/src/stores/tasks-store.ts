@@ -17,7 +17,14 @@ interface TasksStore {
   /** Comments keyed by task id (oldest first). Loaded on demand per task. */
   readonly comments: Readonly<Record<string, ReadonlyArray<TaskComment>>>;
   readonly loading: boolean;
-  readonly error: string | null;
+  /**
+   * The raw thrown value. Pages render it through `ErrorState` /
+   * `useErrorMessage`, which classify it into plain language and keep the
+   * technical string behind a disclosure — so it is deliberately NOT
+   * pre-flattened to `String(e)` here.
+   */
+  readonly error: unknown;
+  clearError: () => void;
   readonly filterAgent: string | null;
   readonly filterPriority: TaskPriority | null;
   fetchTasks: (filters?: { status?: TaskStatus; agent_id?: string }) => Promise<void>;
@@ -114,7 +121,7 @@ export const useTasksStore = create<TasksStore>((set, get) => {
         const result = await api.tasks.list(filters);
         set({ tasks: result?.tasks ?? [], loading: false });
       } catch (e) {
-        set({ error: String(e), loading: false });
+        set({ error: e, loading: false });
       }
     },
 
@@ -126,7 +133,7 @@ export const useTasksStore = create<TasksStore>((set, get) => {
         set({ tasks: upsertTask(get().tasks, task) });
         return task;
       } catch (e) {
-        set({ error: String(e) });
+        set({ error: e });
         return null;
       }
     },
@@ -138,7 +145,7 @@ export const useTasksStore = create<TasksStore>((set, get) => {
           tasks: get().tasks.map((t) => (t.id === taskId ? result.task : t)),
         });
       } catch (e) {
-        set({ error: String(e) });
+        set({ error: e });
       }
     },
 
@@ -147,7 +154,7 @@ export const useTasksStore = create<TasksStore>((set, get) => {
         await api.tasks.remove(taskId);
         set({ tasks: get().tasks.filter((t) => t.id !== taskId) });
       } catch (e) {
-        set({ error: String(e) });
+        set({ error: e });
       }
     },
 
@@ -163,7 +170,7 @@ export const useTasksStore = create<TasksStore>((set, get) => {
         await api.tasks.update(taskId, { status: newStatus });
       } catch (e) {
         // Rollback on failure
-        set({ tasks: prev, error: String(e) });
+        set({ tasks: prev, error: e });
       }
     },
 
@@ -174,9 +181,11 @@ export const useTasksStore = create<TasksStore>((set, get) => {
           tasks: get().tasks.map((t) => (t.id === taskId ? result.task : t)),
         });
       } catch (e) {
-        set({ error: String(e) });
+        set({ error: e });
       }
     },
+
+    clearError: () => set({ error: null }),
 
     setFilterAgent: (agentId) => set({ filterAgent: agentId }),
     setFilterPriority: (priority) => set({ filterPriority: priority }),
@@ -186,7 +195,7 @@ export const useTasksStore = create<TasksStore>((set, get) => {
         const result = await api.activity.list(params);
         set({ activities: result?.events ?? [] });
       } catch (e) {
-        set({ error: String(e) });
+        set({ error: e });
       }
     },
 
@@ -195,7 +204,7 @@ export const useTasksStore = create<TasksStore>((set, get) => {
         const result = await api.tasks.comments(taskId);
         set({ comments: { ...get().comments, [taskId]: result?.comments ?? [] } });
       } catch (e) {
-        set({ error: String(e) });
+        set({ error: e });
       }
     },
 
@@ -207,7 +216,7 @@ export const useTasksStore = create<TasksStore>((set, get) => {
         set({ comments: { ...get().comments, [taskId]: mergeComment(existing, c) } });
         return c;
       } catch (e) {
-        set({ error: String(e) });
+        set({ error: e });
         return null;
       }
     },

@@ -58,14 +58,29 @@ interface GrowthStore {
   loaded: boolean;
   /** Bumped on every level increase — the HUD capsule watches it to pop. */
   levelUpNonce: number;
+  /**
+   * Last snapshot-poll failure, raw. `GrowthMount` is the single poller, so it
+   * is also the only writer here. Without this, a failed poll left `loaded`
+   * false forever and `/growth` sat on its skeleton with no way to tell the
+   * user anything (P05 Blocker, phase-4 audit).
+   */
+  error: unknown;
+  /** Re-run the snapshot poll. Registered by `GrowthMount` while mounted. */
+  retry: (() => void) | null;
   /** Apply a fresh snapshot, diffing against the previous to fire moments. */
   applySnapshot: (next: GrowthSnapshot) => void;
+  setError: (error: unknown) => void;
+  setRetry: (retry: (() => void) | null) => void;
 }
 
 export const useGrowthStore = create<GrowthStore>((set, get) => ({
   snapshot: null,
   loaded: false,
   levelUpNonce: 0,
+  error: null,
+  retry: null,
+  setError: (error) => set({ error }),
+  setRetry: (retry) => set({ retry }),
   applySnapshot: (next) => {
     const { snapshot: prev, levelUpNonce } = get();
     let nonce = levelUpNonce;
@@ -87,6 +102,6 @@ export const useGrowthStore = create<GrowthStore>((set, get) => ({
       }
     }
 
-    set({ snapshot: next, loaded: true, levelUpNonce: nonce });
+    set({ snapshot: next, loaded: true, levelUpNonce: nonce, error: null });
   },
 }));

@@ -50,14 +50,39 @@ describe('agents-store', () => {
     expect(state.error).toBeNull();
   });
 
-  it('fetchAgents sets error on failure', async () => {
-    vi.mocked(api.agents.list).mockRejectedValue(new Error('Network error'));
+  it('fetchAgents keeps the raw thrown value on failure', async () => {
+    const thrown = new Error('Network error');
+    vi.mocked(api.agents.list).mockRejectedValue(thrown);
 
     await useAgentsStore.getState().fetchAgents();
 
     const state = useAgentsStore.getState();
-    expect(state.error).toContain('Network error');
+    // The store keeps the raw error so consuming pages can classify it into
+    // plain language; it must NOT be pre-flattened to a display string.
+    expect(state.error).toBe(thrown);
     expect(state.loading).toBe(false);
+  });
+
+  it('clearError resets the recorded failure', async () => {
+    vi.mocked(api.agents.list).mockRejectedValue(new Error('boom'));
+    await useAgentsStore.getState().fetchAgents();
+    expect(useAgentsStore.getState().error).not.toBeNull();
+
+    useAgentsStore.getState().clearError();
+    expect(useAgentsStore.getState().error).toBeNull();
+  });
+
+  it('pauseAgent rethrows so the caller cannot report a fake success', async () => {
+    useAgentsStore.setState({
+      agents: [{ name: 'bot-1', status: 'active' }] as never[],
+      error: null,
+    });
+    vi.mocked(api.agents.pause).mockRejectedValue(new Error('nope'));
+
+    await expect(useAgentsStore.getState().pauseAgent('bot-1')).rejects.toThrow('nope');
+    expect(useAgentsStore.getState().error).toBeInstanceOf(Error);
+    // The optimistic status flip must not happen when the call failed.
+    expect(useAgentsStore.getState().agents[0].status).toBe('active');
   });
 
   it('pauseAgent updates agent status optimistically', async () => {

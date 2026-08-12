@@ -84,8 +84,19 @@ export {
   SheetFooter,
 } from './sheet';
 export { Empty } from './empty';
+export {
+  ErrorState,
+  useErrorMessage,
+  type ErrorStateProps,
+} from './error-state';
 export { Spinner } from './spinner';
 export { SubmitButton, type SubmitButtonState } from './submit-button';
+export {
+  ThinkingOrb,
+  type ThinkingOrbProps,
+  type ThinkingOrbState,
+  type ThinkingOrbSize,
+} from './thinking-orb';
 
 // ── Layout layer (WP0.3) ──────────────────────────────────────────────
 export {
@@ -150,3 +161,4 @@ export {
   type ActorAvatarSize,
 } from './actor-avatar';
 export { NavProgress } from './nav-progress';
+export { CrossLink } from './cross-link';

@@ -47,11 +47,19 @@ export interface Gated {
   /**
    * Progressive disclosure: hide until the named data actually exists, so
    * never-used features don't occupy nav space with dead pages. `'forks'` =
-   * at least one RFC-26 fork record exists (see `useForksExist`). The route
-   * itself stays reachable by URL — this is presentation, not access control.
+   * at least one RFC-26 fork record exists (see `useForksExist`). `'org'` =
+   * the AI-staff headcount has reached `ORG_CHART_MIN_AGENTS` (D6,
+   * 09-edition-split-features.md §4) — a 1-2-agent org chart is an empty
+   * diagram, so the entry waits for a roster worth drawing. Applies on every
+   * edition (same as `'forks'`), not just Personal: an under-staffed
+   * Enterprise instance gets the same dead-page relief. The route itself
+   * stays reachable by URL — this is presentation, not access control.
    */
-  readonly requiresData?: 'forks';
+  readonly requiresData?: 'forks' | 'org';
 }
+
+/** Minimum AI-employee headcount before the org chart earns a nav slot (D6). */
+export const ORG_CHART_MIN_AGENTS = 3;
 
 /** Extra context needed to evaluate the finer-grained gates. All optional so
  *  existing call sites keep compiling; omitted facts fail closed. */
@@ -60,6 +68,10 @@ export interface VisibilityContext {
   readonly hasOperatorAccess?: boolean;
   /** True once at least one fork record exists (progressive disclosure). */
   readonly forksExist?: boolean;
+  /** Current AI-employee headcount, for the org chart's progressive
+   *  disclosure gate (D6). Absent/undefined counts as 0 (fail-closed: hidden
+   *  until proven otherwise), matching `forksExist`'s default-hidden posture. */
+  readonly agentCount?: number;
   /** True when running inside the desktop app (Tauri). */
   readonly isDesktop?: boolean;
 }
@@ -79,6 +91,7 @@ export function isVisible(
   if (item.operatorOnly && !ctx?.hasOperatorAccess) return false;
   // Progressive disclosure: hidden until the backing data exists.
   if (item.requiresData === 'forks' && !ctx?.forksExist) return false;
+  if (item.requiresData === 'org' && (ctx?.agentCount ?? 0) < ORG_CHART_MIN_AGENTS) return false;
   return true;
 }
 

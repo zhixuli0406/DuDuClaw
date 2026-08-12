@@ -13,7 +13,13 @@ interface AgentsStore {
    *  "never loaded" from "loaded empty" so the first-run gate never redirects
    *  on the initial empty array before the first list call returns. */
   readonly loaded: boolean;
-  readonly error: string | null;
+  /**
+   * The raw thrown value from the last failed call. Pages render it through
+   * `ErrorState` / `useErrorMessage` (plain language + sanitized detail), so it
+   * is deliberately not pre-flattened here.
+   */
+  readonly error: unknown;
+  clearError: () => void;
   fetchAgents: (includeArchived?: boolean) => Promise<void>;
   setIncludeArchived: (v: boolean) => Promise<void>;
   selectAgent: (id: string | null) => void;
@@ -63,13 +69,14 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
         useAgentAvatarStore.getState().seed(agents);
         set({ agents, loading: false, loaded: true });
       } catch (e) {
-        set({ error: String(e), loading: false, loaded: true });
+        set({ error: e, loading: false, loaded: true });
       }
     },
     setIncludeArchived: async (v) => {
       set({ includeArchived: v });
       await get().fetchAgents(v);
     },
+    clearError: () => set({ error: null }),
     selectAgent: (id) => set({ selectedAgentId: id }),
     pauseAgent: async (id) => {
       try {
@@ -79,8 +86,11 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
             a.name === id ? { ...a, status: 'paused' } : a
           ),
         });
-      } catch {
-        set({ error: 'agents.error.pause' });
+      } catch (e) {
+        // Swallowing this used to resolve normally, which let the detail page
+        // toast "已讓他休息" for a call that never landed (P05 Blocker).
+        set({ error: e });
+        throw e;
       }
     },
     resumeAgent: async (id) => {
@@ -91,8 +101,9 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
             a.name === id ? { ...a, status: 'active' } : a
           ),
         });
-      } catch {
-        set({ error: 'agents.error.resume' });
+      } catch (e) {
+        set({ error: e });
+        throw e;
       }
     },
     updateAgent: async (id, fields) => {
@@ -101,8 +112,8 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
         // Re-fetch to get the authoritative state after update
         await get().fetchAgents();
         return res;
-      } catch {
-        set({ error: 'agents.error.update' });
+      } catch (e) {
+        set({ error: e });
         return undefined;
       }
     },
@@ -111,17 +122,29 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
         await api.agents.remove(id);
         set({ agents: get().agents.filter((a) => a.name !== id) });
       } catch (e) {
-        set({ error: 'agents.error.remove' });
+        set({ error: e });
         throw e;
       }
     },
     archiveAgent: async (id) => {
-      await api.agents.archive(id);
+      // Previously had no try/catch at all: a rejected archive surfaced as an
+      // unhandled rejection and the user saw nothing (P05 Blocker).
+      try {
+        await api.agents.archive(id);
+      } catch (e) {
+        set({ error: e });
+        throw e;
+      }
       // Re-fetch so the archived state (and visibility) is authoritative.
       await get().fetchAgents();
     },
     unarchiveAgent: async (id) => {
-      await api.agents.unarchive(id);
+      try {
+        await api.agents.unarchive(id);
+      } catch (e) {
+        set({ error: e });
+        throw e;
+      }
       await get().fetchAgents();
     },
     handoffAgent: async (params) => {
