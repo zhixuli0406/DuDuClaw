@@ -1,11 +1,11 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import {
   api,
   type OdooStatus,
   type OdooAgentConfig,
-  type OdooAgentConfigSet,
   type OdooDiscoverSchemaResult,
 } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
@@ -27,9 +27,10 @@ import {
   Spinner,
   SettingsSection,
   SettingsCard,
+  CrossLink,
 } from '@/components/mds';
-import { RowText, RowNumber, RowSwitch, RowSelect, FieldBlock } from '@/pages/agent-form/form-rows';
-import type { SelectOption } from '@/components/settings/controls';
+import { RowText, RowNumber, RowSwitch, RowSelect } from '@/pages/agent-form/form-rows';
+import { DangerZone, ConfirmDialog, type SelectOption } from '@/components/settings/controls';
 
 const FEATURE_MODULES = ['crm', 'sale', 'inventory', 'accounting', 'project', 'hr'] as const;
 type FeatureKey = (typeof FEATURE_MODULES)[number];
@@ -73,6 +74,13 @@ export function OdooPage() {
   const [webhookEnabled, setWebhookEnabled] = useState(false);
   const [webhookSecret, setWebhookSecret] = useState('');
   const [globalUnblockModels, setGlobalUnblockModels] = useState('');
+  // Last-saved value of the global unblock list — used to detect when Save is
+  // about to *expand* which sensitive models every AI employee can reach, so
+  // that expansion (not unrelated saves) is what triggers the extra confirm
+  // step below (phase4 audit C07/C11 Blocker).
+  const [unblockModelsBaseline, setUnblockModelsBaseline] = useState('');
+  // Newly-added models pending confirmation before Save actually runs.
+  const [confirmUnblock, setConfirmUnblock] = useState<string[] | null>(null);
 
   // Feature toggles
   const [features, setFeatures] = useState<Record<FeatureKey, boolean>>({
@@ -125,6 +133,7 @@ export function OdooPage() {
           webhookSecret: configRes.has_webhook_secret ?? false,
         });
         setGlobalUnblockModels((configRes.unblock_models ?? []).join(', '));
+        setUnblockModelsBaseline((configRes.unblock_models ?? []).join(', '));
         setFeatures({
           crm: configRes.features_crm ?? true,
           sale: configRes.features_sale ?? true,
@@ -152,6 +161,30 @@ export function OdooPage() {
     };
   }, [loadConfig]);
 
+  const parseUnblockModels = (raw: string) =>
+    raw
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+  /**
+   * The global unblock list is one field in a page-wide Save — clicking Save
+   * used to activate it for every AI employee with no preview of which models
+   * were newly exposed (phase4 audit C07/C11 Blocker). Only interrupt Save
+   * when the list actually *grows* relative to what's on file; shrinking it
+   * (or an unrelated field change) saves immediately, so the confirm step
+   * doesn't turn into noise on every unrelated edit.
+   */
+  const requestSave = () => {
+    const before = new Set(parseUnblockModels(unblockModelsBaseline));
+    const added = parseUnblockModels(globalUnblockModels).filter((m) => !before.has(m));
+    if (added.length > 0) {
+      setConfirmUnblock(added);
+      return;
+    }
+    void handleSave();
+  };
+
   const handleSave = async () => {
     setSaving(true);
     setSaved(false);
@@ -170,10 +203,7 @@ export function OdooPage() {
         poll_models: pollModels.split(',').map((s) => s.trim()).filter(Boolean),
         webhook_enabled: webhookEnabled,
         webhook_secret: webhookSecret || undefined,
-        unblock_models: globalUnblockModels
-          .split(/[,\s]+/)
-          .map((s) => s.trim())
-          .filter(Boolean),
+        unblock_models: parseUnblockModels(globalUnblockModels),
         features_crm: features.crm,
         features_sale: features.sale,
         features_inventory: features.inventory,
@@ -308,7 +338,7 @@ export function OdooPage() {
               {t('common.saved')}
             </span>
           )}
-          <Button variant="brand" size="sm" onClick={handleSave} disabled={saving || !url.trim()}>
+          <Button variant="brand" size="sm" onClick={requestSave} disabled={saving || !url.trim()}>
             {saving ? <Loader2 className="animate-spin" /> : <Save />}
             {saving ? t('common.saving') : t('common.save')}
           </Button>
@@ -516,60 +546,86 @@ export function OdooPage() {
         </SettingsCard>
       </SettingsSection>
 
-      {/* Global model access (security unblock list) */}
+      {/* Global model access (security unblock list) — a permission-expansion
+          setting: any model listed here becomes readable/writable by every AI
+          employee, with no per-employee review (phase4 audit C07/C11
+          Blocker). Isolated in a DangerZone and gated by a pre-save impact
+          confirmation (see `requestSave` above). */}
       <SettingsSection title={t('odoo.access')}>
-        <SettingsCard>
-          <RowText
-            label={t('odoo.unblockModels')}
-            description={t('odoo.unblockModelsHint')}
-            value={globalUnblockModels}
-            onChange={setGlobalUnblockModels}
-            placeholder="res.partner, x_custom_model"
-            tier="text"
-          />
-        </SettingsCard>
+        <DangerZone
+          title={t('odoo.access.dangerTitle')}
+          description={t('odoo.access.dangerDesc')}
+        >
+          <SettingsCard>
+            <RowText
+              label={t('odoo.unblockModels')}
+              description={t('odoo.unblockModelsHint')}
+              value={globalUnblockModels}
+              onChange={setGlobalUnblockModels}
+              placeholder="res.partner, x_custom_model"
+              tier="text"
+            />
+          </SettingsCard>
+        </DangerZone>
       </SettingsSection>
 
       {/* Per-agent credential override */}
       <AgentOdooOverride pickedModels={Array.from(pickedModels)} />
+
+      {confirmUnblock && (
+        <ConfirmDialog
+          open
+          title={t('odoo.access.dangerTitle')}
+          message={intl.formatMessage(
+            { id: 'confirm.odoo.unblockModels.message' },
+            { models: confirmUnblock.join(', '), count: confirmUnblock.length },
+          )}
+          confirmLabel={t('common.save')}
+          busy={saving}
+          onConfirm={() => {
+            setConfirmUnblock(null);
+            void handleSave();
+          }}
+          onClose={() => setConfirmUnblock(null)}
+        />
+      )}
     </div>
   );
 }
 
 /**
- * Per-AI-staff Odoo credential override. Pick a staffer, see whether they have
- * an override (or inherit the global config), then edit URL / DB / user /
- * credentials + permission allowlists. api_key / password are write-only:
- * blank keeps the stored secret, the "clear" toggle wipes it. A separate test
- * button verifies the staffer's effective connection.
+ * Per-AI-staff Odoo override — READ-ONLY summary (WP-D §2-9, R-SINGLE-WRITER).
+ *
+ * This used to be a second full edit form for the same fields
+ * `EditAgentPage`'s "整合" tab already writes (`AgentOdooOverride` payload,
+ * `EditAgentPage.tsx` odoo section) — both had their own Save button, neither
+ * knew about the other, so the two could silently drift out of sync. Pick a
+ * staffer, see whether they have an override (or inherit the global config),
+ * and jump to the one real edit surface. A non-destructive "test connection"
+ * stays here (it writes nothing, so it does not reintroduce a second writer).
+ *
+ * `unblock_models` and the "clear stored secret" action — the two fields this
+ * read-only summary used to flag as having no edit path — are now covered by
+ * `EditAgentPage.tsx`'s odoo section too, so every field below is reachable
+ * from the cross-link at the bottom.
  */
-function AgentOdooOverride({ pickedModels = [] }: { pickedModels?: string[] }) {
+function AgentOdooOverride({ pickedModels }: { pickedModels?: string[] }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
+  const navigate = useNavigate();
+  // pickedModels (schema-discovery picks) had no read-only equivalent — the
+  // "add picked models" action always wrote into the (now removed) allowed
+  // models field. Accepted but intentionally unused; kept in the signature so
+  // callers don't need to change.
+  void pickedModels;
 
   const [agents, setAgents] = useState<ReadonlyArray<{ name: string; display_name: string }>>([]);
   const [selected, setSelected] = useState('');
   const [cfg, setCfg] = useState<OdooAgentConfig | null>(null);
   const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
-
-  // Editable form
-  const [profile, setProfile] = useState('');
-  const [url, setUrl] = useState('');
-  const [db, setDb] = useState('');
-  const [username, setUsername] = useState('');
-  const [apiKey, setApiKey] = useState('');
-  const [password, setPassword] = useState('');
-  const [clearApiKey, setClearApiKey] = useState(false);
-  const [clearPassword, setClearPassword] = useState(false);
-  const [allowedModels, setAllowedModels] = useState('');
-  const [unblockModels, setUnblockModels] = useState('');
-  const [allowedActions, setAllowedActions] = useState('');
-  const [companyIds, setCompanyIds] = useState('');
 
   // Load agent roster once
   useEffect(() => {
@@ -586,32 +642,15 @@ function AgentOdooOverride({ pickedModels = [] }: { pickedModels?: string[] }) {
       });
   }, [intl]);
 
-  const applyCfg = useCallback((c: OdooAgentConfig | null) => {
-    setCfg(c);
-    setProfile(c?.profile ?? '');
-    setUrl(c?.url ?? '');
-    setDb(c?.db ?? '');
-    setUsername(c?.username ?? '');
-    setApiKey('');
-    setPassword('');
-    setClearApiKey(false);
-    setClearPassword(false);
-    setAllowedModels((c?.allowed_models ?? []).join(', '));
-    setUnblockModels((c?.unblock_models ?? []).join(', '));
-    setAllowedActions((c?.allowed_actions ?? []).join(', '));
-    setCompanyIds((c?.company_ids ?? []).join(', '));
-  }, []);
-
   // Load override config when the selected staffer changes
   useEffect(() => {
     if (!selected) return;
     setLoading(true);
     setError(null);
     setTestResult(null);
-    setSaved(false);
     api.odoo
       .agentConfigGet(selected)
-      .then(applyCfg)
+      .then(setCfg)
       .catch((e) => {
         console.warn('[api]', e);
         setCfg(null);
@@ -619,49 +658,7 @@ function AgentOdooOverride({ pickedModels = [] }: { pickedModels?: string[] }) {
       })
       .finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, applyCfg]);
-
-  const parseList = (s: string) =>
-    s.split(',').map((x) => x.trim()).filter(Boolean);
-
-  const handleSave = async () => {
-    if (!selected) return;
-    setSaving(true);
-    setSaved(false);
-    setError(null);
-    try {
-      const payload: OdooAgentConfigSet = {
-        agent_id: selected,
-        profile: profile.trim() || undefined,
-        url: url.trim() || undefined,
-        db: db.trim() || undefined,
-        user: username.trim() || undefined,
-        allowed_models: parseList(allowedModels),
-        unblock_models: parseList(unblockModels),
-        allowed_actions: parseList(allowedActions),
-        company_ids: parseList(companyIds)
-          .map((n) => Number(n))
-          .filter((n) => Number.isFinite(n)),
-      };
-      // api_key / password: clear toggle wins, else only send when typed.
-      if (clearApiKey) payload.api_key = '';
-      else if (apiKey) payload.api_key = apiKey;
-      if (clearPassword) payload.password = '';
-      else if (password) payload.password = password;
-
-      await api.odoo.agentConfigSet(payload);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-      // Reload to reflect the new masked/set state
-      const fresh = await api.odoo.agentConfigGet(selected);
-      applyCfg(fresh);
-    } catch (e) {
-      const detail = typeof e === 'string' ? e : e instanceof Error ? e.message : '';
-      setError(detail ? `${t('odoo.saveFailed')}: ${detail}` : t('odoo.saveFailed'));
-    } finally {
-      setSaving(false);
-    }
-  };
+  }, [selected]);
 
   const handleTest = async () => {
     if (!selected) return;
@@ -682,6 +679,9 @@ function AgentOdooOverride({ pickedModels = [] }: { pickedModels?: string[] }) {
     value: a.name,
     label: a.display_name || a.name,
   }));
+
+  const listOrDash = (values: readonly string[] | undefined) =>
+    values && values.length > 0 ? values.join(', ') : '—';
 
   return (
     <SettingsSection title={t('odoo.agent.title')} description={t('odoo.agent.desc')}>
@@ -711,116 +711,33 @@ function AgentOdooOverride({ pickedModels = [] }: { pickedModels?: string[] }) {
           ) : (
             <div className="space-y-4">
               <SettingsCard>
-                <RowText label={t('agents.odoo.profile')} value={profile} onChange={setProfile} placeholder="default" tier="text" />
-                <RowText label={t('odoo.url')} value={url} onChange={setUrl} placeholder="https://erp.example.com" tier="text" />
-                <RowText label={t('odoo.db')} value={db} onChange={setDb} tier="text" />
-                <RowText label={t('odoo.username')} value={username} onChange={setUsername} tier="text" />
-              </SettingsCard>
-
-              {/* Write-only credentials: blank keeps stored, clear-toggle wipes. */}
-              <div className="grid gap-4 sm:grid-cols-2">
-                <FieldBlock
+                <ReadOnlyRow label={t('agents.odoo.profile')} value={cfg?.profile || '—'} />
+                <ReadOnlyRow label={t('odoo.url')} value={cfg?.url || '—'} />
+                <ReadOnlyRow label={t('odoo.db')} value={cfg?.db || '—'} />
+                <ReadOnlyRow label={t('odoo.username')} value={cfg?.username || '—'} />
+                <ReadOnlyRow
                   label={t('odoo.apiKey')}
-                  description={cfg?.api_key_set ? t('odoo.agent.secretSet') : t('odoo.agent.secretHint')}
-                >
-                  <Input
-                    type="password"
-                    autoComplete="off"
-                    placeholder={cfg?.api_key_set ? '••••••••' : ''}
-                    value={apiKey}
-                    disabled={clearApiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                  />
-                  {cfg?.api_key_set && (
-                    <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <Checkbox
-                        checked={clearApiKey}
-                        onCheckedChange={(v) => setClearApiKey(Boolean(v))}
-                        aria-label={t('odoo.agent.clearSecret')}
-                      />
-                      {t('odoo.agent.clearSecret')}
-                    </label>
-                  )}
-                </FieldBlock>
-                <FieldBlock
+                  value={cfg?.api_key_set ? t('odoo.agent.secretSetReadOnly') : t('odoo.agent.secretNotSetReadOnly')}
+                />
+                <ReadOnlyRow
                   label={t('odoo.password')}
-                  description={cfg?.password_set ? t('odoo.agent.secretSet') : t('odoo.agent.secretHint')}
-                >
-                  <Input
-                    type="password"
-                    autoComplete="off"
-                    placeholder={cfg?.password_set ? '••••••••' : ''}
-                    value={password}
-                    disabled={clearPassword}
-                    onChange={(e) => setPassword(e.target.value)}
-                  />
-                  {cfg?.password_set && (
-                    <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <Checkbox
-                        checked={clearPassword}
-                        onCheckedChange={(v) => setClearPassword(Boolean(v))}
-                        aria-label={t('odoo.agent.clearSecret')}
-                      />
-                      {t('odoo.agent.clearSecret')}
-                    </label>
-                  )}
-                </FieldBlock>
-              </div>
-
-              <SettingsCard>
-                <RowText
-                  label={t('agents.odoo.allowedModels')}
-                  description={t('agents.odoo.allowedModels.hint')}
-                  value={allowedModels}
-                  onChange={setAllowedModels}
-                  placeholder="crm.lead, sale.order"
-                  tier="text"
+                  value={cfg?.password_set ? t('odoo.agent.secretSetReadOnly') : t('odoo.agent.secretNotSetReadOnly')}
                 />
-                {pickedModels.length > 0 && (
-                  <div className="flex flex-wrap items-center gap-2 px-1 pb-1">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => {
-                        const current = parseList(allowedModels);
-                        const merged = Array.from(new Set([...current, ...pickedModels]));
-                        setAllowedModels(merged.join(', '));
-                      }}
-                    >
-                      <Database className="size-4" />
-                      {t('odoo.schema.addPicked').replace('{n}', String(pickedModels.length))}
-                    </Button>
-                  </div>
-                )}
-                <RowText
+                <ReadOnlyRow label={t('agents.odoo.allowedModels')} value={listOrDash(cfg?.allowed_models)} />
+                <ReadOnlyRow
                   label={t('agents.odoo.unblockModels')}
-                  description={t('agents.odoo.unblockModels.hint')}
-                  value={unblockModels}
-                  onChange={setUnblockModels}
-                  placeholder="res.partner"
-                  tier="text"
+                  value={listOrDash(cfg?.unblock_models)}
                 />
-                <RowText
-                  label={t('agents.odoo.allowedActions')}
-                  description={t('agents.odoo.allowedActions.hint')}
-                  value={allowedActions}
-                  onChange={setAllowedActions}
-                  placeholder="read, write:crm.lead"
-                  tier="text"
-                />
-                <RowText
+                <ReadOnlyRow label={t('agents.odoo.allowedActions')} value={listOrDash(cfg?.allowed_actions)} />
+                <ReadOnlyRow
                   label={t('agents.odoo.companyIds')}
-                  description={t('agents.odoo.companyIds.hint')}
-                  value={companyIds}
-                  onChange={setCompanyIds}
-                  placeholder="1, 2"
-                  tier="text"
+                  value={listOrDash((cfg?.company_ids ?? []).map(String))}
                 />
               </SettingsCard>
 
               <div className="flex flex-wrap items-center justify-between gap-3 border-t border-surface-border pt-4">
                 <div className="flex items-center gap-3">
-                  <Button variant="outline" size="sm" onClick={handleTest} disabled={testing || saving}>
+                  <Button variant="outline" size="sm" onClick={handleTest} disabled={testing}>
                     {testing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
                     {t('odoo.agent.test')}
                   </Button>
@@ -835,25 +752,33 @@ function AgentOdooOverride({ pickedModels = [] }: { pickedModels?: string[] }) {
                       {testResult.message}
                     </span>
                   )}
-                </div>
-                <div className="flex items-center gap-3">
                   {error && <span className="text-sm text-destructive">{error}</span>}
-                  {saved && (
-                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-success">
-                      <CheckCircle className="size-4" />
-                      {t('common.saved')}
-                    </span>
-                  )}
-                  <Button variant="brand" size="sm" onClick={handleSave} disabled={saving}>
-                    {saving ? <Loader2 className="animate-spin" /> : <Save />}
-                    {saving ? t('common.saving') : t('odoo.agent.save')}
-                  </Button>
                 </div>
+                <CrossLink
+                  label={t('odoo.agent.editLink')}
+                  onClick={() => navigate(`/agents/${encodeURIComponent(selected)}/edit?tab=integration`)}
+                />
               </div>
             </div>
           )}
         </>
       )}
     </SettingsSection>
+  );
+}
+
+/** A single read-only label/value row, laid out like the editable `RowText`
+ *  rows above it so the summary reads as one continuous list. `note` renders
+ *  a small caption under the value for a field-specific caveat, when one
+ *  applies, instead of silently hiding it — no row currently uses it. */
+function ReadOnlyRow({ label, value, note }: { label: string; value: string; note?: string }) {
+  return (
+    <div className="flex min-h-9 flex-wrap items-baseline justify-between gap-x-4 gap-y-1 py-1.5">
+      <span className="text-sm text-muted-foreground">{label}</span>
+      <div className="min-w-0 max-w-[60%] text-right">
+        <span className="break-words font-mono text-xs text-foreground">{value}</span>
+        {note && <p className="mt-0.5 text-[11px] text-muted-foreground">{note}</p>}
+      </div>
+    </div>
   );
 }

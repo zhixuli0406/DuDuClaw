@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
 import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
@@ -6,6 +6,7 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { useConversationsStore } from '@/stores/conversations-store';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
+import { useUrlStateNullable } from '@/lib/use-url-state';
 import { Plus, Paperclip, Eye, EyeOff, MessagesSquare } from 'lucide-react';
 import { toast } from '@/lib/toast';
 import {
@@ -61,6 +62,10 @@ export function WebChatPage() {
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
 
   const [searchParams] = useSearchParams();
+  // P11 (state-as-URL): who you are talking to is page state, so it round-trips
+  // through `?agent=<id>` instead of being read once at mount and then lost on
+  // the next refresh.
+  const [, setAgentParam] = useUrlStateNullable('agent');
   const navigate = useNavigate();
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
@@ -106,12 +111,25 @@ export function WebChatPage() {
   // to it), so it gets no duplicate employee chip in the row.
   const staffAgents = useMemo(() => agents.filter((a) => a.role !== 'main'), [agents]);
 
+  /**
+   * Every user-driven partner switch goes through here so the store and the URL
+   * never disagree (P11). Selecting DuDu drops the param rather than writing an
+   * empty one.
+   */
+  const handleSelectAgent = useCallback(
+    (id: string | null) => {
+      selectAgent(id);
+      setAgentParam(id);
+    },
+    [selectAgent, setAgentParam],
+  );
+
   // A restored/preselected selection (e.g. `?agent=<main>`) may point at the main
   // agent, whose chip no longer exists — normalize it back to DuDu so the
-  // highlighted entry is always present.
+  // highlighted entry is always present (and the URL follows).
   useEffect(() => {
-    if (mainAgentId && selectedAgentId === mainAgentId) selectAgent(null);
-  }, [mainAgentId, selectedAgentId, selectAgent]);
+    if (mainAgentId && selectedAgentId === mainAgentId) handleSelectAgent(null);
+  }, [mainAgentId, selectedAgentId, handleSelectAgent]);
 
   // ── Conversation history ────────────────────────────────────────────────────
   //
@@ -346,7 +364,7 @@ export function WebChatPage() {
           removed left column; it is conversation chrome, not history chrome. */}
       {staffAgents.length > 0 && (
         <div className="shrink-0 border-b border-surface-border">
-          <EmployeeRow agents={staffAgents} selectedId={selectedAgentId} onSelect={selectAgent} />
+          <EmployeeRow agents={staffAgents} selectedId={selectedAgentId} onSelect={handleSelectAgent} />
         </div>
       )}
 

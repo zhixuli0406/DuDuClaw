@@ -1,6 +1,7 @@
 import { Suspense, useEffect } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router';
 import { AppSidebar } from './AppSidebar';
+import { crumbsFor } from './nav-model';
 import { MobileBottomNav } from './MobileBottomNav';
 import { GuidedTour } from '@/components/tour/GuidedTour';
 import { TourPrompt } from '@/components/tour/TourPrompt';
@@ -183,11 +184,28 @@ function AppShell() {
 
 export function MainLayout() {
   const location = useLocation();
+  const intl = useIntl();
+  const brandName = useEffectiveName();
   const hydrateTour = useTourStore((s) => s.hydrate);
   const status = useSystemStore((s) => s.status);
   const fetchStatus = useSystemStore((s) => s.fetchStatus);
   const recordVisit = useCommandPaletteStore((s) => s.recordVisit);
   const fetchBranding = useBrandingStore((s) => s.fetch);
+
+  // Router-level `document.title` sync (UX audit phase4-manage-settings /
+  // phase4-daily-work: `document.title` never changed with the route across all
+  // 16+38 audited pages — `lib/branding.ts` only ever sets one static
+  // "{brand} Dashboard" title, once, at branding-load time). Fixed once here
+  // instead of per-page: reuse the same `crumbsFor` lookup the breadcrumb header
+  // already relies on to resolve the current route's nav-model label, translate
+  // it, and compose "{頁名} · {brand}". Routes `crumbsFor` doesn't recognise
+  // (e.g. `/welcome`, which sits outside the nav model) fall back to the bare
+  // brand name rather than a stale/wrong page name.
+  useEffect(() => {
+    const trail = crumbsFor(location.pathname);
+    const page = trail[trail.length - 1];
+    document.title = page ? `${intl.formatMessage({ id: page.labelId })} · ${brandName}` : brandName;
+  }, [location.pathname, intl, brandName]);
 
   // Restore the once-per-user tour state once the user id is known.
   useEffect(() => {

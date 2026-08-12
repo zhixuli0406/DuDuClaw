@@ -211,10 +211,10 @@ export function MemoryGraph({
       className="w-full text-muted-foreground"
       viewBox={`0 0 ${width} ${height}`}
       role="img"
-      aria-label={`知識圖譜：${nodes.length} 個實體、${links.length} 條關係`}
+      aria-label={`事實溯源圖：${nodes.length} 個實體、${links.length} 條關係`}
     >
-      <title>知識圖譜</title>
-      <desc>力導向知識圖：拖曳節點可重新排列、捲動可縮放、點擊關係可查看來源。顏色代表知識來源可信度。</desc>
+      <title>事實溯源圖</title>
+      <desc>力導向的事實溯源圖：拖曳節點可重新排列、捲動可縮放、點擊關係可查看來源。顏色代表知識來源可信度。</desc>
     </svg>
   );
 }

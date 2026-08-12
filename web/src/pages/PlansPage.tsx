@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useUrlStateNullable } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
 import { usePlansStore } from '@/stores/plans-store';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -11,6 +12,7 @@ import {
   Button,
   Badge,
   Empty,
+  ErrorState,
   Input,
   ActorAvatar,
   ListGridContainer,
@@ -26,15 +28,14 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
-  DialogDescription,
   DialogFooter,
-  DialogClose,
   Select,
   SelectTrigger,
   SelectValue,
   SelectContent,
   SelectItem,
 } from '@/components/mds';
+import { ConfirmDialog } from '@/components/settings/controls';
 import { InlineEditor } from '@/components/ui';
 import { cycleStepStatus, planProgress, stepMoveTarget } from '@/lib/plan-utils';
 import { timeAgo } from '@/lib/format';
@@ -129,13 +130,21 @@ function AssigneePicker({
 /** `/plans` — the shared user ↔ AI-employee co-edited plan (U4, Cocoa). */
 export function PlansPage() {
   const intl = useIntl();
-  const { plans, steps, loading, fetchPlans, fetchPlan, createPlan, updatePlan, removePlan, addStep, updateStep, removeStep } =
+  // `error` was never destructured before (P05 Blocker, phase-4 audit): every
+  // failed mutation set it in the store and the page carried on as if the edit
+  // had landed. Read it, show it, and let the user retry.
+  const { plans, steps, loading, error, clearError, fetchPlans, fetchPlan, createPlan, updatePlan, removePlan, addStep, updateStep, removeStep } =
     usePlansStore();
   const { agents, fetchAgents } = useAgentsStore();
 
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // P11 (state-as-URL): the open plan lives in `?plan=<id>` (id only), so a
+  // refresh or a shared link lands on the same plan instead of the newest one.
+  const [selectedId, setSelectedId] = useUrlStateNullable('plan');
   const [createOpen, setCreateOpen] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<PlanInfo | null>(null);
+  // Step deletion used to fire with zero confirmation (phase4 audit C06
+  // Blocker) — gate it behind the shared ConfirmDialog like the plan itself.
+  const [removeStepTarget, setRemoveStepTarget] = useState<PlanStep | null>(null);
   const [newStepText, setNewStepText] = useState('');
 
   // Initial load + 30s live-ish refresh (the `plan.updated` broadcast in the
@@ -153,16 +162,27 @@ export function PlansPage() {
     return () => window.clearInterval(t);
   }, [fetchPlans, fetchPlan, selectedId]);
 
+  // The listing has come back at least once. Without this, the "keep a valid
+  // selection" effect below would run against the initial empty `plans` array
+  // and wipe a deep-linked `?plan=<id>` before the plans ever arrived.
+  const [listed, setListed] = useState(false);
+  const sawLoading = useRef(false);
+  useEffect(() => {
+    if (loading) sawLoading.current = true;
+    else if (sawLoading.current) setListed(true);
+  }, [loading]);
+
   // Keep a valid selection: default to the newest plan.
   useEffect(() => {
     if (plans.length === 0) {
-      setSelectedId(null);
+      // Only drop the selection once we know the list really is empty.
+      if (listed && selectedId) setSelectedId(null);
       return;
     }
     if (!selectedId || !plans.some((p) => p.id === selectedId)) {
       setSelectedId(plans[0].id);
     }
-  }, [plans, selectedId]);
+  }, [plans, selectedId, listed, setSelectedId]);
   useEffect(() => {
     if (selectedId) void fetchPlan(selectedId);
   }, [selectedId, fetchPlan]);
@@ -209,8 +229,30 @@ export function PlansPage() {
       />
 
       <div className="flex flex-1 flex-col gap-6 p-4 md:p-6">
+        {error != null && plans.length > 0 && (
+          <ErrorState
+            variant="inline"
+            error={error}
+            onRetry={() => {
+              clearError();
+              void fetchPlans();
+              if (selectedId) void fetchPlan(selectedId);
+            }}
+          />
+        )}
+
         {loading && plans.length === 0 ? (
           <CollectionPageState state="loading" />
+        ) : error != null && plans.length === 0 ? (
+          // A failed first load must not borrow the "no plans yet" empty state.
+          <ErrorState
+            icon={ClipboardList}
+            error={error}
+            onRetry={() => {
+              clearError();
+              void fetchPlans();
+            }}
+          />
         ) : plans.length === 0 ? (
           <CollectionPageState
             state="empty"
@@ -446,7 +488,7 @@ export function PlansPage() {
                                 size="icon-xs"
                                 title={intl.formatMessage({ id: 'plans.step.remove' })}
                                 aria-label={intl.formatMessage({ id: 'plans.step.remove' })}
-                                onClick={() => removeStep(plan.id, s.id)}
+                                onClick={() => setRemoveStepTarget(s)}
                               >
                                 <Trash2 />
                               </Button>
@@ -498,31 +540,44 @@ export function PlansPage() {
         }}
       />
 
-      <Dialog open={removeTarget !== null} onOpenChange={(o) => !o && setRemoveTarget(null)}>
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>{intl.formatMessage({ id: 'plans.remove' })}</DialogTitle>
-            <DialogDescription>
-              {removeTarget &&
-                intl.formatMessage({ id: 'plans.remove.confirm' }, { title: removeTarget.title })}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <DialogClose
-              render={<Button variant="outline">{intl.formatMessage({ id: 'plans.cancel' })}</Button>}
-            />
-            <Button
-              variant="destructive"
-              onClick={async () => {
-                if (removeTarget) await removePlan(removeTarget.id);
-                setRemoveTarget(null);
-              }}
-            >
-              {intl.formatMessage({ id: 'plans.remove' })}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {removeTarget && (
+        <ConfirmDialog
+          open
+          title={intl.formatMessage({ id: 'plans.remove' })}
+          message={intl.formatMessage({ id: 'plans.remove.confirm' }, { title: removeTarget.title })}
+          confirmLabel={intl.formatMessage({ id: 'plans.remove' })}
+          cancelLabel={intl.formatMessage({ id: 'plans.cancel' })}
+          onConfirm={async () => {
+            const target = removeTarget;
+            clearError();
+            await removePlan(target.id);
+            // Dismiss only once the delete actually landed — closing on failure
+            // is what made a failed delete read as success (P05 Blocker).
+            if (usePlansStore.getState().error == null) setRemoveTarget(null);
+          }}
+          onClose={() => setRemoveTarget(null)}
+        />
+      )}
+
+      {removeStepTarget && plan && (
+        <ConfirmDialog
+          open
+          title={intl.formatMessage({ id: 'plans.step.remove' })}
+          message={intl.formatMessage(
+            { id: 'confirm.plans.deleteStep.message' },
+            { text: removeStepTarget.text },
+          )}
+          confirmLabel={intl.formatMessage({ id: 'plans.step.remove' })}
+          cancelLabel={intl.formatMessage({ id: 'plans.cancel' })}
+          onConfirm={async () => {
+            const target = removeStepTarget;
+            clearError();
+            await removeStep(plan.id, target.id);
+            if (usePlansStore.getState().error == null) setRemoveStepTarget(null);
+          }}
+          onClose={() => setRemoveStepTarget(null)}
+        />
+      )}
     </div>
   );
 }

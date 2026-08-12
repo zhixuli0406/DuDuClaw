@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
+import { useUrlStateNullable } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type ForkSummary, type ForkDetail, type ForkBranch } from '@/lib/api';
@@ -10,8 +11,10 @@ import {
   Button,
   Badge,
   Empty,
+  ErrorState,
   ActorAvatar,
 } from '@/components/mds';
+import { ConfirmDialog } from '@/components/settings/controls';
 
 // RFC-26 Live Run Forking dashboard. Reads fork state from the cross-process
 // ForkStore via the gateway `fork.*` RPC. Forks execute in the MCP-server
@@ -88,8 +91,16 @@ export function ForkPage() {
   const intl = useIntl();
   const [forks, setForks] = useState<ForkSummary[]>([]);
   const [selected, setSelected] = useState<ForkDetail | null>(null);
+  const [selectedId, setSelectedId] = useUrlStateNullable('fork');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // Was `e.message` with a hardcoded English fallback, rendered verbatim and
+  // untranslated (P05, phase-4 audit).
+  const [error, setError] = useState<unknown>(null);
+  // "Select winner" is the one irreversible decision on this page — it ends
+  // the fork and discards every other branch. It used to fire straight off a
+  // button click with zero confirmation (phase4 audit, most severe C06
+  // Blocker); route it through the shared ConfirmDialog instead.
+  const [pendingWinner, setPendingWinner] = useState<string | null>(null);
 
   const loadForks = useCallback(async () => {
     setLoading(true);
@@ -98,7 +109,7 @@ export function ForkPage() {
       const res = await api.fork.list(50);
       setForks(res.forks);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load forks');
+      setError(e);
     } finally {
       setLoading(false);
     }
@@ -109,9 +120,22 @@ export function ForkPage() {
       const detail = await api.fork.inspect(forkId);
       setSelected(detail);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to inspect fork');
+      setError(e);
     }
   }, []);
+
+  // P11 (state-as-URL): the inspected fork lives in `?fork=<id>` — only the id,
+  // never the fetched detail — so a comparison can be linked to a colleague and
+  // survives a refresh. The URL is the trigger: clicking a row just writes the
+  // param and this effect hydrates the detail pane.
+  useEffect(() => {
+    if (!selectedId) {
+      setSelected(null);
+      return;
+    }
+    if (selected?.fork_id === selectedId) return;
+    void inspect(selectedId);
+  }, [selectedId, selected, inspect]);
 
   const resolve = useCallback(
     async (branchId: string) => {
@@ -121,7 +145,7 @@ export function ForkPage() {
         await inspect(selected.fork_id);
         await loadForks();
       } catch (e) {
-        setError(e instanceof Error ? e.message : 'Failed to resolve fork');
+        setError(e);
       }
     },
     [selected, inspect, loadForks],
@@ -148,8 +172,8 @@ export function ForkPage() {
       />
 
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && (
-          <div className="rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>
+        {error != null && (
+          <ErrorState variant="inline" error={error} onRetry={() => void loadForks()} />
         )}
 
         <div className="grid gap-6 lg:grid-cols-[20rem_1fr]">
@@ -165,12 +189,12 @@ export function ForkPage() {
               </Card>
             ) : (
               forks.map((f) => {
-                const active = selected?.fork_id === f.fork_id;
+                const active = selectedId === f.fork_id;
                 return (
                   <button
                     key={f.fork_id}
                     type="button"
-                    onClick={() => void inspect(f.fork_id)}
+                    onClick={() => setSelectedId(f.fork_id)}
                     aria-current={active ? 'true' : undefined}
                     className={cn(
                       'flex w-full flex-col gap-1 rounded-lg border px-3 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50',
@@ -229,7 +253,7 @@ export function ForkPage() {
                       branch={b}
                       isWinner={selected.winner === b.branch_id}
                       canResolve={!selected.resolved}
-                      onResolve={(bid) => void resolve(bid)}
+                      onResolve={(bid) => setPendingWinner(bid)}
                     />
                   ))}
                 </div>
@@ -242,6 +266,25 @@ export function ForkPage() {
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={pendingWinner !== null}
+        onClose={() => setPendingWinner(null)}
+        onConfirm={() => {
+          const bid = pendingWinner;
+          setPendingWinner(null);
+          if (bid) void resolve(bid);
+        }}
+        title={intl.formatMessage({ id: 'forks.confirmWinner.title' })}
+        message={intl.formatMessage(
+          { id: 'forks.confirmWinner.message' },
+          {
+            branch: pendingWinner?.slice(0, 8) ?? '',
+            count: Math.max((selected?.branches.length ?? 1) - 1, 0),
+          },
+        )}
+        confirmLabel={intl.formatMessage({ id: 'forks.selectWinner' })}
+      />
     </div>
   );
 }

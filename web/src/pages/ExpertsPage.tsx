@@ -3,10 +3,12 @@ import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { api, type ExpertPack, type ExpertCatalogEntry } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
-import { toast, formatError } from '@/lib/toast';
+import { toast } from '@/lib/toast';
 import {
   CollectionPageHeader,
   CollectionPageState,
+  ErrorState,
+  useErrorMessage,
   Card,
   CardContent,
   Button,
@@ -35,6 +37,7 @@ import {
 } from 'lucide-react';
 import { GenerateExpertDialog } from '@/components/experts/GenerateExpertDialog';
 import { AttachUnderSelect } from '@/components/experts/AttachUnderSelect';
+import { AutonomyNote } from '@/components/AutonomyNote';
 
 /** WP-ORG — catalog section order (mirrors `duduclaw_core::org::CATALOG_CATEGORIES`). */
 const CATEGORY_ORDER = ['health', 'professional', 'retail', 'lifestyle', 'education', 'other'] as const;
@@ -53,8 +56,11 @@ export function ExpertsPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const t = useCallback((id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values), [intl]);
+  const errorText = useErrorMessage();
   const [packs, setPacks] = useState<ExpertPack[] | null>(null);
-  const [loadError, setLoadError] = useState(false);
+  // Was a bare boolean feeding an error state that showed only the page
+  // title — no explanation, no retry (P05 Blocker, phase-4 audit).
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [installing, setInstalling] = useState(false);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [removeTarget, setRemoveTarget] = useState<ExpertPack | null>(null);
@@ -76,10 +82,9 @@ export function ExpertsPage() {
     try {
       const res = await api.experts.list();
       setPacks(res.packs ?? []);
-      setLoadError(false);
+      setLoadError(null);
     } catch (e) {
-      setLoadError(true);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      setLoadError(e);
     }
     // Catalog is best-effort — a failure never blocks the installed list.
     try {
@@ -109,7 +114,7 @@ export function ExpertsPage() {
       setInstallTarget(null);
       await load();
     } catch (e) {
-      toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: errorText(e) }));
     } finally {
       setInstallingBuiltin(null);
     }
@@ -162,7 +167,7 @@ export function ExpertsPage() {
       toast.success(t('experts.install.success'));
       await load();
     } catch (e) {
-      toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: errorText(e) }));
     } finally {
       setInstalling(false);
       setUploadPct(null);
@@ -179,7 +184,7 @@ export function ExpertsPage() {
       setRemoveTarget(null);
       await load();
     } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: errorText(e) }));
     } finally {
       setRemoving(false);
     }
@@ -199,7 +204,7 @@ export function ExpertsPage() {
       }
       await load();
     } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: errorText(e) }));
     } finally {
       setApplyingHooks(null);
     }
@@ -358,8 +363,10 @@ export function ExpertsPage() {
       />
 
       <div className="flex-1 overflow-y-auto p-5">
-        {packs === null ? (
-          <CollectionPageState state={loadError ? 'error' : 'loading'} title={t('experts.title')} />
+        {packs === null && loadError != null ? (
+          <ErrorState icon={Package} error={loadError} onRetry={() => void load()} />
+        ) : packs === null ? (
+          <CollectionPageState state="loading" title={t('experts.title')} />
         ) : packs.length === 0 ? (
           <>
             <CollectionPageState
@@ -408,6 +415,7 @@ export function ExpertsPage() {
                   {p.hooks_status === 'pending_approval' && (
                     <div className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs">
                       <p>{t('experts.hooks.pendingHint')}</p>
+                      <AutonomyNote id="expertsApply" />
                       <div className="flex items-center gap-2">
                         <Button variant="outline" size="sm" onClick={() => navigate('/inbox')}>
                           {t('experts.hooks.goApprove')}

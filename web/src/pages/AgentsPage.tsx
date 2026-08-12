@@ -9,6 +9,8 @@ import { api, type AgentDetail } from '@/lib/api';
 import {
   CollectionPageHeader,
   CollectionPageState,
+  ErrorState,
+  useErrorMessage,
   ListGridContainer,
   ListGridHeader,
   ListGridHeaderCell,
@@ -29,9 +31,11 @@ import {
   DialogTitle,
   DialogFooter,
   DialogClose,
+  CrossLink,
   type ActorStatus,
   type SegmentedOption,
 } from '@/components/mds';
+import { toast } from '@/lib/toast';
 import { agentTaskStats } from '@/components/agent';
 import { OffboardDialog } from '@/components/agent/OffboardDialog';
 import { timeAgo } from '@/lib/format';
@@ -95,6 +99,7 @@ function actorStatus(status: string, archived: boolean): ActorStatus {
 export function AgentsPage() {
   const intl = useIntl();
   const navigate = useNavigate();
+  const errorText = useErrorMessage();
   const {
     agents,
     fetchAgents,
@@ -105,6 +110,8 @@ export function AgentsPage() {
     setIncludeArchived,
     loading,
     loaded,
+    error,
+    clearError,
   } = useAgentsStore();
   const { tasks, fetchTasks } = useTasksStore();
 
@@ -147,6 +154,29 @@ export function AgentsPage() {
   );
 
   const openCreate = useCallback(() => navigate('/agents/new'), [navigate]);
+
+  /**
+   * Pause / resume / archive / unarchive used to be fire-and-forget `void`
+   * calls over a store that swallowed its own errors, so a failed lifecycle
+   * change produced exactly nothing on screen (P05 Blocker, phase-4 audit).
+   * Confirm the success, and say so plainly when it didn't happen.
+   */
+  const runLifecycle = useCallback(
+    async (fn: () => Promise<void>, successId: string, agent: AgentDetail) => {
+      clearError();
+      try {
+        await fn();
+        toast.success(
+          intl.formatMessage({ id: successId }, { name: agent.display_name || agent.name }),
+        );
+      } catch (e) {
+        toast.error(
+          intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: errorText(e) }),
+        );
+      }
+    },
+    [clearError, intl, errorText],
+  );
 
   const visible = useMemo(
     () => agents.filter((a) => (scope === 'archived' ? a.archived : !a.archived)),
@@ -229,6 +259,15 @@ export function AgentsPage() {
       {/* Body */}
       {!loaded && loading ? (
         <CollectionPageState state="loading" />
+      ) : error != null && visible.length === 0 ? (
+        <ErrorState
+          icon={Bot}
+          error={error}
+          onRetry={() => {
+            clearError();
+            void fetchAgents();
+          }}
+        />
       ) : visible.length === 0 ? (
         <CollectionPageState
           state="empty"
@@ -267,11 +306,13 @@ export function AgentsPage() {
               key={agent.name}
               agent={agent}
               taskCount={agentTaskStats(tasks, agent.name).total}
-              onPause={() => void pauseAgent(agent.name)}
-              onResume={() => void resumeAgent(agent.name)}
+              onPause={() => void runLifecycle(() => pauseAgent(agent.name), 'agentDetail.rested', agent)}
+              onResume={() => void runLifecycle(() => resumeAgent(agent.name), 'agentDetail.resumed', agent)}
               onDelegate={() => setDelegateTarget(agent.name)}
-              onArchive={() => void archiveAgent(agent.name)}
-              onUnarchive={() => void unarchiveAgent(agent.name)}
+              onArchive={() => void runLifecycle(() => archiveAgent(agent.name), 'agents.archive.done', agent)}
+              onUnarchive={() =>
+                void runLifecycle(() => unarchiveAgent(agent.name), 'agents.unarchive.done', agent)
+              }
               onOffboard={() => setOffboardTarget(agent)}
             />
           ))}
@@ -321,6 +362,7 @@ function AgentRow({
   onOffboard: () => void;
 }) {
   const intl = useIntl();
+  const navigate = useNavigate();
   const archived = !!agent.archived;
   const isMain = agent.role === 'main';
   const to = `/agents/${encodeURIComponent(agent.name)}`;
@@ -366,9 +408,20 @@ function AgentRow({
         </span>
       </ListGridCell>
 
-      {/* Model. */}
+      {/* Model. X03 (UX audit §3.3): this used to be dead text; it now opens
+          the staff member's own 腦袋與引擎 edit tab. The row itself is a
+          `to`-navigable ListGridRow, but `useRowLink` skips clicks landing on
+          a nested button/anchor (see `list-grid.tsx`), so CrossLink's own
+          `<button>` cleanly overrides the row-level navigation. */}
       <ListGridCell hideBelow>
-        <span className="truncate text-xs text-muted-foreground">{model || '—'}</span>
+        {model ? (
+          <CrossLink
+            label={model}
+            onClick={() => navigate(`/agents/${encodeURIComponent(agent.name)}/edit?tab=brain`)}
+          />
+        ) : (
+          <span className="truncate text-xs text-muted-foreground">—</span>
+        )}
       </ListGridCell>
 
       {/* Last active. */}

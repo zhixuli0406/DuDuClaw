@@ -17,6 +17,7 @@ import {
 import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { ChipEditor } from '@/components/shared/ChipEditor';
+import { AccountPoolSelect } from '@/components/shared/AccountPoolSelect';
 import { ToolCatalogPicker } from '@/components/shared/ToolCatalogPicker';
 import { CapabilityToggles } from '@/components/shared/CapabilityToggles';
 import {
@@ -27,7 +28,7 @@ import {
   ConfirmDialog,
   type SelectOption,
 } from '@/components/settings/controls';
-import { toast, formatError } from '@/lib/toast';
+import { toast } from '@/lib/toast';
 import {
   Bot,
   Sparkles,
@@ -35,16 +36,18 @@ import {
   Plug,
   User,
   Cpu,
-  Server,
   Wallet,
   Repeat,
   Settings2,
   ChevronRight,
+  ArrowRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
   Button,
   Empty,
+  ErrorState,
+  useErrorMessage,
   Spinner,
   Input,
   Textarea,
@@ -103,13 +106,73 @@ const SUBTABS = [
   'tools',
   'integration',
   'general',
-  'model',
-  'runtime',
+  'brain',
   'budget',
   'automation',
   'advanced',
 ] as const;
 type SubTab = (typeof SUBTABS)[number];
+
+/**
+ * WP-C (§2-2) — the former 模型 and 執行環境 tabs merged into one 腦袋與引擎 tab
+ * ("which brain does this staff member run on, on whose account, via which
+ * engine" is a single mental task, and splitting it across two non-adjacent
+ * rail items with 預算 wedged between them was the audit's strongest scatter
+ * evidence). Old `?tab=` values stay honoured so existing bookmarks and any
+ * deep link written before the merge still land somewhere correct.
+ */
+const SUBTAB_ALIASES: Readonly<Record<string, SubTab>> = {
+  model: 'brain',
+  runtime: 'brain',
+};
+
+/** Resolve a raw `?tab=` value: whitelist → legacy alias → `general`. */
+function resolveSubTab(raw: string): SubTab {
+  if ((SUBTABS as readonly string[]).includes(raw)) return raw as SubTab;
+  return SUBTAB_ALIASES[raw] ?? 'general';
+}
+
+/**
+ * R-EDIT-SOURCE — the "the real switch for this lives over there" line that
+ * every read-only mirror or adjacent-concept block gets. Plain text plus an
+ * arrow; deliberately quiet so it reads as guidance, not as another control
+ * competing with the fields above it.
+ */
+function CrossLink({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="inline-flex items-center gap-1 text-xs font-medium text-brand underline-offset-2 transition-colors hover:underline"
+    >
+      {label}
+      <ArrowRight className="size-3.5" />
+    </button>
+  );
+}
+
+/**
+ * ODO — this page's local extension of the shared `DEFAULT_ODOO` (defaults.ts).
+ * `unblock_models` and the two clear-secret toggles are additions this tab
+ * needs — ported from the per-agent Odoo edit form that used to live on
+ * `OdooPage.tsx` before WP-D made that copy read-only (single-writer:
+ * `agents.update`'s `odoo` object, not the separate `odoo.agent_config_set`
+ * RPC the old form used — same empty-string-clears semantics either way, see
+ * `apply_odoo_to_table` in the gateway). Kept local rather than widening the
+ * shared default, which nothing else consumes today but shouldn't gain
+ * page-specific UI-only fields.
+ */
+type OdooFormState = typeof DEFAULT_ODOO & {
+  unblock_models: string[];
+  clear_api_key: boolean;
+  clear_password: boolean;
+};
+const DEFAULT_ODOO_FORM: OdooFormState = {
+  ...DEFAULT_ODOO,
+  unblock_models: [],
+  clear_api_key: false,
+  clear_password: false,
+};
 
 /**
  * EditAgentPage — standalone route (/agents/:id/edit) for deep-editing an AI
@@ -123,6 +186,7 @@ type SubTab = (typeof SUBTABS)[number];
  */
 export function EditAgentPage() {
   const intl = useIntl();
+  const errorText = useErrorMessage();
   const navigate = useNavigate();
   const { id } = useParams<{ id: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -131,9 +195,7 @@ export function EditAgentPage() {
 
   // Sub-tab state lives in `?tab=` (replace + whitelist).
   const rawTab = searchParams.get('tab') ?? 'general';
-  const tab: SubTab = (SUBTABS as readonly string[]).includes(rawTab)
-    ? (rawTab as SubTab)
-    : 'general';
+  const tab: SubTab = resolveSubTab(rawTab);
   const setTab = useCallback(
     (next: string) => {
       const nextParams = new URLSearchParams(searchParams);
@@ -145,8 +207,12 @@ export function EditAgentPage() {
 
   // ── Agent detail load (the dialog received it as a prop; the page owns it) ──
   const [agent, setAgent] = useState<AgentDetail | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  // Both of these were `formatError(e)` — the raw JS/API string rendered into
+  // the page and into a toast (P05 Blocker, phase-4 audit). Keep the thrown
+  // value; `ErrorState` / `useErrorMessage` do the plain-language translation.
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [loading, setLoading] = useState(true);
+  const [reloadNonce, setReloadNonce] = useState(0);
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
@@ -158,13 +224,13 @@ export function EditAgentPage() {
         setAgent(detail);
         setLoading(false);
       })
-      .catch((e) => {
+      .catch((e: unknown) => {
         if (cancelled) return;
-        setLoadError(formatError(e));
+        setLoadError(e);
         setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [id]);
+  }, [id, reloadNonce]);
 
   // Deep-link support: the 上級 dropdown lists existing agents — make sure the
   // roster is loaded even when this page is the first one visited.
@@ -177,7 +243,7 @@ export function EditAgentPage() {
   // There is no manual 儲存 button: every user edit schedules a debounced,
   // single-flight save. `saveStatus` drives the header SettingsSaveState.
   const [saveStatus, setSaveStatus] = useState<SettingsSaveStatus>('idle');
-  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   // Monotonic change counter — bumped by every USER edit (never by the
   // programmatic agent-load / lazy prefills). A change reschedules the debounce;
   // the ref mirror is read synchronously by the single-flight loop.
@@ -212,11 +278,15 @@ export function EditAgentPage() {
   // Change 2 — one shared confirm dialog for high-risk (DangerZone) switches.
   // Turning a switch ON opens it; confirming runs `apply` (the normal updater,
   // so autosave fires too). Turning OFF applies immediately, no dialog.
-  const [dangerConfirm, setDangerConfirm] = useState<{ label: string; apply: () => void } | null>(null);
+  // `messageId` lets each call site override the generic "high risk setting"
+  // copy with a sentence that names the actual consequence (phase4 audit —
+  // six permission-expansion switches were sharing one canned warning with no
+  // per-switch impact); omitting it keeps the old generic message.
+  const [dangerConfirm, setDangerConfirm] = useState<{ label: string; apply: () => void; messageId?: string } | null>(null);
   const guardDanger = useCallback(
-    (label: string, apply: (v: boolean) => void) => (v: boolean) => {
+    (label: string, apply: (v: boolean) => void, messageId?: string) => (v: boolean) => {
       if (v === true) {
-        setDangerConfirm({ label, apply: () => apply(true) });
+        setDangerConfirm({ label, apply: () => apply(true), messageId });
       } else {
         apply(false);
       }
@@ -298,7 +368,7 @@ export function EditAgentPage() {
   const [ctAdvDirty, setCtAdvDirty] = useState(false);
 
   // ODO — per-agent Odoo override form (write-only)
-  const [odoo, setOdoo] = useState<typeof DEFAULT_ODOO>(DEFAULT_ODOO);
+  const [odoo, setOdoo] = useState<OdooFormState>(DEFAULT_ODOO_FORM);
   const [odooDirty, setOdooDirty] = useState(false);
 
   // Advanced — G.8 scattered fields (write-only); account_pool prefilled from inspect.
@@ -384,7 +454,7 @@ export function EditAgentPage() {
       setCtAdv(DEFAULT_CONTAINER_ADVANCED);
       setCtAdvDirty(false);
       // ODO — reset write-only Odoo override form.
-      setOdoo(DEFAULT_ODOO);
+      setOdoo(DEFAULT_ODOO_FORM);
       setOdooDirty(false);
       // Advanced — seed account_pool + the [proactive] notify target from
       // inspect (lazy prefill, keeps advDirty false); rest are write-only
@@ -418,7 +488,7 @@ export function EditAgentPage() {
       setContractLoaded(true);
     }).catch((e) => {
       console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: errorText(e) }));
       setContractLoaded(true);
     });
   }, [tab, agent, contractLoaded, intl]);
@@ -515,7 +585,7 @@ export function EditAgentPage() {
   }, [markSectionEdit]);
 
   // ODO — per-agent Odoo override field updater.
-  const updateOdoo = useCallback(<K extends keyof typeof DEFAULT_ODOO>(key: K, value: (typeof DEFAULT_ODOO)[K]) => {
+  const updateOdoo = useCallback(<K extends keyof OdooFormState>(key: K, value: OdooFormState[K]) => {
     setOdooDirty(true);
     markSectionEdit();
     setOdoo((prev) => ({ ...prev, [key]: value }));
@@ -671,7 +741,13 @@ export function EditAgentPage() {
 
       // ODO — only include odoo when the operator edited that tab. company_ids
       // are parsed from the comma-separated form. api_key/password are sent only
-      // when non-empty (write-only — never echoed back).
+      // when non-empty (write-only — never echoed back) UNLESS the operator
+      // ticked "clear stored secret", which always sends '' so the gateway's
+      // `apply_odoo_to_table` drops the stored `*_enc` value — same
+      // empty-string-clears semantics the old per-agent form on OdooPage.tsx
+      // used via the separate `odoo.agent_config_set` RPC, ported here onto
+      // this tab's single `agents.update` writer instead of reintroducing a
+      // second write path (R-SINGLE-WRITER).
       if (odooDirty) {
         const companyIds = odoo.company_ids
           .split(',')
@@ -679,17 +755,24 @@ export function EditAgentPage() {
           .filter((s) => s !== '')
           .map((s) => Number(s))
           .filter((n) => Number.isInteger(n) && n >= 0);
-        const odooPayload: AgentOdooOverride = {
+        // `unblock_models` isn't in the shared `AgentOdooOverride` type (api.ts)
+        // yet, but the gateway's `apply_odoo_to_table` already reads it off the
+        // same `odoo` object (handlers.rs) exactly like `allowed_models` — carry
+        // it as a typed extra field rather than widening the shared type.
+        const odooPayload: AgentOdooOverride & { unblock_models?: string[] } = {
           profile: odoo.profile,
           allowed_models: odoo.allowed_models,
+          unblock_models: odoo.unblock_models,
           allowed_actions: odoo.allowed_actions,
           company_ids: companyIds,
           url: odoo.url,
           db: odoo.db,
           username: odoo.username,
         };
-        if (odoo.api_key.trim() !== '') odooPayload.api_key = odoo.api_key;
-        if (odoo.password.trim() !== '') odooPayload.password = odoo.password;
+        if (odoo.clear_api_key) odooPayload.api_key = '';
+        else if (odoo.api_key.trim() !== '') odooPayload.api_key = odoo.api_key;
+        if (odoo.clear_password) odooPayload.password = '';
+        else if (odoo.password.trim() !== '') odooPayload.password = odoo.password;
         submitForm.odoo = odooPayload;
       }
 
@@ -764,8 +847,8 @@ export function EditAgentPage() {
       if (doSections) sectionsDirtyRef.current = true;
       if (doContract) contractDirtyRef.current = true;
       setSaveStatus('error');
-      setSaveError(formatError(e));
-      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+      setSaveError(e);
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: errorText(e) }));
     }
   }, [
     agent, form, availableModels, updateAgent, intl,
@@ -836,12 +919,26 @@ export function EditAgentPage() {
     );
   }
 
-  if (!agent || loadError) {
+  if (loadError != null) {
+    return (
+      <ErrorState
+        icon={Bot}
+        error={loadError}
+        onRetry={() => setReloadNonce((n) => n + 1)}
+        action={
+          <Button variant="outline" size="sm" onClick={() => navigate('/agents')}>
+            {intl.formatMessage({ id: 'agentDetail.back' })}
+          </Button>
+        }
+      />
+    );
+  }
+
+  if (!agent) {
     return (
       <Empty
         icon={Bot}
         title={intl.formatMessage({ id: 'agentDetail.notFound' })}
-        description={loadError ?? undefined}
         action={
           <Button variant="outline" size="sm" onClick={() => navigate('/agents')}>
             {intl.formatMessage({ id: 'agentDetail.back' })}
@@ -926,8 +1023,7 @@ export function EditAgentPage() {
       label: intl.formatMessage({ id: 'agents.edit.navGroup.settings' }),
       items: [
         { value: 'general', label: intl.formatMessage({ id: 'agents.edit.nav.general' }), icon: User },
-        { value: 'model', label: intl.formatMessage({ id: 'agents.edit.nav.model' }), icon: Cpu },
-        { value: 'runtime', label: intl.formatMessage({ id: 'agents.edit.nav.runtime' }), icon: Server },
+        { value: 'brain', label: intl.formatMessage({ id: 'agentForm.brain.nav' }), icon: Cpu },
         { value: 'budget', label: intl.formatMessage({ id: 'agents.edit.nav.budget' }), icon: Wallet },
         { value: 'automation', label: intl.formatMessage({ id: 'agents.edit.nav.automation' }), icon: Repeat },
         { value: 'advanced', label: intl.formatMessage({ id: 'agents.edit.nav.advanced' }), icon: Settings2 },
@@ -954,7 +1050,7 @@ export function EditAgentPage() {
               status={saveStatus}
               savingLabel={t('common.saving')}
               savedLabel={t('agents.edit.saved')}
-              errorLabel={saveError ?? t('common.saveError')}
+              errorLabel={saveError != null ? errorText(saveError) : t('common.saveError')}
               className="mr-1"
             />
             <Button variant="ghost" size="sm" onClick={() => navigate('/agents')}>
@@ -1142,17 +1238,17 @@ export function EditAgentPage() {
 
           <DangerZone title={t('agents.perm.danger.title')} description={t('agents.perm.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.edit.canCreateAgents.help')} checked={form.can_create_agents ?? false} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v))} />
-              <RowSwitch label={t('agents.edit.canModifySoul')} description={t('agents.edit.canModifySoul.help')} checked={form.can_modify_own_soul ?? false} onChange={guardDanger(t('agents.edit.canModifySoul'), (v) => updateField('can_modify_own_soul', v))} />
+              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.edit.canCreateAgents.help')} checked={form.can_create_agents ?? false} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v), 'agents.edit.dangerConfirm.canCreateAgents')} />
+              <RowSwitch label={t('agents.edit.canModifySoul')} description={t('agents.edit.canModifySoul.help')} checked={form.can_modify_own_soul ?? false} onChange={guardDanger(t('agents.edit.canModifySoul'), (v) => updateField('can_modify_own_soul', v), 'agents.edit.dangerConfirm.canModifySoul')} />
             </SettingsCard>
           </DangerZone>
 
           <DangerZone title={t('agents.cap.danger.title')} description={t('agents.cap.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.cap.computerUse')} description={t('agents.cap.computerUse.help')} checked={caps.computer_use} onChange={guardDanger(t('agents.cap.computerUse'), (v) => updateCap('computer_use', v))} />
+              <RowSwitch label={t('agents.cap.computerUse')} description={t('agents.cap.computerUse.help')} checked={caps.computer_use} onChange={guardDanger(t('agents.cap.computerUse'), (v) => updateCap('computer_use', v), 'agents.edit.dangerConfirm.computerUse')} />
               <RowSelect label={t('agents.cap.computerUseMode')} description={t('agents.cap.computerUseMode.help')} value={caps.computer_use_mode} onChange={(v) => updateCap('computer_use_mode', v as ComputerUseMode)} options={computerUseModeOptions} />
-              <RowSwitch label={t('agents.cap.browserViaBash')} description={t('agents.cap.browserViaBash.help')} checked={caps.browser_via_bash} onChange={guardDanger(t('agents.cap.browserViaBash'), (v) => updateCap('browser_via_bash', v))} />
-              <RowSwitch label={t('agents.cap.recording')} description={t('agents.cap.recording.help')} checked={caps.recording} onChange={guardDanger(t('agents.cap.recording'), (v) => updateCap('recording', v))} />
+              <RowSwitch label={t('agents.cap.browserViaBash')} description={t('agents.cap.browserViaBash.help')} checked={caps.browser_via_bash} onChange={guardDanger(t('agents.cap.browserViaBash'), (v) => updateCap('browser_via_bash', v), 'agents.edit.dangerConfirm.browserViaBash')} />
+              <RowSwitch label={t('agents.cap.recording')} description={t('agents.cap.recording.help')} checked={caps.recording} onChange={guardDanger(t('agents.cap.recording'), (v) => updateCap('recording', v), 'agents.edit.dangerConfirm.recording')} />
             </SettingsCard>
             {caps.computer_use_mode === 'native' && (
               <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.nativeWarning')}</p>
@@ -1204,6 +1300,9 @@ export function EditAgentPage() {
             <FieldBlock label={t('agents.odoo.allowedModels')} description={t('agents.odoo.allowedModels.hint')}>
               <ChipEditor values={odoo.allowed_models} onChange={(v) => updateOdoo('allowed_models', v)} placeholder="crm.lead" addLabel={t('common.add')} />
             </FieldBlock>
+            <FieldBlock label={t('agents.odoo.unblockModels')} description={t('agents.odoo.unblockModels.hint')}>
+              <ChipEditor values={odoo.unblock_models} onChange={(v) => updateOdoo('unblock_models', v)} placeholder="res.partner" addLabel={t('common.add')} />
+            </FieldBlock>
             <FieldBlock label={t('agents.odoo.allowedActions')} description={t('agents.odoo.allowedActions.hint')}>
               <ChipEditor values={odoo.allowed_actions} onChange={(v) => updateOdoo('allowed_actions', v)} placeholder="write:crm.lead" addLabel={t('common.add')} />
             </FieldBlock>
@@ -1213,7 +1312,9 @@ export function EditAgentPage() {
               <RowText label="DB" value={odoo.db} onChange={(v) => updateOdoo('db', v)} />
               <RowText label={t('agents.odoo.username')} value={odoo.username} onChange={(v) => updateOdoo('username', v)} />
               <RowText label={t('agents.odoo.apiKey')} description={t('agents.odoo.secret.hint')} type="password" autoComplete="off" value={odoo.api_key} onChange={(v) => updateOdoo('api_key', v)} />
+              <RowSwitch label={t('odoo.agent.clearSecret')} checked={odoo.clear_api_key} onChange={(v) => updateOdoo('clear_api_key', v)} />
               <RowText label={t('agents.odoo.password')} description={t('agents.odoo.secret.hint')} type="password" autoComplete="off" value={odoo.password} onChange={(v) => updateOdoo('password', v)} />
+              <RowSwitch label={t('odoo.agent.clearSecret')} checked={odoo.clear_password} onChange={(v) => updateOdoo('clear_password', v)} />
             </SettingsCard>
           </SettingsSection>
 
@@ -1265,9 +1366,13 @@ export function EditAgentPage() {
           </SettingsSection>
         </SettingsTab>
 
-        {/* ── 模型 ─────────────────────────────────────────── */}
-        <SettingsTab value="model" title={t('agents.edit.nav.model')} description={t('agents.edit.nav.model.desc')}>
-          <SettingsSection title={t('agents.edit.section.model')}>
+        {/* ── 腦袋與引擎 (WP-C §2-2: 模型 ∪ 執行環境) ────────────
+            One tab for one question: which brain does this staff member think
+            with, on whose account, driven by which engine. The blocks below run
+            in the order an operator answers it — model → engine → local
+            inference → accounts → helper model → how it is actually run. */}
+        <SettingsTab value="brain" title={t('agentForm.brain.nav')} description={t('agentForm.brain.desc')}>
+          <SettingsSection title={t('agentForm.brain.section.model')} description={t('agentForm.brain.section.model.desc')}>
             <FieldBlock label={t('agents.edit.preferredModel')} description={t('agents.edit.preferredModel.help')}>
               <ModelSelect value={form.preferred ?? ''} onChange={(v) => updateField('preferred', v)} models={availableModels} loading={modelsLoading} error={modelsError} discoveredAt={modelsDiscoveredAt} refreshing={modelsRefreshing} onRefresh={modelsRefresh} ariaLabel={t('agents.edit.preferredModel')} />
             </FieldBlock>
@@ -1276,37 +1381,43 @@ export function EditAgentPage() {
             </FieldBlock>
             <SettingsCard>
               <RowSelect label={t('agents.edit.apiMode')} description={t('agents.edit.apiMode.help')} value={form.api_mode ?? 'cli'} onChange={(v) => updateField('api_mode', v as 'cli' | 'direct' | 'auto')} options={apiModeOptions} />
-              <RowSwitch label={t('agents.edit.confidenceRouter')} description={t('agents.edit.confidenceRouter.help')} checked={form.use_router ?? false} onChange={(v) => updateField('use_router', v)} />
             </SettingsCard>
           </SettingsSection>
 
-          {usesLocalModel && (
-            <SettingsSection title={t('agents.edit.localInference')}>
+          <SettingsSection title={t('agentForm.brain.section.engine')} description={t('agentForm.brain.section.engine.desc')}>
+            <SettingsCard>
+              <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerOptions} />
+              <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
+            </SettingsCard>
+          </SettingsSection>
+
+          <SettingsSection title={t('agentForm.brain.section.local')} description={t('agentForm.brain.section.local.desc')}>
+            <SettingsCard>
+              <RowSwitch label={t('agents.edit.confidenceRouter')} description={t('agents.edit.confidenceRouter.help')} checked={form.use_router ?? false} onChange={(v) => updateField('use_router', v)} />
+            </SettingsCard>
+            {usesLocalModel && (
               <SettingsCard>
                 <RowSelect label={t('agents.edit.inferenceBackend')} value={form.local_backend ?? 'llama_cpp'} onChange={(v) => updateField('local_backend', v)} options={localBackendOptions} />
                 <RowNumber label={t('agents.edit.contextLength')} value={form.local_context_length ?? 4096} min={512} onChange={(v) => updateField('local_context_length', v)} />
                 <RowNumber label={t('agents.edit.gpuLayers')} value={form.local_gpu_layers ?? -1} min={-1} onChange={(v) => updateField('local_gpu_layers', v)} />
               </SettingsCard>
-            </SettingsSection>
-          )}
+            )}
+          </SettingsSection>
 
-          <SettingsSection title={t('agents.adv.modelExtras')}>
-            <FieldBlock label={t('agents.adv.accountPool')} description={t('agents.adv.accountPool.hint')}>
-              <ChipEditor values={adv.account_pool} onChange={(v) => updateAdv('account_pool', v)} placeholder="oauth-pro" addLabel={t('common.add')} />
+          {/* 帳號池 — picks from the accounts the deployment actually has
+              (same RPC as 帳號管理), instead of the old free-text field that
+              made the operator retype an id from another page. */}
+          <SettingsSection title={t('agentForm.brain.section.accounts')} description={t('agentForm.brain.section.accounts.desc')}>
+            <FieldBlock label={t('agents.adv.accountPool')} description={t('agentForm.brain.accountPool.hint')}>
+              <AccountPoolSelect values={adv.account_pool} onChange={(v) => updateAdv('account_pool', v)} />
             </FieldBlock>
+            <CrossLink label={t('agentForm.brain.accountPool.manageLink')} onClick={() => navigate('/manage/accounts')} />
+          </SettingsSection>
+
+          <SettingsSection title={t('agentForm.brain.section.utility')} description={t('agentForm.brain.section.utility.desc')}>
             <FieldBlock label={t('agents.adv.utility')} description={t('agents.adv.utility.hint')}>
               <ModelSelect value={adv.utility} onChange={(v) => updateAdv('utility', v)} models={availableModels} loading={modelsLoading} error={modelsError} discoveredAt={modelsDiscoveredAt} refreshing={modelsRefreshing} onRefresh={modelsRefresh} ariaLabel={t('agents.adv.utility')} />
             </FieldBlock>
-          </SettingsSection>
-        </SettingsTab>
-
-        {/* ── 執行環境 (runtime) ────────────────────────────── */}
-        <SettingsTab value="runtime" title={t('agents.edit.nav.runtime')} description={t('agents.edit.nav.runtime.desc')}>
-          <SettingsSection title={t('agents.edit.group.run')} description={t('agents.runtime.desc')}>
-            <SettingsCard>
-              <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerOptions} />
-              <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
-            </SettingsCard>
           </SettingsSection>
 
           <SettingsSection title={t('agents.runtime.ptyTitle')} description={t('agents.runtime.pty.hint')}>
@@ -1338,7 +1449,7 @@ export function EditAgentPage() {
 
           <DangerZone title={t('agents.container.danger.title')} description={t('agents.container.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.networkAccess')} description={t('agents.edit.networkAccess.help')} checked={form.network_access ?? false} onChange={guardDanger(t('agents.edit.networkAccess'), (v) => updateField('network_access', v))} />
+              <RowSwitch label={t('agents.edit.networkAccess')} description={t('agents.edit.networkAccess.help')} checked={form.network_access ?? false} onChange={guardDanger(t('agents.edit.networkAccess'), (v) => updateField('network_access', v), 'agents.edit.dangerConfirm.networkAccess')} />
               <RowSwitch label={t('agents.container.worktreeAutoMerge')} description={t('agents.container.worktreeAutoMerge.help')} checked={ctAdv.worktree_auto_merge} onChange={guardDanger(t('agents.container.worktreeAutoMerge'), (v) => updateCtAdv('worktree_auto_merge', v))} />
             </SettingsCard>
             <MountTable mounts={ctAdv.additional_mounts} onChange={(v) => updateCtAdv('additional_mounts', v)} />
@@ -1347,7 +1458,12 @@ export function EditAgentPage() {
 
         {/* ── 預算 ─────────────────────────────────────────── */}
         <SettingsTab value="budget" title={t('agents.edit.nav.budget')} description={t('agents.edit.nav.budget.desc')}>
-          <SettingsSection title={t('agents.edit.section.budget')}>
+          {/* R-EDIT-SOURCE (§2-2/§2-4): two different ceilings share the word
+              "budget" — this one caps what this single staff member may spend,
+              the account's own ceiling lives on 帳號管理. Neither page used to
+              mention the other, so an operator who capped the wrong one had no
+              way to tell. */}
+          <SettingsSection title={t('agents.edit.section.budget')} description={t('agentForm.brain.budget.layers')}>
             <SettingsCard>
               <SettingsRow label={t('agents.edit.budgetLimit')} description={t('agents.edit.budgetLimit.help')} tier="select">
                 <MoneyField cents={form.monthly_limit_cents ?? 5000} onChange={(c) => updateField('monthly_limit_cents', c)} />
@@ -1355,6 +1471,7 @@ export function EditAgentPage() {
               <RowNumber label={t('agents.edit.warnThreshold')} description={t('agents.edit.warnThreshold.help')} value={form.warn_threshold_percent ?? 80} min={0} max={100} onChange={(v) => updateField('warn_threshold_percent', v)} />
               <RowSwitch label={t('agents.edit.hardStop')} description={t('agents.edit.hardStop.help')} checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} />
             </SettingsCard>
+            <CrossLink label={t('agentForm.brain.budget.manageLink')} onClick={() => navigate('/manage/accounts')} />
           </SettingsSection>
         </SettingsTab>
 
@@ -1490,7 +1607,7 @@ export function EditAgentPage() {
         onConfirm={() => { dangerConfirm?.apply(); setDangerConfirm(null); }}
         title={t('agents.edit.dangerConfirm.title')}
         message={intl.formatMessage(
-          { id: 'agents.edit.dangerConfirm.message' },
+          { id: dangerConfirm?.messageId ?? 'agents.edit.dangerConfirm.message' },
           { label: dangerConfirm?.label ?? '' },
         )}
         confirmLabel={t('common.confirm')}

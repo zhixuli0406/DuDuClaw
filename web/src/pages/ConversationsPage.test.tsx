@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { IntlProvider } from 'react-intl';
+import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router';
+import en from '@/i18n/en.json';
 import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { ConversationsPage } from './ConversationsPage';
@@ -129,5 +132,81 @@ describe('ConversationsPage (full history, D17)', () => {
 
     await user.click(screen.getByRole('button', { name: /Clear filters/i }));
     await waitFor(() => expect(screen.getByText('對話 1')).toBeInTheDocument());
+  });
+});
+
+// ── P11 (state-as-URL): search / employee scope / page are deep-linkable ──────
+
+/** `renderWithProviders`'s router cannot seed a starting query string. */
+function renderAt(path: string) {
+  return render(
+    <IntlProvider messages={en} locale="en" defaultLocale="en">
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route
+            path="/conversations"
+            element={
+              <>
+                <ConversationsPage />
+                <SearchParamsProbe />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    </IntlProvider>,
+  );
+}
+
+function SearchParamsProbe() {
+  const [params] = useSearchParams();
+  return <div data-testid="search-probe">{params.toString()}</div>;
+}
+
+describe('ConversationsPage — state as URL (P11)', () => {
+  it('restores the page number from ?page= on a deep link', async () => {
+    vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: fakeSessions(25) } as never);
+    renderAt('/conversations?page=2');
+
+    await waitFor(() => expect(screen.getByText('對話 21')).toBeInTheDocument());
+    // …and page 1 is genuinely not rendered, i.e. the deep link won, not the default.
+    expect(screen.queryByText('對話 1')).not.toBeInTheDocument();
+  });
+
+  it('restores the search term from ?q= on a deep link', async () => {
+    vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: fakeSessions(4) } as never);
+    renderAt('/conversations?q=業務小美');
+
+    await waitFor(() => expect(screen.getByText('對話 2')).toBeInTheDocument());
+    expect(screen.queryByText('對話 1')).not.toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue('業務小美');
+  });
+
+  it('scopes the listing from ?agent= on a deep link', async () => {
+    const list = vi
+      .spyOn(api.chatSessions, 'list')
+      .mockResolvedValue({ sessions: fakeSessions(2) } as never);
+    renderAt('/conversations?agent=sales');
+    await waitFor(() => expect(list).toHaveBeenCalledWith({ agent_id: 'sales', limit: 200 }));
+  });
+
+  it('writes the page back into the URL when paging forward', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: fakeSessions(25) } as never);
+    renderAt('/conversations');
+    await waitFor(() => expect(screen.getByText('對話 1')).toBeInTheDocument());
+
+    await user.click(screen.getByRole('button', { name: /Next page/i }));
+    await waitFor(() => expect(screen.getByTestId('search-probe')).toHaveTextContent('page=2'));
+  });
+
+  it('drops the page param again when the filter changes (no stranded empty page)', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: fakeSessions(25) } as never);
+    renderAt('/conversations?page=2');
+    await waitFor(() => expect(screen.getByText('對話 21')).toBeInTheDocument());
+
+    await user.type(screen.getByRole('textbox'), '對話');
+    await waitFor(() => expect(screen.getByTestId('search-probe')).not.toHaveTextContent('page='));
   });
 });

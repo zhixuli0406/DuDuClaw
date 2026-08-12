@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useUrlState } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
 import { Download, Eye, FolderOpen } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
@@ -9,6 +10,7 @@ import {
   Button,
   buttonVariants,
   Empty,
+  ErrorState,
   Skeleton,
   Select,
   SelectTrigger,
@@ -78,10 +80,12 @@ export function FilesPage() {
 
   // Admins may browse the shared bucket; scoped users start on their first
   // visible AI staff member (the gateway fails closed without an agent).
-  const [selected, setSelected] = useState<string>('');
+  // P11 (state-as-URL): the browsed bucket lives in `?agent=<id>` (or the
+  // shared bucket sentinel) so a refresh keeps you where you were looking.
+  const [selected, setSelected] = useUrlState('agent', '');
   const [files, setFiles] = useState<FileRow[]>([]);
   const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   useEffect(() => {
     fetchAgents();
@@ -123,7 +127,7 @@ export function FilesPage() {
       setFiles(Array.isArray(data?.files) ? data.files : []);
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(e);
     } finally {
       setLoaded(true);
     }
@@ -217,11 +221,11 @@ export function FilesPage() {
             <Skeleton className="h-10 w-2/3" />
           </div>
         ) : error ? (
-          <Empty
+          <ErrorState
             icon={FolderOpen}
-            tone="destructive"
             title={intl.formatMessage({ id: 'files.error' })}
-            description={error}
+            error={error}
+            onRetry={() => void fetchFiles()}
           />
         ) : files.length === 0 ? (
           <Empty

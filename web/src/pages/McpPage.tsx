@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
+import { useUrlState, useUrlStateNullable } from '@/lib/use-url-state';
 import { openExternal } from '@/lib/external-link';
 import { useMcpStore } from '@/stores/mcp-store';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -9,7 +10,8 @@ import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { toast } from '@/lib/toast';
 import { api, type McpServerDef, type McpCatalogItem, type McpOAuthProvider, type McpImportCandidate, type McpServerEntry } from '@/lib/api';
-import { DangerZone } from '@/components/settings/controls';
+import { DangerZone, ConfirmDialog } from '@/components/settings/controls';
+import { AutonomyNote } from '@/components/AutonomyNote';
 import { OAUTH_REDIRECT_URI } from '@/components/IntegrationConnectPanel';
 import {
   Button,
@@ -26,6 +28,7 @@ import {
   Card,
   CardContent,
   Empty,
+  ErrorState,
   Dialog,
   DialogContent,
   DialogHeader,
@@ -65,7 +68,8 @@ import {
   MoreHorizontal,
 } from 'lucide-react';
 
-type Tab = 'agents' | 'marketplace';
+const TABS = ['agents', 'marketplace'] as const;
+type Tab = (typeof TABS)[number];
 type AgentLite = { name: string; display_name: string };
 
 const categoryIcons: Record<string, typeof Globe> = {
@@ -125,14 +129,24 @@ function AgentSelect({
 export function McpPage() {
   const intl = useIntl();
   const connState = useConnectionStore((s) => s.state);
-  const { agentConfigs, catalog, loading, fetchAll, oauthProviders, fetchOAuthProviders } = useMcpStore();
+  // P05: `useMcpStore` has tracked `error` since it was written, but this page
+  // destructured everything except that field — a failed `mcp.list` fell back
+  // to the same "尚未設定任何 MCP Server" empty state as a clean install.
+  const { agentConfigs, catalog, loading, error, fetchAll, oauthProviders, fetchOAuthProviders } =
+    useMcpStore();
   const { agents, fetchAgents } = useAgentsStore();
-  const [activeTab, setActiveTab] = useState<Tab>('agents');
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  // P11 (state-as-URL). This page renders inside IntegrationsPage's `?tab=`
+  // shell, so every param here is namespaced `mcp_*` — two components sharing
+  // one query string must not fight over the same key.
+  const [activeTab, setActiveTab] = useUrlState('mcp_tab', 'agents', { allowed: TABS });
+  const [selectedAgentId, setSelectedAgentId] = useUrlStateNullable('mcp_agent');
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [showImportDialog, setShowImportDialog] = useState(false);
-  const [catalogFilter, setCatalogFilter] = useState<string | null>(null);
-  const [catalogSearch, setCatalogSearch] = useState('');
+  const [catalogFilter, setCatalogFilter] = useUrlStateNullable('mcp_cat');
+  const [catalogSearch, setCatalogSearch] = useUrlState('mcp_q', '');
+  // Remove-server used to gate on the browser's native `window.confirm()`
+  // (phase4 audit C06 Blocker) — route it through the shared ConfirmDialog.
+  const [removeTarget, setRemoveTarget] = useState<{ agentId: string; serverName: string } | null>(null);
 
   const showToast = useCallback((type: 'success' | 'error', message: string) => {
     if (type === 'success') toast.success(message);
@@ -170,7 +184,6 @@ export function McpPage() {
     agents.find((a) => a.name === agentId)?.display_name ?? agentId;
 
   const handleRemoveServer = async (agentId: string, serverName: string) => {
-    if (!confirm(intl.formatMessage({ id: 'mcp.confirmRemove' }, { agent: agentLabel(agentId), server: serverName }))) return;
     try {
       await useMcpStore.getState().removeServer(agentId, serverName);
       showToast('success', intl.formatMessage({ id: 'mcp.removed' }, { server: serverName, agent: agentLabel(agentId) }));
@@ -250,6 +263,13 @@ export function McpPage() {
         <div className="flex items-center justify-center py-16">
           <Loader2 className="size-6 animate-spin text-brand" />
         </div>
+      ) : error && agentConfigs.length === 0 && catalog.length === 0 ? (
+        <ErrorState
+          error={error}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
+          onRetry={() => void fetchAll()}
+        />
       ) : activeTab === 'agents' ? (
         <div className="space-y-4">
           {/* Agent picker → its configured servers. */}
@@ -295,7 +315,7 @@ export function McpPage() {
                   <ServerRow
                     key={entry.name}
                     entry={entry}
-                    onRemove={() => handleRemoveServer(selectedAgentId, entry.name)}
+                    onRemove={() => selectedAgentId && setRemoveTarget({ agentId: selectedAgentId, serverName: entry.name })}
                   />
                 ))}
               </ListGridContainer>
@@ -349,6 +369,24 @@ export function McpPage() {
             showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: serverName, agent: agentLabel(agentId) }));
             fetchAll();
           }}
+        />
+      )}
+
+      {removeTarget && (
+        <ConfirmDialog
+          open
+          title={intl.formatMessage({ id: 'mcp.remove' })}
+          message={intl.formatMessage(
+            { id: 'confirm.mcp.removeServer.message' },
+            { server: removeTarget.serverName, agent: agentLabel(removeTarget.agentId) },
+          )}
+          confirmLabel={intl.formatMessage({ id: 'mcp.remove' })}
+          onConfirm={() => {
+            const target = removeTarget;
+            setRemoveTarget(null);
+            void handleRemoveServer(target.agentId, target.serverName);
+          }}
+          onClose={() => setRemoveTarget(null)}
         />
       )}
     </div>
@@ -558,6 +596,7 @@ function CatalogRow({
               placeholder={intl.formatMessage({ id: 'mcp.targetAgent' })}
             />
           </div>
+          <AutonomyNote id="mcpInstall" />
           <DialogFooter>
             <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'mcp.cancel' })}</Button>} />
             <Button variant="brand" onClick={handleInstall} disabled={installing || !targetAgent}>
@@ -844,6 +883,9 @@ function OAuthTab({
       select-all manual fallback in case no browser window appeared. */
   const [pendingAuthUrl, setPendingAuthUrl] = useState<string | null>(null);
   const [configureProvider, setConfigureProvider] = useState<McpOAuthProvider | null>(null);
+  // Revoke used to gate on the browser's native `window.confirm()` (phase4
+  // audit C06 Blocker) — route it through the shared ConfirmDialog.
+  const [revokeTarget, setRevokeTarget] = useState<McpOAuthProvider | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -898,7 +940,6 @@ function OAuthTab({
   };
 
   const handleRevoke = async (provider: McpOAuthProvider) => {
-    if (!confirm(intl.formatMessage({ id: 'mcp.oauth.revokeConfirm' }, { provider: provider.name }))) return;
     try {
       await useMcpStore.getState().revokeOAuth(provider.provider_id);
       showToast('success', intl.formatMessage({ id: 'mcp.oauth.revoked' }, { provider: provider.name }));
@@ -1032,7 +1073,7 @@ function OAuthTab({
                     </Button>
                   )}
                   {provider.token_status === 'authenticated' && (
-                    <Button variant="destructive" size="sm" onClick={() => handleRevoke(provider)}>
+                    <Button variant="destructive" size="sm" onClick={() => setRevokeTarget(provider)}>
                       <Trash2 />
                       {intl.formatMessage({ id: 'mcp.oauth.revoke' })}
                     </Button>
@@ -1051,6 +1092,24 @@ function OAuthTab({
           onClose={() => setConfigureProvider(null)}
           showToast={showToast}
           onAuthStarted={(authUrl) => beginAuthorization(configureProvider, authUrl)}
+        />
+      )}
+
+      {revokeTarget && (
+        <ConfirmDialog
+          open
+          title={intl.formatMessage({ id: 'mcp.oauth.revoke' })}
+          message={intl.formatMessage(
+            { id: 'confirm.mcp.revokeOAuth.message' },
+            { provider: revokeTarget.name || revokeTarget.provider_id },
+          )}
+          confirmLabel={intl.formatMessage({ id: 'mcp.oauth.revoke' })}
+          onConfirm={() => {
+            const target = revokeTarget;
+            setRevokeTarget(null);
+            void handleRevoke(target);
+          }}
+          onClose={() => setRevokeTarget(null)}
         />
       )}
     </div>
@@ -1323,6 +1382,8 @@ function AddServerDialog({
               readOnly={mode === 'catalog' && !!selectedCatalogId}
             />
           </div>
+
+          <AutonomyNote id="mcpInstall" />
 
           {/* Command / Args / Env — spawning an MCP server runs a real process on
               the host, so these live inside a DangerZone. */}

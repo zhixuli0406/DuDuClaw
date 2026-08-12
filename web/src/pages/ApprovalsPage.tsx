@@ -58,6 +58,20 @@ function ttlLabel(intl: ReturnType<typeof useIntl>, seconds: number): string {
   return intl.formatMessage({ id: 'approvals.ttl.seconds' }, { seconds });
 }
 
+/**
+ * NO LONGER ROUTED (WP-A, 10-ia-scatter-audit §2-6). `/approvals` redirects to
+ * `/inbox`; nothing renders this component.
+ *
+ * Why it went away: it showed the same decisions as the inbox with less of what
+ * you need to make them safely — no risk badge, no second confirmation on a
+ * high-risk action, no way to inspect the payload, and a new-skill request
+ * reduced to the same generic approve/reject as everything else, with the
+ * skill's own content and its security scan nowhere on screen and no reason
+ * required to reject. Two doors onto one decision, one of them worse.
+ *
+ * The file is kept for one round so the redirect can be reverted cheaply if
+ * anything turns out to depend on it; delete it (and this test) next round.
+ */
 export function ApprovalsPage() {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);

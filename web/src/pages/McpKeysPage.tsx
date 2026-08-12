@@ -20,6 +20,7 @@ import {
   SelectContent,
   SelectItem,
   Empty,
+  ErrorState,
   Dialog,
   DialogContent,
   DialogHeader,
@@ -48,16 +49,22 @@ export function McpKeysPage() {
   const intl = useIntl();
   const [keys, setKeys] = useState<ReadonlyArray<McpKeyEntry>>([]);
   const [loading, setLoading] = useState(false);
+  // P05: with `keys` left at [] a failed list call rendered the "no keys yet"
+  // empty state — and issuing a second key because the first looked missing is
+  // exactly the wrong recovery.
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [created, setCreated] = useState<McpKeyCreateResult | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
 
   const fetchKeys = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const res = await api.mcpKeys.list();
       setKeys(res?.keys ?? []);
     } catch (e) {
+      setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     } finally {
       setLoading(false);
@@ -83,6 +90,13 @@ export function McpKeysPage() {
         <p className="py-12 text-center text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'common.loading' })}
         </p>
+      ) : loadError != null && keys.length === 0 ? (
+        <ErrorState
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
+          onRetry={() => void fetchKeys()}
+        />
       ) : keys.length === 0 ? (
         <Empty icon={KeyRound} title={intl.formatMessage({ id: 'mcpKeys.empty' })} variant="dashed" />
       ) : (

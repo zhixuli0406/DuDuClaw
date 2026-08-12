@@ -27,16 +27,28 @@ import {
 } from '@/lib/memory-category';
 import { timeAgo } from '@/lib/format';
 import { withParam, parseEnumParam } from '@/lib/url-params';
-import { toast, formatError } from '@/lib/toast';
+import { toast } from '@/lib/toast';
 import {
   CollectionPageState,
+  ErrorState,
+  useErrorMessage,
   Card,
   CardContent,
   Button,
   Badge,
   Input,
   Skeleton,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
 } from '@/components/mds';
+import { ConfirmDialog } from '@/components/settings/controls';
+import { MemoryFreshnessBadge, MemoryFreshnessLegend } from './MemoryFreshnessBadge';
+import { MemoryDecayCurve } from './MemoryDecayCurve';
+import { MemoryDecayOverview } from './MemoryDecayOverview';
+import { daysSinceRecall } from '@/lib/memory-freshness';
 import {
   BrainIcon,
   ClockIcon,
@@ -126,6 +138,10 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
   /** WP15 — platform learning telemetry, kept out of the list above. */
   const [signals, setSignals] = useState<ReadonlyArray<MemoryEntry>>([]);
   const [loading, setLoading] = useState(false);
+  // A failed read used to land on the same empty state as "this AI staff
+  // member hasn't remembered anything yet", with only a 7-second toast to
+  // tell the two apart (P05 Blocker, phase-4 audit).
+  const [loadError, setLoadError] = useState<unknown>(null);
   // W3-3 (state-as-URL): the category rail starts from `?cat=` so a
   // bookmarked/shared filtered view opens on the same category.
   const [params, setParams] = useSearchParams();
@@ -149,18 +165,17 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
         const res = await api.memory.browse(agentId, 200);
         setEntries([...(res?.entries ?? [])].sort(byRecency));
         setSignals([...(res?.signals ?? [])].sort(byRecency));
+        setLoadError(null);
       } catch (e) {
         console.warn('[api]', e);
-        toast.error(
-          intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }),
-        );
         setEntries([]);
         setSignals([]);
+        setLoadError(e);
       } finally {
         if (showSpinner) setLoading(false);
       }
     },
-    [agentId, intl],
+    [agentId],
   );
 
   // Browse on agent change. WP5b / D7 — cognitive memory is always-on now, so
@@ -223,15 +238,16 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
       const result = await api.memory.search(agentId, query, 200);
       setEntries([...(result?.entries ?? [])].sort(byRecency));
       setSignals([...(result?.signals ?? [])].sort(byRecency));
+      setLoadError(null);
     } catch (e) {
       console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
       setEntries([]);
       setSignals([]);
+      setLoadError(e);
     } finally {
       setLoading(false);
     }
-  }, [query, agentId, intl]);
+  }, [query, agentId]);
 
   // Debounced search when the query changes (the search field lives on the
   // page's control row, so we react to `query` here).
@@ -251,6 +267,16 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
   }, []);
 
   if (loading) return <MemoryListSkeleton />;
+
+  if (loadError != null) {
+    return (
+      <ErrorState
+        icon={BrainIcon}
+        error={loadError}
+        onRetry={() => void (query.trim() ? handleSearch() : browse(true))}
+      />
+    );
+  }
 
   // The telemetry section renders under every branch below — including the
   // empty one. That is the honest answer to "記憶還沒更新對嗎?": no memories
@@ -287,44 +313,56 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
   const visible = selected === 'all' ? entries : (activeBucket?.entries ?? []);
 
   return (
-    <div className="flex flex-col gap-4 md:flex-row md:items-start md:gap-6">
-      <CategoryRail
-        buckets={buckets}
-        total={entries.length}
-        selected={selected}
-        onSelect={setSelected}
-      />
-      <div className="min-w-0 flex-1 space-y-6">
-        {visible.length === 0 ? (
-          <CollectionPageState
-            state="empty"
-            icon={BrainIcon}
-            title={intl.formatMessage({ id: 'memory.category.empty' })}
-          />
-        ) : (
-          <div className="flex flex-col gap-1">
-            <h2 className="flex items-center gap-2 px-2 pb-1 text-sm font-medium text-foreground">
-              {activeBucket ? (
-                <>
-                  <CategoryIcon name={activeBucket.category.icon} className="size-4 text-brand" />
-                  {intl.formatMessage({ id: activeBucket.category.label })}
-                </>
-              ) : (
-                <>
-                  <LayersIcon className="size-4 text-brand" />
-                  {intl.formatMessage({ id: 'memory.list.recent' })}
-                </>
-              )}
-              <span className="font-mono text-xs tabular-nums text-muted-foreground">
-                {visible.length}
-              </span>
-            </h2>
-            {visible.map((entry) => (
-              <MemoryRow key={entry.id} entry={entry} onForgotten={handleForgotten} />
-            ))}
-          </div>
-        )}
-        {signalSection}
+    <div className="space-y-6">
+      {/* R1 — memory health, above the list: how the pile has grown and how
+          much of it is still within reach. Self-fetching, and it renders
+          nothing at all until there is something to describe. */}
+      <MemoryDecayOverview agentId={agentId} />
+
+      <div className="flex flex-col gap-4 md:flex-row md:items-start md:gap-6">
+        <CategoryRail
+          buckets={buckets}
+          total={entries.length}
+          selected={selected}
+          onSelect={setSelected}
+        />
+        <div className="min-w-0 flex-1 space-y-6">
+          {visible.length === 0 ? (
+            <CollectionPageState
+              state="empty"
+              icon={BrainIcon}
+              title={intl.formatMessage({ id: 'memory.category.empty' })}
+            />
+          ) : (
+            <div className="flex flex-col gap-1">
+              <h2 className="flex items-center gap-2 px-2 text-sm font-medium text-foreground">
+                {activeBucket ? (
+                  <>
+                    <CategoryIcon name={activeBucket.category.icon} className="size-4 text-brand" />
+                    {intl.formatMessage({ id: activeBucket.category.label })}
+                  </>
+                ) : (
+                  <>
+                    <LayersIcon className="size-4 text-brand" />
+                    {intl.formatMessage({ id: 'memory.list.recent' })}
+                  </>
+                )}
+                <span className="font-mono text-xs tabular-nums text-muted-foreground">
+                  {visible.length}
+                </span>
+              </h2>
+              {/* Reads the four badge states once, so no row has to. Sits
+                  between the heading and the rows, and deliberately stays a
+                  sibling of both: the list container is what tests and
+                  keyboard order treat as "the list". */}
+              <MemoryFreshnessLegend className="px-2 pb-1" />
+              {visible.map((entry) => (
+                <MemoryRow key={entry.id} entry={entry} onForgotten={handleForgotten} />
+              ))}
+            </div>
+          )}
+          {signalSection}
+        </div>
       </div>
     </div>
   );
@@ -479,10 +517,12 @@ function MemoryListSkeleton() {
 }
 
 /**
- * Delete affordance: hidden until the row is hovered or focused, and it takes
- * two clicks — the first swaps in an inline confirm so a stray click on a
- * dense list can't silently drop a memory. Keyboard users get the same button
- * via focus-within, so this is not a hover-only control.
+ * Delete affordance: hidden until the row is hovered or focused. The click
+ * opens the shared site-wide `ConfirmDialog` (phase4 audit C06/C11 Blocker —
+ * this used to be a homemade two-button inline confirm with no title and no
+ * stated consequence, so a `forget()` that actually only archives the entry
+ * read on screen as an irreversible delete). Keyboard users get the same
+ * button via focus-within, so this is not a hover-only control.
  */
 function ForgetButton({
   entry,
@@ -494,55 +534,61 @@ function ForgetButton({
   const intl = useIntl();
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const errorText = useErrorMessage();
 
   const run = async () => {
     setBusy(true);
     try {
       await api.memory.forget(entry.agent_id, entry.id);
       toast.success(intl.formatMessage({ id: 'memory.forget.done' }));
+      setConfirming(false);
       onForgotten(entry.id);
     } catch (e) {
       console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'memory.forget.failed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'memory.forget.failed' }, { message: errorText(e) }));
       setConfirming(false);
     } finally {
       setBusy(false);
     }
   };
 
-  if (confirming) {
-    return (
-      <span className="flex shrink-0 items-center gap-1">
-        <Button variant="destructive" size="xs" disabled={busy} onClick={() => void run()}>
-          {intl.formatMessage({ id: 'memory.forget.confirm' })}
-        </Button>
-        <Button variant="ghost" size="xs" disabled={busy} onClick={() => setConfirming(false)}>
-          {intl.formatMessage({ id: 'common.cancel' })}
-        </Button>
-      </span>
-    );
-  }
-
   return (
-    <Button
-      variant="ghost"
-      size="icon-xs"
-      aria-label={intl.formatMessage({ id: 'memory.forget.action' })}
-      title={intl.formatMessage({ id: 'memory.forget.action' })}
-      onClick={() => setConfirming(true)}
-      className="shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 hover:text-destructive"
-    >
-      <Trash2Icon />
-    </Button>
+    <>
+      <Button
+        variant="ghost"
+        size="icon-xs"
+        aria-label={intl.formatMessage({ id: 'memory.forget.action' })}
+        title={intl.formatMessage({ id: 'memory.forget.action' })}
+        onClick={() => setConfirming(true)}
+        className="shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 hover:text-destructive"
+      >
+        <Trash2Icon />
+      </Button>
+      <ConfirmDialog
+        open={confirming}
+        onClose={() => setConfirming(false)}
+        onConfirm={() => void run()}
+        title={intl.formatMessage({ id: 'memory.forget.action' })}
+        message={intl.formatMessage({ id: 'confirm.memory.forget.message' })}
+        confirmLabel={intl.formatMessage({ id: 'memory.forget.confirm' })}
+        busy={busy}
+      />
+    </>
   );
 }
 
 /**
- * One memory = one row: a single-sentence summary, when it was recorded, a
- * delete affordance, and a disclosure that opens the full detail panel. The
- * whole row is the toggle (the chevron is decorative and marked
+ * One memory = one row: a single-sentence summary, its freshness state, when it
+ * was recorded, a delete affordance, and a control that opens the full detail
+ * view. The whole row is that control (the chevron is decorative and marked
  * `aria-hidden`), so there is one control per row for keyboard users instead
  * of a summary and a separate button competing for the same job.
+ *
+ * R1 (2026-08-12) moved the detail out of an inline expansion and into a
+ * near-full-screen dialog. Inline, the memory's text, its provenance, its
+ * forgetting curve and its revision history had to share a row's worth of
+ * width; three of those four were being squeezed out of a list the user was
+ * trying to skim. The dialog gives them one place to coexist.
  */
 function MemoryRow({
   entry,
@@ -578,6 +624,7 @@ function MemoryRow({
           type="button"
           onClick={() => setOpen((v) => !v)}
           aria-expanded={open}
+          aria-haspopup="dialog"
           className="flex min-w-0 flex-1 items-start gap-2 py-1.5 text-left"
         >
           {open ? (
@@ -591,8 +638,14 @@ function MemoryRow({
               part that identified the memory. */}
           <span className="line-clamp-2 min-w-0 flex-1 text-sm text-foreground">{summary}</span>
         </button>
+        {/* Freshness stays visible at every width — it is the one thing on the
+            row that changes on its own, and the reason a memory can vanish. */}
+        <MemoryFreshnessBadge
+          retrievability={entry.retrievability}
+          className="hidden shrink-0 sm:inline-flex"
+        />
         {layerId && (
-          <Badge variant="secondary" className="hidden shrink-0 sm:inline-flex">
+          <Badge variant="secondary" className="hidden shrink-0 lg:inline-flex">
             {intl.formatMessage({ id: layerId })}
           </Badge>
         )}
@@ -601,13 +654,54 @@ function MemoryRow({
         </span>
         <ForgetButton entry={entry} onForgotten={onForgotten} />
       </div>
-      {open && (
-        <div className="space-y-2 px-2 pb-2">
-          <MemoryDetail entry={entry} prediction={prediction} />
-          <MemoryHistory agentId={entry.agent_id} memoryId={entry.id} />
-        </div>
-      )}
+
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle className="pr-6 text-base leading-snug">{summary}</DialogTitle>
+            <DialogDescription>
+              {intl.formatMessage(
+                { id: 'memory.detail.dialog.desc' },
+                { when: timeAgo(entry.timestamp) },
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <MemoryDetail entry={entry} prediction={prediction} />
+            <MemoryDecayPanel entry={entry} />
+            <MemoryHistory agentId={entry.agent_id} memoryId={entry.id} />
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
+  );
+}
+
+/**
+ * The forgetting curve for one memory, with the state it is in right now.
+ *
+ * Renders nothing when the gateway sent no curve figures — an older backend, or
+ * a row that predates the field — rather than drawing a curve from a guess.
+ */
+function MemoryDecayPanel({ entry }: { entry: MemoryEntry }) {
+  const intl = useIntl();
+  if (typeof entry.stability_days !== 'number' || !(entry.stability_days > 0)) return null;
+
+  return (
+    <Card data-size="sm">
+      <CardContent className="space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-xs font-medium text-muted-foreground">
+            {intl.formatMessage({ id: 'memory.decay.curve.title' })}
+          </h3>
+          <MemoryFreshnessBadge retrievability={entry.retrievability} />
+        </div>
+        <MemoryDecayCurve
+          stabilityDays={entry.stability_days}
+          elapsedDays={daysSinceRecall(entry)}
+        />
+      </CardContent>
+    </Card>
   );
 }
 

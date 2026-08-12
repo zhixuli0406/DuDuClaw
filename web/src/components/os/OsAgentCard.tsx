@@ -8,6 +8,7 @@ import {
   Workflow,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { AutonomyNote } from '@/components/AutonomyNote';
 import type { OsAgentStatus, OsSettingsUpdateParams } from '@/lib/api';
 import {
   ActorAvatar,
@@ -181,6 +182,9 @@ export function OsAgentCard({ agent, displayName, quotaBlocked, savingField, onU
           </p>
         ) : (
           <div className="divide-y divide-surface-border">
+            <div className="px-4 py-3">
+              <AutonomyNote id="osNative" />
+            </div>
             {/* Watch paths + live stats (read-only — edited on the agent's own edit page). */}
             <div className="space-y-2 px-4 py-3">
               <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">

@@ -1,15 +1,17 @@
-import { useEffect, useState, useRef } from 'react';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
+  ErrorState,
   SettingsSection,
   SettingsCard,
   SettingsSaveState,
 } from '@/components/mds';
 import { type SelectOption } from '@/components/settings/controls';
 import { RowSelect, RowSwitch, RowNumber } from '@/pages/agent-form/form-rows';
+import { AutonomyNote } from '@/components/AutonomyNote';
 
 // dispatch.policy enum accepted by the gateway's system.update_config.
 const DISPATCH_POLICIES = ['fixed_hierarchy', 'round_robin', 'llm_select'] as const;
@@ -64,10 +66,16 @@ export function AutomationTab() {
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // P05: on a failed read this form used to render its compiled-in defaults,
+  // which reads as "the gateway is set this way" — the most dangerous kind of
+  // silent failure on a settings page. Keep the failure visible and retryable.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
-  useEffect(() => {
+  const load = useCallback(() => {
+    setLoadError(null);
     api.system.config().then((res) => {
       const raw = (res as Record<string, unknown>)?.config;
       if (typeof raw !== 'string') return;
@@ -83,13 +91,17 @@ export function AutomationTab() {
       setGraphEmbedSeed(boolIn(tomlSection(raw, 'memory'), 'graph_embed_seed', false));
     }).catch((e) => {
       console.warn('[api]', e);
+      setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     });
   }, [intl]);
 
+  useEffect(() => { load(); }, [load]);
+
   const handleSave = async () => {
     setSaving(true);
     setSaved(false);
+    setSaveError(null);
     try {
       const res = await api.system.updateConfig({
         goal_loop: { planner_enabled: plannerEnabled, iteration_cap_simple: iterationCapSimple },
@@ -107,6 +119,7 @@ export function AutomationTab() {
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
       console.warn('[api]', e);
+      setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
@@ -119,6 +132,15 @@ export function AutomationTab() {
 
   return (
     <div className="space-y-8">
+      {loadError != null && (
+        <ErrorState
+          variant="inline"
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          onRetry={load}
+        />
+      )}
+
       {/* Goal loop / dispatch / topology — "hard" trio, hot-reloaded on save */}
       <SettingsSection
         title={t('settings.automation.goalLoop')}
@@ -153,6 +175,7 @@ export function AutomationTab() {
             onChange={setTopologyEnabled}
           />
         </SettingsCard>
+        <AutonomyNote id="automation" />
         <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
           {t('settings.automation.hotReloadHint')}
         </p>
@@ -198,6 +221,15 @@ export function AutomationTab() {
         </p>
       </SettingsSection>
 
+      {saveError != null && (
+        <ErrorState
+          variant="inline"
+          error={saveError}
+          title={intl.formatMessage({ id: 'errorState.manage.saveFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.saveFailedHint' })}
+          onRetry={() => void handleSave()}
+        />
+      )}
       <div className="flex items-center justify-end gap-3">
         <SettingsSaveState
           status={saving ? 'saving' : saved ? 'saved' : 'idle'}

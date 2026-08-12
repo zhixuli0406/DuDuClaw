@@ -17,7 +17,8 @@ import { useConnectionStore } from '@/stores/connection-store';
  *  - paused/terminated AI staff  → agents store (already loaded)
  *  - offline channels            → `channels.status`
  *  - pending approvals + open budget events → `approvalsCount` prop, supplied
- *    by DashboardPage from `approvals.list` + `budget.incidents` (WP14-T14.6/7).
+ *    by the old overview page from `approvals.list` + `budget.incidents`
+ *    (WP14-T14.6/7; that page was removed, HomePage carries the banner now).
  */
 export function IncidentBanner({ approvalsCount = 0 }: { approvalsCount?: number }) {
   const intl = useIntl();

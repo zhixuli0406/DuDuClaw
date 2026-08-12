@@ -20,6 +20,7 @@ import {
   PageHeader,
   Button,
   Empty,
+  ErrorState,
   Skeleton,
   ResizablePanelGroup,
   ResizablePanel,
@@ -124,6 +125,8 @@ export function InboxPage() {
   const [entries, setEntries] = useState<RawEntry[]>([]);
   const [agentNames, setAgentNames] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
+  /** First failure among the aggregate sources, if any (partial-load notice). */
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [prefs, setPrefs] = useState<InboxPrefs>(loadPrefs);
   const [read, setRead] = useState<ReadonlySet<string>>(() => loadIdSet(READ_KEY));
   const [archived, setArchived] = useState<ReadonlySet<string>>(() => loadIdSet(ARCHIVED_KEY));
@@ -154,21 +157,31 @@ export function InboxPage() {
   // fail-safe, not fail-loud). Splitting the decisions poll out of the initial
   // burst keeps the Inbox from firing ~17 RPCs the moment it opens (Bug#2).
   const load = useCallback(async () => {
+    // Each source stays best-effort, but a source that failed is recorded so
+    // the list can say "part of this didn't load" instead of silently folding
+    // the failure into an empty tab (P05, phase-4 audit).
+    let firstFailure: unknown = null;
+    const note = (e: unknown) => {
+      if (firstFailure == null) firstFailure = e;
+      return null;
+    };
     const [approvalsRes, budgetRes, tasksRes, needsHumanRes, agentsRes, failedRes, installRes] = await Promise.all([
-      api.approvals.list().catch(() => null),
-      api.budget.incidents().catch(() => null),
-      api.tasks.list({ status: 'blocked' }).catch(() => null),
+      api.approvals.list().catch(note),
+      api.budget.incidents().catch(note),
+      api.tasks.list({ status: 'blocked' }).catch(note),
       // W1-2: a goal-loop task escalated to needs_human is a distinct status
       // from plain `blocked` (task_store.rs) — the Inbox previously never
       // fetched it at all, so it never appeared here despite being exactly
       // the kind of "等你決定" item this page exists for (04 doc §D.6).
-      api.tasks.list({ status: 'needs_human' }).catch(() => null),
-      api.agents.list().catch(() => null),
-      api.audit.unifiedLog({ sources: ['channel_failure'], limit: FAILED_RUN_CAP }).catch(() => null),
+      api.tasks.list({ status: 'needs_human' }).catch(note),
+      api.agents.list().catch(note),
+      api.audit.unifiedLog({ sources: ['channel_failure'], limit: FAILED_RUN_CAP }).catch(note),
       // Install approval requests actionable by this viewer (manager/admin).
       // Employees get 403 → null and simply see no install rows (Bug#3).
+      // Employees get 403 here by design — an expected denial, not an outage.
       api.installRequests.list().catch(() => null),
     ]);
+    setLoadError(firstFailure);
 
     const nameMap: Record<string, string> = {};
     for (const a of agentsRes?.agents ?? []) nameMap[a.name] = a.display_name || a.name;
@@ -856,20 +869,33 @@ export function InboxPage() {
             ))}
           </div>
         ) : (
-          <InboxList
-            groups={groups}
-            canArchive={canArchive}
-            agentName={agentName}
-            labels={rowLabels}
-            selectedId={selectedId}
-            isUnread={isUnread}
-            isProcessed={isProcessed}
-            onSelect={select}
-            onArchive={archive}
-            onUnread={(item) => markUnread(item.id)}
-            onUndo={undo}
-            emptyState={<Empty icon={InboxIcon} title={t('inbox.emptyTab')} variant="dashed" className="mt-6" />}
-          />
+          <>
+            {loadError != null && (
+              <ErrorState
+                variant="inline"
+                className="mb-3"
+                title={t('inbox.partialLoad')}
+                error={loadError}
+                onRetry={() => void load()}
+              />
+            )}
+            <InboxList
+              groups={groups}
+              canArchive={canArchive}
+              agentName={agentName}
+              labels={rowLabels}
+              selectedId={selectedId}
+              isUnread={isUnread}
+              isProcessed={isProcessed}
+              onSelect={select}
+              onArchive={archive}
+              onUnread={(item) => markUnread(item.id)}
+              onUndo={undo}
+              emptyState={
+                <Empty icon={InboxIcon} title={t('inbox.emptyTab')} variant="dashed" className="mt-6" />
+              }
+            />
+          </>
         )}
       </div>
       {/* Keyboard shortcuts (j/k/Enter…) are meaningless on touch devices —

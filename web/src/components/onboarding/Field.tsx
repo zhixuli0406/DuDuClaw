@@ -2,7 +2,7 @@ import { useId, type ReactNode } from 'react';
 import { cn } from '@/lib/utils';
 
 /**
- * Onboarding form primitives (LoginPage / WelcomePage / OnboardWizardPage).
+ * Onboarding form primitives (LoginPage / WelcomePage).
  * These replace the Calm Glass `ui/Field` + `controlClass` on the onboarding
  * surface with MDS-token styling (spec §4 Input / §5.8). They live outside
  * `components/mds/` because they are onboarding-specific compositions, not core

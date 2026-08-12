@@ -1,5 +1,6 @@
 import { useEffect, useRef, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { useUrlState } from '@/lib/use-url-state';
 import { cn } from '@/lib/utils';
 import { useLogsStore, selectFilteredEntries } from '@/stores/logs-store';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -52,13 +53,16 @@ const levelBg: Record<string, string> = {
   error: 'bg-rose-50 dark:bg-rose-900/20',
 };
 
-type Tab = 'history' | 'realtime';
+const TABS = ['history', 'realtime'] as const;
+type Tab = (typeof TABS)[number];
 
 // ── Main component ─────────────────────────────────────────
 
 export function LogsPage() {
   const intl = useIntl();
-  const [tab, setTab] = useState<Tab>('history');
+  // P11 (state-as-URL): which log view you are on is a link, not a mode you
+  // have to re-pick after every refresh.
+  const [tab, setTab] = useUrlState('tab', 'history', { allowed: TABS });
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4">
@@ -91,7 +95,8 @@ export function LogsPage() {
 
 // ── History tab (unified audit events from JSONL sources) ─────
 
-type SeverityFilter = 'all' | 'info' | 'warning' | 'critical';
+const SEVERITY_FILTERS = ['all', 'info', 'warning', 'critical'] as const;
+type SeverityFilter = (typeof SEVERITY_FILTERS)[number];
 
 const ALL_SOURCES: UnifiedAuditSource[] = [
   'security',
@@ -112,9 +117,26 @@ function HistoryTab() {
   });
   const [loading, setLoading] = useState(false);
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
-  // null = all sources; otherwise whitelist subset
-  const [selectedSources, setSelectedSources] = useState<UnifiedAuditSource[] | null>(null);
-  const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('all');
+  // null = all sources; otherwise a whitelist subset, carried in `?source=` as
+  // a comma-separated list. Cross-page deep links (e.g. SecurityPage's Audit
+  // Log card, UX audit §2-11) preselect a single source with `?source=<name>`,
+  // which still parses; unlike before, toggling chips now writes back, so the
+  // filter survives a refresh (P11). Unrecognized values fall back to "all",
+  // never a silent empty filter.
+  const [sourceParam, setSourceParam] = useUrlState('source', '');
+  const selectedSources = useMemo<UnifiedAuditSource[] | null>(() => {
+    const picked = sourceParam
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s): s is UnifiedAuditSource => (ALL_SOURCES as string[]).includes(s));
+    // "none" and "every source" are the same view — keep one canonical form.
+    return picked.length === 0 || picked.length === ALL_SOURCES.length ? null : picked;
+  }, [sourceParam]);
+  const setSelectedSources = (next: UnifiedAuditSource[] | null) =>
+    setSourceParam(next === null ? '' : next.join(','));
+  const [severityFilter, setSeverityFilter] = useUrlState('severity', 'all', {
+    allowed: SEVERITY_FILTERS,
+  });
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
@@ -161,19 +183,20 @@ function HistoryTab() {
   }, [connectionState, selectedSources, severityFilter, intl]);
 
   const toggleSource = (src: UnifiedAuditSource) => {
-    setSelectedSources((prev) => {
-      if (prev === null) {
-        // Going from "all" to a single selection
-        return [src];
-      }
-      if (prev.includes(src)) {
-        const next = prev.filter((s) => s !== src);
-        return next.length === 0 ? null : next;
-      }
-      const next = [...prev, src];
-      // If all four selected, collapse back to "all" (null)
-      return next.length === ALL_SOURCES.length ? null : next;
-    });
+    const prev = selectedSources;
+    if (prev === null) {
+      // Going from "all" to a single selection
+      setSelectedSources([src]);
+      return;
+    }
+    if (prev.includes(src)) {
+      const next = prev.filter((s) => s !== src);
+      setSelectedSources(next.length === 0 ? null : next);
+      return;
+    }
+    const next = [...prev, src];
+    // If all four selected, collapse back to "all" (null)
+    setSelectedSources(next.length === ALL_SOURCES.length ? null : next);
   };
 
   const isSourceActive = (src: UnifiedAuditSource) =>

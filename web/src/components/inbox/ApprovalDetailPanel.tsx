@@ -38,6 +38,7 @@ import {
   type RiskLevel,
 } from '@/lib/approval-risk';
 import { decideApproval } from '@/lib/api-custom-skills';
+import { ConfirmDialog } from '@/components/settings/controls';
 import { parseSkillCreatePayload, type SkillCreatePayload } from '@/components/skills/skill-create-payload';
 import { formatTimeSaved } from '@/components/skills/status-meta';
 import { OpenInChannelButton } from './OpenInChannelButton';
@@ -417,6 +418,11 @@ function SkillCreateApprovalView({
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [decided, setDecided] = useState<DecidedState>(null);
+  // skill_create's base risk is always 'high' (installs and runs code the
+  // agent wrote), yet its 同意 button used to call `decideApproval` straight
+  // off the click — bypassing the confirmation the generic approval view
+  // already gates high-risk decisions behind (phase4 audit C06/C11 Blocker).
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   const sr = payload.safety_report;
   const risk = approvalRisk(approval.kind, approval.payload);
@@ -572,7 +578,7 @@ function SkillCreateApprovalView({
         </div>
       ) : (
         <div className="flex items-center gap-2">
-          <Button variant="brand" onClick={handleApprove} disabled={busy} className="flex-1">
+          <Button variant="brand" onClick={() => setConfirmOpen(true)} disabled={busy} className="flex-1">
             {t('inbox.skillCreate.approve')}
           </Button>
           <Button variant="destructive" onClick={() => setRejecting(true)} disabled={busy} className="flex-1">
@@ -580,6 +586,19 @@ function SkillCreateApprovalView({
           </Button>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmOpen}
+        onClose={() => setConfirmOpen(false)}
+        onConfirm={() => { setConfirmOpen(false); void handleApprove(); }}
+        title={t('inbox.skillCreate.approve')}
+        message={intl.formatMessage(
+          { id: 'confirm.inbox.skillCreateApprove.message' },
+          { name: payload.display_name || payload.slug },
+        )}
+        confirmLabel={t('inbox.skillCreate.approve')}
+        busy={busy}
+      />
     </div>
   );
 }

@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef, useMemo, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import qrcode from 'qrcode-generator';
 import { cn } from '@/lib/utils';
 import {
@@ -33,6 +34,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   Empty,
+  ErrorState,
   Badge,
   Switch,
   Tabs,
@@ -162,6 +164,8 @@ export function ChannelsPage() {
   const connState = useConnectionStore((s) => s.state);
   const [channels, setChannels] = useState<ReadonlyArray<ChannelStatus>>([]);
   const [loading, setLoading] = useState(false);
+  /** Set when `channels.status` threw — keeps a failed load out of the empty state. */
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [showBindDialog, setShowBindDialog] = useState(false);
   const [editChannel, setEditChannel] = useState<string | null>(null);
@@ -191,10 +195,15 @@ export function ChannelsPage() {
 
   const fetchChannels = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const result = await api.channels.status();
       setChannels(result?.channels ?? []);
-    } catch {
+    } catch (e) {
+      // P05: `channels` stays [] on failure, which renders exactly like "no
+      // channels configured" — the reading that sends a user off to add a bot
+      // they already have. Keep the failure on screen, with a retry.
+      setLoadError(e);
       showToast('error', intl.formatMessage({ id: 'channels.loadFailed' }));
     } finally {
       setLoading(false);
@@ -320,7 +329,14 @@ export function ChannelsPage() {
         </div>
       )}
 
-      {channels.length === 0 && !loading ? (
+      {loadError != null && channels.length === 0 && !loading ? (
+        <ErrorState
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
+          onRetry={() => void fetchChannels()}
+        />
+      ) : channels.length === 0 && !loading ? (
         <Empty icon={Radio} title={intl.formatMessage({ id: 'channels.empty' })} />
       ) : (
         <div className="space-y-2">
@@ -713,26 +729,34 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
           </DialogField>
 
           {SUPPORTS_PER_AGENT.includes(channelType) && agents.length > 0 && (
-            <DialogField
-              label={intl.formatMessage({ id: 'channels.dialog.assignAgent' })}
-              help={intl.formatMessage({ id: 'channels.dialog.assignAgentHint' })}
-            >
-              <Select value={selectedAgent} onValueChange={(v) => setSelectedAgent(String(v))}>
-                <SelectTrigger className="w-full">
-                  <SelectValue>
-                    {selectedAgent
-                      ? agents.find((a) => a.name === selectedAgent)?.display_name || selectedAgent
-                      : intl.formatMessage({ id: 'channels.dialog.global' })}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="">{intl.formatMessage({ id: 'channels.dialog.global' })}</SelectItem>
-                  {agents.map((a) => (
-                    <SelectItem key={a.name} value={a.name}>{a.display_name || a.name}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </DialogField>
+            <>
+              <DialogField
+                label={intl.formatMessage({ id: 'channels.dialog.assignAgent' })}
+                help={intl.formatMessage({ id: 'channels.dialog.assignAgentHint' })}
+              >
+                <Select value={selectedAgent} onValueChange={(v) => setSelectedAgent(String(v))}>
+                  <SelectTrigger className="w-full">
+                    <SelectValue>
+                      {selectedAgent
+                        ? agents.find((a) => a.name === selectedAgent)?.display_name || selectedAgent
+                        : intl.formatMessage({ id: 'channels.dialog.global' })}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="">{intl.formatMessage({ id: 'channels.dialog.global' })}</SelectItem>
+                    {agents.map((a) => (
+                      <SelectItem key={a.name} value={a.name}>{a.display_name || a.name}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </DialogField>
+              {/* R-PLAIN-WORDS (§2-1): distinguishes this "路由訊息" setting from
+                  UsersPage's "授權存取" (who can operate the AI staff) and the
+                  channel-identity block's "驗證身分" (who is who on the channel). */}
+              <p className="-mt-3 text-xs text-muted-foreground/80">
+                {intl.formatMessage({ id: 'channels.dialog.assignAgent.explain' })}
+              </p>
+            </>
           )}
 
           {/* Setup guide */}
@@ -1022,6 +1046,7 @@ function ChannelDetailDialog({
   onClose: () => void;
 }) {
   const intl = useIntl();
+  const navigate = useNavigate();
   const t = (id: string) => intl.formatMessage({ id });
   const platform = channelName ? getChannelPlatform(channelName) : '';
   const [tab, setTab] = useState<'behavior' | 'access'>('behavior');
@@ -1038,6 +1063,24 @@ function ChannelDetailDialog({
             {intl.formatMessage({ id: 'channels.detail.title' }, { name: channelDisplayLabel(platform) })}
           </DialogTitle>
         </DialogHeader>
+
+        {/* R-cross-link (§2-1): "路由訊息給哪位 AI 員工" (this dialog's Behavior
+            tab) is a different setting from "授權存取" (who can operate that AI
+            員工) and "驗證身分" (who is who on the channel) — both live on
+            UsersPage. Point admins there instead of letting them assume this
+            dialog covers everything. */}
+        <div className="flex items-start gap-2 rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
+          <Info className="mt-0.5 size-3.5 shrink-0" />
+          <span className="flex-1">{t('channels.detail.crossLink')}</span>
+          <Button
+            variant="link"
+            size="sm"
+            className="h-auto shrink-0 p-0"
+            onClick={() => navigate('/manage/users')}
+          >
+            {t('channels.detail.crossLink.action')}
+          </Button>
+        </div>
 
         {platform && (
           <Tabs value={tab} onValueChange={(v) => setTab(v as 'behavior' | 'access')}>

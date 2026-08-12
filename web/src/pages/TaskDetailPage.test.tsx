@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route } from 'react-router';
 import en from '@/i18n/en.json';
@@ -83,5 +84,62 @@ describe('TaskDetailPage', () => {
       expect(screen.getByRole('button', { name: 'Task title' })).toBeInTheDocument(),
     );
     expect(screen.queryByText('Live')).toBeNull();
+  });
+});
+
+// ── WP-A (§2-6): the detail page used to hand a 等你決定 task to the generic
+// status picker, which could not express "retry" at all (that writes `pending`,
+// a status the picker never listed). It now shows the same three choices as the
+// inbox, and nothing else can write the task's status.
+
+const NEEDS_HUMAN: TaskInfo = {
+  ...TASK,
+  status: 'needs_human',
+  judge_feedback: 'Could not confirm the refund amount',
+};
+
+describe('TaskDetailPage — 等你決定 (WP-A §2-6)', () => {
+  beforeEach(() => {
+    mockWsClient.call.mockResolvedValue({ tasks: [NEEDS_HUMAN], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [NEEDS_HUMAN], comments: {}, activities: [], loading: false });
+  });
+
+  it('shows the decision, its reason, and the same three choices as the inbox', () => {
+    renderAt('task-aaaa1111');
+    expect(
+      screen.getByText('This task is waiting on your decision: try again, call it done, or give up?'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Could not confirm the refund amount')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Mark complete' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Give up' })).toBeInTheDocument();
+  });
+
+  it('hides the header quick-complete so the decision panel is the only writer', () => {
+    renderAt('task-aaaa1111');
+    // The header action carries the aria-label "Mark complete" too; asserting on
+    // the icon-only header button specifically would be brittle, so assert the
+    // count instead — exactly one, the decision panel's.
+    expect(screen.getAllByRole('button', { name: 'Mark complete' })).toHaveLength(1);
+  });
+
+  it('writes `pending` for 重試 — the status the generic picker could never reach', async () => {
+    const user = userEvent.setup();
+    renderAt('task-aaaa1111');
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith('tasks.update', {
+        task_id: 'task-aaaa1111',
+        status: 'pending',
+      }),
+    );
+  });
+
+  it('leaves an ordinary task alone (guard is not a blanket freeze)', () => {
+    mockWsClient.call.mockResolvedValue({ tasks: [TASK], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [TASK], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    expect(screen.getByRole('button', { name: 'Mark complete' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
   });
 });

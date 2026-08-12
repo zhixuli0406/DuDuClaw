@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { api, type AccountInfo, type BudgetSummary, type CliCredentialInfo } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
@@ -106,6 +107,12 @@ const CLI_CRED_LABELS: Record<string, string> = {
   grok: 'Grok CLI',
 };
 
+/** One AI staff member that names a given account in its `[model] account_pool`. */
+interface PoolUser {
+  readonly name: string;
+  readonly display: string;
+}
+
 /**
  * AccountsPage — multi-account rotation surface (MDS, the accounts tab of
  * `/manage/billing` + legacy `/accounts`). Budget KPIs, a usage bar, and a grid
@@ -119,6 +126,13 @@ export function AccountsPage() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [loginRuntime, setLoginRuntime] = useState<LoginRuntime | null>(null);
   const [cliCreds, setCliCreds] = useState<CliCredentialInfo[]>([]);
+  // WP-C (§2-2) — the reverse of `[model] account_pool`: which staff members
+  // name each account. `agents.list` already returns each agent's whole `model`
+  // block (handlers.rs `handle_agents_list_filtered`), so this is one existing
+  // RPC and zero backend work — no per-agent inspect fan-out. `null` means the
+  // roster never resolved; the cards then show guidance instead of claiming
+  // "nobody uses this account", which would be a fabricated answer.
+  const [poolUsers, setPoolUsers] = useState<ReadonlyMap<string, ReadonlyArray<PoolUser>> | null>(null);
 
   const fetchBudget = useCallback(async () => {
     setLoading(true);
@@ -143,6 +157,33 @@ export function AccountsPage() {
   useEffect(() => {
     fetchBudget();
   }, [fetchBudget]);
+
+  // Build the account → staff-members index once. A failure here must never
+  // degrade the accounts view itself, so it stays in its own effect and leaves
+  // `poolUsers` null (= "roster unavailable") rather than an empty map.
+  useEffect(() => {
+    let alive = true;
+    api.agents
+      .list()
+      .then((res) => {
+        if (!alive) return;
+        const index = new Map<string, PoolUser[]>();
+        for (const a of res?.agents ?? []) {
+          for (const accountId of a.model?.account_pool ?? []) {
+            const arr = index.get(accountId) ?? [];
+            arr.push({ name: a.name, display: a.display_name || a.name });
+            index.set(accountId, arr);
+          }
+        }
+        setPoolUsers(index);
+      })
+      .catch(() => {
+        if (alive) setPoolUsers(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const handleRotate = async () => {
     try {
@@ -284,7 +325,13 @@ export function AccountsPage() {
       {!loading && budget?.accounts && budget.accounts.length > 0 ? (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {budget.accounts.map((account) => (
-            <AccountCard key={account.id} account={account} intl={intl} onBudgetUpdated={fetchBudget} />
+            <AccountCard
+              key={account.id}
+              account={account}
+              intl={intl}
+              onBudgetUpdated={fetchBudget}
+              usedBy={poolUsers === null ? null : (poolUsers.get(account.id) ?? [])}
+            />
           ))}
         </div>
       ) : !loading ? (
@@ -477,11 +524,15 @@ function AccountCard({
   account,
   intl,
   onBudgetUpdated,
+  usedBy,
 }: {
   account: AccountInfo;
   intl: ReturnType<typeof useIntl>;
   onBudgetUpdated: () => void;
+  /** Staff members naming this account; `null` = roster unavailable (§2-2). */
+  usedBy: ReadonlyArray<PoolUser> | null;
 }) {
+  const navigate = useNavigate();
   const [editing, setEditing] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
   const [budgetInput, setBudgetInput] = useState(String(account.monthly_budget_cents / 100));
@@ -605,6 +656,40 @@ function AccountCard({
             style={{ width: `${spentPercent}%` }}
           />
         </div>
+      </div>
+
+      {/* WP-C (§2-2) — "which staff members run on this account". The page used
+          to have zero links to any AI staff member, so an account could not be
+          traced to the work it pays for. Each name opens that staff member's
+          own 腦袋與引擎 settings, where the assignment is actually made
+          (R-EDIT-SOURCE). */}
+      <div className="mt-4 border-t border-surface-border pt-3">
+        <p className="text-xs font-medium text-muted-foreground">
+          {intl.formatMessage({ id: 'accounts.usedBy.title' })}
+        </p>
+        {usedBy === null ? (
+          <p className="mt-1 text-xs text-muted-foreground">
+            {intl.formatMessage({ id: 'accounts.usedBy.unavailable' })}
+          </p>
+        ) : usedBy.length === 0 ? (
+          <p className="mt-1 text-xs text-muted-foreground">
+            {intl.formatMessage({ id: 'accounts.usedBy.none' })}
+          </p>
+        ) : (
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            {usedBy.map((u) => (
+              <button
+                key={u.name}
+                type="button"
+                onClick={() => navigate(`/agents/${encodeURIComponent(u.name)}/edit?tab=brain`)}
+                className="inline-flex max-w-full items-center gap-1 rounded-4xl bg-brand/12 px-2.5 py-0.5 text-xs font-medium text-brand transition-colors hover:bg-brand/20"
+                title={intl.formatMessage({ id: 'accounts.usedBy.openAgent' }, { name: u.display })}
+              >
+                <span className="truncate">{u.display}</span>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

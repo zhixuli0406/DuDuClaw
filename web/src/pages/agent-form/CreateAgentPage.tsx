@@ -11,10 +11,11 @@ import {
   type DepartmentInfo,
 } from '@/lib/api';
 import type { SelectOption } from '@/components/settings/controls';
-import { toast, formatError } from '@/lib/toast';
+import { toast } from '@/lib/toast';
 import {
   Button,
   Badge,
+  ErrorState,
   Textarea,
   BreadcrumbHeader,
   SettingsSection,
@@ -47,7 +48,13 @@ export function CreateAgentPage() {
   // department picker there. Enterprise keeps it.
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const [submitting, setSubmitting] = useState(false);
+  // Was `formatError(e)` — the raw JS/API string rendered straight into the
+  // form (P05 Blocker, phase-4 audit). `errorState` holds the thrown value;
+  // `error` stays for the page's own plain-language messages.
   const [error, setError] = useState<string | null>(null);
+  const [errorState, setErrorState] = useState<unknown>(null);
+  /** How to re-attempt whatever produced `errorState`. */
+  const [errorRetry, setErrorRetry] = useState<(() => void) | null>(null);
 
   // ── Template pack state (silent degrade when the RPC is unavailable) ──
   const [roster, setRoster] = useState<TemplateRoster | null>(null);
@@ -99,6 +106,7 @@ export function CreateAgentPage() {
     if (roleId === '') return;
     setRoleLoading(true);
     setError(null);
+    setErrorState(null);
     try {
       const d = await api.templates.role(roleId, roster?.industry ?? undefined);
       setRoleDetail(d);
@@ -110,7 +118,8 @@ export function CreateAgentPage() {
       setAgentToml(d.agent_toml);
     } catch (e) {
       setTemplateRoleId('');
-      setError(formatError(e));
+      setErrorState(e);
+      setErrorRetry(() => () => void selectTemplate(roleId));
     } finally {
       setRoleLoading(false);
     }
@@ -121,6 +130,7 @@ export function CreateAgentPage() {
   const handleSubmit = async () => {
     if (!name.trim() || !displayName.trim()) return;
     setError(null);
+    setErrorState(null);
     setSubmitting(true);
     try {
       if (usingTemplate) {
@@ -153,7 +163,12 @@ export function CreateAgentPage() {
       navigate('/agents');
     } catch (e) {
       // Template errors carry an actionable zh-TW message (e.g. bad TOML).
-      setError(usingTemplate ? formatError(e) : intl.formatMessage({ id: 'agents.create.error' }));
+      if (usingTemplate) {
+        setErrorState(e);
+        setErrorRetry(() => () => void handleSubmit());
+      } else {
+        setError(intl.formatMessage({ id: 'agents.create.error' }));
+      }
     } finally {
       setSubmitting(false);
     }
@@ -327,6 +342,13 @@ export function CreateAgentPage() {
           </SettingsSection>
         )}
 
+        {errorState != null && (
+          <ErrorState
+            variant="inline"
+            error={errorState}
+            onRetry={errorRetry ?? undefined}
+          />
+        )}
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
     </div>

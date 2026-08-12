@@ -19,6 +19,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { departmentsOf } from '@/lib/agents';
 import { CustomSkillsSection } from '@/components/skills/CustomSkillsSection';
+import { AutonomyNote } from '@/components/AutonomyNote';
 import { toast, formatError } from '@/lib/toast';
 import { glyphText } from '@/lib/agent-glyph';
 import {
@@ -1175,6 +1176,8 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
               </SelectContent>
             </Select>
           </div>
+
+          <AutonomyNote id="skillsInstall" />
 
           {/* Security scan */}
           <Button variant="outline" onClick={handleScan} disabled={scanning || !skill.url}>

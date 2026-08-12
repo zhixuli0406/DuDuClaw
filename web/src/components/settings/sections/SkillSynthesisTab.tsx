@@ -4,11 +4,13 @@ import { api, type SkillSynthesisConfig } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
+  ErrorState,
   SettingsSection,
   SettingsCard,
   SettingsSaveState,
 } from '@/components/mds';
 import { RowText, RowNumber, RowSwitch } from '@/pages/agent-form/form-rows';
+import { AutonomyNote } from '@/components/AutonomyNote';
 import { AlertTriangle, ExternalLink } from 'lucide-react';
 
 export function SkillSynthesisTab() {
@@ -20,13 +22,19 @@ export function SkillSynthesisTab() {
   const [gapDigestDirty, setGapDigestDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // P05: with `config` still null after a failed read the tab sat on "載入中…"
+  // forever — a spinner that never resolves reads as a hung app, not an error.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
   const load = useCallback(async () => {
+    setLoadError(null);
     try {
       setConfig(await api.skillSynthesis.get());
     } catch (e) {
+      setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     }
     try {
@@ -42,6 +50,7 @@ export function SkillSynthesisTab() {
   const handleSave = async () => {
     if (!config) return;
     setSaving(true);
+    setSaveError(null);
     try {
       await api.skillSynthesis.update({
         auto_run: config.auto_run,
@@ -57,6 +66,7 @@ export function SkillSynthesisTab() {
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
+      setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
@@ -64,7 +74,13 @@ export function SkillSynthesisTab() {
   };
 
   if (!config) {
-    return (
+    return loadError != null ? (
+      <ErrorState
+        error={loadError}
+        title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+        onRetry={() => void load()}
+      />
+    ) : (
       <p className="py-8 text-center text-sm text-muted-foreground">
         {intl.formatMessage({ id: 'common.loading' })}
       </p>
@@ -94,6 +110,10 @@ export function SkillSynthesisTab() {
             onChange={(v) => { setGapDigest(v); setGapDigestDirty(true); }}
           />
         </SettingsCard>
+        {/* C12: auto_run's own help text only ever said "auto-run" — never the
+            combined behavior with dry_run. One note covers both regardless of
+            which of the two is currently toggled. */}
+        {config.auto_run && <AutonomyNote id="skillSynthesis" className="mt-4" />}
       </SettingsSection>
 
       {/* Live-mode warning when writes are enabled */}
@@ -146,6 +166,15 @@ export function SkillSynthesisTab() {
         </SettingsCard>
       </SettingsSection>
 
+      {saveError != null && (
+        <ErrorState
+          variant="inline"
+          error={saveError}
+          title={intl.formatMessage({ id: 'errorState.manage.saveFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.saveFailedHint' })}
+          onRetry={() => void handleSave()}
+        />
+      )}
       <div className="flex items-center justify-end gap-3">
         <SettingsSaveState
           status={saving ? 'saving' : saved ? 'saved' : 'idle'}

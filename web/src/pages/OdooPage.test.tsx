@@ -78,3 +78,55 @@ describe('OdooPage saved-credential display', () => {
     ).not.toBeInTheDocument();
   });
 });
+
+/**
+ * The per-AI-staff summary (AgentOdooOverride) used to flag `unblock_models`
+ * with an inline "not yet editable from any page" note — that gap is now
+ * closed on EditAgentPage.tsx's integration tab, so the note should be gone
+ * and the field should read like every other row in the summary.
+ */
+describe('OdooPage per-agent override summary — unblock_models edit path', () => {
+  function mockAgentOverride(cfgExtra: Record<string, unknown> = {}) {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'agents.list') {
+        return Promise.resolve({ agents: [{ name: 'bot-1', display_name: 'Bot One' }] });
+      }
+      if (method === 'odoo.agent_config_get') {
+        return Promise.resolve({
+          agent_id: 'bot-1',
+          configured: true,
+          allowed_models: [],
+          unblock_models: ['res.partner'],
+          allowed_actions: [],
+          company_ids: [],
+          api_key_set: false,
+          password_set: false,
+          ...cfgExtra,
+        });
+      }
+      // odoo.status / odoo.config for the page-level connection section.
+      return Promise.resolve({ connected: false });
+    });
+  }
+
+  it('shows the unblock_models value without the stale no-edit-path note', async () => {
+    mockAgentOverride();
+    renderWithProviders(<OdooPage />);
+
+    expect(await screen.findByText('res.partner')).toBeInTheDocument();
+    expect(screen.queryByText('Not yet editable from any page.')).not.toBeInTheDocument();
+  });
+
+  it('still cross-links to the employee edit page (the one real edit surface)', async () => {
+    mockAgentOverride();
+    renderWithProviders(<OdooPage />);
+
+    // Wait for the per-agent config fetch to settle (agents.list → setSelected
+    // → odoo.agent_config_get is a multi-hop async chain) before querying for
+    // the cross-link that renders alongside it.
+    await screen.findByText('res.partner');
+    expect(
+      screen.getByRole('button', { name: "Edit on this employee's page" }),
+    ).toBeInTheDocument();
+  });
+});

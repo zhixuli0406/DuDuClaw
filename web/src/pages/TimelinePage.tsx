@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useUrlState } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
 import { ChartGantt } from 'lucide-react';
 import {
@@ -22,6 +23,7 @@ import {
   CardContent,
   Segmented,
   Empty,
+  ErrorState,
   Skeleton,
   ActorAvatar,
   Select,
@@ -40,7 +42,8 @@ import {
  * `timeline.list`, which only ever reports REAL timestamps.
  */
 
-type RangeKey = '1h' | '6h' | '24h' | '7d';
+const RANGE_KEYS = ['1h', '6h', '24h', '7d'] as const;
+type RangeKey = (typeof RANGE_KEYS)[number];
 const RANGE_HOURS: Record<RangeKey, number> = { '1h': 1, '6h': 6, '24h': 24, '7d': 168 };
 
 const REFRESH_MS = 30_000;
@@ -127,10 +130,12 @@ export function TimelinePage() {
   const scope = useDataScope();
   const visibleAgents = useVisibleAgents();
 
-  const [range, setRange] = useState<RangeKey>('24h');
-  const [agentFilter, setAgentFilter] = useState<string>('');
+  // P11 (state-as-URL): time window and employee scope are what this page *is*
+  // — both round-trip through `?range=`/`?agent=` so a view can be shared.
+  const [range, setRange] = useUrlState('range', '24h', { allowed: RANGE_KEYS });
+  const [agentFilter, setAgentFilter] = useUrlState('agent', '');
   const [result, setResult] = useState<TimelineListResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [loaded, setLoaded] = useState(false);
   const [hover, setHover] = useState<Hover | null>(null);
   const [chartRef, chartWidth] = useElementWidth<HTMLDivElement>();
@@ -153,7 +158,7 @@ export function TimelinePage() {
       setResult(res);
       setError(null);
     } catch (e) {
-      setError(String(e));
+      setError(e);
     } finally {
       setLoaded(true);
     }
@@ -225,7 +230,7 @@ export function TimelinePage() {
     [intl],
   );
 
-  const rangeOptions: SegmentedOption<RangeKey>[] = (['1h', '6h', '24h', '7d'] as const).map((r) => ({
+  const rangeOptions: SegmentedOption<RangeKey>[] = RANGE_KEYS.map((r) => ({
     value: r,
     label: intl.formatMessage({ id: `timeline.range.${r}` }),
   }));
@@ -332,11 +337,11 @@ export function TimelinePage() {
                   <Skeleton className="h-8 w-2/3" />
                 </div>
               ) : error ? (
-                <Empty
-                  tone="destructive"
+                <ErrorState
                   icon={ChartGantt}
                   title={intl.formatMessage({ id: 'timeline.error' })}
-                  description={error}
+                  error={error}
+                  onRetry={() => void fetchTimeline()}
                 />
               ) : !hasRows ? (
                 <Empty

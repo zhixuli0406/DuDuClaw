@@ -1,16 +1,18 @@
-import { useEffect, useState, useRef } from 'react';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { api } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
+  ErrorState,
   Input,
   SettingsSection,
   SettingsCard,
   SettingsSaveState,
 } from '@/components/mds';
 import { AdvancedSection, type SelectOption } from '@/components/settings/controls';
+import { AutonomyNote } from '@/components/AutonomyNote';
 import { RowSelect, RowSwitch, RowText, FieldBlock } from '@/pages/agent-form/form-rows';
 
 // ── Voice Settings Tab ─────────────────────────────────────────
@@ -41,27 +43,37 @@ export function VoiceTab() {
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // P05: voice defaults ("auto"/off) are indistinguishable from a failed read,
+  // so the failure has to say so itself and offer a way back.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
   // Load persisted [voice] settings from inference.toml on mount.
-  useEffect(() => {
+  const load = useCallback(() => {
+    setLoadError(null);
     api.system.config().then((res) => {
       if (res?.voice) {
         setConfig((prev) => ({ ...prev, ...res.voice }));
       }
     }).catch((e) => {
+      setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     });
   }, [intl]);
 
+  useEffect(() => { load(); }, [load]);
+
   const handleSave = async () => {
     setSaving(true);
+    setSaveError(null);
     try {
       await api.system.updateConfig({ voice: config });
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
+      setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
@@ -89,6 +101,15 @@ export function VoiceTab() {
 
   return (
     <div className="space-y-8">
+      {loadError != null && (
+        <ErrorState
+          variant="inline"
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          onRetry={load}
+        />
+      )}
+
       <SettingsSection>
         <SettingsCard>
           <RowSwitch
@@ -119,6 +140,15 @@ export function VoiceTab() {
             options={langOptions}
           />
         </SettingsCard>
+        {saveError != null && (
+          <ErrorState
+            variant="inline"
+            error={saveError}
+            title={intl.formatMessage({ id: 'errorState.manage.saveFailed' })}
+            description={intl.formatMessage({ id: 'errorState.manage.saveFailedHint' })}
+            onRetry={() => void handleSave()}
+          />
+        )}
         <div className="flex items-center justify-end gap-3">
           <SettingsSaveState
             status={saving ? 'saving' : saved ? 'saved' : 'idle'}
@@ -150,10 +180,16 @@ function SttConfigCard() {
   const [keySet, setKeySet] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // P05: "STT 未設定" and "we could not read the STT settings" render the same
+  // empty form. Only a real read failure sets `loadError`; a 401/404 first-run
+  // response keeps the old silent-defaults behaviour.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
-  useEffect(() => {
+  const load = useCallback(() => {
+    setLoadError(null);
     const jwt = useAuthStore.getState().jwt;
     fetch('/api/voice/config', { headers: jwt ? { Authorization: `Bearer ${jwt}` } : {} })
       .then((r) => (r.ok ? r.json() : null))
@@ -167,11 +203,14 @@ function SttConfigCard() {
         });
         setKeySet(!!data.stt_api_key_set);
       })
-      .catch(() => { /* first-run / unauthorized — leave defaults */ });
+      .catch((e) => { setLoadError(e); });
   }, []);
+
+  useEffect(() => { load(); }, [load]);
 
   const handleSave = async () => {
     setSaving(true);
+    setSaveError(null);
     try {
       const jwt = useAuthStore.getState().jwt;
       const payload: Record<string, unknown> = { ...stt };
@@ -190,6 +229,7 @@ function SttConfigCard() {
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
+      setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
@@ -213,6 +253,15 @@ function SttConfigCard() {
         defaultMessage: '設定聊天頁「按住說話」的語音辨識來源。未設定時語音輸入會停用。',
       })}
     >
+      {loadError != null && (
+        <ErrorState
+          variant="inline"
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          onRetry={load}
+        />
+      )}
+
       <SettingsCard>
         <RowSelect
           label={intl.formatMessage({ id: 'voice.stt.provider', defaultMessage: 'STT 供應商' })}
@@ -262,9 +311,19 @@ function SttConfigCard() {
             onChange={(e) => setStt({ ...stt, stt_command: e.target.value })}
             placeholder="whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --no-prints"
           />
+          <AutonomyNote id="voiceSttCommand" className="mt-2" />
         </FieldBlock>
       )}
 
+      {saveError != null && (
+        <ErrorState
+          variant="inline"
+          error={saveError}
+          title={intl.formatMessage({ id: 'errorState.manage.saveFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.saveFailedHint' })}
+          onRetry={() => void handleSave()}
+        />
+      )}
       <div className="flex items-center justify-end gap-3">
         <SettingsSaveState
           status={saving ? 'saving' : saved ? 'saved' : 'idle'}

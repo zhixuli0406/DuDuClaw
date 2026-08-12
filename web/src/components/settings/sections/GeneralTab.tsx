@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { useSystemStore } from '@/stores/system-store';
 import { useTourStore } from '@/stores/tour-store';
@@ -6,6 +6,7 @@ import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
+  ErrorState,
   SettingsSection,
   SettingsCard,
   SettingsRow,
@@ -29,11 +30,16 @@ export function GeneralTab() {
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // P05: a failed load used to leave the form showing its hard-coded defaults —
+  // indistinguishable from "the gateway really is set to info/priority". Both
+  // failure paths now leave a persistent, retryable notice on the page.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
-  // Load current config on mount
-  useEffect(() => {
+  const load = useCallback(() => {
+    setLoadError(null);
     api.system.config().then((res) => {
       const raw = (res as Record<string, unknown>)?.config;
       if (typeof raw === 'string') {
@@ -47,6 +53,7 @@ export function GeneralTab() {
       }
     }).catch((e) => {
       console.warn("[api]", e);
+      setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     });
     // Best-effort: non-admin sessions / older gateways just keep the row hidden.
@@ -54,6 +61,9 @@ export function GeneralTab() {
       if (s.supported) setAutostart(s.enabled);
     }).catch(() => {});
   }, [intl]);
+
+  // Load current config on mount
+  useEffect(() => { load(); }, [load]);
 
   const handleAutostartToggle = async (next: boolean) => {
     setAutostartBusy(true);
@@ -77,6 +87,7 @@ export function GeneralTab() {
   const handleSave = async () => {
     setSaving(true);
     setSaved(false);
+    setSaveError(null);
     try {
       await api.system.updateConfig({
         log_level: logLevel,
@@ -87,6 +98,7 @@ export function GeneralTab() {
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
       console.warn("[api]", e);
+      setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
@@ -115,6 +127,15 @@ export function GeneralTab() {
 
   return (
     <div className="space-y-8">
+      {loadError != null && (
+        <ErrorState
+          variant="inline"
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          onRetry={load}
+        />
+      )}
+
       <SettingsSection>
         <SettingsCard>
           <SettingRow
@@ -178,7 +199,17 @@ export function GeneralTab() {
         </SettingsCard>
       </AdvancedSection>
 
-      {/* Save */}
+      {/* Save — a failed write stays on screen next to the button that caused
+          it, so the user knows the form still holds unsaved edits. */}
+      {saveError != null && (
+        <ErrorState
+          variant="inline"
+          error={saveError}
+          title={intl.formatMessage({ id: 'errorState.manage.saveFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.saveFailedHint' })}
+          onRetry={() => void handleSave()}
+        />
+      )}
       <div className="flex items-center justify-end gap-3">
         <SettingsSaveState
           status={saving ? 'saving' : saved ? 'saved' : 'idle'}

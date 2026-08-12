@@ -9,6 +9,7 @@ import {
   Button,
   Badge,
   Empty,
+  ErrorState,
   ActorAvatar,
   DropdownMenu,
   DropdownMenuTrigger,
@@ -32,6 +33,7 @@ import {
   celebrateTaskDone,
 } from '@/components/task';
 import { OpenInChannelButton } from '@/components/inbox/OpenInChannelButton';
+import { NeedsHumanActions } from '@/components/inbox/NeedsHumanTaskPanel';
 import { toStatusKey } from '@/lib/task-status';
 import { timeAgo } from '@/lib/format';
 import { api, type TaskInfo, type TaskStatus, type TaskPriority, type TaskIteration } from '@/lib/api';
@@ -45,6 +47,7 @@ import {
   ClipboardList,
   ChevronRight,
   CircleCheck,
+  MessageSquareWarning,
 } from 'lucide-react';
 import { toast } from '@/lib/toast';
 
@@ -86,11 +89,16 @@ export function TaskDetailPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const { id } = useParams<{ id: string }>();
+  // Same store, same P05 Blocker as the board: nothing here read `error`, so a
+  // failed edit / assign / comment / delete was invisible — and the delete even
+  // navigated away as if it had worked.
   const {
     tasks,
     activities,
     comments,
     loading,
+    error,
+    clearError,
     fetchTasks,
     updateTask,
     removeTask,
@@ -173,6 +181,12 @@ export function TaskDetailPage() {
     [task, assignTask],
   );
 
+  // WP-A (§2-6): a task parked on a human decision is resolved ONLY through the
+  // three choices below (重試 / 標記完成 / 放棄) — the same ones the inbox and the
+  // channel buttons offer. The generic status picker never handled it correctly
+  // anyway: `pending` (= 重試) was not among its options at all.
+  const needsHuman = task?.status === 'needs_human';
+
   // ── Right-hand PropertiesPanel (shell column, spec §5.3 式1 right 320) ──
   useEffect(() => () => clearPanel(), [clearPanel]);
   useEffect(() => {
@@ -183,13 +197,14 @@ export function TaskDetailPage() {
         <TaskProperties
           task={task}
           agents={agents}
+          statusLocked={needsHuman}
           onStatusChange={applyStatus}
           onPriorityChange={applyPriority}
           onAssign={applyAssign}
         />
       ),
     });
-  }, [task, agents, setPanel, intl, applyStatus, applyPriority, applyAssign]);
+  }, [task, agents, needsHuman, setPanel, intl, applyStatus, applyPriority, applyAssign]);
 
   const copyLink = useCallback(() => {
     try {
@@ -201,12 +216,18 @@ export function TaskDetailPage() {
   }, [intl]);
 
   const handleRemove = useCallback(async () => {
-    if (task) {
-      await removeTask(task.id);
-      setConfirmRemove(false);
-      navigate('/tasks');
+    if (!task) return;
+    clearError();
+    await removeTask(task.id);
+    // Navigating away on a failed delete is the worst outcome available: the
+    // task is still there and the user is told nothing.
+    if (useTasksStore.getState().error != null) {
+      toast.error(intl.formatMessage({ id: 'tasks.remove.failed' }));
+      return;
     }
-  }, [task, removeTask, navigate]);
+    setConfirmRemove(false);
+    navigate('/tasks');
+  }, [task, removeTask, navigate, clearError, intl]);
 
   const togglePanel = useCallback(() => {
     setSheetOpen(true); // mobile: open the sheet
@@ -221,16 +242,35 @@ export function TaskDetailPage() {
           hideTrigger
           segments={[{ label: intl.formatMessage({ id: 'nav.tasks' }), onClick: () => navigate('/tasks') }]}
         />
-        <Empty
-          icon={ClipboardList}
-          title={intl.formatMessage({ id: loading ? 'common.loading' : 'tasks.detail.notFound' })}
-          action={
-            <Button variant="outline" size="sm" onClick={() => navigate('/tasks')}>
-              <ArrowLeft />
-              {intl.formatMessage({ id: 'tasks.detail.backToBoard' })}
-            </Button>
-          }
-        />
+        {error != null && !loading ? (
+          // "Couldn't load" and "this task doesn't exist" are different answers
+          // and used to share one screen.
+          <ErrorState
+            icon={ClipboardList}
+            error={error}
+            onRetry={() => {
+              clearError();
+              void fetchTasks();
+            }}
+            action={
+              <Button variant="outline" size="sm" onClick={() => navigate('/tasks')}>
+                <ArrowLeft />
+                {intl.formatMessage({ id: 'tasks.detail.backToBoard' })}
+              </Button>
+            }
+          />
+        ) : (
+          <Empty
+            icon={ClipboardList}
+            title={intl.formatMessage({ id: loading ? 'common.loading' : 'tasks.detail.notFound' })}
+            action={
+              <Button variant="outline" size="sm" onClick={() => navigate('/tasks')}>
+                <ArrowLeft />
+                {intl.formatMessage({ id: 'tasks.detail.backToBoard' })}
+              </Button>
+            }
+          />
+        )}
       </div>
     );
   }
@@ -254,15 +294,19 @@ export function TaskDetailPage() {
         segments={segments}
         actions={
           <>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={() => applyStatus(isDone ? 'todo' : 'done')}
-              aria-label={intl.formatMessage({ id: isDone ? 'tasks.detail.markDoneUndo' : 'tasks.detail.markDone' })}
-              title={intl.formatMessage({ id: isDone ? 'tasks.detail.markDoneUndo' : 'tasks.detail.markDone' })}
-            >
-              <CircleCheck className={isDone ? 'text-success' : undefined} />
-            </Button>
+            {/* Hidden while the task waits on a decision — the panel below is
+                the single writer for that state (WP-A §2-6). */}
+            {!needsHuman && (
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => applyStatus(isDone ? 'todo' : 'done')}
+                aria-label={intl.formatMessage({ id: isDone ? 'tasks.detail.markDoneUndo' : 'tasks.detail.markDone' })}
+                title={intl.formatMessage({ id: isDone ? 'tasks.detail.markDoneUndo' : 'tasks.detail.markDone' })}
+              >
+                <CircleCheck className={isDone ? 'text-success' : undefined} />
+              </Button>
+            )}
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={
@@ -297,6 +341,18 @@ export function TaskDetailPage() {
 
       {/* Left content column (spec §5.3 式1: mx-auto max-w-4xl px-8 py-8). */}
       <div className="mx-auto w-full max-w-4xl space-y-6 px-5 py-6 md:px-8 md:py-8">
+        {error != null && (
+          <ErrorState
+            variant="inline"
+            title={intl.formatMessage({ id: 'errorState.actionFailed' })}
+            error={error}
+            onRetry={() => {
+              clearError();
+              void fetchTasks();
+            }}
+          />
+        )}
+
         {/* Parent chain */}
         {parent && (
           <button
@@ -332,6 +388,26 @@ export function TaskDetailPage() {
             <OpenInChannelButton channel={task.channel} link={task.channel_link} className="ml-auto" />
           </div>
         </div>
+
+        {/* WP-A (§2-6): the one decision surface for a 等你決定 task, identical to
+            the inbox's — reason first, then the same three choices. */}
+        {needsHuman && (
+          <section
+            aria-label={intl.formatMessage({ id: 'taskStatus.needs_human' })}
+            className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4"
+          >
+            <p className="text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: 'tasks.needsHuman.prompt' })}
+            </p>
+            {task.judge_feedback && (
+              <p className="flex items-start gap-2 rounded-lg bg-surface px-3 py-2 text-xs text-muted-foreground">
+                <MessageSquareWarning className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+                <span>{task.judge_feedback}</span>
+              </p>
+            )}
+            <NeedsHumanActions taskId={task.id} onResolved={fetchTasks} />
+          </section>
+        )}
 
         {/* Description (inline edit, multiline) */}
         <div>
@@ -489,7 +565,9 @@ export function TaskDetailPage() {
           comments={taskComments}
           agents={agents}
           onAddComment={async (body) => {
-            await addComment(task.id, body);
+            clearError();
+            const added = await addComment(task.id, body);
+            if (!added) toast.error(intl.formatMessage({ id: 'tasks.comment.failed' }));
           }}
           currentUserId={currentUser?.id}
           currentUserName={currentUser?.display_name}

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useUrlState } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -18,7 +19,7 @@ import {
   type OsSettingsUpdateParams,
   type OsStatusResult,
 } from '@/lib/api';
-import { toast, formatError } from '@/lib/toast';
+import { toast } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import {
   MonitorCog,
@@ -40,6 +41,8 @@ import {
   CardTitle,
   CardDescription,
   Empty,
+  ErrorState,
+  useErrorMessage,
   Select,
   SelectContent,
   SelectItem,
@@ -183,11 +186,15 @@ export function OSPage() {
     (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values),
     [intl],
   );
+  const errorText = useErrorMessage();
   const connectionState = useConnectionStore((s) => s.state);
   const { agents, fetchAgents } = useAgentsStore();
 
   // ── Overview: fleet status ──
   const [status, setStatus] = useState<OsStatusResult | null>(null);
+  // Each section keeps its own failure so a dead section reads as "this didn't
+  // load" instead of "no AI staff member has OS sensing on" (P05 Blocker).
+  const [statusError, setStatusError] = useState<unknown>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [savingField, setSavingField] = useState<string | null>(null);
@@ -199,9 +206,10 @@ export function OSPage() {
       try {
         const res = await api.os.status();
         setStatus(res);
+        setStatusError(null);
       } catch (e) {
         console.warn('[os]', e);
-        toast.error(t('toast.error.loadFailed', { message: formatError(e) }));
+        setStatusError(e);
       } finally {
         setLoading(false);
         setRefreshing(false);
@@ -240,7 +248,7 @@ export function OSPage() {
         if (errorCode(e) === OS_NATIVE_QUOTA_ERROR_CODE) {
           toast.error(errorMessage(e) ?? t('os.quota.toast'));
         } else {
-          toast.error(t('toast.error.saveFailed', { message: formatError(e) }));
+          toast.error(t('toast.error.saveFailed', { message: errorText(e) }));
         }
       } finally {
         setSavingField((k) => (k === key ? null : k));
@@ -250,9 +258,13 @@ export function OSPage() {
   );
 
   // ── Proactivity gate report ──
-  const [gateAgentFilter, setGateAgentFilter] = useState('');
+  // P11 (state-as-URL): "which employee's gate decisions am I reading" is the
+  // one filter on this report, so it belongs in `?gate_agent=<id>` (namespaced
+  // because the page also carries per-agent settings cards).
+  const [gateAgentFilter, setGateAgentFilter] = useUrlState('gate_agent', '');
   const [gateData, setGateData] = useState<OsGateRecentResult | null>(null);
   const [gateLoading, setGateLoading] = useState(true);
+  const [gateError, setGateError] = useState<unknown>(null);
 
   const fetchGate = useCallback(
     async (agentId: string, silent = false) => {
@@ -260,10 +272,11 @@ export function OSPage() {
       try {
         const res = await api.os.gateRecent({ n: 50, ...(agentId ? { agent_id: agentId } : {}) });
         setGateData(res);
+        setGateError(null);
       } catch (e) {
         console.warn('[os.gate]', e);
         setGateData(null);
-        toast.error(t('toast.error.loadFailed', { message: formatError(e) }));
+        setGateError(e);
       } finally {
         setGateLoading(false);
       }
@@ -297,6 +310,7 @@ export function OSPage() {
   // manual refresh button keeps working either way.
   const [events, setEvents] = useState<OsEventRow[]>([]);
   const [eventsLoading, setEventsLoading] = useState(true);
+  const [eventsError, setEventsError] = useState<unknown>(null);
   const [liveActive, setLiveActive] = useState(false);
   // Synthetic ids for live-pushed rows (negative, decrementing — real DB ids
   // from `os.events.recent` are always positive) double as the "just arrived"
@@ -309,14 +323,15 @@ export function OSPage() {
     try {
       const res = await api.os.eventsRecent({ n: 50 });
       setEvents(res.events ?? []);
+      setEventsError(null);
     } catch (e) {
       console.warn('[os.events]', e);
       setEvents([]);
-      toast.error(t('toast.error.loadFailed', { message: formatError(e) }));
+      setEventsError(e);
     } finally {
       setEventsLoading(false);
     }
-  }, [t]);
+  }, []);
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
@@ -362,7 +377,7 @@ export function OSPage() {
       setDoctorChecks(res.checks ?? []);
     } catch (e) {
       console.warn('[os.doctor]', e);
-      toast.error(t('toast.error.actionFailed', { message: formatError(e) }));
+      toast.error(t('toast.error.actionFailed', { message: errorText(e) }));
     } finally {
       setDoctorLoading(false);
     }
@@ -422,6 +437,12 @@ export function OSPage() {
               <Skeleton className="h-56 w-full rounded-xl" />
               <Skeleton className="h-56 w-full rounded-xl" />
             </div>
+          ) : statusError ? (
+            <ErrorState
+              icon={MonitorCog}
+              error={statusError}
+              onRetry={() => void fetchStatus()}
+            />
           ) : !status || status.agents.length === 0 ? (
             <Empty icon={MonitorCog} title={t('os.empty.title')} description={t('os.empty.desc')} />
           ) : (
@@ -482,6 +503,12 @@ export function OSPage() {
               <Skeleton className="h-40 w-full" />
               <Skeleton className="h-24 w-full" />
             </div>
+          ) : gateError ? (
+            <ErrorState
+              icon={Radar}
+              error={gateError}
+              onRetry={() => void fetchGate(gateAgentFilter)}
+            />
           ) : !gateData || gateData.recent.length === 0 ? (
             <Empty icon={Radar} title={t('os.gate.empty.title')} description={t('os.gate.empty.desc')} />
           ) : (
@@ -581,6 +608,12 @@ export function OSPage() {
               <Skeleton className="h-9 w-full" />
               <Skeleton className="h-9 w-full" />
             </div>
+          ) : eventsError ? (
+            <ErrorState
+              icon={ListChecks}
+              error={eventsError}
+              onRetry={() => void fetchEvents()}
+            />
           ) : events.length === 0 ? (
             <Empty icon={ListChecks} title={t('os.events.empty.title')} description={t('os.events.empty.desc')} />
           ) : (

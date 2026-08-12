@@ -34,17 +34,19 @@ describe('MemoryPage', () => {
     expect(screen.getByRole('radio', { name: 'Memories' })).toBeInTheDocument();
     // The knowledge base merged in here (2026-07-30 client feedback).
     expect(screen.getByRole('radio', { name: 'Personal' })).toBeInTheDocument();
-    expect(screen.getByRole('radio', { name: 'Shared' })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: 'Shared by all staff' })).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: 'Key Insights' })).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: 'Self-Improvement' })).toBeInTheDocument();
   });
 
-  it('collapses the two knowledge bases into one tab on Personal', () => {
+  it('collapses the two knowledge bases into one tab on Personal, but still shows what all staff share', () => {
     setEdition('personal');
     renderWithProviders(<MemoryPage />);
     expect(screen.getByRole('radio', { name: 'Knowledge base' })).toBeInTheDocument();
-    expect(screen.queryByRole('radio', { name: 'Shared' })).not.toBeInTheDocument();
     expect(screen.queryByRole('radio', { name: 'Personal' })).not.toBeInTheDocument();
+    // The shared tab is not enterprise-only — Personal-edition staff still
+    // benefit from whatever the operator curates into the shared wiki.
+    expect(screen.getByRole('radio', { name: 'Shared by all staff' })).toBeInTheDocument();
   });
 
   // Evolution v3 dashboard convergence: stagnation watch, rejection

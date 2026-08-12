@@ -11,6 +11,7 @@ import {
   type NotifyTypeStat,
 } from '@/lib/api';
 import { formatMillicents, formatTokens } from '@/lib/format';
+import { useUrlState } from '@/lib/use-url-state';
 import {
   MessageCircle,
   Zap,
@@ -23,11 +24,11 @@ import {
   TriangleAlert,
   BellRing,
 } from 'lucide-react';
-import { toast, formatError } from '@/lib/toast';
 import {
   PageHeader,
   Segmented,
   Empty,
+  ErrorState,
   Badge,
   ActorAvatar,
   Table,
@@ -39,7 +40,8 @@ import {
   type SegmentedOption,
 } from '@/components/mds';
 
-type Period = 'day' | 'week' | 'month';
+const PERIODS = ['day', 'week', 'month'] as const;
+type Period = (typeof PERIODS)[number];
 
 const PERIOD_HOURS: Record<Period, number> = { day: 24, week: 168, month: 720 };
 
@@ -151,28 +153,32 @@ function ReportCard({
 export function ReportPage() {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
-  const [period, setPeriod] = useState<Period>('month');
+  // P11 (state-as-URL): the reporting window is the page's main control, so a
+  // "last 7 days" view is linkable and survives a refresh.
+  const [period, setPeriod] = useUrlState('period', 'month', { allowed: PERIODS });
   const [summary, setSummary] = useState<Summary | null>(null);
   const [daily, setDaily] = useState<readonly DailyRow[]>([]);
   const [costs, setCosts] = useState<readonly CostRow[]>([]);
+  // A toast that vanishes after 7s leaves every panel sitting at its "no usage
+  // yet" state, which is indistinguishable from a brand-new install. Keep the
+  // failure on screen with a way to retry instead (P05 Blocker, phase-4 audit).
+  const [loadError, setLoadError] = useState<unknown>(null);
 
-  const fetchData = useCallback(
-    (p: Period) => {
-      // One aggregate toast if anything in the group fails so three parallel
-      // errors don't stack three notifications on the user.
-      let notified = false;
-      const onFailure = (e: unknown) => {
-        console.warn('[api]', e);
-        if (notified) return;
-        notified = true;
-        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
-      };
-      api.analytics.summary(p).then(setSummary).catch(onFailure);
-      api.analytics.conversations().then((r) => setDaily(r?.daily ?? [])).catch(onFailure);
-      api.analytics.costSavings().then((r) => setCosts(r?.monthly ?? [])).catch(onFailure);
-    },
-    [intl],
-  );
+  const fetchData = useCallback((p: Period) => {
+    // One aggregate report if anything in the group fails so three parallel
+    // errors don't stack three notices on the user.
+    let notified = false;
+    const onFailure = (e: unknown) => {
+      console.warn('[api]', e);
+      if (notified) return;
+      notified = true;
+      setLoadError(e);
+    };
+    setLoadError(null);
+    api.analytics.summary(p).then(setSummary).catch(onFailure);
+    api.analytics.conversations().then((r) => setDaily(r?.daily ?? [])).catch(onFailure);
+    api.analytics.costSavings().then((r) => setCosts(r?.monthly ?? [])).catch(onFailure);
+  }, []);
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
@@ -185,7 +191,7 @@ export function ReportPage() {
   const visibleDays = period === 'day' ? 7 : period === 'week' ? 14 : 30;
   const visibleDaily = daily.slice(-visibleDays);
 
-  const periodOptions: SegmentedOption<Period>[] = (['day', 'week', 'month'] as const).map((p) => ({
+  const periodOptions: SegmentedOption<Period>[] = PERIODS.map((p) => ({
     value: p,
     label: intl.formatMessage({ id: `reports.period.${p}` }),
   }));
@@ -206,6 +212,14 @@ export function ReportPage() {
       </PageHeader>
 
       <div className="mx-auto w-full max-w-6xl space-y-5 p-6">
+        {loadError != null && (
+          <ErrorState
+            variant="inline"
+            error={loadError}
+            onRetry={() => fetchData(period)}
+          />
+        )}
+
         {/* Conversation KPI strip. */}
         {summary && (
           <KpiGroup>

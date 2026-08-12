@@ -22,6 +22,7 @@ export function LoginPage() {
   const otpVerify = useAuthStore((s) => s.otpVerify);
   const firstRunStatus = useAuthStore((s) => s.firstRunStatus);
   const firstRunClaim = useAuthStore((s) => s.firstRunClaim);
+  const tryLocalSession = useAuthStore((s) => s.tryLocalSession);
   const loading = useAuthStore((s) => s.loading);
 
   const [mode, setMode] = useState<Mode>('password');
@@ -45,6 +46,21 @@ export function LoginPage() {
       active = false;
     };
   }, [firstRunStatus]);
+
+  // WP-F1 (design §2, D3-A). Landing here directly — a bookmarked /login, or a
+  // session that expired — must not dead-end a passwordless Personal install
+  // whose owner never set a password. AuthGuard already probes once per page
+  // load; the store's one-shot flag makes this a no-op when it did, so a
+  // refused instance shows the form immediately with no extra request.
+  useEffect(() => {
+    let active = true;
+    void tryLocalSession().then((ok) => {
+      if (ok && active) navigate('/', { replace: true });
+    });
+    return () => {
+      active = false;
+    };
+  }, [tryLocalSession, navigate]);
 
   const handleClaim = async (e: FormEvent) => {
     e.preventDefault();
