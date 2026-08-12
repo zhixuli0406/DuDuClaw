@@ -2127,6 +2127,23 @@ async fn build_reply_with_session_inner(
             }
         }
 
+        // Cross-invocation continuity: recent self-action feed from the
+        // audit log — the channel run opens aware of what this agent already
+        // did in scheduled/heartbeat/goal-loop invocations, so it can't deny
+        // its own recorded actions (blocked/failed ones included). Tail
+        // placement, after CACHE_SPLIT_MARKER — never in the cached prefix.
+        {
+            let home = ctx.home_dir.clone();
+            let aid = agent_id.clone();
+            if let Ok(Some(section)) = tokio::task::spawn_blocking(move || {
+                crate::recent_actions::build_recent_actions_section(&home, &aid)
+            })
+            .await
+            {
+                prompt = format!("{prompt}\n\n{section}");
+            }
+        }
+
         if !compression_summary.is_empty() {
             prompt = format!("{prompt}\n\n## Prior Conversation Summary\n{compression_summary}");
         }
