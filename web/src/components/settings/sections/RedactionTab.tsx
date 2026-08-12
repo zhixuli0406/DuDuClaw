@@ -22,6 +22,7 @@ import {
   CardContent,
   Button,
   Badge,
+  ErrorState,
   Input,
   Switch,
   Select,
@@ -300,6 +301,10 @@ export function RedactionTab() {
   const [config, setConfig] = useState<RedactionConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // P05: the audit section below already had a proper inline error card; the
+  // main form did not, so a failed read left it on "載入中…" indefinitely.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   const [newTool, setNewTool] = useState('');
   const [customOpen, setCustomOpen] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -312,11 +317,13 @@ export function RedactionTab() {
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
   const load = useCallback(async () => {
+    setLoadError(null);
     try {
       const res = await api.redaction.get();
       setConfig(res);
       savedEgressKeysRef.current = Object.keys(res.tool_egress);
     } catch (e) {
+      setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     }
   }, [intl]);
@@ -326,6 +333,7 @@ export function RedactionTab() {
   const handleSave = async () => {
     if (!config) return;
     setSaving(true);
+    setSaveError(null);
     try {
       const egress: Record<string, RedactionEgressRule | null> = { ...config.tool_egress };
       for (const k of savedEgressKeysRef.current) {
@@ -349,6 +357,7 @@ export function RedactionTab() {
         savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
       }
     } catch (e) {
+      setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
@@ -381,7 +390,13 @@ export function RedactionTab() {
   };
 
   if (!config) {
-    return (
+    return loadError != null ? (
+      <ErrorState
+        error={loadError}
+        title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+        onRetry={() => void load()}
+      />
+    ) : (
       <p className="py-8 text-center text-sm text-muted-foreground">
         {intl.formatMessage({ id: 'common.loading' })}
       </p>
@@ -621,6 +636,16 @@ export function RedactionTab() {
               </div>
             )}
           </div>
+
+          {saveError != null && (
+            <ErrorState
+              variant="inline"
+              error={saveError}
+              title={intl.formatMessage({ id: 'errorState.manage.saveFailed' })}
+              description={intl.formatMessage({ id: 'errorState.manage.saveFailedHint' })}
+              onRetry={() => void handleSave()}
+            />
+          )}
 
           <div className="flex items-center justify-end gap-2 pt-2">
             {saved && <span className="text-xs text-success">{intl.formatMessage({ id: 'redaction.savedLive' })}</span>}

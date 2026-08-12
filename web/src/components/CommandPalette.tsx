@@ -26,8 +26,11 @@ import {
   conversationsEntry,
   inboxEntry,
   manageEntry,
+  navGroups,
   navGroupsForEdition,
+  personalAdvancedGroup,
   primaryItemsForEdition,
+  staffEntry,
   type NavItem,
 } from '@/components/layout/nav-model';
 import { hasMinRole } from '@/lib/roles';
@@ -51,6 +54,10 @@ const ID_LOOKUP_DEBOUNCE_MS = 200;
 interface Command {
   readonly id: string;
   readonly groupLabel: string;
+  /** Route the group's section header navigates to when clicked (X10: "分組
+   *  標題可一鍵前往該分組"). Undefined for utility groups with no representative
+   *  page (最近 / 動作) — their header stays plain, non-interactive text. */
+  readonly groupRoute?: string;
   readonly label: string;
   /** One-line description shown under the label (nav commands). */
   readonly subtitle?: string;
@@ -68,6 +75,19 @@ interface Command {
 interface ScoredCommand extends Command {
   readonly score: number;
   readonly indices: readonly number[];
+}
+
+/**
+ * Landing route for a nav-model group's section header (X10 audit fix — the
+ * header showed which group a result belonged to but offered no way to jump
+ * to that group as a whole). A group lands on its first, highest-priority
+ * item's route — with one exception: 每日's first item is 新對話, an *action*
+ * (clears the chat view) rather than a page, so 每日 lands on 儀表板 instead.
+ */
+function groupLandingRoute(rawGroupLabel: string): string | undefined {
+  if (rawGroupLabel === 'navGroup.daily') return '/';
+  if (rawGroupLabel === personalAdvancedGroup.label) return personalAdvancedGroup.items[0]?.to;
+  return navGroups.find((g) => g.label === rawGroupLabel)?.items[0]?.to;
 }
 
 /** Score a command against the query across label + keywords; keep label hits for highlight. */
@@ -151,12 +171,16 @@ export function CommandPalette() {
         group.items.map((item) => ({ item, groupLabel: group.label })),
       ),
     ];
-    const visibilityCtx = { hasOperatorAccess, forksExist, isDesktop: isTauri() };
+    // D6: mirrors AppSidebar's ctx — `agents` here already feeds the
+    // agent-jump commands below, so the org chart's progressive-disclosure
+    // gate is a free read, not a second fetch.
+    const visibilityCtx = { hasOperatorAccess, forksExist, isDesktop: isTauri(), agentCount: agents.length };
     const navCommands: Command[] = navSources
       .filter(({ item }) => isVisible(item, user?.role, isPersonal, visibilityCtx))
       .map(({ item, groupLabel }) => ({
         id: `nav:${item.to}`,
         groupLabel: t(groupLabel),
+        groupRoute: groupLandingRoute(groupLabel),
         label: t(item.label),
         subtitle: t(item.desc),
         // Latin alias from the i18n id (e.g. "nav.settings" → "settings") + route
@@ -179,6 +203,7 @@ export function CommandPalette() {
       .map((item) => ({
         id: `nav:${item.to}`,
         groupLabel: t(manageEntry.label),
+        groupRoute: manageEntry.to,
         label: t(item.label),
         subtitle: t(item.desc),
         keywords: `${item.label.replace(/^manage\./, '')} ${item.to} ${t(item.desc)} manage 管理`,
@@ -191,6 +216,7 @@ export function CommandPalette() {
     const agentCommands: Command[] = agents.map((a) => ({
       id: `entity:agent:${a.name}`,
       groupLabel: t('cmdk.group.agents'),
+      groupRoute: staffEntry.to,
       label: a.display_name,
       subtitle: a.name,
       keywords: `${a.name} ${a.display_name} staff 員工`,
@@ -205,6 +231,7 @@ export function CommandPalette() {
     const taskCommands: Command[] = tasks.map((task) => ({
       id: `entity:task:${task.id}`,
       groupLabel: t('cmdk.group.tasks'),
+      groupRoute: '/tasks',
       label: task.title,
       subtitle: task.id,
       keywords: `${task.title} ${task.id} task 任務`,
@@ -232,16 +259,22 @@ export function CommandPalette() {
       perform: () => setLocale(code),
     }));
 
-    const logoutAction: Command = {
-      id: 'action:logout',
-      groupLabel: actionGroup,
-      label: t('auth.logout'),
-      keywords: 'logout sign out 登出',
-      icon: LogOut,
-      perform: () => logout(),
-    };
+    // D4-A: the Personal edition signs itself back in automatically on the next
+    // page load, so a logout command there is a button that undoes itself.
+    // Dropped rather than shown-and-broken; password protection is a config
+    // switch (`local_auto_login`), surfaced in account settings.
+    const logoutAction: Command[] = isPersonal
+      ? []
+      : [{
+          id: 'action:logout',
+          groupLabel: actionGroup,
+          label: t('auth.logout'),
+          keywords: 'logout sign out 登出',
+          icon: LogOut,
+          perform: () => logout(),
+        }];
 
-    return [...navCommands, ...manageCommands, ...agentCommands, ...taskCommands, ...themeActions, ...localeActions, logoutAction];
+    return [...navCommands, ...manageCommands, ...agentCommands, ...taskCommands, ...themeActions, ...localeActions, ...logoutAction];
   }, [t, user?.role, hasOperatorAccess, forksExist, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout]);
 
   // Empty query → recent routes first, then all commands in natural order.
@@ -251,7 +284,10 @@ export function CommandPalette() {
       const recentCmds = recent
         .map((r) => byRoute.get(r))
         .filter((c): c is Command => Boolean(c))
-        .map((c) => ({ ...c, score: 0, indices: [] as number[], groupLabel: t('cmdk.group.recent') }));
+        // 最近 is a transient re-labeling of commands pulled from various groups —
+        // clear the inherited `groupRoute` so its header doesn't point at
+        // whichever original group happened to contribute the first item.
+        .map((c) => ({ ...c, score: 0, indices: [] as number[], groupLabel: t('cmdk.group.recent'), groupRoute: undefined }));
       const recentRoutes = new Set(recent);
       const rest = commands
         .filter((c) => !(c.route && recentRoutes.has(c.route)))
@@ -338,14 +374,16 @@ export function CommandPalette() {
   const grouped = useMemo(() => {
     const order: string[] = [];
     const map = new Map<string, { cmd: ScoredCommand; index: number }[]>();
+    const routeByLabel = new Map<string, string | undefined>();
     results.forEach((cmd, index) => {
       if (!map.has(cmd.groupLabel)) {
         map.set(cmd.groupLabel, []);
         order.push(cmd.groupLabel);
+        routeByLabel.set(cmd.groupLabel, cmd.groupRoute);
       }
       map.get(cmd.groupLabel)!.push({ cmd, index });
     });
-    return order.map((label) => ({ label, items: map.get(label)! }));
+    return order.map((label) => ({ label, items: map.get(label)!, route: routeByLabel.get(label) }));
   }, [results]);
 
   const run = useCallback(
@@ -454,9 +492,25 @@ export function CommandPalette() {
           ) : (
             grouped.map((group) => (
               <div key={group.label} className="mb-1 last:mb-0">
-                <div className="px-3 pb-1 pt-2 text-xs font-medium text-muted-foreground">
-                  {group.label}
-                </div>
+                {group.route ? (
+                  // X10 fix: a group header with a representative page (every
+                  // nav-model group + the 員工/任務 entity groups) is a real
+                  // shortcut to that page, not just a label.
+                  <button
+                    type="button"
+                    onClick={() => {
+                      closePalette();
+                      navigate(group.route!);
+                    }}
+                    className="block w-full rounded px-3 pb-1 pt-2 text-left text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                  >
+                    {group.label}
+                  </button>
+                ) : (
+                  <div className="px-3 pb-1 pt-2 text-xs font-medium text-muted-foreground">
+                    {group.label}
+                  </div>
+                )}
                 {group.items.map(({ cmd, index }) => {
                   const isActive = index === activeIndex;
                   const isCurrent = cmd.route && cmd.route === location.pathname;

@@ -42,6 +42,7 @@ import {
 import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
+import { useUrlState, useUrlStateNullable } from '@/lib/use-url-state';
 import { api, type MigratePlatform, type MigrateResult, type MigrateItem } from '@/lib/api';
 import {
   MIGRATE_PLATFORMS,
@@ -264,14 +265,29 @@ function ResultReport({ result }: { result: MigrateResult }) {
   );
 }
 
+/** Legal `?platform=` values — anything else resolves to "not chosen yet". */
+const MIGRATE_PLATFORM_IDS: readonly MigratePlatform[] = MIGRATE_PLATFORMS.map((p) => p.id);
+
 export function MigratePage() {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) =>
     intl.formatMessage({ id }, values);
 
+  // P11 (state-as-URL), partially by design. The *inputs* to the wizard —
+  // which platform and which export path — round-trip through the URL, so a
+  // refresh (or "send me the link you're on") keeps the form filled.
+  //
+  // `step` deliberately stays local: the preview and result steps render from
+  // an in-memory scan/apply result that a cold page load cannot reproduce, so a
+  // `?step=preview` link would restore an empty shell — worse than restarting
+  // at step 1 with the platform and source already chosen.
   const [step, setStep] = useState<WizardStep>('platform');
-  const [platform, setPlatform] = useState<MigratePlatform | null>(null);
-  const [source, setSource] = useState('');
+  const [platformParam, setPlatformParam] = useUrlStateNullable('platform');
+  const platform = MIGRATE_PLATFORM_IDS.includes(platformParam as MigratePlatform)
+    ? (platformParam as MigratePlatform)
+    : null;
+  const setPlatform = (p: MigratePlatform | null) => setPlatformParam(p);
+  const [source, setSource] = useUrlState('source', '');
   const [rename, setRename] = useState(false);
 
   const [scanning, setScanning] = useState(false);

@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import {
   api,
   type OsAgentStatus,
@@ -62,6 +63,7 @@ export function OsAutomationTemplates({
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) =>
     intl.formatMessage({ id }, values);
+  const navigate = useNavigate();
 
   const osAgents = useMemo(() => agents.filter((a) => a.os_native), [agents]);
 
@@ -136,7 +138,13 @@ export function OsAutomationTemplates({
     try {
       if (open === 'file') await applyFileTemplate();
       else await applyAppTemplate();
-      toast.success(t('os.templates.applied'));
+      // UX audit §2-7 — the rule this just created is invisible from this
+      // page (OSPage has no view/edit UI for its own automations); point the
+      // operator straight at SettingsPage's autopilot tab, the only place it
+      // can be reviewed, edited, or deleted.
+      toast.success(t('os.templates.applied'), {
+        action: { label: t('os.templates.manageLink'), onClick: () => navigate('/manage/system?tab=autopilot') },
+      });
       setOpen(null);
       onApplied?.();
     } catch (e) {

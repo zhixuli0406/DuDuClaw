@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import { useConnectionStore } from '@/stores/connection-store';
 import { api, type BillingUsage, type BudgetIncident, type BudgetByAgent } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
-import { Wallet, GaugeCircle } from 'lucide-react';
+import { useUrlState } from '@/lib/use-url-state';
+import { Wallet, GaugeCircle, ShieldAlert } from 'lucide-react';
 import {
   Card,
   CardHeader,
@@ -12,6 +14,7 @@ import {
   CardContent,
   Badge,
   Empty,
+  ErrorState,
   Segmented,
   Table,
   TableHeader,
@@ -20,6 +23,7 @@ import {
   TableHead,
   TableCell,
   ActorAvatar,
+  CrossLink,
 } from '@/components/mds';
 
 /** A single usage KPI tile: label, big value, `used / limit` sub, progress bar. */
@@ -61,6 +65,8 @@ function fmtCents(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
 }
 
+const INCIDENT_FILTERS = ['all', 'over'] as const;
+
 // ── Budget console (WP14-T14.6) — open-events per AI staff + recent incidents ──
 
 function BudgetConsole() {
@@ -68,10 +74,17 @@ function BudgetConsole() {
   const [incidents, setIncidents] = useState<BudgetIncident[]>([]);
   const [byAgent, setByAgent] = useState<BudgetByAgent[]>([]);
   const [loading, setLoading] = useState(true);
-  const [filter, setFilter] = useState<'all' | 'over'>('all');
+  // P11 (state-as-URL): "show me only the over-budget incidents" survives a
+  // refresh and can be sent to someone else as a link.
+  const [filter, setFilter] = useUrlState('incidents', 'all', { allowed: INCIDENT_FILTERS });
+  // P05: an empty incident list is genuinely good news ("no budget events"),
+  // so a failed fetch falling into the same branch tells the user the exact
+  // opposite of the truth on a spend-safety screen.
+  const [loadError, setLoadError] = useState<unknown>(null);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     setLoading(true);
+    setLoadError(null);
     api.budget
       .incidents(50)
       .then((res) => {
@@ -80,10 +93,13 @@ function BudgetConsole() {
       })
       .catch((e) => {
         console.warn('[api]', e);
+        setLoadError(e);
         toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
       })
       .finally(() => setLoading(false));
   }, [intl]);
+
+  useEffect(() => { load(); }, [load]);
 
   const openAgents = byAgent.filter((a) => a.open_events > 0);
   const isOver = (inc: BudgetIncident) => inc.cap_cents > 0 && inc.spent_cents > inc.cap_cents;
@@ -100,6 +116,13 @@ function BudgetConsole() {
         <p className="py-6 text-center text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'common.loading' })}
         </p>
+      ) : loadError != null ? (
+        <ErrorState
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
+          onRetry={load}
+        />
       ) : incidents.length === 0 && openAgents.length === 0 ? (
         <Empty
           icon={GaugeCircle}
@@ -195,21 +218,78 @@ function BudgetConsole() {
   );
 }
 
+// ── Spend-cap mechanisms overview (WP-D §2-4) ──────────────────────
+//
+// UX audit §2-4 — five independent "how much can this cost" mechanisms
+// (account budget / per-employee budget / governance quota / kill-switch
+// cost limit / the budget circuit-breaker events surfaced only here) live on
+// five different pages with no cross-links and no shared vocabulary. This
+// page is pure read-only (no cap-setting control anywhere on it), so instead
+// of adding editing here (which would just create a sixth write point) this
+// card is a plain-language map: one sentence per mechanism + a link to where
+// it is actually configured (R-EDIT-SOURCE).
+function SpendCapsOverview() {
+  const intl = useIntl();
+  const t = (id: string) => intl.formatMessage({ id });
+  const navigate = useNavigate();
+
+  const rows: { key: string; linkLabelId: string; to: string }[] = [
+    { key: 'account', linkLabelId: 'billing.caps.account.link', to: '/manage/accounts' },
+    { key: 'agent', linkLabelId: 'billing.caps.agent.link', to: '/agents' },
+    { key: 'governance', linkLabelId: 'billing.caps.governance.link', to: '/manage/governance' },
+    { key: 'killswitch', linkLabelId: 'billing.caps.killswitch.link', to: '/manage/security' },
+    { key: 'incidents', linkLabelId: 'billing.caps.incidents.link', to: '/inbox' },
+  ];
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <ShieldAlert className="size-4 text-muted-foreground" />
+          {t('billing.caps.title')}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="p-0">
+        <ul className="divide-y divide-surface-border">
+          {rows.map((row) => (
+            <li key={row.key} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-foreground">{t(`billing.caps.${row.key}.title`)}</p>
+                <p className="text-xs text-muted-foreground">{t(`billing.caps.${row.key}.desc`)}</p>
+              </div>
+              <CrossLink label={t(row.linkLabelId)} onClick={() => navigate(row.to)} />
+            </li>
+          ))}
+        </ul>
+      </CardContent>
+    </Card>
+  );
+}
+
 export function BillingPage() {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
   const [usage, setUsage] = useState<BillingUsage | null>(null);
+  // P05: every usage tile falls back to `?? 0`, so a failed fetch renders a
+  // full dashboard reading "0 / 0" — a plausible, wrong, and reassuring number.
+  const [usageError, setUsageError] = useState<unknown>(null);
+
+  const loadUsage = useCallback(() => {
+    setUsageError(null);
+    api.billing
+      .usage()
+      .then((res) => setUsage(res))
+      .catch((e) => {
+        console.warn('[api]', e);
+        setUsageError(e);
+        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      });
+  }, [intl]);
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
-    api.billing
-      .usage()
-      .then(setUsage)
-      .catch((e) => {
-        console.warn('[api]', e);
-        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
-      });
-  }, [connectionState, intl]);
+    loadUsage();
+  }, [connectionState, loadUsage]);
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-5">
@@ -222,12 +302,29 @@ export function BillingPage() {
         </div>
       </div>
 
+      {/* Spend-cap mechanisms overview — R-EDIT-SOURCE map, WP-D §2-4 */}
+      <SpendCapsOverview />
+
       {/* Usage KPI group */}
       <Card>
         <CardHeader>
           <CardTitle>{intl.formatMessage({ id: 'billing.usage' })}</CardTitle>
         </CardHeader>
         <CardContent className="p-0">
+          {/* No usage payload + an error ⇒ show the error instead of a grid of
+              zeros; a stale payload keeps its numbers with the error above. */}
+          {usageError != null && (
+            <div className="border-t border-surface-border p-4">
+              <ErrorState
+                variant={usage == null ? 'page' : 'inline'}
+                error={usageError}
+                title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+                description={intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
+                onRetry={loadUsage}
+              />
+            </div>
+          )}
+          {!(usageError != null && usage == null) && (
           <div className="grid grid-cols-2 divide-x divide-y divide-surface-border border-t border-surface-border lg:grid-cols-4">
             <UsageTile
               label={intl.formatMessage({ id: 'billing.conversations' })}
@@ -250,6 +347,7 @@ export function BillingPage() {
               limit={usage?.inference_hours?.limit ?? 0}
             />
           </div>
+          )}
         </CardContent>
       </Card>
 

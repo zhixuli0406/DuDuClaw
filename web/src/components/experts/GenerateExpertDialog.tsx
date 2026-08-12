@@ -23,6 +23,7 @@ import {
 } from '@/components/mds';
 import { Sparkles, Users, Puzzle, BookOpen, RefreshCw } from 'lucide-react';
 import { AttachUnderSelect } from './AttachUnderSelect';
+import { ThinkingOrbIndicator } from '@/components/chat/ThinkingOrbIndicator';
 
 /** Channels a generated pack may suggest (mirrors the gateway allowlist). */
 const CHANNEL_OPTIONS = [
@@ -259,7 +260,14 @@ export function GenerateExpertDialog({
 
         {(step === 'generating' || step === 'installing') && (
           <div className="flex flex-col items-center gap-3 py-10">
-            <Spinner className="size-6" />
+            {step === 'generating' ? (
+              // AI is generating the expert team spec — big center-stage
+              // "thinking" moment; `decorative` since the paragraph below
+              // already announces the same state as text.
+              <ThinkingOrbIndicator state="waiting" decorative />
+            ) : (
+              <Spinner className="size-6" />
+            )}
             <p className="text-sm text-muted-foreground">
               {step === 'generating'
                 ? t('experts.generate.generating')

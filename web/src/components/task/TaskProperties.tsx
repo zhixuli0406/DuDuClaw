@@ -132,12 +132,20 @@ function PriorityPopover({
 export function TaskProperties({
   task,
   agents,
+  statusLocked = false,
   onStatusChange,
   onPriorityChange,
   onAssign,
 }: {
   task: TaskInfo;
   agents: ReadonlyArray<AssigneeOption>;
+  /**
+   * WP-A (§2-6): drop the picker entirely while the task waits on a person.
+   * The three-choice resolution (重試 / 標記完成 / 放棄) is the only way out of
+   * `needs_human`, and it lives on the page body — offering a generic picker
+   * here would be a second, weaker path to the same decision.
+   */
+  statusLocked?: boolean;
   onStatusChange: (next: import('@/lib/api').TaskStatus) => void;
   onPriorityChange: (next: TaskPriority) => void;
   onAssign: (agentName: string) => void;
@@ -164,13 +172,22 @@ export function TaskProperties({
           <StatusIcon
             status={statusKey}
             size="sm"
-            onChange={(next) => {
-              const backend = toBackendStatus(next);
-              if (backend && backend !== task.status) onStatusChange(backend);
-            }}
+            onChange={
+              statusLocked
+                ? undefined
+                : (next) => {
+                    const backend = toBackendStatus(next);
+                    if (backend && backend !== task.status) onStatusChange(backend);
+                  }
+            }
           />
           <span className="text-sm text-foreground">{statusLabel(statusKey)}</span>
         </PropRow>
+        {statusLocked && (
+          <p className="px-1 pb-1 text-xs text-muted-foreground">
+            {intl.formatMessage({ id: 'tasks.needsHuman.propsHint' })}
+          </p>
+        )}
         <PropRow label={intl.formatMessage({ id: 'tasks.field.priority' })} icon={Flag}>
           <PriorityPopover value={task.priority} onChange={onPriorityChange} />
         </PropRow>

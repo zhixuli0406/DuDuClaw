@@ -6,13 +6,25 @@ import { OrgChart } from '@/components/OrgChart';
 import { OrgNodePanel } from '@/components/agent';
 import type { AgentDetail } from '@/lib/api';
 import { Users } from 'lucide-react';
-import { CollectionPageHeader, CollectionPageState, Card } from '@/components/mds';
+import {
+  CollectionPageHeader,
+  CollectionPageState,
+  Card,
+  ErrorState,
+  useErrorMessage,
+} from '@/components/mds';
+import { toast } from '@/lib/toast';
 import { usePanel } from '@/components/ui';
 
 export function OrgChartPage() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const { agents, fetchAgents, pauseAgent, resumeAgent, loading, loaded } = useAgentsStore();
+  const errorText = useErrorMessage();
+  // `error` was never destructured here (P05 Blocker, phase-4 audit): a failed
+  // roster fetch fell through to the "還沒有 AI 員工？" empty state, telling the
+  // user to hire someone when the real problem was the connection.
+  const { agents, fetchAgents, pauseAgent, resumeAgent, loading, loaded, error, clearError } =
+    useAgentsStore();
   const [selectedAgent, setSelectedAgent] = useState<AgentDetail | null>(null);
   const { setPanel, clearPanel, setSheetOpen } = usePanel();
 
@@ -41,18 +53,36 @@ export function OrgChartPage() {
             clearPanel();
             navigate(`/agents/${encodeURIComponent(selectedAgent.name)}`);
           }}
+          onEdit={() => {
+            clearPanel();
+            navigate(`/agents/${encodeURIComponent(selectedAgent.name)}/edit`);
+          }}
           onPause={async () => {
-            await pauseAgent(selectedAgent.name);
+            try {
+              await pauseAgent(selectedAgent.name);
+            } catch (e) {
+              toast.error(
+                intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: errorText(e) }),
+              );
+              return;
+            }
             setSelectedAgent((prev) => (prev ? { ...prev, status: 'paused' } : null));
           }}
           onResume={async () => {
-            await resumeAgent(selectedAgent.name);
+            try {
+              await resumeAgent(selectedAgent.name);
+            } catch (e) {
+              toast.error(
+                intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: errorText(e) }),
+              );
+              return;
+            }
             setSelectedAgent((prev) => (prev ? { ...prev, status: 'active' } : null));
           }}
         />
       ),
     });
-  }, [selectedAgent, setPanel, clearPanel, navigate, pauseAgent, resumeAgent]);
+  }, [selectedAgent, setPanel, clearPanel, navigate, pauseAgent, resumeAgent, intl, errorText]);
 
   return (
     <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
@@ -68,6 +98,15 @@ export function OrgChartPage() {
       <div className="mx-auto w-full max-w-6xl p-6">
         {!loaded && loading ? (
           <CollectionPageState state="loading" />
+        ) : error != null && agents.length === 0 ? (
+          <ErrorState
+            icon={Users}
+            error={error}
+            onRetry={() => {
+              clearError();
+              void fetchAgents();
+            }}
+          />
         ) : agents.length === 0 ? (
           <CollectionPageState state="empty" icon={Users} title={intl.formatMessage({ id: 'agents.empty' })} />
         ) : (

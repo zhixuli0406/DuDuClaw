@@ -7,6 +7,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import {
   Badge,
   Button,
+  ErrorState,
   SettingsCard,
   SettingsSection,
   SettingsSaveState,
@@ -41,10 +42,15 @@ export function DelegationTab() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // P05: a failed read left the radio group on its `department` default and an
+  // empty pair list — visually identical to a real, saved configuration.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
   const load = useCallback(async () => {
+    setLoadError(null);
     try {
       const [settings, list] = await Promise.all([
         api.delegation.get(),
@@ -56,6 +62,7 @@ export function DelegationTab() {
       setAgents(list.agents ?? []);
     } catch (e) {
       console.warn('[api]', e);
+      setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     } finally {
       setLoading(false);
@@ -98,6 +105,7 @@ export function DelegationTab() {
   const handleSave = async () => {
     setSaving(true);
     setSaved(false);
+    setSaveError(null);
     try {
       await api.delegation.set({
         policy,
@@ -110,6 +118,7 @@ export function DelegationTab() {
       await load();
     } catch (e) {
       console.warn('[api]', e);
+      setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
@@ -118,6 +127,15 @@ export function DelegationTab() {
 
   return (
     <div className="space-y-8">
+      {loadError != null && (
+        <ErrorState
+          variant="inline"
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          onRetry={() => void load()}
+        />
+      )}
+
       {warnings.length > 0 && (
         <div className="rounded-lg border border-warning/30 bg-warning/10 p-3 text-xs text-foreground">
           <p className="mb-1 flex items-center gap-1.5 font-medium">
@@ -237,6 +255,15 @@ export function DelegationTab() {
         </p>
       </SettingsSection>
 
+      {saveError != null && (
+        <ErrorState
+          variant="inline"
+          error={saveError}
+          title={intl.formatMessage({ id: 'errorState.manage.saveFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.saveFailedHint' })}
+          onRetry={() => void handleSave()}
+        />
+      )}
       <div className="flex flex-wrap items-center justify-end gap-3">
         {incomplete && (
           <span className="text-xs text-warning">{t('settings.delegation.pair.incomplete')}</span>

@@ -12,7 +12,10 @@ beforeEach(() => {
   mockWsClient.call.mockResolvedValue({});
 });
 
-describe('ApprovalsPage (MDS)', () => {
+// The page is no longer on any route (WP-A §2-6): `/approvals` redirects to
+// `/inbox`, and `App.routes.test.tsx` locks that in. These tests keep covering
+// the component itself only until the file is deleted next round.
+describe('ApprovalsPage (MDS, unrouted — see App.routes.test.tsx)', () => {
   it('renders the header and the empty state when nothing is pending', async () => {
     renderWithProviders(<ApprovalsPage />);
     expect(await screen.findByText('Approval center')).toBeInTheDocument();

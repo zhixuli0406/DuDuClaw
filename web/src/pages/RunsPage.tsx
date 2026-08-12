@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { useSearchParams } from 'react-router';
 import {
   ArrowLeft,
   CheckCircle2,
@@ -13,7 +12,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
-import { withParam } from '@/lib/url-params';
+import { useUrlState, useUrlStateNullable } from '@/lib/use-url-state';
 import {
   cardsForEvents,
   isRunLive,
@@ -31,6 +30,7 @@ import {
   PageHeader,
   Badge,
   Empty,
+  ErrorState,
   Skeleton,
   ActorAvatar,
   Select,
@@ -105,17 +105,19 @@ export function RunsPage() {
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const scope = useDataScope();
   const visibleAgents = useVisibleAgents();
-  const [searchParams, setSearchParams] = useSearchParams();
 
-  // W3-3 (state-as-URL): the agent filter starts from `?agent=<id>` when the
-  // page is opened via a bookmarked/shared link, same as any other visit.
-  const [agentFilter, setAgentFilter] = useState(() => searchParams.get('agent') ?? '');
+  // W3-3 / P11 (state-as-URL): the agent filter *lives* in `?agent=<id>` — the
+  // URL is the state, not a copy of it, so a bookmarked/shared link opens the
+  // same view and no mirror effect can fall out of sync.
+  const [agentFilter, setAgentFilter] = useUrlState('agent', '');
   const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [listError, setListError] = useState<string | null>(null);
+  const [listError, setListError] = useState<unknown>(null);
   const [listLoaded, setListLoaded] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // The open transcript is page state too: `?run=<id>` makes "look at this
+  // run" a shareable link (P11, phase-4 audit).
+  const [selectedId, setSelectedId] = useUrlStateNullable('run');
   const [detail, setDetail] = useState<RunDetail | null>(null);
-  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailError, setDetailError] = useState<unknown>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
   // Non-admin scopes must query per agent (the gateway fails closed without
@@ -123,13 +125,8 @@ export function RunsPage() {
   const effectiveAgent =
     agentFilter || (scope !== 'all' ? (visibleAgents[0]?.name ?? '') : '');
 
-  // Mirror the explicit filter (not the scope fallback above) back into the
-  // URL so the current view is bookmarkable/shareable (W3-3). Only the
-  // user's own choice is written — the non-admin default scope is derived,
-  // not a filter the user picked, so it stays out of the URL.
-  useEffect(() => {
-    setSearchParams((prev) => withParam(prev, 'agent', agentFilter), { replace: true });
-  }, [agentFilter, setSearchParams]);
+  // Only the user's own choice reaches the URL — the non-admin default scope
+  // above is derived, not a filter the user picked, so it stays out (W3-3).
 
   const agentName = useCallback(
     (id: string) => agents.find((a) => a.name === id)?.display_name || id,
@@ -155,7 +152,7 @@ export function RunsPage() {
       setRuns(res.runs);
       setListError(null);
     } catch (e) {
-      setListError(String(e));
+      setListError(e);
     } finally {
       setListLoaded(true);
     }
@@ -184,7 +181,7 @@ export function RunsPage() {
       setDetail(res);
       setDetailError(null);
     } catch (e) {
-      setDetailError(String(e));
+      setDetailError(e);
     } finally {
       setDetailLoading(false);
     }
@@ -289,11 +286,11 @@ export function RunsPage() {
           </div>
         ) : listError ? (
           <div className="p-4">
-            <Empty
+            <ErrorState
               icon={ScrollText}
-              tone="destructive"
               title={intl.formatMessage({ id: 'runs.error' })}
-              description={listError}
+              error={listError}
+              onRetry={() => void fetchRuns()}
             />
           </div>
         ) : runs.length === 0 ? (
@@ -389,11 +386,13 @@ export function RunsPage() {
         </div>
       ) : detailError ? (
         <div className="p-6">
-          <Empty
+          <ErrorState
             icon={ScrollText}
-            tone="destructive"
             title={intl.formatMessage({ id: 'runs.error' })}
-            description={detailError}
+            error={detailError}
+            onRetry={
+              selectedId ? () => void fetchDetail(selectedId, true) : undefined
+            }
           />
         </div>
       ) : detail ? (

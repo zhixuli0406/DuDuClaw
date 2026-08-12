@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import {
   Share2Icon,
   HistoryIcon,
@@ -22,10 +23,13 @@ import {
   Badge,
   Input,
   Empty,
+  ErrorState,
   Spinner,
+  CrossLink,
 } from '@/components/mds';
 import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
 import { MemoryGraph } from '@/components/MemoryGraph';
+import { ThinkingOrbIndicator } from '@/components/chat/ThinkingOrbIndicator';
 import {
   api,
   type MemoryGraphEdge,
@@ -116,23 +120,45 @@ function GraphTab({
   const [graph, setGraph] = useState<MemoryGraphResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<MemoryGraphEdge | null>(null);
+  // Read failures here used to be rewritten into an empty graph — the write
+  // paths on this page already reported failures properly, the read paths
+  // didn't (P05 Blocker, phase-4 audit).
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setSelected(null);
     api.memory.graph(agentId).then((res) => {
-      if (!cancelled) setGraph(res);
-    }).catch(() => {
-      if (!cancelled) setGraph({ nodes: [], edges: [], truncated: false });
+      if (cancelled) return;
+      setGraph(res);
+      setLoadError(null);
+    }).catch((e: unknown) => {
+      if (cancelled) return;
+      setGraph(null);
+      setLoadError(e);
     }).finally(() => {
       if (!cancelled) setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [agentId]);
+  }, [agentId, reloadNonce]);
 
   if (loading && !graph) {
-    return <div className="flex justify-center py-16"><Spinner /></div>;
+    return (
+      <div className="flex justify-center py-16">
+        <ThinkingOrbIndicator state="searching" />
+      </div>
+    );
+  }
+
+  if (loadError != null) {
+    return (
+      <ErrorState
+        error={loadError}
+        onRetry={() => setReloadNonce((n) => n + 1)}
+      />
+    );
   }
 
   if (!graph || graph.edges.length === 0) {
@@ -146,54 +172,64 @@ function GraphTab({
   }
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[1fr_20rem]">
-      <Card className="overflow-hidden">
-        {/* Legend + truncation notice */}
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b border-surface-border px-4 py-2">
-          <span className="font-mono text-xs tabular-nums text-muted-foreground">
-            {graph.nodes.length} · {graph.edges.length}
-          </span>
-          <span className="hidden h-3 w-px bg-surface-border sm:inline-block" />
-          {(['high', 'medium', 'low'] as const).map((tier) => (
-            <span key={tier} className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: TIER_SWATCH[tier] }} />
-              {intl.formatMessage({ id: `curate.legend.${tier}` })}
+    <div className="space-y-2">
+      {/* Plain-language disambiguation from KnowledgeHubPage's topic map — same
+          page tree, two different "graphs" (UX audit §2-5). */}
+      <p className="text-sm text-muted-foreground">
+        {intl.formatMessage({ id: 'curate.graph.intro' })}
+      </p>
+      <div className="grid gap-4 lg:grid-cols-[1fr_20rem]">
+        <Card className="overflow-hidden">
+          {/* Legend + truncation notice */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b border-surface-border px-4 py-2">
+            <span className="font-mono text-xs tabular-nums text-muted-foreground">
+              {graph.nodes.length} · {graph.edges.length}
             </span>
-          ))}
-          {graph.truncated && (
-            <span className="ml-auto text-xs text-warning">
-              {intl.formatMessage({ id: 'curate.graph.truncated' }, { n: graph.edges.length })}
-            </span>
-          )}
-        </div>
-        <MemoryGraph
-          nodes={graph.nodes}
-          edges={graph.edges}
-          onSelectEdge={setSelected}
-          selectedMemoryId={selected?.memory_id ?? null}
-        />
-      </Card>
-
-      {/* Provenance side panel */}
-      {selected ? (
-        <ProvenancePanel
-          agentId={agentId}
-          edge={selected}
-          onClose={() => setSelected(null)}
-          onOpenHistory={onOpenHistory}
-        />
-      ) : (
-        <Card data-size="sm">
-          <CardContent className="flex h-full items-center justify-center py-10 text-center text-sm text-muted-foreground">
-            {intl.formatMessage({ id: 'curate.graph.selectHint' })}
-          </CardContent>
+            <span className="hidden h-3 w-px bg-surface-border sm:inline-block" />
+            {(['high', 'medium', 'low'] as const).map((tier) => (
+              <span key={tier} className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: TIER_SWATCH[tier] }} />
+                {intl.formatMessage({ id: `curate.legend.${tier}` })}
+              </span>
+            ))}
+            {graph.truncated && (
+              <span className="ml-auto text-xs text-warning">
+                {intl.formatMessage({ id: 'curate.graph.truncated' }, { n: graph.edges.length })}
+              </span>
+            )}
+          </div>
+          <MemoryGraph
+            nodes={graph.nodes}
+            edges={graph.edges}
+            onSelectEdge={setSelected}
+            selectedMemoryId={selected?.memory_id ?? null}
+          />
         </Card>
-      )}
+
+        {/* Provenance side panel */}
+        {selected ? (
+          <ProvenancePanel
+            agentId={agentId}
+            edge={selected}
+            onClose={() => setSelected(null)}
+            onOpenHistory={onOpenHistory}
+          />
+        ) : (
+          <Card data-size="sm">
+            <CardContent className="flex h-full items-center justify-center py-10 text-center text-sm text-muted-foreground">
+              {intl.formatMessage({ id: 'curate.graph.selectHint' })}
+            </CardContent>
+          </Card>
+        )}
+      </div>
     </div>
   );
 }
 
-function ProvenancePanel({
+// X03 (UX audit §3.3): exported so the CrossLink into WikiTrustPage can be
+// unit-tested directly, the same way `formatSource` below is — the graph tab
+// it normally opens inside is a D3/SVG canvas not worth driving from a test.
+export function ProvenancePanel({
   agentId,
   edge,
   onClose,
@@ -205,6 +241,7 @@ function ProvenancePanel({
   onOpenHistory: (fact: FactKey) => void;
 }) {
   const intl = useIntl();
+  const navigate = useNavigate();
   // Enrich with confidence + valid interval from the fact's history (best-effort).
   const [record, setRecord] = useState<MemoryChainEntry | null>(null);
 
@@ -276,6 +313,17 @@ function ProvenancePanel({
           />
         </dl>
 
+        {/* X03 (UX audit §3.3): the trust % above is this same edge's
+            `origin_trust` (write-time trust ceiling); the full page-level
+            trust score audit lives on WikiTrustPage, an unrelated nav branch
+            with no route back until now. */}
+        <div className="flex justify-end">
+          <CrossLink
+            label={intl.formatMessage({ id: 'crosslink.provenance.wikiTrustLink' })}
+            onClick={() => navigate('/manage/governance?tab=wikiTrust')}
+          />
+        </div>
+
         {edge.predicate && (
           <Button
             variant="outline"
@@ -311,6 +359,7 @@ function TimelineTab({ agentId, pinnedFact }: { agentId: string; pinnedFact: Fac
   const [predicate, setPredicate] = useState('');
   const [chain, setChain] = useState<MemoryChainEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [queryError, setQueryError] = useState<unknown>(null);
 
   const runQuery = useCallback(async (subj: string, pred: string) => {
     if (!subj.trim() || !pred.trim()) return;
@@ -318,8 +367,11 @@ function TimelineTab({ agentId, pinnedFact }: { agentId: string; pinnedFact: Fac
     try {
       const res = await api.memory.history(agentId, { subject: subj.trim(), predicate: pred.trim() });
       setChain(res.chain);
-    } catch {
-      setChain([]);
+      setQueryError(null);
+    } catch (e) {
+      // A failed query used to render as "this fact has no history".
+      setChain(null);
+      setQueryError(e);
     } finally {
       setLoading(false);
     }
@@ -362,7 +414,15 @@ function TimelineTab({ agentId, pinnedFact }: { agentId: string; pinnedFact: Fac
       </div>
 
       {loading ? (
-        <div className="flex justify-center py-16"><Spinner /></div>
+        <div className="flex justify-center py-16">
+          <ThinkingOrbIndicator state="searching" />
+        </div>
+      ) : queryError != null ? (
+        <ErrorState
+          icon={HistoryIcon}
+          error={queryError}
+          onRetry={() => void runQuery(subject, predicate)}
+        />
       ) : chain === null ? (
         <Empty icon={HistoryIcon} title={intl.formatMessage({ id: 'curate.timeline.empty' })} variant="dashed" />
       ) : chain.length === 0 ? (
@@ -459,12 +519,17 @@ function AutoPagesTab({ agentId }: { agentId: string }) {
   const [removeTarget, setRemoveTarget] = useState<AutoWikiPage | null>(null);
   const [purgeOpen, setPurgeOpen] = useState(false);
 
+  const [loadError, setLoadError] = useState<unknown>(null);
+
   const fetchPages = useCallback(async () => {
     try {
       const res = await api.wiki.autoPages(agentId);
       setPages(res.pages);
-    } catch {
+      setLoadError(null);
+    } catch (e) {
+      // Was silently rewritten into "no auto-filed pages yet".
       setPages([]);
+      setLoadError(e);
     }
   }, [agentId]);
 
@@ -518,6 +583,16 @@ function AutoPagesTab({ agentId }: { agentId: string }) {
       <div className="flex justify-center py-16">
         <Spinner />
       </div>
+    );
+  }
+
+  if (loadError != null) {
+    return (
+      <ErrorState
+        icon={FileTextIcon}
+        error={loadError}
+        onRetry={() => void fetchPages()}
+      />
     );
   }
 

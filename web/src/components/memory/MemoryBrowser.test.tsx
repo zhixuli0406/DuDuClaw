@@ -487,3 +487,88 @@ describe('MemoryBrowser — category rail as URL (W3-3)', () => {
     });
   });
 });
+
+// ── R1: memory decay made visible (2026-08-12) ──
+//
+// A memory is not a permanent record — unused ones fade and are eventually
+// filed away. That used to be invisible right up until a row disappeared.
+
+describe('MemoryBrowser freshness', () => {
+  /** Same memory, with the decay figures the gateway now sends. */
+  const FADING = {
+    id: 'd1',
+    agent_id: 'agnes',
+    content: '客戶偏好下午開會',
+    timestamp: '2026-05-01T10:00:00Z',
+    tags: [],
+    layer: 'semantic',
+    retrievability: 0.2,
+    stability_days: 14,
+    last_accessed: null,
+  };
+
+  it('shows the state on the row, in words a user can act on', async () => {
+    mockCalls([FADING]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    const badge = await screen.findByLabelText(/^Fading —/);
+    expect(badge).toHaveTextContent('Fading');
+    // The badge is a diagnosis; the explanation has to carry the treatment.
+    expect(badge).toHaveAccessibleName(/Using it again makes it last longer/);
+  });
+
+  it('explains the four states once, above the list', async () => {
+    mockCalls([FADING]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    const legend = await screen.findByRole('list', {
+      name: 'What the freshness labels mean',
+    });
+    expect(within(legend).getAllByRole('listitem')).toHaveLength(4);
+  });
+
+  it('claims no state when the gateway sent no figure', async () => {
+    // An older gateway sends rows without the decay fields. Guessing a state
+    // would be worse than showing none.
+    mockCalls([{ ...FADING, retrievability: undefined, stability_days: undefined }]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    await screen.findByText('客戶偏好下午開會');
+    expect(screen.queryByLabelText(/^Fading —/)).not.toBeInTheDocument();
+  });
+
+  it('opens the full detail — curve and revision history — in one place', async () => {
+    const user = userEvent.setup();
+    mockCalls([FADING]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    await user.click(await screen.findByText('客戶偏好下午開會'));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('How long this one lasts')).toBeInTheDocument();
+    // Every number the curve encodes is also written out, so nothing about it
+    // is gated behind hovering a plot.
+    expect(within(dialog).getByText(/could be filed away at any time/)).toBeInTheDocument();
+    expect(within(dialog).getByText('Filed away')).toBeInTheDocument();
+    // The provenance panel still loads lazily, only once opened.
+    await waitFor(() => {
+      expect(mockWsClient.call).toHaveBeenCalledWith('memory.history', {
+        agent_id: 'agnes',
+        memory_id: 'd1',
+      });
+    });
+  });
+
+  it('omits the curve when there is no figure to draw one from', async () => {
+    const user = userEvent.setup();
+    mockCalls([{ ...FADING, stability_days: undefined }]);
+    renderWithProviders(<MemoryBrowser agentId="agnes" query="" />);
+
+    await user.click(await screen.findByText('客戶偏好下午開會'));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).queryByText('How long this one lasts')).not.toBeInTheDocument();
+    // The rest of the detail is unaffected.
+    expect(within(dialog).getByText('Kind')).toBeInTheDocument();
+  });
+});

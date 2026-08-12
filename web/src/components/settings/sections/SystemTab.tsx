@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { Plus, X } from 'lucide-react';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -7,6 +7,7 @@ import { isImeComposing } from '@/lib/keyboard';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
+  ErrorState,
   Input,
   SettingsSection,
   SettingsCard,
@@ -23,6 +24,41 @@ const SM_BACKENDS = ['local', 'vault', 'env', 'onepassword', 'infisical'];
 type BindMode = 'loopback' | 'lan' | 'custom';
 const bindToMode = (v: string): BindMode =>
   v === '0.0.0.0' ? 'lan' : v === '' || v === '127.0.0.1' ? 'loopback' : 'custom';
+
+/**
+ * Config keys the gateway names in its rejection messages → the i18n id of the
+ * field label the user actually sees. This tab submits 20+ fields in ONE
+ * payload, so "save failed" alone leaves the user hunting; when the server says
+ * which key it choked on we point at that row's label. Purely additive: an
+ * unrecognised message just shows no field hint (never a guessed one).
+ */
+const FIELD_LABEL_IDS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\bbind\b/i, 'settings.system.bind'],
+  [/\bport\b/i, 'settings.system.port'],
+  [/\bauth_token\b/i, 'settings.system.authToken'],
+  [/\bhealth_check_interval_seconds\b/i, 'settings.system.healthInterval'],
+  [/\bcooldown_after_rate_limit_seconds\b/i, 'settings.system.cooldown'],
+  [/\bdefault_agent\b/i, 'settings.system.defaultAgent'],
+  [/\binference_mode\b/i, 'settings.system.inferenceMode'],
+  [/\blog_format\b/i, 'settings.system.logFormat'],
+  [/\ballowed_origins?\b/i, 'settings.system.remoteAccess'],
+  [/\bvault_addr\b/i, 'settings.system.vaultAddr'],
+  [/\bvault_mount\b/i, 'settings.system.vaultMount'],
+  [/\bvault_token\b/i, 'settings.system.vaultToken'],
+  [/\bsecret_manager\b|\bbackend\b/i, 'settings.system.smBackend'],
+  [/\bdaily_digest(_at)?\b/i, 'settings.system.dailyDigest'],
+  [/\bnovelty_gate\b/i, 'settings.system.noveltyGate'],
+  [/\bmdns_advertise\b/i, 'settings.system.mdns'],
+  [/\bname\b/i, 'settings.system.name'],
+];
+
+/** Field label ids named by a rejection message; empty when none match. */
+function fieldsInError(err: unknown): string[] {
+  const text =
+    err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  if (!text) return [];
+  return FIELD_LABEL_IDS.filter(([re]) => re.test(text)).map(([, id]) => id);
+}
 
 // Client-side fail-closed IP check (the gateway re-validates authoritatively).
 // Accepts IPv4 dotted-quad and loose IPv6; rejects hostnames / injection.
@@ -70,6 +106,10 @@ export function SystemTab() {
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // P05: 20+ fields render from compiled-in defaults when the read fails, so a
+  // silent failure here shows a plausible but fictional gateway configuration.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
@@ -77,7 +117,8 @@ export function SystemTab() {
 
   // Load non-secret current values from the TOML config string. Secrets
   // (auth_token / vault_token) are write-only — left blank, only sent if typed.
-  useEffect(() => {
+  const load = useCallback(() => {
+    setLoadError(null);
     api.system.config().then((res) => {
       const raw = (res as Record<string, unknown>)?.config;
       if (typeof raw !== 'string') return;
@@ -116,9 +157,12 @@ export function SystemTab() {
       setDailyDigestAt(res.daily_digest_at ?? '09:00');
     }).catch((e) => {
       console.warn('[api]', e);
+      setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     });
   }, [intl]);
+
+  useEffect(() => { load(); }, [load]);
 
   // Add the draft entry to the allowlist (dedup, trim). Called by the Add button
   // and the Enter key. The gateway re-cleans each entry server-side, so we only
@@ -142,6 +186,7 @@ export function SystemTab() {
     }
     setSaving(true);
     setSaved(false);
+    setSaveError(null);
     try {
       const payload: Record<string, unknown> = {};
       payload.name = name.trim();
@@ -173,11 +218,14 @@ export function SystemTab() {
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
       console.warn('[api]', e);
+      setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
     }
   };
+
+  const saveErrorFields = saveError != null ? fieldsInError(saveError) : [];
 
   const agentOptions: SelectOption[] = [
     { value: '', label: intl.formatMessage({ id: 'settings.system.none' }), raw: '' },
@@ -205,6 +253,15 @@ export function SystemTab() {
 
   return (
     <div className="space-y-8">
+      {loadError != null && (
+        <ErrorState
+          variant="inline"
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          onRetry={load}
+        />
+      )}
+
       {/* Server — display name + LAN binding/broadcast (mostly restart-required) */}
       <SettingsSection
         title={intl.formatMessage({ id: 'settings.system.server' })}
@@ -443,6 +500,32 @@ export function SystemTab() {
         </AdvancedSection>
       </SettingsSection>
 
+      {saveError != null && (
+        <ErrorState
+          variant="inline"
+          error={saveError}
+          title={intl.formatMessage({ id: 'errorState.manage.saveFailed' })}
+          description={
+            <>
+              {intl.formatMessage({ id: 'errorState.manage.saveFailedHint' })}
+              {saveErrorFields.length > 0 && (
+                <>
+                  {' '}
+                  {intl.formatMessage(
+                    { id: 'errorState.manage.fieldHint' },
+                    {
+                      fields: saveErrorFields
+                        .map((id) => intl.formatMessage({ id }))
+                        .join('、'),
+                    },
+                  )}
+                </>
+              )}
+            </>
+          }
+          onRetry={() => void handleSave()}
+        />
+      )}
       <div className="flex items-center justify-end gap-3">
         <SettingsSaveState
           status={saving ? 'saving' : saved ? 'saved' : 'idle'}

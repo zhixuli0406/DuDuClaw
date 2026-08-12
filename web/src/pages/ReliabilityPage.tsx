@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { api, type ReliabilitySummary, type EvolutionEvent } from '@/lib/api';
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
+import { useUrlState } from '@/lib/use-url-state';
 import {
   Button,
   Badge,
@@ -38,12 +40,14 @@ import {
   ActorAvatar,
   Empty,
   Skeleton,
+  CrossLink,
   type SegmentedOption,
   type BadgeProps,
 } from '@/components/mds';
 
 // ── Window options ────────────────────────────────────────────────────────────
 
+const WINDOW_DAY_VALUES = ['7', '14', '30'] as const;
 type WindowDays = 7 | 14 | 30;
 
 // ── Evolution events (self-evolution audit trail) ───────────────────────────────
@@ -180,6 +184,7 @@ function MetricGauge({
   value,
   icon: Icon,
   invertBad,
+  crossLink,
 }: {
   label: string;
   description: string;
@@ -187,6 +192,11 @@ function MetricGauge({
   icon: React.ComponentType<{ className?: string }>;
   /** If true, a HIGH value is BAD (e.g. fallback_trigger_rate). Default false. */
   invertBad?: boolean;
+  /** UX audit §2-14 — this metric is the observed effect of a threshold
+   *  configured on a different, unlinked page; render a jump-to-config link
+   *  under the gauge instead of leaving the operator to remember where it
+   *  lives. Only the fallback-rate gauge has one today. */
+  crossLink?: { label: string; onClick: () => void };
 }) {
   const pct = Math.round(value * 100);
 
@@ -221,6 +231,12 @@ function MetricGauge({
             style={{ width: `${pct}%` }}
           />
         </div>
+
+        {crossLink && (
+          <div className="flex justify-end">
+            <CrossLink label={crossLink.label} onClick={crossLink.onClick} />
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -250,11 +266,18 @@ function SkeletonGauge() {
 
 export function ReliabilityPage() {
   const intl = useIntl();
+  const navigate = useNavigate();
   const connectionState = useConnectionStore((s) => s.state);
   const { agents, fetchAgents } = useAgentsStore();
 
-  const [selectedAgent, setSelectedAgent] = useState<string>('');
-  const [windowDays, setWindowDays] = useState<WindowDays>(7);
+  // P11 (state-as-URL): "which employee, over how many days" is the whole
+  // query behind this report — both live in `?agent=`/`?window=` so the view
+  // can be linked and survives a refresh.
+  const [selectedAgent, setSelectedAgent] = useUrlState('agent', '');
+  const [windowParam, setWindowParam] = useUrlState('window', '7', { allowed: WINDOW_DAY_VALUES });
+  const windowDays = Number(windowParam) as WindowDays;
+  const setWindowDays = (d: WindowDays) =>
+    setWindowParam(String(d) as (typeof WINDOW_DAY_VALUES)[number]);
   const [summary, setSummary] = useState<ReliabilitySummary | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -440,6 +463,10 @@ export function ReliabilityPage() {
               value={summary.fallback_trigger_rate}
               icon={GitFork}
               invertBad
+              crossLink={{
+                label: intl.formatMessage({ id: 'reliability.metric.fallbackTriggerRate.tuneLink' }),
+                onClick: () => navigate('/manage/inference'),
+              }}
             />
           </>
         ) : null}

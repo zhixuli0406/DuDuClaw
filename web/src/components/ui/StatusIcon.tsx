@@ -14,6 +14,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { BACKEND_STATUSES } from '@/lib/task-status';
 
 /**
  * StatusIcon — the one task-status glyph used everywhere a task appears
@@ -39,15 +40,19 @@ export type TaskStatusKey =
   | 'failed'
   | 'cancelled';
 
-export const TASK_STATUS_ORDER: readonly TaskStatusKey[] = [
-  'backlog',
-  'todo',
-  'in_progress',
-  'in_review',
-  'done',
-  'blocked',
-  'cancelled',
-];
+/**
+ * The statuses the inline picker offers.
+ *
+ * WP-A (§2-6): this used to list seven, three of which (`backlog` /
+ * `in_review` / `cancelled`) have no backend representation — `toBackendStatus`
+ * returns `null` for them, so picking one looked like it worked and then did
+ * nothing at all. Visually-clickable-but-silently-inert is a lie the UI should
+ * never tell, so the picker now offers exactly what the gateway can persist.
+ * `BACKEND_STATUSES` (`lib/task-status.ts`) stays the single source of truth;
+ * the forward-looking three keep their glyphs and labels for DISPLAY, they are
+ * simply no longer offered as a choice.
+ */
+export const TASK_STATUS_ORDER: readonly TaskStatusKey[] = BACKEND_STATUSES;
 
 const ICONS: Record<TaskStatusKey, LucideIcon> = {
   backlog: CircleDashed,

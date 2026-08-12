@@ -1,7 +1,7 @@
 import { useIntl } from 'react-intl';
 import { ArrowRight, Pause, Play } from 'lucide-react';
 import type { AgentDetail } from '@/lib/api';
-import { ActorAvatar, Badge, Button, type ActorStatus } from '@/components/mds';
+import { ActorAvatar, Badge, Button, CrossLink, type ActorStatus } from '@/components/mds';
 
 /** Lifecycle → ActorAvatar availability dot. */
 function actorStatus(status: string): ActorStatus {
@@ -15,15 +15,22 @@ function actorStatus(status: string): ActorStatus {
  * OrgNodePanel — the small staff card that opens in the right PropertiesPanel
  * when an org-chart node is clicked (§5.4 T6.3). Avatar + status + a link into
  * the full detail page and rest/resume.
+ *
+ * X03 (UX audit §3.3): the only exit used to be "查看員工詳情" into
+ * AgentDetailPage — actually editing the staff member took 3 hops (node →
+ * detail page → kebab menu → edit). `onEdit` adds a direct CrossLink straight
+ * into EditAgentPage, bringing it back under the ≤2-hop bar.
  */
 export function OrgNodePanel({
   agent,
   onOpenDetail,
+  onEdit,
   onPause,
   onResume,
 }: {
   agent: AgentDetail;
   onOpenDetail: () => void;
+  onEdit: () => void;
   onPause: () => void;
   onResume: () => void;
 }) {
@@ -87,6 +94,9 @@ export function OrgNodePanel({
           <ArrowRight />
           {intl.formatMessage({ id: 'orgchart.openDetail' })}
         </Button>
+        <div className="flex justify-center">
+          <CrossLink label={intl.formatMessage({ id: 'crosslink.orgChart.editAgent' })} onClick={onEdit} />
+        </div>
         {active ? (
           <Button variant="outline" size="sm" onClick={onPause} className="w-full">
             <Pause />

@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useMemo, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import {
   api,
   GOV_POLICY_TYPES,
@@ -13,6 +14,7 @@ import {
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { ConfirmDialog } from '@/components/settings/controls';
 import { toast, formatError } from '@/lib/toast';
+import { useUrlState } from '@/lib/use-url-state';
 import { Scale, Plus, Trash2, Pencil, MoreHorizontal } from 'lucide-react';
 import {
   Button,
@@ -41,9 +43,11 @@ import {
   ListGridHeaderCell,
   ListGridRow,
   ListGridCell,
+  CrossLink,
 } from '@/components/mds';
 
 type TypeFilter = 'all' | GovPolicyType;
+const TYPE_FILTERS: readonly TypeFilter[] = ['all', ...GOV_POLICY_TYPES];
 
 /** Badge tone per policy type (spec: rate=info, permission=accent, quota=warning, lifecycle=success). */
 const TYPE_BADGE: Record<GovPolicyType, { variant: BadgeProps['variant']; className?: string }> = {
@@ -72,12 +76,15 @@ function defaultPolicy(type: GovPolicyType): GovPolicy {
 
 export function GovernancePage() {
   const intl = useIntl();
+  const navigate = useNavigate();
   const [policies, setPolicies] = useState<ReadonlyArray<GovPolicy>>([]);
   const [loading, setLoading] = useState(false);
   const [editing, setEditing] = useState<{ policy: GovPolicy; isNew: boolean } | null>(null);
   const [removing, setRemoving] = useState<GovPolicy | null>(null);
   const [removeBusy, setRemoveBusy] = useState(false);
-  const [filter, setFilter] = useState<TypeFilter>('all');
+  // P11 (state-as-URL): the policy-type filter is linkable, so "look at the
+  // quota policies" is one URL instead of one instruction.
+  const [filter, setFilter] = useUrlState('type', 'all', { allowed: TYPE_FILTERS });
 
   const fetchPolicies = useCallback(async () => {
     setLoading(true);
@@ -154,6 +161,22 @@ export function GovernancePage() {
         options={filterOptions}
         aria-label={intl.formatMessage({ id: 'nav.governance' })}
       />
+
+      {/* X03 (UX audit §3.3) — SecurityPage's RBAC card already links back
+          here (`security.rbac.editLink` → `/manage/governance?tab=governance`);
+          this is the missing reverse direction, shown while looking at
+          permission-type policies specifically. */}
+      {filter === 'permission' && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-muted/40 px-3 py-2">
+          <p className="text-xs text-muted-foreground">
+            {intl.formatMessage({ id: 'gov.permission.rbacHint' })}
+          </p>
+          <CrossLink
+            label={intl.formatMessage({ id: 'crosslink.governance.rbacMatrix' })}
+            onClick={() => navigate('/manage/security')}
+          />
+        </div>
+      )}
 
       {loading ? (
         <p className="py-8 text-center text-sm text-muted-foreground">{intl.formatMessage({ id: 'common.loading' })}</p>

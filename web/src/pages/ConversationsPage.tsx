@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
 import { MessagesSquare, Plus, Search, ChevronLeft, ChevronRight } from 'lucide-react';
@@ -7,6 +7,7 @@ import { toast } from '@/lib/toast';
 import { timeAgo } from '@/lib/format';
 import { sessionChannel, isConversationSession } from '@/lib/session-channel';
 import { hasMinRole } from '@/lib/roles';
+import { useUrlNumberState, useUrlState } from '@/lib/use-url-state';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useChatStore } from '@/stores/chat-store';
@@ -70,9 +71,14 @@ export function ConversationsPage() {
 
   const [sessions, setSessions] = useState<readonly ChatSessionSummary[]>([]);
   const [state, setState] = useState<LoadState>('loading');
-  const [query, setQuery] = useState('');
-  const [agentFilter, setAgentFilter] = useState<string>('all');
-  const [page, setPage] = useState(0);
+  // P11 (state-as-URL): search / employee scope / page all live in the query
+  // string, so a filtered listing is bookmarkable and survives a refresh.
+  const [query, setQuery] = useUrlState('q', '');
+  const [agentFilter, setAgentFilter] = useUrlState('agent', 'all');
+  // The URL carries the 1-based page the user sees; the slice math stays 0-based.
+  const [pageParam, setPageParam] = useUrlNumberState('page', 1, { min: 1 });
+  const page = pageParam - 1;
+  const setPage = (next: number) => setPageParam(next + 1);
   /** Bumped by the retry button so a failed listing can be re-attempted. */
   const [reloadNonce, setReloadNonce] = useState(0);
 
@@ -140,11 +146,18 @@ export function ConversationsPage() {
     // `agents` participates through agentLabel; re-run when the roster lands.
   }, [sessions, query, agents, untitled]);
 
-  // Any change to what is being listed puts you back on the first page —
-  // otherwise a narrowed filter can strand the view on an empty page 4.
+  // A *changed* filter puts you back on the first page — otherwise a narrowed
+  // filter can strand the view on an empty page 4. Deliberately keyed on the
+  // filters only (not `sessions`): the first listing landing must not stomp a
+  // deep-linked `?page=3`, and `safePage` below already clamps a page that the
+  // current result count can no longer fill.
+  const filterKey = `${query}\u0000${agentFilter}`;
+  const lastFilterKey = useRef(filterKey);
   useEffect(() => {
-    setPage(0);
-  }, [query, agentFilter, sessions]);
+    if (lastFilterKey.current === filterKey) return;
+    lastFilterKey.current = filterKey;
+    if (pageParam !== 1) setPageParam(1);
+  }, [filterKey, pageParam, setPageParam]);
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
@@ -361,7 +374,7 @@ export function ConversationsPage() {
                 variant="outline"
                 size="icon-sm"
                 disabled={safePage === 0}
-                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                onClick={() => setPage(Math.max(0, safePage - 1))}
                 aria-label={intl.formatMessage({ id: 'conversations.page.prev' })}
               >
                 <ChevronLeft />
@@ -370,7 +383,7 @@ export function ConversationsPage() {
                 variant="outline"
                 size="icon-sm"
                 disabled={safePage >= pageCount - 1}
-                onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+                onClick={() => setPage(Math.min(pageCount - 1, safePage + 1))}
                 aria-label={intl.formatMessage({ id: 'conversations.page.next' })}
               >
                 <ChevronRight />

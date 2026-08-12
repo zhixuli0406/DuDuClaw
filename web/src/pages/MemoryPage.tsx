@@ -16,7 +16,7 @@ import {
 } from '@/lib/api';
 import { timeAgo } from '@/lib/format';
 import { withParam } from '@/lib/url-params';
-import { toast, formatError } from '@/lib/toast';
+import { toast } from '@/lib/toast';
 import { useSystemStore } from '@/stores/system-store';
 import { MemoryBrowser } from '@/components/memory/MemoryBrowser';
 import { KnowledgeHubPage } from './KnowledgeHubPage';
@@ -24,6 +24,8 @@ import { SharedWikiPage } from './SharedWikiPage';
 import {
   CollectionPageHeader,
   CollectionPageState,
+  ErrorState,
+  useErrorMessage,
   Card,
   CardHeader,
   CardTitle,
@@ -68,9 +70,9 @@ import {
  *
  *   記憶       — auto-accumulated memory, grouped by topic (MemoryBrowser)
  *   個人知識庫  — the agent's own curated wiki (KnowledgeHubPage, embedded)
- *   共享知識庫  — the cross-agent wiki (SharedWikiPage, embedded) — enterprise
- *                only; on the Personal edition there is only one knowledge
- *                base, so the tab is hidden entirely
+ *   共享知識庫  — the cross-agent wiki (SharedWikiPage, embedded) — shown on
+ *                both editions; on Personal it surfaces what all AI staff
+ *                share
  *   觀察洞察    — extracted key facts
  *   自主學習    — SOUL.md evolution status and version history
  *
@@ -82,18 +84,17 @@ type ViewId = 'memories' | 'wiki' | 'shared' | 'insights' | 'evolution';
 
 const VIEW_IDS: readonly ViewId[] = ['memories', 'wiki', 'shared', 'insights', 'evolution'];
 
-function parseView(raw: string | null, allowShared: boolean): ViewId {
+function parseView(raw: string | null): ViewId {
   const v = VIEW_IDS.find((id) => id === raw);
-  if (!v) return 'memories';
-  if (v === 'shared' && !allowShared) return 'wiki';
-  return v;
+  return v ?? 'memories';
 }
 
 export function MemoryPage() {
   const intl = useIntl();
+  const errorText = useErrorMessage();
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const [params, setParams] = useSearchParams();
-  const view = parseView(params.get('tab'), !isPersonal);
+  const view = parseView(params.get('tab'));
   const [agents, setAgents] = useState<ReadonlyArray<{ name: string; display_name: string }>>([]);
   const [selectedAgent, setSelectedAgent] = useState('');
   // W3-3 (state-as-URL): the memories search term starts from `?q=` so a
@@ -119,7 +120,7 @@ export function MemoryPage() {
       if (list.length > 0) setSelectedAgent((prev) => prev || list[0].name);
     }).catch((e) => {
       console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: errorText(e) }));
     });
     // Run once on mount; intl is stable from context.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -137,12 +138,10 @@ export function MemoryPage() {
         }),
       },
     ];
-    if (!isPersonal) {
-      opts.push({
-        value: 'shared',
-        label: intl.formatMessage({ id: 'memory.tab.knowledge.shared' }),
-      });
-    }
+    opts.push({
+      value: 'shared',
+      label: intl.formatMessage({ id: 'memory.tab.knowledge.shared' }),
+    });
     opts.push(
       { value: 'insights', label: intl.formatMessage({ id: 'memory.tab.insights' }) },
       { value: 'evolution', label: intl.formatMessage({ id: 'memory.tab.evolution' }) },
@@ -251,20 +250,35 @@ function InsightsView({ agentId }: { agentId: string }) {
   const intl = useIntl();
   const [facts, setFacts] = useState<ReadonlyArray<KeyFactEntry>>([]);
   const [loading, setLoading] = useState(false);
+  // A failed read used to land on the same empty state as "nothing learned
+  // yet", with only a toast to tell them apart (P05, phase-4 audit).
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
     if (!agentId) return;
     setLoading(true);
     api.memory.keyFacts(agentId, 50).then((res) => {
       setFacts(res?.entries ?? []);
-    }).catch((e) => {
+      setLoadError(null);
+    }).catch((e: unknown) => {
       console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
       setFacts([]);
+      setLoadError(e);
     }).finally(() => setLoading(false));
-  }, [agentId, intl]);
+  }, [agentId, reloadNonce]);
 
   if (loading) return <MemoryListSkeleton />;
+
+  if (loadError != null) {
+    return (
+      <ErrorState
+        icon={LightbulbIcon}
+        error={loadError}
+        onRetry={() => setReloadNonce((n) => n + 1)}
+      />
+    );
+  }
 
   if (facts.length === 0) {
     return (
@@ -331,6 +345,7 @@ interface EvolutionAgent {
 
 function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
   const intl = useIntl();
+  const errorText = useErrorMessage();
   const [agents, setAgents] = useState<EvolutionAgent[]>([]);
   const [mode, setMode] = useState('');
   const [enabled, setEnabled] = useState(false);
@@ -347,7 +362,7 @@ function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
       console.warn('[api]', e);
       if (notified) return null;
       notified = true;
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: errorText(e) }));
       return null;
     };
     Promise.all([
@@ -809,6 +824,7 @@ function PlaybookEntryRow({ entry, onRetire }: { entry: PlaybookEntry; onRetire:
 
 function PlaybookCard({ agentId }: { agentId: string }) {
   const intl = useIntl();
+  const errorText = useErrorMessage();
   const [entries, setEntries] = useState<ReadonlyArray<PlaybookEntry>>([]);
   const [loading, setLoading] = useState(true);
   const [retireTarget, setRetireTarget] = useState<PlaybookEntry | null>(null);
@@ -821,7 +837,7 @@ function PlaybookCard({ agentId }: { agentId: string }) {
       setEntries(res?.entries ?? []);
     }).catch((e) => {
       console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: errorText(e) }));
       setEntries([]);
     }).finally(() => setLoading(false));
     // Run once per agent; `intl` is stable from context.
@@ -842,7 +858,7 @@ function PlaybookCard({ agentId }: { agentId: string }) {
       URL.revokeObjectURL(url);
       toast.success(intl.formatMessage({ id: 'playbook.export.success' }));
     } catch (e) {
-      toast.error(intl.formatMessage({ id: 'playbook.export.error' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'playbook.export.error' }, { message: errorText(e) }));
     }
   };
 
@@ -860,7 +876,7 @@ function PlaybookCard({ agentId }: { agentId: string }) {
       setReason('');
       load();
     } catch (e) {
-      toast.error(intl.formatMessage({ id: 'playbook.retire.error' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'playbook.retire.error' }, { message: errorText(e) }));
     } finally {
       setRetiring(false);
     }

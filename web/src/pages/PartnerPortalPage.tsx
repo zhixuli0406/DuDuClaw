@@ -1,5 +1,6 @@
 import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import {
   Handshake,
   Users,
@@ -16,6 +17,7 @@ import {
   Pencil,
   Trash2,
   Terminal,
+  Info,
   X,
 } from 'lucide-react';
 import { toast, formatError } from '@/lib/toast';
@@ -48,6 +50,7 @@ import {
   DialogTitle,
   DialogFooter,
   DialogClose,
+  CrossLink,
 } from '@/components/mds';
 import {
   api,
@@ -172,6 +175,7 @@ function formatDollars(cents: number): string {
 
 export function PartnerPortalPage() {
   const intl = useIntl();
+  const navigate = useNavigate();
 
   // Partner data state
   const [profile, setProfile] = useState<PartnerProfile | null>(null);
@@ -225,6 +229,23 @@ export function PartnerPortalPage() {
 
   return (
     <div className="space-y-6">
+      {/* Scope disclaimer (UX audit §2-10) — this tab tracks sales/commission
+          only; it is not the formal license-issuance surface (that's
+          DistributorsPage, /manage/distributors). Shown regardless of load
+          state so the distinction is clear from the first paint.
+          X03 (§3.3): the cross-reference used to be plain, unclickable text —
+          now a real CrossLink over to the Distributors tab. */}
+      <div className="flex flex-wrap items-start justify-between gap-3 rounded-lg border border-info/30 bg-info/10 px-4 py-3 text-sm text-foreground">
+        <div className="flex items-start gap-3">
+          <Info className="mt-0.5 size-4 shrink-0 text-info" />
+          <p>{intl.formatMessage({ id: 'partner.scopeNote' })}</p>
+        </div>
+        <CrossLink
+          label={intl.formatMessage({ id: 'crosslink.partner.toDistributors' })}
+          onClick={() => navigate('/manage/distributors?tab=distributors')}
+        />
+      </div>
+
       {/* Top-of-page load error (rose alert, dismissible). */}
       {loadError && (
         <div
@@ -456,22 +477,19 @@ export function PartnerPortalPage() {
         <CardContent>
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <MaterialCard
-              icon={<Presentation className="size-5 text-brand" />}
+              icon={<Presentation className="size-5 text-muted-foreground" />}
               title={intl.formatMessage({ id: 'partner.downloadSlides' })}
               description={intl.formatMessage({ id: 'partner.slideDecks' }) + ' (PDF, 4.2 MB)'}
-              href="#"
             />
             <MaterialCard
-              icon={<FileText className="size-5 text-brand" />}
+              icon={<FileText className="size-5 text-muted-foreground" />}
               title={intl.formatMessage({ id: 'partner.dmTemplate' })}
               description={intl.formatMessage({ id: 'partner.dmTemplate' }) + ' (DOCX, 1.8 MB)'}
-              href="#"
             />
             <MaterialCard
-              icon={<BookOpen className="size-5 text-brand" />}
+              icon={<BookOpen className="size-5 text-muted-foreground" />}
               title={intl.formatMessage({ id: 'partner.downloadCaseStudy' })}
               description={intl.formatMessage({ id: 'partner.caseStudies' }) + ' (PDF, 6.1 MB)'}
-              href="#"
             />
           </div>
         </CardContent>
@@ -836,28 +854,39 @@ function AddCustomerModal({
 
 // ── Sub-components ───────────────────────────────────────
 
+/**
+ * A marketing-material card. No real asset ships in the repo yet (checked —
+ * `marketing/slide-decks/` is still empty), so this renders as an honest
+ * disabled "coming soon" affordance (VoiceButton pattern, workspace/PromptBar.tsx)
+ * rather than a `href="#"` link that does nothing when clicked (UX audit §2-10).
+ */
 function MaterialCard({
   icon,
   title,
   description,
-  href,
 }: {
   readonly icon: ReactNode;
   readonly title: string;
   readonly description: string;
-  readonly href: string;
 }) {
+  const intl = useIntl();
+  const comingSoon = intl.formatMessage({ id: 'partner.materials.comingSoon' });
   return (
-    <a
-      href={href}
-      className="flex items-start gap-3 rounded-xl border border-surface-border bg-surface p-4 transition-colors hover:bg-surface-hover"
+    <div
+      role="group"
+      aria-disabled="true"
+      title={comingSoon}
+      className="flex cursor-not-allowed items-start gap-3 rounded-xl border border-surface-border bg-surface p-4 opacity-60"
     >
       <div className="mt-0.5">{icon}</div>
       <div className="flex-1">
         <p className="text-sm font-medium text-foreground">{title}</p>
         <p className="mt-1 text-xs text-muted-foreground">{description}</p>
+        <Badge variant="outline" className="mt-2 text-[10px]">
+          {comingSoon}
+        </Badge>
       </div>
-      <Download className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-    </a>
+      <Download className="mt-0.5 size-4 shrink-0 text-muted-foreground/40" />
+    </div>
   );
 }

@@ -34,13 +34,15 @@ import { useAgentAvatarStore } from '@/stores/agent-avatar-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentGlyphState } from '@/stores/agent-activity-store';
 import { readFileAsBase64 } from '@/lib/attachments';
-import { toast, formatError } from '@/lib/toast';
+import { toast } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import {
   PageHeader,
   Button,
   Badge,
   Empty,
+  ErrorState,
+  useErrorMessage,
   Card,
   CardHeader,
   CardTitle,
@@ -56,6 +58,7 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
   Skeleton,
+  CrossLink,
   type ActorStatus,
 } from '@/components/mds';
 import { StatusIcon } from '@/components/ui';
@@ -104,11 +107,15 @@ export function AgentDetailPage() {
   const rawTab = params.tab ?? 'overview';
   const tab: TabId = (TAB_IDS as readonly string[]).includes(rawTab) ? (rawTab as TabId) : 'overview';
 
+  const errorText = useErrorMessage();
   const connectionState = useConnectionStore((s) => s.state);
   const { pauseAgent, resumeAgent, archiveAgent, unarchiveAgent, agents, fetchAgents } = useAgentsStore();
   const setAvatarCache = useAgentAvatarStore((s) => s.set);
 
   const [detail, setDetail] = useState<AgentDetail | null>(null);
+  // A failed inspect used to fire a toast and leave the page in the same
+  // "not found" state as a deleted staff member (P05, phase-4 audit).
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [tasks, setTasks] = useState<TaskInfo[] | null>(null);
   const [activities, setActivities] = useState<ActivityEvent[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -126,14 +133,15 @@ export function AgentDetailPage() {
     try {
       const d = await api.agents.inspect(id);
       setDetail(d);
+      setLoadError(null);
       setAvatarCache(id, d.avatar ?? null);
     } catch (e) {
       console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      setLoadError(e);
     } finally {
       setLoading(false);
     }
-  }, [id, intl, setAvatarCache]);
+  }, [id, setAvatarCache]);
 
   useEffect(() => {
     if (connectionState !== 'authenticated' || !id) return;
@@ -161,7 +169,7 @@ export function AgentDetailPage() {
         .then((r) => setActivities(r?.events ?? []))
         .catch((e) => {
           console.warn('[api]', e);
-          toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+          toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: errorText(e) }));
           setActivities([]);
         });
     }
@@ -182,12 +190,15 @@ export function AgentDetailPage() {
         toast.success(intl.formatMessage({ id: successId }, { name: detail?.display_name ?? id }));
         await loadDetail();
       } catch (e) {
-        toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+        // Reachable at last: `pauseAgent`/`resumeAgent` used to swallow their
+        // own errors and resolve, so this page toasted "已讓他休息" for calls
+        // that never landed (P05 Blocker, phase-4 audit).
+        toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: errorText(e) }));
       } finally {
         setBusy(false);
       }
     },
-    [detail, id, intl, loadDetail],
+    [detail, id, intl, loadDetail, errorText],
   );
 
   const handleAvatarFile = useCallback(
@@ -209,7 +220,7 @@ export function AgentDetailPage() {
         setDetail((d) => (d ? { ...d, avatar: dataUri, has_avatar: true } : d));
         toast.success(intl.formatMessage({ id: 'agents.avatar.saved' }));
       } catch (e) {
-        toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+        toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: errorText(e) }));
       } finally {
         setAvatarBusy(false);
       }
@@ -225,7 +236,7 @@ export function AgentDetailPage() {
       setDetail((d) => (d ? { ...d, avatar: null, has_avatar: false } : d));
       toast.success(intl.formatMessage({ id: 'agents.avatar.removed' }));
     } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: errorText(e) }));
     } finally {
       setAvatarBusy(false);
     }
@@ -258,15 +269,28 @@ export function AgentDetailPage() {
             {intl.formatMessage({ id: 'nav.agents' })}
           </button>
         </PageHeader>
-        <Empty
-          icon={ListTodo}
-          title={intl.formatMessage({ id: 'agentDetail.notFound' })}
-          action={
-            <Button variant="outline" size="sm" onClick={() => navigate('/agents')}>
-              {intl.formatMessage({ id: 'agentDetail.back' })}
-            </Button>
-          }
-        />
+        {loadError != null ? (
+          <ErrorState
+            icon={ListTodo}
+            error={loadError}
+            onRetry={() => void loadDetail()}
+            action={
+              <Button variant="outline" size="sm" onClick={() => navigate('/agents')}>
+                {intl.formatMessage({ id: 'agentDetail.back' })}
+              </Button>
+            }
+          />
+        ) : (
+          <Empty
+            icon={ListTodo}
+            title={intl.formatMessage({ id: 'agentDetail.notFound' })}
+            action={
+              <Button variant="outline" size="sm" onClick={() => navigate('/agents')}>
+                {intl.formatMessage({ id: 'agentDetail.back' })}
+              </Button>
+            }
+          />
+        )}
       </div>
     );
   }
@@ -546,6 +570,7 @@ function OverviewTab({
   moodKey: string;
 }) {
   const intl = useIntl();
+  const navigate = useNavigate();
   return (
     <div className="mx-auto w-full max-w-[1440px] p-4 sm:p-6">
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
@@ -608,13 +633,25 @@ function OverviewTab({
             <PropertyRow label={intl.formatMessage({ id: 'agents.inspect.status' })}>
               {intl.formatMessage({ id: `status.${detail.archived ? 'archived' : detail.status}` })}
             </PropertyRow>
+            {/* X03 (UX audit §3.3): 模型/執行環境 used to be dead text with no
+                route to the 腦袋與引擎 tab that actually sets them — bring the
+                same "value opens its own edit tab" affordance the budget row
+                below already established, via the shared CrossLink primitive. */}
             <PropertyRow label={intl.formatMessage({ id: 'agentDetail.field.model' })}>
-              <span className="font-mono text-xs">{detail.model?.preferred || '—'}</span>
+              <CrossLink
+                label={detail.model?.preferred || '—'}
+                onClick={() => navigate(`/agents/${encodeURIComponent(detail.name)}/edit?tab=brain`)}
+              />
             </PropertyRow>
             <PropertyRow label={intl.formatMessage({ id: 'agentDetail.summary.runtime' })}>
-              {detail.model?.api_mode
-                ? intl.formatMessage({ id: `agents.apiMode.${detail.model.api_mode}` })
-                : '—'}
+              <CrossLink
+                label={
+                  detail.model?.api_mode
+                    ? intl.formatMessage({ id: `agents.apiMode.${detail.model.api_mode}` })
+                    : '—'
+                }
+                onClick={() => navigate(`/agents/${encodeURIComponent(detail.name)}/edit?tab=brain`)}
+              />
             </PropertyRow>
             <PropertyRow label={intl.formatMessage({ id: 'agentDetail.field.skills' })}>
               <span className="font-mono tabular-nums">{detail.skills?.length ?? 0}</span>
@@ -624,29 +661,55 @@ function OverviewTab({
                 {detail.department}
               </PropertyRow>
             )}
+            {/* R-EDIT-SOURCE (§2-2): the spend/limit pair used to be dead text
+                on a page with no route to the field that sets it. It now opens
+                the staff member's own budget settings. */}
             <PropertyRow label={intl.formatMessage({ id: 'agentDetail.overview.budget' })}>
-              <span className="font-mono text-xs tabular-nums">
+              <button
+                type="button"
+                onClick={() => navigate(`/agents/${encodeURIComponent(detail.name)}/edit?tab=budget`)}
+                className="inline-flex items-center gap-1 font-mono text-xs tabular-nums text-foreground underline-offset-2 transition-colors hover:text-brand hover:underline"
+                title={intl.formatMessage({ id: 'agentDetail.overview.budget.edit' })}
+              >
                 {formatCents(detail.budget?.spent_cents)} / {formatCents(detail.budget?.monthly_limit_cents)}
-              </span>
+                <ChevronRight className="size-3" />
+              </button>
             </PropertyRow>
+            {/* X03: 心跳 mirrors [heartbeat] in agent.toml — the switch itself
+                lives on the 自動化 tab. */}
             <PropertyRow label={intl.formatMessage({ id: 'agentDetail.field.heartbeat' })}>
-              {detail.heartbeat?.enabled
-                ? intl.formatMessage({ id: 'common.enabled' })
-                : intl.formatMessage({ id: 'common.disabled' })}
+              <CrossLink
+                label={
+                  detail.heartbeat?.enabled
+                    ? intl.formatMessage({ id: 'common.enabled' })
+                    : intl.formatMessage({ id: 'common.disabled' })
+                }
+                onClick={() => navigate(`/agents/${encodeURIComponent(detail.name)}/edit?tab=automation`)}
+              />
             </PropertyRow>
             {/* Evolution v3: runtime-true GVU toggle (agent.toml `[evolution]
                 gvu_enabled`, WP0.1 — not the struct default). Full diagnostics
                 (stagnation/telemetry/playbook) live on the 記憶 › 自主學習 tab;
-                this is just the at-a-glance state on the staff member's own card. */}
+                this is just the at-a-glance state on the staff member's own card.
+                X03: the on/off badge itself carries meaningful color, so it
+                stays a Badge rather than becoming CrossLink's plain-text label
+                — a quiet CrossLink sits beside it to reach the 自動化 tab
+                (same tab as 心跳, above) where gvu_enabled actually lives. */}
             <PropertyRow label={intl.formatMessage({ id: 'agentDetail.field.evolution' })}>
-              <Badge
-                variant="secondary"
-                className={detail.evolution?.gvu_enabled ? 'bg-success/15 text-success' : undefined}
-              >
-                {detail.evolution?.gvu_enabled
-                  ? intl.formatMessage({ id: 'common.enabled' })
-                  : intl.formatMessage({ id: 'common.disabled' })}
-              </Badge>
+              <span className="inline-flex items-center gap-2">
+                <Badge
+                  variant="secondary"
+                  className={detail.evolution?.gvu_enabled ? 'bg-success/15 text-success' : undefined}
+                >
+                  {detail.evolution?.gvu_enabled
+                    ? intl.formatMessage({ id: 'common.enabled' })
+                    : intl.formatMessage({ id: 'common.disabled' })}
+                </Badge>
+                <CrossLink
+                  label={intl.formatMessage({ id: 'crosslink.agentDetail.editLink' })}
+                  onClick={() => navigate(`/agents/${encodeURIComponent(detail.name)}/edit?tab=automation`)}
+                />
+              </span>
             </PropertyRow>
           </CardContent>
         </Card>

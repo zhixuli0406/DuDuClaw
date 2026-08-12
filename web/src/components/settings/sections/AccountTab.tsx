@@ -1,10 +1,12 @@
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useAuthStore } from '@/stores/auth-store';
+import { useSystemStore } from '@/stores/system-store';
 import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
+  ErrorState,
   Input,
   SettingsSection,
   SettingsCard,
@@ -20,10 +22,20 @@ import { SettingRow } from './shared';
 export function AccountTab() {
   const intl = useIntl();
   const user = useAuthStore((s) => s.user);
+  // WP-F1 / D4-A: the Personal edition signs the owner in automatically over
+  // loopback, which is also why the logout item is gone. Say so here in plain
+  // words — the switch itself lives in `config.toml`, deliberately not in the
+  // UI (turning it off from inside a session you got for free is a footgun:
+  // you would need a password you have never set).
+  const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const [current, setCurrent] = useState('');
   const [next, setNext] = useState('');
   const [confirm, setConfirm] = useState('');
   const [saving, setSaving] = useState(false);
+  // P05: a rejected password change used to leave nothing behind but a toast,
+  // so "did my old password not match?" was unanswerable 7 seconds later. The
+  // reason now stays under the field group until the next attempt.
+  const [submitError, setSubmitError] = useState<unknown>(null);
 
   const submit = async () => {
     if (next.length < 8) {
@@ -39,6 +51,7 @@ export function AccountTab() {
       return;
     }
     setSaving(true);
+    setSubmitError(null);
     try {
       await api.users.changePassword(current, next);
       toast.success(intl.formatMessage({ id: 'settings.account.changed' }));
@@ -47,6 +60,7 @@ export function AccountTab() {
       setConfirm('');
     } catch (e) {
       console.warn('[api]', e);
+      setSubmitError(e);
       toast.error(formatError(e));
     } finally {
       setSaving(false);
@@ -62,6 +76,11 @@ export function AccountTab() {
             value={user ? `${user.display_name || user.email} (${user.email})` : '-'}
           />
         </SettingsCard>
+        {isPersonal && (
+          <p className="mt-2 text-sm text-muted-foreground">
+            {intl.formatMessage({ id: 'login.local.accountNote' })}
+          </p>
+        )}
       </SettingsSection>
 
       <SettingsSection description={intl.formatMessage({ id: 'settings.account.hint' })}>
@@ -72,6 +91,8 @@ export function AccountTab() {
               value={current}
               onChange={(e) => setCurrent(e.target.value)}
               autoComplete="current-password"
+              aria-invalid={submitError != null}
+              aria-describedby={submitError != null ? 'account-submit-error' : undefined}
             />
           </SettingsRow>
           <SettingsRow label={intl.formatMessage({ id: 'settings.account.new' })} tier="text">
@@ -97,6 +118,15 @@ export function AccountTab() {
             />
           </SettingsRow>
         </SettingsCard>
+        {submitError != null && (
+          <div id="account-submit-error" className="mt-2">
+            <ErrorState
+              variant="inline"
+              error={submitError}
+              title={intl.formatMessage({ id: 'errorState.manage.actionFailed' })}
+            />
+          </div>
+        )}
       </SettingsSection>
 
       <div className="flex items-center justify-end">

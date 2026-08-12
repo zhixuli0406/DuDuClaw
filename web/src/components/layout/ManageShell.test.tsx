@@ -116,14 +116,17 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
     expect(screen.getByRole('link', { name: en['manage.inference'] })).toBeInTheDocument();
   });
 
-  // 2026-08-04 (WP14): operator-grade diagnostics leave the Personal rail. The
-  // routes stay reachable — only the advanced sub-list stops advertising them.
-  it('hides 安全 / 可靠性 / 日誌 on the personal edition and keeps them on enterprise', () => {
+  // D9 (09-edition-split-features.md §4, 2026-08-12) revises the 2026-08-04
+  // call: 安全 and 日誌 are no longer `personalHidden` — a single operator
+  // still needs an emergency brake and a way to see what happened, so both
+  // stay in the rail (still folded under 進階設定, same as everything else
+  // here). 可靠性 (an SRE-style fleet report) is the one that stays hidden.
+  it('hides 可靠性 on the personal edition but keeps 安全 / 日誌 (D9), and keeps all three on enterprise', () => {
     useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
     const { unmount } = renderManage('/manage/billing');
-    expect(screen.queryByRole('link', { name: en['manage.security'] })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: en['manage.reliability'] })).not.toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: en['manage.logs'] })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: en['manage.security'] })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: en['manage.logs'] })).toBeInTheDocument();
     unmount();
 
     useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
@@ -143,6 +146,38 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
     expect(labels.indexOf(en['manage.billing'])).toBeLessThan(labels.indexOf(en['manage.system']));
     expect(labels.indexOf(en['manage.license'])).toBeLessThan(labels.indexOf(en['manage.system']));
     expect(labels.at(-1)).toBe(en['manage.system']);
+  });
+
+  // WP-NAV (2026-08-12): 進階設定 IS the 進階層, sorted 低頻・高重要 →
+  // 低頻・低重要 (12-ia-redesign-blueprint.md §2 over the frequency × importance
+  // matrix). Asserted as an exact sequence, not a set of pairwise "before"
+  // checks, so a future reshuffle has to come back here and restate the intent.
+  it('orders the 進階設定 sub-list 錢 → 存取與安全 → 維運 → 設定', () => {
+    renderManage('/manage/billing');
+    const labels = screen
+      .getAllByRole('link')
+      .map((el) => el.textContent?.trim())
+      .filter(Boolean) as string[];
+    // Drop the five primary rows; what follows 進階設定 is the sub-list.
+    const sub = labels.slice(labels.indexOf(en['manage.advanced']) + 1);
+    expect(sub).toEqual([
+      // 錢 — client order invariant (2026-08-04 WP14).
+      en['manage.billing'],
+      en['manage.license'],
+      en['manage.distributors'],
+      // 存取與安全 — 低頻・高重要.
+      en['manage.security'],
+      en['manage.governance'],
+      en['manage.users'],
+      en['manage.departments'],
+      // 維運 — 低頻・低重要; 可靠性 and 模型用量 stay adjacent (§2-14).
+      en['manage.logs'],
+      en['manage.reliability'],
+      en['manage.inference'],
+      en['manage.migrate'],
+      // catch-all last.
+      en['manage.system'],
+    ]);
   });
 
   it('redirects bare /manage to the first surface the viewer can see', () => {

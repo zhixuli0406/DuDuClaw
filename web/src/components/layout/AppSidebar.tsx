@@ -307,6 +307,11 @@ function CompanySwitcher({ collapsed }: { collapsed: boolean }) {
   const intl = useIntl();
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
+  // D4-A: on the Personal edition the next page load signs the operator back in
+  // automatically (loopback auto-login), so a logout item here would visibly
+  // undo itself. Hidden instead of shown-and-broken — password protection is
+  // the `local_auto_login` switch, explained in account settings.
+  const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const brandName = useEffectiveName();
   const brandLogo = useEffectiveLogo();
   const locale = useLocaleStore((s) => s.locale);
@@ -357,11 +362,15 @@ function CompanySwitcher({ collapsed }: { collapsed: boolean }) {
             {locale === code && <span className="text-brand">•</span>}
           </DropdownMenuItem>
         ))}
-        <DropdownMenuSeparator />
-        <DropdownMenuItem variant="destructive" onClick={() => logout()}>
-          <LogOut />
-          {intl.formatMessage({ id: 'auth.logout' })}
-        </DropdownMenuItem>
+        {!isPersonal && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem variant="destructive" onClick={() => logout()}>
+              <LogOut />
+              {intl.formatMessage({ id: 'auth.logout' })}
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -464,6 +473,7 @@ export function AppSidebar() {
   const connectionState = useConnectionStore((s) => s.state);
   const inboxCount = useApprovalsStore((s) => s.pendingCount);
   const fetchInboxCount = useApprovalsStore((s) => s.fetchCount);
+  const agents = useAgentsStore((s) => s.agents);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const theme = useThemeStore((s) => s.theme);
   const cycleTheme = useThemeStore((s) => s.cycleTheme);
@@ -481,7 +491,9 @@ export function AppSidebar() {
   }, [connectionState, fetchInboxCount, fetchAgents]);
 
   const forksExist = useForksExist(hasMinRole(user?.role, 'manager'));
-  const ctx = { hasOperatorAccess, forksExist, isDesktop: isTauri() };
+  // D6: the org chart's progressive-disclosure gate reuses the roster that's
+  // already being fetched for the LIVE staff zone — no second RPC.
+  const ctx = { hasOperatorAccess, forksExist, isDesktop: isTauri(), agentCount: agents.length };
 
   const workItems = filterVisible(navGroups[0].items, user?.role, isPersonal, ctx);
   const companyItems = filterVisible(navGroups[1].items, user?.role, isPersonal, ctx);

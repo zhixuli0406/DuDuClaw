@@ -1,29 +1,60 @@
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useBrowserStore } from '@/stores/browser-store';
+import { AutonomyNote } from '@/components/AutonomyNote';
+import { ErrorState } from '@/components/mds';
+import { ConfirmDialog } from '@/components/settings/controls';
 import { ShieldCheck, Plus, Clock, X } from 'lucide-react';
 
+/**
+ * Tool-approval panel of the 瀏覽器 settings tab.
+ *
+ * P05 (the strongest Blocker evidence in the 2026-08 audit): `approveTool` /
+ * `revokeTool` / `fetchToolApprovals` write their failure into the store's
+ * `lastError`, and this component never read it — granting `computer_use` to
+ * an agent could fail server-side while the UI showed nothing at all, which on
+ * a security control reads as success. The failure is now persistent and
+ * retryable.
+ */
 export function ToolApprovalPanel() {
   const intl = useIntl();
-  const { toolApprovals, fetchToolApprovals, approveTool, revokeTool } = useBrowserStore();
+  const { toolApprovals, fetchToolApprovals, approveTool, revokeTool, lastError, clearError } =
+    useBrowserStore();
   const [showForm, setShowForm] = useState(false);
   const [formTool, setFormTool] = useState('browser');
   const [formAgent, setFormAgent] = useState('');
   const [formDuration, setFormDuration] = useState('');
   const [formSession, setFormSession] = useState(false);
+  // One click used to grant an AI employee immediate use of a tool — up to and
+  // including computer_use (screen/mouse/keyboard control) — with no
+  // confirmation and no summary of what was about to be authorized (phase4
+  // audit C06 Blocker). Gate the actual grant behind the shared ConfirmDialog.
+  const [confirmApprove, setConfirmApprove] = useState<{
+    tool: string;
+    agent: string;
+    duration?: number;
+    session: boolean;
+  } | null>(null);
 
   useEffect(() => {
     fetchToolApprovals();
   }, [fetchToolApprovals]);
 
-  const handleApprove = () => {
+  const requestApprove = () => {
     if (!formAgent.trim()) return;
-    approveTool(
-      formTool,
-      formAgent.trim(),
-      formDuration ? Number(formDuration) : undefined,
-      formSession
-    );
+    setConfirmApprove({
+      tool: formTool,
+      agent: formAgent.trim(),
+      duration: formDuration ? Number(formDuration) : undefined,
+      session: formSession,
+    });
+  };
+
+  const handleApprove = () => {
+    if (!confirmApprove) return;
+    clearError();
+    void approveTool(confirmApprove.tool, confirmApprove.agent, confirmApprove.duration, confirmApprove.session);
+    setConfirmApprove(null);
     setShowForm(false);
     setFormAgent('');
     setFormDuration('');
@@ -100,6 +131,7 @@ export function ToolApprovalPanel() {
               </label>
             </div>
           </div>
+          {formTool === 'computer_use' && <AutonomyNote id="browserComputerUse" />}
           <div className="flex justify-end gap-2">
             <button
               onClick={() => setShowForm(false)}
@@ -108,13 +140,26 @@ export function ToolApprovalPanel() {
               {intl.formatMessage({ id: 'browser.approvals.cancel' })}
             </button>
             <button
-              onClick={handleApprove}
+              onClick={requestApprove}
               disabled={!formAgent.trim()}
               className="rounded-lg bg-brand px-4 py-1.5 text-xs font-medium text-brand-foreground hover:bg-brand/90 disabled:opacity-40"
             >
               {intl.formatMessage({ id: 'browser.approvals.approve' })}
             </button>
           </div>
+        </div>
+      )}
+
+      {/* A failed grant/revoke stays on screen — never silently swallowed. */}
+      {lastError && (
+        <div className="mb-4">
+          <ErrorState
+            variant="inline"
+            error={lastError}
+            title={intl.formatMessage({ id: 'errorState.manage.actionFailed' })}
+            onRetry={() => { clearError(); void fetchToolApprovals(); }}
+            retryLabel={intl.formatMessage({ id: 'errorState.manage.reload' })}
+          />
         </div>
       )}
 
@@ -147,7 +192,7 @@ export function ToolApprovalPanel() {
                 </span>
               )}
               <button
-                onClick={() => revokeTool(a.tool_name, a.agent_id)}
+                onClick={() => { clearError(); void revokeTool(a.tool_name, a.agent_id); }}
                 className="ml-auto rounded-md p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                 title={intl.formatMessage({ id: 'browser.approvals.revoke' })}
               >
@@ -156,6 +201,26 @@ export function ToolApprovalPanel() {
             </div>
           ))}
         </div>
+      )}
+
+      {confirmApprove && (
+        <ConfirmDialog
+          open
+          title={intl.formatMessage({ id: 'browser.approvals.approve' })}
+          message={intl.formatMessage(
+            {
+              id:
+                confirmApprove.tool === 'computer_use'
+                  ? 'confirm.browser.approveComputerUse.message'
+                  : 'confirm.browser.approveTool.message',
+            },
+            { tool: confirmApprove.tool, agent: confirmApprove.agent },
+          )}
+          confirmLabel={intl.formatMessage({ id: 'browser.approvals.approve' })}
+          cancelLabel={intl.formatMessage({ id: 'browser.approvals.cancel' })}
+          onConfirm={handleApprove}
+          onClose={() => setConfirmApprove(null)}
+        />
       )}
     </div>
   );

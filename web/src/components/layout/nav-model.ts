@@ -114,6 +114,34 @@ export type NavGroup = {
  */
 
 /**
+ * ── 一般層 / 進階層：the ordering law for everything in this file ────────────
+ * (WP-NAV, 2026-08-12; `12-ia-redesign-blueprint.md` §2 over the frequency ×
+ * importance matrix in `10-ia-scatter-audit.md` §4.)
+ *
+ * The navigation has exactly TWO disclosure layers — the 2026-08 IA audit found
+ * the four-layer status quo to be the root cause of "I can't find it":
+ *
+ *   一般層 (open by default) = 每日 rail + 工作 + 公司.
+ *     Everything a person touches in an ordinary week lives here, in
+ *     frequency order, phrased in plain words. Low-frequency rows are not
+ *     removed from these groups — they sink to the tail, ahead of nothing.
+ *
+ *   進階層 (folded away) = 管理 → 進階設定 (`manageAdvancedNav`), plus the
+ *     Personal edition's collapsed 進階 group (`personalAdvancedGroup`).
+ *     Ordered 低頻・高重要 first (money, then access control), 低頻・低重要
+ *     last (logs / reliability / models / migration), catch-all 設定 dead last.
+ *
+ * Two invariants outrank the matrix and must survive any future reshuffle:
+ *   1. 2026-08-04 WP14 client order, both editions:
+ *      新對話 → 例行工作 → 技能庫 → 記憶 → AI 員工 → 世界, 任務看板 demoted.
+ *   2. 2026-08-04 WP14 money order inside the 進階層:
+ *      帳務 → 授權 → 經銷 before every operational row; 設定 last.
+ *
+ * "Demoting a row into 進階 decides that 95% of users will live with its
+ * default forever" — so a demotion is only honest when the default is right.
+ */
+
+/**
  * Flat, always-first daily items (rendered with no section header).
  *
  * 2026-07-30 client feedback: the 對話 row became 「新對話」— an action that
@@ -209,7 +237,13 @@ export const navGroups: NavGroup[] = [
       // 進階 on Personal; last row of this group on Enterprise, where no 進階
       // group exists). Nothing was removed — the board keeps its route, the Home
       // task-summary cards, the mobile ＋交辦 action, and ⌘K.
-      { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', minRole: 'manager' },
+      // D7 (09-edition-split-features.md §4): `minRole: 'manager'` used to gate
+      // this row, which was never a real access-control question on Personal
+      // (single owner = always admin) but reads oddly for a future `employee`
+      // role — a cron schedule for one's own agent is the same "own scope" as
+      // /plans (no gate) and /runs (no gate), so it drops to `ownScope` here.
+      // — daily rows (一般層, frequency order).
+      { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', ownScope: true },
       // U4 co-edited plans — shared step lists between the user and an AI employee.
       { to: '/plans', icon: ListChecks, label: 'nav.plans', desc: 'nav.plans.desc', ownScope: true },
       // G12 run inspector — per-run transcripts (session turns + tool receipts).
@@ -218,16 +252,23 @@ export const navGroups: NavGroup[] = [
       { to: '/canvas', icon: Presentation, label: 'nav.canvas', desc: 'nav.canvas.desc', ownScope: true },
       // WP1.4 file panel — attachments an AI staff member received/produced.
       { to: '/files', icon: FolderOpen, label: 'nav.files', desc: 'nav.files.desc', ownScope: true },
+      // — oversight rows: read weekly, not daily (WP-NAV frequency order).
       // G11 Work Timeline — company-level Gantt of every AI staff member's runs.
       { to: '/timeline', icon: ChartGantt, label: 'nav.timeline', desc: 'nav.timeline.desc', minRole: 'manager' },
       { to: '/reports', icon: BarChart3, label: 'nav.reports', desc: 'nav.reports.desc', minRole: 'manager' },
+      // — occasional rows: 低頻, and the only place in the 一般層 where a
+      // machine-shaped word (OS) still shows. WP-NAV (2026-08-12) sank them
+      // below the oversight pair and put 分支決戰 first of the two: it is
+      // 低頻・高重要 (an irreversible pick between branches, matrix §4) while
+      // OS is a 低頻 fleet report. Neither leaves the group — Enterprise has no
+      // 進階 group to fold them into, so "tail of 工作" IS the demotion.
+      // Progressive disclosure: hidden until the first fork ever runs — a
+      // dormant RFC-26 surface shouldn't occupy nav space with a dead page.
+      { to: '/forks', icon: GitFork, label: 'nav.forks', desc: 'nav.forks.desc', minRole: 'manager', requiresData: 'forks' },
       // P4-3 — OS-native fleet report + settings (filesystem watch / frontmost
       // polling / footprint / proactive gate). All os.* RPCs are admin-gated
       // server-side (require_admin!); minRole mirrors that here.
       { to: '/os', icon: MonitorCog, label: 'nav.os', desc: 'nav.os.desc', minRole: 'admin' },
-      // Progressive disclosure: hidden until the first fork ever runs — a
-      // dormant RFC-26 surface shouldn't occupy nav space with a dead page.
-      { to: '/forks', icon: GitFork, label: 'nav.forks', desc: 'nav.forks.desc', minRole: 'manager', requiresData: 'forks' },
       // 任務看板 — demoted to the tail of the group (2026-08-04 WP14). Enterprise
       // has no 進階 group to fold it into, so "least prominent slot" is the
       // closest equivalent to the Personal treatment.
@@ -246,12 +287,26 @@ export const navGroups: NavGroup[] = [
       { to: '/memory', icon: Brain, label: 'nav.memory', desc: 'nav.memory.desc', ownScope: true },
       staffEntry,
       { to: '/world', icon: Globe2, label: 'nav.world', desc: 'nav.world.desc', ownScope: true },
-      { to: '/org', icon: Users2, label: 'nav.team', desc: 'nav.team.desc', minRole: 'manager', personalHidden: true },
+      // 成長 lifted above the occasional rows (WP-NAV, 2026-08-12): the matrix
+      // (10-ia-scatter-audit.md §4) grades it 高頻・低重要 — people open it
+      // often even though nothing depends on it — so it belongs with the daily
+      // surfaces rather than buried under three 低頻 rows. It stays BELOW the
+      // client-annotated four (技能庫 → 記憶 → AI 員工 → 世界), which nothing
+      // may push down.
+      { to: '/growth', icon: Trophy, label: 'nav.growth', desc: 'nav.growth.desc', ownScope: true },
+      // — 低頻 tail of 公司, in importance order.
+      // D6 (09-edition-split-features.md §4): this used to be `personalHidden`
+      // — reasoning it drew the agent `reports_to` tree, not a chart of human
+      // reporting lines, so a Personal instance "shouldn't" need it. The
+      // counter-argument that won: a 1-2-agent org chart is genuinely an empty
+      // diagram no matter the edition, so `requiresData: 'org'` (progressive
+      // disclosure, same mechanism as `/forks`) is the honest fix — it shows
+      // up once there is actually something to draw, on EVERY edition.
+      { to: '/org', icon: Users2, label: 'nav.team', desc: 'nav.team.desc', minRole: 'manager', requiresData: 'org' },
       // 專家包 — install/manage bundled AI teams; experts.* RPCs are admin-only.
       { to: '/experts', icon: Package, label: 'nav.experts', desc: 'nav.experts.desc', minRole: 'admin' },
       // Widget 工坊 — custom dashboard cards (AI-built / HTML / shared).
       { to: '/widgets', icon: LayoutGrid, label: 'nav.widgets', desc: 'nav.widgets.desc' },
-      { to: '/growth', icon: Trophy, label: 'nav.growth', desc: 'nav.growth.desc', ownScope: true },
       // 桌寵工作室 — photo → interactive desktop pet. Desktop app only
       // (2026-07-29): hidden in a plain browser instead of showing a stub page.
       { to: '/pet-studio', icon: PawPrint, label: 'nav.petStudio', desc: 'nav.petStudio.desc', desktopOnly: true },
@@ -273,10 +328,12 @@ export const navGroups: NavGroup[] = [
 // Personal gets a deliberately minimal sidebar: the daily row plus a handful
 // of primary surfaces, with every power-user page folded into a collapsed
 // 「進階」 group at the bottom (below 設定, which also starts collapsed).
-// Hidden entirely on Personal: AI 員工 roster (+ LIVE staff zone), 公司 org
-// chart, 授權 (see `personalHidden` gates above / in `manageNav`). 桌寵工作室
-// is desktop-app-only everywhere (`desktopOnly`). Enterprise keeps the
-// original three-group layout untouched.
+// Hidden entirely on Personal: AI 員工 LIVE staff zone, 授權 (see
+// `personalHidden` gates above / in `manageNav`). 公司 org chart is no longer
+// unconditionally hidden (D6) — it lives in 進階 and progressively discloses
+// itself once the roster is ≥3 (`requiresData: 'org'`). 桌寵工作室 is
+// desktop-app-only everywhere (`desktopOnly`). Enterprise keeps the original
+// three-group layout untouched.
 //
 // Items are looked up by route so both layouts share the same NavItem objects
 // (labels, icons, and role gates can never drift between editions).
@@ -316,7 +373,17 @@ export const personalPrimaryItems: NavItem[] = pickItems([
   '/pet-studio',
 ]);
 
-/** Personal 進階 — collapsed-by-default group at the very bottom. */
+/**
+ * Personal 進階 — collapsed-by-default group at the very bottom, and the
+ * Personal edition's half of the 進階層.
+ *
+ * Order (WP-NAV, 2026-08-12) mirrors the Enterprise 工作 → 公司 reading order
+ * exactly, so the same surfaces never appear in two different sequences across
+ * editions: the work cluster first (任務看板 leading it per WP14), then the
+ * company cluster (成長 → 組織架構 → 專家包 → Widget 工坊). Within the work
+ * cluster the same frequency slope applies — daily surfaces, oversight pair,
+ * then the two occasional rows (分支決戰 → OS).
+ */
 export const personalAdvancedGroup: NavGroup = {
   label: 'navGroup.advanced',
   items: pickItems([
@@ -329,11 +396,16 @@ export const personalAdvancedGroup: NavGroup = {
     '/files',
     '/timeline',
     '/reports',
+    '/forks',
     '/os',
+    // Company cluster. 成長 leads it (高頻・低重要, matrix §4) — same slot it
+    // holds in the Enterprise 公司 group. D6: the org chart is folded here
+    // rather than on the primary rail; it is a progressive-disclosure surface
+    // (`requiresData: 'org'`), not a daily one.
+    '/growth',
+    '/org',
     '/experts',
     '/widgets',
-    '/growth',
-    '/forks',
   ]),
 };
 
@@ -377,32 +449,74 @@ export const manageNav: NavItem[] = [
  * simply no longer occupy a top-level rail slot. The `ManageShell` reveals them
  * as a sub-list whenever the viewer is inside this subtree.
  *
- * Order invariant (2026-08-04 WP14 client annotation): the money surfaces
- * (帳務 → 授權 → 經銷) come FIRST and 設定 stays LAST, so "where do I see what
- * this costs" is never below the catch-all settings row.
+ * This list IS the 進階層 (see the layering note at the top of this file), so
+ * WP-NAV (2026-08-12) sorted it 低頻・高重要 → 低頻・低重要 per
+ * `12-ia-redesign-blueprint.md` §2 and the matrix in `10-ia-scatter-audit.md`
+ * §4, in four runs:
  *
- * 安全 / 可靠性 / 日誌 carry `personalHidden` — operator-grade diagnostics that a
- * one-person office never opens, and which made the advanced list read as a wall
- * of jargon. The routes stay URL-reachable and every other edition keeps them.
+ *   1. 錢 — 帳務 → 授權 → 經銷. Order invariant (2026-08-04 WP14 client
+ *      annotation): "這個要花多少錢" may never sit below an operational row,
+ *      and 設定 stays LAST. 經銷 is 低頻・低重要 on the matrix but the client
+ *      pinned it to the money run; the annotation wins.
+ *   2. 存取與安全 — 安全 → 治理 → 成員 → 部門. All 低頻・高重要: one switch
+ *      here changes who may do what, so they lead the operational rows.
+ *   3. 維運 — 日誌 → 可靠性 → 模型用量 → 資料搬家, the blueprint's own
+ *      低頻・低重要 sequence. 可靠性 and 模型用量 stay ADJACENT on purpose:
+ *      the fallback rate is observed on one page and caused by a threshold
+ *      edited on the other (10-ia-scatter-audit.md §2-14), so splitting them
+ *      is what made that pair hard to use.
+ *   4. 設定 — the catch-all, dead last.
+ *
+ * 帳戶與登入 (`/manage/accounts`) is NOT in this list even though it is
+ * 低頻・高重要: D16/D18 promoted it to the five-row rail above. Nothing to
+ * re-sort — it is already ahead of everything here.
+ *
+ * 可靠性 carries `personalHidden` — an SRE-style fleet report that a one-person
+ * office never opens, and which made the advanced list read as a wall of
+ * jargon. The route stays URL-reachable and every other edition keeps it.
+ *
+ * 安全 / 日誌 dropped their `personalHidden` gate (D9,
+ * 09-edition-split-features.md §4): a single operator still needs an
+ * emergency brake and a way to see what happened, so both are visible here —
+ * same "folded under 進階設定" treatment as everything else in this list, not
+ * hidden. `SecurityPage` itself splits its content by edition (kill switch +
+ * audit log stay, in a page-internal collapsed section; the RBAC / credential
+ * proxy / mount guard cards — organisation-scale views with no single-owner
+ * counterpart — stay hidden there).
  */
 export const manageAdvancedNav: NavItem[] = [
+  // ── 1. 錢（客戶排序鐵律：帳務 → 授權 → 經銷，其餘一律排在後面）
   { to: '/manage/billing', icon: CreditCard, label: 'manage.billing', desc: 'manage.billing.desc', minRole: 'manager' },
   // 授權 hidden on Personal (2026-07-29 client feedback). The page stays
   // URL-reachable (`/manage/license`) and ⌘K still finds it on other editions.
   { to: '/manage/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager', personalHidden: true },
-  { to: '/manage/distributors', icon: Store, label: 'manage.distributors', desc: 'manage.distributors.desc', minRole: 'admin' },
-  { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },
+  // 經銷商管理 signs real, machine-fingerprint-bound OEM licences — an
+  // Enterprise-only capability that a Personal instance has no counterpart for.
+  // It was the one such surface missing its gate (10-ia-scatter-audit D8), so a
+  // Personal instance could see the licence-issuing console. Bug fix, not a
+  // policy change.
+  { to: '/manage/distributors', icon: Store, label: 'manage.distributors', desc: 'manage.distributors.desc', minRole: 'admin', enterprise: true },
+  // ── 2. 存取與安全（低頻・高重要：改一格就改變「誰可以做什麼」）
+  // D9: no longer `personalHidden` — `SecurityPage` itself hides the
+  // organisation-scale content on Personal (see the block comment above).
+  { to: '/manage/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin' },
+  { to: '/manage/governance', icon: Scale, label: 'manage.governance', desc: 'manage.governance.desc', minRole: 'admin', enterprise: true },
   { to: '/manage/users', icon: Users, label: 'manage.users', desc: 'manage.users.desc', minRole: 'admin', enterprise: true },
   // Departments are an org grouping — an Enterprise concept. Personal is a
   // single-owner form factor with no departments, so this page (and the
   // department dropdowns that draw from it — agent-create dialog, skill-install
   // scope) are hidden in the Personal edition.
   { to: '/manage/departments', icon: Network, label: 'manage.departments', desc: 'manage.departments.desc', minRole: 'admin', enterprise: true },
-  { to: '/manage/governance', icon: Scale, label: 'manage.governance', desc: 'manage.governance.desc', minRole: 'admin', enterprise: true },
-  { to: '/manage/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin', personalHidden: true },
+  // ── 3. 維運（低頻・低重要：日誌 → 可靠性 → 模型用量 → 資料搬家）
+  // D9: no longer `personalHidden` — a single operator needs to see what
+  // happened too; it stays folded under 進階設定 same as every other row here.
+  { to: '/manage/logs', icon: FileText, label: 'manage.logs', desc: 'manage.logs.desc', minRole: 'manager' },
   { to: '/manage/reliability', icon: Activity, label: 'manage.reliability', desc: 'manage.reliability.desc', minRole: 'admin', personalHidden: true },
   { to: '/manage/inference', icon: Cpu, label: 'manage.inference', desc: 'manage.inference.desc', minRole: 'admin' },
-  { to: '/manage/logs', icon: FileText, label: 'manage.logs', desc: 'manage.logs.desc', minRole: 'manager', personalHidden: true },
+  // 資料搬家 is a one-shot wizard — the least-often-opened row that still is
+  // not the catch-all settings page.
+  { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },
+  // ── 4. 設定 last（2026-08-04 鐵律）
   { to: '/manage/system', icon: Settings, label: 'manage.system', desc: 'manage.system.desc', minRole: 'admin' },
 ];
 

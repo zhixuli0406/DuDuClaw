@@ -15,6 +15,7 @@ import {
   CardContent,
   Badge,
   Button,
+  ErrorState,
   Input,
   Textarea,
   SettingsCard,
@@ -226,13 +227,19 @@ export function LicensePage() {
   const [snapshot, setSnapshot] = useState<LicenseSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  // P05: with `snapshot` null and `loading` back to false, both render branches
+  // below are false — the page went blank under its own header and the only
+  // clue was a toast that had already disappeared.
+  const [loadError, setLoadError] = useState<unknown>(null);
 
   const load = useMemo(
     () => async () => {
+      setLoadError(null);
       try {
         const result = await api.license.status();
         setSnapshot(result);
       } catch (e) {
+        setLoadError(e);
         toast.error(formatError(e));
       } finally {
         setLoading(false);
@@ -283,6 +290,35 @@ export function LicensePage() {
             </p>
           </CardContent>
         </Card>
+      )}
+
+      {!loading && loadError != null && !snapshot && (
+        <Card>
+          <CardContent>
+            <ErrorState
+              error={loadError}
+              title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+              onRetry={() => {
+                setLoading(true);
+                void load();
+              }}
+            />
+          </CardContent>
+        </Card>
+      )}
+
+      {/* A refresh that failed on top of an existing snapshot: keep the data,
+          but say the numbers on screen are the previous read. */}
+      {loadError != null && snapshot && (
+        <ErrorState
+          variant="inline"
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          onRetry={() => {
+            setRefreshing(true);
+            void load();
+          }}
+        />
       )}
 
       {snapshot && (

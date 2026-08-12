@@ -5,6 +5,8 @@ import {
   Badge,
   Button,
   Empty,
+  ErrorState,
+  useErrorMessage,
   Input,
   Tabs,
   TabsList,
@@ -129,6 +131,7 @@ function ServerCard({
 
 export function MarketplacePage() {
   const intl = useIntl();
+  const errorText = useErrorMessage();
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<Category>('all');
   const [installError, setInstallError] = useState<string | null>(null);
@@ -138,7 +141,7 @@ export function MarketplacePage() {
   const [installTarget, setInstallTarget] = useState<string | null>(null);
   const [installAgent, setInstallAgent] = useState('');
   const [installing, setInstalling] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<unknown>(null);
 
   useEffect(() => {
     api.agents.list().then((res) => {
@@ -161,8 +164,8 @@ export function MarketplacePage() {
       const res = await api.marketplace.list();
       setServers(res.servers ?? []);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setLoadError(message);
+      // Was `err.message` rendered verbatim with no retry (P05 Blocker).
+      setLoadError(err);
     } finally {
       setLoading(false);
     }
@@ -207,8 +210,9 @@ export function MarketplacePage() {
       // Refetch so installed_by reflects the new `.mcp.json` state.
       await load();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setInstallError(intl.formatMessage({ id: 'marketplace.installError' }, { message }));
+      setInstallError(
+        intl.formatMessage({ id: 'marketplace.installError' }, { message: errorText(err) }),
+      );
     } finally {
       setInstalling(false);
     }
@@ -244,13 +248,8 @@ export function MarketplacePage() {
       )}
 
       {/* Load Error */}
-      {loadError && (
-        <div
-          role="alert"
-          className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
-        >
-          {loadError}
-        </div>
+      {loadError != null && (
+        <ErrorState variant="inline" error={loadError} onRetry={() => void load()} />
       )}
 
       {/* Search + category tabs */}

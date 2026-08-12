@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router';
 import en from '@/i18n/en.json';
@@ -86,5 +87,70 @@ describe('RunsPage — agent filter as URL (W3-3)', () => {
       expect(screen.getByRole('heading', { name: 'Run log' })).toBeInTheDocument();
     });
     expect(screen.getByTestId('search-probe')).not.toHaveTextContent('agent=');
+  });
+});
+
+// ── P11: the open transcript is deep-linkable too (`?run=<id>`) ───────────────
+
+/** A minimal but well-formed `runs.get` payload (the page reads `detail.run`). */
+const RUN_DETAIL = {
+  run: {
+    id: 'run-42',
+    agent_id: 'nova',
+    channel: 'webchat',
+    started_at: '2026-08-12T00:00:00Z',
+    status: 'ok',
+  },
+  events: [],
+};
+
+describe('RunsPage — selected run as URL (P11)', () => {
+  beforeEach(() => {
+    mockWsClient.call.mockImplementation((method: string) =>
+      method === 'runs.get'
+        ? Promise.resolve(RUN_DETAIL)
+        : Promise.resolve({ runs: [], agents: AGENTS }),
+    );
+  });
+
+  it('fetches the transcript named by ?run= on load', async () => {
+    renderAt('/runs?run=run-42');
+    await waitFor(() => {
+      expect(mockWsClient.call).toHaveBeenCalledWith('runs.get', { run_id: 'run-42' });
+    });
+  });
+
+  it('shows the transcript pane instead of the "pick a run" prompt', async () => {
+    renderAt('/runs?run=run-42');
+    await waitFor(() => {
+      expect(screen.queryByText('Pick a run on the left')).not.toBeInTheDocument();
+    });
+  });
+
+  it('writes the selected run back into the URL when a row is clicked', async () => {
+    const user = userEvent.setup();
+    mockWsClient.call.mockImplementation((method: string) =>
+      method === 'runs.list'
+        ? Promise.resolve({
+            runs: [
+              {
+                id: 'run-7',
+                agent_id: 'nova',
+                channel: 'webchat',
+                started_at: new Date().toISOString(),
+                status: 'ok',
+              },
+            ],
+            agents: AGENTS,
+          })
+        : Promise.resolve({ run: {}, events: [] }),
+    );
+    renderAt('/runs');
+
+    const row = await screen.findByRole('button', { name: /run-7|Nova/i });
+    await user.click(row);
+    await waitFor(() => {
+      expect(screen.getByTestId('search-probe')).toHaveTextContent('run=run-7');
+    });
   });
 });

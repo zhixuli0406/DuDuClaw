@@ -6,7 +6,7 @@ import { handleDashboardNavigate } from './lib/dashboard-navigate';
 import { toast } from './lib/toast';
 import { MainLayout } from './components/layout/MainLayout';
 import { ManageShell } from './components/layout/ManageShell';
-import { AuthGuard, RoleGuard } from './components/AuthGuard';
+import { AuthGuard, RoleGuard, EditionGuard } from './components/AuthGuard';
 import { FirstRunGate } from './components/FirstRunGate';
 import { LoginPage } from './pages/LoginPage';
 import { useConnectionStore } from './stores/connection-store';
@@ -20,7 +20,6 @@ import { ApprovalModal } from './components/ApprovalModal';
 const lazyPage = <K extends string>(loader: () => Promise<Record<K, React.ComponentType>>, key: K) =>
   lazy(() => loader().then((m) => ({ default: m[key] })));
 
-const DashboardPage = lazyPage(() => import('./pages/DashboardPage'), 'DashboardPage');
 const HomePage = lazyPage(() => import('./pages/HomePage'), 'HomePage');
 const InboxPage = lazyPage(() => import('./pages/InboxPage'), 'InboxPage');
 const RoutinesPage = lazyPage(() => import('./pages/RoutinesPage'), 'RoutinesPage');
@@ -50,10 +49,11 @@ const KnowledgeHubPage = lazyPage(() => import('./pages/KnowledgeHubPage'), 'Kno
 const SharedWikiPage = lazyPage(() => import('./pages/SharedWikiPage'), 'SharedWikiPage');
 const OrgChartPage = lazyPage(() => import('./pages/OrgChartPage'), 'OrgChartPage');
 const WorldPage = lazyPage(() => import('./pages/WorldPage'), 'WorldPage');
-const PartnerPortalPage = lazyPage(() => import('./pages/PartnerPortalPage'), 'PartnerPortalPage');
+// PartnerPortalPage is mounted inside LicenseShell (`/manage/license`); the
+// bare-page import was only needed for the now-removed `/partner` legacy
+// route below, which redirects instead.
 const ReportPage = lazyPage(() => import('./pages/ReportPage'), 'ReportPage');
 const BillingPage = lazyPage(() => import('./pages/BillingPage'), 'BillingPage');
-const ApprovalsPage = lazyPage(() => import('./pages/ApprovalsPage'), 'ApprovalsPage');
 const LicensePage = lazyPage(() => import('./pages/LicensePage'), 'LicensePage');
 const LogsPage = lazyPage(() => import('./pages/LogsPage'), 'LogsPage');
 const ChannelsPage = lazyPage(() => import('./pages/ChannelsPage'), 'ChannelsPage');
@@ -61,16 +61,11 @@ const AccountsPage = lazyPage(() => import('./pages/AccountsPage'), 'AccountsPag
 const SecurityPage = lazyPage(() => import('./pages/SecurityPage'), 'SecurityPage');
 const GovernancePage = lazyPage(() => import('./pages/GovernancePage'), 'GovernancePage');
 const ReliabilityPage = lazyPage(() => import('./pages/ReliabilityPage'), 'ReliabilityPage');
-const WikiTrustPage = lazyPage(() => import('./pages/WikiTrustPage'), 'WikiTrustPage');
 const SettingsPage = lazyPage(() => import('./pages/SettingsPage'), 'SettingsPage');
-const McpPage = lazyPage(() => import('./pages/McpPage'), 'McpPage');
-const McpKeysPage = lazyPage(() => import('./pages/McpKeysPage'), 'McpKeysPage');
-const OdooPage = lazyPage(() => import('./pages/OdooPage'), 'OdooPage');
 const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'InferencePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const DepartmentsPage = lazyPage(() => import('./pages/DepartmentsPage'), 'DepartmentsPage');
 const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
-const OnboardWizardPage = lazyPage(() => import('./pages/OnboardWizardPage'), 'OnboardWizardPage');
 const WelcomePage = lazyPage(() => import('./pages/WelcomePage'), 'WelcomePage');
 // v2 redesign lazy placeholder pages (T1.5) — replaced in place by later waves.
 const TaskDetailPage = lazyPage(() => import('./pages/TaskDetailPage'), 'TaskDetailPage');
@@ -148,7 +143,11 @@ export function App() {
       <Suspense fallback={<PageFallback />}>
         <Routes>
           <Route path="login" element={<LoginPage />} />
-          <Route path="wizard" element={<OnboardWizardPage />} />
+          {/* `/wizard` was a second, older first-run wizard that nothing linked
+              to and `FirstRunGate` never sent anyone to (§2-13). Its component
+              is gone; the path redirects so any stale bookmark lands on the one
+              real onboarding surface. */}
+          <Route path="wizard" element={<Navigate to="/welcome" replace />} />
           {/* Tauri desktop-pet mini route (§7.4) — no app shell. */}
           <Route path="mascot-overlay" element={<MascotOverlayPage />} />
           {/* WP-GW desktop Gateway picker — pre-login, no app shell; redirects
@@ -186,6 +185,11 @@ export function App() {
               <Route path="runs" element={<RunsPage />} />
               <Route path="canvas" element={<CanvasPage />} />
               <Route path="files" element={<FilesPage />} />
+              {/* D7 (09-edition-split-features.md §4): dropped out of the
+                  manager+ RoleGuard block below — a cron schedule for one's own
+                  agent is the same "own scope" as /plans and /runs above, not a
+                  manager-level concern. */}
+              <Route path="routines" element={<RoutinesPage />} />
 
               {/* ── 員工 / 公司 ── */}
               <Route path="agents" element={<AgentsPage />} />
@@ -221,7 +225,6 @@ export function App() {
               {/* manager+ routes (Zone B/C) */}
               <Route element={<RoleGuard minRole="manager" />}>
                 <Route path="forks" element={<ForkPage />} />
-                <Route path="routines" element={<RoutinesPage />} />
                 <Route path="timeline" element={<TimelinePage />} />
                 <Route path="reports" element={<ReportPage />} />
                 <Route path="org" element={<OrgChartPage />} />
@@ -256,39 +259,70 @@ export function App() {
                   <Route path="inference" element={<InferencePage />} />
                   <Route path="reliability" element={<ReliabilityPage />} />
                   <Route path="security" element={<SecurityPage />} />
-                  <Route path="governance" element={<GovernanceShell />} />
-                  <Route path="users" element={<UsersPage />} />
-                  <Route path="departments" element={<DepartmentsPage />} />
-                  <Route path="distributors" element={<DistributorsPage />} />
                   <Route path="system" element={<SettingsPage />} />
+                  {/* Enterprise-only surfaces (D8/D10-B). The rail already hides
+                      these on a Personal instance; `EditionGuard` closes the URL
+                      too, so a bookmark or a typed path can't reach a console
+                      whose feature that edition doesn't have. `personalHidden`
+                      surfaces (可靠性 / 授權 — 安全 / 日誌 dropped this gate
+                      under D9) stay reachable on purpose — see the guard's own
+                      note. */}
+                  <Route element={<EditionGuard enterprise />}>
+                    <Route path="governance" element={<GovernanceShell />} />
+                    <Route path="users" element={<UsersPage />} />
+                    <Route path="departments" element={<DepartmentsPage />} />
+                    <Route path="distributors" element={<DistributorsPage />} />
+                  </Route>
                 </Route>
               </Route>
 
               {/* ── Legacy route aliases (bookmarks keep working; §0 可回滾) ── */}
-              <Route path="legacy-dashboard" element={<DashboardPage />} />
+              {/* The old overview page was an earlier draft of `/` and nothing
+                  linked to it (§2-13); its component is gone. */}
+              <Route path="legacy-dashboard" element={<Navigate to="/" replace />} />
               <Route path="marketplace" element={<MarketplacePage />} />
               <Route path="wiki" element={<KnowledgeHubPage />} />
               <Route path="shared-wiki" element={<SharedWikiPage />} />
+              {/* The approval centre showed the same decisions as the inbox but
+                  with less of the information needed to make them safely — no
+                  risk badge, no second confirmation on a high-risk action, and a
+                  new-skill request reduced to a plain approve/reject with the
+                  skill's own content and security scan nowhere in sight (§2-6).
+                  One door for decisions; this one redirects to it. */}
+              <Route path="approvals" element={<Navigate to="/inbox" replace />} />
+              {/* These three are the source files behind 管理 → 整合's tabs, not
+                  standalone pages (§2-8). Their old paths land on the tab that
+                  actually renders them — MCP access keys share the 工具伺服器 tab. */}
+              <Route path="mcp" element={<Navigate to="/manage/integrations?tab=mcp" replace />} />
+              <Route path="mcp-keys" element={<Navigate to="/manage/integrations?tab=mcp" replace />} />
+              <Route path="odoo" element={<Navigate to="/manage/integrations?tab=odoo" replace />} />
+              {/* Orphan-page fixups (X04, audit phase4): these three used to render
+                  a full standalone page with no nav-model / command-palette entry
+                  pointing at it. Their content lives inside a `/manage/*` shell
+                  now, so the old path redirects there instead of rendering a
+                  second, unreachable-except-by-URL copy. */}
+              <Route path="partner" element={<Navigate to="/manage/license" replace />} />
+              <Route path="wiki-trust" element={<Navigate to="/manage/governance?tab=wikiTrust" replace />} />
               <Route element={<RoleGuard minRole="manager" />}>
-                <Route path="approvals" element={<ApprovalsPage />} />
-                <Route path="partner" element={<PartnerPortalPage />} />
                 <Route path="billing" element={<BillingPage />} />
                 <Route path="license" element={<LicensePage />} />
                 <Route path="logs" element={<LogsPage />} />
               </Route>
               <Route element={<RoleGuard minRole="admin" />}>
-                <Route path="channels" element={<ChannelsPage />} />
+                <Route path="channels" element={<Navigate to="/manage/channels" replace />} />
                 <Route path="accounts" element={<AccountsPage />} />
                 <Route path="security" element={<SecurityPage />} />
-                <Route path="governance" element={<GovernancePage />} />
                 <Route path="reliability" element={<ReliabilityPage />} />
-                <Route path="wiki-trust" element={<WikiTrustPage />} />
                 <Route path="settings" element={<SettingsPage />} />
-                <Route path="mcp" element={<McpPage />} />
-                <Route path="mcp-keys" element={<McpKeysPage />} />
-                <Route path="odoo" element={<OdooPage />} />
                 <Route path="inference" element={<InferencePage />} />
-                <Route path="users" element={<UsersPage />} />
+                {/* D10-B: the aliases were the hole — every Enterprise-only page
+                    had an ungated second path in here. Same guard as the
+                    canonical routes above, so neither can be used to walk around
+                    the other. */}
+                <Route element={<EditionGuard enterprise />}>
+                  <Route path="governance" element={<GovernancePage />} />
+                  <Route path="users" element={<UsersPage />} />
+                </Route>
               </Route>
               </Route>{/* end FirstRunGate */}
             </Route>

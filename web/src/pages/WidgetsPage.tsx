@@ -4,10 +4,12 @@ import { useNavigate } from 'react-router';
 import { api, type CustomWidgetSummary } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { hasMinRole } from '@/lib/roles';
-import { toast, formatError } from '@/lib/toast';
+import { toast } from '@/lib/toast';
 import {
   CollectionPageHeader,
   CollectionPageState,
+  ErrorState,
+  useErrorMessage,
   Card,
   CardContent,
   Button,
@@ -20,6 +22,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from '@/components/mds';
+import { ConfirmDialog } from '@/components/settings/controls';
 import { CustomWidgetFrame } from '@/components/home/CustomWidgetFrame';
 import {
   LayoutGrid, Plus, Code, Share2, Download, Upload, Trash2, Pencil, Copy, Check, MoreHorizontal,
@@ -83,6 +86,7 @@ interface WidgetExportFile {
  */
 export function WidgetsPage() {
   const intl = useIntl();
+  const errorText = useErrorMessage();
   const navigate = useNavigate();
   const user = useAuthStore((s) => s.user);
   const isAdmin = hasMinRole(user?.role, 'admin');
@@ -92,7 +96,11 @@ export function WidgetsPage() {
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [onBoard, setOnBoard] = useState<Set<string>>(new Set());
+  // Delete used to gate on the browser's native `window.confirm()` (phase4
+  // audit C06 Blocker) — route it through the shared ConfirmDialog.
+  const [removeTarget, setRemoveTarget] = useState<CustomWidgetSummary | null>(null);
   const importRef = useRef<HTMLInputElement | null>(null);
+  const [loadError, setLoadError] = useState<unknown>(null);
 
   const refresh = useCallback(() => {
     setLoading(true);
@@ -104,8 +112,12 @@ export function WidgetsPage() {
         setWidgets(r.widgets);
         setMaxPerUser(r.max_per_user);
         setOnBoard(new Set((l.layout?.widgets ?? []).map((w) => w.id)));
+        setLoadError(null);
       })
-      .catch((e) => toast.error(formatError(e)))
+      // A toast plus an empty list told the user "you haven't built any
+      // widgets yet" when the real answer was "we couldn't load them"
+      // (P05 Blocker, phase-4 audit).
+      .catch((e: unknown) => setLoadError(e))
       .finally(() => setLoading(false));
   }, []);
 
@@ -136,7 +148,7 @@ export function WidgetsPage() {
       setOnBoard((s) => new Set(s).add(lid));
       toast.success(intl.formatMessage({ id: 'widgets.action.added' }));
     } catch (e) {
-      toast.error(formatError(e));
+      toast.error(errorText(e));
     } finally {
       setBusyId(null);
     }
@@ -148,20 +160,19 @@ export function WidgetsPage() {
       await api.widgetsCustom.share(w.id, !w.shared);
       refresh();
     } catch (e) {
-      toast.error(formatError(e));
+      toast.error(errorText(e));
     } finally {
       setBusyId(null);
     }
   };
 
   const remove = async (w: CustomWidgetSummary) => {
-    if (!window.confirm(intl.formatMessage({ id: 'widgets.action.deleteConfirm' }, { title: w.title }))) return;
     setBusyId(w.id);
     try {
       await api.widgetsCustom.remove(w.id);
       refresh();
     } catch (e) {
-      toast.error(formatError(e));
+      toast.error(errorText(e));
     } finally {
       setBusyId(null);
     }
@@ -183,7 +194,7 @@ export function WidgetsPage() {
       a.click();
       URL.revokeObjectURL(a.href);
     } catch (e) {
-      toast.error(formatError(e));
+      toast.error(errorText(e));
     }
   };
 
@@ -201,7 +212,7 @@ export function WidgetsPage() {
       setTab('mine');
       refresh();
     } catch (e) {
-      toast.error(formatError(e));
+      toast.error(errorText(e));
     } finally {
       setBusyId(null);
     }
@@ -226,7 +237,7 @@ export function WidgetsPage() {
       setTab('mine');
       refresh();
     } catch (e) {
-      toast.error(formatError(e));
+      toast.error(errorText(e));
     }
   };
 
@@ -288,6 +299,8 @@ export function WidgetsPage() {
       <div className="flex flex-1 flex-col p-4 md:p-6">
         {loading ? (
           <CollectionPageState state="loading" />
+        ) : loadError != null ? (
+          <ErrorState icon={LayoutGrid} error={loadError} onRetry={refresh} />
         ) : rows.length === 0 ? (
           <CollectionPageState
             state="empty"
@@ -372,7 +385,7 @@ export function WidgetsPage() {
                             {intl.formatMessage({ id: 'widgets.action.export' })}
                           </DropdownMenuItem>
                           {(isMine || isAdmin) && (
-                            <DropdownMenuItem variant="destructive" onClick={() => void remove(w)}>
+                            <DropdownMenuItem variant="destructive" onClick={() => setRemoveTarget(w)}>
                               <Trash2 />
                               {intl.formatMessage({ id: 'common.delete' })}
                             </DropdownMenuItem>
@@ -387,6 +400,20 @@ export function WidgetsPage() {
           </div>
         )}
       </div>
+
+      {removeTarget && (
+        <ConfirmDialog
+          open
+          title={intl.formatMessage({ id: 'common.delete' })}
+          message={intl.formatMessage({ id: 'widgets.action.deleteConfirm' }, { title: removeTarget.title })}
+          onConfirm={() => {
+            const target = removeTarget;
+            setRemoveTarget(null);
+            void remove(target);
+          }}
+          onClose={() => setRemoveTarget(null)}
+        />
+      )}
     </div>
   );
 }

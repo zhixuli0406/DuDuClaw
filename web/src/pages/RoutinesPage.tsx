@@ -6,10 +6,12 @@ import { client } from '@/lib/ws-client';
 import { debounceTrailing } from '@/lib/debounce';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { toast, formatError } from '@/lib/toast';
+import { toast } from '@/lib/toast';
 import {
   CollectionPageHeader,
   CollectionPageState,
+  ErrorState,
+  useErrorMessage,
   Button,
   Switch,
   Input,
@@ -36,7 +38,8 @@ import {
   ListGridCell,
   ActorAvatar,
 } from '@/components/mds';
-import { ScheduleBuilder } from '@/components/settings/controls';
+import { ScheduleBuilder, ConfirmDialog } from '@/components/settings/controls';
+import { AutonomyNote } from '@/components/AutonomyNote';
 import { timeAgo } from '@/lib/format';
 import { glyphText } from '@/lib/agent-glyph';
 
@@ -112,6 +115,7 @@ function RoutineFormDialog({
   onSaved: () => Promise<void>;
 }) {
   const intl = useIntl();
+  const errorText = useErrorMessage();
   const isEdit = !!task;
   const [name, setName] = useState(task?.name ?? '');
   const [schedule, setSchedule] = useState(task?.schedule ?? task?.cron ?? '0 * * * *');
@@ -165,7 +169,9 @@ function RoutineFormDialog({
       await onSaved();
       onClose();
     } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+      toast.error(
+        intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: errorText(e) }),
+      );
     } finally {
       setSaving(false);
     }
@@ -235,6 +241,8 @@ function RoutineFormDialog({
               onChange={(e) => setBody(e.target.value)}
             />
           </div>
+
+          <AutonomyNote id="routinesEnable" />
         </div>
 
         <DialogFooter>
@@ -350,21 +358,29 @@ function RoutineRow({
  */
 export function RoutinesPage() {
   const intl = useIntl();
+  const errorText = useErrorMessage();
   const connectionState = useConnectionStore((s) => s.state);
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [loading, setLoading] = useState(true);
+  // A failed load must not read as "you have no routines" — that misleads the
+  // user into creating duplicates (P05 Blocker, phase-4 audit).
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   // `undefined` = dialog closed; `null` = create; a Routine = edit that task.
   const [dialog, setDialog] = useState<Routine | null | undefined>(undefined);
+  // Delete used to fire straight off the kebab menu with zero confirmation
+  // (phase4 audit C06 Blocker) — gate it behind the shared ConfirmDialog.
+  const [toRemove, setToRemove] = useState<Routine | null>(null);
 
   const load = useCallback(async () => {
     try {
       const res = await api.cron.list();
       setRoutines(res?.tasks ?? []);
+      setLoadError(null);
     } catch (e) {
       console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
       setRoutines([]);
+      setLoadError(e);
     } finally {
       setLoading(false);
     }
@@ -403,7 +419,9 @@ export function RoutinesPage() {
         await load();
       } catch (e) {
         console.warn('[api]', e);
-        toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+        toast.error(
+          intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: errorText(e) }),
+        );
       } finally {
         setBusy((p) => {
           const next = { ...p };
@@ -442,6 +460,15 @@ export function RoutinesPage() {
       <div className="flex flex-1 flex-col p-4 md:p-6">
         {loading ? (
           <CollectionPageState state="loading" />
+        ) : loadError ? (
+          <ErrorState
+            icon={Clock}
+            error={loadError}
+            onRetry={() => {
+              setLoading(true);
+              void load();
+            }}
+          />
         ) : routines.length === 0 ? (
           <CollectionPageState
             state="empty"
@@ -486,7 +513,7 @@ export function RoutinesPage() {
                     )
                   }
                   onEdit={() => setDialog(r)}
-                  onRemove={() => act(r.id, () => api.cron.remove(r.id), 'routines.removedToast')}
+                  onRemove={() => setToRemove(r)}
                   onRunNow={() => act(r.id, () => api.cron.runNow(r.id), 'routines.runNowToast')}
                 />
               ))}
@@ -494,6 +521,24 @@ export function RoutinesPage() {
           </div>
         )}
       </div>
+
+      {toRemove && (
+        <ConfirmDialog
+          open
+          title={intl.formatMessage({ id: 'routines.remove' })}
+          message={intl.formatMessage(
+            { id: 'routines.remove.confirm' },
+            { name: toRemove.name || toRemove.id },
+          )}
+          confirmLabel={intl.formatMessage({ id: 'routines.remove' })}
+          onConfirm={() => {
+            const target = toRemove;
+            setToRemove(null);
+            void act(target.id, () => api.cron.remove(target.id), 'routines.removedToast');
+          }}
+          onClose={() => setToRemove(null)}
+        />
+      )}
     </div>
   );
 }

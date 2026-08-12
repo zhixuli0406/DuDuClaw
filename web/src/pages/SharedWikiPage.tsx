@@ -15,6 +15,7 @@ import { timeAgo } from '@/lib/format';
 import {
   CollectionPageHeader,
   CollectionPageState,
+  ErrorState,
   Card,
   CardContent,
   BreadcrumbHeader,
@@ -46,6 +47,7 @@ import {
   ActorAvatar,
   type SegmentedOption,
 } from '@/components/mds';
+import { ConfirmDialog } from '@/components/settings/controls';
 import {
   GlobeIcon,
   BookOpenIcon,
@@ -75,7 +77,11 @@ function namespaceOf(path: string): string {
  * lists pages as a flat ListGrid and opens a max-w-4xl reading view. Namespace
  * policy modes render as tone-coded badges (read_only=warning / operator_only=
  * destructive / agent_writable=secondary). Data flow is unchanged. Renders
- * header-less when `embedded` (MemoryPage's 共享知識庫 tab owns the header).
+ * header-less when `embedded` (MemoryPage's 所有員工共用 tab owns the header) —
+ * this page still shows its own one-line explainer inline in that case (D5,
+ * 09-edition-split-features.md §4) so the personal-vs-shared distinction is
+ * visible wherever this content actually renders, not just on the standalone
+ * `/shared-wiki` route.
  */
 export function SharedWikiPage({ embedded = false }: { embedded?: boolean }) {
   const intl = useIntl();
@@ -90,6 +96,15 @@ export function SharedWikiPage({ embedded = false }: { embedded?: boolean }) {
 
   const inner = (
     <div className="space-y-4">
+      {/* Embedded contexts (the memory-page tab) skip CollectionPageHeader, so
+          the plain-language distinction from the personal knowledge base would
+          otherwise never render there. Standalone gets it via the header
+          description below instead — showing both would just repeat it. */}
+      {embedded && (
+        <p className="text-sm text-muted-foreground">
+          {intl.formatMessage({ id: 'sharedWiki.subtitle' })}
+        </p>
+      )}
       <Segmented
         value={view}
         onValueChange={setView}
@@ -129,23 +144,38 @@ function BrowseView() {
   const [loading, setLoading] = useState(false);
   const [selectedPath, setSelectedPath] = useState('');
   const [pageContent, setPageContent] = useState('');
+  // Swallowing these used to render a real read failure as "the wiki is empty"
+  // and a bare English 'Error loading page' (P05 Blocker, phase-4 audit).
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [pageError, setPageError] = useState<unknown>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
     setLoading(true);
     api.sharedWiki.pages().then((res) => {
       setPages(res?.pages ?? []);
       setWikiExists(res?.exists ?? false);
-    }).catch(() => {
+      setLoadError(null);
+    }).catch((e: unknown) => {
       setPages([]);
       setWikiExists(false);
+      setLoadError(e);
     }).finally(() => setLoading(false));
+  }, [reloadNonce]);
+
+  const loadPage = useCallback((path: string) => {
+    setPageContent('');
+    setPageError(null);
+    api.sharedWiki
+      .read(path)
+      .then((res) => setPageContent(res?.content ?? ''))
+      .catch((e: unknown) => setPageError(e));
   }, []);
 
   const handleSelect = useCallback((path: string) => {
     setSelectedPath(path);
-    setPageContent('');
-    api.sharedWiki.read(path).then((res) => setPageContent(res?.content ?? '')).catch(() => setPageContent('Error loading page'));
-  }, []);
+    loadPage(path);
+  }, [loadPage]);
 
   const sortedPages = useMemo(
     () => [...pages].sort((a, b) => a.path.localeCompare(b.path)),
@@ -153,6 +183,16 @@ function BrowseView() {
   );
 
   if (loading) return <CollectionPageState state="loading" />;
+
+  if (loadError != null) {
+    return (
+      <ErrorState
+        icon={BookOpenIcon}
+        error={loadError}
+        onRetry={() => setReloadNonce((n) => n + 1)}
+      />
+    );
+  }
 
   if (!wikiExists || pages.length === 0) {
     return <CollectionPageState state="empty" icon={BookOpenIcon} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />;
@@ -171,9 +211,17 @@ function BrowseView() {
         />
         <div className="mx-auto max-w-4xl px-8 py-8">
           <h1 className="mb-4 text-xl font-semibold text-foreground sm:text-2xl">{page?.title ?? selectedPath}</h1>
-          <pre className="overflow-auto whitespace-pre-wrap rounded-xl border border-surface-border bg-muted p-4 font-mono text-sm text-foreground">
-            {pageContent || intl.formatMessage({ id: 'common.loading' })}
-          </pre>
+          {pageError != null ? (
+            <ErrorState
+              icon={FileTextIcon}
+              error={pageError}
+              onRetry={() => loadPage(selectedPath)}
+            />
+          ) : (
+            <pre className="overflow-auto whitespace-pre-wrap rounded-xl border border-surface-border bg-muted p-4 font-mono text-sm text-foreground">
+              {pageContent || intl.formatMessage({ id: 'common.loading' })}
+            </pre>
+          )}
         </div>
       </div>
     );
@@ -236,11 +284,24 @@ function SearchView() {
   const [query, setQuery] = useState('');
   const [hits, setHits] = useState<ReadonlyArray<WikiSearchHit>>([]);
   const [loading, setLoading] = useState(false);
+  const [searchError, setSearchError] = useState<unknown>(null);
 
   const handleSearch = useCallback(() => {
     if (!query.trim()) return;
     setLoading(true);
-    api.sharedWiki.search(query.trim()).then((res) => setHits(res?.hits ?? [])).catch(() => setHits([])).finally(() => setLoading(false));
+    api.sharedWiki
+      .search(query.trim())
+      .then((res) => {
+        setHits(res?.hits ?? []);
+        setSearchError(null);
+      })
+      // A failed search used to render as "no results", which reads as an
+      // answer rather than a failure (P05 Blocker).
+      .catch((e: unknown) => {
+        setHits([]);
+        setSearchError(e);
+      })
+      .finally(() => setLoading(false));
   }, [query]);
 
   return (
@@ -258,6 +319,8 @@ function SearchView() {
 
       {loading ? (
         <CollectionPageState state="loading" />
+      ) : searchError != null ? (
+        <ErrorState icon={SearchIcon} error={searchError} onRetry={handleSearch} />
       ) : hits.length === 0 ? (
         <CollectionPageState state="empty" icon={SearchIcon} title={intl.formatMessage({ id: 'sharedWiki.search.empty' })} />
       ) : (
@@ -293,12 +356,35 @@ function StatsView() {
   const intl = useIntl();
   const [stats, setStats] = useState<SharedWikiStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [statsError, setStatsError] = useState<unknown>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
-    api.sharedWiki.stats().then(setStats).catch(() => setStats(null)).finally(() => setLoading(false));
-  }, []);
+    setLoading(true);
+    api.sharedWiki
+      .stats()
+      .then((res) => {
+        setStats(res);
+        setStatsError(null);
+      })
+      .catch((e: unknown) => {
+        setStats(null);
+        setStatsError(e);
+      })
+      .finally(() => setLoading(false));
+  }, [reloadNonce]);
 
   if (loading) return <CollectionPageState state="loading" />;
+
+  if (statsError != null) {
+    return (
+      <ErrorState
+        icon={BarChart3Icon}
+        error={statsError}
+        onRetry={() => setReloadNonce((n) => n + 1)}
+      />
+    );
+  }
 
   if (!stats?.exists) {
     return <CollectionPageState state="empty" icon={BarChart3Icon} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />;
@@ -389,6 +475,12 @@ function PolicyView() {
   const [namespaces, setNamespaces] = useState<ReadonlyArray<WikiScopeNamespace>>([]);
   const [loading, setLoading] = useState(false);
   const [editing, setEditing] = useState<{ ns: WikiScopeNamespace; isNew: boolean } | null>(null);
+  // Removing a namespace's governance policy used to fire straight from the
+  // kebab menu with zero confirmation (phase4 audit C06/C11 Blocker) — this is
+  // not a content delete, it silently reverts the namespace's write policy
+  // (e.g. read_only / operator_only) back to the unrestricted default. Gate it
+  // behind the shared ConfirmDialog.
+  const [removeTarget, setRemoveTarget] = useState<WikiScopeNamespace | null>(null);
 
   const fetchScope = useCallback(async () => {
     setLoading(true);
@@ -479,7 +571,7 @@ function PolicyView() {
                           <PencilIcon />
                           {intl.formatMessage({ id: 'common.edit' })}
                         </DropdownMenuItem>
-                        <DropdownMenuItem className="text-destructive focus:bg-destructive/10" onClick={() => handleRemove(n.namespace)}>
+                        <DropdownMenuItem className="text-destructive focus:bg-destructive/10" onClick={() => setRemoveTarget(n)}>
                           <Trash2Icon />
                           {intl.formatMessage({ id: 'common.delete' })}
                         </DropdownMenuItem>
@@ -499,6 +591,24 @@ function PolicyView() {
           isNew={editing.isNew}
           onClose={() => setEditing(null)}
           onSaved={() => { setEditing(null); fetchScope(); }}
+        />
+      )}
+
+      {removeTarget && (
+        <ConfirmDialog
+          open
+          title={intl.formatMessage({ id: 'common.delete' })}
+          message={intl.formatMessage(
+            { id: 'confirm.sharedWiki.removeNamespace.message' },
+            { namespace: removeTarget.namespace, mode: removeTarget.mode },
+          )}
+          confirmLabel={intl.formatMessage({ id: 'common.delete' })}
+          onConfirm={() => {
+            const target = removeTarget;
+            setRemoveTarget(null);
+            void handleRemove(target.namespace);
+          }}
+          onClose={() => setRemoveTarget(null)}
         />
       )}
     </div>

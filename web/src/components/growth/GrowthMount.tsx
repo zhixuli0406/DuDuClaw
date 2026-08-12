@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useSharedLeaderQuery } from '@/hooks/useSharedLeaderQuery';
@@ -26,8 +26,14 @@ export function GrowthMount() {
   const intl = useIntl();
   const authed = useConnectionStore((s) => s.state === 'authenticated');
   const applySnapshot = useGrowthStore((s) => s.applySnapshot);
+  const setError = useGrowthStore((s) => s.setError);
+  const setRetry = useGrowthStore((s) => s.setRetry);
 
-  const { data } = useSharedLeaderQuery<GrowthSnapshot>(
+  // `error` was dropped on the floor here, so a failing poll never reached the
+  // store: `applySnapshot` was never called, `loaded` stayed false, and
+  // `/growth` sat on its skeleton forever with no hint that anything was wrong
+  // (P05 Blocker, phase-4 audit — the "infinite spinner" case).
+  const { data, error, refetch } = useSharedLeaderQuery<GrowthSnapshot>(
     'growth.snapshot',
     () => growthApi.snapshot(),
     60_000,
@@ -37,6 +43,19 @@ export function GrowthMount() {
   useEffect(() => {
     if (data) applySnapshot(data);
   }, [data, applySnapshot]);
+
+  useEffect(() => {
+    setError(error ?? null);
+  }, [error, setError]);
+
+  // `refetch` is a fresh closure each render; register a stable wrapper once so
+  // the store isn't rewritten (and every subscriber re-rendered) per render.
+  const refetchRef = useRef(refetch);
+  refetchRef.current = refetch;
+  useEffect(() => {
+    setRetry(() => refetchRef.current());
+    return () => setRetry(null);
+  }, [setRetry]);
 
   // Turn store transitions into localized acknowledgements.
   useEffect(

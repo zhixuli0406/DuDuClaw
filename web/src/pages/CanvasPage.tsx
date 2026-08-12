@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useUrlState, useUrlStateNullable } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
 import { History, Presentation, RefreshCw, MoreHorizontal } from 'lucide-react';
 import { api, type CanvasGetResult } from '@/lib/api';
@@ -13,6 +14,7 @@ import {
   Badge,
   Button,
   Empty,
+  ErrorState,
   Skeleton,
   Select,
   SelectTrigger,
@@ -49,11 +51,15 @@ export function CanvasPage() {
   const scope = useDataScope();
   const visibleAgents = useVisibleAgents();
 
-  const [agentFilter, setAgentFilter] = useState('');
+  // P11 (state-as-URL): whose canvas, and which version of it, are both page
+  // state — `?agent=<id>&seq=<n>` makes "look at this version" a link.
+  const [agentFilter, setAgentFilter] = useUrlState('agent', '');
   /** null = live current version; a number = pinned history version. */
-  const [viewSeq, setViewSeq] = useState<number | null>(null);
+  const [seqParam, setSeqParam] = useUrlStateNullable('seq');
+  const viewSeq = seqParam != null && /^\d+$/.test(seqParam) ? Number(seqParam) : null;
+  const setViewSeq = (seq: number | null) => setSeqParam(seq == null ? null : String(seq));
   const [result, setResult] = useState<CanvasGetResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [loaded, setLoaded] = useState(false);
 
   // The canvas is strictly per-agent (the gateway fails closed without an
@@ -72,7 +78,7 @@ export function CanvasPage() {
       setResult(res);
       setError(null);
     } catch (e) {
-      setError(String(e));
+      setError(e);
     } finally {
       setLoaded(true);
     }
@@ -217,11 +223,11 @@ export function CanvasPage() {
             </div>
           ) : error ? (
             <div className="flex flex-1 items-center justify-center">
-              <Empty
+              <ErrorState
                 icon={Presentation}
-                tone="destructive"
                 title={intl.formatMessage({ id: 'canvas.error' })}
-                description={error}
+                error={error}
+                onRetry={() => void fetchCanvas()}
               />
             </div>
           ) : isEmpty ? (

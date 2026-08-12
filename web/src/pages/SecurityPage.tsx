@@ -1,7 +1,9 @@
 import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import { api, type AuditEvent, type KillswitchConfig } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useSystemStore } from '@/stores/system-store';
 import { AdvancedSection, ConfirmDialog } from '@/components/settings/controls';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
@@ -25,6 +27,7 @@ import {
   ActorAvatar,
   Skeleton,
   SettingsSaveState,
+  CrossLink,
   type SettingsSaveStatus,
 } from '@/components/mds';
 import { cn } from '@/lib/utils';
@@ -53,6 +56,15 @@ interface SecurityStatus {
 
 export function SecurityPage() {
   const intl = useIntl();
+  const navigate = useNavigate();
+  // D9 (09-edition-split-features.md §4): a single operator still needs an
+  // emergency brake and a way to see what happened, so kill switch + audit
+  // log stay — folded into a page-internal collapsed section rather than
+  // hidden. RBAC / credential proxy / mount guard are organisation-scale
+  // views (which agent may do what across a team, whose secrets flow through
+  // the proxy, which container mounts are shared) with no single-owner
+  // counterpart, so those stay hidden on Personal.
+  const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
   const [status, setStatus] = useState<SecurityStatus | null>(null);
@@ -86,12 +98,11 @@ export function SecurityPage() {
         </div>
       </div>
 
-      {/* KPI overview — scalar security metrics (§5.5 divide group) */}
-      <div className="grid gap-px overflow-hidden rounded-xl border border-surface-border bg-surface-border sm:grid-cols-2 lg:grid-cols-4">
-        <KpiCell
-          label={intl.formatMessage({ id: 'security.injectedSecrets' })}
-          value={status?.credential_proxy?.injected_secrets ?? 0}
-        />
+      {/* KPI overview — scalar security metrics (§5.5 divide group). Personal
+          drops the two cells that are read-outs of the hidden credential-proxy
+          / mount-guard cards below; the rate-limiter pair stays (it protects
+          a single owner's own usage same as anyone else's). */}
+      <div className={cn('grid gap-px overflow-hidden rounded-xl border border-surface-border bg-surface-border sm:grid-cols-2', !isPersonal && 'lg:grid-cols-4')}>
         <KpiCell
           label={intl.formatMessage({ id: 'security.reqPerMin' })}
           value={status?.rate_limiter?.requests_per_minute ?? 60}
@@ -100,121 +111,193 @@ export function SecurityPage() {
           label={intl.formatMessage({ id: 'security.concurrent' })}
           value={status?.rate_limiter?.concurrent_requests ?? 5}
         />
-        <KpiCell
-          label={intl.formatMessage({ id: 'security.mountGuard.title' })}
-          value={status?.mount_guard?.rules?.length ?? 0}
-        />
+        {!isPersonal && (
+          <>
+            <KpiCell
+              label={intl.formatMessage({ id: 'security.injectedSecrets' })}
+              value={status?.credential_proxy?.injected_secrets ?? 0}
+            />
+            <KpiCell
+              label={intl.formatMessage({ id: 'security.mountGuard.title' })}
+              value={status?.mount_guard?.rules?.length ?? 0}
+            />
+          </>
+        )}
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        {/* Audit Log */}
-        <SecurityCard
-          icon={History}
-          title={intl.formatMessage({ id: 'security.audit.title' })}
-          description={intl.formatMessage({ id: 'security.audit.desc' })}
+      {isPersonal ? (
+        // Personal: everything left (audit log + kill switch) is an
+        // emergency-brake surface, not a daily one — folded behind the
+        // site-wide "advanced" disclosure so the page opens calm.
+        <AdvancedSection
+          storageKey="security.personal.emergency"
+          label={intl.formatMessage({ id: 'security.personal.advancedLabel' })}
         >
-          {auditLoading ? (
-            <div className="space-y-2">
-              <Skeleton className="h-9 w-full" />
-              <Skeleton className="h-9 w-full" />
-              <Skeleton className="h-9 w-full" />
-            </div>
-          ) : auditEvents.length === 0 ? (
-            <Empty icon={History} title={intl.formatMessage({ id: 'security.audit.empty' })} />
-          ) : (
-            <div className="max-h-64 space-y-2 overflow-y-auto">
-              {auditEvents.map((evt, i) => (
-                <AuditRow key={`${evt.timestamp}-${i}`} event={evt} />
-              ))}
-            </div>
-          )}
-        </SecurityCard>
-
-        {/* Credential Proxy */}
-        <SecurityCard
-          icon={Lock}
-          title={intl.formatMessage({ id: 'security.credentialProxy.title' })}
-          description={intl.formatMessage({ id: 'security.credentialProxy.desc' })}
-        >
-          <div className="space-y-3">
-            <StatusRow
-              label={intl.formatMessage({ id: 'security.proxyStatus' })}
-              status={status?.credential_proxy?.active ? 'active' : 'inactive'}
-            />
-            <StatusRow
-              label={intl.formatMessage({ id: 'security.vaultBackend' })}
-              value={status?.credential_proxy?.vault_backend ?? '—'}
+          <div className="grid gap-6 lg:grid-cols-2">
+            <AuditLogCard
+              auditLoading={auditLoading}
+              auditEvents={auditEvents}
+              onViewFull={() => navigate('/manage/logs?source=security')}
             />
           </div>
-        </SecurityCard>
+          <KillswitchSection />
+        </AdvancedSection>
+      ) : (
+        <>
+          <div className="grid gap-6 lg:grid-cols-2">
+            <AuditLogCard
+              auditLoading={auditLoading}
+              auditEvents={auditEvents}
+              onViewFull={() => navigate('/manage/logs?source=security')}
+            />
 
-        {/* Mount Guard */}
-        <SecurityCard
-          icon={ShieldCheck}
-          title={intl.formatMessage({ id: 'security.mountGuard.title' })}
-          description={intl.formatMessage({ id: 'security.mountGuard.desc' })}
-        >
-          <div className="space-y-2">
-            {status?.mount_guard?.rules && status.mount_guard.rules.length > 0 ? (
-              status.mount_guard.rules.map((rule) => (
-                <RuleRow key={rule.path} path={rule.path} access={rule.access} />
-              ))
-            ) : (
-              <p className="py-2 text-center text-sm text-muted-foreground">
-                {intl.formatMessage({ id: 'common.noData' })}
-              </p>
-            )}
-          </div>
-        </SecurityCard>
+            {/* Credential Proxy */}
+            <SecurityCard
+              icon={Lock}
+              title={intl.formatMessage({ id: 'security.credentialProxy.title' })}
+              description={intl.formatMessage({ id: 'security.credentialProxy.desc' })}
+            >
+              <div className="space-y-3">
+                <StatusRow
+                  label={intl.formatMessage({ id: 'security.proxyStatus' })}
+                  status={status?.credential_proxy?.active ? 'active' : 'inactive'}
+                />
+                <StatusRow
+                  label={intl.formatMessage({ id: 'security.vaultBackend' })}
+                  value={status?.credential_proxy?.vault_backend ?? '—'}
+                />
+              </div>
+            </SecurityCard>
 
-        {/* RBAC */}
-        <SecurityCard
-          icon={Users}
-          title={intl.formatMessage({ id: 'security.rbac.title' })}
-          description={intl.formatMessage({ id: 'security.rbac.desc' })}
-          className="lg:col-span-2"
-        >
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>{intl.formatMessage({ id: 'security.rbac.agent' })}</TableHead>
-                <TableHead className="text-center">{intl.formatMessage({ id: 'security.rbac.tool' })}</TableHead>
-                <TableHead className="text-center">{intl.formatMessage({ id: 'security.rbac.web' })}</TableHead>
-                <TableHead className="text-center">{intl.formatMessage({ id: 'security.rbac.file' })}</TableHead>
-                <TableHead className="text-center">{intl.formatMessage({ id: 'security.rbac.shell' })}</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {(status?.rbac ?? []).map((agent) => (
-                <TableRow key={agent.agent_id}>
-                  <TableCell>
-                    <span className="flex items-center gap-2">
-                      <ActorAvatar actorType="agent" name={agent.agent_id} size="sm" />
-                      <span className="font-mono text-xs text-foreground">{agent.agent_id}</span>
-                      <span className="text-xs text-muted-foreground">({agent.role})</span>
-                    </span>
-                  </TableCell>
-                  <PermCell allowed={agent.tool_use} />
-                  <PermCell allowed={agent.web_access} />
-                  <PermCell allowed={agent.file_write} />
-                  <PermCell allowed={agent.shell_exec} />
-                </TableRow>
-              ))}
-              {(!status?.rbac || status.rbac.length === 0) && (
-                <TableRow>
-                  <TableCell colSpan={5} className="py-4 text-center text-sm text-muted-foreground">
+            {/* Mount Guard */}
+            <SecurityCard
+              icon={ShieldCheck}
+              title={intl.formatMessage({ id: 'security.mountGuard.title' })}
+              description={intl.formatMessage({ id: 'security.mountGuard.desc' })}
+            >
+              <div className="space-y-2">
+                {status?.mount_guard?.rules && status.mount_guard.rules.length > 0 ? (
+                  status.mount_guard.rules.map((rule) => (
+                    <RuleRow key={rule.path} path={rule.path} access={rule.access} />
+                  ))
+                ) : (
+                  <p className="py-2 text-center text-sm text-muted-foreground">
                     {intl.formatMessage({ id: 'common.noData' })}
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </SecurityCard>
-      </div>
+                  </p>
+                )}
+              </div>
+            </SecurityCard>
 
-      {/* Killswitch (KS) — editable, dangerous */}
-      <KillswitchSection />
+            {/* RBAC */}
+            <SecurityCard
+              icon={Users}
+              title={intl.formatMessage({ id: 'security.rbac.title' })}
+              description={intl.formatMessage({ id: 'security.rbac.desc' })}
+              className="lg:col-span-2"
+            >
+              {/* UX audit §2-12 — this table is a read-only mirror; the actual
+                  editable "which actions require approval" policy lives on the
+                  Governance page, on an unrelated nav branch with no link back. */}
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-muted/40 px-3 py-2">
+                <p className="text-xs text-muted-foreground">
+                  {intl.formatMessage({ id: 'security.rbac.editHint' })}
+                </p>
+                <CrossLink
+                  label={intl.formatMessage({ id: 'security.rbac.editLink' })}
+                  onClick={() => navigate('/manage/governance?tab=governance')}
+                />
+              </div>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>{intl.formatMessage({ id: 'security.rbac.agent' })}</TableHead>
+                    <TableHead className="text-center">{intl.formatMessage({ id: 'security.rbac.tool' })}</TableHead>
+                    <TableHead className="text-center">{intl.formatMessage({ id: 'security.rbac.web' })}</TableHead>
+                    <TableHead className="text-center">{intl.formatMessage({ id: 'security.rbac.file' })}</TableHead>
+                    <TableHead className="text-center">{intl.formatMessage({ id: 'security.rbac.shell' })}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {(status?.rbac ?? []).map((agent) => (
+                    <TableRow key={agent.agent_id}>
+                      <TableCell>
+                        <span className="flex items-center gap-2">
+                          <ActorAvatar actorType="agent" name={agent.agent_id} size="sm" />
+                          <span className="font-mono text-xs text-foreground">{agent.agent_id}</span>
+                          <span className="text-xs text-muted-foreground">({agent.role})</span>
+                        </span>
+                      </TableCell>
+                      <PermCell allowed={agent.tool_use} />
+                      <PermCell allowed={agent.web_access} />
+                      <PermCell allowed={agent.file_write} />
+                      <PermCell allowed={agent.shell_exec} />
+                    </TableRow>
+                  ))}
+                  {(!status?.rbac || status.rbac.length === 0) && (
+                    <TableRow>
+                      <TableCell colSpan={5} className="py-4 text-center text-sm text-muted-foreground">
+                        {intl.formatMessage({ id: 'common.noData' })}
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </SecurityCard>
+          </div>
+
+          {/* Killswitch (KS) — editable, dangerous */}
+          <KillswitchSection />
+        </>
+      )}
     </div>
+  );
+}
+
+/** Audit Log card — shared by both the Enterprise grid and the Personal
+ *  collapsed section (D9) so the two paths can never drift apart. */
+function AuditLogCard({
+  auditLoading,
+  auditEvents,
+  onViewFull,
+}: {
+  auditLoading: boolean;
+  auditEvents: AuditEvent[];
+  onViewFull: () => void;
+}) {
+  const intl = useIntl();
+  return (
+    <SecurityCard
+      icon={History}
+      title={intl.formatMessage({ id: 'security.audit.title' })}
+      description={intl.formatMessage({ id: 'security.audit.desc' })}
+    >
+      <div className="space-y-3">
+        {auditLoading ? (
+          <div className="space-y-2">
+            <Skeleton className="h-9 w-full" />
+            <Skeleton className="h-9 w-full" />
+            <Skeleton className="h-9 w-full" />
+          </div>
+        ) : auditEvents.length === 0 ? (
+          <Empty icon={History} title={intl.formatMessage({ id: 'security.audit.empty' })} />
+        ) : (
+          <div className="max-h-64 space-y-2 overflow-y-auto">
+            {auditEvents.map((evt, i) => (
+              <AuditRow key={`${evt.timestamp}-${i}`} event={evt} />
+            ))}
+          </div>
+        )}
+        {/* UX audit §2-11 — this card is a fixed, unfilterable last-30-events
+            slice; LogsPage's history tab is the full, filterable superset over
+            the same `security` source. */}
+        <div className="flex justify-end border-t border-surface-border pt-2">
+          <CrossLink
+            label={intl.formatMessage({ id: 'security.audit.viewFullLink' })}
+            onClick={onViewFull}
+          />
+        </div>
+      </div>
+    </SecurityCard>
   );
 }
 
@@ -266,10 +349,15 @@ function KillswitchSection() {
 
   return (
     <>
+    {/* Killswitch controls a gateway-wide behavioral kill circuit — visually
+        isolate it like every other DangerZone control instead of the same
+        neutral surface as the read-only cards above it (phase4 audit C07
+        Blocker). */}
     <SecurityCard
       icon={OctagonX}
       title={intl.formatMessage({ id: 'killswitch.title' })}
       description={intl.formatMessage({ id: 'killswitch.desc' })}
+      className="border-destructive/30 bg-destructive/5"
     >
       {!config ? (
         <p className="py-4 text-center text-sm text-muted-foreground">{intl.formatMessage({ id: 'common.loading' })}</p>
@@ -372,16 +460,31 @@ function KillswitchSection() {
     </SecurityCard>
 
     {/* Killswitch is a dangerous, gateway-wide behavioral control — gate Save
-        behind an explicit destructive confirmation. */}
+        behind an explicit destructive confirmation that spells out, in plain
+        language, what the current threshold values actually do (phase4 audit
+        — "no impact preview" on this control). */}
     <ConfirmDialog
       open={confirmOpen}
       onClose={() => setConfirmOpen(false)}
       onConfirm={() => { setConfirmOpen(false); handleSave(); }}
       title={intl.formatMessage({ id: 'killswitch.confirmTitle' })}
-      message={intl.formatMessage({
-        id: 'killswitch.confirmSave',
-        defaultMessage: 'Save kill-switch thresholds now? Most changes only take effect after a gateway restart.',
-      })}
+      message={
+        config
+          ? intl.formatMessage(
+              { id: 'confirm.security.killswitchImpact' },
+              {
+                maxReplies: config.triggers.max_replies_per_minute,
+                maxErrors: config.triggers.max_consecutive_errors,
+                errorRate: Math.round(config.triggers.error_rate_threshold * 100),
+                costLimit: config.triggers.cost_limit_usd,
+                cooldown: config.circuit_breaker.cooldown_secs,
+              },
+            )
+          : intl.formatMessage({
+              id: 'killswitch.confirmSave',
+              defaultMessage: 'Save kill-switch thresholds now? Most changes only take effect after a gateway restart.',
+            })
+      }
       confirmLabel={intl.formatMessage({ id: 'common.save' })}
       busy={saving}
     />

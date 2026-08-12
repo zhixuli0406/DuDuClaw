@@ -1,6 +1,5 @@
-import { useState } from 'react';
 import { useIntl } from 'react-intl';
-import { useSearchParams } from 'react-router';
+import { useUrlState } from '@/lib/use-url-state';
 import { Plug, Building2, UserSearch, Mail } from 'lucide-react';
 import { Tabs, TabsList, TabsTab, TabsPanel, Separator } from '@/components/mds';
 import { McpPage } from './McpPage';
@@ -40,22 +39,14 @@ type TabId = (typeof TAB_IDS)[number];
  */
 export function IntegrationsPage() {
   const intl = useIntl();
-  const [params, setParams] = useSearchParams();
-  const fromUrl = params.get('tab');
+  // P11 (state-as-URL): the active tab *is* `?tab=` — no shadow `useState`, so
+  // Back/Forward and a pasted link can never disagree with what is rendered.
+  // An unknown or hidden tab resolves to the first one rather than a blank panel.
   const hidden: TabId[] = GOOGLE_INTEGRATION_ENABLED ? [] : ['google'];
-  const initial: TabId =
-    TAB_IDS.includes(fromUrl as TabId) && !hidden.includes(fromUrl as TabId)
-      ? (fromUrl as TabId)
-      : TAB_IDS[0];
-  const [active, setActive] = useState<TabId>(initial);
+  const [tab, setTab] = useUrlState('tab', TAB_IDS[0], { allowed: TAB_IDS });
+  const active: TabId = hidden.includes(tab) ? TAB_IDS[0] : tab;
 
-  const onChange = (value: unknown) => {
-    const id = value as TabId;
-    setActive(id);
-    const next = new URLSearchParams(params);
-    next.set('tab', id);
-    setParams(next, { replace: true });
-  };
+  const onChange = (value: unknown) => setTab(value as TabId);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">

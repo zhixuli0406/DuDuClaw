@@ -6,11 +6,13 @@ import { toast, formatError } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
 import {
   Button,
+  ErrorState,
   SettingsSection,
   SettingsCard,
   SettingsSaveState,
 } from '@/components/mds';
 import { RowSwitch } from '@/pages/agent-form/form-rows';
+import { AutonomyNote } from '@/components/AutonomyNote';
 
 /**
  * 校準式預測與學習閘 (v1.54) — the three global `[task_forward_model]`
@@ -35,15 +37,21 @@ export function CalibrationTab() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // P05: a failed read left all three switches showing `false`, i.e. exactly
+  // what a deliberately-disabled forward model looks like. Say which it is.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
   const load = useCallback(async () => {
+    setLoadError(null);
     try {
       const settings = await api.taskForwardModel.get();
       setConfig(settings);
     } catch (e) {
       console.warn('[api]', e);
+      setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     } finally {
       setLoading(false);
@@ -63,6 +71,7 @@ export function CalibrationTab() {
   const handleSave = async () => {
     setSaving(true);
     setSaved(false);
+    setSaveError(null);
     try {
       const res = await api.taskForwardModel.set(config);
       setConfig({
@@ -77,6 +86,7 @@ export function CalibrationTab() {
       }
     } catch (e) {
       console.warn('[api]', e);
+      setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
@@ -85,6 +95,15 @@ export function CalibrationTab() {
 
   return (
     <div className="space-y-8">
+      {loadError != null && (
+        <ErrorState
+          variant="inline"
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          onRetry={() => void load()}
+        />
+      )}
+
       <SettingsSection
         title={t('settings.calibration.section')}
         description={t('settings.calibration.section.desc')}
@@ -112,7 +131,9 @@ export function CalibrationTab() {
             onChange={(v) => setConfig((c) => ({ ...c, held_out_gate_enabled: v }))}
           />
         </SettingsCard>
-        {!config.enabled && (
+        {config.enabled ? (
+          <AutonomyNote id="calibration" />
+        ) : (
           <p className="flex items-start gap-2 rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
             <Info className="mt-0.5 size-3.5 shrink-0" />
             {t('settings.calibration.masterOffHint')}
@@ -120,6 +141,15 @@ export function CalibrationTab() {
         )}
       </SettingsSection>
 
+      {saveError != null && (
+        <ErrorState
+          variant="inline"
+          error={saveError}
+          title={intl.formatMessage({ id: 'errorState.manage.saveFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.saveFailedHint' })}
+          onRetry={() => void handleSave()}
+        />
+      )}
       <div className="flex flex-wrap items-center justify-end gap-3">
         <span className="mr-auto text-xs text-muted-foreground">
           {t('settings.calibration.applied')}

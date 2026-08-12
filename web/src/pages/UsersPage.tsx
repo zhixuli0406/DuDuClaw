@@ -8,6 +8,11 @@ import type { UserRole } from '@/stores/auth-store';
 import { ROLE_LEVELS } from '@/lib/roles';
 import { ConfirmDialog } from '@/components/settings/controls';
 import {
+  listChannelIdentities,
+  bindChannelIdentity,
+  type ChannelIdentity,
+} from '@/lib/channel-identity-api';
+import {
   Button,
   Badge,
   Input,
@@ -46,7 +51,22 @@ import {
   MoreHorizontal,
   Loader2,
   AlertTriangle,
+  ShieldCheck,
+  Plus,
 } from 'lucide-react';
+
+/** Channels the backend's admin-prefill bind endpoint accepts (mirrors
+ * `OTP_CHANNELS` in `server.rs::handle_channel_bind` — keep in sync). */
+const IDENTITY_CHANNELS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: 'telegram', label: 'Telegram' },
+  { value: 'line', label: 'LINE' },
+  { value: 'discord', label: 'Discord' },
+  { value: 'slack', label: 'Slack' },
+];
+
+function channelLabel(value: string): string {
+  return IDENTITY_CHANNELS.find((c) => c.value === value)?.label ?? value;
+}
 
 /** Local option shape shared by the role / access / agent pickers below. */
 interface Option {
@@ -150,7 +170,7 @@ function statusBadgeProps(status: string): { variant: BadgeProps['variant']; cla
   return { variant: 'outline' };
 }
 
-const COLUMNS = 'minmax(0,1.6fr) minmax(0,0.9fr) minmax(0,1.8fr) minmax(0,0.7fr) 2.5rem';
+const COLUMNS = 'minmax(0,1.4fr) minmax(0,0.8fr) minmax(0,1.5fr) minmax(0,1.5fr) minmax(0,0.7fr) 2.5rem';
 
 export function UsersPage() {
   const intl = useIntl();
@@ -169,6 +189,11 @@ export function UsersPage() {
   const [showEdit, setShowEdit] = useState<UserDetail | null>(null);
   const [showOffboard, setShowOffboard] = useState<UserDetail | null>(null);
   const [showRemove, setShowRemove] = useState<UserDetail | null>(null);
+  // WP-B (2026-08-12 IA audit §2-1) — per-user channel identity ("驗證身分",
+  // dashboard user ↔ channel DM identity). `'error'` marks a row whose fetch
+  // failed; a missing key means "not fetched yet".
+  const [identities, setIdentities] = useState<Record<string, ChannelIdentity[] | 'error'>>({});
+  const [showIdentityBind, setShowIdentityBind] = useState<string | null>(null);
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -185,6 +210,21 @@ export function UsersPage() {
   useEffect(() => {
     fetchUsers();
   }, [fetchUsers]);
+
+  const refreshIdentity = useCallback((userId: string) => {
+    listChannelIdentities(userId)
+      .then((list) => setIdentities((prev) => ({ ...prev, [userId]: list })))
+      .catch(() => setIdentities((prev) => ({ ...prev, [userId]: 'error' })));
+  }, []);
+
+  // Fetch each user's channel identities once (skip ids already fetched, so
+  // an unrelated `fetchUsers()` re-run after e.g. an edit doesn't re-fire N
+  // requests). Small admin rosters only — no pagination on this endpoint yet.
+  useEffect(() => {
+    const missing = users.map((u) => u.id).filter((id) => !(id in identities));
+    missing.forEach(refreshIdentity);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [users]);
 
   // UI.1 — unbind a single user↔agent binding.
   const handleUnbind = useCallback(async (userId: string, agentName: string) => {
@@ -239,6 +279,7 @@ export function UsersPage() {
                 <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.name' })}</ListGridHeaderCell>
                 <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.role' })}</ListGridHeaderCell>
                 <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.agents' })}</ListGridHeaderCell>
+                <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.channelIdentity' })}</ListGridHeaderCell>
                 <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.status' })}</ListGridHeaderCell>
                 <ListGridHeaderCell aria-hidden />
               </ListGridHeader>
@@ -286,6 +327,46 @@ export function UsersPage() {
                       </span>
                     ))}
                     {user.bindings.length === 0 && <span className="text-xs text-muted-foreground">—</span>}
+                  </ListGridCell>
+                  <ListGridCell className="flex-wrap gap-1 py-1.5">
+                    {(() => {
+                      const rec = identities[user.id];
+                      if (rec === undefined) {
+                        return <Loader2 className="size-3.5 animate-spin text-muted-foreground" />;
+                      }
+                      if (rec === 'error') {
+                        return (
+                          <span className="text-xs text-destructive">
+                            {intl.formatMessage({ id: 'users.channelIdentity.loadError' })}
+                          </span>
+                        );
+                      }
+                      return rec.map((ident) => (
+                        <span
+                          key={`${ident.channel}:${ident.channel_user_id}`}
+                          className="inline-flex max-w-40 items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                          title={`${channelLabel(ident.channel)} · ${ident.channel_user_id}`}
+                        >
+                          <ShieldCheck
+                            className="size-3 shrink-0 text-success"
+                            aria-label={intl.formatMessage({ id: 'users.channelIdentity.verifiedTooltip' })}
+                          />
+                          <span className="truncate">
+                            {channelLabel(ident.channel)} · {ident.channel_user_id}
+                          </span>
+                        </span>
+                      ));
+                    })()}
+                    <button
+                      type="button"
+                      data-stop-row-nav
+                      onClick={() => setShowIdentityBind(user.id)}
+                      className="inline-flex items-center gap-1 rounded-full border border-dashed border-surface-border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:border-brand hover:text-brand"
+                      title={intl.formatMessage({ id: 'users.channelIdentity.add' })}
+                    >
+                      <Plus className="size-3" />
+                      {intl.formatMessage({ id: 'users.channelIdentity.add' })}
+                    </button>
                   </ListGridCell>
                   <ListGridCell>
                     <Badge variant={status.variant} className={status.className}>{user.status}</Badge>
@@ -369,8 +450,32 @@ export function UsersPage() {
           boundAgents={users.find((u) => u.id === showBind)?.bindings.map((b) => b.agent_name) ?? []}
           onClose={() => setShowBind(null)}
           onBound={() => {
+            const boundUserId = showBind;
             setShowBind(null);
             fetchUsers();
+            // R-cross-link (§2-1): access authorization and channel-side
+            // identity verification are two different settings — point the
+            // admin at the one they likely also need, one click away.
+            toast.info(intl.formatMessage({ id: 'users.bind.crossLink' }), {
+              action: {
+                label: intl.formatMessage({ id: 'users.bind.crossLink.action' }),
+                onClick: () => setShowIdentityBind(boundUserId),
+              },
+            });
+          }}
+        />
+      )}
+
+      {/* Verify Channel Identity Dialog (WP-B, §2-1) */}
+      {showIdentityBind && (
+        <BindChannelIdentityDialog
+          userId={showIdentityBind}
+          onClose={() => setShowIdentityBind(null)}
+          onBound={() => {
+            const boundUserId = showIdentityBind;
+            setShowIdentityBind(null);
+            refreshIdentity(boundUserId);
+            toast.success(intl.formatMessage({ id: 'users.channelIdentity.bound' }));
           }}
         />
       )}
@@ -727,6 +832,9 @@ function BindAgentDialog({
           <DialogTitle>{intl.formatMessage({ id: 'users.action.bind' })}</DialogTitle>
         </DialogHeader>
         <div className="space-y-4">
+          <p className="text-xs text-muted-foreground">
+            {intl.formatMessage({ id: 'users.action.bind.explain' })}
+          </p>
           {error && (
             <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
           )}
@@ -754,7 +862,7 @@ function BindAgentDialog({
               />
             )}
           </DialogField>
-          <DialogField label={intl.formatMessage({ id: 'users.action.bind' })}>
+          <DialogField label={intl.formatMessage({ id: 'users.action.bind.accessLevel' })}>
             <Select value={accessLevel} onValueChange={(v) => setAccessLevel(String(v))}>
               <SelectTrigger className="w-full">
                 <SelectValue>{accesses.find((a) => a.value === accessLevel)?.label}</SelectValue>
@@ -773,6 +881,97 @@ function BindAgentDialog({
           </Button>
           <Button variant="brand" onClick={handleSubmit} disabled={submitting || !agentName}>
             {intl.formatMessage({ id: 'users.action.bind' })}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ── WP-B (2026-08-12 IA audit §2-1) — 驗證身分 ──────────────────
+//
+// The third of three unrelated "binding" concepts in the dashboard:
+// dashboard user ↔ channel DM identity (`channel_identities` table). This is
+// the data `approver_links`/`mapped_role` actually read for channel-side
+// approvals (`decision_notify.rs`) — previously had a ready backend
+// (`verified_channels_for_user`, `POST /api/channel-identity/bind`) but zero
+// dashboard surface, so an admin who only did "授權存取" (§ user↔agent) and
+// "路由訊息" (§ agent↔channel) would reasonably assume channel approvals were
+// already wired up. They were not — this dialog closes that gap.
+function BindChannelIdentityDialog({
+  userId,
+  onClose,
+  onBound,
+}: {
+  userId: string;
+  onClose: () => void;
+  onBound: () => void;
+}) {
+  const intl = useIntl();
+  const [channel, setChannel] = useState(IDENTITY_CHANNELS[0].value);
+  const [channelUserId, setChannelUserId] = useState('');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async () => {
+    const trimmed = channelUserId.trim();
+    if (!trimmed) return;
+    setError('');
+    setSubmitting(true);
+    try {
+      await bindChannelIdentity(userId, channel, trimmed);
+      onBound();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const howToId = `users.channelIdentity.howTo.${channel}`;
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'users.channelIdentity.add' })}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <p className="text-xs text-muted-foreground">
+            {intl.formatMessage({ id: 'users.channelIdentity.explain' })}
+          </p>
+          {error && (
+            <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
+          )}
+          <DialogField label={intl.formatMessage({ id: 'users.channelIdentity.channel' })}>
+            <Select value={channel} onValueChange={(v) => setChannel(String(v))}>
+              <SelectTrigger className="w-full">
+                <SelectValue>{IDENTITY_CHANNELS.find((c) => c.value === channel)?.label}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {IDENTITY_CHANNELS.map((c) => (
+                  <SelectItem key={c.value} value={c.value}>{c.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </DialogField>
+          <DialogField
+            label={intl.formatMessage({ id: 'users.channelIdentity.channelUserId' })}
+            help={intl.formatMessage({ id: howToId })}
+          >
+            <Input
+              value={channelUserId}
+              onChange={(e) => setChannelUserId(e.target.value)}
+              placeholder={intl.formatMessage({ id: 'users.channelIdentity.channelUserIdPlaceholder' })}
+            />
+          </DialogField>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            {intl.formatMessage({ id: 'common.cancel' })}
+          </Button>
+          <Button variant="brand" onClick={handleSubmit} disabled={submitting || !channelUserId.trim()}>
+            {intl.formatMessage({ id: 'users.channelIdentity.add' })}
           </Button>
         </DialogFooter>
       </DialogContent>

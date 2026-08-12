@@ -8,6 +8,17 @@ import { AppSidebar } from './AppSidebar';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
+import { useAgentsStore } from '@/stores/agents-store';
+import { ORG_CHART_MIN_AGENTS } from '@/lib/nav-visibility';
+
+/** Minimal agent fixtures — just enough for `agents.length` (D6 org-chart gate). */
+function makeAgents(count: number) {
+  return Array.from({ length: count }, (_, i) => ({
+    name: `agent-${i}`,
+    display_name: `Agent ${i}`,
+    status: 'active',
+  }));
+}
 
 function renderSidebar() {
   return renderWithProviders(
@@ -32,6 +43,8 @@ beforeEach(() => {
   useCommandPaletteStore.setState({ open: false });
   // Default to the non-personal layout; the personal-IA test opts in itself.
   useSystemStore.setState({ status: null } as never);
+  // Default to no agents; the org-chart-disclosure tests opt into a roster.
+  useAgentsStore.setState({ agents: [] as never, fetchAgents: vi.fn() as never });
 });
 
 describe('AppSidebar (Multica shell)', () => {
@@ -64,6 +77,34 @@ describe('AppSidebar (Multica shell)', () => {
     // …while open surfaces stay.
     expect(screen.getByRole('link', { name: /Dashboard/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /About/i })).toBeInTheDocument();
+    // D7 (09-edition-split-features.md §4): 例行工作 dropped its manager+ gate
+    // — an employee's own agent's cron schedule is the same "own scope" as
+    // 共同計畫, which was already open.
+    expect(screen.getByRole('link', { name: /Routines/i })).toBeInTheDocument();
+  });
+
+  // D6 (09-edition-split-features.md §4): the org chart is a progressive-
+  // disclosure surface now, not a `personalHidden` one — it waits for the
+  // roster to clear ORG_CHART_MIN_AGENTS, on EITHER edition.
+  it('org chart discloses itself once the roster reaches ORG_CHART_MIN_AGENTS', () => {
+    useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
+    useAgentsStore.setState({ agents: makeAgents(ORG_CHART_MIN_AGENTS - 1) as never });
+    const { unmount } = renderSidebar();
+    expect(screen.queryByRole('link', { name: /^Team$/i })).not.toBeInTheDocument();
+    unmount();
+
+    useAgentsStore.setState({ agents: makeAgents(ORG_CHART_MIN_AGENTS) as never });
+    renderSidebar();
+    expect(screen.getByRole('link', { name: /^Team$/i })).toBeInTheDocument();
+  });
+
+  it('personal edition: org chart is folded into 進階, not shown before the roster is big enough', async () => {
+    const user = userEvent.setup();
+    useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+    useAgentsStore.setState({ agents: makeAgents(1) as never });
+    renderSidebar();
+    await user.click(screen.getByText(/^Advanced$/));
+    expect(screen.queryByRole('link', { name: /^Team$/i })).not.toBeInTheDocument();
   });
 
   it('marks the current route active (aria-current + accent class)', () => {
@@ -125,6 +166,19 @@ describe('AppSidebar (Multica shell)', () => {
     await user.click(screen.getByText(/^Advanced$/));
     expect(screen.getByRole('link', { name: /Task Board/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Reports/i })).toBeInTheDocument();
+
+    // WP-NAV (2026-08-12): the 進階 group reads work cluster → company cluster,
+    // the same sequence the Enterprise 工作 / 公司 groups use, so the two
+    // editions never present these surfaces in two different orders. 成長 leads
+    // the company cluster (高頻・低重要 on the matrix), 組織架構 follows it.
+    const advanced = screen
+      .getAllByRole('link')
+      .map((el) => el.textContent?.trim())
+      .filter(Boolean) as string[];
+    const advSeq = ['Task Board', 'Reports', 'OS', 'Growth', 'Expert Packs', 'Widget Studio'];
+    const advPos = advSeq.map((l) => advanced.indexOf(l));
+    expect(advPos.every((i) => i >= 0)).toBe(true);
+    expect(advPos).toEqual([...advPos].sort((a, b) => a - b));
   });
 
   // WP14 (2026-08-04) — the two editions must present the same six surfaces in
@@ -133,12 +187,19 @@ describe('AppSidebar (Multica shell)', () => {
   // read so neither can drift without the other failing.
   it('enterprise edition: 公司 group follows the same 技能庫→記憶→AI 員工→世界 order', () => {
     useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
+    // D6: 'Team' (the org chart) only shows once the roster clears the
+    // progressive-disclosure threshold — this assertion is about ordering,
+    // not disclosure, so seed enough agents for it to actually be present.
+    useAgentsStore.setState({ agents: makeAgents(ORG_CHART_MIN_AGENTS) as never });
     renderSidebar();
     const order = screen
       .getAllByRole('link')
       .map((el) => el.textContent?.trim())
       .filter(Boolean) as string[];
-    const seq = ['Skills', 'Memory', 'Agents', 'World', 'Team'];
+    // WP-NAV (2026-08-12) inserts 成長 between 世界 and the 低頻 tail: the
+    // matrix grades it 高頻・低重要, so it sits with the daily surfaces but
+    // still below the four the client annotated.
+    const seq = ['Skills', 'Memory', 'Agents', 'World', 'Growth', 'Team'];
     const positions = seq.map((l) => order.indexOf(l));
     // -1 guard: a missing row would otherwise sneak through as "sorted".
     expect(positions.every((i) => i >= 0)).toBe(true);
@@ -149,6 +210,12 @@ describe('AppSidebar (Multica shell)', () => {
     expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Routines'));
     expect(order.indexOf('Routines')).toBeLessThan(order.indexOf('Reports'));
     expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Reports'));
+    // WP-NAV: the occasional rows sink below the oversight pair (時間軸 / 用量)
+    // and stay above the deliberately-demoted board. `/forks` is
+    // progressive-disclosure (no fork records in this fixture) so OS is the one
+    // occasional row rendered here.
+    expect(order.indexOf('OS')).toBeGreaterThan(order.indexOf('Reports'));
+    expect(order.indexOf('OS')).toBeLessThan(order.indexOf('Task Board'));
     // WP18-B: the 對話紀錄 slot is identical on Enterprise — after the 公司
     // group's last row, before 設定. If the two editions ever fork here, one of
     // these two assertions fails.

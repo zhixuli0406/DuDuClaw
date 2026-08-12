@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router';
@@ -9,6 +9,7 @@ import { renderWithProviders } from '@/test/render';
 import { TaskBoardPage } from './TaskBoardPage';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { toastBus, type ToastInput } from '@/lib/toast';
 import type { TaskInfo } from '@/lib/api';
 
 const AGENTS = [{ name: 'nova', display_name: 'Nova', status: 'active', role: 'main', sandboxed: false }];
@@ -175,5 +176,165 @@ describe('TaskBoardPage — filters as URL (W3-3)', () => {
     await waitFor(() => {
       expect(screen.getByTestId('search-probe')).not.toHaveTextContent('agent=nova');
     });
+  });
+});
+
+// ── WP-A (§2-6): a task parked on a human decision ──────────────────────────
+// The board used to show it as a read-only badge in a read-only column, so the
+// only thing you could do with it there was drag it somewhere else — which the
+// board happily did, skipping the decision entirely. Now the card carries the
+// decision, and every other writer path refuses the task.
+
+const NEEDS_HUMAN: TaskInfo = task({
+  id: 'task-cccc3333',
+  title: 'Waiting on you',
+  status: 'needs_human',
+  judge_feedback: 'Could not confirm the refund amount',
+});
+
+/** Capture toasts — `renderWithProviders` mounts no ToastProvider. */
+function captureToasts() {
+  const seen: ToastInput[] = [];
+  const off = toastBus.subscribe((t) => seen.push(t));
+  return { seen, off };
+}
+
+describe('TaskBoardPage — 等你決定 is decided, never moved (WP-A §2-6)', () => {
+  beforeEach(() => {
+    useTasksStore.setState({ tasks: [...SEED, NEEDS_HUMAN], loading: false });
+    mockWsClient.call.mockResolvedValue({ tasks: [...SEED, NEEDS_HUMAN], agents: AGENTS, events: [] });
+  });
+
+  it('puts the same three choices on the card as the inbox offers', () => {
+    renderWithProviders(<TaskBoardPage />);
+    expect(screen.getByText('Waiting on you')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Mark complete' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Give up' })).toBeInTheDocument();
+    // The escalation reason stays visible next to the decision.
+    expect(screen.getByText(/Could not confirm the refund amount/)).toBeInTheDocument();
+  });
+
+  it('refuses a drop into a writable column and points at the inbox', async () => {
+    const moveTask = vi.fn();
+    useTasksStore.setState({ moveTask } as never);
+    const { seen, off } = captureToasts();
+    renderWithProviders(<TaskBoardPage />);
+
+    // The droppable body is the sibling of each column's header row.
+    const doneColumn = screen.getByRole('heading', { name: 'Done' }).closest('div')!
+      .nextElementSibling as HTMLElement;
+    fireEvent.drop(doneColumn, {
+      dataTransfer: { getData: () => NEEDS_HUMAN.id },
+    });
+
+    await waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0].message).toBe('This task is waiting on your decision — handle it in the inbox');
+    expect(seen[0].action?.label).toBe('Go to inbox');
+    expect(moveTask).not.toHaveBeenCalled();
+    off();
+  });
+
+  it('still moves an ordinary card, so the guard is not a blanket freeze', async () => {
+    const moveTask = vi.fn();
+    useTasksStore.setState({ moveTask } as never);
+    renderWithProviders(<TaskBoardPage />);
+
+    const doneColumn = screen.getByRole('heading', { name: 'Done' }).closest('div')!
+      .nextElementSibling as HTMLElement;
+    fireEvent.drop(doneColumn, { dataTransfer: { getData: () => 'task-aaaa1111' } });
+
+    await waitFor(() => expect(moveTask).toHaveBeenCalledWith('task-aaaa1111', 'done'));
+  });
+
+  it('refuses the list view’s inline status picker too (same guard, other path)', async () => {
+    const user = userEvent.setup();
+    const moveTask = vi.fn();
+    useTasksStore.setState({ moveTask } as never);
+    const { seen, off } = captureToasts();
+    localStorage.setItem('duduclaw:tasks:view', 'list');
+    renderWithProviders(<TaskBoardPage />);
+
+    await user.click(await screen.findByRole('button', { name: 'Needs your decision' }));
+    await user.click(await screen.findByRole('menuitemradio', { name: 'Done' }));
+
+    await waitFor(() => expect(seen).toHaveLength(1));
+    expect(moveTask).not.toHaveBeenCalled();
+    off();
+  });
+});
+
+describe('TaskBoardPage — the batch action cannot route around the guard', () => {
+  beforeEach(() => {
+    useTasksStore.setState({ tasks: [SEED[0], NEEDS_HUMAN], loading: false });
+    mockWsClient.call.mockResolvedValue({ tasks: [SEED[0], NEEDS_HUMAN], agents: AGENTS, events: [] });
+  });
+
+  it('completes the ordinary selection and refuses only the 等你決定 row', async () => {
+    const user = userEvent.setup();
+    const moveTask = vi.fn();
+    useTasksStore.setState({ moveTask } as never);
+    const { seen, off } = captureToasts();
+    localStorage.setItem('duduclaw:tasks:view', 'list');
+    renderWithProviders(<TaskBoardPage />);
+
+    for (const cb of await screen.findAllByRole('checkbox', { name: 'Select task' })) {
+      await user.click(cb);
+    }
+    await user.click(await screen.findByRole('button', { name: /Mark done/i }));
+
+    await waitFor(() => expect(moveTask).toHaveBeenCalledWith('task-aaaa1111', 'done'));
+    expect(moveTask).not.toHaveBeenCalledWith(NEEDS_HUMAN.id, 'done');
+    expect(seen.some((t) => t.message.includes('waiting on your decision'))).toBe(true);
+    off();
+  });
+});
+
+describe('TaskBoardPage — a failed delete is reported, not mimed as success', () => {
+  beforeEach(() => {
+    useTasksStore.setState({ tasks: [...SEED], loading: false, error: null });
+    mockWsClient.call.mockResolvedValue({ tasks: [...SEED], agents: AGENTS, events: [] });
+  });
+
+  /** Open the single-task delete confirmation from the first card. */
+  async function openDeleteDialog(user: ReturnType<typeof userEvent.setup>) {
+    renderWithProviders(<TaskBoardPage />);
+    const trash = (await screen.findAllByRole('button', { name: 'Delete Task' }))[0];
+    await user.click(trash);
+    return await screen.findByRole('dialog');
+  }
+
+  // Nothing in this file read the store's `error`, so a rejected delete closed
+  // the confirmation dialog and left the user believing the task was gone
+  // (P05 Blocker, phase-4 audit).
+  it('keeps the confirmation open and says so when the delete fails', async () => {
+    const user = userEvent.setup();
+    const { seen, off } = captureToasts();
+    const removeTask = vi.fn().mockImplementation(async () => {
+      useTasksStore.setState({ error: new Error('Failed to fetch') });
+    });
+    useTasksStore.setState({ removeTask } as never);
+
+    const dialog = await openDeleteDialog(user);
+    await user.click(within(dialog).getByRole('button', { name: 'Delete Task' }));
+
+    await waitFor(() => expect(removeTask).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0].variant).toBe('error');
+    // The dialog stays up: the task is still there and the user must know.
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    off();
+  });
+
+  it('closes the confirmation when the delete lands', async () => {
+    const user = userEvent.setup();
+    const removeTask = vi.fn().mockResolvedValue(undefined);
+    useTasksStore.setState({ removeTask, error: null } as never);
+
+    const dialog = await openDeleteDialog(user);
+    await user.click(within(dialog).getByRole('button', { name: 'Delete Task' }));
+
+    await waitFor(() => expect(removeTask).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   });
 });

@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
 import {
@@ -28,6 +29,7 @@ import { timeAgo } from '@/lib/format';
 import {
   CollectionPageHeader,
   CollectionPageState,
+  ErrorState,
   Card,
   CardContent,
   BreadcrumbHeader,
@@ -46,6 +48,7 @@ import {
   ListGridHeaderCell,
   ListGridRow,
   ListGridCell,
+  CrossLink,
   type SegmentedOption,
 } from '@/components/mds';
 
@@ -70,6 +73,11 @@ export function KnowledgeHubPage({ embedded = false }: { embedded?: boolean }) {
   const [view, setView] = useState<ViewId>('browse');
   const [agents, setAgents] = useState<ReadonlyArray<{ name: string; display_name: string }>>([]);
   const [selectedAgent, setSelectedAgent] = useState('');
+  // A node clicked in the topic map (graph view) hands its page path here so
+  // the browse view can open straight into the reading view for that page
+  // (previously WikiGraph's onSelectPage was never wired up — a click that
+  // looked live but did nothing, UX audit §2-5).
+  const [graphSelectedPath, setGraphSelectedPath] = useState<string | null>(null);
 
   useEffect(() => {
     api.agents.list().then((res) => {
@@ -103,9 +111,23 @@ export function KnowledgeHubPage({ embedded = false }: { embedded?: boolean }) {
           agents={agents}
         />
       </div>
-      {selectedAgent && view === 'browse' && <BrowseView agentId={selectedAgent} />}
+      {selectedAgent && view === 'browse' && (
+        <BrowseView
+          agentId={selectedAgent}
+          initialPath={graphSelectedPath}
+          onInitialPathConsumed={() => setGraphSelectedPath(null)}
+        />
+      )}
       {selectedAgent && view === 'search' && <SearchView agentId={selectedAgent} />}
-      {selectedAgent && view === 'graph' && <GraphView agentId={selectedAgent} />}
+      {selectedAgent && view === 'graph' && (
+        <GraphView
+          agentId={selectedAgent}
+          onSelectPage={(path) => {
+            setGraphSelectedPath(path);
+            setView('browse');
+          }}
+        />
+      )}
       {selectedAgent && view === 'health' && <HealthView agentId={selectedAgent} />}
       {selectedAgent && view === 'curate' && <KnowledgeCuration agentId={selectedAgent} />}
     </div>
@@ -160,13 +182,29 @@ function AgentSelect({
 
 const WIKI_COLUMNS = 'minmax(0,1fr) auto auto';
 
-function BrowseView({ agentId }: { agentId: string }) {
+function BrowseView({
+  agentId,
+  initialPath,
+  onInitialPathConsumed,
+}: {
+  agentId: string;
+  /** A page path handed off from GraphView's node click — opens straight into
+   *  the reading view for that page instead of the flat list. */
+  initialPath?: string | null;
+  onInitialPathConsumed?: () => void;
+}) {
   const intl = useIntl();
   const [pages, setPages] = useState<ReadonlyArray<WikiPageMeta>>([]);
   const [wikiExists, setWikiExists] = useState(false);
   const [loading, setLoading] = useState(false);
   const [selectedPath, setSelectedPath] = useState('');
   const [pageContent, setPageContent] = useState('');
+
+  // Every read failure in this file was swallowed, so a dead backend rendered
+  // as "this AI staff member has no notes yet" (P05 Blocker, phase-4 audit).
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [pageError, setPageError] = useState<unknown>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
     setLoading(true);
@@ -175,24 +213,39 @@ function BrowseView({ agentId }: { agentId: string }) {
     api.wiki.pages(agentId).then((res) => {
       setPages(res?.pages ?? []);
       setWikiExists(res?.exists ?? false);
-    }).catch(() => {
+      setLoadError(null);
+    }).catch((e: unknown) => {
       setPages([]);
       setWikiExists(false);
+      setLoadError(e);
     }).finally(() => setLoading(false));
-  }, [agentId]);
+  }, [agentId, reloadNonce]);
 
   const latestPathRef = useRef('');
   const handleSelect = useCallback(async (path: string) => {
     latestPathRef.current = path;
     setSelectedPath(path);
     setPageContent('');
+    setPageError(null);
     try {
       const res = await api.wiki.read(agentId, path);
       if (latestPathRef.current === path) setPageContent(res?.content ?? '');
-    } catch {
-      if (latestPathRef.current === path) setPageContent('Failed to load page.');
+    } catch (e) {
+      if (latestPathRef.current === path) setPageError(e);
     }
   }, [agentId]);
+
+  // Consume a graph-view handoff: open the reading view for the given path
+  // once, then tell the parent to clear it so re-mounting this view later
+  // (e.g. switching tabs away and back) doesn't keep re-opening it.
+  useEffect(() => {
+    if (initialPath) {
+      void handleSelect(initialPath);
+      onInitialPathConsumed?.();
+    }
+    // Only re-run when the handed-off path itself changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialPath]);
 
   const sortedPages = useMemo(
     () => [...pages].sort((a, b) => a.path.localeCompare(b.path)),
@@ -200,6 +253,16 @@ function BrowseView({ agentId }: { agentId: string }) {
   );
 
   if (loading) return <CollectionPageState state="loading" />;
+
+  if (loadError != null) {
+    return (
+      <ErrorState
+        icon={BookOpenIcon}
+        error={loadError}
+        onRetry={() => setReloadNonce((n) => n + 1)}
+      />
+    );
+  }
 
   if (!wikiExists || pages.length === 0) {
     return (
@@ -220,7 +283,13 @@ function BrowseView({ agentId }: { agentId: string }) {
           ]}
         />
         <div className="mx-auto max-w-4xl px-8 py-8">
-          {pageContent ? (
+          {pageError != null ? (
+            <ErrorState
+              icon={FileTextIcon}
+              error={pageError}
+              onRetry={() => void handleSelect(selectedPath)}
+            />
+          ) : pageContent ? (
             <WikiPageBody path={selectedPath} content={pageContent} />
           ) : (
             <div className="space-y-3">
@@ -355,6 +424,7 @@ function SearchView({ agentId }: { agentId: string }) {
   const [hits, setHits] = useState<ReadonlyArray<WikiSearchHit>>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
+  const [searchError, setSearchError] = useState<unknown>(null);
 
   const handleSearch = useCallback(async () => {
     if (!query.trim()) return;
@@ -363,8 +433,11 @@ function SearchView({ agentId }: { agentId: string }) {
     try {
       const res = await api.wiki.search(agentId, query);
       setHits(res?.hits ?? []);
-    } catch {
+      setSearchError(null);
+    } catch (e) {
+      // "Search failed" and "nothing matched" are different answers.
       setHits([]);
+      setSearchError(e);
     } finally {
       setLoading(false);
     }
@@ -385,6 +458,8 @@ function SearchView({ agentId }: { agentId: string }) {
 
       {loading ? (
         <CollectionPageState state="loading" />
+      ) : searchError != null ? (
+        <ErrorState icon={SearchIcon} error={searchError} onRetry={() => void handleSearch()} />
       ) : hits.length === 0 ? (
         <CollectionPageState
           state="empty"
@@ -421,12 +496,20 @@ function SearchView({ agentId }: { agentId: string }) {
 
 // ── Graph view ──────────────────────────────────────────────
 
-function GraphView({ agentId }: { agentId: string }) {
+function GraphView({
+  agentId,
+  onSelectPage,
+}: {
+  agentId: string;
+  onSelectPage?: (path: string) => void;
+}) {
   const intl = useIntl();
   const [pages, setPages] = useState<ReadonlyArray<WikiPageMeta>>([]);
   const [pageContents, setPageContents] = useState<Record<string, string>>({});
   const [memoryEdges, setMemoryEdges] = useState<ReadonlyArray<MemoryGraphEdge>>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   // WP16 — the topic graph blends what the AI learned (`memory.graph` SPO
   // triples) into the page graph. Optional data: a permission error or an
@@ -449,6 +532,7 @@ function GraphView({ agentId }: { agentId: string }) {
       if (cancelled) return;
       const pageList = res?.pages ?? [];
       setPages(pageList);
+      setLoadError(null);
       const contents: Record<string, string> = {};
       const BATCH_SIZE = 10;
       for (let i = 0; i < pageList.length; i += BATCH_SIZE) {
@@ -464,30 +548,50 @@ function GraphView({ agentId }: { agentId: string }) {
         );
       }
       if (!cancelled) setPageContents({ ...contents });
-    }).catch(() => {
-      if (!cancelled) setPages([]);
+    }).catch((e: unknown) => {
+      if (cancelled) return;
+      setPages([]);
+      setLoadError(e);
     }).finally(() => {
       if (!cancelled) setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [agentId]);
+  }, [agentId, reloadNonce]);
+
+  if (loadError != null) {
+    return (
+      <ErrorState
+        icon={Share2Icon}
+        error={loadError}
+        onRetry={() => setReloadNonce((n) => n + 1)}
+      />
+    );
+  }
 
   if (!loading && pages.length === 0) {
     return <CollectionPageState state="empty" icon={Share2Icon} title={intl.formatMessage({ id: 'wiki.empty' })} />;
   }
 
   return (
-    <Card>
-      <CardContent>
-        <WikiGraph
-          pages={pages}
-          pageContents={pageContents}
-          memoryEdges={memoryEdges}
-          width={900}
-          height={550}
-        />
-      </CardContent>
-    </Card>
+    <div className="space-y-2">
+      {/* Plain-language disambiguation from KnowledgeCuration's fact-provenance
+          graph — same page tree, two different "graphs" (UX audit §2-5). */}
+      <p className="text-sm text-muted-foreground">
+        {intl.formatMessage({ id: 'wiki.graph.intro' })}
+      </p>
+      <Card>
+        <CardContent>
+          <WikiGraph
+            pages={pages}
+            pageContents={pageContents}
+            memoryEdges={memoryEdges}
+            width={900}
+            height={550}
+            onSelectPage={onSelectPage}
+          />
+        </CardContent>
+      </Card>
+    </div>
   );
 }
 
@@ -495,9 +599,11 @@ function GraphView({ agentId }: { agentId: string }) {
 
 function HealthView({ agentId }: { agentId: string }) {
   const intl = useIntl();
+  const navigate = useNavigate();
   const [stats, setStats] = useState<WikiStats | null>(null);
   const [lint, setLint] = useState<WikiLintReport | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<unknown>(null);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -505,7 +611,11 @@ function HealthView({ agentId }: { agentId: string }) {
       const [statsRes, lintRes] = await Promise.all([api.wiki.stats(agentId), api.wiki.lint(agentId)]);
       setStats(statsRes);
       setLint(lintRes);
-    } catch { /* handled by empty state */ } finally {
+      setLoadError(null);
+    } catch (e) {
+      // Was "handled by empty state", i.e. reported as "no wiki yet".
+      setLoadError(e);
+    } finally {
       setLoading(false);
     }
   }, [agentId]);
@@ -513,6 +623,10 @@ function HealthView({ agentId }: { agentId: string }) {
   useEffect(() => { fetchData(); }, [fetchData]);
 
   if (loading && !stats) return <CollectionPageState state="loading" />;
+
+  if (loadError != null) {
+    return <ErrorState icon={BookOpenIcon} error={loadError} onRetry={() => void fetchData()} />;
+  }
 
   if (!stats?.exists) {
     return <CollectionPageState state="empty" icon={BookOpenIcon} title={intl.formatMessage({ id: 'wiki.empty' })} />;
@@ -536,6 +650,18 @@ function HealthView({ agentId }: { agentId: string }) {
           label={intl.formatMessage({ id: 'wiki.stats.health' })}
           value={lint?.healthy ? intl.formatMessage({ id: 'wiki.healthy' }) : intl.formatMessage({ id: 'wiki.unhealthy' })}
           tone={lint?.healthy ? 'success' : 'destructive'}
+        />
+      </div>
+
+      {/* UX audit §2-5 — the "page trust score" (WikiTrustPage) audits a
+          different-but-related property and lives on an unrelated nav branch
+          (設定 → 管理 → 治理), so this health view links straight to it
+          instead of leaving the operator to discover it separately. */}
+      <div className="flex items-center justify-between gap-3 rounded-lg border border-surface-border bg-muted/40 px-4 py-3">
+        <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'wiki.health.trustScoreHint' })}</p>
+        <CrossLink
+          label={intl.formatMessage({ id: 'wiki.health.trustScoreLink' })}
+          onClick={() => navigate('/manage/governance?tab=wikiTrust')}
         />
       </div>
 

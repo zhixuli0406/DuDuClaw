@@ -22,6 +22,68 @@ const RESOLVE_STATUS: Record<ResolveAction, 'pending' | 'done' | 'cancelled'> = 
 };
 
 /**
+ * NeedsHumanActions — the three-state resolution (重試 / 標記完成 / 放棄) on its
+ * own, so every surface that shows a `needs_human` task offers the SAME three
+ * choices instead of degrading to the generic status picker.
+ *
+ * WP-A (§2-6): before this extraction the decision existed only inside the
+ * Inbox detail pane; the board card was read-only and the detail page fell back
+ * to a 7-option picker in which `pending` (= 重試) did not even appear, so
+ * "retry" was unreachable outside the Inbox and a drag could silently move the
+ * card past the decision entirely. The mapping above stays the single source of
+ * truth — callers never write a `needs_human` task's status themselves.
+ */
+export function NeedsHumanActions({
+  taskId,
+  onResolved,
+  size,
+  className,
+}: {
+  taskId: string;
+  onResolved: () => void;
+  /** `sm` for the compact board card; default for detail surfaces. */
+  size?: 'sm';
+  className?: string;
+}) {
+  const intl = useIntl();
+  const [busy, setBusy] = useState<ResolveAction | null>(null);
+
+  const resolve = useCallback(
+    async (action: ResolveAction) => {
+      if (busy) return;
+      setBusy(action);
+      try {
+        await api.tasks.update(taskId, { status: RESOLVE_STATUS[action] });
+        toast.success(intl.formatMessage({ id: `inbox.needsHuman.${action}Toast` }));
+        onResolved();
+      } catch (e) {
+        toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [busy, taskId, intl, onResolved],
+  );
+
+  return (
+    <div className={className ?? 'flex flex-wrap items-center gap-2'}>
+      <Button variant="brand" size={size} disabled={!!busy} onClick={() => resolve('retry')}>
+        {busy === 'retry' ? <Loader2 className="animate-spin" /> : <RotateCcw />}
+        {intl.formatMessage({ id: 'inbox.needsHuman.retry' })}
+      </Button>
+      <Button variant="outline" size={size} disabled={!!busy} onClick={() => resolve('done')}>
+        {busy === 'done' ? <Loader2 className="animate-spin" /> : <CheckCircle2 />}
+        {intl.formatMessage({ id: 'inbox.needsHuman.done' })}
+      </Button>
+      <Button variant="destructive" size={size} disabled={!!busy} onClick={() => resolve('abort')}>
+        {busy === 'abort' ? <Loader2 className="animate-spin" /> : <XCircle />}
+        {intl.formatMessage({ id: 'inbox.needsHuman.abort' })}
+      </Button>
+    </div>
+  );
+}
+
+/**
  * NeedsHumanTaskPanel — the Inbox detail-pane body for a goal-loop task
  * escalated to `needs_human` (04 doc §D.6 "「等你決定」時做決定(重試/標記完成/
  * 放棄)"). Previously the Inbox only fetched `status: 'blocked'` tasks and
@@ -49,24 +111,6 @@ export function NeedsHumanTaskPanel({
   const intl = useIntl();
   const t = useCallback((id: string) => intl.formatMessage({ id }), [intl]);
   const navigate = useNavigate();
-  const [busy, setBusy] = useState<ResolveAction | null>(null);
-
-  const resolve = useCallback(
-    async (action: ResolveAction) => {
-      if (busy) return;
-      setBusy(action);
-      try {
-        await api.tasks.update(task.id, { status: RESOLVE_STATUS[action] });
-        toast.success(t(`inbox.needsHuman.${action}Toast`));
-        onResolved();
-      } catch (e) {
-        toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
-      } finally {
-        setBusy(null);
-      }
-    },
-    [busy, task.id, t, intl, onResolved],
-  );
 
   return (
     <DetailShell icon={TYPE_META.blocked.icon} title={task.title} typeLabel={typeLabel} agentId={task.assigned_to} agentName={agentName}>
@@ -80,20 +124,7 @@ export function NeedsHumanTaskPanel({
         </p>
       )}
 
-      <div className="flex flex-wrap items-center gap-2">
-        <Button variant="brand" disabled={!!busy} onClick={() => resolve('retry')}>
-          {busy === 'retry' ? <Loader2 className="animate-spin" /> : <RotateCcw />}
-          {t('inbox.needsHuman.retry')}
-        </Button>
-        <Button variant="outline" disabled={!!busy} onClick={() => resolve('done')}>
-          {busy === 'done' ? <Loader2 className="animate-spin" /> : <CheckCircle2 />}
-          {t('inbox.needsHuman.done')}
-        </Button>
-        <Button variant="destructive" disabled={!!busy} onClick={() => resolve('abort')}>
-          {busy === 'abort' ? <Loader2 className="animate-spin" /> : <XCircle />}
-          {t('inbox.needsHuman.abort')}
-        </Button>
-      </div>
+      <NeedsHumanActions taskId={task.id} onResolved={onResolved} />
 
       <div className="flex flex-wrap items-center gap-2">
         <Button variant="ghost" onClick={() => navigate(`/tasks/${task.id}`)}>

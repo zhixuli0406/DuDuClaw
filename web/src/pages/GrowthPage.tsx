@@ -10,6 +10,7 @@ import {
   CardAction,
   CardContent,
   Empty,
+  ErrorState,
   Skeleton,
 } from '@/components/mds';
 import { useGrowthStore } from '@/stores/growth-store';
@@ -160,6 +161,8 @@ export function GrowthPage() {
   const intl = useIntl();
   const snapshot = useGrowthStore((s) => s.snapshot);
   const loaded = useGrowthStore((s) => s.loaded);
+  const loadError = useGrowthStore((s) => s.error);
+  const retry = useGrowthStore((s) => s.retry);
   const authed = useConnectionStore((s) => s.state === 'authenticated');
 
   const unlockedCount = snapshot?.achievements.filter((a) => a.unlocked).length ?? 0;
@@ -177,8 +180,28 @@ export function GrowthPage() {
       </PageHeader>
 
       <div className="mx-auto w-full max-w-6xl space-y-5 p-6">
+        {/* A later poll failing while a snapshot is already on screen: say so
+            without throwing away the figures the user is looking at. */}
+        {loaded && loadError != null && (
+          <ErrorState
+            variant="inline"
+            error={loadError}
+            onRetry={retry ?? undefined}
+          />
+        )}
+
         {/* Level card — big level, XP bar, into/next figures, and the six facts. */}
-        {!loaded ? (
+        {!loaded && loadError != null ? (
+          <Card>
+            <CardContent>
+              <ErrorState
+                icon={TrendingUp}
+                error={loadError}
+                onRetry={retry ?? undefined}
+              />
+            </CardContent>
+          </Card>
+        ) : !loaded ? (
           <Skeleton className="h-44 w-full" />
         ) : !snapshot ? (
           <Card>

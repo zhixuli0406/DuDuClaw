@@ -9,6 +9,7 @@ import {
   Button,
   Badge,
   Empty,
+  ErrorState,
   Switch,
   Input,
   Textarea,
@@ -24,6 +25,7 @@ import {
   DialogFooter,
 } from '@/components/mds';
 import { ConfirmDialog } from '@/components/settings/controls';
+import { AutonomyNote } from '@/components/AutonomyNote';
 import { FieldBlock } from '@/pages/agent-form/form-rows';
 import { Plus, Clock, XCircle, Workflow } from 'lucide-react';
 import { glyphText } from '@/lib/agent-glyph';
@@ -64,6 +66,13 @@ export function AutopilotTab() {
   const intl = useIntl();
   const [rules, setRules] = useState<AutopilotRule[]>([]);
   const [loading, setLoading] = useState(true);
+  // P05: `setRules([])` on failure made a broken fetch look like "no rules
+  // configured" — the one reading a user is most likely to act on wrongly
+  // (they go create a duplicate rule). Three separate error slots: the list,
+  // the last row action, and the history dialog.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [actionError, setActionError] = useState<unknown>(null);
+  const [historyError, setHistoryError] = useState<unknown>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [historyRuleId, setHistoryRuleId] = useState<string | null>(null);
   const [historyEntries, setHistoryEntries] = useState<AutopilotHistoryEntry[]>([]);
@@ -71,11 +80,13 @@ export function AutopilotTab() {
 
   const fetchRules = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const result = await api.autopilot.list();
       setRules(result?.rules ?? []);
     } catch (e) {
       setRules([]);
+      setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     } finally {
       setLoading(false);
@@ -86,20 +97,24 @@ export function AutopilotTab() {
 
   const handleToggle = useCallback(async (ruleId: string, enabled: boolean) => {
     setRules((prev) => prev.map((r) => (r.id === ruleId ? { ...r, enabled } : r)));
+    setActionError(null);
     try {
       await api.autopilot.update(ruleId, { enabled });
     } catch (e) {
       setRules((prev) => prev.map((r) => (r.id === ruleId ? { ...r, enabled: !enabled } : r)));
+      setActionError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     }
   }, [intl]);
 
   const handleRemove = useCallback(async () => {
     if (!removeTarget) return;
+    setActionError(null);
     try {
       await api.autopilot.remove(removeTarget.id);
       setRules((prev) => prev.filter((r) => r.id !== removeTarget.id));
     } catch (e) {
+      setActionError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     }
     setRemoveTarget(null);
@@ -107,11 +122,13 @@ export function AutopilotTab() {
 
   const handleViewHistory = useCallback(async (ruleId: string) => {
     setHistoryRuleId(ruleId);
+    setHistoryError(null);
     try {
       const result = await api.autopilot.history(ruleId);
       setHistoryEntries(result?.entries ?? []);
     } catch (e) {
       setHistoryEntries([]);
+      setHistoryError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     }
   }, [intl]);
@@ -130,10 +147,27 @@ export function AutopilotTab() {
         </Button>
       </div>
 
+      {actionError != null && (
+        <ErrorState
+          variant="inline"
+          error={actionError}
+          title={intl.formatMessage({ id: 'errorState.manage.actionFailed' })}
+          onRetry={() => { setActionError(null); void fetchRules(); }}
+          retryLabel={intl.formatMessage({ id: 'errorState.manage.reload' })}
+        />
+      )}
+
       {loading ? (
         <p className="py-12 text-center text-sm text-muted-foreground">
           {intl.formatMessage({ id: 'common.loading' })}
         </p>
+      ) : loadError != null ? (
+        <ErrorState
+          error={loadError}
+          title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+          description={intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
+          onRetry={() => void fetchRules()}
+        />
       ) : rules.length === 0 ? (
         <Empty
           icon={Workflow}
@@ -210,7 +244,9 @@ export function AutopilotTab() {
       {historyRuleId && (
         <AutopilotHistoryDialog
           entries={historyEntries}
-          onClose={() => setHistoryRuleId(null)}
+          error={historyError}
+          onRetry={() => void handleViewHistory(historyRuleId)}
+          onClose={() => { setHistoryRuleId(null); setHistoryError(null); }}
         />
       )}
 
@@ -370,6 +406,8 @@ function AutopilotCreateDialog({
             </FieldBlock>
           )}
 
+          {actionType === 'delegate' && <AutonomyNote id="autopilotDelegate" />}
+
           {actionType === 'run_skill' && (
             <FieldBlock label={intl.formatMessage({ id: 'autopilot.field.skillName' })}>
               <Input value={skillName} onChange={(e) => setSkillName(e.target.value)} />
@@ -397,9 +435,14 @@ function AutopilotCreateDialog({
 
 function AutopilotHistoryDialog({
   entries,
+  error,
+  onRetry,
   onClose,
 }: {
   entries: ReadonlyArray<AutopilotHistoryEntry>;
+  /** Set when the history fetch failed — never rendered as "no history". */
+  error?: unknown;
+  onRetry?: () => void;
   onClose: () => void;
 }) {
   const intl = useIntl();
@@ -410,7 +453,14 @@ function AutopilotHistoryDialog({
           <DialogTitle>{intl.formatMessage({ id: 'autopilot.history' })}</DialogTitle>
         </DialogHeader>
         <div className="max-h-[400px] space-y-2 overflow-y-auto">
-          {entries.length === 0 ? (
+          {error != null ? (
+            <ErrorState
+              error={error}
+              title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
+              description={intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
+              onRetry={onRetry}
+            />
+          ) : entries.length === 0 ? (
             <p className="py-8 text-center text-sm text-muted-foreground">
               {intl.formatMessage({ id: 'autopilot.history.empty' })}
             </p>

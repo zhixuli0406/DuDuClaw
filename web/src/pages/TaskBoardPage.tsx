@@ -9,6 +9,7 @@ import {
   Button,
   Badge,
   Empty,
+  ErrorState,
   Segmented,
   Checkbox,
   ActorAvatar,
@@ -36,7 +37,9 @@ import {
   type TaskStatusKey,
 } from '@/components/ui';
 import { CreateTaskModal, TaskDoneBurst, celebrateTaskDone } from '@/components/task';
+import { NeedsHumanActions } from '@/components/inbox/NeedsHumanTaskPanel';
 import { toStatusKey, toBackendStatus } from '@/lib/task-status';
+import { toast } from '@/lib/toast';
 import { timeAgo } from '@/lib/format';
 import { withParam, parseEnumParam } from '@/lib/url-params';
 import { api, type TaskInfo, type TaskStatus, type TaskPriority, type TaskCreateParams, type FlowMetrics } from '@/lib/api';
@@ -163,11 +166,14 @@ function TaskCard({
   agent,
   onOpen,
   onRemove,
+  onResolved,
 }: {
   task: TaskInfo;
   agent?: { name: string; display_name: string };
   onOpen: (id: string) => void;
   onRemove: (task: TaskInfo) => void;
+  /** Re-fetch after a `needs_human` card was resolved from the board (WP-A §2-6). */
+  onResolved: () => void;
 }) {
   const intl = useIntl();
   const handleDragStart = useCallback(
@@ -245,10 +251,17 @@ function TaskCard({
           {task.judge_feedback || task.blocked_reason ? `：${task.judge_feedback || task.blocked_reason}` : ''}
         </div>
       )}
+      {/* WP-A (§2-6): a "等你決定" card carries the SAME three choices as the
+          inbox — 重試 / 標記完成 / 放棄 — instead of being a read-only badge that
+          pushed people into dragging the card past the decision. `stopPropagation`
+          keeps a button press from also opening the task. */}
       {task.status === 'needs_human' && (
-        <div className="mt-2 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">
-          <span className="font-medium">{intl.formatMessage({ id: 'tasks.column.needs_human' })}</span>
-          {task.judge_feedback ? `：${task.judge_feedback}` : ''}
+        <div className="mt-2 space-y-2" onClick={(e) => e.stopPropagation()}>
+          <div className="rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">
+            <span className="font-medium">{intl.formatMessage({ id: 'tasks.column.needs_human' })}</span>
+            {task.judge_feedback ? `：${task.judge_feedback}` : ''}
+          </div>
+          <NeedsHumanActions taskId={task.id} onResolved={onResolved} size="sm" />
         </div>
       )}
     </div>
@@ -265,6 +278,7 @@ function KanbanColumn({
   onDrop,
   onOpen,
   onRemove,
+  onResolved,
   onAdd,
 }: {
   status: TaskStatus;
@@ -276,6 +290,7 @@ function KanbanColumn({
   onDrop: (taskId: string, status: TaskStatus) => void;
   onOpen: (id: string) => void;
   onRemove: (task: TaskInfo) => void;
+  onResolved: () => void;
   onAdd: () => void;
 }) {
   const intl = useIntl();
@@ -348,6 +363,7 @@ function KanbanColumn({
             agent={agents.find((a) => a.name === task.assigned_to)}
             onOpen={onOpen}
             onRemove={onRemove}
+            onResolved={onResolved}
           />
         ))}
         {tasks.length === 0 && (
@@ -369,6 +385,7 @@ function KanbanBoard({
   onDrop,
   onOpen,
   onRemove,
+  onResolved,
   onAdd,
 }: {
   rows: ReadonlyArray<TaskInfo>;
@@ -377,6 +394,7 @@ function KanbanBoard({
   onDrop: (taskId: string, status: TaskStatus) => void;
   onOpen: (id: string) => void;
   onRemove: (task: TaskInfo) => void;
+  onResolved: () => void;
   onAdd: () => void;
 }) {
   return (
@@ -392,6 +410,7 @@ function KanbanBoard({
           onDrop={onDrop}
           onOpen={onOpen}
           onRemove={onRemove}
+          onResolved={onResolved}
           onAdd={onAdd}
         />
       ))}
@@ -675,9 +694,14 @@ export function TaskBoardPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  // `error` was unread across this whole file (P05 Blocker, phase-4 audit):
+  // every failed read and write was silent, and a failed delete still closed
+  // its confirmation dialog as if the task were gone.
   const {
     tasks,
     loading,
+    error,
+    clearError,
     fetchTasks,
     createTask,
     moveTask,
@@ -772,18 +796,46 @@ export function TaskBoardPage() {
 
   const handleCreate = useCallback(async (params: TaskCreateParams) => createTask(params), [createTask]);
 
+  /**
+   * WP-A (§2-6) source validation. The board used to check only whether the
+   * DESTINATION column was writable, never where the card came from — so a
+   * 等你決定 card could be dragged straight into 完成 / 卡住了 / 待處理, silently
+   * skipping the three-choice decision the card (and the inbox) are built
+   * around. A task waiting on a person is resolved only through that decision,
+   * so the move is refused and the user is pointed at where it happens.
+   *
+   * Returns `true` when the write was refused.
+   */
+  const refuseIfNeedsHuman = useCallback(
+    (task: TaskInfo): boolean => {
+      if (task.status !== 'needs_human') return false;
+      toast.info(intl.formatMessage({ id: 'tasks.needsHuman.locked' }), {
+        action: {
+          label: intl.formatMessage({ id: 'tasks.needsHuman.locked.action' }),
+          onClick: () => navigate('/inbox'),
+        },
+      });
+      return true;
+    },
+    [intl, navigate],
+  );
+
   // One completion path for drag-drop, list StatusIcon, and batch: write via the
   // store, and fire the §5.5 celebration when a task first reaches `done`.
+  // The needs_human refusal lives HERE rather than at each call site, so a path
+  // added later (or the batch action, which never went through the drag guard)
+  // cannot route around it.
   const applyStatus = useCallback(
     (task: TaskInfo, next: TaskStatus) => {
       if (next === task.status) return;
+      if (refuseIfNeedsHuman(task)) return;
       if (next === 'done') {
         celebrateTaskDone(intl.formatMessage({ id: 'tasks.celebrate.done' }));
         if (task.assigned_to) setBurst({ agentId: task.assigned_to });
       }
       moveTask(task.id, next);
     },
-    [moveTask, intl],
+    [moveTask, intl, refuseIfNeedsHuman],
   );
 
   const handleDrop = useCallback(
@@ -803,11 +855,17 @@ export function TaskBoardPage() {
   );
 
   const handleRemoveConfirm = useCallback(async () => {
-    if (removeTarget) {
-      await removeTask(removeTarget.id);
-      setRemoveTarget(null);
+    if (!removeTarget) return;
+    clearError();
+    await removeTask(removeTarget.id);
+    // Keep the dialog open when the delete didn't land — closing it is what
+    // made a failed delete look like a successful one.
+    if (useTasksStore.getState().error != null) {
+      toast.error(intl.formatMessage({ id: 'tasks.remove.failed' }));
+      return;
     }
-  }, [removeTarget, removeTask]);
+    setRemoveTarget(null);
+  }, [removeTarget, removeTask, clearError, intl]);
 
   // ── Selection (batch) ────────────────────────────────────
   const toggleSelect = useCallback((id: string) => {
@@ -851,10 +909,23 @@ export function TaskBoardPage() {
   }, [selectedTasks, applyStatus, clearSelection]);
 
   const handleBatchDelete = useCallback(async () => {
-    for (const t of selectedTasks) await removeTask(t.id);
+    clearError();
+    let failed = 0;
+    for (const t of selectedTasks) {
+      await removeTask(t.id);
+      if (useTasksStore.getState().error != null) {
+        failed += 1;
+        clearError();
+      }
+    }
+    if (failed > 0) {
+      // Report the real outcome instead of closing on a partial failure.
+      toast.error(intl.formatMessage({ id: 'tasks.batch.deleteFailed' }, { count: failed }));
+      return;
+    }
     clearSelection();
     setConfirmBatch(false);
-  }, [selectedTasks, removeTask, clearSelection]);
+  }, [selectedTasks, removeTask, clearSelection, clearError, intl]);
 
   // Per-AI-staff buckets (incl. an unassigned bucket) — the single grouping
   // source shared by the list "by staff" view and the kanban swimlanes.
@@ -991,7 +1062,29 @@ export function TaskBoardPage() {
 
       {/* Body */}
       <div className="min-h-[50vh] pb-16 pt-2">
-        {filteredTasks.length === 0 && !loading ? (
+        {error != null && (
+          <div className="px-2 pb-3">
+            <ErrorState
+              variant="inline"
+              error={error}
+              onRetry={() => {
+                clearError();
+                void fetchTasks();
+              }}
+            />
+          </div>
+        )}
+        {filteredTasks.length === 0 && !loading && error != null ? (
+          // A failed load must not borrow the "no tasks yet" empty state.
+          <ErrorState
+            icon={KanbanSquare}
+            error={error}
+            onRetry={() => {
+              clearError();
+              void fetchTasks();
+            }}
+          />
+        ) : filteredTasks.length === 0 && !loading ? (
           <Empty
             icon={KanbanSquare}
             title={intl.formatMessage({ id: 'tasks.empty' })}
@@ -1027,6 +1120,7 @@ export function TaskBoardPage() {
                         onDrop={handleDrop}
                         onOpen={openTask}
                         onRemove={setRemoveTarget}
+                        onResolved={fetchTasks}
                         onAdd={openCreate}
                       />
                     )}
@@ -1042,6 +1136,7 @@ export function TaskBoardPage() {
               onDrop={handleDrop}
               onOpen={openTask}
               onRemove={setRemoveTarget}
+              onResolved={fetchTasks}
               onAdd={openCreate}
             />
           )

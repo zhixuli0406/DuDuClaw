@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
-import { useSearchParams } from 'react-router';
+import { useNavigate } from 'react-router';
+import { useUrlState } from '@/lib/use-url-state';
 import {
   Store,
   Plus,
@@ -47,6 +48,7 @@ import {
   ListGridRow,
   ListGridCell,
   Empty,
+  CrossLink,
 } from '@/components/mds';
 import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
 import { BrandingTab } from '@/components/settings/sections/BrandingTab';
@@ -77,7 +79,8 @@ import {
  * and never offers an issue action.
  */
 
-type WhiteLabelTab = 'branding' | 'distributors';
+const WHITE_LABEL_TABS = ['branding', 'distributors'] as const;
+type WhiteLabelTab = (typeof WHITE_LABEL_TABS)[number];
 
 const DEFAULT_EXPIRES_DAYS = 365;
 
@@ -147,12 +150,12 @@ function DialogField({
 
 export function DistributorsPage() {
   const intl = useIntl();
-  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
   // Default to 品牌設定 — the more commonly-edited surface and the one users
-  // struggled to find. `?tab=distributors` (or legacy `?tab=branding`) deep-links.
-  const [tab, setTab] = useState<WhiteLabelTab>(
-    searchParams.get('tab') === 'distributors' ? 'distributors' : 'branding',
-  );
+  // struggled to find. `?tab=distributors` (or legacy `?tab=branding`)
+  // deep-links, and switching tabs writes back (P11: it used to read the param
+  // once at mount, so a refresh always dumped you back on 品牌設定).
+  const [tab, setTab] = useUrlState('tab', 'branding', { allowed: WHITE_LABEL_TABS });
   const [issuerConfigured, setIssuerConfigured] = useState<boolean | null>(null);
   const [refreshEndpointActive, setRefreshEndpointActive] = useState(false);
   const [stats, setStats] = useState<DistributorStats | null>(null);
@@ -286,33 +289,51 @@ export function DistributorsPage() {
 
       {tab === 'branding' && <BrandingTab />}
 
-      {tab === 'distributors' &&
-        (loading ? (
-          <div className="flex items-center justify-center py-16">
-            <Loader2 className="size-6 animate-spin text-muted-foreground" />
+      {tab === 'distributors' && (
+        <div className="space-y-4">
+          {/* Scope disclaimer (UX audit §2-10) — this tab issues real, verifiable
+              licenses; it is not the sales/commission tracker (that's the
+              Partner tab, /manage/license?tab=partner). Shown regardless of
+              issuer/loading state so the distinction is clear up front.
+              X03 (§3.3): the cross-reference used to be plain, unclickable
+              text — now a real CrossLink over to the Partner tab. */}
+          <div className="flex flex-wrap items-start justify-between gap-2 rounded-lg border border-info/30 bg-info/10 px-3 py-2 text-xs text-foreground">
+            <div className="flex items-start gap-2">
+              <Info className="mt-0.5 h-4 w-4 shrink-0 text-info" />
+              <p>{intl.formatMessage({ id: 'distributor.scopeNote' })}</p>
+            </div>
+            <CrossLink
+              label={intl.formatMessage({ id: 'crosslink.distributor.toPartner' })}
+              onClick={() => navigate('/manage/license?tab=partner')}
+            />
           </div>
-        ) : !issuerConfigured ? (
-          <Card>
-            <CardContent>
-              <Empty
-                icon={KeyRound}
-                title={intl.formatMessage({ id: 'distributor.noIssuer.title' })}
-                description={intl.formatMessage({ id: 'distributor.noIssuer.hint' })}
-              />
-              <pre className="mx-auto mt-2 max-w-md overflow-x-auto rounded-lg bg-muted px-4 py-3 text-xs text-muted-foreground">
+
+          {loading ? (
+            <div className="flex items-center justify-center py-16">
+              <Loader2 className="size-6 animate-spin text-muted-foreground" />
+            </div>
+          ) : !issuerConfigured ? (
+            <Card>
+              <CardContent>
+                <Empty
+                  icon={KeyRound}
+                  title={intl.formatMessage({ id: 'distributor.noIssuer.title' })}
+                  description={intl.formatMessage({ id: 'distributor.noIssuer.hint' })}
+                />
+                <pre className="mx-auto mt-2 max-w-md overflow-x-auto rounded-lg bg-muted px-4 py-3 text-xs text-muted-foreground">
 {`[distributor]
 issuer_key_path = "~/.duduclaw/keys/issuer.key"
 public_url = "https://your-gateway.example.com"`}
-              </pre>
-              <p className="mx-auto mt-2 max-w-md text-center text-xs text-muted-foreground">
-                {intl.formatMessage({ id: 'distributor.noIssuer.publicUrl' })}
-              </p>
-            </CardContent>
-          </Card>
-        ) : (
-          <>
-            {/* Control-plane (P2) status + distributor setup guidance */}
-            <Card>
+                </pre>
+                <p className="mx-auto mt-2 max-w-md text-center text-xs text-muted-foreground">
+                  {intl.formatMessage({ id: 'distributor.noIssuer.publicUrl' })}
+                </p>
+              </CardContent>
+            </Card>
+          ) : (
+            <>
+              {/* Control-plane (P2) status + distributor setup guidance */}
+              <Card>
               <CardContent className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
                   <h2 className="text-sm font-semibold">
@@ -556,7 +577,9 @@ public_url = "https://your-gateway.example.com"`}
               )}
             </section>
           </>
-        ))}
+          )}
+        </div>
+      )}
 
       {/* Add distributor */}
       <AddDistributorDialog
