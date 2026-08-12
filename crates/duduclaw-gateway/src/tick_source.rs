@@ -569,6 +569,11 @@ pub(crate) struct SourceState {
     pub(crate) emitted: u64,
     pub(crate) failures: u64,
     pub(crate) file_offset: u64,
+    /// `http_poll` only — the client pinned to the last DNS answer that passed
+    /// screening (D5-W2). Cached here, on the source's own state, because the
+    /// pin is a client-level setting: see
+    /// [`crate::tick_source_poll::PinnedHttpClient`].
+    pub(crate) http_client: Option<crate::tick_source_poll::PinnedHttpClient>,
 }
 
 impl SourceState {
@@ -580,6 +585,7 @@ impl SourceState {
             emitted: 0,
             failures: 0,
             file_offset: 0,
+            http_client: None,
         }
     }
 }
@@ -1130,6 +1136,9 @@ mod tests {
             command: None,
             path: None,
             subscribe: Vec::new(),
+            headers: BTreeMap::new(),
+            ping_interval_secs: 0,
+            idle_timeout_secs: 0,
             json_fields: BTreeMap::new(),
             emit_unchanged: false,
             max_events_per_minute: 2,

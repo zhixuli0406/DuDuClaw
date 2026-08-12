@@ -2079,7 +2079,7 @@
   "agents.adv.notifyThreadId": "討論串 ID（選填）",
   "agents.adv.notifyThreadId.help": "指定聊天室內的討論串或主題；留空則發到聊天室主頁。",
   "agents.adv.quietHours": "勿擾時段",
-  "agents.adv.quietHours.desc": "這段時間內，週知／待確認的主動通知會延後合併送出；需要你立即決定的通知（審批、預算停工、通道故障）不受影響，照常即時送達。",
+  "agents.adv.quietHours.desc": "這段時間內，週知／待確認的主動通知會延後合併送出；需要你立即決定的通知（審批、預算停工、通道故障）不受影響，照常即時送達。注意：需要你決定的卡片（審批／需人工）不受此設定影響，只受系統層勿擾時段管理。",
   "agents.adv.quietHours.window": "時段",
   "agents.adv.quietHours.help": "格式 HH:MM-HH:MM，例如 22:00-08:00（可跨午夜）；留空代表不設定。",
   "agents.adv.quietHours.invalid": "格式不正確，請輸入 HH:MM-HH:MM，例如 22:00-08:00。",

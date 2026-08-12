@@ -25054,7 +25054,7 @@ impl MethodHandler {
     async fn handle_mcp_oauth_providers(&self) -> WsFrame {
         use crate::mcp_oauth;
 
-        let redirect_uri = mcp_oauth::redirect_uri();
+        let redirect_uri = mcp_oauth::redirect_uri(&self.home_dir);
         // Every built-in provider is listed, Google included. Filtering Google
         // out when `[integrations] google_workspace` is off used to hide the
         // *tools* gate behind a *credentials* lie: the Google tab (visible since
@@ -25147,7 +25147,7 @@ impl MethodHandler {
             "expires_at": token.and_then(|t| t.expires_at),
             // The exact URI to register with the provider. Derived from the live
             // gateway port — a UI constant would drift the moment anyone sets
-            // DUDUCLAW_PORT.
+            // DUDUCLAW_PORT or edits config.toml [gateway] port.
             "redirect_uri": p.redirect_uri,
         })
     }
@@ -25173,7 +25173,7 @@ impl MethodHandler {
             .to_string();
 
         // Find the built-in provider or create a custom one
-        let redirect_uri = mcp_oauth::redirect_uri();
+        let redirect_uri = mcp_oauth::redirect_uri(&self.home_dir);
         let mut config = mcp_oauth::builtin_providers(&redirect_uri)
             .into_iter()
             .find(|p| p.provider_id == provider_id)
@@ -28552,6 +28552,10 @@ impl MethodHandler {
                 "enabled": s.enabled,
                 "interval_secs": s.interval_secs,
                 "max_events_per_minute": s.max_events_per_minute,
+                // D5-W2 — how many custom headers this source sends. The
+                // COUNT only: header values are credentials and never leave
+                // the config file (not through this RPC, not through a log).
+                "headers_count": s.headers.len(),
                 "last_tick_ts": counters.last_tick_ts,
                 "events_per_minute_approx": events_per_minute_approx,
                 "events_emitted_total": counters.events_emitted,
@@ -37824,6 +37828,52 @@ mod resident_sensing_dashboard_tests {
         assert_eq!(sources[0]["enabled"], false);
         assert_eq!(sources[0]["events_emitted_total"], 0);
         assert!(sources[0]["last_tick_ts"].is_null());
+    }
+
+    /// D5-W2 — a source's custom headers are credentials. The RPC reports how
+    /// many there are and nothing else: no name, and above all no value.
+    #[tokio::test]
+    async fn sources_reports_a_header_count_and_never_a_header_value() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "secured"
+            kind = "http_poll"
+            url = "https://example.com/quote"
+            headers = { "X-Api-Key" = "sk-live-DO-NOT-LEAK", "Accept" = "application/json" }
+            [[tick.sources]]
+            id = "plain"
+            kind = "http_poll"
+            url = "https://example.com/other"
+            "#,
+        )
+        .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let p = payload(&handler.handle_ticks_sources().await);
+
+        let sources = p["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0]["headers_count"], 2, "{sources:?}");
+        assert_eq!(
+            sources[1]["headers_count"], 0,
+            "the key is always present so the UI never has to branch"
+        );
+
+        // The whole response, serialized — the value must not appear anywhere
+        // in it, under any key.
+        let body = p.to_string();
+        assert!(
+            !body.contains("sk-live"),
+            "a header value reached the dashboard RPC: {body}"
+        );
+        assert!(
+            !body.contains("X-Api-Key"),
+            "even the header name stays in the config file: {body}"
+        );
     }
 
     // ── ticks.recent ──────────────────────────────────────────

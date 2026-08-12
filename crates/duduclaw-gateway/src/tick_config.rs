@@ -59,6 +59,42 @@ const MAX_ID_LEN: usize = 64;
 pub const MAX_SUBSCRIBE_FRAMES: usize = 8;
 /// D5-W — byte ceiling on one `subscribe` frame.
 pub const MAX_SUBSCRIBE_FRAME_BYTES: usize = 4096;
+/// D5-W2 — how many custom `headers` one source may declare.
+pub const MAX_HEADERS: usize = 8;
+/// D5-W2 — byte ceiling on one header value.
+pub const MAX_HEADER_VALUE_BYTES: usize = 1024;
+/// D5-W2 — default WS client-ping period (seconds of inbound silence before a
+/// `Ping` frame is sent). `0` disables pinging.
+pub const DEFAULT_PING_INTERVAL_SECS: u64 = 30;
+/// D5-W2 — default WS idle watchdog (seconds of *total* inbound silence,
+/// pongs included, before the connection is recycled). `0` disables it.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+/// D5-W2 — floor on a non-zero `ping_interval_secs`. Below this the client
+/// would prod a healthy peer several times a second for no diagnostic gain.
+pub const MIN_PING_INTERVAL_SECS: u64 = 5;
+/// D5-W2 — floor on a non-zero `idle_timeout_secs`. The recycle path redials
+/// **immediately** (a quiet feed is not a failure, so it does not pay the
+/// backoff), which means the timeout itself is the only thing bounding how
+/// often a permanently-silent peer is redialled. Anything under this turns the
+/// watchdog into a reconnect storm, so it is refused rather than clamped —
+/// a source asking for a 1-second watchdog has misunderstood the setting, and
+/// silently rewriting it to 30 would hide that.
+pub const MIN_IDLE_TIMEOUT_SECS: u64 = 30;
+
+/// D5-W2 — header names the transport owns. An operator-supplied value for any
+/// of these would either corrupt the HTTP/WS framing or forge the handshake, so
+/// they are refused at config load rather than silently dropped at send time.
+/// Compared **lowercased and whole** (never `contains`).
+pub const RESERVED_HEADER_NAMES: &[&str] = &[
+    "host",
+    "content-length",
+    "connection",
+    "upgrade",
+    "transfer-encoding",
+];
+/// D5-W2 — prefix reserved for the websocket handshake's own headers
+/// (`sec-websocket-key` / `-version` / `-protocol` / `-extensions`).
+pub const RESERVED_HEADER_PREFIX: &str = "sec-websocket-";
 
 /// D7 — field names an extraction may not claim, because
 /// [`crate::autopilot_engine::AutopilotEvent::Tick`]'s `to_fields()` owns
@@ -99,7 +135,13 @@ impl TickKind {
 }
 
 /// One `[[tick.sources]]` entry, after [`validate_source`] normalization.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+///
+/// `Debug` is **hand-written** ([`std::fmt::Debug for TickSourceConfig`]) so
+/// that `headers` renders as a count. Deriving it would leave one
+/// `debug!(?cfg)` anywhere in the gateway's future between an API key and the
+/// log file; the convention "don't log the config" is not a guarantee, this is.
+/// There is deliberately no `Serialize`, for the same reason.
+#[derive(Clone, PartialEq, Deserialize)]
 pub struct TickSourceConfig {
     /// `^[a-z0-9][a-z0-9-]{0,63}$` — also the ring-buffer key and the
     /// `source` field rules match on, so it must be stable and unambiguous.
@@ -131,6 +173,29 @@ pub struct TickSourceConfig {
     /// for every other kind.
     #[serde(default)]
     pub subscribe: Vec<String>,
+    /// D5-W2 — custom request headers, for `http_poll` (every GET) and
+    /// `websocket` (the upgrade request). The usual shape for a feed behind an
+    /// API key: `headers = { "X-API-Key" = "…" }`.
+    ///
+    /// **Values are credentials.** They are never logged (not even at
+    /// `debug`), never surfaced by `ticks.sources` (which exposes only a
+    /// count), and never rendered into a prompt. Validated by
+    /// [`validate_headers`]; cleared for the kinds that make no request.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// D5-W2, `websocket` only — seconds of inbound silence after which a WS
+    /// `Ping` frame is sent. `0` disables client pinging.
+    #[serde(default = "default_ping_interval_secs")]
+    pub ping_interval_secs: u64,
+    /// D5-W2, `websocket` only — seconds of *total* inbound silence (pongs
+    /// count as traffic) after which the connection is recycled and
+    /// immediately redialled. `0` disables the watchdog.
+    ///
+    /// A TCP connection to a feed that stops sending can stay "open" for
+    /// hours; without this the source is silently dead and only `last_tick_ts`
+    /// says so, after the fact.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
     /// `field name → JSON pointer` (RFC 6901). A pointer that doesn't resolve
     /// leaves the field **absent**, never zero — an absent field satisfies no
     /// condition (`autopilot_engine::apply_op`), which is exactly the
@@ -149,6 +214,30 @@ pub struct TickSourceConfig {
     pub persist_every_n: u32,
 }
 
+impl std::fmt::Debug for TickSourceConfig {
+    /// Every field except `headers`, which is reduced to `headers_count` —
+    /// the same thing the dashboard RPC exposes, and for the same reason.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TickSourceConfig")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("enabled", &self.enabled)
+            .field("interval_secs", &self.interval_secs)
+            .field("url", &self.url)
+            .field("command", &self.command)
+            .field("path", &self.path)
+            .field("subscribe", &self.subscribe)
+            .field("headers_count", &self.headers.len())
+            .field("ping_interval_secs", &self.ping_interval_secs)
+            .field("idle_timeout_secs", &self.idle_timeout_secs)
+            .field("json_fields", &self.json_fields)
+            .field("emit_unchanged", &self.emit_unchanged)
+            .field("max_events_per_minute", &self.max_events_per_minute)
+            .field("persist_every_n", &self.persist_every_n)
+            .finish()
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -157,6 +246,12 @@ fn default_interval_secs() -> u64 {
 }
 fn default_max_events_per_minute() -> u32 {
     DEFAULT_MAX_EVENTS_PER_MINUTE
+}
+fn default_ping_interval_secs() -> u64 {
+    DEFAULT_PING_INTERVAL_SECS
+}
+fn default_idle_timeout_secs() -> u64 {
+    DEFAULT_IDLE_TIMEOUT_SECS
 }
 
 /// The `[tick]` section. `enabled = false` by default — with it unset, no
@@ -305,6 +400,11 @@ pub fn validate_source(
     // empty vector so a stray entry can never be silently carried around (and
     // can never be mistaken for an active handshake later).
     let mut subscribe: Vec<String> = Vec::new();
+    // D5-W2 — same reasoning for `headers` and the two websocket clocks: only
+    // the kinds that can act on them keep them.
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    let mut ping_interval_secs = 0u64;
+    let mut idle_timeout_secs = 0u64;
 
     match raw.kind {
         TickKind::HttpPoll => {
@@ -318,6 +418,7 @@ pub fn validate_source(
             // path in the gateway uses (loopback / private ranges / cloud
             // metadata / non-http schemes are all refused there).
             crate::web_fetch::validate_url(u).map_err(|e| format!("url rejected: {e}"))?;
+            headers = validate_headers(&raw.headers)?;
         }
         TickKind::Command => {
             url = None;
@@ -364,6 +465,43 @@ pub fn validate_source(
                 .ok_or_else(|| "kind = \"websocket\" requires `url`".to_string())?;
             validate_ws_url(u)?;
             subscribe = validate_subscribe_frames(&raw.subscribe)?;
+            headers = validate_headers(&raw.headers)?;
+            // D5-W2 — per-clock floors, checked before the pairing rule so the
+            // error names the field that is actually wrong. `0` stays legal on
+            // both (it means "disabled"); anything between 1 and the floor is a
+            // misunderstanding of the unit and is refused, not clamped.
+            if raw.ping_interval_secs > 0 && raw.ping_interval_secs < MIN_PING_INTERVAL_SECS {
+                return Err(format!(
+                    "ping_interval_secs ({}) must be 0 (disabled) or at least \
+                     {MIN_PING_INTERVAL_SECS}",
+                    raw.ping_interval_secs
+                ));
+            }
+            if raw.idle_timeout_secs > 0 && raw.idle_timeout_secs < MIN_IDLE_TIMEOUT_SECS {
+                return Err(format!(
+                    "idle_timeout_secs ({}) must be 0 (disabled) or at least \
+                     {MIN_IDLE_TIMEOUT_SECS} — the watchdog redials immediately, so a \
+                     shorter timeout is a reconnect loop",
+                    raw.idle_timeout_secs
+                ));
+            }
+            // D5-W2 — with both clocks on, a ping that is never answered must
+            // still be able to trip the watchdog. `idle <= ping` would either
+            // recycle before the ping could prove anything (idle < ping) or
+            // race it (idle == ping), so the pair is refused outright rather
+            // than silently reordered.
+            if raw.ping_interval_secs > 0
+                && raw.idle_timeout_secs > 0
+                && raw.idle_timeout_secs <= raw.ping_interval_secs
+            {
+                return Err(format!(
+                    "idle_timeout_secs ({}) must be greater than ping_interval_secs ({}) \
+                     when both are enabled",
+                    raw.idle_timeout_secs, raw.ping_interval_secs
+                ));
+            }
+            ping_interval_secs = raw.ping_interval_secs;
+            idle_timeout_secs = raw.idle_timeout_secs;
         }
     }
 
@@ -376,6 +514,9 @@ pub fn validate_source(
         command,
         path,
         subscribe,
+        headers,
+        ping_interval_secs,
+        idle_timeout_secs,
         json_fields: raw.json_fields,
         emit_unchanged: raw.emit_unchanged,
         max_events_per_minute,
@@ -401,8 +542,7 @@ pub fn validate_source(
 /// never `contains`/`starts_with` — `ws://localhost.evil.example` is a public
 /// host and must not inherit the loopback carve-out.
 pub fn validate_ws_url(url: &str) -> Result<(), String> {
-    let parsed =
-        reqwest::Url::parse(url).map_err(|e| format!("url rejected: invalid URL: {e}"))?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("url rejected: invalid URL: {e}"))?;
 
     let scheme = parsed.scheme();
     if scheme != "ws" && scheme != "wss" {
@@ -463,6 +603,83 @@ fn validate_subscribe_frames(frames: &[String]) -> Result<Vec<String>, String> {
         }
     }
     Ok(frames.to_vec())
+}
+
+/// D5-W2 — validate the custom `headers` table. Returns a **new** map (the
+/// project's immutability convention).
+///
+/// Fail-closed on four axes:
+///
+/// 1. **Count** — at most [`MAX_HEADERS`].
+/// 2. **Name** — `^[A-Za-z0-9-]{1,64}$`, and not a transport-owned name
+///    ([`RESERVED_HEADER_NAMES`] / [`RESERVED_HEADER_PREFIX`]). The reserved
+///    comparison lowercases both sides and matches the **whole** name (plus one
+///    explicit prefix family), never a substring — `X-Host` is a perfectly good
+///    custom header and must not be caught by a `contains("host")`.
+/// 3. **Value length** — at most [`MAX_HEADER_VALUE_BYTES`].
+/// 4. **Value bytes** — visible ASCII plus space only. This bans CR/LF (header
+///    injection: a value carrying `\r\n` would otherwise append attacker-chosen
+///    headers, or a whole second request, to every poll), every other C0
+///    control and DEL, and non-ASCII bytes — which also guarantees the value
+///    survives `HeaderValue::from_str` at send time instead of failing there.
+///
+/// Error messages name the **header**, never the value: an invalid API key is
+/// still an API key, and this string reaches the log.
+pub fn validate_headers(
+    headers: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    if headers.len() > MAX_HEADERS {
+        return Err(format!(
+            "`headers` has {} entries — the maximum is {MAX_HEADERS}",
+            headers.len()
+        ));
+    }
+    for (name, value) in headers {
+        if name.is_empty() || name.len() > MAX_ID_LEN {
+            return Err(format!(
+                "header name '{name}' must be 1-{MAX_ID_LEN} characters"
+            ));
+        }
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(format!(
+                "header name '{name}' may only contain ASCII letters, digits and '-'"
+            ));
+        }
+        let lower = name.to_ascii_lowercase();
+        if RESERVED_HEADER_NAMES.iter().any(|r| *r == lower)
+            || lower.starts_with(RESERVED_HEADER_PREFIX)
+        {
+            return Err(format!(
+                "header '{name}' is reserved by the transport (reserved: {}, {RESERVED_HEADER_PREFIX}*)",
+                RESERVED_HEADER_NAMES.join(", ")
+            ));
+        }
+        if value.len() > MAX_HEADER_VALUE_BYTES {
+            return Err(format!(
+                "header '{name}' has a {}-byte value — the maximum is {MAX_HEADER_VALUE_BYTES}",
+                value.len()
+            ));
+        }
+        if let Some(bad) = value.chars().find(|c| !is_legal_header_value_char(*c)) {
+            let described = match bad {
+                '\r' => "CR".to_string(),
+                '\n' => "LF".to_string(),
+                other => format!("U+{:04X}", other as u32),
+            };
+            return Err(format!(
+                "header '{name}' has an illegal character in its value ({described}) — \
+                 values must be visible ASCII"
+            ));
+        }
+    }
+    Ok(headers.clone())
+}
+
+/// Visible ASCII (`0x20`-`0x7E`). Deliberately excludes tab: a tab is legal in
+/// an HTTP field value only as obsolete line folding, which is the same class
+/// of trouble as a bare CR/LF.
+fn is_legal_header_value_char(c: char) -> bool {
+    matches!(c, ' '..='~')
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,63}$`, hand-rolled (the project does not carry a
@@ -1049,6 +1266,363 @@ mod tests {
         assert!(
             s.subscribe.is_empty(),
             "subscribe only means anything for websocket sources"
+        );
+    }
+
+    // ── D5-W2: idle watchdog + client ping ───────────────────
+
+    #[test]
+    fn websocket_watchdog_clocks_default_to_30s_ping_and_300s_idle() {
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "quotes"
+            kind = "websocket"
+            url = "wss://example.com/stream"
+            "#,
+        );
+        assert_eq!(s.ping_interval_secs, DEFAULT_PING_INTERVAL_SECS);
+        assert_eq!(s.idle_timeout_secs, DEFAULT_IDLE_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn watchdog_clocks_are_cleared_for_non_websocket_kinds() {
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "poller"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            ping_interval_secs = 5
+            idle_timeout_secs = 60
+            "#,
+        );
+        assert_eq!(s.ping_interval_secs, 0, "only websocket sources ping");
+        assert_eq!(s.idle_timeout_secs, 0, "only websocket sources idle out");
+    }
+
+    #[test]
+    fn idle_timeout_must_exceed_ping_interval_when_both_are_on() {
+        let both = |ping: u64, idle: u64| {
+            websocket(
+                "wss://example.com/stream",
+                &format!("ping_interval_secs = {ping}\nidle_timeout_secs = {idle}"),
+            )
+        };
+        // Equal and inverted are both refused: a ping must have room to be
+        // answered before the watchdog gives up on the connection.
+        assert!(both(30, 30).sources.is_empty(), "equal is refused");
+        assert!(both(60, 30).sources.is_empty(), "inverted is refused");
+        assert_eq!(
+            both(30, 31).sources.len(),
+            1,
+            "one second of room is enough"
+        );
+
+        // Either clock disabled ⇒ the ordering rule does not apply.
+        assert_eq!(both(0, 30).sources.len(), 1, "ping off");
+        assert_eq!(both(5, 0).sources.len(), 1, "watchdog off");
+        assert_eq!(both(0, 0).sources.len(), 1, "both off");
+    }
+
+    #[test]
+    fn watchdog_clocks_have_a_floor_when_enabled() {
+        let both = |ping: u64, idle: u64| {
+            websocket(
+                "wss://example.com/stream",
+                &format!("ping_interval_secs = {ping}\nidle_timeout_secs = {idle}"),
+            )
+        };
+
+        // Exactly the floors is legal — the boundary belongs to the allowed
+        // side, and this pair also satisfies `idle > ping`.
+        let ok = both(MIN_PING_INTERVAL_SECS, MIN_IDLE_TIMEOUT_SECS);
+        assert_eq!(ok.sources.len(), 1, "the floors themselves are allowed");
+        assert_eq!(ok.sources[0].ping_interval_secs, MIN_PING_INTERVAL_SECS);
+        assert_eq!(ok.sources[0].idle_timeout_secs, MIN_IDLE_TIMEOUT_SECS);
+
+        // One under either floor disables the source. Refused, never clamped:
+        // silently rewriting 1 → 30 would hide the misunderstanding.
+        for ping in 1..MIN_PING_INTERVAL_SECS {
+            assert!(
+                both(ping, DEFAULT_IDLE_TIMEOUT_SECS).sources.is_empty(),
+                "ping_interval_secs = {ping} is under the floor and must disable the source"
+            );
+        }
+        for idle in [1, 5, 10, MIN_IDLE_TIMEOUT_SECS - 1] {
+            assert!(
+                both(0, idle).sources.is_empty(),
+                "idle_timeout_secs = {idle} is under the floor and must disable the source"
+            );
+        }
+
+        // `0` still means "disabled" on both and is never treated as under the
+        // floor — that is the whole escape hatch.
+        assert_eq!(both(0, 0).sources.len(), 1, "0 is disabled, not too small");
+        assert_eq!(
+            both(0, DEFAULT_IDLE_TIMEOUT_SECS).sources.len(),
+            1,
+            "ping disabled, watchdog at its default"
+        );
+        assert_eq!(
+            both(DEFAULT_PING_INTERVAL_SECS, 0).sources.len(),
+            1,
+            "watchdog disabled, ping at its default"
+        );
+
+        // The shipped defaults must clear their own floors.
+        assert!(DEFAULT_PING_INTERVAL_SECS >= MIN_PING_INTERVAL_SECS);
+        assert!(DEFAULT_IDLE_TIMEOUT_SECS >= MIN_IDLE_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn watchdog_floor_errors_name_the_offending_field() {
+        let err = validate_source(
+            TickSourceConfig {
+                id: "feed".into(),
+                kind: TickKind::Websocket,
+                enabled: true,
+                interval_secs: 5,
+                url: Some("wss://example.com/stream".into()),
+                command: None,
+                path: None,
+                subscribe: Vec::new(),
+                headers: BTreeMap::new(),
+                ping_interval_secs: 0,
+                idle_timeout_secs: 1,
+                json_fields: BTreeMap::new(),
+                emit_unchanged: false,
+                max_events_per_minute: 120,
+                persist_every_n: 0,
+            },
+            false,
+        )
+        .expect_err("a 1-second watchdog must be refused");
+        assert!(err.contains("idle_timeout_secs"), "{err}");
+        assert!(err.contains("30"), "the floor is stated: {err}");
+    }
+
+    // ── D5-W2: custom headers ────────────────────────────────
+
+    #[test]
+    fn headers_parse_for_the_two_kinds_that_make_requests() {
+        for (kind, target) in [
+            ("http_poll", "url = \"https://example.com/x\""),
+            ("websocket", "url = \"wss://example.com/stream\""),
+        ] {
+            let s = source(&format!(
+                r#"
+                [tick]
+                enabled = true
+                [[tick.sources]]
+                id = "feed"
+                kind = "{kind}"
+                {target}
+                headers = {{ "X-API-Key" = "secret-value", "Accept" = "application/json" }}
+                "#
+            ));
+            assert_eq!(s.headers.len(), 2, "{kind}");
+            assert_eq!(s.headers.get("X-API-Key").unwrap(), "secret-value");
+            assert_eq!(s.headers.get("Accept").unwrap(), "application/json");
+        }
+    }
+
+    #[test]
+    fn headers_are_cleared_for_kinds_that_make_no_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("feed.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        let s = source(&format!(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "feed"
+            kind = "file_tail"
+            path = "{}"
+            headers = {{ "X-API-Key" = "secret-value" }}
+            "#,
+            file.display()
+        ));
+        assert!(
+            s.headers.is_empty(),
+            "a file tail sends no request — a stray credential must not be carried around"
+        );
+    }
+
+    #[test]
+    fn reserved_header_names_disable_the_source() {
+        for name in [
+            "Host",
+            "host",
+            "Content-Length",
+            "Connection",
+            "Upgrade",
+            "Transfer-Encoding",
+            "Sec-WebSocket-Key",
+            "sec-websocket-version",
+        ] {
+            let cfg = websocket(
+                "wss://example.com/stream",
+                &format!("headers = {{ \"{name}\" = \"x\" }}"),
+            );
+            assert!(
+                cfg.sources.is_empty(),
+                "'{name}' is transport-owned and must disable the source"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_header_merely_containing_a_reserved_word_is_allowed() {
+        // The reserved check is whole-name (plus one explicit prefix family),
+        // never a substring — these are ordinary custom headers.
+        for name in ["X-Host", "Host-Override", "My-Connection-Id"] {
+            let cfg = websocket(
+                "wss://example.com/stream",
+                &format!("headers = {{ \"{name}\" = \"x\" }}"),
+            );
+            assert_eq!(cfg.sources.len(), 1, "'{name}' must be allowed");
+        }
+    }
+
+    #[test]
+    fn header_values_with_crlf_or_control_characters_disable_the_source() {
+        for value in [
+            "bad\\r\\nX-Injected: yes", // CR/LF — header injection
+            "bad\\rvalue",
+            "bad\\nvalue",
+            "bad\\u0000value", // NUL
+            "bad\\u0007value", // BEL
+            "bad\\tvalue",     // tab: obsolete line folding
+            "祕密",            // non-ASCII
+        ] {
+            let cfg = websocket(
+                "wss://example.com/stream",
+                &format!("headers = {{ \"X-Api-Key\" = \"{value}\" }}"),
+            );
+            assert!(
+                cfg.sources.is_empty(),
+                "value {value:?} must disable the source"
+            );
+        }
+    }
+
+    #[test]
+    fn header_count_name_and_value_limits_are_enforced() {
+        let ok: Vec<String> = (0..MAX_HEADERS)
+            .map(|i| format!("\"X-H{i}\" = \"v\""))
+            .collect();
+        assert_eq!(
+            websocket(
+                "wss://example.com/stream",
+                &format!("headers = {{ {} }}", ok.join(", "))
+            )
+            .sources
+            .len(),
+            1,
+            "exactly the cap is allowed"
+        );
+
+        let too_many: Vec<String> = (0..=MAX_HEADERS)
+            .map(|i| format!("\"X-H{i}\" = \"v\""))
+            .collect();
+        assert!(
+            websocket(
+                "wss://example.com/stream",
+                &format!("headers = {{ {} }}", too_many.join(", "))
+            )
+            .sources
+            .is_empty(),
+            "one over the header cap disables the source"
+        );
+
+        let long_value = "v".repeat(MAX_HEADER_VALUE_BYTES + 1);
+        assert!(
+            websocket(
+                "wss://example.com/stream",
+                &format!("headers = {{ \"X-Api-Key\" = \"{long_value}\" }}")
+            )
+            .sources
+            .is_empty(),
+            "an over-size value disables the source"
+        );
+        assert_eq!(
+            websocket(
+                "wss://example.com/stream",
+                &format!(
+                    "headers = {{ \"X-Api-Key\" = \"{}\" }}",
+                    "v".repeat(MAX_HEADER_VALUE_BYTES)
+                )
+            )
+            .sources
+            .len(),
+            1,
+            "exactly the value cap is allowed"
+        );
+
+        for name in ["X Api Key", "X_Api_Key", "X-Api:Key", "", &"x".repeat(65)] {
+            assert!(
+                websocket(
+                    "wss://example.com/stream",
+                    &format!("headers = {{ \"{name}\" = \"v\" }}")
+                )
+                .sources
+                .is_empty(),
+                "header name {name:?} must disable the source"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_formatting_reduces_headers_to_a_count() {
+        // Structural, not conventional: a future `debug!(?cfg)` cannot leak an
+        // API key even if whoever writes it never reads this module.
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "secured"
+            kind = "http_poll"
+            url = "https://example.com/x"
+            headers = { "X-Api-Key" = "sk-live-DO-NOT-LOG" }
+            "#,
+        );
+        let rendered = format!("{s:?}");
+        assert!(
+            !rendered.contains("sk-live"),
+            "the header value must not survive Debug: {rendered}"
+        );
+        assert!(rendered.contains("headers_count: 1"), "{rendered}");
+        // The rest of the config is still fully inspectable.
+        assert!(rendered.contains("secured") && rendered.contains("HttpPoll"));
+
+        // Same guarantee through the enclosing `[tick]` section.
+        let cfg = TickConfig {
+            enabled: true,
+            allow_command_sources: false,
+            sources: vec![s],
+        };
+        assert!(!format!("{cfg:?}").contains("sk-live"));
+    }
+
+    #[test]
+    fn header_rejection_messages_never_echo_the_value() {
+        let secret = "sk-live-DO-NOT-LOG\r\nX-Injected: yes";
+        let err = validate_headers(&BTreeMap::from([(
+            "X-Api-Key".to_string(),
+            secret.to_string(),
+        )]))
+        .expect_err("CRLF must be refused");
+        assert!(err.contains("X-Api-Key"), "the header name is diagnostic");
+        assert!(
+            !err.contains("sk-live"),
+            "the value is a credential and must never reach a log line: {err}"
         );
     }
 

@@ -64,9 +64,6 @@ mod systemd {
 mod launchd {
     use duduclaw_core::error::Result;
 
-    /// Default port used by the DuDuClaw gateway.
-    const DEFAULT_PORT: u16 = 18789;
-
     pub async fn start() -> Result<()> {
         let home = dirs::home_dir().unwrap_or_default();
         let plist_path = duduclaw_core::autostart::launchd_plist_path_in(
@@ -83,10 +80,13 @@ mod launchd {
     }
 
     pub async fn stop() -> Result<()> {
-        let port: u16 = std::env::var("DUDUCLAW_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(DEFAULT_PORT);
+        // Same priority resolution `duduclaw run` uses (env > config.toml
+        // [gateway] port > default) — this used to read only `DUDUCLAW_PORT`
+        // and default to 18789, so a gateway actually running on a
+        // config.toml-configured port would go un-found: `service stop`
+        // would report "no process found" while the gateway kept running.
+        let (port, _source) =
+            duduclaw_core::gateway_port_for_home(&duduclaw_core::duduclaw_home());
 
         // 1. Unload from launchctl (stops auto-restart via KeepAlive). Both the
         //    current and the legacy label, whichever is registered.

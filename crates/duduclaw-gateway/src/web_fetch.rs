@@ -91,8 +91,10 @@ pub struct FetchResult {
 /// Validate that a URL is safe to fetch (not targeting internal resources).
 ///
 /// Public so other download paths (`media::download_url`) can share the same
-/// SSRF gate. Note this is the pattern-level check only — the full DNS-rebind
-/// pinning happens inside [`web_fetch_cached`].
+/// SSRF gate. Note this is the pattern-level check only — the DNS-rebind
+/// defence is [`resolve_public_addrs`], which callers that actually dial
+/// (here, and the resident-sensing tick sources) run immediately before
+/// connecting.
 pub fn validate_url(url: &str) -> Result<reqwest::Url, FetchError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| FetchError::SsrfBlocked(format!("invalid URL: {e}")))?;
@@ -150,7 +152,11 @@ pub fn validate_url(url: &str) -> Result<reqwest::Url, FetchError> {
 }
 
 /// Returns `true` if the IP address belongs to a private/reserved range.
-fn is_internal_ip(ip: &IpAddr) -> bool {
+///
+/// `pub(crate)` so every outbound path in the gateway classifies an address
+/// with ONE implementation — a second copy of "which ranges are internal" is
+/// exactly how an SSRF gate rots out of sync with itself.
+pub(crate) fn is_internal_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let octets = v4.octets();
@@ -174,6 +180,68 @@ fn is_internal_ip(ip: &IpAddr) -> bool {
             || (v6.segments()[0] & 0xfe00) == 0xfc00
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DNS re-pin (shared)
+// ---------------------------------------------------------------------------
+
+/// Screen an already-resolved address set: the whole set is refused unless
+/// **every** address is public.
+///
+/// All-or-nothing rather than "filter out the internal ones" on purpose. A
+/// hostname that answers with one public and one internal address is either
+/// misconfigured or actively rebinding; connecting to the public half of that
+/// answer would leave the rebinding attempt silently half-successful. Pure (no
+/// I/O) so the policy is testable without a resolver.
+pub(crate) fn vet_resolved_addrs(
+    host: &str,
+    addrs: Vec<std::net::SocketAddr>,
+) -> Result<Vec<std::net::SocketAddr>, FetchError> {
+    if addrs.is_empty() {
+        return Err(FetchError::SsrfBlocked(format!(
+            "DNS returned no results for {host}"
+        )));
+    }
+    if let Some(bad) = addrs.iter().find(|a| is_internal_ip(&a.ip())) {
+        return Err(FetchError::SsrfBlocked(format!(
+            "DNS rebinding detected: {host} resolved to private IP {}",
+            bad.ip()
+        )));
+    }
+    Ok(addrs)
+}
+
+/// Resolve `host:port` **now** and return every address, having proved they are
+/// all public ([`vet_resolved_addrs`]).
+///
+/// This is the DNS re-pin primitive shared by [`web_fetch_cached`] and the
+/// resident-sensing tick sources: the caller pins the returned addresses into
+/// the connection it is about to make (reqwest `resolve_to_addrs`, or a
+/// `TcpStream` dialled straight at them), so the address that was validated is
+/// the address that is dialled — closing the window between "validated the
+/// name" and "connected to whatever the name resolves to now".
+pub(crate) async fn resolve_public_addrs(
+    host: &str,
+    port: u16,
+) -> Result<Vec<std::net::SocketAddr>, FetchError> {
+    let target = format!("{host}:{port}");
+    // `to_socket_addrs` blocks; keep it off the async executor exactly as the
+    // original inline implementation here did.
+    let resolved: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
+        target
+            .to_socket_addrs()
+            .map(|iter| iter.collect::<Vec<_>>())
+            .map_err(|e| FetchError::SsrfBlocked(format!("DNS resolution failed: {e}")))
+    })
+    .await
+    .map_err(|e| FetchError::SsrfBlocked(format!("DNS task failed: {e}")))??;
+
+    let vetted = vet_resolved_addrs(host, resolved);
+    if let Err(e) = &vetted {
+        warn!(host = %host, error = %e, "DNS re-pin refused the resolved address set");
+    }
+    vetted
 }
 
 // ---------------------------------------------------------------------------
@@ -374,27 +442,11 @@ pub async fn web_fetch_cached(
         .to_string();
     let port = validated.port_or_known_default().unwrap_or(443);
 
-    // Synchronous DNS resolution — runs on the blocking thread pool via
-    // spawn_blocking to avoid blocking the async executor.
-    let host_for_dns = host.clone();
-    let resolved_addr = tokio::task::spawn_blocking(move || {
-        format!("{host_for_dns}:{port}")
-            .to_socket_addrs()
-            .map_err(|e| FetchError::SsrfBlocked(format!("DNS resolution failed: {e}")))?
-            .next()
-            .ok_or_else(|| FetchError::SsrfBlocked("DNS returned no results".into()))
-    })
-    .await
-    .map_err(|e| FetchError::SsrfBlocked(format!("DNS task failed: {e}")))??;
-
-    // Re-check the resolved IP — catches DNS rebinding to internal ranges.
-    if is_internal_ip(&resolved_addr.ip()) {
-        warn!(host = %host, ip = %resolved_addr.ip(), "DNS rebinding detected: resolved to private IP");
-        return Err(FetchError::SsrfBlocked(format!(
-            "DNS rebinding detected: {host} resolved to private IP {}",
-            resolved_addr.ip()
-        )));
-    }
+    // Resolve + screen every answer through the shared re-pin primitive. All
+    // resolved addresses must be public, and all of them are pinned below, so a
+    // dual-stack host keeps its fallback address instead of being reduced to
+    // whichever record the resolver happened to list first.
+    let resolved_addrs = resolve_public_addrs(&host, port).await?;
 
     // Build a one-shot client with the IP pinned so reqwest dials the
     // same address we just validated, regardless of later DNS changes.
@@ -443,7 +495,7 @@ pub async fn web_fetch_cached(
     let pinned_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(CLIENT_TIMEOUT_SECONDS))
         .redirect(redirect_policy)
-        .resolve(&host, resolved_addr)
+        .resolve_to_addrs(&host, &resolved_addrs)
         .build()
         .map_err(|e| FetchError::IoError(format!("failed to build pinned client: {e}")))?;
 
@@ -524,6 +576,61 @@ pub async fn web_fetch_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- DNS re-pin (shared with the resident-sensing tick sources) --
+
+    fn addr(s: &str) -> std::net::SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn vetting_keeps_every_address_when_all_are_public() {
+        let addrs = vec![addr("93.184.216.34:443"), addr("[2606:2800:220:1::1]:443")];
+        let kept = vet_resolved_addrs("example.com", addrs.clone()).unwrap();
+        assert_eq!(
+            kept, addrs,
+            "a dual-stack answer keeps both records, so the fallback survives"
+        );
+    }
+
+    #[test]
+    fn vetting_refuses_the_whole_set_if_any_address_is_internal() {
+        // All-or-nothing: connecting to the public half of a half-rebound
+        // answer would leave the attempt silently half-successful.
+        for internal in [
+            "127.0.0.1:443",
+            "169.254.169.254:80",
+            "10.1.2.3:443",
+            "192.168.1.10:443",
+            "172.16.0.9:443",
+            "[::1]:443",
+            "[fd00::1]:443",
+            "0.0.0.0:443",
+        ] {
+            let addrs = vec![addr("93.184.216.34:443"), addr(internal)];
+            let err = vet_resolved_addrs("rebind.example", addrs)
+                .expect_err("{internal} must refuse the whole set");
+            assert!(
+                matches!(err, FetchError::SsrfBlocked(_)),
+                "{internal} → {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vetting_refuses_an_empty_answer() {
+        let err = vet_resolved_addrs("nxdomain.invalid", Vec::new()).unwrap_err();
+        assert!(matches!(err, FetchError::SsrfBlocked(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolving_a_loopback_name_is_refused() {
+        // `localhost` resolves from the hosts file, so this needs no network.
+        let err = resolve_public_addrs("localhost", 8080)
+            .await
+            .expect_err("loopback must never survive the re-pin screen");
+        assert!(matches!(err, FetchError::SsrfBlocked(_)), "{err}");
+    }
 
     // -- SSRF validation tests --
 

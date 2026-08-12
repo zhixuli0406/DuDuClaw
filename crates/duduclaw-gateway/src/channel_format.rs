@@ -692,6 +692,52 @@ pub fn decision_markup(channel: &str, source: DecisionSource, id: &str) -> Optio
     Some(markup)
 }
 
+/// [`decision_markup`] plus, when `miniapp_url` is present, a second Telegram
+/// keyboard row holding a `web_app` button that opens the channel-embedded
+/// detail card (D-S1 spike).
+///
+/// The URL is decided entirely by [`crate::miniapp::approval_web_app_url`],
+/// which returns `Some` only when the feature is on, the destination is a
+/// Telegram private chat and the dashboard has an https public URL — all three
+/// are Telegram's own preconditions for a `web_app` button, and any of them
+/// failing must leave the existing keyboard byte-identical rather than fail
+/// the send.
+pub fn decision_markup_with_miniapp(
+    channel: &str,
+    source: DecisionSource,
+    id: &str,
+    miniapp_url: Option<&str>,
+) -> Option<Value> {
+    let mut markup = decision_markup(channel, source, id)?;
+    if let Some(url) = miniapp_url {
+        attach_telegram_web_app_button(&mut markup, "🔎 查看詳情", url);
+    }
+    Some(markup)
+}
+
+/// Append a `web_app` button as a new row of an existing Telegram inline
+/// keyboard. Its own row rather than beside 同意/拒絕: P5-5 caps a message at
+/// three primary actions, and "查看詳情" is not one of them — it is the way in
+/// to the two that are.
+///
+/// Returns whether the row was added. A markup that is not a Telegram inline
+/// keyboard (a Discord row, a Slack block, an already-mangled value) is left
+/// untouched and reported as `false` — silently corrupting a keyboard would
+/// cost the whole card.
+pub fn attach_telegram_web_app_button(markup: &mut Value, label: &str, url: &str) -> bool {
+    if label.is_empty() || url.is_empty() {
+        return false;
+    }
+    let Some(rows) = markup
+        .get_mut("inline_keyboard")
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    rows.push(json!([{ "text": label, "web_app": { "url": url } }]));
+    true
+}
+
 // ── Install sign-off (two-stage manager → admin gate) ──
 
 /// Telegram inline keyboard with approve / decline buttons for a request.
@@ -1033,6 +1079,81 @@ mod tests {
         let row = &kb["inline_keyboard"][0];
         assert_eq!(row[0]["callback_data"], "duduclaw:decide:inst:ok:req-123");
         assert_eq!(row[1]["callback_data"], "duduclaw:decide:inst:no:req-123");
+    }
+
+    // ── D-S1: the Mini App "查看詳情" row ───────────────────
+
+    #[test]
+    fn miniapp_row_is_appended_below_the_decision_buttons() {
+        let kb = decision_markup_with_miniapp(
+            "telegram",
+            DecisionSource::Approval,
+            "ap-1",
+            Some("https://ai.example.com/miniapp/approval?id=ap-1"),
+        )
+        .expect("telegram approvals have buttons");
+        let rows = kb["inline_keyboard"].as_array().expect("keyboard rows");
+        assert_eq!(rows.len(), 2, "decision row untouched, Mini App row appended");
+        // Row 0 is byte-identical to what the card carried before the spike.
+        assert_eq!(rows[0], telegram_broker_approval_buttons("ap-1")["inline_keyboard"][0]);
+        assert_eq!(rows[1][0]["text"], "🔎 查看詳情");
+        assert_eq!(
+            rows[1][0]["web_app"]["url"],
+            "https://ai.example.com/miniapp/approval?id=ap-1"
+        );
+        // A web_app button carries no callback_data — pressing it opens the
+        // view, it does not decide anything.
+        assert!(rows[1][0].get("callback_data").is_none());
+    }
+
+    #[test]
+    fn no_url_leaves_the_keyboard_byte_identical() {
+        for source in [
+            DecisionSource::Approval,
+            DecisionSource::Goal,
+            DecisionSource::Install,
+            DecisionSource::Kickoff,
+            DecisionSource::Autopilot,
+        ] {
+            for channel in ["telegram", "slack", "discord", "line"] {
+                assert_eq!(
+                    decision_markup_with_miniapp(channel, source, "x-1", None),
+                    decision_markup(channel, source, "x-1"),
+                    "{channel}/{source:?} must be unchanged without a Mini App URL"
+                );
+            }
+        }
+        // A channel with no buttons at all still degrades to None.
+        assert_eq!(
+            decision_markup_with_miniapp("whatsapp", DecisionSource::Approval, "x-1", Some("https://a/b")),
+            None
+        );
+    }
+
+    #[test]
+    fn attach_refuses_shapes_that_are_not_telegram_keyboards() {
+        // A Discord action row, a Slack block and a LINE quickReply all lack
+        // `inline_keyboard`; corrupting them would cost the whole card.
+        for mut markup in [
+            discord_broker_approval_buttons("ap-1"),
+            slack_broker_approval_buttons("ap-1"),
+            line_broker_approval_quick_reply("ap-1"),
+            json!("not even an object"),
+            json!({ "inline_keyboard": "not an array" }),
+        ] {
+            let before = markup.clone();
+            assert!(!attach_telegram_web_app_button(&mut markup, "🔎 查看詳情", "https://a/b"));
+            assert_eq!(markup, before);
+        }
+    }
+
+    #[test]
+    fn attach_refuses_empty_label_or_url() {
+        let mut kb = telegram_broker_approval_buttons("ap-1");
+        let before = kb.clone();
+        assert!(!attach_telegram_web_app_button(&mut kb, "", "https://a/b"));
+        assert!(!attach_telegram_web_app_button(&mut kb, "🔎 查看詳情", ""));
+        assert_eq!(kb, before);
     }
 
     #[test]

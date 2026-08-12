@@ -56,7 +56,7 @@ const SUMMARY_MAX_CHARS: usize = 300;
 /// Human-facing zh-TW label for an `action_kind`. Internal identifiers must not
 /// leak into an end-user message (project convention: user-facing copy hides
 /// implementation detail), so anything unmapped renders as a generic phrase.
-fn zh_action_kind(kind: &str) -> &str {
+pub(crate) fn zh_action_kind(kind: &str) -> &str {
     match kind {
         "mcp_install" => "安裝新技能／工具",
         "mcp_call" => "執行高風險工具",
@@ -219,7 +219,7 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
 /// The broker persists the destination a successful push landed on, so unlike
 /// the sources that re-derive it, this is an actual delivery record. `None`
 /// before any push has succeeded ⇒ no destination authority exists yet.
-fn delivered_targets(rec: &ApprovalRecord) -> Vec<(String, String)> {
+pub(crate) fn delivered_targets(rec: &ApprovalRecord) -> Vec<(String, String)> {
     match (rec.notify_channel.as_deref(), rec.notify_chat_id.as_deref()) {
         (Some(ch), Some(id)) if !ch.is_empty() && !id.is_empty() => {
             vec![(ch.to_string(), id.to_string())]

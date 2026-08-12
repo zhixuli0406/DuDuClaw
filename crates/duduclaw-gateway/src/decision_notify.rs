@@ -450,7 +450,23 @@ pub(crate) async fn deliver_now(
     chat_id: &str,
     card: &DecisionCard<'_>,
 ) -> bool {
-    match crate::channel_format::decision_markup(channel, card.source, card.decision_id) {
+    // D-S1: a Telegram private-chat approval card also gets a `web_app`
+    // button opening the Mini App detail view. `None` in every other case —
+    // feature off, wrong channel/source, group chat, no https public URL —
+    // and the keyboard below is then exactly what it was before the spike.
+    let miniapp_url = crate::miniapp::approval_web_app_url(
+        home_dir,
+        card.source,
+        channel,
+        chat_id,
+        card.decision_id,
+    );
+    match crate::channel_format::decision_markup_with_miniapp(
+        channel,
+        card.source,
+        card.decision_id,
+        miniapp_url.as_deref(),
+    ) {
         Some(markup) => {
             // Button-capable channels get the link too, as a fallback for
             // when the buttons themselves fail to render or tap.
