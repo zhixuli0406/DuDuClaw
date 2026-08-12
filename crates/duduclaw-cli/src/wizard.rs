@@ -675,7 +675,7 @@ features = {features_toml}
 [model]
 preferred = "claude-sonnet-4-6"
 fallback = "claude-haiku-4-5"
-account_pool = ["main"]
+account_pool = []
 api_mode = "cli"
 
 [model.local]

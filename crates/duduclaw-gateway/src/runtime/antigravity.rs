@@ -464,6 +464,7 @@ mod tests {
             preferred_provider: None,
             conversation_history: vec![],
             capabilities: None,
+            account_pool: vec![],
         }
     }
 
@@ -593,6 +594,7 @@ mod tests {
             preferred_provider: None,
             conversation_history: vec![],
             capabilities: None,
+            account_pool: vec![],
         };
         let resp = rt
             .execute("Reply with exactly: PONG", &c)

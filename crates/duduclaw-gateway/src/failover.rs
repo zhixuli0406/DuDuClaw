@@ -335,6 +335,7 @@ mod tests {
             preferred_provider: None,
             conversation_history: vec![],
             capabilities: None,
+            account_pool: vec![],
         }
     }
 

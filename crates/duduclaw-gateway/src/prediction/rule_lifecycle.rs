@@ -36,7 +36,7 @@ use tracing::{info, warn};
 use duduclaw_memory::SqliteMemoryEngine;
 
 use super::engine::ErrorCategory;
-use super::rule_gate::{evaluate_rule_gate, GateDecision, HeldOutStats};
+use super::rule_gate::{evaluate_rule_gate, GateDecision, HeldOutStats, DEFAULT_BASELINE_HIT_RATE};
 
 /// `source_event` written by `reflexion::maybe_consolidate` (F2b).
 pub const RULE_SOURCE_EVENT: &str = "reflexion_consolidation";
@@ -166,6 +166,10 @@ pub struct InjectedRule {
     pub net: i64,
     /// Still on the Janus trial period (carries [`PROBATION_RULE_TAG`]).
     pub probation: bool,
+    /// G6: at least one recorded source fact has been superseded (carries
+    /// [`crate::prediction::rule_staleness::SOURCE_STALE_RULE_TAG`]). Sorts
+    /// after fresh rules; the render path appends a 「來源已更新」 marker.
+    pub source_stale: bool,
 }
 
 /// Select active (non-retired) consolidated rules for F2a injection, ranked
@@ -231,11 +235,19 @@ async fn select_rules_by_source_event(
         .map(|(entry, metadata)| InjectedRule {
             net: RuleStats::from_metadata(&metadata).net(),
             probation: entry.tags.iter().any(|t| t == PROBATION_RULE_TAG),
+            source_stale: crate::prediction::rule_staleness::is_source_stale(&entry.tags),
             id: entry.id,
             content: entry.content,
         })
         .collect();
-    rules.sort_by(|a, b| b.net.cmp(&a.net).then(a.probation.cmp(&b.probation)));
+    // G6: source-stale rules sort after fresh ones regardless of net score
+    // (still injectable, just downweighted — mirrors `playbook::select`).
+    rules.sort_by(|a, b| {
+        a.source_stale
+            .cmp(&b.source_stale)
+            .then(b.net.cmp(&a.net))
+            .then(a.probation.cmp(&b.probation))
+    });
     rules.truncate(limit);
     rules
 }
@@ -258,7 +270,15 @@ pub fn build_rules_section_blocking(
     let ids: Vec<String> = rules.iter().map(|r| r.id.clone()).collect();
     let section = rules
         .iter()
-        .map(|r| r.content.as_str())
+        .map(|r| {
+            // G6: annotate a source-stale rule inline (it is already
+            // downweighted to last by the selection sort above).
+            if r.source_stale {
+                format!("{} {}", r.content, crate::playbook::select::SOURCE_STALE_MARKER)
+            } else {
+                r.content.clone()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
     Some((section, ids))
@@ -596,46 +616,137 @@ pub async fn score_shadow_candidates_for_task(
     let k = shadow.len().max(1);
 
     let mut out = ShadowScoreOutcome::default();
-    for (id, tags, mut metadata) in shadow {
+    for (id, tags, metadata) in shadow {
         // Signal match: only score a shadow rule whose trigger matches this
         // round's task situation (goal_kind tag equality — the reused
         // task_rule_induce convention).
         if !tags.iter().any(|t| t == match_tag) {
             continue;
         }
+        score_one_shadow_candidate(
+            engine, agent_id, &id, metadata, category, k, baseline_hit_rate, now_seq, &mut out,
+        )
+        .await;
+    }
+    out
+}
 
-        let stats = HeldOutStats::from_metadata(&metadata);
-        let (updated, decision) =
-            update_held_out_and_gate(stats, category, now_seq, k, baseline_hit_rate);
-        updated.merge_into(&mut metadata);
-        if let Err(e) = engine.update_metadata(agent_id, &id, &metadata).await {
-            warn!(agent = %agent_id, rule = %id, "shadow-scoring: write metadata failed: {e}");
-            continue;
-        }
-        out.scored += 1;
+/// Shared per-candidate body of the two shadow-scoring passes
+/// ([`score_shadow_candidates_for_task`] / [`score_shadow_candidates_by_ids`]):
+/// fold this settle's out-of-sample observation into the candidate's
+/// [`HeldOutStats`] (shadow polarity, prequential-guarded), persist, and act
+/// on the gate decision. The caller has already established that the row is
+/// an active shadow candidate. Failures log and leave the row untouched.
+#[allow(clippy::too_many_arguments)]
+async fn score_one_shadow_candidate(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    id: &str,
+    mut metadata: serde_json::Value,
+    category: ErrorCategory,
+    k_concurrent_candidates: usize,
+    baseline_hit_rate: f64,
+    now_seq: u64,
+    out: &mut ShadowScoreOutcome,
+) {
+    let stats = HeldOutStats::from_metadata(&metadata);
+    let (updated, decision) = update_held_out_and_gate(
+        stats,
+        category,
+        now_seq,
+        k_concurrent_candidates,
+        baseline_hit_rate,
+    );
+    updated.merge_into(&mut metadata);
+    if let Err(e) = engine.update_metadata(agent_id, id, &metadata).await {
+        warn!(agent = %agent_id, rule = %id, "shadow-scoring: write metadata failed: {e}");
+        return;
+    }
+    out.scored += 1;
 
-        match decision {
-            GateDecision::Inject => match engine.remove_tag(agent_id, &id, SHADOW_RULE_TAG).await {
-                Ok(true) => out.promoted.push(id.clone()),
+    match decision {
+        GateDecision::Inject => match engine.remove_tag(agent_id, id, SHADOW_RULE_TAG).await {
+            Ok(true) => out.promoted.push(id.to_string()),
+            Ok(false) => {}
+            Err(e) => warn!(agent = %agent_id, rule = %id, "shadow-scoring: promote failed: {e}"),
+        },
+        GateDecision::Retire => {
+            match engine
+                .set_importance_and_add_tag(agent_id, id, RETIRED_IMPORTANCE, RETIRED_RULE_TAG)
+                .await
+            {
+                Ok(true) => out.retired.push(id.to_string()),
                 Ok(false) => {}
-                Err(e) => warn!(agent = %agent_id, rule = %id, "shadow-scoring: promote failed: {e}"),
-            },
-            GateDecision::Retire => {
-                match engine
-                    .set_importance_and_add_tag(agent_id, &id, RETIRED_IMPORTANCE, RETIRED_RULE_TAG)
-                    .await
-                {
-                    Ok(true) => out.retired.push(id.clone()),
-                    Ok(false) => {}
-                    Err(e) => {
-                        warn!(agent = %agent_id, rule = %id, "shadow-scoring: retire failed: {e}")
-                    }
+                Err(e) => {
+                    warn!(agent = %agent_id, rule = %id, "shadow-scoring: retire failed: {e}")
                 }
             }
-            // Already un-injected: nothing to stop injecting (Demote), and
-            // Shadow means "not decidable yet" — leave the row as-is.
-            GateDecision::Demote | GateDecision::Shadow => {}
         }
+        // Already un-injected: nothing to stop injecting (Demote), and
+        // Shadow means "not decidable yet" — leave the row as-is.
+        GateDecision::Demote | GateDecision::Shadow => {}
+    }
+}
+
+/// Dialogue-layer shadow-scoring pass (closes the v1.54 debt documented in
+/// `docs/features/39-calibrated-forward-model.md` "還沒做的部分") — the
+/// channel-reply twin of [`score_shadow_candidates_for_task`].
+///
+/// The task pass signal-matches at settle time by `goal_kind:` tag equality;
+/// dialogue rules instead carry playbook `signals_match` tokens, which the
+/// prompt-build step already evaluates against the turn's `TurnSignals`
+/// (`playbook::collect_armed_shadow`). So this pass takes the **armed id
+/// list** captured at build time: each armed candidate implicitly predicted
+/// "this turn is high-risk", and the settled [`ErrorCategory`] is its
+/// deterministic out-of-sample oracle ([`score_shadow_candidate`] polarity —
+/// hit ⇔ Significant/Critical).
+///
+/// `k_concurrent_candidates` is the agent's active shadow family size at
+/// arming time (Bonferroni — more candidates trialed at once makes promotion
+/// strictly harder). A row that lost its shadow tag, was retired, or was
+/// deleted between arming and settle is skipped silently: the observation
+/// belongs to the state the rule was armed in, and that state no longer
+/// exists. Every failure path logs and continues — scoring is an
+/// enhancement, never a settle blocker.
+pub async fn score_shadow_candidates_by_ids(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    armed_ids: &[String],
+    k_concurrent_candidates: usize,
+    category: ErrorCategory,
+    baseline_hit_rate: f64,
+    now_seq: u64,
+) -> ShadowScoreOutcome {
+    let k = k_concurrent_candidates.max(1);
+    let mut out = ShadowScoreOutcome::default();
+    for id in armed_ids {
+        let entry = match engine.get_by_id(agent_id, id).await {
+            Ok(Some(e)) => e,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(agent = %agent_id, rule = %id, "shadow-scoring: read entry failed: {e}");
+                continue;
+            }
+        };
+        // Still an active shadow candidate? (State may have changed between
+        // arming and settle — e.g. promoted or retired by a concurrent turn.)
+        let is_shadow = entry.tags.iter().any(|t| t == SHADOW_RULE_TAG);
+        let is_retired = entry.tags.iter().any(|t| t == RETIRED_RULE_TAG);
+        if !is_shadow || is_retired {
+            continue;
+        }
+        let metadata = match engine.get_metadata(agent_id, id).await {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(agent = %agent_id, rule = %id, "shadow-scoring: read metadata failed: {e}");
+                continue;
+            }
+        };
+        score_one_shadow_candidate(
+            engine, agent_id, id, metadata, category, k, baseline_hit_rate, now_seq, &mut out,
+        )
+        .await;
     }
     out
 }
@@ -665,6 +776,93 @@ pub fn settle_detached(
                 }
             }
             Err(e) => warn!(agent = %agent_id, "rule lifecycle: open memory engine failed: {e}"),
+        }
+    });
+}
+
+/// Fire-and-forget held-out settlement for the channel-reply outcome path —
+/// the gate-on twin of [`settle_detached`], mirroring `dispatch_engine`'s A4
+/// settle so dialogue rules ride the same numeric-oracle lifecycle as task
+/// rules. Reached only when `[task_forward_model] held_out_gate_enabled =
+/// true` (the caller branches; gate-off keeps calling [`settle_detached`],
+/// byte-identical).
+///
+/// Two independent populations settle here:
+/// - `injected_ids` — rules injected into this turn's prompt, routed through
+///   [`settle_injected_rules_held_out`] (helper polarity: hit ⇔ the turn went
+///   well) against the domain-agnostic [`DEFAULT_BASELINE_HIT_RATE`], with
+///   the injected batch itself as the Bonferroni family — the same two
+///   choices `dispatch_engine` makes for its injected settle.
+/// - `armed_shadow_ids` — shadow candidates whose signals matched this turn
+///   at prompt-build time (`playbook::collect_armed_shadow`), scored via
+///   [`score_shadow_candidates_by_ids`] (risk-predictor polarity: hit ⇔ the
+///   turn was high-risk) against `shadow_baseline_hit_rate` — the caller
+///   passes the agent's dialogue climatology
+///   (`PredictionEngine::high_risk_base_rate`) or its coin-flip fallback.
+///
+/// Detached so it never delays reply delivery; failures only log.
+#[allow(clippy::too_many_arguments)]
+pub fn settle_detached_held_out(
+    db_path: PathBuf,
+    agent_id: String,
+    injected_ids: Vec<String>,
+    armed_shadow_ids: Vec<String>,
+    shadow_family_k: usize,
+    category: ErrorCategory,
+    shadow_baseline_hit_rate: f64,
+) {
+    if injected_ids.is_empty() && armed_shadow_ids.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(engine) => engine,
+            Err(e) => {
+                warn!(agent = %agent_id, "held-out settle: open memory engine failed: {e}");
+                return;
+            }
+        };
+        let now_seq = chrono::Utc::now().timestamp().max(0) as u64;
+        if !injected_ids.is_empty() {
+            let retired = settle_injected_rules_held_out(
+                &engine,
+                &agent_id,
+                &injected_ids,
+                category,
+                injected_ids.len(),
+                DEFAULT_BASELINE_HIT_RATE,
+                now_seq,
+            )
+            .await;
+            if !retired.is_empty() {
+                info!(
+                    agent = %agent_id,
+                    retired = retired.len(),
+                    "rule lifecycle: held-out gate retired spent rules"
+                );
+            }
+        }
+        if !armed_shadow_ids.is_empty() {
+            let pass = score_shadow_candidates_by_ids(
+                &engine,
+                &agent_id,
+                &armed_shadow_ids,
+                shadow_family_k,
+                category,
+                shadow_baseline_hit_rate,
+                now_seq,
+            )
+            .await;
+            if pass.scored > 0 {
+                info!(
+                    agent = %agent_id,
+                    scored = pass.scored,
+                    promoted = pass.promoted.len(),
+                    retired = pass.retired.len(),
+                    baseline = shadow_baseline_hit_rate,
+                    "dialogue shadow-scoring pass"
+                );
+            }
         }
     });
 }
@@ -1342,6 +1540,144 @@ mod tests {
             entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
             "a large concurrent-candidate family must block a promotion that passed at k=1"
         );
+    }
+
+    // ── dialogue-layer shadow-scoring by armed ids (v1.54 debt closure) ──
+
+    /// Store a dialogue-layer (reflexion) shadow rule with a pre-seeded
+    /// held-out record — the fixture the by-ids pass consumes.
+    async fn store_shadow_dialogue_rule(
+        engine: &SqliteMemoryEngine,
+        agent: &str,
+        held: HeldOutStats,
+    ) -> String {
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: "shadow inductive lesson".to_string(),
+            timestamp: chrono::Utc::now(),
+            tags: vec!["reflexion".to_string(), SHADOW_RULE_TAG.to_string()],
+            embedding: None,
+            layer: MemoryLayer::Semantic,
+            importance: 8.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: RULE_SOURCE_EVENT.to_string(),
+        };
+        let mut metadata = serde_json::json!({ "rule_stats": RuleStats::initial() });
+        held.merge_into(&mut metadata);
+        let meta = TemporalMeta {
+            metadata: Some(metadata),
+            ..Default::default()
+        };
+        engine.store_temporal(agent, entry, meta).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn by_ids_pass_promotes_after_enough_high_risk_hits() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-byids-promote";
+        let id = store_shadow_dialogue_rule(&engine, agent, HeldOutStats::born(100)).await;
+        let armed = vec![id.clone()];
+
+        // Frozen baseline 0.3; 10 high-risk settles strictly after birth →
+        // Wilson lower bound clears the baseline → promoted out of shadow.
+        for _ in 0..10 {
+            score_shadow_candidates_by_ids(
+                &engine, agent, &armed, 1, ErrorCategory::Critical, 0.3, 200,
+            )
+            .await;
+        }
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(
+            !entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
+            "a strong out-of-sample risk-prediction record is promoted out of shadow"
+        );
+        // Promoted dialogue rules become selectable on the F2a path.
+        let sel = select_rules(&engine, agent, INJECTION_LIMIT).await;
+        assert!(sel.iter().any(|r| r.id == id), "promoted rule becomes injectable");
+    }
+
+    #[tokio::test]
+    async fn by_ids_pass_retires_persistent_false_alarm() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-byids-retire";
+        let id = store_shadow_dialogue_rule(&engine, agent, HeldOutStats::born(0)).await;
+        let armed = vec![id.clone()];
+
+        // 16 low-risk settles = 16 false alarms at baseline 0.5 → even the
+        // optimistic upper bound falls below baseline → retire.
+        for _ in 0..16 {
+            score_shadow_candidates_by_ids(
+                &engine, agent, &armed, 1, ErrorCategory::Negligible, 0.5, 10,
+            )
+            .await;
+        }
+        let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
+        assert!(
+            entry.tags.iter().any(|t| t == RETIRED_RULE_TAG),
+            "a spent false-alarm risk predictor is retired"
+        );
+        assert!(entry.importance < 2.0, "importance demoted on retirement");
+    }
+
+    #[tokio::test]
+    async fn by_ids_pass_skips_birth_batch_and_counts_later_settles() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-byids-birth";
+        let id = store_shadow_dialogue_rule(&engine, agent, HeldOutStats::born(500)).await;
+        let armed = vec![id.clone()];
+
+        // now_seq == born_seq → birth batch, not counted (train != test).
+        let out = score_shadow_candidates_by_ids(
+            &engine, agent, &armed, 1, ErrorCategory::Critical, 0.3, 500,
+        )
+        .await;
+        assert_eq!(out.scored, 1, "the candidate is still visited (gate evaluated)");
+        let held =
+            HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
+        assert_eq!(held.total(), 0, "birth-batch settle (now_seq <= born_seq) must not count");
+
+        // A strictly later settle IS counted.
+        score_shadow_candidates_by_ids(&engine, agent, &armed, 1, ErrorCategory::Critical, 0.3, 501)
+            .await;
+        let held =
+            HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
+        assert_eq!(held.oos_hits, 1, "an out-of-sample settle (now_seq > born_seq) counts");
+    }
+
+    #[tokio::test]
+    async fn by_ids_pass_skips_rows_no_longer_shadow() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-byids-stale-arm";
+        // Armed as shadow, then promoted by a concurrent settle before this
+        // one lands → the stale armed id must be skipped untouched.
+        let promoted = store_shadow_dialogue_rule(&engine, agent, HeldOutStats::born(0)).await;
+        engine.remove_tag(agent, &promoted, SHADOW_RULE_TAG).await.unwrap();
+        // Armed, then retired concurrently → also skipped.
+        let retired = store_shadow_dialogue_rule(&engine, agent, HeldOutStats::born(0)).await;
+        engine
+            .set_importance_and_add_tag(agent, &retired, 1.0, RETIRED_RULE_TAG)
+            .await
+            .unwrap();
+
+        let out = score_shadow_candidates_by_ids(
+            &engine,
+            agent,
+            &[promoted.clone(), retired.clone(), "no-such-id".to_string()],
+            3,
+            ErrorCategory::Critical,
+            0.3,
+            10,
+        )
+        .await;
+        assert_eq!(out.scored, 0, "stale armed ids are skipped, not scored");
+        for id in [&promoted, &retired] {
+            let held = HeldOutStats::from_metadata(
+                &engine.get_metadata(agent, id).await.unwrap().unwrap(),
+            );
+            assert_eq!(held.total(), 0, "no out-of-sample record written for a stale armed id");
+        }
     }
 
     #[tokio::test]

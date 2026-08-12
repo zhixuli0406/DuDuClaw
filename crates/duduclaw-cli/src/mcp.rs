@@ -3682,7 +3682,7 @@ async fn handle_create_agent(params: &Value, home_dir: &Path, caller_agent: &str
         [model]
         preferred = model
         fallback = "claude-haiku-4-5"
-        account_pool = ["main"]
+        account_pool = []
 
         [container]
         timeout_ms = 1800000

@@ -114,12 +114,24 @@ pub fn ebbinghaus_retrievability(
     importance: f64,
     w: &RetrievalWeights,
 ) -> f64 {
-    let stability = (w.base_stability_days
+    let stability = ebbinghaus_stability_days(access_count, importance, w);
+    (-days_since_access.max(0.0) / stability).exp()
+}
+
+/// Stability `S` (in days) of the Ebbinghaus curve — the single source of the
+/// `S` used by [`ebbinghaus_retrievability`], extracted so callers that want to
+/// *report* the curve (dashboard decay visualisation) derive it from exactly the
+/// same expression the archival job scores against, instead of re-deriving it.
+///
+/// `S = base · (1 + k·ln(1 + access_count)) · clamp(importance / 5, 0.2, 2.0)`,
+/// capped at `max_stability_days` and floored above zero so the exponential
+/// below never divides by zero.
+pub fn ebbinghaus_stability_days(access_count: u32, importance: f64, w: &RetrievalWeights) -> f64 {
+    (w.base_stability_days
         * (1.0 + w.reinforce_k * (1.0 + access_count as f64).ln())
         * (importance / 5.0).clamp(0.2, 2.0))
     .min(w.max_stability_days)
-    .max(f64::EPSILON);
-    (-days_since_access.max(0.0) / stability).exp()
+    .max(f64::EPSILON)
 }
 
 /// Optional temporal / knowledge-graph metadata for a memory write (F1, v1.19.0).
@@ -1434,6 +1446,48 @@ impl SqliteMemoryEngine {
             }
             None => Ok(None),
         }
+    }
+
+    /// Return the subset of `ids` that are currently **superseded** — i.e. a
+    /// newer fact with the same `(subject, predicate)` triple has replaced
+    /// them (their `superseded_by` column is non-NULL). Ownership enforced
+    /// (`agent_id` scoped).
+    ///
+    /// Fail-open on lookup: an id that does not exist for this agent is simply
+    /// omitted from the result (NOT reported as superseded) — a source we
+    /// cannot locate is never asserted stale. This is the memory-side
+    /// primitive that lets the rule layer (G6, Hindsight #6/#7) propagate
+    /// fact-layer supersession up to consolidated reflexion rules / playbook
+    /// entries: a rule records the memory ids of the facts it was derived
+    /// from, and this query tells the rule layer which of those source facts
+    /// have since been superseded. Preserves the input order of the surviving
+    /// (superseded) ids.
+    pub async fn superseded_fact_ids(
+        &self,
+        agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT superseded_by FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let mut out = Vec::new();
+        for id in ids {
+            // Outer Option: row found? Inner Option: superseded_by NULL or set?
+            let superseded_by: Option<Option<String>> = stmt
+                .query_row(params![id, agent_id], |r| r.get::<_, Option<String>>(0))
+                .optional()
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            if matches!(superseded_by, Some(Some(_))) {
+                out.push(id.clone());
+            }
+        }
+        Ok(out)
     }
 
     /// Overwrite an entry's `content` text in place (ownership enforced).
@@ -5952,5 +6006,66 @@ mod tests {
             )
             .unwrap();
         assert!(embedded > 0, "entity vectors must be lazily populated when embed seeding is on");
+    }
+
+    // ── G6: superseded_fact_ids (rule-layer staleness primitive) ────────────
+
+    /// Only ids whose `(subject, predicate)` triple has been replaced by a
+    /// newer fact are reported; still-valid ids and unknown ids are omitted
+    /// (fail-open on lookup).
+    #[tokio::test]
+    async fn superseded_fact_ids_reports_only_replaced_facts() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "g6-agent";
+
+        // Fact A: superseded by a newer write of the same triple.
+        let a = engine
+            .store_temporal(agent, make_entry(agent, "price is 100", vec![]), triple_meta("product:price", "is", "100"))
+            .await
+            .unwrap();
+        // Newer value supersedes A.
+        engine
+            .store_temporal(agent, make_entry(agent, "price is 120", vec![]), triple_meta("product:price", "is", "120"))
+            .await
+            .unwrap();
+
+        // Fact B: still valid, never superseded.
+        let b = engine
+            .store_temporal(agent, make_entry(agent, "sky is blue", vec![]), triple_meta("sky", "color", "blue"))
+            .await
+            .unwrap();
+
+        let stale = engine
+            .superseded_fact_ids(agent, &[a.clone(), b.clone(), "no-such-id".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(stale, vec![a], "only the replaced fact is reported; valid + unknown ids omitted");
+    }
+
+    /// Ownership is enforced and the empty-input fast path returns empty.
+    #[tokio::test]
+    async fn superseded_fact_ids_scopes_by_agent_and_handles_empty() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let owner = "owner";
+        let other = "other";
+
+        let a = engine
+            .store_temporal(owner, make_entry(owner, "v1", vec![]), triple_meta("k", "is", "1"))
+            .await
+            .unwrap();
+        engine
+            .store_temporal(owner, make_entry(owner, "v2", vec![]), triple_meta("k", "is", "2"))
+            .await
+            .unwrap();
+
+        // Empty input → empty output, no query.
+        assert!(engine.superseded_fact_ids(owner, &[]).await.unwrap().is_empty());
+
+        // A different agent cannot observe `owner`'s superseded row (id scoped).
+        let cross = engine.superseded_fact_ids(other, &[a.clone()]).await.unwrap();
+        assert!(cross.is_empty(), "another agent's supersession state is not visible");
+
+        // Owner does see it.
+        assert_eq!(engine.superseded_fact_ids(owner, &[a.clone()]).await.unwrap(), vec![a]);
     }
 }

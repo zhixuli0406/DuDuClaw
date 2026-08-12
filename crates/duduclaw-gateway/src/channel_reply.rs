@@ -1396,6 +1396,12 @@ async fn build_reply_with_session_inner(
     }
     let agent_dir = agent.map(|a| a.dir.clone());
     let capabilities = agent.map(|a| a.config.capabilities.clone());
+    // G1: the agent's `[model] account_pool` narrows the rotator candidate set
+    // (fail-open — see `AccountRotator::select_for_provider_with_pool`). Empty
+    // when unset or when no agent resolved ⇒ rotation is unchanged.
+    let account_pool: Vec<String> = agent
+        .map(|a| a.config.model.account_pool.clone())
+        .unwrap_or_default();
     let skill_token_budget = agent
         .map(|a| a.config.evolution.skill_token_budget)
         .unwrap_or(2500);
@@ -1939,6 +1945,15 @@ async fn build_reply_with_session_inner(
     // Consolidated-rule ids injected this turn (ACE/ExpeL lifecycle) — settled
     // against the prediction outcome in the spawned task below.
     let mut injected_rule_ids: Vec<String> = Vec::new();
+    // v1.54 dialogue shadow-scoring: read the held-out gate once per turn so
+    // the build-time arming below and the settle-time scoring in the spawned
+    // prediction task always agree on the same flag value. `armed_shadow`
+    // captures the shadow candidates whose signals matched this turn — never
+    // injected, graded out-of-sample at settle.
+    let held_out_gate_enabled =
+        crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(&ctx.home_dir)
+            .held_out_gate_enabled;
+    let mut armed_shadow = crate::playbook::ArmedShadow::default();
     let full_system_prompt = {
         let mut prompt = system_prompt;
 
@@ -2055,13 +2070,31 @@ async fn build_reply_with_session_inner(
                 .as_deref()
                 .and_then(crate::prompt_audit::read_max_input_tokens);
             let budget = crate::playbook::InjectionBudget::from_max_input_tokens(max_input_tokens);
-            if let Ok(Some((section, ids))) = tokio::task::spawn_blocking(move || {
-                crate::playbook::build_playbook_section_blocking(&db_path, &aid, &signals_for_task, budget)
+            // v1.54 shadow-scoring closure: when the held-out gate is on, the
+            // same blocking hop also collects the shadow candidates whose
+            // signals match this turn ("armed") — they are never injected,
+            // but the settle task below grades each of them out-of-sample
+            // against this turn's final error category. Gate off ⇒ the scan
+            // is skipped and this block is byte-identical to before.
+            let arm_shadow = held_out_gate_enabled;
+            if let Ok((section, armed)) = tokio::task::spawn_blocking(move || {
+                let section = crate::playbook::build_playbook_section_blocking(
+                    &db_path, &aid, &signals_for_task, budget,
+                );
+                let armed = if arm_shadow {
+                    crate::playbook::collect_armed_shadow_blocking(&db_path, &aid, &signals_for_task)
+                } else {
+                    crate::playbook::ArmedShadow::default()
+                };
+                (section, armed)
             })
             .await
             {
-                prompt = format!("{prompt}\n\n{section}");
-                injected_rule_ids = ids;
+                if let Some((section, ids)) = section {
+                    prompt = format!("{prompt}\n\n{section}");
+                    injected_rule_ids = ids;
+                }
+                armed_shadow = armed;
             }
         }
 
@@ -2553,6 +2586,7 @@ async fn build_reply_with_session_inner(
                 capabilities.as_ref(),
                 if has_history { Some(session_id) } else { None },
                 &conversation_history,
+                &account_pool,
             )),
             crate::pty_runtime::RuntimeMode::FreshSpawn => Box::pin(call_claude_cli_rotated(
                 &effective_message,
@@ -2564,6 +2598,7 @@ async fn build_reply_with_session_inner(
                 capabilities.as_ref(),
                 if has_history { Some(session_id) } else { None },
                 &conversation_history,
+                &account_pool,
             )),
         }
     };
@@ -3330,6 +3365,8 @@ async fn build_reply_with_session_inner(
             let notebook_for_pred = ctx.mistake_notebook.clone();
             let memory_db_path_for_pred = cognitive_memory_db.clone();
             let injected_rule_ids_for_pred = injected_rule_ids.clone();
+            let armed_shadow_for_pred = armed_shadow.clone();
+            let held_out_gate_for_pred = held_out_gate_enabled;
             let ext_factors_cfg = external_factors_config.clone();
             let evolution_emitter_for_pred = ctx.evolution_emitter.clone();
 
@@ -3403,13 +3440,52 @@ async fn build_reply_with_session_inner(
                 // rules injected into this turn's prompt using the settled
                 // error category; net-zero rules are retired. Detached —
                 // must run after apply_outcome so the category is final.
+                //
+                // Held-out gate on (v1.54): dialogue parity with
+                // dispatch_engine's A4 settle — injected rules route through
+                // the numeric-oracle gate instead of ErrorCategory credit,
+                // and the shadow candidates armed at prompt-build time each
+                // get their out-of-sample observation (the shadow-scoring
+                // flow that lets an inductive lesson actually earn
+                // promotion). Gate off ⇒ the unchanged `settle_detached`
+                // runs, byte-identical.
                 if let Some(ref dbp) = memory_db_path_for_pred {
-                    crate::prediction::rule_lifecycle::settle_detached(
-                        dbp.clone(),
-                        agent_id_for_pred.clone(),
-                        injected_rule_ids_for_pred.clone(),
-                        error.category,
-                    );
+                    if held_out_gate_for_pred {
+                        if !injected_rule_ids_for_pred.is_empty()
+                            || !armed_shadow_for_pred.ids.is_empty()
+                        {
+                            // Shadow-pass baseline: the agent's dialogue
+                            // climatology (fraction of logged turns that were
+                            // high-risk); domain-agnostic coin-flip until
+                            // enough history accumulates — the same fallback
+                            // shape as the task-layer pass.
+                            let baseline = pe
+                                .high_risk_base_rate(
+                                    &agent_id_for_pred,
+                                    crate::prediction::rule_gate::MIN_HELD_OUT_SAMPLES,
+                                )
+                                .await
+                                .unwrap_or(
+                                    crate::prediction::rule_gate::DEFAULT_BASELINE_HIT_RATE,
+                                );
+                            crate::prediction::rule_lifecycle::settle_detached_held_out(
+                                dbp.clone(),
+                                agent_id_for_pred.clone(),
+                                injected_rule_ids_for_pred.clone(),
+                                armed_shadow_for_pred.ids.clone(),
+                                armed_shadow_for_pred.family_k,
+                                error.category,
+                                baseline,
+                            );
+                        }
+                    } else {
+                        crate::prediction::rule_lifecycle::settle_detached(
+                            dbp.clone(),
+                            agent_id_for_pred.clone(),
+                            injected_rule_ids_for_pred.clone(),
+                            error.category,
+                        );
+                    }
                 }
 
                 // ── Wiki RL trust feedback (Phase 2) ───────────────────
@@ -5595,6 +5671,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             move |env_vars, retry_hint| {
                 let n = call_count_cloned.fetch_add(1, Ordering::SeqCst);
                 // First attempt: simulate rate limit.
@@ -5661,6 +5738,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             move |_env_vars, retry_hint| {
                 let n = call_count_cloned.fetch_add(1, Ordering::SeqCst);
                 async move {
@@ -5737,6 +5815,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             |_env_vars, _retry_hint| async move {
                 Err::<String, _>("claude CLI hard timeout (1800s, no output)".to_string())
             },
@@ -5768,6 +5847,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             |_env_vars, _retry_hint| async move {
                 Err::<String, _>("HTTP 402 insufficient_quota credit balance".to_string())
             },
@@ -5806,6 +5886,7 @@ mod rotation_tests {
         for _ in 0..5 {
             let result = rotate_cli_spawn(
                 &rotator,
+                &[],
                 |_env_vars, _retry_hint| async move {
                     Err::<String, _>(
                         "interactive REPL stalled: no substantive progress for 120s \
@@ -5843,6 +5924,7 @@ mod rotation_tests {
         for _ in 0..3 {
             let _ = rotate_cli_spawn(
                 &rotator,
+                &[],
                 |_env_vars, _retry_hint| async move {
                     Err::<String, _>("claude CLI spawn error: exit 1".to_string())
                 },
@@ -5871,6 +5953,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             |_env_vars, _retry_hint| async move { Ok::<String, String>("unreachable".into()) },
             100,
         )
@@ -5904,6 +5987,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             |_env_vars, _retry_hint| async move { Ok::<String, String>("unreachable".into()) },
             100,
         )
@@ -5930,6 +6014,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             |_env_vars, _retry_hint| async move { Ok::<String, String>("unreachable".into()) },
             100,
         )
@@ -5964,6 +6049,7 @@ mod rotation_tests {
         for _ in 0..5 {
             let _ = rotate_cli_spawn(
                 &rotator,
+                &[],
                 |_env_vars, _retry_hint| async move {
                     Err::<String, _>(
                         duduclaw_cli_runtime::SessionError::ChildExited { code: Some(1) }
@@ -6000,6 +6086,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             move |_env_vars, _retry_hint| {
                 attempts_cloned.fetch_add(1, Ordering::SeqCst);
                 async move { Ok::<String, String>("OK".to_string()) }
@@ -6033,6 +6120,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             |_env_vars, _retry_hint| async move {
                 Err::<String, _>("Error 429 rate limit: usage limit exceeded".to_string())
             },
@@ -6076,6 +6164,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             |_env_vars, _retry_hint| async move {
                 Err::<String, _>(
                     "claude CLI stream error: Not logged in · Please run /login".to_string(),
@@ -6110,6 +6199,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
+            &[],
             |_env_vars, _retry_hint| async move { Ok::<String, String>("never called".to_string()) },
             100,
         )
@@ -6930,6 +7020,8 @@ pub(crate) async fn call_claude_cli_public(
         None,
         None,
         &[],
+        // GVU / internal-utility call — not an agent turn, so no account pool.
+        &[],
     )
     .await
 }
@@ -7174,6 +7266,7 @@ pub fn build_channel_provenance_config(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one extra pass-through param (account_pool)
 pub(crate) async fn call_claude_cli_rotated(
     user_message: &str,
     model: &str,
@@ -7188,6 +7281,11 @@ pub(crate) async fn call_claude_cli_rotated(
     // instead.
     _session_id: Option<&str>,
     conversation_history: &[ConversationTurn],
+    // The answering agent's `agent.toml [model] account_pool`. Empty (`&[]`)
+    // for agent-less system callers (dashboard widget / expert-pack
+    // generation) — behavior is then byte-identical to before the pool
+    // existed.
+    account_pool: &[String],
 ) -> Result<String, String> {
     // MoA virtual models must never reach a CLI spawn — fail with a clear
     // reason instead of a confusing upstream model-not-found error.
@@ -7250,6 +7348,7 @@ pub(crate) async fn call_claude_cli_rotated(
     let history_clone = conversation_history.to_vec();
     rotate_cli_spawn(
         &rotator,
+        account_pool,
         move |env_vars, retry_hint| {
             let model = model.to_string();
             let system_prompt = system_prompt.to_string();
@@ -7309,8 +7408,24 @@ pub(crate) async fn call_claude_cli_rotated(
 ///
 /// `input_size_hint` is used for rough API-key cost accounting when the
 /// spawn closure doesn't extract token usage from the CLI stream.
+///
+/// `account_pool` (the answering agent's `agent.toml [model] account_pool`)
+/// narrows the rotator's *candidate set* only (see
+/// [`AccountRotator::select_for_provider_with_pool`]); the rotation strategy,
+/// the failure classification, and the cost accounting below are untouched.
+/// `&[]` is the pre-pool behavior, byte-for-byte.
+///
+/// Note the deliberate interaction with the attempt budget: `max_attempts`
+/// still counts *all* configured accounts, not just the pooled ones. When a
+/// pooled account is exhausted mid-loop the rotator's fail-open rule hands
+/// back the full set, and the remaining attempts can still land a reply —
+/// availability beats the operator's preference, which is the whole point of
+/// the fail-open semantics.
+///
+/// [`AccountRotator::select_for_provider_with_pool`]: duduclaw_agent::account_rotator::AccountRotator::select_for_provider_with_pool
 pub(crate) async fn rotate_cli_spawn<F, Fut>(
     rotator: &duduclaw_agent::account_rotator::AccountRotator,
+    account_pool: &[String],
     spawn: F,
     input_size_hint: usize,
 ) -> Result<String, String>
@@ -7324,7 +7439,7 @@ where
     let mut retry_hint: Option<String> = None;
 
     for attempt in 0..max_attempts {
-        let Some(selected) = rotator.select().await else {
+        let Some(selected) = rotator.select_with_pool(account_pool).await else {
             // WP10: distinguish "accounts ARE configured but none is currently
             // available" (all cooling down / marked unhealthy) from "the last
             // attempt failed with <error>". Previously both collapsed into
@@ -8733,6 +8848,10 @@ pub(crate) async fn call_claude_cli_pty_rotated(
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     session_id: Option<&str>,
     conversation_history: &[ConversationTurn],
+    // The answering agent's `agent.toml [model] account_pool` (see
+    // `call_claude_cli_rotated`). Threaded through the fresh-spawn fallback
+    // below so a pooled agent keeps its pool on either path.
+    account_pool: &[String],
 ) -> Result<String, String> {
     match call_claude_cli_pty_rotated_pool(
         user_message,
@@ -8744,6 +8863,7 @@ pub(crate) async fn call_claude_cli_pty_rotated(
         capabilities,
         session_id,
         conversation_history,
+        account_pool,
     )
     .await
     {
@@ -8793,6 +8913,7 @@ pub(crate) async fn call_claude_cli_pty_rotated(
                 capabilities,
                 session_id,
                 conversation_history,
+                account_pool,
             )
             .await
         }
@@ -8845,6 +8966,7 @@ async fn call_claude_cli_pty_rotated_pool(
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     _session_id: Option<&str>,
     conversation_history: &[ConversationTurn],
+    account_pool: &[String],
 ) -> Result<String, String> {
     // MoA virtual models must never reach a CLI spawn — fail with a clear
     // reason instead of a confusing upstream model-not-found error.
@@ -8898,6 +9020,7 @@ async fn call_claude_cli_pty_rotated_pool(
     let history_clone = conversation_history.to_vec();
     rotate_cli_spawn(
         &rotator,
+        account_pool,
         move |env_vars, retry_hint| {
             let model = model.to_string();
             let system_prompt = system_prompt.to_string();

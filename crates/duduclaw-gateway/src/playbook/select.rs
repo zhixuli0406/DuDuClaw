@@ -16,11 +16,19 @@ use super::entry::{PlaybookCategory, PlaybookMeta, PlaybookState, LEGACY_RULE_SO
 use super::signals::{self, TurnSignals};
 use super::store::CANDIDATE_SCAN_CAP;
 use crate::prediction::rule_lifecycle::{RuleStats, PROBATION_RULE_TAG, RETIRED_RULE_TAG, SHADOW_RULE_TAG};
+use crate::prediction::rule_staleness::SOURCE_STALE_RULE_TAG;
 
 /// Section header — deliberately dropped the old "(from past mistakes)"
 /// suffix since entries can now originate from signal-matched playbook
 /// `Add`s, not only mistake consolidation.
 pub const SECTION_HEADER: &str = "## Learned Rules";
+
+/// User-facing marker appended to a rule whose source fact has been superseded
+/// (G6). Plain-language per the R2 basing: says the underlying information
+/// changed, without leaking internal vocabulary. Both downweighted (sorts
+/// after fresh rules) AND annotated, so the model can still see a superseded
+/// rule but knows to treat it cautiously.
+pub const SOURCE_STALE_MARKER: &str = "（來源已更新，僅供參考）";
 
 /// W3-2 — one line telling the model these rules are quotable.
 ///
@@ -54,6 +62,10 @@ pub struct SelectedEntry {
     /// (`settle_injected_rules`, unmodified) still drives via tags.
     pub probation: bool,
     pub signal_matched: bool,
+    /// G6: at least one of this rule's recorded source facts has been
+    /// superseded (carries `rule_staleness::SOURCE_STALE_RULE_TAG`). Sorts
+    /// after fresh rules and renders with a 「來源已更新」 marker.
+    pub source_stale: bool,
 }
 
 /// Hard caps on the rendered "## Learned Rules" section (§1.8).
@@ -139,6 +151,7 @@ pub async fn select_playbook(
             }
             let stats = RuleStats::from_metadata(&metadata);
             let probation = mem_entry.tags.iter().any(|t| t == PROBATION_RULE_TAG);
+            let source_stale = mem_entry.tags.iter().any(|t| t == SOURCE_STALE_RULE_TAG);
             let signal_matched = signals::matches(&meta.signals_match, turn_signals);
             let candidate = SelectedEntry {
                 id: mem_entry.id,
@@ -148,6 +161,7 @@ pub async fn select_playbook(
                 success_streak: meta.success_streak,
                 probation,
                 signal_matched,
+                source_stale,
             };
             if signal_matched {
                 matched.push(candidate);
@@ -158,8 +172,13 @@ pub async fn select_playbook(
     }
 
     let cmp = |a: &SelectedEntry, b: &SelectedEntry| {
-        b.net
-            .cmp(&a.net)
+        // G6: a source-stale rule (its underlying fact was superseded) is
+        // downweighted below any fresh rule regardless of net score — false
+        // (fresh) sorts before true (stale). It is still injectable (with a
+        // marker), just last in line.
+        a.source_stale
+            .cmp(&b.source_stale)
+            .then_with(|| b.net.cmp(&a.net))
             .then_with(|| b.success_streak.cmp(&a.success_streak))
             .then_with(|| a.probation.cmp(&b.probation)) // false (graduated) sorts before true (probation)
     };
@@ -187,7 +206,14 @@ pub fn render_section(entries: &[SelectedEntry], budget: &InjectionBudget) -> Op
         if ids.len() >= budget.max_entries {
             break;
         }
-        let labeled = format!("{}{}", rule_label(ids.len() + 1), e.content);
+        // G6: append the 「來源已更新」 marker for a source-stale rule so the
+        // model sees the caveat inline (the entry is already downweighted to
+        // last by the selection sort). Charged to the same char budget.
+        let labeled = if e.source_stale {
+            format!("{}{} {}", rule_label(ids.len() + 1), e.content, SOURCE_STALE_MARKER)
+        } else {
+            format!("{}{}", rule_label(ids.len() + 1), e.content)
+        };
         // Recompute the actual joined length directly (simplest correct way
         // to know if appending this entry stays within `max_chars`).
         let would_be_body = if body_parts.is_empty() {
@@ -224,6 +250,103 @@ pub fn build_playbook_section_blocking(
     let rt = tokio::runtime::Handle::current();
     let entries = rt.block_on(select_playbook(&engine, agent_id, turn_signals));
     render_section(&entries, &budget)
+}
+
+/// Dialogue-layer armed-shadow scan (closes the v1.54 shadow-scoring debt —
+/// design DESIGN-lwm-calibration-2026-08-10.md §6 item 3: every new
+/// observation is held-out for every concurrently-trialed candidate).
+///
+/// [`select_playbook`] above deliberately *skips* shadow candidates (they are
+/// scored, never injected). This scan collects the population it skipped:
+/// every active shadow candidate whose `signals_match` tokens match THIS
+/// turn's [`TurnSignals`] is **armed** — it implicitly predicts "this turn is
+/// high-risk", and the settle path
+/// (`rule_lifecycle::score_shadow_candidates_by_ids`) grades exactly these
+/// ids against the turn's settled outcome. Matching happens here, at
+/// prompt-build time, because that is when the turn's signal set exists — the
+/// dialogue twin of the task pass's settle-time `goal_kind:` tag match.
+///
+/// The wildcard is deliberately inert for arming (unlike injection ranking):
+/// only discriminating (non-wildcard) tokens can arm, and rows with no such
+/// token are excluded from the trial family altogether — a candidate armed on
+/// every turn is statistically unfalsifiable (see
+/// `signals::has_discriminating_signal`).
+#[derive(Debug, Clone, Default)]
+pub struct ArmedShadow {
+    /// Active shadow candidates signal-matched to this turn (to be scored at
+    /// settle).
+    pub ids: Vec<String>,
+    /// The agent's whole active shadow family, matched or not — the
+    /// Bonferroni `k` for the promotion gate (trialing more candidates at
+    /// once makes promotion strictly harder).
+    pub family_k: usize,
+}
+
+/// See [`ArmedShadow`]. Excludes retired rows and `Stale` (superseded)
+/// entries — a superseded rule must not earn promotion. Errors degrade to an
+/// empty result: arming is an enhancement, never a reply blocker.
+pub async fn collect_armed_shadow(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    turn_signals: &TurnSignals,
+) -> ArmedShadow {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = ArmedShadow::default();
+    for source_event in [PLAYBOOK_SOURCE_EVENT, LEGACY_RULE_SOURCE_EVENT] {
+        let rows = match engine.list_valid_by_source_event(agent_id, source_event, CANDIDATE_SCAN_CAP).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, source_event, "playbook: collect_armed_shadow list failed: {e}");
+                continue;
+            }
+        };
+        for (mem_entry, metadata) in rows {
+            if !seen.insert(mem_entry.id.clone()) {
+                continue;
+            }
+            let is_shadow = mem_entry.tags.iter().any(|t| t == SHADOW_RULE_TAG);
+            let is_retired = mem_entry.tags.iter().any(|t| t == RETIRED_RULE_TAG);
+            if !is_shadow || is_retired {
+                continue;
+            }
+            let meta = PlaybookMeta::from_metadata(&metadata)
+                .unwrap_or_else(|| PlaybookMeta::legacy_default(&mem_entry.tags, &mem_entry.content));
+            if meta.state == PlaybookState::Stale {
+                continue;
+            }
+            // Falsifiability guard: a shadow candidate is only trialable
+            // through a discriminating (non-wildcard) trigger. Wildcard-only
+            // rows — real `["*"]` entries and `legacy_default` fallbacks
+            // alike — would arm on every turn, so their hit rate converges to
+            // the baseline itself and the gate can never resolve them (see
+            // `signals::has_discriminating_signal`). They are excluded from
+            // BOTH the armed set and the Bonferroni family (they are not
+            // being trialed); they stay shadow, un-injected, until curated.
+            if !signals::has_discriminating_signal(&meta.signals_match) {
+                continue;
+            }
+            out.family_k += 1;
+            if signals::matches_ignoring_wildcard(&meta.signals_match, turn_signals) {
+                out.ids.push(mem_entry.id);
+            }
+        }
+    }
+    out
+}
+
+/// Blocking wrapper for [`collect_armed_shadow`] — same spawn_blocking
+/// convention as [`build_playbook_section_blocking`], so the channel-reply
+/// prompt-assembly closure can run both against one engine handle per call.
+pub fn collect_armed_shadow_blocking(
+    db_path: &Path,
+    agent_id: &str,
+    turn_signals: &TurnSignals,
+) -> ArmedShadow {
+    let Ok(engine) = SqliteMemoryEngine::new(db_path) else {
+        return ArmedShadow::default();
+    };
+    let rt = tokio::runtime::Handle::current();
+    rt.block_on(collect_armed_shadow(&engine, agent_id, turn_signals))
 }
 
 #[cfg(test)]
@@ -329,8 +452,8 @@ mod tests {
     #[test]
     fn render_section_never_truncates_a_single_entry() {
         let entries = vec![
-            SelectedEntry { id: "1".into(), content: "a".repeat(50), category: PlaybookCategory::Repair, net: 5, success_streak: 0, probation: false, signal_matched: true },
-            SelectedEntry { id: "2".into(), content: "b".repeat(50), category: PlaybookCategory::Repair, net: 4, success_streak: 0, probation: false, signal_matched: true },
+            SelectedEntry { id: "1".into(), content: "a".repeat(50), category: PlaybookCategory::Repair, net: 5, success_streak: 0, probation: false, signal_matched: true, source_stale: false },
+            SelectedEntry { id: "2".into(), content: "b".repeat(50), category: PlaybookCategory::Repair, net: 4, success_streak: 0, probation: false, signal_matched: true, source_stale: false },
         ];
         // Prefix (header + W3-2 guidance line, both newline-terminated) plus
         // one labeled 50-char entry, with a little slack. A second entry
@@ -349,7 +472,7 @@ mod tests {
     #[test]
     fn render_section_respects_max_entries() {
         let entries: Vec<SelectedEntry> = (0..10)
-            .map(|i| SelectedEntry { id: i.to_string(), content: format!("entry {i}"), category: PlaybookCategory::Repair, net: 0, success_streak: 0, probation: false, signal_matched: false })
+            .map(|i| SelectedEntry { id: i.to_string(), content: format!("entry {i}"), category: PlaybookCategory::Repair, net: 0, success_streak: 0, probation: false, signal_matched: false, source_stale: false })
             .collect();
         let budget = InjectionBudget { max_entries: 3, max_chars: 100_000 };
         let (_, ids) = render_section(&entries, &budget).unwrap();
@@ -374,6 +497,7 @@ mod tests {
             success_streak: 0,
             probation: false,
             signal_matched: false,
+            source_stale: false,
         }];
         // 30 chars + prefix + label, with slack — a byte-based budget would
         // have blown past this three times over.
@@ -402,6 +526,7 @@ mod tests {
                 success_streak: 0,
                 probation: false,
                 signal_matched: false,
+                source_stale: false,
             })
             .collect();
         let (section, ids) = render_section(&entries, &InjectionBudget::default_budget()).unwrap();
@@ -417,6 +542,202 @@ mod tests {
         for internal in ["playbook", "shadow", "probation", "GVU"] {
             assert!(!SECTION_GUIDANCE.contains(internal), "guidance leaks `{internal}`");
         }
+    }
+
+    // ── G6: source-stale downweight + marker ──
+
+    #[test]
+    fn render_section_appends_marker_only_to_source_stale_entries() {
+        let entries = vec![
+            SelectedEntry { id: "fresh".into(), content: "fresh rule".into(), category: PlaybookCategory::Repair, net: 5, success_streak: 0, probation: false, signal_matched: true, source_stale: false },
+            SelectedEntry { id: "stale".into(), content: "outdated rule".into(), category: PlaybookCategory::Repair, net: 4, success_streak: 0, probation: false, signal_matched: true, source_stale: true },
+        ];
+        let (section, ids) = render_section(&entries, &InjectionBudget::default_budget()).unwrap();
+        assert_eq!(ids, vec!["fresh".to_string(), "stale".to_string()]);
+        // Marker present exactly once, on the stale rule only.
+        assert!(section.contains(&format!("outdated rule {SOURCE_STALE_MARKER}")), "{section}");
+        assert!(!section.contains(&format!("fresh rule {SOURCE_STALE_MARKER}")), "{section}");
+        assert_eq!(section.matches(SOURCE_STALE_MARKER).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn select_playbook_downweights_source_stale_rule_below_fresh() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-g6-sel";
+        // Stale rule with a HIGHER net score than the fresh one.
+        let stale = store_playbook_entry(&engine, agent, "stale high-score rule", vec!["*".to_string()], 10, false).await;
+        engine.set_importance_and_add_tag(agent, &stale, 8.0, SOURCE_STALE_RULE_TAG).await.unwrap();
+        let fresh = store_playbook_entry(&engine, agent, "fresh low-score rule", vec!["*".to_string()], 1, false).await;
+
+        let turn = TurnSignals::new();
+        let selected = select_playbook(&engine, agent, &turn).await;
+        let order: Vec<&str> = selected.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![fresh.as_str(), stale.as_str()],
+            "a source-stale rule sorts after a fresh one even with a higher net score"
+        );
+        assert!(selected.iter().find(|e| e.id == stale).unwrap().source_stale);
+        assert!(!selected.iter().find(|e| e.id == fresh).unwrap().source_stale);
+    }
+
+    // ── collect_armed_shadow (v1.54 shadow-scoring debt closure) ──
+
+    /// Store a shadow-tagged entry (excluded from injection, candidate for
+    /// arming). `extra_tags` lets tests add RETIRED etc.
+    async fn store_shadow_entry(
+        engine: &SqliteMemoryEngine,
+        agent: &str,
+        source_event: &str,
+        signals_match: Vec<String>,
+        extra_tags: Vec<String>,
+    ) -> String {
+        use crate::playbook::entry::PLAYBOOK_KEY;
+
+        let mut tags = vec![SHADOW_RULE_TAG.to_string()];
+        tags.extend(extra_tags);
+        let meta = PlaybookMeta {
+            schema_version: crate::playbook::entry::PLAYBOOK_SCHEMA_VERSION,
+            category: PlaybookCategory::Repair,
+            signals_match,
+            strategy: Vec::new(),
+            failure_history: Vec::new(),
+            eval_cases: Vec::new(),
+            applications: Vec::new(),
+            success_streak: 0,
+            state: PlaybookState::Probation,
+            revision: 0,
+            dedup_key: "0".repeat(16),
+            embed_model: None,
+            origin: "agent_derived".to_string(),
+            derived_from: Vec::new(),
+            assertions: Default::default(),
+        };
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: "shadow candidate".to_string(),
+            timestamp: chrono::Utc::now(),
+            tags,
+            embedding: None,
+            layer: MemoryLayer::Semantic,
+            importance: 8.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: source_event.to_string(),
+        };
+        let mut blob = serde_json::json!({"rule_stats": {"helpful": 1, "harmful": 0}});
+        meta.merge_into(&mut blob);
+        assert!(blob.get(PLAYBOOK_KEY).is_some());
+        let temporal = TemporalMeta { metadata: Some(blob), ..Default::default() };
+        engine.store_temporal(agent, entry, temporal).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn collect_armed_shadow_matches_signals_and_counts_whole_family() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-armed";
+
+        // Matching shadow candidates across BOTH source events.
+        let armed_playbook = store_shadow_entry(
+            &engine, agent, PLAYBOOK_SOURCE_EVENT,
+            vec!["mistake:capability".to_string()], vec![],
+        )
+        .await;
+        let armed_reflexion = store_shadow_entry(
+            &engine, agent, LEGACY_RULE_SOURCE_EVENT,
+            vec!["mistake:capability".to_string()], vec![],
+        )
+        .await;
+        // Active shadow but non-matching signal: counts toward family_k only.
+        store_shadow_entry(
+            &engine, agent, LEGACY_RULE_SOURCE_EVENT,
+            vec!["channel:discord".to_string()], vec![],
+        )
+        .await;
+        // Retired shadow: excluded from BOTH ids and family.
+        store_shadow_entry(
+            &engine, agent, LEGACY_RULE_SOURCE_EVENT,
+            vec!["mistake:capability".to_string()],
+            vec![RETIRED_RULE_TAG.to_string()],
+        )
+        .await;
+        // Active NON-shadow entry: not part of the shadow family at all.
+        store_playbook_entry(
+            &engine, agent, "active rule",
+            vec!["mistake:capability".to_string()], 3, false,
+        )
+        .await;
+
+        let turn = TurnSignals::new().with_mistake_category("capability");
+        let armed = collect_armed_shadow(&engine, agent, &turn).await;
+        assert_eq!(armed.family_k, 3, "family = every active shadow candidate, matched or not");
+        assert_eq!(armed.ids.len(), 2, "armed = signal-matched active shadow candidates only");
+        assert!(armed.ids.contains(&armed_playbook));
+        assert!(armed.ids.contains(&armed_reflexion));
+    }
+
+    #[tokio::test]
+    async fn collect_armed_shadow_excludes_unfalsifiable_wildcard_candidates() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-armed-wildcard";
+
+        // Wildcard-only signal set — real entry or legacy_default fallback
+        // shape — is unfalsifiable as a risk predictor: excluded from ids AND
+        // family_k.
+        let wildcard_only = store_shadow_entry(
+            &engine, agent, LEGACY_RULE_SOURCE_EVENT,
+            vec!["*".to_string()], vec![],
+        )
+        .await;
+        // Mixed set: the wildcard is inert for arming; the discriminating
+        // token governs. Counted in the family.
+        let mixed = store_shadow_entry(
+            &engine, agent, PLAYBOOK_SOURCE_EVENT,
+            vec!["*".to_string(), "mistake:capability".to_string()], vec![],
+        )
+        .await;
+
+        // Turn WITHOUT the discriminating token: the mixed entry must NOT be
+        // armed via its wildcard.
+        let unrelated = TurnSignals::new().with_channel("telegram");
+        let armed = collect_armed_shadow(&engine, agent, &unrelated).await;
+        assert_eq!(armed.family_k, 1, "only the mixed entry is trialable");
+        assert!(armed.ids.is_empty(), "wildcard must never arm a shadow candidate");
+
+        // Turn WITH the discriminating token: the mixed entry arms; the
+        // wildcard-only entry still doesn't exist as far as the trial goes.
+        let matching = TurnSignals::new().with_mistake_category("capability");
+        let armed = collect_armed_shadow(&engine, agent, &matching).await;
+        assert_eq!(armed.family_k, 1);
+        assert_eq!(armed.ids, vec![mixed.clone()]);
+        assert!(!armed.ids.contains(&wildcard_only));
+
+        // The wildcard-only row stays shadow and un-injected (unchanged
+        // selection behavior) — parked for curation, not silently trialed.
+        let selected = select_playbook(&engine, agent, &matching).await;
+        assert!(!selected.iter().any(|e| e.id == wildcard_only));
+    }
+
+    #[tokio::test]
+    async fn collect_armed_shadow_excludes_stale_entries() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-armed-stale";
+        let id = store_shadow_entry(
+            &engine, agent, PLAYBOOK_SOURCE_EVENT,
+            vec!["mistake:capability".to_string()], vec![],
+        )
+        .await;
+        let mut meta = engine.get_metadata(agent, &id).await.unwrap().unwrap();
+        let mut m = PlaybookMeta::from_metadata(&meta).unwrap();
+        m.state = PlaybookState::Stale;
+        m.merge_into(&mut meta);
+        engine.update_metadata(agent, &id, &meta).await.unwrap();
+
+        let turn = TurnSignals::new().with_mistake_category("capability");
+        let armed = collect_armed_shadow(&engine, agent, &turn).await;
+        assert_eq!(armed.family_k, 0, "a superseded (Stale) shadow entry is not trialed");
+        assert!(armed.ids.is_empty());
     }
 
     #[test]

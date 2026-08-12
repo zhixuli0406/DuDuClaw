@@ -1,6 +1,7 @@
 pub mod agent_guard;
 pub mod agent_rename;
 pub mod autostart;
+pub mod concurrency_gate;
 pub mod config;
 pub mod cron_tz;
 pub mod delegation_policy;
@@ -26,6 +27,11 @@ pub mod zh_variant;
 
 pub use agent_guard::{check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES};
 pub use agent_rename::{rename_in_markdown, synced_trigger};
+pub use concurrency_gate::{
+    active_count as concurrency_active_count, effective_limit as concurrency_effective_limit,
+    release as concurrency_release, renew as concurrency_renew, try_acquire as concurrency_try_acquire,
+    AcquireOutcome as ConcurrencyAcquireOutcome, ConcurrencyGateConfig, Lease as ConcurrencyLease,
+};
 pub use config::{
     gateway_bind_for_home, gateway_port_for_home, read_gateway_raw_settings, resolve_gateway_bind,
     resolve_gateway_port, write_minimal_config, GatewaySettingSource,

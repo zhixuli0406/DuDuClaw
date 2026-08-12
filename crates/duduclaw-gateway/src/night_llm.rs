@@ -186,6 +186,7 @@ impl NightLlm for RotatedNightLlm {
             Some(&caps), // capabilities — locked down: night needs NO tools
             None,        // session_id — single-shot, no multi-turn session
             &[],         // conversation_history — prompts are self-contained
+            &[],         // account_pool — system-level utility call, no agent pool
         )
         .await
         {

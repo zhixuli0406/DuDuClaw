@@ -23,7 +23,7 @@ icon = "shield-check"
 [model]
 preferred = "claude-haiku-4-5"  # Cost-efficient for verification
 fallback = "claude-haiku-4-5"
-account_pool = ["main"]
+account_pool = []  # empty = every rotator account; list account ids/labels to restrict this agent
 api_mode = "cli"
 
 [model.local]

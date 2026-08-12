@@ -318,6 +318,29 @@ impl UserDb {
         }
     }
 
+    /// Get a user by email address, without presenting a credential.
+    ///
+    /// Deliberately separate from [`Self::verify_password`]: callers must have
+    /// established authority some other way. The only caller today is the
+    /// Personal-edition local session endpoint, whose authority is the TCP peer
+    /// address being loopback (`server.rs::handle_local_session`).
+    pub fn get_user_by_email(&self, email: &str) -> Result<Option<User>, String> {
+        let id: String = {
+            let conn = self.conn();
+            match conn.query_row(
+                "SELECT id FROM users WHERE email = ?1",
+                params![email],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(id) => id,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(e) => return Err(format!("query error: {e}")),
+            }
+            // guard dropped here, before `get_user` takes its own connection
+        };
+        self.get_user(&id)
+    }
+
     /// List all users.
     pub fn list_users(&self) -> Result<Vec<User>, String> {
         let conn = self.conn();
@@ -467,6 +490,22 @@ impl UserDb {
             )
             .map_err(|e| format!("claim error: {e}"))?;
         Ok(affected == 1)
+    }
+
+    /// Claim the bootstrap admin with a freshly generated random password.
+    ///
+    /// Used by the Personal-edition local session endpoint: `ensure_default_admin`
+    /// leaves `admin@local` flagged `must_change_password = 1`, and
+    /// `authenticate_jwt` refuses every operation while that flag is set — so a
+    /// token issued without clearing it would be dead on arrival. The generated
+    /// password is intentionally discarded: "no password prompt" must not mean
+    /// "empty password", and an operator who later needs one sets their own from
+    /// the dashboard's account settings.
+    ///
+    /// Same single-shot atomicity as [`Self::claim_default_admin`] (it *is* that
+    /// call) — a racing claim affects zero rows and gets `Ok(false)`.
+    pub fn claim_default_admin_random(&self) -> Result<bool, String> {
+        self.claim_default_admin(&generate_password(32))
     }
 
     // ── Agent Bindings ───────────────────────────────────────
@@ -857,6 +896,33 @@ mod tests {
             .verify_password("admin@local", "a-new-strong-password")
             .unwrap();
         assert!(!user2.must_change_password);
+    }
+
+    /// WP-F1: the two helpers the Personal-edition local session depends on.
+    /// The implicit claim exists solely to clear `must_change_password` — a
+    /// token issued while that flag is set is refused on its very next use, so
+    /// "it returned a token" would be a false success without this.
+    #[test]
+    fn random_claim_unblocks_the_bootstrap_admin_and_lookup_by_email_works() {
+        let (db, _tmp) = test_db();
+        db.ensure_default_admin().unwrap().expect("admin created");
+        assert!(db.is_unclaimed_default_admin());
+
+        assert!(db.claim_default_admin_random().unwrap(), "first claim wins");
+        assert!(!db.is_unclaimed_default_admin());
+        // Single-shot: a second attempt changes nothing.
+        assert!(!db.claim_default_admin_random().unwrap());
+
+        let admin = db
+            .get_user_by_email("admin@local")
+            .unwrap()
+            .expect("admin found by email");
+        assert_eq!(admin.role, UserRole::Admin);
+        assert!(
+            !admin.must_change_password,
+            "the claim must clear the flag, otherwise every issued token is dead on arrival",
+        );
+        assert!(db.get_user_by_email("nobody@example.com").unwrap().is_none());
     }
 
     #[test]

@@ -398,6 +398,53 @@ impl PredictionEngine {
         super::task_forward_store::init_task_tables(conn)
     }
 
+    /// Dialogue-layer frozen climatology: fraction of this agent's logged
+    /// turns whose error category was high-risk (Significant/Critical).
+    ///
+    /// The dialogue twin of `task_forward_store::high_risk_base_rate` — used
+    /// as the baseline the shadow-scoring pass
+    /// (`rule_lifecycle::score_shadow_candidates_by_ids`) must beat.
+    /// Returns `None` until `min_samples` rows exist so callers fall back to
+    /// the domain-agnostic coin-flip prior instead of trusting a 2-turn rate.
+    ///
+    /// `prediction_log.category` stores `format!("{category:?}")` (capitalized
+    /// Debug names — 'Significant', not 'significant'), and rows are written
+    /// at `calculate_error` time, i.e. before `apply_outcome`'s final
+    /// adjustment. Both are acceptable for a base rate: the population is
+    /// large, the category distribution shift from outcome adjustment is
+    /// marginal, and a slightly-stale climatology only makes promotion
+    /// slightly conservative.
+    pub async fn high_risk_base_rate(&self, agent_id: &str, min_samples: u64) -> Option<f64> {
+        let db_path = self.db_path.clone();
+        let agent = agent_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).ok()?;
+            let (hi, total): (i64, i64) = conn
+                .query_row(
+                    "SELECT
+                       SUM(CASE WHEN category IN ('Significant','Critical') THEN 1 ELSE 0 END),
+                       COUNT(*)
+                     FROM prediction_log
+                     WHERE agent_id = ?1",
+                    params![agent],
+                    |row| {
+                        // SUM(...) is NULL when zero rows match — coalesce to 0.
+                        let hi = row.get::<_, Option<i64>>(0)?.unwrap_or(0);
+                        let total: i64 = row.get(1)?;
+                        Ok((hi, total))
+                    },
+                )
+                .ok()?;
+            if total <= 0 || (total as u64) < min_samples {
+                return None;
+            }
+            Some(hi as f64 / total as f64)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Log a structured evolution event to SQLite (Sutskever Day 1 principle).
     ///
     /// Non-blocking: spawns a blocking task for the SQLite write.
@@ -977,5 +1024,42 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM user_models", [], |r| r.get(0))
             .expect("count rows");
         assert_eq!(count, 2, "flush_all returned before writes were durable");
+    }
+
+    /// Dialogue-layer climatology (v1.54 shadow-scoring): rate over
+    /// `prediction_log`, gated by `min_samples`, matching the capitalized
+    /// Debug category names the write path actually stores.
+    #[tokio::test]
+    async fn high_risk_base_rate_counts_debug_capitalized_categories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("prediction.db");
+        let engine = PredictionEngine::new(db_path.clone(), None);
+
+        let conn = Connection::open(&db_path).expect("open db");
+        // 2 high-risk + 6 low-risk for agent-a; category strings are the
+        // Debug names written by `calculate_error` (`format!("{category:?}")`
+        // — 'Significant', never 'significant').
+        for cat in ["Significant", "Critical", "Negligible", "Negligible", "Negligible", "Moderate", "Moderate", "Negligible"] {
+            conn.execute(
+                "INSERT INTO prediction_log (agent_id, user_id, composite_error, category, timestamp)
+                 VALUES ('agent-a', 'u', 0.5, ?1, '2026-08-12T00:00:00Z')",
+                params![cat],
+            )
+            .expect("insert row");
+        }
+        // Another agent's rows must not leak into agent-a's rate.
+        conn.execute(
+            "INSERT INTO prediction_log (agent_id, user_id, composite_error, category, timestamp)
+             VALUES ('agent-b', 'u', 0.9, 'Critical', '2026-08-12T00:00:00Z')",
+            [],
+        )
+        .expect("insert row");
+
+        let rate = engine.high_risk_base_rate("agent-a", 8).await;
+        assert_eq!(rate, Some(2.0 / 8.0), "2 of agent-a's 8 turns were high-risk");
+
+        // Below min_samples → None (callers fall back to the coin-flip prior).
+        assert_eq!(engine.high_risk_base_rate("agent-a", 9).await, None);
+        assert_eq!(engine.high_risk_base_rate("agent-none", 1).await, None);
     }
 }

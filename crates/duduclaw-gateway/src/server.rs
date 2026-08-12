@@ -1794,11 +1794,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/otp/request", post(handle_otp_request))
         .route("/api/otp/verify", post(handle_otp_verify))
         .route("/api/channel-identity/bind", post(handle_channel_bind))
+        .route("/api/channel-identity/list", get(handle_channel_identity_list))
         .route("/api/refresh", post(handle_refresh))
         .route("/api/me", get(handle_me))
         .route("/api/change-password", post(handle_change_password))
         .route("/api/first-run/status", get(handle_first_run_status))
         .route("/api/first-run/claim", post(handle_first_run_claim))
+        .route("/api/session/local", post(handle_local_session))
         .with_state(state.clone());
 
     let mut app = Router::new()
@@ -2465,6 +2467,83 @@ async fn handle_channel_bind(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ChannelIdentityListQuery {
+    user_id: String,
+}
+
+/// GET /api/channel-identity/list?user_id=<id> — admin-only, read-only
+/// listing of a user's verified channel DM identities (WP-B, 2026-08-12 IA
+/// audit §2-1: this data drives `approver_links`/channel-side approvals but
+/// previously had zero dashboard surface — see `decision_notify.rs`).
+/// Same auth posture as `handle_channel_bind`: admin JWT required, target
+/// user existence checked, fail-closed on every branch.
+async fn handle_channel_identity_list(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<ChannelIdentityListQuery>,
+) -> impl IntoResponse {
+    if q.user_id.is_empty() || q.user_id.len() > 255 {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid user_id"})),
+        )
+            .into_response();
+    }
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "missing Authorization header"})),
+            )
+                .into_response();
+        }
+    };
+    let claims = match state.jwt_config.verify_access_token(token) {
+        Ok(c) => c,
+        _ => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid or expired token"})),
+            )
+                .into_response();
+        }
+    };
+    let caller = match state.user_db.get_user(&claims.sub) {
+        Ok(Some(u)) => u,
+        _ => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "user not found"})),
+            )
+                .into_response();
+        }
+    };
+    if caller.role != duduclaw_auth::UserRole::Admin {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin required"})),
+        )
+            .into_response();
+    }
+    if !matches!(state.user_db.get_user(&q.user_id), Ok(Some(_))) {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "target user not found"})),
+        )
+            .into_response();
+    }
+    match state.user_db.verified_channels_for_user(&q.user_id) {
+        Ok(identities) => Json(serde_json::json!({ "identities": identities })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
 /// Iterate every agent's wiki under `agents_dir` and run the Phase 3
 /// janitor (auto-correct, archive, snapshot sync). Best-effort — failures
 /// are logged and the loop continues.
@@ -2807,6 +2886,139 @@ async fn handle_first_run_claim(
                 .into_response()
         }
     }
+}
+
+/// POST /api/session/local — Personal-edition passwordless local session
+/// (WP-F1, design §2.3, decision D3 = plan A).
+///
+/// Issues a **normal** JWT pair for the real `admin@local` user to a caller
+/// that has proven it is sitting at this machine. Nothing downstream changes:
+/// the token is indistinguishable from one obtained via `/api/login`, so every
+/// `require_admin!` site, the WS handshake, and audit attribution keep working
+/// unmodified. The only new thing is how the token is obtained.
+///
+/// The six-condition gate lives in [`crate::local_session::evaluate`] (pure,
+/// unit-tested per branch). Every failure returns the SAME 403 body: an
+/// off-loopback prober must not be able to learn the edition, the switch
+/// state, or which condition it tripped — same rule as
+/// `handle_first_run_status` never advertising `claimable` off-loopback.
+///
+/// One subtlety worth stating: the bootstrap `admin@local` carries
+/// `must_change_password = 1`, and `authenticate_jwt` refuses *all* operations
+/// while that flag is set — so a token issued without clearing it would be
+/// dead on its very next request. The endpoint therefore performs an implicit
+/// claim with a random password it immediately discards (§2.3). "No password
+/// prompt" never becomes "empty password"; the operator can still set one of
+/// their own later from account settings before exposing the port.
+async fn handle_local_session(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    use crate::local_session;
+
+    /// One uniform refusal — never says which condition failed.
+    fn refused() -> axum::response::Response {
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "local auto-login unavailable"})),
+        )
+            .into_response()
+    }
+
+    let enabled = local_session::auto_login_enabled(&state.home_dir);
+    let is_personal = state.handler.resolve_edition_profile().await.is_personal();
+    let origin_allowed = origin_is_allowed(&headers);
+
+    if let Err(denial) = local_session::evaluate(
+        enabled,
+        is_personal,
+        addr.ip().is_loopback(),
+        origin_allowed,
+        &headers,
+    ) {
+        // Local-only diagnostic; the client learns nothing from it.
+        tracing::debug!(reason = denial.as_str(), "local session refused");
+        return refused();
+    }
+
+    // Implicit claim — single-shot and atomic inside the DB (a racing claim
+    // affects zero rows). `Ok(false)` just means someone else claimed first,
+    // which is exactly as good for us.
+    if state.user_db.is_unclaimed_default_admin() {
+        if let Err(e) = state.user_db.claim_default_admin_random() {
+            error!("local session: implicit claim failed: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to establish local session"})),
+            )
+                .into_response();
+        }
+    }
+
+    let user = match state
+        .user_db
+        .get_user_by_email(local_session::LOCAL_ADMIN_EMAIL)
+    {
+        Ok(Some(u)) => u,
+        // No bootstrap admin (operator deleted/renamed it) — fall back to the
+        // login page rather than inventing an identity.
+        Ok(None) => return refused(),
+        Err(e) => {
+            error!("local session: admin lookup failed: {e}");
+            return refused();
+        }
+    };
+
+    // Fail closed on the same two conditions `authenticate_jwt` enforces, so we
+    // never hand out a token that would be rejected on its next use.
+    if user.status != duduclaw_auth::UserStatus::Active || user.must_change_password {
+        return refused();
+    }
+
+    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
+    let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
+        .iter()
+        .map(|b| (b.agent_name.clone(), b.access_level))
+        .collect();
+
+    let access_token = match state.jwt_config.issue_access_token(&user, &agent_access) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("local session: failed to issue access token: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "token generation failed"})),
+            )
+                .into_response();
+        }
+    };
+    let refresh_token = match state.jwt_config.issue_refresh_token(&user.id) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("local session: failed to issue refresh token: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "token generation failed"})),
+            )
+                .into_response();
+        }
+    };
+
+    let _ = state.user_db.update_last_login(&user.id);
+    // Attributed to the real user id — the reason plan A was chosen over
+    // synthesising an `admin_fallback` context whose audit rows read "system".
+    let ip_str = addr.ip().to_string();
+    let _ = state
+        .user_db
+        .log_action(Some(&user.id), "login_local_auto", None, None, Some(&ip_str));
+
+    Json(serde_json::json!({
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "user": user,
+    }))
+    .into_response()
 }
 
 /// Built-in loopback origins that are always allowed for the local dashboard,

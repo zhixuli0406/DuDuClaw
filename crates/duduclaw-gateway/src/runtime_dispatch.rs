@@ -167,6 +167,14 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
         capabilities: req
             .agent_dir
             .and_then(crate::runtime::load_agent_capabilities),
+        // G1: the agent's `[model] account_pool`, so a runtime that rotates
+        // DuDuClaw-managed accounts (the Claude CLI runtime, incl. failover
+        // substitutions) honors the same pool the direct paths do. Empty for
+        // agent-less utility calls.
+        account_pool: req
+            .agent_dir
+            .map(crate::runtime::load_agent_account_pool)
+            .unwrap_or_default(),
     };
 
     // RFC-25 R1: route through the FailoverManager so provider health is tracked
