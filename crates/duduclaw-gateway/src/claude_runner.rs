@@ -526,6 +526,18 @@ async fn call_claude_for_agent_impl(
         }),
         None => tasks_suffix,
     };
+    // Cross-invocation continuity: recent self-action feed from the audit
+    // log, so a dispatch/cron/heartbeat run opens aware of what this agent
+    // already did in other invocations (channel replies included). Same
+    // uncached dynamic block as the task queue.
+    let tasks_suffix =
+        match crate::recent_actions::build_recent_actions_section(home_dir, agent_id) {
+            Some(actions) => Some(match tasks_suffix {
+                Some(t) => format!("{t}\n\n{actions}"),
+                None => actions,
+            }),
+            None => tasks_suffix,
+        };
 
     // Install agent-file-guard PreToolUse hook before any spawn.
     // Blocks the sub-agent from using raw Write/Edit to create

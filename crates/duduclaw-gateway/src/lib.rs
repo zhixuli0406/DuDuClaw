@@ -266,6 +266,7 @@ pub mod night_llm;
 // WP-A3 (task-forward-model design, 2026-08-06): shared `tool_calls.jsonl`
 // record shape + window filter, used by both `dispatch_engine` (judge
 // evidence block) and `prediction::task_observe` (A3 observation layer).
+pub mod recent_actions;
 pub mod tool_activity;
 
 // ── G1: durable multi-agent dispatch engine (atomic claim / zombie reclaim /
