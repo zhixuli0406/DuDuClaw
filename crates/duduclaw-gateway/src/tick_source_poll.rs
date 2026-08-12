@@ -66,9 +66,22 @@ async fn pinned_client_for(
     host: &str,
     port: u16,
 ) -> Result<reqwest::Client, String> {
-    let mut addrs = crate::web_fetch::resolve_public_addrs(host, port)
-        .await
-        .map_err(|e| e.to_string())?;
+    // R2 — inside the DNS TTL this returns the cached, already-screened
+    // address set and never touches the resolver; a 1 s source stops issuing
+    // 86k lookups a day for an answer that changes hourly at most.
+    let key = format!("{host}:{port}");
+    let owned_host = host.to_string();
+    let mut addrs = crate::tick_source::resolve_with_cache(
+        &mut state.dns,
+        &key,
+        std::time::Instant::now(),
+        || async move {
+            crate::web_fetch::resolve_public_addrs(&owned_host, port)
+                .await
+                .map_err(|e| e.to_string())
+        },
+    )
+    .await?;
     // Sorted so a round-robin resolver returning the same addresses in a
     // different order counts as "unchanged" and keeps the warm pool.
     addrs.sort();
@@ -320,8 +333,7 @@ async fn read_new_lines(path: &Path, cursor: &mut u64) -> Result<Vec<String>, St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::autopilot_engine::AutopilotEvent;
-    use crate::tick_source::{DropReason, TickHub, run_source};
+    use crate::tick_source::{TickHub, run_source};
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use tokio::sync::broadcast;
@@ -529,6 +541,8 @@ mod tests {
             emit_unchanged: false,
             max_events_per_minute: 120,
             persist_every_n: 0,
+            baseline_max_age_secs: crate::tick_config::DEFAULT_BASELINE_MAX_AGE_SECS,
+            dns_ttl_secs: 0,
         };
         let hub2 = hub.clone();
         let handle = tokio::spawn(async move {

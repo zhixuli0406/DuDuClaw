@@ -877,6 +877,12 @@ export interface TickDroppedCounts {
   fetch_error: number;
   /** websocket sources only — binary frames the text-only pipeline refuses. */
   non_text: number;
+  /**
+   * Payloads that resolved none of the source's configured `json_fields` —
+   * a feed's control/heartbeat frames. Always present; 0 for a source that
+   * declares no `json_fields`.
+   */
+  no_fields: number;
 }
 
 export interface TickSourceStatus {

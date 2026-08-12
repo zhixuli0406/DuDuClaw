@@ -22,7 +22,7 @@ const KIND_LABEL_KEYS: Record<TickSourceStatus['kind'], string> = {
 };
 
 function droppedTotal(d: TickSourceStatus['dropped']): number {
-  return d.rate_cap + d.unchanged + d.oversize + d.fetch_error + d.non_text;
+  return d.rate_cap + d.unchanged + d.oversize + d.fetch_error + d.non_text + d.no_fields;
 }
 
 /** Compact `key=value` rendering of one buffered observation. */

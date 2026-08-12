@@ -28568,6 +28568,9 @@ impl MethodHandler {
                     // refuses. Always present (0 for the polling kinds) so the
                     // dashboard's dropped total never has to guess a key.
                     "non_text": counters.dropped_non_text,
+                    // F3 — payloads that resolved none of the configured
+                    // `json_fields` (a feed's control/heartbeat frames).
+                    "no_fields": counters.dropped_no_fields,
                 },
             }));
         }
@@ -37794,6 +37797,15 @@ mod resident_sensing_dashboard_tests {
         // D5-W — the websocket-only reason is still reported (as 0) for a
         // polling source, so the dashboard can sum a fixed set of keys.
         assert_eq!(s0["dropped"]["non_text"], 0);
+        // F3 — same contract for the field-less-frame reason: always present,
+        // so `droppedTotal` on the dashboard never has to guess a key.
+        assert_eq!(s0["dropped"]["no_fields"], 0);
+        assert_eq!(
+            s0["dropped"].as_object().unwrap().len(),
+            6,
+            "the dropped breakdown is a fixed six-key shape: {:?}",
+            s0["dropped"]
+        );
         assert!(s0["last_tick_ts"].is_string());
         assert_eq!(p["screen"]["pass"], 1);
         assert_eq!(p["screen"]["drop"], 1);

@@ -157,7 +157,7 @@ canonicalize(skills_dir/skill_name)
     ]
   },
   "action": {
-    "kind": "delegate",
+    "type": "delegate",
     "target_agent": "oncall",
     "prompt": "An urgent incident task was just created. Triage it."
   }
@@ -175,7 +175,7 @@ canonicalize(skills_dir/skill_name)
     "all": [ { "field": "idle_minutes", "op": "gt", "value": 30 } ]
   },
   "action": {
-    "kind": "notify",
+    "type": "notify",
     "channel": "telegram",
     "chat_id": "12345",
     "text": "An agent has been idle for over 30 minutes."
