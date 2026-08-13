@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [1.56.0] - 2026-08-13 — 儀表板 UX 重構：資訊架構分層、記憶視覺化、白話化與個人版強化
 ### Added
 - **經驗法則會標記「來源已更新」（Hindsight #6 對位；預設隨既有 24h 掃描運作）**：先前 DuDuClaw 只在**事實層**做時間性取代——寫入更新的 `(主體, 述詞, 客體)` 事實會讓舊事實失效（`valid_until`／`superseded_by`）——但這個訊號沒有往上傳到「靠這些事實歸納出的經驗法則」。現在補上這一層（`prediction::rule_staleness`，沿用既有 `rule_lifecycle` 記憶列，**不另開 store**）：規則可在自身 metadata 的 `source_facts` 記下它由哪些事實記憶 id 歸納而來；每次 playbook 掃描（既有 24h/員工節流）會問記憶引擎新增的 `SqliteMemoryEngine::superseded_fact_ids`，只要其中任一來源事實已被取代，該規則就被標上 `source-stale` 標籤＋`source_staleness` 明細（哪幾筆來源、何時偵測）。注入 `## Learned Rules` 時 source-stale 規則**一律排在新鮮規則之後**（無論淨分數多高，仍可注入但降權），並附白話標記「（來源已更新，僅供參考）」。新增查詢 `list_source_stale_rules`（唯讀，供儀表板「重新整理這條過時規則」下期接線）。**fail-open 是硬不變量**：沒有記錄 `source_facts` 的規則（絕大多數既有規則——由 MistakeNotebook 歸納、無 F1 事實來源）**永遠不會被誤判為 stale**，找不到的來源 id 也不算 stale。reflexion 合併路徑已接上記錄 API（因其由錯誤筆記而非事實歸納，目前以空清單呼叫、保持 fail-open；未來讀事實的合併來源只需在此傳入 id 即可生效）。
 - **整合失敗可查（Hindsight #7）**：reflexion 合併先前在數個關卡靜默回傳「沒有合併」，使用者問「為什麼這幾筆重複錯誤沒被學起來」時無從查起。新增 `consolidation_failures` 遙測模組：只記錄**真正達到門檻後才被關卡擋下**的整合失敗——B2 證據過濾把原始達標的群組砍到門檻以下（`insufficient_verified_evidence`，附 raw／verified／threshold）、GovMem 獨立性閘判定證據相關（`needs_more_evidence`，附 distinct_sessions／distinct_lessons）、B1 新穎性閘判定近重複（`novelty_rejected`，附 matched_id／similarity／threshold）。**刻意不記錄**「還在累積、未達門檻」這種正常進度（幾乎每筆錯誤都會觸發），所以每一列都是真正的「為什麼沒合併」。存於 `<home>/consolidation_failures.jsonl`（`with_file_lock` 附加、上限 2000 列滾動保留最新尾段），提供 `list_failures(home, agent, limit)` 查詢介面（最新在前、可依員工過濾）；寫入全程 best-effort，遙測失敗只記 log、絕不阻斷合併路徑。儀表板 UI 下期接線。
