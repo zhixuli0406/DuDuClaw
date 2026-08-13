@@ -4899,6 +4899,12 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_telegram_bind_token(params).await
             }
+            // WP1.1 (ecosystem): LINE OA add-friend link for the QR onboarding
+            // card / printable poster. Admin only, same gate as its siblings.
+            "channels.line_add_friend" => {
+                require_admin!();
+                self.handle_line_add_friend().await
+            }
 
             // ── W2-2 (E1/E2, D-C1): behavior settings + access control ──
             // Read/write the same `ChannelSettingsManager`/`AccessController`
@@ -5244,6 +5250,69 @@ impl MethodHandler {
             }
             "models.list" => self.handle_models_list().await,
             "models.refresh" => self.handle_models_refresh().await,
+
+            // ── Local-model marketplace (design doc: DESIGN-local-model-
+            //    marketplace-2026-08-13). Reads for any logged-in user;
+            //    mutations (install/cancel/remove) manager+. ──
+            "localmodels.search" => {
+                let intent = params.get("intent").and_then(|v| v.as_str()).unwrap_or("chat");
+                match crate::local_models::search(intent, &self.home_dir).await {
+                    Ok(v) => WsFrame::ok_response("", v),
+                    Err(e) => WsFrame::error_response("", &e),
+                }
+            }
+            "localmodels.quants" => {
+                let repo = params.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+                match crate::local_models::quants(repo, &self.home_dir).await {
+                    Ok(v) => WsFrame::ok_response("", v),
+                    Err(e) => WsFrame::error_response("", &e),
+                }
+            }
+            "localmodels.installed" => {
+                WsFrame::ok_response("", crate::local_models::installed(&self.home_dir).await)
+            }
+            "localmodels.install_status" => {
+                WsFrame::ok_response("", crate::local_models::install_status())
+            }
+            "localmodels.install" => {
+                require_manager!();
+                let repo = params.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+                let filename = params.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                let shards: Vec<String> = params
+                    .get("shards")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                let total = params.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                if filename.is_empty() {
+                    WsFrame::error_response("", "filename is required")
+                } else {
+                    match crate::local_models::install(
+                        repo, filename, shards, total, &self.home_dir,
+                    )
+                    .await
+                    {
+                        Ok(id) => WsFrame::ok_response("", json!({ "job_id": id })),
+                        Err(e) => WsFrame::error_response("", &e),
+                    }
+                }
+            }
+            "localmodels.cancel" => {
+                require_manager!();
+                let id = params.get("job_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                match crate::local_models::cancel(id) {
+                    Ok(()) => WsFrame::ok_response("", json!({ "cancelled": true })),
+                    Err(e) => WsFrame::error_response("", &e),
+                }
+            }
+            "localmodels.remove" => {
+                require_manager!();
+                let filename = params.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                match crate::local_models::remove(filename, &self.home_dir).await {
+                    Ok(()) => WsFrame::ok_response("", json!({ "removed": true })),
+                    Err(e) => WsFrame::error_response("", &e),
+                }
+            }
             "runtime.detect" => self.handle_runtime_detect().await,
             // ── WP2 / D16: onboarding one-click CLI install ──────────────
             // Admin-only. The only accepted parameter is a provider NAME,
@@ -5389,6 +5458,17 @@ impl MethodHandler {
             "evolution.consolidations" => {
                 require_manager!();
                 self.handle_evolution_consolidations(params).await
+            }
+            // ── Forward model / calibration views (manager+) — the v1.53/54
+            //    predict-act-verify layer's first dashboard surface. Generic:
+            //    reads only the platform store (prediction.db), any agent. ──
+            "forward.summary" => {
+                require_manager!();
+                self.handle_forward_summary(params).await
+            }
+            "forward.recent" => {
+                require_manager!();
+                self.handle_forward_recent(params).await
             }
 
             // ── Playbook (agent-scoped gene-shaped experience entries) ──
@@ -11236,6 +11316,22 @@ impl MethodHandler {
     /// employee on the company's shared Telegram bot. The frontend renders a
     /// QR of the returned `deep_link`. The bot username is resolved live from
     /// the configured global token via getMe — never hardcoded. Admin only.
+    /// LINE OA add-friend payload (WP1.1 LINE QR onboarding). The dashboard
+    /// renders the QR locally from `add_friend_url` — no external QR service.
+    async fn handle_line_add_friend(&self) -> WsFrame {
+        match crate::line::fetch_line_add_friend_info(&self.home_dir).await {
+            Ok((add_friend_url, basic_id, display_name)) => WsFrame::ok_response(
+                "",
+                json!({
+                    "add_friend_url": add_friend_url,
+                    "basic_id": basic_id,
+                    "display_name": display_name,
+                }),
+            ),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
     async fn handle_telegram_bind_token(&self, params: Value) -> WsFrame {
         let agent = params
             .get("agent")
@@ -13892,13 +13988,12 @@ impl MethodHandler {
             }
         }
 
-        // Search the skill market registry (remote-backed, cached locally)
-        let mut registry = duduclaw_agent::skill_registry::SkillRegistry::load(&self.home_dir);
-
-        // Auto-refresh from remote if cache is stale or empty
-        if registry.needs_refresh() {
-            let _ = registry.refresh().await;
-        }
+        // Search the skill market via the multi-hub aggregator — the same
+        // HubRegistry the MCP `skill_search` tool uses, so the dashboard and
+        // agent-facing tools see one consistent result set (previously this
+        // path used the legacy GitHub-only SkillRegistry).
+        let hub_registry = duduclaw_agent::skill_hub::HubRegistry::from_home(&self.home_dir);
+        let hub_ids: Vec<String> = hub_registry.ids().iter().map(|s| s.to_string()).collect();
 
         // Collect local skill names for dedup (MCP-L3)
         let local_names: std::collections::HashSet<String> = results
@@ -13906,8 +14001,11 @@ impl MethodHandler {
             .filter_map(|r| r["name"].as_str().map(|s| s.to_string()))
             .collect();
 
-        let index_results = registry.search(query, 20);
-        for entry in index_results {
+        let aggregated = hub_registry.search(&self.home_dir, query, 20, None).await;
+        let hit_count = aggregated.hits.len();
+        let reachable_hubs = hub_ids.len().saturating_sub(aggregated.errors.len());
+        for hit in aggregated.hits {
+            let entry = hit.entry;
             if !local_names.contains(&entry.name) {
                 results.push(json!({
                     "name": entry.name,
@@ -13916,16 +14014,30 @@ impl MethodHandler {
                     "author": entry.author,
                     "url": entry.url,
                     "compatible": entry.compatible,
+                    "hub": hit.hub,
+                    "trust_tier": entry.trust_tier.as_str(),
+                    "install_count": entry.install_count,
+                    "source_verdict": entry.source_verdict,
                 }));
             }
         }
+
+        // Per-hub failures are surfaced, never swallowed.
+        let hub_errors: Vec<Value> = aggregated
+            .errors
+            .iter()
+            .map(|(hub, err)| json!({ "hub": hub, "error": err }))
+            .collect();
 
         WsFrame::ok_response(
             "",
             json!({
                 "skills": results,
-                "source": registry.source(),
-                "total_indexed": registry.count(),
+                "source": format!("hubs:{}", hub_ids.join("+")),
+                // UI contract: 0 ⇔ the market itself was unreachable (every
+                // hub failed). A reachable-but-no-match query stays non-zero.
+                "total_indexed": hit_count + reachable_hubs,
+                "hub_errors": hub_errors,
             }),
         )
     }
@@ -19448,6 +19560,71 @@ impl MethodHandler {
     /// `evolution.telemetry` — WP0.6 Verifier/Updater rejection distribution
     /// (ABC §3.3 P2 diagnostic half). Optional `agent_id` (empty aggregates
     /// every registered agent) + `days` (default 7, capped 1..=90).
+    /// `forward.summary` — per-agent aggregates over the task forward-model
+    /// audit trail (`prediction.db` / `task_prediction_log`). Read-only,
+    /// fail-open (missing db ⇒ empty), window-bounded and honest about it
+    /// (`window_scanned`). Optional `agent_id` scopes server-side.
+    async fn handle_forward_summary(&self, params: Value) -> WsFrame {
+        let agent_filter = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(a) = agent_filter.as_deref() {
+            if !is_valid_agent_id(a) {
+                return WsFrame::error_response("", "Invalid agent_id format");
+            }
+        }
+        let db_path = self.home_dir.join("prediction.db");
+        let result = tokio::task::spawn_blocking(move || {
+            crate::prediction::forward_view::forward_summaries(&db_path, agent_filter.as_deref())
+        })
+        .await;
+        match result {
+            Ok((summaries, scanned)) => WsFrame::ok_response(
+                "",
+                json!({
+                    "agents": summaries,
+                    "window_scanned": scanned,
+                    "window_cap": crate::prediction::forward_view::SCAN_CAP,
+                }),
+            ),
+            Err(e) => WsFrame::error_response("", &format!("forward summary: {e}")),
+        }
+    }
+
+    /// `forward.recent` — newest predictions (settled + pending), newest
+    /// first. Same access bar and fail-open shape as `forward.summary`.
+    async fn handle_forward_recent(&self, params: Value) -> WsFrame {
+        let agent_filter = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(a) = agent_filter.as_deref() {
+            if !is_valid_agent_id(a) {
+                return WsFrame::error_response("", "Invalid agent_id format");
+            }
+        }
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .min(crate::prediction::forward_view::RECENT_MAX_LIMIT as u64)
+            as usize;
+        let db_path = self.home_dir.join("prediction.db");
+        let result = tokio::task::spawn_blocking(move || {
+            crate::prediction::forward_view::forward_recent(&db_path, agent_filter.as_deref(), limit)
+        })
+        .await;
+        match result {
+            Ok(rows) => WsFrame::ok_response("", json!({ "predictions": rows })),
+            Err(e) => WsFrame::error_response("", &format!("forward recent: {e}")),
+        }
+    }
+
     async fn handle_evolution_telemetry(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         let days = params.get("days").and_then(|v| v.as_i64()).unwrap_or(7).clamp(1, 90);
@@ -27489,7 +27666,7 @@ impl MethodHandler {
                     .ok()
             })
             .unwrap_or_default();
-        let runs_json: Vec<Value> = runs
+        let mut runs_json: Vec<Value> = runs
             .iter()
             .map(|r| {
                 let native = step_metas
@@ -27507,11 +27684,106 @@ impl MethodHandler {
                 run_summary_to_json(r, steps)
             })
             .collect();
+
+        // Cron/dispatch runs (dispatch_runs in run_steps.db) — the scheduled
+        // twin of the session-folded channel runs above. Previously these
+        // invocations left zero rows anywhere runs.list could read (LWM D4:
+        // 202 intraday cron runs, an empty run inspector). Merged newest-first
+        // on started_at; `channel` carries the source ("cron"/"dispatch").
+        let dispatch_runs = crate::run_steps::shared_store(&self.home_dir)
+            .and_then(|s| s.list_dispatch_runs(&agent_filter, limit).ok())
+            .unwrap_or_default();
+        runs_json.extend(dispatch_runs.iter().map(|r| {
+            json!({
+                "id": format!("dispatch:{}", r.id),
+                "session_id": format!("dispatch:{}", r.id),
+                "agent_id": r.agent_id,
+                "channel": r.source,
+                "started_at": r.started_at,
+                "ended_at": r.ended_at,
+                "status": r.status,
+                "step_count": r.step_count,
+                "preview": r.preview_in,
+            })
+        }));
+        runs_json.sort_by(|a, b| {
+            b["started_at"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(a["started_at"].as_str().unwrap_or(""))
+        });
+        runs_json.truncate(limit);
         WsFrame::ok_response("", json!({ "runs": runs_json }))
     }
 
     async fn handle_runs_get(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let run_id = params.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Cron/dispatch run (`dispatch:<id>`) — served entirely from
+        // run_steps.db (dispatch_runs + its `dispatch:<id>` step stream);
+        // these invocations have no sessions.db presence. Same fail-closed
+        // authz bar as the session branch below.
+        if let Some(rest) = run_id.strip_prefix("dispatch:") {
+            let Ok(id) = rest.parse::<i64>() else {
+                return WsFrame::error_response("", "Missing or invalid 'run_id' parameter");
+            };
+            let Some(store) = crate::run_steps::shared_store(&self.home_dir) else {
+                return WsFrame::error_response("", "Run not found");
+            };
+            let Ok(Some(run)) = store.get_dispatch_run(id) else {
+                return WsFrame::error_response("", "Run not found");
+            };
+            if !ctx.is_admin() {
+                if let Err(e) = acl::require_agent_access(ctx, &run.agent_id, AccessLevel::Viewer)
+                {
+                    return WsFrame::error_response("", &e);
+                }
+            }
+            let mut events = vec![json!({
+                "kind": "text",
+                "role": "user",
+                "ts": run.started_at,
+                "preview": run.preview_in,
+            })];
+            if let Ok(rows) = store.recent_for_session(run_id, RUN_STEPS_SESSION_CAP) {
+                events.extend(rows.iter().map(|r| {
+                    json!({
+                        "kind": r.kind,
+                        "label": r.label,
+                        "ts": r.ts,
+                        "seq": r.seq,
+                        "preview": r.payload_preview,
+                    })
+                }));
+            }
+            events.push(json!({
+                "kind": "text",
+                "role": "assistant",
+                "ts": run.ended_at,
+                "preview": run.preview_out,
+            }));
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "run": {
+                        "id": run_id,
+                        "session_id": run_id,
+                        "agent_id": run.agent_id,
+                        "channel": run.source,
+                        "started_at": run.started_at,
+                        "ended_at": run.ended_at,
+                        "status": run.status,
+                    },
+                    "events": events,
+                    "event_sources": {
+                        "text": "run_steps.db (dispatch_runs)",
+                        "tool_step": "run_steps.db",
+                    },
+                    "not_persisted": ["thinking_summaries"],
+                }),
+            );
+        }
+
         let Some((session_id, rowid_str)) = run_id.rsplit_once('#') else {
             return WsFrame::error_response("", "Missing or invalid 'run_id' parameter");
         };

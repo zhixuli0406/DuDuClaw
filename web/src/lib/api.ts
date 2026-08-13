@@ -1022,6 +1022,88 @@ export interface EvolutionMetrics {
   contract_violations: number;
 }
 
+/** Tri-state hardware fit for one quant (`localmodels.*`). */
+export type MarketFit = 'comfortable' | 'tight' | 'too_big';
+
+export interface MarketQuant {
+  filename: string;
+  quant: string;
+  size_bytes: number;
+  shards?: string[];
+  imatrix: boolean;
+  fit: MarketFit;
+  /** MoE only: fit when experts are offloaded to system RAM (cpu_moe). */
+  fit_offload?: MarketFit;
+}
+
+export interface MarketModel {
+  repo: string;
+  name: string;
+  publisher: string;
+  downloads: number;
+  likes: number;
+  gated: boolean;
+  params_b?: number;
+  architecture?: string;
+  moe: boolean;
+  active_params_b?: number;
+  context_length?: number;
+  has_chat_template: boolean;
+  languages: string[];
+  recommended?: MarketQuant;
+  quants: MarketQuant[];
+}
+
+export interface MarketHardware {
+  gpu_name: string;
+  gpu_type: string;
+  vram_available_mb: number;
+  ram_total_mb: number;
+  ram_available_mb: number;
+}
+
+export interface MarketInstallJob {
+  id: number;
+  repo: string;
+  filename: string;
+  state: 'queued' | 'downloading' | 'completed' | 'failed' | 'cancelled';
+  downloaded_bytes: number;
+  total_bytes: number;
+  error?: string;
+  dest?: string;
+}
+
+/** Per-agent forward-model aggregate (`forward.summary`). */
+export interface ForwardAgentSummary {
+  agent_id: string;
+  total: number;
+  settled: number;
+  avg_brier: number | null;
+  avg_composite_error: number | null;
+  /** Settled rows by error category (negligible/moderate/significant/critical). */
+  categories: Record<string, number>;
+  /** Settled rows by observation fidelity (full/mcp_only/none). */
+  fidelity: Record<string, number>;
+  /** All rows by prediction source tier. */
+  sources: Record<string, number>;
+  last_settled_at: string | null;
+}
+
+/** One prediction row (`forward.recent`), newest first. */
+export interface ForwardPredictionRow {
+  prediction_id: string;
+  task_id: string;
+  agent_id: string;
+  round: number;
+  source: string;
+  fidelity: string | null;
+  category: string | null;
+  brier: number | null;
+  composite_error: number | null;
+  created_at: string;
+  settled_at: string | null;
+}
+
 export interface EvolutionVersion {
   version_id: string;
   agent_id: string;
@@ -3632,6 +3714,14 @@ export const api = {
       }>,
     remove: (type: string) =>
       client.call('channels.remove', { type }),
+    // WP1.1 (ecosystem): LINE OA add-friend link for the QR onboarding card /
+    // printable poster. QR is rendered client-side from `add_friend_url`.
+    lineAddFriend: () =>
+      client.call('channels.line_add_friend', {}) as Promise<{
+        add_friend_url: string;
+        basic_id: string;
+        display_name: string | null;
+      }>,
     // WP9: mint a one-time Telegram deep-link/QR bind token so an employee can
     // bind the company's shared bot to a specific AI employee (agent).
     telegramBindToken: (agent: string, opts?: { ttl_minutes?: number; max_uses?: number }) =>
@@ -3959,6 +4049,48 @@ export const api = {
         leaderboard: SkillLeaderboardEntry[];
         metric: string;
         note: string;
+      }>,
+  },
+  /** Local-model marketplace (design: DESIGN-local-model-marketplace).
+   *  Reads for any user; install/cancel/remove are manager+. */
+  localmodels: {
+    search: (intent: string) =>
+      client.call('localmodels.search', { intent }) as Promise<{
+        models: MarketModel[];
+        hardware: MarketHardware;
+      }>,
+    quants: (repo: string) =>
+      client.call('localmodels.quants', { repo }) as Promise<{ model: MarketModel }>,
+    installed: () =>
+      client.call('localmodels.installed') as Promise<{
+        models: Array<{ filename: string; size_bytes: number }>;
+      }>,
+    install: (repo: string, filename: string, shards: string[], totalBytes: number) =>
+      client.call('localmodels.install', {
+        repo,
+        filename,
+        shards,
+        total_bytes: totalBytes,
+      }) as Promise<{ job_id: number }>,
+    installStatus: () =>
+      client.call('localmodels.install_status') as Promise<{ jobs: MarketInstallJob[] }>,
+    cancel: (jobId: number) =>
+      client.call('localmodels.cancel', { job_id: jobId }) as Promise<{ cancelled: boolean }>,
+    remove: (filename: string) =>
+      client.call('localmodels.remove', { filename }) as Promise<{ removed: boolean }>,
+  },
+  /** v1.53/54 task forward-model + calibration views — generic, per-agent
+   *  (the LWM trading experiment is just one producer of this store). */
+  forward: {
+    summary: (agentId?: string) =>
+      client.call('forward.summary', { agent_id: agentId ?? '' }) as Promise<{
+        agents: ForwardAgentSummary[];
+        window_scanned: number;
+        window_cap: number;
+      }>,
+    recent: (agentId?: string, limit = 50) =>
+      client.call('forward.recent', { agent_id: agentId ?? '', limit }) as Promise<{
+        predictions: ForwardPredictionRow[];
       }>,
   },
   evolution: {

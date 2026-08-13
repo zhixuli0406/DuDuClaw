@@ -9,6 +9,10 @@
 pub mod curated;
 pub mod downloader;
 pub mod hf_api;
+// Marketplace-grade search (intent + hardware fit + MoE awareness) — the
+// "本地模型" page's engine; supersedes the curated-list UX (curated.rs stays
+// as the trust-tier source only).
+pub mod market;
 
 use serde::{Deserialize, Serialize};
 

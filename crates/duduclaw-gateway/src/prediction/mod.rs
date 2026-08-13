@@ -9,6 +9,9 @@
 //! Only genuine prediction errors trigger expensive LLM reflections.
 
 pub mod calibration;
+// Read-only dashboard views over the forward-model audit trail (generic —
+// works for every agent; the LWM trading experiment is just one producer).
+pub mod forward_view;
 pub mod engine;
 pub mod feedback_bus;
 pub mod forced_reflection;

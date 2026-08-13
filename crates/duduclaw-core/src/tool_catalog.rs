@@ -106,6 +106,30 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "memory",
     ),
     (
+        "working_state_get",
+        "Read the agent's authoritative cross-wake working state",
+        "memory:read",
+        "memory",
+    ),
+    (
+        "working_state_set",
+        "Set one key in the authoritative cross-wake working state",
+        "memory:write",
+        "memory",
+    ),
+    (
+        "working_state_clear",
+        "Retire one key from the cross-wake working state",
+        "memory:write",
+        "memory",
+    ),
+    (
+        "working_state_handoff",
+        "Overwrite the next-wake handoff note",
+        "memory:write",
+        "memory",
+    ),
+    (
         "memory_fetch_batch",
         "Fetch up to 100 memory entries by ID",
         "memory:read",

@@ -66,6 +66,11 @@ pub const SELF_ECHO_TOOL_NAMES: &[&str] = &[
     "tasks_complete",
     "tasks_block",
     "activity_post",
+    // Cross-wake working state writes echo the agent's own authored
+    // value/reason/note back — they can never ground the agent's claims.
+    "working_state_set",
+    "working_state_clear",
+    "working_state_handoff",
 ];
 
 /// `true` when `name` (matched via [`tool_name_matches`], so an MCP-prefixed
