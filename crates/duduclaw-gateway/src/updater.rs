@@ -608,7 +608,10 @@ pub async fn apply_update_with_progress(
     if detect_install_method() == InstallMethod::Homebrew {
         return Ok(ApplyResult {
             success: false,
-            message: format!("Homebrew installation detected. Please run: brew upgrade {}", brew_formula_name()),
+            message: "Homebrew installation detected. The Homebrew tap has been discontinued — \
+                      please reinstall via npm (npm install -g duduclaw) or the desktop app to \
+                      keep receiving updates."
+                .to_string(),
             needs_restart: false,
         });
     }
