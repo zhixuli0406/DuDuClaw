@@ -63,6 +63,8 @@ import {
   MoreHorizontal,
   SlidersHorizontal,
   ShieldCheck,
+  QrCode as QrCodeIcon,
+  Printer,
 } from 'lucide-react';
 
 const channelMeta: Record<
@@ -168,6 +170,15 @@ export function ChannelsPage() {
   const [loadError, setLoadError] = useState<unknown>(null);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [showBindDialog, setShowBindDialog] = useState(false);
+  const [showLineQr, setShowLineQr] = useState(false);
+
+  // WP1.2 First-Win deep link: /manage/channels?lineQr=1 opens the LINE QR
+  // dialog directly — used by onboarding hand-offs and docs.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get('lineQr') === '1') {
+      setShowLineQr(true);
+    }
+  }, []);
   const [editChannel, setEditChannel] = useState<string | null>(null);
   const [removeTarget, setRemoveTarget] = useState<string | null>(null);
   // W2-2 (E1/E2) — 行為 + 存取 detail dialog, keyed by channel row name
@@ -290,6 +301,10 @@ export function ChannelsPage() {
           </div>
         </div>
         <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={() => setShowLineQr(true)}>
+            <QrCodeIcon />
+            <span className="hidden sm:inline">{intl.formatMessage({ id: 'channels.lineQr.action' })}</span>
+          </Button>
           <Button variant="outline" size="sm" onClick={() => setShowBindDialog(true)}>
             <Link2 />
             <span className="hidden sm:inline">{intl.formatMessage({ id: 'channels.bind.action' })}</span>
@@ -357,7 +372,10 @@ export function ChannelsPage() {
       <AddChannelDialog
         open={showAddDialog}
         onClose={() => setShowAddDialog(false)}
-        onCreated={fetchChannels}
+        onCreated={(createdType) => {
+          fetchChannels();
+          if (createdType === 'line') setShowLineQr(true);
+        }}
       />
 
       {/* WP9 — Telegram shared-bot employee bind link / QR */}
@@ -365,6 +383,9 @@ export function ChannelsPage() {
         open={showBindDialog}
         onClose={() => setShowBindDialog(false)}
       />
+
+      {/* WP1.1 (ecosystem) — LINE OA add-friend QR + printable poster */}
+      <LineQrDialog open={showLineQr} onClose={() => setShowLineQr(false)} />
 
       {/* Edit Channel Dialog (re-uses add flow to replace token) */}
       <AddChannelDialog
@@ -510,7 +531,7 @@ function DialogField({
   );
 }
 
-function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boolean; onClose: () => void; onCreated: () => void; fixedType?: string }) {
+function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boolean; onClose: () => void; onCreated: (createdType?: string) => void; fixedType?: string }) {
   const intl = useIntl();
   // Parse fixedType: "discord:lab-bot" → platform="discord", agent="lab-bot"
   const parsedPlatform = fixedType?.split(':')[0];
@@ -572,7 +593,7 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
         if (wecomAesKey.trim()) config.wecom_encoding_aes_key = wecomAesKey.trim();
       }
       await api.channels.add(channelType, config, selectedAgent || undefined);
-      onCreated();
+      onCreated(channelType);
       onClose();
       setToken('');
       setSecret('');
@@ -870,6 +891,130 @@ function QrCode({ value, size = 200 }: { value: string; size?: number }) {
       aria-hidden
       dangerouslySetInnerHTML={{ __html: svg }}
     />
+  );
+}
+
+/// Minimal HTML-escape for text interpolated into the poster popup.
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string
+  );
+}
+
+/// WP1.1 (ecosystem) — LINE OA add-friend QR. Fetches the OA's deep link,
+/// renders a local QR (no external QR service), and prints an A-size poster
+/// via a minimal popup + window.print() — zero PDF dependencies.
+function LineQrDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const intl = useIntl();
+  const [info, setInfo] = useState<{
+    add_friend_url: string;
+    basic_id: string;
+    display_name: string | null;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setInfo(null);
+    setError(null);
+    setCopied(false);
+    setLoading(true);
+    api.channels
+      .lineAddFriend()
+      .then(setInfo)
+      .catch((e) => setError(formatError(e)))
+      .finally(() => setLoading(false));
+  }, [open]);
+
+  const copyLink = () => {
+    if (!info) return;
+    navigator.clipboard.writeText(info.add_friend_url).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  const printPoster = () => {
+    if (!info) return;
+    const qr = qrcode(0, 'M');
+    qr.addData(info.add_friend_url);
+    qr.make();
+    const svg = qr.createSvgTag({ scalable: true });
+    const title = escapeHtml(info.display_name ?? 'DuDuClaw AI');
+    const scanLine = escapeHtml(intl.formatMessage({ id: 'channels.lineQr.posterScan' }));
+    const idLine = escapeHtml(info.basic_id);
+    const w = window.open('', '_blank', 'width=520,height=720');
+    if (!w) return;
+    w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title>
+<style>
+  body { font-family: system-ui, -apple-system, "PingFang TC", sans-serif; text-align: center;
+         margin: 0; padding: 40px 24px; color: #1c1917; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  .id { color: #57534e; font-size: 15px; margin-bottom: 22px; }
+  .qr { width: 300px; height: 300px; margin: 0 auto 22px; }
+  .qr svg { width: 100%; height: 100%; }
+  .scan { font-size: 19px; font-weight: 600; }
+  .brand { margin-top: 28px; font-size: 12px; color: #a8a29e; }
+  @media print { .brand { color: #a8a29e; } }
+</style></head><body>
+<h1>${title}</h1><div class="id">LINE ID：${idLine}</div>
+<div class="qr">${svg}</div><div class="scan">${scanLine}</div>
+<div class="brand">Powered by DuDuClaw 🐾</div>
+</body></html>`);
+    w.document.close();
+    w.focus();
+    w.print();
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{intl.formatMessage({ id: 'channels.lineQr.title' })}</DialogTitle>
+        </DialogHeader>
+        <p className="text-sm text-muted-foreground">
+          {intl.formatMessage({ id: 'channels.lineQr.desc' })}
+        </p>
+        {loading && (
+          <p className="py-6 text-center text-sm text-muted-foreground">…</p>
+        )}
+        {error && <p className="py-4 text-sm text-destructive">{error}</p>}
+        {info && (
+          <div className="flex flex-col items-center gap-3 py-2">
+            <QrCode value={info.add_friend_url} size={220} />
+            <div className="text-center">
+              <p className="font-medium">{info.display_name ?? 'LINE OA'}</p>
+              <p className="text-sm text-muted-foreground">{info.basic_id}</p>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={copyLink}>
+                {copied ? <Check /> : <Copy />}
+                {intl.formatMessage({
+                  id: copied ? 'channels.lineQr.copied' : 'channels.lineQr.copyLink',
+                })}
+              </Button>
+              <Button variant="brand" size="sm" onClick={printPoster}>
+                <Printer />
+                {intl.formatMessage({ id: 'channels.lineQr.print' })}
+              </Button>
+            </div>
+            {/* WP1.7 — NFC touchpoint: the same deep link doubles as the NFC
+                tag payload. Write it to an NTAG213 with any NFC-writer app
+                and the table card becomes "tap to chat". */}
+            <div className="mt-2 w-full rounded-lg border border-border p-3 text-sm">
+              <p className="font-medium">
+                {intl.formatMessage({ id: 'channels.lineQr.nfcTitle' })}
+              </p>
+              <p className="mt-1 text-muted-foreground">
+                {intl.formatMessage({ id: 'channels.lineQr.nfcDesc' })}
+              </p>
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 

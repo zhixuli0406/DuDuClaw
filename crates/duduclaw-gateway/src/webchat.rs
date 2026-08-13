@@ -200,6 +200,12 @@ impl WebChatState {
 
     /// Verify a JWT and confirm the user is active. Returns the user id.
     fn authenticate(&self, token: &str) -> Result<String, String> {
+        // WP1.3/1.8 (ecosystem): public-widget visitor mode — site-embedded
+        // chat for anonymous visitors (WordPress widget, website demo).
+        // Default OFF; every failure path denies. JWT path is untouched.
+        if let Some(presented) = token.strip_prefix("widget:") {
+            return widget_authenticate(&self.ctx.home_dir, presented);
+        }
         authenticate_with(&self.jwt_config, &self.user_db, token)
     }
 
@@ -222,6 +228,42 @@ impl WebChatState {
             }
         }
     }
+}
+
+/// WP1.3/1.8 (ecosystem): public-widget visitor auth. Gate requirements —
+/// ALL must hold, every miss is a DENY (fail-closed):
+///   1. `config.toml [webchat] public_widget = true` (explicit opt-in;
+///      default off),
+///   2. `widget_key` present with ≥16 chars,
+///   3. the presented key matches (constant-time).
+///
+/// Threat model: the key ships inside the public page's JS, so it is public
+/// by design — it grants exactly one thing: anonymous visitor chat, behind
+/// the existing per-IP connection cap and the global WebChat semaphore. What
+/// it must never grant is access to ANYONE ELSE's conversation: each
+/// connection gets a unique random visitor identity, so the resume-ownership
+/// guard (keyed on this identity) can never match another visitor's session.
+fn widget_authenticate(home_dir: &std::path::Path, presented: &str) -> Result<String, String> {
+    let raw = std::fs::read_to_string(home_dir.join("config.toml"))
+        .map_err(|_| "widget mode not configured".to_string())?;
+    let cfg: toml::Value = raw
+        .parse()
+        .map_err(|_| "widget mode not configured".to_string())?;
+    let section = cfg.get("webchat").ok_or("widget mode not configured")?;
+    if section.get("public_widget").and_then(|v| v.as_bool()) != Some(true) {
+        return Err("widget mode disabled".to_string());
+    }
+    let key = section
+        .get("widget_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if key.len() < 16 {
+        return Err("widget key missing or too short (min 16 chars)".to_string());
+    }
+    if !crate::auth::constant_time_eq(key.as_bytes(), presented.as_bytes()) {
+        return Err("invalid widget key".to_string());
+    }
+    Ok(format!("widget-visitor:{}", uuid::Uuid::new_v4()))
 }
 
 /// C5: core WebChat authentication logic, decoupled from `WebChatState` so it
@@ -1110,6 +1152,55 @@ mod resume_ownership_tests {
         // wildcard that matches every session.
         assert!(!owns_webchat_session("webchat:webchat::conn1", ""));
         assert!(!owns_webchat_session("webchat:webchat:abc:conn1", ""));
+    }
+}
+
+#[cfg(test)]
+mod widget_auth_tests {
+    use super::*;
+
+    #[test]
+    fn widget_gate_fails_closed_on_every_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        // No config at all.
+        assert!(widget_authenticate(dir.path(), "whatever-key-1234").is_err());
+        // Configured but disabled.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[webchat]\npublic_widget = false\nwidget_key = \"0123456789abcdef\"\n",
+        )
+        .unwrap();
+        assert!(widget_authenticate(dir.path(), "0123456789abcdef").is_err());
+        // Enabled but key too short.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[webchat]\npublic_widget = true\nwidget_key = \"short\"\n",
+        )
+        .unwrap();
+        assert!(widget_authenticate(dir.path(), "short").is_err());
+        // Enabled, long key, wrong presentation.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[webchat]\npublic_widget = true\nwidget_key = \"0123456789abcdef\"\n",
+        )
+        .unwrap();
+        assert!(widget_authenticate(dir.path(), "0123456789abcdeX").is_err());
+    }
+
+    #[test]
+    fn widget_visitors_get_unique_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[webchat]\npublic_widget = true\nwidget_key = \"0123456789abcdef\"\n",
+        )
+        .unwrap();
+        let a = widget_authenticate(dir.path(), "0123456789abcdef").unwrap();
+        let b = widget_authenticate(dir.path(), "0123456789abcdef").unwrap();
+        assert!(a.starts_with("widget-visitor:"));
+        // Unique per connection ⇒ resume guard can never cross visitors.
+        assert_ne!(a, b);
+        assert_ne!(webchat_owner_tag(&a), webchat_owner_tag(&b));
     }
 }
 

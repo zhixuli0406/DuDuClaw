@@ -44,7 +44,7 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 | Multi-LLM failover | Manual restart | 4 rotation strategies + cross-provider failover |
 | Context survives switching LLMs | Lost | Preserved |
 | Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
-| Tools shared across LLMs | Rewrite per vendor | Write 130+ MCP tools once, use on all 5 backends |
+| Tools shared across LLMs | Rewrite per vendor | Write 200+ MCP tools once, use on all 5 backends |
 | Guardrails / audit / secret management | Build it yourself | Policy kernel + OS sandbox + AES-256-GCM built in |
 
 <a id="architecture"></a>
@@ -61,7 +61,7 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WebChat
   ├─ Multi-Runtime — 5 backends, auto-detected, configured per agent
   ├─ Session Memory — native --resume + temporal memory + key facts + layered wiki
-  ├─ MCP Server — 130+ tools (channels, memory, agents, skills, tasks, wiki, ERP)
+  ├─ MCP Server — 200+ tools (channels, memory, agents, skills, tasks, wiki, ERP)
   ├─ Evolution Engine — GVU² dual-loop evolution + prediction-driven + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS sandbox + redaction vault
   ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
@@ -162,7 +162,7 @@ duduclaw service install   # start on boot (launchd / systemd)
 | Channels | 9 channels (Telegram / LINE / Discord + voice / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards | [docs/features](docs/features/README.md) |
 | Multi-runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat, auto-detected, per-agent config, context survives backend switches | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Unified LLM API layer | `duduclaw-llm` covers 4 native protocols (Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat) with one normalized request, plus 8 OpenAI-compat presets (DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen), a pricing registry, and cross-provider fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP server | 138 tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports, with only 7 whitelisted tools exposed externally | [docs/api](docs/api/README.md) |
+| MCP server | 200+ tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports, with only 7 whitelisted tools exposed externally | [docs/api](docs/api/README.md) |
 | Memory | SQLite temporal memory (fact supersession chains), HippoRAG-lite knowledge-graph retrieval (Personalized PageRank), Ebbinghaus forgetting-curve archival, cross-agent shared wiki | [docs/features](docs/features/README.md) |
 | Self-evolution | GVU² dual loop + prediction-driven (about 90% of conversations cost zero LLM calls), SOUL.md versioning with 24h observation and auto-rollback, MistakeNotebook cross-turn memory | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock native sandbox, Docker / Apple Container / WSL2 container sandbox, secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
@@ -171,7 +171,7 @@ duduclaw service install   # start on boot (launchd / systemd)
 | Live forking | RFC-26: fork an in-progress task into N competing branches, each in a copy-on-write isolate, with an AI judge picking the winner to merge (off by default) | [docs/rfc](docs/rfc) |
 | Auto-update | One click from the dashboard or unattended (`auto_update = true`); SHA-256 + Ed25519 verification, in-place restart, open tabs reload themselves | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web dashboard | React 19 + TypeScript SPA, 32 pages, embedded in the binary; zh-TW / en / ja | [docs/features](docs/features/README.md) |
-| ERP | Odoo bridge with 15 MCP tools (CRM / sales / inventory / accounting), CE/EE auto-detection, per-agent credential isolation | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| ERP | Odoo bridge with 17 MCP tools (CRM / sales / inventory / accounting), CE/EE auto-detection, per-agent credential isolation | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 
 Full feature list in [docs/features/feature-inventory.md](docs/features/feature-inventory.md); version history in [CHANGELOG.md](CHANGELOG.md).
 
@@ -194,7 +194,8 @@ duduclaw export / import     # export / import ~/.duduclaw (portable personal da
 duduclaw migrate-from openclaw   # painless migration from OpenClaw / Hermes / paperclip (dry-run by default, --apply to write)
 duduclaw mcp-server          # start the MCP server (stdio JSON-RPC 2.0)
 duduclaw http-server         # start the MCP HTTP/SSE transport (Bearer auth)
-duduclaw acp-server          # start the ACP/A2A server (Zed / JetBrains / Neovim)
+duduclaw acp                 # start the Agent Client Protocol server (Zed / JetBrains / Neovim agent panels)
+duduclaw acp-server          # start the A2A server (agent-to-agent interop)
 duduclaw license             # license management (activate / status / redeem / rebind / …)
 ```
 
@@ -235,7 +236,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 | Language | Rust | TypeScript | Rust | Python |
 | Channels | 9 | 25+ | 8 | 0 (API) |
 | Multi-runtime | 5 backends | single | single | multi-LLM |
-| MCP server | 138 tools | no | no | no |
+| MCP server | 200+ tools | no | no | no |
 | Self-evolution engine | GVU² dual loop | no | no | no |
 | Local inference | 5 backends + confidence routing | no | no | no |
 | Behavioral contracts | CONTRACT.toml + red team | no | WASM sandbox | no |

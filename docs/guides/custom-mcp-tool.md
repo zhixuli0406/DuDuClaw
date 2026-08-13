@@ -7,7 +7,7 @@
 
 ## Overview
 
-DuDuClaw exposes 52+ MCP tools via JSON-RPC 2.0 over stdin/stdout. This guide explains how to add custom tools that integrate with Claude Code.
+DuDuClaw exposes 200+ MCP tools (206 as of v1.56) via JSON-RPC 2.0 over stdin/stdout. This guide explains how to add custom tools that integrate with Claude Code.
 
 ## Architecture
 

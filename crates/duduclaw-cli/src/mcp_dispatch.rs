@@ -278,7 +278,7 @@ impl McpDispatcher {
         // still call any tool by name via `tools/call`. Mirror the filter
         // here so non-discoverable tools are also non-callable.
         if principal.is_external
-            && !crate::mcp::EXTERNAL_TOOLS_WHITELIST.contains(&tool_name)
+            && !crate::mcp_auth::external_tool_allowed(tool_name, principal)
         {
             warn!(
                 client_id = %principal.client_id,
@@ -366,7 +366,12 @@ impl McpDispatcher {
         // ── 2. Rate-limit check (Read / Write) ───────────────────────────────
         let op_type = if matches!(
             tool_name,
-            "memory_store" | "wiki_write" | "send_message"
+            "memory_store"
+                | "wiki_write"
+                | "send_message"
+                | "working_state_set"
+                | "working_state_clear"
+                | "working_state_handoff"
         ) {
             OpType::Write
         } else {

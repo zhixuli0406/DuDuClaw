@@ -1,0 +1,21 @@
+{
+  "name": "duduclaw-streamdeck",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DuDuClaw Stream Deck plugin — physical HITL approve/deny keys",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit -p ./",
+    "build": "npm run check && esbuild src/plugin.ts --bundle --outfile=com.duduclaw.deck.sdPlugin/bin/plugin.js --format=esm --platform=node --target=node20 --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\""
+  },
+  "dependencies": {
+    "@elgato/streamdeck": "^1.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  }
+}

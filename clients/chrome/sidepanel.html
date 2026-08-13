@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, "PingFang TC", sans-serif; margin: 0;
+         display: flex; flex-direction: column; height: 100vh; font-size: 14px;
+         background: #fafaf9; color: #1c1917; }
+  @media (prefers-color-scheme: dark) { body { background: #1c1917; color: #fafaf9; } }
+  .tabs { display: flex; border-bottom: 1px solid #d6d3d1; }
+  @media (prefers-color-scheme: dark) { .tabs { border-color: #44403c; } }
+  .tab { padding: 8px 14px; cursor: pointer; opacity: .65; }
+  .tab.active { opacity: 1; border-bottom: 2px solid #f59e0b; }
+  .page { flex: 1; overflow-y: auto; padding: 10px; display: none; }
+  .page.active { display: block; }
+  .msg { margin: 6px 0; padding: 7px 10px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { background: #fde9c8; }
+  .msg.bot  { background: #e7e5e4; }
+  @media (prefers-color-scheme: dark) {
+    .msg.user { background: #78350f; }
+    .msg.bot  { background: #292524; }
+  }
+  .msg.sys { opacity: .6; font-size: 12px; }
+  #composer { display: flex; gap: 6px; padding: 10px; border-top: 1px solid #d6d3d1; }
+  @media (prefers-color-scheme: dark) { #composer { border-color: #44403c; } }
+  #input { flex: 1; border: 1px solid #d6d3d1; border-radius: 8px; padding: 7px; resize: none;
+           background: inherit; color: inherit; }
+  button { background: #f59e0b; color: #fff; border: 0; border-radius: 8px; padding: 6px 13px; cursor: pointer; }
+  button.secondary { background: #a8a29e; }
+  .card { border: 1px solid #d6d3d1; border-radius: 10px; padding: 9px; margin: 8px 0; }
+  @media (prefers-color-scheme: dark) { .card { border-color: #44403c; } }
+  .card .meta { opacity: .7; font-size: 12px; margin-bottom: 4px; }
+  .card .actions { display: flex; gap: 6px; margin-top: 8px; }
+  .banner { padding: 14px; text-align: center; }
+  .status { font-size: 11px; opacity: .6; padding: 2px 10px; }
+</style>
+</head>
+<body>
+<div class="tabs">
+  <div class="tab active" data-page="chat">💬 對話</div>
+  <div class="tab" data-page="approvals">✅ 審批 <span id="apcount"></span></div>
+</div>
+<div id="banner" class="banner" style="display:none">
+  <p>尚未連線到 DuDuClaw gateway。</p>
+  <button id="openOptions">前往設定／登入</button>
+</div>
+<div id="page-chat" class="page active"><div id="chatlog"></div></div>
+<div id="page-approvals" class="page">
+  <div style="display:flex;justify-content:flex-end"><button id="apRefresh" class="secondary">重新整理</button></div>
+  <div id="aplist"></div>
+</div>
+<div id="composer">
+  <textarea id="input" rows="2" placeholder="跟你的 AI 員工說話…（Enter 送出，Shift+Enter 換行）"></textarea>
+  <button id="send">送出</button>
+</div>
+<div class="status" id="status"></div>
+<script src="sidepanel.js"></script>
+</body>
+</html>

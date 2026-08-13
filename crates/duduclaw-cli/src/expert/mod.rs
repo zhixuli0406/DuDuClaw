@@ -28,6 +28,7 @@ pub mod hooks;
 mod install;
 pub mod manifest;
 mod plugin;
+pub mod registry;
 mod safe_zip;
 mod skill_import;
 mod team_convert;
@@ -75,6 +76,23 @@ pub enum ExpertCommands {
         /// Output `.zip` path (default: `<slug>-<version>.zip`).
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+
+    /// Produce a ready-to-PR registry entry for a pack: validate + zip +
+    /// sha256, then write `index/<slug>.json` beside the zip. Upload the zip
+    /// to a release, fill in `archive_url` (if not given here), and PR the
+    /// JSON to the pack registry.
+    Publish {
+        /// The pack directory (must contain `expert.toml`).
+        dir: PathBuf,
+        /// Final archive URL (your release asset). A placeholder is emitted
+        /// when omitted.
+        #[arg(long)]
+        archive_url: Option<String>,
+        /// Your GitHub username (the registry `publisher` field; must match
+        /// the PR author).
+        #[arg(long)]
+        publisher: Option<String>,
     },
 
     /// List installed expert packs.
@@ -137,6 +155,9 @@ pub async fn run(cmd: ExpertCommands) -> Result<()> {
             attach_under,
         } => install::cmd_install(&home, &source, dry_run, rename, trust_hooks, attach_under).await,
         ExpertCommands::Pack { dir, out } => cmd_pack(&dir, out.as_deref()),
+        ExpertCommands::Publish { dir, archive_url, publisher } => {
+            cmd_publish(&dir, archive_url.as_deref(), publisher.as_deref())
+        }
         ExpertCommands::List { json } => cmd_list(&home, json),
         ExpertCommands::Remove { slug } => cmd_remove(&home, &slug).await,
         ExpertCommands::Export { slug, format, out } => {
@@ -442,6 +463,77 @@ fn cfg_err(msg: String) -> DuDuClawError {
 }
 
 // ─────────────────────────── pack / list / remove ───────────────────────────
+
+
+/// WP2.2 R2 — `expert publish`: pack + hash + emit the registry entry JSON.
+/// The zip itself is NOT uploaded anywhere (registry stores metadata only);
+/// the printed steps walk the publisher through release upload + PR.
+fn cmd_publish(dir: &Path, archive_url: Option<&str>, publisher: Option<&str>) -> Result<()> {
+    let m = manifest::read(dir).map_err(cfg_err)?;
+    let slug = m.expert.name.clone();
+    let version = if m.expert.version.is_empty() { "0.0.0".into() } else { m.expert.version.clone() };
+    let zip_path = PathBuf::from(format!("{slug}-{version}.zip"));
+    cmd_pack(dir, Some(&zip_path))?;
+
+    let bytes = std::fs::read(&zip_path)
+        .map_err(|e| cfg_err(format!("讀取剛打包的 zip 失敗: {e}")))?;
+    let sha = registry::sha256_hex(&bytes);
+
+    let has = |sub: &str| dir.join(sub).is_dir();
+    let code_lane = has("hooks") || has("skills");
+    let entry = serde_json::json!({
+        "slug": slug,
+        "kind": "pack",
+        "title": m.expert
+            .display_name
+            .get(UI_LOCALE)
+            .cloned()
+            .unwrap_or_else(|| slug.clone()),
+        "description": m.expert.description,
+        "publisher": publisher.unwrap_or("YOUR-GITHUB-USERNAME"),
+        "license": if m.expert.license.is_empty() { "MIT".into() } else { m.expert.license.clone() },
+        "version": version,
+        "archive_url": archive_url.unwrap_or("https://github.com/<you>/<repo>/releases/download/vX.Y.Z/REPLACE-ME.zip"),
+        "sha256": sha,
+        "categories": [m.expert.category],
+        "tags": m.expert.tags,
+        "contains": {
+            "agents": m.expert.agents.len(),
+            "skills": has("skills"),
+            "hooks": has("hooks"),
+            "wiki": has("wiki"),
+        },
+        "eval_attached": has("evals"),
+    });
+    let entry_path = PathBuf::from(format!("{slug}.registry.json"));
+    std::fs::write(&entry_path, serde_json::to_string_pretty(&entry).unwrap_or_default())
+        .map_err(|e| cfg_err(format!("寫入 entry JSON 失敗: {e}")))?;
+
+    // WP2.5: advisory quality tier — never blocks, tells the publisher
+    // exactly what would raise it.
+    let (tier, score_missing) = registry::compute_score(dir);
+    println!("\n  {} 品質分級：{}", style("★").yellow(), style(tier).bold());
+    for m in &score_missing {
+        println!("    · 還差：{m}");
+    }
+
+    println!("
+  {} {}", style("✓").green(), style("registry entry 已產出").bold());
+    println!("    zip:   {}", zip_path.display());
+    println!("    entry: {}", entry_path.display());
+    println!("
+  發佈三步：");
+    println!("  1. 把 zip 上傳到你的 GitHub Release，將 entry 的 archive_url 換成資產網址");
+    if code_lane {
+        println!("  2. 此包含 hooks/skills（code lane）：需以 minisign 簽章 zip 並提供 minisig_url，");
+        println!("     且先在 registry 的 publishers/<你的帳號>/minisign.pub 註冊公鑰：");
+        println!("       minisign -Sm {}", zip_path.display());
+    } else {
+        println!("  2. 純資料包（data lane）：免簽章");
+    }
+    println!("  3. fork duduclaw-registry → 放 index/{slug}.json → PR（CI 綠即上架）");
+    Ok(())
+}
 
 fn cmd_pack(dir: &Path, out: Option<&Path>) -> Result<()> {
     if !dir.join("expert.toml").is_file() {

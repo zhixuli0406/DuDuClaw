@@ -132,6 +132,31 @@ fn format_label(f: Format) -> &'static str {
 /// Resolve `source` to a directory containing the pack. Handles a plain
 /// directory, a local `.zip`, and an `http(s)` URL to a `.zip`.
 async fn resolve_source(source: &str, staging: &Path) -> Result<PathBuf> {
+    // WP2.5: BRAT-style side door — `github:user/repo[@branch]` installs the
+    // repo's default-branch archive directly. Unregistered and unreviewed;
+    // say so honestly, then let the normal fences (zip fence, content scan,
+    // hook quarantine) do their job.
+    if let Some(spec) = source.strip_prefix("github:") {
+        let (url, label) = super::registry::github_archive_url(spec.trim())?;
+        println!("  ⚠ 側門安裝 {label}：未經 registry 驗證，來源風險自負（掃描與 hooks 隔離照常生效）");
+        std::fs::create_dir_all(staging).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
+        let zip_path = staging.join("download.zip");
+        download_zip(&url, &zip_path).await?;
+        let unpack = staging.join("unpacked");
+        safe_zip::extract_to(&zip_path, &unpack)?;
+        return Ok(descend_single_dir(unpack));
+    }
+    // WP2.2 R2/R3: `registry:<slug>` — resolve via the pack registry with
+    // client-side sha256 (always) + minisign (code lane) verification.
+    if let Some(slug) = source.strip_prefix("registry:") {
+        let (_entry, archive) = super::registry::fetch_verified_archive(slug.trim()).await?;
+        std::fs::create_dir_all(staging).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
+        let zip_path = staging.join("download.zip");
+        std::fs::write(&zip_path, &archive).map_err(|e| io_err(format!("寫入下載檔失敗: {e}")))?;
+        let unpack = staging.join("unpacked");
+        safe_zip::extract_to(&zip_path, &unpack)?;
+        return Ok(unpack);
+    }
     if source.starts_with("http://") || source.starts_with("https://") {
         std::fs::create_dir_all(staging).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
         let zip_path = staging.join("download.zip");
@@ -161,6 +186,24 @@ async fn resolve_source(source: &str, staging: &Path) -> Result<PathBuf> {
     let unpack = staging.join("unpacked");
     safe_zip::extract_to(&path, &unpack)?;
     Ok(unpack)
+}
+
+
+/// GitHub source archives wrap everything in a `<repo>-<branch>/` top dir —
+/// when the extraction root has exactly one directory and no manifest of its
+/// own, descend into it so format detection sees the real pack root.
+fn descend_single_dir(root: PathBuf) -> PathBuf {
+    if root.join("expert.toml").is_file() || root.join(".claude-plugin").is_dir() {
+        return root;
+    }
+    let entries: Vec<_> = std::fs::read_dir(&root)
+        .map(|it| it.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    let dirs: Vec<_> = entries.iter().filter(|p| p.is_dir()).collect();
+    if dirs.len() == 1 && entries.len() == 1 {
+        return dirs[0].clone();
+    }
+    root
 }
 
 /// Download a URL to `dest`, capped at [`safe_zip::MAX_UNPACK_BYTES`].

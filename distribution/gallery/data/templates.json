@@ -1,0 +1,181 @@
+{
+  "site": {
+    "base_url": "https://duduclaw.app",
+    "title": "DuDuClaw 板模畫廊",
+    "tagline": "挑一個產業板模，三分鐘讓 AI 員工在 LINE 上班"
+  },
+  "templates": [
+    {
+      "slug": "restaurant",
+      "title": "餐飲客服 AI 員工",
+      "industry": "餐飲",
+      "description": "替餐廳接 LINE 訊息的 AI 員工：回覆菜單與營業時間、處理訂位詢問、常見問題即答，尖峰時段不漏接任何一位客人。",
+      "keywords": [
+        "餐廳 LINE 客服",
+        "訂位機器人",
+        "餐飲 AI"
+      ],
+      "roles": [
+        "前台客服"
+      ],
+      "kind": "free",
+      "install": {
+        "wizard": "npx duduclaw onboard（產業選「餐飲」）"
+      }
+    },
+    {
+      "slug": "manufacturing",
+      "title": "製造業廠務 AI 員工",
+      "industry": "製造",
+      "description": "盯產線回報、轉達 SOP、班別交接協調的 AI 員工——把主管從「群組裡重複回答同一題」解放出來。",
+      "keywords": [
+        "工廠 AI 助理",
+        "產線回報",
+        "SOP 查詢"
+      ],
+      "roles": [
+        "廠務助理"
+      ],
+      "kind": "free",
+      "install": {
+        "wizard": "npx duduclaw onboard（產業選「製造」）"
+      }
+    },
+    {
+      "slug": "trading",
+      "title": "貿易業務 AI 員工",
+      "industry": "貿易",
+      "description": "處理國外客戶詢價、依價目表報價、追蹤訂單進度的 AI 員工，跨時區訊息不再等到隔天早上。",
+      "keywords": [
+        "貿易報價",
+        "外銷客服",
+        "訂單追蹤 AI"
+      ],
+      "roles": [
+        "業務助理"
+      ],
+      "kind": "free",
+      "install": {
+        "wizard": "npx duduclaw onboard（產業選「貿易」）"
+      }
+    },
+    {
+      "slug": "ecommerce-starter",
+      "kind": "pack",
+      "industry": "電商",
+      "title": "電商客服 AI 員工（入門版）",
+      "roles": [
+        "客服助理"
+      ],
+      "keywords": [
+        "蝦皮客服機器人",
+        "電商 LINE 客服",
+        "退換貨 AI",
+        "momo 客服"
+      ],
+      "description": "替蝦皮／momo／官網賣場接住每一則顧客訊息：訂單與物流查詢、七天鑑賞期與退換貨正確說明、發票載具處理；該由老闆決定的退款金額一律轉真人。",
+      "install": {
+        "registry_slug": "ecommerce-starter"
+      }
+    },
+    {
+      "slug": "realestate-starter",
+      "kind": "pack",
+      "industry": "房仲",
+      "title": "房仲業務 AI 助理（入門版）",
+      "roles": [
+        "業務助理"
+      ],
+      "keywords": [
+        "房仲 LINE 助理",
+        "帶看預約",
+        "實價登錄查詢",
+        "房仲 AI"
+      ],
+      "description": "秒回物件詢問、主動約帶看、初步貸款試算引導（一律標示以銀行核算為準）；法律稅務與簽約永遠交給持證經紀人與代書。",
+      "install": {
+        "registry_slug": "realestate-starter"
+      }
+    },
+    {
+      "slug": "education-starter",
+      "kind": "pack",
+      "industry": "教育",
+      "title": "補習班招生 AI 助理（入門版）",
+      "roles": [
+        "招生窗口"
+      ],
+      "keywords": [
+        "補習班招生",
+        "試聽預約",
+        "安親班 LINE",
+        "補習班客服"
+      ],
+      "description": "家長半夜傳的訊息也有人接：課程諮詢、試聽預約、收退費規定白話說明、請假登記；退費裁定與契約一律轉行政老師，未成年個資嚴格把關。",
+      "install": {
+        "registry_slug": "education-starter"
+      }
+    },
+    {
+      "slug": "fitness-starter",
+      "kind": "pack",
+      "industry": "健身",
+      "title": "健身房會務 AI 助理（入門版）",
+      "roles": [
+        "會務櫃檯"
+      ],
+      "keywords": [
+        "健身房會籍",
+        "教練課諮詢",
+        "健身房 LINE",
+        "場館客服"
+      ],
+      "description": "會籍方案、教練課、營業資訊即問即答，審閱期與暫停會籍權益如實告知；身體警訊與傷痛問題絕不亂答，先停推課、引導就醫。",
+      "install": {
+        "registry_slug": "fitness-starter"
+      }
+    },
+    {
+      "slug": "vet-starter",
+      "kind": "pack",
+      "industry": "寵物",
+      "title": "寵物醫院前台 AI 助理（入門版）",
+      "roles": [
+        "前台掛號"
+      ],
+      "keywords": [
+        "動物醫院掛號",
+        "獸醫 LINE",
+        "寵物急診",
+        "毛孩掛號"
+      ],
+      "description": "掛號改約、門診時段、一般衛教都能即時回覆；症狀問題永遠是「協助更快見到獸醫師」而非線上判斷，急症清單命中直接標急診。",
+      "install": {
+        "registry_slug": "vet-starter"
+      }
+    },
+    {
+      "slug": "clinic-starter",
+      "kind": "pack",
+      "industry": "醫美診所",
+      "title": "診所前台 AI 助理（入門版）",
+      "roles": [
+        "前台諮詢"
+      ],
+      "keywords": [
+        "醫美診所 LINE",
+        "牙醫預約",
+        "診所客服",
+        "面診預約"
+      ],
+      "description": "預約改約、療程項目與價格區間、術前術後一般衛教；任何「適不適合」的醫療判斷一律溫暖引導醫師面診，不碰醫療廣告禁語。",
+      "install": {
+        "registry_slug": "clinic-starter"
+      }
+    }
+  ],
+  "_notes": [
+    "降級包（premium 團隊劇本去 wiki 法規包後的免費版，拍板挑 5-8 個高搜尋量產業）產製完成後：每包一個 entry，kind 設 'pack'，install 加 pack_url（duduclaw expert install <url> 一鍵匯入），generate.mjs 會自動渲染安裝指令與 deep link。",
+    "kind: free = 內建 starter 板模（走 onboard 精靈）；pack = expert pack zip（走 expert install，支援 URL 一鍵匯入）。"
+  ]
+}

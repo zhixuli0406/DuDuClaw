@@ -1,0 +1,20 @@
+[expert]
+author = "嘟嘟數位"
+category = "retail"
+description = "房仲團隊的免費入門 AI 員工：物件詢問即答、主動約帶看、初步試算引導（一律標示以銀行核算為準）、實價登錄查詢引導；法律稅務貸款一律轉持證專業人員。"
+license = "Apache-2.0"
+name = "realestate-starter"
+tags = ["realestate", "starter", "taiwan"]
+version = "1.0.0"
+
+[expert.display_name]
+"zh-TW" = "房仲業務助理（入門版）"
+
+[expert.channels]
+suggested = ["line"]
+
+[[expert.agents]]
+display_name = "房仲業務助理"
+name = "realestate-assistant"
+role = "main"
+trigger = "@房仲業務助理"

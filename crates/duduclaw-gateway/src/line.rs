@@ -70,6 +70,11 @@ struct LineMessage {
     #[serde(rename = "type")]
     msg_type: String,
     text: Option<String>,
+    /// Present when the user replied-with-quote to an earlier message —
+    /// WP1.6 matches it against recorded decision-card ids so a quoted
+    /// 「同意」counts as pressing the card's button.
+    #[serde(rename = "quotedMessageId")]
+    quoted_message_id: Option<String>,
     /// Original filename (for file type messages).
     #[serde(rename = "fileName")]
     file_name: Option<String>,
@@ -113,6 +118,59 @@ struct LineReplyMessage {
 struct LineBotInfo {
     #[serde(rename = "displayName")]
     display_name: Option<String>,
+    /// Bot basic ID (e.g. `@abc1234`) — the stable handle behind the
+    /// add-friend deep link. LINE may serialize with or without the leading
+    /// `@`; callers normalize.
+    #[serde(rename = "basicId")]
+    basic_id: Option<String>,
+}
+
+/// Resolve the LINE OA add-friend link from the configured channel token
+/// (WP1.1 LINE QR onboarding). Returns `(add_friend_url, basic_id, display_name)`
+/// with `basic_id` normalized to the `@xxx` form. Error strings are zh-TW and
+/// user-facing (dashboard RPC surface).
+pub async fn fetch_line_add_friend_info(
+    home_dir: &Path,
+) -> Result<(String, String, Option<String>), String> {
+    let (token, _secret) = read_line_config(home_dir)
+        .await
+        .ok_or_else(|| "尚未設定 LINE 通道（請先在通道頁新增 LINE）".to_string())?;
+    if token.is_empty() {
+        return Err("尚未設定 LINE 通道（請先在通道頁新增 LINE）".to_string());
+    }
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client 建立失敗：{e}"))?;
+    let resp = http
+        .get(format!("{LINE_API}/info"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| format!("無法連線 LINE API：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("LINE token 無效（HTTP {}）", resp.status()));
+    }
+    let info: LineBotInfo = resp
+        .json()
+        .await
+        .map_err(|e| format!("LINE API 回應無法解析：{e}"))?;
+    let bare = info
+        .basic_id
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('@')
+        .to_string();
+    if bare.is_empty() {
+        return Err("LINE API 未回傳 basic ID".to_string());
+    }
+    let basic = format!("@{bare}");
+    Ok((
+        format!("https://line.me/R/ti/p/{basic}"),
+        basic,
+        info.display_name,
+    ))
 }
 
 // ── Shared state ────────────────────────────────────────────
@@ -303,6 +361,47 @@ async fn line_webhook_handler(
             // ── Channel whitelist (group chats only) ──
             if is_group && !state.ctx.channel_settings.is_channel_allowed("line", "global", scope_id).await {
                 continue;
+            }
+
+            // WP1.6 (ecosystem): quoting a decision card with a bare verb
+            // (「同意」/「拒絕」…) counts as pressing its button — LINE watch
+            // and quick-reply surfaces carry `quotedMessageId` but no
+            // postback. Quoting the card IS addressing the bot, so this runs
+            // before the mention-only gate. Same dispatch (auth +
+            // accounting) as a physical press; everything else falls
+            // through to normal chat.
+            if msg.msg_type == "text" {
+                if let (Some(qid), Some(text)) = (msg.quoted_message_id.as_deref(), msg.text.as_deref()) {
+                    let sender_for_decision = event
+                        .source
+                        .as_ref()
+                        .and_then(|s| s.user_id.as_deref())
+                        .unwrap_or("unknown");
+                    let card_chat = if is_group { scope_id } else { sender_for_decision };
+                    if let Some(outcome) = crate::decision_text::route_text_reply(
+                        &state.home_dir,
+                        "line",
+                        sender_for_decision,
+                        card_chat,
+                        qid,
+                        text,
+                    )
+                    .await
+                    {
+                        let ack = match outcome {
+                            Ok(m) => m,
+                            Err(e) => format!("⚠ {e}"),
+                        };
+                        let _ = send_reply_rich(
+                            &state.http,
+                            &token,
+                            reply_token,
+                            vec![serde_json::json!({ "type": "text", "text": ack })],
+                        )
+                        .await;
+                        continue;
+                    }
+                }
             }
 
             // ── Mention-only mode (group chats only, LINE has no native @mention) ──

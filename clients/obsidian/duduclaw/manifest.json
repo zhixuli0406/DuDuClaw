@@ -1,0 +1,10 @@
+{
+  "id": "duduclaw",
+  "name": "DuDuClaw",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Chat with the AI employees on your self-hosted DuDuClaw gateway and send notes into their memory. Connects only to the gateway URL you configure — no telemetry.",
+  "author": "DuDu Digital",
+  "authorUrl": "https://github.com/zhixuli0406/DuDuClaw",
+  "isDesktopOnly": true
+}

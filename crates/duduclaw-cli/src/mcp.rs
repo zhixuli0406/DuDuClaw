@@ -184,6 +184,39 @@ const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "working_state_set",
+        description: "Set or update ONE key in your authoritative cross-wake working state (e.g. stop_loss.2317 = 262). This block is auto-injected into every future wake-up as the single source of truth — decision parameters (stop-loss lines, position caps, current phase) MUST live here, not only in journal notes. Superseded values are kept in an auditable history chain.",
+        params: &[
+            ParamDef { name: "key", description: "State key, ^[a-z0-9][a-z0-9._-]{0,63}$ (convention: stop_loss.<symbol>, position_cap, phase)", required: true },
+            ParamDef { name: "value", description: "The current authoritative value (single line, ≤400 chars)", required: true },
+            ParamDef { name: "reason", description: "Why this value was set/changed (≤200 chars) — required for the audit chain", required: true },
+            ParamDef { name: "ttl_hours", description: "Optional expiry in hours (max 720). Use for day-scoped rules so yesterday's intraday line never survives as today's authority", required: false },
+            ParamDef { name: "expected_value", description: "Optional compare-and-swap guard: if provided and it does not match the current value, the write is refused and the current value returned — protects against a concurrent wake-up having already changed it", required: false },
+        ],
+    },
+    ToolDef {
+        name: "working_state_clear",
+        description: "Retire ONE key from your authoritative working state (with a reason, recorded in the history chain). Use when a rule/commitment no longer applies.",
+        params: &[
+            ParamDef { name: "key", description: "State key to retire", required: true },
+            ParamDef { name: "reason", description: "Why it no longer applies (≤200 chars)", required: true },
+        ],
+    },
+    ToolDef {
+        name: "working_state_handoff",
+        description: "Overwrite your handoff note — what the NEXT wake-up of yourself needs to know (in-progress work, verified facts, watch items). Auto-injected into every future wake-up. Your context can end at any moment: write the handoff before finishing, or the progress is lost.",
+        params: &[
+            ParamDef { name: "note", description: "The handoff note (≤1200 chars)", required: true },
+        ],
+    },
+    ToolDef {
+        name: "working_state_get",
+        description: "Read your full working state: all keys (including expired ones, flagged), the handoff note, and the recent supersession history.",
+        params: &[
+            ParamDef { name: "history_limit", description: "Max history records to return (default 20, max 100)", required: false },
+        ],
+    },
+    ToolDef {
         name: "memory_read",
         description: "Read a single memory entry by ID",
         params: &[
@@ -9528,7 +9561,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
 
         let response = match method {
             "initialize" => handle_initialize(&id, &request),
-            "tools/list" => handle_tools_list(&id, principal.is_external, home_dir),
+            "tools/list" => handle_tools_list(&id, &principal, home_dir),
             "tools/call" => {
                 // W20-P1 Phase 2A + P2-4: delegate to McpDispatcher, which now
                 // enforces the full pipeline — including RFC-23 egress ("secret
@@ -9616,17 +9649,34 @@ const GOOGLE_WORKSPACE_TOOLS: &[&str] = &[
 /// Test helper: tools/list now needs a home_dir (Google Workspace gate). An
 /// empty tempdir has no config.toml, so the gate reads closed (the fail-closed
 /// default) and google tools stay out of the listing.
+
+#[cfg(test)]
+fn test_principal(is_external: bool) -> crate::mcp_auth::Principal {
+    crate::mcp_auth::Principal {
+        client_id: "test".into(),
+        scopes: std::collections::HashSet::new(),
+        is_external,
+        created_at: chrono::Utc::now(),
+    }
+}
+
 #[cfg(test)]
 fn tmp_home_for_tools_list() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
-fn handle_tools_list(id: &Value, is_external: bool, home_dir: &Path) -> Value {
+pub(crate) fn handle_tools_list(
+    id: &Value,
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+) -> Value {
     let google_enabled = duduclaw_gateway::google_workspace::integration_enabled(home_dir);
     let tools: Vec<Value> = TOOLS
         .iter()
         .filter(|t| {
-            !is_external || EXTERNAL_TOOLS_WHITELIST.contains(&t.name)
+            // C4: discoverable ⇔ callable — same predicate as the dispatch
+            // gate (legacy whitelist ∪ explicitly-granted grantable scopes).
+            !principal.is_external || crate::mcp_auth::external_tool_allowed(t.name, principal)
         })
         .filter(|t| google_enabled || !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
         .map(build_tool_schema)
@@ -9800,6 +9850,9 @@ pub(crate) async fn handle_tools_call(
             | "memory_store"
             | "memory_invalidate_by_origin"
             | "memory_alias_add"
+            | "working_state_set"
+            | "working_state_clear"
+            | "working_state_handoff"
             | "model_load"
             | "model_download"
             | "model_unload"
@@ -9832,6 +9885,11 @@ pub(crate) async fn handle_tools_call(
         // ── W19-P0 M1: namespace-aware memory endpoints ────────────────────
         "memory_search" => crate::mcp_memory_handlers::handle_memory_search(&arguments, memory, ns_ctx).await,
         "memory_store"  => crate::mcp_memory_handlers::handle_memory_store(&arguments, memory, ns_ctx, daily_quota).await,
+        // ── Cross-wake authoritative working state (D3 ghost-memory fix) ──
+        "working_state_set" => handle_working_state_set(&arguments, home_dir, default_agent).await,
+        "working_state_clear" => handle_working_state_clear(&arguments, home_dir, default_agent).await,
+        "working_state_handoff" => handle_working_state_handoff(&arguments, home_dir, default_agent).await,
+        "working_state_get" => handle_working_state_get(&arguments, home_dir, default_agent).await,
         "user_profile_record" => crate::mcp_memory_handlers::handle_user_profile_record(&arguments, memory, ns_ctx).await,
         "user_profile_get" => crate::mcp_memory_handlers::handle_user_profile_get(&arguments, memory, ns_ctx).await,
         "user_code_profile" => crate::mcp_memory_handlers::handle_user_code_profile(memory, ns_ctx).await,
@@ -15070,6 +15128,106 @@ async fn handle_goals_list(args: &Value, home_dir: &Path) -> Value {
         })
         .to_string(),
     )
+}
+
+// ── Cross-wake authoritative working state (D3 ghost-memory fix) ──────────
+//
+// Thin MCP fronts over `duduclaw_gateway::working_state` — validation, caps,
+// CAS and the supersession chain all live in the gateway module (single
+// source of truth shared with the prompt-injection builder). Store I/O is
+// small bounded files; `spawn_blocking` keeps the advisory file lock off the
+// async runtime.
+
+async fn handle_working_state_set(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // Number-or-numeric-string tolerance: some CLI runtimes stringify args.
+    let ttl_hours = args
+        .get("ttl_hours")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
+    let expected_value = args
+        .get("expected_value")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let home = home_dir.to_path_buf();
+    let agent = default_agent.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        duduclaw_gateway::working_state::set_entry(
+            &home,
+            &agent,
+            &key,
+            &value,
+            &reason,
+            ttl_hours,
+            expected_value.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("working_state_set join error: {e}")));
+    match result {
+        Ok(out) => tool_text(
+            &serde_json::json!({ "ok": true, "version": out.version, "superseded": out.superseded, "truncated": out.truncated })
+                .to_string(),
+        ),
+        Err(e) => tool_error(&e),
+    }
+}
+
+async fn handle_working_state_clear(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let home = home_dir.to_path_buf();
+    let agent = default_agent.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        duduclaw_gateway::working_state::clear_entry(&home, &agent, &key, &reason)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("working_state_clear join error: {e}")));
+    match result {
+        Ok(out) => tool_text(
+            &serde_json::json!({ "ok": true, "version": out.version, "retired_value": out.superseded })
+                .to_string(),
+        ),
+        Err(e) => tool_error(&e),
+    }
+}
+
+async fn handle_working_state_handoff(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let home = home_dir.to_path_buf();
+    let agent = default_agent.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        duduclaw_gateway::working_state::set_handoff(&home, &agent, &note)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("working_state_handoff join error: {e}")));
+    match result {
+        Ok(out) => tool_text(
+            &serde_json::json!({ "ok": true, "version": out.version, "truncated": out.truncated })
+                .to_string(),
+        ),
+        Err(e) => tool_error(&e),
+    }
+}
+
+async fn handle_working_state_get(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let limit = args
+        .get("history_limit")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+        .map(|n| (n as usize).clamp(1, 100))
+        .unwrap_or(20);
+    let home = home_dir.to_path_buf();
+    let agent = default_agent.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        duduclaw_gateway::working_state::read_full(&home, &agent, limit)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("working_state_get join error: {e}")));
+    match result {
+        Ok(v) => tool_text(&v.to_string()),
+        Err(e) => tool_error(&e),
+    }
 }
 
 async fn handle_activity_post(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
@@ -20465,6 +20623,162 @@ high_context = true
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Cross-wake working state MCP tools (D3 ghost-memory fix)
+// ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod working_state_mcp_tests {
+    use super::*;
+    use std::fs;
+
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("duduclaw-ws-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn parse_ok(value: &Value) -> Value {
+        assert!(
+            !value.get("isError").and_then(|v| v.as_bool()).unwrap_or(false),
+            "tool returned error: {value}"
+        );
+        let text = value["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn mk_agent(home: &std::path::Path, id: &str) {
+        fs::create_dir_all(home.join("agents").join(id)).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_get_clear_roundtrip() {
+        let tmp = TempDir::new();
+        mk_agent(tmp.path(), "trader");
+
+        let set = handle_working_state_set(
+            &serde_json::json!({
+                "key": "stop_loss.2317",
+                "value": "262",
+                "reason": "跌破即出場不猶豫",
+                "ttl_hours": 4.5,
+            }),
+            tmp.path(),
+            "trader",
+        )
+        .await;
+        let out = parse_ok(&set);
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["version"], 1);
+
+        let get = handle_working_state_get(&serde_json::json!({}), tmp.path(), "trader").await;
+        let full = parse_ok(&get);
+        assert_eq!(full["states"]["stop_loss.2317"]["value"], "262");
+        assert_eq!(full["states"]["stop_loss.2317"]["expired"], false);
+        assert!(full["states"]["stop_loss.2317"]["expires_at"].as_str().is_some());
+
+        let clear = handle_working_state_clear(
+            &serde_json::json!({ "key": "stop_loss.2317", "reason": "已出場" }),
+            tmp.path(),
+            "trader",
+        )
+        .await;
+        let cleared = parse_ok(&clear);
+        assert_eq!(cleared["retired_value"], "262");
+
+        // History records both mutations.
+        let get2 = handle_working_state_get(&serde_json::json!({}), tmp.path(), "trader").await;
+        let full2 = parse_ok(&get2);
+        assert_eq!(full2["history"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cas_conflict_surfaces_as_tool_error() {
+        let tmp = TempDir::new();
+        mk_agent(tmp.path(), "trader");
+        parse_ok(
+            &handle_working_state_set(
+                &serde_json::json!({ "key": "k", "value": "262", "reason": "r" }),
+                tmp.path(),
+                "trader",
+            )
+            .await,
+        );
+        let conflict = handle_working_state_set(
+            &serde_json::json!({ "key": "k", "value": "254", "reason": "r", "expected_value": "260" }),
+            tmp.path(),
+            "trader",
+        )
+        .await;
+        assert!(conflict["isError"].as_bool().unwrap_or(false));
+        let text = conflict["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("262"), "CAS error must report the current value: {text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_overwrites_and_missing_fields_error() {
+        let tmp = TempDir::new();
+        mk_agent(tmp.path(), "trader");
+        parse_ok(
+            &handle_working_state_handoff(
+                &serde_json::json!({ "note": "盤中巡檢中，帳務已核對" }),
+                tmp.path(),
+                "trader",
+            )
+            .await,
+        );
+        // Missing note → error, unknown agent → error, missing reason → error.
+        let bad = handle_working_state_handoff(&serde_json::json!({}), tmp.path(), "trader").await;
+        assert!(bad["isError"].as_bool().unwrap_or(false));
+        let ghost = handle_working_state_set(
+            &serde_json::json!({ "key": "k", "value": "v", "reason": "r" }),
+            tmp.path(),
+            "ghost",
+        )
+        .await;
+        assert!(ghost["isError"].as_bool().unwrap_or(false));
+        let no_reason = handle_working_state_set(
+            &serde_json::json!({ "key": "k", "value": "v" }),
+            tmp.path(),
+            "trader",
+        )
+        .await;
+        assert!(no_reason["isError"].as_bool().unwrap_or(false));
+    }
+
+    /// Scope table: writes are MemoryWrite, read is MemoryRead — enumerated,
+    /// never falling through to the Admin default.
+    #[test]
+    fn working_state_scopes_enumerated() {
+        use crate::mcp_auth::{tool_requires_scope, Scope};
+        for tool in ["working_state_set", "working_state_clear", "working_state_handoff"] {
+            assert_eq!(tool_requires_scope(tool), Some(Scope::MemoryWrite), "{tool}");
+        }
+        assert_eq!(tool_requires_scope("working_state_get"), Some(Scope::MemoryRead));
+        // Internal-only: never on the external whitelist.
+        for tool in [
+            "working_state_set",
+            "working_state_clear",
+            "working_state_handoff",
+            "working_state_get",
+        ] {
+            assert!(!EXTERNAL_TOOLS_WHITELIST.contains(&tool));
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Scope dispatch tests (W19-P0 M2)
 // ─────────────────────────────────────────────────────────────────
 
@@ -20779,7 +21093,7 @@ mod wiki_namespace_tests {
         let id = json!(1);
 
         // External principal → should see exactly 7 whitelisted tools
-        let response = super::handle_tools_list(&id, true, tmp_home_for_tools_list().path());
+        let response = super::handle_tools_list(&id, &super::test_principal(true), tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"].as_array().expect("tools must be array");
         assert_eq!(
             tools.len(),
@@ -20812,7 +21126,7 @@ mod wiki_namespace_tests {
         let id = json!(1);
 
         // Internal principal → should see all tools (more than 7)
-        let response = super::handle_tools_list(&id, false, tmp_home_for_tools_list().path());
+        let response = super::handle_tools_list(&id, &super::test_principal(false), tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"].as_array().expect("tools must be array");
         assert!(
             tools.len() > 7,
@@ -21189,7 +21503,7 @@ mod wiki_namespace_tests {
         use serde_json::json;
         let id = json!(1);
 
-        let response = super::handle_tools_list(&id, /* is_external= */ false, tmp_home_for_tools_list().path());
+        let response = super::handle_tools_list(&id, &super::test_principal(false), tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -21213,7 +21527,7 @@ mod wiki_namespace_tests {
         use serde_json::json;
         let id = json!(1);
 
-        let response = super::handle_tools_list(&id, /* is_external= */ true, tmp_home_for_tools_list().path());
+        let response = super::handle_tools_list(&id, &super::test_principal(true), tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -21241,7 +21555,7 @@ mod wiki_namespace_tests {
     fn rollout_to_skill_pipeline_tools_visible_to_internal_principal() {
         use serde_json::json;
 
-        let response = super::handle_tools_list(&json!(1), /* is_external= */ false, tmp_home_for_tools_list().path());
+        let response = super::handle_tools_list(&json!(1), &super::test_principal(false), tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -21272,7 +21586,7 @@ mod wiki_namespace_tests {
     fn rollout_to_skill_pipeline_tools_hidden_from_external_principal() {
         use serde_json::json;
 
-        let response = super::handle_tools_list(&json!(1), /* is_external= */ true, tmp_home_for_tools_list().path());
+        let response = super::handle_tools_list(&json!(1), &super::test_principal(true), tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -21302,7 +21616,7 @@ mod wiki_namespace_tests {
     fn pipeline_tool_descriptions_are_non_empty() {
         use serde_json::json;
 
-        let response = super::handle_tools_list(&json!(1), /* is_external= */ false, tmp_home_for_tools_list().path());
+        let response = super::handle_tools_list(&json!(1), &super::test_principal(false), tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -21332,7 +21646,7 @@ mod wiki_namespace_tests {
         use serde_json::json;
         let id = json!(1);
 
-        let response = super::handle_tools_list(&id, /* is_external= */ false, tmp_home_for_tools_list().path());
+        let response = super::handle_tools_list(&id, &super::test_principal(false), tmp_home_for_tools_list().path());
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools must be array");
@@ -21369,7 +21683,7 @@ mod wiki_namespace_tests {
     #[test]
     fn g5_skill_tools_visible_internal_hidden_external() {
         use serde_json::json;
-        let internal = super::handle_tools_list(&json!(1), /* is_external= */ false, tmp_home_for_tools_list().path());
+        let internal = super::handle_tools_list(&json!(1), &super::test_principal(false), tmp_home_for_tools_list().path());
         let internal_names: Vec<&str> = internal["result"]["tools"]
             .as_array()
             .unwrap()
@@ -21388,7 +21702,7 @@ mod wiki_namespace_tests {
             .unwrap();
         assert!(search["inputSchema"]["properties"].get("hub").is_some());
 
-        let external = super::handle_tools_list(&json!(1), /* is_external= */ true, tmp_home_for_tools_list().path());
+        let external = super::handle_tools_list(&json!(1), &super::test_principal(true), tmp_home_for_tools_list().path());
         let external_names: Vec<&str> = external["result"]["tools"]
             .as_array()
             .unwrap()

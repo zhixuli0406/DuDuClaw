@@ -1,0 +1,16 @@
+# Umbrel app compose — app_proxy fronts the dashboard; gateway state persists
+# under the app's data dir. Image is the multi-arch GHCR build (amd64/arm64).
+services:
+  app_proxy:
+    environment:
+      APP_HOST: duduclaw_server_1
+      APP_PORT: 18789
+
+  server:
+    image: ghcr.io/zhixuli0406/duduclaw:1.56.0
+    restart: on-failure
+    stop_grace_period: 30s
+    environment:
+      - DUDUCLAW_BIND=0.0.0.0
+    volumes:
+      - ${APP_DATA_DIR}/data:/home/duduclaw/.duduclaw

@@ -1,0 +1,44 @@
+# Registry CI — every PR must pass entry validation; green PRs that only touch
+# index/<slug>.json + publishers/<pr-author>/ are eligible for auto-merge.
+name: validate
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Validate entries
+        run: node scripts/validate.mjs
+      - name: Publisher may only touch their own entries (PRs)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          # Every changed index entry must declare publisher == PR author, and
+          # publishers/ changes must stay inside the author's own directory.
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          changed=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD)
+          echo "$changed"
+          for f in $changed; do
+            case "$f" in
+              index/*.json)
+                pub=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$f','utf8')).publisher ?? '')")
+                if [ "$pub" != "$PR_AUTHOR" ]; then
+                  echo "::error file=$f::publisher '$pub' != PR author '$PR_AUTHOR'"; exit 1
+                fi ;;
+              publishers/*)
+                case "$f" in
+                  publishers/$PR_AUTHOR/*) ;;
+                  *) echo "::error file=$f::may only modify publishers/$PR_AUTHOR/"; exit 1 ;;
+                esac ;;
+              schema/*|scripts/*|.github/*|README.md)
+                echo "::error file=$f::infra files are maintainer-only"; exit 1 ;;
+            esac
+          done

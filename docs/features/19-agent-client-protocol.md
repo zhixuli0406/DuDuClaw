@@ -13,7 +13,11 @@ Every restaurant has two entrances:
 
 IDEs like Zed, JetBrains, and Neovim want to ask an agent *"can you take this task?"* without having to understand DuDuClaw's entire channel infrastructure. They need the reservation line — a clean, stable, protocol-driven interface.
 
-That's what the ACP server is.
+That's what the two protocol servers are. DuDuClaw ships them as **separate
+commands**: `duduclaw acp` speaks the Agent Client Protocol for IDE agent
+panels (Zed / JetBrains / nvim — see "Protocol Scope" below for setup), and
+`duduclaw acp-server` speaks the A2A protocol for agent-to-agent and
+script/CI integration (everything described in the next sections).
 
 ---
 
@@ -151,22 +155,39 @@ This means tasks submitted via ACP flow through the **same** pipelines as tasks 
 
 ---
 
-## Why IDE Integration Matters
+## Protocol Scope — Read This First
 
-### Zed
+> **Status correction (2026-08-13).** `duduclaw acp-server` currently speaks the
+> **A2A (Agent2Agent) protocol** over stdio — `agent/discover`, `message/send`,
+> `tasks/send|get|cancel` — plus the `.well-known` agent card. It does **not**
+> yet implement the *Agent Client Protocol* used by IDE agent panels
+> (`initialize` / `authenticate` / `session/new` / `session/prompt` with
+> streaming updates). Pointing Zed, the JetBrains ACP integration, or
+> `nvim-acp` at it today will fail at `initialize` with "Method not found".
+> The two protocols unfortunately share the "ACP" acronym; earlier revisions
+> of this document conflated them.
+>
+> **Update (2026-08-13, same day): the real Agent Client Protocol now ships as
+> its own command — `duduclaw acp`.** It implements ACP **v1**
+> (`initialize` → `session/new` → `session/prompt`, with `session/update`
+> streaming: `agent_message_chunk`, `tool_call` / `tool_call_update`, `plan`)
+> plus `session/cancel` (the pending turn answers `stopReason: "cancelled"` as
+> the spec requires). An unconfigured home answers the spec's `AUTH_REQUIRED`
+> error (`-32000`) and advertises an auth method that points at `duduclaw
+> onboard` in a terminal. Prompt turns run through the same gateway reply
+> pipeline as the messaging channels (session memory, contract enforcement),
+> against your Main-role agent.
+>
+> Zed `settings.json`:
+>
+> ```json
+> { "agent_servers": { "DuDuClaw": { "command": "duduclaw", "args": ["acp"] } } }
+> ```
+>
+> `duduclaw acp-server` remains the A2A surface — the two protocols stay on
+> separate commands on purpose.
 
-[Zed](https://zed.dev) exposes an "agent panel" that can talk to any ACP-compatible agent. Point it at `duduclaw acp-server --agent <your-agent>` and Zed gets native access to:
-- Task routing (via `tasks/send`)
-- Inline responses in the editor
-- Multi-turn follow-up within the IDE
-
-### JetBrains
-
-The IntelliJ platform's AI Assistant can be extended to speak ACP via a plugin. Once connected, the agent can browse the project, suggest refactors that flow through the dispatcher, and land commits through the worktree isolation layer.
-
-### Neovim
-
-`nvim-acp` plugins use the stdio line protocol directly — `duduclaw acp-server` is a drop-in backend. You get command-line-driven agent access without leaving the editor.
+## What Works Today (A2A over stdio)
 
 ### CI/CD Pipelines
 
@@ -247,7 +268,7 @@ The client being an IDE doesn't grant elevated trust — the agent's own policie
 
 ### Standards-Based Integration
 
-ACP is a real protocol with real clients (Zed, nvim-acp, experimental JetBrains plugins). Supporting it puts DuDuClaw in a growing ecosystem instead of requiring custom integrations per IDE.
+A2A is the Linux-Foundation-governed interop standard for agent-to-agent messaging (150+ organizations as of 2026), and the Agent Client Protocol has real IDE clients (Zed, nvim-acp, JetBrains). DuDuClaw ships A2A today; genuine Agent Client Protocol support is the planned bridge into the IDE ecosystem (see the status note at the top).
 
 ### Same Agent, New Interface
 

@@ -73,7 +73,7 @@
 |------|------|
 | Multi-Runtime AI Agent 平台 | 統一 `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / OpenAI-compat 五後端自動偵測 |
 | MCP Server（JSON-RPC 2.0） | 透過 stdin/stdout 向 AI Runtime 暴露 80+ 工具；註冊於 `<agent>/.mcp.json`（Claude CLI `-p` 僅讀取專案層級），gateway 啟動時自動建立/修復 |
-| ACP/A2A Server | `duduclaw acp-server` — stdio JSON-RPC 2.0，提供 `agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`；輸出 `.well-known/agent.json` AgentCard；支援 Zed / JetBrains / Neovim IDE 整合 |
+| ACP/A2A Server | 兩個指令：`duduclaw acp` — IDE agent panel 用的 Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` 串流、未設定時回 `AUTH_REQUIRED`）；`duduclaw acp-server` — A2A 協定（`agent/discover` / `message/send` / `tasks/*`、`.well-known/agent.json` AgentCard） |
 | Agent 目錄結構 | `.claude/`、`.mcp.json`、`SOUL.md`、`CLAUDE.md`、`CONTRACT.toml`、`agent.toml`、`wiki/`、`SKILLS/`、`memory/`、`tasks/`、`state/` |
 | Sub-agent 編排 | `create_agent` / `spawn_agent` / `list_agents` + `reports_to` 階層 + D3.js 組織圖 + 系統 prompt 自動注入「## Your Team」名冊 |
 | DelegationEnvelope | 結構化交接協議 — context / constraints / task_chain / expected_output |

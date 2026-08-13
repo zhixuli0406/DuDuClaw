@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "Name": "DuDuClaw",
+  "Version": "0.1.0.0",
+  "Author": "DuDu Digital",
+  "Description": "Physical HITL for your self-hosted DuDuClaw AI employees: see the pending approval on the key, approve or deny with a press. Connects only to the gateway you configure — no telemetry.",
+  "Category": "DuDuClaw",
+  "CategoryIcon": "imgs/icon",
+  "Icon": "imgs/icon",
+  "URL": "https://github.com/zhixuli0406/DuDuClaw",
+  "CodePath": "bin/plugin.js",
+  "SDKVersion": 2,
+  "Nodejs": {
+    "Version": "20",
+    "Debug": "disabled"
+  },
+  "Software": {
+    "MinimumVersion": "6.5"
+  },
+  "OS": [
+    { "Platform": "mac", "MinimumVersion": "12" },
+    { "Platform": "windows", "MinimumVersion": "10" }
+  ],
+  "Actions": [
+    {
+      "Name": "同意最舊待審",
+      "UUID": "com.duduclaw.deck.approve",
+      "Icon": "imgs/icon",
+      "Tooltip": "鍵面顯示最舊待審批項目摘要；按下＝同意它",
+      "States": [{ "Image": "imgs/icon", "TitleAlignment": "middle" }]
+    },
+    {
+      "Name": "拒絕最舊待審",
+      "UUID": "com.duduclaw.deck.deny",
+      "Icon": "imgs/icon",
+      "Tooltip": "鍵面顯示最舊待審批項目摘要；按下＝拒絕它",
+      "States": [{ "Image": "imgs/icon", "TitleAlignment": "middle" }]
+    },
+    {
+      "Name": "狀態",
+      "UUID": "com.duduclaw.deck.status",
+      "Icon": "imgs/icon",
+      "Tooltip": "顯示待審數；按下開啟儀表板",
+      "States": [{ "Image": "imgs/icon", "TitleAlignment": "middle" }]
+    }
+  ]
+}

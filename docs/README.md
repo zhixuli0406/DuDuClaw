@@ -29,7 +29,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/16-session-memory-stack.md](features/16-session-memory-stack.md) | Session memory stack — pinned instructions + snowball recap + key facts |
 | [features/17-wiki-knowledge-layer.md](features/17-wiki-knowledge-layer.md) | Wiki knowledge layer — L0-L3 trust-weighted auto-injection |
 | [features/18-worktree-isolation.md](features/18-worktree-isolation.md) | Git worktree L0 isolation — lightweight per-task sandbox |
-| [features/19-agent-client-protocol.md](features/19-agent-client-protocol.md) | ACP/A2A protocol server — Zed / JetBrains / Neovim integration |
+| [features/19-agent-client-protocol.md](features/19-agent-client-protocol.md) | ACP/A2A protocol server — A2A v1.0 over stdio（真正的 IDE Agent Client Protocol 支援規劃中） |
 | [features/20-memory-intelligence.md](features/20-memory-intelligence.md) | Memory intelligence — temporal facts + reflexion loop + batch fetch |
 | [features/21-governance-layer.md](features/21-governance-layer.md) | Governance layer — policy registry + per-agent quotas |
 | [features/22-durability-framework.md](features/22-durability-framework.md) | Durability — idempotency / retry / circuit breaker / checkpoint / DLQ |
@@ -54,6 +54,8 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/41-resident-sensing.md](features/41-resident-sensing.md) | 常駐感知＋訊號喚醒（Resident Sensing）— 外部資料流（http_poll/command/file_tail/websocket）進 autopilot 匯流排、deterministic delta 衍生欄位、本地模型初篩、ticks.sources/ticks.recent 觀測 RPC |
 | [features/42-human-takeover.md](features/42-human-takeover.md) | 真人接手對話 — 管理者發言即接手、暫停+接手工作+活動流三合一、每條派發路徑逐一擋住、`/takeover` 生命週期 |
 | [features/43-telegram-miniapp.md](features/43-telegram-miniapp.md) | Telegram 內的審批詳情卡（Mini App，試作／預設關閉）— `initData` HMAC-SHA-256 驗簽、與按鈕共用同一套授權、https + 私訊才附「查看詳情」按鈕 |
+| [features/44-working-state.md](features/44-working-state.md) | 工作狀態（Working State）— AI 員工跨喚醒的唯一權威狀態：鍵值化現行規則＋交接註記每次喚醒自動注入、變更必經工具＋理由＋取代鏈、CAS 並發保護、TTL 當日規則 |
+| [features/45-local-model-marketplace.md](features/45-local-model-marketplace.md) | 本地模型市集 — 依用途挑選＋硬體適配三態燈＋一鍵安裝；MoE 省顯存雙軌判定（turbo-fieldfare 路線）；五發布者白名單＋手動 repo 逃生口 |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios (zh-TW) — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix (zh-TW) — sales-facing coverage table |
 
@@ -68,6 +70,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [spec/soul-md-spec.md](spec/soul-md-spec.md) | SOUL.md agent identity format v1.0 | Draft |
 | [spec/contract-toml-spec.md](spec/contract-toml-spec.md) | CONTRACT.toml behavioral boundary format v1.0 | Draft |
 | [spec/contract-toml-schema.json](spec/contract-toml-schema.json) | CONTRACT.toml JSON Schema | Draft |
+| [spec/expert-pack-spec.md](spec/expert-pack-spec.md) | Expert Pack format v1.0 — 可攜「完整 AI 員工/團隊」單位：layout、expert.toml 欄位、安裝語意（拓撲/深合併/hooks 隔離）、與 SKILL.md/AGENTS.md/.af/agent card 的互補定位與映射 | Draft |
 
 ## Architecture & Technical Reference
 
@@ -97,6 +100,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 |----------|-------------|
 | [todo/TODO-agent-honesty.md](todo/TODO-agent-honesty.md) | Agent honesty / anti-hallucination tasks |
 | [todo/TODO-agent-cross-invocation-continuity.md](todo/TODO-agent-cross-invocation-continuity.md) | Agent 跨 invocation 行動連續性（否認/遺忘自己排程時的行動）修復 |
+| [todo/TODO-dispatch-run-visibility.md](todo/TODO-dispatch-run-visibility.md) | 排程／派工執行紀錄可觀測性——cron 路徑不落 run 紀錄，RunsPage 只看得到頻道對話 |
+| [todo/TODO-skill-extraction-cron-path.md](todo/TODO-skill-extraction-cron-path.md) | 技能萃取的排程路徑——cron 場景無使用者回饋，成功訊號分級（判官 accept/成功 run）替代方案已定向 |
 | [todo/TODO-rfc24-decision-continuity.md](todo/TODO-rfc24-decision-continuity.md) | RFC-24 decision-continuity implementation tracking |
 | [todo/TODO-rfc26-live-forking.md](todo/TODO-rfc26-live-forking.md) | RFC-26 live-forking implementation tracking |
 | [todo/TODO-telegram-reply-context.md](todo/TODO-telegram-reply-context.md) | Telegram 回覆/引用訊息內容遺失（reply_to_message 未解析）修復 |
@@ -110,6 +115,10 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/memory-vs-knowledge.html](guides/memory-vs-knowledge.html) | 記憶 vs 知識庫（終端使用者版，自包含 HTML，可直接寄給客戶；WP5c 全自動分流上線後改寫） | Current |
 | [guides/goal-loop.md](guides/goal-loop.md) | 自主目標迴圈（`/goal` 入口、AutonomyLevel 五級、`[goal_loop]`/`[dispatch]`/`[dispatch_guard]` 設定、needs_human 按鈕） | Current |
 | [guides/topology-evolution.md](guides/topology-evolution.md) | 半自動拓撲演化（D5，human-gated 路由改派提案、`[topology_evolution]` 設定、觀察期自動回滾、`topology.list` RPC） | Current |
+| [guides/line-touch-nfc.md](guides/line-touch-nfc.md) | 實體觸點：QR 桌牌列印、自製 NFC 桌牌（NTAG213 寫入/鎖定）、LINE Touch readiness 檢查清單（藍盾認證＋OA Shop 標籤時程） | Current |
+| [guides/build-your-own-pack.md](guides/build-your-own-pack.md) | Expert pack 創作教學（最小可用包 10 分鐘、本機測試迴路、團隊/wiki/requires 進階、convert-teams/claude-plugin 轉出、品質建議） | Current |
+| [guides/shortcuts-and-wearables.md](guides/shortcuts-and-wearables.md) | 手腕與穿戴：Apple Watch 捷徑打 HTTP API、Bee=外部 MCP 純設定、Omi/Plaud webhook→`/ingest/transcript` 直灌記憶 | Current |
+| [guides/remote-mcp.md](guides/remote-mcp.md) | Remote MCP：claude.ai 自訂連接器直連自家 DuDuClaw（標準 `/mcp` 端點＋OAuth 2.1 流程、scope 收斂模型、tunnel 部署與撤銷） | Current |
 | [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |

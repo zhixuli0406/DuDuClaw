@@ -1,0 +1,23 @@
+# Demo sandbox gateway config（WP1.3）— 公開試玩站的 DUDUCLAW_HOME 種子。
+# 部署時整包 COPY 到容器 volume（見 ../README.md），只需改兩處：
+#   1. widget_key — 換成你自己生成的 ≥16 字元隨機字串
+#   2. allowed_origins — 換成官網網域
+
+[gateway]
+port = 18789
+# 官網（掛 demo widget 的那個網域）；瀏覽器帶 Origin，必須列名才放行。
+allowed_origins = ["duduclaw.app", "www.duduclaw.app"]
+
+[webchat]
+# 訪客模式：官網 demo 的唯一入口。key 出現在官網原始碼是設計使然，
+# 只授權匿名訪客對話（per-IP 連線上限＋全域 semaphore 照常生效）。
+public_widget = true
+widget_key = "CHANGE-ME-random-16plus-chars"
+
+[branding]
+# demo 站保留尾註（免費層本來就恆開，此鍵寫出來只是自我文件化）。
+reply_footer = true
+
+[dispatch]
+# demo 站不開自主派工——訪客只需要對話。
+enabled = false

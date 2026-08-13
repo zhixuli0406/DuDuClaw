@@ -1,0 +1,20 @@
+[expert]
+author = "嘟嘟數位"
+category = "lifestyle"
+description = "健身房／工作室的免費入門會務 AI 員工：會籍與教練課諮詢、審閱期與暫停會籍權益如實告知、場館資訊即答；傷痛與醫療判斷絕不碰，安全永遠優先於成交。"
+license = "Apache-2.0"
+name = "fitness-starter"
+tags = ["fitness", "starter", "taiwan"]
+version = "1.0.0"
+
+[expert.display_name]
+"zh-TW" = "健身房會務助理（入門版）"
+
+[expert.channels]
+suggested = ["line"]
+
+[[expert.agents]]
+display_name = "健身房會務助理"
+name = "fitness-assistant"
+role = "main"
+trigger = "@健身房會務助理"

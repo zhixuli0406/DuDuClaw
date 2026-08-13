@@ -1,0 +1,18 @@
+# Starter pack defaults — whitelisted settings only (deep-merged at install).
+[budget]
+hard_stop = false
+monthly_limit_cents = 3000
+warn_threshold_percent = 80
+
+[capabilities]
+browser_via_bash = false
+computer_use = false
+
+[permissions]
+allowed_channels = [
+    "line",
+    "telegram",
+]
+can_create_agents = false
+can_modify_own_soul = false
+can_schedule_tasks = true

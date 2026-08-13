@@ -44,7 +44,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | 多 LLM 容錯切換 | 手動重啟 | 4 種輪替策略 + 跨供應商 failover |
 | 換 LLM 時保留上下文 | 遺失 | 完整保留 |
 | 對話記憶與知識庫 | 單次 session | SQLite 時態記憶 + 分層 wiki + 自動注入 |
-| 工具跨 LLM 共用 | 每家重寫 | 130+ MCP 工具寫一次,五種後端共用 |
+| 工具跨 LLM 共用 | 每家重寫 | 200+ MCP 工具寫一次,五種後端共用 |
 | 安全邊界 / 稽核 / 密鑰管理 | 自己造 | 政策核心 + OS 沙箱 + AES-256-GCM 內建 |
 
 <a id="architecture"></a>
@@ -61,7 +61,7 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WebChat
   ├─ Multi-Runtime — 5 種後端自動偵測,per-agent 設定
   ├─ Session Memory — 原生 --resume + 時態記憶 + key-fact 累積 + 分層 wiki
-  ├─ MCP Server — 130+ 工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
+  ├─ MCP Server — 200+ 工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
   ├─ Evolution Engine — 預測驅動 + AEE playbook 進化(v3 預設) + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS 沙箱 + redaction vault
   ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
@@ -162,7 +162,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 通訊通道 | 9 通道(Telegram / LINE / Discord + 語音 / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat),per-agent bot、熱啟停、平台原生排版、輸入中指示、長任務進度看板 | [docs/features](docs/features/README.md) |
 | Multi-Runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat 五後端,自動偵測、per-agent 設定、換後端保留上下文 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 統一 LLM API 層 | `duduclaw-llm` 用一套正規化請求覆蓋 4 種原生協定(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat),內建 8 個 OpenAI-compat preset(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 計價 registry + 跨供應商 fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP Server | 138 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport,對外只暴露 7 個白名單工具 | [docs/api](docs/api/README.md) |
+| MCP Server | 200+ 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport,對外只暴露 7 個白名單工具 | [docs/api](docs/api/README.md) |
 | 記憶系統 | SQLite 時態記憶(事實取代鏈)、HippoRAG-lite 知識圖譜檢索(Personalized PageRank)、Ebbinghaus 遺忘曲線自動封存、跨 agent 共享 wiki | [docs/features](docs/features/README.md) |
 | 自我進化 | 預測驅動(約 90% 對話零 LLM 成本)、AEE playbook 進化(v3 預設,SOUL.md 對 agent 唯讀,行為規則獨立驗證 + 條目級觀察窗回滾)、MistakeNotebook 跨回合記憶;GVU² SOUL.md 整份改寫降為選配逃生門 | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | 安全 | PolicyKernel reference monitor(零 LLM、fail-closed)、macOS Seatbelt / Linux Landlock 原生沙箱、Docker / Apple Container / WSL2 容器沙箱、secret redaction vault、CONTRACT.toml 行為契約 + 紅隊測試 | [SECURITY.md](SECURITY.md) |
@@ -171,7 +171,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | Live Forking | RFC-26:把進行中的任務分叉成 N 個競爭分支,各自 copy-on-write 隔離、AI judge 選勝者合併(預設關閉) | [docs/rfc](docs/rfc) |
 | 自動更新 | Dashboard 一鍵更新或背景自動更新(`auto_update = true`),SHA-256 + Ed25519 雙重驗證後原地重啟,前台分頁自動重載 | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web Dashboard | React 19 + TypeScript SPA 32 頁,嵌入 binary 零額外部署;zh-TW / en / ja 三語 | [docs/features](docs/features/README.md) |
-| ERP 整合 | Odoo 中間層 15 個 MCP 工具(CRM / 銷售 / 庫存 / 會計),CE/EE 自動偵測、per-agent 認證隔離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| ERP 整合 | Odoo 中間層 17 個 MCP 工具(CRM / 銷售 / 庫存 / 會計),CE/EE 自動偵測、per-agent 認證隔離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 
 完整功能清單見 [docs/features/feature-inventory.md](docs/features/feature-inventory.md),版本演進見 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -194,7 +194,8 @@ duduclaw export / import     # 匯出 / 匯入 ~/.duduclaw(個人版資料可攜
 duduclaw migrate-from openclaw   # 從 OpenClaw / Hermes / paperclip 無痛轉移(預設 dry-run,--apply 落地)
 duduclaw mcp-server          # 啟動 MCP Server(stdio JSON-RPC 2.0)
 duduclaw http-server         # 啟動 MCP HTTP/SSE Transport(Bearer 認證)
-duduclaw acp-server          # 啟動 ACP/A2A Server(Zed / JetBrains / Neovim 整合)
+duduclaw acp                 # 啟動 Agent Client Protocol server(Zed / JetBrains / Neovim agent panel)
+duduclaw acp-server          # 啟動 A2A Server(agent 對 agent 互通)
 duduclaw license             # 授權管理(activate / status / redeem / rebind / …)
 ```
 
@@ -235,7 +236,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | 語言 | Rust | TypeScript | Rust | Python |
 | 通道 | 9 | 25+ | 8 | 0(API)|
 | Multi-Runtime | 5 後端 | 單一 | 單一 | 多 LLM |
-| MCP Server | 138 工具 | 無 | 無 | 無 |
+| MCP Server | 200+ 工具 | 無 | 無 | 無 |
 | 自我進化引擎 | GVU² 雙迴圈 | 無 | 無 | 無 |
 | 本地推論 | 5 後端 + 信心路由 | 無 | 無 | 無 |
 | 行為契約 | CONTRACT.toml + 紅隊 | 無 | WASM 沙箱 | 無 |

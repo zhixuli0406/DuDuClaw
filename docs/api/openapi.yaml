@@ -1,9 +1,17 @@
 openapi: 3.1.0
 info:
   title: DuDuClaw WebSocket RPC API
-  version: 0.12.0
+  version: 1.56.0
   description: |
     JSON-RPC 2.0 API over WebSocket for DuDuClaw multi-agent orchestration.
+
+    > **Coverage note (2026-08-13)**: this spec documents the stable core of
+    > the WebSocket RPC surface but lags the product — many RPC method
+    > families added after 0.12.0 (templates.*, experts.*, evolution.*,
+    > playbook.*, delegation.*, widgets.*, ticks.*, notify.*, …) are not yet
+    > described here. The authoritative method list is the dispatch table in
+    > `crates/duduclaw-gateway/src/handlers.rs`; treat this file as a guide,
+    > not an exhaustive contract. A full regeneration is tracked separately.
 
     ## Connection
 

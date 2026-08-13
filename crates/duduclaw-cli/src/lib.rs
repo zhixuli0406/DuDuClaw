@@ -15,6 +15,7 @@ mod playbook_export;      // WP2.2/B4 batch: gene JSON export CLI (`duduclaw pla
 mod eval_scaffold;        // WP2.1: free-tier eval draft bootstrap (`duduclaw eval-scaffold`)
 mod playbook_migrate;     // WP1.4: SOUL.md → playbook migration drafts (`duduclaw playbook migrate-soul`)
 mod portability;          // Personal-edition data portability: export/import ~/.duduclaw
+mod tunnel;               // B5 (ecosystem): `duduclaw tunnel` — Cloudflare quick-tunnel wizard
 mod premium_templates;    // Licensed industry templates (commercial/templates-premium), gated by premium_templates feature
 mod mcp;
 pub mod mcp_auth;
@@ -26,6 +27,8 @@ pub mod mcp_refresh;             // v1.16.0: refresh-token credential type
 pub mod mcp_dispatch;          // W20-P1 Phase 2A: transport-agnostic dispatcher
 pub(crate) mod mcp_http_errors; // W20-P1 Phase 2B: JSON-RPC ↔ HTTP status mapping
 pub mod mcp_http_server;       // W20-P1 Phase 2B: Axum HTTP/SSE server
+pub mod mcp_streamable;        // WP3.1-T1: standard MCP Streamable HTTP endpoint (/mcp)
+pub mod mcp_oauth_server;      // WP3.1-T2: OAuth 2.1 issuance for remote MCP clients
 pub mod mcp_headers;           // W22-P0 ADR-002: capability registry + x-duduclaw header builder
 pub mod mcp_capability;        // W22-P0 ADR-002: inject_capability_headers + negotiate_capabilities
 pub mod mcp_memory_handlers;
@@ -289,6 +292,11 @@ enum Commands {
 
     /// Run system diagnostics
     Doctor,
+
+    /// Expose the dashboard remotely via a Cloudflare quick tunnel
+    /// (no account needed; prints the assigned URL + the allowed_origins
+    /// line to add). Production paths: docs/guides/deployment-guide.md.
+    Tunnel,
 
     /// Inspect and maintain the organisational authority (`~/.duduclaw/org.toml`)
     Org {
@@ -649,8 +657,15 @@ enum Commands {
     #[command(subcommand)]
     Lifecycle(LifecycleCommands),
 
-    /// ACP (Agent Client Protocol) server for IDE integration
+    /// A2A protocol server (agent-to-agent interop over stdio JSON-RPC).
+    /// NOT the editor-facing Agent Client Protocol — use `duduclaw acp` to
+    /// connect Zed/JetBrains/nvim agent panels.
     AcpServer,
+
+    /// Agent Client Protocol v1 server (stdio) — point your editor's agent
+    /// panel (Zed `agent_servers`, JetBrains, nvim) at `duduclaw acp` to chat
+    /// with your DuDuClaw agents in the IDE.
+    Acp,
 
     /// Start DuDuClaw MCP server over HTTP/SSE transport (W20-P1 Phase 2)
     ///
@@ -1504,6 +1519,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Gateway => cmd_run_server(true).await,
         Commands::Status => cmd_status().await,
         Commands::Doctor => cmd_doctor().await,
+        Commands::Tunnel => tunnel::cmd_tunnel(&duduclaw_home()).await,
         Commands::Org { command } => match command {
             OrgCommands::Show => cmd_org_show(),
             OrgCommands::Sync { agent, dry_run } => cmd_org_sync(agent.as_deref(), dry_run),
@@ -1645,6 +1661,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::AcpServer => {
             acp::server::run_acp_server(&duduclaw_home()).await
+        }
+        Commands::Acp => {
+            acp::client_protocol::run_acp_client_protocol(&duduclaw_home()).await
         }
         Commands::HttpServer { bind, no_sse, timeout_secs } => {
             cmd_http_server(&bind, no_sse, timeout_secs).await
@@ -6537,7 +6556,9 @@ async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
 
     if info.install_method == duduclaw_gateway::updater::InstallMethod::Homebrew {
         println!("\n  Homebrew installation detected.");
-        println!("  Please run: brew upgrade {}", duduclaw_gateway::updater::brew_formula_name());
+        println!("  The Homebrew tap has been discontinued — `brew upgrade` will never deliver");
+        println!("  a new version. Please reinstall via npm (npm install -g duduclaw) or the");
+        println!("  desktop app to keep receiving updates.");
         return Ok(());
     }
 

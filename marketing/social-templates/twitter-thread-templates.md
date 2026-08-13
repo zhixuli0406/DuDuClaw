@@ -29,7 +29,7 @@ Local inference stack:
 - Confidence Router: auto-routes by query complexity
 
 **Tweet 5 (CTA):**
-Open source under Elastic License 2.0.
+Open source under Apache License 2.0.
 ⭐ GitHub: [link]
 💬 Discord: [link]
 

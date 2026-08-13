@@ -147,6 +147,47 @@ pub fn record_card_message(
     }
 }
 
+/// WP1.6 (ecosystem, text-reply decisions): reverse lookup — which decision
+/// card does a channel message belong to? Linear scan is fine: the store is
+/// pruned to `MAX_ENTRIES` and consulted only for messages that REPLY to a
+/// bot message. The key layout is `namespace:decision_id:channel:chat_id`;
+/// the entry's own channel/chat_id fields anchor the suffix strip so chat ids
+/// containing `:` (Teams) cannot skew the parse. Returns `(namespace,
+/// decision_id)`.
+pub fn lookup_decision_by_message(
+    home_dir: &Path,
+    channel: &str,
+    chat_id: &str,
+    message_id: &str,
+) -> Option<(String, String)> {
+    if message_id.is_empty() {
+        return None;
+    }
+    let state = load_state(&store_path(home_dir));
+    for (key, e) in state.iter() {
+        if e.channel != channel || e.message_id != message_id {
+            continue;
+        }
+        // Inbound events carry the PLATFORM channel id, which for Discord DM
+        // cards is `edit_chat_id` (the bot↔user DM channel) while the store
+        // key was built from the original destination (`chat_id` = user id).
+        // Accept either — the message id already pins the exact card.
+        if e.chat_id != chat_id && e.edit_chat_id != chat_id {
+            continue;
+        }
+        let suffix = format!(":{channel}:{}", e.chat_id);
+        let Some(head) = key.strip_suffix(suffix.as_str()) else {
+            continue;
+        };
+        // Decision ids carry no `:` (uuid/token forms), so the first split is
+        // exactly the namespace boundary.
+        if let Some((namespace, decision_id)) = head.split_once(':') {
+            return Some((namespace.to_string(), decision_id.to_string()));
+        }
+    }
+    None
+}
+
 /// Look up the stored message identity for a decision card, if any.
 pub fn lookup_card_message(
     home_dir: &Path,

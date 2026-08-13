@@ -1,0 +1,20 @@
+[expert]
+author = "嘟嘟數位"
+category = "retail"
+description = "台灣電商賣家的免費入門客服 AI 員工：訂單查詢、物流追蹤、七天鑑賞期與退換貨說明、發票載具、缺貨補貨——守住消保法紅線，該轉真人時明確轉接。"
+license = "Apache-2.0"
+name = "ecommerce-starter"
+tags = ["ecommerce", "starter", "taiwan"]
+version = "1.0.0"
+
+[expert.display_name]
+"zh-TW" = "電商客服助理（入門版）"
+
+[expert.channels]
+suggested = ["line"]
+
+[[expert.agents]]
+display_name = "電商客服助理"
+name = "ecommerce-assistant"
+role = "main"
+trigger = "@電商客服助理"

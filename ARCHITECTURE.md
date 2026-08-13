@@ -153,7 +153,7 @@ crates/                            # v1.9.4 共 16 個 crate
 ├── duduclaw-gateway/              # Axum 伺服器、通道整合、WebSocket、MCP tools、LLM fallback、evolution events
 ├── duduclaw-bus/                  # tokio broadcast + mpsc 訊息路由
 ├── duduclaw-bridge/               # PyO3 Rust↔Python 橋接（bus_queue 寫入）
-├── duduclaw-odoo/                 # Odoo ERP 中間層（JSON-RPC, 15 MCP tools）
+├── duduclaw-odoo/                 # Odoo ERP 中間層（JSON-RPC, 17 MCP tools）
 ├── duduclaw-cli/                  # clap CLI 入口、mcp-server (stdio/HTTP/SSE)、migrate
 ├── duduclaw-dashboard/            # rust-embed 嵌入 React SPA
 ├── duduclaw-desktop/              # 桌面端 wrapper（macOS/Windows/Linux）

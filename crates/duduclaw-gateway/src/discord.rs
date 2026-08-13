@@ -1314,6 +1314,38 @@ async fn handle_message_create(
         return;
     }
 
+    // WP1.6 (ecosystem): replying to a decision card with a bare verb
+    // (「同意」/「拒絕」…) counts as pressing its button — clients without
+    // component rendering (watch/embeds-off) still get to decide. Same
+    // dispatch (auth + accounting) as a physical press; anything that isn't
+    // a whole-message verb on a live card falls through to normal chat.
+    if replied_to_bot && !content.is_empty() {
+        if let Some(ref_mid) = data
+            .get("referenced_message")
+            .and_then(|m| m.get("id"))
+            .and_then(|v| v.as_str())
+        {
+            if let Some(outcome) = crate::decision_text::route_text_reply(
+                &ctx.home_dir,
+                "discord",
+                author_id,
+                channel_id,
+                ref_mid,
+                content,
+            )
+            .await
+            {
+                let ack = match outcome {
+                    Ok(m) => m,
+                    Err(e) => format!("⚠ {e}"),
+                };
+                let _ = send_discord_message(http, token, channel_id, json!({ "content": ack }))
+                    .await;
+                return;
+            }
+        }
+    }
+
     // Strip bot mention from content and append attachment info
     let stripped = strip_bot_mention(content, bot_id);
     let stripped = stripped.trim();

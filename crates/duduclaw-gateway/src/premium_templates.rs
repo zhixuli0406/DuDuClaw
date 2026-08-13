@@ -74,6 +74,29 @@ pub fn label_for_slug(slug: &str) -> String {
     pretty.to_string()
 }
 
+/// Optional per-pack display metadata (`<pack>/template.toml`). A pack that
+/// ships one needs no code change to get a proper wizard label — the table
+/// in [`label_for_slug`] stays only as the fallback for packs predating this
+/// manifest.
+#[derive(Debug, Deserialize)]
+struct PackManifest {
+    label: Option<String>,
+}
+
+/// Read `label` from `<dir>/template.toml`. Fail-closed to `None` on any
+/// missing file, parse error, empty/oversized value, or control characters —
+/// callers then fall back to [`label_for_slug`], so a broken manifest can
+/// never blank out a menu entry.
+fn label_from_manifest(dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join("template.toml")).ok()?;
+    let manifest: PackManifest = toml::from_str(&raw).ok()?;
+    let label = manifest.label?.trim().to_string();
+    if label.is_empty() || label.chars().count() > 80 || label.chars().any(char::is_control) {
+        return None;
+    }
+    Some(label)
+}
+
 /// A slug is a single path component: lowercase alphanumeric + hyphen, no
 /// `.`/`/`/`..`. This blocks path-traversal via a crafted slug.
 pub fn is_safe_slug(slug: &str) -> bool {
@@ -185,7 +208,7 @@ pub fn discover_in(dir: &Path) -> Vec<PremiumIndustry> {
         }
         out.push(PremiumIndustry {
             slug: slug.to_string(),
-            label: label_for_slug(slug),
+            label: label_from_manifest(&path).unwrap_or_else(|| label_for_slug(slug)),
             dir: path,
         });
     }
@@ -825,6 +848,44 @@ mod tests {
     fn label_falls_back_to_slug() {
         assert_eq!(label_for_slug("ecommerce-pro"), "電商客服 (Pro)");
         assert_eq!(label_for_slug("logistics-pro"), "logistics-pro (Pro)");
+    }
+
+    #[test]
+    fn manifest_label_wins_and_fails_closed() {
+        let tmp = std::env::temp_dir().join(format!("dudu-premium-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // Pack with a manifest label → manifest wins, no code change needed.
+        let a = tmp.join("logistics-pro");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("SOUL.md"), "# x").unwrap();
+        std::fs::write(a.join("template.toml"), "label = \"物流貨運 (Pro)\"\n").unwrap();
+
+        // Malformed manifest → fall back to the built-in table.
+        let b = tmp.join("ecommerce-pro");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join("SOUL.md"), "# x").unwrap();
+        std::fs::write(b.join("template.toml"), "label = {{{ not toml").unwrap();
+
+        // Empty / control-char / oversized labels are rejected → fallback.
+        let c = tmp.join("foo-pro");
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(c.join("SOUL.md"), "# x").unwrap();
+        std::fs::write(c.join("template.toml"), "label = \"  \"\n").unwrap();
+
+        let found = discover_in(&tmp);
+        let by_slug = |s: &str| found.iter().find(|p| p.slug == s).unwrap();
+        assert_eq!(by_slug("logistics-pro").label, "物流貨運 (Pro)");
+        assert_eq!(by_slug("ecommerce-pro").label, "電商客服 (Pro)");
+        assert_eq!(by_slug("foo-pro").label, "foo-pro (Pro)");
+
+        assert_eq!(
+            label_from_manifest(&tmp.join("missing")),
+            None,
+            "missing manifest must fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

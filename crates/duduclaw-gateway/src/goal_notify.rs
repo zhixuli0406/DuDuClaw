@@ -1043,9 +1043,23 @@ pub(crate) async fn send_with_markup(
             if !resp.status().is_success() {
                 return Err(format!("line HTTP {}", resp.status()));
             }
-            // LINE has no editable message id worth capturing — see
-            // `decision_card::channel_editable`.
-            Ok(None)
+            // LINE messages are not editable (`channel_editable` excludes it,
+            // so collapse never tries), but the sent message id IS worth
+            // recording: quoting the card in a reply carries
+            // `quotedMessageId`, which is how text-reply decisions (WP1.6)
+            // find their card.
+            let data: serde_json::Value = resp.json().await.unwrap_or_default();
+            let mid = data
+                .get("sentMessages")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|m| m.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Ok(mid.map(|m| crate::decision_card::PushedMessage {
+                edit_chat_id: chat_id.to_string(),
+                message_id: m,
+            }))
         }
         other => Err(format!("channel {other} has no button sender")),
     }
