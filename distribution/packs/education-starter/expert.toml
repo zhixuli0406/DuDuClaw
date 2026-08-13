@@ -1,0 +1,20 @@
+[expert]
+author = "嘟嘟數位"
+category = "education"
+description = "補習班／安親班的免費入門 AI 員工：課程諮詢、試聽預約、收退費規定白話說明、請假與進度轉達；退費裁定與契約簽訂一律轉真人，保護未成年個資。"
+license = "Apache-2.0"
+name = "education-starter"
+tags = ["education", "starter", "taiwan"]
+version = "1.0.0"
+
+[expert.display_name]
+"zh-TW" = "補習班招生助理（入門版）"
+
+[expert.channels]
+suggested = ["line"]
+
+[[expert.agents]]
+display_name = "補習班招生助理"
+name = "education-assistant"
+role = "main"
+trigger = "@補習班招生助理"

@@ -1,0 +1,28 @@
+# Umbrel app manifest — target: community app store first (zero review),
+# official getumbrel/umbrel-apps PR second. Validate field set against the
+# current https://github.com/getumbrel/umbrel-community-app-store template
+# before publishing (schema evolves).
+manifestVersion: 1
+id: duduclaw
+category: ai
+name: DuDuClaw
+version: "1.56.0"
+tagline: AI employees for your business, reachable on LINE, Telegram, Discord & more
+description: >-
+  DuDuClaw is a self-hosted, multi-runtime AI agent platform. Deploy AI
+  "employees" that answer customers and run tasks over LINE, Telegram,
+  Discord, Slack, WhatsApp, Teams and more — with persistent memory, task
+  boards, human-in-the-loop approvals, and cost controls. Bring your own
+  Anthropic/OpenAI-compatible credentials; everything runs on your Umbrel.
+developer: DuDu Digital (嘟嘟數位)
+website: https://github.com/zhixuli0406/DuDuClaw
+repo: https://github.com/zhixuli0406/DuDuClaw
+support: https://github.com/zhixuli0406/DuDuClaw/issues
+port: 18789
+gallery: []
+path: ""
+releaseNotes: >-
+  See https://github.com/zhixuli0406/DuDuClaw/blob/main/CHANGELOG.md
+dependencies: []
+submitter: zhixuli0406
+submission: https://github.com/zhixuli0406/DuDuClaw

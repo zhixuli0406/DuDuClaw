@@ -1,0 +1,16 @@
+{
+  "slug": "example-clinic-team",
+  "kind": "pack",
+  "title": "診所前台 AI 團隊（範例）",
+  "description": "示範 entry：前台客服＋回診提醒兩位 AI 員工。實際提交時把本檔改名為 <slug>.json 並填入真實資料；底線開頭的檔案會被驗證器忽略。",
+  "publisher": "zhixuli0406",
+  "license": "MIT",
+  "homepage": "https://github.com/zhixuli0406/DuDuClaw",
+  "version": "1.0.0",
+  "archive_url": "https://github.com/zhixuli0406/example/releases/download/v1.0.0/example-clinic-team-1.0.0.zip",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "categories": ["clinic"],
+  "tags": ["診所", "front-desk"],
+  "contains": { "agents": 2, "skills": false, "hooks": false, "wiki": true },
+  "eval_attached": false
+}

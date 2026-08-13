@@ -1,0 +1,22 @@
+PackageIdentifier: ZhixuLi.DuDuClaw
+PackageVersion: 1.56.0
+PackageLocale: en-US
+Publisher: DuDu Digital (嘟嘟數位)
+PublisherUrl: https://github.com/zhixuli0406/DuDuClaw
+PublisherSupportUrl: https://github.com/zhixuli0406/DuDuClaw/issues
+PackageName: DuDuClaw
+PackageUrl: https://github.com/zhixuli0406/DuDuClaw
+License: Apache-2.0
+LicenseUrl: https://github.com/zhixuli0406/DuDuClaw/blob/main/LICENSE
+ShortDescription: Multi-runtime AI agent platform — run AI employees that talk over LINE, Telegram, Discord, Slack and more, from one self-hosted binary.
+Moniker: duduclaw
+Tags:
+  - ai
+  - agent
+  - assistant
+  - chatbot
+  - line
+  - telegram
+  - self-hosted
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

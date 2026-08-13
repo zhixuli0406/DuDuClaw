@@ -1,0 +1,85 @@
+{
+  "name": "duduclaw",
+  "displayName": "DuDuClaw — AI 員工",
+  "description": "Chat with and approve actions from your self-hosted DuDuClaw AI employees, right inside VS Code. Connects only to the gateway URL you configure — no telemetry, no third-party servers.",
+  "version": "0.1.0",
+  "publisher": "dudustudio",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhixuli0406/DuDuClaw"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "keywords": [
+    "ai agent",
+    "duduclaw",
+    "line",
+    "assistant",
+    "self-hosted"
+  ],
+  "icon": "media/icon.png",
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "duduclaw",
+          "title": "DuDuClaw",
+          "icon": "media/paw.svg"
+        }
+      ]
+    },
+    "views": {
+      "duduclaw": [
+        {
+          "type": "webview",
+          "id": "duduclaw.panel",
+          "name": "AI 員工"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "duduclaw.login",
+        "title": "DuDuClaw: 登入 Gateway"
+      },
+      {
+        "command": "duduclaw.logout",
+        "title": "DuDuClaw: 登出"
+      }
+    ],
+    "configuration": {
+      "title": "DuDuClaw",
+      "properties": {
+        "duduclaw.gatewayUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:18789",
+          "description": "你的 DuDuClaw gateway 位址（本機預設 http://127.0.0.1:18789；遠端請用 https）。擴充功能只會連線到這個位址。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p ./",
+    "compile": "npm run check && esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node20",
+    "package": "npm run compile && npx --yes @vscode/vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  }
+}

@@ -73,7 +73,7 @@
 |------|------|
 | マルチランタイム AI エージェントプラットフォーム | 統一 `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / OpenAI-compat 5 バックエンド自動検出 |
 | MCP Server（JSON-RPC 2.0）| stdin/stdout 経由で AI Runtime に 80+ ツールを公開。`<agent>/.mcp.json` に登録（Claude CLI `-p` はプロジェクトレベルのみ読取）、起動時に自動生成/修復 |
-| ACP/A2A Server | `duduclaw acp-server` — stdio JSON-RPC 2.0（`agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`）、`.well-known/agent.json` AgentCard、Zed / JetBrains / Neovim IDE 統合 |
+| ACP/A2A Server | 2 コマンド：`duduclaw acp` — IDE agent panel 向け Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` ストリーミング、未設定時は `AUTH_REQUIRED`）；`duduclaw acp-server` — A2A プロトコル（`agent/discover` / `message/send` / `tasks/*`、`.well-known/agent.json` AgentCard） |
 | エージェントディレクトリ構造 | `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/` |
 | サブエージェントオーケストレーション | `create_agent` / `spawn_agent` / `list_agents` + `reports_to` 階層 + D3.js OrgChart + 「## Your Team」自動注入 |
 | DelegationEnvelope | 構造化受け渡しプロトコル — context / constraints / task_chain / expected_output |

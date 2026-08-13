@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "DuDuClaw — AI 員工",
+  "version": "0.1.0",
+  "description": "跟你自架的 DuDuClaw AI 員工對話、審批待決動作、把網頁選取內容餵給 agent。只連你自己設定的 gateway，無遙測。",
+  "icons": {
+    "32": "icons/32.png",
+    "64": "icons/64.png",
+    "128": "icons/128.png"
+  },
+  "action": {
+    "default_title": "開啟 DuDuClaw 側邊欄"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "options_page": "options.html",
+  "background": {
+    "service_worker": "sw.js"
+  },
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "activeTab",
+    "scripting",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ]
+}

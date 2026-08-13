@@ -44,7 +44,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | マルチ LLM フェイルオーバー | 手動再起動 | 4 種のローテーション戦略 + クロスプロバイダ failover |
 | LLM 切替時のコンテキスト | 消失 | 完全保持 |
 | 会話メモリと知識ベース | 単発セッション | SQLite 時系列メモリ + 階層 wiki を自動注入 |
-| ツールの LLM 間共有 | ベンダーごとに書き直し | 130+ MCP ツールを一度書けば 5 バックエンドで共用 |
+| ツールの LLM 間共有 | ベンダーごとに書き直し | 200+ MCP ツールを一度書けば 5 バックエンドで共用 |
 | ガードレール / 監査 / 秘密情報管理 | 自作 | ポリシーカーネル + OS サンドボックス + AES-256-GCM 内蔵 |
 
 <a id="architecture"></a>
@@ -61,7 +61,7 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WebChat
   ├─ Multi-Runtime — 5 バックエンド自動検出、エージェントごとに設定
   ├─ Session Memory — ネイティブ --resume + 時系列メモリ + key facts + 階層 wiki
-  ├─ MCP Server — 130+ ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
+  ├─ MCP Server — 200+ ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
   ├─ Evolution Engine — GVU² 二重ループ進化 + 予測駆動 + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS サンドボックス + redaction vault
   ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
@@ -162,7 +162,7 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | チャネル | 9 チャネル(Telegram / LINE / Discord + 音声 / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード | [docs/features](docs/features/README.md) |
 | マルチランタイム | Claude / Codex / Gemini / Antigravity / OpenAI-compat、自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 統一 LLM API 層 | `duduclaw-llm` が 4 つのネイティブプロトコル(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat)を単一の正規化リクエストでカバー。8 つの OpenAI-compat プリセット(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 価格レジストリ + クロスプロバイダ fallback を内蔵 | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP サーバー | 138 ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート、外部には 7 ツールのみ公開 | [docs/api](docs/api/README.md) |
+| MCP サーバー | 200+ ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート、外部には 7 ツールのみ公開 | [docs/api](docs/api/README.md) |
 | メモリ | SQLite 時系列メモリ(事実の置換チェーン)、HippoRAG-lite 知識グラフ検索(Personalized PageRank)、エビングハウス忘却曲線によるアーカイブ、エージェント横断の共有 wiki | [docs/features](docs/features/README.md) |
 | 自己進化 | GVU² 二重ループ + 予測駆動(会話の約 90% は LLM コストゼロ)、SOUL.md バージョン管理 + 24 時間観察期間つき自動ロールバック、MistakeNotebook のターン横断メモリ | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | セキュリティ | PolicyKernel reference monitor(LLM 不使用、fail-closed)、macOS Seatbelt / Linux Landlock ネイティブサンドボックス、Docker / Apple Container / WSL2 コンテナサンドボックス、secret redaction vault、CONTRACT.toml 行動契約 + レッドチーム CLI | [SECURITY.md](SECURITY.md) |
@@ -171,7 +171,7 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | Live Forking | RFC-26:進行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write 隔離、AI ジャッジが勝者を選んでマージ(デフォルト無効) | [docs/rfc](docs/rfc) |
 | 自動アップデート | ダッシュボードからワンクリック、または無人更新(`auto_update = true`)。SHA-256 + Ed25519 の二重検証後にその場で再起動、開いているタブは自動リロード | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web ダッシュボード | React 19 + TypeScript SPA 32 ページ、バイナリに内蔵で追加デプロイ不要。zh-TW / en / ja 対応 | [docs/features](docs/features/README.md) |
-| ERP 連携 | Odoo ブリッジ 15 MCP ツール(CRM / 販売 / 在庫 / 会計)、CE/EE 自動検出、エージェントごとの認証分離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| ERP 連携 | Odoo ブリッジ 17 MCP ツール(CRM / 販売 / 在庫 / 会計)、CE/EE 自動検出、エージェントごとの認証分離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 
 全機能リストは [docs/features/feature-inventory.md](docs/features/feature-inventory.md)、バージョン履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
@@ -194,7 +194,8 @@ duduclaw export / import     # ~/.duduclaw の書き出し / 取り込み(個人
 duduclaw migrate-from openclaw   # OpenClaw / Hermes / paperclip からの無痛移行(既定は dry-run、--apply で反映)
 duduclaw mcp-server          # MCP サーバー起動(stdio JSON-RPC 2.0)
 duduclaw http-server         # MCP HTTP/SSE トランスポート起動(Bearer 認証)
-duduclaw acp-server          # ACP/A2A サーバー起動(Zed / JetBrains / Neovim 連携)
+duduclaw acp                 # Agent Client Protocol サーバー起動(Zed / JetBrains / Neovim agent panel)
+duduclaw acp-server          # A2A サーバー起動(エージェント間相互運用)
 duduclaw license             # ライセンス管理(activate / status / redeem / rebind / …)
 ```
 
@@ -235,7 +236,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | 言語 | Rust | TypeScript | Rust | Python |
 | チャネル | 9 | 25+ | 8 | 0(API)|
 | マルチランタイム | 5 バックエンド | 単一 | 単一 | マルチ LLM |
-| MCP サーバー | 138 ツール | なし | なし | なし |
+| MCP サーバー | 200+ ツール | なし | なし | なし |
 | 自己進化エンジン | GVU² 二重ループ | なし | なし | なし |
 | ローカル推論 | 5 バックエンド + 信頼度ルーティング | なし | なし | なし |
 | 行動契約 | CONTRACT.toml + レッドチーム | なし | WASM サンドボックス | なし |

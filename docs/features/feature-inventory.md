@@ -9,6 +9,12 @@
 
 ---
 
+## 2026-08 additions (unreleased)
+
+| Feature | Description |
+|---------|-------------|
+| Working State — cross-wake authoritative state | Per-agent key-value posture + handoff note auto-injected into every wake-up (cron / heartbeat / goal loop / channels) as the single source of truth; explicit-tool-only updates with required reason + supersession history, `expected_value` CAS against concurrent wakes, `ttl_hours` for day-scoped rules, 32-key cap; `[memory] working_state_enabled`, default on ([44-working-state.md](44-working-state.md)) |
+
 ## 2026-08 additions (v1.53)
 
 | Feature | Description |
@@ -77,7 +83,7 @@
 |---------|-------------|
 | Multi-Runtime AI Agent Platform | Unified `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / Grok (`grok`) / OpenAI-compat six backends with auto-detection |
 | MCP Server (JSON-RPC 2.0) | Exposes 80+ tools to AI Runtime via stdin/stdout; registered at `<agent>/.mcp.json` (v1.8.5 — Claude CLI `-p` only reads project-level), gateway auto-creates/repairs on startup |
-| ACP/A2A Server | `duduclaw acp-server` — stdio JSON-RPC 2.0 with `agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`; `.well-known/agent.json` AgentCard; IDE integration (Zed / JetBrains / Neovim) |
+| ACP/A2A Server | Two commands: `duduclaw acp` — Agent Client Protocol v1 for IDE agent panels (Zed / JetBrains / nvim; `initialize` / `session/new` / `session/prompt` streaming, `AUTH_REQUIRED` when unconfigured); `duduclaw acp-server` — A2A protocol (`agent/discover` / `message/send` / `tasks/*`, `.well-known/agent.json` AgentCard) |
 | Agent Directory Structure | `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/` |
 | Sub-agent Orchestration | `create_agent` / `spawn_agent` / `list_agents` with `reports_to` hierarchy + D3.js OrgChart + "## Your Team" auto-injection |
 | DelegationEnvelope | Structured handoff protocol — context / constraints / task_chain / expected_output |

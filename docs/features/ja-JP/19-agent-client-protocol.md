@@ -13,7 +13,7 @@
 
 Zed、JetBrains、Neovim のような IDE は、DuDuClaw のチャネルインフラ全体を理解することなく、エージェントに「このタスクを引き受けられますか？」と尋ねたいのです。彼らに必要なのは予約専用回線——クリーンで安定した、プロトコル駆動のインターフェースです。
 
-それが ACP server です。
+それがこの 2 つのプロトコルサーバーの役割です。DuDuClaw はこれらを**別々のコマンド**として出荷しています：`duduclaw acp` は IDE agent panel 用の Agent Client Protocol（Zed／JetBrains／nvim——設定方法は下記「プロトコル範囲」参照）、`duduclaw acp-server` は A2A プロトコル（エージェント間・スクリプト／CI 統合、以降のセクションで説明する内容）を話します。
 
 ---
 
@@ -151,22 +151,19 @@ stdio 上の JSON-RPC は MCP が使うトランスポートと同じです—�
 
 ---
 
-## なぜ IDE 統合が重要か
+## プロトコル範囲——最初にお読みください
 
-### Zed
-
-[Zed](https://zed.dev) は、ACP 互換のあらゆるエージェントと対話できる「agent panel」を提供します。`duduclaw acp-server --agent <your-agent>` に向ければ、Zed は次のものへのネイティブアクセスを得ます：
-- タスクルーティング（`tasks/send` 経由）
-- エディタ内のインラインレスポンス
-- IDE 内のマルチターンのフォローアップ
-
-### JetBrains
-
-IntelliJ プラットフォームの AI Assistant は、プラグイン経由で ACP を話せるよう拡張できます。接続すると、エージェントはプロジェクトを閲覧し、dispatcher を流れるリファクタを提案し、worktree 分離レイヤーを通じてコミットを着地させられます。
-
-### Neovim
-
-`nvim-acp` プラグインは stdio 行プロトコルを直接使用します——`duduclaw acp-server` はドロップインのバックエンドです。エディタを離れることなく、コマンドライン駆動のエージェントアクセスが得られます。
+> **状態訂正（2026-08-13）。**`duduclaw acp-server` が現在話すのは **A2A（Agent2Agent）プロトコル**（stdio 上の `agent/discover`、`message/send`、`tasks/send|get|cancel`＋`.well-known` agent card）であり、IDE の agent panel が使う *Agent Client Protocol*（`initialize`／`authenticate`／`session/new`／`session/prompt` ストリーミング）は**未実装**です。現時点で Zed・JetBrains・`nvim-acp` を向けると `initialize` で Method not found になります。両プロトコルは不運にも「ACP」の略称を共有しており、本文書の旧版はこれらを混同していました。
+>
+> **更新（2026-08-13 同日）：本物の Agent Client Protocol は独立コマンド `duduclaw acp` として出荷されました。** ACP **v1** を実装（`initialize` → `session/new` → `session/prompt`、`session/update` ストリーミング：`agent_message_chunk`、`tool_call`／`tool_call_update`、`plan`）し、`session/cancel` にも対応（進行中のターンは spec 通り `stopReason: "cancelled"` で応答）。home 未設定時は spec の `AUTH_REQUIRED`（`-32000`）を返し、ターミナルで `duduclaw onboard` を実行する認証メソッドを宣言します。prompt ターンはメッセージングチャネルと**同一の** gateway 応答パイプライン（セッション記憶、契約チェック）を通り、Main ロールの AI 社員が応答します。
+>
+> Zed の `settings.json`：
+>
+> ```json
+> { "agent_servers": { "DuDuClaw": { "command": "duduclaw", "args": ["acp"] } } }
+> ```
+>
+> `duduclaw acp-server` は引き続き A2A 用です——2 つのプロトコルは意図的に別コマンドに分かれています。
 
 ### CI/CD パイプライン
 

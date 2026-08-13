@@ -1,0 +1,6 @@
+{
+  "name": "duduclaw-connect",
+  "description": "Connect Claude Code to your self-hosted DuDuClaw AI-employee platform: persistent memory, shared wiki, task board and channel tools via MCP.",
+  "version": "0.1.0",
+  "author": { "name": "DuDu Digital", "url": "https://github.com/zhixuli0406/DuDuClaw" }
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "duduclaw": {
+      "command": "npx",
+      "args": ["-y", "duduclaw", "mcp-server"]
+    }
+  }
+}

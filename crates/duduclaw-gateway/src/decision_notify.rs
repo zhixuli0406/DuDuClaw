@@ -503,6 +503,42 @@ pub(crate) async fn deliver_now(
                 Some(url) => format!("{}\n\n{}\n👉 {url}", card.body, card.no_button_hint),
                 None => format!("{}\n\n{}", card.body, card.no_button_hint),
             };
+            // WP1.6: Teams cards are plain text (no button codec), but the
+            // sent activity id is still worth recording — quoted-replying to
+            // the card is how Teams text-verdict decisions find it. Teams is
+            // outside `channel_editable`, so collapse never tries to edit;
+            // recording only enables the reverse lookup (same shape as LINE).
+            if channel == "teams" {
+                return match crate::msteams::send_text_to_conversation_with_id(
+                    home_dir, chat_id, &text,
+                )
+                .await
+                {
+                    Ok(pushed_id) => {
+                        if let Some(id) = pushed_id {
+                            crate::decision_message_store::record_card_message(
+                                home_dir,
+                                card.source.namespace(),
+                                card.decision_id,
+                                channel,
+                                chat_id,
+                                &crate::decision_card::PushedMessage {
+                                    edit_chat_id: chat_id.to_string(),
+                                    message_id: id,
+                                },
+                            );
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %channel, decision = %card.decision_id, error = %e,
+                            "decision-notify: teams plain push failed"
+                        );
+                        false
+                    }
+                };
+            }
             crate::goal_notify::send_plain_text(home_dir, http, channel, token, chat_id, &text).await
         }
     }

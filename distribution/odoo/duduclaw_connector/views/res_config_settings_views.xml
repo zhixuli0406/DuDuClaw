@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+  <record id="res_config_settings_view_form_duduclaw" model="ir.ui.view">
+    <field name="name">res.config.settings.view.form.inherit.duduclaw</field>
+    <field name="model">res.config.settings</field>
+    <field name="inherit_id" ref="base_setup.res_config_settings_view_form"/>
+    <field name="arch" type="xml">
+      <xpath expr="//form" position="inside">
+        <app string="DuDuClaw" name="duduclaw_connector">
+          <block title="DuDuClaw 連線">
+            <setting string="Gateway" help="模組只會連線到這個位址（你自己的伺服器）。無遙測、無第三方服務。">
+              <field name="duduclaw_gateway_url" placeholder="http://192.168.1.10:8765"/>
+              <field name="duduclaw_api_key" password="True"/>
+              <field name="duduclaw_dashboard_url" placeholder="http://192.168.1.10:18789"/>
+              <button name="action_duduclaw_test_connection" type="object"
+                      string="測試連線" class="btn-primary" icon="fa-plug"/>
+            </setting>
+          </block>
+        </app>
+      </xpath>
+    </field>
+  </record>
+</odoo>

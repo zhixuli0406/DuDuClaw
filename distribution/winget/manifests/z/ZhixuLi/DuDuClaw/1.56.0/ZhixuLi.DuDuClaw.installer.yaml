@@ -1,0 +1,17 @@
+PackageIdentifier: ZhixuLi.DuDuClaw
+PackageVersion: 1.56.0
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  # Verified 2026-08-13: duduclaw.exe sits at the zip root (python/ sidecar
+  # beside it is not required for the CLI to start).
+  - RelativeFilePath: duduclaw.exe
+    PortableCommandAlias: duduclaw
+Commands:
+  - duduclaw
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.56.0/duduclaw-windows-x64.zip
+    InstallerSha256: D7BEC015B3D0C9F4E62CCD018A675329FBB560CD8F2C6E9850CF4779EFA86406
+ManifestType: installer
+ManifestVersion: 1.6.0

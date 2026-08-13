@@ -70,7 +70,7 @@ pub struct HttpState {
 
 /// Extract and validate a Bearer API key from headers.
 /// Returns (Principal, NamespaceContext) or an error Response.
-fn authenticate_bearer(
+pub(crate) fn authenticate_bearer(
     headers: &HeaderMap,
     home_dir: &std::path::Path,
 ) -> Result<(Principal, NamespaceContext), Response> {
@@ -115,7 +115,16 @@ fn authenticate_bearer(
                 .into_response()
         })?;
 
-    let principal = authenticate_with_key(raw_key, home_dir).map_err(|e| {
+    // WP3.1-T2: OAuth-issued access tokens share the Bearer surface but live
+    // in their own store (hashed at rest); everything else stays the static
+    // mcp_keys path. Both produce a Principal that flows through the SAME
+    // scope/namespace enforcement below.
+    let auth_result = if raw_key.starts_with(crate::mcp_oauth_server::OAUTH_TOKEN_PREFIX) {
+        crate::mcp_oauth_server::validate_oauth_token(raw_key, home_dir)
+    } else {
+        authenticate_with_key(raw_key, home_dir)
+    };
+    let principal = auth_result.map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
             Json(crate::mcp_dispatch::jsonrpc_error(
@@ -209,7 +218,32 @@ pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> Router
 fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz_handler))
-        .route("/mcp/v1/call", post(call_handler));
+        // WP3.1-T1: standard MCP Streamable HTTP endpoint (spec transport for
+        // claude.ai custom connectors / MCP Inspector / any remote MCP client).
+        .route(
+            "/mcp",
+            post(crate::mcp_streamable::mcp_post_handler)
+                .get(crate::mcp_streamable::mcp_get_handler)
+                .delete(crate::mcp_streamable::mcp_delete_handler),
+        )
+        // WP3.1-T2: OAuth 2.1 surface for remote MCP clients (claude.ai
+        // custom connectors and friends). Metadata is unauthenticated by
+        // design (RFC 9728 / RFC 8414 discovery documents).
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(crate::mcp_oauth_server::protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(crate::mcp_oauth_server::authorization_server_metadata),
+        )
+        .route("/oauth/register", post(crate::mcp_oauth_server::register_handler))
+        .route("/oauth/authorize", get(crate::mcp_oauth_server::authorize_handler))
+        .route("/oauth/decision", post(crate::mcp_oauth_server::decision_handler))
+        .route("/oauth/token", post(crate::mcp_oauth_server::token_handler))
+        .route("/mcp/v1/call", post(call_handler))
+        // WP2.12: wearable-transcript ingest (vendor-webhook-friendly shape).
+        .route("/ingest/transcript", post(ingest_transcript_handler));
 
     if cfg.enable_sse {
         router = router
@@ -328,6 +362,123 @@ async fn call_handler(
     };
 
     into_axum_response(jsonrpc)
+}
+
+// ── POST /ingest/transcript ───────────────────────────────────────────────────
+
+/// WP2.12 (ecosystem): wearable-transcript ingest — a thin adapter so vendor
+/// webhooks (Omi / Plaud / anything that POSTs JSON with a transcript) can
+/// land text in agent memory WITHOUT speaking JSON-RPC. Same Bearer auth as
+/// `/mcp/v1/call`, same rate gate, and the write goes through the SAME
+/// dispatcher as a `memory_store` tool call — scope checks, the external
+/// whitelist, and write-time origin binding all apply. No second write path.
+async fn ingest_transcript_handler(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let (principal, ns_ctx) = match authenticate_bearer(&headers, &state.home_dir) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if let Err(e) = state.dispatcher.rate_limiter.check(&principal.client_id, OpType::HttpRequest) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "stored": false,
+                "error": format!("rate limited, retry after {}s", e.retry_after_secs),
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(text) = extract_transcript_text(&payload) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "stored": false,
+                "error": "no transcript text found (accepted fields: text / transcript / summary / segments[].text / transcript_segments[].text)",
+            })),
+        )
+            .into_response();
+    };
+    let source = payload
+        .get("source")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("app").and_then(|v| v.as_str()))
+        .unwrap_or("wearable");
+    // CJK-safe cap — a runaway payload becomes a truncated memory, not a DoS.
+    let text = duduclaw_core::truncate_bytes(&text, 16 * 1024);
+    let params = serde_json::json!({
+        "name": "memory_store",
+        "arguments": {
+            "content": format!("[{source} 逐字稿] {text}"),
+            "tags": format!("wearable,{source}"),
+        },
+    });
+    let jsonrpc = match tokio::time::timeout(
+        state.call_timeout,
+        state.dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &Value::Null),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({ "stored": false, "error": "timed out" })),
+            )
+                .into_response();
+        }
+    };
+    let ok = jsonrpc.get("error").is_none();
+    let status = if ok { StatusCode::OK } else { StatusCode::UNPROCESSABLE_ENTITY };
+    (status, Json(serde_json::json!({ "stored": ok, "detail": jsonrpc }))).into_response()
+}
+
+/// Lenient transcript extraction across wearable-vendor payload shapes.
+/// Whole-field reads only — no substring guessing.
+fn extract_transcript_text(v: &Value) -> Option<String> {
+    for k in ["text", "transcript", "summary"] {
+        if let Some(s) = v.get(k).and_then(|x| x.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    for k in ["segments", "transcript_segments"] {
+        if let Some(arr) = v.get(k).and_then(|x| x.as_array()) {
+            let joined = arr
+                .iter()
+                .filter_map(|s| s.get("text").and_then(|t| t.as_str()))
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !joined.trim().is_empty() {
+                return Some(joined.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod ingest_tests {
+    use super::*;
+
+    #[test]
+    fn transcript_extraction_covers_vendor_shapes() {
+        let flat = serde_json::json!({ "text": " 今天客戶說要改單 " });
+        assert_eq!(extract_transcript_text(&flat).as_deref(), Some("今天客戶說要改單"));
+        let omi = serde_json::json!({ "segments": [ {"text": "a"}, {"text": " b "}, {"speaker": "x"} ] });
+        assert_eq!(extract_transcript_text(&omi).as_deref(), Some("a b"));
+        let plaud = serde_json::json!({ "summary": "重點：週五交貨" });
+        assert_eq!(extract_transcript_text(&plaud).as_deref(), Some("重點：週五交貨"));
+        assert!(extract_transcript_text(&serde_json::json!({})).is_none());
+        assert!(extract_transcript_text(&serde_json::json!({ "text": "  " })).is_none());
+    }
 }
 
 // ── GET /mcp/v1/stream ────────────────────────────────────────────────────────

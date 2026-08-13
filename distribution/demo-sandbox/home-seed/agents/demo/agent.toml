@@ -1,0 +1,28 @@
+# Demo 導覽員 — 公開試玩站唯一員工。護欄全開：工具面全關、預算硬停。
+
+[agent]
+name = "demo"
+display_name = "嘟嘟（產品導覽員）"
+role = "main"
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = false
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = ["webchat"]
+
+[capabilities]
+computer_use = false
+browser_via_bash = false
+# Deny-by-default：demo 員工不需要任何工具。
+allowed_tools = []
+
+[budget]
+# 公開站的成本斷路器：單日 NT$150 上下（500 美分），到頂硬停，
+# 訪客會收到「已停工（花費達上限）」白話說明而不是已讀不回。
+monthly_limit_cents = 10000
+daily_cap_cents = 500
+warn_threshold_percent = 80
+hard_stop = true

@@ -470,6 +470,42 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
 /// `Scope::Admin` (a superuser in the dispatcher check), so normal operation is
 /// unaffected. When adding a new tool, map it to the least scope it needs here;
 /// leaving it unmapped means it requires Admin.
+
+/// C4 (ecosystem WP3.2): scopes an OPERATOR may grant to external clients at
+/// key issuance. Curated and conservative — credential-adjacent connector
+/// scopes (Odoo/Google/Notion/Github), execution-class scopes (Fork/OsNative/
+/// SkillExecute/Recording), the person registry (IdentityRead) and Admin are
+/// deliberately absent: external surfaces never reach them regardless of what
+/// a key claims.
+pub const EXTERNALLY_GRANTABLE_SCOPES: &[Scope] = &[
+    Scope::MemoryRead,
+    Scope::MemoryWrite,
+    Scope::WikiRead,
+    Scope::WikiWrite,
+    Scope::MessagingSend,
+];
+
+/// C4: may this EXTERNAL principal call `tool_name`?
+///
+/// Replaces the binary 7-tool whitelist with a scope-driven policy whose
+/// zero-config default is byte-identical to the old behavior:
+///   1. legacy whitelist tools → allowed (baseline unchanged), else
+///   2. the tool must HAVE a scope-table entry (unscoped ⇒ Admin-class ⇒
+///      never external), and
+///   3. that scope must be externally grantable ([`EXTERNALLY_GRANTABLE_SCOPES`]), and
+///   4. the key must carry that scope EXPLICITLY — Admin does not substitute
+///      here (an external Admin key still only widens within the grantable set).
+/// Callable ⇔ discoverable: `tools/list` filters with this same predicate.
+pub fn external_tool_allowed(tool_name: &str, principal: &Principal) -> bool {
+    if crate::mcp::EXTERNAL_TOOLS_WHITELIST.contains(&tool_name) {
+        return true;
+    }
+    let Some(required) = tool_requires_scope(tool_name) else {
+        return false;
+    };
+    EXTERNALLY_GRANTABLE_SCOPES.contains(&required) && principal.scopes.contains(&required)
+}
+
 pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
     match tool_name {
         // ── Memory: read family ──────────────────────────────────────────
@@ -488,9 +524,16 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "memory_episodic_pressure"
         | "user_profile_get"
         | "user_code_profile"
+        // Cross-wake working state — read tier.
+        | "working_state_get"
         | "code_map" => Some(Scope::MemoryRead),
         // D3.2 entity-alias mutation — write tier.
         "memory_store" | "memory_alias_add" | "user_profile_record" => Some(Scope::MemoryWrite),
+        // Cross-wake working state mutation (D3 ghost-memory fix) — the
+        // agent's own authoritative posture, same trust tier as memory_store.
+        "working_state_set" | "working_state_clear" | "working_state_handoff" => {
+            Some(Scope::MemoryWrite)
+        }
         // ── Wiki: read family ────────────────────────────────────────────
         "wiki_read"
         | "wiki_search"
@@ -1214,5 +1257,61 @@ is_external = true
         assert!(principal.is_external);
         assert!(principal.scopes.contains(&Scope::WikiRead));
         assert!(!principal.scopes.contains(&Scope::MemoryRead));
+    }
+}
+
+#[cfg(test)]
+mod external_scope_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn ext(scopes: &[Scope]) -> Principal {
+        Principal {
+            client_id: "t".into(),
+            scopes: scopes.iter().cloned().collect::<HashSet<_>>(),
+            is_external: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn default_external_key_is_byte_identical_to_legacy_whitelist() {
+        let p = ext(&[]);
+        for t in crate::mcp::EXTERNAL_TOOLS_WHITELIST {
+            assert!(external_tool_allowed(t, &p), "{t} must stay allowed");
+        }
+        // Same-family-but-off-whitelist tools stay hidden without a grant.
+        assert!(!external_tool_allowed("memory_alias_add", &p));
+        assert!(!external_tool_allowed("memory_fetch_batch", &p));
+        // Unscoped (Admin-class) tools are never external.
+        assert!(!external_tool_allowed("create_agent", &p));
+    }
+
+    #[test]
+    fn explicit_grant_widens_within_family_only() {
+        let p = ext(&[Scope::MemoryWrite]);
+        assert!(external_tool_allowed("memory_alias_add", &p));
+        assert!(external_tool_allowed("working_state_set", &p));
+        // Different family still needs its own grant.
+        assert!(!external_tool_allowed("memory_fetch_batch", &p), "read tier not granted");
+    }
+
+    #[test]
+    fn non_grantable_scopes_are_refused_even_when_the_key_claims_them() {
+        // A key that somehow carries a connector scope gains nothing:
+        // Odoo/Google/etc. are outside EXTERNALLY_GRANTABLE_SCOPES.
+        let p = ext(&[Scope::OdooRead, Scope::GoogleRead, Scope::IdentityRead]);
+        assert!(!external_tool_allowed("odoo_search", &p));
+        assert!(!external_tool_allowed("identity_resolve", &p));
+    }
+
+    #[test]
+    fn admin_does_not_substitute_for_explicit_grants_externally() {
+        let p = ext(&[Scope::Admin]);
+        // Whitelist baseline still works…
+        assert!(external_tool_allowed("memory_store", &p));
+        // …but Admin alone does not unlock the wider families.
+        assert!(!external_tool_allowed("memory_alias_add", &p));
+        assert!(!external_tool_allowed("working_state_set", &p));
     }
 }

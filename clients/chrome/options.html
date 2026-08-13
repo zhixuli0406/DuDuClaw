@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, "PingFang TC", sans-serif; max-width: 560px;
+         margin: 32px auto; padding: 0 16px; font-size: 14px; line-height: 1.6;
+         background: #fafaf9; color: #1c1917; }
+  @media (prefers-color-scheme: dark) { body { background: #1c1917; color: #fafaf9; } }
+  label { display: block; margin-top: 14px; font-weight: 600; }
+  input { width: 100%; padding: 8px; border: 1px solid #d6d3d1; border-radius: 8px;
+          background: inherit; color: inherit; box-sizing: border-box; }
+  button { background: #f59e0b; color: #fff; border: 0; border-radius: 8px;
+           padding: 8px 16px; cursor: pointer; margin-top: 16px; }
+  code { background: rgba(120,113,108,.15); padding: 2px 6px; border-radius: 4px; }
+  .note { font-size: 13px; opacity: .8; border-left: 3px solid #f59e0b; padding-left: 10px; margin-top: 20px; }
+  #msg { margin-top: 12px; }
+</style>
+</head>
+<body>
+<h2>🐾 DuDuClaw 設定</h2>
+<label>Gateway 位址</label>
+<input id="gateway" placeholder="http://127.0.0.1:18789">
+<label>Email</label>
+<input id="email" type="email" autocomplete="username">
+<label>密碼</label>
+<input id="password" type="password" autocomplete="current-password">
+<button id="loginBtn">儲存並登入</button>
+<div id="msg"></div>
+
+<div class="note">
+  <p><strong>一次性設定：gateway 來源白名單。</strong>瀏覽器擴充功能連線時會帶
+  <code>chrome-extension://…</code> 的 Origin，gateway 預設只信任 loopback 網頁來源。
+  請把下面這個擴充功能 id（純 id，不含 scheme）加進 gateway 的
+  <code>config.toml → [gateway] allowed_origins</code>（或環境變數
+  <code>DUDUCLAW_ALLOWED_ORIGINS</code>），並重載設定：</p>
+  <p><code id="extid"></code> <button id="copyId" style="margin-top:0;padding:3px 10px">複製</button></p>
+</div>
+
+<div class="note">
+  <p><strong>隱私聲明：</strong>本擴充功能只連線到你在上方設定的 gateway 位址，
+  不傳送任何資料到其他伺服器、不含遙測。登入換得的 token 存在瀏覽器的擴充功能儲存區。</p>
+</div>
+<script src="options.js"></script>
+</body>
+</html>

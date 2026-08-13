@@ -1,0 +1,63 @@
+{
+  "id": "duduclaw",
+  "name": "DuDuClaw",
+  "version": "1.56.0",
+  "description": "Multi-runtime AI agent platform — drive your self-hosted AI employees (memory, task board, channels, HITL approvals) from any ACP client.",
+  "repository": "https://github.com/zhixuli0406/DuDuClaw",
+  "website": "https://github.com/zhixuli0406/DuDuClaw",
+  "authors": [
+    "DuDu Digital (嘟嘟數位)"
+  ],
+  "license": "Apache-2.0",
+  "icon": "https://raw.githubusercontent.com/agentclientprotocol/registry/main/duduclaw/icon.svg",
+  "distribution": {
+    "npx": {
+      "package": "duduclaw",
+      "args": [
+        "acp"
+      ]
+    },
+    "binary": {
+      "darwin-aarch64": {
+        "archive": "https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.56.0/duduclaw-darwin-arm64.tar.gz",
+        "sha256": "db41f36e42a4c167ad7a5987fb4ff81d573de06924a3f5f529e7c51a1c6d17eb",
+        "cmd": "./duduclaw",
+        "args": [
+          "acp"
+        ]
+      },
+      "darwin-x86_64": {
+        "archive": "https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.56.0/duduclaw-darwin-x64.tar.gz",
+        "sha256": "b23f6028f005136541b4ce53898c515ba039e134d5585714c45247e9cd0487e8",
+        "cmd": "./duduclaw",
+        "args": [
+          "acp"
+        ]
+      },
+      "linux-aarch64": {
+        "archive": "https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.56.0/duduclaw-linux-arm64.tar.gz",
+        "sha256": "76605e857bbb0a5816b24910aa6765a9eb946f87308abea9e1d2e6d4e2197e2b",
+        "cmd": "./duduclaw",
+        "args": [
+          "acp"
+        ]
+      },
+      "linux-x86_64": {
+        "archive": "https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.56.0/duduclaw-linux-x64.tar.gz",
+        "sha256": "d3fce92674bc49c415bc6395f15a0f87691f72b8110691d4b370036b70beaa49",
+        "cmd": "./duduclaw",
+        "args": [
+          "acp"
+        ]
+      },
+      "windows-x86_64": {
+        "archive": "https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.56.0/duduclaw-windows-x64.zip",
+        "sha256": "d7bec015b3d0c9f4e62ccd018a675329fbb560cd8f2c6e9850cf4779efa86406",
+        "cmd": "./duduclaw.exe",
+        "args": [
+          "acp"
+        ]
+      }
+    }
+  }
+}

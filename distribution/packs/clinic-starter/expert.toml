@@ -1,0 +1,20 @@
+[expert]
+author = "嘟嘟數位"
+category = "health"
+description = "醫美／牙醫／自費門診的免費入門前台 AI 員工：預約改約、療程項目與價格區間、術前術後一般衛教；任何醫療判斷一律引導醫師面診，不碰醫療廣告禁語。"
+license = "Apache-2.0"
+name = "clinic-starter"
+tags = ["clinic", "starter", "taiwan"]
+version = "1.0.0"
+
+[expert.display_name]
+"zh-TW" = "診所前台助理（入門版）"
+
+[expert.channels]
+suggested = ["line"]
+
+[[expert.agents]]
+display_name = "診所前台助理"
+name = "clinic-assistant"
+role = "main"
+trigger = "@診所前台助理"

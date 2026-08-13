@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://duduclaw.app/registry/entry.schema.json",
+  "title": "DuDuClaw registry entry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["slug", "kind", "title", "description", "publisher", "license", "version", "archive_url", "sha256"],
+  "properties": {
+    "slug": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,63}$" },
+    "kind": { "enum": ["pack"] },
+    "title": { "type": "string", "minLength": 3, "maxLength": 80 },
+    "description": { "type": "string", "minLength": 10, "maxLength": 400 },
+    "publisher": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$",
+      "description": "GitHub username; CI enforces it matches the PR author, and it owns publishers/<publisher>/minisign.pub"
+    },
+    "license": { "type": "string", "minLength": 2, "maxLength": 40 },
+    "homepage": { "type": "string", "pattern": "^https://" },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "archive_url": { "type": "string", "pattern": "^https://" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "minisig_url": {
+      "type": "string",
+      "pattern": "^https://",
+      "description": "Detached minisign signature of the archive, by the publisher's registered key. Required when contains.hooks or contains.skills is true (code lane)."
+    },
+    "categories": { "type": "array", "items": { "type": "string", "maxLength": 32 }, "maxItems": 5 },
+    "tags": { "type": "array", "items": { "type": "string", "maxLength": 32 }, "maxItems": 10 },
+    "contains": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agents": { "type": "integer", "minimum": 0 },
+        "skills": { "type": "boolean" },
+        "hooks": { "type": "boolean" },
+        "wiki": { "type": "boolean" }
+      },
+      "description": "Two-lane trust model: hooks/skills present ⇒ code lane (signature mandatory); pure agents+wiki ⇒ data lane."
+    },
+    "eval_attached": { "type": "boolean", "description": "Pack ships an eval suite — quality-tier signal." }
+  }
+}

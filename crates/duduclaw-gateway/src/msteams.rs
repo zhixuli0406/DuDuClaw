@@ -256,6 +256,18 @@ pub async fn send_text_to_conversation(
     conversation_id: &str,
     markdown: &str,
 ) -> Result<(), String> {
+    send_text_to_conversation_with_id(home_dir, conversation_id, markdown).await.map(|_| ())
+}
+
+/// Like [`send_text_to_conversation`] but returns the FIRST chunk's activity
+/// id — the message head a user quotes when replying, which is how
+/// text-verdict decisions (WP1.6) find their card. `Ok(None)` only when the
+/// platform response carried no id (delivered regardless).
+pub(crate) async fn send_text_to_conversation_with_id(
+    home_dir: &Path,
+    conversation_id: &str,
+    markdown: &str,
+) -> Result<Option<String>, String> {
     let conv = lookup_conversation_ref(home_dir, conversation_id).ok_or_else(|| {
         format!("no stored conversation reference for {conversation_id} (bot must receive a message there first)")
     })?;
@@ -270,13 +282,18 @@ pub async fn send_text_to_conversation(
         user_account: conv.user_account,
     };
     let formatted = crate::markdown_render::to_teams_markdown(markdown);
+    let mut first_id: Option<String> = None;
     for chunk in crate::channel_format::split_text(&formatted, TEAMS_TEXT_CHUNK) {
-        let body = message_activity(&target, &chunk, false);
-        if send_activity(&creds, &target, &body).await.is_none() {
-            return Err("Teams send failed".into());
+        match send_activity(&creds, &target, &message_activity(&target, &chunk, false)).await {
+            Some(id) => {
+                if first_id.is_none() {
+                    first_id = Some(id);
+                }
+            }
+            None => return Err("Teams send failed".into()),
         }
     }
-    Ok(())
+    Ok(first_id)
 }
 
 /// Read config and build the Teams webhook router. `None` when unconfigured.
@@ -462,6 +479,30 @@ fn teams_quoted_context(activity: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// WP1.6: the quoted activity id of a Teams quoted reply. Teams embeds the
+/// quote as a `text/html` attachment whose `<blockquote>` open tag carries
+/// `itemid="<activity id>"` — the id of the message being replied to.
+fn teams_quoted_reply_id(activity: &serde_json::Value) -> Option<String> {
+    let arr = activity.get("attachments")?.as_array()?;
+    for a in arr {
+        if a.get("contentType").and_then(|v| v.as_str()) != Some("text/html") {
+            continue;
+        }
+        let html = a.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(open) = html.find("<blockquote") else { continue };
+        let Some(tag_end) = html[open..].find('>') else { continue };
+        let tag = &html[open..open + tag_end];
+        let Some(id_pos) = tag.find("itemid=\"") else { continue };
+        let rest = &tag[id_pos + "itemid=\"".len()..];
+        let Some(end) = rest.find('"') else { continue };
+        let id = rest[..end].trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
 async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
     let raw_text = activity.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let text = strip_mention_tags(raw_text);
@@ -559,6 +600,50 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
             teams_tenant_id,
         },
     );
+
+    // WP1.6 (ecosystem): quoted-replying to a decision card with a bare
+    // verdict（「同意」／「拒絕」…）counts as pressing its button — watch and
+    // mobile surfaces render the card text but not always the buttons. Same
+    // dispatch (auth + idempotency + accounting) as a physical press;
+    // anything that isn't a whole-message verdict on a live card falls
+    // through to normal chat. Channel-thread replies carry `;messageid=…` on
+    // `conversation.id` while the card was recorded under the base id, so
+    // both forms are tried (the quoted activity id pins the exact card).
+    if !text.is_empty() {
+        if let Some(quoted_id) = teams_quoted_reply_id(activity) {
+            let base_conv =
+                target.conversation_id.split(';').next().unwrap_or("").to_string();
+            let mut outcome = crate::decision_text::route_text_reply(
+                &state.ctx.home_dir,
+                "teams",
+                &sender_id,
+                &target.conversation_id,
+                &quoted_id,
+                &text,
+            )
+            .await;
+            if outcome.is_none() && base_conv != target.conversation_id {
+                outcome = crate::decision_text::route_text_reply(
+                    &state.ctx.home_dir,
+                    "teams",
+                    &sender_id,
+                    &base_conv,
+                    &quoted_id,
+                    &text,
+                )
+                .await;
+            }
+            if let Some(result) = outcome {
+                let ack = match result {
+                    Ok(m) => m,
+                    Err(e) => format!("⚠ {e}"),
+                };
+                let body = message_activity(&target, &ack, true);
+                let _ = send_activity(&state.creds, &target, &body).await;
+                return;
+            }
+        }
+    }
 
     // ── Typing indicator (Teams renders ~3s; refresh every 3s) ──
     let typing_state = state.clone();
@@ -1001,5 +1086,88 @@ mod quoted_context_tests {
     fn html_to_text_strips_tags_and_decodes_entities() {
         assert_eq!(html_to_text("<p>a&nbsp;&amp;&nbsp;b</p>"), "a & b");
         assert_eq!(html_to_text("<strong>粗體</strong>文字"), "粗體 文字");
+    }
+
+    // ── WP1.6: quoted-reply id extraction (text-verdict decisions) ──
+
+    #[test]
+    fn quoted_reply_id_comes_from_blockquote_itemid() {
+        // Realistic Teams quoted-reply attachment shape: the <blockquote>
+        // open tag carries itemtype + itemid (the quoted activity id).
+        let activity = serde_json::json!({
+            "text": "同意",
+            "attachments": [{
+                "contentType": "text/html",
+                "content": "<blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Reply\" \
+                            itemid=\"1755083112345\"><strong>DuDuClaw</strong>\
+                            <p>需要你的決定…</p></blockquote><p>同意</p>"
+            }]
+        });
+        assert_eq!(teams_quoted_reply_id(&activity).as_deref(), Some("1755083112345"));
+    }
+
+    #[test]
+    fn quoted_reply_id_absent_or_malformed_yields_none() {
+        // No attachments at all.
+        assert!(teams_quoted_reply_id(&serde_json::json!({"text": "同意"})).is_none());
+        // HTML without a blockquote (plain formatted message).
+        let plain = serde_json::json!({
+            "attachments": [{ "contentType": "text/html", "content": "<p>同意</p>" }]
+        });
+        assert!(teams_quoted_reply_id(&plain).is_none());
+        // Blockquote without an itemid (not a reply quote).
+        let no_id = serde_json::json!({
+            "attachments": [{ "contentType": "text/html",
+                              "content": "<blockquote><p>引文</p></blockquote>" }]
+        });
+        assert!(teams_quoted_reply_id(&no_id).is_none());
+        // Empty itemid is refused, not returned as an empty key.
+        let empty_id = serde_json::json!({
+            "attachments": [{ "contentType": "text/html",
+                              "content": "<blockquote itemid=\"\"><p>x</p></blockquote>" }]
+        });
+        assert!(teams_quoted_reply_id(&empty_id).is_none());
+        // Non-html attachments are ignored.
+        let wrong_type = serde_json::json!({
+            "attachments": [{ "contentType": "application/json",
+                              "content": "<blockquote itemid=\"9\"></blockquote>" }]
+        });
+        assert!(teams_quoted_reply_id(&wrong_type).is_none());
+    }
+
+    #[test]
+    fn teams_card_roundtrips_through_message_store_with_colon_chat_id() {
+        // Teams conversation ids carry colons (`a:1abc…`) — the store's
+        // reverse lookup must survive them (suffix-anchored key parse).
+        let dir = tempfile::tempdir().unwrap();
+        let conv = "a:1AbCdEf:GhIjKl";
+        crate::decision_message_store::record_card_message(
+            dir.path(),
+            "approval",
+            "req-42",
+            "teams",
+            conv,
+            &crate::decision_card::PushedMessage {
+                edit_chat_id: conv.into(),
+                message_id: "1755083112345".into(),
+            },
+        );
+        let hit = crate::decision_message_store::lookup_decision_by_message(
+            dir.path(),
+            "teams",
+            conv,
+            "1755083112345",
+        );
+        assert_eq!(hit, Some(("approval".to_string(), "req-42".to_string())));
+        // Wrong message id → no match.
+        assert!(
+            crate::decision_message_store::lookup_decision_by_message(
+                dir.path(),
+                "teams",
+                conv,
+                "999"
+            )
+            .is_none()
+        );
     }
 }

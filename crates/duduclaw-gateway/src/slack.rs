@@ -450,6 +450,38 @@ async fn handle_event(
         return;
     }
 
+    // WP1.6 (ecosystem): a threaded reply under a decision card carrying a
+    // bare verb (「同意」/「拒絕」…) is a button press — the thread parent IS
+    // the card, so no @mention is required (this must run before the
+    // mention-only filter). Same dispatch (auth + accounting) as a physical
+    // press; non-verb replies fall through to normal chat.
+    if let Some(parent_ts) = thread_ts.as_deref() {
+        if !text.is_empty() {
+            if let Some(outcome) = crate::decision_text::route_text_reply(
+                &ctx.home_dir,
+                "slack",
+                user,
+                channel,
+                parent_ts,
+                text,
+            )
+            .await
+            {
+                let ack = match outcome {
+                    Ok(m) => m,
+                    Err(e) => format!("⚠ {e}"),
+                };
+                let _ = http
+                    .post(format!("{SLACK_API}/chat.postMessage"))
+                    .header("Authorization", format!("Bearer {bot_token}"))
+                    .json(&json!({ "channel": channel, "thread_ts": parent_ts, "text": ack }))
+                    .send()
+                    .await;
+                return;
+            }
+        }
+    }
+
     // ── Mention-only filter ──
     // Per-agent bots default to mention-only to prevent all bots responding
     let default_mention_only = agent_name.is_some();

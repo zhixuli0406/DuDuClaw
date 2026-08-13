@@ -1,0 +1,18 @@
+<!-- 官網 demo widget 嵌入片段（WP1.3）——貼進官網任一頁 </body> 前。
+     邏輯與 clients/wordpress/duduclaw-webchat/widget.js 同一套 WebChat 訪客協定；
+     GATEWAY / KEY 換成 demo 站實際值。 -->
+<script>
+(function () {
+  var GATEWAY = 'https://demo.duduclaw.app';        // demo gateway（Cloud Run 網址或自訂網域）
+  var KEY = 'CHANGE-ME-random-16plus-chars';         // 與 gateway config.toml [webchat] widget_key 相同
+  var s = document.createElement('script');
+  // 直接複用 WordPress 外掛的 widget.js（同一份檔案可放官網 CDN／static 目錄）
+  s.src = '/assets/duduclaw-widget.js';
+  window.DUDUCLAW_WC = { gateway: GATEWAY, key: KEY, title: '問問嘟嘟 🐾', position: 'right' };
+  document.body.appendChild(s);
+  var l = document.createElement('link');
+  l.rel = 'stylesheet';
+  l.href = '/assets/duduclaw-widget.css';
+  document.head.appendChild(l);
+})();
+</script>

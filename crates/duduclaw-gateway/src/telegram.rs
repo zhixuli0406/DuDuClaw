@@ -622,6 +622,42 @@ async fn poll_loop(
                     continue;
                 }
 
+                // WP1.6 (ecosystem): replying to a decision card with a bare
+                // verb (「同意」/「拒絕」…) counts as pressing its button —
+                // watch clients render the card but not the buttons. Same
+                // dispatch (auth + accounting) as a physical press; anything
+                // that isn't a whole-message verb on a live card falls
+                // through to normal chat.
+                if replied_to_bot && !text_content.is_empty() {
+                    if let Some(reply_mid) =
+                        msg.reply_to_message.as_deref().and_then(|q| q.message_id)
+                    {
+                        let presser = msg
+                            .from
+                            .as_ref()
+                            .map(|u| u.id.to_string())
+                            .unwrap_or_default();
+                        if let Some(outcome) = crate::decision_text::route_text_reply(
+                            &ctx.home_dir,
+                            "telegram",
+                            &presser,
+                            &chat_id.to_string(),
+                            &reply_mid.to_string(),
+                            text_content,
+                        )
+                        .await
+                        {
+                            let ack = match outcome {
+                                Ok(m) => m,
+                                Err(e) => format!("⚠ {e}"),
+                            };
+                            send_reply(&client, &api_base, chat_id, &ack, thread_id, msg_id, None)
+                                .await;
+                            continue;
+                        }
+                    }
+                }
+
                 // ── Channel whitelist ──
                 if is_group && !ctx.channel_settings.is_channel_allowed("telegram", "global", &scope_id).await {
                     continue;

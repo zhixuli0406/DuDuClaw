@@ -1,0 +1,7 @@
+# Created for submission to microsoft/winget-pkgs. Regenerate per release —
+# see distribution/winget/README.md for the sync/publish runbook.
+PackageIdentifier: ZhixuLi.DuDuClaw
+PackageVersion: 1.56.0
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0
