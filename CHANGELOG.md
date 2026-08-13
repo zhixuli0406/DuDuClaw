@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.57.0] - 2026-08-13 — 生態系擴展：IDE／Remote MCP 直連、五通道文字裁決、客戶端與散發矩陣＋本地模型市集與工作狀態
+
 ### Added
 - **六個免費產業入門包（premium 降級版）＋板模畫廊擴充**：從付費產業板模降級出六個免費入門包——電商客服、房仲業務、補習班招生、健身房會務、寵物醫院前台、診所前台（`distribution/packs/`，expert pack 格式、單一 AI 員工、`expert install` 一鍵匯入）。降級刀法固定：**安全邊界與轉真人規則全數保留**（免費核心不閹割——獸醫法／醫師法／消保法紅線、急症清單、禁語表一字不減），移除的是付費版的產業法規知識包（wiki）、FAQ 題庫、多員工團隊劇本與加購話術。六包 dry-run 安裝驗證全過＋一包真安裝活測（persona／設定合併正確）；板模畫廊同步收錄六頁（SEO landing＋一鍵匯入指令），公開上架待 registry repo 建立與畫廊部署。
 - **Remote MCP：claude.ai 可以直連你自架的 DuDuClaw 了（標準 `/mcp` 端點＋完整 OAuth 2.1）**（[docs/guides/remote-mcp.md](docs/guides/remote-mcp.md)）：`duduclaw http-server` 先前只有 DuDuClaw 自定的 REST 包裝（`/mcp/v1/call`＋SSE），標準 MCP 客戶端（claude.ai 自訂連接器、Claude 行動版、MCP Inspector）無法接上。現在補齊兩塊：**①規範原生端點** `POST /mcp`——`initialize` 版本協商（2024-11-05／2025-03-26／2025-06-18）、`ping`／`tools/list`／`tools/call`，通知回 202、無 session 的無狀態模式（spec 合法；GET/DELETE 405）、`MCP-Protocol-Version` 標頭驗證、`Origin` 錨定白名單 fail-closed（防 DNS rebinding）。**②最小而完整的 OAuth 2.1 授權面**——RFC 9728 資源中繼資料（401 附 `WWW-Authenticate` 探索指標）、RFC 8414 AS 中繼資料、RFC 7591 動態註冊（僅收 https 與 loopback 回呼、拒自訂 scheme）、授權碼＋PKCE S256 必須、操作者同意頁（貼一把**內部** MCP key 證明是操作者本人；外部 key 不能自我升級）、refresh token 每用即輪替。安全模型與既有面**同一套、沒有第二條規則**：OAuth 簽發的權杖永遠是外部客戶端等級（C4 對外工具謂詞照管），scope 收斂到可對外授與白名單（連接器／執行類／Admin 永不透過 OAuth 開放）；權杖落盤只存 SHA-256（0600）、授權碼單次 10 分鐘、存取權杖 1 小時。所有行為對照官方 spec repo 2025-06-18 版逐條核驗；活體測試 45 項全過（transport 16＋OAuth 全流程 29，含負面：code 重用拒、錯 PKCE 拒、舊 refresh 燒毀、admin 工具不露出、落盤無明文）；mcp 家族 341 測試零回歸。claude.ai 端實測需公網網址（tunnel／網域），留待部署後驗收。
