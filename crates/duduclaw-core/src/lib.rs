@@ -232,15 +232,49 @@ pub const SUPPORTED_CHANNEL_TYPES: &[&str] = &[
 ///
 /// Preference order:
 /// 1. `DUDUCLAW_BIN` env var (test / override hook)
-/// 2. `std::env::current_exe()` — the actual binary path
-/// 3. Fallback to `"duduclaw"` (PATH-dependent, least robust)
+/// 2. `std::env::current_exe()` when it IS the open-source `duduclaw` binary
+/// 3. A sibling `duduclaw` next to `current_exe()` — the Enterprise fix
+///    (LWM D4 incident): when the running process is `duduclaw-pro`, writing
+///    `current_exe()` into `.mcp.json` pointed every agent's MCP server at a
+///    binary whose `mcp-server` invocation boots a second gateway and dies
+///    on the port bind — agents silently lost the entire duduclaw tool
+///    surface (memory / wiki / tasks) for four days. Enterprise images ship
+///    both binaries side by side, so prefer the sibling `duduclaw` when the
+///    current exe isn't it.
+/// 4. `current_exe()` as-is (single-binary installs), else `"duduclaw"`
+///    (PATH-dependent, least robust)
 pub fn resolve_duduclaw_bin() -> std::path::PathBuf {
     if let Ok(override_path) = std::env::var("DUDUCLAW_BIN")
         && !override_path.is_empty()
     {
         return std::path::PathBuf::from(override_path);
     }
-    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("duduclaw"))
+    let Ok(exe) = std::env::current_exe() else {
+        return std::path::PathBuf::from("duduclaw");
+    };
+    resolve_duduclaw_bin_from_exe(&exe)
+}
+
+/// Pure half of [`resolve_duduclaw_bin`] — sibling preference given the
+/// current executable path (separated so the Enterprise-container behavior
+/// is unit-testable without faking `current_exe`).
+pub fn resolve_duduclaw_bin_from_exe(exe: &std::path::Path) -> std::path::PathBuf {
+    let is_open_source = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("duduclaw"));
+    if !is_open_source {
+        if let Some(dir) = exe.parent() {
+            #[cfg(windows)]
+            let sibling = dir.join("duduclaw.exe");
+            #[cfg(not(windows))]
+            let sibling = dir.join("duduclaw");
+            if sibling.exists() {
+                return sibling;
+            }
+        }
+    }
+    exe.to_path_buf()
 }
 
 /// Validate that an agent ID is safe for filesystem and log use.
@@ -700,6 +734,31 @@ pub fn which_grok() -> Option<String> {
 /// Resolve the Grok CLI from a specific HOME. See [`which_cli_in_home`].
 pub fn which_grok_in_home(home: &std::path::Path) -> Option<String> {
     which_cli_in_home(home, "grok").or_else(|| which_cli_in_home(home, "grok-cli"))
+}
+
+#[cfg(test)]
+mod resolve_bin_tests {
+    use super::resolve_duduclaw_bin_from_exe;
+
+    /// LWM D4 regression: a `duduclaw-pro` process must resolve to the
+    /// sibling open-source `duduclaw` for `.mcp.json` generation — pro's
+    /// `mcp-server` boots a second gateway and dies on the port bind.
+    #[test]
+    fn pro_exe_prefers_sibling_open_source_binary() {
+        let dir = std::env::temp_dir().join(format!("ddc-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pro = dir.join("duduclaw-pro");
+        std::fs::write(&pro, b"x").unwrap();
+        let oss = dir.join("duduclaw");
+        std::fs::write(&oss, b"x").unwrap();
+        assert_eq!(resolve_duduclaw_bin_from_exe(&pro), oss);
+        // Open-source exe keeps itself.
+        assert_eq!(resolve_duduclaw_bin_from_exe(&oss), oss);
+        // Pro without a sibling keeps itself (single-binary install).
+        std::fs::remove_file(&oss).unwrap();
+        assert_eq!(resolve_duduclaw_bin_from_exe(&pro), pro);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

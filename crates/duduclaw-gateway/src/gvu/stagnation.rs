@@ -427,6 +427,14 @@ impl StagnationMonitor {
         let mut snapshots = Vec::with_capacity(agent_ids.len());
         for agent_id in agent_ids {
             let agent_dir = self.agents_dir.join(&agent_id);
+            // GVU-disabled agents cannot be "stuck evolving" — they opted out
+            // of evolving at all. Scanning them anyway turned rejected
+            // trigger attempts into a standing false alarm (LWM containers:
+            // 152 stagnation events = 71% of the activity feed, for agents
+            // with `gvu_enabled = false`). Alerts belong to opted-in agents.
+            if !super::trigger::agent_gvu_enabled(&agent_dir) {
+                continue;
+            }
             let cfg = GvuStagnationConfig::from_agent_dir(&agent_dir);
             let snapshot = stagnation_snapshot(&self.version_store, &agent_id, &cfg);
             if snapshot.is_stagnant() {
@@ -1020,6 +1028,13 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let agents_dir = home.path().join("agents");
         std::fs::create_dir_all(agents_dir.join("agent-dup")).unwrap();
+        // The tick-level gate skips GVU-disabled agents (fail-closed opt-in)
+        // — this fixture's agent must be opted in to be scanned at all.
+        std::fs::write(
+            agents_dir.join("agent-dup").join("agent.toml"),
+            "[evolution]\ngvu_enabled = true\n",
+        )
+        .unwrap();
         let pe = Arc::new(PredictionEngine::new(
             home.path().join("prediction.db"),
             Some(home.path().join("metacog.json")),
@@ -1050,6 +1065,44 @@ mod tests {
         );
     }
 
+    /// LWM D4 noise fix: a GVU-disabled agent (fail-closed opt-in default)
+    /// must be skipped entirely — no snapshot, no alert. 152 stagnation
+    /// events (71% of the activity feed) came from scanning agents whose
+    /// GVU was off.
+    #[tokio::test]
+    async fn monitor_skips_gvu_disabled_agents() {
+        let (_dir, db_path) = temp_db();
+        let vs = VersionStore::new(&db_path);
+        for _ in 0..5 {
+            vs.record_experiment(&ExperimentLogEntry::new(
+                "agent-off",
+                3,
+                3,
+                StdDuration::from_secs(60),
+                "abandoned",
+                "same reason repeated",
+            ));
+        }
+        let home = tempfile::TempDir::new().unwrap();
+        let agents_dir = home.path().join("agents");
+        // No agent.toml at all (default) and an explicit false both gate out.
+        std::fs::create_dir_all(agents_dir.join("agent-off")).unwrap();
+        std::fs::write(
+            agents_dir.join("agent-off").join("agent.toml"),
+            "[evolution]\ngvu_enabled = false\n",
+        )
+        .unwrap();
+        let pe = Arc::new(PredictionEngine::new(
+            home.path().join("prediction.db"),
+            Some(home.path().join("metacog.json")),
+        ));
+        let monitor =
+            StagnationMonitor::new(&db_path, None, agents_dir, home.path().to_path_buf(), pe);
+        let snapshots = monitor.tick().await;
+        assert!(snapshots.is_empty(), "disabled agent must not be scanned");
+        assert!(!monitor.last_alerted.lock().await.contains_key("agent-off"));
+    }
+
     #[tokio::test]
     async fn monitor_clears_fingerprint_on_recovery() {
         let (_dir, db_path) = temp_db();
@@ -1074,6 +1127,12 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let agents_dir = home.path().join("agents");
         std::fs::create_dir_all(agents_dir.join("agent-rec")).unwrap();
+        // Opt in past the tick-level gvu_enabled gate (see the sibling test).
+        std::fs::write(
+            agents_dir.join("agent-rec").join("agent.toml"),
+            "[evolution]\ngvu_enabled = true\n",
+        )
+        .unwrap();
         let pe = Arc::new(PredictionEngine::new(
             home.path().join("prediction.db"),
             Some(home.path().join("metacog.json")),

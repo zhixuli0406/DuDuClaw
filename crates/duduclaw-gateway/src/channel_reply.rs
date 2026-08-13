@@ -1025,7 +1025,120 @@ pub async fn build_reply_with_session(
     let agent_id = resolve_agent_for_restore(ctx, session_id).await;
     let restored = restore_for_channel(raw, ctx, &agent_id, session_id).await;
     let enforced = enforce_contract(restored, &ctx.home_dir, &agent_id).await;
-    append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id)
+    let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id);
+    append_branding_footer(with_notice, &ctx.home_dir, session_id).await
+}
+
+/// WP1.4 (ecosystem, 2026-08-13 拍板): free-tier branding footer on
+/// end-customer channel replies. Free tiers (OpenSource / Hobby) always show
+/// it; paid tiers may opt out via `config.toml [branding] reply_footer =
+/// false` — the config is license-gated, so flipping it on a free install is
+/// a no-op. Consistent with the edition principle: quota/branding-locked,
+/// never capability-locked.
+///
+/// Scope: EXTERNAL channel sessions only (the surfaces end customers see).
+/// The dashboard's own WebChat console and internal sessions (cron / bus /
+/// "default") stay clean — branding the owner's console serves nobody.
+const BRANDING_FOOTER: &str = "— Powered by DuDuClaw 🐾";
+
+/// Session prefixes that reach end customers (external messaging platforms).
+const FOOTER_CHANNELS: &[&str] = &[
+    "telegram", "discord", "slack", "line", "whatsapp", "feishu", "googlechat", "teams",
+    "wecom", "dingtalk",
+];
+
+fn footer_applies_to_session(session_id: &str) -> bool {
+    FOOTER_CHANNELS
+        .iter()
+        .any(|c| session_id.strip_prefix(c).is_some_and(|rest| rest.starts_with(':')))
+}
+
+/// `[branding] reply_footer` from config.toml; absent/malformed ⇒ `true`
+/// (footer on) — fail-open to visibility, never to silence.
+fn branding_footer_enabled(home_dir: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(home_dir.join("config.toml")) else {
+        return true;
+    };
+    let Ok(v) = raw.parse::<toml::Value>() else {
+        return true;
+    };
+    v.get("branding")
+        .and_then(|b| b.get("reply_footer"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true)
+}
+
+async fn append_branding_footer(
+    reply: String,
+    home_dir: &std::path::Path,
+    session_id: &str,
+) -> String {
+    // Deliberate silences (gates upstream) stay silent; non-customer
+    // sessions stay unbranded.
+    if reply.is_empty() || !footer_applies_to_session(session_id) {
+        return reply;
+    }
+    // Paid tiers may opt out; free tiers (and no-license installs) always
+    // show the footer. `global()` absent ⇒ treat as free (fail to visible).
+    let paid = match crate::license_runtime::global() {
+        Some(rt) => !matches!(
+            rt.current_tier().await,
+            duduclaw_license::LicenseTier::OpenSource | duduclaw_license::LicenseTier::Hobby
+        ),
+        None => false,
+    };
+    if paid && !branding_footer_enabled(home_dir) {
+        return reply;
+    }
+    format!("{reply}\n\n{BRANDING_FOOTER}")
+}
+
+#[cfg(test)]
+mod branding_footer_tests {
+    use super::*;
+
+    #[test]
+    fn footer_targets_external_channels_only() {
+        assert!(footer_applies_to_session("line:U123"));
+        assert!(footer_applies_to_session("telegram:42#topic:7"));
+        // Owner console + internal sessions stay unbranded.
+        assert!(!footer_applies_to_session("webchat:conn#agent:a"));
+        assert!(!footer_applies_to_session("default"));
+        assert!(!footer_applies_to_session("cron:daily"));
+        // Prefix must be exact-token (`linex:` is not `line:`).
+        assert!(!footer_applies_to_session("linex:U123"));
+    }
+
+    #[test]
+    fn config_gate_fails_open_to_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        // No config at all ⇒ on.
+        assert!(branding_footer_enabled(dir.path()));
+        // Malformed config ⇒ on.
+        std::fs::write(dir.path().join("config.toml"), "{{{").unwrap();
+        assert!(branding_footer_enabled(dir.path()));
+        // Explicit opt-out parses.
+        std::fs::write(dir.path().join("config.toml"), "[branding]\nreply_footer = false\n")
+            .unwrap();
+        assert!(!branding_footer_enabled(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn footer_appends_on_free_tier_and_skips_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // No global license runtime in tests ⇒ treated as free ⇒ footer on,
+        // even when the config says off (the opt-out is paid-gated).
+        std::fs::write(dir.path().join("config.toml"), "[branding]\nreply_footer = false\n")
+            .unwrap();
+        let out = append_branding_footer("好的，已完成".into(), dir.path(), "line:U1").await;
+        assert!(out.ends_with(BRANDING_FOOTER), "free tier must keep the footer: {out}");
+        // Deliberate silence stays silent.
+        let silent = append_branding_footer(String::new(), dir.path(), "line:U1").await;
+        assert!(silent.is_empty());
+        // Owner console stays unbranded.
+        let console = append_branding_footer("hi".into(), dir.path(), "webchat:c#a").await;
+        assert_eq!(console, "hi");
+    }
 }
 
 /// Append any pending "rules changed" / "model switched" FYI line(s) — see
@@ -2157,6 +2270,22 @@ async fn build_reply_with_session_inner(
                         prompt = format!("{prompt}\n\n{s}");
                     }
                 }
+            }
+        }
+
+        // Cross-wake working state: the agent's authoritative key-value
+        // posture + handoff note (working_state.rs, D3 ghost-memory fix).
+        // Placed BEFORE the recent-actions feed — standing authority first,
+        // action evidence second. Tail placement, after CACHE_SPLIT_MARKER.
+        {
+            let home = ctx.home_dir.clone();
+            let aid = agent_id.clone();
+            if let Ok(Some(section)) = tokio::task::spawn_blocking(move || {
+                crate::working_state::build_working_state_section(&home, &aid)
+            })
+            .await
+            {
+                prompt = format!("{prompt}\n\n{section}");
             }
         }
 

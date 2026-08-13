@@ -21,6 +21,7 @@ import {
   Plug,
   CreditCard,
   Cpu,
+  HardDriveDownload,
   Activity,
   Shield,
   Scale,
@@ -513,6 +514,9 @@ export const manageAdvancedNav: NavItem[] = [
   { to: '/manage/logs', icon: FileText, label: 'manage.logs', desc: 'manage.logs.desc', minRole: 'manager' },
   { to: '/manage/reliability', icon: Activity, label: 'manage.reliability', desc: 'manage.reliability.desc', minRole: 'admin', personalHidden: true },
   { to: '/manage/inference', icon: Cpu, label: 'manage.inference', desc: 'manage.inference.desc', minRole: 'admin' },
+  // 本地模型市集 — intent + hardware-fit HF picker with one-click install
+  // (design: DESIGN-local-model-marketplace-2026-08-13).
+  { to: '/manage/local-models', icon: HardDriveDownload, label: 'manage.localModels', desc: 'manage.localModels.desc', minRole: 'admin' },
   // 資料搬家 is a one-shot wizard — the least-often-opened row that still is
   // not the catch-all settings page.
   { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },

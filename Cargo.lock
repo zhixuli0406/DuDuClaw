@@ -2070,6 +2070,7 @@ dependencies = [
  "http-body-util",
  "iana-time-zone",
  "json5",
+ "minisign-verify",
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.28",

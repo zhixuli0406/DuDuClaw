@@ -63,6 +63,9 @@ pub mod decision_capture;
 pub mod decision_card;
 pub mod decision_message_store;
 pub mod decision_notify;
+// WP1.6 (ecosystem): text-reply decisions — replying to a decision card with
+// a bare verb counts as a button press (wrist/watch clients have no buttons).
+pub mod decision_text;
 // W2-4 notification governance: the gate every outbound notification passes
 // through (levels + quiet hours + deferred queue), its action-rate telemetry,
 // and the scheduled daily digest.
@@ -270,6 +273,17 @@ pub mod night_llm;
 // evidence block) and `prediction::task_observe` (A3 observation layer).
 pub mod recent_actions;
 pub mod tool_activity;
+
+// ── D3 (LWM incident): per-agent authoritative working state — pinned
+//    key-value block + handoff note injected into every wake-up, updated
+//    only via explicit MCP tools with CAS supersession (ghost-memory fix,
+//    A-TMA arXiv:2607.01935 / Letta memory-block pattern) ──
+pub mod working_state;
+
+// ── Local-model marketplace backend (`localmodels.*` RPCs): HF intent
+//    sweep + hardware fit via duduclaw-inference::model_registry::market,
+//    install-job registry over the resumable downloader ──
+pub mod local_models;
 
 // ── G1: durable multi-agent dispatch engine (atomic claim / zombie reclaim /
 //        dependency unlock / goal-mode judge acceptance) ──

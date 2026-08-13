@@ -174,6 +174,9 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
       en['manage.logs'],
       en['manage.reliability'],
       en['manage.inference'],
+      // 本地模型市集 rides directly after 推理設定 — same mental bucket
+      // (local model runtime), install surface next to its settings.
+      en['manage.localModels'],
       en['manage.migrate'],
       // catch-all last.
       en['manage.system'],

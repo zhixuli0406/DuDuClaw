@@ -395,7 +395,142 @@ pub async fn call_claude_for_agent_with_type(
     prompt: &str,
     request_type: crate::cost_telemetry::RequestType,
 ) -> Result<String, String> {
-    call_claude_for_agent_impl(home_dir, registry, agent_id, prompt, request_type, None).await
+    invoke_recorded(
+        home_dir,
+        agent_id,
+        prompt,
+        request_type,
+        call_claude_for_agent_impl(home_dir, registry, agent_id, prompt, request_type, None),
+    )
+    .await
+}
+
+/// Wrap one dispatcher invocation with dispatch-run recording — the LWM D4
+/// observability gap: 202 intraday cron runs left zero rows anywhere the
+/// dashboard could read (`runs.list` folds channel sessions only, and the
+/// `run_steps` step stream was channel_reply-exclusive). Cron/Dispatch
+/// invocations now land one `dispatch_runs` row (+ per-tool steps under
+/// `dispatch:<run_id>`) in `run_steps.db`.
+///
+/// Chat/Evolution invocations pass through untouched (channel runs and
+/// evolution events already have their own surfaces — no double-recording).
+/// Recording is strictly fail-open: a store failure never affects the reply.
+async fn invoke_recorded<F>(
+    home_dir: &Path,
+    agent_id: &str,
+    prompt: &str,
+    request_type: crate::cost_telemetry::RequestType,
+    fut: F,
+) -> Result<String, String>
+where
+    F: std::future::Future<Output = Result<String, String>>,
+{
+    use crate::cost_telemetry::RequestType as RT;
+    if !matches!(request_type, RT::Cron | RT::Dispatch) {
+        return fut.await;
+    }
+    let started_at = chrono::Utc::now().to_rfc3339();
+    // Native-tool collection: REUSE an outer scope when the goal loop already
+    // installed one — installing a nested scope would shadow it and starve
+    // the settle-side evidence consumers (forward-model observe / grounding /
+    // judge digest). Cloning the accumulated events is read-only. Only when
+    // no scope exists (plain cron / bus dispatch) do we install our own.
+    let outer_scope = crate::runtime::NATIVE_TOOL_COLLECTOR.try_with(|_| ()).is_ok();
+    let (result, events) = if outer_scope {
+        let r = fut.await;
+        let ev = crate::runtime::NATIVE_TOOL_COLLECTOR
+            .try_with(|c| c.lock().map(|g| g.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        (r, ev)
+    } else {
+        let collector: std::sync::Arc<std::sync::Mutex<Vec<crate::runtime::NativeToolEvent>>> =
+            Default::default();
+        let r = crate::runtime::NATIVE_TOOL_COLLECTOR
+            .scope(collector.clone(), fut)
+            .await;
+        let ev = collector
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        (r, ev)
+    };
+    let ended_at = chrono::Utc::now().to_rfc3339();
+    let (status, preview_out) = match &result {
+        Ok(text) => ("completed".to_string(), text.clone()),
+        Err(e) => ("error".to_string(), e.clone()),
+    };
+    let steps: Vec<(String, bool)> =
+        events.iter().map(|e| (e.tool_name.clone(), e.success)).collect();
+    if let Some(store) = crate::run_steps::shared_store(home_dir) {
+        let agent = agent_id.to_string();
+        let source = request_type.as_str().to_string();
+        // Store masks + caps again; this pre-trim just bounds the move.
+        let preview_in = duduclaw_core::truncate_chars(prompt, 500);
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.record_dispatch_run(
+                &agent, &source, &started_at, &ended_at, &status, &preview_in, &preview_out,
+                &steps,
+            ) {
+                tracing::debug!(error = %e, "dispatch run record failed (ignored)");
+            }
+        })
+        .await;
+    }
+
+    // Knowledge/memory extraction for scheduled work (LWM D4 finding #2):
+    // the whole distillation pipeline (`wiki_ingest::run_ingest` → memory
+    // facts + auto wiki pages) hung exclusively off the channel-reply path,
+    // so a cron-driven agent accumulated NOTHING in four days of real
+    // decisions (observer: not even a memory.db). Feed successful Cron/
+    // Dispatch runs through the same pipeline, throttled to one ingest per
+    // agent per hour — intraday crons repeat every 3 minutes with mostly
+    // identical content, and `classify_for_ingest`'s cloud indicators would
+    // otherwise burn a utility call per patrol. Fail-open: throttle-file
+    // errors just skip this round's ingest.
+    if let Ok(reply) = &result {
+        if !reply.trim().is_empty() && ingest_throttle_acquire(home_dir, agent_id) {
+            let user_text = prompt.to_string();
+            let reply = reply.clone();
+            let agent = agent_id.to_string();
+            let home = home_dir.to_path_buf();
+            let memory_db = home_dir.join("memory.db");
+            let session = format!("{}:{agent_id}", request_type.as_str());
+            tokio::spawn(async move {
+                crate::wiki_ingest::run_ingest(
+                    &user_text, &reply, &agent, "system", &home, &memory_db, &session,
+                )
+                .await;
+            });
+        }
+    }
+    result
+}
+
+/// Sliding one-hour throttle for dispatch-path ingestion, keyed per agent by
+/// a stamp file's mtime. Returns `true` (and refreshes the stamp) when this
+/// invocation may ingest. Any filesystem error skips ingestion (fail-open
+/// toward "no extra cost", never toward "burn a call").
+fn ingest_throttle_acquire(home_dir: &Path, agent_id: &str) -> bool {
+    const THROTTLE_SECS: u64 = 3600;
+    if !duduclaw_core::is_valid_agent_id(agent_id) {
+        return false;
+    }
+    let dir = home_dir.join("ingest_throttle");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let stamp = dir.join(format!("{agent_id}.stamp"));
+    if let Ok(meta) = std::fs::metadata(&stamp) {
+        if let Ok(modified) = meta.modified() {
+            match modified.elapsed() {
+                Ok(age) if age.as_secs() < THROTTLE_SECS => return false,
+                // Future mtime (clock skew) — treat as fresh, skip.
+                Err(_) => return false,
+                _ => {}
+            }
+        }
+    }
+    std::fs::write(&stamp, chrono::Utc::now().to_rfc3339()).is_ok()
 }
 
 /// O2 (ephemeral sub-agent synthesis): like [`call_claude_for_agent_with_type`]
@@ -413,13 +548,12 @@ pub async fn call_claude_for_agent_preloaded(
     request_type: crate::cost_telemetry::RequestType,
 ) -> Result<String, String> {
     let agent_id = agent.config.agent.name.clone();
-    call_claude_for_agent_impl(
+    invoke_recorded(
         home_dir,
-        registry,
         &agent_id,
         prompt,
         request_type,
-        Some(agent),
+        call_claude_for_agent_impl(home_dir, registry, &agent_id, prompt, request_type, Some(agent)),
     )
     .await
 }
@@ -529,6 +663,18 @@ async fn call_claude_for_agent_impl(
         }),
         None => tasks_suffix,
     };
+    // Cross-wake working state: the agent's authoritative key-value posture
+    // + handoff note (working_state.rs, D3 ghost-memory fix). Placed BEFORE
+    // the recent-actions feed — standing authority first, action evidence
+    // second. Same uncached dynamic block as the task queue.
+    let tasks_suffix =
+        match crate::working_state::build_working_state_section(home_dir, agent_id) {
+            Some(ws) => Some(match tasks_suffix {
+                Some(t) => format!("{t}\n\n{ws}"),
+                None => ws,
+            }),
+            None => tasks_suffix,
+        };
     // Cross-invocation continuity: recent self-action feed from the audit
     // log, so a dispatch/cron/heartbeat run opens aware of what this agent
     // already did in other invocations (channel replies included). Same

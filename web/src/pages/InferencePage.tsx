@@ -267,6 +267,18 @@ export function InferencePage() {
         </div>
       </div>
 
+      {/* Model install moved to the marketplace — this page keeps runtime
+          settings only (the old curated list UX is retired). */}
+      <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
+        <Cpu className="mt-0.5 size-4 shrink-0 text-brand" />
+        <span>
+          {t('inference.marketplaceMoved')}{' '}
+          <a href="/manage/local-models" className="text-brand underline underline-offset-2">
+            {t('manage.localModels')}
+          </a>
+        </span>
+      </div>
+
       {/* Advanced-notice banner */}
       <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
         <AlertTriangle className="mt-0.5 size-4 shrink-0 text-brand" />

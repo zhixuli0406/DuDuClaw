@@ -63,6 +63,7 @@ const GovernancePage = lazyPage(() => import('./pages/GovernancePage'), 'Governa
 const ReliabilityPage = lazyPage(() => import('./pages/ReliabilityPage'), 'ReliabilityPage');
 const SettingsPage = lazyPage(() => import('./pages/SettingsPage'), 'SettingsPage');
 const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'InferencePage');
+const LocalModelsPage = lazyPage(() => import('./pages/LocalModelsPage'), 'LocalModelsPage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const DepartmentsPage = lazyPage(() => import('./pages/DepartmentsPage'), 'DepartmentsPage');
 const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
@@ -257,6 +258,7 @@ export function App() {
                   <Route path="updates" element={<SystemUpdatePage />} />
                   <Route path="integrations" element={<IntegrationsPage />} />
                   <Route path="inference" element={<InferencePage />} />
+                  <Route path="local-models" element={<LocalModelsPage />} />
                   <Route path="reliability" element={<ReliabilityPage />} />
                   <Route path="security" element={<SecurityPage />} />
                   <Route path="system" element={<SettingsPage />} />
@@ -315,6 +317,7 @@ export function App() {
                 <Route path="reliability" element={<ReliabilityPage />} />
                 <Route path="settings" element={<SettingsPage />} />
                 <Route path="inference" element={<InferencePage />} />
+                <Route path="local-models" element={<LocalModelsPage />} />
                 {/* D10-B: the aliases were the hole — every Enterprise-only page
                     had an ungated second path in here. Same guard as the
                     canonical routes above, so neither can be used to walk around

@@ -43,6 +43,39 @@ pub const PRUNE_EVERY_INSERTS: u64 = 1_000;
 const LABEL_CHAR_CAP: usize = 120;
 const PAYLOAD_PREVIEW_CHAR_CAP: usize = 500;
 
+/// One cron/dispatch invocation row (`dispatch_runs`), for the `runs.list`
+/// merge — the scheduled-run twin of the session-folded channel runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatchRunRow {
+    pub id: i64,
+    pub agent_id: String,
+    /// `RequestType::as_str()` — "cron" | "dispatch".
+    pub source: String,
+    pub started_at: String,
+    pub ended_at: String,
+    /// "completed" | "error".
+    pub status: String,
+    pub preview_in: String,
+    pub preview_out: String,
+    pub step_count: usize,
+}
+
+/// Row mapper shared by [`RunStepStore::list_dispatch_runs`] and
+/// [`RunStepStore::get_dispatch_run`] (identical column order).
+fn map_dispatch_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchRunRow> {
+    Ok(DispatchRunRow {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        source: row.get(2)?,
+        started_at: row.get(3)?,
+        ended_at: row.get(4)?,
+        status: row.get(5)?,
+        preview_in: row.get(6)?,
+        preview_out: row.get(7)?,
+        step_count: row.get::<_, i64>(8)?.max(0) as usize,
+    })
+}
+
 /// One persisted step row, as read back for `runs.get`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunStepRow {
@@ -119,7 +152,20 @@ impl RunStepStore {
 
              CREATE INDEX IF NOT EXISTS idx_run_steps_session ON run_steps(session_key, id);
              CREATE INDEX IF NOT EXISTS idx_run_steps_agent   ON run_steps(agent_id, id);
-             CREATE INDEX IF NOT EXISTS idx_run_steps_ts      ON run_steps(ts);",
+             CREATE INDEX IF NOT EXISTS idx_run_steps_ts      ON run_steps(ts);
+
+             CREATE TABLE IF NOT EXISTS dispatch_runs (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 agent_id    TEXT NOT NULL,
+                 source      TEXT NOT NULL,
+                 started_at  TEXT NOT NULL,
+                 ended_at    TEXT NOT NULL,
+                 status      TEXT NOT NULL,
+                 preview_in  TEXT NOT NULL DEFAULT '',
+                 preview_out TEXT NOT NULL DEFAULT '',
+                 step_count  INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_dispatch_runs_agent ON dispatch_runs(agent_id, id);",
         )
         .map_err(|e| format!("init run_steps schema: {e}"))?;
         Ok(())
@@ -184,6 +230,89 @@ impl RunStepStore {
         }
     }
 
+    /// Record one finished cron/dispatch invocation (LWM D4 observability
+    /// gap: 202 intraday cron runs, zero rows anywhere the dashboard could
+    /// read). Inserts the run row, then one `tool_step` per collected native
+    /// tool event under session_key `dispatch:<run_id>` so `runs.get` can
+    /// replay them with the existing step query. Previews are secret-masked
+    /// + char-capped like every other write here. Returns the run id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_dispatch_run(
+        &self,
+        agent_id: &str,
+        source: &str,
+        started_at: &str,
+        ended_at: &str,
+        status: &str,
+        preview_in: &str,
+        preview_out: &str,
+        steps: &[(String, bool)],
+    ) -> Result<i64, String> {
+        let preview_in =
+            duduclaw_core::truncate_chars(&mask_secretish(preview_in), PAYLOAD_PREVIEW_CHAR_CAP);
+        let preview_out =
+            duduclaw_core::truncate_chars(&mask_secretish(preview_out), PAYLOAD_PREVIEW_CHAR_CAP);
+        let run_id: i64 = {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO dispatch_runs
+                 (agent_id, source, started_at, ended_at, status, preview_in, preview_out, step_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    agent_id, source, started_at, ended_at, status, preview_in, preview_out,
+                    steps.len() as i64
+                ],
+            )
+            .map_err(|e| format!("insert dispatch run: {e}"))?;
+            conn.last_insert_rowid()
+        };
+        let session_key = format!("dispatch:{run_id}");
+        for (seq, (tool_name, success)) in steps.iter().enumerate() {
+            let label = if *success {
+                tool_name.clone()
+            } else {
+                format!("{tool_name} ❌")
+            };
+            self.append_best_effort(agent_id, &session_key, KIND_TOOL_STEP, &label, "", seq as i64);
+        }
+        Ok(run_id)
+    }
+
+    /// Newest dispatch runs, optionally agent-scoped, for the `runs.list`
+    /// merge. Retention rides on the run_steps prune cycle (see [`prune`]).
+    pub fn list_dispatch_runs(
+        &self,
+        agent_filter: &str,
+        limit: usize,
+    ) -> Result<Vec<DispatchRunRow>, String> {
+        let conn = self.lock();
+        let sql = "SELECT id, agent_id, source, started_at, ended_at, status, preview_in,
+                          preview_out, step_count
+                   FROM dispatch_runs
+                   WHERE (?1 = '' OR agent_id = ?1)
+                   ORDER BY id DESC LIMIT ?2";
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![agent_filter, limit as i64], map_dispatch_run)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// One dispatch run by id, for `runs.get`'s `dispatch:<id>` branch.
+    pub fn get_dispatch_run(&self, id: i64) -> Result<Option<DispatchRunRow>, String> {
+        let conn = self.lock();
+        let sql = "SELECT id, agent_id, source, started_at, ended_at, status, preview_in,
+                          preview_out, step_count
+                   FROM dispatch_runs WHERE id = ?1";
+        match conn.query_row(sql, params![id], map_dispatch_run) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Retention: delete rows older than [`RETENTION_DAYS`] (all agents —
     /// one cheap indexed range delete) and cap **every** agent at
     /// [`PER_AGENT_ROW_CAP`] most-recent rows.
@@ -213,6 +342,12 @@ impl RunStepStore {
                 params![PER_AGENT_ROW_CAP as i64],
             )
             .map_err(|e| format!("prune run_steps by cap: {e}"))?;
+        // Dispatch-run rows ride the same age-based retention (their step
+        // rows are already covered by the two deletes above).
+        let _ = conn.execute(
+            "DELETE FROM dispatch_runs WHERE started_at < ?1",
+            params![cutoff],
+        );
         Ok(by_age + by_cap)
     }
 
@@ -394,6 +529,52 @@ pub(crate) fn mask_secretish(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_run_record_list_get_roundtrip() {
+        let store = RunStepStore::open_in_memory().unwrap();
+        let steps = vec![
+            ("mcp__masterlink__quote".to_string(), true),
+            ("place_order".to_string(), false),
+        ];
+        let run_id = store
+            .record_dispatch_run(
+                "trader",
+                "cron",
+                "2026-08-13T01:00:00+00:00",
+                "2026-08-13T01:01:00+00:00",
+                "completed",
+                "【每日盤前】檢查掛單",
+                "已完成盤前檢查",
+                &steps,
+            )
+            .unwrap();
+        // Another agent's run — the agent filter must exclude it.
+        store
+            .record_dispatch_run(
+                "observer", "dispatch", "2026-08-13T02:00:00+00:00",
+                "2026-08-13T02:01:00+00:00", "error", "in", "boom", &[],
+            )
+            .unwrap();
+
+        let all = store.list_dispatch_runs("", 10).unwrap();
+        assert_eq!(all.len(), 2);
+        let mine = store.list_dispatch_runs("trader", 10).unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].step_count, 2);
+        assert_eq!(mine[0].source, "cron");
+
+        let got = store.get_dispatch_run(run_id).unwrap().unwrap();
+        assert_eq!(got.agent_id, "trader");
+        assert_eq!(got.preview_out, "已完成盤前檢查");
+        assert!(store.get_dispatch_run(9999).unwrap().is_none());
+
+        // Steps land under the run's session key, failures marked.
+        let rows = store.recent_for_session(&format!("dispatch:{run_id}"), 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "mcp__masterlink__quote");
+        assert!(rows[1].label.contains('❌'));
+    }
 
     #[test]
     fn roundtrip_append_and_read_back() {
