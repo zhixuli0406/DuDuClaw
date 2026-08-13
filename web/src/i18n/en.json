@@ -174,6 +174,8 @@
   "agents.create.displayName": "Display Name",
   "agents.create.idHint": "Lowercase letters, numbers, hyphens",
   "agents.create.triggerHint": "Leave empty to auto-generate",
+  "agents.create.model": "Model",
+  "agents.create.modelHint": "Which model this employee replies with by default; you can change it anytime under the employee's Brain & Engine settings.",
   "agents.create.error": "Failed to create agent. Please check the name format.",
   "agents.create.template": "Apply a template",
   "agents.create.template.blank": "Blank (no template)",

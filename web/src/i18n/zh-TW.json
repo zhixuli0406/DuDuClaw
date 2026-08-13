@@ -173,6 +173,8 @@
   "agents.create.displayName": "顯示名稱",
   "agents.create.idHint": "小寫英文、數字、連字號",
   "agents.create.triggerHint": "留空則自動產生",
+  "agents.create.model": "使用的模型",
+  "agents.create.modelHint": "這位員工預設用哪個模型回覆；之後可在員工設定的「腦袋與引擎」隨時更換。",
   "agents.create.error": "新增 AI 員工失敗，請確認名稱格式正確",
   "agents.create.template": "套用板模",
   "agents.create.template.blank": "空白（不套板模）",
