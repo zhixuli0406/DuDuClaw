@@ -3356,6 +3356,9 @@ export const api = {
       /** Optional `[runtime]` written at create time (e.g. onboarding picks a
        *  non-Claude backend). Omit ⇒ defaults to Claude. */
       runtime?: AgentRuntime;
+      /** Preferred model chosen in the create form (unified id). Omit ⇒ server
+       *  falls back to a default for programmatic callers only. */
+      model_preferred?: string;
     }) =>
       client.call('agents.create', params) as Promise<{ success: boolean; agent: AgentInfo }>,
     delegate: (agentId: string, prompt: string) =>

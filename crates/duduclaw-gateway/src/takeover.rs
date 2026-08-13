@@ -4,8 +4,13 @@
 //!
 //! When somebody the dashboard knows as a manager **speaks** in a channel
 //! conversation, the AI stops answering that one conversation for a bounded
-//! window (default 60 minutes). No button, no mode switch, no global setting:
-//! typing *is* the declaration. While the window is open, every path that
+//! window (default 60 minutes). No button, no mode switch: typing *is* the
+//! declaration. This automatic path is **opt-in** (`config.toml [takeover]
+//! enabled`, default `false`) — on-by-default silenced the AI whenever an
+//! owner/admin talked to their *own* assistant (every Personal-edition chat),
+//! which is never a takeover; it is meaningful only for teams whose AI answers
+//! others. The explicit `/takeover` command works regardless. While the window
+//! is open, every path that
 //! could put an AI message into that conversation is skipped, and the goal
 //! tasks the conversation spawned are stamped as handled by a human. When the
 //! window closes — by timer or by `/takeover end` — the conversation says so.
@@ -548,7 +553,8 @@ mod tests {
     use duduclaw_core::takeover_state::DEFAULT_DURATION_MINUTES;
 
     fn cfg() -> TakeoverConfig {
-        TakeoverConfig::default()
+        // Behaviour tests opt in explicitly (default is now off).
+        TakeoverConfig { enabled: true, ..TakeoverConfig::default() }
     }
 
     /// D5 inventory, kept next to the predicate it documents. Every entry is
@@ -892,6 +898,8 @@ mod tests {
     async fn a_manager_speaking_takes_over_and_announces_once() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
+        // Auto-takeover is opt-in now; a team that wants it turns it on.
+        std::fs::write(home.join("config.toml"), "[takeover]\nenabled = true\n").unwrap();
         seed_user(home, "王小明", UserRole::Admin, "555", true);
         let ctx = test_ctx(home);
 
@@ -919,6 +927,7 @@ mod tests {
     async fn an_ordinary_user_is_recorded_but_never_answered_or_told() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
+        std::fs::write(home.join("config.toml"), "[takeover]\nenabled = true\n").unwrap();
         seed_user(home, "王小明", UserRole::Admin, "555", true);
         let ctx = test_ctx(home);
         intercept(&ctx, "telegram:1", "555", "我來處理").await;
@@ -983,7 +992,7 @@ mod tests {
         let home = dir.path();
         std::fs::write(
             home.join("config.toml"),
-            "[takeover]\nduration_minutes = 1\n",
+            "[takeover]\nenabled = true\nduration_minutes = 1\n",
         )
         .unwrap();
         seed_user(home, "王小明", UserRole::Admin, "555", true);

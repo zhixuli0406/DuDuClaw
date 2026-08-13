@@ -74,7 +74,15 @@ pub const MAX_EXTENSION_MINUTES: i64 = 8 * 60;
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default)]
 pub struct TakeoverConfig {
-    /// Master switch for the whole feature.
+    /// Master switch for the automatic "a manager spoke ⇒ take over" path.
+    /// **Opt-in (default `false`).** On-by-default was a false-trigger for the
+    /// most common shape of conversation — an owner/admin talking to *their own*
+    /// AI (every Personal-edition conversation, and any admin using the AI as a
+    /// personal assistant): each message they sent silenced the AI as if they
+    /// were stepping into a conversation it was handling for someone else. The
+    /// seamless-takeover feature is meaningful only for teams whose AI answers
+    /// *others* (customer/support channels), so it is now opt-in. The explicit
+    /// `/takeover` command is unaffected by this switch.
     pub enabled: bool,
     /// Window applied when a manager speaks, and when `/takeover` is used
     /// without an explicit amount.
@@ -87,7 +95,9 @@ pub struct TakeoverConfig {
 impl Default for TakeoverConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Opt-in: auto-takeover-on-type stays off until a team explicitly
+            // turns it on (see the `enabled` field doc for why).
+            enabled: false,
             duration_minutes: DEFAULT_DURATION_MINUTES,
             max_duration_minutes: HARD_MAX_DURATION_MINUTES,
         }
@@ -515,7 +525,16 @@ mod tests {
     }
 
     fn cfg() -> TakeoverConfig {
-        TakeoverConfig::default()
+        // These tests exercise the takeover *behaviour*, so opt in explicitly
+        // now that the default is off.
+        TakeoverConfig { enabled: true, ..TakeoverConfig::default() }
+    }
+
+    #[test]
+    fn default_is_opt_in_off() {
+        // Regression guard: the automatic takeover path must stay off by
+        // default so an owner/admin talking to their own AI is never silenced.
+        assert!(!TakeoverConfig::default().enabled);
     }
 
     #[test]

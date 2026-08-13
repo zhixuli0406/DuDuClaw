@@ -173,6 +173,8 @@
   "agents.create.displayName": "表示名",
   "agents.create.idHint": "小文字英字、数字、ハイフン",
   "agents.create.triggerHint": "空欄で自動生成",
+  "agents.create.model": "使用するモデル",
+  "agents.create.modelHint": "この従業員が既定で使うモデル。後から従業員設定の「頭脳とエンジン」でいつでも変更できます。",
   "agents.create.error": "Agent の作成に失敗しました。名前の形式を確認してください。",
   "agents.create.template": "テンプレートを適用",
   "agents.create.template.blank": "空白（テンプレートなし）",

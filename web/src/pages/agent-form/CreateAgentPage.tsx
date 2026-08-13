@@ -23,6 +23,8 @@ import {
 } from '@/components/mds';
 import { RowText, RowSelect, FieldBlock } from './form-rows';
 import { TEMPLATE_KIND_ORDER } from './defaults';
+import { ModelSelect } from '@/components/shared/ModelSelect';
+import { useAvailableModels } from '@/hooks/useAvailableModels';
 
 /**
  * CreateAgentPage — standalone route (/agents/new) for hiring a new AI
@@ -40,6 +42,19 @@ export function CreateAgentPage() {
   const [displayName, setDisplayName] = useState('');
   const [role, setRole] = useState('specialist');
   const [trigger, setTrigger] = useState('');
+  // Preferred model — no hardcoded default; the operator must pick one so a new
+  // employee never silently inherits a model they didn't choose (was always
+  // `claude-sonnet-4-6` server-side). Only shown on the blank path; a template
+  // brings its own model.
+  const [model, setModel] = useState('');
+  const {
+    models: availableModels,
+    loading: modelsLoading,
+    error: modelsError,
+    discoveredAt: modelsDiscoveredAt,
+    refreshing: modelsRefreshing,
+    refresh: modelsRefresh,
+  } = useAvailableModels();
   // Org placement — '' keeps the default (standalone, or the template's wiring).
   const [reportsTo, setReportsTo] = useState('');
   const [department, setDepartment] = useState('');
@@ -153,6 +168,7 @@ export function CreateAgentPage() {
           display_name: displayName.trim(),
           role,
           trigger: trigger || `@${displayName.trim()}`,
+          model_preferred: model,
           ...(reportsTo ? { reports_to: reportsTo } : {}),
           ...(department ? { department } : {}),
         });
@@ -204,7 +220,13 @@ export function CreateAgentPage() {
     ...departments.map((d) => ({ value: d.name, label: d.name, raw: d.name })),
   ];
 
-  const canSubmit = !submitting && !roleLoading && !!name.trim() && !!displayName.trim();
+  // Blank path requires an explicit model choice; a template supplies its own.
+  const canSubmit =
+    !submitting &&
+    !roleLoading &&
+    !!name.trim() &&
+    !!displayName.trim() &&
+    (usingTemplate || !!model);
 
   return (
     <div className="-mx-4 -mt-4 -mb-20 flex min-h-0 flex-1 flex-col md:-mx-6 md:-mt-6 md:-mb-6">
@@ -292,6 +314,21 @@ export function CreateAgentPage() {
               <RowSelect label={t('orgchart.detail.role')} value={role} onChange={setRole} options={roleOptions} />
             )}
             <RowText label={t('orgchart.detail.trigger')} description={t('agents.create.triggerHint')} value={trigger} placeholder="@Coder" onChange={setTrigger} />
+            {!usingTemplate && (
+              <FieldBlock label={t('agents.create.model')} description={t('agents.create.modelHint')}>
+                <ModelSelect
+                  value={model}
+                  onChange={setModel}
+                  models={availableModels}
+                  loading={modelsLoading}
+                  error={modelsError}
+                  discoveredAt={modelsDiscoveredAt}
+                  refreshing={modelsRefreshing}
+                  onRefresh={modelsRefresh}
+                  ariaLabel={t('agents.create.model')}
+                />
+              </FieldBlock>
+            )}
           </SettingsCard>
         </SettingsSection>
 

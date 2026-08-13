@@ -6439,6 +6439,17 @@ impl MethodHandler {
         } else {
             trigger.to_string()
         };
+        // Preferred model is now chosen by the user in the create form. The
+        // hardcoded `claude-sonnet-4-6` remains ONLY as a last-resort fallback
+        // for programmatic callers (MCP / API) that don't pass one — the
+        // dashboard always sends the operator's explicit choice.
+        let preferred_model = params
+            .get("model_preferred")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("claude-sonnet-4-6")
+            .to_string();
 
         if name.is_empty() {
             return WsFrame::error_response("", "Agent name is required");
@@ -6582,7 +6593,7 @@ impl MethodHandler {
             icon = "🤖"
 
             [model]
-            preferred = "claude-sonnet-4-6"
+            preferred = preferred_model
             fallback = "claude-haiku-4-5"
             account_pool = []
 
@@ -38326,6 +38337,33 @@ mod agents_create_reserved_name_tests {
             "{frame:?}"
         );
         assert!(home.path().join("agents").join("sales-lead").exists());
+    }
+
+    /// The operator's `model_preferred` choice is written verbatim — a created
+    /// employee no longer silently inherits `claude-sonnet-4-6`. Absent/blank
+    /// falls back to the default (kept for programmatic MCP/API callers).
+    #[tokio::test]
+    async fn create_honors_model_preferred_and_falls_back() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let _ = handler
+            .handle_agents_create(json!({
+                "name": "picky", "display_name": "Picky", "model_preferred": "opus"
+            }))
+            .await;
+        let picked =
+            std::fs::read_to_string(home.path().join("agents/picky/agent.toml")).unwrap();
+        assert!(picked.contains("preferred = \"opus\""), "{picked}");
+        assert!(!picked.contains("claude-sonnet-4-6"), "{picked}");
+
+        // No model_preferred → the programmatic fallback still applies.
+        let _ = handler
+            .handle_agents_create(json!({ "name": "plain", "display_name": "Plain" }))
+            .await;
+        let fallback =
+            std::fs::read_to_string(home.path().join("agents/plain/agent.toml")).unwrap();
+        assert!(fallback.contains("preferred = \"claude-sonnet-4-6\""), "{fallback}");
     }
 }
 
